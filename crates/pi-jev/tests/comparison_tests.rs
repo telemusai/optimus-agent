@@ -427,6 +427,7 @@ fn enforce_age_never_deletes_credential_or_settings_files() {
             pi_jev::types::DecisionCategory::TaskClassification,
             "age_probe",
             "jev-compare-prompts/1",
+            "compare",
         );
     }
     let survivors: Vec<String> = std::fs::read_dir(&jev_dir)
@@ -899,16 +900,17 @@ async fn off_mode_never_schedules_anything() {
     fixture.observer.shutdown();
 }
 
-/// Active must be permanently reserved and disabled: it is refused by the
-/// client, registers nothing, and no flag can grant Active capabilities
-/// (DESIGN.md sections 10-12). The mode stays visible for honest status
-/// output, but the observer registration gate is Compare-only.
+/// Active is an operative mode, and the mode resolution rules are unchanged:
+/// an explicit per-session mode wins, and a mode is never silently rewritten.
+/// What Active does NOT grant is unchanged too: this crate holds no host
+/// authority, applies nothing itself, and the client-side refusals for every
+/// control capability still hold.
 #[test]
-fn active_mode_is_permanently_disabled() {
+fn active_mode_is_operative_and_never_silently_rewritten() {
     use pi_jev::config::{resolve_effective_mode, JevSettings};
 
-    // The reserved mode is representable (visible in status) but can never
-    // act: the client refuses it and the observer gate fires only on Compare.
+    // The mode is represented exactly as set: never silently turned into
+    // Compare, and never inferred from a credential.
     assert_eq!(
         resolve_effective_mode(Some(JevMode::Active), None),
         JevMode::Active,
@@ -933,11 +935,11 @@ fn active_mode_is_permanently_disabled() {
     };
     assert_eq!(settings.effective_mode("sess-a"), JevMode::Active);
     assert!(
-        !settings.wants_observer(),
-        "an Active-only configuration must register nothing"
+        settings.wants_observer(),
+        "an Active configuration needs the observer and its client"
     );
 
-    // The settings file may say active; loading still cannot enable acting.
+    // The settings file may say active; loading reports exactly that.
     let dir = tempfile::Builder::new()
         .prefix("jev-active-")
         .tempdir()
@@ -950,19 +952,20 @@ fn active_mode_is_permanently_disabled() {
     .unwrap();
     let loaded = pi_jev::config::JevSettingsStore::new(dir.path()).load();
     assert_eq!(loaded.effective_mode("sess-any"), JevMode::Active);
-    assert!(!loaded.wants_observer());
+    // Active is operative: it needs the observer and its client.
+    assert!(loaded.wants_observer());
 
-    // The client refuses the reserved mode outright, credential or not.
-    assert!(matches!(
-        JevSystemOne::new(
-            JevMode::Active,
-            SecretString::new(SYNTHETIC_KEY),
-            Arc::new(MockJevTransport::all_valid()),
-            JevLimits::default(),
-            Arc::new(JevStats::default()),
-        ),
-        Err(JevError::ActiveReserved)
-    ));
+    // Active builds a real client. The crate still applies nothing itself:
+    // an accepted answer is returned to the caller, which owns the effect.
+    let client = JevSystemOne::new(
+        JevMode::Active,
+        SecretString::new(SYNTHETIC_KEY),
+        Arc::new(MockJevTransport::all_valid()),
+        JevLimits::default(),
+        Arc::new(JevStats::default()),
+    )
+    .expect("Active must construct");
+    assert_eq!(client.effective_mode(), JevMode::Active);
 }
 
 /// Delayed/stale SystemOne answers can only ever become records

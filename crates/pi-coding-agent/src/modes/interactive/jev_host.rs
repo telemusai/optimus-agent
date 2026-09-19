@@ -37,10 +37,10 @@ use super::Dialog;
 use super::jev_footer::JevFooterSnapshot;
 use super::jev_key_input::JevKeyInputComponent;
 use super::jev_menu::{
-    clear_secret, is_reserved_on, is_submit_key, jev_usage, mode_change_message, parse_jev_request,
-    render_help, render_status, CredentialStatus, JevMenuAction, JevModeBridge,
-    JevRequest, JevSecret, JevStatusReport, KeyInputState, JEV_ACTIVE_DISABLED_NOTICE,
-    JEV_ON_RESERVED_NOTICE,
+    clear_secret, is_on_shorthand, is_submit_key, jev_usage, mode_change_message,
+    parse_jev_request, render_help, render_status, CredentialStatus, JevMenuAction,
+    JevModeBridge, JevRequest, JevSecret, JevStatusReport, KeyInputState,
+    JEV_BOUNDARY_NOTICE, JEV_ON_COMPARE_NOTICE,
 };
 use super::jev_menu_component::JevMenuComponent;
 // `CommandOutput` and `HostEvent` are declared by the host module that owns this
@@ -212,8 +212,11 @@ fn publish_footer(
     let _ = send.send(HostEvent::Connection(event));
 }
 
-/// The `/jev status` panel, built from local state only: no network call, no
-/// secret, and `applied` is always zero because Compare applies nothing.
+/// The `/jev status` panel, built from local state only: no network call and no
+/// secret. The `applied` figure is zero in Compare because Compare applies
+/// nothing; in Active the panel renders the worker's real Active counters
+/// (applied boundaries, accepted-with-no-effect, refused, unavailable), and an
+/// absent block is reported as unknown rather than as zero.
 pub(super) async fn status_panel(
     connection: &Arc<dyn wire::AgentConnection>,
     settings: &pi_jev::config::JevSettings,
@@ -250,29 +253,26 @@ pub(super) async fn run(
 
     match parse_jev_request(args) {
         JevRequest::Unknown(argument) => Ok(CommandOutput::Error(format!(
-            "Unknown /jev option: {argument}\n{}\n{JEV_ACTIVE_DISABLED_NOTICE}",
+            "Unknown /jev option: {argument}\n{}\n{JEV_BOUNDARY_NOTICE}",
             jev_usage()
         ))),
         JevRequest::Menu => menu_dialog(connection, &bridge, &session_id, credential, send).await,
-        // `active` is reserved: the mode does NOT change and the reason is shown.
-        JevRequest::SetMode(JevMode::Active) => {
-            let mode = bridge.effective_mode(&session_id);
-            Ok(CommandOutput::Status(format!(
-                "{JEV_ACTIVE_DISABLED_NOTICE} Mode stays {}.",
-                super::jev_menu::mode_label(mode)
-            )))
-        }
+        // Every mode is a real mode, so `active` takes the same write path as Off
+        // and Compare and simply reports what was written.
         JevRequest::SetMode(mode) => {
             let change = bridge.set_session_mode(&session_id, mode)?;
             crate::core::jev_bridge::invalidate_settings_cache();
-            // Off must take effect immediately: the footer is republished in the
-            // same turn as the write, so nothing can render the old state.
+            // A mode change must take effect immediately: the footer is republished
+            // in the same turn as the write, so nothing can render the old state.
             publish_footer(send, bridge.effective_mode(&session_id), credential);
             let message = mode_change_message(&change);
-            if is_reserved_on(args) {
-                // `/jev on` means Compare, and it says so unambiguously.
+            // `/jev active` needs no extra wording: `mode_change_message` already
+            // appends the exact Active notice and the permanent boundary for it.
+            // `/jev on` stays Compare and adds the one line that explains why the
+            // shorthand is not the request-changing mode.
+            if mode == JevMode::Compare && is_on_shorthand(args) {
                 return Ok(CommandOutput::Status(format!(
-                    "{JEV_ON_RESERVED_NOTICE}. {message}"
+                    "{message}\n{JEV_ON_COMPARE_NOTICE}"
                 )));
             }
             Ok(CommandOutput::Status(message))
@@ -326,9 +326,6 @@ async fn menu_dialog(
                 let _ = send.send(HostEvent::CloseCommandDialog);
                 return Ok(CommandOutput::Status("Jev: cancelled".to_string()));
             }
-            // The overlay explains the reserved option and stays open: nothing
-            // changes, and no mode is written.
-            JevMenuAction::ReservedActive => {}
             JevMenuAction::SetMode(mode) => {
                 let change = bridge.set_session_mode(session_id, mode)?;
                 crate::core::jev_bridge::invalidate_settings_cache();

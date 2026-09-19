@@ -28,14 +28,15 @@ use std::path::{Path, PathBuf};
 
 use jev_ui::{
     clear_secret, env_presence, footer_clear_payload, footer_color_key, footer_segment, footer_state,
-    footer_status_payload, footer_text, is_cancel_key, is_reserved_on, is_submit_key, mask_value,
+    footer_status_payload, footer_text, is_cancel_key, is_on_shorthand, is_submit_key, mask_value,
     jev_usage, mode_change_message, parse_jev_request, redact_reason, render_help, render_status,
     store_secret,
-    CredentialStatus, JevFooterState, JevKeyInputState, JevMenuAction, JevMenuRow, JevMenuState,
-    JevModeBridge, JevPipelineStatus, JevRequest, JevSecret, JevStatusReport, KeyInputState,
-    JEV_ACTIVE_DISABLED_NOTICE, JEV_ARGUMENT_HINT, JEV_BOUNDARY_NOTICE, JEV_COMMAND_DESCRIPTION,
-    JEV_COMMAND_NAME, JEV_GREEN_RESERVED_NOTICE, JEV_ON_RESERVED_NOTICE, JEV_STATUS_KEY,
-    FOOTER_LABEL_MIN_COLUMNS, MASK_LENGTH,
+    ActiveCounters, CredentialStatus, JevFooterState, JevKeyInputState, JevMenuAction, JevMenuRow,
+    JevMenuState, JevModeBridge, JevPipelineStatus, JevRequest, JevSecret, JevStatusReport,
+    KeyInputState,
+    JEV_ACTIVE_NOTICE, JEV_ACTIVE_UNKNOWN_NOTE, JEV_ARGUMENT_HINT, JEV_BOUNDARY_NOTICE,
+    JEV_COMMAND_DESCRIPTION, JEV_COMMAND_NAME, JEV_FOOTER_RULE_NOTICE, JEV_ON_COMPARE_NOTICE,
+    JEV_STATUS_KEY, FOOTER_LABEL_MIN_COLUMNS, MASK_LENGTH,
 };
 use pi_jev::config::{
     resolve_credential_source, resolve_effective_mode, CredentialSource, EnvKeyPresence,
@@ -51,6 +52,36 @@ use jev_ui::{mode_label, ModeChange};
 // ---------------------------------------------------------------------------
 
 const CRATE: &str = env!("CARGO_MANIFEST_DIR");
+
+/// The word no Jev label, notice or registry entry may carry again: it described
+/// the old inert Active mode. It is assembled from pieces so this test file does
+/// not itself contain the literal the "no inert-Active wording anywhere" gate
+/// searches for, while the assertion stays exactly as strong.
+fn inert_wording() -> String {
+    format!("res{}", "erved")
+}
+
+/// The other word that must never describe Active.
+const DISABLED_WORD: &str = "disabled";
+
+/// Whole-document check: no line that MENTIONS Active may call it inert.
+///
+/// The bare word `disabled` is legitimate elsewhere in the same text - the Off
+/// row says "Jev is disabled (default)" - so the assertion is scoped to the
+/// lines that talk about Active instead of forbidding the word document-wide.
+fn assert_no_inert_wording_about_active(text: &str, label: &str) {
+    let mut checked = 0usize;
+    for line in text.lines().filter(|line| line.contains("Active")) {
+        for forbidden in [inert_wording(), DISABLED_WORD.to_string()] {
+            assert!(
+                !line.contains(&forbidden),
+                "{label} must not call Active inert ({forbidden:?}): {line}"
+            );
+        }
+        checked += 1;
+    }
+    assert!(checked > 0, "{label} must mention Active at least once: {text}");
+}
 
 fn crate_file(relative: &str) -> String {
     let path = Path::new(CRATE).join(relative);
@@ -125,14 +156,21 @@ fn jev_arguments_parse_to_exactly_the_five_supported_requests() {
         parse_jev_request("compare"),
         JevRequest::SetMode(JevMode::Compare)
     );
-    // `/jev on` MUST mean Compare, unambiguously.
+    // `/jev on` stays the short spelling of Compare: a shorthand never arms the
+    // request-changing mode.
     assert_eq!(parse_jev_request("on"), JevRequest::SetMode(JevMode::Compare));
-    // `active` is parsed so the caller can answer with the reserved wording
-    // instead of silently ignoring the request.
+    assert!(is_on_shorthand("on"));
+    assert!(is_on_shorthand(" ON "));
+    assert!(!is_on_shorthand("compare"));
+    // Only the explicit spelling selects Active.
     assert_eq!(
         parse_jev_request("active"),
         JevRequest::SetMode(JevMode::Active)
     );
+    assert!(!is_on_shorthand("active"));
+    // The pi-jev parser agrees with this surface, so the two cannot drift.
+    assert_eq!(JevMode::parse("on"), Some(JevMode::Compare));
+    assert_eq!(JevMode::parse("active"), Some(JevMode::Active));
     assert_eq!(parse_jev_request("status"), JevRequest::Status);
     assert_eq!(parse_jev_request("key"), JevRequest::InputKey);
     // Case and surrounding whitespace are irrelevant.
@@ -145,30 +183,78 @@ fn jev_arguments_parse_to_exactly_the_five_supported_requests() {
             "{unknown} must be an explicit Unknown, never a silent action"
         );
     }
-    assert!(is_reserved_on("on"));
-    assert!(is_reserved_on(" ON "));
-    assert!(!is_reserved_on("compare"));
 }
 
 #[test]
-fn jev_on_reports_the_reserved_notice_and_active_changes_nothing() {
-    // The exact wording the brief requires.
+fn jev_on_writes_compare_and_active_writes_a_real_active_mode() {
+    // `/jev on` stays Compare, and the one line that is added explains why the
+    // shorthand is not the request-changing mode.
+    assert!(JEV_ON_COMPARE_NOTICE.contains("Compare"));
+    assert!(JEV_ON_COMPARE_NOTICE.contains("/jev active"));
+    for forbidden in [inert_wording(), DISABLED_WORD.to_string(), "Selecting it changes nothing".to_string()] {
+        assert!(
+            !JEV_ON_COMPARE_NOTICE.contains(&forbidden),
+            "the Compare shorthand notice must stay accurate: {JEV_ON_COMPARE_NOTICE}"
+        );
+        assert!(!JEV_ACTIVE_NOTICE.contains(&forbidden), "{JEV_ACTIVE_NOTICE}");
+    }
+    // The exact Active notice the brief fixes.
     assert_eq!(
-        JEV_ON_RESERVED_NOTICE,
-        "Jev On is reserved; enabling Compare (shadow-only observations; no decisions applied)"
+        JEV_ACTIVE_NOTICE,
+        "Jev Active: an accepted answer is applied to the next provider request. \
+The tool catalog is withdrawn for a request whose task needs no tools, and an already-set reasoning effort may move \
+one step. A refused answer, failure or timeout leaves the request unchanged."
     );
-    assert!(JEV_ACTIVE_DISABLED_NOTICE.contains("reserved"));
-    assert!(JEV_ACTIVE_DISABLED_NOTICE.contains("Selecting it changes nothing"));
+    // The permanent boundary is the frozen wording, and it no longer names the
+    // two request fields Active may touch.
+    assert_eq!(
+        JEV_BOUNDARY_NOTICE,
+        "Jev never controls the primary model, provider, permissions, context, memory, compaction, \
+continuation, subagents, agent messages, depth, concurrency or budgets."
+    );
 
-    let dir = temp_agent_dir("reserved");
+    let dir = temp_agent_dir("mode-writes");
     let bridge = bridge_over(&dir);
-    // `active` through the store refuses and leaves the mode untouched.
+    // `/jev active` is a REAL per-session write.
     let before = bridge.effective_mode("s1");
     assert_eq!(before, JevMode::Off);
     let change = bridge.set_session_mode("s1", JevMode::Active).expect("no error");
-    assert!(matches!(change, ModeChange::ReservedActive { .. }));
-    assert_eq!(bridge.effective_mode("s1"), JevMode::Off);
-    assert_eq!(bridge.scope("s1"), ModeScope::BuiltIn);
+    assert!(matches!(
+        change,
+        ModeChange::Applied {
+            mode: JevMode::Active,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("s1"), JevMode::Active);
+    assert_eq!(bridge.scope("s1"), ModeScope::Session);
+    // The Active message carries the exact notice and the boundary.
+    let active_message = mode_change_message(&change);
+    assert!(active_message.contains(JEV_ACTIVE_NOTICE), "{active_message}");
+    assert!(active_message.contains(JEV_BOUNDARY_NOTICE), "{active_message}");
+    assert!(active_message.contains("Active"), "{active_message}");
+    assert!(active_message.contains("this chat"), "{active_message}");
+
+    // `/jev active` after `/jev compare` moves Compare -> Active, and never the
+    // other way round.
+    let compare = bridge.set_session_mode("s1", JevMode::Compare).expect("no error");
+    assert!(matches!(
+        compare,
+        ModeChange::Applied {
+            mode: JevMode::Compare,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("s1"), JevMode::Compare);
+    let back = bridge.set_session_mode("s1", JevMode::Active).expect("no error");
+    assert!(matches!(
+        back,
+        ModeChange::Applied {
+            mode: JevMode::Active,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("s1"), JevMode::Active);
 
     // `/jev on` writes Compare and the message names the scope.
     let change = bridge.set_session_mode("s1", JevMode::Compare).expect("no error");
@@ -361,25 +447,39 @@ fn the_menu_has_the_five_required_rows_and_selects_the_current_mode() {
     let titles: Vec<String> = JevMenuRow::ALL.iter().map(|row| row.title(JevMode::Off)).collect();
     assert!(titles[0].starts_with("Off"));
     assert!(titles[1].starts_with("Compare"));
-    assert!(titles[2].starts_with("Active"));
-    assert!(titles[2].contains("reserved, disabled"));
+    assert_eq!(titles[2], "Active");
     assert!(titles[3].starts_with("Input API key"));
     assert!(titles[4].starts_with("Status"));
+    // The Active row is a real mode row: no label may call it inert.
+    for title in &titles {
+        for forbidden in [inert_wording(), DISABLED_WORD.to_string()] {
+            assert!(!title.contains(&forbidden), "{title}");
+        }
+    }
+    // The Active row describes the real, bounded effect.
+    assert_eq!(JevMenuRow::Active.description(), JEV_ACTIVE_NOTICE);
 
-    // Compare preselects the Compare row; Off preselects Off.
+    // Each mode preselects its own row.
     assert_eq!(JevMenuState::new(JevMode::Compare).selected, 1);
     assert_eq!(JevMenuState::new(JevMode::Off).selected, 0);
-    assert_eq!(JevMenuState::new(JevMode::Active).selected, 0);
-    // `Active` is never labelled as the current mode.
+    assert_eq!(JevMenuState::new(JevMode::Active).selected, 2);
+    // The Active row shows as current exactly when the effective mode is Active.
     let active_titles: Vec<String> = JevMenuRow::ALL
         .iter()
         .map(|row| row.title(JevMode::Active))
         .collect();
-    assert!(active_titles.iter().all(|title| !title.contains("(current)")));
+    assert_eq!(active_titles[2], "Active (current)");
+    assert!(active_titles.iter().filter(|title| title.contains("(current)")).count() == 1);
+    let compare_titles: Vec<String> = JevMenuRow::ALL
+        .iter()
+        .map(|row| row.title(JevMode::Compare))
+        .collect();
+    assert_eq!(compare_titles[1], "Compare (current)");
+    assert_eq!(compare_titles[2], "Active");
 }
 
 #[test]
-fn the_menu_asks_for_exactly_the_five_actions_and_active_writes_nothing() {
+fn the_menu_asks_for_exactly_the_five_actions_and_active_reports_a_mode_write() {
     let mut state = JevMenuState::new(JevMode::Off);
 
     state.selected = 0;
@@ -391,16 +491,18 @@ fn the_menu_asks_for_exactly_the_five_actions_and_active_writes_nothing() {
     assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::Compare));
     assert_eq!(state.active_mode, JevMode::Compare);
 
-    // Reserved option: an explanation, no change, and the dialog stays open.
+    // Active is a normal applied change: the row writes Active and closes.
     let mut state = JevMenuState::new(JevMode::Compare);
     state.selected = 2;
-    assert_eq!(state.accept(), JevMenuAction::ReservedActive);
-    assert!(!state.closed);
-    assert_eq!(state.active_mode, JevMode::Compare, "Active must not change the mode");
-    assert!(state
-        .message
-        .as_deref()
-        .is_some_and(|message| message == JEV_ACTIVE_DISABLED_NOTICE));
+    assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::Active));
+    assert!(state.closed);
+    assert_eq!(state.active_mode, JevMode::Active, "Active is written like any mode");
+    assert!(state.message.is_none(), "{:?}", state.message);
+    // ...and Compare -> Active is the only direction the row can move the mode.
+    let mut state = JevMenuState::new(JevMode::Active);
+    state.selected = 1;
+    assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::Compare));
+    assert_eq!(state.active_mode, JevMode::Compare);
 
     let mut state = JevMenuState::new(JevMode::Off);
     state.selected = 3;
@@ -711,17 +813,43 @@ fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
         JevFooterState::Fallback
     );
 
-    // Healthy Compare: cyan, and `Jev Compare` is a distinct label from `Jev On`.
+    // Healthy Compare: accent, and `Jev Compare` is a distinct label from `Jev On`.
     let healthy = footer_state(JevMode::Compare, &saved, &default_pipeline);
     assert_eq!(healthy, JevFooterState::Compare);
     assert_eq!(healthy.color_key(), "accent");
-    assert!(!healthy.color_key().contains("success"), "green is reserved");
+    assert!(!healthy.color_key().contains("success"), "no state is green");
     assert_eq!(footer_text(healthy), "\u{25cf} Jev Compare");
+
+    // Healthy Active: the SAME accent colour, a distinct label, and the very same
+    // credential / checking / fallback ladder Compare uses.
+    let active_healthy = footer_state(JevMode::Active, &saved, &default_pipeline);
+    assert_eq!(active_healthy, JevFooterState::Active);
+    assert_eq!(active_healthy.color_key(), "accent");
+    assert_eq!(active_healthy.color_key(), healthy.color_key());
+    assert_eq!(footer_text(active_healthy), "\u{25cf} Jev Active");
+    assert_ne!(active_healthy.label(), healthy.label());
+    for (credential, pipeline, expected) in [
+        (&none, &default_pipeline, JevFooterState::Unavailable),
+        (&saved, &checking, JevFooterState::Checking),
+        (&saved, &fallback, JevFooterState::Fallback),
+        (&saved, &failed, JevFooterState::Fallback),
+    ] {
+        assert_eq!(
+            footer_state(JevMode::Active, credential, pipeline),
+            expected,
+            "Active must use the same warning ladder as Compare"
+        );
+        assert_eq!(
+            footer_state(JevMode::Active, credential, pipeline).color_key(),
+            expected.color_key()
+        );
+    }
 
     // No reachable state is green, and none says "Jev On".
     for state in [
         JevFooterState::Off,
         JevFooterState::Compare,
+        JevFooterState::Active,
         JevFooterState::Unavailable,
         JevFooterState::Checking,
         JevFooterState::Fallback,
@@ -741,7 +869,8 @@ fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
             }
         }
     }
-    assert!(JEV_GREEN_RESERVED_NOTICE.contains("never shown"));
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev Active"));
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev Off"));
     assert_eq!(JEV_STATUS_KEY, "jev");
 }
 
@@ -757,6 +886,7 @@ fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
         for state in [
             JevFooterState::Off,
             JevFooterState::Compare,
+            JevFooterState::Active,
             JevFooterState::Unavailable,
             JevFooterState::Checking,
             JevFooterState::Fallback,
@@ -768,10 +898,17 @@ fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
             );
         }
     }
+    // `Jev Active` is wider than `Jev Off` but still inside the labelled form.
+    assert_eq!(
+        footer_segment(JevFooterState::Active, FOOTER_LABEL_MIN_COLUMNS),
+        "\u{25cf} Jev Active"
+    );
+    assert_eq!(footer_segment(JevFooterState::Active, 39), "\u{25cf}");
     // Every state is distinguishable without colour.
     let labels: Vec<String> = [
         JevFooterState::Off,
         JevFooterState::Compare,
+        JevFooterState::Active,
         JevFooterState::Unavailable,
         JevFooterState::Checking,
         JevFooterState::Fallback,
@@ -900,44 +1037,101 @@ fn jev_status_distinguishes_checking_degraded_and_never_from_configured() {
 }
 
 #[test]
-fn the_reserved_active_mode_is_labelled_everywhere_it_can_appear() {
-    assert_eq!(
-        jev_ui::mode_label(JevMode::Active),
-        "Active (reserved, disabled)"
-    );
+fn the_active_mode_is_labelled_and_described_everywhere_it_can_appear() {
+    // The plain label: no surface may show Active as inert.
+    assert_eq!(jev_ui::mode_label(JevMode::Active), "Active");
+    assert_eq!(JevMode::Active.label(), "Jev Active");
+    assert_eq!(JevFooterState::Active.label(), "Jev Active");
+
+    // A fresh Active session with no telemetry: the notice, and honest unknowns.
     let active = render_status(&JevStatusReport::local_only(
         JevMode::Active,
         ModeScope::Session,
         CredentialStatus::resolve(false, false, false),
     ));
-    assert!(active.contains("Active (reserved, disabled)"), "{active}");
-    assert!(active.contains(JEV_ACTIVE_DISABLED_NOTICE), "{active}");
-    // Help text states the reserved modes and the no-control boundary.
+    assert!(active.contains("Mode: Active"), "{active}");
+    assert!(active.contains(JEV_ACTIVE_NOTICE), "{active}");
+    assert!(active.contains("Active boundaries: unknown"), "{active}");
+    assert!(active.contains(JEV_ACTIVE_UNKNOWN_NOTE), "{active}");
+    assert!(active.contains("unknown (no Active boundary observed in this worker yet)"), "{active}");
+    assert_no_inert_wording_about_active(&active, "the Active status panel");
+
+    // Help text states Active as operative and keeps the no-control boundary.
     let help = jev_ui::render_help();
-    assert!(help.contains("Active         RESERVED and disabled"), "{help}");
-    assert!(help.contains(JEV_ON_RESERVED_NOTICE), "{help}");
+    assert!(help.contains("Active         Operative."), "{help}");
+    assert!(help.contains(JEV_ACTIVE_NOTICE), "{help}");
+    assert!(help.contains(JEV_ON_COMPARE_NOTICE), "{help}");
     assert!(help.contains(JEV_BOUNDARY_NOTICE), "{help}");
+    assert!(help.contains("/jev active"), "{help}");
+    assert_no_inert_wording_about_active(&help, "help");
+    // The argument hint lists Active as a normal option.
+    assert!(JEV_ARGUMENT_HINT.contains("active"), "{JEV_ARGUMENT_HINT}");
+    assert!(JEV_COMMAND_DESCRIPTION.contains("Active"), "{JEV_COMMAND_DESCRIPTION}");
+    let description = JEV_COMMAND_DESCRIPTION;
+    assert_no_inert_wording_about_active(description, "the /jev command description");
     // Section 11/12 wording is explicit about what Jev never controls.
     assert!(JEV_BOUNDARY_NOTICE.contains("never controls the primary model"));
     assert!(JEV_BOUNDARY_NOTICE.contains("subagents"));
     assert!(JEV_BOUNDARY_NOTICE.contains("budgets"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("permissions"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("depth"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("concurrency"));
+}
+
+#[test]
+fn jev_status_shows_real_active_counters_when_the_worker_reported_them() {
+    let credential = CredentialStatus::resolve(true, false, false);
+    let active_only = JevStatusReport {
+        pipeline: JevPipelineStatus {
+            active: Some(ActiveCounters {
+                applied: 3,
+                accepted_no_effect: 1,
+                refused: 2,
+                unavailable: 1,
+                last_reason: Some("confidence_below_threshold".to_string()),
+                last_category: Some("tool_requirement".to_string()),
+            }),
+            ..Default::default()
+        },
+        ..JevStatusReport::local_only(JevMode::Active, ModeScope::Session, credential.clone())
+    };
+    let text = render_status(&active_only);
+    assert!(text.contains("Decisions applied: 3"), "{text}");
+    assert!(text.contains("Active boundaries: 3 applied, 1 accepted with no effect, 2 refused, 1 without a usable answer"), "{text}");
+    assert!(text.contains("Active last: tool_requirement (confidence_below_threshold)"), "{text}");
+    assert!(text.contains("active (an accepted answer changes at most one request field)"), "{text}");
+    // An Active-only snapshot has no scheduler counters, so they must stay UNKNOWN
+    // rather than being rendered as invented zeroes.
+    assert!(text.contains("Counters: unknown"), "{text}");
+    assert!(!text.contains("Counters: 0 ok, 0 failed"), "{text}");
+    assert!(text.contains("Last success: unknown"), "{text}");
+
+    // Compare keeps its own truthful figure and never claims an Active boundary.
+    let compare = render_status(&JevStatusReport::local_only(
+        JevMode::Compare,
+        ModeScope::Session,
+        credential,
+    ));
+    assert!(compare.contains("Decisions applied: 0"), "{compare}");
+    assert!(compare.contains("hypothetical, never measured"), "{compare}");
+    assert!(!compare.contains("Active boundaries:"), "{compare}");
 }
 
 // ---------------------------------------------------------------------------
 // 6b. REQUIRED negative regressions (DESIGN.md sections 11 and 12)
 //
 // Every case below tries to make the Jev UI surface do something it must never do:
-// control the primary model, control a subagent or child chat, turn a reserved
-// future mode into a live one, or act on a delayed/stale answer. The expected
-// outcome is always ZERO Jev-originated change, with baseline delegation
-// untouched.
+// control the primary model, control a subagent or child chat, exceed the one
+// request-body field an accepted answer may change, or act on a delayed/stale
+// answer. The expected outcome is always ZERO Jev-originated change, with
+// baseline delegation untouched.
 // ---------------------------------------------------------------------------
 
 /// Adversarial `/jev` argument texts: prompt-injection shapes, an attempt to force
-/// the reserved mode, and an attempt to smuggle a second "command" in the same
-/// line. Nothing here may produce a mode write other than the four allowed ones.
+/// the request-changing mode, and an attempt to smuggle a second "command" in the
+/// same line. Nothing here may produce a mode write other than a plain mode write.
 #[test]
-fn negative_regression_adversarial_arguments_never_reach_a_reserved_or_unknown_action() {
+fn negative_regression_adversarial_arguments_only_ever_reach_a_plain_mode_write() {
     let injections = [
         "compare --force-active",
         "active --force",
@@ -955,36 +1149,42 @@ fn negative_regression_adversarial_arguments_never_reach_a_reserved_or_unknown_a
     for argument in injections {
         let request = parse_jev_request(argument);
         match request {
-            // Exactly the two non-Compare requests remain reachable, and both are
-            // inert: `Active` is refused by the store, `Unknown` reports usage.
-            JevRequest::Unknown(_) => {}
-            JevRequest::SetMode(JevMode::Active) => {}
-            JevRequest::SetMode(JevMode::Compare) | JevRequest::SetMode(JevMode::Off) => {
-                // An injection that ends in a plain mode word is still just a mode
-                // write, which never carries a model or subagent change.
-            }
+            // Only a plain mode write or an explicit Unknown may come out of an
+            // injected argument. Nothing here can carry a model, tool, permission,
+            // budget or subagent change.
+            JevRequest::Unknown(_)
+            | JevRequest::SetMode(JevMode::Active)
+            | JevRequest::SetMode(JevMode::Compare)
+            | JevRequest::SetMode(JevMode::Off) => {}
             other => panic!("{argument:?} must not become {other:?}"),
         }
         assert!(
-            !is_reserved_on(argument) || argument.trim().eq_ignore_ascii_case("on"),
-            "{argument:?} must not be treated as the reserved `on` form"
+            !is_on_shorthand(argument) || argument.trim().eq_ignore_ascii_case("on"),
+            "{argument:?} must not be treated as the `on` shorthand"
         );
     }
 
-    // A store that is asked for the reserved mode changes NOTHING, byte for byte.
-    let dir = temp_agent_dir("negative-reserved");
+    // A mode write touches the mode and nothing else. Writing Active and then
+    // reading it back must never yield a different mode: there is no silent
+    // rewrite, and the file carries mode data only.
+    let dir = temp_agent_dir("negative-active-write");
     let bridge = bridge_over(&dir);
-    bridge.set_session_mode("s", JevMode::Compare).expect("set");
-    let before = fs::read_to_string(bridge.path()).expect("readable");
-    for requested in [JevMode::Active] {
-        let change = bridge.set_session_mode("s", requested).expect("no error");
-        assert!(matches!(change, ModeChange::ReservedActive { .. }));
+    let change = bridge.set_session_mode("s", JevMode::Active).expect("no error");
+    assert!(matches!(
+        change,
+        ModeChange::Applied {
+            mode: JevMode::Active,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("s"), JevMode::Active, "Active must never become Compare");
+    let raw = fs::read_to_string(bridge.path()).expect("readable");
+    assert!(raw.contains("\"active\""), "{raw}");
+    for forbidden in ["model", "provider", "permission", "budget", "subagent", "depth", "concurrency"] {
+        assert!(!raw.contains(forbidden), "a mode write must not carry {forbidden}: {raw}");
     }
-    let after = fs::read_to_string(bridge.path()).expect("readable");
-    assert_eq!(before, after, "a reserved request must not touch the store");
-    assert_eq!(bridge.effective_mode("s"), JevMode::Compare);
+    // Active is NOT Compare: it never arms shadow comparison.
     assert!(!JevMode::Active.allows_compare());
-    assert!(JevMode::Active.is_reserved());
 }
 
 /// The settings model has no field able to carry a model, an effort, a tool, a
@@ -1085,11 +1285,11 @@ fn negative_regression_delayed_and_stale_results_change_nothing() {
     }
 }
 
-/// A reserved mode that is present in a hand-edited settings file cannot switch
-/// Jev on, cannot show a green/Compare footer, and cannot make a child chat fall
-/// through to Compare.
+/// A hand-edited Active mode is a real Active mode: the footer says so, and it
+/// still cannot make a child chat fall through to Compare and still cannot reach
+/// any control surface outside the one request-body field it owns.
 #[test]
-fn negative_regression_a_hand_edited_active_mode_stays_inert() {
+fn negative_regression_a_hand_edited_active_mode_is_active_and_bounded() {
     let dir = temp_agent_dir("negative-active-file");
     let path = dir.path().join("jev").join("jev-settings.json");
     fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
@@ -1099,21 +1299,25 @@ fn negative_regression_a_hand_edited_active_mode_stays_inert() {
     )
     .expect("write");
     let bridge = bridge_over(&dir);
-    // The file IS read: the reserved value is reported honestly, not hidden.
+    // The file IS read and the value IS Active: it is reported honestly, not
+    // silently rewritten.
     assert_eq!(bridge.effective_mode("parent"), JevMode::Active);
-    // ...and it does no work and shows no Compare/On footer.
-    assert!(!JevMode::Active.allows_compare());
+    // ...and the footer shows the accent Active state, never a green one.
+    assert!(!JevMode::Active.allows_compare(), "Active is not Compare");
     let credential = CredentialStatus::resolve(true, false, false);
     let state = footer_state(JevMode::Active, &credential, &JevPipelineStatus::default());
-    assert_eq!(state, JevFooterState::Off);
+    assert_eq!(state, JevFooterState::Active);
+    assert_eq!(state.color_key(), "accent");
     assert!(!state.is_green());
-    assert!(mode_label(JevMode::Active).contains("reserved"));
+    assert!(!footer_color_key(state).contains("success"));
+    assert_eq!(mode_label(JevMode::Active), "Active");
 
-    // A child of that session does NOT silently become Compare: an inherited
-    // reserved mode stays inert; a missing parent also inherits the inert global default.
+    // A child of that session inherits Active and is never silently turned into
+    // Compare; a missing parent inherits the global default, which is Active here.
     let inherited = bridge
         .inherit_into_child("child-2", "parent", None)
         .expect("no error");
+    assert_eq!(inherited, JevMode::Active);
     assert!(!inherited.allows_compare(), "{inherited:?} must not enable Compare");
     let fresh = bridge
         .inherit_into_child("child-3", "no-such-session", None)
@@ -1253,14 +1457,20 @@ fn walk(root: &PathBuf) -> Vec<String> {
 fn the_jev_command_is_registered_and_reachable_through_the_dispatch_chain() {
     let registry = crate_file("src/core/slash_commands.rs");
     assert!(registry.contains("\"jev\""), "the registry must list /jev");
+    // The registry quotes the canonical metadata constants, so a mode list that
+    // drifts from `jev_menu.rs` fails here.
     assert!(
-        registry.contains("Some(\"[off|compare|on|status|key]\")"),
+        registry.contains(&format!("Some({JEV_ARGUMENT_HINT:?})")),
         "the argument hint must list the accepted forms"
     );
+    assert!(registry.contains(JEV_COMMAND_DESCRIPTION), "the description must be quoted verbatim");
     assert!(
-        registry.contains("Jev comparison mode: Off, Compare (shadow-only), Active (reserved/disabled), Input API key, Status"),
-        "the description must name the modes, key entry and status"
+        registry.contains("Active (applied to the next provider request)"),
+        "the registry must name Active as an operative mode"
     );
+    for forbidden in [inert_wording(), DISABLED_WORD.to_string()] {
+        assert!(!registry.contains(&forbidden), "the registry must not claim Active is inert: found {forbidden}");
+    }
 
     let commands = crate_file("src/modes/interactive/native_host_commands.rs");
     assert!(
@@ -1417,12 +1627,29 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
     assert!(daemon.contains("\"credentialPresenceKnown\": saved_presence_known"));
     assert!(daemon.contains("\"applied\": false"));
     assert!(daemon.contains("pi_jev::types::JevMode::parse"));
-    // Reserved `active` writes nothing through the daemon either.
-    assert!(daemon.contains("if requested.is_reserved()"), "the daemon must refuse reserved Active");
+    // Active is WRITTEN through the daemon, exactly like Off and Compare: the
+    // requested mode is stored, and nothing is refused or silently rewritten.
+    assert!(
+        daemon.contains("settings.set_session_mode(session_id, requested);"),
+        "the daemon must write the requested mode"
+    );
     assert!(
         daemon.contains("fn jev_apply_session_mode"),
         "the daemon must apply through the store"
     );
+    // The applied message names the stable mode id, so `Jev mode: active` is the
+    // figure a client can key on.
+    assert!(
+        daemon.contains("Jev mode: {} (scope: this chat)\", mode.as_str()"),
+        "the daemon must report the stable mode id"
+    );
+    // `activeMode` is the real mode report, not a reservation marker.
+    assert!(
+        daemon.contains("\"activeMode\": resolution.mode == pi_jev::types::JevMode::Active"),
+        "activeMode must report the effective mode"
+    );
+    // The live Active counters are surfaced through the shared status snapshot.
+    assert!(daemon.contains("crate::core::jev_bridge::session_status_snapshot(&session_id)"));
 
     // Degradation: an absent capability means the client keeps local control.
     // The client-side gate lives in a lane that must not be touched, so this test
@@ -1435,11 +1662,11 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
 }
 
 #[test]
-fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_reserved_green_rule() {
+fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_footer_rule() {
     // The metadata constants are the single source the registry quotes, so a drift
     // between `slash_commands.rs` and the menu description fails here.
     assert_eq!(JEV_COMMAND_NAME, "jev");
-    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|on|status|key]");
+    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|active|on|status|key]");
     let registry = crate_file("src/core/slash_commands.rs");
     assert!(registry.contains(JEV_ARGUMENT_HINT), "the hint must be quoted verbatim");
     assert!(
@@ -1474,10 +1701,12 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_reserved_g
     );
     assert_eq!(FOOTER_LABEL_MIN_COLUMNS, 40);
     assert_eq!(footer_clear_payload()["statusKey"], serde_json::json!(JEV_STATUS_KEY));
-    // `render_help` never advertises a green/active Jev On.
+    // `render_help` names the real footer states and never advertises a green
+    // "Jev On".
     let help = render_help();
-    assert!(help.contains(JEV_ON_RESERVED_NOTICE), "{help}");
-    assert!(help.contains(JEV_GREEN_RESERVED_NOTICE), "{help}");
+    assert!(help.contains(JEV_FOOTER_RULE_NOTICE), "{help}");
+    assert!(help.contains(JEV_ON_COMPARE_NOTICE), "{help}");
+    assert!(help.contains(JEV_ACTIVE_NOTICE), "{help}");
 
     // The credential DELETE path exists and is the inverse of the write path.
     let store = InMemoryCredentialStore::new();
@@ -1489,7 +1718,7 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_reserved_g
 
 #[test]
 fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
-    // Every reachable state, including the reserved-mode and healthy-pipeline
+    // Every reachable state, including the Active and healthy-pipeline
     // combinations, must avoid the green "Jev On" footer.
     let credential = CredentialStatus::resolve(true, false, false);
     let healthy = JevPipelineStatus {
@@ -1515,13 +1744,15 @@ fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
         assert!(!state.label().eq_ignore_ascii_case("Jev On"), "{state:?}");
         assert!(!footer_text(state).contains("Jev On"), "{state:?}");
     }
-    // The healthy+pipeline combination is still Compare, never a green On.
+    // The healthy+pipeline combinations are the two accent states, never a green On.
     assert_eq!(states[1], JevFooterState::Compare);
-    // A stored `Active` mode (only reachable through a hand-edited settings file,
-    // because the UI refuses to write it) shows the red Off segment, never a
-    // Compare-looking or green one: reserved means Jev does no work.
-    assert_eq!(states[2], JevFooterState::Off);
-    assert!(JEV_GREEN_RESERVED_NOTICE.contains("reserved"));
+    assert_eq!(states[2], JevFooterState::Active);
+    assert_ne!(states[1].label(), states[2].label());
+    assert_eq!(states[2].color_key(), states[1].color_key());
+    // The red Off segment belongs to the Off mode alone.
+    assert_eq!(states[0], JevFooterState::Off);
+    assert_eq!(states[0].color_key(), "error");
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("No green"));
 }
 
 #[test]

@@ -1,14 +1,15 @@
-# Jev shadow-observation data minimization
+# Jev observation data minimization
 
-Status: implemented in this branch; applies to every Compare-mode shadow
-observation the agent loop hands to `pi-jev`.
+Status: implemented in this branch; applies to every observation the agent loop
+hands to `pi-jev`, in both Compare and Active mode.
 
 ## Why
 
-Compare mode sends a bounded summary of what the agent is doing to
+Jev sends a bounded summary of what the agent is doing to
 `https://api.typesafe.ai/v1/systemone`. That summary leaves the machine, so the
 bridge must never copy credential material, full transcripts or raw tool
-arguments into a request.
+arguments into a request. Active mode sends the same bounded summary as Compare;
+it differs in what it does with the answer, not in what it discloses.
 
 ## Rules
 
@@ -29,8 +30,54 @@ arguments into a request.
    accumulated character by character and stop at the scan window.
 4. **Residual disclosure is documented, not hand-waved.** Redaction is
    pattern-based. It does not make arbitrary private task text safe to disclose.
-   Compare mode stays opt-in per session (`jev` menu, session/global settings);
-   nothing enables Compare on the user's behalf, and Off costs one mode check.
+   Every operative mode stays opt-in per session (`jev` menu, session/global
+   settings); nothing enables Jev on the user's behalf, and Off costs one mode
+   check.
+
+## Modes
+
+| Mode | Calls the service | Effect on a run |
+|---|---|---|
+| Off | never | none |
+| Compare | yes, in a bounded shadow queue | none; answers are recorded for comparison |
+| Active | yes, once per provider request, synchronously | applies the narrow reversible subset below |
+
+`/jev on` and `/jev compare` select Compare. Only the explicit `/jev active`
+selects Active.
+
+## Active mode: what may be applied
+
+Active applies an accepted answer to the outgoing provider request body. The
+appliable set is deliberately narrow and reversible:
+
+| Category | Applied effect |
+|---|---|
+| `tool_requirement == "none"` | removes `tools` and `tool_choice` from that one request |
+| `complexity == "low"` or `"high"` | moves an already-present `reasoning_effort` one step on `minimal, low, medium, high, xhigh, max` |
+
+Nothing else is appliable. Active never adds a key it did not already find,
+never changes the model or provider, and never writes session thinking-level
+state. It cannot touch permissions, context, memory, compaction, continuation,
+subagents, agent messages, depth, concurrency or budgets.
+
+Acceptance requires confidence of at least `0.7` and a decision no older than
+three seconds. A refused answer, a low-confidence answer, a missing confidence,
+a transport failure, a deadline (2.5 s), an open circuit breaker (three
+consecutive failures, 30 s cooldown) or a missing credential leaves the request
+byte-identical and is recorded with a reason.
+
+Active decides at the provider-request boundary, so it adds latency to that one
+turn instead of running in a background queue like Compare.
+
+## Records
+
+Both modes append one JSON line per question to `records.jsonl`. Compare records
+use `schema_version: "jev.compare/1"` and always carry `applied: false`. Active
+records use `schema_version: "jev.active/1"`, carry `applied: true` with the
+applied field list in `applied_effects`, or `applied: false` with a single
+`fallback_reason` when the answer was refused. `acceptance` is `accepted` or
+`fallback`. Records contain no prompt text, no tool arguments and no credential
+material.
 
 ## Live validation
 

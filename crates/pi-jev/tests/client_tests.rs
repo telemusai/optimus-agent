@@ -846,18 +846,21 @@ async fn off_never_touches_the_transport_even_with_a_credential_present() {
 }
 
 #[tokio::test]
-async fn the_reserved_active_mode_never_becomes_compare() {
-    assert!(matches!(
-        JevSystemOne::with_http(
-            JevMode::Active,
-            SecretString::new(SYNTHETIC_KEY),
-            JevLimits::default(),
-            Arc::new(JevStats::default()),
-        ),
-        Err(JevError::ActiveReserved)
-    ));
+async fn active_mode_builds_a_client_and_never_becomes_compare() {
+    // Active is operative: it builds a real client, and it is never silently
+    // downgraded to Compare.
+    let client = JevSystemOne::with_http(
+        JevMode::Active,
+        SecretString::new(SYNTHETIC_KEY),
+        JevLimits::default(),
+        Arc::new(JevStats::default()),
+    )
+    .expect("Active must construct");
+    assert_eq!(client.effective_mode(), JevMode::Active);
+
+    // The disabled wrapper must never claim an operative mode back.
     let disabled = DisabledSystemOne::new(JevMode::Active);
-    assert_eq!(disabled.mode(), JevMode::Active);
+    assert_eq!(disabled.mode(), JevMode::Off);
     let outcome = disabled.decide(default_bundle()).await;
     assert!(outcome.is_empty());
     assert!(outcome.skips.is_empty());
@@ -1156,18 +1159,24 @@ fn credential_status_lines_are_secret_free_and_name_the_winner_on_conflict() {
 }
 
 #[test]
-fn mode_parsing_treats_on_as_compare_and_never_as_active() {
+fn mode_parsing_keeps_on_as_compare_and_active_explicit() {
+    // `on` stays the shadow mode. Only the explicit `active` spelling arms a
+    // mode that may change a provider request.
     assert_eq!(JevMode::parse("on"), Some(JevMode::Compare));
     assert_eq!(JevMode::parse("COMPARE"), Some(JevMode::Compare));
     assert_eq!(JevMode::parse("off"), Some(JevMode::Off));
     assert_eq!(JevMode::parse("active"), Some(JevMode::Active));
     assert_eq!(JevMode::parse("nonsense"), None);
-    assert!(JevMode::Active.is_reserved());
+    // Active is an operative mode; it is no longer reported as reserved.
+    assert_eq!(JevMode::Active.label(), "Jev Active");
     assert!(!JevMode::Active.allows_compare());
     assert!(JevMode::Compare
         .description()
         .contains("do not change"));
-    assert!(JevMode::Active.description().contains("reserved and disabled"));
+    assert!(JevMode::Active
+        .description()
+        .contains("applied to the next provider request"));
+    assert!(!JevMode::Active.description().contains("reserved"));
 }
 
 #[test]
@@ -1431,7 +1440,7 @@ async fn client_debug_and_status_surfaces_never_print_the_key() {
 // ---------------------------------------------------------------------------
 
 #[tokio::test]
-async fn build_system_one_never_constructs_a_client_for_off_or_active() {
+async fn build_system_one_constructs_a_client_only_for_operative_modes() {
     use pi_jev::build_system_one;
     // Off: no credential needed, no transport, no network object.
     let off = build_system_one(
@@ -1444,7 +1453,7 @@ async fn build_system_one_never_constructs_a_client_for_off_or_active() {
     assert_eq!(off.mode(), JevMode::Off);
     assert!(off.decide(default_bundle()).await.is_empty());
 
-    // Reserved Active: still disabled, even when a credential is available.
+    // Active is operative: with a credential it builds a real client.
     let active = build_system_one(
         JevMode::Active,
         Some(SecretString::new(SYNTHETIC_KEY)),
@@ -1453,10 +1462,17 @@ async fn build_system_one_never_constructs_a_client_for_off_or_active() {
     )
     .unwrap();
     assert_eq!(active.mode(), JevMode::Active);
-    let reserved = active.decide(default_bundle()).await;
-    assert!(reserved.is_empty());
-    assert!(reserved.skips.is_empty());
-    assert!(!reserved.applied);
+
+    // Active without a credential is refused, exactly like Compare.
+    assert!(matches!(
+        build_system_one(
+            JevMode::Active,
+            None,
+            JevLimits::default(),
+            Arc::new(JevStats::default()),
+        ),
+        Err(JevError::MissingCredential)
+    ));
 
     // Compare without a credential is refused rather than degraded to Off.
     assert!(matches!(
@@ -1775,18 +1791,16 @@ async fn delayed_and_stale_results_produce_zero_child_changes() {
 }
 
 #[tokio::test]
-async fn future_active_mode_still_has_zero_child_control() {
+async fn active_mode_still_has_zero_child_control() {
     let baseline = DelegationBaseline::sample();
-    // Active is refused outright; it cannot even build a client, let alone a child action.
-    assert!(matches!(
-        JevSystemOne::with_http(
-            JevMode::Active,
-            SecretString::new(SYNTHETIC_KEY),
-            JevLimits::default(),
-            Arc::new(JevStats::default()),
-        ),
-        Err(JevError::ActiveReserved)
-    ));
+    // Active builds a client, and that client still has no child authority.
+    assert!(JevSystemOne::with_http(
+        JevMode::Active,
+        SecretString::new(SYNTHETIC_KEY),
+        JevLimits::default(),
+        Arc::new(JevStats::default()),
+    )
+    .is_ok());
     let active = DisabledSystemOne::new(JevMode::Active);
     let outcome = active.decide(default_bundle()).await;
     assert!(outcome.is_empty());

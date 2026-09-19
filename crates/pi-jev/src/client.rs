@@ -495,8 +495,9 @@ impl std::fmt::Debug for JevSystemOne {
 }
 
 impl JevSystemOne {
-    /// Builds a Compare client. Requires an explicit `Compare` mode: Off and Active are refused
-    /// before any network object is created.
+    /// Builds a client for an operative mode: `Compare` (record only) or `Active` (the host may
+    /// apply accepted answers through `crate::active`). `Off` is refused before any network object
+    /// is created.
     ///
     /// The returned client is observational only. It cannot spawn, delete, pause, resume, steer or
     /// re-route a subagent in any mode, and no configuration flag can grant it those abilities.
@@ -509,8 +510,7 @@ impl JevSystemOne {
     ) -> Result<Self, JevError> {
         match mode {
             JevMode::Off => return Err(JevError::ModeOff),
-            JevMode::Active => return Err(JevError::ActiveReserved),
-            JevMode::Compare => {}
+            JevMode::Compare | JevMode::Active => {}
         }
         if credential.expose().trim().is_empty() {
             return Err(JevError::MissingCredential);
@@ -525,10 +525,9 @@ impl JevSystemOne {
         })
     }
 
-    /// Builds a Compare client and its production HTTP transport.
+    /// Builds a client and its production HTTP transport for an operative mode.
     ///
-    /// The mode is checked FIRST, so an `Off` or reserved `Active` mode does not even construct
-    /// a network client. The credential goes to the transport (header only) and stays here for
+    /// The mode is checked FIRST, so an `Off` mode does not even construct a network client. The credential goes to the transport (header only) and stays here for
     /// the change-detection fingerprint.
     pub fn with_http(
         mode: JevMode,
@@ -538,8 +537,7 @@ impl JevSystemOne {
     ) -> Result<Self, JevError> {
         match mode {
             JevMode::Off => return Err(JevError::ModeOff),
-            JevMode::Active => return Err(JevError::ActiveReserved),
-            JevMode::Compare => {}
+            JevMode::Compare | JevMode::Active => {}
         }
         let transport = JevHttpTransport::new(limits.clone(), credential.clone())?;
         Self::new(mode, credential, Arc::new(transport), limits, stats)
@@ -607,11 +605,8 @@ pub async fn decide_with(
     stats: &Arc<JevStats>,
     bundle: DecisionBundle,
 ) -> DecisionOutcome {
-    if mode != JevMode::Compare {
-        return DecisionOutcome::skipped_all(match mode {
-            JevMode::Off => "mode_off",
-            _ => "active_reserved",
-        });
+    if mode == JevMode::Off {
+        return DecisionOutcome::skipped_all("mode_off");
     }
     if credential.expose().trim().is_empty() {
         return DecisionOutcome::skipped_all("missing_credential");
@@ -815,7 +810,7 @@ fn count_error_class(stats: &Arc<JevStats>, error: &JevError) {
     }
 }
 
-/// `SystemOne` implementation for `Off` (and for the reserved `Active`).
+/// `SystemOne` implementation for a client that performs no evaluation and no I/O.
 ///
 /// Holds a mode and nothing else: no transport, no credential, no counters, no runtime, and no
 /// child-control capability. Calling `decide` returns a skip without performing any I/O.
@@ -831,13 +826,13 @@ impl Default for DisabledSystemOne {
 }
 
 impl DisabledSystemOne {
-    /// Disabled instance for a mode other than Compare (Off, or the reserved Active).
+    /// Disabled instance for a mode that evaluates nothing (Off).
     ///
-    /// `Compare` maps to `Off`: a disabled client must never report that shadow evaluation is
-    /// enabled, because the UI and the status line read this mode back.
+    /// `Compare` and `Active` map to `Off`: a disabled client must never report that evaluation
+    /// is enabled, because the UI and the status line read this mode back.
     pub fn new(mode: JevMode) -> Self {
         Self {
-            mode: if mode == JevMode::Compare {
+            mode: if matches!(mode, JevMode::Compare | JevMode::Active) {
                 JevMode::Off
             } else {
                 mode
@@ -852,10 +847,8 @@ impl SystemOne for DisabledSystemOne {
     }
 
     fn decide(&self, _bundle: DecisionBundle) -> BoxFuture<DecisionOutcome> {
-        let reason = match self.mode {
-            JevMode::Off => "mode_off",
-            _ => "active_reserved",
-        };
+        // A disabled client only ever reports Off.
+        let reason = "mode_off";
         Box::pin(async move { DecisionOutcome::skipped_all(reason) })
     }
 }
@@ -874,7 +867,9 @@ pub fn build_system_one(
     stats: Arc<JevStats>,
 ) -> Result<Arc<dyn SystemOne>, JevError> {
     match mode {
-        JevMode::Compare => {
+        // Both operative modes need a credential; without one the caller gets
+        // an explicit refusal rather than a silently disabled client.
+        JevMode::Compare | JevMode::Active => {
             let Some(credential) = credential else {
                 return Err(JevError::MissingCredential);
             };

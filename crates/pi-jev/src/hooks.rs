@@ -4,9 +4,17 @@
 //! pi-coding-agent builds bounded values). In Compare: capture baselines
 //! synchronously at the boundary, build one bundled request per snapshot,
 //! enqueue asynchronously, and write correlated records when results arrive.
-//! There is no decision-returning API: nothing Jev produces can re-enter the
-//! agent loop. In Off: a single cheap mode check and nothing else — no
-//! scheduling, no client work, no records.
+//! Nothing a Compare answer says can re-enter the agent loop.
+//!
+//! In Active, `decide_active` is the single decision-returning path. It makes
+//! one bounded call at the boundary, runs the answer through the acceptance
+//! policy in `crate::active`, and returns only the decisions the policy
+//! accepted. The caller owns the effect: this crate never mutates host state
+//! and never applies anything itself. Every outcome, accepted or refused, is
+//! recorded with the single reason that stopped it.
+//!
+//! In Off: a single cheap mode check and nothing else — no scheduling, no
+//! client work, no records.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
@@ -29,6 +37,95 @@ pub const SYSTEM_ONE_MODEL: &str = "jev-latest";
 
 pub const PROMPT_VERSION: &str = "jev-compare-prompts/1";
 
+/// Operational bounds for the Active decision path.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveSettings {
+    /// Hard deadline for one Active decision call. The caller waits at most
+    /// this long before behaving as if Jev were absent.
+    pub deadline: std::time::Duration,
+    /// Consecutive failed or timed-out calls that open the breaker.
+    pub max_consecutive_failures: u32,
+    /// How long the breaker stays open before another attempt is allowed.
+    pub breaker_cooldown: std::time::Duration,
+}
+
+impl Default for ActiveSettings {
+    fn default() -> Self {
+        Self {
+            deadline: std::time::Duration::from_millis(2500),
+            max_consecutive_failures: 3,
+            breaker_cooldown: std::time::Duration::from_secs(30),
+        }
+    }
+}
+
+/// Outcome of one Active decision boundary.
+#[derive(Debug, Clone)]
+pub struct ActiveDecideOutcome {
+    pub session_id: String,
+    pub turn: u64,
+    pub stage: String,
+    pub request_id: Option<String>,
+    pub response_model: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub state_fingerprint: String,
+    /// Decisions the policy accepted, in the order the answers arrived.
+    pub decisions: Vec<crate::active::ActiveDecision>,
+    /// Answers that were refused, each with the one reason that stopped it.
+    pub refusals: Vec<ActiveRefusal>,
+    /// Set when no answer was obtained at all (transport, timeout, breaker,
+    /// wrong mode). The caller must then behave as if Jev were absent.
+    pub unavailable: Option<crate::active::FallbackReason>,
+}
+
+/// One refused answer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct ActiveRefusal {
+    pub category: DecisionCategory,
+    pub reason: crate::active::FallbackReason,
+}
+
+impl ActiveRefusal {
+    pub fn new(category: DecisionCategory, reason: crate::active::FallbackReason) -> Self {
+        Self { category, reason }
+    }
+}
+
+/// Per-session counters for the Active path. These describe boundaries, not
+/// answers: `applied` counts boundaries where a request field actually changed.
+#[derive(Debug, Default)]
+struct ActiveCounters {
+    applied: u64,
+    accepted_no_effect: u64,
+    refused: u64,
+    unavailable: u64,
+    last_reason: Option<String>,
+    last_category: Option<String>,
+}
+
+/// Breaker state for the Active path.
+#[derive(Debug, Default)]
+struct ActiveBreaker {
+    consecutive_failures: u32,
+    open_until: Option<std::time::Instant>,
+}
+
+/// Result of preparing one boundary's request.
+enum BundlePreparation {
+    /// Nothing askable: no eligible question, or a missing session id.
+    Nothing,
+    /// The bounded state exceeded its cap; every eligible category is recorded
+    /// as skipped.
+    StateTooLarge,
+    Ready(Box<PreparedBundle>),
+}
+
+/// A prepared request plus the context needed to record it.
+struct PreparedBundle {
+    request: crate::types::SystemOneRequest,
+    ctx: RequestContext,
+}
+
 /// Observer configuration.
 #[derive(Clone)]
 pub struct JevObserverConfig {
@@ -41,6 +138,8 @@ pub struct JevObserverConfig {
     pub min_confidence: f64,
     /// UI metadata notification only; never carries a recommendation.
     pub on_terminal: Option<Arc<dyn Fn(&str) + Send + Sync>>,
+    /// Bounds for the Active decision path. Unused in Compare and Off.
+    pub active: ActiveSettings,
 }
 
 impl Default for JevObserverConfig {
@@ -51,6 +150,7 @@ impl Default for JevObserverConfig {
             scheduler: SchedulerConfig::default(),
             min_confidence: 0.7,
             on_terminal: None,
+            active: ActiveSettings::default(),
         }
     }
 }
@@ -70,6 +170,11 @@ pub struct JevObserver {
     config: JevObserverConfig,
     correlator: Arc<Correlator>,
     scheduler: JevScheduler,
+    /// Retained for the Active path: one bounded, synchronous call per
+    /// decision boundary. Unused by Compare, which goes through the queue.
+    system_one: Arc<dyn crate::types::SystemOne>,
+    active_breaker: Mutex<ActiveBreaker>,
+    active_counters: Mutex<std::collections::HashMap<String, ActiveCounters>>,
     sessions: Mutex<std::collections::HashMap<String, u32>>,
     skipped_categories: Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>,
 }
@@ -95,13 +200,18 @@ impl JevObserver {
         });
         let mode_gate = Arc::clone(&config.mode_gate);
         let scheduler = JevScheduler::new_with_gate(
-            config.scheduler.clone(), system_one, sink,
+            config.scheduler.clone(),
+            Arc::clone(&system_one),
+            sink,
             Arc::new(move |session_id| mode_gate(Some(session_id)) == JevMode::Compare),
         );
         Arc::new(Self {
             config,
             correlator,
             scheduler,
+            system_one,
+            active_breaker: Mutex::new(ActiveBreaker::default()),
+            active_counters: Mutex::new(std::collections::HashMap::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
             skipped_categories: Mutex::new(std::collections::HashMap::new()),
         })
@@ -116,10 +226,36 @@ impl JevObserver {
     }
 
     pub fn session_status(&self, session_id: &str) -> Option<Value> {
-        let mut status = self.scheduler.session_status(session_id)?;
-        let skipped = self.skipped_categories.lock().unwrap_or_else(|p| p.into_inner());
-        status["skipped_categories"] = serde_json::to_value(skipped.get(session_id).cloned().unwrap_or_default()).ok()?;
+        let scheduler_status = self.scheduler.session_status(session_id);
+        let active_status = self.active_status(session_id);
+        if scheduler_status.is_none() && active_status.is_none() {
+            return None;
+        }
+        let mut status = scheduler_status.unwrap_or_else(|| Value::Object(Default::default()));
+        if status.get("skipped_categories").is_none() {
+            let skipped = self.skipped_categories.lock().unwrap_or_else(|p| p.into_inner());
+            status["skipped_categories"] = serde_json::to_value(skipped.get(session_id).cloned().unwrap_or_default()).ok()?;
+        }
+        if let Some(active) = active_status {
+            status["active"] = active;
+        }
         Some(status)
+    }
+
+    /// Counters for the last Active boundaries in one session. `applied` counts
+    /// boundaries where a field of the outgoing request actually changed, so it
+    /// is not an answer count.
+    pub fn active_status(&self, session_id: &str) -> Option<Value> {
+        let counters = self.active_counters.lock().unwrap_or_else(|p| p.into_inner());
+        let counters = counters.get(session_id)?;
+        Some(serde_json::json!({
+            "applied": counters.applied,
+            "accepted_no_effect": counters.accepted_no_effect,
+            "refused": counters.refused,
+            "unavailable": counters.unavailable,
+            "last_reason": counters.last_reason,
+            "last_category": counters.last_category,
+        }))
     }
 
     /// Drop every queued/in-flight request for a session (disposal path).
@@ -191,14 +327,19 @@ impl JevObserver {
         *counter
     }
 
-    fn observe_snapshot(&self, _event_type: &str, payload: &Value, stage: SnapshotStage) {
+    /// Build the bounded request for one boundary: snapshot, baselines and
+    /// typed questions. Shared by the Compare queue and the Active decision
+    /// path so both ask the same thing of the same snapshot.
+    ///
+    /// Every refusal to ask is recorded here rather than silently dropped.
+    fn prepare_bundle(&self, payload: &Value, stage: SnapshotStage, mode: &str) -> BundlePreparation {
         let session_id = payload
             .get("session_id")
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
         if session_id.is_empty() {
-            return;
+            return BundlePreparation::Nothing;
         }
         let turn = payload
             .get("turn")
@@ -225,9 +366,10 @@ impl JevObserver {
                     evaluator.category(),
                     "state_too_large",
                     PROMPT_VERSION,
+                    mode,
                 );
             }
-            return;
+            return BundlePreparation::StateTooLarge;
         }
 
         // Baselines captured synchronously at the boundary BEFORE any shadow
@@ -276,7 +418,7 @@ impl JevObserver {
         );
         let snapshot = match evaluator_input {
             Ok(snapshot) => snapshot,
-            Err(_) => return,
+            Err(_) => return BundlePreparation::Nothing,
         };
         for evaluator in for_boundary(stage) {
             let category_id = evaluator.category().as_str().to_string();
@@ -290,6 +432,7 @@ impl JevObserver {
                     evaluator.category(),
                     "category_disabled",
                     PROMPT_VERSION,
+                    mode,
                 );
                 continue;
             }
@@ -315,6 +458,7 @@ impl JevObserver {
                         evaluator.category(),
                         &reason,
                         PROMPT_VERSION,
+                        mode,
                     );
                 }
             }
@@ -340,11 +484,12 @@ impl JevObserver {
                 .unwrap_or(DecisionCategory::TaskClassification),
                 "question_limit",
                 PROMPT_VERSION,
+                mode,
             );
         }
         if questions.is_empty() {
             // Every eligible category was skipped: nothing to ask.
-            return;
+            return BundlePreparation::Nothing;
         }
 
         // One bundled request per snapshot stage; no question depends on
@@ -366,7 +511,7 @@ impl JevObserver {
             state_fingerprint: fingerprint_of(&state),
             state_schema_version: STATE_SCHEMA_VERSION.to_string(),
             prompt_version: PROMPT_VERSION.to_string(),
-            mode: "compare".to_string(),
+            mode: mode.to_string(),
             questions: questions
                 .iter()
                 .map(|question| QuestionMeta {
@@ -381,13 +526,290 @@ impl JevObserver {
             baselines,
             request_start_ts: snapshot.created_at.clone(),
         };
+        BundlePreparation::Ready(Box::new(PreparedBundle { request, ctx }))
+    }
+
+    /// Observe one boundary in Compare mode: capture baselines synchronously,
+    /// hand the request to the bounded queue, and return. Fire-and-forget.
+    fn observe_snapshot(&self, _event_type: &str, payload: &Value, stage: SnapshotStage) {
         // Baselines and context were captured synchronously at the boundary;
         // the SystemOne call happens asynchronously in the scheduler.
-        self.correlator.track(&ctx);
-        let enqueued = self.scheduler.enqueue(request, ctx);
-        if !enqueued {
+        if let BundlePreparation::Ready(bundle) = self.prepare_bundle(payload, stage, "compare") {
+            self.correlator.track(&bundle.ctx);
             // Dropped requests are recorded by the scheduler sink.
-            return;
+            let _ = self.scheduler.enqueue(bundle.request, bundle.ctx);
         }
+    }
+
+    /// Decide one boundary in Active mode and return the answers an activation
+    /// policy may apply. This is the only path in this crate that returns Jev
+    /// output to a caller, and it is reachable only when the effective mode is
+    /// `Active`.
+    ///
+    /// Bounded by `config.active.deadline`. A timeout, transport failure, open
+    /// breaker or refused answer yields no decision and a reason; the caller
+    /// must then behave exactly as if Jev were absent.
+    pub async fn decide_active(
+        &self,
+        payload: &Value,
+        stage: SnapshotStage,
+        policy: &crate::active::ActivationPolicy,
+    ) -> ActiveDecideOutcome {
+        use crate::active::FallbackReason;
+
+        let session_id = payload
+            .get("session_id")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string();
+        let turn = payload.get("turn").and_then(Value::as_u64).unwrap_or(0);
+        let appliable: Vec<DecisionCategory> = for_boundary(stage)
+            .into_iter()
+            .map(|evaluator| evaluator.category())
+            .filter(|category| policy.appliable().contains(category))
+            .collect();
+        let mut outcome = ActiveDecideOutcome {
+            session_id: session_id.clone(),
+            turn,
+            stage: stage.as_str().to_string(),
+            request_id: None,
+            response_model: None,
+            duration_ms: None,
+            state_fingerprint: String::new(),
+            decisions: Vec::new(),
+            refusals: Vec::new(),
+            unavailable: None,
+        };
+        if session_id.is_empty() {
+            outcome.unavailable = Some(FallbackReason::ModeNotActive);
+            return outcome;
+        }
+        // The gate is read again here: a caller cannot reach this path with a
+        // non-Active effective mode.
+        if (self.config.mode_gate)(Some(session_id.as_str())) != JevMode::Active {
+            outcome.unavailable = Some(FallbackReason::ModeNotActive);
+            return outcome;
+        }
+        if appliable.is_empty() {
+            // Nothing at this boundary has a reversible effect, so a call
+            // could not change the request even if it succeeded.
+            outcome.unavailable = Some(FallbackReason::CategoryNotAppliable);
+            return outcome;
+        }
+        if !self.active_breaker_allows() {
+            for category in &appliable {
+                outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::Unavailable));
+            }
+            outcome.unavailable = Some(FallbackReason::Unavailable);
+            return outcome;
+        }
+        let bundle = match self.prepare_bundle(payload, stage, "active") {
+            BundlePreparation::Ready(bundle) => bundle,
+            BundlePreparation::StateTooLarge | BundlePreparation::Nothing => {
+                outcome.unavailable = Some(FallbackReason::NoAnswer);
+                return outcome;
+            }
+        };
+        outcome.request_id = Some(bundle.ctx.request_id.clone());
+        outcome.state_fingerprint = bundle.ctx.state_fingerprint.clone();
+        let started = std::time::Instant::now();
+        let call = self.system_one.decide(crate::client::bundle_with_questions(
+            bundle.ctx.session_id.clone(),
+            bundle.ctx.turn,
+            bundle.ctx.stage.clone(),
+            bundle.request.state.clone(),
+            bundle.request.model.clone(),
+            bundle.request.questions.clone(),
+        ));
+        let decision = match tokio::time::timeout(self.config.active.deadline, call).await {
+            Ok(decision) => decision,
+            Err(_) => {
+                self.note_active_failure();
+                outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
+                for category in &appliable {
+                    outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::Unavailable));
+                }
+                outcome.unavailable = Some(FallbackReason::Unavailable);
+                return outcome;
+            }
+        };
+        outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
+        outcome.response_model = decision.response_model.clone();
+        if decision.records.is_empty() {
+            // No answer at all: transport failure, refusal to call, or an
+            // unusable response. Either way nothing may be applied.
+            self.note_active_failure();
+            for category in &appliable {
+                outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::NoAnswer));
+            }
+            outcome.unavailable = Some(FallbackReason::NoAnswer);
+            return outcome;
+        }
+        self.note_active_success();
+        let now = std::time::SystemTime::now();
+        for record in &decision.records {
+            let confidence = record.answer.confidence();
+            let value = Some(record.answer.selected_value());
+            if !appliable.contains(&record.category) {
+                // Record-only category: answered, but this mode has no
+                // reversible effect for it.
+                let reason = if crate::active::DEFAULT_APPLIABLE_CATEGORIES.contains(&record.category) {
+                    FallbackReason::CategoryDisabled
+                } else {
+                    FallbackReason::CategoryNotAppliable
+                };
+                outcome.refusals.push(ActiveRefusal::new(record.category, reason));
+                continue;
+            }
+            let candidate = crate::active::AnswerCandidate {
+                category: record.category,
+                question_id: record.question_id.clone(),
+                value,
+                confidence,
+                response_model: record.response_model.clone(),
+                request_id: bundle.ctx.request_id.clone(),
+                turn,
+                decided_at: now,
+            };
+            match crate::active::evaluate_answer(policy, JevMode::Active, &candidate, now) {
+                crate::active::Acceptance::Accepted(decision) => outcome.decisions.push(*decision),
+                crate::active::Acceptance::Fallback(reason) => {
+                    outcome.refusals.push(ActiveRefusal::new(record.category, reason));
+                }
+            }
+        }
+        outcome
+    }
+
+    /// Write the records for one Active boundary. `effects` maps a category id
+    /// to the fields the host actually changed for that category; a category
+    /// with no entry is recorded as accepted with no changes, which is not a
+    /// success story and is visible as such.
+    pub fn record_active(
+        &self,
+        outcome: &ActiveDecideOutcome,
+        effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>,
+    ) -> usize {
+        if outcome.session_id.is_empty() {
+            return 0;
+        }
+        let ctx = crate::correlate::ActiveRecordContext {
+            request_id: outcome
+                .request_id
+                .clone()
+                .unwrap_or_else(|| format!("active-{}", uuid::Uuid::new_v4())),
+            session_id: outcome.session_id.clone(),
+            turn: outcome.turn,
+            stage: outcome.stage.clone(),
+            response_model: outcome.response_model.clone(),
+            duration_ms: outcome.duration_ms,
+            state_fingerprint: outcome.state_fingerprint.clone(),
+            prompt_version: PROMPT_VERSION.to_string(),
+        };
+        let mut rows: Vec<crate::correlate::ActiveRecordRow> = Vec::new();
+        for decision in &outcome.decisions {
+            let category_id = decision.category.as_str().to_string();
+            rows.push(crate::correlate::ActiveRecordRow {
+                category: category_id.clone(),
+                question_id: decision.question_id.clone(),
+                accepted: true,
+                selected_value: Some(decision.value.clone()),
+                confidence: Some(decision.confidence),
+                fallback_reason: None,
+                applied_effects: effects.get(&category_id).cloned().unwrap_or_default(),
+            });
+        }
+        for refusal in &outcome.refusals {
+            rows.push(crate::correlate::ActiveRecordRow {
+                category: refusal.category.as_str().to_string(),
+                question_id: format!("{}.0", refusal.category.as_str()),
+                accepted: false,
+                selected_value: None,
+                confidence: None,
+                fallback_reason: Some(refusal.reason.as_str().to_string()),
+                applied_effects: Vec::new(),
+            });
+        }
+        {
+            let mut counters = self.active_counters.lock().unwrap_or_else(|p| p.into_inner());
+            let entry = counters
+                .entry(outcome.session_id.clone())
+                .or_default();
+            let applied = outcome
+                .decisions
+                .iter()
+                .filter(|decision| effects.contains_key(decision.category.as_str()))
+                .count() as u64;
+            entry.applied += applied;
+            entry.accepted_no_effect += outcome.decisions.len() as u64 - applied;
+            entry.refused += outcome.refusals.len() as u64;
+            if outcome.unavailable.is_some() {
+                entry.unavailable += 1;
+            }
+            entry.last_reason = outcome
+                .unavailable
+                .map(|reason| reason.as_str().to_string())
+                .or_else(|| {
+                    outcome
+                        .refusals
+                        .first()
+                        .map(|refusal| refusal.reason.as_str().to_string())
+                });
+            entry.last_category = outcome
+                .decisions
+                .first()
+                .map(|decision| decision.category.as_str().to_string())
+                .or_else(|| {
+                    outcome
+                        .refusals
+                        .first()
+                        .map(|refusal| refusal.category.as_str().to_string())
+                });
+        }
+        if rows.is_empty() {
+            return 0;
+        }
+        self.correlator.record_active_rows(&ctx, &rows)
+    }
+
+    /// True while the Active breaker permits a new call.
+    fn active_breaker_allows(&self) -> bool {
+        let breaker = self
+            .active_breaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        match breaker.open_until {
+            Some(deadline) => std::time::Instant::now() >= deadline,
+            None => true,
+        }
+    }
+
+    /// One failed or timed-out Active call. Repeated failures open the
+    /// breaker so a dead service degrades to normal behavior instead of
+    /// stalling every turn for the deadline.
+    fn note_active_failure(&self) {
+        let mut breaker = self
+            .active_breaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        breaker.consecutive_failures = breaker.consecutive_failures.saturating_add(1);
+        if breaker.consecutive_failures >= self.config.active.max_consecutive_failures {
+            breaker.open_until = Some(std::time::Instant::now() + self.config.active.breaker_cooldown);
+            breaker.consecutive_failures = 0;
+        }
+    }
+
+    fn note_active_success(&self) {
+        let mut breaker = self
+            .active_breaker
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        breaker.consecutive_failures = 0;
+        breaker.open_until = None;
+    }
+
+    /// Breaker state, for status surfaces and tests.
+    pub fn active_breaker_open(&self) -> bool {
+        !self.active_breaker_allows()
     }
 }

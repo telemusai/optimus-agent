@@ -20,7 +20,7 @@ Optimus focuses on **native Windows reliability, stronger session continuity, As
 | Rust implementation | Available on `main`, installed as `optimus-agent`; remaining parity gaps are documented |
 | Platforms | macOS, Linux, and native Windows; Windows currently requires a Bash shell such as Git Bash |
 | Memory | Session, project, and global harness memory, with optional selected sharing; authoritative project storage is JSON |
-| Jev integration | Optional Compare (shadow) mode against TypeSafe System One; recommendations are recorded for comparison and never applied |
+| Jev integration | Optional Compare (shadow) and Active modes against TypeSafe System One; Compare records recommendations, Active applies a narrow reversible subset to the next request |
 | TencentDB-backed memory | An intended integration direction, not an implemented backend in the current `main` branch |
 
 The feature descriptions below refer to `main` unless explicitly marked as development work. Some hardened Windows installations also use deployment-specific launchers and compatibility layers that are not included in a plain source checkout.
@@ -127,38 +127,52 @@ Experimental model-facing output reduction, iterative-summary consolidation, and
 
 Optimus can put the same decision questions it is making to the TypeSafe System One ("Jev") service at `https://api.typesafe.ai/v1/systemone`, so an external recommendation can be compared against what the agent actually did.
 
-This is **Compare** mode, a shadow mode. It never changes a run: recommendations are recorded for comparison only, the model, tools, context, and stopping behavior are untouched, and each answer is stored as not applied. Jev is **off by default**, and `/jev` is the only command that sets the mode.
+There are two operative modes. **Compare** is a shadow mode: it never changes a run, recommendations are recorded for comparison only, and each answer is stored as not applied. **Active** applies an accepted answer to the next provider request, within a narrow reversible set (below). Jev is **off by default**, and `/jev` is the only command that sets the mode.
 
 ```text
 /jev            # menu
 /jev compare    # shadow mode for this chat (also: /jev on)
-/jev off        # no shadow calls, no network, no overhead beyond the mode check
+/jev active     # apply an accepted answer to the next provider request
+/jev off        # no calls, no network, no overhead beyond the mode check
 /jev status     # mode, the scope that decided it, and credential source presence
 /jev key        # enter an API key
 /jev key clear  # remove the saved key
 ```
 
-An explicit per-session mode wins over the default for new chats, so `/jev off` in one chat does not turn Jev off elsewhere, and `/jev compare` in one chat is not cancelled by a global default of off. A key being present never enables Jev on its own. `Active` mode, where a recommendation would be applied, is reserved and is not implemented; `/jev active` reports that instead of accepting the request.
+An explicit per-session mode wins over the default for new chats, so `/jev off` in one chat does not turn Jev off elsewhere, and `/jev compare` in one chat is not cancelled by a global default of off. A key being present never enables Jev on its own. `on` is the short alias for Compare; only the explicit `/jev active` spelling selects the mode that may change a request, so nothing arms it by shorthand.
+
+### Active mode: what gets applied
+
+Active applies an accepted answer to the outgoing request body, and only these two effects exist:
+
+| Category | Effect |
+|---|---|
+| `tool_requirement == "none"` | removes `tools` and `tool_choice` from that one request |
+| `complexity` `low` or `high` | moves an already-present `reasoning_effort` one step |
+
+Nothing else is appliable. Active never adds a key it did not find, never changes the model or provider, and never writes session thinking-level state. It cannot touch permissions, context, memory, compaction, continuation, subagents, agent messages, depth, concurrency or budgets.
+
+Acceptance needs confidence of at least `0.7` and a decision no older than three seconds. A refused answer, a low-confidence answer, a missing confidence, a transport failure, a 2.5 s deadline, an open circuit breaker (three consecutive failures, 30 s cooldown) or a missing credential leaves the request unchanged and is recorded with a reason. Active decides at the provider-request boundary, so it adds latency to that turn instead of running in a background queue like Compare.
 
 Compare mode asks bounded questions across eleven decision categories: task classification, complexity, tool requirement, tool candidates, subagent requirement, subagent model routing, context relevance, memory relevance, continue/stop/escalate, result sufficiency, and first-pass verification. Questions are grouped into bundles at defined lifecycle stages such as `turn_start`, `tool_call`, `agent_end`, and `model_select`, and each bundle carries a bounded state snapshot treated as untrusted data.
 
 ### What leaves the machine
 
-Compare mode sends a summary of what the agent is doing to an external service, so the bridge keeps credential material and raw content out of the request:
+Every operative mode sends the same summary of what the agent is doing to an external service, so the bridge keeps credential material and raw content out of the request:
 
 - **Raw tool arguments are not observed.** The bridge records tool identity, a tool-call id, and an explicit `args_omitted` marker. Tool arguments can carry API keys, `Authorization` headers, and passwords, and the evaluators only need tool identity. A source guard fails the test suite if argument capture returns.
 - **Bound before redacting.** Excerpts read at most the first 4096 characters of a source, so a multi-megabyte tool result is never fully copied just to keep a short excerpt.
 - **Redact before the payload exists.** Credential-shaped material is replaced with `[redacted]` while the excerpt is built: authorization headers, provider key prefixes, private-key blocks, secret-named assignment values, URL userinfo, and JWT-shaped strings.
 
-Redaction is pattern-based. It does not make arbitrary private task text safe to disclose, so treat Compare mode as an opt-in disclosure you control per session.
+Redaction is pattern-based. It does not make arbitrary private task text safe to disclose, so treat an operative mode as an opt-in disclosure you control per session.
 
 ### Credentials, settings, and records
 
 The credential is read from a saved credential first (the Windows DPAPI envelope at `<agent-dir>/jev/typesafe.jev-credential.json`), then from `TYPESAFE_API_KEY`, then from `JEV_API_KEY`. Windows uses the DPAPI store; macOS and Linux use the environment variables, because those builds have no DPAPI store. A hand-written `KEY=value` file at the envelope path is not read. `/jev status` reports which source is in use and never prints the secret.
 
-Local state stays under `jev/` in the agent directory: `jev-settings.json` holds the mode default for new chats, per-session modes, and the key id, and `records.jsonl` holds the comparison records. Set `JEV_BASE_URL` to point a run at a staging or replay endpoint instead of the production service.
+Local state stays under `jev/` in the agent directory: `jev-settings.json` holds the mode default for new chats, per-session modes, and the key id, and `records.jsonl` holds the records (`jev.compare/1` rows for Compare, `jev.active/1` rows for Active). Set `JEV_BASE_URL` to point a run at a staging or replay endpoint instead of the production service.
 
-See [Jev shadow-observation data minimization](docs/JEV_DATA_MINIMIZATION.md).
+See [Jev observation data minimization](docs/JEV_DATA_MINIMIZATION.md).
 
 ## Telegram access
 
@@ -266,7 +280,7 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 | `/heartbeat` | Configure recurring session prompts |
 | `/tree`, `/fork`, `/clone` | Navigate or branch session history |
 | `/telegram` | Manage the Telegram connection |
-| `/jev` | Configure Jev Compare mode and its credential |
+| `/jev` | Configure Jev mode (off/compare/active) and its credential |
 | `/settings`, `/mcp`, `/reload` | Configure and reload integrations and resources |
 
 ## Safety and compatibility

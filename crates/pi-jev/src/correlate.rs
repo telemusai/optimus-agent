@@ -16,8 +16,13 @@ use serde::{Deserialize, Serialize};
 use crate::scheduler::JobResult;
 use crate::types::DecisionCategory;
 
-/// Record schema version.
+/// Record schema version for Compare (shadow) records.
 pub const RECORD_SCHEMA_VERSION: &str = "jev.compare/1";
+
+/// Record schema version for Active records, where the answer may have been
+/// applied. Separate from the Compare id so a reader can never mistake an
+/// applied row for a shadow row.
+pub const ACTIVE_RECORD_SCHEMA_VERSION: &str = "jev.active/1";
 
 /// Maximum text length of any single field value kept in a record.
 pub const MAX_FIELD_TEXT: usize = 120;
@@ -87,9 +92,10 @@ pub struct CorrelationRecord {
     pub category: String,
     pub question_id: String,
     pub prompt_version: String,
-    /// Comparison mode; records only exist in Compare.
+    /// `compare` or `active`; no record is written in Off.
     pub mode: String,
-    /// ALWAYS false in this build. Test-enforced.
+    /// True only when this record describes an answer that was applied to an
+    /// outgoing provider request. Every Compare record is false.
     pub applied: bool,
     pub request_start_ts: Option<String>,
     pub terminal_ts: Option<String>,
@@ -106,6 +112,40 @@ pub struct CorrelationRecord {
     pub hypothetical_acceptance: Option<String>,
     pub fallback_reason: Option<String>,
     pub skipped_reason: Option<String>,
+    /// `accepted` | `fallback`. Present on Active records only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub acceptance: Option<String>,
+    /// Fields the host changed because this decision was applied. Active only,
+    /// and empty for a refused answer.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub applied_effects: Vec<crate::active::AppliedEffect>,
+}
+
+/// Everything an Active record row needs that is shared across rows of one
+/// decision boundary.
+#[derive(Debug, Clone)]
+pub struct ActiveRecordContext {
+    pub request_id: String,
+    pub session_id: String,
+    pub turn: u64,
+    pub stage: String,
+    pub response_model: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub state_fingerprint: String,
+    pub prompt_version: String,
+}
+
+/// One row of an Active decision boundary: an accepted answer with the fields
+/// it changed, or a refused answer with the single reason that stopped it.
+#[derive(Debug, Clone)]
+pub struct ActiveRecordRow {
+    pub category: String,
+    pub question_id: String,
+    pub accepted: bool,
+    pub selected_value: Option<String>,
+    pub confidence: Option<f64>,
+    pub fallback_reason: Option<String>,
+    pub applied_effects: Vec<crate::active::AppliedEffect>,
 }
 
 /// Retention caps for Jev-owned record files.
@@ -201,6 +241,8 @@ impl Correlator {
             hypothetical_acceptance: None,
             fallback_reason: None,
             skipped_reason: None,
+            acceptance: None,
+            applied_effects: Vec::new(),
         }
     }
 
@@ -400,6 +442,7 @@ impl Correlator {
         category: DecisionCategory,
         reason: &str,
         prompt_version: &str,
+        mode: &str,
     ) {
         let record = CorrelationRecord {
             schema_version: RECORD_SCHEMA_VERSION.to_string(),
@@ -413,7 +456,7 @@ impl Correlator {
             category: category.as_str().to_string(),
             question_id: format!("{}.0", category.as_str()),
             prompt_version: prompt_version.to_string(),
-            mode: "compare".to_string(),
+            mode: mode.to_string(),
             applied: false,
             request_start_ts: None,
             terminal_ts: Some(Self::now_rfc3339()),
@@ -426,8 +469,60 @@ impl Correlator {
             hypothetical_acceptance: None,
             fallback_reason: None,
             skipped_reason: Some(sanitize_text(reason, MAX_FIELD_TEXT)),
+            acceptance: Some("fallback".to_string()),
+            applied_effects: Vec::new(),
         };
         self.write_record(&record);
+    }
+
+    /// Write one Active decision boundary. Returns the number of rows written.
+    ///
+    /// An accepted row carries `applied: true` and the fields the host
+    /// actually changed. A refused row carries `applied: false` and the single
+    /// reason that stopped it. Nothing is written when there is nothing to
+    /// report: an empty boundary is not an event.
+    pub fn record_active_rows(&self, ctx: &ActiveRecordContext, rows: &[ActiveRecordRow]) -> usize {
+        let terminal_ts = Self::now_rfc3339();
+        let mut written = 0;
+        for row in rows {
+            let record = CorrelationRecord {
+                schema_version: ACTIVE_RECORD_SCHEMA_VERSION.to_string(),
+                request_id: ctx.request_id.clone(),
+                attempt: 0,
+                session_id: sanitize_text(&ctx.session_id, MAX_FIELD_TEXT),
+                turn: ctx.turn,
+                stage: ctx.stage.clone(),
+                state_fingerprint: ctx.state_fingerprint.clone(),
+                state_schema_version: crate::snapshot::STATE_SCHEMA_VERSION.to_string(),
+                category: sanitize_text(&row.category, MAX_FIELD_TEXT),
+                question_id: sanitize_text(&row.question_id, MAX_FIELD_TEXT),
+                prompt_version: ctx.prompt_version.clone(),
+                mode: "active".to_string(),
+                applied: row.accepted,
+                request_start_ts: None,
+                terminal_ts: Some(terminal_ts.clone()),
+                duration_ms: ctx.duration_ms,
+                response_model: ctx.response_model.clone(),
+                confidence: row.confidence,
+                selected_value: row
+                    .selected_value
+                    .as_deref()
+                    .map(|value| sanitize_text(value, MAX_FIELD_TEXT)),
+                baseline_actual_choice: None,
+                agreement: None,
+                hypothetical_acceptance: None,
+                fallback_reason: row
+                    .fallback_reason
+                    .as_deref()
+                    .map(|reason| sanitize_text(reason, MAX_FIELD_TEXT)),
+                skipped_reason: None,
+                acceptance: Some(if row.accepted { "accepted".to_string() } else { "fallback".to_string() }),
+                applied_effects: if row.accepted { row.applied_effects.clone() } else { Vec::new() },
+            };
+            self.write_record(&record);
+            written += 1;
+        }
+        written
     }
 
     fn write_record(&self, record: &CorrelationRecord) {
