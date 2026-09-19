@@ -4119,6 +4119,9 @@ mod tests {
     /// G2-01: cleanup_resources must bound the Windows tree kill at
     /// TASKKILL_TIMEOUT_MS and fall back to signaling the child (TS
     /// repl-manager.ts:1412-1435). A hung taskkill must never hang teardown.
+    // Windows-only: the fixture spawns `ping -n`, waits through a Win32
+    // process handle, and asserts the taskkill fallback path.
+    #[cfg(windows)]
     #[test]
     fn cleanup_resources_taskkill_is_bounded_and_falls_back() {
         let _guard = TEST_ENV_LOCK.lock().unwrap();
@@ -4201,6 +4204,7 @@ mod tests {
         std::env::remove_var(crate::core::orphan_process_journal::ORPHAN_PROCESS_JOURNAL_ENV);
     }
 
+    #[cfg(windows)]
     fn spawn_helper(seconds: u32) -> (tokio::process::Child, i32) {
         let handle = crate::utils::child_process::spawn_hidden(
             "ping",
@@ -4212,6 +4216,7 @@ mod tests {
         (handle.child, pid)
     }
 
+    #[cfg(windows)]
     fn read_journal_records(path: &std::path::Path) -> Vec<crate::core::orphan_process_journal::OrphanProcessRecord> {
         match std::fs::read_to_string(path) {
             Ok(contents) => contents
@@ -4225,6 +4230,7 @@ mod tests {
     /// Test liveness oracle: a terminated process whose handle is still open
     /// (tokio reaper) reports `STILL_ACTIVE`-independent existence via
     /// `process_id_exists`, so check the exit code like the OS task list does.
+    #[cfg(windows)]
     fn probe_process_running(pid: i32) -> bool {
         use windows_sys::Win32::Foundation::CloseHandle;
         use windows_sys::Win32::System::Threading::{
@@ -4243,6 +4249,7 @@ mod tests {
         }
     }
 
+    #[cfg(windows)]
     fn wait_process_gone(pid: i32, deadline: Duration) -> bool {
         let start = Instant::now();
         while start.elapsed() < deadline {

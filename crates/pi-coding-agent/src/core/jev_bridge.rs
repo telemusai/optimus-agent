@@ -192,7 +192,9 @@ impl JevBridgeCore {
             }
         }
         let book = sessions.entry(session_id.to_string()).or_default();
-        book.last_task_excerpt = Some(pi_jev::snapshot::truncate_text(text, 400).0);
+        // Redacted while the excerpt is built: this text is later sent to
+        // SystemOne as `user_text_excerpt`.
+        book.last_task_excerpt = Some(pi_jev::redact::bounded_excerpt(text, 400));
     }
 
     fn task_excerpt(&self, session_id: &str) -> Option<String> {
@@ -673,7 +675,7 @@ fn bridge_event(
                 "session_id": session_id,
                 "turn": turn,
                 "state": {
-                    "user_text_excerpt": pi_jev::snapshot::truncate_text(&payload.text, 400).0,
+                    "user_text_excerpt": pi_jev::redact::bounded_excerpt(&payload.text, 400),
                     "message_count": message_count,
                     "model": model_id,
                     "model_allowlist": allowlist,
@@ -683,8 +685,7 @@ fn bridge_event(
         ExtensionEvent::ToolCall(tool_call) => {
             let tool_name = tool_call.tool_name().to_string();
             let tool_call_id = tool_call.tool_call_id().to_string();
-            // Bounded args excerpt (never the full input).
-            let args_excerpt = pi_jev::snapshot::truncate_text(&tool_call.input().to_string(), 400).0;
+            let state = tool_call_observation(&tool_name, &tool_call_id, &allowlist);
             Some((
                 "tool_call".to_string(),
                 json!({
@@ -692,12 +693,7 @@ fn bridge_event(
                     "turn": turn,
                     "tool_name": tool_name,
                     "model": model_id,
-                    "state": {
-                        "tool_name": tool_name,
-                        "tool_call_id": tool_call_id,
-                        "args_excerpt": args_excerpt,
-                        "model_allowlist": allowlist,
-                    },
+                    "state": state,
                 }),
             ))
         }
@@ -769,12 +765,33 @@ fn bridge_event(
     }
 }
 
+/// Observation state for one tool call.
+///
+/// Tool ARGUMENTS are never observed. Callers pass credentials, connection
+/// strings and file bodies through tool input, and the tool-choice evaluators
+/// only need tool identity. Serializing `input()` here - even truncated right
+/// afterwards - would copy a potentially multi-megabyte payload and could
+/// disclose a credential that sits in its first characters.
+fn tool_call_observation(tool_name: &str, tool_call_id: &str, allowlist: &[String]) -> Value {
+    json!({
+        "tool_name": tool_name,
+        "tool_call_id": tool_call_id,
+        "args_omitted": true,
+        "model_allowlist": allowlist,
+    })
+}
+
 struct AgentEndSummary {
     result_excerpt: Option<String>,
     stop_reason: Option<String>,
 }
 
-/// Bounded summary of the final assistant message (no full transcript copy).
+/// Bounded, redacted summary of the final assistant message.
+///
+/// The excerpt is accumulated character by character and stops at the redaction
+/// scan window, so a multi-megabyte final message is never cloned or joined in
+/// full just to keep 400 characters. Redaction happens before the value reaches
+/// the snapshot state.
 fn summarize_agent_end(messages: &[Value]) -> AgentEndSummary {
     let last_assistant = messages
         .iter()
@@ -786,29 +803,41 @@ fn summarize_agent_end(messages: &[Value]) -> AgentEndSummary {
             stop_reason: None,
         };
     };
-    let text = message
-        .get("content")
-        .and_then(Value::as_array)
-        .map(|blocks| {
-            blocks
-                .iter()
-                .filter_map(|block| {
-                    block
-                        .get("text")
-                        .and_then(Value::as_str)
-                        .map(str::to_string)
-                })
-                .collect::<Vec<_>>()
-                .join(" ")
-        })
-        .unwrap_or_default();
     AgentEndSummary {
-        result_excerpt: Some(pi_jev::snapshot::truncate_text(&text, 400).0),
+        result_excerpt: Some(bounded_assistant_excerpt(message)),
         stop_reason: message
             .get("stopReason")
             .and_then(Value::as_str)
             .map(str::to_string),
     }
+}
+
+/// Incremental excerpt of one assistant message's text blocks.
+fn bounded_assistant_excerpt(message: &Value) -> String {
+    let mut collected = String::new();
+    let mut budget = pi_jev::redact::MAX_SCAN_CHARS;
+    if let Some(blocks) = message.get("content").and_then(Value::as_array) {
+        for block in blocks {
+            if budget == 0 {
+                break;
+            }
+            let Some(text) = block.get("text").and_then(Value::as_str) else {
+                continue;
+            };
+            if !collected.is_empty() && budget > 1 {
+                collected.push(' ');
+                budget -= 1;
+            }
+            for character in text.chars() {
+                if budget == 0 {
+                    break;
+                }
+                collected.push(character);
+                budget -= 1;
+            }
+        }
+    }
+    pi_jev::redact::bounded_excerpt(&collected, 400)
 }
 
 /// High-confidence valid answers that pick the most "act now"-looking option
@@ -981,5 +1010,107 @@ mod no_subagent_control_tests {
         // The reserved mode stays representable for honest status; it can
         // never register (Compare-only gate) and the client refuses it.
         assert_eq!(settings.effective_mode("any-session"), JevMode::Active);
+    }
+}
+
+
+#[cfg(test)]
+mod observation_redaction_tests {
+    use super::*;
+    use serde_json::json;
+
+    /// Fixtures used across these tests: values that must never reach a
+    /// SystemOne request built from a shadow observation.
+    const SECRETS: [&str; 6] = [
+        "sk-live-abcdefghijklmnopqrstuvwxyz",
+        "ghp_abcdefghijklmnopqrstuvwxyz",
+        "hunter2-the-password",
+        "dXNlcjpwYXNzd29yZA==",
+        "AKIAIOSFODNN7EXAMPLE",
+        "MIIEowIBAAKCAQEAprivatekeymaterial",
+    ];
+
+    fn assert_no_secret(payload: &Value) {
+        let text = serde_json::to_string(payload).unwrap();
+        for secret in SECRETS {
+            assert!(!text.contains(secret), "{secret} reached the payload: {text}");
+        }
+    }
+
+    #[test]
+    fn tool_arguments_are_never_observed_or_serialized() {
+        let state = tool_call_observation("bash", "call-1", &[]);
+        assert_eq!(state["args_omitted"], json!(true));
+        assert!(state.get("args_excerpt").is_none(), "{state}");
+        // Source guard: serializing tool input anywhere in the PRODUCTION
+        // bridge would reintroduce the raw-argument capture this repair
+        // removed. The scan stops at the first `#[cfg(test)]` module, because
+        // test code must be able to name the field it forbids. Tokens are
+        // split so the guard cannot match its own source text.
+        let source = include_str!("jev_bridge.rs");
+        let production = source.split("#[cfg(test)]").next().unwrap_or(source);
+        let raw_args_field = concat!("args", "_exc", "erpt");
+        let raw_input_call = concat!("tool_call", ".in", "put()");
+        assert!(
+            !production.contains(raw_args_field) && !production.contains(raw_input_call),
+            "the bridge serializes raw tool arguments again"
+        );
+    }
+
+    #[test]
+    fn secret_bearing_task_text_is_redacted_before_the_payload() {
+        let raw = "deploy with TYPESAFE_API_KEY=sk-live-abcdefghijklmnopqrstuvwxyz \
+                  and Authorization: Bearer ghp_abcdefghijklmnopqrstuvwxyz";
+        let state = json!({ "user_text_excerpt": pi_jev::redact::bounded_excerpt(raw, 400) });
+        assert_no_secret(&state);
+        assert!(serde_json::to_string(&state).unwrap().contains(pi_jev::redact::REDACTED));
+    }
+
+    #[test]
+    fn secret_bearing_final_message_is_redacted_in_the_end_of_turn_state() {
+        let messages = vec![json!({
+            "role": "assistant",
+            "stopReason": "end_turn",
+            "content": [
+                { "type": "text", "text": "wrote the config" },
+                { "type": "text", "text": "password=hunter2-the-password" },
+                { "type": "text", "text": "token AKIAIOSFODNN7EXAMPLE ok" },
+            ],
+        })];
+        let summary = summarize_agent_end(&messages);
+        let excerpt = summary.result_excerpt.unwrap_or_default();
+        for secret in SECRETS {
+            assert!(!excerpt.contains(secret), "{secret} survived: {excerpt}");
+        }
+        assert!(excerpt.contains("wrote the config"), "{excerpt}");
+    }
+
+    #[test]
+    fn a_multi_megabyte_final_message_is_bounded_without_a_full_copy() {
+        // 4 MiB assistant message ending in a credential: the excerpt must stay
+        // bounded and must not disclose the credential.
+        let big = format!(
+            "{}{}",
+            "x".repeat(4 * 1024 * 1024),
+            "-----BEGIN RSA PRIVATE KEY-----\nMIIEowIBAAKCAQEAprivatekeymaterial"
+        );
+        let messages = vec![json!({
+            "role": "assistant",
+            "content": [{ "type": "text", "text": big }],
+        })];
+        let summary = summarize_agent_end(&messages);
+        let excerpt = summary.result_excerpt.unwrap_or_default();
+        assert!(excerpt.chars().count() <= 400);
+        for secret in SECRETS {
+            assert!(!excerpt.contains(secret), "{secret} survived: {excerpt}");
+        }
+    }
+
+    #[test]
+    fn observation_state_never_carries_a_raw_allowlist_or_transcript() {
+        let allowlist: Vec<String> = Vec::new();
+        let state = tool_call_observation("read_file", "call-2", &allowlist);
+        assert_eq!(state["model_allowlist"], json!([]));
+        assert_eq!(state["tool_name"], json!("read_file"));
     }
 }

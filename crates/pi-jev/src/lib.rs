@@ -14,6 +14,7 @@ pub mod config;
 pub mod credential;
 pub mod error;
 pub mod mock;
+pub mod redact;
 pub mod types;
 
 // Lane B modules. Created as empty placeholders so the crate compiles before lane B lands.
