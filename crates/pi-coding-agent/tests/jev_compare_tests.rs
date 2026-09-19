@@ -428,7 +428,12 @@ async fn jev_compare_e2e_parity_and_isolation() {
             "Compare must register the observer handler for {event}"
         );
     }
-    // Mutating surfaces must stay untouched even in Compare.
+    // Mutating surfaces must stay untouched even in Compare. The provider-request
+    // surface is checked here too: Active-handler presence follows the setting, so
+    // a Compare-only process installs no `before_provider_request` handler at all
+    // and the retry/semantic-edge behavior of a user who never enabled Active is
+    // exactly the default one. Active is the only mode that adds that handler
+    // (Phase 3b asserts the positive case).
     for event in [
         "context",
         "before_provider_request",
@@ -587,9 +592,12 @@ async fn jev_compare_e2e_parity_and_isolation() {
     hostile.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
-    // Phase 3b: Future-Active settings are permanently disabled (no-subagent-
-    // control boundary). They must behave exactly like Off: no registration,
-    // no records, zero agent-loop deltas, no capability granted.
+    // Phase 3b: Active is a REAL mode with a bounded effect. It registers the
+    // observe-only handlers PLUS the one provider-boundary handler, and the only
+    // things that handler may change are the tool catalog (withdrawn for one
+    // request whose task needs no tools) and an already-set reasoning effort (moved
+    // one ladder step). Everything else — model, provider, messages, delegation —
+    // is unchanged, and the session's own thinking level is never touched.
     // ------------------------------------------------------------------
     write_settings(
         &agent_dir,
@@ -599,37 +607,78 @@ async fn jev_compare_e2e_parity_and_isolation() {
     for event in JEV_EVENT_NAMES {
         assert!(
             active.session.has_extension_handlers(event),
-            "future-Active keeps only a dormant observer for {event}"
+            "Active keeps the observer handler for {event}"
+        );
+    }
+    assert!(
+        active.session.has_extension_handlers("before_provider_request"),
+        "Active installs the one provider-boundary handler"
+    );
+    // Every other mutating surface stays unregistered in Active as well.
+    for event in [
+        "context",
+        "before_agent_start",
+        "session_before_compact",
+        "session_before_refine",
+        "session_before_switch",
+        "tool_result",
+        "user_bash",
+        "message_update",
+    ] {
+        assert!(
+            !active.session.has_extension_handlers(event),
+            "Active must NOT register a handler on {event}"
         );
     }
     active.provider.set_responses(vec![FauxResponseStep::Message(reply(4))]);
-    let active_records_before = {
-        let settled = wait_records_settled(&agent_dir, 1).await;
-        let _ = settled;
-        read_record_count(&agent_dir)
-    };
     turn(&active.session, "active-mode prompt").await;
     assert_eq!(active.provider.call_count(), 1, "active-mode turn ran normally");
     assert_eq!(
         active.session.thinking_level(),
         off_thinking,
-        "Jev must never change effort/thinking level"
+        "Active never changes the SESSION thinking level; only a request-body hint may move"
     );
     assert_eq!(
         active.session.model().expect("active model").id,
         off_model,
-        "future-Active must not change the model"
-    );
-    assert_eq!(
-        read_record_count(&agent_dir),
-        active_records_before,
-        "future-Active must produce no records"
+        "Active must not change the model"
     );
     assert_eq!(
         shapes(&active.session).len(),
         3,
-        "no injected messages under future-Active"
+        "no injected messages under Active"
     );
+    // Whatever Active recorded is bounded to the two appliable categories and to
+    // effects on the three provider-body keys it owns. A record can therefore never
+    // carry a model, provider, permission, budget, depth or concurrency change.
+    let mut active_records = 0usize;
+    for line in std::fs::read_to_string(records_path(&agent_dir)).unwrap_or_default().lines() {
+        let record: Value = serde_json::from_str(line).unwrap();
+        if record["mode"] != json!("active") {
+            continue;
+        }
+        active_records += 1;
+        let category = record["category"].as_str().unwrap_or("");
+        assert!(
+            ["tool_requirement", "complexity"].contains(&category),
+            "Active may only record an appliable category: {line}"
+        );
+        assert_eq!(
+            record["session_id"],
+            json!(active.session.session_id()),
+            "records belong to the Active session"
+        );
+        for effect in record["applied_effects"].as_array().into_iter().flatten() {
+            let field = effect["field"].as_str().unwrap_or("");
+            assert!(
+                ["tools", "tool_choice", "reasoning_effort"].contains(&field),
+                "Active may only change a provider-body tool/effort key: {line}"
+            );
+        }
+    }
+    // An accepted answer is allowed to exist here (that is what Active means); the
+    // point of this phase is that its effect stays inside the request body.
+    let _ = active_records;
     active.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------

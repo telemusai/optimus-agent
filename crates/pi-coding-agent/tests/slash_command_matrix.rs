@@ -275,7 +275,7 @@ fn matrix() -> Vec<Row> {
         Verdict::Ok, None),
     row("jev", "jev", false, Classification::Builtin, Some("jev"),
         "local built-in (no TypeScript owner; comparison-mode surface)",
-        "parses the /jev argument, writes the session mode through the pi-jev store, republishes the footer; `active` is reserved and changes nothing",
+        "parses the /jev argument, writes the requested mode through the pi-jev store, republishes the footer; `compare`/`on` stay shadow-only and `active` is a real mode whose effect is bounded to one provider request body",
         Verdict::Ok, None),
     row("quit", "quit", false, Classification::Builtin, Some("quit"),
         "interactive-mode.ts:5040-5043", "the input loop owns shutdown_requested (/quit and /exit); the arm is intentionally silent",

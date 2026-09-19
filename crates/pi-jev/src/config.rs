@@ -54,17 +54,12 @@ impl JevMode {
         matches!(self, JevMode::Compare)
     }
 
-    /// True when the UI must explain that this option is reserved and disabled.
-    pub fn is_reserved(self) -> bool {
-        matches!(self, JevMode::Active)
-    }
-
     /// Short label for the footer. Text accompanies the colour so colour is never the only cue.
     pub fn label(self) -> &'static str {
         match self {
             JevMode::Off => "Jev Off",
             JevMode::Compare => "Jev Compare",
-            JevMode::Active => "Jev On (reserved)",
+            JevMode::Active => "Jev Active",
         }
     }
 
@@ -76,7 +71,7 @@ impl JevMode {
                 "Jev Compare: recommendations are recorded for comparison only. Nothing Jev returns is applied; your model, tools, context and stopping behavior do not change."
             }
             JevMode::Active => {
-                "Jev Active is reserved and disabled: acting on recommendations requires a separately reviewed activation policy. Selecting this does not enable anything."
+                "Jev Active: an accepted answer is applied to the next provider request. It withdraws the tool catalog when the task needs no tools, and moves an already-set reasoning effort by one step. Nothing else is applied, and a refused answer, failure or timeout leaves the request unchanged."
             }
         }
     }
@@ -356,13 +351,15 @@ impl JevSettings {
     ///
     /// Registration gate for the observer extension: an Active-only or Off
     /// configuration registers nothing (fail closed; DESIGN.md 10/12).
+    /// True when any scope resolves to an operative mode. Both `Compare`
+    /// (records only) and `Active` (may apply accepted answers) need the
+    /// observer and its client; `Off` never does.
     pub fn wants_observer(&self) -> bool {
-        if self.global_default == Some(JevMode::Compare) {
+        let operative = |mode: Option<JevMode>| matches!(mode, Some(JevMode::Compare) | Some(JevMode::Active));
+        if operative(self.global_default) {
             return true;
         }
-        self.sessions
-            .values()
-            .any(|entry| entry.mode == Some(JevMode::Compare))
+        self.sessions.values().any(|entry| operative(entry.mode))
     }
 
     /// Settings with an explicit global default.

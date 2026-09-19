@@ -412,9 +412,9 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
     // what the UI accepts.
     push(
         "jev",
-        "Jev comparison mode: Off, Compare (shadow-only), Active (reserved/disabled), Input API key, Status"
+        "Jev comparison mode: Off, Compare (shadow-only), Active (applied to the next provider request), Input API key, Status"
             .to_string(),
-        Some("[off|compare|on|status|key]"),
+        Some("[off|compare|active|on|status|key]"),
         Some(true),
     );
     push("quit", format!("Quit {APP_NAME}"), None, None);

@@ -6,8 +6,16 @@
 //! retains a dormant adapter so first-use Compare works without restart. Handlers
 //! never return Jev output (always `None`), so nothing Jev produces can
 //! re-enter the agent loop, and Off costs exactly one cheap mode check.
+//!
+//! Active mode adds one handler on `before_provider_request`
+//! ([`JEV_ACTIVE_EVENT`]). That handler makes one bounded decision call per
+//! provider request, runs the answer through `pi_jev::active` acceptance, and
+//! applies only the fields `core::jev_active` knows how to change. Every other
+//! handler, in every mode, still returns `None`. The permanent boundary is
+//! unchanged: permissions, budgets, provider choice, effort defaults,
+//! subagents, messages and compaction are never touched.
 
-use std::collections::HashMap;
+use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -48,6 +56,9 @@ pub fn session_status_snapshot(session_id: &str) -> Option<Value> {
 pub fn footer_status_text(session_id: &str) -> String {
     let settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
     let mode = settings.effective_mode(session_id);
+    if mode == JevMode::Active {
+        return crate::modes::interactive::theme::theme::theme().fg("accent", "\u{25cf} Jev Active");
+    }
     let (color, label) = if mode != JevMode::Compare {
         ("error", "Jev Off")
     } else {
@@ -66,14 +77,23 @@ pub fn footer_status_text(session_id: &str) -> String {
     crate::modes::interactive::theme::theme::theme().fg(color, &format!("\u{25cf} {label}"))
 }
 
+/// The one event the Active handler subscribes to. Registering it makes the
+/// provider path dispatch one bounded extension call per request; in Off and
+/// Compare the handler returns the untouched payload immediately.
+pub const JEV_ACTIVE_EVENT: &str = "before_provider_request";
+
 /// Settings-file cache TTL: one cheap stat/read per interval per process.
 const SETTINGS_TTL: Duration = Duration::from_millis(250);
 
-/// Events the observer extension subscribes to. Every handler is
+/// Events the observer extension subscribes to. Every handler here is
 /// observe-only and always returns `None`; no session_before_* event and no
-/// mutating surface (`context`, `before_provider_request`) is touched.
-/// `input` is bookkeeping-only (task text capture) and returns `None`, which
-/// the input pipeline maps to "Continue" with the original text.
+/// mutating surface is touched. `input` is bookkeeping-only (task text
+/// capture) and returns `None`, which the input pipeline maps to "Continue"
+/// with the original text.
+///
+/// Active mode adds one separate handler on `before_provider_request`
+/// (see [`JEV_ACTIVE_EVENT`]). It is registered in addition to these, and it
+/// is the only Jev handler in the process that may return a modified value.
 pub const JEV_EVENTS: [&str; 11] = [
     "session_start",
     "agent_start",
@@ -124,9 +144,42 @@ fn load_settings_cached() -> JevSettings {
 }
 
 /// Invalidate the settings cache; the /jev UI lane can call this after
-/// writing settings so a mode change is visible immediately.
+/// writing settings so a mode change is visible immediately. It also re-syncs
+/// Active-handler presence, so `/jev active` takes effect without a restart.
 pub fn invalidate_settings_cache() {
     *settings_cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+    sync_active_handlers();
+}
+
+/// True when some session or the global default is set to Active.
+fn active_mode_requested() -> bool {
+    let settings = load_settings_cached();
+    settings.global_default == Some(JevMode::Active)
+        || settings
+            .sessions
+            .values()
+            .any(|session| session.mode == Some(JevMode::Active))
+}
+
+/// Add or remove the Active provider-request handler on every live bridge.
+///
+/// The handler is the only Jev surface that can change a provider request, and
+/// the runner treats "a `before_provider_request` handler exists" as "the
+/// request body may change", which also decides whether a retry may reuse the
+/// previous turn's semantic edges. Registering it while every session is Off or
+/// Compare would change retry behavior for a user who never enabled Jev, so
+/// handler presence follows the setting instead of the process.
+fn sync_active_handlers() {
+    let cores: Vec<_> = live_bridges()
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .iter()
+        .filter_map(Weak::upgrade)
+        .collect();
+    let wanted = active_mode_requested();
+    for core in cores {
+        core.set_active_handler(&core, wanted);
+    }
 }
 
 /// A dormant adapter must exist even at default-Off startup so `/jev compare`
@@ -139,7 +192,9 @@ pub fn maybe_register_jev_observer(extensions: &mut Vec<SharedExtension>) {
         bridges.retain(|core| core.strong_count() > 0);
         bridges.push(Arc::downgrade(&core));
     }
-    let extension = build_observer_extension(core);
+    let extension = build_observer_extension(Arc::clone(&core));
+    core.attach_extension(&extension);
+    core.set_active_handler(&core, active_mode_requested());
     extensions.push(extension);
 }
 
@@ -161,6 +216,9 @@ struct JevBridgeCore {
     /// with; a credential rotation (or transport change) rebuilds it.
     observer: Mutex<Option<ObserverBuild>>,
     sessions: Mutex<HashMap<String, SessionBook>>,
+    /// Weak handle to this core's registered extension, so Active-handler
+    /// presence can follow the setting at runtime.
+    extension: Mutex<Weak<Mutex<Extension>>>,
 }
 
 struct ObserverBuild {
@@ -178,6 +236,42 @@ impl JevBridgeCore {
         Self {
             observer: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            extension: Mutex::new(Weak::new()),
+        }
+    }
+
+    /// Remember the registered extension so Active-handler presence can be
+    /// added or removed later. Called once, at registration.
+    fn attach_extension(&self, extension: &SharedExtension) {
+        *self.extension.lock().unwrap_or_else(|p| p.into_inner()) = Arc::downgrade(extension);
+    }
+
+    /// Make Active-handler presence match `wanted`. This is the only place the
+    /// provider-request handler is installed, and it is installed for every
+    /// registered bridge rather than for one session: an extension handler list
+    /// is process-wide, while modes are per session. Presence is therefore the
+    /// conservative union ("some session is Active"), and the handler itself
+    /// re-checks the effective mode of the session it is called for.
+    fn set_active_handler(&self, core: &Arc<JevBridgeCore>, wanted: bool) {
+        let Some(extension) = self
+            .extension
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .upgrade()
+        else {
+            return;
+        };
+        let mut guard = extension.lock().unwrap_or_else(|p| p.into_inner());
+        let handlers = guard
+            .handlers
+            .entry(JEV_ACTIVE_EVENT.to_string())
+            .or_default();
+        if wanted {
+            if handlers.is_empty() {
+                handlers.push(make_active_handler(Arc::clone(core)));
+            }
+        } else {
+            handlers.clear();
         }
     }
 
@@ -270,7 +364,10 @@ impl JevBridgeCore {
     /// nothing is ever constructed.
     fn observer(&self, session_id: &str, ui: Arc<dyn crate::core::extensions::types::ExtensionUiContext>) -> Option<Arc<JevObserver>> {
         let settings = load_settings_cached();
-        if settings.effective_mode(session_id) != JevMode::Compare {
+        if !matches!(
+            settings.effective_mode(session_id),
+            JevMode::Compare | JevMode::Active
+        ) {
             return None;
         }
         // Cheap change probe BEFORE any credential read or client build: the
@@ -292,9 +389,10 @@ impl JevBridgeCore {
         // the same key: the dispatch gate captures the generation, not only
         // key identity. Reusing that observer would reject all later work.
         let (transport, credential, _fingerprint) = build_transport(&settings);
+        let effective = settings.effective_mode(session_id);
         let system_one: Arc<dyn pi_jev::types::SystemOne> = match
             pi_jev::client::JevSystemOne::new(
-                JevMode::Compare,
+                effective,
                 credential,
                 transport,
                 pi_jev::client::JevLimits::default(),
@@ -304,7 +402,7 @@ impl JevBridgeCore {
             // Construction can only fail on an unusable credential here;
             // comparison requests then fail closed to logged skips and no
             // network object is used.
-            Err(_) => Arc::new(pi_jev::client::DisabledSystemOne::new(JevMode::Compare)),
+            Err(_) => Arc::new(pi_jev::client::DisabledSystemOne::new(effective)),
         };
         // The observer re-checks the effective mode itself; the gate reads the
         // same cached settings the handlers use (one cheap read per event).
@@ -551,6 +649,11 @@ fn build_observer_extension(core: Arc<JevBridgeCore>) -> SharedExtension {
             .or_default()
             .push(handler);
     }
+    // The Active handler ([`JEV_ACTIVE_EVENT`]) is NOT registered here.
+    // [`sync_active_handlers`] installs it when some session is actually Active,
+    // because its presence alone changes retry behavior for the whole process.
+    // The caller stores the extension on the core via
+    // [`JevBridgeCore::attach_extension`].
     Arc::new(Mutex::new(Extension {
         path: JEV_OBSERVER_PATH.to_string(),
         resolved_path: JEV_OBSERVER_PATH.to_string(),
@@ -582,7 +685,8 @@ fn make_handler(
             let core = Arc::clone(&core);
             Box::pin(async move {
                 let session_id = ctx.session_manager().get_session_id();
-                if core.effective_mode(Some(&session_id)) != JevMode::Compare {
+                let mode = core.effective_mode(Some(&session_id));
+                if mode != JevMode::Compare && mode != JevMode::Active {
                     // Off takes effect immediately: cancel/forget this
                     // session's queued and in-flight comparison work so no
                     // late result can surface after the mode changed.
@@ -592,11 +696,12 @@ fn make_handler(
                     }
                     return None::<Value>;
                 }
-                let Some(observer) = core.observer(&session_id, ctx.ui()) else {
-                    return None::<Value>;
-                };
                 // Bounded per-session bookkeeping (never leaves the
                 // process except as a capped excerpt inside a snapshot).
+                //
+                // This runs in Active too: the Active decision at the provider
+                // boundary asks the same questions about the same state, so it
+                // needs the same task excerpt and observed tool names.
                 match &event {
                     ExtensionEvent::Input(payload) => {
                         core.remember_task_text(&session_id, &payload.text);
@@ -612,6 +717,15 @@ fn make_handler(
                     }
                     _ => {}
                 }
+                if mode == JevMode::Active {
+                    // Active decides synchronously at the provider-request
+                    // boundary. Nothing is observed or queued from here, so
+                    // there is no shadow work and no second network call.
+                    return None::<Value>;
+                }
+                let Some(observer) = core.observer(&session_id, ctx.ui()) else {
+                    return None::<Value>;
+                };
                 if let Some((event_type, payload)) =
                     bridge_event(&core, &event, &ctx, &session_id, handler_event)
                 {
@@ -622,6 +736,144 @@ fn make_handler(
             })
         },
     )
+}
+
+/// Build the one Active-mode handler.
+///
+/// Registered in addition to the observe-only handlers, and only reached when
+/// the effective mode for this session is `Active`. In Off and Compare it
+/// returns the untouched payload, so the provider path is unchanged.
+fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
+    Arc::new(
+        move |event: ExtensionEvent,
+              ctx: Arc<dyn crate::core::extensions::types::ExtensionContext>| {
+            let core = Arc::clone(&core);
+            Box::pin(async move {
+                let ExtensionEvent::BeforeProviderRequest(payload) = event else {
+                    return None::<Value>;
+                };
+                let session_id = ctx.session_manager().get_session_id();
+                if core.effective_mode(Some(&session_id)) != JevMode::Active {
+                    return None::<Value>;
+                }
+                let Some(observer) = core.observer(&session_id, ctx.ui()) else {
+                    return None::<Value>;
+                };
+                let mut params = payload.payload;
+                // One decision boundary per provider request. The snapshot is
+                // built from what the adapter already tracks plus the tool
+                // catalog actually advertised in this request.
+                let state = active_request_state(&core, &ctx, &session_id, &params);
+                let policy = pi_jev::active::ActivationPolicy::default();
+                let outcome = observer
+                    .decide_active(
+                        &state,
+                        pi_jev::snapshot::SnapshotStage::TurnStart,
+                        &policy,
+                    )
+                    .await;
+                let mut effects: BTreeMap<String, Vec<pi_jev::active::AppliedEffect>> =
+                    BTreeMap::new();
+                for decision in &outcome.decisions {
+                    let changes = crate::core::jev_active::apply_decision(
+                        &mut params,
+                        decision.category.as_str(),
+                        &decision.value,
+                    );
+                    if changes.is_empty() {
+                        continue;
+                    }
+                    effects.insert(
+                        decision.category.as_str().to_string(),
+                        changes
+                            .iter()
+                            .map(|change| {
+                                pi_jev::active::AppliedEffect::new(
+                                    change.key.clone(),
+                                    change.from.clone(),
+                                    change.to.clone(),
+                                )
+                            })
+                            .collect(),
+                    );
+                }
+                observer.record_active(&outcome, &effects);
+                ctx.ui()
+                    .set_status("jev".into(), Some(footer_status_text(&session_id)));
+                if effects.is_empty() {
+                    // Nothing applied: hand the payload back untouched rather
+                    // than claim a change the request never had.
+                    None::<Value>
+                } else {
+                    Some(params)
+                }
+            })
+        },
+    )
+}
+
+/// Bounded state for one Active decision boundary at the provider edge.
+///
+/// Reuses the same field names the Compare path sends at `turn_start`, so both
+/// modes ask the same questions of the same snapshot. The tool catalog is the
+/// one this request actually advertises, which is what the tool-candidate and
+/// tool-requirement evaluators need; the observed-tool history is the fallback.
+fn active_request_state(
+    core: &Arc<JevBridgeCore>,
+    ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>,
+    session_id: &str,
+    params: &Value,
+) -> Value {
+    let advertised = advertised_tool_names(params);
+    let observed = if advertised.is_empty() {
+        core.observed_tools(session_id)
+    } else {
+        advertised
+    };
+    let model_id = ctx.model().map(|model| model.id.clone());
+    json!({
+        "session_id": session_id,
+        "turn": core.turn(session_id),
+        "model": model_id,
+        "state": {
+            "user_text_excerpt": core.task_excerpt(session_id),
+            "observed_tools": observed,
+            "message_count": ctx.session_manager().get_entry_count(),
+            "model": model_id,
+            "model_allowlist": Vec::<String>::new(),
+            "cwd_name": std::path::Path::new(&ctx.cwd())
+                .file_name()
+                .map(|name| name.to_string_lossy().to_string()),
+        },
+    })
+}
+
+/// Tool names advertised in one provider request body, in order, bounded.
+///
+/// Only `function.name` entries are read. A tool schema is public by
+/// definition: it is already on its way to the model provider.
+fn advertised_tool_names(params: &Value) -> Vec<String> {
+    const MAX_ADVERTISED_TOOLS: usize = 16;
+    let Some(tools) = params.get(crate::core::jev_active::TOOLS_KEY).and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    let mut names: Vec<String> = Vec::new();
+    for tool in tools {
+        let name = tool
+            .get("function")
+            .and_then(|function| function.get("name"))
+            .and_then(Value::as_str)
+            .or_else(|| tool.get("name").and_then(Value::as_str));
+        if let Some(name) = name {
+            if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+                names.push(name.to_string());
+            }
+        }
+        if names.len() >= MAX_ADVERTISED_TOOLS {
+            break;
+        }
+    }
+    names
 }
 
 /// Convert an `ExtensionEvent` into the bounded `(event_type, payload)` DTO
@@ -993,10 +1245,10 @@ mod no_subagent_control_tests {
         }
     }
 
-    /// Future-Active settings can never register anything: the resolver
-    /// fails Active closed to Off, so `wants_observer` is false.
+    /// Active is operative: it wants the observer, keeps the exact per-session
+    /// value (never coerced to Compare or Off), and is not a Compare mode.
     #[test]
-    fn active_settings_register_nothing() {
+    fn active_settings_select_active_and_never_compare() {
         let mut settings = JevSettings::default();
         settings.global_default = Some(JevMode::Active);
         settings.sessions.insert(
@@ -1006,10 +1258,49 @@ mod no_subagent_control_tests {
                 inherited_from: None,
             },
         );
-        assert!(!settings.wants_observer());
-        // The reserved mode stays representable for honest status; it can
-        // never register (Compare-only gate) and the client refuses it.
+        assert!(settings.wants_observer());
         assert_eq!(settings.effective_mode("any-session"), JevMode::Active);
+        assert!(!JevMode::Active.allows_compare());
+        // A per-session override always wins over the global default, in both
+        // directions, so an Active session never silently becomes Compare.
+        settings.sessions.insert(
+            "any-session".to_string(),
+            pi_jev::config::PersistedSessionMode {
+                mode: Some(JevMode::Off),
+                inherited_from: None,
+            },
+        );
+        assert_eq!(settings.effective_mode("any-session"), JevMode::Off);
+    }
+
+    /// The provider-request handler exists only while Active is requested.
+    ///
+    /// Its presence alone tells the runner that a request body may change,
+    /// which also gates retry reuse of semantic edges. A process where nobody
+    /// enabled Active must therefore keep the handler absent.
+    #[test]
+    fn active_handler_presence_follows_the_setting() {
+        fn active_handlers(extension: &SharedExtension) -> usize {
+            let guard = extension.lock().unwrap();
+            guard
+                .handlers
+                .get(JEV_ACTIVE_EVENT)
+                .map(|handlers| handlers.len())
+                .unwrap_or(0)
+        }
+
+        let core = Arc::new(JevBridgeCore::new(JevSettings::default()));
+        // A default-Off build registers no provider-request handler at all.
+        let extension = build_observer_extension(Arc::clone(&core));
+        assert_eq!(active_handlers(&extension), 0);
+        core.attach_extension(&extension);
+        // Installing is idempotent; removing leaves an empty entry.
+        core.set_active_handler(&core, true);
+        assert_eq!(active_handlers(&extension), 1);
+        core.set_active_handler(&core, true);
+        assert_eq!(active_handlers(&extension), 1);
+        core.set_active_handler(&core, false);
+        assert_eq!(active_handlers(&extension), 0);
     }
 }
 

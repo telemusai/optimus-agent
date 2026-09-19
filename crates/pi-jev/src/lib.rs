@@ -9,6 +9,7 @@
 //! Lane B (jev-comparison) owns: snapshot.rs, scheduler.rs, evaluators.rs, evaluators/*.rs,
 //! hooks.rs, correlate.rs, report.rs and fills the placeholder modules declared below.
 
+pub mod active;
 pub mod client;
 pub mod config;
 pub mod credential;
@@ -25,6 +26,10 @@ pub mod report;
 pub mod scheduler;
 pub mod snapshot;
 
+pub use active::{
+    evaluate_answer, Acceptance, ActivationPolicy, ActiveDecision, AnswerCandidate, AppliedEffect,
+    FallbackReason, DEFAULT_APPLIABLE_CATEGORIES, MAX_EFFECT_CHARS, MAX_VALUE_CHARS,
+};
 pub use client::{
     accepted_answers, backoff_policy_line, build_system_one, bundle_with_questions, decide_with, parse_systemone_body,
     retry_decision, ClientHandle, DisabledSystemOne, JevHttpTransport, JevLimits, JevStats, JevStatsSnapshot,

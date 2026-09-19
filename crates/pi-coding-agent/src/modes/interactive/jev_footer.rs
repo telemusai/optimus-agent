@@ -22,15 +22,18 @@
 //! |---|---|---|
 //! | `Off` | `* Jev Off` | red (`error`) |
 //! | `Compare` | `* Jev Compare` | cyan (`accent`) |
+//! | `Active` | `* Jev Active` | cyan (`accent`) |
 //! | checking | `* Jev checking` | amber (`warning`) |
 //! | unavailable | `* Jev unavailable` | amber (`warning`) |
 //! | fallback | `* Jev fallback` | amber (`warning`) |
-//! | green `* Jev On` | RESERVED for a future genuinely Active healthy mode | never produced |
 //!
-//! Green is not merely unused: [`JevFooterState::is_green`] is a constant
-//! `false`, [`JevFooterState::color_key`] has no `success` arm, and
-//! [`JEV_GREEN_RESERVED_NOTICE`] documents the reservation, so a future edit
-//! that wants a green footer must deliberately change the pure module.
+//! Active is one of the two accent states, not a separate colour: it runs the
+//! same credential / checking / fallback ladder Compare runs, and the text is the
+//! only thing that differs. A green `* Jev On` state is not produced here:
+//! [`JevFooterState::is_green`] is a constant `false`, [`JevFooterState::color_key`]
+//! has no `success` arm for these states, and [`JEV_FOOTER_RULE_NOTICE`] documents
+//! the rule, so a future edit that wants a green footer must deliberately change
+//! the pure module.
 //!
 //! The segment renders from a snapshot the caller owns. Nothing here reads the
 //! mode store, the credential store, or the network, so a render pass can never
@@ -79,8 +82,8 @@ impl JevFooterSnapshot {
     ///
     /// The text goes through the same `theme().fg` call the rest of the interactive
     /// host uses for status surfaces, and the colour comes from
-    /// [`footer_color_key`](super::jev_menu::footer_color_key), so the reserved
-    /// green can only be reached by changing the pure module.
+    /// [`footer_color_key`](super::jev_menu::footer_color_key), so a green segment
+    /// can only be reached by changing the pure module.
     fn themed_text(&self) -> String {
         let state = self.state();
         let text = self.text();

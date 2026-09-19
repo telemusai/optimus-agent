@@ -862,8 +862,11 @@ impl AgentDaemon {
     }
 
     /// The mode view both `jev_get_settings` and `jev_get_status` return. It reads
-    /// only local settings and credential PRESENCE: no network call, no secret
-    /// value, and `applied` is always false because nothing is applied in Compare.
+    /// only local settings and credential PRESENCE: no network call and no secret
+    /// value. Every mode is reported as the real mode it is: `mode` and `activeMode`
+    /// carry the effective mode and whether it is Active. This view applies nothing
+    /// itself, so `applied` stays false; the live Active counters ride in the
+    /// `pipeline` block of `jev_get_status`.
     fn jev_settings_view(&self, session_id: &str) -> Result<Value, String> {
         let store = self.jev_settings_store();
         let settings = store.load();
@@ -881,15 +884,19 @@ impl AgentDaemon {
             // Store access failures mean UNKNOWN, not absent.
             "credentialPresenceKnown": saved_presence_known,
             "envConflict": env.has_conflict(),
-            "activeMode": "reserved",
-            // Compare never applies anything; a client must never read otherwise.
+            // A real, operative mode: this reports whether THIS session's effective
+            // mode is Active. It is not a reservation or readiness marker.
+            "activeMode": resolution.mode == pi_jev::types::JevMode::Active,
+            // This settings view applies nothing itself, in any mode.
             "applied": false,
+            // No per-view counters: the live figures are in `pipeline.active`.
             "appliedDecisions": 0,
         }))
     }
 
-    /// Applies one mode change through lane A's store. `Active` is reserved and
-    /// writes nothing, so `applied` is false for it.
+    /// Applies one mode change through lane A's store. Every mode is written,
+    /// including `Active`, so a request is never silently rewritten into another
+    /// mode; `applied` is true for every accepted write.
     fn jev_apply_session_mode(
         &self,
         session_id: &str,
@@ -897,10 +904,6 @@ impl AgentDaemon {
     ) -> Result<(bool, pi_jev::types::JevMode), String> {
         let store = self.jev_settings_store();
         let mut settings = store.load();
-        if requested.is_reserved() {
-            let unchanged = settings.effective_mode(session_id);
-            return Ok((false, unchanged));
-        }
         settings.set_session_mode(session_id, requested);
         store.save(&settings).map_err(|error| error.log_line())?;
         // The interactive host caches settings for 250ms; a daemon-side write
@@ -911,13 +914,16 @@ impl AgentDaemon {
 }
 
 /// The one message form both the interactive command and the daemon return, so a
-/// user sees identical wording through either path.
+/// user sees identical wording through either path. The stable mode name is used
+/// so a client can key on `Jev mode: active` / `Jev mode: compare` without
+/// matching display text.
 fn jev_mode_change_message(applied: bool, mode: pi_jev::types::JevMode) -> String {
     if applied {
-        return format!("Jev mode: {} (scope: this chat)", mode.label());
+        return format!("Jev mode: {} (scope: this chat)", mode.as_str());
     }
     format!(
-        "Active is reserved and disabled in this release; mode stays {}. Nothing changed.",
+        "Jev mode not applied; mode stays {} ({}). Nothing changed.",
+        mode.as_str(),
         mode.label()
     )
 }
@@ -5340,10 +5346,8 @@ impl AgentDaemon {
                         "requested": requested,
                         "mode": effective.as_str(),
                         "scope": resolution.scope.as_str(),
-                        // `active` is reserved: applied stays false, nothing changed,
-                        // and `reserved` records why.
+                        // Every mode, Active included, is applied on request.
                         "applied": applied,
-                        "reserved": !applied,
                         "message": jev_mode_change_message(applied, effective),
                     })),
                 )))

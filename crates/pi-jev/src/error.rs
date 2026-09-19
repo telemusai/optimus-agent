@@ -174,9 +174,6 @@ pub enum JevError {
     /// Shadow work was requested while the effective mode does not enable Compare.
     #[error("jev mode off: shadow evaluation is disabled")]
     ModeOff,
-    /// Reserved for a future, separately reviewed Active policy.
-    #[error("jev mode active is reserved and disabled")]
-    ActiveReserved,
     /// No key is configured anywhere. Key presence is never a mode.
     #[error("jev credential missing: no saved credential and no TYPESAFE_API_KEY/JEV_API_KEY")]
     MissingCredential,
@@ -232,7 +229,6 @@ impl JevError {
     pub fn kind(&self) -> &'static str {
         match self {
             JevError::ModeOff => "mode_off",
-            JevError::ActiveReserved => "active_reserved",
             JevError::MissingCredential => "missing_credential",
             JevError::Unavailable { .. } => "credential_store_unavailable",
             JevError::CredentialStore { .. } => "credential_store_error",
@@ -281,7 +277,7 @@ impl JevError {
     pub fn is_mode_refusal(&self) -> bool {
         matches!(
             self,
-            JevError::ModeOff | JevError::ActiveReserved | JevError::SubagentControlForbidden { .. }
+            JevError::ModeOff | JevError::SubagentControlForbidden { .. }
         )
     }
 

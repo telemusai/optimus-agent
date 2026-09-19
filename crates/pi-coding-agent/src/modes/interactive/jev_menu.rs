@@ -2,8 +2,8 @@
 //!
 //! This module owns three things and nothing else:
 //!
-//! 1. `/jev` argument parsing (`/jev`, `/jev off`, `/jev compare`, `/jev on`,
-//!    `/jev status`, `/jev key`, plus the reserved forms).
+//! 1. `/jev` argument parsing (`/jev`, `/jev off`, `/jev compare`, `/jev active`,
+//!    `/jev on`, `/jev status`, `/jev key`, `/jev help`).
 //! 2. The mode get/set bridge into the `pi-jev` config store, including scope
 //!    reporting ("this chat" vs "defaults for new chats").
 //! 3. The truthful status text the UI renders for `/jev status`.
@@ -34,20 +34,31 @@ use pi_jev::types::JevMode;
 /// Canonical builtin command name (added to `core/slash_commands.rs`).
 pub const JEV_COMMAND_NAME: &str = "jev";
 
-/// Autocomplete argument hint.
-pub const JEV_ARGUMENT_HINT: &str = "[off|compare|on|status|key]";
+/// Autocomplete argument hint. `on` is the short form of `compare`; only the
+/// explicit `active` spelling selects the mode that changes a request.
+pub const JEV_ARGUMENT_HINT: &str = "[off|compare|active|on|status|key]";
 
 /// Autocomplete description. It names the modes, the key entry and status.
 pub const JEV_COMMAND_DESCRIPTION: &str =
-    "Jev comparison mode: Off, Compare (shadow-only), Active (reserved/disabled), Input API key, Status";
+    "Jev comparison mode: Off, Compare (shadow-only), Active (applied to the next provider request), Input API key, Status";
 
-/// The exact status line the reserved `on` form must produce.
-pub const JEV_ON_RESERVED_NOTICE: &str =
-    "Jev On is reserved; enabling Compare (shadow-only observations; no decisions applied)";
+/// The one line `/jev on` adds after the Compare confirmation, so the shorthand
+/// cannot be mistaken for the request-changing mode.
+pub const JEV_ON_COMPARE_NOTICE: &str = "`on` selects Compare: answers are recorded, never applied. Use `/jev active` to let an accepted answer change the next provider request.";
 
-/// The exact explanation for the reserved `Active` option.
-pub const JEV_ACTIVE_DISABLED_NOTICE: &str = "Active is reserved and disabled in this release: acting on Jev recommendations \
-requires a separately reviewed activation policy and an explicit activation step. Selecting it changes nothing.";
+/// True when the typed argument was the `on` shorthand, which selects Compare and
+/// must say so. No key or case is hardcoded.
+pub fn is_on_shorthand(args: &str) -> bool {
+    args.trim().eq_ignore_ascii_case("on")
+}
+
+/// Why an Active session can show no counters at all.
+pub const JEV_ACTIVE_UNKNOWN_NOTE: &str =
+    "no Active boundary has been observed in this worker yet; unknown is not zero";
+
+/// The exact notice an `active` mode change prints. Active is a real, operative
+/// mode in this release; `/jev on` stays Compare and says so instead.
+pub const JEV_ACTIVE_NOTICE: &str = "Jev Active: an accepted answer is applied to the next provider request. The tool catalog is withdrawn for a request whose task needs no tools, and an already-set reasoning effort may move one step. A refused answer, failure or timeout leaves the request unchanged.";
 
 /// Documented SystemOne endpoint (DESIGN.md section 2). Recorded for display only:
 /// this UI lane never calls it.
@@ -59,11 +70,15 @@ pub const JEV_DEFAULT_MODEL: &str = "jev-latest";
 /// The first-use disclosure wording (DESIGN.md data-handling requirement).
 pub const JEV_DISCLOSURE_NOTICE: &str = "Disclosure: in Compare mode selected prompt/context excerpts are sent to TypeSafe \
 for bounded, explicit decision categories. Redaction cannot guarantee that every confidential business item is found; \
-treat data minimisation as the user's protection. Nothing Jev returns is applied: the primary model keeps full control.";
+treat data minimisation as the user's protection. In Compare mode nothing Jev returns is applied. In Active mode an \
+accepted answer may change at most one field of one outgoing provider request, as described by /jev status; the primary \
+model keeps full control.";
 
 /// Section 11/12 boundary wording appended to help and status.
-pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, provider, effort, tools, permissions, \
-context, memory, compaction, continuation, subagents, agent messages, depth, concurrency or budgets.";
+///
+/// This is also the permanent limit of Active: the notice above is the whole of
+/// what an accepted answer may change, and nothing here is ever in reach.
+pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, provider, permissions, context, memory, compaction, continuation, subagents, agent messages, depth, concurrency or budgets.";
 
 /// One parsed `/jev` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -94,16 +109,16 @@ pub fn jev_usage() -> String {
 
 /// Parse the `/jev` argument text.
 ///
-/// `on` is accepted and maps to `Compare`, and the caller MUST say so with
-/// [`JEV_ON_RESERVED_NOTICE`]. `active` parses to [`JevMode::Active`] so the
-/// caller can answer with the reserved explanation instead of silently ignoring
-/// the request.
+/// `on` stays the short alias for `Compare` (the repo rule: no shorthand arms a
+/// request-changing mode), and the caller must explain the difference with
+/// [`JEV_ON_COMPARE_NOTICE`]. Only the explicit `active` spelling selects
+/// [`JevMode::Active`] and prints [`JEV_ACTIVE_NOTICE`]. No form is silently
+/// rewritten to another mode.
 pub fn parse_jev_request(args: &str) -> JevRequest {
     match args.trim().to_ascii_lowercase().as_str() {
         "" => JevRequest::Menu,
         "off" => JevRequest::SetMode(JevMode::Off),
-        "compare" => JevRequest::SetMode(JevMode::Compare),
-        "on" => JevRequest::SetMode(JevMode::Compare),
+        "compare" | "on" => JevRequest::SetMode(JevMode::Compare),
         "active" => JevRequest::SetMode(JevMode::Active),
         "status" => JevRequest::Status,
         "key" | "key-input" => JevRequest::InputKey,
@@ -111,11 +126,6 @@ pub fn parse_jev_request(args: &str) -> JevRequest {
         "help" | "-h" | "--help" => JevRequest::Help,
         other => JevRequest::Unknown(other.to_string()),
     }
-}
-
-/// True when the typed argument was `on`, which must report the reserved notice.
-pub fn is_reserved_on(args: &str) -> bool {
-    args.trim().eq_ignore_ascii_case("on")
 }
 
 /// Environment presence read through a caller-supplied accessor, so tests never
@@ -214,12 +224,60 @@ pub struct JevPipelineStatus {
     pub fallback_reason: String,
     /// Response model the server reported (config drift is visible).
     pub response_model: Option<String>,
+    /// Real Active-mode counters for this session, present only when the worker
+    /// observed an Active provider boundary. Absent in Off and Compare, so an
+    /// absent block is unknown and never rendered as zero.
+    pub active: Option<ActiveCounters>,
+}
+
+/// The `active` block of one worker snapshot.
+///
+/// `applied` counts provider-request boundaries where a request field actually
+/// changed (not answers), `accepted_no_effect` counts accepted answers with no
+/// reversible effect, `refused` counts refused answers, and `unavailable`
+/// counts boundaries with no usable answer.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActiveCounters {
+    pub applied: u64,
+    pub accepted_no_effect: u64,
+    pub refused: u64,
+    pub unavailable: u64,
+    pub last_reason: Option<String>,
+    pub last_category: Option<String>,
+}
+
+impl ActiveCounters {
+    /// Parse the block when the snapshot carries one. An absent or malformed
+    /// block is `None`: "no Active boundary seen" is not the same as all-zero.
+    pub fn from_snapshot(value: Option<&serde_json::Value>) -> Option<Self> {
+        let value = value.filter(|value| value.is_object())?;
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str)
+            .map(|text| pi_jev::correlate::sanitize_text(text, 120));
+        Some(Self {
+            applied: number("applied"),
+            accepted_no_effect: number("accepted_no_effect"),
+            refused: number("refused"),
+            unavailable: number("unavailable"),
+            last_reason: text("last_reason"),
+            last_category: text("last_category"),
+        })
+    }
 }
 
 impl JevPipelineStatus {
+    /// Accept either snapshot shape: the Compare/scheduler counters, the Active
+    /// counters, or both. A snapshot with neither is unknown.
     pub fn from_snapshot(snapshot: Option<&serde_json::Value>) -> Self {
-        let Some(value) = snapshot.filter(|value| ["success_count", "failure_count", "queue_capacity"]
-            .iter().all(|key| value.get(key).and_then(serde_json::Value::as_u64).is_some())) else { return Self::default(); };
+        let Some(value) = snapshot else { return Self::default(); };
+        let active = ActiveCounters::from_snapshot(value.get("active"));
+        let compare_counters = ["success_count", "failure_count", "queue_capacity"]
+            .iter().all(|key| value.get(key).and_then(serde_json::Value::as_u64).is_some());
+        if !compare_counters {
+            // An Active-only snapshot has no scheduler counters. They stay at
+            // their default (unknown) values instead of being invented as zero.
+            return Self { active, ..Self::default() };
+        }
         let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
         let optional_text = |key: &str| value.get(key).and_then(serde_json::Value::as_str)
             .map(|text| pi_jev::correlate::sanitize_text(text, 120));
@@ -240,12 +298,21 @@ impl JevPipelineStatus {
                     .take(11).collect()).unwrap_or_default(),
             fallback_reason: optional_text("fallback_reason").unwrap_or_default(),
             response_model: optional_text("response_model"),
+            active,
         }
     }
 
-    pub fn known(&self) -> bool {
+    /// True when the snapshot carried the Compare/scheduler counters. The zeroes
+    /// of an Active-only snapshot are NOT counter facts and must not be rendered
+    /// as one.
+    pub fn counters_known(&self) -> bool {
         self.observed || self.in_flight > 0 || self.queue_capacity > 0
             || self.last_success_at.is_some() || self.success_count > 0 || self.failure_count > 0
+    }
+
+    /// True when anything at all was observed for this session, in either mode.
+    pub fn known(&self) -> bool {
+        self.counters_known() || self.active.is_some()
     }
     /// True while Jev is working: this is what makes the footer amber/checking
     /// rather than green.
@@ -269,7 +336,9 @@ pub struct JevStatusReport {
     /// API/model identity.
     pub api_endpoint: String,
     pub requested_model: String,
-    /// "0 in Compare" is the truthful figure; savings are hypothetical only.
+    /// Compare keeps this at 0: nothing is applied. In Active the live figure is
+    /// [`JevPipelineStatus::active`]`::applied`, which counts boundaries where a
+    /// request field actually changed.
     pub applied_decisions: u64,
     pub hypothetical_only: bool,
     /// Where the pipeline figures came from, or why they are empty. Kept in the
@@ -319,7 +388,7 @@ pub fn render_status(report: &JevStatusReport) -> String {
         }
     ));
     if report.mode == JevMode::Active {
-        text.push_str(&format!("{JEV_ACTIVE_DISABLED_NOTICE}\n"));
+        text.push_str(&format!("{JEV_ACTIVE_NOTICE}\n"));
     }
     text.push_str(&format!("{}\n", report.credential.describe()));
     text.push_str(&format!("API: {}\n", report.api_endpoint));
@@ -337,6 +406,10 @@ pub fn render_status(report: &JevStatusReport) -> String {
         "State: {}\n",
         if report.mode == JevMode::Off {
             "idle (Off: no scheduling, no client, no network)"
+        } else if report.mode == JevMode::Active && !report.pipeline.known() {
+            "unknown (no Active boundary observed in this worker yet)"
+        } else if report.mode == JevMode::Active {
+            "active (an accepted answer changes at most one request field)"
         } else if !report.pipeline.known() {
             "unknown (worker telemetry unavailable or no observation yet)"
         } else if report.pipeline.checking() {
@@ -351,14 +424,14 @@ pub fn render_status(report: &JevStatusReport) -> String {
     ));
     text.push_str(&format!(
         "Last success: {} (latency {})\n",
-        report.pipeline.last_success_at.clone().unwrap_or_else(|| if report.pipeline.known() { "never" } else { "unknown" }.to_string()),
+        report.pipeline.last_success_at.clone().unwrap_or_else(|| if report.pipeline.counters_known() { "never" } else { "unknown" }.to_string()),
         report
             .pipeline
             .last_latency_ms
             .map(|ms| format!("{ms} ms"))
             .unwrap_or_else(|| "unknown".to_string())
     ));
-    if report.pipeline.known() {
+    if report.pipeline.counters_known() {
     text.push_str(&format!(
         "Counters: {} ok, {} failed\n",
         report.pipeline.success_count, report.pipeline.failure_count
@@ -395,14 +468,35 @@ pub fn render_status(report: &JevStatusReport) -> String {
     }
     text.push_str(&format!(
         "Decisions applied: {} ({})\n",
-        report.applied_decisions,
-        if report.hypothetical_only {
+        if report.mode == JevMode::Active {
+            report.pipeline.active.as_ref().map(|counters| counters.applied).unwrap_or(0)
+        } else {
+            report.applied_decisions
+        },
+        if report.mode == JevMode::Active {
+            "Active counts one boundary per provider request whose body actually changed"
+        } else if report.hypothetical_only {
             "Compare is shadow-only; potential savings are hypothetical, never measured"
         } else {
-            "no recommendation is applied in this release"
+            "nothing is applied while Jev is Off"
         }
     ));
-    text.push_str(&format!("Footer: {JEV_GREEN_RESERVED_NOTICE}\n"));
+    if let Some(counters) = report.pipeline.active.as_ref() {
+        text.push_str(&format!(
+            "Active boundaries: {} applied, {} accepted with no effect, {} refused, {} without a usable answer\n",
+            counters.applied, counters.accepted_no_effect, counters.refused, counters.unavailable
+        ));
+        text.push_str(&format!(
+            "Active last: {} ({})\n",
+            counters.last_category.clone().unwrap_or_else(|| "none".to_string()),
+            counters.last_reason.clone().unwrap_or_else(|| "none".to_string())
+        ));
+    } else if report.mode == JevMode::Active {
+        text.push_str(&format!(
+            "Active boundaries: unknown ({JEV_ACTIVE_UNKNOWN_NOTE})\n"
+        ));
+    }
+    text.push_str(&format!("Footer: {JEV_FOOTER_RULE_NOTICE}\n"));
     text.push('\n');
     text.push_str(JEV_DISCLOSURE_NOTICE);
     text.push_str("\n\n");
@@ -411,43 +505,43 @@ pub fn render_status(report: &JevStatusReport) -> String {
     text
 }
 
-/// Help/hotkey text: the modes and the reserved wording, with no model or
+/// Help/hotkey text: the modes and their real scope, with no model or
 /// subagent claims (sections 11 and 12).
 pub fn render_help() -> String {
     let mut text = String::new();
     text.push_str(&format!("{JEV_COMMAND_DESCRIPTION}\n\n"));
     text.push_str("Off            Jev is disabled (default). No client, no scheduling, no network.\n");
     text.push_str("Compare        Shadow-only. Jev observes and records; Optimus alone decides.\n");
-    text.push_str("Active         RESERVED and disabled.");
-    text.push_str(JEV_ACTIVE_DISABLED_NOTICE);
+    text.push_str("Active         Operative. An accepted answer changes at most one field of the next\n");
+    text.push_str("               provider request.\n");
+    text.push_str(JEV_ACTIVE_NOTICE);
     text.push('\n');
     text.push_str("Input API key  Enter a TypeSafe key (masked; never stored in the transcript).\n");
     text.push_str("Status         Mode, scope, credential source, counters, queue, skips.\n");
-    text.push_str(&format!("Footer         {JEV_GREEN_RESERVED_NOTICE}.\n\n"));
+    text.push_str(&format!("Footer         {JEV_FOOTER_RULE_NOTICE}\n\n"));
     text.push_str(&format!(
-        "Commands: /{JEV_COMMAND_NAME}, /{JEV_COMMAND_NAME} off, /{JEV_COMMAND_NAME} compare, /{JEV_COMMAND_NAME} on, /{JEV_COMMAND_NAME} status, /{JEV_COMMAND_NAME} key, /{JEV_COMMAND_NAME} key clear, /{JEV_COMMAND_NAME} help\n"
+        "Commands: /{JEV_COMMAND_NAME}, /{JEV_COMMAND_NAME} off, /{JEV_COMMAND_NAME} compare, /{JEV_COMMAND_NAME} active, /{JEV_COMMAND_NAME} on, /{JEV_COMMAND_NAME} status, /{JEV_COMMAND_NAME} key, /{JEV_COMMAND_NAME} key clear, /{JEV_COMMAND_NAME} help\n"
     ));
-    text.push_str("Note: /jev on enables Compare.");
-    text.push_str(JEV_ON_RESERVED_NOTICE);
+    text.push_str("Note: /jev compare and its short form /jev on stay shadow-only and apply nothing.\n");
+    text.push_str(JEV_ON_COMPARE_NOTICE);
     text.push_str("\n\n");
     text.push_str(JEV_BOUNDARY_NOTICE);
     text.push('\n');
     text
 }
 
-/// Human label for a mode. `Active` is always labelled as reserved so no surface
-/// can show a plain enabled-looking "Active".
+/// Human label for a mode. Active is a real mode, so it is labelled plainly; the
+/// wording that bounds what it does lives in [`JEV_ACTIVE_NOTICE`].
 pub fn mode_label(mode: JevMode) -> &'static str {
     match mode {
         JevMode::Off => "Off",
         JevMode::Compare => "Compare",
-        // Never a plain "Active": the label itself carries the reserved state, so
-        // no renderer can show it as a plain selectable mode.
-        JevMode::Active => "Active (reserved, disabled)",
+        JevMode::Active => "Active",
     }
 }
 
-/// The message a mode change produces, including scope and the reserved cases.
+/// The message a mode change produces, including scope and the notice that
+/// belongs to the mode that was written.
 pub fn mode_change_message(change: &ModeChange) -> String {
     match change {
         ModeChange::Applied { mode, scope } => format!(
@@ -458,24 +552,23 @@ pub fn mode_change_message(change: &ModeChange) -> String {
                 ModeScope::GlobalDefault => "defaults for new chats",
                 ModeScope::BuiltIn => "built-in default",
             },
-            if *mode == JevMode::Compare { format!("\n{JEV_DISCLOSURE_NOTICE}") } else { String::new() },
-        ),
-        ModeChange::ReservedActive { unchanged_mode } => format!(
-            "{} Mode stays {}. Nothing changed.",
-            JEV_ACTIVE_DISABLED_NOTICE,
-            mode_label(*unchanged_mode)
+            match mode {
+                JevMode::Compare => format!("\n{JEV_DISCLOSURE_NOTICE}"),
+                JevMode::Active => format!("\n{JEV_ACTIVE_NOTICE}\n{JEV_BOUNDARY_NOTICE}"),
+                JevMode::Off => String::new(),
+            },
         ),
     }
 }
 
 /// The outcome of one mode-set request.
 ///
-/// `Applied` means the explicit per-session value was written. `ReservedActive`
-/// means `Active` was requested: it is reserved, so NOTHING changed.
+/// `Applied` means the requested value was written to the store. Every mode is
+/// writable, so there is no refusal variant: a mode is never silently rewritten
+/// into another one.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeChange {
     Applied { mode: JevMode, scope: ModeScope },
-    ReservedActive { unchanged_mode: JevMode },
 }
 
 /// Thin bridge the host uses for mode get/set, over lane A's
@@ -513,18 +606,15 @@ impl JevModeBridge {
         self.store.load().effective_mode_with_scope(session_id).scope
     }
 
-    /// Write an explicit per-session mode. `Active` is refused with no change.
+    /// Write an explicit per-session mode. Every mode is written, including
+    /// `Active`: the store is the only source of truth, and no request is
+    /// silently redirected to a different mode.
     pub fn set_session_mode(
         &self,
         session_id: &str,
         requested: JevMode,
     ) -> Result<ModeChange, String> {
         let mut settings = self.store.load();
-        if requested.is_reserved() {
-            return Ok(ModeChange::ReservedActive {
-                unchanged_mode: settings.effective_mode(session_id),
-            });
-        }
         settings.set_session_mode(session_id, requested);
         self.store.save(&settings).map_err(describe_error)?;
         Ok(ModeChange::Applied {
@@ -533,14 +623,10 @@ impl JevModeBridge {
         })
     }
 
-    /// Write the global default for sessions with no explicit value.
+    /// Write the global default for sessions with no explicit value. `Active`
+    /// is written like every other mode.
     pub fn set_global_default(&self, requested: JevMode) -> Result<ModeChange, String> {
         let mut settings = self.store.load();
-        if requested.is_reserved() {
-            return Ok(ModeChange::ReservedActive {
-                unchanged_mode: settings.global_default.unwrap_or(JevMode::Off),
-            });
-        }
         settings.global_default = Some(requested);
         self.store.save(&settings).map_err(describe_error)?;
         Ok(ModeChange::Applied {
@@ -582,13 +668,13 @@ pub fn describe_error(error: JevError) -> String {
     error.log_line()
 }
 
-/// The three footer states this release can show. `Active-Healthy` is
-/// deliberately unreachable: green is reserved for a future genuinely active
-/// healthy mode and must never be produced by this code.
+/// The footer states this release can show. Both Compare and Active are accent
+/// (working) states; no state in this release is green.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JevFooterState {
     Off,
     Compare,
+    Active,
     Unavailable,
     Checking,
     Fallback,
@@ -600,17 +686,19 @@ impl JevFooterState {
         match self {
             JevFooterState::Off => "Jev Off",
             JevFooterState::Compare => "Jev Compare",
+            JevFooterState::Active => "Jev Active",
             JevFooterState::Unavailable => "Jev unavailable",
             JevFooterState::Checking => "Jev checking",
             JevFooterState::Fallback => "Jev fallback",
         }
     }
 
-    /// Theme colour key. Green (`success`) is never returned here.
+    /// Theme colour key. Green (`success`) is never returned here: Active is an
+    /// accent state, not a green one.
     pub fn color_key(self) -> &'static str {
         match self {
             JevFooterState::Off => "error",
-            JevFooterState::Compare => "accent",
+            JevFooterState::Compare | JevFooterState::Active => "accent",
             JevFooterState::Unavailable | JevFooterState::Checking | JevFooterState::Fallback => {
                 "warning"
             }
@@ -622,7 +710,9 @@ impl JevFooterState {
         "\u{25cf}"
     }
 
-    /// True only for a future genuinely active healthy mode. Always false today.
+    /// True only for a state that is both active and healthy-green. This release
+    /// marks no state green, so the rule holds by construction and
+    /// [`footer_color_key`] can never return `success`.
     pub fn is_green(self) -> bool {
         false
     }
@@ -631,19 +721,21 @@ impl JevFooterState {
 /// Derive the footer state from mode + credential + pipeline truth.
 ///
 /// Rules, in order:
-/// * `Off` -> red dot + `Jev Off`, always.
-/// * `Active` -> the same red `Jev Off`: the mode is reserved and disabled, so Jev
-///   does no work. A hand-edited settings file therefore cannot make the footer
-///   claim Jev is running, and it can never reach the reserved green form.
+/// * `Off` -> red dot + `Jev Off`, always. Off does no work, so the credential and
+///   the pipeline cannot change that.
+/// * `Active` -> accent `Jev Active` once the credential and the pipeline allow it;
+///   otherwise the same amber unavailable / checking / fallback states Compare uses.
+/// * `Compare` -> accent `Jev Compare` under the same credential and pipeline rules.
 /// * No credential -> amber `Jev unavailable`.
 /// * In-flight work -> amber `Jev checking`.
 /// * Recorded fallback/failure -> amber `Jev fallback`.
-/// * Otherwise `Compare` -> cyan accent `Jev Compare`.
 /// Green is never produced.
 pub fn footer_state(mode: JevMode, credential: &CredentialStatus, pipeline: &JevPipelineStatus) -> JevFooterState {
-    if !mode.allows_compare() {
-        return JevFooterState::Off;
-    }
+    let healthy = match mode {
+        JevMode::Off => return JevFooterState::Off,
+        JevMode::Compare => JevFooterState::Compare,
+        JevMode::Active => JevFooterState::Active,
+    };
     if !credential.present() {
         return JevFooterState::Unavailable;
     }
@@ -653,7 +745,7 @@ pub fn footer_state(mode: JevMode, credential: &CredentialStatus, pipeline: &Jev
     if pipeline.degraded() {
         return JevFooterState::Fallback;
     }
-    JevFooterState::Compare
+    healthy
 }
 
 /// Plain-text footer segment: `\u{25cf} Jev Off`. No ANSI, so the caller can
@@ -713,13 +805,14 @@ impl JevMenuRow {
         let marker = match self {
             JevMenuRow::Off if active == JevMode::Off => " (current)",
             JevMenuRow::Compare if active == JevMode::Compare => " (current)",
+            JevMenuRow::Active if active == JevMode::Active => " (current)",
             _ => "",
         };
         match self {
+            // The row is the plain mode name: Active is a real, selectable mode.
             JevMenuRow::Off => format!("Off{marker}"),
             JevMenuRow::Compare => format!("Compare{marker}"),
-            // `Active` is never labelled as current: it is unreachable.
-            JevMenuRow::Active => "Active (reserved, disabled)".to_string(),
+            JevMenuRow::Active => format!("Active{marker}"),
             JevMenuRow::InputKey => "Input API key".to_string(),
             JevMenuRow::Status => "Status".to_string(),
         }
@@ -729,7 +822,7 @@ impl JevMenuRow {
         match self {
             JevMenuRow::Off => "Disable Jev. No client, no scheduling, no network.",
             JevMenuRow::Compare => "Shadow-only observations; no decisions applied.",
-            JevMenuRow::Active => JEV_ACTIVE_DISABLED_NOTICE,
+            JevMenuRow::Active => JEV_ACTIVE_NOTICE,
             JevMenuRow::InputKey => "Enter the TypeSafe key (masked, never echoed).",
             JevMenuRow::Status => "Mode, scope, credential source, counters, queue, skips.",
         }
@@ -742,10 +835,9 @@ pub enum JevMenuAction {
     None,
     /// Cancel the dialog immediately.
     Cancel,
-    /// Set the session mode to this value.
+    /// Set the session mode to this value. Every row that selects a mode reports
+    /// this action; the owner writes it.
     SetMode(JevMode),
-    /// The reserved option was chosen; nothing changes and the reason is shown.
-    ReservedActive,
     /// Open the masked key-entry dialog.
     InputKey,
     /// Show the status panel.
@@ -760,7 +852,7 @@ pub enum JevMenuAction {
 pub struct JevMenuState {
     pub selected: usize,
     pub active_mode: JevMode,
-    /// The last explanation shown under the list (reserved wording, errors).
+    /// The last explanation shown under the list (errors, async notes).
     pub message: Option<String>,
     /// True while the owner is doing async work for this dialog.
     pub busy: bool,
@@ -776,8 +868,11 @@ impl Default for JevMenuState {
 
 impl JevMenuState {
     pub fn new(active_mode: JevMode) -> Self {
+        // Preselect the row of the effective mode, so the current mode is always
+        // visible as `(current)` under the cursor.
         let selected = match active_mode {
             JevMode::Compare => 1,
+            JevMode::Active => 2,
             _ => 0,
         };
         Self {
@@ -830,10 +925,11 @@ impl JevMenuState {
                 JevMenuAction::SetMode(JevMode::Compare)
             }
             JevMenuRow::Active => {
-                // Reserved: the state does NOT change, and the dialog stays open so
-                // the user can read the reason.
-                self.message = Some(JEV_ACTIVE_DISABLED_NOTICE.to_string());
-                JevMenuAction::ReservedActive
+                // Active is a real mode: the state changes and the owner writes it,
+                // exactly like Off and Compare.
+                self.active_mode = JevMode::Active;
+                self.closed = true;
+                JevMenuAction::SetMode(JevMode::Active)
             }
             JevMenuRow::InputKey => {
                 self.closed = true;
@@ -1177,16 +1273,17 @@ pub fn binding_hint(keybinding: &str, description: &str) -> String {
 /// The extension status key the Jev footer publishes under.
 pub const JEV_STATUS_KEY: &str = "jev";
 
-/// Documentation of the reserved green state (asserted by the tests).
-pub const JEV_GREEN_RESERVED_NOTICE: &str =
-    "Green \"Jev On\" is reserved for a future genuinely Active healthy mode and is never shown in this release";
+/// Documentation of the footer colour rule (asserted by the tests). The callers
+/// prefix it with `Footer: `, so it does not repeat that word itself.
+pub const JEV_FOOTER_RULE_NOTICE: &str =
+    "red \"Jev Off\", accent \"Jev Compare\", accent \"Jev Active\", amber \"Jev unavailable\"/\"Jev checking\"/\"Jev fallback\". No green \"Jev On\" state is produced by this release.";
 
 /// The theme colour key for the footer segment.
 ///
-/// This is the one place the reserved-green rule is enforced in the LIVE path:
+/// This is the one place the no-green rule is enforced in the LIVE path:
 /// `success` is returned only when [`JevFooterState::is_green`] says the state is
-/// a genuinely Active healthy one, and that method is a constant `false` in this
-/// release. A future activation policy must change the pure module to get green.
+/// a green one, and that method is a constant `false` in this release. Active is
+/// an accent state, so a green footer would require changing the pure module.
 pub fn footer_color_key(state: JevFooterState) -> &'static str {
     if state.is_green() {
         "success"
