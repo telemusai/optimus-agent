@@ -5,7 +5,7 @@
 //! 1. `/jev` argument parsing (`/jev`, `/jev off`, `/jev compare`, `/jev active`,
 //!    `/jev on`, `/jev status`, `/jev key`, `/jev help`).
 //! 2. The mode get/set bridge into the `pi-jev` config store, including scope
-//!    reporting ("this chat" vs "defaults for new chats").
+//!    reporting (explicit session overrides vs global defaults).
 //! 3. The truthful status text the UI renders for `/jev status`.
 //!
 //! DESIGN.md binding constraints this module implements:
@@ -24,7 +24,7 @@ use std::path::{Path, PathBuf};
 use pi_tui::keybindings::get_keybindings;
 
 use pi_jev::config::{
-    resolve_credential_source, CredentialSource, EnvKeyPresence, JevSettings, JevSettingsStore,
+    resolve_credential_source, CredentialSource, EnvKeyPresence, JevFeature, JevFeatures, JevSettings, JevSettingsStore,
     ModeScope, DEFAULT_KEY_ID, ENV_JEV_API_KEY, ENV_TYPESAFE_API_KEY,
 };
 use pi_jev::credential::{CredentialStore, SecretString};
@@ -36,11 +36,11 @@ pub const JEV_COMMAND_NAME: &str = "jev";
 
 /// Autocomplete argument hint. `on` is the short form of `compare`; only the
 /// explicit `active` spelling selects the mode that changes a request.
-pub const JEV_ARGUMENT_HINT: &str = "[off|compare|active|on|status|key]";
+pub const JEV_ARGUMENT_HINT: &str = "[off|compare|active|compare-active|on|compact|feature|default|status|key]";
 
 /// Autocomplete description. It names the modes, the key entry and status.
 pub const JEV_COMMAND_DESCRIPTION: &str =
-    "Jev comparison mode: Off, Compare (shadow-only), Active (applied to the next provider request), Input API key, Status";
+    "Jev System One: Off, Compare, Active, Compare + Active, compaction, feature gates, API key and status";
 
 /// The one line `/jev on` adds after the Compare confirmation, so the shorthand
 /// cannot be mistaken for the request-changing mode.
@@ -58,7 +58,7 @@ pub const JEV_ACTIVE_UNKNOWN_NOTE: &str =
 
 /// The exact notice an `active` mode change prints. Active is a real, operative
 /// mode in this release; `/jev on` stays Compare and says so instead.
-pub const JEV_ACTIVE_NOTICE: &str = "Jev Active: an accepted answer is applied to the next provider request. The tool catalog is withdrawn for a request whose task needs no tools, and an already-set reasoning effort may move one step. A refused answer, failure or timeout leaves the request unchanged.";
+pub const JEV_ACTIVE_NOTICE: &str = "Jev Active applies accepted, feature-gated decisions at bounded native boundaries. Tool requirement and complexity are enabled by default; optional tool/retrieval filtering, observers and compaction need separate opt-in. A refused answer, failure or timeout keeps the baseline unchanged.";
 
 /// Documented SystemOne endpoint (DESIGN.md section 2). Recorded for display only:
 /// this UI lane never calls it.
@@ -68,17 +68,9 @@ pub const JEV_API_ENDPOINT: &str = "https://api.typesafe.ai/v1/systemone";
 pub const JEV_DEFAULT_MODEL: &str = "jev-latest";
 
 /// The first-use disclosure wording (DESIGN.md data-handling requirement).
-pub const JEV_DISCLOSURE_NOTICE: &str = "Disclosure: in Compare mode selected prompt/context excerpts are sent to TypeSafe \
-for bounded, explicit decision categories. Redaction cannot guarantee that every confidential business item is found; \
-treat data minimisation as the user's protection. In Compare mode nothing Jev returns is applied. In Active mode an \
-accepted answer may change at most one field of one outgoing provider request, as described by /jev status; the primary \
-model keeps full control.";
+pub const JEV_DISCLOSURE_NOTICE: &str = "Disclosure: Jev decisions and independently enabled compaction send selected, bounded prompt/context excerpts to TypeSafe. Pattern-based redaction cannot find every confidential item. Compare records recommendations without applying them. Active applies only accepted decisions allowed by local feature gates. Combined mode records both outcomes from one boundary request.";
 
-/// Section 11/12 boundary wording appended to help and status.
-///
-/// This is also the permanent limit of Active: the notice above is the whole of
-/// what an accepted answer may change, and nothing here is ever in reach.
-pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, provider, permissions, context, memory, compaction, continuation, subagents, agent messages, depth, concurrency or budgets.";
+pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, provider, permissions, subagents, agent messages, depth, concurrency or budgets. It never deletes durable memory or transcript history. Compaction is request-local and separately controlled; continuation and verification remain advisory.";
 
 /// One parsed `/jev` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -87,6 +79,11 @@ pub enum JevRequest {
     Menu,
     /// `/jev off`, `/jev compare`, `/jev on`, `/jev active`.
     SetMode(JevMode),
+    SetDefaultMode(JevMode),
+    SetFeature(JevFeature, bool),
+    SetCompaction(bool),
+    SetDefaultCompaction(bool),
+    CompactionStatus,
     /// `/jev status`.
     Status,
     /// `/jev key`: masked credential entry.
@@ -115,16 +112,25 @@ pub fn jev_usage() -> String {
 /// [`JevMode::Active`] and prints [`JEV_ACTIVE_NOTICE`]. No form is silently
 /// rewritten to another mode.
 pub fn parse_jev_request(args: &str) -> JevRequest {
-    match args.trim().to_ascii_lowercase().as_str() {
-        "" => JevRequest::Menu,
-        "off" => JevRequest::SetMode(JevMode::Off),
-        "compare" | "on" => JevRequest::SetMode(JevMode::Compare),
-        "active" => JevRequest::SetMode(JevMode::Active),
-        "status" => JevRequest::Status,
-        "key" | "key-input" => JevRequest::InputKey,
-        "key clear" | "key-clear" | "clear-key" => JevRequest::ClearKey,
-        "help" | "-h" | "--help" => JevRequest::Help,
-        other => JevRequest::Unknown(other.to_string()),
+    let normalized = args.trim().to_ascii_lowercase();
+    let parts: Vec<&str> = normalized.split(' ').filter(|part| !part.is_empty()).collect();
+    let toggle = |value: &str| match value { "on" => Some(true), "off" => Some(false), _ => None };
+    match parts.as_slice() {
+        [] => JevRequest::Menu,
+        ["off"] => JevRequest::SetMode(JevMode::Off),
+        ["compare" | "on"] => JevRequest::SetMode(JevMode::Compare),
+        ["active"] => JevRequest::SetMode(JevMode::Active),
+        ["compare-active" | "compare-and-active" | "compare_and_active" | "both"] => JevRequest::SetMode(JevMode::CompareAndActive),
+        ["status"] => JevRequest::Status,
+        ["compact" | "compaction"] | ["compact" | "compaction", "status"] => JevRequest::CompactionStatus,
+        ["compact" | "compaction", value] if toggle(value).is_some() => JevRequest::SetCompaction(toggle(value).unwrap()),
+        ["default", "compact" | "compaction", value] if toggle(value).is_some() => JevRequest::SetDefaultCompaction(toggle(value).unwrap()),
+        ["default", mode] if JevMode::parse(mode).is_some() => JevRequest::SetDefaultMode(JevMode::parse(mode).unwrap()),
+        ["feature", feature, value] if JevFeature::parse(feature).is_some() && toggle(value).is_some() => JevRequest::SetFeature(JevFeature::parse(feature).unwrap(), toggle(value).unwrap()),
+        ["key" | "key-input"] => JevRequest::InputKey,
+        ["key", "clear"] | ["key-clear" | "clear-key"] => JevRequest::ClearKey,
+        ["help" | "-h" | "--help"] => JevRequest::Help,
+        _ => JevRequest::Unknown(normalized),
     }
 }
 
@@ -228,6 +234,62 @@ pub struct JevPipelineStatus {
     /// observed an Active provider boundary. Absent in Off and Compare, so an
     /// absent block is unknown and never rendered as zero.
     pub active: Option<ActiveCounters>,
+    pub compaction: Option<CompactionStatus>,
+}
+
+/// Latest request-local compaction metadata. Missing fields remain unknown.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CompactionStatus {
+    pub applied: Option<bool>,
+    pub estimated_tokens_before: Option<u64>,
+    pub estimated_tokens_after: Option<u64>,
+    pub calls_evaluated: Option<u64>,
+    pub calls_removed: Option<u64>,
+    pub results_removed: Option<u64>,
+    pub results_truncated: Option<u64>,
+    pub reduction_percent: Option<String>,
+    pub fallback_reason: Option<String>,
+    pub breaker_state: Option<String>,
+}
+
+impl CompactionStatus {
+    pub fn from_snapshot(value: Option<&serde_json::Value>) -> Option<Self> {
+        let value = value.filter(|value| value.is_object())?;
+        let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str)
+            .map(|text| pi_jev::correlate::sanitize_text(text, 120));
+        let applied = value.get("applied").and_then(serde_json::Value::as_bool);
+        let fallback_reason = text("fallback_reason");
+        if applied.is_none() && fallback_reason.is_none() { return None; }
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
+        Some(Self {
+            applied,
+            estimated_tokens_before: number("estimated_tokens_before"),
+            estimated_tokens_after: number("estimated_tokens_after"),
+            calls_evaluated: number("calls_evaluated"),
+            calls_removed: number("calls_removed"),
+            results_removed: number("results_removed"),
+            results_truncated: number("results_truncated"),
+            reduction_percent: value.get("reduction_ratio").and_then(serde_json::Value::as_f64)
+                .filter(|ratio| ratio.is_finite() && (0.0..=1.0).contains(ratio))
+                .map(|ratio| format!("{:.1}%", ratio * 100.0)),
+            fallback_reason,
+            breaker_state: text("breaker_state"),
+        })
+    }
+}
+
+pub fn render_compaction_observation(status: Option<&CompactionStatus>) -> String {
+    let Some(status) = status else {
+        return "Compaction last: unknown (no worker boundary observed)\nCompaction breaker: unknown\n".into();
+    };
+    let count = |value: Option<u64>| value.map(|value| value.to_string()).unwrap_or_else(|| "unknown".into());
+    format!("Compaction last: {}\nCompaction estimated tokens: {} -> {} (reduction {})\nCompaction candidates: {} evaluated, {} calls removed, {} results removed, {} results truncated\nCompaction fallback: {}\nCompaction breaker: {}\n",
+        match status.applied { Some(true) => "applied", Some(false) => "not applied", None => "unknown" },
+        count(status.estimated_tokens_before), count(status.estimated_tokens_after),
+        status.reduction_percent.as_deref().unwrap_or("unknown"),
+        count(status.calls_evaluated), count(status.calls_removed), count(status.results_removed), count(status.results_truncated),
+        status.fallback_reason.as_deref().unwrap_or("none reported"),
+        status.breaker_state.as_deref().unwrap_or("unknown"))
 }
 
 /// The `active` block of one worker snapshot.
@@ -251,14 +313,14 @@ impl ActiveCounters {
     /// block is `None`: "no Active boundary seen" is not the same as all-zero.
     pub fn from_snapshot(value: Option<&serde_json::Value>) -> Option<Self> {
         let value = value.filter(|value| value.is_object())?;
-        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
+        let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64);
         let text = |key: &str| value.get(key).and_then(serde_json::Value::as_str)
             .map(|text| pi_jev::correlate::sanitize_text(text, 120));
         Some(Self {
-            applied: number("applied"),
-            accepted_no_effect: number("accepted_no_effect"),
-            refused: number("refused"),
-            unavailable: number("unavailable"),
+            applied: number("applied")?,
+            accepted_no_effect: number("accepted_no_effect")?,
+            refused: number("refused")?,
+            unavailable: number("unavailable")?,
             last_reason: text("last_reason"),
             last_category: text("last_category"),
         })
@@ -271,12 +333,13 @@ impl JevPipelineStatus {
     pub fn from_snapshot(snapshot: Option<&serde_json::Value>) -> Self {
         let Some(value) = snapshot else { return Self::default(); };
         let active = ActiveCounters::from_snapshot(value.get("active"));
+        let compaction = CompactionStatus::from_snapshot(value.get("compaction"));
         let compare_counters = ["success_count", "failure_count", "queue_capacity"]
             .iter().all(|key| value.get(key).and_then(serde_json::Value::as_u64).is_some());
         if !compare_counters {
             // An Active-only snapshot has no scheduler counters. They stay at
             // their default (unknown) values instead of being invented as zero.
-            return Self { active, ..Self::default() };
+            return Self { active, compaction, ..Self::default() };
         }
         let number = |key: &str| value.get(key).and_then(serde_json::Value::as_u64).unwrap_or(0);
         let optional_text = |key: &str| value.get(key).and_then(serde_json::Value::as_str)
@@ -295,10 +358,11 @@ impl JevPipelineStatus {
             skipped_categories: value.get("skipped_categories").and_then(serde_json::Value::as_object)
                 .map(|categories| categories.iter().filter_map(|(category, reason)| reason.as_str()
                     .map(|reason| (pi_jev::correlate::sanitize_text(category, 80), pi_jev::correlate::sanitize_text(reason, 120))))
-                    .take(11).collect()).unwrap_or_default(),
+                    .take(13).collect()).unwrap_or_default(),
             fallback_reason: optional_text("fallback_reason").unwrap_or_default(),
             response_model: optional_text("response_model"),
             active,
+            compaction,
         }
     }
 
@@ -312,10 +376,9 @@ impl JevPipelineStatus {
 
     /// True when anything at all was observed for this session, in either mode.
     pub fn known(&self) -> bool {
-        self.counters_known() || self.active.is_some()
+        self.counters_known() || self.active.is_some() || self.compaction.is_some()
     }
-    /// True while Jev is working: this is what makes the footer amber/checking
-    /// rather than green.
+    /// In-flight work makes the footer amber/checking rather than accent.
     pub fn checking(&self) -> bool {
         self.in_flight > 0
     }
@@ -327,10 +390,14 @@ impl JevPipelineStatus {
 
 /// Everything `/jev status` needs. Assembled by the caller from the store plus
 /// whatever the comparison pipeline exposes; no field requires a network call.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct JevStatusReport {
     pub mode: JevMode,
     pub scope: ModeScope,
+    pub features: JevFeatures,
+    pub compaction_enabled: bool,
+    pub compaction_scope: ModeScope,
+    pub compaction_config: pi_jev::compaction::CompactionConfig,
     pub credential: CredentialStatus,
     pub pipeline: JevPipelineStatus,
     /// API/model identity.
@@ -347,12 +414,15 @@ pub struct JevStatusReport {
 }
 
 impl JevStatusReport {
-    /// The report for a UI that has no comparison-pipeline telemetry yet: the
-    /// counters are truthful zeros and the note says so.
+    /// No worker telemetry means unknown counters, not measured zeroes.
     pub fn local_only(mode: JevMode, scope: ModeScope, credential: CredentialStatus) -> Self {
         Self {
             mode,
             scope,
+            features: JevFeatures::default(),
+            compaction_enabled: false,
+            compaction_scope: ModeScope::BuiltIn,
+            compaction_config: pi_jev::compaction::CompactionConfig::default(),
             credential,
             pipeline: JevPipelineStatus::default(),
             api_endpoint: JEV_API_ENDPOINT.to_string(),
@@ -364,6 +434,13 @@ impl JevStatusReport {
                     .to_string(),
             ),
         }
+    }
+
+    pub fn with_settings(mut self, settings: &JevSettings, session_id: &str) -> Self {
+        self.features = settings.effective_features(session_id);
+        self.compaction_config = settings.compaction.clone();
+        (self.compaction_enabled, self.compaction_scope) = settings.effective_compaction_with_scope(session_id);
+        self
     }
 
     pub fn with_snapshot(mut self, snapshot: Option<&serde_json::Value>) -> Self {
@@ -387,8 +464,17 @@ pub fn render_status(report: &JevStatusReport) -> String {
             ModeScope::BuiltIn => "no per-session setting and no global default; this is the built-in default",
         }
     ));
-    if report.mode == JevMode::Active {
+    if report.mode.allows_active() {
         text.push_str(&format!("{JEV_ACTIVE_NOTICE}\n"));
+    }
+    text.push_str(&render_compaction_status(report.compaction_enabled, report.compaction_scope));
+    text.push_str(&format!("Compaction policy: keep_threshold={}, preserve_recent_messages={}, max_state_tokens={}, max_request_tokens={}, truncate_head_chars={}, minimum_reduction_ratio={}\n",
+        report.compaction_config.keep_threshold, report.compaction_config.preserve_recent_messages,
+        report.compaction_config.max_state_tokens, report.compaction_config.max_request_tokens,
+        report.compaction_config.truncate_head_chars, report.compaction_config.minimum_reduction_ratio));
+    text.push_str("Feature gates (configured; not proof of an applied decision):\n");
+    for feature in JevFeature::ALL {
+        text.push_str(&format!("  {}: {}\n", feature.as_str(), if report.features.enabled(feature) { "on" } else { "off" }));
     }
     text.push_str(&format!("{}\n", report.credential.describe()));
     text.push_str(&format!("API: {}\n", report.api_endpoint));
@@ -404,12 +490,14 @@ pub fn render_status(report: &JevStatusReport) -> String {
     text.push_str(&format!("Configured: {}\n", if report.credential.present() { "yes" } else { "no credential" }));
     text.push_str(&format!(
         "State: {}\n",
-        if report.mode == JevMode::Off {
+        if report.mode == JevMode::Off && report.compaction_enabled {
+            "decision mode off (request-local compaction independently enabled)"
+        } else if report.mode == JevMode::Off {
             "idle (Off: no scheduling, no client, no network)"
-        } else if report.mode == JevMode::Active && !report.pipeline.known() {
+        } else if report.mode.allows_active() && !report.pipeline.known() {
             "unknown (no Active boundary observed in this worker yet)"
-        } else if report.mode == JevMode::Active {
-            "active (an accepted answer changes at most one request field)"
+        } else if report.mode.allows_active() {
+            "active (accepted decisions remain feature-gated and bounded)"
         } else if !report.pipeline.known() {
             "unknown (worker telemetry unavailable or no observation yet)"
         } else if report.pipeline.checking() {
@@ -468,14 +556,14 @@ pub fn render_status(report: &JevStatusReport) -> String {
     }
     text.push_str(&format!(
         "Decisions applied: {} ({})\n",
-        if report.mode == JevMode::Active {
-            report.pipeline.active.as_ref().map(|counters| counters.applied).unwrap_or(0)
+        if report.mode.allows_active() {
+            report.pipeline.active.as_ref().map(|counters| counters.applied.to_string()).unwrap_or_else(|| "unknown".into())
         } else {
-            report.applied_decisions
+            report.applied_decisions.to_string()
         },
-        if report.mode == JevMode::Active {
-            "Active counts one boundary per provider request whose body actually changed"
-        } else if report.hypothetical_only {
+        if report.mode.allows_active() {
+            "Active counts boundaries with an actual applied effect"
+        } else if report.mode.allows_compare() {
             "Compare is shadow-only; potential savings are hypothetical, never measured"
         } else {
             "nothing is applied while Jev is Off"
@@ -491,11 +579,12 @@ pub fn render_status(report: &JevStatusReport) -> String {
             counters.last_category.clone().unwrap_or_else(|| "none".to_string()),
             counters.last_reason.clone().unwrap_or_else(|| "none".to_string())
         ));
-    } else if report.mode == JevMode::Active {
+    } else if report.mode.allows_active() {
         text.push_str(&format!(
             "Active boundaries: unknown ({JEV_ACTIVE_UNKNOWN_NOTE})\n"
         ));
     }
+    text.push_str(&render_compaction_observation(report.pipeline.compaction.as_ref()));
     text.push_str(&format!("Footer: {JEV_FOOTER_RULE_NOTICE}\n"));
     text.push('\n');
     text.push_str(JEV_DISCLOSURE_NOTICE);
@@ -508,26 +597,36 @@ pub fn render_status(report: &JevStatusReport) -> String {
 /// Help/hotkey text: the modes and their real scope, with no model or
 /// subagent claims (sections 11 and 12).
 pub fn render_help() -> String {
-    let mut text = String::new();
-    text.push_str(&format!("{JEV_COMMAND_DESCRIPTION}\n\n"));
-    text.push_str("Off            Jev is disabled (default). No client, no scheduling, no network.\n");
-    text.push_str("Compare        Shadow-only. Jev observes and records; Optimus alone decides.\n");
-    text.push_str("Active         Operative. An accepted answer changes at most one field of the next\n");
-    text.push_str("               provider request.\n");
-    text.push_str(JEV_ACTIVE_NOTICE);
-    text.push('\n');
-    text.push_str("Input API key  Enter a TypeSafe key (masked; never stored in the transcript).\n");
-    text.push_str("Status         Mode, scope, credential source, counters, queue, skips.\n");
-    text.push_str(&format!("Footer         {JEV_FOOTER_RULE_NOTICE}\n\n"));
-    text.push_str(&format!(
-        "Commands: /{JEV_COMMAND_NAME}, /{JEV_COMMAND_NAME} off, /{JEV_COMMAND_NAME} compare, /{JEV_COMMAND_NAME} active, /{JEV_COMMAND_NAME} on, /{JEV_COMMAND_NAME} status, /{JEV_COMMAND_NAME} key, /{JEV_COMMAND_NAME} key clear, /{JEV_COMMAND_NAME} help\n"
-    ));
-    text.push_str("Note: /jev compare and its short form /jev on stay shadow-only and apply nothing.\n");
-    text.push_str(JEV_ON_COMPARE_NOTICE);
-    text.push_str("\n\n");
-    text.push_str(JEV_BOUNDARY_NOTICE);
-    text.push('\n');
-    text
+    format!("{JEV_COMMAND_DESCRIPTION}\n\n\
+Off                 No feature decision calls; compaction is independent.\n\
+Compare             Shadow-only; no decisions applied.\n\
+Active              Accepted, feature-gated native effects.\n\
+Compare + Active    Comparison and application from one boundary request.\n\
+{JEV_ACTIVE_NOTICE}\n\n\
+Commands: /jev off|compare|active|compare-active|on|status|key|help\n\
+/jev compact on|off|status    Independent request-local compaction control.\n\
+/jev feature <name> on|off   Set one feature gate for this chat.\n\
+/jev default <mode>          Default for sessions without a mode override.\n\
+/jev default compact on|off  Default independent compaction toggle.\n\
+/jev key clear              Remove the saved credential.\n\
+Numeric compaction/filtering policy is configured in jev-settings.json.\n\
+{JEV_ON_COMPARE_NOTICE}\nFooter: {JEV_FOOTER_RULE_NOTICE}\n\n{JEV_BOUNDARY_NOTICE}\n")
+}
+
+pub fn render_compaction_status(enabled: bool, scope: ModeScope) -> String {
+    format!("Compaction: {} (scope: {}; {})\n",
+        if enabled { "on" } else { "off" }, scope.as_str(),
+        if !enabled { "independent toggle is off" }
+        else { "request-local; independent of decision mode" })
+}
+
+pub fn render_compaction_settings(settings: &JevSettings, session_id: &str) -> String {
+    let (enabled, scope) = settings.effective_compaction_with_scope(session_id);
+    let config = &settings.compaction;
+    format!("{}keep_threshold: {}\npreserve_recent_messages: {}\nmax_state_tokens: {}\nmax_request_tokens: {}\ntruncate_head_chars: {}\nminimum_reduction_ratio: {}\nHard request and candidate caps also apply. No durable history is deleted.\n",
+        render_compaction_status(enabled, scope),
+        config.keep_threshold, config.preserve_recent_messages, config.max_state_tokens,
+        config.max_request_tokens, config.truncate_head_chars, config.minimum_reduction_ratio)
 }
 
 /// Human label for a mode. Active is a real mode, so it is labelled plainly; the
@@ -537,6 +636,7 @@ pub fn mode_label(mode: JevMode) -> &'static str {
         JevMode::Off => "Off",
         JevMode::Compare => "Compare",
         JevMode::Active => "Active",
+        JevMode::CompareAndActive => "Compare + Active",
     }
 }
 
@@ -549,12 +649,13 @@ pub fn mode_change_message(change: &ModeChange) -> String {
             mode_label(*mode),
             match scope {
                 ModeScope::Session => "this chat",
-                ModeScope::GlobalDefault => "defaults for new chats",
+                ModeScope::GlobalDefault => "default for sessions without an override",
                 ModeScope::BuiltIn => "built-in default",
             },
             match mode {
                 JevMode::Compare => format!("\n{JEV_DISCLOSURE_NOTICE}"),
                 JevMode::Active => format!("\n{JEV_ACTIVE_NOTICE}\n{JEV_BOUNDARY_NOTICE}"),
+                JevMode::CompareAndActive => format!("\n{JEV_DISCLOSURE_NOTICE}\n{JEV_ACTIVE_NOTICE}\n{JEV_BOUNDARY_NOTICE}"),
                 JevMode::Off => String::new(),
             },
         ),
@@ -569,6 +670,12 @@ pub fn mode_change_message(change: &ModeChange) -> String {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeChange {
     Applied { mode: JevMode, scope: ModeScope },
+}
+
+pub fn require_feature_support(supported: bool) -> Result<(), String> {
+    if supported { Ok(()) } else {
+        Err("The attached worker does not support Jev System One features. No settings were changed; update the daemon before enabling combined mode, feature gates or compaction.".into())
+    }
 }
 
 /// Thin bridge the host uses for mode get/set, over lane A's
@@ -601,9 +708,19 @@ impl JevModeBridge {
         self.store.load().effective_mode(session_id)
     }
 
-    /// The deciding scope, so status can say "this chat" or "defaults for new chats".
+    /// The deciding scope for the status panel.
     pub fn scope(&self, session_id: &str) -> ModeScope {
         self.store.load().effective_mode_with_scope(session_id).scope
+    }
+
+    pub fn set_session_mode_supported(&self, session_id: &str, requested: JevMode, supported: bool) -> Result<ModeChange, String> {
+        if requested == JevMode::CompareAndActive { require_feature_support(supported)?; }
+        self.set_session_mode(session_id, requested)
+    }
+
+    pub fn set_global_default_supported(&self, requested: JevMode, supported: bool) -> Result<ModeChange, String> {
+        if requested == JevMode::CompareAndActive { require_feature_support(supported)?; }
+        self.set_global_default(requested)
     }
 
     /// Write an explicit per-session mode. Every mode is written, including
@@ -633,6 +750,24 @@ impl JevModeBridge {
             mode: requested,
             scope: ModeScope::GlobalDefault,
         })
+    }
+
+    pub fn set_feature(&self, session_id: &str, feature: JevFeature, enabled: bool) -> Result<(), String> {
+        let mut settings = self.store.load();
+        settings.set_session_feature(session_id, feature, enabled);
+        self.store.save(&settings).map_err(describe_error)
+    }
+
+    pub fn set_compaction(&self, session_id: &str, enabled: bool) -> Result<(), String> {
+        let mut settings = self.store.load();
+        settings.set_session_compaction_enabled(session_id, enabled);
+        self.store.save(&settings).map_err(describe_error)
+    }
+
+    pub fn set_default_compaction(&self, enabled: bool) -> Result<(), String> {
+        let mut settings = self.store.load();
+        settings.compaction_enabled = enabled;
+        self.store.save(&settings).map_err(describe_error)
     }
 
     /// Clear the explicit per-session mode so the global default applies again.
@@ -668,13 +803,13 @@ pub fn describe_error(error: JevError) -> String {
     error.log_line()
 }
 
-/// The footer states this release can show. Both Compare and Active are accent
-/// (working) states; no state in this release is green.
+/// Operative modes use accent; no state claims healthy-green merely from configuration.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JevFooterState {
     Off,
     Compare,
     Active,
+    CompareAndActive,
     Unavailable,
     Checking,
     Fallback,
@@ -687,6 +822,7 @@ impl JevFooterState {
             JevFooterState::Off => "Jev Off",
             JevFooterState::Compare => "Jev Compare",
             JevFooterState::Active => "Jev Active",
+            JevFooterState::CompareAndActive => "Jev Compare + Active",
             JevFooterState::Unavailable => "Jev unavailable",
             JevFooterState::Checking => "Jev checking",
             JevFooterState::Fallback => "Jev fallback",
@@ -698,7 +834,7 @@ impl JevFooterState {
     pub fn color_key(self) -> &'static str {
         match self {
             JevFooterState::Off => "error",
-            JevFooterState::Compare | JevFooterState::Active => "accent",
+            JevFooterState::Compare | JevFooterState::Active | JevFooterState::CompareAndActive => "accent",
             JevFooterState::Unavailable | JevFooterState::Checking | JevFooterState::Fallback => {
                 "warning"
             }
@@ -735,6 +871,7 @@ pub fn footer_state(mode: JevMode, credential: &CredentialStatus, pipeline: &Jev
         JevMode::Off => return JevFooterState::Off,
         JevMode::Compare => JevFooterState::Compare,
         JevMode::Active => JevFooterState::Active,
+        JevMode::CompareAndActive => JevFooterState::CompareAndActive,
     };
     if !credential.present() {
         return JevFooterState::Unavailable;
@@ -780,23 +917,28 @@ pub fn footer_segment(state: JevFooterState, terminal_columns: usize) -> String 
 // test in `tests/jev_ui_tests.rs` can include this file with `#[path]`)
 // ===========================================================================
 
-/// The five menu rows, in the order the brief fixes: Off, Compare, Active,
-/// Input API key, Status.
+/// Modes, independent compaction controls, credentials and status.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JevMenuRow {
     Off,
     Compare,
     Active,
+    CompareAndActive,
+    CompactionOn,
+    CompactionOff,
     InputKey,
     Status,
 }
 
 impl JevMenuRow {
     /// Declaration order; the selector walks this.
-    pub const ALL: [JevMenuRow; 5] = [
+    pub const ALL: [JevMenuRow; 8] = [
         JevMenuRow::Off,
         JevMenuRow::Compare,
         JevMenuRow::Active,
+        JevMenuRow::CompareAndActive,
+        JevMenuRow::CompactionOn,
+        JevMenuRow::CompactionOff,
         JevMenuRow::InputKey,
         JevMenuRow::Status,
     ];
@@ -806,6 +948,7 @@ impl JevMenuRow {
             JevMenuRow::Off if active == JevMode::Off => " (current)",
             JevMenuRow::Compare if active == JevMode::Compare => " (current)",
             JevMenuRow::Active if active == JevMode::Active => " (current)",
+            JevMenuRow::CompareAndActive if active == JevMode::CompareAndActive => " (current)",
             _ => "",
         };
         match self {
@@ -813,6 +956,9 @@ impl JevMenuRow {
             JevMenuRow::Off => format!("Off{marker}"),
             JevMenuRow::Compare => format!("Compare{marker}"),
             JevMenuRow::Active => format!("Active{marker}"),
+            JevMenuRow::CompareAndActive => format!("Compare + Active{marker}"),
+            JevMenuRow::CompactionOn => "Compaction on".to_string(),
+            JevMenuRow::CompactionOff => "Compaction off".to_string(),
             JevMenuRow::InputKey => "Input API key".to_string(),
             JevMenuRow::Status => "Status".to_string(),
         }
@@ -820,9 +966,12 @@ impl JevMenuRow {
 
     pub fn description(self) -> &'static str {
         match self {
-            JevMenuRow::Off => "Disable Jev. No client, no scheduling, no network.",
+            JevMenuRow::Off => "Disable feature decisions. Independent compaction keeps its setting.",
             JevMenuRow::Compare => "Shadow-only observations; no decisions applied.",
             JevMenuRow::Active => JEV_ACTIVE_NOTICE,
+            JevMenuRow::CompareAndActive => "Compare and apply accepted, gated decisions from the same boundary request.",
+            JevMenuRow::CompactionOn => "Enable request-local compaction independently of the decision mode.",
+            JevMenuRow::CompactionOff => "Disable compaction only. Other Jev features and mode stay unchanged.",
             JevMenuRow::InputKey => "Enter the TypeSafe key (masked, never echoed).",
             JevMenuRow::Status => "Mode, scope, credential source, counters, queue, skips.",
         }
@@ -838,6 +987,7 @@ pub enum JevMenuAction {
     /// Set the session mode to this value. Every row that selects a mode reports
     /// this action; the owner writes it.
     SetMode(JevMode),
+    SetCompaction(bool),
     /// Open the masked key-entry dialog.
     InputKey,
     /// Show the status panel.
@@ -873,6 +1023,7 @@ impl JevMenuState {
         let selected = match active_mode {
             JevMode::Compare => 1,
             JevMode::Active => 2,
+            JevMode::CompareAndActive => 3,
             _ => 0,
         };
         Self {
@@ -884,7 +1035,7 @@ impl JevMenuState {
         }
     }
 
-    pub fn rows(&self) -> [JevMenuRow; 5] {
+    pub fn rows(&self) -> [JevMenuRow; 8] {
         JevMenuRow::ALL
     }
 
@@ -930,6 +1081,16 @@ impl JevMenuState {
                 self.active_mode = JevMode::Active;
                 self.closed = true;
                 JevMenuAction::SetMode(JevMode::Active)
+            }
+            JevMenuRow::CompareAndActive => {
+                self.active_mode = JevMode::CompareAndActive;
+                self.closed = true;
+                JevMenuAction::SetMode(JevMode::CompareAndActive)
+            }
+            JevMenuRow::CompactionOn | JevMenuRow::CompactionOff => {
+                let enabled = self.current_row() == JevMenuRow::CompactionOn;
+                self.closed = true;
+                JevMenuAction::SetCompaction(enabled)
             }
             JevMenuRow::InputKey => {
                 self.closed = true;
@@ -1276,7 +1437,7 @@ pub const JEV_STATUS_KEY: &str = "jev";
 /// Documentation of the footer colour rule (asserted by the tests). The callers
 /// prefix it with `Footer: `, so it does not repeat that word itself.
 pub const JEV_FOOTER_RULE_NOTICE: &str =
-    "red \"Jev Off\", accent \"Jev Compare\", accent \"Jev Active\", amber \"Jev unavailable\"/\"Jev checking\"/\"Jev fallback\". No green \"Jev On\" state is produced by this release.";
+    "red \"Jev Off\", accent \"Jev Compare\", accent \"Jev Active\"/\"Jev Compare + Active\", amber \"Jev unavailable\"/\"Jev checking\"/\"Jev fallback\". No green \"Jev On\" state is produced by this release.";
 
 /// The theme colour key for the footer segment.
 ///

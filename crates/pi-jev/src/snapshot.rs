@@ -29,6 +29,7 @@ pub const MAX_DEPTH: usize = 6;
 #[serde(rename_all = "snake_case")]
 pub enum SnapshotStage {
     TurnStart,
+    TurnEnd,
     ToolCall,
     AgentEnd,
     ModelSelect,
@@ -38,6 +39,7 @@ impl SnapshotStage {
     pub fn as_str(&self) -> &'static str {
         match self {
             SnapshotStage::TurnStart => "turn_start",
+            SnapshotStage::TurnEnd => "turn_end",
             SnapshotStage::ToolCall => "tool_call",
             SnapshotStage::AgentEnd => "agent_end",
             SnapshotStage::ModelSelect => "model_select",

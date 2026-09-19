@@ -60,8 +60,10 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 28 adds optional providerContext to compaction summary messages and maxInputTokens to models.
 // Both are backward-compatible response metadata; older clients render the existing summary text.
 // Revision 29 adds capability-gated, pinned recent-first history windows and older range reads.
-pub const DAEMON_SCHEMA_REVISION: u32 = 29;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-29-c16da0e12d5a";
+// Revision 30 gates combined Jev mode with jev_features. Feature and compaction
+// settings are optional response metadata; legacy Jev commands and events remain compatible.
+pub const DAEMON_SCHEMA_REVISION: u32 = 30;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-30-c16da0e12d5a";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -141,6 +143,9 @@ pub enum DaemonServerCapability {
     // OPTIONAL. A daemon that does not advertise this capability never receives
     // them, and the client degrades to local (settings-file) mode control.
     JevControl,
+    // Combined Compare + Active mode and optional feature/compaction settings metadata.
+    // Clients must negotiate this before sending the combined mode or relying on its metadata.
+    JevFeatures,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -191,7 +196,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 23] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 24] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -215,6 +220,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 23] = [
     DaemonServerCapability::SessionInputPause,
     DaemonServerCapability::AcpMcpServers,
     DaemonServerCapability::JevControl,
+    DaemonServerCapability::JevFeatures,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2142,16 +2148,20 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "heartbeat_manage" => DaemonCommandCompatibility::capability(Capability::HeartbeatManagement),
         "get_rlm_max_depth_status" | "set_rlm_max_depth" => DaemonCommandCompatibility::revision(11),
         "get_session_tree" => DaemonCommandCompatibility::legacy(),
-        // SHARED FILE EDIT (daemon_protocol.rs, capability-gated addition by
-        // jev-ui lane): the optional Jev surface. No schema revision and no
-        // protocol bump: an old daemon simply does not advertise `jev_control`,
-        // so a new client never sends these commands, and an old client never
-        // looks at them. A new daemon that serves them stays compatible.
+        // Legacy Jev control remains available without the expansion capability.
+        // The free-JSON mode field has an additional gate in daemon_jev_mode_compatibility.
         "jev_get_settings" | "jev_set_session_mode" | "jev_get_status" => {
             DaemonCommandCompatibility::capability(Capability::JevControl)
         }
         _ => DaemonCommandCompatibility::legacy(),
     }
+}
+
+/// Additional requirement for the free-JSON Jev mode setter. Parsing matches
+/// the worker, so aliases cannot bypass the capability check on send or replay.
+pub fn daemon_jev_mode_compatibility(mode: &str) -> Option<DaemonCommandCompatibility> {
+    (pi_jev::types::JevMode::parse(mode) == Some(pi_jev::types::JevMode::CompareAndActive))
+        .then_some(DaemonCommandCompatibility::gated(30, DaemonServerCapability::JevFeatures))
 }
 
 // The command-level gates the union's members carry on top of the table.
@@ -2714,12 +2724,15 @@ impl DaemonOutbound {
 
 /// `DAEMON_OUTBOUND_COMPATIBILITY`. Revision 28's opaque context is owned by the
 /// worker; message/snapshot consumers may ignore it, so response and session
-/// channels retain their protocol-7 floor.
+/// channels retain their protocol-7 floor. Revision 30 adds no event types;
+/// optional Jev response metadata is ignored by legacy readers.
 pub fn daemon_outbound_compatibility(outbound: &'static str) -> DaemonCommandCompatibility {
     use DaemonServerCapability as Capability;
     match outbound {
         "heartbeats_changed" => DaemonCommandCompatibility::capability(Capability::HeartbeatCatalog),
         "roster_update" => DaemonCommandCompatibility::capability(Capability::AgentRoster),
+        // Jev feature metadata is additive; no new startup or event requirement.
+        "response" | "extension_ui_request" => DaemonCommandCompatibility::legacy(),
         _ => DaemonCommandCompatibility::legacy(),
     }
 }

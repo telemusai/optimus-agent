@@ -17,6 +17,13 @@ impl super::CategoryEvaluator for ContextRelevance {
     }
 
     fn evaluate(&self, snapshot: &crate::snapshot::StateSnapshot) -> EvaluatorOutput {
+        if let Some(questions) = crate::filtering::candidate_questions(&snapshot.state, self.category(), "context_candidates") {
+            return if questions.is_empty() {
+                EvaluatorOutput::Skipped("no_eligible_candidates".to_string())
+            } else {
+                EvaluatorOutput::Questions(questions)
+            };
+        }
         let view = StateView::new(snapshot);
         let message_count = view.num_field("message_count").unwrap_or(0.0);
         if message_count <= 0.0 {

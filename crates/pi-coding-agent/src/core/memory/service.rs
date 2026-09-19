@@ -121,11 +121,12 @@ impl MemoryService {
     }
 
     pub fn recall(&self, query: &str) -> RecallResult {
-        recall_memory(
-            &self.search(query, false),
-            &self.store.settings(),
-            Some(&self.store.project.root),
-        )
+        self.render_recall(&self.search(query, false))
+    }
+
+    /// Render a request-local candidate selection without changing stored memory.
+    pub fn render_recall(&self, hits: &[MemoryHit]) -> RecallResult {
+        recall_memory(hits, &self.store.settings(), Some(&self.store.project.root))
     }
 
     pub async fn request(

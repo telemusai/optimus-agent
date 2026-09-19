@@ -2737,6 +2737,10 @@ impl AgentConnection for DaemonAgentConnection {
         })
     }
 
+    fn supports_jev_features(&self) -> bool {
+        self.client.supports_server_capability("jev_features")
+    }
+
     fn get_jev_status(&self) -> BoxFuture<Result<Option<Value>, String>> {
         let this = self.clone();
         Box::pin(async move {

@@ -597,16 +597,18 @@ pub async fn create_agent_session_with_factories(
     let transform_context = {
         let extension_runner_ref = Arc::clone(&extension_runner_ref);
         Arc::new(
-            move |messages: Vec<AgentMessage>, _signal: Option<tokio_util::sync::CancellationToken>| {
+            move |messages: Vec<AgentMessage>, signal: Option<tokio_util::sync::CancellationToken>| {
                 let runner = extension_runner_ref.current();
                 Box::pin(async move {
                     let Some(runner) = runner else { return messages; };
-                    let values = messages.iter().map(|message| {
-                        serde_json::to_value(message).expect("agent message is serializable")
-                    }).collect();
-                    runner.emit_context(values).await.into_iter().map(|message| {
-                        serde_json::from_value(message).expect("context extension returned an invalid agent message")
-                    }).collect()
+                    let Ok(values) = messages.iter().map(serde_json::to_value).collect::<Result<Vec<_>, _>>() else {
+                        return messages;
+                    };
+                    let values = runner.emit_context(values).await;
+                    let ctx = runner.create_context();
+                    let values = crate::core::jev_bridge::filter_context_candidates(ctx.clone(), values).await;
+                    let values = crate::core::jev_compaction::compact_context(ctx, values, signal).await;
+                    values.into_iter().map(serde_json::from_value).collect::<Result<Vec<_>, _>>().unwrap_or(messages)
                 }) as BoxFuture<Vec<AgentMessage>>
             },
         ) as Arc<

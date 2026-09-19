@@ -23,13 +23,13 @@
 //! | `Off` | `* Jev Off` | red (`error`) |
 //! | `Compare` | `* Jev Compare` | cyan (`accent`) |
 //! | `Active` | `* Jev Active` | cyan (`accent`) |
+//! | `CompareAndActive` | `* Jev Compare + Active` | cyan (`accent`) |
 //! | checking | `* Jev checking` | amber (`warning`) |
 //! | unavailable | `* Jev unavailable` | amber (`warning`) |
 //! | fallback | `* Jev fallback` | amber (`warning`) |
 //!
-//! Active is one of the two accent states, not a separate colour: it runs the
-//! same credential / checking / fallback ladder Compare runs, and the text is the
-//! only thing that differs. A green `* Jev On` state is not produced here:
+//! All operative modes use the same credential / checking / fallback ladder.
+//! Their labels distinguish the mode. A green `* Jev On` state is not produced:
 //! [`JevFooterState::is_green`] is a constant `false`, [`JevFooterState::color_key`]
 //! has no `success` arm for these states, and [`JEV_FOOTER_RULE_NOTICE`] documents
 //! the rule, so a future edit that wants a green footer must deliberately change

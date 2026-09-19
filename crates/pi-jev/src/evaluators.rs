@@ -1,6 +1,7 @@
-//! The eleven comparison categories (DESIGN.md section 3) and the boundary
-//! mapping (section 4): categories 1-8 at TurnStart, category 4 observed at
-//! ToolCall, 9-11 at AgentEnd, routing (advisory only) at ModelSelect.
+//! Eleven legacy comparison categories plus opt-in failure and trace observations.
+//! Categories 1-8 run at TurnStart, category 4 at ToolCall, 9-11 at AgentEnd,
+//! and advisory routing at ModelSelect. Opt-in loop and failure observations
+//! also run at TurnEnd. No evaluator grants runtime authority.
 //!
 //! Every evaluator produces typed questions with stable ids
 //! `"<category>.<n>"` (n = 0-based sub-question) and returns an explicit
@@ -13,6 +14,8 @@ pub mod complexity;
 pub mod first_pass_verification;
 pub mod memory_relevance;
 pub mod result_sufficiency;
+pub mod retry_classification;
+pub mod trace_assessment;
 pub mod subagent_model_routing;
 pub mod subagent_requirement;
 pub mod task_classification;
@@ -47,6 +50,17 @@ pub struct StateView<'a> {
 impl<'a> StateView<'a> {
     pub fn new(snapshot: &'a StateSnapshot) -> Self {
         Self { snapshot }
+    }
+
+    pub fn feature_enabled(&self, name: &str) -> bool {
+        self.snapshot.state.get("features")
+            .and_then(|features| features.get(name))
+            .and_then(serde_json::Value::as_bool) == Some(true)
+    }
+
+    pub fn observation(&self) -> Option<crate::observation::TraceSummary> {
+        let value = self.snapshot.state.get("observation")?;
+        serde_json::from_value(value.clone()).ok()
     }
 
     pub fn str_field(&self, key: &str) -> Option<String> {
@@ -99,7 +113,7 @@ pub fn question_id(category: DecisionCategory, n: usize) -> String {
     format!("{}.{}", category.as_str(), n)
 }
 
-/// Registry of all eleven evaluators in stable order.
+/// Registry of all evaluators in stable order.
 pub fn all_evaluators() -> Vec<Arc<dyn CategoryEvaluator>> {
     vec![
         Arc::new(task_classification::TaskClassification),
@@ -113,6 +127,8 @@ pub fn all_evaluators() -> Vec<Arc<dyn CategoryEvaluator>> {
         Arc::new(continue_stop_escalate::ContinueStopEscalate),
         Arc::new(result_sufficiency::ResultSufficiency),
         Arc::new(first_pass_verification::FirstPassVerification),
+        Arc::new(retry_classification::RetryClassification),
+        Arc::new(trace_assessment::TraceAssessment),
     ]
 }
 

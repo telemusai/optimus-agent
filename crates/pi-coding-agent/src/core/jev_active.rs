@@ -172,6 +172,112 @@ fn apply_complexity(
     }]
 }
 
+
+/// Optional catalog pruning is independent of the legacy whole-catalog switch.
+/// An empty optional allowlist intentionally preserves every tool.
+pub struct PreparedToolPruning {
+    pub state: Value,
+    names: Vec<String>,
+    catalog_fingerprint: String,
+    options: pi_jev::filtering::FilteringOptions,
+}
+
+impl PreparedToolPruning {
+    pub fn questions(&self) -> Vec<pi_jev::evaluators::PreparedQuestion> {
+        pi_jev::filtering::candidate_questions(&self.state, pi_jev::types::DecisionCategory::ToolCandidates, "optional_tools")
+            .unwrap_or_default()
+    }
+
+    pub fn apply(
+        &self,
+        params: &mut Value,
+        decisions: &[pi_jev::active::ActiveDecision],
+        request_id: &str,
+        turn: u64,
+    ) -> Vec<AppliedChange> {
+        if !pruning_choice_is_auto(params) { return Vec::new(); }
+        let Some(tools) = params.get(TOOLS_KEY) else { return Vec::new(); };
+        if pi_jev::snapshot::fingerprint_of(tools) != self.catalog_fingerprint { return Vec::new(); }
+        let dropped = pi_jev::filtering::dropped_candidate_indices_with_options(
+            decisions, pi_jev::types::DecisionCategory::ToolCandidates, self.names.len(), request_id,
+            turn, std::time::SystemTime::now(), &self.options,
+        );
+        let removed: Vec<&str> = dropped.iter().map(|index| self.names[*index].as_str()).collect();
+        let Some(tools) = params.get_mut(TOOLS_KEY).and_then(Value::as_array_mut) else { return Vec::new(); };
+        if removed.is_empty() || removed.len() >= tools.len() { return Vec::new(); }
+        tools.retain(|tool| !tool_name_for_pruning(tool).is_some_and(|name| removed.contains(&name)));
+        removed.into_iter().map(|name| AppliedChange {
+            key: TOOLS_KEY.to_string(), from: Some(name.to_string()), to: None,
+            category: "tool_candidates".to_string(),
+        }).collect()
+    }
+}
+
+fn pruning_choice_is_auto(params: &Value) -> bool {
+    match params.get(TOOL_CHOICE_KEY) {
+        None => true,
+        Some(Value::String(choice)) => choice == "auto",
+        Some(Value::Object(choice)) => choice.len() == 1 && choice.get("type").and_then(Value::as_str) == Some("auto"),
+        _ => false,
+    }
+}
+
+fn tool_name_for_pruning(tool: &Value) -> Option<&str> {
+    let name = if tool.get("type").and_then(Value::as_str) == Some("function") {
+        if tool.get("function").is_some() {
+            tool.get("function")?.get("name")?.as_str()?
+        } else {
+            tool.get("name")?.as_str()?
+        }
+    } else if tool.get("type").is_none() && tool.get("input_schema").is_some_and(Value::is_object) {
+        tool.get("name")?.as_str()?
+    } else {
+        return None;
+    };
+    if name.is_empty() || name.len() > 64
+        || !name.bytes().all(|byte| byte.is_ascii_alphanumeric() || b"_-.".contains(&byte)) {
+        return None;
+    }
+    Some(name)
+}
+
+pub fn prepare_tool_pruning(
+    params: &Value,
+    query: &str,
+    options: &pi_jev::filtering::FilteringOptions,
+) -> PreparedToolPruning {
+    let mut plan = PreparedToolPruning {
+        state: serde_json::json!({
+            "user_text_excerpt": pi_jev::redact::bounded_excerpt(query, pi_jev::filtering::MAX_FILTER_EXCERPT_CHARS),
+            "optional_tools": [],
+        }),
+        names: Vec::new(), catalog_fingerprint: String::new(), options: options.clone(),
+    };
+    if options.validate().is_err() || !pruning_choice_is_auto(params) { return plan; }
+    let Some(catalog) = params.get(TOOLS_KEY) else { return plan; };
+    let Some(tools) = catalog.as_array().filter(|tools| tools.len() <= 128) else { return plan; };
+    let mut seen = std::collections::BTreeSet::new();
+    let mut candidates = Vec::new();
+    for tool in tools {
+        let Some(name) = tool_name_for_pruning(tool) else {
+            // An unknown schema may carry provider-specific tool references.
+            return plan;
+        };
+        if !seen.insert(name) { return plan; }
+        let mandatory = name == "ipython" || name.starts_with("__") || name.starts_with("rlm")
+            || name.starts_with("agent_") || options.mandatory_tool_names.iter().any(|item| item == name);
+        if mandatory || !options.optional_tool_names.iter().any(|item| item == name)
+            || candidates.len() >= options.max_candidates { continue; }
+        let description = tool.get("function").unwrap_or(tool).get("description").and_then(Value::as_str).unwrap_or("");
+        let excerpt = format!("{name}: {}", pi_jev::redact::bounded_excerpt(description, 160));
+        candidates.push(serde_json::json!({"id":plan.names.len().to_string(), "excerpt":excerpt}));
+        plan.names.push(name.to_string());
+    }
+    plan.state["optional_tools"] = Value::Array(candidates);
+    plan.catalog_fingerprint = pi_jev::snapshot::fingerprint_of(catalog);
+    plan
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -378,6 +484,86 @@ mod tests {
         assert!(truncated.len() <= MAX_RENDER_BYTES + TRUNCATION_MARKER.len());
         assert!(truncated.is_char_boundary(0));
         assert_eq!(truncate_bytes(String::from("short"), MAX_RENDER_BYTES), "short");
+    }
+
+
+    fn pruning_options(names: &[&str]) -> pi_jev::filtering::FilteringOptions {
+        pi_jev::filtering::FilteringOptions {
+            optional_tool_names: names.iter().map(|name| name.to_string()).collect(),
+            ..Default::default()
+        }
+    }
+
+    fn pruning_decision(index: usize, value: &str) -> pi_jev::active::ActiveDecision {
+        pi_jev::active::ActiveDecision {
+            category: pi_jev::types::DecisionCategory::ToolCandidates,
+            question_id: format!("tool_candidates.{index}"), value: value.to_string(),
+            confidence: 0.99, response_model: None, request_id: "r1".to_string(),
+            turn: 2, decided_at: std::time::SystemTime::now(),
+        }
+    }
+
+    #[test]
+    fn optional_pruning_supports_native_provider_schemas_and_preserves_authority() {
+        for tools in [
+            json!([{"type":"function","function":{"name":"ipython"}}, {"type":"function","function":{"name":"lookup"}}]),
+            json!([{"type":"function","name":"ipython"}, {"type":"function","name":"lookup"}]),
+            json!([{"name":"ipython","input_schema":{}}, {"name":"lookup","input_schema":{}}]),
+        ] {
+            let mut body = json!({"model":"unchanged","messages":[{"role":"user","content":"task"}],"tools":tools,"tool_choice":"auto","reasoning_effort":"high"});
+            let original = body.clone();
+            let plan = prepare_tool_pruning(&body,"task",&pruning_options(&["ipython","lookup"]));
+            assert_eq!(plan.questions().len(), 1);
+            let changes = plan.apply(&mut body,&[pruning_decision(0,"drop")],"r1",2);
+            assert_eq!(changes.len(),1);
+            assert_eq!(changes[0].from.as_deref(),Some("lookup"));
+            assert_eq!(body["tools"].as_array().unwrap().len(),1);
+            assert_eq!(tool_name_for_pruning(&body["tools"][0]),Some("ipython"));
+            for key in ["model","messages","tool_choice","reasoning_effort"] { assert_eq!(body[key],original[key]); }
+            assert_eq!(original["tools"].as_array().unwrap().len(),2);
+        }
+    }
+
+    #[test]
+    fn optional_pruning_pins_explicit_mandatory_internal_forced_and_unlisted_tools() {
+        let options = pi_jev::filtering::FilteringOptions {
+            mandatory_tool_names: vec!["guard".to_string()],
+            ..pruning_options(&["ipython","guard","rlm_spawn","agent_message","__internal","lookup"])
+        };
+        let tools: Vec<Value> = ["ipython","guard","rlm_spawn","agent_message","__internal","unlisted","lookup"]
+            .iter().map(|name|json!({"type":"function","name":name})).collect();
+        let mut body = json!({"tools":tools});
+        let plan = prepare_tool_pruning(&body,"task",&options);
+        assert_eq!(plan.questions().len(),1);
+        plan.apply(&mut body,&[pruning_decision(0,"drop")],"r1",2);
+        assert_eq!(body["tools"].as_array().unwrap().len(),6);
+        for choice in [json!("required"),json!({"type":"function","name":"lookup"}),json!({"type":"tool","name":"lookup"}),json!(null)] {
+            let body = json!({"tools":tools,"tool_choice":choice});
+            assert!(prepare_tool_pruning(&body,"task",&options).questions().is_empty());
+        }
+    }
+
+    #[test]
+    fn optional_pruning_fails_open_for_invalid_unknown_changed_or_empty_catalogs() {
+        let options = pruning_options(&["lookup"]);
+        for tools in [json!([{"type":"web_search"}]),json!([{"type":"function"}]),
+            json!([{"type":"function","name":"lookup"},{"type":"function","name":"lookup"}])] {
+            let mut body = json!({"tools":tools}); let original=body.clone();
+            let plan=prepare_tool_pruning(&body,"task",&options);
+            assert!(plan.questions().is_empty());
+            assert!(plan.apply(&mut body,&[pruning_decision(0,"drop")],"r1",2).is_empty());
+            assert_eq!(body,original);
+        }
+        let mut only = json!({"tools":[{"type":"function","name":"lookup"}]});
+        let original=only.clone();
+        let plan=prepare_tool_pruning(&only,"task",&options);
+        assert!(plan.apply(&mut only,&[pruning_decision(0,"drop")],"r1",2).is_empty());
+        assert_eq!(only,original);
+        let mut body = json!({"tools":[{"type":"function","name":"ipython"},{"type":"function","name":"lookup"}]});
+        let plan=prepare_tool_pruning(&body,"task",&options);
+        body["tools"][1]["description"] = json!("changed"); let original=body.clone();
+        assert!(plan.apply(&mut body,&[pruning_decision(0,"drop")],"r1",2).is_empty());
+        assert_eq!(body,original);
     }
 
     #[test]

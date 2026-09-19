@@ -1,7 +1,7 @@
 # Jev observation data minimization
 
 Status: implemented in this branch; applies to every observation the agent loop
-hands to `pi-jev`, in both Compare and Active mode.
+hands to `pi-jev`, in Compare, Active and combined mode.
 
 ## Why
 
@@ -34,50 +34,53 @@ it differs in what it does with the answer, not in what it discloses.
    settings); nothing enables Jev on the user's behalf, and Off costs one mode
    check.
 
-## Modes
+## Modes and independent controls
 
 | Mode | Calls the service | Effect on a run |
 |---|---|---|
-| Off | never | none |
-| Compare | yes, in a bounded shadow queue | none; answers are recorded for comparison |
-| Active | yes, once per provider request, synchronously | applies the narrow reversible subset below |
+| Off | no feature decision calls | independent compaction keeps its setting |
+| Compare | bounded shadow work | none; records recommendations |
+| Active | bounded native decision boundaries | only accepted, feature-gated effects |
+| Compare + Active | one request per shared boundary | records shadow and active outcomes from that same answer |
 
-`/jev on` and `/jev compare` select Compare. Only the explicit `/jev active`
-selects Active.
+`/jev on` stays Compare. `/jev compare-active` selects the combined mode.
+`/jev compact on|off|status` controls compaction independently. Disabling
+compaction does not turn off Compare or the other feature gates. Compaction works
+independently of decision mode, including Off and Compare, when its own toggle is on.
 
-## Active mode: what may be applied
+Tool requirement and complexity keep their existing defaults. New feature gates
+are off by default. Optional-tool filtering requires explicit optional tool
+names and preserves mandatory/internal and forced-choice tools. Context and
+memory relevance filters only affect eligible retrieval candidates, never the
+persistent store. High-impact continuation, retry and verification decisions
+remain advisory. These gates do not remove the legacy Compare category set.
 
-Active applies an accepted answer to the outgoing provider request body. The
-appliable set is deliberately narrow and reversible:
+Compaction is a request-local projection over eligible old tool-call/result
+pairs. It preserves recent/protected messages, uses bounded importance/relevance
+questions and can remove or truncate only validated candidates. It commits only
+when the configured minimum reduction is met. It does not rewrite transcript
+history or replace normal `/compact` summarization. The six persisted algorithm
+parameters are validated and remain subject to hard request/candidate limits.
+See [native System One design](JEV_SYSTEM_ONE.md) for the exact boundary and
+validation method.
 
-| Category | Applied effect |
-|---|---|
-| `tool_requirement == "none"` | removes `tools` and `tool_choice` from that one request |
-| `complexity == "low"` or `"high"` | moves an already-present `reasoning_effort` one step on `minimal, low, medium, high, xhigh, max` |
-
-Nothing else is appliable. Active never adds a key it did not already find,
-never changes the model or provider, and never writes session thinking-level
-state. It cannot touch permissions, context, memory, compaction, continuation,
-subagents, agent messages, depth, concurrency or budgets.
-
-Acceptance requires confidence of at least `0.7` and a decision no older than
-three seconds. A refused answer, a low-confidence answer, a missing confidence,
-a transport failure, a deadline (2.5 s), an open circuit breaker (three
-consecutive failures, 30 s cooldown) or a missing credential leaves the request
-byte-identical and is recorded with a reason.
-
-Active decides at the provider-request boundary, so it adds latency to that one
-turn instead of running in a background queue like Compare.
+Invalid, missing, refused, stale or unavailable decisions leave baseline behavior
+unchanged. No Jev feature changes model/provider selection, permissions,
+subagents, messages, depth, concurrency or budgets. Active decisions can add
+bounded latency; no measured performance gain is implied.
 
 ## Records
 
-Both modes append one JSON line per question to `records.jsonl`. Compare records
-use `schema_version: "jev.compare/1"` and always carry `applied: false`. Active
-records use `schema_version: "jev.active/1"`, carry `applied: true` with the
-applied field list in `applied_effects`, or `applied: false` with a single
-`fallback_reason` when the answer was refused. `acceptance` is `accepted` or
-`fallback`. Records contain no prompt text, no tool arguments and no credential
-material.
+Records are bounded metadata, not request or response transcripts. Compare rows
+remain `applied: false`; Active rows state actual effects or the fallback reason.
+Combined boundaries link their shadow and active rows to one request id, so a
+report must count that physical request once. Applied effects do not imply a
+measured speed, cost or quality improvement.
+
+Records contain no prompt text, raw tool arguments or credential material.
+Compaction records describe action/count/reduction facts, not removed text.
+Absent worker telemetry is unknown, not a fabricated zero. Use the benchmark
+method in the design document before making savings claims.
 
 ## Live validation
 
@@ -106,7 +109,7 @@ by the current user with permissions `600`; symlinks are refused. Blank
 lines, comments and matching quotes around values are accepted. The file is
 parsed as data, never sourced as shell code. Existing process credentials
 take precedence over the file. Relaunch the client/daemon after changing it.
-Loading a key does not enable Compare.
+Loading a key does not enable any Jev mode.
 
 If `/jev status` reports `Credential: none`, check the active agent directory
 (`PRIME_AGENT_CODING_AGENT_DIR` overrides it) and the platform's credential

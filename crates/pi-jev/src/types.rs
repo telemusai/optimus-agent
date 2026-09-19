@@ -788,7 +788,8 @@ pub enum VerificationRecommendation {
     Verify,
 }
 
-/// The eleven comparison categories. All are recommend/record only in Compare.
+/// Comparison categories. All are recommend/record only in Compare.
+/// Retry classification and trace assessment require explicit observation flags.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum DecisionCategory {
@@ -803,6 +804,8 @@ pub enum DecisionCategory {
     ContinueStopEscalate,
     ResultSufficiency,
     FirstPassVerification,
+    RetryClassification,
+    TraceAssessment,
 }
 
 impl DecisionCategory {
@@ -820,11 +823,13 @@ impl DecisionCategory {
             DecisionCategory::ContinueStopEscalate => "continue_stop_escalate",
             DecisionCategory::ResultSufficiency => "result_sufficiency",
             DecisionCategory::FirstPassVerification => "first_pass_verification",
+            DecisionCategory::RetryClassification => "retry_classification",
+            DecisionCategory::TraceAssessment => "trace_assessment",
         }
     }
 
-    /// All eleven categories in canonical order.
-    pub fn all() -> [DecisionCategory; 11] {
+    /// All categories in canonical order.
+    pub fn all() -> [DecisionCategory; 13] {
         [
             DecisionCategory::TaskClassification,
             DecisionCategory::Complexity,
@@ -837,6 +842,8 @@ impl DecisionCategory {
             DecisionCategory::ContinueStopEscalate,
             DecisionCategory::ResultSufficiency,
             DecisionCategory::FirstPassVerification,
+            DecisionCategory::RetryClassification,
+            DecisionCategory::TraceAssessment,
         ]
     }
 
@@ -859,7 +866,7 @@ impl fmt::Display for DecisionCategory {
     }
 }
 
-/// All eleven categories enabled; Compare never disables a category implicitly.
+/// Category switches enabled; optional observers also require their feature flag.
 pub fn compare_default_categories() -> BTreeMap<DecisionCategory, bool> {
     DecisionCategory::all()
         .into_iter()
