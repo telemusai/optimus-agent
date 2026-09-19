@@ -1090,6 +1090,8 @@ impl JevKeyInputState {
         if self.is_done() || matches!(self.state(), KeyInputState::Validating) {
             return;
         }
+        let chunk = chunk.strip_prefix("\x1b[200~").unwrap_or(chunk);
+        let chunk = chunk.strip_suffix("\x1b[201~").unwrap_or(chunk);
         for character in chunk.chars().filter(|ch| !ch.is_control()) {
             if self.value.len().saturating_add(character.len_utf8()) > pi_jev::credential::MAX_SECRET_LEN {
                 self.value.clear();

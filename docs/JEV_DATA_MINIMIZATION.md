@@ -50,3 +50,27 @@ Credential sources, in order: saved credential (Windows DPAPI envelope
 `JEV_API_KEY`. Linux builds have no DPAPI store, so the environment variables
 are the working path there; a hand-written `KEY=value` file at the envelope path
 is not read and is not a credential store.
+
+The installed Linux `optimus-agent` launcher also accepts an explicit
+`<agent-dir>/jev/env` file containing `TYPESAFE_API_KEY=value` (or the
+`JEV_API_KEY` alias). This is a user-managed plaintext environment file,
+separate from the encrypted Windows store. It must be a regular file owned
+by the current user with permissions `600`; symlinks are refused. Blank
+lines, comments and matching quotes around values are accepted. The file is
+parsed as data, never sourced as shell code. Existing process credentials
+take precedence over the file. Relaunch the client/daemon after changing it.
+Loading a key does not enable Compare.
+
+If `/jev status` reports `Credential: none`, check the active agent directory
+(`PRIME_AGENT_CODING_AGENT_DIR` overrides it) and the platform's credential
+source. On Windows, use `/jev key` on that computer under the account running
+Optimus; a manually written JSON/key file is not a DPAPI envelope, and copying
+another computer's encrypted file is not a supported way to transfer the key.
+On Linux, put the assignment in `jev/env` and launch with the updated installed
+launcher, or set `TYPESAFE_API_KEY` in the process environment when running from
+source. The Linux `/jev key` dialog does not provide a secure saved-key store.
+
+Settings writes use a cooperating OS lock, a unique temporary file and a
+checked read generation. A conflicting or corrupt settings file is preserved;
+the command reports an error so the change can be retried after reload.
+This protection applies to cooperating writers, not external editors.

@@ -10,10 +10,12 @@
 //! Key values are never written to the settings file; only key-presence metadata is.
 
 use std::fmt;
+use std::io::Write;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 
 /// Authoritative mode control (DESIGN.md sections 0/3.1). `/jev` is the only writer;
 /// key presence never sets a mode.
@@ -298,6 +300,9 @@ pub struct PersistedSessionMode {
 /// Persisted settings. Contains NO secret material; only presence metadata.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct JevSettings {
+    /// Read generation for checked saves; never part of the persisted schema.
+    #[serde(skip)]
+    pub loaded_generation: Option<SettingsGeneration>,
     pub schema_version: u32,
     /// Global default for new sessions. `None` means built-in Off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -327,6 +332,7 @@ pub struct JevSettings {
 impl Default for JevSettings {
     fn default() -> Self {
         Self {
+            loaded_generation: None,
             schema_version: SETTINGS_SCHEMA_VERSION,
             global_default: None,
             sessions: std::collections::BTreeMap::new(),
@@ -336,6 +342,13 @@ impl Default for JevSettings {
             transport: None,
         }
     }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SettingsGeneration(Option<[u8; 32]>);
+
+fn settings_generation(bytes: Option<&[u8]>) -> SettingsGeneration {
+    SettingsGeneration(bytes.map(|bytes| Sha256::digest(bytes).into()))
 }
 
 impl JevSettings {
@@ -506,10 +519,12 @@ impl JevSettingsStore {
     /// Loads settings. A missing file yields defaults; a corrupt file yields defaults and
     /// never panics (a broken settings file must not block startup).
     pub fn load(&self) -> JevSettings {
-        match std::fs::read(&self.path) {
-            Ok(bytes) => serde_json::from_slice::<JevSettings>(&bytes).unwrap_or_default(),
-            Err(_) => JevSettings::default(),
-        }
+        let bytes = std::fs::read(&self.path).ok();
+        let mut settings = bytes.as_deref()
+            .and_then(|bytes| serde_json::from_slice::<JevSettings>(bytes).ok())
+            .unwrap_or_default();
+        settings.loaded_generation = Some(settings_generation(bytes.as_deref()));
+        settings
     }
 
     /// Saves settings. Refuses to write a file that appears to contain a secret.
@@ -525,17 +540,40 @@ impl JevSettingsStore {
         std::fs::create_dir_all(parent).map_err(|error| {
             crate::error::JevError::config(format!("cannot create settings dir: {}", error.kind()))
         })?;
+        // Keep a stable lock inode: deleting this file would allow two processes
+        // to acquire different locks. Dropping the handle releases a crashed writer.
+        let lock = std::fs::OpenOptions::new().read(true).write(true).create(true)
+            .truncate(false).open(self.path.with_extension("json.lock"))
+            .map_err(|_| crate::error::JevError::config("cannot open settings lock"))?;
+        lock.try_lock().map_err(|_| crate::error::JevError::config("settings busy; retry the change"))?;
+        let current = match std::fs::read(&self.path) {
+            Ok(bytes) => {
+                serde_json::from_slice::<JevSettings>(&bytes)
+                    .map_err(|_| crate::error::JevError::config("settings are corrupt; refusing to overwrite"))?;
+                Some(bytes)
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+            Err(_) => return Err(crate::error::JevError::config("cannot read settings; refusing to overwrite")),
+        };
+        if settings.loaded_generation.as_ref().is_some_and(|generation|
+            *generation != settings_generation(current.as_deref())) {
+            return Err(crate::error::JevError::config("settings changed; reload and retry the change"));
+        }
         let serialized = serde_json::to_vec_pretty(settings).map_err(|_| {
             crate::error::JevError::config("cannot serialize settings")
         })?;
-        let temp = self.path.with_extension("json.tmp");
-        std::fs::write(&temp, serialized).map_err(|error| {
-            crate::error::JevError::config(format!("cannot write settings: {}", error.kind()))
-        })?;
-        std::fs::rename(&temp, &self.path).map_err(|error| {
+        let temp = self.path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
+        let result = (|| {
+            let mut file = std::fs::File::create_new(&temp)?;
+            file.write_all(&serialized)?;
+            file.sync_all()?;
+            drop(file);
+            std::fs::rename(&temp, &self.path)
+        })();
+        if result.is_err() {
             let _ = std::fs::remove_file(&temp);
-            crate::error::JevError::config(format!("cannot replace settings: {}", error.kind()))
-        })
+        }
+        result.map_err(|error| crate::error::JevError::config(format!("cannot save settings: {}", error.kind())))
     }
 }
 

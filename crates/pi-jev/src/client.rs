@@ -13,7 +13,9 @@
 use std::collections::BTreeMap;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
-use std::time::{Duration, Instant};
+use std::time::Duration;
+
+use tokio::time::Instant;
 
 use parking_lot::Mutex;
 use serde_json::Value;
@@ -219,7 +221,7 @@ fn is_retryable_status(status: u16) -> bool {
 /// Documented retry decision for one attempt.
 ///
 /// Policy: retry only while attempts remain; honor the server `retry-after` hint when present
-/// (capped at `backoff_max`); otherwise exponential backoff starting at `backoff_initial`,
+/// (never shortened to `backoff_max`); otherwise exponential backoff starting at `backoff_initial`,
 /// doubling per attempt, capped at `backoff_max`. Timeouts and connection failures are retried
 /// the same way. Validation failures and 4xx (except 408/425/429/529) are terminal.
 pub fn retry_decision(
@@ -241,26 +243,35 @@ pub fn retry_decision(
     }
     let hint = error.retry_after();
     let delay = match hint {
-        Some(hint) => hint.min(limits.backoff_max),
+        Some(hint) if hint >= MAX_RETRY_AFTER => return RetryDecision::Stop,
+        Some(hint) => hint,
         None => {
             let factor = 1u32 << attempt.min(16);
-            (limits.backoff_initial * factor).min(limits.backoff_max)
+            limits.backoff_initial.saturating_mul(factor).min(limits.backoff_max)
         }
     };
     RetryDecision::RetryAfter(delay)
 }
 
 /// Largest accepted `retry-after` hint. Anything above this is clamped, so a hostile or broken
-/// header value can neither panic the conversion nor stall the caller.
+/// header value can neither panic the conversion nor stall the caller. A clamped hint is
+/// terminal rather than retried early.
 pub const MAX_RETRY_AFTER: Duration = Duration::from_secs(3600);
 
-/// Reads a `retry-after` header. Only the documented seconds form is accepted.
+/// Reads a `retry-after` header in seconds or HTTP-date form.
 ///
-/// A non-numeric value (including an HTTP-date) is ignored rather than guessed. A very large
-/// numeric value is clamped to `MAX_RETRY_AFTER`.
+/// Invalid values are ignored. Very large delays are clamped to `MAX_RETRY_AFTER`
+/// and cause the retry policy to stop.
 pub fn parse_retry_after(value: &str) -> Option<Duration> {
     let trimmed = value.trim();
-    let seconds = trimmed.parse::<f64>().ok()?;
+    let seconds = match trimmed.parse::<f64>() {
+        Ok(seconds) => seconds,
+        Err(_) => {
+            let date = chrono::DateTime::parse_from_rfc2822(trimmed).ok()?;
+            (date.with_timezone(&chrono::Utc) - chrono::Utc::now())
+                .to_std().unwrap_or_default().as_secs_f64()
+        }
+    };
     if !seconds.is_finite() || seconds < 0.0 {
         return None;
     }
@@ -704,6 +715,21 @@ struct AttemptedError {
     attempts: u32,
 }
 
+struct InFlightAttempt(Arc<JevStats>);
+
+impl InFlightAttempt {
+    fn new(stats: &Arc<JevStats>) -> Self {
+        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        Self(Arc::clone(stats))
+    }
+}
+
+impl Drop for InFlightAttempt {
+    fn drop(&mut self) {
+        self.0.in_flight.fetch_sub(1, Ordering::Relaxed);
+    }
+}
+
 /// Sends one request with the documented retry policy. Returns the response,
 /// latency and attempts, or a terminal error with the attempts made.
 async fn send_with_retries(
@@ -717,11 +743,23 @@ async fn send_with_retries(
     // Total budget for one logical call: the per-attempt deadline times the attempt count.
     let budget = limits.timeout.saturating_mul(limits.max_retries.saturating_add(1));
     loop {
+        let remaining = budget.saturating_sub(started.elapsed());
+        if remaining.is_zero() {
+            stats.failures.fetch_add(1, Ordering::Relaxed);
+            return Err(AttemptedError {
+                error: JevError::Timeout { detail: "request budget exhausted".to_string() },
+                attempts: attempt,
+            });
+        }
         stats.attempts.fetch_add(1, Ordering::Relaxed);
-        stats.in_flight.fetch_add(1, Ordering::Relaxed);
+        let in_flight = InFlightAttempt::new(stats);
         let attempt_started = Instant::now();
-        let result = transport.post(request, limits.timeout).await;
-        stats.in_flight.fetch_sub(1, Ordering::Relaxed);
+        let timeout = limits.timeout.min(remaining);
+        let result = tokio::time::timeout(timeout, transport.post(request, timeout))
+            .await.unwrap_or_else(|_| Err(JevError::Timeout {
+                detail: "request exceeded its timeout".to_string(),
+            }));
+        drop(in_flight);
         match result {
             Ok(response) => {
                 stats.successes.fetch_add(1, Ordering::Relaxed);
@@ -735,7 +773,7 @@ async fn send_with_retries(
                 count_error_class(stats, &error);
                 match retry_decision(&error, attempt, limits) {
                     RetryDecision::RetryAfter(delay) => {
-                        if started.elapsed().saturating_add(delay) > budget {
+                        if started.elapsed().saturating_add(delay) >= budget {
                             stats.failures.fetch_add(1, Ordering::Relaxed);
                             return Err(AttemptedError {
                                 error,

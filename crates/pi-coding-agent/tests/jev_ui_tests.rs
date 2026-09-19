@@ -44,7 +44,7 @@ use pi_jev::config::{
 use pi_jev::config::DEFAULT_KEY_ID;
 use pi_jev::credential::{CredentialStore, InMemoryCredentialStore};
 use pi_jev::types::JevMode;
-use jev_ui::{is_green, mode_label, ModeChange};
+use jev_ui::{mode_label, ModeChange};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -90,7 +90,7 @@ fn calls_on_a_connection(source: &str) -> Vec<String> {
             if !name.is_empty() {
                 let after = rest[name.len()..].trim_start();
                 if after.starts_with('(') {
-                    found.push(name);
+                    found.push(name.clone());
                 }
             }
             remaining = &rest[name.len()..];
@@ -441,19 +441,12 @@ fn escape_and_ctrl_c_cancel_the_menu_at_every_moment_and_no_key_is_hardcoded() {
 
     // Navigation uses the configured select bindings, so a rebind still works.
     let mut state = JevMenuState::new(JevMode::Off);
-    let up = pi_tui::keybindings::get_keybindings()
-        .get_keys("tui.select.up")
-        .into_iter()
-        .next()
-        .expect("the TUI ships a select-up binding");
-    let down = pi_tui::keybindings::get_keybindings()
-        .get_keys("tui.select.down")
-        .into_iter()
-        .next()
-        .expect("the TUI ships a select-down binding");
-    state.handle_key(&down);
+    let bindings = pi_tui::keybindings::get_keybindings();
+    assert!(bindings.matches("\x1b[B", "tui.select.down"));
+    assert!(bindings.matches("\x1b[A", "tui.select.up"));
+    state.handle_key("\x1b[B");
     assert_eq!(state.selected, 1);
-    state.handle_key(&up);
+    state.handle_key("\x1b[A");
     assert_eq!(state.selected, 0);
 
     // Neither the pure state machine nor the component hardcodes a literal key:
@@ -571,7 +564,10 @@ fn paste_is_sanitised_and_never_breaks_the_single_line_contract() {
     assert!(!value.contains('\n'), "{value:?}");
     assert!(!value.contains('\r'), "{value:?}");
     assert!(!value.contains('\t'), "{value:?}");
-    assert!(value.starts_with("sk-live"), "{value:?}");
+    assert_eq!(value, "sk-live0123456789");
+    let mut typed = JevKeyInputState::new();
+    typed.handle_key("\x1b[200~synthetic-pasted-key\x1b[201~");
+    assert_eq!(typed.take_for_validation().as_deref(), Some("synthetic-pasted-key"));
 }
 
 #[test]
@@ -593,7 +589,7 @@ fn cancel_during_validation_wins_and_a_stale_result_is_ignored() {
     assert_eq!(input.state(), KeyInputState::Cancelled);
     assert!(!input.masked_line().contains("sk"));
 
-    // A fresh attempt is its own generation, so a stale failure cannot poison it.
+    // A cancelled dialog stays closed even when more input or a stale result arrives.
     let mut input = JevKeyInputState::new();
     input.handle_key("a");
     let first = input.generation();
@@ -602,7 +598,8 @@ fn cancel_during_validation_wins_and_a_stale_result_is_ignored() {
     input.cancel();
     input.handle_key("b");
     assert!(!input.apply_validation(first_token, Err("HTTP 401".to_string())));
-    assert_eq!(input.state(), KeyInputState::Editing);
+    assert_eq!(input.state(), KeyInputState::Cancelled);
+    assert!(input.value_is_empty());
     assert_ne!(first, first_token);
 
     // Cancel is immediate even while a validation is "running".
@@ -834,7 +831,7 @@ fn jev_status_reports_scope_credential_source_and_truthful_counters() {
     );
     let text = render_status(&report);
     assert!(text.contains("Mode: Compare"), "{text}");
-    assert!(text.contains("this chat"), "{text}");
+    assert!(text.contains("Scope: session"), "{text}");
     assert!(text.contains("TYPESAFE_API_KEY wins"), "{text}");
     assert!(text.contains("https://api.typesafe.ai/v1/systemone"), "{text}");
     assert!(text.contains("jev-latest"), "{text}");
@@ -899,7 +896,7 @@ fn jev_status_distinguishes_checking_degraded_and_never_from_configured() {
         credential,
     ));
     assert!(off.contains("idle (Off: no scheduling, no client, no network)"), "{off}");
-    assert!(off.contains("defaults for new chats"), "{off}");
+    assert!(off.contains("Scope: global_default"), "{off}");
 }
 
 #[test]
@@ -1007,7 +1004,6 @@ fn negative_regression_settings_cannot_carry_model_or_subagent_control() {
         sorted,
         vec![
             "credential_configured",
-            "credential_source",
             "disclosure_shown",
             "global_default",
             "schema_version",
@@ -1110,11 +1106,11 @@ fn negative_regression_a_hand_edited_active_mode_stays_inert() {
     let credential = CredentialStatus::resolve(true, false, false);
     let state = footer_state(JevMode::Active, &credential, &JevPipelineStatus::default());
     assert_eq!(state, JevFooterState::Off);
-    assert!(!is_green(state));
+    assert!(!state.is_green());
     assert!(mode_label(JevMode::Active).contains("reserved"));
 
     // A child of that session does NOT silently become Compare: an inherited
-    // reserved mode stays inert, and a fresh child with no parent stays Off.
+    // reserved mode stays inert; a missing parent also inherits the inert global default.
     let inherited = bridge
         .inherit_into_child("child-2", "parent", None)
         .expect("no error");
@@ -1122,7 +1118,8 @@ fn negative_regression_a_hand_edited_active_mode_stays_inert() {
     let fresh = bridge
         .inherit_into_child("child-3", "no-such-session", None)
         .expect("no error");
-    assert_eq!(fresh, JevMode::Off);
+    assert_eq!(fresh, JevMode::Active);
+    assert!(!fresh.allows_compare());
 
     // The UI then writes a real mode over it, and only the requested one lands.
     let change = bridge
@@ -1220,8 +1217,8 @@ fn negative_regression_baseline_delegation_is_unchanged() {
     written.sort();
     assert_eq!(
         written,
-        vec!["jev".to_string(), "jev/jev-settings.json".to_string()],
-        "a mode change must write the settings file and nothing else"
+        vec!["jev".to_string(), "jev/jev-settings.json".to_string(), "jev/jev-settings.json.lock".to_string()],
+        "a mode change must write only settings and the cooperating lock"
     );
 }
 
@@ -1409,7 +1406,8 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
     let daemon = crate_file("src/modes/daemon/daemon_mode.rs");
     for command in ["jev_get_settings", "jev_set_session_mode", "jev_get_status"] {
         assert!(daemon.contains(&format!("\"{command}\",")), "{command} must be routable");
-        assert!(daemon.contains(&format!("\"{command}\" =>")), "{command} must have a handler");
+        assert!(daemon.lines().any(|line| line.contains(&format!("\"{command}\""))
+            && line.contains("=>")), "{command} must have a handler");
     }
     assert!(daemon.contains("pub const DAEMON_COMMAND_TYPES: [&str; 103] = ["));
     // The daemon writes the same store the UI reads (lane A's `JevSettingsStore`
@@ -1479,7 +1477,7 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_reserved_g
     // `render_help` never advertises a green/active Jev On.
     let help = render_help();
     assert!(help.contains(JEV_ON_RESERVED_NOTICE), "{help}");
-    assert!(!help.contains(JEV_GREEN_RESERVED_NOTICE), "{help}");
+    assert!(help.contains(JEV_GREEN_RESERVED_NOTICE), "{help}");
 
     // The credential DELETE path exists and is the inverse of the write path.
     let store = InMemoryCredentialStore::new();
@@ -1509,7 +1507,7 @@ fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
         footer_state(JevMode::Compare, &CredentialStatus::resolve(false, false, false), &healthy),
     ];
     for state in states {
-        assert!(!is_green(state), "{state:?} must never be green");
+        assert!(!state.is_green(), "{state:?} must never be green");
         assert_ne!(state.color_key(), "success", "{state:?}");
         // The LIVE colour path goes through `footer_color_key`, which consults
         // `is_green` first: it cannot return `success` while that is a constant false.

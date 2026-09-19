@@ -551,7 +551,7 @@ async fn rate_limit_retry_after_is_honored_then_the_call_succeeds() {
 }
 
 #[tokio::test]
-async fn retry_after_hint_is_used_verbatim_and_capped() {
+async fn retry_after_hint_is_never_shortened_to_the_backoff_ceiling() {
     let limits = JevLimits {
         backoff_initial: Duration::from_millis(10),
         backoff_max: Duration::from_secs(5),
@@ -567,11 +567,11 @@ async fn retry_after_hint_is_used_verbatim_and_capped() {
         RetryDecision::RetryAfter(delay) => assert_eq!(delay, Duration::from_secs(2)),
         RetryDecision::Stop => panic!("429 with a hint must retry while attempts remain"),
     }
-    // The hint is capped at backoff_max so a hostile header cannot stall the caller.
+    // The local backoff ceiling must not override the server's minimum delay.
     match retry_decision(&rate_limited, 0, &JevLimits { backoff_max: Duration::from_millis(200), ..limits.clone() })
     {
-        RetryDecision::RetryAfter(delay) => assert_eq!(delay, Duration::from_millis(200)),
-        RetryDecision::Stop => panic!("expected a capped retry"),
+        RetryDecision::RetryAfter(delay) => assert_eq!(delay, Duration::from_secs(2)),
+        RetryDecision::Stop => panic!("expected the server delay"),
     }
     // Attempts are finite: the last permitted attempt stops.
     assert_eq!(retry_decision(&rate_limited, limits.max_retries, &limits), RetryDecision::Stop);
@@ -585,8 +585,8 @@ fn retry_after_parsing_is_bounded_and_rejects_non_numeric_values() {
     // A hostile value is clamped, never converted (which would panic) or honored verbatim.
     assert_eq!(parse_retry_after("1e300"), Some(pi_jev::MAX_RETRY_AFTER));
     assert_eq!(parse_retry_after("999999999"), Some(pi_jev::MAX_RETRY_AFTER));
-    // Non-numeric and negative values are ignored rather than guessed.
-    assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), None);
+    // A past HTTP-date permits immediate retry; malformed values are ignored.
+    assert_eq!(parse_retry_after("Wed, 21 Oct 2015 07:28:00 GMT"), Some(Duration::ZERO));
     assert_eq!(parse_retry_after("-5"), None);
     assert_eq!(parse_retry_after("NaN"), None);
     assert_eq!(parse_retry_after(""), None);
