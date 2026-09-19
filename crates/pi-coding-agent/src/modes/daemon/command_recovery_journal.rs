@@ -99,6 +99,17 @@ struct JournalEntry {
     response: Option<DaemonResponse>,
 }
 
+/// Bounded observability of unresolved command-journal entries (audit D-07).
+/// `total` counts received commands without an acknowledgement; `without_result`
+/// is the uncertain subset whose result never arrived.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct CommandJournalPendingSummary {
+    pub total: usize,
+    pub without_result: usize,
+    pub oldest_recorded_at: Option<String>,
+    pub oldest_command_type: Option<String>,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum CommandJournalBeginResult {
     New,
@@ -203,6 +214,36 @@ impl CommandRecoveryJournal {
             return Err(format!("Cannot record a result before command receipt: {key}"));
         }
         self.record_result(client_id, command_id, response)
+    }
+
+    /// Snapshot of unresolved entries, oldest first by `recordedAt`.
+    pub fn pending_summary(&self) -> CommandJournalPendingSummary {
+        let mut summary = CommandJournalPendingSummary::default();
+        let mut oldest: Option<(String, &str, &str)> = None;
+        for entry in self.entries.values() {
+            summary.total += 1;
+            if entry.response.is_none() {
+                summary.without_result += 1;
+            }
+            let candidate = (
+                entry.received.recorded_at.clone(),
+                entry.received.command_type.as_str(),
+                entry.received.command_id.as_str(),
+            );
+            let older = match &oldest {
+                None => true,
+                Some((at, _, _)) => candidate.0 < *at,
+            };
+            if candidate.0.is_empty() { continue; }
+            if older {
+                oldest = Some(candidate);
+            }
+        }
+        if let Some((recorded_at, command_type, _)) = oldest {
+            summary.oldest_recorded_at = Some(recorded_at);
+            summary.oldest_command_type = Some(command_type.to_string());
+        }
+        summary
     }
 
     pub fn acknowledge(&mut self, client_id: &str, command_id: &str) -> Result<(), String> {
@@ -437,6 +478,29 @@ mod tests {
     #[test]
     fn idempotency_key_is_a_two_element_json_array() {
         assert_eq!(create_command_idempotency_key("c", "1"), "[\"c\",\"1\"]");
+    }
+
+    #[test]
+    fn pending_summary_reports_the_uncertain_backlog() {
+        let path = temp_path("journal.jsonl");
+        let mut journal = CommandRecoveryJournal::new(&path).unwrap();
+        assert_eq!(journal.pending_summary(), CommandJournalPendingSummary::default());
+        journal.begin("client", "c-1", "prompt").unwrap();
+        journal.begin("client", "c-2", "create").unwrap();
+        journal.record_result("client", "c-1", response("c-1")).unwrap();
+        let summary = journal.pending_summary();
+        assert_eq!(summary.total, 2);
+        assert_eq!(summary.without_result, 1);
+        assert_eq!(summary.oldest_command_type.as_deref(), Some("prompt"));
+        assert!(summary.oldest_recorded_at.is_some());
+        // Acknowledged entries leave the backlog; a recorded result stays until acked.
+        journal.acknowledge("client", "c-1").unwrap();
+        let summary = journal.pending_summary();
+        assert_eq!(summary.total, 1);
+        assert_eq!(summary.without_result, 1);
+        assert_eq!(summary.oldest_command_type.as_deref(), Some("create"));
+        journal.acknowledge("client", "c-2").unwrap();
+        assert_eq!(journal.pending_summary().total, 0);
     }
 
     #[test]

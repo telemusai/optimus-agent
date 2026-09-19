@@ -288,6 +288,9 @@ pub trait ReadonlySessionManager: Send + Sync {
     fn get_session_file(&self) -> Option<String>;
     fn get_session_dir(&self) -> String;
     fn get_branch(&self) -> Vec<SessionEntry>;
+    /// Optional no-copy entry count. Unavailable implementations must not materialize
+    /// a transcript merely to report this monitoring field.
+    fn get_entry_count(&self) -> Option<usize> { None }
 }
 
 /// blocked_on: needs core::session_manager::SessionManager

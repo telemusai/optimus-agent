@@ -1341,6 +1341,11 @@ pub trait AgentConnection: Send + Sync {
     ) -> Box<dyn Fn() + Send + Sync>;
 
     fn get_state(&self) -> pi_ai::types::BoxFuture<Result<AgentConnectionState, String>>;
+    /// Read-only Jev observations for this session. `None` means unsupported;
+    /// `Some({"pipeline": null})` means supported but no observations yet.
+    fn get_jev_status(&self) -> pi_ai::types::BoxFuture<Result<Option<Value>, String>> {
+        Box::pin(async { Ok(None) })
+    }
     fn get_initial_snapshot(&self) -> pi_ai::types::BoxFuture<Result<AgentConnectionSnapshot, String>>;
     fn get_rlm_child_snapshots(&self) -> pi_ai::types::BoxFuture<Result<Vec<AgentConnectionRlmChildAgentSnapshot>, String>>;
     fn get_messages(&self) -> pi_ai::types::BoxFuture<Result<Vec<AgentMessage>, String>>;

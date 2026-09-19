@@ -47,7 +47,8 @@ const OPERATIONS: [PerformanceMetricOperation; 20] = [
 ];
 
 /// `OUTCOMES`.
-const OUTCOMES: [PerformanceMetricOutcome; 4] = [
+const OUTCOMES: [PerformanceMetricOutcome; 5] = [
+    PerformanceMetricOutcome::Started,
     PerformanceMetricOutcome::Success,
     PerformanceMetricOutcome::Failure,
     PerformanceMetricOutcome::Cancelled,
@@ -67,10 +68,11 @@ const COMPONENTS: [PerformanceMetricComponent; 8] = [
 ];
 
 /// `MEASUREMENTS`.
-const MEASUREMENTS: [PerformanceMetricMeasurement; 34] = [
+const MEASUREMENTS: [PerformanceMetricMeasurement; 35] = [
     PerformanceMetricMeasurement::TotalMs,
     PerformanceMetricMeasurement::WaitMs,
     PerformanceMetricMeasurement::DispatchToResponseHeadersMs,
+    PerformanceMetricMeasurement::TransportOpenAckMs,
     PerformanceMetricMeasurement::DispatchToFirstEventMs,
     PerformanceMetricMeasurement::DispatchToFirstVisibleMs,
     PerformanceMetricMeasurement::DispatchToFirstRawMs,

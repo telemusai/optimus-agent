@@ -69,6 +69,10 @@ impl crate::core::extensions::types::ReadonlySessionManager for RuntimeSessionMa
         self.manager.lock().unwrap().get_session_dir()
     }
 
+    fn get_entry_count(&self) -> Option<usize> {
+        Some(self.manager.lock().unwrap().get_entry_count())
+    }
+
     /// `sessionManager.getEntries()` as the runner's `SessionEntry` shape
     /// (`{ type, id, ...rest }`); `types::SessionEntry` flattens the rest.
     fn get_branch(&self) -> Vec<ExtensionSessionEntry> {
@@ -2760,11 +2764,54 @@ impl AgentSession {
         });
         self.retry_attempt.store(0, Ordering::SeqCst);
         self.retry_auth_failure_sources.lock().unwrap().clear();
+        // The group is exhausted: settle its outer terminal and hand the next turn a
+        // fresh correlation, so no later attempt is attributed to this finished group.
+        self.close_retry_metric_group(Some(
+            pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure,
+        ));
+    }
+
+    /// Settle the host-owned logical-request group of the active retry and drop the
+    /// group correlation from the agent.
+    ///
+    /// The host owns the outer `logical_request` terminal while a retry group is open
+    /// (`host_owns_logical_request_terminal`). Without this, the group's id, settlement
+    /// and attempt ordinal outlive the group: later turns reuse a settled group id, no
+    /// new outer terminal is emitted, and their attempts are attributed to a logical
+    /// request that finished earlier (B6). Correlation is settled at most once, and
+    /// clearing the host-owned metrics restores the ordinary per-turn baseline.
+    pub(super) fn close_retry_metric_group(
+        &self,
+        outcome: Option<pi_agent_core::performance_metrics::PerformanceMetricOutcome>,
+    ) {
+        if let Some(metrics) = self.agent.performance_metrics() {
+            if !metrics.host_owns_logical_request_terminal {
+                return;
+            }
+        } else {
+            return;
+        }
+        if let Some(message) = self.retry_metric_message.lock().unwrap().clone() {
+            pi_agent_core::agent_loop::finalize_performance_metric_logical_request(&message, outcome);
+        }
+        if let Some(metrics) = self.agent.performance_metrics() {
+            self.agent.set_performance_metrics(Some(
+                pi_agent_core::performance_metrics::AgentLoopPerformanceMetrics::new(
+                    metrics.recorder.clone(),
+                ),
+            ));
+        }
     }
 
     /// `_handleRetryableError(message, options?)` (agent-session.ts:12118-12253).
     pub(super) async fn handle_retryable_error(self: &Arc<Self>, message: &AssistantMessage) -> bool {
+        // Every path that ends the retry instead of starting another attempt must close
+        // the host-owned group. Otherwise the group's id, settlement and attempt ordinal
+        // stay live after the retry is over and later turns reuse them (B6).
         if self.explicitly_stopped() {
+            self.close_retry_metric_group(Some(
+                pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled,
+            ));
             self.resolve_retry();
             return false;
         }
@@ -2774,6 +2821,9 @@ impl AgentSession {
         if !policy.enabled {
             self.mark_provider_auth_stale_for_retry_failure(message);
             self.retry_auth_failure_sources.lock().unwrap().clear();
+            self.close_retry_metric_group(Some(
+                pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure,
+            ));
             self.resolve_retry();
             return false;
         }
@@ -2790,6 +2840,10 @@ impl AgentSession {
             });
             self.retry_attempt.store(0, Ordering::SeqCst);
             self.retry_auth_failure_sources.lock().unwrap().clear();
+            // The retry budget is exhausted, so no further attempt will settle the group.
+            self.close_retry_metric_group(Some(
+                pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure,
+            ));
             self.resolve_retry();
             return false;
         }
@@ -2814,6 +2868,10 @@ impl AgentSession {
                 });
                 self.retry_attempt.store(0, Ordering::SeqCst);
                 self.retry_auth_failure_sources.lock().unwrap().clear();
+                // No attempt will follow the refused wait, so the group ends here.
+                self.close_retry_metric_group(Some(
+                    pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure,
+                ));
                 self.resolve_retry();
                 return false;
             }
@@ -2854,10 +2912,9 @@ impl AgentSession {
                 attempt: attempt as i64,
                 final_error: Some("Retry cancelled".to_string()),
             });
-            pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
-                message,
-                Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled),
-            );
+            self.close_retry_metric_group(Some(
+                pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled,
+            ));
             self.resolve_retry();
             self.retry_auth_failure_sources.lock().unwrap().clear();
             return false;
@@ -2914,10 +2971,11 @@ impl AgentSession {
                         attempt: attempt as i64,
                         final_error: Some(error.to_string()),
                     });
-                    pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
-                        &message,
-                        Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure),
-                    );
+                    // The retry never reached the provider, so nothing will settle the
+                    // group for it: close it here as a failure, exactly once.
+                    session.close_retry_metric_group(Some(
+                        pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure,
+                    ));
                     session.resolve_retry();
                 }
             });
@@ -2943,12 +3001,11 @@ impl AgentSession {
                 final_error: Some("Retry cancelled".to_string()),
             });
             self.retry_attempt.store(0, Ordering::SeqCst);
-            if let Some(message) = self.retry_metric_message.lock().unwrap().clone() {
-                pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
-                    &message,
-                    Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled),
-                );
-            }
+            // The cancelled retry still owns a live group; settle it once and restore the
+            // per-turn baseline so the next turn cannot reuse the finished group (B6).
+            self.close_retry_metric_group(Some(
+                pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled,
+            ));
         }
         self.retry_auth_failure_sources.lock().unwrap().clear();
         self.resolve_retry();

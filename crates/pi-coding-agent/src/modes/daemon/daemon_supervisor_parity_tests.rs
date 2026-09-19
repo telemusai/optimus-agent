@@ -73,6 +73,11 @@ impl SupervisorFixture {
             idle_eviction_task: Mutex::new(None),
             socket_path: socket_path.clone(),
             journal: Mutex::new(journal),
+            agent_message_delivery_journal: Mutex::new(AgentMessageDeliveryJournal::new(
+                &Path::new(&descriptor_dir)
+                    .join(AGENT_MESSAGE_DELIVERY_JOURNAL_FILE)
+                    .to_string_lossy(),
+            )),
             descriptor_dir: PathBuf::from(&descriptor_dir),
             config: AgentSessionRuntimeConfig {
                 cwd: Some(root.join("workspace").to_string_lossy().into_owned()),
@@ -100,6 +105,7 @@ impl SupervisorFixture {
             prompt_admissions: Mutex::new(HashMap::new()),
             opening_workers: Mutex::new(HashMap::new()),
             pending_session_names: Mutex::new(HashSet::new()),
+            pending_command_journal_log: Mutex::new(None),
         });
         supervisor.init_roster();
         let (sender, outbound) = mpsc::channel::<Vec<u8>>(1024);

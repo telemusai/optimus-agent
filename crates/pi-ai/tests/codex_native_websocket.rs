@@ -169,6 +169,13 @@ async fn native_default_transport_reuses_connection_and_sends_only_followup_delt
     assert!(stages.iter().any(|stage| stage == "raw_event"));
     assert_eq!(stages.iter().filter(|stage| *stage == "text").count(), 3);
     assert_eq!(stages.iter().filter(|stage| *stage == "terminal").count(), 3);
+    // B5: the native WebSocket path reports no response header edge, so it labels its
+    // transport on its own observation stage: one label per payload sent.
+    assert_eq!(
+        stages.iter().filter(|stage| *stage == "transport_ws").count(),
+        3,
+        "every WebSocket payload send is labelled: {stages:?}"
+    );
     close_openai_codex_web_socket_sessions(Some("native-delta"));
     server.await.unwrap();
 }
@@ -385,6 +392,12 @@ async fn native_upgrade_rejection_falls_back_to_sse_and_remembers_session_choice
     let stages = observed.lock().unwrap().clone();
     assert_eq!(stages.iter().filter(|stage| *stage == "text").count(), 2);
     assert_eq!(stages.iter().filter(|stage| *stage == "terminal").count(), 2);
+    // B5: the SSE fallback must never claim the WebSocket transport.
+    assert_eq!(
+        stages.iter().filter(|stage| *stage == "transport_ws").count(),
+        0,
+        "an SSE attempt must not be labelled as a WebSocket attempt: {stages:?}"
+    );
     server.await.unwrap();
 }
 

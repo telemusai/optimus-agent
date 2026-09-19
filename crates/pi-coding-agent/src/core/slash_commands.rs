@@ -405,6 +405,18 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
         Some("[on|off]"),
         Some(true),
     );
+    // SHARED FILE EDIT (core/slash_commands.rs, jev-ui lane): the canonical `/jev`
+    // entry. It is a plain local built-in (no `execution: "session"`, so it is
+    // resolved locally and never forwarded to the model). `takes_argument` is true
+    // because `/jev <mode>` is a real form, and the argument hint lists exactly
+    // what the UI accepts.
+    push(
+        "jev",
+        "Jev comparison mode: Off, Compare (shadow-only), Active (reserved/disabled), Input API key, Status"
+            .to_string(),
+        Some("[off|compare|on|status|key]"),
+        Some(true),
+    );
     push("quit", format!("Quit {APP_NAME}"), None, None);
     commands
 }

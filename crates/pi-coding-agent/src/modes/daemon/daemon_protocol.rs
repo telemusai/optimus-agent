@@ -135,6 +135,12 @@ pub enum DaemonServerCapability {
     OwnedPromptCancellation,
     AcpMcpServers,
     DirectPeerTransport,
+    // SHARED FILE EDIT (modes/daemon/daemon_protocol.rs, capability-gated addition
+    // by jev-ui lane; REPAIR-OVERLAP file - keep the coordinator's version at
+    // integration): Jev comparison mode control. The three `jev_*` commands are
+    // OPTIONAL. A daemon that does not advertise this capability never receives
+    // them, and the client degrades to local (settings-file) mode control.
+    JevControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -185,7 +191,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 22] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 23] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -208,6 +214,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 22] = [
     DaemonServerCapability::RlmQuiescenceBarrier,
     DaemonServerCapability::SessionInputPause,
     DaemonServerCapability::AcpMcpServers,
+    DaemonServerCapability::JevControl,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2135,6 +2142,14 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "heartbeat_manage" => DaemonCommandCompatibility::capability(Capability::HeartbeatManagement),
         "get_rlm_max_depth_status" | "set_rlm_max_depth" => DaemonCommandCompatibility::revision(11),
         "get_session_tree" => DaemonCommandCompatibility::legacy(),
+        // SHARED FILE EDIT (daemon_protocol.rs, capability-gated addition by
+        // jev-ui lane): the optional Jev surface. No schema revision and no
+        // protocol bump: an old daemon simply does not advertise `jev_control`,
+        // so a new client never sends these commands, and an old client never
+        // looks at them. A new daemon that serves them stays compatible.
+        "jev_get_settings" | "jev_set_session_mode" | "jev_get_status" => {
+            DaemonCommandCompatibility::capability(Capability::JevControl)
+        }
         _ => DaemonCommandCompatibility::legacy(),
     }
 }
@@ -2179,7 +2194,9 @@ pub fn daemon_command_plane(command: &str) -> Option<&'static str> {
         | "navigate_tree" | "import_jsonl" | "export_html" | "export_jsonl" | "get_rlm_max_depth_status"
         | "set_rlm_max_depth" | "get_session_context" | "get_session_tree" | "get_user_messages_for_forking"
         | "get_last_assistant_text" | "get_system_prompt" | "get_tool_definition" | "set_session_entry_label"
-        | "extension_ui_response" => Some("session"),
+        | "extension_ui_response" | "jev_get_settings" | "jev_set_session_mode" | "jev_get_status" => {
+            Some("session")
+        }
         _ => None,
     }
 }
@@ -2757,7 +2774,7 @@ pub fn salvage_daemon_command_id(line: &str) -> Option<String> {
 }
 
 /// `READ_ONLY_DAEMON_COMMANDS`.
-pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 34] = [
+pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 36] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -2792,6 +2809,11 @@ pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 34] = [
     "get_system_prompt",
     "get_rlm_max_depth_status",
     "get_tool_definition",
+    // SHARED FILE EDIT (daemon_protocol.rs, jev-ui lane): the two Jev GETTERS are
+    // read-only. The mode SETTER is deliberately absent: it writes the local mode
+    // setting, so a read-only client must not send it.
+    "jev_get_settings",
+    "jev_get_status",
 ];
 
 pub fn is_daemon_mutating_command(command_type: &str) -> bool {

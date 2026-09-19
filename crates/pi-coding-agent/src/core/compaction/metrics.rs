@@ -93,7 +93,10 @@ impl CompactionPhase {
                 .get_or_insert_with(Default::default)
                 .insert(Measurement::AttemptOrdinal, Some(ordinal as f64));
         }
-        // An absent outcome marks the start; a terminal event reuses the same IDs.
+        // The start row is explicitly labeled `started` (never null, never a
+        // failure) so paired accounting cannot mistake it for a terminal; the
+        // terminal event reuses the same IDs with a terminal outcome.
+        event.outcome = Some(Outcome::Started);
         safe_record_performance_metric(metrics.recorder.as_ref(), event.clone());
         Self {
             metrics,
@@ -227,16 +230,26 @@ impl CompactionRequestMetrics {
         let caller = options.stream.on_response.clone();
         options.stream.on_response = Some(Arc::new(move |response, model| {
             if let Ok(mut state) = state.lock() {
-                state.headers = state.headers.or_else(|| safe_now(recorder.as_ref()));
-                state.websocket = match response
+                // B2: a WebSocket send acknowledgement is not an HTTP header edge, so it
+                // must not claim `dispatch_to_response_headers_ms` here either. The
+                // compaction phase has no dedicated ack stage, so it records none.
+                let is_send_ack = response
+                    .headers
+                    .get("x-optimus-response-edge")
+                    .map(String::as_str)
+                    == Some("transport_send_ack");
+                if !is_send_ack {
+                    state.headers = state.headers.or_else(|| safe_now(recorder.as_ref()));
+                }
+                match response
                     .headers
                     .get("x-optimus-transport")
                     .map(String::as_str)
                 {
-                    Some("websocket") => Some(1.0),
-                    Some("sse") => Some(0.0),
-                    _ => None,
-                };
+                    Some("websocket") => state.websocket = Some(1.0),
+                    Some("sse") => state.websocket = Some(0.0),
+                    _ => {}
+                }
             }
             caller
                 .as_ref()
@@ -248,16 +261,25 @@ impl CompactionRequestMetrics {
         let caller = options.stream.on_stream_observation.clone();
         options.stream.on_stream_observation = Some(Arc::new(move |stage| {
             if let Ok(mut state) = state.lock() {
-                let slot = match stage {
-                    "raw_event" => Some(&mut state.first_raw),
-                    "thinking" => Some(&mut state.thinking),
-                    "tool" => Some(&mut state.tool),
-                    "text" => Some(&mut state.text),
-                    "terminal" => Some(&mut state.terminal),
-                    _ => None,
-                };
-                if let Some(slot) = slot {
-                    *slot = slot.or_else(|| safe_now(recorder.as_ref()));
+                // B5: a provider whose WebSocket transport reports no response header edge
+                // labels its transport on its own stage, so the attempt is comparable with
+                // an SSE attempt of the same provider.
+                if stage == "transport_ws" {
+                    if state.websocket.is_none() {
+                        state.websocket = Some(1.0);
+                    }
+                } else {
+                    let slot = match stage {
+                        "raw_event" => Some(&mut state.first_raw),
+                        "thinking" => Some(&mut state.thinking),
+                        "tool" => Some(&mut state.tool),
+                        "text" => Some(&mut state.text),
+                        "terminal" => Some(&mut state.terminal),
+                        _ => None,
+                    };
+                    if let Some(slot) = slot {
+                        *slot = slot.or_else(|| safe_now(recorder.as_ref()));
+                    }
                 }
             }
             if let Some(caller) = &caller {

@@ -35,10 +35,15 @@ async fn serve<S: AsyncRead + AsyncWrite + Unpin>(
                 Some("list") => json!({"sessions":[summary]}),
                 Some("attach") => json!({"activeSessionId":summary.id,"snapshot":{"summary":summary,"state":{},"messages":[{"role":"user","content":"saved transcript","timestamp":1}],"lastEventSequence":2}}),
                 Some("worker_deliver_message") => json!({
-                    "id":"receipt-one", "source":"agent_message",
+                    "id":format!("agentmsg_{}", summary.session_id), "source":"agent_message",
                     "message":command["message"], "from":command["sender"],
                     "target":{"activeSessionId":summary.active_session_id,"sessionId":summary.session_id},
-                    "deliveryStatus":if command["message"] == "queued" { "queued" } else { "delivered" },
+                    "deliveryStatus":match command["message"].as_str() {
+                        Some("queued") => "queued",
+                        // An unrecognized status is not proof of delivery (D-04).
+                        Some("unknown-status") => "in-progress",
+                        _ => "delivered",
+                    },
                 }),
                 _ => Value::Null,
             };
@@ -178,6 +183,130 @@ async fn messaging_safety_supervisor_uses_trusted_sender_and_truthful_receipts()
     assert_eq!(commands.len(), 3);
     assert!(commands.iter().all(|command| command["type"] == "worker_deliver_message"));
     assert!(commands.iter().all(|command| command.get("fromActiveSessionId").is_none()));
+}
+
+/// Register a worker that is addressable but no longer running: its recorded process
+/// identity no longer matches, so a forward fails before the message reaches the target.
+async fn unreachable_worker(fixture: &SupervisorFixture, name: &str) -> Arc<Worker> {
+    let worker = add_descriptor_only_worker(fixture, name, name, &format!("token-{name}"), DAEMON_WORKER_LIFECYCLE_READY);
+    let summary = SessionSummary {
+        id: name.to_string(), active_session_id: Some(name.to_string()),
+        session_id: format!("session-{name}"), session_name: Some(format!("Name {name}")),
+        cwd: fixture.root.join("workspace").to_string_lossy().into_owned(),
+        rlm_depth: Some(0), runtime_kind: Some("top-level".to_string()),
+        lifecycle: "resident".to_string(), activity: "idle".to_string(),
+        unfinished_action_count: Some(0), ..Default::default()
+    };
+    fixture.supervisor.write_roster_entry(worker_roster_entry_from_summary(&summary.roster_view()), Some(&worker), None);
+    worker.descriptor.lock().unwrap().process_start_id = Some("exited-worker-process".to_string());
+    worker
+}
+
+/// D-04: every attempted cross-worker forward leaves one durable, content-free delivery
+/// record, telemetry never changes the delivery result, and nothing is replayed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn messaging_safety_supervisor_records_durable_delivery_outcomes() {
+    use crate::modes::daemon::agent_message_delivery_journal::{
+        AgentMessageDeliveryJournal, AgentMessageDeliveryOutcome,
+    };
+    // A fresh case root per run, so the durable journal starts empty and the record
+    // count in this test is the count this test produced.
+    let case = format!("messaging-safety-delivery-journal-{}", uuid::Uuid::new_v4());
+    let mut fixture = SupervisorFixture::new(&case).await;
+    let _source = ScriptedWorker::new(&fixture, "source", 0, None).await;
+    let target = ScriptedWorker::new(&fixture, "target", 0, None).await;
+    let _unreachable = unreachable_worker(&fixture, "unreachable").await;
+    let journal_path = fixture
+        .root
+        .join("daemon-workers")
+        .join(AGENT_MESSAGE_DELIVERY_JOURNAL_FILE)
+        .to_string_lossy()
+        .into_owned();
+
+    for message in ["delivered", "queued", "unknown-status"] {
+        let response = fixture.send(json!({
+            "type":"send_message","id":message,"fromActiveSessionId":"source",
+            "targetActiveSessionId":"target","message":message,"agentOrigin":true,
+        })).await;
+        // Telemetry does not change what the caller sees: the receipt decides the result.
+        assert_eq!(response["success"], true, "{response}");
+        assert_eq!(response["data"]["from"]["activeSessionId"], "source");
+    }
+
+    // A self-send is rejected without a forward.
+    let rejected = fixture.send(json!({
+        "type":"send_message","id":"delivery-two","fromActiveSessionId":"source",
+        "targetActiveSessionId":"source","message":"never delivered","agentOrigin":true,
+    })).await;
+    assert_eq!(rejected["success"], false, "{rejected}");
+    assert_eq!(rejected["error"], "Agent messaging cannot target the sending session");
+
+    // An unreachable target fails before any delivery, and the send is never replayed.
+    let before = target.commands.lock().unwrap().len();
+    let lost = fixture.send(json!({
+        "type":"send_message","id":"delivery-three","fromActiveSessionId":"source",
+        "targetActiveSessionId":"unreachable","message":"never attempted","agentOrigin":true,
+    })).await;
+    assert_eq!(lost["success"], false, "{lost}");
+    assert_eq!(
+        target.commands.lock().unwrap().len(),
+        before,
+        "a failed forward must not be delivered or replayed"
+    );
+
+    let records = AgentMessageDeliveryJournal::read(&journal_path);
+    let outcomes: Vec<AgentMessageDeliveryOutcome> = records.iter().map(|record| record.outcome).collect();
+    assert!(outcomes.contains(&AgentMessageDeliveryOutcome::Delivered), "{records:?}");
+    assert!(outcomes.contains(&AgentMessageDeliveryOutcome::Queued), "{records:?}");
+    assert!(outcomes.contains(&AgentMessageDeliveryOutcome::Rejected), "{records:?}");
+    // Exactly one record per attempted send: three accepted forwards, a rejected self-send
+    // and a rejected unreachable forward.
+    assert_eq!(records.len(), 5, "{records:?}");
+    assert_eq!(
+        records.iter().filter(|record| matches!(record.outcome,
+            AgentMessageDeliveryOutcome::Delivered | AgentMessageDeliveryOutcome::Queued)).count(),
+        2,
+        "one record per accepted forward, and no duplicate record per send: {records:?}"
+    );
+
+    let rejected_record = records
+        .iter()
+        .find(|record| record.outcome == AgentMessageDeliveryOutcome::Rejected)
+        .expect("a rejected forward leaves a durable rejected record");
+    assert_eq!(rejected_record.reason_code.as_deref(), Some("self_target"));
+    assert_eq!(rejected_record.target_active_session_id, "source");
+    assert_eq!(rejected_record.source_active_session_id.as_deref(), Some("source"));
+
+    // An unrecognized receipt status is recorded as uncertain, not as delivered.
+    let uncertain: Vec<&_> = records
+        .iter()
+        .filter(|record| record.outcome == AgentMessageDeliveryOutcome::Uncertain)
+        .collect();
+    assert_eq!(uncertain.len(), 1, "{records:?}");
+    assert_eq!(uncertain[0].reason_code.as_deref(), Some("invalid_receipt"));
+    assert_eq!(uncertain[0].target_active_session_id, "target");
+
+    let unreachable_record = records
+        .iter()
+        .find(|record| record.target_active_session_id == "unreachable")
+        .expect("an unreachable target leaves a durable record");
+    assert_eq!(unreachable_record.outcome, AgentMessageDeliveryOutcome::Rejected);
+    assert_eq!(unreachable_record.reason_code.as_deref(), Some("worker_unavailable"));
+    assert!(unreachable_record.message_id.is_none(), "no receipt means no message id");
+    // The reachable target got one record per send it received, and no duplicates.
+    assert_eq!(
+        records.iter().filter(|record| record.target_active_session_id == "target").count(),
+        3,
+        "{records:?}"
+    );
+
+    // The journal is telemetry, so no record may carry message text or a session name.
+    let raw = std::fs::read_to_string(&journal_path).unwrap();
+    for secret in ["never delivered", "never attempted", "Name source", "Name target", "Name unreachable"] {
+        assert!(!raw.contains(secret), "delivery telemetry must not persist {secret:?}");
+    }
+    // One bounded JSON line per record, and nothing else.
+    assert_eq!(raw.lines().count(), records.len(), "{raw}");
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

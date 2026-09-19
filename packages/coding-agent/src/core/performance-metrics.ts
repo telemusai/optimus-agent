@@ -38,7 +38,7 @@ const OPERATIONS = new Set<PerformanceMetricOperation>([
 	"ui_session_open",
 	"recorder",
 ]);
-const OUTCOMES = new Set<PerformanceMetricOutcome>(["success", "failure", "cancelled", "unavailable"]);
+const OUTCOMES = new Set<PerformanceMetricOutcome>(["started", "success", "failure", "cancelled", "unavailable"]);
 const COMPONENTS = new Set<PerformanceMetricComponent>([
 	"agent",
 	"provider",

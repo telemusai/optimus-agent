@@ -1454,7 +1454,17 @@ async fn compaction_metrics_follow_real_persistence_and_failure_boundaries() {
     recorder.flush().await;
     let sidecar = std::fs::read_to_string(recorder.log_path()).unwrap();
     let events: Vec<Value> = sidecar.lines().map(|line| serde_json::from_str(line).unwrap()).collect();
-    let terminals = |operation: &str| events.iter().filter(|event| event["operation"] == operation && event.get("outcome").is_some()).collect::<Vec<_>>();
+    // Start rows are labeled "started"; only terminal outcomes count as terminals.
+    let terminals = |operation: &str| {
+        events
+            .iter()
+            .filter(|event| {
+                event["operation"] == operation
+                    && event.get("outcome").is_some()
+                    && event["outcome"] != "started"
+            })
+            .collect::<Vec<_>>()
+    };
     for operation in ["compaction_persist", "compaction_restore"] {
         let records = terminals(operation);
         assert_eq!(records.len(), 1, "{operation} must only run after a usable summary");

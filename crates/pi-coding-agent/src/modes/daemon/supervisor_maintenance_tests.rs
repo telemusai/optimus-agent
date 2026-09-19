@@ -56,10 +56,15 @@ async fn nine_supervisor_stale_reclaim_preserves_transcript_and_rejects_live_ide
     let worker = dead_worker(&fixture, "dead");
     let (file, _) = session(&fixture, &worker, "saved");
     let before = std::fs::read(&file).unwrap();
+    // A reclaimed generation's journals are retired with its descriptor
+    // (audit STALE-JOURNALS-01); the saved transcript is untouched.
+    let recovery_path = worker.descriptor.lock().unwrap().recovery_journal_path.clone();
+    std::fs::write(&recovery_path, "seed").expect("journal seed");
     assert!(fixture.supervisor.reclaim_stale_worker_registration(&worker).await.unwrap());
     assert_eq!(std::fs::read(&file).unwrap(), before);
     assert!(!fixture.supervisor.descriptor_dir.join("dead.json").exists());
     assert!(!fixture.supervisor.workers.lock().unwrap().contains_key("dead"));
+    assert!(!Path::new(&recovery_path).exists(), "the recovery journal is retired after a successful reclaim");
     let live = add_descriptor_only_worker(&fixture, "live", "live", "token-live", DAEMON_WORKER_LIFECYCLE_FAILED);
     live.descriptor.lock().unwrap().process_start_id = None;
     assert!(!fixture.supervisor.reclaim_stale_worker_registration(&live).await.unwrap());
@@ -98,18 +103,151 @@ async fn nine_supervisor_orphan_cleanup_never_signals_reused_pid() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn nine_supervisor_unknown_or_malformed_orphans_preserve_cleanup_evidence() {
+async fn nine_supervisor_malformed_orphans_preserve_cleanup_evidence() {
     let fixture = SupervisorFixture::new("nine-orphan-evidence").await;
     let worker = dead_worker(&fixture, "dead");
     let journal = fixture.root.join("orphans.jsonl");
     worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
-    let identity_free = json!({"version":1,"ownerPid":i32::MAX,"pid":std::process::id(),"active":true,"recordedAt":"now"});
-    for bytes in [format!("{identity_free}\n"), "{\"version\":1,\"pid\":".into(), format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":std::process::id(),"processStartId":17,"active":true,"recordedAt":"now"}))] {
+    for bytes in ["{\"version\":1,\"pid\":".to_string(), format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":std::process::id(),"processStartId":17,"active":true,"recordedAt":"now"}))] {
         std::fs::write(&journal, &bytes).unwrap();
         let error = fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap_err();
         assert!(error.contains("journal retained"), "{error}");
         assert_eq!(std::fs::read_to_string(&journal).unwrap(), bytes);
         assert!(get_process_start_id(std::process::id() as i64).is_some());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_supervisor_dead_pid_only_orphans_are_nothing_to_reap() {
+    let fixture = SupervisorFixture::new("nine-orphan-dead-pid").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    // A pid-only record (no start identity) naming a pid that holds no live
+    // process: the reaper has nothing to reap, so the stop must not be failed
+    // and the journal must not be retained forever (audit ORPHAN-STOP-01).
+    std::fs::write(&journal, format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":999_999_999i64,"active":true,"recordedAt":"now"}))).unwrap();
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap();
+    assert!(!journal.exists(), "a provably dead pid is cleared with the journal");
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    assert!(!side.exists(), "nothing was unproven, so no side record is written");
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_supervisor_dead_pid_with_recorded_start_id_is_nothing_to_reap() {
+    let fixture = SupervisorFixture::new("nine-orphan-dead-start-id").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    // A record with a recorded start id whose pid is gone entirely: the identity
+    // check fails AND no live process holds that pid, so the journaled process is
+    // provably dead. It must be skipped like the pid-only dead branch, not
+    // side-recorded as unproven-live (review defect #5).
+    std::fs::write(
+        &journal,
+        format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":999_999_999i64,"processStartId":"win:123456","active":true,"recordedAt":"now"})),
+    )
+    .unwrap();
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap();
+    assert!(!journal.exists(), "a provably dead journaled process is cleared with the journal");
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    assert!(!side.exists(), "a dead pid is not unproven-live, so no side record is written");
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn nine_supervisor_pid_only_live_orphans_are_deferred_not_failed() {
+    let fixture = SupervisorFixture::new("nine-orphan-defer").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    // A pid-only record naming the still-live test process: the win32 kill-on-close
+    // job owns that tree, a bare pid is never kill authority, and the stop must
+    // neither fail nor strand the journal forever. The uncertainty is superseded
+    // into the bounded side record.
+    let test_pid = std::process::id() as i64;
+    std::fs::write(&journal, format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":test_pid,"active":true,"recordedAt":"now"}))).unwrap();
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap();
+    assert!(!journal.exists(), "the journal is superseded after a successful recovery");
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    let side_text = std::fs::read_to_string(&side).expect("deferred orphan side record");
+    assert!(side_text.contains(&test_pid.to_string()), "{side_text}");
+    // The uncertainty is recorded, never cleared to green: the side record says why.
+    assert!(side_text.contains("could not prove the live pid is the journaled process"), "{side_text}");
+    assert!(
+        is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }),
+        "the unproven pid must never be killed"
+    );
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_orphan_write_failure_retains_source_and_parks_cleanup() {
+    let fixture = SupervisorFixture::new("deferred-write-failure").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    let test_pid = std::process::id() as i64;
+    let original = format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":test_pid,"active":true,"recordedAt":"now"}));
+    std::fs::write(&journal, &original).unwrap();
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    std::fs::create_dir(&side).unwrap();
+    let error = fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap_err();
+    assert!(super::supervisor_maintenance::permanent_stop_cleanup_error(&error), "{error}");
+    assert_eq!(std::fs::read_to_string(&journal).unwrap(), original);
+    assert!(side.is_dir());
+    assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+    worker.descriptor.lock().unwrap().stop_requested_at = Some("now".into());
+    fixture.supervisor.park_worker_stop_cleanup_failure(&worker, &error);
+    assert!(stop_cleanup_is_parked(&worker.descriptor.lock().unwrap()));
+    assert!(fixture.supervisor.descriptor_dir.join("dead.json").exists());
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_orphan_capacity_and_malformed_evidence_never_discard_records() {
+    let fixture = SupervisorFixture::new("deferred-capacity").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    let test_pid = std::process::id() as i64;
+    let original = format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":test_pid,"active":true,"recordedAt":"now"}));
+    std::fs::write(&journal, &original).unwrap();
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    let full = (0..64).map(|index| format!("{}\n", json!({"workerId":"dead","pid":900_000_000i64 + index,"kernelPid":null,"processStartId":null,"reason":"unverified"}))).collect::<String>();
+    for evidence in [full, "{truncated evidence".into()] {
+        std::fs::write(&side, &evidence).unwrap();
+        let error = fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap_err();
+        assert!(super::supervisor_maintenance::permanent_stop_cleanup_error(&error), "{error}");
+        assert_eq!(std::fs::read_to_string(&side).unwrap(), evidence);
+        assert_eq!(std::fs::read_to_string(&journal).unwrap(), original);
+        assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+    }
+}
+
+#[cfg(windows)]
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn deferred_orphan_retry_is_idempotent_at_capacity() {
+    let fixture = SupervisorFixture::new("deferred-idempotence").await;
+    let worker = dead_worker(&fixture, "dead");
+    let journal = fixture.root.join("orphans.jsonl");
+    let test_pid = std::process::id() as i64;
+    let original = format!("{}\n", json!({"version":1,"ownerPid":i32::MAX,"pid":test_pid,"active":true,"recordedAt":"now"}));
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    let side = fixture.supervisor.descriptor_dir.join("dead.orphans.unreapable.jsonl");
+    let prior = (0..63).map(|index| format!("{}\n", json!({"workerId":"dead","pid":900_000_000i64 + index,"kernelPid":null,"processStartId":null,"reason":"unverified"}))).collect::<String>();
+    std::fs::write(&side, &prior).unwrap();
+    for _ in 0..2 {
+        std::fs::write(&journal, &original).unwrap();
+        fixture.supervisor.recover_uncertain_worker_operations(&worker).await.unwrap();
+        assert!(!journal.exists());
+        let rows: Vec<Value> = std::fs::read_to_string(&side).unwrap().lines().map(|line| serde_json::from_str(line).unwrap()).collect();
+        assert_eq!(rows.len(), 64);
+        assert_eq!(rows.iter().filter(|record| record["pid"] == test_pid).count(), 1);
+        assert!(rows.iter().any(|record| record["pid"] == 900_000_000i64));
+        assert!(is_stopping_process_alive(&ProcessIdentity { pid: test_pid, process_start_id: None }));
+        assert!(!std::fs::read_dir(&fixture.supervisor.descriptor_dir).unwrap().filter_map(Result::ok).any(|entry| entry.file_name().to_string_lossy().ends_with(".tmp")));
     }
 }
 

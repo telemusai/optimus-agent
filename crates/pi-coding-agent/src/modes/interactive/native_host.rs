@@ -72,6 +72,9 @@ mod native_settings;
 mod native_state;
 #[path = "native_host_commands.rs"]
 mod native_commands;
+// Child-session mode inheritance (integration hunk C-4) uses the /jev mode
+// bridge from core paths that cannot see the private `native_commands` module.
+pub(crate) use native_commands::jev_menu::JevModeBridge;
 #[path = "native_host_extensions.rs"]
 mod native_extensions;
 #[path = "native_host_extension_bridge.rs"]
@@ -3681,7 +3684,7 @@ async fn run_builtin_command(
             let _ = send.send(HostEvent::MenuTiming(started));
             Ok(CommandOutput::Nothing)
         }
-        "btw" | "side" | "fork" | "logout" | "scoped-models" | "share" | "traces" | "monitor" | "tree" | "update" | "debug" | "mcp" => native_commands::run(connection, send, if name == "side" { "btw" } else { name }, args).await,
+        "btw" | "side" | "fork" | "logout" | "scoped-models" | "share" | "traces" | "monitor" | "tree" | "update" | "debug" | "mcp" | "jev" => native_commands::run(connection, send, if name == "side" { "btw" } else { name }, args).await,
         "settings" => {
             let started = Instant::now();
             let _ = send.send(HostEvent::Settings(connection.get_state().await?));

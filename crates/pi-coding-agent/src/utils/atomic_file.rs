@@ -177,7 +177,13 @@ fn parent_dir(path: &str) -> String {
 }
 
 /// Durable-write owner: temp file beside the destination, then an atomic rename.
-pub fn write_file_atomic_sync(path: &str, data: &str, mut options: WriteFileAtomicOptions) -> std::io::Result<()> {
+pub fn write_file_atomic_sync(path: &str, data: &str, options: WriteFileAtomicOptions) -> std::io::Result<()> {
+    write_bytes_atomic_sync(path, data.as_bytes(), options)
+}
+
+/// Byte-capable twin of `write_file_atomic_sync` for payloads that are not valid
+/// UTF-8 (corrupt-state recovery copies must preserve the original bytes exactly).
+pub fn write_bytes_atomic_sync(path: &str, data: &[u8], mut options: WriteFileAtomicOptions) -> std::io::Result<()> {
     let temp_path = temp_path_for(path);
     let platform = process_platform().to_string();
 
@@ -192,7 +198,7 @@ pub fn write_file_atomic_sync(path: &str, data: &str, mut options: WriteFileAtom
         let mut descriptor = open_options.open(&temp_path)?;
 
         // writeSync may return a short count without throwing; a partial temp must never be renamed in.
-        let bytes = data.as_bytes();
+        let bytes = data;
         let mut offset = 0usize;
         while offset < bytes.len() {
             let written = descriptor.write(&bytes[offset..])?;

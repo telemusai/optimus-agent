@@ -115,13 +115,17 @@ impl AgentHandle for Arc<Agent> {
     fn prompt(&self, messages: Vec<AgentMessage>) -> BoxFuture<Result<(), String>> {
         let agent = self.clone();
         Box::pin(async move {
+            claim_error_metric_settlement(&agent);
             Agent::prompt(&agent, PromptInput::Messages(messages)).await.map_err(|error| error.to_string())
         })
     }
 
     fn continue_(&self) -> BoxFuture<Result<(), AgentContinueError>> {
         let agent = self.clone();
-        Box::pin(async move { Agent::continue_(&agent).await })
+        Box::pin(async move {
+            claim_error_metric_settlement(&agent);
+            Agent::continue_(&agent).await
+        })
     }
 
     fn is_streaming(&self) -> bool {
@@ -201,6 +205,19 @@ impl AgentHandle for Arc<Agent> {
 
     fn signal(&self) -> Option<CancellationToken> {
         Agent::signal(self)
+    }
+}
+
+fn claim_error_metric_settlement(agent: &Arc<Agent>) {
+    if let Some(metrics) = agent
+        .performance_metrics
+        .lock()
+        .unwrap_or_else(|error| error.into_inner())
+        .as_mut()
+    {
+        // The session decides whether an error is retried after message_end.
+        // Claim that decision before the first attempt, not after it failed.
+        metrics.host_owns_logical_request_terminal = true;
     }
 }
 

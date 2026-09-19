@@ -377,6 +377,15 @@ impl AgentConnection for InProcessAgentConnection {
         Box::pin(async move { Ok(state) })
     }
 
+    fn get_jev_status(&self) -> BoxFuture<Result<Option<Value>, String>> {
+        // The header supplies canonical identity without cloning transcript or
+        // provider state. A missing observation remains unknown, never zero.
+        let pipeline = self.runtime_host.session_header().and_then(|header| {
+            crate::core::jev_bridge::session_status_snapshot(&header.id)
+        });
+        Box::pin(async move { Ok(Some(serde_json::json!({ "pipeline": pipeline }))) })
+    }
+
     fn get_initial_snapshot(&self) -> BoxFuture<Result<AgentConnectionSnapshot, String>> {
         let snapshot = create_agent_connection_snapshot(&self.runtime_host.snapshot_source(), None);
         Box::pin(async move { Ok(snapshot) })

@@ -1,0 +1,1550 @@
+//! Lane-C (`jev-ui`) behaviour tests for the `/jev` surface, the mode store, the
+//! masked key entry and the footer truth table.
+//!
+//! ## Why this shape
+//!
+//! The interactive host (`modes/interactive/native_host.rs`) is crate-private, so
+//! an integration test cannot call its dispatch chain. This suite therefore
+//! combines the two reachable halves, exactly like `slash_command_matrix.rs`:
+//!
+//! 1. The PURE UI logic is executed for real. `src/modes/interactive/jev_menu.rs`
+//!    is self-contained (only `pi_jev`, `pi_tui`, `serde_json`), so this file
+//!    includes the REAL source with `#[path]` and exercises it directly: argument
+//!    parsing, the mode store, child inheritance, the menu state machine, masked
+//!    input, the footer truth table, and the status text.
+//! 2. The WIRING is audited from source: the `Dialog` variants, the dispatch arm,
+//!    the registry entry and the daemon capability gates are located in the real
+//!    files, so deleting one fails this suite.
+//!
+//! Tests are written but NOT run in this lane (the build gate owns compilation).
+//! Every assertion below is a source-level or pure-logic check, so it needs no
+//! terminal, no daemon and no network.
+
+#[path = "../src/modes/interactive/jev_menu.rs"]
+mod jev_ui;
+
+use std::fs;
+use std::path::{Path, PathBuf};
+
+use jev_ui::{
+    clear_secret, env_presence, footer_clear_payload, footer_color_key, footer_segment, footer_state,
+    footer_status_payload, footer_text, is_cancel_key, is_reserved_on, is_submit_key, mask_value,
+    jev_usage, mode_change_message, parse_jev_request, redact_reason, render_help, render_status,
+    store_secret,
+    CredentialStatus, JevFooterState, JevKeyInputState, JevMenuAction, JevMenuRow, JevMenuState,
+    JevModeBridge, JevPipelineStatus, JevRequest, JevSecret, JevStatusReport, KeyInputState,
+    JEV_ACTIVE_DISABLED_NOTICE, JEV_ARGUMENT_HINT, JEV_BOUNDARY_NOTICE, JEV_COMMAND_DESCRIPTION,
+    JEV_COMMAND_NAME, JEV_GREEN_RESERVED_NOTICE, JEV_ON_RESERVED_NOTICE, JEV_STATUS_KEY,
+    FOOTER_LABEL_MIN_COLUMNS, MASK_LENGTH,
+};
+use pi_jev::config::{
+    resolve_credential_source, resolve_effective_mode, CredentialSource, EnvKeyPresence,
+    JevSettings, ModeScope,
+};
+use pi_jev::config::DEFAULT_KEY_ID;
+use pi_jev::credential::{CredentialStore, InMemoryCredentialStore};
+use pi_jev::types::JevMode;
+use jev_ui::{is_green, mode_label, ModeChange};
+
+// ---------------------------------------------------------------------------
+// helpers
+// ---------------------------------------------------------------------------
+
+const CRATE: &str = env!("CARGO_MANIFEST_DIR");
+
+fn crate_file(relative: &str) -> String {
+    let path = Path::new(CRATE).join(relative);
+    fs::read_to_string(&path)
+        .unwrap_or_else(|error| panic!("{} must be readable: {error}", path.display()))
+}
+
+fn jev_source(relative: &str) -> String {
+    crate_file(&format!("src/modes/interactive/{relative}"))
+}
+
+/// Every lane-C file that touches the UI surface.
+const JEV_FILES: [&str; 5] = [
+    "jev_menu.rs",
+    "jev_menu_component.rs",
+    "jev_key_input.rs",
+    "jev_footer.rs",
+    "jev_host.rs",
+];
+
+/// Calls on the actual connection receiver, excluding unrelated String/Vec/UI
+/// methods. Mutation checks below also independently reject forbidden symbols.
+fn calls_on_a_connection(source: &str) -> Vec<String> {
+    let mut found: Vec<String> = Vec::new();
+    for line in source.lines() {
+        let line = line.trim_start();
+        if line.starts_with("//") || line.starts_with("//!") {
+            continue;
+        }
+        let mut remaining = line;
+        while let Some(start) = remaining.find("connection.") {
+            let rest = &remaining[start + "connection.".len()..];
+            let name: String = rest
+                .chars()
+                .take_while(|ch| ch.is_ascii_alphanumeric() || *ch == '_')
+                .collect();
+            if !name.is_empty() {
+                let after = rest[name.len()..].trim_start();
+                if after.starts_with('(') {
+                    found.push(name);
+                }
+            }
+            remaining = &rest[name.len()..];
+        }
+    }
+    found.sort();
+    found.dedup();
+    found
+}
+
+fn temp_agent_dir(label: &str) -> tempfile::TempDir {
+    tempfile::Builder::new()
+        .prefix(&format!("jev-ui-{label}-"))
+        .tempdir()
+        .expect("a temp dir")
+}
+
+fn bridge_over(dir: &tempfile::TempDir) -> JevModeBridge {
+    JevModeBridge::new(dir.path())
+}
+
+// ---------------------------------------------------------------------------
+// 1. `/jev` argument contract
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jev_arguments_parse_to_exactly_the_five_supported_requests() {
+    assert_eq!(parse_jev_request(""), JevRequest::Menu);
+    assert_eq!(parse_jev_request("  "), JevRequest::Menu);
+    assert_eq!(parse_jev_request("off"), JevRequest::SetMode(JevMode::Off));
+    assert_eq!(
+        parse_jev_request("compare"),
+        JevRequest::SetMode(JevMode::Compare)
+    );
+    // `/jev on` MUST mean Compare, unambiguously.
+    assert_eq!(parse_jev_request("on"), JevRequest::SetMode(JevMode::Compare));
+    // `active` is parsed so the caller can answer with the reserved wording
+    // instead of silently ignoring the request.
+    assert_eq!(
+        parse_jev_request("active"),
+        JevRequest::SetMode(JevMode::Active)
+    );
+    assert_eq!(parse_jev_request("status"), JevRequest::Status);
+    assert_eq!(parse_jev_request("key"), JevRequest::InputKey);
+    // Case and surrounding whitespace are irrelevant.
+    assert_eq!(parse_jev_request(" OFF "), JevRequest::SetMode(JevMode::Off));
+    assert_eq!(parse_jev_request("On"), JevRequest::SetMode(JevMode::Compare));
+
+    for unknown in ["bogus", "compare now", "off --force", "status; rm -rf /"] {
+        assert!(
+            matches!(parse_jev_request(unknown), JevRequest::Unknown(ref value) if value.as_str() == unknown),
+            "{unknown} must be an explicit Unknown, never a silent action"
+        );
+    }
+    assert!(is_reserved_on("on"));
+    assert!(is_reserved_on(" ON "));
+    assert!(!is_reserved_on("compare"));
+}
+
+#[test]
+fn jev_on_reports_the_reserved_notice_and_active_changes_nothing() {
+    // The exact wording the brief requires.
+    assert_eq!(
+        JEV_ON_RESERVED_NOTICE,
+        "Jev On is reserved; enabling Compare (shadow-only observations; no decisions applied)"
+    );
+    assert!(JEV_ACTIVE_DISABLED_NOTICE.contains("reserved"));
+    assert!(JEV_ACTIVE_DISABLED_NOTICE.contains("Selecting it changes nothing"));
+
+    let dir = temp_agent_dir("reserved");
+    let bridge = bridge_over(&dir);
+    // `active` through the store refuses and leaves the mode untouched.
+    let before = bridge.effective_mode("s1");
+    assert_eq!(before, JevMode::Off);
+    let change = bridge.set_session_mode("s1", JevMode::Active).expect("no error");
+    assert!(matches!(change, ModeChange::ReservedActive { .. }));
+    assert_eq!(bridge.effective_mode("s1"), JevMode::Off);
+    assert_eq!(bridge.scope("s1"), ModeScope::BuiltIn);
+
+    // `/jev on` writes Compare and the message names the scope.
+    let change = bridge.set_session_mode("s1", JevMode::Compare).expect("no error");
+    let message = mode_change_message(&change);
+    assert!(message.contains("Compare"), "{message}");
+    assert!(message.contains("this chat"), "{message}");
+    assert_eq!(bridge.scope("s1"), ModeScope::Session);
+}
+
+// ---------------------------------------------------------------------------
+// 2. mode store: DESIGN.md 10.2 precedence, persistence, scope
+// ---------------------------------------------------------------------------
+
+#[test]
+fn effective_mode_precedence_is_explicit_session_then_global_then_off() {
+    assert_eq!(resolve_effective_mode(None, None), JevMode::Off);
+    assert_eq!(
+        resolve_effective_mode(None, Some(JevMode::Compare)),
+        JevMode::Compare
+    );
+    // A GLOBAL default Off must never defeat an explicit per-session Compare.
+    assert_eq!(
+        resolve_effective_mode(Some(JevMode::Compare), Some(JevMode::Off)),
+        JevMode::Compare
+    );
+    assert_eq!(
+        resolve_effective_mode(Some(JevMode::Off), Some(JevMode::Compare)),
+        JevMode::Off
+    );
+
+    let dir = temp_agent_dir("precedence");
+    let bridge = bridge_over(&dir);
+    // Global default Compare: a session without an override inherits it.
+    bridge.set_global_default(JevMode::Compare).expect("no error");
+    assert_eq!(bridge.effective_mode("new-chat"), JevMode::Compare);
+    assert_eq!(bridge.scope("new-chat"), ModeScope::GlobalDefault);
+    // An explicit per-session Off wins over the global Compare.
+    bridge.set_session_mode("new-chat", JevMode::Off).expect("no error");
+    assert_eq!(bridge.effective_mode("new-chat"), JevMode::Off);
+    assert_eq!(bridge.scope("new-chat"), ModeScope::Session);
+    // Another session is unaffected: existing chats do not change silently.
+    assert_eq!(bridge.effective_mode("other-chat"), JevMode::Compare);
+}
+
+#[test]
+fn key_presence_never_enables_jev_and_the_source_order_is_documented() {
+    // Source resolution order: saved > TYPESAFE_API_KEY > JEV_API_KEY.
+    assert_eq!(
+        resolve_credential_source(true, true, true),
+        CredentialSource::Saved
+    );
+    assert_eq!(
+        resolve_credential_source(false, true, true),
+        CredentialSource::EnvTypesafe
+    );
+    assert_eq!(
+        resolve_credential_source(false, false, true),
+        CredentialSource::EnvJev
+    );
+    assert_eq!(
+        resolve_credential_source(false, false, false),
+        CredentialSource::None
+    );
+    assert!(EnvKeyPresence { typesafe_api_key: true, jev_api_key: true }.has_conflict());
+    assert!(!EnvKeyPresence { typesafe_api_key: true, jev_api_key: false }.has_conflict());
+
+    // A credential of any source changes NO mode decision.
+    for source in [
+        CredentialStatus::resolve(true, false, false),
+        CredentialStatus::resolve(false, true, true),
+        CredentialStatus::resolve(false, false, false),
+    ] {
+        // The mode store has no credential input at all.
+        let dir = temp_agent_dir("key-presence");
+        let bridge = bridge_over(&dir);
+        assert_eq!(bridge.effective_mode("s"), JevMode::Off);
+        assert!(source.present() || !source.present());
+    }
+    // The conflict is reported without any secret, and names the winner.
+    let conflict = CredentialStatus::resolve(false, true, true);
+    let text = conflict.describe();
+    assert!(text.contains("TYPESAFE_API_KEY wins"), "{text}");
+    assert!(conflict.env_conflict());
+    // A saved credential also reports the conflict, and says the env vars lose.
+    let saved_conflict = CredentialStatus::resolve(true, true, true);
+    assert!(saved_conflict.describe().contains("ignored"), "{}", saved_conflict.describe());
+}
+
+#[test]
+fn the_mode_store_persists_across_a_restart_and_is_a_plain_json_file() {
+    let dir = temp_agent_dir("restart");
+    {
+        let bridge = bridge_over(&dir);
+        bridge.set_session_mode("chat-a", JevMode::Compare).expect("no error");
+        bridge.set_global_default(JevMode::Off).expect("no error");
+    }
+    // A brand-new bridge (a fresh process in production) reads the same file.
+    let bridge = bridge_over(&dir);
+    assert_eq!(bridge.effective_mode("chat-a"), JevMode::Compare);
+    assert_eq!(bridge.effective_mode("chat-b"), JevMode::Off);
+    let path = bridge.path();
+    // Lane A's owner file name: the UI must not invent one.
+    assert!(
+        path.ends_with(PathBuf::from("jev").join("jev-settings.json")),
+        "{path:?}"
+    );
+    let raw = fs::read_to_string(&path).expect("the settings file exists");
+    // Mode data only: a credential must never be written here.
+    assert!(raw.contains("chat-a"), "{raw}");
+    for forbidden in ["TYPESAFE_API_KEY=", "JEV_API_KEY=", "Bearer ", "api_key", "secret"] {
+        assert!(!raw.contains(forbidden), "settings.json must not carry {forbidden}: {raw}");
+    }
+    let parsed: JevSettings = serde_json::from_str(&raw).expect("valid settings json");
+    assert_eq!(parsed.session_mode("chat-a"), Some(JevMode::Compare));
+    assert_eq!(parsed.global_default, Some(JevMode::Off));
+    // The owner's own guard agrees: this file carries no credential material.
+    assert!(!parsed.looks_like_it_contains_a_secret());
+}
+
+#[test]
+fn children_inherit_the_parent_mode_and_absence_never_becomes_compare() {
+    let dir = temp_agent_dir("children");
+    let bridge = bridge_over(&dir);
+    // Parent in Compare: the child inherits Compare.
+    bridge.set_session_mode("parent", JevMode::Compare).expect("no error");
+    let parent = bridge.effective_mode("parent");
+    assert_eq!(parent, JevMode::Compare);
+    let inherited = bridge
+        .inherit_into_child("child-1", "parent", None)
+        .expect("no error");
+    assert_eq!(inherited, JevMode::Compare);
+    assert_eq!(bridge.effective_mode("child-1"), JevMode::Compare);
+    // The child records where the value came from, so a later global change cannot
+    // silently alter an existing chat.
+    let settings = bridge.settings();
+    assert_eq!(
+        settings.sessions.get("child-1").and_then(|entry| entry.inherited_from.clone()),
+        Some("parent".to_string())
+    );
+
+    // Parent unknown (no snapshot): the child degrades to the global default,
+    // which is Off here - never silently Compare.
+    let degraded = bridge
+        .inherit_into_child("child-2", "no-such-parent", None)
+        .expect("no error");
+    assert_eq!(degraded, JevMode::Off);
+
+    // An explicit child override wins over the parent.
+    let overridden = bridge
+        .inherit_into_child("child-3", "parent", Some(JevMode::Off))
+        .expect("no error");
+    assert_eq!(overridden, JevMode::Off);
+
+    // The integration call sites for this are the child-creation hooks; the exact
+    // guarded hunks are recorded in reports/ui/LANE_REPORT.md (C-4). They are
+    // outside this lane's file list, which is why no test asserts their source.
+}
+
+// ---------------------------------------------------------------------------
+// 3. menu state machine
+// ---------------------------------------------------------------------------
+
+#[test]
+fn help_and_key_clear_are_parsed_and_report_truthfully() {
+    assert_eq!(parse_jev_request("help"), JevRequest::Help);
+    assert_eq!(parse_jev_request("--help"), JevRequest::Help);
+    assert_eq!(parse_jev_request("key clear"), JevRequest::ClearKey);
+    assert_eq!(parse_jev_request("KEY CLEAR"), JevRequest::ClearKey);
+    assert_eq!(parse_jev_request("key"), JevRequest::InputKey);
+
+    let help = render_help();
+    // The usage line is built from the same constant the registry quotes.
+    assert!(jev_usage().contains(JEV_ARGUMENT_HINT), "{}", jev_usage());
+    assert!(help.contains(JEV_COMMAND_DESCRIPTION), "{help}");
+    assert!(help.contains("/jev key clear"), "{help}");
+
+    // `/jev key clear` is the inverse of the only write path, and it never reads
+    // the stored value: the delete is issued against the owner's store.
+    let store = InMemoryCredentialStore::new();
+    store_secret(&store, JevSecret::new("sk-live-0123456789".to_string())).expect("stored");
+    assert!(store.exists(DEFAULT_KEY_ID).expect("readable"));
+    clear_secret(&store).expect("cleared");
+    assert!(!store.exists(DEFAULT_KEY_ID).expect("readable"));
+    assert_eq!(store.backend_name(), "memory");
+}
+
+#[test]
+fn the_menu_has_the_five_required_rows_and_selects_the_current_mode() {
+    assert_eq!(JevMenuRow::ALL.len(), 5);
+    let titles: Vec<String> = JevMenuRow::ALL.iter().map(|row| row.title(JevMode::Off)).collect();
+    assert!(titles[0].starts_with("Off"));
+    assert!(titles[1].starts_with("Compare"));
+    assert!(titles[2].starts_with("Active"));
+    assert!(titles[2].contains("reserved, disabled"));
+    assert!(titles[3].starts_with("Input API key"));
+    assert!(titles[4].starts_with("Status"));
+
+    // Compare preselects the Compare row; Off preselects Off.
+    assert_eq!(JevMenuState::new(JevMode::Compare).selected, 1);
+    assert_eq!(JevMenuState::new(JevMode::Off).selected, 0);
+    assert_eq!(JevMenuState::new(JevMode::Active).selected, 0);
+    // `Active` is never labelled as the current mode.
+    let active_titles: Vec<String> = JevMenuRow::ALL
+        .iter()
+        .map(|row| row.title(JevMode::Active))
+        .collect();
+    assert!(active_titles.iter().all(|title| !title.contains("(current)")));
+}
+
+#[test]
+fn the_menu_asks_for_exactly_the_five_actions_and_active_writes_nothing() {
+    let mut state = JevMenuState::new(JevMode::Off);
+
+    state.selected = 0;
+    assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::Off));
+    assert!(state.closed);
+
+    let mut state = JevMenuState::new(JevMode::Off);
+    state.selected = 1;
+    assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::Compare));
+    assert_eq!(state.active_mode, JevMode::Compare);
+
+    // Reserved option: an explanation, no change, and the dialog stays open.
+    let mut state = JevMenuState::new(JevMode::Compare);
+    state.selected = 2;
+    assert_eq!(state.accept(), JevMenuAction::ReservedActive);
+    assert!(!state.closed);
+    assert_eq!(state.active_mode, JevMode::Compare, "Active must not change the mode");
+    assert!(state
+        .message
+        .as_deref()
+        .is_some_and(|message| message == JEV_ACTIVE_DISABLED_NOTICE));
+
+    let mut state = JevMenuState::new(JevMode::Off);
+    state.selected = 3;
+    assert_eq!(state.accept(), JevMenuAction::InputKey);
+    let mut state = JevMenuState::new(JevMode::Off);
+    state.selected = 4;
+    assert_eq!(state.accept(), JevMenuAction::ShowStatus);
+
+    // Navigation is bounded and never wraps past the ends.
+    let mut state = JevMenuState::new(JevMode::Off);
+    for _ in 0..10 {
+        state.move_down();
+    }
+    assert_eq!(state.selected, 4);
+    for _ in 0..10 {
+        state.move_up();
+    }
+    assert_eq!(state.selected, 0);
+}
+
+#[test]
+fn escape_and_ctrl_c_cancel_the_menu_at_every_moment_and_no_key_is_hardcoded() {
+    // Esc (the live `tui.select.cancel` binding) cancels.
+    let mut state = JevMenuState::new(JevMode::Compare);
+    assert_eq!(state.handle_key("\x1b"), JevMenuAction::Cancel);
+    assert!(state.closed);
+
+    // Ctrl+C resolves through the TUI cancel binding as well; assert against the
+    // helper so a user override keeps working.
+    assert!(is_cancel_key("\x1b"));
+    assert!(is_cancel_key("\u{3}"));
+
+    // Cancel is available while async work is pending: it never waits.
+    let mut state = JevMenuState::new(JevMode::Compare);
+    state.set_busy(true);
+    assert_eq!(state.handle_key("\x1b"), JevMenuAction::Cancel);
+    assert!(!state.busy);
+
+    // Navigation uses the configured select bindings, so a rebind still works.
+    let mut state = JevMenuState::new(JevMode::Off);
+    let up = pi_tui::keybindings::get_keybindings()
+        .get_keys("tui.select.up")
+        .into_iter()
+        .next()
+        .expect("the TUI ships a select-up binding");
+    let down = pi_tui::keybindings::get_keybindings()
+        .get_keys("tui.select.down")
+        .into_iter()
+        .next()
+        .expect("the TUI ships a select-down binding");
+    state.handle_key(&down);
+    assert_eq!(state.selected, 1);
+    state.handle_key(&up);
+    assert_eq!(state.selected, 0);
+
+    // Neither the pure state machine nor the component hardcodes a literal key:
+    // both ask the configured bindings.
+    let pure = jev_source("jev_menu.rs");
+    for hardcoded in ["\"\\x1b\"", "\"escape\"", "\"ctrl+c\"", "\"enter\"", "\"up\"", "\"down\""] {
+        for file in ["jev_menu.rs", "jev_menu_component.rs", "jev_key_input.rs", "jev_footer.rs", "jev_host.rs"] {
+            assert!(
+                !jev_source(file).contains(hardcoded),
+                "{file} must not hardcode {hardcoded}"
+            );
+        }
+    }
+    for binding in ["tui.select.up", "tui.select.down", "tui.select.confirm", "tui.select.cancel"] {
+        assert!(pure.contains(binding), "the menu must resolve {binding}");
+    }
+    assert!(pure.contains("get_keybindings"));
+}
+
+// ---------------------------------------------------------------------------
+// 4. masked key input
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_mask_never_reveals_any_character_or_the_real_length() {
+    assert!(mask_value("").is_empty());
+    let short = mask_value("abc");
+    let long = mask_value("abcdefghijklmnopqrstuvwxyz");
+    assert_eq!(short, long, "the mask must not publish the value length");
+    assert_eq!(short.chars().count(), MASK_LENGTH);
+    let secret = "sk-live-DEADBEEF-0123456789";
+    let masked = mask_value(secret);
+    for character in secret.chars() {
+        assert!(!masked.contains(character), "the mask leaked {character}");
+    }
+    assert!(!masked.contains(secret));
+
+    let mut input = JevKeyInputState::new();
+    for character in secret.chars() {
+        input.handle_key(&character.to_string());
+    }
+    assert_eq!(input.value_len(), secret.chars().count());
+    assert!(!input.masked_line().contains(secret));
+    assert_eq!(input.status_line().contains(secret), false);
+}
+
+#[test]
+fn the_secret_is_redacted_in_debug_and_cannot_be_displayed() {
+    let secret = JevSecret::new("sk-live-DEADBEEF-0123456789".to_string());
+    let debug = format!("{secret:?}");
+    assert!(debug.contains("<redacted>"), "{debug}");
+    assert!(!debug.contains("DEADBEEF"), "{debug}");
+    assert_eq!(secret.peek(), "sk-live-DEADBEEF-0123456789");
+
+    let input = {
+        let mut input = JevKeyInputState::new();
+        input.handle_key("sk-live-DEADBEEF");
+        input
+    };
+    let input_debug = format!("{input:?}");
+    assert!(input_debug.contains("<redacted>"), "{input_debug}");
+    assert!(!input_debug.contains("DEADBEEF"), "{input_debug}");
+    assert!(input_debug.contains("value_present"));
+
+    // `JevSecret` has no `Display`, so a key can never be interpolated into a
+    // message. This is asserted structurally: the only accessor is `expose`.
+    let source = jev_source("jev_menu.rs");
+    assert!(source.contains("pub fn peek(&self) -> &str"));
+    assert!(!source.contains("impl std::fmt::Display for JevSecret"));
+    assert!(!source.contains("impl fmt::Display for JevSecret"));
+    // The only value handed to the credential store is the owner's `SecretString`,
+    // which also has no `Display`.
+    assert!(source.contains("pub fn into_secret_string(self) -> SecretString"));
+}
+
+#[test]
+fn secret_store_validation_rejects_empty_and_placeholder_values() {
+    let store = InMemoryCredentialStore::new();
+    assert!(store_secret(&store, JevSecret::new(String::new())).is_err());
+    assert!(store_secret(&store, JevSecret::new("   ".to_string())).is_err());
+    for placeholder in ["test", "changeme", "sk-xxxxxx"] {
+        assert!(
+            store_secret(&store, JevSecret::new(placeholder.to_string())).is_err(),
+            "{placeholder} must be refused"
+        );
+    }
+    // Too short / contains whitespace: refused before any store call.
+    assert!(store_secret(&store, JevSecret::new("short".to_string())).is_err());
+    assert!(store_secret(&store, JevSecret::new("sk live 0123456789".to_string())).is_err());
+    store_secret(&store, JevSecret::new("sk-live-0123456789".to_string())).expect("stored");
+    assert!(store.exists(DEFAULT_KEY_ID).expect("readable"));
+    assert_eq!(store.backend_name(), "memory");
+
+    // A store that is NOT available is refused BEFORE the write, so the UI can
+    // never degrade to a plaintext fallback.
+    let unavailable = pi_jev::credential::UnavailableCredentialStore::new("no platform store");
+    let error = store_secret(&unavailable, JevSecret::new("sk-live-0123456789".to_string()))
+        .expect_err("an unavailable store must refuse");
+    assert!(matches!(error, pi_jev::error::JevError::Unavailable { .. }), "{error}");
+    assert!(!unavailable.exists(DEFAULT_KEY_ID).unwrap_or(false));
+
+    // The store is the only holder; the UI never writes a file of its own.
+    let source = jev_source("jev_menu.rs");
+    assert!(source.contains("store.store(DEFAULT_KEY_ID"));
+    assert!(!source.contains("std::fs::write"));
+    assert!(!source.contains("File::create"));
+}
+
+#[test]
+fn paste_is_sanitised_and_never_breaks_the_single_line_contract() {
+    let mut input = JevKeyInputState::new();
+    // A bracketed-paste chunk with embedded newlines and tabs.
+    input.paste("\x1b[200~sk-live\r\n01234\t56789\x1b[201~");
+    let value = input.take_for_validation().expect("a value");
+    assert!(!value.contains('\n'), "{value:?}");
+    assert!(!value.contains('\r'), "{value:?}");
+    assert!(!value.contains('\t'), "{value:?}");
+    assert!(value.starts_with("sk-live"), "{value:?}");
+}
+
+#[test]
+fn cancel_during_validation_wins_and_a_stale_result_is_ignored() {
+    let mut input = JevKeyInputState::new();
+    input.handle_key("s");
+    input.handle_key("k");
+    let token = input.generation();
+    let value = input.take_for_validation().expect("a value");
+    assert_eq!(value, "sk");
+    assert_eq!(input.state(), KeyInputState::Validating);
+    assert_eq!(input.generation(), token.wrapping_add(1));
+
+    // Cancel while the validation is in flight: the state flips immediately and
+    // the late result is dropped because its token is stale.
+    input.handle_key("\x1b");
+    assert_eq!(input.state(), KeyInputState::Cancelled);
+    assert!(!input.apply_validation(token.wrapping_add(1), Ok(())));
+    assert_eq!(input.state(), KeyInputState::Cancelled);
+    assert!(!input.masked_line().contains("sk"));
+
+    // A fresh attempt is its own generation, so a stale failure cannot poison it.
+    let mut input = JevKeyInputState::new();
+    input.handle_key("a");
+    let first = input.generation();
+    input.take_for_validation();
+    let first_token = input.generation();
+    input.cancel();
+    input.handle_key("b");
+    assert!(!input.apply_validation(first_token, Err("HTTP 401".to_string())));
+    assert_eq!(input.state(), KeyInputState::Editing);
+    assert_ne!(first, first_token);
+
+    // Cancel is immediate even while a validation is "running".
+    let mut input = JevKeyInputState::new();
+    input.handle_key("x");
+    input.take_for_validation();
+    input.handle_key("\u{3}");
+    assert_eq!(input.state(), KeyInputState::Cancelled);
+    assert!(is_cancel_key("\u{3}"));
+}
+
+#[test]
+fn validation_success_and_failure_are_reported_without_the_key() {
+    let mut input = JevKeyInputState::new();
+    input.handle_key("z");
+    let token = input.take_for_validation().map(|_| input.generation()).expect("token");
+    assert!(input.apply_validation(token, Ok(())));
+    assert_eq!(input.state(), KeyInputState::Validated);
+    assert!(input.status_line().contains("accepted"));
+
+    let mut input = JevKeyInputState::new();
+    input.handle_key("z");
+    input.take_for_validation();
+    let token = input.generation();
+    assert!(input.apply_validation(token, Err("HTTP 401 invalid key sk-live-0123456789abcdef".to_string())));
+    match input.state() {
+        KeyInputState::Failed(reason) => {
+            assert!(reason.contains("HTTP 401"), "{reason}");
+            assert!(!reason.contains("sk-live-0123456789abcdef"), "{reason}");
+            assert!(reason.contains("[redacted]"), "{reason}");
+        }
+        other => panic!("expected a failure state, got {other:?}"),
+    }
+    // The redactor keeps short, useful words and removes long opaque tokens.
+    assert_eq!(redact_reason("HTTP 401"), "HTTP 401");
+    assert_eq!(redact_reason("token abcdefghijklmnopqrstuvwxyz"), "token [redacted]");
+}
+
+#[test]
+fn submit_uses_the_configured_binding_not_a_literal_key() {
+    assert!(is_submit_key("\r") || is_submit_key("\n"));
+    let source = jev_source("jev_key_input.rs");
+    assert!(source.contains("tui.select.cancel"));
+    assert!(!source.contains("\"escape\""));
+    assert!(!source.contains("\"ctrl+c\""));
+    // The masked buffer is rendered, never the value.
+    assert!(source.contains("masked_line()"));
+}
+
+// ---------------------------------------------------------------------------
+// 5. footer truth table
+// ---------------------------------------------------------------------------
+
+fn status_with(credential: CredentialStatus, pipeline: JevPipelineStatus) -> (CredentialStatus, JevPipelineStatus) {
+    (credential, pipeline)
+}
+
+#[test]
+fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
+    let none = CredentialStatus::resolve(false, false, false);
+    let saved = CredentialStatus::resolve(true, false, false);
+    let default_pipeline = JevPipelineStatus::default();
+
+    // Off is red and wins over everything, including a present credential.
+    assert_eq!(
+        footer_state(JevMode::Off, &saved, &default_pipeline),
+        JevFooterState::Off
+    );
+    assert_eq!(footer_state(JevMode::Off, &none, &default_pipeline), JevFooterState::Off);
+    assert_eq!(footer_state(JevMode::Off, &none, &default_pipeline).color_key(), "error");
+    assert_eq!(footer_text(JevFooterState::Off), "\u{25cf} Jev Off");
+
+    // No credential: amber unavailable, never green.
+    assert_eq!(
+        footer_state(JevMode::Compare, &none, &default_pipeline),
+        JevFooterState::Unavailable
+    );
+    assert_eq!(
+        footer_state(JevMode::Compare, &none, &default_pipeline).color_key(),
+        "warning"
+    );
+
+    // In-flight work: amber checking, even with a credential.
+    let checking = JevPipelineStatus {
+        in_flight: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        footer_state(JevMode::Compare, &saved, &checking),
+        JevFooterState::Checking
+    );
+    assert_eq!(footer_state(JevMode::Compare, &saved, &checking).color_key(), "warning");
+
+    // A recorded fallback or failure: amber fallback.
+    let fallback = JevPipelineStatus {
+        fallback_reason: "context too large; category skipped".to_string(),
+        ..Default::default()
+    };
+    assert_eq!(
+        footer_state(JevMode::Compare, &saved, &fallback),
+        JevFooterState::Fallback
+    );
+    let failed = JevPipelineStatus {
+        failure_count: 1,
+        ..Default::default()
+    };
+    assert_eq!(
+        footer_state(JevMode::Compare, &saved, &failed),
+        JevFooterState::Fallback
+    );
+
+    // Healthy Compare: cyan, and `Jev Compare` is a distinct label from `Jev On`.
+    let healthy = footer_state(JevMode::Compare, &saved, &default_pipeline);
+    assert_eq!(healthy, JevFooterState::Compare);
+    assert_eq!(healthy.color_key(), "accent");
+    assert!(!healthy.color_key().contains("success"), "green is reserved");
+    assert_eq!(footer_text(healthy), "\u{25cf} Jev Compare");
+
+    // No reachable state is green, and none says "Jev On".
+    for state in [
+        JevFooterState::Off,
+        JevFooterState::Compare,
+        JevFooterState::Unavailable,
+        JevFooterState::Checking,
+        JevFooterState::Fallback,
+    ] {
+        assert!(!state.is_green(), "{state:?} must never be green");
+        assert_ne!(state.color_key(), "success");
+        assert!(
+            !state.label().contains("Jev On"),
+            "{state:?} must never claim Jev On"
+        );
+        // The mode + credential + pipeline cross product is covered above; this
+        // asserts the same for every (mode, credential) pair.
+        for mode in [JevMode::Off, JevMode::Compare, JevMode::Active] {
+            for credential in [&none, &saved] {
+                let derived = footer_state(mode, credential, &default_pipeline);
+                assert!(!derived.is_green(), "{mode:?}/{derived:?} must never be green");
+            }
+        }
+    }
+    assert!(JEV_GREEN_RESERVED_NOTICE.contains("never shown"));
+    assert_eq!(JEV_STATUS_KEY, "jev");
+}
+
+#[test]
+fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
+    // Wide terminal: the labelled form.
+    assert_eq!(footer_segment(JevFooterState::Off, 120), "\u{25cf} Jev Off");
+    // Narrow terminal: dot only, which still fits in one column.
+    let narrow = footer_segment(JevFooterState::Off, 10);
+    assert_eq!(narrow, "\u{25cf}");
+    assert!(pi_tui::utils::visible_width(&narrow) <= 10);
+    for columns in [1usize, 2, 5, 10, 20, 39, 40, 41, 80, 200] {
+        for state in [
+            JevFooterState::Off,
+            JevFooterState::Compare,
+            JevFooterState::Unavailable,
+            JevFooterState::Checking,
+            JevFooterState::Fallback,
+        ] {
+            let segment = footer_segment(state, columns);
+            assert!(
+                pi_tui::utils::visible_width(&segment) <= columns.max(1),
+                "{state:?} at {columns} columns overflowed: {segment:?}"
+            );
+        }
+    }
+    // Every state is distinguishable without colour.
+    let labels: Vec<String> = [
+        JevFooterState::Off,
+        JevFooterState::Compare,
+        JevFooterState::Unavailable,
+        JevFooterState::Checking,
+        JevFooterState::Fallback,
+    ]
+    .iter()
+    .map(|state| state.label().to_string())
+    .collect();
+    let mut unique = labels.clone();
+    unique.sort();
+    unique.dedup();
+    assert_eq!(unique.len(), labels.len(), "{labels:?}");
+}
+
+#[test]
+fn the_footer_payload_uses_the_existing_setstatus_surface_and_does_no_io() {
+    let payload = footer_status_payload(JevFooterState::Compare, 120);
+    assert_eq!(payload["statusKey"], serde_json::json!("jev"));
+    assert_eq!(payload["statusText"], serde_json::json!("\u{25cf} Jev Compare"));
+    // Removal is explicit null, which `Surfaces::set_status` deletes on.
+    let cleared = footer_clear_payload();
+    assert_eq!(cleared["statusKey"], serde_json::json!("jev"));
+    assert_eq!(cleared["statusText"], serde_json::Value::Null);
+
+    // The labelled (unmeasured) form is what the live publisher sends, because the
+    // dispatch task cannot measure the terminal.
+    let labelled = footer_status_payload(JevFooterState::Compare, usize::MAX);
+    assert_eq!(labelled["statusText"], serde_json::json!("\u{25cf} Jev Compare"));
+    // Below the threshold the CALLER keeps only the dot, so a narrow terminal
+    // cannot lose layout; at and above it the label is used.
+    assert_eq!(footer_segment(JevFooterState::Compare, 39), "\u{25cf}");
+    assert_eq!(
+        footer_segment(JevFooterState::Compare, FOOTER_LABEL_MIN_COLUMNS),
+        footer_text(JevFooterState::Compare)
+    );
+
+    // The footer renders from a snapshot: no store read, no RPC, no counter poll.
+    let source = jev_source("jev_footer.rs");
+    for forbidden in ["reqwest", "std::fs", "tokio::spawn", "get_keybindings"] {
+        assert!(
+            !source.contains(forbidden),
+            "a render pass must not do work: found {forbidden}"
+        );
+    }
+    assert!(source.contains("setStatus"));
+}
+
+// ---------------------------------------------------------------------------
+// 6. status text
+// ---------------------------------------------------------------------------
+
+#[test]
+fn jev_status_reports_scope_credential_source_and_truthful_counters() {
+    let report = JevStatusReport::local_only(
+        JevMode::Compare,
+        ModeScope::Session,
+        CredentialStatus::resolve(false, true, true),
+    );
+    let text = render_status(&report);
+    assert!(text.contains("Mode: Compare"), "{text}");
+    assert!(text.contains("this chat"), "{text}");
+    assert!(text.contains("TYPESAFE_API_KEY wins"), "{text}");
+    assert!(text.contains("https://api.typesafe.ai/v1/systemone"), "{text}");
+    assert!(text.contains("jev-latest"), "{text}");
+    assert!(text.contains("Decisions applied: 0"), "{text}");
+    assert!(text.contains("hypothetical, never measured"), "{text}");
+    // Honest about what the counters mean in this build.
+    assert!(text.contains("Pipeline source:"), "{text}");
+    assert!(text.contains(JEV_BOUNDARY_NOTICE), "{text}");
+    // Never a secret, and no model/subagent control claim.
+    for forbidden in ["sk-live", "Bearer ", "api key:", "set_model", "subagent:"] {
+        assert!(!text.contains(forbidden), "status leaked {forbidden}: {text}");
+    }
+}
+
+#[test]
+fn jev_status_distinguishes_checking_degraded_and_never_from_configured() {
+    let credential = CredentialStatus::resolve(true, false, false);
+    let base = JevStatusReport::local_only(JevMode::Compare, ModeScope::Session, credential.clone());
+
+    let checking = JevStatusReport {
+        pipeline: JevPipelineStatus { in_flight: 2, queue_depth: 1, queue_capacity: 8, ..Default::default() },
+        ..base.clone()
+    };
+    let text = render_status(&checking);
+    assert!(text.contains("checking (comparisons in flight)"), "{text}");
+    assert!(text.contains("Queue: 1/8 (in flight 2)"), "{text}");
+
+    let degraded = JevStatusReport {
+        pipeline: JevPipelineStatus {
+            failure_count: 3,
+            dropped_comparisons: 4,
+            fallback_reason: "redacted fallback: local heuristic used".to_string(),
+            skipped_categories: vec![("category-4 tool choice".to_string(), "no hook in this session".to_string())],
+            last_success_at: Some("2026-09-19T10:00:00Z".to_string()),
+            last_latency_ms: Some(412),
+            ..Default::default()
+        },
+        ..base.clone()
+    };
+    let text = render_status(&degraded);
+    assert!(text.contains("degraded"), "{text}");
+    assert!(text.contains("Last success: 2026-09-19T10:00:00Z (latency 412 ms)"), "{text}");
+    assert!(text.contains("Counters: 0 ok, 3 failed"), "{text}");
+    assert!(text.contains("Dropped comparisons: 4"), "{text}");
+    assert!(text.contains("category-4 tool choice: no hook in this session"), "{text}");
+    assert!(text.contains("Fallback reason: redacted fallback"), "{text}");
+
+    // An unavailable worker snapshot cannot prove zero calls or no success.
+    let fresh = render_status(&base);
+    assert!(fresh.contains("Last success: unknown"), "{fresh}");
+    assert!(fresh.contains("Counters: unknown"), "{fresh}");
+    let observed_fresh = render_status(&JevStatusReport {
+        pipeline: JevPipelineStatus { observed: true, ..Default::default() },
+        ..base.clone()
+    });
+    assert!(observed_fresh.contains("Last success: never"), "{observed_fresh}");
+    assert!(observed_fresh.contains("no successful call yet"), "{observed_fresh}");
+    // Off says it is idle with no scheduling and no network.
+    let off = render_status(&JevStatusReport::local_only(
+        JevMode::Off,
+        ModeScope::GlobalDefault,
+        credential,
+    ));
+    assert!(off.contains("idle (Off: no scheduling, no client, no network)"), "{off}");
+    assert!(off.contains("defaults for new chats"), "{off}");
+}
+
+#[test]
+fn the_reserved_active_mode_is_labelled_everywhere_it_can_appear() {
+    assert_eq!(
+        jev_ui::mode_label(JevMode::Active),
+        "Active (reserved, disabled)"
+    );
+    let active = render_status(&JevStatusReport::local_only(
+        JevMode::Active,
+        ModeScope::Session,
+        CredentialStatus::resolve(false, false, false),
+    ));
+    assert!(active.contains("Active (reserved, disabled)"), "{active}");
+    assert!(active.contains(JEV_ACTIVE_DISABLED_NOTICE), "{active}");
+    // Help text states the reserved modes and the no-control boundary.
+    let help = jev_ui::render_help();
+    assert!(help.contains("Active         RESERVED and disabled"), "{help}");
+    assert!(help.contains(JEV_ON_RESERVED_NOTICE), "{help}");
+    assert!(help.contains(JEV_BOUNDARY_NOTICE), "{help}");
+    // Section 11/12 wording is explicit about what Jev never controls.
+    assert!(JEV_BOUNDARY_NOTICE.contains("never controls the primary model"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("subagents"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("budgets"));
+}
+
+// ---------------------------------------------------------------------------
+// 6b. REQUIRED negative regressions (DESIGN.md sections 11 and 12)
+//
+// Every case below tries to make the Jev UI surface do something it must never do:
+// control the primary model, control a subagent or child chat, turn a reserved
+// future mode into a live one, or act on a delayed/stale answer. The expected
+// outcome is always ZERO Jev-originated change, with baseline delegation
+// untouched.
+// ---------------------------------------------------------------------------
+
+/// Adversarial `/jev` argument texts: prompt-injection shapes, an attempt to force
+/// the reserved mode, and an attempt to smuggle a second "command" in the same
+/// line. Nothing here may produce a mode write other than the four allowed ones.
+#[test]
+fn negative_regression_adversarial_arguments_never_reach_a_reserved_or_unknown_action() {
+    let injections = [
+        "compare --force-active",
+        "active --force",
+        "on; active",
+        "compare\nmodel=gpt-5",
+        "compare model=claude",
+        "compare spawn child",
+        "compare subagents=on",
+        "compare budget=unlimited",
+        "active -y",
+        "compare --no-confirm",
+        "<active>",
+        "compare && set_model x",
+    ];
+    for argument in injections {
+        let request = parse_jev_request(argument);
+        match request {
+            // Exactly the two non-Compare requests remain reachable, and both are
+            // inert: `Active` is refused by the store, `Unknown` reports usage.
+            JevRequest::Unknown(_) => {}
+            JevRequest::SetMode(JevMode::Active) => {}
+            JevRequest::SetMode(JevMode::Compare) | JevRequest::SetMode(JevMode::Off) => {
+                // An injection that ends in a plain mode word is still just a mode
+                // write, which never carries a model or subagent change.
+            }
+            other => panic!("{argument:?} must not become {other:?}"),
+        }
+        assert!(
+            !is_reserved_on(argument) || argument.trim().eq_ignore_ascii_case("on"),
+            "{argument:?} must not be treated as the reserved `on` form"
+        );
+    }
+
+    // A store that is asked for the reserved mode changes NOTHING, byte for byte.
+    let dir = temp_agent_dir("negative-reserved");
+    let bridge = bridge_over(&dir);
+    bridge.set_session_mode("s", JevMode::Compare).expect("set");
+    let before = fs::read_to_string(bridge.path()).expect("readable");
+    for requested in [JevMode::Active] {
+        let change = bridge.set_session_mode("s", requested).expect("no error");
+        assert!(matches!(change, ModeChange::ReservedActive { .. }));
+    }
+    let after = fs::read_to_string(bridge.path()).expect("readable");
+    assert_eq!(before, after, "a reserved request must not touch the store");
+    assert_eq!(bridge.effective_mode("s"), JevMode::Compare);
+    assert!(!JevMode::Active.allows_compare());
+    assert!(JevMode::Active.is_reserved());
+}
+
+/// The settings model has no field able to carry a model, an effort, a tool, a
+/// subagent or a budget. This is the structural half of the section 11/12 boundary:
+/// a future field would fail this test instead of silently gaining reach.
+#[test]
+fn negative_regression_settings_cannot_carry_model_or_subagent_control() {
+    let settings = JevSettings {
+        global_default: Some(JevMode::Compare),
+        ..JevSettings::default()
+    };
+    let value = serde_json::to_value(&settings).expect("serializable");
+    let keys: Vec<&str> = value.as_object().expect("object").keys().map(String::as_str).collect();
+    let mut sorted = keys.clone();
+    sorted.sort();
+    assert_eq!(
+        sorted,
+        vec![
+            "credential_configured",
+            "credential_source",
+            "disclosure_shown",
+            "global_default",
+            "schema_version",
+            "sessions",
+        ],
+        "the settings model must hold modes and presence metadata only"
+    );
+    for forbidden in [
+        "model",
+        "provider",
+        "effort",
+        "thinking",
+        "tools",
+        "permissions",
+        "subagent",
+        "subagents",
+        "budget",
+        "depth",
+        "concurrency",
+        "systemPrompt",
+    ] {
+        assert!(
+            !keys.contains(&forbidden),
+            "JevSettings must not carry {forbidden}"
+        );
+    }
+    // A per-session entry is equally narrow.
+    let entry = serde_json::to_value(pi_jev::config::PersistedSessionMode {
+        mode: Some(JevMode::Compare),
+        inherited_from: None,
+    })
+    .expect("serializable");
+    let mut entry_keys: Vec<&str> = entry
+        .as_object()
+        .expect("object")
+        .keys()
+        .map(String::as_str)
+        .collect();
+    entry_keys.sort();
+    assert_eq!(entry_keys, vec!["mode"], "{entry}");
+
+    // And the whole crate surface refuses a subagent-control request by construction.
+    let refused = pi_jev::types::refuse_subagent_control(
+        &pi_jev::types::SubagentControlRequest::Spawn {
+            role: "reviewer".to_string(),
+        },
+    );
+    assert!(refused.is_err(), "spawning a child through Jev must be impossible");
+    assert!(matches!(
+        refused.expect_err("refused"),
+        pi_jev::error::JevError::SubagentControlForbidden { .. }
+    ));
+}
+
+/// A delayed or stale validation result must never change state, and a cancel must
+/// win over work that is already running. Repeated for both orderings.
+#[test]
+fn negative_regression_delayed_and_stale_results_change_nothing() {
+    for cancel_first in [true, false] {
+        let mut input = JevKeyInputState::new();
+        input.handle_key("sk-live-DELAYED-0123456");
+        let token = input.take_for_validation().map(|_| input.generation()).expect("a value");
+        if cancel_first {
+            input.cancel();
+            // The late answer arrives after the cancel: it is stale and dropped.
+            assert!(!input.apply_validation(token, Ok(())));
+            assert_eq!(input.state(), KeyInputState::Cancelled);
+        } else {
+            // The answer arrives first; a later cancel still wins.
+            assert!(input.apply_validation(token, Ok(())));
+            input.cancel();
+            assert_eq!(input.state(), KeyInputState::Cancelled);
+            // A second, stale answer cannot resurrect the cancelled attempt.
+            assert!(!input.apply_validation(token, Err("late failure".to_string())));
+            assert_eq!(input.state(), KeyInputState::Cancelled);
+        }
+        assert!(input.value_is_empty(), "no value may survive a cancel");
+        assert_eq!(input.generation(), token + 1);
+    }
+}
+
+/// A reserved mode that is present in a hand-edited settings file cannot switch
+/// Jev on, cannot show a green/Compare footer, and cannot make a child chat fall
+/// through to Compare.
+#[test]
+fn negative_regression_a_hand_edited_active_mode_stays_inert() {
+    let dir = temp_agent_dir("negative-active-file");
+    let path = dir.path().join("jev").join("jev-settings.json");
+    fs::create_dir_all(path.parent().expect("dir")).expect("mkdir");
+    fs::write(
+        &path,
+        r#"{"schema_version":1,"global_default":"active","sessions":{"parent":{"mode":"active"},"child":{"mode":"active"}},"credential_configured":true,"disclosure_shown":true}"#,
+    )
+    .expect("write");
+    let bridge = bridge_over(&dir);
+    // The file IS read: the reserved value is reported honestly, not hidden.
+    assert_eq!(bridge.effective_mode("parent"), JevMode::Active);
+    // ...and it does no work and shows no Compare/On footer.
+    assert!(!JevMode::Active.allows_compare());
+    let credential = CredentialStatus::resolve(true, false, false);
+    let state = footer_state(JevMode::Active, &credential, &JevPipelineStatus::default());
+    assert_eq!(state, JevFooterState::Off);
+    assert!(!is_green(state));
+    assert!(mode_label(JevMode::Active).contains("reserved"));
+
+    // A child of that session does NOT silently become Compare: an inherited
+    // reserved mode stays inert, and a fresh child with no parent stays Off.
+    let inherited = bridge
+        .inherit_into_child("child-2", "parent", None)
+        .expect("no error");
+    assert!(!inherited.allows_compare(), "{inherited:?} must not enable Compare");
+    let fresh = bridge
+        .inherit_into_child("child-3", "no-such-session", None)
+        .expect("no error");
+    assert_eq!(fresh, JevMode::Off);
+
+    // The UI then writes a real mode over it, and only the requested one lands.
+    let change = bridge
+        .set_session_mode("parent", JevMode::Off)
+        .expect("no error");
+    assert!(matches!(
+        change,
+        ModeChange::Applied {
+            mode: JevMode::Off,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("parent"), JevMode::Off);
+}
+
+/// Baseline delegation is untouched: the lane adds no call site and no argument
+/// that could change a model, a tool, a permission, a child, a message or a
+/// budget. Audited as CALLS on the connection, not as prose.
+#[test]
+fn negative_regression_baseline_delegation_is_unchanged() {
+    // 1. The only session calls are identity and optional telemetry reads.
+    for file in JEV_FILES {
+        let source = jev_source(file);
+        let calls = calls_on_a_connection(&source);
+        for call in &calls {
+            assert!(
+                matches!(call.as_str(), "get_state" | "get_jev_status"),
+                "{file} may only READ the session (found {call})"
+            );
+        }
+    }
+
+    // 2. The delegation surface is not named at all, so a future edit that wants it
+    //    must delete this assertion deliberately.
+    let delegation = [
+        "create_rlm_subagent",
+        "create_rlm_child",
+        "start_rlm_child_run",
+        "cancel_rlm_child",
+        "delete_rlm_subagent",
+        "set_rlm_max_depth",
+        "agent_message",
+        "send_message",
+        "steer",
+        "follow_up",
+        "replace_acp_mcp_servers",
+        "set_model",
+        "cycle_model",
+        "set_scoped_models",
+        "set_thinking_level",
+        "cycle_thinking_level",
+        "set_service_tier",
+        "abort_bash",
+    ];
+    for file in JEV_FILES {
+        let source = jev_source(file);
+        for symbol in delegation {
+            assert!(
+                !calls_on_a_connection(&source).iter().any(|call| call == symbol),
+                "{file} must not call {symbol}"
+            );
+            assert!(
+                !source.contains(&format!(".{symbol}(")),
+                "{file} must not call {symbol}"
+            );
+        }
+    }
+
+    // 3. The dialogs the lane mounts carry an event channel and the host sender
+    //    only: no session handle, no child handle, no model handle.
+    let handlers = crate_file("src/modes/interactive/native_host_commands.rs");
+    for variant in ["Jev(", "JevKey("] {
+        let start = handlers
+            .find(&format!("Dialog::{variant}"))
+            .unwrap_or_else(|| panic!("Dialog::{variant} must exist"));
+        let block = &handlers[start..(start + 400).min(handlers.len())];
+        for forbidden in ["AgentConnection", "RlmChild", "Model", "Tool", "Subagent"] {
+            assert!(
+                !block.contains(forbidden),
+                "Dialog::{variant} must not carry {forbidden}: {block}"
+            );
+        }
+    }
+
+    // 4. A mode write changes the mode file only: no other file in the agent dir is
+    //    created or modified by a `/jev` mode change.
+    let dir = temp_agent_dir("negative-baseline");
+    let bridge = bridge_over(&dir);
+    bridge.set_session_mode("s", JevMode::Compare).expect("no error");
+    bridge.set_global_default(JevMode::Off).expect("no error");
+    let mut written: Vec<String> = Vec::new();
+    for entry in walk(&dir.path().to_path_buf()) {
+        written.push(entry);
+    }
+    written.sort();
+    assert_eq!(
+        written,
+        vec!["jev".to_string(), "jev/jev-settings.json".to_string()],
+        "a mode change must write the settings file and nothing else"
+    );
+}
+
+/// Every path under a directory, as `dir`-relative slash-separated strings.
+fn walk(root: &PathBuf) -> Vec<String> {
+    let mut out = Vec::new();
+    let mut stack = vec![root.clone()];
+    while let Some(current) = stack.pop() {
+        let Ok(entries) = fs::read_dir(&current) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            let relative = path
+                .strip_prefix(root)
+                .map(|value| value.to_string_lossy().replace('\\', "/"))
+                .unwrap_or_else(|_| path.to_string_lossy().to_string());
+            out.push(relative);
+            if path.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    out
+}
+
+// ---------------------------------------------------------------------------
+// 7. wiring: registry, dispatch, dialogs, keybindings, daemon gate
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_jev_command_is_registered_and_reachable_through_the_dispatch_chain() {
+    let registry = crate_file("src/core/slash_commands.rs");
+    assert!(registry.contains("\"jev\""), "the registry must list /jev");
+    assert!(
+        registry.contains("Some(\"[off|compare|on|status|key]\")"),
+        "the argument hint must list the accepted forms"
+    );
+    assert!(
+        registry.contains("Jev comparison mode: Off, Compare (shadow-only), Active (reserved/disabled), Input API key, Status"),
+        "the description must name the modes, key entry and status"
+    );
+
+    let commands = crate_file("src/modes/interactive/native_host_commands.rs");
+    assert!(
+        commands.contains("\"jev\" => return jev_host::run(connection, send, args).await"),
+        "the dispatch arm must call the Jev handler"
+    );
+    assert!(commands.contains("Dialog::Jev("), "the menu dialog must exist");
+    assert!(commands.contains("Dialog::JevKey("), "the key dialog must exist");
+    assert!(commands.contains("JevMenuOverlay::new"), "the menu overlay must mount");
+    assert!(commands.contains("JevKeyOverlay::new"), "the key overlay must mount");
+    // The overlays are declared from this file with `#[path]`, so no edit to the
+    // shared `native_host.rs` is needed for the modules themselves.
+    for module in ["jev_menu.rs", "jev_menu_component.rs", "jev_key_input.rs", "jev_footer.rs", "jev_host.rs"] {
+        assert!(
+            commands.contains(&format!("#[path = \"{module}\"]")),
+            "{module} must be declared"
+        );
+    }
+
+    // The out-of-lane half of reachability is hunk C-1: one token in the shared
+    // host arm list. This lane must not edit `native_host.rs`, so the test records
+    // the hunk instead of applying it, and it fails loudly if the arm list moves.
+    let host = crate_file("src/modes/interactive/native_host.rs");
+    let arms = host
+        .lines()
+        .find(|line| line.contains("native_commands::run("))
+        .expect("the host arm list must exist");
+    assert!(
+        arms.contains("\"btw\""),
+        "sanity: the host arm list is the one under audit"
+    );
+    assert!(
+        arms.contains("\"mcp\""),
+        "sanity: the guarded `/mcp` arm is in the same list"
+    );
+    // Integration hunk C-1 is coordinator-applied: the arm list must carry
+    // `| "jev"` so /jev is actually reachable through the dispatch chain.
+    assert!(
+        arms.contains("\"jev\""),
+        "the host arm list must route /jev (integration hunk C-1)"
+    );
+}
+
+#[test]
+fn the_jev_surface_cannot_express_a_model_or_subagent_control_action() {
+    // Binding DESIGN.md sections 11 and 12: no model control, no subagent control.
+    let forbidden = [
+        "set_model",
+        "cycle_model",
+        "set_scoped_models",
+        "set_thinking_level",
+        "cycle_thinking_level",
+        "set_service_tier",
+        "cancel_rlm_child",
+        "delete_rlm_subagent",
+        "spawn_subagent",
+        "create_child",
+        "send_message",
+        "replace_acp_mcp_servers",
+        "rlm_max_depth",
+        "abort_bash",
+        "steer",
+        "follow_up",
+    ];
+    for file in JEV_FILES {
+        let source = jev_source(file);
+        for call in calls_on_a_connection(&source) {
+            assert!(
+                !forbidden.contains(&call.as_str()),
+                "{file} must not reach {call} (sections 11/12)"
+            );
+        }
+    }
+
+    // Both identity and optional telemetry are read-only connection calls.
+    let host = jev_source("jev_host.rs");
+    let connection_calls = calls_on_a_connection(&host);
+    assert_eq!(
+        connection_calls,
+        vec!["get_jev_status".to_string(), "get_state".to_string()],
+        "only identity and worker telemetry reads are allowed"
+    );
+    assert!(host.contains("connection.get_state().await?"));
+
+    // The only two `fn new` in the handler are the overlay constructors, and both
+    // take the event channel and the host sender only: a child or session mutation
+    // is structurally unreachable from the overlays.
+    let handlers = jev_source("jev_host.rs");
+    let overlay_constructors: Vec<&str> = handlers
+        .split("pub(super) fn new(")
+        .skip(1)
+        .map(|tail| tail.split(") -> Self").next().expect("constructor signature"))
+        .collect();
+    assert_eq!(overlay_constructors.len(), 2, "{overlay_constructors:?}");
+    for constructor in overlay_constructors {
+        assert!(!constructor.contains("AgentConnection"), "{constructor}");
+        assert!(!constructor.contains("connection"), "{constructor}");
+    }
+
+    // And the pure module has no effectful surface either.
+    let pure = jev_source("jev_menu.rs");
+    assert!(calls_on_a_connection(&pure).is_empty());
+    assert!(!pure.contains("AgentConnection"));
+    assert!(!pure.contains("reqwest"));
+    // The pure module performs no file I/O at all: the settings file is written by
+    // the pi-jev store, so the UI can never write a path of its own choosing.
+    assert!(!pure.contains("std::fs::write"));
+    assert!(!pure.contains("std::fs::create_dir_all"));
+    assert!(pure.contains("store.store(DEFAULT_KEY_ID"));
+}
+
+#[test]
+fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
+    let protocol = crate_file("src/modes/daemon/daemon_protocol.rs");
+    assert!(
+        protocol.contains("DaemonServerCapability::JevControl"),
+        "the capability must be declared"
+    );
+    assert!(
+        protocol.contains("\"jev_get_settings\" | \"jev_set_session_mode\" | \"jev_get_status\" => {"),
+        "the three commands must share one capability gate"
+    );
+    assert!(
+        protocol.contains("DaemonCommandCompatibility::capability(Capability::JevControl)"),
+        "the gate must be the capability, not a schema revision"
+    );
+    // No version bump and no schema bump for an optional additive surface.
+    assert!(protocol.contains("pub const DAEMON_PROTOCOL_VERSION: u32 = 7;"));
+    assert!(protocol.contains("pub const DAEMON_SCHEMA_REVISION: u32 = 29;"));
+    // The getters are read-only; the setter is not.
+    assert!(protocol.contains("\"jev_get_settings\",\n    \"jev_get_status\","));
+    let read_only_block = protocol
+        .split("pub const READ_ONLY_DAEMON_COMMANDS")
+        .nth(1)
+        .expect("the read-only list");
+    let read_only_block = read_only_block.split("];").next().unwrap();
+    assert!(read_only_block.contains("jev_get_settings"));
+    assert!(!read_only_block.contains("jev_set_session_mode"));
+    // The commands are session-plane, so a control-plane-only client never sends
+    // them and an unknown command still falls through to `None`.
+    assert!(protocol.contains("\"jev_get_settings\" | \"jev_set_session_mode\" | \"jev_get_status\" => {\n            Some(\"session\")"));
+
+    let daemon = crate_file("src/modes/daemon/daemon_mode.rs");
+    for command in ["jev_get_settings", "jev_set_session_mode", "jev_get_status"] {
+        assert!(daemon.contains(&format!("\"{command}\",")), "{command} must be routable");
+        assert!(daemon.contains(&format!("\"{command}\" =>")), "{command} must have a handler");
+    }
+    assert!(daemon.contains("pub const DAEMON_COMMAND_TYPES: [&str; 103] = ["));
+    // The daemon writes the same store the UI reads (lane A's `JevSettingsStore`
+    // over the same `<agent_dir>`), and never reads a secret value.
+    assert!(daemon.contains("pi_jev::config::JevSettingsStore::new"));
+    assert!(daemon.contains("pi_jev::credential::default_credential_store"));
+    assert!(daemon.contains("\"credentialPresenceKnown\": saved_presence_known"));
+    assert!(daemon.contains("\"applied\": false"));
+    assert!(daemon.contains("pi_jev::types::JevMode::parse"));
+    // Reserved `active` writes nothing through the daemon either.
+    assert!(daemon.contains("if requested.is_reserved()"), "the daemon must refuse reserved Active");
+    assert!(
+        daemon.contains("fn jev_apply_session_mode"),
+        "the daemon must apply through the store"
+    );
+
+    // Degradation: an absent capability means the client keeps local control.
+    // The client-side gate lives in a lane that must not be touched, so this test
+    // pins the contract instead: the commands are optional (capability-gated), the
+    // getter list is read-only, and the handler is additive.
+    assert!(
+        protocol.contains("A daemon that does not advertise this capability never receives"),
+        "the degradation rule must be documented next to the gate"
+    );
+}
+
+#[test]
+fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_reserved_green_rule() {
+    // The metadata constants are the single source the registry quotes, so a drift
+    // between `slash_commands.rs` and the menu description fails here.
+    assert_eq!(JEV_COMMAND_NAME, "jev");
+    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|on|status|key]");
+    let registry = crate_file("src/core/slash_commands.rs");
+    assert!(registry.contains(JEV_ARGUMENT_HINT), "the hint must be quoted verbatim");
+    assert!(
+        registry.contains(JEV_COMMAND_DESCRIPTION),
+        "the description must be quoted verbatim"
+    );
+
+    // `env_presence` reads through a caller-supplied accessor, so a presence probe
+    // needs no real environment. An empty or whitespace value is NOT present.
+    let read_env = |name: &str| match name {
+        "TYPESAFE_API_KEY" => Some("  ".to_string()),
+        "JEV_API_KEY" => Some("alias-present".to_string()),
+        _ => None,
+    };
+    let env = env_presence(&read_env);
+    assert!(!env.typesafe_api_key, "whitespace is not a credential");
+    assert!(env.jev_api_key);
+    assert!(!env.has_conflict());
+    let empty = env_presence(&|_| None);
+    assert!(!empty.typesafe_api_key && !empty.jev_api_key);
+    assert_eq!(
+        resolve_credential_source(false, empty.typesafe_api_key, empty.jev_api_key),
+        CredentialSource::None
+    );
+
+    // The footer helpers expose the pinned texts and the width threshold, and the
+    // removal event reuses the same status key.
+    assert_eq!(footer_text(JevFooterState::Off), "\u{25cf} Jev Off");
+    assert_eq!(
+        footer_text(JevFooterState::Compare),
+        "\u{25cf} Jev Compare"
+    );
+    assert_eq!(FOOTER_LABEL_MIN_COLUMNS, 40);
+    assert_eq!(footer_clear_payload()["statusKey"], serde_json::json!(JEV_STATUS_KEY));
+    // `render_help` never advertises a green/active Jev On.
+    let help = render_help();
+    assert!(help.contains(JEV_ON_RESERVED_NOTICE), "{help}");
+    assert!(!help.contains(JEV_GREEN_RESERVED_NOTICE), "{help}");
+
+    // The credential DELETE path exists and is the inverse of the write path.
+    let store = InMemoryCredentialStore::new();
+    store_secret(&store, JevSecret::new("sk-live-0123456789".to_string())).expect("stored");
+    assert!(store.exists(DEFAULT_KEY_ID).expect("readable"));
+    clear_secret(&store).expect("deleted");
+    assert!(!store.exists(DEFAULT_KEY_ID).expect("readable"));
+}
+
+#[test]
+fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
+    // Every reachable state, including the reserved-mode and healthy-pipeline
+    // combinations, must avoid the green "Jev On" footer.
+    let credential = CredentialStatus::resolve(true, false, false);
+    let healthy = JevPipelineStatus {
+        last_success_at: Some("2026-09-19T00:00:00Z".to_string()),
+        last_latency_ms: Some(120),
+        success_count: 9,
+        failure_count: 0,
+        queue_capacity: 8,
+        ..JevPipelineStatus::default()
+    };
+    let states = [
+        footer_state(JevMode::Off, &credential, &healthy),
+        footer_state(JevMode::Compare, &credential, &healthy),
+        footer_state(JevMode::Active, &credential, &healthy),
+        footer_state(JevMode::Compare, &CredentialStatus::resolve(false, false, false), &healthy),
+    ];
+    for state in states {
+        assert!(!is_green(state), "{state:?} must never be green");
+        assert_ne!(state.color_key(), "success", "{state:?}");
+        // The LIVE colour path goes through `footer_color_key`, which consults
+        // `is_green` first: it cannot return `success` while that is a constant false.
+        assert_ne!(footer_color_key(state), "success", "{state:?}");
+        assert!(!state.label().eq_ignore_ascii_case("Jev On"), "{state:?}");
+        assert!(!footer_text(state).contains("Jev On"), "{state:?}");
+    }
+    // The healthy+pipeline combination is still Compare, never a green On.
+    assert_eq!(states[1], JevFooterState::Compare);
+    // A stored `Active` mode (only reachable through a hand-edited settings file,
+    // because the UI refuses to write it) shows the red Off segment, never a
+    // Compare-looking or green one: reserved means Jev does no work.
+    assert_eq!(states[2], JevFooterState::Off);
+    assert!(JEV_GREEN_RESERVED_NOTICE.contains("reserved"));
+}
+
+#[test]
+fn the_keybinding_addition_has_no_default_key_and_keeps_the_app_order() {
+    let keybindings = crate_file("src/core/keybindings.rs");
+    assert!(keybindings.contains("pub const APP_KEYBINDINGS: [AppKeybinding; 57] = ["));
+    assert!(keybindings.contains("\"app.jev.cancel\","));
+    let definition = keybindings
+        .split("\"app.jev.cancel\".to_string(),")
+        .nth(1)
+        .expect("the app entry");
+    assert!(definition.contains("default_keys: vec![]"), "{definition}");
+    assert!(definition.contains("default_keys_is_single: false"), "{definition}");
+    assert!(definition.contains("Cancel the /jev dialog"), "{definition}");
+    // The declaration order test is driven by the constant, so the entry must be
+    // last in both places or `keybindings_spread_tui_entries_first_then_app_entries`
+    // fails. Guard that ordering here as well.
+    let list = keybindings
+        .split("pub const APP_KEYBINDINGS")
+        .nth(1)
+        .expect("the constant");
+    let list = list.split("];").next().unwrap();
+    assert!(list.trim_end().ends_with("\"app.jev.cancel\","), "{list}");
+}

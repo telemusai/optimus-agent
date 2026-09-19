@@ -1869,6 +1869,12 @@ pub fn create_extension_runner(
     session_manager: Arc<dyn SessionManager>,
     model_registry: Arc<dyn ModelRegistry>,
 ) -> Arc<ExtensionRunner> {
+    // Jev comparison observer (guarded): with default Off settings this is
+    // one cheap settings read and no extension is added. See
+    // `core::jev_bridge`. Repair-overlap note: the ONLY lane-B edit in this
+    // file; integration may relocate the call to the session assembly site.
+    let mut extensions = extensions;
+    crate::core::jev_bridge::maybe_register_jev_observer(&mut extensions);
     Arc::new(ExtensionRunner::new(
         extensions,
         runtime,

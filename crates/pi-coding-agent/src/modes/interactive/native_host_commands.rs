@@ -1,5 +1,18 @@
 //! Native owner-thread dialogs for the remaining interactive slash commands.
 use super::*;
+
+// Jev surfaces. Registered here (inside the lane-C-owned file) with `#[path]`
+// sibling declarations, so the new files need no edit to `native_host.rs`.
+#[path = "jev_menu.rs"]
+pub(crate) mod jev_menu;
+#[path = "jev_menu_component.rs"]
+pub(crate) mod jev_menu_component;
+#[path = "jev_key_input.rs"]
+pub(crate) mod jev_key_input;
+#[path = "jev_footer.rs"]
+pub(crate) mod jev_footer;
+#[path = "jev_host.rs"]
+pub(crate) mod jev_host;
 use crate::core::{auth_storage::AuthStorage, settings_manager::SettingsManager};
 use crate::modes::interactive::components::{
     scoped_models_selector::{ModelsCallbacks, ModelsConfig, ScopedModelsSelectorComponent},
@@ -29,6 +42,14 @@ pub(super) enum Dialog {
         Option<Vec<String>>,
         async_mpsc::UnboundedSender<ScopeChange>,
     ),
+    // SHARED FILE EDIT (modes/interactive/native_host_commands.rs, jev-ui lane):
+    // the two `/jev` overlays. Additive `Dialog` variants; every other producer
+    // of `Dialog` is untouched.
+    Jev(
+        pi_jev::types::JevMode,
+        async_mpsc::UnboundedSender<jev_host::JevMenuEvent>,
+    ),
+    JevKey(async_mpsc::UnboundedSender<jev_host::JevKeyEvent>),
 }
 
 pub(super) enum ScopeChange {
@@ -68,6 +89,16 @@ pub(super) fn mount(
     connection: Arc<dyn wire::AgentConnection>,
     send: mpsc::Sender<HostEvent>,
 ) -> Rc<RefCell<dyn TuiComponent>> {
+    // SHARED FILE EDIT (native_host_commands.rs, jev-ui lane): the two `/jev`
+    // overlay mounts. Additive branches ahead of the existing ones.
+    if let Dialog::Jev(active_mode, events) = dialog {
+        return Rc::new(RefCell::new(jev_host::JevMenuOverlay::new(
+            active_mode, events, send,
+        )));
+    }
+    if let Dialog::JevKey(events) = dialog {
+        return Rc::new(RefCell::new(jev_host::JevKeyOverlay::new(events, send)));
+    }
     if let Dialog::Logout(providers, reply) = dialog {
         use crate::modes::interactive::components::oauth_selector::*;
         let rows = ui.clone();
@@ -109,6 +140,8 @@ pub(super) fn mount(
         )));
     }
     let (reply, content) = match dialog {
+        // Handled above; listed so a future `Dialog` variant forces an update here.
+        Dialog::Jev(..) | Dialog::JevKey(..) => unreachable!(),
         Dialog::Select(title, values, reply) => (reply, (Some(title), values, None, None, false)),
         Dialog::Input(title, multiline, reply) => {
             (reply, (Some(title), Vec::new(), None, None, multiline))
@@ -497,6 +530,9 @@ pub(super) async fn run(
                 return Ok(CommandOutput::Status(message));
             }
         }
+        // SHARED FILE EDIT (native_host_commands.rs, jev-ui lane): the `/jev`
+        // dispatch arm.
+        "jev" => return jev_host::run(connection, send, args).await,
         "mcp" => return mcp(connection, send, args).await,
         "share" => return share(connection, send).await,
         "traces" => return traces(connection, send, args).await,

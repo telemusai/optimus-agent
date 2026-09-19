@@ -626,6 +626,11 @@ pub(super) struct ReportingSession {
     pub active_session_id: String,
     pub session_id: String,
     pub session_file: String,
+    /// Overrides `is_session_active` for the recovery-busy predicate test; the
+    /// default (`true`) keeps every existing fixture resident.
+    pub session_active: bool,
+    /// Overrides `has_running_rlm_children` for the recovery-busy predicate test.
+    pub running_children: bool,
     /// `(reportSucceeded, reportQueued)` - what the session reports at its own preflight.
     pub report: Option<(bool, bool)>,
     /// The admission call's own outcome (a thrown admission error when `Some`).
@@ -707,6 +712,8 @@ impl ReportingSession {
             active_session_id: active_session_id.to_string(),
             session_id: session_id.to_string(),
             session_file: session_file.to_string(),
+            session_active: true,
+            running_children: false,
             report,
             error,
             calls: Arc::new(AtomicU64::new(0)),
@@ -729,7 +736,7 @@ impl DaemonSession for ReportingSession {
         Some(self.session_file.clone())
     }
     fn is_session_active(&self) -> bool {
-        true
+        self.session_active
     }
     fn unfinished_action_count(&self) -> f64 {
         0.0
@@ -805,7 +812,7 @@ impl DaemonSession for ReportingSession {
         self.inner.is_retrying()
     }
     fn has_running_rlm_children(&self) -> bool {
-        self.inner.has_running_rlm_children()
+        self.inner.has_running_rlm_children() || self.running_children
     }
     fn messages(&self) -> Vec<AgentMessage> {
         self.inner.messages()
@@ -1434,5 +1441,73 @@ async fn t08_disconnect_during_admission_keeps_admission_observable() {
     assert_eq!(
         value["id"], "after-disconnect",
         "the post-disconnect command was not answered: {value}"
+    );
+}
+
+/// The recovery-journal busy predicate must match the TypeScript
+/// `recordWorkerRecoveryState` busy expression (daemon-mode.ts:7375-7380):
+/// `hasLiveSessionWork(state) || isRetrying || hasAcceptedPromptInFlight`,
+/// where `hasLiveSessionWork` is `isSessionActive || hasRunningRlmChildren`.
+/// A settled session with running children is busy; a settled session with no
+/// children and no foreground work is not (audit BUSY-FLAG-01 parity delta).
+#[test]
+fn recovery_busy_matches_the_typescript_predicate() {
+    let file = "parity-recovery-busy.jsonl";
+    let active = ReportingSession::arc("active", "saved", file, None, None);
+    assert!(
+        crate::modes::daemon::daemon_mode::worker_recovery_busy(active.as_ref()),
+        "a session-active session is busy"
+    );
+
+    let settled_with_children = {
+        // The `arc` constructor pins `session_active`/`running_children` for the
+        // existing fixtures; the predicate test builds the settled-with-children
+        // variant directly.
+        let variant = ReportingSession {
+            inner: MissingSession::new("active"),
+            active_session_id: "active".to_string(),
+            session_id: "saved".to_string(),
+            session_file: file.to_string(),
+            session_active: false,
+            running_children: true,
+            report: None,
+            error: None,
+            calls: Arc::new(AtomicU64::new(0)),
+            gate: AtomicBool::new(false),
+            gate_notify: StdMutex::new(None),
+            entered: Arc::new(AtomicU64::new(0)),
+            finished: Arc::new(AtomicU64::new(0)),
+        };
+        variant
+    };
+    assert!(
+        !settled_with_children.is_session_active(),
+        "the fixture must model a settled session"
+    );
+    assert!(
+        crate::modes::daemon::daemon_mode::worker_recovery_busy(&settled_with_children),
+        "running rlm children keep the recovery record busy even while the parent is settled"
+    );
+
+    let settled = {
+        ReportingSession {
+            inner: MissingSession::new("active"),
+            active_session_id: "active".to_string(),
+            session_id: "saved".to_string(),
+            session_file: file.to_string(),
+            session_active: false,
+            running_children: false,
+            report: None,
+            error: None,
+            calls: Arc::new(AtomicU64::new(0)),
+            gate: AtomicBool::new(false),
+            gate_notify: StdMutex::new(None),
+            entered: Arc::new(AtomicU64::new(0)),
+            finished: Arc::new(AtomicU64::new(0)),
+        }
+    };
+    assert!(
+        !crate::modes::daemon::daemon_mode::worker_recovery_busy(&settled),
+        "a fully settled session with no children is not busy"
     );
 }

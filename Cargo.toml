@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/pi-ai",
     "crates/pi-agent-core",
+    "crates/pi-jev",
     "crates/pi-tui",
     "crates/pi-coding-agent",
 ]
@@ -74,3 +75,5 @@ pi-ai = { path = "crates/pi-ai" }
 pi-agent-core = { path = "crates/pi-agent-core" }
 pi-tui = { path = "crates/pi-tui" }
 pi-coding-agent = { path = "crates/pi-coding-agent" }
+
+pi-jev = { path = "crates/pi-jev" }

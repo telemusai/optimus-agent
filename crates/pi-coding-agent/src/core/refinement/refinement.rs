@@ -16,7 +16,8 @@ use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
 
 use crate::utils::atomic_file::{
-    realpath_if_present_sync, write_file_atomic_sync, WriteFileAtomicOptions,
+    realpath_if_present_sync, write_bytes_atomic_sync, write_file_atomic_sync,
+    WriteFileAtomicOptions,
 };
 
 use super::super::memory::evidence::{
@@ -114,6 +115,7 @@ impl std::error::Error for RefinementJsonError {}
 pub const REFINE_SKILL_NAME: &str = "refine";
 const HARNESS_STATE_DIR_NAME: &str = "harness";
 const REFINEMENT_HISTORY_FILE_NAME: &str = "refinements.jsonl";
+const HARNESS_STATE_CORRUPT_PREFIX: &str = "harness_state.corrupt-";
 const DEFAULT_OVERVIEW_ENTRY_LIMIT: usize = 6;
 const DEFAULT_OVERVIEW_REFINEMENT_LIMIT: usize = 5;
 const DEFAULT_OVERVIEW_CONTENT_LIMIT: usize = 180;
@@ -659,24 +661,166 @@ fn entry_from_value(id: &str, raw: &Value, scope: HarnessScope) -> Option<Harnes
     serde_json::from_value(Value::Object(value)).ok()
 }
 
-pub fn load_harness_state(harness_state_dir: &str, scope: HarnessScope) -> HarnessState {
-    let state_path = get_harness_state_path(harness_state_dir);
-    if !Path::new(&state_path).exists() {
-        return empty_harness_state();
+/// Outcome of reading `harness_state.json`, kept separate from the parsed
+/// entries so a read that failed for a real reason is never confused with a
+/// genuinely new store.
+///
+/// `load_harness_state` still returns an empty state on every path (it runs on
+/// every prompt build), but [`load_harness_state_details`] exposes which path
+/// was taken so writes can refuse to overwrite bytes they could not read.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum HarnessStateLoadStatus {
+    /// No file at the state path: a new store, safe to create.
+    Missing,
+    /// The file parsed as a JSON object.
+    Loaded,
+    /// The file exists, was readable, and is corrupt or not a JSON object.
+    Corrupt,
+    /// The file exists but could not be read (permissions, sharing violation, IO).
+    Unreadable,
+}
+
+#[derive(Debug, Clone)]
+pub struct HarnessStateLoad {
+    pub state: HarnessState,
+    pub status: HarnessStateLoadStatus,
+    /// One-line reason for `Corrupt`/`Unreadable`, for the warning and tests.
+    pub reason: Option<String>,
+    /// Hash of the exact bytes read. A missing file has no generation; an
+    /// unreadable load is never a valid save baseline, even if access recovers.
+    generation: Option<String>,
+}
+
+/// One raw read of `harness_state.json`, classified before any parsing decisions.
+#[derive(Debug, Clone, PartialEq, Eq)]
+enum HarnessStateRead {
+    /// No file at the state path: a new store.
+    Missing,
+    /// Readable and parsable as a JSON object; carries the parsed value so the
+    /// hot load path parses the file once.
+    Content(Value, String),
+    /// Readable but not a JSON object (or not valid UTF-8); carries the raw bytes
+    /// for quarantine so a recovery copy preserves them exactly.
+    Corrupt(String, Vec<u8>),
+    /// Present but not readable at all; carries the reason.
+    Unreadable(String),
+}
+
+impl HarnessStateRead {
+    fn generation(&self) -> Option<String> {
+        match self {
+            Self::Content(_, generation) => Some(generation.clone()),
+            Self::Corrupt(_, raw) => Some(format!("{:x}", Sha256::digest(raw))),
+            Self::Missing | Self::Unreadable(_) => None,
+        }
     }
-    let parsed: Value = match std::fs::read_to_string(&state_path) {
-        Ok(raw) => match serde_json::from_str(&raw) {
-            // loadHarnessState runs on every system-prompt build and before each /refine, so
-            // a corrupt or unreadable (or non-object) state file must degrade to empty rather
-            // than throw and break the session. The next saveHarnessState rewrites it cleanly.
-            Ok(value) => value,
-            Err(_) => return empty_harness_state(),
-        },
-        Err(_) => return empty_harness_state(),
+}
+
+/// Transient-access retry for the state read, mirroring the bounded Windows
+/// rename retry in `utils/atomic_file.rs`: an antivirus or indexer holding the
+/// file for a few milliseconds must not turn a healthy store into a refusal.
+const HARNESS_STATE_READ_ATTEMPTS: u32 = 5;
+
+fn read_harness_state_raw(state_path: &str) -> HarnessStateRead {
+    // `Path::exists()` reports false for any metadata error, including an
+    // ACL-denied stat, which would masquerade an inaccessible store as a new
+    // one. Classify through an explicit probe instead.
+    match std::fs::metadata(state_path) {
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return HarnessStateRead::Missing;
+        }
+        Err(error) => return HarnessStateRead::Unreadable(error.to_string()),
+        Ok(_) => {}
+    }
+    let mut attempt: u32 = 1;
+    let bytes = loop {
+        match std::fs::read(state_path) {
+            Ok(bytes) => break bytes,
+            Err(error) => {
+                let transient = matches!(
+                    error.kind(),
+                    std::io::ErrorKind::PermissionDenied | std::io::ErrorKind::WouldBlock
+                );
+                if !transient || attempt >= HARNESS_STATE_READ_ATTEMPTS {
+                    return HarnessStateRead::Unreadable(error.to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10 * attempt as u64));
+                attempt += 1;
+            }
+        }
     };
-    let parsed = match parsed {
-        Value::Object(map) => map,
-        _ => return empty_harness_state(),
+    // Bytes that are not valid UTF-8 are readable corruption, not an access
+    // error: quarantine preserves them exactly and the next save may proceed.
+    let raw = match String::from_utf8(bytes.clone()) {
+        Ok(raw) => raw,
+        Err(_) => {
+            return HarnessStateRead::Corrupt(
+                "state file is not valid UTF-8".to_string(),
+                bytes,
+            )
+        }
+    };
+    match serde_json::from_str::<Value>(&raw) {
+        Ok(value @ Value::Object(_)) => {
+            HarnessStateRead::Content(value, format!("{:x}", Sha256::digest(&bytes)))
+        }
+        Ok(_) => HarnessStateRead::Corrupt("state file is not a JSON object".to_string(), bytes),
+        Err(error) => HarnessStateRead::Corrupt(error.to_string(), bytes),
+    }
+}
+
+pub fn load_harness_state(harness_state_dir: &str, scope: HarnessScope) -> HarnessState {
+    load_harness_state_details(harness_state_dir, scope).state
+}
+
+impl HarnessStateLoad {
+    /// True when writing the loaded state would replace bytes we could not read.
+    pub fn is_write_unsafe(&self) -> bool {
+        matches!(
+            self.status,
+            HarnessStateLoadStatus::Corrupt | HarnessStateLoadStatus::Unreadable
+        )
+    }
+}
+
+pub fn load_harness_state_details(
+    harness_state_dir: &str,
+    scope: HarnessScope,
+) -> HarnessStateLoad {
+    let state_path = get_harness_state_path(harness_state_dir);
+    let raw = read_harness_state_raw(&state_path);
+    let generation = raw.generation();
+    let parsed: Value = match raw {
+        HarnessStateRead::Missing => {
+            return HarnessStateLoad {
+                state: empty_harness_state(),
+                status: HarnessStateLoadStatus::Missing,
+                reason: None,
+                generation,
+            }
+        }
+        // loadHarnessState runs on every system-prompt build and before each /refine, so
+        // a corrupt or unreadable (or non-object) state file must degrade to empty rather
+        // than throw and break the session. `save_harness_state` keeps a recovery copy of
+        // those bytes before it replaces them, and refuses the write when they cannot be
+        // copied aside.
+        HarnessStateRead::Corrupt(reason, _) => {
+            return HarnessStateLoad {
+                state: empty_harness_state(),
+                status: HarnessStateLoadStatus::Corrupt,
+                reason: Some(reason),
+                generation,
+            }
+        }
+        HarnessStateRead::Unreadable(reason) => {
+            return HarnessStateLoad {
+                state: empty_harness_state(),
+                status: HarnessStateLoadStatus::Unreadable,
+                reason: Some(reason),
+                generation,
+            }
+        }
+        HarnessStateRead::Content(value, _) => value,
     };
     let mut state = empty_harness_state();
     state.schema = parsed.get("schema").and_then(Value::as_f64).unwrap_or(1.0);
@@ -704,7 +848,12 @@ pub fn load_harness_state(harness_state_dir: &str, scope: HarnessScope) -> Harne
             .filter_map(|value| serde_json::from_value(value.clone()).ok())
             .collect();
     }
-    state
+    HarnessStateLoad {
+        state,
+        status: HarnessStateLoadStatus::Loaded,
+        reason: None,
+        generation,
+    }
 }
 
 pub fn merge_harness_states(
@@ -763,10 +912,81 @@ pub fn merge_harness_states(
     merged
 }
 
+/// Save a newly constructed state. Read/modify/write callers must retain their
+/// load result and use `save_harness_state_checked` instead.
 pub fn save_harness_state(harness_state_dir: &str, state: &HarnessState) -> Result<String, String> {
+    let baseline = load_harness_state_details(harness_state_dir, HarnessScope::Local);
+    save_harness_state_checked(harness_state_dir, state, &baseline)
+}
+
+/// Lock the same stable side file as the Python harness writer. OS ownership
+/// releases on crash, unlike an orphanable directory lock. Never unlink the
+/// lock file: doing so would allow simultaneous locks on different file objects.
+fn lock_harness_state(target_path: &str) -> Result<std::fs::File, String> {
+    let lock_path = format!("{target_path}.lock");
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true).write(true).create(true).truncate(false);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let file = options.open(&lock_path).map_err(|error| error.to_string())?;
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(1);
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Ok(file),
+            Err(std::fs::TryLockError::WouldBlock) => {
+                if std::time::Instant::now() >= deadline {
+                    return Err("Harness state is being saved by another writer; retry the operation.".to_string());
+                }
+                std::thread::sleep(std::time::Duration::from_millis(10));
+            }
+            Err(std::fs::TryLockError::Error(error)) => return Err(error.to_string()),
+        }
+    }
+}
+
+/// Compare the current bytes with the exact load baseline while holding the
+/// cross-runtime write lock. Never merge or retry a stale proposal implicitly:
+/// its caller must reload and reapply against the new state.
+pub fn save_harness_state_checked(
+    harness_state_dir: &str,
+    state: &HarnessState,
+    baseline: &HarnessStateLoad,
+) -> Result<String, String> {
     let state_path = get_harness_state_path(harness_state_dir);
+    if baseline.status == HarnessStateLoadStatus::Unreadable {
+        return Err(format!(
+            "Harness state at {state_path} could not be read ({}); refusing to overwrite unreadable state. Reload and retry.",
+            baseline.reason.as_deref().unwrap_or("load failed")
+        ));
+    }
     std::fs::create_dir_all(harness_state_dir).map_err(|error| error.to_string())?;
-    let target_path = realpath_if_present_sync(&state_path).unwrap_or_else(|_| state_path.clone());
+    let target_path = realpath_if_present_sync(&state_path).map_err(|error| error.to_string())?;
+    let _write_lock = lock_harness_state(&target_path)?;
+    let current = read_harness_state_raw(&target_path);
+    if let HarnessStateRead::Unreadable(reason) = &current {
+        return Err(format!(
+            "Harness state at {state_path} could not be read ({reason}); refusing to overwrite unreadable state. Resolve permissions or sharing locks, then retry."
+        ));
+    }
+    if current.generation() != baseline.generation {
+        return Err("Harness state changed since it was loaded; reload and retry the operation. The newer state was not overwritten.".to_string());
+    }
+    match current {
+        // Readable but unparsable: preserve the bytes before the rewrite.
+        HarnessStateRead::Corrupt(_, raw) => {
+            quarantine_harness_state_bytes(harness_state_dir, &raw)?;
+        }
+        // Present but unreadable: the bytes are unknown, so never replace them.
+        HarnessStateRead::Unreadable(reason) => {
+            return Err(format!(
+                "Harness state at {state_path} could not be read ({reason}); refusing to overwrite unreadable state. Resolve permissions or sharing locks, then retry."
+            ))
+        }
+        HarnessStateRead::Missing | HarnessStateRead::Content(_, _) => {}
+    }
     let mode = if Path::new(&target_path).exists() {
         #[cfg(unix)]
         {
@@ -784,18 +1004,50 @@ pub fn save_harness_state(harness_state_dir: &str, state: &HarnessState) -> Resu
     };
     let body = format!(
         "{}\n",
-        serde_json::to_string_pretty(state).unwrap_or_default()
+        serde_json::to_string_pretty(state).map_err(|error| error.to_string())?
     );
-    write_file_atomic_sync(
-        &target_path,
-        &body,
-        WriteFileAtomicOptions {
-            mode: Some(mode),
-            ..Default::default()
-        },
-    )
-    .map_err(|error| error.to_string())?;
+    write_file_atomic_sync(&target_path, &body, harness_state_write_options(mode))
+        .map_err(|error| error.to_string())?;
     Ok(state_path)
+}
+
+/// `harness_state.corrupt-<content-hash>.json` beside the state file.
+///
+/// The name is content-addressed, so quarantining identical bytes twice is
+/// idempotent: the same corrupt file is copied aside once, not once per save.
+/// The copy's own mtime records when the quarantine happened.
+pub fn corrupt_harness_state_backup_path(harness_state_dir: &str, raw: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(raw);
+    let digest = format!("{:x}", hasher.finalize());
+    join_posix(
+        harness_state_dir,
+        &format!("{HARNESS_STATE_CORRUPT_PREFIX}{}.json", &digest[..16]),
+    )
+}
+
+/// Atomic-write options for `harness_state.json` and its recovery copies.
+///
+/// fsync + directory fsync match `memory/store.rs` write_json so a completed
+/// save survives power loss; the Windows rename retry already lives inside
+/// `write_file_atomic_sync` (utils/atomic_file.rs).
+fn harness_state_write_options(mode: u32) -> WriteFileAtomicOptions {
+    WriteFileAtomicOptions {
+        mode: Some(mode),
+        fsync: true,
+        fsync_dir: true,
+        ..Default::default()
+    }
+}
+
+/// Copy unparseable state bytes aside before they are replaced.
+fn quarantine_harness_state_bytes(harness_state_dir: &str, raw: &[u8]) -> Result<String, String> {
+    let backup_path = corrupt_harness_state_backup_path(harness_state_dir, raw);
+    std::fs::create_dir_all(harness_state_dir)
+        .map_err(|error| format!("Could not create {harness_state_dir}: {error}"))?;
+    write_bytes_atomic_sync(&backup_path, raw, harness_state_write_options(0o600))
+        .map_err(|error| format!("Could not write the harness state recovery copy: {error}"))?;
+    Ok(backup_path)
 }
 
 pub fn get_refinement_history_path(harness_state_dir: &str) -> String {
@@ -827,20 +1079,66 @@ pub fn append_global_refinement(
         .map_err(|error| error.to_string())?;
     file.write_all(line.as_bytes())
         .map_err(|error| error.to_string())?;
+    // A completed history append must be durable: it is the cross-session
+    // rollback record for an already-applied global refinement.
+    file.flush().map_err(|error| error.to_string())?;
+    file.sync_all().map_err(|error| error.to_string())?;
     Ok(history_path)
 }
 
+/// Append a global refinement and turn a persistence failure into a reportable
+/// one-line warning.
+///
+/// Returns `None` on success. The caller keeps the applied refinement and its
+/// rollback evidence; only the cross-session history line is missing, and the
+/// returned message states exactly that instead of implying the edits failed.
+pub fn append_global_refinement_reported(
+    harness_state_dir: &str,
+    result: &RefinementResult,
+) -> Option<String> {
+    match append_global_refinement(harness_state_dir, result) {
+        Ok(_) => None,
+        Err(error) => Some(format!(
+            "refinement {} was applied and saved, but its global history record could not be written to {}: {error}. Cross-session rollback will not list it.",
+            result.id,
+            get_refinement_history_path(harness_state_dir)
+        )),
+    }
+}
+
 pub fn load_global_refinement_history(harness_state_dir: &str) -> Vec<RefinementResult> {
+    load_global_refinement_history_reported(harness_state_dir).0
+}
+
+/// Load the cross-session history and report rows that could not be read.
+///
+/// A malformed line is still skipped (one bad append must not break rollback),
+/// but a row that carries the `RefinementResult` markers and fails to deserialize
+/// is a rollback target the user can no longer see, so it is reported once per
+/// window instead of disappearing. Returns `(results, warning)`; `warning` is
+/// `None` when every marked row parsed.
+pub fn load_global_refinement_history_reported(
+    harness_state_dir: &str,
+) -> (Vec<RefinementResult>, Option<String>) {
     let history_path = get_refinement_history_path(harness_state_dir);
     if !Path::new(&history_path).exists() {
-        return Vec::new();
+        return (Vec::new(), None);
     }
     let raw = match std::fs::read_to_string(&history_path) {
         Ok(value) => value,
-        Err(_) => return Vec::new(),
+        Err(error) => {
+            return (
+                Vec::new(),
+                Some(format!(
+                    "refinement history at {history_path} could not be read ({error}); rollback will not list any entry."
+                )),
+            )
+        }
     };
     let mut results = Vec::new();
-    for line in raw.split('\n') {
+    let mut unreadable = 0usize;
+    let mut first_error: Option<String> = None;
+    for (index, line) in raw.split('\n').enumerate() {
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -848,16 +1146,31 @@ pub fn load_global_refinement_history(harness_state_dir: &str) -> Vec<Refinement
         // Skip malformed lines so a single bad append cannot break rollback.
         let parsed: Value = match serde_json::from_str(trimmed) {
             Ok(value) => value,
-            Err(_) => continue,
+            Err(error) => {
+                unreadable += 1;
+                first_error.get_or_insert_with(|| format!("line {}: {error}", index + 1));
+                continue;
+            }
         };
         if !is_refinement_result(&parsed) {
+            // A row without the result markers (for example a kernel-side
+            // refinement event) is not a rollback target by design.
             continue;
         }
-        if let Ok(result) = serde_json::from_value::<RefinementResult>(parsed) {
-            results.push(with_default_refinement_scope(result, HarnessScope::Global));
+        match serde_json::from_value::<RefinementResult>(parsed) {
+            Ok(result) => results.push(with_default_refinement_scope(result, HarnessScope::Global)),
+            Err(error) => {
+                unreadable += 1;
+                first_error.get_or_insert_with(|| format!("line {}: {error}", index + 1));
+            }
         }
     }
-    results
+    let warning = first_error.map(|error| {
+        format!(
+            "{unreadable} refinement history row(s) at {history_path} could not be read ({error}); those rollback targets are not listed."
+        )
+    });
+    (results, warning)
 }
 
 /// Merge global and session refinement history, de-duplicating by id. Session entries
@@ -2552,12 +2865,102 @@ mod tests {
         let state = empty_harness_state();
         save_harness_state(&dir.to_string_lossy(), &state).unwrap();
         save_harness_state(&dir.to_string_lossy(), &state).unwrap();
-        let names: Vec<String> = std::fs::read_dir(&dir)
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
             .unwrap()
             .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
             .collect();
-        assert_eq!(names, vec!["harness_state.json".to_string()]);
+        names.sort();
+        assert_eq!(names, vec!["harness_state.json", "harness_state.json.lock"]);
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn harness_checked_save_rejects_an_unreadable_baseline_after_access_recovers() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy();
+        let path = dir.join("harness_state.json");
+        // A directory at the file path deterministically simulates a failed read
+        // without changing permissions or touching any production files.
+        std::fs::create_dir(&path).unwrap();
+        let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
+        assert_eq!(baseline.status, HarnessStateLoadStatus::Unreadable);
+        std::fs::remove_dir(&path).unwrap();
+        let healthy = br#"{"schema":1,"entries":{"memory":{"keep":{"title":"Keep","content":"Healthy"}}}}"#;
+        std::fs::write(&path, healthy).unwrap();
+        let error = save_harness_state_checked(&dir_text, &baseline.state, &baseline).unwrap_err();
+        assert!(error.contains("refusing to overwrite unreadable state"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), healthy);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn harness_checked_save_preserves_a_newer_valid_generation() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy();
+        let state = empty_harness_state();
+        save_harness_state(&dir_text, &state).unwrap();
+        let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
+        let path = dir.join("harness_state.json");
+        let concurrent = br#"{"schema":1,"entries":{"memory":{"peer":{"title":"Peer","content":"Newer"}}}}"#;
+        std::fs::write(&path, concurrent).unwrap();
+        let error = save_harness_state_checked(&dir_text, &state, &baseline).unwrap_err();
+        assert!(error.contains("changed since it was loaded"), "{error}");
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        assert!(load_harness_state(&dir_text, HarnessScope::Local).entries["memory"].contains_key("peer"));
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn harness_checked_save_preserves_a_store_created_after_a_missing_load() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy();
+        let missing = load_harness_state_details(&dir_text, HarnessScope::Local);
+        assert_eq!(missing.status, HarnessStateLoadStatus::Missing);
+        let path = dir.join("harness_state.json");
+        let concurrent = b"{\"schema\":1,\"entries\":{},\"refinements\":[]}";
+        std::fs::write(&path, concurrent).unwrap();
+        assert!(save_harness_state_checked(&dir_text, &missing.state, &missing).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), concurrent);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn harness_checked_save_quarantines_only_the_corrupt_generation_it_loaded() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy();
+        let path = dir.join("harness_state.json");
+        let first = b"{first corrupt generation";
+        let second = b"{second corrupt generation";
+        std::fs::write(&path, first).unwrap();
+        let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
+        std::fs::write(&path, second).unwrap();
+        assert!(save_harness_state_checked(&dir_text, &baseline.state, &baseline).is_err());
+        assert_eq!(std::fs::read(&path).unwrap(), second);
+        assert!(!Path::new(&corrupt_harness_state_backup_path(&dir_text, second)).exists());
+        let fresh = load_harness_state_details(&dir_text, HarnessScope::Local);
+        save_harness_state_checked(&dir_text, &fresh.state, &fresh).unwrap();
+        assert_eq!(std::fs::read(corrupt_harness_state_backup_path(&dir_text, second)).unwrap(), second);
+        std::fs::remove_dir_all(&dir).unwrap();
+    }
+
+    #[test]
+    fn harness_checked_save_waits_boundedly_for_the_shared_writer_lock() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy();
+        let state = empty_harness_state();
+        save_harness_state(&dir_text, &state).unwrap();
+        let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
+        let path = get_harness_state_path(&dir_text);
+        let bytes = std::fs::read(&path).unwrap();
+        let lock = lock_harness_state(&path).unwrap();
+        let start = std::time::Instant::now();
+        let error = save_harness_state_checked(&dir_text, &state, &baseline).unwrap_err();
+        assert!(error.contains("another writer"), "{error}");
+        assert!(start.elapsed() < std::time::Duration::from_secs(5));
+        assert_eq!(std::fs::read(&path).unwrap(), bytes);
+        drop(lock);
+        save_harness_state_checked(&dir_text, &state, &baseline).unwrap();
+        std::fs::remove_dir_all(&dir).unwrap();
     }
 
     #[test]
@@ -2649,6 +3052,255 @@ mod tests {
     }
 
     #[test]
+    fn classifies_missing_loaded_corrupt_and_unreadable_state() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        // Missing: a new store, safe to create.
+        assert_eq!(
+            load_harness_state_details(&dir_text, HarnessScope::Global).status,
+            HarnessStateLoadStatus::Missing
+        );
+        // Loaded: healthy state.
+        let mut state = empty_harness_state();
+        state.entries.get_mut("memory").unwrap().insert(
+            "keep".to_string(),
+            serde_json::from_value(entry_value("keep", "memory", "t", "c")).unwrap(),
+        );
+        save_harness_state(&dir_text, &state).unwrap();
+        let loaded = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert_eq!(loaded.status, HarnessStateLoadStatus::Loaded);
+        assert!(loaded.state.entries["memory"].contains_key("keep"));
+        assert!(!loaded.is_write_unsafe());
+        // Corrupt: readable, unparsable.
+        let path = get_harness_state_path(&dir_text);
+        std::fs::write(&path, "{not json").unwrap();
+        let corrupt = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert_eq!(corrupt.status, HarnessStateLoadStatus::Corrupt);
+        assert!(corrupt.is_write_unsafe());
+        assert!(corrupt.reason.is_some());
+        // Non-object JSON is corrupt, not "loaded empty".
+        std::fs::write(&path, "[1,2]").unwrap();
+        assert_eq!(
+            load_harness_state_details(&dir_text, HarnessScope::Global).status,
+            HarnessStateLoadStatus::Corrupt
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CF-04 regression: a corrupt state file must never be replaced without a
+    /// recovery copy that still holds the original bytes.
+    #[test]
+    fn saving_over_corrupt_state_keeps_a_recovery_copy_of_the_original_bytes() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let path = get_harness_state_path(&dir_text);
+        std::fs::write(&path, "{not json").unwrap();
+        // The load degrades to empty (unchanged behaviour)...
+        assert!(load_harness_state(&dir_text, HarnessScope::Global)
+            .entries
+            .values()
+            .all(|bucket| bucket.is_empty()));
+
+        let mut state = empty_harness_state();
+        state.entries.get_mut("memory").unwrap().insert(
+            "fresh".to_string(),
+            serde_json::from_value(entry_value("fresh", "memory", "t", "c")).unwrap(),
+        );
+        save_harness_state(&dir_text, &state).unwrap();
+
+        // ...and the original bytes survive beside the rewritten state.
+        let backups: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(HARNESS_STATE_CORRUPT_PREFIX))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one recovery copy: {backups:?}");
+        assert_eq!(
+            std::fs::read_to_string(dir.join(&backups[0])).unwrap(),
+            "{not json"
+        );
+        // The rewritten state is healthy and keeps the new entry.
+        let reloaded = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert_eq!(reloaded.status, HarnessStateLoadStatus::Loaded);
+        assert!(reloaded.state.entries["memory"].contains_key("fresh"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn invalid_utf8_state_bytes_are_corrupt_not_unreadable() {
+        // Review defect D1 (review-glm): `fs::read_to_string` fails invalid UTF-8
+        // with InvalidData, which the old classifier treated as Unreadable - a
+        // permanent save refusal with no recovery copy, and a parity break with
+        // the Python side. Readable corruption must quarantine, not refuse.
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let path = get_harness_state_path(&dir_text);
+        let original: Vec<u8> = vec![0xFF, 0xFE, 0x7B, 0x7D];
+        std::fs::write(&path, &original).unwrap();
+        let loaded = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert_eq!(loaded.status, HarnessStateLoadStatus::Corrupt);
+        assert_eq!(loaded.reason.as_deref(), Some("state file is not valid UTF-8"));
+
+        // The save proceeds and the recovery copy preserves the bytes exactly.
+        save_harness_state(&dir_text, &empty_harness_state()).unwrap();
+        let backups: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(HARNESS_STATE_CORRUPT_PREFIX))
+            .collect();
+        assert_eq!(backups.len(), 1, "exactly one recovery copy: {backups:?}");
+        assert_eq!(
+            std::fs::read(dir.join(&backups[0])).unwrap(),
+            original,
+            "recovery copy preserves the invalid-UTF-8 bytes byte-for-byte"
+        );
+        let reloaded = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert_eq!(reloaded.status, HarnessStateLoadStatus::Loaded);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A repeat save must not pile up recovery copies of identical bytes.
+    #[test]
+    fn repeat_quarantine_of_identical_bytes_is_idempotent() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let path = get_harness_state_path(&dir_text);
+        std::fs::write(&path, "{not json").unwrap();
+        save_harness_state(&dir_text, &empty_harness_state()).unwrap();
+        // Rewrite the same corrupt bytes and save again.
+        std::fs::write(&path, "{not json").unwrap();
+        save_harness_state(&dir_text, &empty_harness_state()).unwrap();
+        let backups: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .filter(|name| name.starts_with(HARNESS_STATE_CORRUPT_PREFIX))
+            .collect();
+        assert_eq!(backups.len(), 1, "one copy per distinct corrupt content: {backups:?}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// An unreadable state file is never replaced: the write must fail loudly and
+    /// leave the bytes on disk untouched. A directory at the state path is present
+    /// (`exists()`) but cannot be read as text, which is the access-error class on
+    /// Windows and POSIX alike.
+    #[test]
+    fn an_unreadable_state_file_blocks_the_save() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let path = get_harness_state_path(&dir_text);
+        // A directory is present but unreadable as text: an access-class failure.
+        std::fs::create_dir(&path).unwrap();
+        let load = load_harness_state_details(&dir_text, HarnessScope::Global);
+        assert!(load.is_write_unsafe());
+        let error = save_harness_state(&dir_text, &empty_harness_state())
+            .expect_err("an unreadable state file must block the save");
+        assert!(error.contains("refusing to overwrite unreadable state"), "{error}");
+        // The unreadable path itself is untouched, and nothing was quarantined.
+        assert!(Path::new(&path).is_dir());
+        let backups = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter(|entry| {
+                entry
+                    .as_ref()
+                    .map(|entry| {
+                        entry
+                            .file_name()
+                            .to_string_lossy()
+                            .starts_with(HARNESS_STATE_CORRUPT_PREFIX)
+                    })
+                    .unwrap_or(false)
+            })
+            .count();
+        assert_eq!(backups, 0, "an unreadable file is never quarantined or replaced");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// No harness save may leave a partial rename state behind, and the fsync
+    /// options must be the durable ones the memory store also uses (CF-05).
+    #[test]
+    fn harness_saves_request_fsync_and_directory_fsync() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let path = get_harness_state_path(&dir_text);
+        assert!(!Path::new(&path).exists());
+        save_harness_state(&dir_text, &empty_harness_state()).unwrap();
+        // A missing file is created, not refused.
+        assert!(Path::new(&path).exists());
+        // The destination is replaced in place with no leftover temp files.
+        let mut names: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().to_string_lossy().to_string())
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["harness_state.json", "harness_state.json.lock"], "{names:?}");
+        let body = std::fs::read_to_string(&path).unwrap();
+        assert!(body.ends_with('\n'));
+        // The durability options the save path actually passes to the writer.
+        let options = harness_state_write_options(0o600);
+        assert!(options.fsync, "harness saves must fsync the temp file");
+        assert!(options.fsync_dir, "harness saves must fsync the directory");
+        assert_eq!(options.mode, Some(0o600), "mode must not loosen");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// CF-03 regression: the cross-session history append must be observable.
+    #[test]
+    fn a_failed_global_history_append_is_reported_without_losing_the_result() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let result = RefinementResult {
+            id: "refine_report".to_string(),
+            summary: "s".to_string(),
+            rationale: "r".to_string(),
+            expected_outcome: "o".to_string(),
+            applied_edits: Vec::new(),
+            harness_state_path: get_harness_state_path(&dir_text),
+            rollback_of: None,
+            scope: Some(HarnessScope::Global),
+        };
+        // Healthy directory: the append succeeds and reports nothing.
+        assert!(append_global_refinement_reported(&dir_text, &result).is_none());
+        assert_eq!(load_global_refinement_history(&dir_text).len(), 1);
+        // A directory at the history path makes the append fail: the caller gets
+        // a warning that names the applied refinement and the missing record.
+        let history_path = get_refinement_history_path(&dir_text);
+        std::fs::remove_file(&history_path).unwrap();
+        std::fs::create_dir(&history_path).unwrap();
+        let warning = append_global_refinement_reported(&dir_text, &result)
+            .expect("a failed history append must be reported");
+        assert!(warning.contains("refine_report"), "{warning}");
+        assert!(warning.contains("could not be written"), "{warning}");
+        assert!(warning.contains("rollback will not list it"), "{warning}");
+        // The applied refinement itself is untouched by the failure.
+        assert_eq!(result.applied_edits.len(), 0);
+        assert!(result.harness_state_path.ends_with("harness_state.json"));
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The history append is durable, so a completed result survives a reopen.
+    #[test]
+    fn global_history_appends_flush_and_reload_across_calls() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let result = RefinementResult {
+            id: "refine_durable".to_string(),
+            summary: "s".to_string(),
+            rationale: "r".to_string(),
+            expected_outcome: "o".to_string(),
+            applied_edits: Vec::new(),
+            harness_state_path: String::new(),
+            rollback_of: None,
+            scope: Some(HarnessScope::Global),
+        };
+        append_global_refinement(&dir_text, &result).unwrap();
+        let raw = std::fs::read_to_string(get_refinement_history_path(&dir_text)).unwrap();
+        assert!(raw.ends_with('\n'), "one JSONL record per line: {raw:?}");
+        assert_eq!(raw.lines().count(), 1);
+        assert_eq!(load_global_refinement_history(&dir_text).len(), 1);
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn appends_and_reloads_refinement_results_across_calls() {
         let dir = temp_dir();
         let result = RefinementResult {
@@ -2672,7 +3324,59 @@ mod tests {
             "not json\n{\"id\":\"refine_b\"}\n",
         )
         .unwrap();
-        assert!(load_global_refinement_history(&dir.to_string_lossy()).is_empty());
+        // Malformed lines and marker-less rows are still skipped so one bad
+        // append cannot break rollback, but they are now reported.
+        let (loaded, warning) = load_global_refinement_history_reported(&dir.to_string_lossy());
+        assert!(loaded.is_empty());
+        let warning = warning.expect("skipped rows must be reported");
+        assert!(warning.contains("1 refinement history row(s)"), "{warning}");
+        assert!(warning.contains("those rollback targets are not listed"), "{warning}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// A healthy history reports nothing, and a marker-less (kernel event) row is
+    /// skipped by design rather than counted as an unreadable rollback target.
+    #[test]
+    fn history_load_reports_only_rows_that_claim_to_be_results() {
+        let dir = temp_dir();
+        let dir_text = dir.to_string_lossy().to_string();
+        let history = get_refinement_history_path(&dir_text);
+        let result = RefinementResult {
+            id: "refine_ok".to_string(),
+            summary: "s".to_string(),
+            rationale: "r".to_string(),
+            expected_outcome: "o".to_string(),
+            applied_edits: Vec::new(),
+            harness_state_path: String::new(),
+            rollback_of: None,
+            scope: None,
+        };
+        std::fs::write(
+            &history,
+            format!(
+                "{}\n{{\"id\":\"refine_event\",\"trigger\":\"t\"}}\n",
+                serde_json::to_string(&result).unwrap()
+            ),
+        )
+        .unwrap();
+        let (loaded, warning) = load_global_refinement_history_reported(&dir_text);
+        assert_eq!(loaded.len(), 1);
+        assert_eq!(loaded[0].id, "refine_ok");
+        assert!(
+            warning.is_none(),
+            "a kernel event row is not an unreadable result: {warning:?}"
+        );
+
+        // A row with the result markers but a broken shape IS reported.
+        std::fs::write(
+            &history,
+            "{\"id\":\"refine_bad\",\"appliedEdits\":\"not-an-array\"}\n",
+        )
+        .unwrap();
+        let (loaded, warning) = load_global_refinement_history_reported(&dir_text);
+        assert!(loaded.is_empty());
+        let warning = warning.expect("broken result row must be reported");
+        assert!(warning.contains("1 refinement history row(s)"), "{warning}");
         std::fs::remove_dir_all(&dir).ok();
     }
 

@@ -36,6 +36,7 @@ const MEASUREMENTS = new Set([
 	"total_ms",
 	"wait_ms",
 	"dispatch_to_response_headers_ms",
+	"transport_open_ack_ms",
 	"dispatch_to_first_event_ms",
 	"dispatch_to_first_visible_ms",
 	"dispatch_to_first_raw_ms",
@@ -144,7 +145,7 @@ function newSummary() {
 			"Token fields are summed independently; overlap categories are never added into input/output or provider total.",
 			"Provider usage and local estimates are separate. This report is not a bill or cost estimate.",
 			"Current host integrations attach authoritative raw provider usage to provider_attempt only; schema-valid legacy records remain readable.",
-			"Compaction start records are counted separately and excluded from completed measurements. Compaction provider attempts have their own identity distributions.",
+			"Compaction start records (outcome \"started\", or a missing outcome in legacy files) are counted separately and excluded from completed measurements. Compaction provider attempts have their own identity distributions.",
 			"File bytes selected from opening stats and bytes actually consumed are reported separately.",
 		],
 	};
@@ -218,7 +219,7 @@ function acceptRecord(summary, sessions, record) {
 	const sessionId = record.correlation?.sessionId;
 	if (typeof sessionId === "string" && sessions.size < SESSION_SET_LIMIT) sessions.add(sessionId);
 	else if (typeof sessionId === "string") summary.sessions.capped = true;
-	if (record.identity?.component === "compaction" && record.outcome === undefined) {
+	if (record.identity?.component === "compaction" && (record.outcome === undefined || record.outcome === "started")) {
 		summary.records.startedByOperation[record.operation] = (summary.records.startedByOperation[record.operation] ?? 0) + 1;
 		return;
 	}

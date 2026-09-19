@@ -62,6 +62,14 @@ struct RequestMetricState {
     first_text_at: Option<f64>,
     network_terminal_at: Option<f64>,
     transport_websocket: Option<f64>,
+    /// A WebSocket transport reports its own socket send acknowledgement through the
+    /// same `onResponse` callback, with no server response yet. The edge is measured,
+    /// but as its own stage: `dispatch_to_response_headers_ms` stays null because no
+    /// HTTP header edge was observed.
+    transport_open_ack_at: Option<f64>,
+    /// The host decides whether error terminals are retried. Success and cancellation
+    /// settle here; a failed terminal waits for the host's retry decision.
+    defer_logical_request_terminal: bool,
     provider_usage: Option<PerformanceMetricUsageV1>,
     finished: bool,
 }
@@ -90,6 +98,11 @@ pub struct LogicalRequestMetricFinalizer {
     pub started_at: Option<f64>,
     pub dispatch_edge_at: Option<f64>,
     pub response_headers_at: Option<f64>,
+    pub transport_open_ack_at: Option<f64>,
+    /// True when a host owns the outer logical-request terminal for this request's live
+    /// retry group. The shared `settlement` handle remains the authority: a settled group
+    /// cannot be settled twice, so a stale deferral cannot swallow a real terminal.
+    pub defer_terminal: bool,
     pub first_event_at: Option<f64>,
     pub first_visible_at: Option<f64>,
 }
@@ -339,7 +352,13 @@ fn settle_logical_request_metric(state: &LogicalRequestMetricFinalizer, outcome:
     );
     measurements.insert(PerformanceMetricMeasurement::LocalGatewayWaitMs, None);
     measurements.insert(PerformanceMetricMeasurement::UpstreamWaitMs, None);
-    measurements.insert(PerformanceMetricMeasurement::AttemptCount, None);
+    // B5: the number of provider attempts in this logical request is genuinely derivable
+    // from the group's own settlement, so it is reported instead of a permanent null.
+    let attempt_count = state.settlement.max_provider_attempt_number();
+    measurements.insert(
+        PerformanceMetricMeasurement::AttemptCount,
+        (attempt_count > 0).then(|| attempt_count as f64),
+    );
 
     let mut identity = state.identity.clone();
     identity.component = Some(PerformanceMetricComponent::Agent);
@@ -1020,12 +1039,30 @@ fn create_observed_callbacks(
         Arc::new(move |provider_response: pi_ai::types::ProviderResponse, model: &Model| {
             let observed = if metrics_enabled {
                 if let Ok(mut slot) = state.lock() {
-                    if slot.response_headers_at.is_none() {
+                    // A WebSocket transport has no HTTP response yet: it calls this
+                    // hook with its own send acknowledgement. Recording that instant as
+                    // the "response headers" edge made every WS-vs-SSE comparison of
+                    // that field invalid (B2). The ack is measured on its own stage, and
+                    // the header stage stays null until a real header edge is observed.
+                    let is_send_ack = provider_response
+                        .headers
+                        .get("x-optimus-response-edge")
+                        .map(String::as_str)
+                        == Some("transport_send_ack");
+                    if is_send_ack {
+                        if slot.transport_open_ack_at.is_none() {
+                            slot.transport_open_ack_at = metric_now(&config);
+                        }
+                    } else if slot.response_headers_at.is_none() {
                         slot.response_headers_at = metric_now(&config);
                     }
-                    slot.transport_websocket = match provider_response.headers.get("x-optimus-transport").map(String::as_str) {
-                        Some("websocket") => Some(1.0), Some("sse") => Some(0.0), _ => None,
-                    };
+                    // A missing label must not erase an already observed label: the
+                    // provider may have reported its transport on its own stage (B5).
+                    match provider_response.headers.get("x-optimus-transport").map(String::as_str) {
+                        Some("websocket") => slot.transport_websocket = Some(1.0),
+                        Some("sse") => slot.transport_websocket = Some(0.0),
+                        _ => {}
+                    }
                 }
                 match config.stream_options.stream.on_response.as_ref() {
                     Some(hook) => hook(provider_response, model),
@@ -1072,6 +1109,15 @@ fn create_observed_callbacks(
         let config = config.clone();
         Some(Arc::new(move |stage: &str| {
             if let Ok(mut state) = state.lock() {
+                // B5: a provider whose WebSocket transport reports no response header edge
+                // labels its transport here instead, so the attempt is still comparable to
+                // an SSE attempt of the same provider. The label is a flag, not a time.
+                if stage == "transport_ws" {
+                    if state.transport_websocket.is_none() {
+                        state.transport_websocket = Some(1.0);
+                    }
+                    return;
+                }
                 let slot = match stage {
                     "raw_event" => &mut state.first_raw_at,
                     "thinking" => &mut state.first_thinking_at,
@@ -1992,24 +2038,36 @@ async fn stream_assistant_response(
     let use_configured_correlation = !metric_loop_state.configured_logical_request_consumed;
     metric_loop_state.configured_logical_request_consumed = true;
     let configured_started_at = metrics.as_ref().and_then(|metrics| metrics.logical_request_started_at);
-    let started_at = if use_configured_correlation
+    let configured_attempt_number = metrics.as_ref().and_then(|metrics| metrics.provider_attempt_number);
+    // A host-owned settlement is reusable only while it is unsettled. Once it has been
+    // settled, the group is over and reusing its id would attribute this request's
+    // attempts to a finished logical request whose terminal already exists (B6). Such a
+    // turn mints a fresh id, a fresh settlement and a fresh attempt ordinal instead.
+    let configured_settlement = if use_configured_correlation {
+        metrics
+            .as_ref()
+            .and_then(|metrics| metrics.logical_request_settlement.clone())
+    } else {
+        None
+    };
+    let configured_settlement_is_live = configured_settlement
+        .as_ref()
+        .map(|settlement| !settlement.is_settled())
+        .unwrap_or(false);
+    let reuse_configured_logical_request = use_configured_correlation
+        && (configured_settlement.is_none() || configured_settlement_is_live);
+    let started_at = if reuse_configured_logical_request
         && configured_started_at.map(|value| value.is_finite()).unwrap_or(false)
     {
         configured_started_at
     } else {
         metric_now(config)
     };
-    let configured_attempt_number = metrics.as_ref().and_then(|metrics| metrics.provider_attempt_number);
-    let logical_request_settlement = if use_configured_correlation {
-        metrics
-            .as_ref()
-            .and_then(|metrics| metrics.logical_request_settlement.clone())
-    } else {
-        None
-    }
-    .unwrap_or_else(|| Arc::new(AgentLoopLogicalRequestSettlement::new()));
+    let logical_request_settlement = configured_settlement
+        .filter(|settlement| !settlement.is_settled())
+        .unwrap_or_else(|| Arc::new(AgentLoopLogicalRequestSettlement::new()));
     let mut request_metrics = RequestMetricState {
-        logical_request_id: if use_configured_correlation {
+        logical_request_id: if reuse_configured_logical_request {
             metrics.as_ref().and_then(|metrics| metrics.logical_request_id.clone())
         } else {
             None
@@ -2026,7 +2084,7 @@ async fn stream_assistant_response(
         } else {
             None
         },
-        provider_attempt_number: if use_configured_correlation
+        provider_attempt_number: if reuse_configured_logical_request
             && configured_attempt_number.map(|value| value > 0).unwrap_or(false)
         {
             configured_attempt_number.unwrap_or(1)
@@ -2034,6 +2092,12 @@ async fn stream_assistant_response(
             1
         },
         started_at,
+        // This also applies to the first failed request, and later tool turns,
+        // before a retry correlation has been installed by the host.
+        defer_logical_request_terminal: metrics
+            .as_ref()
+            .map(|metrics| metrics.host_owns_logical_request_terminal)
+            .unwrap_or(false),
         finished: false,
         ..Default::default()
     };
@@ -2203,6 +2267,8 @@ fn finish_request_metrics(
         request_metrics.dispatch_edge_at = request_metrics.dispatch_edge_at.or(observed_state.dispatch_edge_at);
         request_metrics.response_headers_at =
             request_metrics.response_headers_at.or(observed_state.response_headers_at);
+        request_metrics.transport_open_ack_at =
+            request_metrics.transport_open_ack_at.or(observed_state.transport_open_ack_at);
         request_metrics.first_raw_at = observed_state.first_raw_at;
         request_metrics.first_thinking_at = observed_state.first_thinking_at;
         request_metrics.first_tool_at = observed_state.first_tool_at;
@@ -2247,6 +2313,8 @@ fn finish_request_metrics(
         started_at: request_metrics.started_at,
         dispatch_edge_at: request_metrics.dispatch_edge_at,
         response_headers_at: request_metrics.response_headers_at,
+        transport_open_ack_at: request_metrics.transport_open_ack_at,
+        defer_terminal: request_metrics.defer_logical_request_terminal,
         first_event_at: request_metrics.first_event_at,
         first_visible_at: request_metrics.first_visible_at,
     };
@@ -2283,10 +2351,24 @@ fn finish_request_metrics(
         PerformanceMetricMeasurement::TotalMs,
         elapsed_metric_ms(request_metrics.dispatch_edge_at, finished_at),
     );
-    attempt_measurements.insert(PerformanceMetricMeasurement::WaitMs, None);
+    // B5: for the first attempt of a logical request the pre-dispatch wait is the same
+    // observable window as `logical_request.wait_ms` (request start to payload dispatch).
+    // A retried attempt has no single honest wait, so it stays null rather than guessed.
+    attempt_measurements.insert(
+        PerformanceMetricMeasurement::WaitMs,
+        if request_metrics.provider_attempt_number == 1 {
+            elapsed_metric_ms(request_metrics.started_at, request_metrics.dispatch_edge_at)
+        } else {
+            None
+        },
+    );
     attempt_measurements.insert(
         PerformanceMetricMeasurement::DispatchToResponseHeadersMs,
         elapsed_metric_ms(request_metrics.dispatch_edge_at, request_metrics.response_headers_at),
+    );
+    attempt_measurements.insert(
+        PerformanceMetricMeasurement::TransportOpenAckMs,
+        elapsed_metric_ms(request_metrics.dispatch_edge_at, request_metrics.transport_open_ack_at),
     );
     attempt_measurements.insert(
         PerformanceMetricMeasurement::DispatchToFirstEventMs,
@@ -2327,7 +2409,12 @@ fn finish_request_metrics(
             usage,
         },
     );
-    if message.is_none() || !metrics_ref.host_owns_logical_request_terminal {
+    // Only an error awaits the host's retry decision. A success or cancellation
+    // closes the shared group using this attempt's final timestamps.
+    let host_owns_live_group = metrics_ref.host_owns_logical_request_terminal
+        && request_metrics.defer_logical_request_terminal
+        && !logical_finalizer.settlement.is_settled();
+    if message.is_none() || outcome != PerformanceMetricOutcome::Failure || !host_owns_live_group {
         settle_logical_request_metric(&logical_finalizer, outcome);
     }
 }
@@ -2353,16 +2440,16 @@ mod rlm_t16_tests {
     const RETENTION_BOUND: usize = 256;
 
     /// Serializes the tests in this binary that assert registry counts.
-    static REGISTRY_TESTS: Mutex<()> = Mutex::new(());
+    pub(super) static REGISTRY_TESTS: Mutex<()> = Mutex::new(());
 
     /// A real recorder whose session id distinguishes two process-local sessions.
-    struct SessionRecorder {
+    pub(super) struct SessionRecorder {
         session_id: String,
         recorded: AtomicUsize,
     }
 
     impl SessionRecorder {
-        fn new(session_id: &str) -> Arc<Self> {
+        pub(super) fn new(session_id: &str) -> Arc<Self> {
             Arc::new(Self {
                 session_id: session_id.to_string(),
                 recorded: AtomicUsize::new(0),
@@ -2383,6 +2470,22 @@ mod rlm_t16_tests {
         fn record(&self, _event: PerformanceMetricEvent) {
             self.recorded.fetch_add(1, Ordering::SeqCst);
         }
+        fn flush(&self) {}
+        fn close(&self) {}
+    }
+
+    /// A recorder that keeps every event it receives, so a test can assert the emitted
+    /// measurement maps directly instead of only counting records.
+    #[derive(Default)]
+    struct CaptureMetrics(std::sync::Mutex<Vec<PerformanceMetricEvent>>);
+
+    impl PerformanceMetricRecorder for CaptureMetrics {
+        fn session_id(&self) -> &str { "capture" }
+        fn monotonic_now(&self) -> f64 { 10.0 }
+        fn next_id(&self, scope: crate::performance_metrics::PerformanceMetricIdScope) -> String {
+            format!("{scope:?}-capture")
+        }
+        fn record(&self, event: PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
         fn flush(&self) {}
         fn close(&self) {}
     }
@@ -2445,6 +2548,50 @@ mod rlm_t16_tests {
                 messages = produced;
             }
         }
+        messages
+            .into_iter()
+            .rev()
+            .find_map(|message| match message {
+                AgentMessage::Message(Message::Assistant(assistant)) => Some(assistant),
+                _ => None,
+            })
+            .expect("the run must produce a terminal assistant message")
+    }
+
+    /// Run one real agent loop with an explicitly supplied host correlation.
+    pub(super) async fn run_session_with_metrics(
+        provider: &pi_ai::providers::faux::FauxProviderRegistration,
+        recorder: Arc<SessionRecorder>,
+        content_seed: u64,
+        metrics: AgentLoopPerformanceMetrics,
+    ) -> AssistantMessage {
+        provider.set_responses(vec![FauxResponseStep::Message(pinned_message(provider, content_seed))]);
+        let mut config = AgentLoopConfig::new(provider.get_model());
+        config.performance_metrics = Some(metrics);
+        config.stream_options.stream.session_id = Some("pinned-stream-session".to_string());
+        let stream = agent_loop(
+            vec![AgentMessage::from(UserMessage {
+                role: "user".to_string(),
+                content: UserContent::Text("question".to_string()),
+                provider_context: None,
+                timestamp: 1,
+            })],
+            AgentContext {
+                system_prompt: String::new(),
+                messages: Vec::new(),
+                tools: None,
+            },
+            config,
+            None,
+            None,
+        );
+        let mut messages: Vec<AgentMessage> = Vec::new();
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::AgentEnd { messages: produced } = event {
+                messages = produced;
+            }
+        }
+        let _ = recorder;
         messages
             .into_iter()
             .rev()
@@ -2629,8 +2776,27 @@ mod tool_abort_cleanup_tests;
 #[cfg(test)]
 mod tests {
     use super::*;
+    use super::rlm_t16_tests::{REGISTRY_TESTS, SessionRecorder, run_session_with_metrics};
+    use crate::performance_metrics::AgentLoopPerformanceMetrics;
     use crate::types::ToolExecutionMode;
+    use pi_ai::providers::faux::register_faux_provider;
     use serde_json::json;
+
+    /// Shared recorder fixture for the transport-edge tests; the emitted
+    /// events are introspected through `.0` where a test needs them.
+    #[derive(Default)]
+    struct CaptureMetrics(std::sync::Mutex<Vec<PerformanceMetricEvent>>);
+
+    impl PerformanceMetricRecorder for CaptureMetrics {
+        fn session_id(&self) -> &str { "capture" }
+        fn monotonic_now(&self) -> f64 { 10.0 }
+        fn next_id(&self, scope: crate::performance_metrics::PerformanceMetricIdScope) -> String {
+            format!("{scope:?}-capture")
+        }
+        fn record(&self, event: PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
+        fn flush(&self) {}
+        fn close(&self) {}
+    }
 
     #[tokio::test]
     async fn transport_monitoring_keeps_raw_usage_and_first_phase_timestamps() {
@@ -2664,6 +2830,351 @@ mod tests {
         assert_eq!(usage.input_tokens,Some(100.0)); assert_eq!(usage.cached_input_tokens,Some(80.0));
         assert_eq!(usage.reasoning_tokens,Some(0.0)); assert_eq!(usage.output_tokens,None);
         assert_eq!(usage.cached_input_included_in_input,Some(true));
+    }
+
+    /// B2: a WebSocket transport's local send acknowledgement is not an HTTP header
+    /// edge. It is measured on its own stage and the header stage stays unavailable.
+    #[tokio::test]
+    async fn websocket_send_ack_is_not_recorded_as_a_response_header_edge() {
+        #[derive(Default)]
+        struct Capture(std::sync::Mutex<Vec<PerformanceMetricEvent>>);
+        impl PerformanceMetricRecorder for Capture {
+            fn session_id(&self) -> &str { "edge-test" }
+            fn monotonic_now(&self) -> f64 { 10.0 }
+            fn next_id(&self, scope: crate::performance_metrics::PerformanceMetricIdScope) -> String {
+                format!("{scope:?}-edge")
+            }
+            fn record(&self, event: PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
+            fn flush(&self) {}
+            fn close(&self) {}
+        }
+        let capture = Arc::new(Capture::default());
+        let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "azure-openai-managed", "http://localhost"));
+        config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let state = RequestMetricState::default();
+        let observed = create_observed_callbacks(&config, config.performance_metrics.clone(), &state);
+        observed.on_payload.clone()(json!({"model": "m"}), &config.model).await;
+
+        let send_ack_headers = || {
+            let mut headers = indexmap::IndexMap::new();
+            headers.insert("x-optimus-transport".to_string(), "websocket".to_string());
+            headers.insert("x-optimus-response-edge".to_string(), "transport_send_ack".to_string());
+            headers
+        };
+        observed
+            .on_response
+            .clone()(pi_ai::types::ProviderResponse { status: 101, headers: send_ack_headers() }, &config.model)
+            .await;
+        {
+            let slot = observed.timestamps.lock().unwrap();
+            assert!(
+                slot.response_headers_at.is_none(),
+                "a local send acknowledgement must not claim the response-header edge"
+            );
+            assert_eq!(slot.transport_open_ack_at, Some(10.0), "the acknowledgement is measured on its own stage");
+            assert_eq!(slot.transport_websocket, Some(1.0), "the transport label stays truthful");
+        }
+
+        let mut final_message = AssistantMessage::new("openai-responses", "azure-openai-managed", "m", 1);
+        final_message.usage = Usage::zero();
+        let mut request_metrics = observed.timestamps.lock().unwrap().clone();
+        let settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        finish_request_metrics(
+            &config,
+            &config.performance_metrics,
+            &settlement,
+            Some(&final_message),
+            PerformanceMetricOutcome::Success,
+            &mut request_metrics,
+            &observed,
+        );
+
+        let records = capture.0.lock().unwrap();
+        let attempt = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::ProviderAttempt)
+            .expect("a provider attempt is recorded");
+        let measurements = attempt.measurements.as_ref().expect("attempt measurements");
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::DispatchToResponseHeadersMs),
+            Some(&None),
+            "an unavailable header edge is null, never a local acknowledgement timing"
+        );
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::TransportOpenAckMs),
+            Some(&Some(0.0)),
+            "the send acknowledgement is recorded on the transport stage"
+        );
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::TransportWebsocket),
+            Some(&Some(1.0))
+        );
+
+        // SSE keeps the real HTTP header edge on the original field.
+        let mut sse_config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+        sse_config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let sse_observed = create_observed_callbacks(&sse_config, sse_config.performance_metrics.clone(), &RequestMetricState::default());
+        sse_observed.on_payload.clone()(json!({"model": "m"}), &sse_config.model).await;
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("x-optimus-transport".to_string(), "sse".to_string());
+        sse_observed
+            .on_response
+            .clone()(pi_ai::types::ProviderResponse { status: 200, headers }, &sse_config.model)
+            .await;
+        let slot = sse_observed.timestamps.lock().unwrap();
+        assert_eq!(slot.response_headers_at, Some(10.0), "an SSE header edge stays on the header stage");
+        assert!(slot.transport_open_ack_at.is_none(), "SSE has no transport send acknowledgement");
+    }
+
+    /// B5: the transport label is observable for a provider that never reports a response
+    /// header edge, and an unlabelled response never erases an observed label.
+    #[tokio::test]
+    async fn a_provider_transport_stage_labels_the_attempt_and_is_never_erased() {
+        let config = AgentLoopConfig::new(Model::new(
+            "m", "M", "openai-codex-responses", "openai-codex", "http://localhost",
+        ));
+        let observed = create_observed_callbacks(&config, config.performance_metrics.clone(), &RequestMetricState::default());
+        assert!(config.performance_metrics.is_none());
+        // Without metrics the stage is inert, so callbacks stay absent.
+        assert!(observed.on_stream_observation.is_none());
+
+        let capture = Arc::new(CaptureMetrics::default());
+        let mut config = config;
+        config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let observed = create_observed_callbacks(&config, config.performance_metrics.clone(), &RequestMetricState::default());
+        let observe = observed.on_stream_observation.clone().unwrap();
+        observe("transport_ws");
+        {
+            let slot = observed.timestamps.lock().unwrap();
+            assert_eq!(slot.transport_websocket, Some(1.0));
+            assert!(
+                slot.first_raw_at.is_none() && slot.network_terminal_at.is_none(),
+                "a transport label is not a content stage"
+            );
+        }
+        // A later unlabelled response must not clear the recorded transport.
+        observed
+            .on_response
+            .clone()(pi_ai::types::ProviderResponse { status: 200, headers: indexmap::IndexMap::new() }, &config.model)
+            .await;
+        assert_eq!(
+            observed.timestamps.lock().unwrap().transport_websocket,
+            Some(1.0),
+            "an unlabelled response must not erase an observed transport label"
+        );
+        // And the documented content stages still record their own timestamps.
+        for stage in ["raw_event", "thinking", "tool", "text", "terminal"] {
+            observe(stage);
+        }
+        let slot = observed.timestamps.lock().unwrap();
+        for value in [
+            slot.first_raw_at, slot.first_thinking_at, slot.first_tool_at,
+            slot.first_text_at, slot.network_terminal_at,
+        ] {
+            assert!(value.is_some(), "content stages still record a timestamp");
+        }
+    }
+
+    /// B5: a logical request reports the number of provider attempts its group observed,
+    /// and the first attempt reports a wait that the record can justify.
+    #[tokio::test]
+    async fn logical_request_reports_attempt_count_and_only_derivable_waits() {
+        // This test records logical-request correlations, so it shares the registry lock.
+        let _guard = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let capture = Arc::new(CaptureMetrics::default());
+        let recorder: Arc<dyn PerformanceMetricRecorder> = capture.clone();
+        let config = {
+            let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+            config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(recorder.clone()));
+            config
+        };
+        let settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        settlement.observe_provider_attempt_number(1);
+        settlement.observe_provider_attempt_number(3);
+        let mut request_metrics = RequestMetricState {
+            logical_request_id: Some("logical-b5".to_string()),
+            provider_attempt_number: 3,
+            started_at: Some(100.0),
+            dispatch_edge_at: Some(140.0),
+            ..Default::default()
+        };
+        // The real callbacks share their timestamps with the loop, exactly as production
+        // does, so this test exercises the same merge path.
+        let observed = create_observed_callbacks(
+            &config,
+            config.performance_metrics.clone(),
+            &request_metrics,
+        );
+        let mut message = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        message.usage = Usage::zero();
+        finish_request_metrics(
+            &config,
+            &config.performance_metrics,
+            &settlement,
+            Some(&message),
+            PerformanceMetricOutcome::Success,
+            &mut request_metrics,
+            &observed,
+        );
+        let records = capture.0.lock().unwrap();
+        let attempt = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::ProviderAttempt)
+            .expect("attempt record");
+        assert_eq!(
+            attempt.measurements.as_ref().unwrap().get(&PerformanceMetricMeasurement::WaitMs),
+            Some(&None),
+            "a retried attempt has no single honest wait"
+        );
+        let logical = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::LogicalRequest)
+            .expect("logical record");
+        let measurements = logical.measurements.as_ref().unwrap();
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::AttemptCount),
+            Some(&Some(3.0)),
+            "the group's own settled attempt ordinal is reported"
+        );
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::LocalGatewayWaitMs),
+            Some(&None),
+            "an unmeasurable stage stays null, never zero"
+        );
+        assert_eq!(
+            measurements.get(&PerformanceMetricMeasurement::UpstreamWaitMs),
+            Some(&None),
+            "an unmeasurable stage stays null, never zero"
+        );
+
+        // The first attempt of a fresh group records the request-start to dispatch wait.
+        let capture = Arc::new(CaptureMetrics::default());
+        let config = {
+            let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+            config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+            config
+        };
+        let settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        // The loop observes the attempt ordinal on the group right after building the state.
+        settlement.observe_provider_attempt_number(1);
+        let mut request_metrics = RequestMetricState {
+            logical_request_id: Some("logical-b5-first".to_string()),
+            provider_attempt_number: 1,
+            started_at: Some(100.0),
+            dispatch_edge_at: Some(140.0),
+            ..Default::default()
+        };
+        let observed = create_observed_callbacks(
+            &config,
+            config.performance_metrics.clone(),
+            &request_metrics,
+        );
+        finish_request_metrics(
+            &config,
+            &config.performance_metrics,
+            &settlement,
+            Some(&message),
+            PerformanceMetricOutcome::Success,
+            &mut request_metrics,
+            &observed,
+        );
+        let records = capture.0.lock().unwrap();
+        let attempt = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::ProviderAttempt)
+            .expect("attempt record");
+        assert_eq!(
+            attempt.measurements.as_ref().unwrap().get(&PerformanceMetricMeasurement::WaitMs),
+            Some(&Some(40.0)),
+            "the first attempt's pre-dispatch wait is derivable and reported"
+        );
+        let logical = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::LogicalRequest)
+            .expect("logical record");
+        assert_eq!(
+            logical.measurements.as_ref().unwrap().get(&PerformanceMetricMeasurement::AttemptCount),
+            Some(&Some(1.0)),
+            "a single-attempt group reports one attempt"
+        );
+        assert_eq!(
+            logical.measurements.as_ref().unwrap().get(&PerformanceMetricMeasurement::WaitMs),
+            Some(&Some(40.0)),
+            "the logical wait and the first attempt wait are the same observable window"
+        );
+    }
+
+    /// B6: after a host-owned retry group settles, the next request must not reuse the
+    /// finished group's id, settlement or attempt ordinal.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn a_settled_host_group_is_not_reused_by_the_next_request() {
+        let _guard = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let provider = register_faux_provider(None);
+        let recorder = SessionRecorder::new("session-settled-group");
+        let group_settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        let terminal = run_session_with_metrics(
+            &provider,
+            recorder.clone(),
+            900,
+            AgentLoopPerformanceMetrics {
+                recorder: recorder.clone(),
+                logical_request_id: Some("logical-retry-group".to_string()),
+                logical_request_started_at: Some(0.0),
+                provider_attempt_number: Some(2),
+                host_owns_logical_request_terminal: true,
+                logical_request_settlement: Some(group_settlement.clone()),
+            },
+        )
+        .await;
+        assert_eq!(
+            get_performance_metric_request_correlation(&terminal)
+                .and_then(|correlation| correlation.logical_request_id)
+                .as_deref(),
+            Some("logical-retry-group"),
+        );
+        // The host settles the group's single outer terminal (successful retry path).
+        finalize_performance_metric_logical_request(&terminal, Some(PerformanceMetricOutcome::Success));
+        assert!(group_settlement.is_settled(), "the group is settled exactly once");
+
+        // The next request still carries the host's stale group correlation.
+        let next = run_session_with_metrics(
+            &provider,
+            recorder.clone(),
+            901,
+            AgentLoopPerformanceMetrics {
+                recorder: recorder.clone(),
+                logical_request_id: Some("logical-retry-group".to_string()),
+                logical_request_started_at: Some(0.0),
+                provider_attempt_number: Some(3),
+                host_owns_logical_request_terminal: true,
+                logical_request_settlement: Some(group_settlement.clone()),
+            },
+        )
+        .await;
+        let next_id = get_performance_metric_request_correlation(&next)
+            .and_then(|correlation| correlation.logical_request_id);
+        assert_ne!(
+            next_id.as_deref(),
+            Some("logical-retry-group"),
+            "a finished group id must never be reused by a later request"
+        );
+        assert!(
+            next_id.is_some(),
+            "the later request still reports its own logical request id"
+        );
+        assert_eq!(
+            get_performance_metric_request_correlation(&next)
+                .map(|correlation| correlation.provider_attempt_number),
+            Some(1),
+            "a new group starts at ordinal 1 instead of continuing the finished group"
+        );
+        assert_eq!(
+            get_performance_metric_request_correlation(&next)
+                .and_then(|correlation| correlation.logical_request_started_at),
+            Some(1.0),
+            "a new group uses the current recorder time, not the finished group's start"
+        );
+        provider.unregister();
     }
 
     fn assistant_with_tool_call(id: &str, name: &str) -> AssistantMessage {
@@ -2812,6 +3323,8 @@ mod tests {
             started_at: Some(0.0),
             dispatch_edge_at: Some(1.0),
             response_headers_at: Some(2.0),
+            transport_open_ack_at: None,
+            defer_terminal: false,
             first_event_at: Some(3.0),
             first_visible_at: Some(4.0),
         };

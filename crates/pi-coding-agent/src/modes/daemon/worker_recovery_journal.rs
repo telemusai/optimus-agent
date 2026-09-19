@@ -7,6 +7,14 @@ use std::path::Path;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Compaction is no longer gated only on an all-idle journal: a stale busy
+/// entry would otherwise grow the file without bound (audit BUSY-FLAG-01
+/// measured 15,420 records / 5.56MB). Once the file exceeds this budget, the
+/// next record compacts it to the latest state even while a busy entry exists
+/// (the rewrite keeps the latest record per active session, including busy
+/// ones, so no recovery evidence is lost).
+pub const WORKER_RECOVERY_COMPACT_BYTES: u64 = 512 * 1024;
+
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct WorkerRecoveryRecord {
     pub version: u32,
@@ -89,9 +97,20 @@ impl WorkerRecoveryJournal {
         };
         self.append(&record);
         self.latest.insert(record.active_session_id.clone(), record);
-        if self.latest.values().all(|entry| !entry.busy) {
+        let all_idle = self.latest.values().all(|entry| !entry.busy);
+        if all_idle || self.exceeds_compact_budget() {
             self.compact();
         }
+    }
+
+    /// The append-only tail is bounded even while a busy entry persists: once
+    /// the file grows past `WORKER_RECOVERY_COMPACT_BYTES`, compaction rewrites
+    /// the latest-per-session state (a failed rename leaves the original file,
+    /// so the rewrite retries on the next record).
+    fn exceeds_compact_budget(&self) -> bool {
+        std::fs::metadata(&self.path)
+            .map(|metadata| metadata.len() > WORKER_RECOVERY_COMPACT_BYTES)
+            .unwrap_or(false)
     }
 
     pub fn get_latest(&self) -> Vec<WorkerRecoveryRecord> {
@@ -211,6 +230,41 @@ mod tests {
         assert_eq!(reloaded.len(), 1);
         assert!(!reloaded[0].busy);
         assert_eq!(reloaded[0].operation, "idle");
+    }
+
+    #[test]
+    fn compaction_bounds_the_file_even_while_a_busy_entry_persists() {
+        let dir = std::env::temp_dir().join(format!("worker-recovery-bound-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).expect("temp dir");
+        let path = dir.join("journal.jsonl");
+        let path_text = path.to_string_lossy().to_string();
+        let mut journal = WorkerRecoveryJournal::new(&path_text);
+        // A session that never settles: the busy flag persists and the distinct
+        // operation strings bypass the record dedup gate, so every record appends.
+        let base = WorkerRecoveryRecordInput {
+            active_session_id: "stale-busy".to_string(),
+            session_id: "stale-busy".to_string(),
+            session_file: Some("/tmp/stale.jsonl".to_string()),
+            busy: true,
+            operation: "tool_call".to_string(),
+        };
+        journal.record(base.clone());
+        let padding = "x".repeat(2048);
+        for index in 0..400 {
+            journal.record(WorkerRecoveryRecordInput { operation: format!("{padding}-{index}"), ..base.clone() });
+        }
+        let size = std::fs::metadata(&path).expect("journal exists").len();
+        assert!(
+            size < WORKER_RECOVERY_COMPACT_BYTES,
+            "a persisting busy entry must not grow the journal without bound: {size} bytes"
+        );
+        // The rewrite preserves the latest record per active session, including
+        // the busy one: no recovery evidence is dropped by the bounded compaction.
+        let latest = WorkerRecoveryJournal::read_latest(&path_text);
+        assert_eq!(latest.len(), 1);
+        assert!(latest[0].busy);
+        assert_eq!(latest[0].active_session_id, "stale-busy");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

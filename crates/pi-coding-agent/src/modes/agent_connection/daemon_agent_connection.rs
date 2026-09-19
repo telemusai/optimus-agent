@@ -713,6 +713,7 @@ pub fn invalidates_cached_snapshot(command_type: &str) -> bool {
             | "list_saved_sessions"
             | "wait_for_idle"
             | "get_state"
+            | "jev_get_status"
             | "get_connection_state"
             | "get_messages"
             | "get_history_range"
@@ -2736,6 +2737,32 @@ impl AgentConnection for DaemonAgentConnection {
         })
     }
 
+    fn get_jev_status(&self) -> BoxFuture<Result<Option<Value>, String>> {
+        let this = self.clone();
+        Box::pin(async move {
+            if !this.client.supports_server_capability("jev_control") {
+                return Ok(None);
+            }
+            let active_session_id = this.active_session_id();
+            let command = command_body(
+                "jev_get_status",
+                vec![("activeSessionId", Value::String(active_session_id.clone()))],
+            );
+            // Status must not be replayed against a different worker/session
+            // after reconnect, or force a fresh (potentially large) transcript.
+            let data = this.request_data_with_recovery(command, Some(2_000), false).await?;
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while reading Jev status".to_string());
+            }
+            match data.get("pipeline") {
+                Some(pipeline) if pipeline.is_object() || pipeline.is_null() => {
+                    Ok(Some(json!({ "pipeline": pipeline })))
+                }
+                _ => Err("Daemon returned an invalid Jev status response".to_string()),
+            }
+        })
+    }
+
     fn get_initial_snapshot(&self) -> BoxFuture<Result<AgentConnectionSnapshot, String>> {
         let this = self.clone();
         Box::pin(async move { this.get_initial_snapshot_inner(true).await })
@@ -4407,6 +4434,10 @@ pub(crate) async fn test_decode_cached_attach_frames(frames: &[Value]) -> Vec<Ag
 mod daemon_backlog_tests;
 
 #[cfg(test)]
+#[path = "jev_status_tests.rs"]
+mod jev_status_tests;
+
+#[cfg(test)]
 mod tests {
     use super::*;
     use crate::modes::daemon::daemon_client::{DaemonClientError, DaemonSocketClosedError};
@@ -4565,6 +4596,7 @@ mod tests {
     #[test]
     fn invalidates_cached_snapshot_matches_the_switch() {
         assert!(!invalidates_cached_snapshot("get_messages"));
+        assert!(!invalidates_cached_snapshot("jev_get_status"));
         assert!(!invalidates_cached_snapshot("attach"));
         assert!(invalidates_cached_snapshot("set_model"));
         assert!(invalidates_cached_snapshot("abort"));

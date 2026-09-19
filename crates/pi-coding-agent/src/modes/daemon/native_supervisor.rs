@@ -20,6 +20,10 @@ use crate::utils::atomic_file::{write_file_atomic_sync, remove_file_durably, Rem
 use crate::utils::child_process::{signal_process_group_or_process, Signal};
 use super::super::active_session_state::create_active_session_id;
 use super::super::command_recovery_journal::{create_command_idempotency_key, CommandRecoveryJournal, CommandJournalBeginResult};
+use crate::modes::daemon::agent_message_delivery_journal::{
+    delivery_reason_code, AgentMessageDeliveryJournal, AgentMessageDeliveryOutcome,
+    AgentMessageDeliveryRecord, AGENT_MESSAGE_DELIVERY_JOURNAL_FILE,
+};
 use super::super::compact_session_stream::{CompactAssistantStreamReconstructor, CompactAssistantDelta};
 use super::super::daemon_catalog_process::{CatalogListCallbacks, DaemonCatalogClient, DAEMON_CATALOG_ROLE_ENV};
 use super::super::agent_roster::{
@@ -77,6 +81,10 @@ const MAX_PUBLIC_LINE: usize = super::super::daemon_client::DAEMON_MAX_LINE_LENG
 
 /// `ROSTER_WATCHDOG_INTERVAL_MS` / `ROSTER_STALE_AFTER_MS` (daemon-supervisor.ts:194-195).
 const ROSTER_WATCHDOG_INTERVAL_MS: u64 = 15_000;
+/// Maximum rate for the aged repeat of the command-journal pending report
+/// (audit D-07): a backlog that persists unchanged is re-reported at most
+/// this often, so a never-resolved command cannot hide behind "no change".
+const PENDING_COMMAND_JOURNAL_REPORT_INTERVAL_MS: u64 = 30 * 60 * 1000;
 const ROSTER_STALE_AFTER_MS: u64 = 3 * ROSTER_HEARTBEAT_INTERVAL_MS;
 
 /// `SCHEDULED_WAKE_RETRY_MS` / `SCHEDULED_WAKE_MAX_TIMEOUT_MS` / `SCHEDULED_WAKE_CLIENT_ID`
@@ -218,6 +226,9 @@ struct Supervisor {
     opening_workers: Mutex<HashMap<String, Arc<OpeningWorker>>>,
     pauses: Mutex<HashMap<String, InputPause>>,
     journal: Mutex<CommandRecoveryJournal>,
+    /// D-04: bounded, content-free delivery telemetry for cross-worker agent messages.
+    /// Telemetry only: it never changes delivery semantics and never replays a send.
+    agent_message_delivery_journal: Mutex<AgentMessageDeliveryJournal>,
     catalog: Arc<DaemonCatalogClient>,
     stopped: CancellationToken,
     /// `this.rosterStore`: the one supervisor-owned roster, lazily created.
@@ -242,6 +253,8 @@ struct Supervisor {
     /// `this.pendingSessionNames` (daemon-supervisor.ts:4545-4552): reservation keys held while a
     /// create with a name is in flight, so two concurrent creates cannot both pass the check.
     pending_session_names: Mutex<HashSet<String>>,
+    /// Rate-limit state for the bounded command-journal pending report (audit D-07).
+    pending_command_journal_log: Mutex<Option<(usize, u64)>>,
 }
 
 pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut config: AgentSessionRuntimeConfig) -> Result<(), String> {
@@ -263,7 +276,7 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         wait_for_daemon_startup_fence(&socket_path, 120_000, None).await?;
         acquire_daemon_supervisor_ownership(AcquireDaemonSupervisorOwnershipOptions {
             socket_path: socket_path.clone(), descriptor_dir: descriptor_dir.to_string_lossy().into_owned(),
-            agent_dir, generation: uuid::Uuid::new_v4().to_string(), app_version: crate::config::VERSION.to_string(), registry_dir: None,
+            agent_dir: agent_dir.clone(), generation: uuid::Uuid::new_v4().to_string(), app_version: crate::config::VERSION.to_string(), registry_dir: None,
         }).await
     }.await {
         Ok(owner) => owner,
@@ -273,9 +286,13 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         Ok(journal) => journal,
         Err(error) => { let _ = ownership.release().await; if let Some(lease) = lease { lease.release().await; } return Err(error); }
     };
+    let delivery_journal = AgentMessageDeliveryJournal::new(
+        &descriptor_dir.join(AGENT_MESSAGE_DELIVERY_JOURNAL_FILE).to_string_lossy(),
+    );
     let supervisor = Arc::new(Supervisor {
         eviction_fence: tokio::sync::RwLock::new(()), idle_eviction_task: Mutex::new(None),
         socket_path: socket_path.clone(), journal: Mutex::new(journal),
+        agent_message_delivery_journal: Mutex::new(delivery_journal),
         descriptor_dir, config, ownership, workers: Mutex::new(HashMap::new()), clients: Mutex::new(HashMap::new()), opening: tokio::sync::RwLock::new(()), pauses: Mutex::new(HashMap::new()),
         catalog: Arc::new(DaemonCatalogClient::new(Arc::new(|message| eprintln!("Daemon catalog: {message}")))), stopped: CancellationToken::new(),
         roster: Mutex::new(None), pending_roster_changed: Mutex::new(HashSet::new()), pending_roster_removed: Mutex::new(HashSet::new()),
@@ -285,6 +302,7 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         scheduled_wake_recompute_queued: AtomicBool::new(false), scheduled_wake_failures: Mutex::new(HashMap::new()),
         prompt_admissions: Mutex::new(HashMap::new()), opening_workers: Mutex::new(HashMap::new()),
         pending_session_names: Mutex::new(HashSet::new()),
+        pending_command_journal_log: Mutex::new(None),
     });
     // The TS store is installed lazily by `roster()`; the port installs it here
     // because its mutation sink needs a `Weak` to the finished `Arc`.
@@ -305,10 +323,20 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         environment.retain(|(key, _)| key != DAEMON_WORKER_ROLE_ENV && key != DAEMON_WORKER_TOKEN_ENV);
         environment.push((DAEMON_CATALOG_ROLE_ENV.to_string(), "1".to_string()));
         supervisor.catalog.start(&executable.to_string_lossy(), vec![], environment).await?;
+        // Bounded dead-owner lease cleanup at supervisor start (audit D-08): a lease
+        // whose recorded owner process is verifiably dead is reclaimed. Live owners
+        // are never touched and nothing here kills a process.
+        let lease_sweep = crate::core::session_lease::sweep_dead_owner_leases(&agent_dir);
+        eprintln!(
+            "[{}] Session lease sweep: scanned {}, reclaimed {} dead-owner lease(s), {} unreadable owner(s) left for manual review",
+            iso_from_ms(supervisor_now_ms() as f64), lease_sweep.scanned, lease_sweep.reclaimed.len(), lease_sweep.unreadable_owners
+        );
         supervisor.adopt_workers().await?;
         supervisor.seed_roster_ledger().await;
         supervisor.start_roster_watchdog();
         supervisor.start_idle_eviction();
+        // Startup view of the command-recovery journal backlog (audit D-07).
+        supervisor.report_pending_command_journal();
         // `this.scheduleScheduledSessionWakeRecompute()` on startup (daemon-supervisor.ts:883).
         supervisor.schedule_scheduled_session_wake_recompute();
         #[cfg(unix)]
@@ -319,7 +347,12 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         restrict_daemon_socket_path(&socket_path);
         supervisor.ownership.update_phase("owner").await?;
         supervisor.register_signals();
-        eprintln!("Prime Agent daemon supervisor {} listening on {}", supervisor.ownership.snapshot().generation, socket_path);
+        eprintln!(
+            "[{}] Prime Agent daemon supervisor {} listening on {}",
+            iso_from_ms(supervisor_now_ms() as f64),
+            supervisor.ownership.snapshot().generation,
+            socket_path
+        );
         loop {
             #[cfg(unix)] {
                 let accepted = tokio::select! { _ = supervisor.stopped.cancelled() => break, result = listener.accept() => result };
@@ -1215,9 +1248,36 @@ impl Supervisor {
         tokio::spawn(async move {
             let mut interval = tokio::time::interval(Duration::from_millis(ROSTER_WATCHDOG_INTERVAL_MS));
             loop {
-                tokio::select! { _ = supervisor.stopped.cancelled() => break, _ = interval.tick() => supervisor.sweep_roster_staleness() }
+                tokio::select! { _ = supervisor.stopped.cancelled() => break, _ = interval.tick() => { supervisor.sweep_roster_staleness(); supervisor.report_pending_command_journal(); } }
             }
         });
+    }
+
+    /// Bounded command-journal delivery observability (audit D-07): entries that
+    /// were received but never resolved are uncertain commands that are never
+    /// replayed; this only makes the backlog observable. It logs at startup, on
+    /// count changes, and at most once per aged interval; it never resends and
+    /// adds no wire shape.
+    fn report_pending_command_journal(&self) {
+        let summary = self.journal.lock().unwrap().pending_summary();
+        if summary.total == 0 {
+            *self.pending_command_journal_log.lock().unwrap() = None;
+            return;
+        }
+        let now = supervisor_now_ms();
+        let mut state = self.pending_command_journal_log.lock().unwrap();
+        let should_log = match *state {
+            None => true,
+            Some((count, at)) => count != summary.total || now.saturating_sub(at) >= PENDING_COMMAND_JOURNAL_REPORT_INTERVAL_MS,
+        };
+        if !should_log { return; }
+        *state = Some((summary.total, now));
+        let oldest = summary.oldest_recorded_at.as_deref().unwrap_or("unknown");
+        let oldest_type = summary.oldest_command_type.as_deref().unwrap_or("unknown");
+        eprintln!(
+            "[{}] Command recovery journal: {} unacknowledged command(s), {} still without a result; oldest is a {oldest_type} recorded {oldest}",
+            iso_from_ms(now as f64), summary.total, summary.without_result
+        );
     }
     /// `seedRosterLedger()`: registered workers' families become roster rows.
     async fn seed_roster_ledger(self: &Arc<Self>) {
@@ -2376,6 +2436,7 @@ impl Supervisor {
         }
         assert_stop_current()?;
         remove_file_durably(&self.descriptor_dir.join(format!("{}.json", descriptor.worker_id)).to_string_lossy(), RemoveFileDurablyOptions { fsync_dir: true, platform: None }).await.map_err(|error| error.to_string())?;
+        self.retire_worker_journals(&descriptor).await;
         assert_stop_current()?;
         self.workers.lock().unwrap().remove(&descriptor.worker_id);
         // The registration is gone, so its rows stop being live: owned rows die
@@ -2554,17 +2615,50 @@ impl Supervisor {
             // target worker cannot resolve a source session hosted by another worker.
             "send_message" if body.get("activeSessionId").and_then(Value::as_str).is_none() => {
                 let target_selector = body.get("targetActiveSessionId").and_then(Value::as_str).ok_or("send_message requires targetActiveSessionId")?.to_string();
+                // D-04: the journal records one outcome per attempted forward. Every
+                // rejection is recorded with a fixed reason code, never with the raw error
+                // text or the message body, and no failure path retries the send.
+                let rejected = |source: Option<&str>, target: &str, reason: &'static str| {
+                    self.record_agent_message_delivery(AgentMessageDeliveryRecord::new(
+                        source, target, None, AgentMessageDeliveryOutcome::Rejected, Some(reason),
+                    ));
+                };
                 let source = match body.get("fromActiveSessionId").and_then(Value::as_str) {
-                    Some(from) => Some(self.find(&public.identity(), from).await.map_err(|error| error.to_string())?),
+                    Some(from) => match self.find(&public.identity(), from).await {
+                        Ok(found) => Some(found),
+                        Err(error) => {
+                            rejected(None, &target_selector, delivery_reason_code(&error));
+                            return Err(error);
+                        }
+                    },
                     None => None,
                 };
-                let source_summary = source.as_ref().map(|(worker, active)| {
+                // The resolved source id is known before the summary lookup, so a source that
+                // resolves but has no roster summary is still attributable in the journal.
+                let source_active_session_id = source.as_ref().map(|(_, active)| active.clone());
+                let source_summary = match source.as_ref().map(|(worker, active)| {
                     self.summary_for_active(worker, active).ok_or("Source session worker has no summary")
-                }).transpose()?;
+                }).transpose() {
+                    Ok(summary) => summary,
+                    Err(error) => {
+                        rejected(source_active_session_id.as_deref(), &target_selector, delivery_reason_code(&error));
+                        return Err(error.to_string());
+                    }
+                };
+                let source_active_session_id = source_summary
+                    .as_ref()
+                    .map(|summary| summary.active_session_id.clone().unwrap_or_else(|| summary.id.clone()))
+                    .or(source_active_session_id);
                 let agent_origin = body.get("agentOrigin").and_then(Value::as_bool) == Some(true);
                 if agent_origin && source_summary.is_none() {
+                    rejected(None, &target_selector, "missing_source");
                     return Err("Agent messaging requires fromActiveSessionId".into());
                 }
+                // Rejections after the source is known record it, so an operator can join
+                // the outcome to the sender without the journal storing any session name.
+                let rejected_with_source = |target: &str, reason: &'static str| {
+                    rejected(source_active_session_id.as_deref(), target, reason);
+                };
                 let target = match self.find(&public.identity(), &target_selector).await {
                     Ok(found) => found,
                     Err(error) if error.starts_with("Unknown active session:") => {
@@ -2572,40 +2666,87 @@ impl Supervisor {
                             .or_else(|| self.config.cwd.clone())
                             .unwrap_or_else(|| std::env::current_dir().map(|dir| dir.to_string_lossy().into_owned()).unwrap_or_default());
                         let session_dir = source.as_ref().and_then(|(worker, _)| worker.descriptor.lock().unwrap().session_dir.clone()).or_else(|| self.config.session_dir.clone());
-                        let session_path = self.catalog.resolve(&target_selector, &cwd, session_dir.as_deref()).await.map_err(|catalog_error| {
-                            // `Ambiguous session selector` is preserved so a2a senders can tell
-                            // it apart from the original lookup failure (:2725-2732).
-                            if catalog_error.starts_with("Ambiguous session selector") { catalog_error } else { error.clone() }
-                        })?;
+                        let session_path = match self.catalog.resolve(&target_selector, &cwd, session_dir.as_deref()).await {
+                            Ok(session_path) => session_path,
+                            Err(catalog_error) => {
+                                // `Ambiguous session selector` is preserved so a2a senders can tell
+                                // it apart from the original lookup failure (:2725-2732).
+                                let catalog_error = if catalog_error.starts_with("Ambiguous session selector") { catalog_error } else { error.clone() };
+                                rejected_with_source(&target_selector, delivery_reason_code(&catalog_error));
+                                return Err(catalog_error);
+                            }
+                        };
                         if let (Some(source_summary), true) = (source_summary.as_ref(), agent_origin) {
-                            let target_info = crate::core::session_manager::read_session_info(&session_path).await
-                                .ok_or_else(|| format!("Unknown active session: {target_selector}"))?;
-                            crate::core::agent_messages::assert_agent_family_reach(
+                            let Some(target_info) = crate::core::session_manager::read_session_info(&session_path).await else {
+                                let message = format!("Unknown active session: {target_selector}");
+                                rejected_with_source(&target_selector, delivery_reason_code(&message));
+                                return Err(message);
+                            };
+                            if let Err(error) = crate::core::agent_messages::assert_agent_family_reach(
                                 &self.family_catalog_entry(source_summary),
                                 &self.family_catalog_entry(&summary_for_inactive_session(&target_info, false, false)),
-                            )?;
+                            ) {
+                                rejected_with_source(&target_selector, delivery_reason_code(&error));
+                                return Err(error);
+                            }
                         }
                         let create = json!({"type":"create", "sessionPath": session_path, "continueRecent": false});
-                        self.create_for_owner(public.identity(), create.as_object().expect("create body is an object")).await?;
+                        if let Err(error) = self.create_for_owner(public.identity(), create.as_object().expect("create body is an object")).await {
+                            // A session that was never created cannot have received the message.
+                            rejected_with_source(&target_selector, delivery_reason_code(&error));
+                            return Err(error);
+                        }
                         // `findSummaryInWorker(worker, sessionPath) ?? sessionSummaryFromRosterEntry(root)`
                         // (:2746-2750): the created root is now addressable, so the ordinary
                         // lookup yields the target the wake was for.
-                        self.find(&public.identity(), &target_selector).await?
+                        match self.find(&public.identity(), &target_selector).await {
+                            Ok(found) => found,
+                            Err(error) => {
+                                rejected_with_source(&target_selector, delivery_reason_code(&error));
+                                return Err(error);
+                            }
+                        }
                     }
-                    Err(error) => return Err(error),
+                    Err(error) => {
+                        rejected_with_source(&target_selector, delivery_reason_code(&error));
+                        return Err(error);
+                    }
                 };
                 let (target_worker, target_active) = target;
                 if source.as_ref().is_some_and(|(_, source_active)| source_active == &target_active) {
+                    rejected_with_source(&target_active, "self_target");
                     return Err("Agent messaging cannot target the sending session".into());
                 }
                 if let (Some(source_summary), true) = (source_summary.as_ref(), agent_origin) {
-                    let target_summary = self.summary_for_active(&target_worker, &target_active)
-                        .ok_or("Target session worker has no summary")?;
-                    crate::core::agent_messages::assert_agent_family_reach(
+                    let target_summary = match self.summary_for_active(&target_worker, &target_active) {
+                        Some(summary) => summary,
+                        None => {
+                            rejected_with_source(&target_active, "worker_error");
+                            return Err("Target session worker has no summary".to_string());
+                        }
+                    };
+                    if let Err(error) = crate::core::agent_messages::assert_agent_family_reach(
                         &self.family_catalog_entry(source_summary), &self.family_catalog_entry(&target_summary),
-                    )?;
+                    ) {
+                        rejected_with_source(&target_active, delivery_reason_code(&error));
+                        return Err(error);
+                    }
                 }
-                let client = self.connected_client(&target_worker).await?;
+                let client = match self.connected_client(&target_worker).await {
+                    Ok(client) => client,
+                    Err(error) => {
+                        // The connection failed before the forward, so the message provably
+                        // never reached the target: that is a rejection, not an unknown result.
+                        self.record_agent_message_delivery(AgentMessageDeliveryRecord::new(
+                            source_active_session_id.as_deref(),
+                            &target_active,
+                            None,
+                            AgentMessageDeliveryOutcome::Rejected,
+                            Some(delivery_reason_code(&error.to_string())),
+                        ));
+                        return Err(error);
+                    }
+                };
                 let forwarded = if let Some(source_summary) = source_summary {
                     // Never accept sender attribution supplied by the public caller.
                     let sender = crate::core::agent_messages::AgentSessionMessageSender {
@@ -2622,7 +2763,26 @@ impl Supervisor {
                     forwarded.insert("targetActiveSessionId".into(), json!(target_active));
                     forwarded
                 };
-                let mut response = client.request_worker(forwarded, REQUEST_TIMEOUT).await.map_err(|error| error.to_string())?;
+                let mut response = match client.request_worker(forwarded, REQUEST_TIMEOUT).await {
+                    Ok(response) => response,
+                    Err(error) => {
+                        // A lost response leaves delivery unknown and is never replayed;
+                        // the journal records that uncertainty instead of guessing.
+                        self.record_agent_message_delivery(AgentMessageDeliveryRecord::new(
+                            source_active_session_id.as_deref(),
+                            &target_active,
+                            None,
+                            AgentMessageDeliveryOutcome::Uncertain,
+                            Some(delivery_reason_code(&error.to_string())),
+                        ));
+                        return Err(error.to_string());
+                    }
+                };
+                self.record_agent_message_delivery(agent_message_delivery_record_from_response(
+                    source_active_session_id.as_deref(),
+                    &target_active,
+                    &response,
+                ));
                 response.id = id; response.command = kind.clone();
                 return Ok(Some(response));
             }
@@ -3096,6 +3256,14 @@ impl Supervisor {
             public.write(&json!(response));
         }
     }
+    /// D-04: append one bounded, content-free delivery record. Telemetry only: a failed
+    /// append never changes the delivery result or triggers a replay.
+    fn record_agent_message_delivery(&self, record: AgentMessageDeliveryRecord) {
+        if let Ok(mut journal) = self.agent_message_delivery_journal.lock() {
+            journal.record(record);
+        }
+    }
+
     fn owned_worker_candidates(&self, owner: &str) -> Vec<Arc<Worker>> {
         let candidates: Vec<_> = self.workers.lock().unwrap().values().cloned().collect();
         candidates.into_iter().filter(|worker| worker.descriptor.lock().unwrap().owner_client_id.as_deref() == Some(owner)).collect()
@@ -3508,6 +3676,63 @@ fn worker_roster_entry_from_value(summary: &Value) -> Option<WorkerRosterEntry> 
     let summary: RosterSessionSummary = serde_json::from_value(summary.clone()).ok()?;
     Some(worker_roster_entry_from_summary(&summary))
 }
+/// D-04: convert a forwarded delivery response into a content-free journal record.
+/// A receipt with an unexpected status is recorded as `uncertain`, never as delivered.
+fn agent_message_delivery_record_from_response(
+    source_active_session_id: Option<&str>,
+    target_active_session_id: &str,
+    response: &DaemonResponse,
+) -> AgentMessageDeliveryRecord {
+    if !response.success {
+        // A failed forward provably did not deliver. Prefer the fixed reason code derived
+        // from the message; the structured error code is already a fixed identifier.
+        let reason = response
+            .error
+            .as_deref()
+            .map(delivery_reason_code)
+            .or_else(|| response.error_info.as_ref().map(|info| info.code()))
+            .unwrap_or("worker_error");
+        return AgentMessageDeliveryRecord::new(
+            source_active_session_id,
+            target_active_session_id,
+            None,
+            AgentMessageDeliveryOutcome::Rejected,
+            Some(reason),
+        );
+    }
+    let data = response.data.clone().unwrap_or(Value::Null);
+    let message_id = data.get("id").and_then(Value::as_str);
+    let receipt_target = data
+        .get("target")
+        .and_then(|target| target.get("activeSessionId"))
+        .and_then(Value::as_str)
+        .unwrap_or(target_active_session_id);
+    let outcome = data
+        .get("deliveryStatus")
+        .and_then(Value::as_str)
+        .and_then(AgentMessageDeliveryOutcome::from_receipt_status);
+    let outcome = match outcome {
+        Some(outcome) => outcome,
+        None => {
+            // A success response without a recognized status is not proof of delivery.
+            return AgentMessageDeliveryRecord::new(
+                source_active_session_id,
+                target_active_session_id,
+                None,
+                AgentMessageDeliveryOutcome::Uncertain,
+                Some("invalid_receipt"),
+            );
+        }
+    };
+    AgentMessageDeliveryRecord::new(
+        source_active_session_id,
+        receipt_target,
+        message_id,
+        outcome,
+        None,
+    )
+}
+
 fn command(kind: &str) -> Map<String, Value> { json!({"type":kind}).as_object().unwrap().clone() }
 fn response_data(response: DaemonResponse) -> Result<Value, String> { if response.success { Ok(response.data.unwrap_or(Value::Null)) } else { Err(response.error.unwrap_or_else(|| "Session worker request failed".to_string())) } }
 fn persist_json(path: &Path, value: &Value) -> Result<(), String> {

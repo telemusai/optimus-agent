@@ -1,4 +1,5 @@
 pub mod active_session_state;
+pub mod agent_message_delivery_journal;
 pub mod agent_roster;
 pub mod command_recovery_journal;
 pub mod compact_session_stream;

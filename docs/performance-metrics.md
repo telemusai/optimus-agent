@@ -58,7 +58,9 @@ The two factory functions return `undefined` if local metrics are disabled or re
 
 Operations are `logical_request`, `provider_attempt`, `tool`, `snapshot`, `compaction`, `file_retry`, `session_reopen`, `session_input`, and `recorder`. The Rust host also records `compaction_prepare`, `compaction_history`, `compaction_prefix`, `compaction_native`, `compaction_persist`, and `compaction_restore`.
 
-Measurements are `total_ms`, `wait_ms`, `dispatch_to_response_headers_ms`, `dispatch_to_first_event_ms`, `dispatch_to_first_visible_ms`, `local_gateway_wait_ms`, `upstream_wait_ms`, `serialization_ms`, `serialization_cpu_ms`, `write_ms`, `queue_ms`, `next_cell_delay_ms`, `reopen_ms`, `serialized_bytes`, `written_bytes`, `read_bytes`, `retry_count`, `attempt_count`, `attempt_ordinal`, and `dropped_count`.
+Measurements are `total_ms`, `wait_ms`, `dispatch_to_response_headers_ms`, `transport_open_ack_ms`, `dispatch_to_first_event_ms`, `dispatch_to_first_visible_ms`, `local_gateway_wait_ms`, `upstream_wait_ms`, `serialization_ms`, `serialization_cpu_ms`, `write_ms`, `queue_ms`, `next_cell_delay_ms`, `reopen_ms`, `serialized_bytes`, `written_bytes`, `read_bytes`, `retry_count`, `attempt_count`, `attempt_ordinal`, and `dropped_count`.
+
+`transport_open_ack_ms` is the pre-network `onPayload` edge to a transport-level send acknowledgement. A WebSocket transport has no HTTP response yet when it reports that its socket accepted the bytes, so it calls `onResponse` with the headers `x-optimus-transport: websocket` and `x-optimus-response-edge: transport_send_ack`. The host records that instant here and leaves `dispatch_to_response_headers_ms` `null`, because no HTTP header edge was observed. A response without the ack marker keeps the normal header-edge meaning, so the two stages are never mixed. The Azure WebSocket `transport_open_ack_ms` distribution and the SSE `dispatch_to_response_headers_ms` distribution measure different events and must not be compared as one population.
 
 A measurement is a finite nonnegative number or `null`. `null` means unavailable. It is not zero. Unknown keys and arbitrary runtime fields are removed. Correlation and provider/model/API strings are control-character sanitized and length bounded. The schema has no prompt, content, arguments, error text, path, header, credential, reasoning text, or checkpoint field.
 
@@ -127,7 +129,7 @@ Never pass `error`, tool names, file paths, source values, or serialized data to
 }
 ```
 
-The host can reuse `logicalRequestId`, preserve `logicalRequestStartedAt`, and increment `providerAttemptNumber` around a retry. `providerAttemptNumber` becomes `attempt_ordinal`; it is only a host-observed stream invocation ordinal. It is not proof of an SDK-internal HTTP attempt. `attempt_count` stays `null` until an owner can establish the complete host retry count. Unknown upstream retries remain unavailable.
+The host can reuse `logicalRequestId`, preserve `logicalRequestStartedAt`, and increment `providerAttemptNumber` around a retry. `providerAttemptNumber` becomes `attempt_ordinal`; it is only a host-observed stream invocation ordinal. It is not proof of an SDK-internal HTTP attempt. `attempt_count` is the count of host-observed attempts in the group and is reported once the group's own settlement knows it. Unknown upstream/transport-internal retries remain unavailable and are never inferred.
 
 `hostOwnsLogicalRequestTerminal` and its process-local `logicalRequestSettlement` handle are internal and never enter provider options. The handle is shared only by attempts in one host retry group and makes settlement idempotent across cancellation races. When host ownership is true, the agent loop still emits each `provider_attempt` but leaves the single outer `logical_request` terminal to the host. `AgentSession` uses that boundary for its local retry group, so total logical elapsed time includes the locally observed retry wait and settles once on success, exhaustion, failure, or cancellation. A standalone `Agent` leaves the flag absent and emits its one-attempt logical terminal itself.
 
@@ -139,7 +141,11 @@ The agent loop removes `performanceMetrics` before calling the provider. With me
 - `dispatch_to_first_visible_ms`: the same edge to the first non-empty text delta. A reasoning-only stream has `null` visible latency.
 - `total_ms`: start to terminal response, error, or cancellation. For an outer retry-group logical record this is the whole group; its dispatch split measurements describe only the final locally observed attempt.
 
-The `onPayload` edge is not a socket-write timestamp. It can include provider SDK work before actual I/O. Client-observed response latency can include the local gateway, network, and upstream work. Therefore `local_gateway_wait_ms` and `upstream_wait_ms` stay `null` unless a separately instrumented component establishes them. Client TTFT is never called server queue time.
+The `onPayload` edge is not a socket-write timestamp. It can include provider SDK work before actual I/O. Client-observed response latency can include the local gateway, network, and upstream work. Therefore `local_gateway_wait_ms` and `upstream_wait_ms` stay `null` unless a separately instrumented component establishes them. They are structurally unavailable to the client, not zero and not unmeasured-but-imminent. Client TTFT is never called server queue time.
+
+`transport_websocket` is `1` for a WebSocket attempt and `0` for an SSE attempt. Both the Azure/`github-copilot` WebSocket transport and the `openai-codex` native WebSocket path set it: the Codex SSE path labels its real HTTP response, and a Codex WebSocket attempt labels itself through the content-free `transport_ws` observation stage after the payload is sent. A provider that reached the wire therefore always carries a transport label, and a missing label means the attempt never reached the wire.
+
+`attempt_count` is the number of provider attempts the logical request's own settlement observed, so it is reported for a completed group. A `provider_attempt` record keeps `attempt_count` `null`: one record is one attempt, and its `attempt_ordinal` already says which one it is, so a per-attempt count of `1` would add no information and could be misread as the group count. `provider_attempt.wait_ms` is reported only for ordinal 1: for that attempt it is the same request-start to `onPayload` window as `logical_request.wait_ms`. A retried attempt has no single honest wait and stays `null`.
 
 Each local stream invocation emits one terminal `provider_attempt`. A standalone one-attempt Agent also emits one `logical_request`. A retry-owning host emits exactly one outer logical terminal for the complete retry group. Authoritative raw usage belongs only to `provider_attempt`; the outer logical terminal omits usage. Reporting must not sum nested operation durations. Tool execution emits one terminal `tool` record. Stream deltas do not write metric records.
 
@@ -147,13 +153,39 @@ Each local stream invocation emits one terminal `provider_attempt`. A standalone
 
 ### Rust compaction phases
 
-Compaction uses the session recorder when metrics are enabled. A start event has no outcome; its terminal event reuses the same correlation IDs with `success`, `failure`, `cancelled`, or `unavailable`. Group related phases by `actionId`. Preparation includes authentication, history selection, and extension preparation. Persistence measures the durable compaction append. Restoration measures live-context replacement, extension notification, and kernel/provider restoration. The outer `compaction` duration includes the complete shared operation; phase durations overlap and must not be summed.
+Compaction uses the session recorder when metrics are enabled. A start event has outcome `started` (legacy files may omit the outcome); its terminal event reuses the same correlation IDs with `success`, `failure`, `cancelled`, or `unavailable`, and only terminal rows count as attempts. Group related phases by `actionId`. Preparation includes authentication, history selection, and extension preparation. Persistence measures the durable compaction append. Restoration measures live-context replacement, extension notification, and kernel/provider restoration. The outer `compaction` duration includes the complete shared operation; phase durations overlap and must not be summed.
 
-History and split-turn prefix summaries have separate logical request IDs. Each actual summary completion invocation, including a local retry, records one terminal `provider_attempt` with `identity.component: "compaction"`; these attempts must be separated from ordinary agent requests. The existing content-free observer records response headers, first raw/thinking/tool/text event, stream terminal, local drain, and provider usage when available. A fast HTTP 200/header event does not measure completion of the response body. Unknown timings remain null. Error and cancellation outcomes contain no provider error text, prompts, summaries, reasoning text, request headers, credentials, or checkpoints.
+History and split-turn prefix summaries have separate logical request IDs. Each actual summary completion invocation, including a local retry, records one terminal `provider_attempt` with `identity.component: "compaction"`; these attempts must be separated from ordinary agent requests. The existing content-free observer records response headers, first raw/thinking/tool/text event, stream terminal, local drain, and provider usage when available. Its stages are `raw_event`, `thinking`, `tool`, `text`, `terminal`, and `transport_ws`, and its contract is append-only: a new stage is additive, and an unknown stage must be ignored rather than treated as an error. `transport_ws` records only "the payload was sent over a WebSocket" for a provider whose WebSocket transport never reports a response header edge; it carries no content or timing. A fast HTTP 200/header event does not measure completion of the response body. Unknown timings remain null. Error and cancellation outcomes contain no provider error text, prompts, summaries, reasoning text, request headers, credentials, or checkpoints.
 
 Native checkpoint requests retain their own `compaction_native` phase. Native providers without stream observations have only their measured phase duration. An explicit unsupported native result is `unavailable`; malformed checkpoints are failures. A cancelled or dropped split-summary operation cancels its child requests without cancelling the parent session token.
 
-Rust queue records also include `input_agent_message`: 1 identifies a structured agent message; 0 identifies other input and is not, by itself, proof of human origin. This field contains no message text. The report accepts the Rust stream measurements (`dispatch_to_first_raw_ms`, `dispatch_to_first_thinking_ms`, `dispatch_to_first_tool_ms`, `dispatch_to_first_text_ms`, `dispatch_to_network_terminal_ms`, `local_drain_ms`, and `transport_websocket`) without treating unknown values as zero.
+Rust queue records also include `input_agent_message`: 1 identifies a structured agent message; 0 identifies other input and is not, by itself, proof of human origin. This field contains no message text.
+
+### Agent-message delivery telemetry (D-04)
+
+Cross-worker agent messaging is at-most-once by design: once a payload may have been accepted by the target worker, it is never replayed. The supervisor therefore writes a bounded, content-free delivery journal at `<descriptor dir>/agent-message-delivery-journal.jsonl`, one JSON line per attempted forward.
+
+```ts
+{
+  version: 1;
+  sourceActiveSessionId?: string;
+  targetActiveSessionId: string;
+  messageId?: string;          // the target worker's own `agentmsg_<uuid>` receipt id
+  outcome: "delivered" | "queued" | "rejected" | "uncertain";
+  reasonCode?: string;         // fixed code, never raw error text
+  recordedAt: string;
+}
+```
+
+Read it as follows:
+
+- One record per attempted forward, written only by the supervisor hop that forwards the message.
+- `uncertain` means the forward was attempted but the result is unknown, for example a lost response or an invalid receipt. The send is not retried, so `uncertain` is a terminal outcome for that send.
+- `rejected` means the message provably never left the supervisor, for example a self-send, a denied reach, a missing source, or a target worker that is no longer running.
+- The journal is telemetry only. It never changes a delivery result, never retries, and never fails a send. Records are bounded (`512` retained) and the file self-compacts.
+- Records carry no message text, session names, sender names, or raw error strings.
+
+The report accepts the Rust stream measurements (`dispatch_to_first_raw_ms`, `dispatch_to_first_thinking_ms`, `dispatch_to_first_tool_ms`, `dispatch_to_first_text_ms`, `dispatch_to_network_terminal_ms`, `local_drain_ms`, and `transport_websocket`) without treating unknown values as zero.
 
 `PerformanceMetricUsageV1` keeps provider observations and local estimates separate:
 
@@ -170,6 +202,8 @@ Rust queue records also include `input_agent_message`: 1 identifies a structured
   estimator?: string;
 }
 ```
+
+`queue_ms` for `session_input` means acceptance to primary delivery of that input, and that window includes any in-flight turn the input waited behind. A long `queue_ms` is therefore not by itself evidence of a slow queue implementation; it is the elapsed wait for the session to become free. The record carries no currently-running action id, so a long wait cannot yet be attributed to one specific turn.
 
 `inputTokens` and `outputTokens` retain the concrete provider observation's own inclusive or exclusive meaning. When an overlap flag is `true`, the nested category must not be added again. When it is `false`, the categories are disjoint, but the provider `totalTokens` still remains authoritative as its own field. When it is null, no arithmetic is justified. A local estimate must use `source: "local_estimate"` and name its estimator. Neither form is a bill or cost.
 

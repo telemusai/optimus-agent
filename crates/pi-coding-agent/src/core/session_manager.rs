@@ -4494,6 +4494,11 @@ impl SessionManager {
             .cloned()
     }
 
+    /// Count non-header entries without cloning transcript content.
+    pub fn get_entry_count(&self) -> usize {
+        self.file_entries.iter().filter(|entry| !is_session_header(entry)).count()
+    }
+
     pub fn get_entries(&self) -> Vec<SessionEntry> {
         self.file_entries
             .iter()

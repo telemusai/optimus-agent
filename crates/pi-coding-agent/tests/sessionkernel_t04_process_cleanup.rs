@@ -240,6 +240,25 @@ async fn detached_bash_is_journaled_and_reaped() {
     std::env::remove_var(ORPHAN_PROCESS_JOURNAL_ENV);
 }
 
+/// A4 regression: kill_process_tree must spawn the hardened absolute System32
+/// taskkill (a bare-name spawn would resolve a planted CWD taskkill.exe via
+/// PATH) and still kill the whole tree.
+#[test]
+fn kill_process_tree_uses_the_hardened_absolute_taskkill() {
+    let helper = spawn_hidden(
+        "ping",
+        &["-n".to_string(), "30".to_string(), "127.0.0.1".to_string()],
+        SpawnOptions::default(),
+    )
+    .expect("helper spawn");
+    let helper_pid = helper.child.id().expect("helper pid") as i32;
+    kill_process_tree(helper_pid);
+    assert!(
+        wait_process_gone(helper_pid, Duration::from_secs(10)),
+        "the hardened taskkill tree kill did not terminate the helper"
+    );
+}
+
 /// G-20: the daemon supervisor launch environment must strip inherited
 /// worker role/token/lease variables and must NOT mark the orphan journal
 /// with a literal "1" (daemon-mode.ts:925-934 deletes all of them).

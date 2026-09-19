@@ -184,6 +184,17 @@ impl AgentSession {
         }
         self.assert_rlm_subagent_session_name_available(&name, true)
             .await?;
+        // The parent's effective mode is snapshotted at child creation, so a
+        // later global change cannot silently alter an existing child chat.
+        // Best-effort: failing to record inheritance must not fail the spawn,
+        // and a skipped record resolves to the same global default (built-in
+        // Off) - never a silent Compare.
+        if let Some(agent_dir) = self.agent_dir.as_deref() {
+            let bridge = crate::modes::interactive::native_host::JevModeBridge::new(
+                std::path::Path::new(agent_dir),
+            );
+            let _ = bridge.inherit_into_child(&id, &self.session_id(), None);
+        }
         let handle = RlmSpawnHandle {
             rlm_child_id: id.clone(),
             name: name.clone(),

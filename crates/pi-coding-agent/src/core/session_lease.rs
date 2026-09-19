@@ -415,13 +415,13 @@ fn is_process_alive(pid: i64) -> bool {
     }
     #[cfg(windows)]
     {
-        windows_process_id_exists(pid as u32)
+        u32::try_from(pid).is_ok_and(windows_process_id_exists)
     }
 }
 
 #[cfg(windows)]
 fn windows_process_id_exists(pid: u32) -> bool {
-    use windows_sys::Win32::Foundation::CloseHandle;
+    use windows_sys::Win32::Foundation::{CloseHandle, GetLastError};
     use windows_sys::Win32::System::Threading::{
         GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
     };
@@ -429,13 +429,24 @@ fn windows_process_id_exists(pid: u32) -> bool {
     unsafe {
         let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid);
         if handle.is_null() {
-            return false;
+            // Access denied (or another probe failure) is not proof of death.
+            // Only the documented nonexistent-PID result permits reclamation.
+            return windows_process_probe_may_be_alive(Some(GetLastError()), None);
         }
         let mut exit_code: u32 = 0;
         let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
         CloseHandle(handle);
-        ok && exit_code == STILL_ACTIVE
+        windows_process_probe_may_be_alive(None, ok.then_some(exit_code == STILL_ACTIVE))
     }
+}
+
+#[cfg(windows)]
+fn windows_process_probe_may_be_alive(open_error: Option<u32>, active: Option<bool>) -> bool {
+    use windows_sys::Win32::Foundation::ERROR_INVALID_PARAMETER;
+    if let Some(error) = open_error {
+        return error != ERROR_INVALID_PARAMETER;
+    }
+    active.unwrap_or(true)
 }
 
 fn is_lease_owner_alive(owner: &SessionLeaseOwner) -> bool {
@@ -518,6 +529,26 @@ fn acquire_lease_guard(directory: &str) -> Result<LeaseGuard, String> {
 
 fn with_lease_guard<T>(directory: &str, action: impl FnOnce() -> T) -> Result<T, String> {
     let guard = acquire_lease_guard(directory)?;
+    with_acquired_lease_guard(directory, guard, action)
+}
+
+/// Opportunistic cleanup must not wait behind or evict a contended guard. The
+/// normal acquire/release paths retain their bounded coordination retries.
+fn try_with_lease_guard<T>(directory: &str, action: impl FnOnce() -> T) -> Result<T, String> {
+    let path = PathBuf::from(format!("{directory}.guard"));
+    std::fs::create_dir(&path).map_err(|error| error.to_string())?;
+    let guard = LeaseGuard {
+        path,
+        compromised: std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false)),
+    };
+    with_acquired_lease_guard(directory, guard, action)
+}
+
+fn with_acquired_lease_guard<T>(
+    directory: &str,
+    guard: LeaseGuard,
+    action: impl FnOnce() -> T,
+) -> Result<T, String> {
     let assert_guard_held = || -> Result<(), String> {
         if guard.compromised.load(std::sync::atomic::Ordering::SeqCst) {
             return Err(format!("Session lease guard was compromised: {directory}"));
@@ -762,6 +793,95 @@ pub fn acquire_session_lease(
     acquired
 }
 
+/// Result of a bounded dead-owner lease sweep (audit D-08).
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct SessionLeaseSweepResult {
+    pub scanned: usize,
+    pub reclaimed: Vec<String>,
+    /// Directories the sweep could not resolve (unreadable or corrupt owner
+    /// files, guard coordination failures). Never reclaimed; only counted.
+    pub unreadable_owners: usize,
+}
+
+/// Upper bound on lease directories examined per sweep, so a large directory
+/// cannot turn startup cleanup into an unbounded pass.
+const SESSION_LEASE_SWEEP_MAX_DIRECTORIES: usize = 256;
+const SESSION_LEASE_SWEEP_MAX_DURATION: Duration = Duration::from_millis(250);
+/// A lease younger than this is left for a later sweep, so a concurrently
+/// starting owner is never raced by the reclamation window.
+const SESSION_LEASE_SWEEP_MIN_AGE_MS: u64 = 30_000;
+
+/// Bounded reclamation of dead-owner session leases: a `session-leases/*.lock`
+/// directory whose recorded owner process is verifiably dead (or that has no
+/// owner file at all) is reclaimed; the sweep never kills a process, never
+/// touches directories it could not prove dead, and leaves unreadable owner
+/// files for a manual pass while only counting them.
+pub fn sweep_dead_owner_leases(agent_dir: &str) -> SessionLeaseSweepResult {
+    let mut result = SessionLeaseSweepResult::default();
+    let root = Path::new(agent_dir).join("session-leases");
+    let Ok(entries) = std::fs::read_dir(&root) else {
+        return result;
+    };
+    let started = std::time::Instant::now();
+    // Count every directory-entry attempt, not only successfully parsed owners:
+    // an all-corrupt or all-contended directory must have the same work bound.
+    for entry in entries.take(SESSION_LEASE_SWEEP_MAX_DIRECTORIES) {
+        if started.elapsed() >= SESSION_LEASE_SWEEP_MAX_DURATION {
+            break;
+        }
+        let Ok(entry) = entry else { continue };
+        let path = entry.path();
+        if path.extension().and_then(|value| value.to_str()) != Some("lock") {
+            continue;
+        }
+        if !path.is_dir() {
+            continue;
+        }
+        let directory = path.to_string_lossy().to_string();
+        let mut unreadable = false;
+        let claimed = try_with_lease_guard(&directory, || {
+            let owner = match read_lease_owner(&directory) {
+                Ok(LeaseOwnerState::Owner(owner)) => owner,
+                Ok(LeaseOwnerState::Absent) => return Ok(reclaim_stale_lease(&directory)),
+                Ok(LeaseOwnerState::Unreadable) | Err(_) => {
+                    unreadable = true;
+                    return Err("unreadable session lease owner".to_string());
+                }
+            };
+            // Age floor: a fresh lease is left for its owner, dead or not, so a
+            // restarting process that reused the pid is never evicted mid-start.
+            if parse_lease_created_at(&owner.created_at)
+                .is_some_and(|created_at| now_millis().saturating_sub(created_at) < SESSION_LEASE_SWEEP_MIN_AGE_MS)
+            {
+                return Ok(false);
+            }
+            if is_lease_owner_alive(&owner) {
+                return Ok(false);
+            }
+            Ok(reclaim_stale_lease(&directory))
+        });
+        // Only directories the sweep could actually examine count as scanned;
+        // unreadable/corrupt owners and guard-coordination failures may hold a
+        // live lease: separately counted, never reclaimed.
+        if unreadable || claimed.is_err() {
+            result.unreadable_owners += 1;
+        } else {
+            result.scanned += 1;
+        }
+        match claimed {
+            Ok(Ok(true)) => result.reclaimed.push(basename(&directory)),
+            Ok(Ok(false)) => {}
+            Ok(Err(_)) | Err(_) => {}
+        }
+    }
+    result
+}
+
+fn parse_lease_created_at(value: &str) -> Option<u64> {
+    let millis = crate::core::cron_jobs::parse_iso_date(value);
+    millis.is_finite().then_some(millis as u64)
+}
+
 fn platform_name() -> &'static str {
     if cfg!(windows) {
         "win32"
@@ -995,6 +1115,145 @@ mod tests {
         assert_eq!(get_windows_process_start_id(-1, None), None);
         assert_eq!(get_windows_process_start_id(u32::MAX as i64 + 1, None), None);
         assert_eq!(get_windows_process_start_id(u32::MAX as i64, None), None);
+    }
+
+    #[test]
+    fn sweep_reclaims_only_dead_owner_leases() {
+        let temp = tempfile::tempdir().unwrap();
+        let agent_dir = temp.path().to_string_lossy().to_string();
+        let root = Path::new(&agent_dir).join("session-leases");
+        std::fs::create_dir_all(&root).unwrap();
+
+        let dead_session = temp.path().join("dead.jsonl");
+        std::fs::write(&dead_session, b"").unwrap();
+        let dead_owner = SessionLeaseOwner {
+            version: 1,
+            token: "dead".to_string(),
+            pid: 999_999_999,
+            process_start_id: None,
+            active_session_id: Some("dead".to_string()),
+            session_path: canonical_session_path(&dead_session.to_string_lossy()),
+            // Old enough to pass the sweep's age floor.
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        let dead_dir = lease_directory(&agent_dir, &canonical_session_path(&dead_session.to_string_lossy()));
+        std::fs::create_dir_all(&dead_dir).unwrap();
+        std::fs::write(
+            Path::new(&dead_dir).join(LEASE_OWNER_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&dead_owner).unwrap()),
+        )
+        .unwrap();
+
+        let live_session = temp.path().join("live.jsonl");
+        std::fs::write(&live_session, b"").unwrap();
+        let live_owner = SessionLeaseOwner {
+            version: 1,
+            token: "live".to_string(),
+            pid: std::process::id() as i64,
+            process_start_id: get_current_process_start_id(),
+            active_session_id: Some("live".to_string()),
+            session_path: canonical_session_path(&live_session.to_string_lossy()),
+            created_at: "2026-01-01T00:00:00.000Z".to_string(),
+        };
+        let live_dir = lease_directory(&agent_dir, &canonical_session_path(&live_session.to_string_lossy()));
+        std::fs::create_dir_all(&live_dir).unwrap();
+        std::fs::write(
+            Path::new(&live_dir).join(LEASE_OWNER_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&live_owner).unwrap()),
+        )
+        .unwrap();
+
+        // A lease with a fresh (recent) dead owner is left for a later sweep.
+        let fresh_dir = lease_directory(&agent_dir, "Z:\\fresh-never-held.jsonl");
+        std::fs::create_dir_all(&fresh_dir).unwrap();
+        let fresh_owner = SessionLeaseOwner { created_at: iso_now(), ..dead_owner.clone() };
+        std::fs::write(
+            Path::new(&fresh_dir).join(LEASE_OWNER_FILE),
+            format!("{}\n", serde_json::to_string_pretty(&fresh_owner).unwrap()),
+        )
+        .unwrap();
+
+        // An abandoned directory (no owner file) is reclaimable.
+        let absent_dir = lease_directory(&agent_dir, "Z:\\abandoned.jsonl");
+        std::fs::create_dir_all(&absent_dir).unwrap();
+        // An unreadable owner is counted and left alone.
+        let corrupt_dir = lease_directory(&agent_dir, "Z:\\corrupt.jsonl");
+        std::fs::create_dir_all(&corrupt_dir).unwrap();
+        std::fs::write(Path::new(&corrupt_dir).join(LEASE_OWNER_FILE), "{not json").unwrap();
+
+        let result = sweep_dead_owner_leases(&agent_dir);
+        assert_eq!(result.scanned, 4, "{result:?}");
+        assert_eq!(result.reclaimed.len(), 2, "{result:?}");
+        assert!(result.reclaimed.contains(&basename(&dead_dir)));
+        assert!(result.reclaimed.contains(&basename(&absent_dir)));
+        assert_eq!(result.unreadable_owners, 1, "{result:?}");
+        let exists = |dir: &str| Path::new(dir).exists();
+        assert!(!exists(&dead_dir));
+        assert!(!exists(&absent_dir));
+        assert!(exists(&live_dir), "a live owner's lease must survive the sweep");
+        assert!(exists(&fresh_dir), "a fresh dead-owner lease is left for a later sweep");
+        assert!(exists(&corrupt_dir), "an unreadable owner is never reclaimed");
+        std::fs::remove_dir_all(&live_dir).unwrap();
+        std::fs::remove_dir_all(&fresh_dir).unwrap();
+        std::fs::remove_dir_all(&corrupt_dir).unwrap();
+    }
+
+    #[test]
+    fn sweep_bounds_unreadable_entries_instead_of_only_successful_scans() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("session-leases");
+        std::fs::create_dir_all(&root).unwrap();
+        for index in 0..SESSION_LEASE_SWEEP_MAX_DIRECTORIES + 20 {
+            let dir = root.join(format!("corrupt-{index}.lock"));
+            std::fs::create_dir(&dir).unwrap();
+            std::fs::write(dir.join(LEASE_OWNER_FILE), b"{unreadable owner").unwrap();
+        }
+        let result = sweep_dead_owner_leases(&temp.path().to_string_lossy());
+        assert_eq!(result.scanned, 0);
+        assert!(result.unreadable_owners > 0);
+        assert!(result.unreadable_owners <= SESSION_LEASE_SWEEP_MAX_DIRECTORIES, "{result:?}");
+        assert!(result.reclaimed.is_empty());
+        assert_eq!(std::fs::read_dir(&root).unwrap().count(), SESSION_LEASE_SWEEP_MAX_DIRECTORIES + 20);
+    }
+
+    #[test]
+    fn sweep_never_waits_on_or_reclaims_a_contended_guard() {
+        let temp = tempfile::tempdir().unwrap();
+        let root = temp.path().join("session-leases");
+        std::fs::create_dir_all(&root).unwrap();
+        let mut guards = Vec::new();
+        for index in 0..12 {
+            let dir = root.join(format!("contended-{index}.lock"));
+            std::fs::create_dir(&dir).unwrap();
+            // Even ownerless leases are protected by another writer's guard.
+            let guard = PathBuf::from(format!("{}.guard", dir.display()));
+            std::fs::create_dir(&guard).unwrap();
+            guards.push((dir, guard));
+        }
+        let started = std::time::Instant::now();
+        let result = sweep_dead_owner_leases(&temp.path().to_string_lossy());
+        assert!(started.elapsed() < Duration::from_secs(2), "cleanup waited on a contended guard");
+        assert_eq!(result.scanned, 0);
+        assert!(result.unreadable_owners > 0);
+        assert!(result.reclaimed.is_empty());
+        for (directory, guard) in guards {
+            assert!(directory.is_dir());
+            assert!(guard.is_dir(), "another writer's guard must not be removed");
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn windows_lease_cleanup_requires_proof_of_death_not_a_failed_probe() {
+        use windows_sys::Win32::Foundation::{ERROR_ACCESS_DENIED, ERROR_INVALID_PARAMETER};
+        assert!(windows_process_probe_may_be_alive(Some(ERROR_ACCESS_DENIED), None));
+        assert!(windows_process_probe_may_be_alive(Some(1), None));
+        assert!(windows_process_probe_may_be_alive(None, None));
+        assert!(windows_process_probe_may_be_alive(None, Some(true)));
+        assert!(!windows_process_probe_may_be_alive(None, Some(false)));
+        assert!(!windows_process_probe_may_be_alive(Some(ERROR_INVALID_PARAMETER), None));
+        assert!(is_process_alive(std::process::id() as i64));
+        assert!(!is_process_alive(i64::MAX));
     }
 
     #[test]

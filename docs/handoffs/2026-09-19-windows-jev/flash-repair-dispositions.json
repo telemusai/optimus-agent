@@ -1,0 +1,88 @@
+{
+  "schemaVersion": 1,
+  "generatedAt": "2026-09-19T11:28:31.174415+00:00",
+  "source": "consolidated from lane DISPOSITIONS.md files + both review rounds + coordinator triage",
+  "auditFindings": {
+    "compactionLane": {
+      "CF-01": "fixed (cooldown gates on check_compaction + run_pre_turn_compaction; review D-01 gap \u2014 turn-end stop path \u2014 fixed by coordinator, tested)",
+      "CF-02": "fixed (failure messages carry stop_reason/provider_status class; verified safe by reviewer)",
+      "B9": "fixed (compaction start rows outcome='started'; TS union/OUTCOMES/summarizer parity by coordinator)",
+      "CF-09": "addressed_by_B9",
+      "A8(partial, compaction-side)": "timestamped audited route + all new/modified supervisor lines"
+    },
+    "lifecycleLane": {
+      "ORPHAN-STOP-01": "fixed (reaper-first repair; reviewer gap #5 dead-pid-with-start-id misclassification fixed by coordinator with new test)",
+      "BUSY-FLAG-01": "fixed (worker_recovery_busy verified vs TS; RESIDUAL: age-based injection suppression not implemented)",
+      "STALE-JOURNALS-01": "fixed (retire_worker_journals wired at reclaim+stop; stop_requested_at gate)",
+      "A4": "fixed (windows_taskkill_program, no bare-name taskkill)",
+      "A6": "fixed (10s bounded settle wait on shutdown/replaced; killed-branch unreachable-with-wait)",
+      "D-02(kernelPid)": "not_a_defect (reviewer-verified; inventing kernelPid is the forbidden anti-pattern)",
+      "D-05": "fixed (identity captured before close)",
+      "D-07": "fixed (pending_summary evidence, 30-min rate limit, no replay)",
+      "D-08": "fixed (sweep_dead_owner_leases; coordinator fixed scanned-vs-unreadable counting defect caught by the lane's own test)",
+      "D-09": "not_a_defect (TS has no gc/parent-teardown producers either)",
+      "A8": "implemented_brief_with_gap (35/38 pre-existing supervisor eprintln sites remain untimestamped \u2014 documented deferral)"
+    },
+    "memoryLane": [
+      "per lane reports/memory/DISPOSITIONS.md (DeepSeek attribution preserved)",
+      "refinement.rs + project.rs + harness state fixes applied"
+    ],
+    "streamingLane": {
+      "B1": "fixed (additive empty_completion diagnostic, no retry-classification change)",
+      "B2": "fixed (WS send-ack labelled transport_send_ack on new transport_open_ack_ms; dispatch_to_response_headers stays null for WS)",
+      "B3": "fixed (doc-only latency attribution honesty label)",
+      "B4": "fixed (doc-only queue_ms definition)",
+      "B5": "fixed (logical attempt_count = group settlement max ordinal; wait_ms ordinal 1 only; Codex SSE/WS transport labels)",
+      "B6": "fixed (host group reuse only while live; settle-once semantics; correlation cleared; risk: test asserts telemetry ordering not the 2.5h live sample)",
+      "B7": "fixed (distinct non-replayable interruption reasons, same responses_request_interrupted code)",
+      "B8": "not_a_defect (ui_render ~1s window by design; documented)",
+      "CF-07": "unresolved/not_a_defect (image hypothesis refuted by source: serialize_conversation drops images; 400 not reproducible offline)",
+      "D-04": "fixed (bounded content-free delivery journal; deliberately no new daemon command -> no protocol/schema change; risk: no duplicate-suppression test)"
+    },
+    "historicalPreSession": {
+      "A5": "addressed in prior session (per WORK_PLAN.json)",
+      "CF-06": "addressed in prior session",
+      "CF-10": "addressed in prior session"
+    }
+  },
+  "monitoringGaps": {
+    "A8": "partial (see lifecycle A8 gap)",
+    "B5": "fixed (see streaming B5)",
+    "CF-09": "addressed_by_B9",
+    "D-04": "fixed (delivery journal)",
+    "D-05": "fixed (see lifecycle)",
+    "COORD-01": "coordinator process discipline (no cutover/commit) maintained",
+    "COORD-02": "serial gate discipline maintained",
+    "COORD-03": "model/attribution discipline maintained"
+  },
+  "reviewDefects": {
+    "compactionReview (DeepSeek sub-41790baf)": {
+      "D-01": "FIXED (cooldown gate in threshold_compaction_needed, tested)",
+      "D-02": "FIXED (docs contract line)",
+      "D-03": "FIXED (new turn-boundary + transcript-immutability test)"
+    },
+    "lifecycleReview (GLM sub-15932ed6)": {
+      "1-4 patch compile/test defects": "FIXED during integration (supervisor_maintenance retire call, RemoveFileDurablyOptions move, agent_dir clone, session_lease Path::exists closures)",
+      "5 dead-pid-with-start-id side record": "FIXED + new test",
+      "6 side-file write failure log detail": "FIXED (log line carries {orphans:?}); dedicated failure-path test NOT written (deferred to Codex)"
+    },
+    "coordinatorFoundDuringGates": [
+      "streaming lane did not compile: E0432 module path (journal declared in daemon_supervisor.rs), E0308 x2 \u2014 fixed",
+      "streaming lane test code did not compile: E0382 counter move (responses_transport), E0433/E0425/E0308/E0063 in agent_loop tests \u2014 fixed",
+      "sweep_dead_owner_leases scanned/unreadable counting violated its own test contract \u2014 fixed",
+      "MEASUREMENTS allowlist 34->35 (transport_open_ack_ms) \u2014 intent-resolved during streaming apply"
+    ]
+  },
+  "residualsForCodex": [
+    "BUSY-FLAG-01 age-based injection suppression not implemented (documented residual)",
+    "A8: 35/38 pre-existing supervisor eprintln sites untimestamped (documented deferral)",
+    "D-01 design question: cooldown turn-end now continues the turn instead of stopping; explicit-resume alternative documented in compaction review",
+    "D-04 duplicate-suppression test absent",
+    "B6 live-sample verification (2.5h) not performed; telemetry-ordering test only",
+    "Azure/github-copilot WS paths not exercised end to end (loopback only)",
+    "TS: node --test run of performance-metrics-compaction-report.test.mjs and npm run check not executed (stop order)"
+  ],
+  "wrapUpRequirement": {
+    "COMPACTION_WRAPUP_REQUIREMENT": "OPEN \u2014 carried for Codex; evidence: reports/COMPACTION_INCIDENT_ANALYSIS.md + incident replay in reports/review-ds/REVIEW.md (attempts 1-5 unchanged, 6 deferred ~22s, 7 deferred ~52s, ~2 cooldown windows at ~60s cadence)"
+  }
+}

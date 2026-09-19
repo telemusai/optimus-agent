@@ -986,10 +986,16 @@ async fn run_openai_codex_responses(
         }
     };
     if let Some(on_response) = options.stream.on_response.clone() {
+        let mut headers = header_map_to_record(response.headers());
+        // Codex has a native WebSocket path and an SSE fallback. The SSE response is a
+        // real HTTP header edge, so label it: without a label Codex attempts recorded
+        // `transport_websocket = null` in every case and a WS-vs-SSE comparison was
+        // impossible (B5).
+        headers.insert("x-optimus-transport".into(), "sse".into());
         on_response(
             ProviderResponse {
                 status: response.status().as_u16() as i64,
-                headers: header_map_to_record(response.headers()),
+                headers,
             },
             model,
         )
@@ -2659,6 +2665,13 @@ async fn process_web_socket_stream(
         }
     });
     socket.send(&serde_json::to_string(&Value::Object(request)).unwrap_or_default());
+    // B5: this provider's native WebSocket path never reports a response header edge, so
+    // every Codex attempt used to record `transport_websocket = null` and a WS-vs-SSE
+    // comparison was impossible. The stage is a content-free observation, emitted only to
+    // the metrics observer, and it means "the payload was sent over a WebSocket".
+    if let Some(observer) = options.stream.on_stream_observation.clone() {
+        let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer("transport_ws")));
+    }
     let events: Pin<Box<dyn futures::Stream<Item = Value> + Send>> = map_codex_events(
         raw_events,
         codex_error.clone(),

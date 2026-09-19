@@ -35,6 +35,7 @@ zip = { workspace = true }
 pi-ai = { workspace = true }
 pi-agent-core = { workspace = true }
 pi-tui = { workspace = true }
+pi-jev = { workspace = true }
 mermansi = "=0.1.6"
 pulldown-cmark = { workspace = true }
 

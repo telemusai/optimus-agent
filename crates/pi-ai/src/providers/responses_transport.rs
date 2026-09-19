@@ -439,9 +439,15 @@ pub(crate) async fn try_websocket(
         TransportError::interrupted("WebSocket request send timed out; not replayed")
     })?
     .map_err(|_| TransportError::interrupted("WebSocket request send failed; not replayed"))?;
+    // The socket accepted our bytes; no server acknowledgement has arrived yet. The
+    // edge marker keeps that distinct from a real HTTP response header edge so the
+    // host records this as `transport_open_ack_ms` and leaves the header stage null.
     let response = ProviderResponse {
         status: 101,
-        headers: IndexMap::from([("x-optimus-transport".into(), "websocket".into())]),
+        headers: IndexMap::from([
+            ("x-optimus-transport".into(), "websocket".into()),
+            ("x-optimus-response-edge".into(), "transport_send_ack".into()),
+        ]),
     };
     let events = futures::stream::unfold(Some(lease), |state| async move {
         let mut lease = state?;
@@ -452,6 +458,9 @@ pub(crate) async fn try_websocket(
             } else {
                 next.await
             };
+            // B7: never fold the deadline into a generic socket close. A hit deadline and
+            // a socket that stopped producing frames are different failures, and the
+            // operator must be able to tell them apart. Neither is replayed.
             let mut event = match next {
                 Ok(Some(Ok(Message::Text(text)))) => match serde_json::from_str::<Value>(&text) {
                     Ok(event) => event,
@@ -478,10 +487,42 @@ pub(crate) async fn try_websocket(
                     continue;
                 }
                 Ok(Some(Ok(Message::Pong(_)))) => continue,
-                _ => {
+                Ok(Some(Err(error))) => {
+                    return Some((
+                        transport_error(&format!(
+                            "WebSocket transport error ({error}); request not replayed"
+                        )),
+                        None,
+                    ))
+                }
+                Ok(None) => {
                     return Some((
                         transport_error(
-                            "WebSocket ended before response completion; request not replayed",
+                            "WebSocket closed before response completion; request not replayed",
+                        ),
+                        None,
+                    ))
+                }
+                Ok(Some(Ok(Message::Close(_)))) => {
+                    return Some((
+                        transport_error(
+                            "WebSocket closed before response completion; request not replayed",
+                        ),
+                        None,
+                    ))
+                }
+                Ok(Some(Ok(_))) => {
+                    return Some((
+                        transport_error(
+                            "WebSocket frame stream ended before response completion; request not replayed",
+                        ),
+                        None,
+                    ))
+                }
+                Err(_) => {
+                    return Some((
+                        transport_error(
+                            "WebSocket response deadline expired before response completion; request not replayed",
                         ),
                         None,
                     ))
@@ -768,7 +809,79 @@ mod tests {
         let events = events.collect::<Vec<_>>().await;
         assert_eq!(events.len(), 3);
         assert_eq!(events[2]["type"], "error");
+        // B7: a socket that goes away is reported as a close, not as a deadline, and it
+        // is still never replayed.
+        assert_eq!(events[2]["code"], "responses_request_interrupted");
+        let message = events[2]["message"].as_str().unwrap();
+        assert!(message.contains("closed before response completion"), "{message}");
+        assert!(message.contains("request not replayed"), "{message}");
+        assert!(
+            !message.contains("deadline"),
+            "a close must stay distinguishable from a deadline: {message}"
+        );
         assert_eq!(connections.load(Ordering::SeqCst), 1);
+        server.abort();
+    }
+
+    /// B7: a response deadline is reported as a deadline, still without replaying the
+    /// already-sent request.
+    #[tokio::test]
+    async fn websocket_deadline_is_reported_as_a_deadline_and_never_replayed() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let accepted = Arc::new(AtomicUsize::new(0));
+        let counter = accepted.clone();
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let counter = counter.clone();
+                children.spawn(async move {
+                    let mut buf = [0; 4096];
+                    let count = tcp.peek(&mut buf).await.unwrap();
+                    if String::from_utf8_lossy(&buf[..count]).starts_with("GET /models ") {
+                        let _ = tcp.read(&mut buf).await.unwrap();
+                        let body = r#"{"data":[{"id":"model","policy":{"state":"enabled"},"supported_endpoints":["ws:/responses"]}]}"#;
+                        tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                    } else {
+                        counter.fetch_add(1, Ordering::SeqCst);
+                        let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                        while let Some(Ok(Message::Text(_))) = ws.next().await {
+                            // Accept the request, stream one frame, then stall. The client
+                            // deadline (1000 ms in this fixture) must expire.
+                            ws.send(Message::Text(
+                                json!({"type":"response.created","response":{"id":"resp_deadline"}}).to_string().into(),
+                            )).await.unwrap();
+                            futures::future::pending::<()>().await;
+                        }
+                    }
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let (model, client, options, params) = fake_request(&base);
+        let (events, metadata) = try_websocket(&model, &client, &params, &options)
+            .await
+            .unwrap()
+            .expect("the capability probe must keep WebSockets");
+        assert_eq!(metadata.status, 101);
+        assert_eq!(
+            metadata.headers.get("x-optimus-response-edge").map(String::as_str),
+            Some("transport_send_ack"),
+            "a local send acknowledgement must be labelled as such"
+        );
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("the deadline must fire instead of hanging");
+        let terminal = events.last().expect("a terminal event");
+        assert_eq!(terminal["type"], "error");
+        let message = terminal["message"].as_str().unwrap();
+        assert!(message.contains("deadline expired"), "{message}");
+        assert!(message.contains("request not replayed"), "{message}");
+        assert!(
+            !message.contains("closed before"),
+            "a deadline must stay distinguishable from a socket close: {message}"
+        );
+        assert_eq!(accepted.load(Ordering::SeqCst), 1, "the payload is sent once and never replayed");
         server.abort();
     }
 

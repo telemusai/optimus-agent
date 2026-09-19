@@ -155,7 +155,7 @@ pub fn supervisor_server_capabilities() -> Vec<String> {
 }
 
 /// `DAEMON_COMMAND_TYPES`.
-pub const DAEMON_COMMAND_TYPES: [&str; 107] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 110] = [
     "ack_result",
     "list",
     "list_agent_peers",
@@ -258,6 +258,11 @@ pub const DAEMON_COMMAND_TYPES: [&str; 107] = [
     "get_system_prompt",
     "get_tool_definition",
     "set_session_entry_label",
+    // Optional Jev surface, advertised only when the daemon capability
+    // `jev_control` is negotiated (no protocol/schema bump).
+    "jev_get_settings",
+    "jev_set_session_mode",
+    "jev_get_status",
     "extension_ui_response",
     "prepare_update_restart",
     "retry_worker",

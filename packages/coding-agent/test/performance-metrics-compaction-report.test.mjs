@@ -17,6 +17,7 @@ test("reports compaction phases and keeps summary attempts separate from ordinar
 		const rows = [
 			record("compaction_history", "compaction", undefined),
 			record("provider_attempt", "compaction", undefined, { attempt_ordinal: 1 }),
+			record("provider_attempt", "compaction", "started", { attempt_ordinal: 1 }),
 			record("provider_attempt", "compaction", "success", { total_ms: 600, dispatch_to_network_terminal_ms: 590, attempt_ordinal: 1 }),
 			record("compaction_history", "compaction", "success", { total_ms: 610 }),
 			record("provider_attempt", "provider", "success", { total_ms: 30 }),
@@ -25,7 +26,8 @@ test("reports compaction phases and keeps summary attempts separate from ordinar
 		writeFileSync(join(directory, "performance-v1-isolated.jsonl"), rows.map((row) => JSON.stringify(row)).join("\n") + "\n");
 		const report = JSON.parse(execFileSync(process.execPath, [fileURLToPath(new URL("../scripts/summarize-performance-metrics.mjs", import.meta.url)), "--dir", directory, "--json"], { encoding: "utf8" }));
 		assert.equal(report.records.invalid, 0);
-		assert.equal(report.records.startedByOperation.provider_attempt, 1);
+		assert.equal(report.records.startedByOperation.provider_attempt, 2);
+		assert.equal(report.measurements.byOperation.provider_attempt.attempt_ordinal.available, 1);
 		assert.equal(report.measurements.byOperation.provider_attempt.attempt_ordinal.available, 1);
 		assert.equal(Object.values(report.measurements.providerAttemptsByIdentity)[0].total_ms.mean, 30);
 		assert.equal(Object.values(report.measurements.compactionAttemptsByIdentity)[0].total_ms.mean, 600);

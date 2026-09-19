@@ -2016,6 +2016,7 @@ dependencies = [
  "once_cell",
  "pi-agent-core",
  "pi-ai",
+ "pi-jev",
  "pi-tui",
  "pulldown-cmark",
  "rand 0.8.8",
@@ -2034,6 +2035,26 @@ dependencies = [
  "uuid",
  "windows-sys 0.61.2",
  "zip",
+]
+
+[[package]]
+name = "pi-jev"
+version = "0.1.0"
+dependencies = [
+ "base64",
+ "chrono",
+ "once_cell",
+ "parking_lot",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha2",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "url",
+ "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

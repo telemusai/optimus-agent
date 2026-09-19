@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 pub type AppKeybinding = &'static str;
 
 /// `keyof AppKeybindings` in declaration order.
-pub const APP_KEYBINDINGS: [AppKeybinding; 56] = [
+pub const APP_KEYBINDINGS: [AppKeybinding; 57] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -70,6 +70,13 @@ pub const APP_KEYBINDINGS: [AppKeybinding; 56] = [
     "app.tree.filter.all",
     "app.tree.filter.cycleForward",
     "app.tree.filter.cycleBackward",
+    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by jev-ui lane):
+    // the `/jev` menu's explicit cancel action. It has NO default key of its own
+    // (`default_keys: vec![]`), so Escape/Ctrl+C keep resolving through the TUI
+    // `tui.select.cancel` / `app.interrupt` bindings and a user override of those
+    // still cancels the dialog. The id exists so the intent is configurable and
+    // named instead of hardcoded inside the component.
+    "app.jev.cancel",
 ];
 
 /// `Keybinding` (the merged id type) and `KeyId`; the TUI crate models both as
@@ -617,6 +624,19 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
             default_keys: vec![String::from("shift+ctrl+o")],
             default_keys_is_single: true,
             description: Some("Tree filter: cycle backward".to_string()),
+            default_key_scope: None,
+        },
+    );
+    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by jev-ui lane):
+    // see `APP_KEYBINDINGS`. No default key on purpose: the dialog cancels through
+    // the TUI `tui.select.cancel` / `app.interrupt` ids, and this id documents the
+    // action so a user can bind it without touching component code.
+    map.insert(
+        "app.jev.cancel".to_string(),
+        KeybindingDefinition {
+            default_keys: vec![],
+            default_keys_is_single: false,
+            description: Some("Cancel the /jev dialog".to_string()),
             default_key_scope: None,
         },
     );

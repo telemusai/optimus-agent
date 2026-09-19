@@ -160,15 +160,17 @@ use crate::core::model_tool_output_policy::{
 };
 use crate::core::prompt_templates::{expand_prompt_template, PromptTemplate};
 use crate::core::extensions::types::InputEventResult;
+#[cfg(test)]
+use crate::core::refinement::refinement::save_harness_state;
 use crate::core::refinement::refinement::{
-    append_global_refinement, apply_refinement_proposal, format_harness_state_for_prompt,
+    append_global_refinement_reported, apply_refinement_proposal, format_harness_state_for_prompt,
     generate_refinement_id, get_global_harness_state_dir, get_local_harness_state_dir,
-    get_refinement_history, infer_refinement_result_scope, load_global_refinement_history,
-    load_harness_state, merge_harness_states, merge_refinement_history,
-    normalize_refinement_proposal, plan_refinement, review_auto_refine, save_harness_state,
+    get_refinement_history, infer_refinement_result_scope, load_global_refinement_history_reported,
+    load_harness_state, load_harness_state_details, merge_harness_states, merge_refinement_history,
+    normalize_refinement_proposal, plan_refinement, review_auto_refine, save_harness_state_checked,
     ApplyRefinementOptions, AutoRefineReason, AutoRefineReview, AutoRefineReviewContext,
-    CompletionFn, HarnessScope, HarnessState, PlanRefinementRequest,
-    ProviderRetryPolicy, RefineModel, RefinementCompletionRequest, RefinementFailureError,
+    CompletionFn, HarnessScope, HarnessState, PlanRefinementRequest, ProviderRetryPolicy,
+    RefineModel, RefinementCompletionRequest, RefinementFailureError,
     RefinementPlan, RefinementProposal, RefinementResult, RefineOptions, ReviewAutoRefineRequest,
     REFINE_SKILL_NAME, REFINEMENT_CUSTOM_TYPE, REFINEMENT_FAILURE_CUSTOM_TYPE,
 };
@@ -221,6 +223,7 @@ use crate::core::usage::{
 use crate::core::websearch_credential::{SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME};
 use crate::core::cron_jobs::normalize_heartbeat_delivery_mode;
 use crate::modes::agent_connection::daemon_agent_connection::now_iso;
+use crate::utils::warning_limiter::{limited_warning, wall_clock_ms, DEFAULT_WARNING_WINDOW_MS};
 use pi_ai::models::{
     get_model_input_limit, get_supported_thinking_levels, models_are_equal, supports_fast_mode,
 };
@@ -495,6 +498,35 @@ pub const COMPACTION_REASON_MANUAL: &str = "manual";
 pub const COMPACTION_REASON_THRESHOLD: &str = "threshold";
 pub const COMPACTION_REASON_OVERFLOW: &str = "overflow";
 pub const COMPACTION_REASON_REQUESTED: &str = "requested";
+
+/// Bounded retry pacing for automatic threshold-compaction failures.
+///
+/// The 2026-09-18 episode re-attacked the failing summary call on every turn
+/// end (18 failed attempts in 4m51s, some ~5s apart). Each automatic
+/// threshold-compaction failure arms an exponential cooldown that doubles up
+/// to a fixed ceiling; the streak stops growing at the cap, so the retry rate
+/// stays bounded and compaction is never locked out permanently. Requested and
+/// overflow compaction, queued human input and the transcript are untouched.
+const THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS: u64 = 5_000;
+const THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS: u64 = 120_000;
+const THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES: u32 = 6;
+
+/// Consecutive automatic threshold-compaction failures and when the last one
+/// landed. Session-lifetime only; a restart starts without a cooldown.
+#[derive(Debug, Clone, Copy)]
+struct ThresholdCompactionFailureState {
+    consecutive_failures: u32,
+    last_failure: std::time::Instant,
+}
+
+/// `initial * 2^(failures - 1)`, clamped to the ceiling.
+fn threshold_compaction_retry_backoff_delay(consecutive_failures: u32) -> std::time::Duration {
+    let shift = consecutive_failures.saturating_sub(1).min(16);
+    let delay_ms = THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS
+        .saturating_mul(1u64 << shift)
+        .min(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS);
+    std::time::Duration::from_millis(delay_ms)
+}
 
 /// `AgentSessionEvent` - a tagged union mirroring the TypeScript union members.
 #[derive(Debug, Clone)]
@@ -2298,6 +2330,7 @@ pub struct AgentSession {
     /// `"idle" | "attempted" | "reported"`
     overflow_recovery: Mutex<String>,
     continue_after_threshold_compaction: AtomicBool,
+    threshold_compaction_failure_streak: Mutex<Option<ThresholdCompactionFailureState>>,
     pending_requested_compaction: Mutex<Option<PendingRequestedCompaction>>,
     pending_requested_refine: Mutex<Option<PendingRequestedRefine>>,
     branch_summary_abort_controller: Mutex<Option<CancellationToken>>,
@@ -2485,6 +2518,52 @@ pub struct PendingRequestedRefine {
 /// `SessionContext`/`SessionStats` re-exports used by callers of this module.
 pub use crate::core::session_manager::SessionContext as AgentSessionContext;
 
+/// Roll up restore-failure reasons as `top 5 reasons + counts`, or `None` when
+/// no reason is recorded. The per-name lines above stay authoritative; this only
+/// adds the aggregate cause the failure list otherwise requires manual counting
+/// to find (18 events listed dozens-hundreds of names each).
+fn summarize_restore_failure_reasons(
+    failed: &[crate::core::kernel::state_snapshot::SkippedVariable],
+) -> Option<String> {
+    let mut counts: Vec<(String, usize)> = Vec::new();
+    for variable in failed {
+        let reason = normalize_restore_failure_reason(&variable.reason);
+        match counts.iter_mut().find(|(existing, _)| *existing == reason) {
+            Some((_, count)) => *count += 1,
+            None => counts.push((reason, 1)),
+        }
+    }
+    if counts.is_empty() {
+        return None;
+    }
+    counts.sort_by(|left, right| right.1.cmp(&left.1).then_with(|| left.0.cmp(&right.0)));
+    let listed: Vec<String> = counts
+        .iter()
+        .take(5)
+        .map(|(reason, count)| format!("{reason} ({count})"))
+        .collect();
+    let remainder = counts.len().saturating_sub(listed.len());
+    let suffix = if remainder == 0 {
+        String::new()
+    } else {
+        format!("; {remainder} more distinct reason(s)")
+    };
+    Some(format!("Failure reasons: {}{}.", listed.join(", "), suffix))
+}
+
+/// Group `ExceptionType: message` reasons by exception type so near-identical
+/// messages (object ids, paths) collapse into one countable cause.
+fn normalize_restore_failure_reason(reason: &str) -> String {
+    let trimmed = reason.trim();
+    if trimmed.is_empty() {
+        return "no reason recorded".to_string();
+    }
+    match trimmed.split_once(':') {
+        Some((kind, _)) if !kind.contains(' ') && !kind.is_empty() => kind.to_string(),
+        _ => trimmed.to_string(),
+    }
+}
+
 impl AgentSession {
     /// `constructor(config: AgentSessionConfig)`.
     pub fn new(config: AgentSessionConfig) -> Result<Arc<Self>, String> {
@@ -2610,6 +2689,7 @@ impl AgentSession {
             compaction_operation: Mutex::new(None),
             overflow_recovery: Mutex::new("idle".to_string()),
             continue_after_threshold_compaction: AtomicBool::new(false),
+            threshold_compaction_failure_streak: Mutex::new(None),
             pending_requested_compaction: Mutex::new(None),
             pending_requested_refine: Mutex::new(None),
             branch_summary_abort_controller: Mutex::new(None),
@@ -4238,6 +4318,9 @@ impl AgentSession {
             return false;
         };
         if !should_compact_for_model(context_tokens, &model, &settings) {
+            return false;
+        }
+        if self.threshold_compaction_retry_in_cooldown() {
             return false;
         }
 
@@ -6311,7 +6394,14 @@ impl AgentSession {
                     if !state.is_streaming { state.error_message = None; }
                 }));
                 *self.last_assistant_message.lock().unwrap() = None;
-                let _ = messages;
+                for message in messages {
+                    if let AgentMessage::Message(Message::Assistant(assistant)) = message {
+                        pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
+                            assistant,
+                            Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Cancelled),
+                        );
+                    }
+                }
                 for action in cleared {
                     self.action_store.lock().unwrap().release_terminal(&action);
                 }
@@ -6355,6 +6445,12 @@ impl AgentSession {
                 }
             };
             if persisted.is_err() {
+                if let AgentMessage::Message(Message::Assistant(assistant)) = message {
+                    pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
+                        assistant,
+                        Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure),
+                    );
+                }
                 return;
             }
             self.consume_started_rlm_continuation(message);
@@ -6395,6 +6491,13 @@ impl AgentSession {
                     });
                     self.retry_attempt.store(0, Ordering::SeqCst);
                     self.retry_auth_failure_sources.lock().unwrap().clear();
+                    // The retry succeeded, so the host-owned group is complete. Settle
+                    // its single outer logical_request terminal with the whole group
+                    // duration (the successful path previously never settled) and
+                    // release the group correlation before the next turn starts (B6).
+                    self.close_retry_metric_group(Some(
+                        pi_agent_core::performance_metrics::PerformanceMetricOutcome::Success,
+                    ));
                 }
                 if self.account_goal_usage_for_assistant_message(assistant) {
                     if let Ok(message) = create_goal_context_message(
@@ -6429,6 +6532,14 @@ impl AgentSession {
 
         if let AgentEvent::AgentEnd { messages } = &event {
             if self.has_failed_dispatch_persistence() {
+                for message in messages {
+                    if let AgentMessage::Message(Message::Assistant(assistant)) = message {
+                        pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
+                            assistant,
+                            Some(pi_agent_core::performance_metrics::PerformanceMetricOutcome::Failure),
+                        );
+                    }
+                }
                 self.resolve_retry();
                 return;
             }
@@ -6472,6 +6583,11 @@ impl AgentSession {
                     return;
                 }
             }
+
+            // Failed attempts stay unsettled until the session decides whether to
+            // retry. No retry was scheduled, so close this request before any
+            // compaction or new turn. Successful/cancelled terminals are idempotent.
+            pi_agent_core::agent_loop::finalize_performance_metric_logical_request(&message, None);
 
             // TS 4298-4304: `_checkCompaction(msg)` (skipAbortedCheck defaults to
             // true) - Case 1 (context overflow, which strips the failed assistant
@@ -7615,7 +7731,9 @@ impl AgentSession {
             let model = self.agent.state().model;
             let tokens = estimate_context_tokens(&self.agent.state().messages).tokens;
             let settings = self.compaction_settings();
-            if should_compact_for_model(tokens, &model, &settings) {
+            if should_compact_for_model(tokens, &model, &settings)
+                && !self.threshold_compaction_retry_in_cooldown()
+            {
                 let _ = self.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await;
             }
         }
@@ -12086,6 +12204,12 @@ impl AgentSession {
                     .collect::<Vec<String>>()
                     .join(", ")
             ));
+            // The per-name reasons already exist in `SkippedVariable`; roll them up
+            // so a 100-name failure list names the actual causes instead of forcing
+            // the reader to guess. Aggregate only, so the notice stays bounded.
+            if let Some(reasons) = summarize_restore_failure_reasons(&result.failed) {
+                text_lines.push(reasons);
+            }
         }
         text_lines.push("</ipython_state_restored>".to_string());
         let message = CustomMessage {
@@ -13486,7 +13610,16 @@ impl AgentSession {
                 )
             }
         };
-        let mut state = load_harness_state(&target_dir, target_scope);
+        // Keep the exact read baseline through apply/save. If access failed or
+        // another writer changes the bytes, a blank/stale state must never win.
+        let loaded = load_harness_state_details(&target_dir, target_scope);
+        if loaded.status == crate::core::refinement::refinement::HarnessStateLoadStatus::Unreadable {
+            return Err(format!(
+                "Harness state could not be read ({}); refusing to apply refinement. Reload and retry.",
+                loaded.reason.as_deref().unwrap_or("load failed"),
+            ));
+        }
+        let mut state = loaded.state.clone();
         let proposal = RefinementProposal {
             edits: plan
                 .proposal
@@ -13522,9 +13655,14 @@ impl AgentSession {
                 baseline_state: plan.baseline_state.clone(),
             },
         );
-        result.harness_state_path = save_harness_state(&target_dir, &state)?;
+        result.harness_state_path = save_harness_state_checked(&target_dir, &state, &loaded)?;
         if target_scope == HarnessScope::Global {
-            append_global_refinement(&global_dir, &result);
+            // The refinement is already applied and saved above. A failed history
+            // append must stay visible (this event loses cross-session rollback)
+            // without reporting the applied edits as failed.
+            if let Some(warning) = append_global_refinement_reported(&global_dir, &result) {
+                eprintln!("Warning: {warning}");
+            }
         }
         let _ = self
             .session_manager
@@ -14017,9 +14155,23 @@ impl AgentSession {
 
     /// `_loadRefinementHistory()`.
     fn load_refinement_history(&self) -> Vec<RefinementResult> {
-        let global = load_global_refinement_history(&get_global_harness_state_dir(
-            &crate::config::get_agent_dir(),
-        ));
+        // A row that carries the result markers but cannot be read is a rollback
+        // target the user can no longer see; report it once per window instead of
+        // letting it disappear.
+        let (global, unreadable) = load_global_refinement_history_reported(
+            &get_global_harness_state_dir(&crate::config::get_agent_dir()),
+        );
+        if let Some(warning) = unreadable.as_deref() {
+            if let Some(line) = limited_warning(
+                "refinement-history",
+                "unreadable-rows",
+                &format!("Warning: {warning}"),
+                wall_clock_ms(),
+                DEFAULT_WARNING_WINDOW_MS,
+            ) {
+                eprintln!("{line}");
+            }
+        }
         let entries: Vec<crate::core::refinement::refinement::CustomEntry> = self
             .session_manager
             .lock()
@@ -14232,6 +14384,13 @@ impl AgentSession {
             return Ok(false);
         };
         if !should_compact_for_model(tokens, &model, settings) {
+            return Ok(false);
+        }
+        // Bounded retry pacing: a failing summary call must not be re-attacked on
+        // a fixed cadence. During the cooldown the automatic threshold path is
+        // skipped; queued session input still runs and the next turn end
+        // re-evaluates. Requested and overflow compaction are never gated.
+        if self.threshold_compaction_retry_in_cooldown() {
             return Ok(false);
         }
         // TS 9492-9509: the agent-end threshold case queues the RLM child / goal /
@@ -14510,6 +14669,9 @@ impl AgentSession {
         let mut compaction_succeeded = false;
         match auth {
             Err(detail) => {
+                if reason == COMPACTION_REASON_THRESHOLD {
+                    self.record_threshold_compaction_failure();
+                }
                 self.end_compaction_unsuccessfully(
                     reason,
                     "failed",
@@ -14536,6 +14698,9 @@ impl AgentSession {
                 match &result {
                     Ok(compaction_result) => {
                         compaction_succeeded = true;
+                        if reason == COMPACTION_REASON_THRESHOLD {
+                            self.clear_threshold_compaction_failure_streak();
+                        }
                         // TS 9638-9645.
                         self.emit(AgentSessionEvent::CompactionEnd {
                             reason: reason.to_string(),
@@ -14653,6 +14818,11 @@ impl AgentSession {
         let aborted = error == COMPACTION_CANCELLED_ERROR_MESSAGE
             || error == ABORTED_ERROR_MESSAGE;
         if aborted {
+            // A user-driven cancel is not a failed attempt; the next threshold
+            // check starts without a cooldown.
+            if reason == COMPACTION_REASON_THRESHOLD {
+                self.clear_threshold_compaction_failure_streak();
+            }
             // TS 9679-9689.
             self.clear_queued_goal_continuation_after_cancelled_threshold_compaction();
             self.end_compaction_unsuccessfully(
@@ -14681,6 +14851,10 @@ impl AgentSession {
         if error == COMPACTION_SKIPPED_ERROR_MESSAGE
             || error == COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE
         {
+            // A skip is not a failed attempt; the streak must not carry over.
+            if reason == COMPACTION_REASON_THRESHOLD {
+                self.clear_threshold_compaction_failure_streak();
+            }
             // TS 9691-9702.
             self.end_compaction_unsuccessfully(
                 reason,
@@ -14701,6 +14875,9 @@ impl AgentSession {
             return;
         }
         // TS 9703-9713.
+        if reason == COMPACTION_REASON_THRESHOLD {
+            self.record_threshold_compaction_failure();
+        }
         self.end_compaction_unsuccessfully(
             reason,
             "failed",
@@ -14735,6 +14912,42 @@ impl AgentSession {
         {
             self.schedule_post_compaction_continue(should_continue_after_compaction);
         }
+    }
+
+    /// Remaining cooldown before the next automatic threshold-compaction
+    /// attempt, or `None` when the gate is open. Only the automatic threshold
+    /// path consults this; requested, manual and overflow compaction never do.
+    fn threshold_compaction_retry_cooldown_remaining(&self) -> Option<std::time::Duration> {
+        let streak = self.threshold_compaction_failure_streak.lock().unwrap();
+        let state = streak.as_ref()?;
+        let delay = threshold_compaction_retry_backoff_delay(state.consecutive_failures);
+        let elapsed = state.last_failure.elapsed();
+        if elapsed >= delay {
+            None
+        } else {
+            Some(delay - elapsed)
+        }
+    }
+
+    fn threshold_compaction_retry_in_cooldown(&self) -> bool {
+        self.threshold_compaction_retry_cooldown_remaining().is_some()
+    }
+
+    fn record_threshold_compaction_failure(&self) {
+        let mut streak = self.threshold_compaction_failure_streak.lock().unwrap();
+        let consecutive_failures = streak
+            .as_ref()
+            .map(|state| state.consecutive_failures.saturating_add(1))
+            .unwrap_or(1)
+            .min(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES);
+        *streak = Some(ThresholdCompactionFailureState {
+            consecutive_failures,
+            last_failure: std::time::Instant::now(),
+        });
+    }
+
+    fn clear_threshold_compaction_failure_streak(&self) {
+        *self.threshold_compaction_failure_streak.lock().unwrap() = None;
     }
 
     /// `setAutoCompactionEnabled(enabled)`.
@@ -18950,6 +19163,467 @@ mod post_compaction_continuation_tests {
     }
 
 // ---------------------------------------------------------------------------
+// Bounded retry pacing for automatic threshold compaction (CF-01 repair).
+//
+// The gate, the streak bookkeeping and the exemption of requested/overflow
+// compaction are exercised directly against the in-memory scripted fixture:
+// no network, no credentials, no production paths.
+// ---------------------------------------------------------------------------
+#[cfg(test)]
+mod compaction_retry_backoff_tests {
+    use super::*;
+    use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
+    use pi_ai::utils::event_stream::AssistantMessageEventStream;
+    use std::sync::atomic::AtomicUsize;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn failed_threshold_summary_preserves_history_and_delivers_queued_human_input() {
+        const HUMAN: &str = "Keep this queued human request after failed summarization.";
+        let session = post_compaction_continuation_tests::test_session_with_credentials().await;
+        let api = format!("summary-queued-human-{}", uuid::Uuid::new_v4());
+        let summary_calls = Arc::new(AtomicUsize::new(0));
+        let release_summary = CancellationToken::new();
+        let calls = summary_calls.clone();
+        let release = release_summary.clone();
+        register_api_provider_simple(ApiProviderSimple {
+            api: api.clone().into(),
+            stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+            stream_simple: Arc::new(move |model, _, _| {
+                calls.fetch_add(1, Ordering::SeqCst);
+                let model = model.clone();
+                let stream = AssistantMessageEventStream::new();
+                let output = stream.clone();
+                let release = release.clone();
+                tokio::spawn(async move {
+                    release.cancelled().await;
+                    let mut message = AssistantMessage::new(model.api, model.provider, model.id, 0);
+                    message.stop_reason = "length".into();
+                    message.stop_reason_raw = Some("other".into());
+                    message.content = vec![pi_ai::types::ContentBlock::Text(
+                        pi_ai::types::TextContent::new("An incomplete handoff must not replace history."),
+                    )];
+                    output.push(pi_ai::types::AssistantMessageEvent::Done { reason: "length".into(), message });
+                    output.end(None);
+                });
+                stream
+            }),
+            compact: None,
+            supports_compaction: None,
+        }, None);
+        session.settings_manager.lock().unwrap().apply_overrides(
+            serde_json::json!({"compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 100}})
+                .as_object().unwrap(),
+        );
+        let mut state = session.agent.state();
+        state.model.api = api;
+        state.model.context_window = 100_000.0;
+        state.model.max_tokens = 4_000.0;
+        for turn in 0..2 {
+            let mut manager = session.session_manager.lock().unwrap();
+            manager.append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text(format!("preserved user turn {turn} ").repeat(200)), turn,
+            )))).unwrap();
+            let mut assistant = AssistantMessage::new(state.model.api.clone(), state.model.provider.clone(), state.model.id.clone(), turn);
+            assistant.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(format!("preserved reply {turn}")))];
+            assistant.usage.input = 99_900.0;
+            manager.append_message(AgentMessage::Message(Message::Assistant(assistant))).unwrap();
+        }
+        state.messages = session.session_manager.lock().unwrap().build_session_context(Some(&state.model)).messages;
+        session.agent.set_state(state);
+        let before = session.session_manager.lock().unwrap().get_entries();
+        let delivered_calls = Arc::new(AtomicUsize::new(0));
+        let delivered = delivered_calls.clone();
+        session.agent.set_stream_fn(Arc::new(move |model, context, _| {
+            let delivered = delivered.clone();
+            Box::pin(async move {
+                assert!(serde_json::to_string(&context.messages).unwrap().contains(HUMAN), "queued human input reaches the model");
+                delivered.fetch_add(1, Ordering::SeqCst);
+                let stream = AssistantMessageEventStream::new();
+                let mut message = AssistantMessage::new(model.api, model.provider, model.id, 5);
+                message.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new("Queued human request received."))];
+                stream.push(pi_ai::types::AssistantMessageEvent::Done { reason: "stop".into(), message });
+                stream.end(None);
+                stream
+            })
+        }));
+        let compact_session = session.clone();
+        let compaction = tokio::spawn(async move {
+            compact_session.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(3), async {
+            while summary_calls.load(Ordering::SeqCst) == 0 {
+                tokio::task::yield_now().await;
+            }
+        }).await.expect("isolated summary request started");
+        session.steer(HUMAN, None, None, None, Some(true)).await.unwrap();
+        assert_eq!(delivered_calls.load(Ordering::SeqCst), 0, "human input waits for the compaction fence");
+        release_summary.cancel();
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(3), compaction)
+            .await.expect("compaction bounded").expect("compaction joined"));
+        tokio::time::timeout(std::time::Duration::from_secs(3), session.wait_for_idle())
+            .await.expect("queued input drains").expect("session settles");
+        let after = session.session_manager.lock().unwrap().get_entries();
+        assert_eq!(&after[..before.len()], before.as_slice(), "old durable entries remain unchanged");
+        assert!(!after.iter().any(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction")),
+            "unusable summary never becomes the durable context head");
+        assert_eq!(summary_calls.load(Ordering::SeqCst), 1, "unknown truncation is not replayed during cooldown");
+        assert_eq!(delivered_calls.load(Ordering::SeqCst), 1, "queued human input is delivered exactly once");
+        assert!(session.threshold_compaction_retry_in_cooldown());
+        session.dispose_async(Some(false)).await;
+    }
+
+    #[test]
+    fn threshold_compaction_retry_backoff_doubles_and_caps() {
+        let delay = |count| threshold_compaction_retry_backoff_delay(count);
+        assert_eq!(delay(1), std::time::Duration::from_millis(5_000));
+        assert_eq!(delay(2), std::time::Duration::from_millis(10_000));
+        assert_eq!(delay(3), std::time::Duration::from_millis(20_000));
+        assert_eq!(delay(4), std::time::Duration::from_millis(40_000));
+        assert_eq!(delay(5), std::time::Duration::from_millis(80_000));
+        assert_eq!(delay(6), std::time::Duration::from_millis(120_000));
+        assert_eq!(
+            delay(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
+            std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn failure_streak_is_capped_and_the_gate_reopens_after_the_cooldown() {
+        let agent = ScriptedAgent::new(vec![]);
+        let session = test_session(agent);
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
+            session.record_threshold_compaction_failure();
+        }
+        assert_eq!(
+            session
+                .threshold_compaction_failure_streak
+                .lock()
+                .unwrap()
+                .as_ref()
+                .unwrap()
+                .consecutive_failures,
+            THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES,
+            "the streak stops growing at the cap"
+        );
+        let remaining = session
+            .threshold_compaction_retry_cooldown_remaining()
+            .expect("a capped failure streak is cooling down");
+        assert!(remaining > std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000));
+        assert!(remaining <= std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS));
+        // Backdate the last failure past the ceiling: the gate opens again and
+        // the next turn end may retry compaction.
+        {
+            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+            let state = streak.as_mut().unwrap();
+            state.last_failure = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_millis(
+                    THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS + 1,
+                ))
+                .expect("the backdated instant stays representable");
+        }
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        session.clear_threshold_compaction_failure_streak();
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        assert!(session.threshold_compaction_failure_streak.lock().unwrap().is_none());
+    }
+
+    /// A session whose settings enable compaction and whose scripted state holds
+    /// an assistant turn above the (tiny) model threshold.
+    async fn gated_session() -> (Arc<AgentSession>, Arc<Mutex<Vec<AgentSessionEvent>>>) {
+        let agent = ScriptedAgent::new(vec![]);
+        let session = test_session(agent);
+        session
+            .settings_manager
+            .lock()
+            .unwrap()
+            .set_compaction_enabled(true);
+        let mut model = Model::new(
+            "unit-compaction-gate",
+            "unit-compaction-gate",
+            "faux",
+            "faux",
+            "https://fixture.invalid",
+        );
+        model.context_window = 1_000.0;
+        model.max_tokens = 500.0;
+        let mut assistant = AssistantMessage::new("faux", "faux", model.id.clone(), 0);
+        assistant.stop_reason = STOP_REASON_STOP.to_string();
+        assistant.usage.input = 900.0;
+        let mut state = session.agent.state();
+        state.model = model;
+        state.messages = vec![
+            AgentMessage::Message(Message::User(UserMessage::new(
+                UserContent::Text("Please keep working on this task.".to_string()),
+                0,
+            ))),
+            AgentMessage::Message(Message::Assistant(assistant)),
+        ];
+        session.agent.set_state(state);
+        let events = Arc::new(Mutex::new(Vec::new()));
+        let sink = events.clone();
+        session.subscribe(Arc::new(move |event| {
+            sink.lock().unwrap().push(event);
+        }));
+        (session, events)
+    }
+
+    fn compaction_starts(events: &[AgentSessionEvent]) -> Vec<String> {
+        events
+            .iter()
+            .filter_map(|event| match event {
+                AgentSessionEvent::CompactionStart { reason, .. } => Some(reason.clone()),
+                _ => None,
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn threshold_compaction_is_skipped_during_the_cooldown_and_retried_after_it() {
+        let (session, events) = gated_session().await;
+        let settings = session.compaction_settings();
+        // Two failed threshold attempts arm a 10s cooldown.
+        session.record_threshold_compaction_failure();
+        session.record_threshold_compaction_failure();
+        assert!(session.threshold_compaction_retry_in_cooldown());
+        assert!(!session.check_compaction(&settings, false).await.unwrap());
+        assert_eq!(
+            compaction_starts(&events.lock().unwrap()),
+            Vec::<String>::new(),
+            "no summary call is made while the cooldown runs"
+        );
+
+        // Backdate the last failure past the cooldown: the same check now runs
+        // the automatic threshold compaction (it fails at the auth pre-check,
+        // which is fine here; only the attempt boundary is under test).
+        {
+            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+            let state = streak.as_mut().unwrap();
+            state.last_failure = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(11))
+                .expect("the backdated instant stays representable");
+        }
+        let _ = session.check_compaction(&settings, false).await.unwrap();
+        assert_eq!(
+            compaction_starts(&events.lock().unwrap()),
+            vec![COMPACTION_REASON_THRESHOLD.to_string()]
+        );
+        session.dispose_async(Some(false)).await;
+    }
+
+    /// The turn-end stop decision must respect the cooldown like the other
+    /// threshold paths: during a cooldown the session is not stopped for a
+    /// compaction that cannot run, and the conversation stays untouched.
+    #[tokio::test]
+    async fn cooldown_gates_the_turn_end_stop_decision() {
+        let (session, _events) = gated_session().await;
+        session.record_threshold_compaction_failure();
+        session.record_threshold_compaction_failure();
+        assert!(session.threshold_compaction_retry_in_cooldown());
+        let message = match &session.agent.state().messages[1] {
+            AgentMessage::Message(Message::Assistant(assistant)) => assistant.clone(),
+            _ => panic!("fixture assistant turn missing"),
+        };
+        let context = ShouldStopAfterTurnContext {
+            message,
+            tool_results: vec![],
+            context: AgentContext::default(),
+            new_messages: vec![],
+        };
+        let before = serde_json::to_string(&session.agent.state().messages).unwrap();
+        assert!(
+            !session.should_stop_after_turn(context.clone()).await,
+            "a cooling-down session is not stopped for a compaction that cannot run"
+        );
+        assert!(!session.threshold_compaction_needed(&context).await);
+        // Backdate past the cooldown: the same decision path may stop again.
+        {
+            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+            let state = streak.as_mut().unwrap();
+            state.last_failure = std::time::Instant::now()
+                .checked_sub(std::time::Duration::from_secs(11))
+                .expect("the backdated instant stays representable");
+        }
+        assert!(session.threshold_compaction_needed(&context).await);
+        // The gated turn left the conversation byte-identical.
+        let after = serde_json::to_string(&session.agent.state().messages).unwrap();
+        assert_eq!(before, after, "the gated turn must not mutate the conversation");
+        session.dispose_async(Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn requested_and_overflow_compaction_ignore_the_threshold_cooldown() {
+        let (session, events) = gated_session().await;
+        session.record_threshold_compaction_failure();
+        session.record_threshold_compaction_failure();
+        assert!(session.threshold_compaction_retry_in_cooldown());
+
+        // Manual/requested compaction is never gated.
+        *session.pending_requested_compaction.lock().unwrap() =
+            Some(PendingRequestedCompaction { custom_instructions: None });
+        session.check_compaction(&session.compaction_settings(), false).await.unwrap();
+        assert_eq!(compaction_starts(&events.lock().unwrap()), vec![COMPACTION_REASON_REQUESTED.to_string()]);
+
+        // Overflow recovery is never gated, even with the cooldown armed.
+        let _ = session
+            .run_auto_compaction(COMPACTION_REASON_OVERFLOW, true)
+            .await;
+        assert_eq!(
+            compaction_starts(&events.lock().unwrap()),
+            vec![
+                COMPACTION_REASON_REQUESTED.to_string(),
+                COMPACTION_REASON_OVERFLOW.to_string()
+            ]
+        );
+        session.dispose_async(Some(false)).await;
+    }
+
+    #[tokio::test]
+    async fn threshold_failure_records_the_streak_and_cancel_skip_overflow_do_not() {
+        let (session, _events) = gated_session().await;
+        session.handle_auto_compaction_failure(
+            COMPACTION_REASON_THRESHOLD,
+            "provider failure",
+            None,
+            false,
+            &[],
+            None,
+        );
+        assert!(session.threshold_compaction_retry_in_cooldown());
+        // Cancelled and skipped attempts are not failures.
+        session.handle_auto_compaction_failure(
+            COMPACTION_REASON_THRESHOLD,
+            COMPACTION_CANCELLED_ERROR_MESSAGE,
+            None,
+            false,
+            &[],
+            None,
+        );
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        session.handle_auto_compaction_failure(
+            COMPACTION_REASON_THRESHOLD,
+            COMPACTION_SKIPPED_ERROR_MESSAGE,
+            None,
+            false,
+            &[],
+            None,
+        );
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        // Overflow failures never arm the threshold cooldown.
+        session.handle_auto_compaction_failure(
+            COMPACTION_REASON_OVERFLOW,
+            "provider failure",
+            None,
+            false,
+            &[],
+            None,
+        );
+        assert!(!session.threshold_compaction_retry_in_cooldown());
+        session.dispose_async(Some(false)).await;
+    }
+
+    /// A fully seeded in-memory session whose summary call succeeds: proves a
+    /// successful threshold compaction clears the cooldown so later failures
+    /// start a fresh streak instead of inheriting the old one.
+    #[tokio::test]
+    async fn successful_threshold_compaction_clears_the_streak() {
+        const VALID_SUMMARY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
+        let api = "summary-backoff-success";
+        let registered = api.to_string();
+        let _ = register_api_provider_simple(
+            ApiProviderSimple {
+                api: registered.clone().into(),
+                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                stream_simple: Arc::new(move |_, _, _| {
+                    let stream = AssistantMessageEventStream::new();
+                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                        reason: STOP_REASON_STOP.to_string(),
+                        message: AssistantMessage {
+                            content: vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new(VALID_SUMMARY),
+                            )],
+                            stop_reason: STOP_REASON_STOP.to_string(),
+                            ..Default::default()
+                        },
+                    });
+                    stream
+                }),
+                compact: None,
+                supports_compaction: None,
+            },
+            None,
+        );
+        let agent = ScriptedAgent::new(vec![]);
+        let session = test_session(agent);
+        session.model_registry.lock().unwrap().set_runtime_api_key("faux", "unit-faux-key");
+        let overrides = serde_json::json!({
+            "autoRefine": {"enabled": false},
+            "retry": {"enabled": false},
+            "compaction": {"enabled": true, "reserveTokens": 500.0, "keepRecentTokens": 100.0},
+            "telemetryEnabled": false,
+            "agentTracesEnabled": false,
+        })
+        .as_object()
+        .unwrap()
+        .clone();
+        session
+            .settings_manager
+            .lock()
+            .unwrap()
+            .apply_overrides(&overrides);
+        let mut model = Model::new(
+            "unit-backoff-success-model",
+            "unit-backoff-success-model",
+            api,
+            "faux",
+            "https://fixture.invalid",
+        );
+        model.context_window = 100_000.0;
+        model.max_tokens = 4_000.0;
+        // Seed durable turns so prepare_compaction has history to cut: the
+        // second turn must cross the 100-token keep-recent window so the cut
+        // lands on it and the first turn gets summarized.
+        for turn in 0..2 {
+            let mut manager = session.session_manager.lock().unwrap();
+            let text = format!("user turn {turn} ").repeat(200);
+            manager
+                .append_message(AgentMessage::Message(Message::User(
+                    UserMessage::new(UserContent::Text(text), 0),
+                )))
+                .unwrap();
+            manager
+                .append_message(AgentMessage::Message(Message::Assistant(AssistantMessage {
+                    content: vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
+                        format!("assistant reply {turn}"),
+                    ))],
+                    api: model.api.clone(),
+                    provider: model.provider.clone(),
+                    model: model.id.clone(),
+                    stop_reason: STOP_REASON_STOP.to_string(),
+                    timestamp: turn,
+                    usage: Usage { input: 900.0, ..Default::default() },
+                    ..Default::default()
+                })))
+                .unwrap();
+        }
+        let mut state = session.agent.state();
+        state.model = model;
+        session.agent.set_state(state);
+
+        // Arm the cooldown, then succeed: the streak must be gone afterwards.
+        session.record_threshold_compaction_failure();
+        session.record_threshold_compaction_failure();
+        assert!(session.threshold_compaction_retry_in_cooldown());
+        let _ = session.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await;
+        assert!(
+            !session.threshold_compaction_retry_in_cooldown(),
+            "a successful threshold compaction clears the backoff"
+        );
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+// ---------------------------------------------------------------------------
 // T11 refinement and extension lifecycle parity (H-01, H-02, H-03, H-04,
 // H-08, H-09, H-13).
 //
@@ -22445,5 +23119,74 @@ mod rlm_session_t10_tests {
             "the UI-owned roster copy stays idle (native_wire.rs:19)"
         );
         crate::core::kernel::shared::live_kernels_delete(&owned);
+    }
+}
+
+/// CF-08 observability: the restore notice must name the failure causes, not
+/// only the failed names, and must stay bounded when the reasons are distinct.
+#[cfg(test)]
+mod restore_notice_tests {
+    use super::*;
+    use crate::core::kernel::state_snapshot::SkippedVariable;
+
+    fn failed(name: &str, reason: &str) -> SkippedVariable {
+        SkippedVariable {
+            name: name.to_string(),
+            reason: reason.to_string(),
+        }
+    }
+
+    #[test]
+    fn reasons_are_rolled_up_by_exception_type_with_counts() {
+        let failed_variables = vec![
+            failed("worker_ast", "TypeError: cannot pickle 'module' object"),
+            failed("worker_name", "TypeError: cannot pickle 'module' object"),
+            failed(
+                "frame",
+                "AttributeError: Can't pickle local object 'main.<locals>.f'",
+            ),
+            failed("socket_handle", ""),
+        ];
+        let summary = summarize_restore_failure_reasons(&failed_variables).unwrap();
+        assert!(summary.starts_with("Failure reasons: "), "{summary}");
+        assert!(summary.contains("TypeError (2)"), "{summary}");
+        assert!(summary.contains("AttributeError (1)"), "{summary}");
+        assert!(summary.contains("no reason recorded (1)"), "{summary}");
+        assert!(summary.ends_with('.'), "{summary}");
+    }
+
+    #[test]
+    fn reason_rollup_is_bounded_to_five_causes() {
+        let failed_variables: Vec<SkippedVariable> = (0..9)
+            .map(|index| failed(&format!("name_{index}"), &format!("Error{index}: boom")))
+            .collect();
+        let summary = summarize_restore_failure_reasons(&failed_variables).unwrap();
+        let listed = summary
+            .trim_start_matches("Failure reasons: ")
+            .split(", ")
+            .count();
+        assert_eq!(listed, 5, "{summary}");
+        assert!(summary.contains("4 more distinct reason(s)"), "{summary}");
+    }
+
+    #[test]
+    fn reasons_without_an_exception_prefix_are_kept_verbatim() {
+        assert_eq!(
+            normalize_restore_failure_reason("exceeds per-variable snapshot size cap"),
+            "exceeds per-variable snapshot size cap"
+        );
+        assert_eq!(
+            normalize_restore_failure_reason("ModuleNotFoundError: no module named 'pandas'"),
+            "ModuleNotFoundError"
+        );
+        assert_eq!(
+            normalize_restore_failure_reason("   "),
+            "no reason recorded"
+        );
+    }
+
+    #[test]
+    fn an_empty_failure_list_produces_no_summary() {
+        assert!(summarize_restore_failure_reasons(&[]).is_none());
     }
 }

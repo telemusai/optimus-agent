@@ -186,11 +186,7 @@ pub fn kill_orphan_process(pid: i64) -> bool {
     if cfg!(windows) {
         // In-kernel bash() kill paths use taskkill /T; the reaper must kill the same tree,
         // not just the shell pid.
-        let system_root = std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string());
-        let taskkill = format!(
-            "{}\\System32\\taskkill.exe",
-            system_root.trim_end_matches('\\')
-        );
+        let taskkill = crate::utils::shell::windows_taskkill_program();
         let mut env = SpawnOptions::default();
         env.env = Some(vec![("NoDefaultCurrentDirectoryInExePath".to_string(), "1".to_string())]);
         let result = spawn_sync_hidden(

@@ -9,26 +9,125 @@ Execution still belongs to Prime Agent's TypeScript host and the existing
 
 from __future__ import annotations
 
+import errno
+import hashlib
 import json
 import os
 import stat
+import time
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass, field, fields
 from datetime import datetime, timezone
 from pathlib import Path
 from uuid import uuid4
-from typing import Any, Literal
+from typing import Any, Iterator, Literal
+
+if os.name == "nt":
+    import msvcrt
+else:
+    import fcntl
 
 HarnessKind = Literal["prompt", "memory", "skill", "subagent"]
 HarnessScope = Literal["local", "global"]
 
 _DEFAULT_FILE_NAME = "harness_state.json"
 _DEFAULT_HARNESS_DIR_NAME = "harness"
+# Recovery copies of unparsable state live beside the state file, named by content
+# hash so a repeat quarantine of identical bytes is idempotent.
+_CORRUPT_STATE_PREFIX = "harness_state.corrupt-"
+# Transient Windows rename retries, mirroring WIN32_RENAME_ATTEMPTS in
+# crates/pi-coding-agent/src/utils/atomic_file.rs.
+_WIN32_RENAME_ATTEMPTS = 5
+_STATE_LOCK_TIMEOUT_SECONDS = 1.0
 _KINDS: tuple[HarnessKind, ...] = ("prompt", "memory", "skill", "subagent")
 _state_cache: dict[tuple[Path, HarnessScope], "HarnessState"] = {}
 
 
+@contextmanager
+def _state_write_lock(state_path: Path) -> Iterator[None]:
+    """Coordinate Python/Rust writers using a crash-released OS file lock.
+
+    Keep the stable lock file: unlinking it would let a new writer lock a
+    different inode while another writer still holds the original one. The
+    Rust writer locks this same file; on Windows our first-byte lock conflicts
+    with its whole-file LockFileEx lock.
+    """
+    lock_path = state_path.with_name(f"{state_path.name}.lock")
+    lock_path.parent.mkdir(parents=True, exist_ok=True)
+    descriptor = os.open(lock_path, os.O_RDWR | os.O_CREAT, 0o600)
+    with os.fdopen(descriptor, "r+b") as lock_file:
+        deadline = time.monotonic() + _STATE_LOCK_TIMEOUT_SECONDS
+        while True:
+            try:
+                if os.name == "nt":
+                    lock_file.seek(0)
+                    msvcrt.locking(lock_file.fileno(), msvcrt.LK_NBLCK, 1)
+                else:
+                    fcntl.flock(lock_file.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except OSError as error:
+                if error.errno not in (errno.EACCES, errno.EAGAIN, errno.EDEADLK):
+                    raise
+                if time.monotonic() >= deadline:
+                    raise RuntimeError("Harness state is being saved by another writer; retry the operation.") from error
+                time.sleep(0.01)
+        try:
+            yield
+        finally:
+            if os.name == "nt":
+                lock_file.seek(0)
+                msvcrt.locking(lock_file.fileno(), msvcrt.LK_UNLCK, 1)
+            else:
+                fcntl.flock(lock_file.fileno(), fcntl.LOCK_UN)
+
+
 def _now() -> str:
     return datetime.now(timezone.utc).isoformat()
+
+
+def generate_refinement_id() -> str:
+    """Mint a refinement id in the canonical `refine_<17-digit timestamp>` form.
+
+    The Rust and TypeScript refiners mint ids this way (see
+    `generate_refinement_id` in
+    crates/pi-coding-agent/src/core/refinement/refinement.rs and
+    packages/coding-agent/src/core/refinement/refinement.ts), so a kernel-side
+    refinement is addressable by the same id format as a host-side one. Rows
+    written by older kernels keep their `refine_NNNN` ids; they are read as-is.
+    """
+    digits = "".join(character for character in _now() if character.isdigit())
+    return f"refine_{digits[:17]}"
+
+
+def _is_transient_replace_error(error: OSError) -> bool:
+    """Windows reports the destination being held open as a sharing violation.
+
+    The accepted codes mirror `is_transient_windows_rename_error` in
+    crates/pi-coding-agent/src/utils/atomic_file.rs (EPERM/EACCES/EBUSY and
+    ERROR_ACCESS_DENIED/ERROR_SHARING_VIOLATION/ERROR_LOCK_VIOLATION).
+    """
+    transient_errno = {errno.EPERM, errno.EACCES, errno.EBUSY}
+    if error.errno in transient_errno:
+        return True
+    return os.name == "nt" and getattr(error, "winerror", None) in {5, 32, 33}
+
+
+def _replace_with_retry(source: Path, destination: Path) -> None:
+    """`os.replace` with the bounded Windows rename retry the Rust writer uses.
+
+    A transient sharing violation must not abort a completed save; a persistent
+    failure still raises, so a lost refinement is never silent.
+    """
+    attempt = 1
+    while True:
+        try:
+            os.replace(source, destination)
+            return
+        except OSError as error:
+            if not _is_transient_replace_error(error) or attempt >= _WIN32_RENAME_ATTEMPTS:
+                raise
+            time.sleep(0.01 * attempt)
+            attempt += 1
 
 
 def _slug(raw: str, fallback: str) -> str:
@@ -168,10 +267,17 @@ class HarnessState:
         self._local_write_error = local_write_error
         self.entries: dict[HarnessKind, dict[str, HarnessEntry]] = {kind: {} for kind in _KINDS}
         self.refinements: list[RefinementEvent] = []
+        # "missing" (no file yet), "loaded", "corrupt" (readable, unparsable), or
+        # "unreadable" (access error). Only the last two make a write unsafe.
+        self._load_status: str = "missing"
+        self._load_reason: str | None = None
         self._global_target_state_dir: Path | None = None
         # mtime of the file as of the last load/save, used to detect out-of-process
         # writes (e.g. the host `/refine` command) and avoid clobbering them.
         self._loaded_mtime: int | None = None
+        # The bytes we actually read, not the mtime of a later filesystem probe.
+        self._loaded_generation: str | None = None
+        self._needs_reload = False
         self.load()
 
     def _ensure_local_writable(self) -> None:
@@ -195,25 +301,97 @@ class HarnessState:
         stale snapshot. We re-read whenever the on-disk mtime no longer matches the
         value recorded at our last load/save.
         """
-        if self._disk_mtime() != self._loaded_mtime:
+        try:
+            generation = self._disk_generation()
+        except OSError:
+            self.load()
+            return
+        if (
+            self._needs_reload
+            or self._load_status == "unreadable"
+            or generation != self._loaded_generation
+            or self._disk_mtime() != self._loaded_mtime
+        ):
             self.load()
 
-    def load(self) -> "HarnessState":
-        if self.file_path is None or not self.file_path.exists():
-            self._loaded_mtime = None
-            return self
-        mtime = self._disk_mtime()
+    def _disk_generation(self) -> str | None:
+        if self.file_path is None:
+            return None
         try:
-            with self.file_path.open("r", encoding="utf-8") as f:
-                data = json.load(f)
-        except (OSError, ValueError):
-            # A corrupt or unreadable state file must not crash the kernel or block
-            # refinement. Treat it as empty; the next save() rewrites it cleanly.
-            data = {}
-        # json.load returns non-dict types for valid JSON like `null`, `[]`, or a bare
-        # string; coerce those to an empty object before attribute access.
+            return hashlib.sha256(self.file_path.read_bytes()).hexdigest()
+        except FileNotFoundError:
+            return None
+
+    def _read_state_payload(self) -> tuple[dict[str, Any], str, str | None]:
+        """Read and parse the state payload, classifying it for CF-04 safety.
+
+        Returns ``(data, status, reason)``. An access error is "unreadable"
+        (bytes unknown, save must fail closed); readable but unparsable bytes
+        (including invalid UTF-8) are "corrupt" (recovery copy before rewrite);
+        a valid JSON non-object is also "corrupt".
+        """
+        try:
+            raw = self.file_path.read_bytes()
+        except OSError as error:
+            self._loaded_generation = None
+            return {}, "unreadable", str(error)
+        self._loaded_generation = hashlib.sha256(raw).hexdigest()
+        try:
+            text = raw.decode("utf-8")
+        except UnicodeDecodeError as error:
+            # Invalid UTF-8 is readable corruption, not an access error: the
+            # bytes survive quarantine and the next save may proceed (review
+            # defect D1, review-glm; parity with the Rust classifier).
+            return {}, "corrupt", str(error)
+        try:
+            data = json.loads(text)
+        except ValueError as error:
+            return {}, "corrupt", str(error)
         if not isinstance(data, dict):
+            # json.loads returns non-dict types for valid JSON like `null`, `[]`,
+            # or a bare string; those are corrupt state, not an empty store.
+            return (
+                {},
+                "corrupt",
+                f"state file is a JSON {type(data).__name__}, not an object",
+            )
+        return data, "loaded", None
+
+    def load(self) -> "HarnessState":
+        self._needs_reload = False
+        if self.file_path is None:
+            self._loaded_mtime = None
+            self._loaded_generation = None
+            self._load_status = "missing"
+            self._load_reason = None
+            return self
+        # Classify through an explicit metadata probe: Path.exists() reports
+        # false for any stat error, including an ACL denial, which would
+        # masquerade an inaccessible store as a new one (review defect D4,
+        # review-glm).
+        try:
+            os.lstat(self.file_path)
+        except FileNotFoundError:
+            self._loaded_mtime = None
+            self._loaded_generation = None
+            self._load_status = "missing"
+            self._load_reason = None
+            self.entries = {kind: {} for kind in _KINDS}
+            self.refinements = []
+            return self
+        except OSError as error:
+            # An access error is not "no state": the bytes are unknown, so the
+            # next save must not replace them. load() still returns an empty view.
+            self._loaded_mtime = None
+            self._loaded_generation = None
+            self._load_status = "unreadable"
+            self._load_reason = str(error)
             data = {}
+        else:
+            data, status, reason = self._read_state_payload()
+            self._load_status = status
+            self._load_reason = reason
+        mtime = self._disk_mtime()
 
         entries: dict[HarnessKind, dict[str, HarnessEntry]] = {kind: {} for kind in _KINDS}
         raw_entries = data.get("entries", {})
@@ -284,10 +462,70 @@ class HarnessState:
             return None
         return target
 
+    def _classify_on_disk(self) -> tuple[str, str | None, str | None]:
+        """Classify the current on-disk bytes at save time.
+
+        Mirrors the Rust save-time re-classification: a writer that corrupts the
+        file while preserving its mtime (backup/restore tools, racing writers
+        landing inside the sync window) must not escape the quarantine decision
+        by hiding behind the cached load-time status (review defect D3,
+        review-glm).
+        """
+        if self.file_path is None:
+            return ("missing", None, None)
+        try:
+            os.lstat(self.file_path)
+        except FileNotFoundError:
+            return ("missing", None, None)
+        except OSError as error:
+            # A stat denial is an access failure, not an empty store (review
+            # defect D4, review-glm).
+            return ("unreadable", str(error), None)
+        try:
+            raw = self.file_path.read_bytes()
+        except OSError as error:
+            return ("unreadable", str(error), None)
+        generation = hashlib.sha256(raw).hexdigest()
+        try:
+            data = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, ValueError) as error:
+            return ("corrupt", str(error), generation)
+        if not isinstance(data, dict):
+            return ("corrupt", f"state file is a JSON {type(data).__name__}, not an object", generation)
+        return ("loaded", None, generation)
+
     def save(self) -> "HarnessState":
         if self.file_path is None:
             # in_memory fallback: nothing to persist.
             return self
+        try:
+            with _state_write_lock(self.file_path):
+                return self._save_locked()
+        except Exception:
+            # The mutation may already be in our cached view, but is not durable.
+            # Subsequent reads/mutations must reload instead of presenting it as saved.
+            self._needs_reload = True
+            raise
+
+    def _save_locked(self) -> "HarnessState":
+        # Fail closed: when the state file could not be read, replacing it would
+        # destroy bytes nobody has seen. A corrupt (readable) file is copied aside
+        # first; an unreadable file blocks the write entirely. The classification
+        # comes from the bytes on disk right now, not from the cached load-time
+        # status.
+        status, reason, generation = self._classify_on_disk()
+        if self._needs_reload or self._load_status == "unreadable" or status == "unreadable":
+            raise RuntimeError(
+                f"Harness state at {self.file_path} could not be read "
+                f"({reason or self._load_reason or 'reload required'}); refusing to overwrite unreadable state."
+            )
+        if generation != self._loaded_generation:
+            raise RuntimeError(
+                "Harness state changed since it was loaded; reload and retry the operation. "
+                "The newer state was not overwritten."
+            )
+        if status == "corrupt":
+            self._quarantine_corrupt_state()
         self.file_path.parent.mkdir(parents=True, exist_ok=True)
         data = {
             "schema": 1,
@@ -310,13 +548,57 @@ class HarnessState:
             descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
             with os.fdopen(descriptor, "w", encoding="utf-8") as f:
                 json.dump(data, f, indent=2, ensure_ascii=False)
+                # Durability parity with the Rust harness writer and the CAS store:
+                # a completed save must survive power loss.
+                f.flush()
+                os.fsync(f.fileno())
             if existing_mode is not None:
                 os.chmod(temp_path, existing_mode)
-            os.replace(temp_path, target_path)
+            _replace_with_retry(temp_path, target_path)
         finally:
             temp_path.unlink(missing_ok=True)
+        # The rewrite reconciled the file, so the status is healthy again.
+        self._load_status = "loaded"
+        self._load_reason = None
         self._loaded_mtime = self._disk_mtime()
+        self._loaded_generation = self._disk_generation()
+        self._needs_reload = False
         return self
+
+    def _quarantine_corrupt_state(self) -> Path | None:
+        """Copy unparsable state bytes aside before the rewrite.
+
+        The copy is content-addressed, so quarantining identical bytes twice is
+        idempotent. A file that cannot be copied aside raises, so the caller never
+        silently destroys content it could not preserve.
+        """
+        if self.file_path is None:
+            return None
+        try:
+            raw = self.file_path.read_bytes()
+        except OSError as error:
+            raise RuntimeError(
+                f"Harness state at {self.file_path} could not be read ({error}); "
+                "refusing to overwrite unreadable state."
+            ) from error
+        digest = hashlib.sha256(raw).hexdigest()[:16]
+        backup_path = self.file_path.with_name(f"{_CORRUPT_STATE_PREFIX}{digest}.json")
+        # Atomic, unconditional rewrite through temp + fsync + the bounded
+        # rename retry: a torn partial copy from a killed process must never be
+        # pinned as the recovery copy by an exists() skip (review defect D2,
+        # review-glm). The content-addressed name keeps repeat quarantine
+        # idempotent in the success case.
+        temp_path = backup_path.with_name(f"{backup_path.name}.{os.getpid()}.{uuid4().hex}.tmp")
+        try:
+            descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+            with os.fdopen(descriptor, "wb") as f:
+                f.write(raw)
+                f.flush()
+                os.fsync(f.fileno())
+            _replace_with_retry(temp_path, backup_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return backup_path
 
     def upsert(
         self,
@@ -707,7 +989,7 @@ class HarnessState:
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
         self._ensure_local_writable()
         self._sync_from_disk()
-        event_id = id or f"refine_{len(self.refinements) + 1:04d}"
+        event_id = id or generate_refinement_id()
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
         event = RefinementEvent(
             id=event_id,
@@ -829,6 +1111,7 @@ def get_harness_state(
 
 
 __all__ = [
+    "generate_refinement_id",
     "HarnessEntry",
     "HarnessKind",
     "HarnessScope",

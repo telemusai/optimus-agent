@@ -17,6 +17,9 @@ use crate::types::{
     ProviderUsageObservation, TextContent, ThinkingContent, Tool, ToolCall, ToolResultMessage, Usage, UserContent,
     TextSignatureV1,
 };
+use crate::utils::diagnostics::{
+    append_assistant_message_diagnostic, now_millis, AssistantMessageDiagnostic,
+};
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
 use crate::utils::json_parse::parse_streaming_json;
@@ -652,6 +655,67 @@ fn map_stop_reason(status: Option<&str>) -> Result<String, ResponsesStreamError>
     }
 }
 
+/// True when the message carries no visible text, no reasoning text and no tool call.
+///
+/// An empty text or thinking block counts as no content: the provider opened the
+/// block but never filled it. A completed turn may legitimately end this way after
+/// streaming tokens into reasoning the client cannot render, so this is only used
+/// to label the terminal, never to fail or retry it.
+pub fn has_no_deliverable_content(message: &AssistantMessage) -> bool {
+    !message.content.iter().any(|block| match block {
+        ContentBlock::Text(text) => !text.text.trim().is_empty(),
+        ContentBlock::Thinking(thinking) => !thinking.thinking.trim().is_empty(),
+        ContentBlock::ToolCall(_) => true,
+    })
+}
+
+/// Record a content-free `empty_completion` diagnostic on a terminal that consumed
+/// output tokens but delivered nothing visible.
+///
+/// Additive only: `stop_reason`, `error_message`, usage and every retry decision stay
+/// exactly as the provider reported them. The diagnostic carries counts and the raw
+/// stop signal, never content, so it cannot leak text into the transcript.
+fn note_empty_completion(output: &mut AssistantMessage, reason: &str) {
+    if output.stop_reason != "stop" {
+        return;
+    }
+    if !has_no_deliverable_content(output) {
+        return;
+    }
+    let output_tokens = if output.usage.output.is_finite() {
+        output.usage.output
+    } else {
+        0.0
+    };
+    if output_tokens <= 0.0 {
+        // No billed output means the provider sent nothing at all; that is a
+        // different (transport) concern and stays out of this diagnostic.
+        return;
+    }
+    let mut details = Map::new();
+    details.insert("reason".to_string(), Value::String(reason.to_string()));
+    details.insert("outputTokens".to_string(), serde_json::json!(output_tokens));
+    details.insert(
+        "totalTokens".to_string(),
+        serde_json::json!(if output.usage.total_tokens.is_finite() {
+            output.usage.total_tokens
+        } else {
+            0.0
+        }),
+    );
+    details.insert(
+        "contentBlocks".to_string(),
+        serde_json::json!(output.content.len() as f64),
+    );
+    let diagnostic = AssistantMessageDiagnostic {
+        type_: "empty_completion".to_string(),
+        timestamp: now_millis(),
+        error: None,
+        details: Some(details),
+    };
+    append_assistant_message_diagnostic(output, diagnostic);
+}
+
 /// The TypeScript `for await (const event of openaiStream) { ... }` body.
 pub async fn process_responses_stream(
     mut openai_stream: ResponsesEventStream,
@@ -1143,6 +1207,16 @@ pub async fn process_responses_stream(
                 if let Some(status) = status {
                     output.stop_reason_raw = Some(status.to_string());
                 }
+            }
+            // A genuinely completed turn that billed output tokens but delivered no
+            // text, reasoning or tool call is otherwise indistinguishable from a normal
+            // answer. Label it for the operator and telemetry; the terminal status and
+            // every retry decision stay untouched. A refusal is its own signal and an
+            // incomplete/errored terminal never reaches here.
+            if status == Some("completed")
+                && output.stop_reason_raw.as_deref() != Some("refusal")
+            {
+                note_empty_completion(output, "completed_without_deliverable_content");
             }
         } else if event_type == "error" {
             let code = get(&event, "code");
@@ -1768,6 +1842,219 @@ mod tests {
             assert_eq!(output.stop_reason, "stop", "ordinary visible refusal behavior stays unchanged");
             assert_eq!(output.stop_reason_raw.as_deref(), Some("refusal"));
             assert_eq!(output.content[0].as_text().unwrap().text, "Cannot summarize.");
+        }
+    }
+
+    /// B1: a completed turn that billed output tokens but delivered nothing visible is
+    /// labelled for the operator without changing its terminal status or retry behavior.
+    #[tokio::test]
+    async fn completed_empty_output_with_billed_tokens_is_labelled_and_stays_a_stop() {
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new();
+        let events = vec![
+            json!({ "type": "response.created", "response": { "id": "resp_empty" } }),
+            json!({ "type": "response.output_item.added", "item": { "type": "reasoning", "id": "rs_empty", "summary": [] } }),
+            json!({ "type": "response.output_item.done", "item": { "type": "reasoning", "id": "rs_empty", "summary": [], "content": [] } }),
+            json!({ "type": "response.output_item.added", "item": { "type": "message", "id": "msg_empty", "content": [] } }),
+            json!({ "type": "response.output_item.done", "item": { "type": "message", "id": "msg_empty", "content": [] } }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_empty",
+                    "status": "completed",
+                    "usage": { "input_tokens": 10, "output_tokens": 71, "total_tokens": 81 }
+                }
+            }),
+        ];
+        process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+            .await
+            .unwrap();
+
+        // The terminal status and error surface are untouched, so no consumer that
+        // treats "stop" as success changes behavior.
+        assert_eq!(output.stop_reason, "stop");
+        assert!(output.error_message.is_none());
+        // The billed output remains visible instead of being hidden by the label.
+        assert_eq!(output.usage.output, 71.0);
+        assert!(has_no_deliverable_content(&output));
+
+        let diagnostics = output.diagnostics.as_ref().expect("labelled terminal");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].type_, "empty_completion");
+        assert!(diagnostics[0].error.is_none(), "the label carries no error text");
+        let details = diagnostics[0].details.as_ref().expect("counts");
+        assert_eq!(details["reason"], json!("completed_without_deliverable_content"));
+        assert_eq!(details["outputTokens"], json!(71.0));
+        assert_eq!(details["totalTokens"], json!(81.0));
+        // Nothing in the label can trigger the provider/lifecycle retry classifiers.
+        assert!(!diagnostics.iter().any(|diagnostic| matches!(
+            diagnostic.type_.as_str(),
+            "provider_stream_failure" | "agent_lifecycle_failure"
+        )));
+    }
+
+    /// B1: the label is additive telemetry. The host retry classifiers read only the
+    /// `provider_stream_failure` and `agent_lifecycle_failure` diagnostics, so an
+    /// `empty_completion` label cannot make a completed turn retryable or permanent.
+    #[tokio::test]
+    async fn empty_completion_label_cannot_change_retry_classification() {
+        use crate::utils::stream_failure::classify_stream_failure;
+        let model = text_model();
+        let mut output = empty_output(&model);
+        let stream = AssistantMessageEventStream::new();
+        let events = vec![
+            json!({ "type": "response.created", "response": { "id": "resp_inert" } }),
+            json!({
+                "type": "response.completed",
+                "response": {
+                    "id": "resp_inert",
+                    "status": "completed",
+                    "usage": { "input_tokens": 4, "output_tokens": 12, "total_tokens": 16 }
+                }
+            }),
+        ];
+        process_responses_stream(event_stream(events), &mut output, &stream, &model, None)
+            .await
+            .unwrap();
+        let diagnostics = output.diagnostics.as_ref().expect("labelled terminal");
+        assert_eq!(diagnostics.len(), 1);
+        assert_eq!(diagnostics[0].type_, "empty_completion");
+        // Neither classifier the retry owner reads can see this label.
+        for name in ["provider_stream_failure", "agent_lifecycle_failure"] {
+            assert!(
+                !diagnostics.iter().any(|diagnostic| diagnostic.type_ == name),
+                "an empty completion must not look like {name}"
+            );
+        }
+        // The turn keeps the same terminal status and carries no provider error type, so
+        // the same failure classification as an unlabelled completed turn is unchanged.
+        assert_eq!(output.stop_reason, "stop");
+        assert_eq!(
+            classify_stream_failure(output.stop_reason_raw.as_deref(), None),
+            classify_stream_failure(None, None),
+        );
+        assert_eq!(output.stop_reason_raw, None);
+        // The transcript keeps the same shape a downstream consumer expects from a
+        // completed turn: content and usage present, no error message.
+        assert!(output.error_message.is_none());
+        assert_eq!(output.usage.output, 12.0);
+    }
+
+    /// B1: legitimate terminals keep their existing shape and carry no label.
+    #[tokio::test]
+    async fn deliverable_refusal_incomplete_and_unbilled_terminals_stay_unlabelled() {
+        struct Case {
+            name: &'static str,
+            events: Vec<Value>,
+            expected_stop_reason: &'static str,
+        }
+        let cases = vec![
+            Case {
+                name: "visible text",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "message", "id": "m1", "content": [] } }),
+                    json!({ "type": "response.content_part.added", "part": { "type": "output_text", "text": "" } }),
+                    json!({ "type": "response.output_text.delta", "delta": "answer" }),
+                    json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "output_tokens": 7 } } }),
+                ],
+                expected_stop_reason: "stop",
+            },
+            Case {
+                name: "visible reasoning only",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "reasoning", "id": "r1", "summary": [] } }),
+                    json!({ "type": "response.reasoning_summary_part.added", "part": { "type": "summary_text", "text": "" } }),
+                    json!({ "type": "response.reasoning_summary_text.delta", "delta": "hidden chain" }),
+                    json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "output_tokens": 5 } } }),
+                ],
+                expected_stop_reason: "stop",
+            },
+            Case {
+                name: "tool-only",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "function_call", "id": "fc1", "call_id": "c1", "name": "bash", "arguments": "{}" } }),
+                    json!({ "type": "response.output_item.done", "item": { "type": "function_call", "id": "fc1", "call_id": "c1", "name": "bash", "arguments": "{}" } }),
+                    json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "output_tokens": 9 } } }),
+                ],
+                expected_stop_reason: "toolUse",
+            },
+            Case {
+                name: "refusal",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "message", "id": "m2", "content": [] } }),
+                    json!({ "type": "response.content_part.added", "part": { "type": "refusal", "refusal": "" } }),
+                    json!({ "type": "response.refusal.delta", "delta": "Cannot help." }),
+                    json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "output_tokens": 4 } } }),
+                ],
+                expected_stop_reason: "stop",
+            },
+            Case {
+                name: "empty text block with billed tokens but delivered refusal text",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "message", "id": "m4", "content": [] } }),
+                    json!({ "type": "response.output_item.done", "item": { "type": "message", "id": "m4", "content": [{ "type": "refusal", "refusal": "Nope." }] } }),
+                    json!({ "type": "response.completed", "response": { "status": "completed", "usage": { "output_tokens": 6 } } }),
+                ],
+                expected_stop_reason: "stop",
+            },
+            Case {
+                name: "unbilled empty completion",
+                events: vec![
+                    json!({ "type": "response.output_item.added", "item": { "type": "message", "id": "m3", "content": [] } }),
+                    json!({ "type": "response.completed", "response": { "status": "completed" } }),
+                ],
+                expected_stop_reason: "stop",
+            },
+        ];
+        for case in cases {
+            let model = text_model();
+            let mut output = empty_output(&model);
+            let stream = AssistantMessageEventStream::new();
+            process_responses_stream(event_stream(case.events), &mut output, &stream, &model, None)
+                .await
+                .unwrap();
+            assert_eq!(output.stop_reason, case.expected_stop_reason, "case {}", case.name);
+            assert!(
+                output.diagnostics.is_none(),
+                "case {} must not be labelled as an empty completion",
+                case.name
+            );
+        }
+    }
+
+    /// B1: an incomplete or errored terminal is never relabelled, because its own
+    /// status already explains why nothing was delivered.
+    #[tokio::test]
+    async fn incomplete_and_errored_terminals_are_never_labelled_empty() {
+        for response in [
+            json!({ "status": "incomplete", "incomplete_details": { "reason": "max_output_tokens" }, "usage": { "output_tokens": 12 } }),
+            json!({ "status": "failed", "error": { "code": "server_error", "message": "boom" }, "usage": { "output_tokens": 3 } }),
+        ]
+        .into_iter()
+        .enumerate()
+        {
+            let (index, response) = response;
+            let model = text_model();
+            let mut output = empty_output(&model);
+            let stream = AssistantMessageEventStream::new();
+            let events = if index == 0 {
+                vec![
+                    json!({ "type": "response.completed", "response": response }),
+                ]
+            } else {
+                vec![
+                    json!({ "type": "response.failed", "response": response }),
+                ]
+            };
+            let result = process_responses_stream(event_stream(events), &mut output, &stream, &model, None).await;
+            if index == 0 {
+                result.unwrap();
+                assert_eq!(output.stop_reason, "length");
+                assert!(output.diagnostics.is_none(), "an incomplete terminal keeps its own status");
+            } else {
+                assert!(result.is_err(), "a failed terminal stays a failure");
+            }
         }
     }
 

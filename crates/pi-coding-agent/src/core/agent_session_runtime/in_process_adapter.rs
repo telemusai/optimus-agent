@@ -33,6 +33,7 @@ use crate::core::session_action_store::{
     QueuedMessageLane, QueuedMessageMutation, QueuedMessageMutationStatus,
 };
 use crate::core::source_info::SourceInfo;
+use crate::utils::warning_limiter::{limited_warning, wall_clock_ms, DEFAULT_WARNING_WINDOW_MS};
 use crate::modes::agent_connection::daemon_agent_connection::build_session_tree_from_flat_nodes;
 use crate::core::autonomous::AgentAutonomousStatus;
 use crate::modes::agent_connection::in_process_agent_connection::InProcessRuntimeHost;
@@ -245,8 +246,55 @@ fn bash_result_value(result: &crate::core::bash_executor::BashResult) -> Value {
 /// the snapshot builder agree on the same session-manager reads.
 fn session_tree_value(session: &Arc<AgentSession>) -> AgentConnectionSessionTree {
     let manager = session.session_manager.lock().unwrap();
+    let (flat_nodes, dropped) = project_flat_tree(manager.get_flat_tree());
+    let leaf_id = manager.get_leaf_id();
+    drop(manager);
+    if !dropped.is_empty() {
+        for line in report_projection_drops(&dropped) {
+            eprintln!("{line}");
+        }
+    }
+    AgentConnectionSessionTree {
+        tree: build_session_tree_from_flat_nodes(&flat_nodes),
+        leaf_id,
+    }
+}
+
+/// One counted projection failure, keyed by its serde error signature.
+struct ProjectionDrop {
+    /// The serde error text: the same field is missing for every entry in the
+    /// group, so one line covers them all.
+    signature: String,
+    count: usize,
+    /// Bounded sample of the dropped entry ids, so the offending entries can be
+    /// located from the log instead of guessed.
+    sample_ids: Vec<String>,
+}
+
+/// Dropped entry ids named per failure signature.
+const MAX_SAMPLE_IDS: usize = 3;
+
+/// Project flat session-tree nodes into the connection union.
+///
+/// A node outside the union cannot be projected and is dropped. The drops are
+/// counted per serde error rather than logged per entry: one non-conforming
+/// entry is re-projected on every snapshot and tree refresh, and an observed
+/// burst produced 10,530 per-entry warning lines.
+fn project_flat_tree(
+    nodes: Vec<crate::core::session_manager::SessionTreeFlatNode>,
+) -> (Vec<AgentConnectionSessionTreeFlatNode>, Vec<ProjectionDrop>) {
     let mut flat_nodes: Vec<AgentConnectionSessionTreeFlatNode> = Vec::new();
-    for node in manager.get_flat_tree() {
+    let mut dropped: Vec<ProjectionDrop> = Vec::new();
+    for node in nodes {
+        // Read the id before the entry is consumed: the projection owns the
+        // parsed value, and cloning a whole entry per refresh would double the
+        // allocation for every session tree.
+        let entry_id = node
+            .entry
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or("<entry has no id>")
+            .to_string();
         match serde_json::from_value(Value::Object(node.entry)) {
             Ok(entry) => flat_nodes.push(AgentConnectionSessionTreeFlatNode {
                 entry,
@@ -254,17 +302,154 @@ fn session_tree_value(session: &Arc<AgentSession>) -> AgentConnectionSessionTree
                 label_timestamp: node.label_timestamp,
             }),
             Err(error) => {
-                // A session entry outside the connection union cannot be
-                // projected; report it instead of dropping it silently.
-                eprintln!("Warning: Could not project session tree entry: {error}");
+                let signature = error.to_string();
+                match dropped
+                    .iter_mut()
+                    .find(|group| group.signature == signature)
+                {
+                    Some(group) => {
+                        group.count += 1;
+                        if group.sample_ids.len() < MAX_SAMPLE_IDS {
+                            group.sample_ids.push(entry_id);
+                        }
+                    }
+                    None => dropped.push(ProjectionDrop {
+                        signature,
+                        count: 1,
+                        sample_ids: vec![entry_id],
+                    }),
+                }
             }
         }
     }
-    let leaf_id = manager.get_leaf_id();
-    drop(manager);
-    AgentConnectionSessionTree {
-        tree: build_session_tree_from_flat_nodes(&flat_nodes),
-        leaf_id,
+    (flat_nodes, dropped)
+}
+
+/// Distinct failure signatures named in one summary line.
+const MAX_SUMMARY_SIGNATURES: usize = 5;
+
+/// Build the warnings for a projection that omitted non-conforming entries.
+///
+/// Bounded by design: at most [`MAX_SUMMARY_SIGNATURES`] per-signature lines
+/// plus one aggregate line, and each key emits at most once per window. A burst
+/// of identical projections therefore costs two lines instead of one per entry,
+/// while the first line of every window carries the true drop total, so a
+/// suppressed repeat can never look like a clean projection.
+fn report_projection_drops(dropped: &[ProjectionDrop]) -> Vec<String> {
+    let total: usize = dropped.iter().map(|group| group.count).sum();
+    let now_ms = wall_clock_ms();
+    let mut lines: Vec<String> = Vec::new();
+    for group in dropped.iter().take(MAX_SUMMARY_SIGNATURES) {
+        let count = group.count;
+        let sample = describe_sample_ids(&group.sample_ids, count);
+        let sample = if sample.is_empty() {
+            sample
+        } else {
+            format!(" ({sample})")
+        };
+        let message = format!(
+            "Warning: Could not project {count} session tree entr{}{sample}: {signature}",
+            if count == 1 { "y" } else { "ies" },
+            signature = group.signature
+        );
+        // Key the limiter on a normalised signature: serde errors that embed the
+        // offending value (for example "invalid type: integer `5`") would rotate
+        // fresh keys per entry and defeat the per-window bound. The emitted line
+        // keeps the verbatim signature for attribution.
+        if let Some(line) = limited_warning(
+            "session-tree-projection",
+            &normalize_projection_signature(&group.signature),
+            &message,
+            now_ms,
+            DEFAULT_WARNING_WINDOW_MS,
+        ) {
+            lines.push(line);
+        }
+    }
+    // Cap the signature list so one pathological session cannot make the
+    // summary line itself unbounded.
+    let listed: Vec<String> = dropped
+        .iter()
+        .take(MAX_SUMMARY_SIGNATURES)
+        .map(|group| format!("{}x {}", group.count, group.signature))
+        .collect();
+    let remainder = dropped.len().saturating_sub(listed.len());
+    let summary = if remainder == 0 {
+        format!(
+            "Warning: {total} session tree entr{} omitted from this projection: {}",
+            if total == 1 { "y" } else { "ies" },
+            listed.join("; ")
+        )
+    } else {
+        format!(
+            "Warning: {total} session tree entr{} omitted from this projection: {}; and {remainder} more distinct error(s)",
+            if total == 1 { "y" } else { "ies" },
+            listed.join("; ")
+        )
+    };
+    // Keyed by the total so a changed drop count is always reported, while a
+    // repeated identical projection stays suppressed inside the window.
+    let summary_key = format!("aggregate:{total}");
+    if let Some(line) = limited_warning(
+        "session-tree-projection",
+        &summary_key,
+        &summary,
+        now_ms,
+        DEFAULT_WARNING_WINDOW_MS,
+    ) {
+        lines.push(line);
+    }
+    lines
+}
+/// Limiter key for a projection signature: digits (and quoted ids) collapse to a
+/// placeholder so value-embedding serde errors cannot rotate fresh keys per
+/// entry. Display keeps the verbatim signature.
+fn normalize_projection_signature(signature: &str) -> String {
+    let mut normalized = String::with_capacity(signature.len());
+    let mut in_quotes = false;
+    let mut chars = signature.chars().peekable();
+    while let Some(ch) = chars.next() {
+        match ch {
+            '"' => {
+                in_quotes = !in_quotes;
+                if !in_quotes {
+                    // Closing quote of a quoted span: collapse the span's content
+                    // by appending a single placeholder marker before the quote.
+                    normalized.push('"');
+                } else {
+                    normalized.push('"');
+                }
+            }
+            _ if in_quotes => {
+                // Skip the quoted span content; it is replaced by the marker at
+                // the closing quote. Backslash escapes are skipped too.
+                if ch == '\\' {
+                    chars.next();
+                }
+            }
+            _ if ch.is_ascii_digit() => {
+                normalized.push('#');
+                while chars.peek().is_some_and(|next| next.is_ascii_digit()) {
+                    chars.next();
+                }
+            }
+            other => normalized.push(other),
+        }
+    }
+    normalized
+}
+
+/// Name the sampled entries for one drop group: `ids a, b, c; +N more`.
+fn describe_sample_ids(sample_ids: &[String], count: usize) -> String {
+    if sample_ids.is_empty() {
+        return String::new();
+    }
+    let named = sample_ids.join(", ");
+    let remainder = count.saturating_sub(sample_ids.len());
+    if remainder == 0 {
+        format!("ids {named}")
+    } else {
+        format!("ids {named}; +{remainder} more")
     }
 }
 
@@ -1195,5 +1380,239 @@ impl AgentConnectionSessionWatcher for ChildWatcher {
         let subscriptions = std::mem::take(&mut *self.subscriptions.lock().unwrap());
         for unsubscribe in subscriptions { unsubscribe(); }
         Box::pin(async {})
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::utils::warning_limiter::{limiter_test_lock, reset_limited_warnings};
+    use serde_json::json;
+
+    // The warning limiter is process-global and Rust runs test functions in
+    // parallel threads inside one process, so every test below takes the shared
+    // limiter test lock before it resets or reads the map, and each test uses its
+    // OWN serde failure signature. Without both, one test's reset would land
+    // inside another test's 60s window and make the suite order-dependent.
+
+    fn node(entry: Value) -> crate::core::session_manager::SessionTreeFlatNode {
+        crate::core::session_manager::SessionTreeFlatNode {
+            entry: match entry {
+                Value::Object(map) => map,
+                _ => panic!("node entry must be an object"),
+            },
+            label: None,
+            label_timestamp: None,
+        }
+    }
+
+    /// `label` without `targetId`: "missing field `target_id`" (the audit's
+    /// 7,837-line signature).
+    fn label_missing_target_id(id: &str) -> crate::core::session_manager::SessionTreeFlatNode {
+        node(json!({
+            "type": "label", "id": id, "timestamp": "2026-01-01T00:00:00.000Z", "label": "stale"
+        }))
+    }
+
+    /// `custom_message` without `customType`: "missing field `custom_type`"
+    /// (the audit's 2,377-line signature).
+    fn custom_message_missing_custom_type(
+        id: &str,
+    ) -> crate::core::session_manager::SessionTreeFlatNode {
+        node(json!({
+            "type": "custom_message", "id": id, "timestamp": "2026-01-01T00:00:00.000Z",
+            "content": "kept", "display": true
+        }))
+    }
+
+    /// `label` with a numeric `targetId`: "invalid type: integer ..., expected a
+    /// string". A third, distinct signature for the burst test.
+    fn label_with_numeric_target_id(id: &str) -> crate::core::session_manager::SessionTreeFlatNode {
+        node(json!({
+            "type": "label", "id": id, "timestamp": "2026-01-01T00:00:00.000Z",
+            "label": "stale", "targetId": 5
+        }))
+    }
+
+    fn group(signature: &str, count: usize, sample_ids: &[&str]) -> ProjectionDrop {
+        ProjectionDrop {
+            signature: signature.to_string(),
+            count,
+            sample_ids: sample_ids.iter().map(|id| id.to_string()).collect(),
+        }
+    }
+
+    /// A conforming entry projects; a foreign-shape entry is counted, not lost
+    /// silently, and the report names both the cause and the offending entry.
+    #[test]
+    fn projection_counts_foreign_entries_and_names_them() {
+        let _guard = limiter_test_lock();
+        reset_limited_warnings();
+        let (flat, dropped) = project_flat_tree(vec![
+            node(json!({
+                "type": "session_info", "id": "e1", "timestamp": "2026-01-01T00:00:00.000Z",
+                "name": "kept"
+            })),
+            label_missing_target_id("e2"),
+        ]);
+        assert_eq!(flat.len(), 1);
+        assert_eq!(flat[0].entry.type_name(), "session_info");
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].count, 1);
+        assert_eq!(dropped[0].sample_ids, vec!["e2".to_string()]);
+        // The current serde error spells the field camelCase (`targetId`); the
+        // audit's pre-2026-09-18 log text was snake_case (`target_id`). The
+        // bounded-warning mechanism is independent of the field spelling.
+        assert!(
+            dropped[0].signature.contains("targetId") || dropped[0].signature.contains("target_id"),
+            "{}",
+            dropped[0].signature
+        );
+
+        let lines = report_projection_drops(&dropped);
+        assert_eq!(lines.len(), 2, "per-signature plus aggregate: {lines:?}");
+        assert!(
+            lines[0].contains("Could not project 1 session tree entry"),
+            "{}",
+            lines[0]
+        );
+        assert!(lines[0].contains("ids e2"), "{}", lines[0]);
+        assert!(
+            lines[1].contains("1 session tree entry omitted from this projection"),
+            "{}",
+            lines[1]
+        );
+        reset_limited_warnings();
+    }
+
+    /// The dropped entry ids are bounded, so the naming cannot grow with the
+    /// session either.
+    #[test]
+    fn dropped_id_samples_are_bounded() {
+        let _guard = limiter_test_lock();
+        reset_limited_warnings();
+        let nodes: Vec<crate::core::session_manager::SessionTreeFlatNode> = (0..40)
+            .map(|index| custom_message_missing_custom_type(&format!("c{index}")))
+            .collect();
+        let (_, dropped) = project_flat_tree(nodes);
+        assert_eq!(dropped.len(), 1);
+        assert_eq!(dropped[0].count, 40);
+        assert_eq!(dropped[0].sample_ids.len(), MAX_SAMPLE_IDS);
+        assert!(
+            dropped[0].signature.contains("customType") || dropped[0].signature.contains("custom_type"),
+            "{}",
+            dropped[0].signature
+        );
+        let lines = report_projection_drops(&dropped);
+        assert!(lines[0].contains("+37 more"), "{}", lines[0]);
+        reset_limited_warnings();
+    }
+
+    /// Repeated identical failures across many projections must produce a
+    /// bounded number of lines, and the true count must survive in the summary.
+    #[test]
+    fn repeated_projection_failures_produce_bounded_lines() {
+        let _guard = limiter_test_lock();
+        reset_limited_warnings();
+        let nodes: Vec<crate::core::session_manager::SessionTreeFlatNode> = (0..7837)
+            .map(|index| label_with_numeric_target_id(&format!("n{index}")))
+            .collect();
+        let mut emitted: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            let (_, dropped) = project_flat_tree(nodes.clone());
+            assert_eq!(dropped.iter().map(|group| group.count).sum::<usize>(), 7837);
+            assert_eq!(
+                dropped.len(),
+                1,
+                "identical failures collapse to one signature"
+            );
+            emitted.extend(report_projection_drops(&dropped));
+        }
+        assert_eq!(
+            emitted.len(),
+            2,
+            "one window keeps the flood at two lines: {}",
+            emitted.len()
+        );
+        assert!(
+            emitted.iter().any(|line| line.contains("7837")),
+            "the suppressed total stays truthful: {emitted:?}"
+        );
+        reset_limited_warnings();
+    }
+
+    /// Value-embedding serde errors (a distinct integer per entry) must not
+    /// defeat the per-window bound: the limiter key is normalised, so a
+    /// pathological session still costs two lines, not one per distinct value
+    /// (review defect D5, review-glm).
+    #[test]
+    fn value_embedding_signatures_stay_bounded_across_projections() {
+        let _guard = limiter_test_lock();
+        reset_limited_warnings();
+        let nodes: Vec<crate::core::session_manager::SessionTreeFlatNode> = (0..7837)
+            .map(|index| {
+                node(json!({
+                    "type": "label", "id": format!("n{index}"),
+                    "timestamp": "2026-01-01T00:00:00.000Z",
+                    "label": "stale", "targetId": index
+                }))
+            })
+            .collect();
+        let mut emitted: Vec<String> = Vec::new();
+        for _ in 0..12 {
+            let (_, dropped) = project_flat_tree(nodes.clone());
+            assert_eq!(
+                dropped.iter().map(|group| group.count).sum::<usize>(),
+                7837,
+                "every non-conforming entry is still counted"
+            );
+            emitted.extend(report_projection_drops(&dropped));
+        }
+        assert_eq!(
+            emitted.len(),
+            2,
+            "one signature line plus the aggregate line per window: {emitted:?}"
+        );
+        assert!(
+            emitted.iter().any(|line| line.contains("7837")),
+            "the aggregate still states the true total: {emitted:?}"
+        );
+        reset_limited_warnings();
+    }
+
+    /// Distinct failure signatures are counted separately and listed, with the
+    /// line count capped so the summary cannot grow without bound.
+    #[test]
+    fn distinct_projection_signatures_are_listed_but_capped() {
+        let _guard = limiter_test_lock();
+        reset_limited_warnings();
+        // Digit-free names: the limiter keys on a normalised signature where
+        // digits collapse to a placeholder, so numbered names would merge into
+        // one key and defeat the distinct-listing this test verifies.
+        let names = [
+            "synthetic signature alpha", "synthetic signature beta", "synthetic signature gamma",
+            "synthetic signature delta", "synthetic signature epsilon", "synthetic signature zeta",
+            "synthetic signature eta",
+        ];
+        let dropped: Vec<ProjectionDrop> = names
+            .iter()
+            .map(|name| group(name, 4, &["x"]))
+            .collect();
+        let lines = report_projection_drops(&dropped);
+        assert_eq!(
+            lines.len(),
+            6,
+            "5 listed signatures plus the aggregate line"
+        );
+        let summary = &lines[lines.len() - 1];
+        assert!(
+            summary.contains("28 session tree entries omitted"),
+            "{summary}"
+        );
+        assert!(
+            summary.contains("and 2 more distinct error(s)"),
+            "{summary}"
+        );
+        reset_limited_warnings();
     }
 }

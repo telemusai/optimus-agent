@@ -14,7 +14,7 @@ use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple, Simpl
 use pi_ai::compaction::CompactionOptions;
 use pi_ai::types::{
     AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Model, ProviderResponse,
-    ProviderUsageObservation, TextContent, UserContent, UserMessage,
+    ProviderUsageObservation, SimpleStreamOptions, TextContent, UserContent, UserMessage,
 };
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use pi_coding_agent::core::compaction::compaction::{
@@ -111,7 +111,20 @@ fn terminal(
 ) -> Vec<&PerformanceMetricEvent> {
     events
         .iter()
-        .filter(|event| event.operation == operation && event.outcome.is_some())
+        .filter(|event| {
+            event.operation == operation
+                && matches!(event.outcome, Some(Outcome::Success | Outcome::Failure | Outcome::Cancelled | Outcome::Unavailable))
+        })
+        .collect()
+}
+
+fn started(
+    events: &[PerformanceMetricEvent],
+    operation: Operation,
+) -> Vec<&PerformanceMetricEvent> {
+    events
+        .iter()
+        .filter(|event| event.operation == operation && event.outcome == Some(Outcome::Started))
         .collect()
 }
 
@@ -243,6 +256,120 @@ async fn text_summary_preserves_options_and_records_body_timing_without_content(
     }
 }
 
+/// B2/B5: a WebSocket send acknowledgement, real HTTP headers and a provider that only
+/// labels its transport on an observation stage must stay distinguishable.
+#[tokio::test]
+async fn transport_edges_are_recorded_without_confusing_an_ack_with_headers() {
+    let recorder = Arc::new(Recorder::default());
+    let clock = recorder.clone();
+    let model = register(
+        "compaction-observed-transport-edges",
+        Arc::new(|_, _, _| AssistantMessageEventStream::new()),
+    );
+    let metrics = CompactionMetrics::new(Some(recorder.clone()), &model);
+    // The wrapper phase is a history phase, so the three attempt records below are the
+    // only provider-attempt terminals in this fixture.
+    let phase = metrics.phase(Operation::CompactionHistory);
+    let requests = phase.requests();
+
+    // A WebSocket attempt: the provider answers the upgrade with a send acknowledgement.
+    let request = requests.next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    let response_hook = options.stream.on_response.clone().unwrap();
+    let observation_hook = options.stream.on_stream_observation.clone().unwrap();
+    clock.clock.store(100, Ordering::SeqCst);
+    assert!(options.stream.on_payload.as_ref().unwrap()(
+        serde_json::json!({"secret": "SECRET-PAYLOAD"}),
+        &model
+    )
+    .await
+    .is_none());
+    clock.clock.store(150, Ordering::SeqCst);
+    response_hook(
+        ProviderResponse {
+            status: 101,
+            headers: [
+                ("x-optimus-transport".into(), "websocket".into()),
+                ("x-optimus-response-edge".into(), "transport_send_ack".into()),
+            ]
+            .into(),
+        },
+        &model,
+    )
+    .await;
+    clock.clock.store(300, Ordering::SeqCst);
+    observation_hook("terminal");
+    request.finish(&response("acknowledged"), false);
+
+    // An SSE attempt of the same request shape reports a real header edge.
+    let request = requests.next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    clock.clock.store(400, Ordering::SeqCst);
+    assert!(options.stream.on_payload.as_ref().unwrap()(
+        serde_json::json!({"secret": "SECRET-PAYLOAD"}),
+        &model
+    )
+    .await
+    .is_none());
+    clock.clock.store(420, Ordering::SeqCst);
+    options.stream.on_response.as_ref().unwrap()(
+        ProviderResponse {
+            status: 200,
+            headers: [
+                ("x-optimus-transport".into(), "sse".into()),
+                ("x-optimus-response-edge".into(), "response_headers".into()),
+            ]
+            .into(),
+        },
+        &model,
+    )
+    .await;
+    request.finish(&response("streamed"), false);
+
+    // A WebSocket provider that never calls the response hook labels its transport on the
+    // observation stage instead, so the attempt is still comparable with an SSE attempt.
+    let request = requests.next();
+    let mut options = SimpleStreamOptions::default();
+    request.observe(&mut options);
+    assert!(options.stream.on_payload.as_ref().unwrap()(
+        serde_json::json!({"secret": "SECRET-PAYLOAD"}),
+        &model
+    )
+    .await
+    .is_none());
+    options.stream.on_stream_observation.as_ref().unwrap()("transport_ws");
+    options.stream.on_stream_observation.as_ref().unwrap()("terminal");
+    request.finish(&response("labelled"), false);
+
+    phase.finish(Outcome::Success);
+    let events = recorder.events.lock().unwrap();
+    let attempts = terminal(&events, Operation::ProviderAttempt);
+    assert_eq!(attempts.len(), 3);
+    let ack = attempts[0].measurements.as_ref().unwrap();
+    assert_eq!(
+        ack[&Measurement::DispatchToResponseHeadersMs],
+        None::<f64>,
+        "a send acknowledgement is not an HTTP header edge"
+    );
+    assert_eq!(ack[&Measurement::TransportWebsocket], Some(1.0));
+    assert_eq!(ack[&Measurement::DispatchToNetworkTerminalMs], Some(200.0));
+    let sse = attempts[1].measurements.as_ref().unwrap();
+    assert_eq!(sse[&Measurement::DispatchToResponseHeadersMs], Some(20.0));
+    assert_eq!(sse[&Measurement::TransportWebsocket], Some(0.0));
+    let labelled = attempts[2].measurements.as_ref().unwrap();
+    assert_eq!(
+        labelled[&Measurement::DispatchToResponseHeadersMs],
+        None::<f64>,
+        "an unobserved header edge stays null, never zero"
+    );
+    assert_eq!(labelled[&Measurement::TransportWebsocket], Some(1.0));
+    let encoded = serde_json::to_string(&*events).unwrap();
+    assert!(!encoded.contains("SECRET-PAYLOAD"));
+    assert!(!encoded.contains("acknowledged"));
+}
+
 #[tokio::test]
 async fn split_failure_cancels_pending_sibling_without_cancelling_parent() {
     let barrier = Arc::new(Barrier::new(2));
@@ -358,6 +485,70 @@ async fn successful_split_requests_remain_concurrent_and_separately_correlated()
     assert_eq!(first.action_id, second.action_id);
     assert_ne!(first.logical_request_id, second.logical_request_id);
     assert_ne!(first.provider_attempt_id, second.provider_attempt_id);
+}
+
+#[tokio::test]
+async fn provider_attempt_start_rows_are_labeled_started_and_paired_one_to_one() {
+    let count = Arc::new(AtomicU64::new(0));
+    let called = count.clone();
+    let model = register(
+        "compaction-observed-start-rows",
+        Arc::new(move |_, _, _| {
+            let stream = AssistantMessageEventStream::new();
+            let message = if called.fetch_add(1, Ordering::SeqCst) == 0 {
+                AssistantMessage {
+                    stop_reason: "error".into(),
+                    error_message: Some("server unavailable".into()),
+                    ..Default::default()
+                }
+            } else {
+                response(VALID)
+            };
+            push(&stream, message);
+            stream
+        }),
+    );
+    let recorder = Arc::new(Recorder::default());
+    let metrics = CompactionMetrics::new(Some(recorder.clone()), &model);
+    let retry = ProviderRetryPolicy {
+        enabled: true,
+        max_retries: 1,
+        base_delay_ms: 0.0,
+        max_retry_delay_ms: 100.0,
+    };
+    compact_with_metrics(
+        &preparation(false),
+        &model,
+        "unused",
+        None,
+        None,
+        None,
+        default_summary_call_runner(None),
+        Some(&retry),
+        None,
+        &metrics,
+    )
+    .await
+    .unwrap();
+    let events = recorder.events.lock().unwrap();
+    // Every provider attempt is emitted twice under the same correlation IDs:
+    // an explicitly labeled `started` row (never null, never a failure) and a
+    // terminal row. Terminal accounting counts terminals only.
+    let starts = started(&events, Operation::ProviderAttempt);
+    let terminals = terminal(&events, Operation::ProviderAttempt);
+    assert_eq!(starts.len(), terminals.len());
+    for (start, terminal) in starts.iter().zip(terminals.iter()) {
+        let start = start.correlation.as_ref().unwrap();
+        let terminal = terminal.correlation.as_ref().unwrap();
+        assert_eq!(start.action_id, terminal.action_id);
+        assert_eq!(start.logical_request_id, terminal.logical_request_id);
+        assert_eq!(start.provider_attempt_id, terminal.provider_attempt_id);
+    }
+    assert_eq!(terminals[0].outcome, Some(Outcome::Failure));
+    assert_eq!(terminals[1].outcome, Some(Outcome::Success));
+    // Phase rows pair the same way.
+    assert_eq!(started(&events, Operation::CompactionHistory).len(), 1);
+    assert_eq!(terminal(&events, Operation::CompactionHistory).len(), 1);
 }
 
 #[tokio::test]

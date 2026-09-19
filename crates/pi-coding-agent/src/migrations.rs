@@ -412,7 +412,7 @@ fn migrate_keybindings_config(
 /// `TUI_KEYBINDINGS` first and then adds the app entries in this order.
 /// `core/keybindings.ts` belongs to another slice; the order itself is what the
 /// migration needs, so it is kept private here.
-const APP_KEYBINDING_ORDER: [&str; 56] = [
+const APP_KEYBINDING_ORDER: [&str; 57] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -469,6 +469,7 @@ const APP_KEYBINDING_ORDER: [&str; 56] = [
     "app.tree.filter.all",
     "app.tree.filter.cycleForward",
     "app.tree.filter.cycleBackward",
+    "app.jev.cancel",
 ];
 
 fn order_keybindings_config(

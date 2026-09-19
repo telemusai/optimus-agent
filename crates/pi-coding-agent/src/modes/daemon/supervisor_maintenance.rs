@@ -1,7 +1,8 @@
 //! Recovery cleanup and existing optional heartbeat/snapshot contracts.
 use super::*;
+use std::io::Read;
 use crate::core::cron_jobs::{AgentCronJobStore, CancelJobsForSessionInput, SESSION_SCHEDULED_JOBS_FILENAME};
-use crate::core::orphan_process_journal::{clear_orphan_process_journal, kill_orphan_process, read_active_orphan_processes, should_reap_orphan_process, OrphanProcessRecord};
+use crate::core::orphan_process_journal::{clear_orphan_process_journal, is_orphan_process_identity_current, kill_orphan_process, read_active_orphan_processes, should_reap_orphan_process, ActiveOrphanProcess, OrphanProcessRecord};
 use crate::modes::daemon::snapshot_transcript_cache::{SnapshotTranscriptCache, SnapshotTranscriptCacheOptions, SNAPSHOT_TARGET_CHUNK_BYTES};
 use crate::modes::daemon::worker_recovery_journal::{WorkerRecoveryJournal, WorkerRecoveryRecordInput};
 
@@ -20,6 +21,72 @@ impl HeartbeatSnapshot {
     pub fn fresh(&self) -> Option<Vec<Value>> { (!self.stale).then(|| self.rows.clone()).flatten() }
 }
 
+/// Durable evidence for unresolved ownership. Capacity is a refusal boundary,
+/// never permission to discard an older unresolved process record.
+const ORPHANS_UNREAPABLE_MAX_RECORDS: usize = 64;
+const ORPHANS_UNREAPABLE_MAX_BYTES: u64 = 256 * 1024;
+const DEFERRED_ORPHAN_PERSISTENCE_ERROR: &str = "Deferred orphan evidence could not be persisted; recovery journal retained";
+
+fn record_deferred_orphans(descriptor_dir: &Path, worker_id: &str, orphans: &[ActiveOrphanProcess]) -> Result<(), String> {
+    let path = descriptor_dir.join(format!("{worker_id}.orphans.unreapable.jsonl"));
+    let mut raw = Vec::new();
+    match std::fs::File::open(&path) {
+        Ok(file) => {
+            file.take(ORPHANS_UNREAPABLE_MAX_BYTES + 1).read_to_end(&mut raw)
+                .map_err(|error| format!("could not read {}: {error}", path.display()))?;
+            if raw.len() as u64 > ORPHANS_UNREAPABLE_MAX_BYTES {
+                return Err("deferred orphan evidence exceeds its byte limit".into());
+            }
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+        Err(error) => return Err(format!("could not read {}: {error}", path.display())),
+    }
+    let contents = String::from_utf8(raw).map_err(|_| "deferred orphan evidence is not UTF-8".to_string())?;
+    let mut prior: Vec<Value> = Vec::new();
+    for line in contents.lines().filter(|line| !line.trim().is_empty()) {
+        let record: Value = serde_json::from_str(line).map_err(|_| "deferred orphan evidence contains malformed JSON".to_string())?;
+        if record.get("workerId").and_then(Value::as_str) != Some(worker_id)
+            || !record.get("pid").and_then(Value::as_i64).is_some_and(|pid| pid > 0) {
+            return Err("deferred orphan evidence has an unverified owner or pid".into());
+        }
+        prior.push(record);
+        if prior.len() > ORPHANS_UNREAPABLE_MAX_RECORDS {
+            return Err("deferred orphan evidence exceeds its record limit".into());
+        }
+    }
+    let stamp = iso_from_ms(supervisor_now_ms() as f64);
+    for orphan in orphans {
+        let record = json!({
+            "at": stamp,
+            "workerId": worker_id,
+            "pid": orphan.pid,
+            "kernelPid": orphan.kernel_pid,
+            "processStartId": orphan.process_start_id,
+            "reason": "cleanup could not prove the live pid is the journaled process; no bare-pid kill was attempted and cleanup remains unverified",
+        });
+        // A crash after side-record persistence but before journal removal must
+        // be safe to retry without consuming capacity a second time.
+        if prior.iter().any(|existing| existing.get("pid") == record.get("pid")
+            && existing.get("kernelPid") == record.get("kernelPid")
+            && existing.get("processStartId") == record.get("processStartId")) { continue; }
+        if prior.len() >= ORPHANS_UNREAPABLE_MAX_RECORDS {
+            return Err("deferred orphan evidence exceeds its record limit".into());
+        }
+        prior.push(record);
+    }
+    let payload = prior.iter().map(serde_json::to_string).collect::<Result<Vec<_>, _>>()
+        .map_err(|error| error.to_string())?.join("\n");
+    let payload = format!("{payload}\n");
+    if payload.len() as u64 > ORPHANS_UNREAPABLE_MAX_BYTES {
+        return Err("deferred orphan evidence exceeds its byte limit".into());
+    }
+    write_file_atomic_sync(&path.to_string_lossy(), &payload, WriteFileAtomicOptions {
+        mode: Some(0o600), fsync: true, fsync_dir: true, ..Default::default()
+    }).map_err(|error| format!("could not persist {}: {error}", path.display()))?;
+    eprintln!("[{stamp}] Session worker {worker_id} deferred unproven orphan cleanup for {} record(s) {orphans:?}; recorded in {} (the journal is superseded; the unproven pids stay observable)", orphans.len(), path.display());
+    Ok(())
+}
+
 fn same_registration(left: &DaemonWorkerDescriptor, right: &DaemonWorkerDescriptor) -> bool {
     left.worker_id == right.worker_id && left.pid == right.pid
         && left.process_start_id == right.process_start_id
@@ -33,7 +100,8 @@ pub(super) fn permanent_stop_cleanup_error(error: &str) -> bool {
     matches!(error,
         "Uncertain operation has no saved transcript; recovery journal retained"
         | "Malformed orphan record; recovery journal retained"
-        | "Unverified orphan record; recovery journal retained")
+        | "Unverified orphan record; recovery journal retained"
+        | DEFERRED_ORPHAN_PERSISTENCE_ERROR)
 }
 
 impl Supervisor {
@@ -102,20 +170,55 @@ impl Supervisor {
             }
             let orphans = read_active_orphan_processes(path, descriptor.pid as i64).map_err(|error| error.to_string())?;
             let mut failed = false;
+            let mut deferred = Vec::new();
             for orphan in orphans {
                 self.assert_dead_registration(worker, &descriptor).await?;
-                // A PID without a start identity is not authority to kill a process.
-                if orphan.process_start_id.as_deref().is_none_or(str::is_empty) { failed = true; continue; }
                 let identity = ProcessIdentity { pid: orphan.pid, process_start_id: orphan.process_start_id.clone() };
-                if !should_reap_orphan_process(&orphan) {
-                    if is_stopping_process_alive(&identity) { failed = true; }
+                if should_reap_orphan_process(&orphan) {
+                    // Only a provably live record needs a kill; a gone pid is
+                    // nothing to reap, not a failed cleanup.
+                    if is_stopping_process_alive(&identity) {
+                        let killed = tokio::time::timeout(Duration::from_secs(6), tokio::task::spawn_blocking(move || {
+                            kill_orphan_process(orphan.pid)
+                        })).await;
+                        if !matches!(killed, Ok(Ok(true))) { failed = true; }
+                    }
                     continue;
                 }
-                let killed = tokio::time::timeout(Duration::from_secs(6), tokio::task::spawn_blocking(move || {
-                    if !should_reap_orphan_process(&orphan) { return !is_stopping_process_alive(&identity); }
-                    kill_orphan_process(orphan.pid)
-                })).await;
-                if !matches!(killed, Ok(Ok(true))) { failed = true; }
+                // The reaper intentionally declines this record. A recorded start
+                // id that provably no longer matches the pid proves the journaled
+                // process is gone (or the pid moved on), so there is nothing left
+                // to reap; a start id that cannot be observed at all is unknown,
+                // like a pid-only record.
+                if orphan.process_start_id.as_deref().is_some_and(|start| !start.is_empty())
+                    && !is_orphan_process_identity_current(&orphan)
+                {
+                    if get_process_start_id(orphan.pid).is_some() { continue; }
+                    // The pid is gone entirely: the journaled process is provably
+                    // dead, so there is nothing to defer (same gate as the
+                    // pid-only branch below).
+                    if !is_stopping_process_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
+                        continue;
+                    }
+                    deferred.push(orphan.clone());
+                    continue;
+                }
+                // A pid-only record can never prove identity: win32 relies on the
+                // kernel's kill-on-close job for those, and a bare pid is never
+                // kill authority. A provably dead pid needs no reap.
+                if !is_stopping_process_alive(&ProcessIdentity { pid: orphan.pid, process_start_id: None }) {
+                    continue;
+                }
+                // A live pid the cleanup cannot prove is ours: never kill by bare
+                // pid and never report the stop failed for it. Record bounded,
+                // truthful, recoverable state instead of erasing the uncertainty.
+                deferred.push(orphan);
+            }
+            if !deferred.is_empty() {
+                if let Err(error) = record_deferred_orphans(&self.descriptor_dir, &descriptor.worker_id, &deferred) {
+                    eprintln!("[{}] Deferred orphan evidence for {} was not safely persisted: {error}; authoritative journal retained", iso_from_ms(supervisor_now_ms() as f64), descriptor.worker_id);
+                    return Err(DEFERRED_ORPHAN_PERSISTENCE_ERROR.into());
+                }
             }
             if failed { return Err("Orphan cleanup incomplete; recovery journal retained".into()); }
             self.assert_dead_registration(worker, &descriptor).await?;
@@ -182,8 +285,32 @@ impl Supervisor {
         self.invalidate_worker_input_pauses(worker);
         self.flip_worker_roster_entries_inactive(worker);
         remove_file_durably(&self.descriptor_dir.join(format!("{}.json", descriptor.worker_id)).to_string_lossy(), RemoveFileDurablyOptions { fsync_dir: true, platform: None }).await.map_err(|error| error.to_string())?;
+        self.retire_worker_journals(&descriptor).await;
         self.workers.lock().unwrap().remove(&descriptor.worker_id);
         Ok(true)
+    }
+
+    /// Retirement of a stopped generation's journals (audit STALE-JOURNALS-01):
+    /// a successful stop has resolved the recovery evidence, so this worker's own
+    /// recovery and orphan journals are superseded instead of accumulating. The
+    /// deferred-orphan side record (unproven pids) is intentionally kept, and
+    /// journals of other runs or workers are never touched.
+    pub(super) async fn retire_worker_journals(&self, descriptor: &DaemonWorkerDescriptor) {
+        // RemoveFileDurablyOptions is not Copy; each durable removal gets its own value.
+        if let Err(error) = remove_file_durably(
+            &descriptor.recovery_journal_path,
+            RemoveFileDurablyOptions { fsync_dir: true, platform: None },
+        ).await {
+            eprintln!("Could not retire recovery journal for {}: {error}", descriptor.worker_id);
+        }
+        if let Some(orphan_path) = &descriptor.orphan_process_journal_path {
+            if let Err(error) = remove_file_durably(
+                orphan_path,
+                RemoveFileDurablyOptions { fsync_dir: true, platform: None },
+            ).await {
+                eprintln!("Could not retire orphan journal for {}: {error}", descriptor.worker_id);
+            }
+        }
     }
 
     async fn cancel_session_tree(self: &Arc<Self>, descriptor: &DaemonWorkerDescriptor, exclude: Option<&Arc<Worker>>) -> Result<(), String> {

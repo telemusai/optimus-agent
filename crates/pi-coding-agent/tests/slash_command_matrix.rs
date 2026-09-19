@@ -1,7 +1,7 @@
 //! Exhaustive slash-command validation matrix (Hish's "test and validate every
 //! slash command").
 //!
-//! Every entry of `builtin_slash_commands()` (37 canonical) plus the five aliases
+//! Every entry of `builtin_slash_commands()` (38 canonical) plus the five aliases
 //! is EXERCISED and its ACTUAL behaviour recorded. The table is executed, not
 //! prose: classification runs against the real registry, and handler presence is
 //! extracted from the real handler chain, so a command that silently regresses
@@ -150,7 +150,7 @@ fn row(
 const SESSION_REF: &str = "interactive-mode.ts:4821-5030 (no local arm) -> :5177-5181 prompt -> agent-session.ts:5065-5068";
 const SESSION_OBSERVED: &str = "prompted verbatim to the session (SlashDispatch::SessionCommand)";
 
-/// All 37 canonical registry entries plus the five aliases (42 rows).
+/// All 38 canonical registry entries plus the five aliases (43 rows).
 fn matrix() -> Vec<Row> {
     vec![
     row("settings", "settings", false, Classification::Builtin, Some("settings"),
@@ -272,6 +272,10 @@ fn matrix() -> Vec<Row> {
         Verdict::Ok, None),
     row("fullscreen", "fullscreen", false, Classification::Builtin, Some("fullscreen"),
         "interactive-mode.ts:5014-5023, 7522-7537", "parses on/off, rejects anything else with the usage error, else applies the requested/LIVE state",
+        Verdict::Ok, None),
+    row("jev", "jev", false, Classification::Builtin, Some("jev"),
+        "local built-in (no TypeScript owner; comparison-mode surface)",
+        "parses the /jev argument, writes the session mode through the pi-jev store, republishes the footer; `active` is reserved and changes nothing",
         Verdict::Ok, None),
     row("quit", "quit", false, Classification::Builtin, Some("quit"),
         "interactive-mode.ts:5040-5043", "the input loop owns shutdown_requested (/quit and /exit); the arm is intentionally silent",
@@ -553,8 +557,8 @@ fn every_slash_command_is_exercised_and_its_actual_behaviour_recorded() {
         .collect();
     assert_eq!(
         canonical.len(),
-        37,
-        "the registry must hold 37 canonical entries, got {canonical:?}"
+        38,
+        "the registry must hold 38 canonical entries, got {canonical:?}"
     );
 
     let table = matrix();
@@ -562,7 +566,7 @@ fn every_slash_command_is_exercised_and_its_actual_behaviour_recorded() {
     rows.sort_by_key(|row| row.name);
 
     // Coverage: every registry entry and every alias has exactly one row.
-    assert_eq!(rows.len(), 42, "37 canonical rows plus 5 alias rows");
+    assert_eq!(rows.len(), 43, "38 canonical rows plus 5 alias rows");
     for name in &canonical {
         assert!(
             rows.iter().any(|row| row.canonical == *name),

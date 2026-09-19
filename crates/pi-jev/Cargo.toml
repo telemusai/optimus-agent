@@ -1,0 +1,31 @@
+[package]
+name = "pi-jev"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[dev-dependencies]
+tempfile = { workspace = true }
+
+[dependencies]
+serde = { workspace = true }
+serde_json = { workspace = true }
+thiserror = { workspace = true }
+tokio = { workspace = true }
+once_cell = { workspace = true }
+reqwest = { workspace = true }
+url = { workspace = true }
+uuid = { workspace = true }
+chrono = { workspace = true }
+base64 = { workspace = true }
+sha2 = { workspace = true }
+parking_lot = { workspace = true }
+
+[target.'cfg(windows)'.dependencies]
+# Verified against the vendored windows-sys 0.61.2 source (registry cache):
+# CryptProtectData/CryptUnprotectData/CRYPT_INTEGER_BLOB/CRYPTPROTECT_UI_FORBIDDEN live in
+# src/Windows/Win32/Security/Cryptography/mod.rs behind `Win32_Security_Cryptography`.
+# LocalFree lives in Win32/Foundation behind `Win32_Foundation`, which that feature enables
+# transitively: Win32_Security_Cryptography -> Win32_Security -> Win32 -> Win32_Foundation.
+# Only this one extra feature is needed; nothing else is added to the workspace feature set.
+windows-sys = { version = "0.61", features = ["Win32_Security_Cryptography"] }

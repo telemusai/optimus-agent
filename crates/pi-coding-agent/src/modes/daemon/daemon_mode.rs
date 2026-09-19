@@ -689,7 +689,7 @@ pub struct DaemonHistoryRange {
 }
 
 /// `DAEMON_COMMAND_TYPES` (ported verbatim from daemon-mode.ts).
-pub const DAEMON_COMMAND_TYPES: [&str; 100] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 103] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -785,6 +785,14 @@ pub const DAEMON_COMMAND_TYPES: [&str; 100] = [
     "get_system_prompt",
     "get_tool_definition",
     "set_session_entry_label",
+    // SHARED FILE EDIT (modes/daemon/daemon_mode.rs, capability-gated addition by
+    // jev-ui lane; REPAIR-OVERLAP file - keep the coordinator's version at
+    // integration): the optional Jev mode surface. Optional means a client only
+    // sends them after the daemon advertised `jev_control`, and an old daemon
+    // answers "Unknown daemon command" to a client that sends them anyway.
+    "jev_get_settings",
+    "jev_set_session_mode",
+    "jev_get_status",
     "extension_ui_response",
     "prepare_update_restart",
     "retry_worker",
@@ -792,8 +800,134 @@ pub const DAEMON_COMMAND_TYPES: [&str; 100] = [
     "shutdown",
 ];
 
+// SHARED FILE EDIT (modes/daemon/daemon_mode.rs, jev-ui lane; REPAIR-OVERLAP
+// file - keep the coordinator's version at integration): the two small helpers the
+// optional `jev_*` command arms use. They keep the surface minimal: one store path,
+// one presence probe and one view builder, no new state on `AgentDaemon`.
+impl AgentDaemon {
+    /// The same store the interactive `/jev` command uses
+    /// (`<agent_dir>/jev/jev-settings.json`, lane A's `JevSettingsStore`), so a
+    /// client and the daemon never disagree about a session's mode.
+    fn jev_settings_store(&self) -> pi_jev::config::JevSettingsStore {
+        pi_jev::config::JevSettingsStore::new(std::path::Path::new(&self.agent_dir))
+    }
+
+    /// Saved-credential PRESENCE through lane A's store. It never reads the secret
+    /// and never guesses a file layout; an unavailable store reports `false` and
+    /// `credentialPresenceKnown: false` in the view.
+    fn jev_saved_credential(&self) -> (bool, bool) {
+        let store = pi_jev::credential::default_credential_store(
+            std::path::Path::new(&self.agent_dir),
+        );
+        if !store.is_available() {
+            return (false, false);
+        }
+        match store.exists(pi_jev::config::DEFAULT_KEY_ID) {
+            Ok(present) => (present, true),
+            Err(_) => (false, false),
+        }
+    }
+
+    /// Settings and worker telemetry use the durable transcript UUID, never the
+    /// ephemeral daemon selector (which changes when a worker is reopened).
+    fn jev_session_id(&self, selector: &str) -> Result<String, String> {
+        if selector.is_empty() {
+            return Err("activeSessionId is required".to_string());
+        }
+        let state = self.get_bound_session_state(selector)?;
+        Ok(self.session_of(&state).session_id())
+    }
+
+    fn publish_jev_attach_footer(
+        self: &Arc<Self>,
+        client: &Arc<DaemonClientHandle>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+    ) {
+        let active_session_id = state.lock().expect("active session poisoned").active_session_id.clone();
+        if !client.capabilities_for_session(&active_session_id).contains("extension_ui") {
+            return;
+        }
+        let message = DaemonOutbound::ExtensionUiRequest {
+            active_session_id: active_session_id.clone(),
+            id: format!("jev-attach-{}", self.next_id()),
+            method: "setStatus".to_string(),
+            payload: serde_json::json!({
+                "statusKey": "jev",
+                "statusText": crate::core::jev_bridge::footer_status_text(&self.session_of(state).session_id()),
+            }),
+        };
+        if !self.defer_snapshot_frame(client, &active_session_id, &message) {
+            self.write(client, &message);
+        }
+    }
+
+    /// The mode view both `jev_get_settings` and `jev_get_status` return. It reads
+    /// only local settings and credential PRESENCE: no network call, no secret
+    /// value, and `applied` is always false because nothing is applied in Compare.
+    fn jev_settings_view(&self, session_id: &str) -> Result<Value, String> {
+        let store = self.jev_settings_store();
+        let settings = store.load();
+        let env = pi_jev::config::EnvKeyPresence::from_env();
+        let (saved_present, saved_presence_known) = self.jev_saved_credential();
+        let credential = pi_jev::config::resolve_credential_source_from_presence(saved_present, env);
+        let resolution = settings.effective_mode_with_scope(session_id);
+        Ok(serde_json::json!({
+            "mode": resolution.mode.as_str(),
+            "explicitSessionMode": settings.session_mode(session_id).map(|mode| mode.as_str()),
+            "globalDefault": settings.global_default.map(|mode| mode.as_str()),
+            "scope": resolution.scope.as_str(),
+            "credentialSource": credential.as_str(),
+            "credentialPresent": credential.is_configured(),
+            // Store access failures mean UNKNOWN, not absent.
+            "credentialPresenceKnown": saved_presence_known,
+            "envConflict": env.has_conflict(),
+            "activeMode": "reserved",
+            // Compare never applies anything; a client must never read otherwise.
+            "applied": false,
+            "appliedDecisions": 0,
+        }))
+    }
+
+    /// Applies one mode change through lane A's store. `Active` is reserved and
+    /// writes nothing, so `applied` is false for it.
+    fn jev_apply_session_mode(
+        &self,
+        session_id: &str,
+        requested: pi_jev::types::JevMode,
+    ) -> Result<(bool, pi_jev::types::JevMode), String> {
+        let store = self.jev_settings_store();
+        let mut settings = store.load();
+        if requested.is_reserved() {
+            let unchanged = settings.effective_mode(session_id);
+            return Ok((false, unchanged));
+        }
+        settings.set_session_mode(session_id, requested);
+        store.save(&settings).map_err(|error| error.log_line())?;
+        // The interactive host caches settings for 250ms; a daemon-side write
+        // must invalidate it so both surfaces agree immediately.
+        crate::core::jev_bridge::invalidate_settings_cache();
+        Ok((true, requested))
+    }
+}
+
+/// The one message form both the interactive command and the daemon return, so a
+/// user sees identical wording through either path.
+fn jev_mode_change_message(applied: bool, mode: pi_jev::types::JevMode) -> String {
+    if applied {
+        return format!("Jev mode: {} (scope: this chat)", mode.label());
+    }
+    format!(
+        "Active is reserved and disabled in this release; mode stays {}. Nothing changed.",
+        mode.label()
+    )
+}
+
 const CLIENT_CATCHUP_RETRY_MS: u64 = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS: u64 = 5000;
+/// Bound for the shutdown/replaced close settle wait (audit A6): the abort is
+/// delivered first, so a hung agent cannot park a daemon shutdown forever. The
+/// cap matches the worker stop's non-forced graceful deadline.
+const CLOSE_SETTLE_WAIT_TIMEOUT: Duration = Duration::from_millis(10_000);
 const SUPERVISOR_FENCE_POLL_MS: u64 = 250;
 const UPDATE_RESTART_MARKER: &str = "<prime_agent_update_interrupted>\nPrime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been stopped.\n</prime_agent_update_interrupted>";
 
@@ -2366,7 +2500,9 @@ impl AgentDaemon {
     /// rotating log file and the shared structured log (and stderr too, for when
     /// it's run in the foreground).
     fn log(&self, message: &str) {
-        eprintln!("{message}");
+        // The stderr route is what a foreground run (and `--log` capture) sees, so
+        // it carries the same timestamp as the rotating line (audit A8).
+        eprintln!("[{}] {message}", now_iso());
         let mut fields = Map::new();
         fields.insert(
             "socketPath".to_string(),
@@ -3421,6 +3557,16 @@ pub trait DaemonSession: Send + Sync {
         cwd_override: Option<&str>,
     ) -> BoxFuture<'static, Result<Value, String>>;
     fn dispose(&self) -> BoxFuture<'static, ()>;
+}
+
+/// `recordWorkerRecoveryState`'s busy predicate (daemon-mode.ts:7375-7380):
+/// `hasLiveSessionWork(state) || session.isRetrying || session.hasAcceptedPromptInFlight`.
+/// `hasLiveSessionWork` is `isSessionActive || hasRunningRlmChildren`, and
+/// isRetrying/isStreaming/isCompacting/isBashRunning are subsumed by the Rust
+/// `is_session_active`, so the port collapses to these two terms. The running
+/// children term is the BUSY-FLAG-01 parity delta (audit BUSY-FLAG-01).
+pub(crate) fn worker_recovery_busy(session: &dyn DaemonSession) -> bool {
+    session.is_session_active() || session.has_running_rlm_children()
 }
 
 /// `runUserBash(command, options)`.
@@ -4603,6 +4749,7 @@ impl AgentDaemon {
                         }
                     }
                 }
+                self.publish_jev_attach_footer(client, &state);
                 if streams_snapshot {
                     let snapshot_id = snapshot_transfer_id(&result.snapshot);
                     let snapshot_messages = result
@@ -5155,6 +5302,50 @@ impl AgentDaemon {
                     id,
                     "agent_messages_resume",
                     Some(self.get_agent_message_safety_status()),
+                )))
+            }
+            // SHARED FILE EDIT (daemon_mode.rs, capability-gated addition by jev-ui
+            // lane): the three optional Jev commands. They read and write the same
+            // `pi-jev` settings store the interactive `/jev` command uses (lane A's
+            // `JevSettingsStore`), so a client and a daemon never disagree.
+            "jev_get_settings" | "jev_get_status" => {
+                let session_id = self.jev_session_id(
+                    body.get("activeSessionId").and_then(Value::as_str).unwrap_or(""),
+                )?;
+                let mut view = self.jev_settings_view(&session_id)?;
+                if command.type_ == "jev_get_status" {
+                    view["pipeline"] = crate::core::jev_bridge::session_status_snapshot(&session_id)
+                        .unwrap_or(Value::Null);
+                }
+                Ok(Some(DaemonResponse::success(id, &command.type_, Some(view))))
+            }
+            "jev_set_session_mode" => {
+                let requested = body.get("mode").and_then(Value::as_str).unwrap_or("");
+                let Some(mode) = pi_jev::types::JevMode::parse(requested) else {
+                    return Err(format!(
+                        "Unknown Jev mode: {requested} (expected off, compare, or active)"
+                    ));
+                };
+                let session_id = self.jev_session_id(body
+                    .get("activeSessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or(""))?;
+                let (applied, effective) = self.jev_apply_session_mode(&session_id, mode)?;
+                let store = self.jev_settings_store();
+                let resolution = store.load().effective_mode_with_scope(&session_id);
+                Ok(Some(DaemonResponse::success(
+                    id,
+                    "jev_set_session_mode",
+                    Some(serde_json::json!({
+                        "requested": requested,
+                        "mode": effective.as_str(),
+                        "scope": resolution.scope.as_str(),
+                        // `active` is reserved: applied stays false, nothing changed,
+                        // and `reserved` records why.
+                        "applied": applied,
+                        "reserved": !applied,
+                        "message": jev_mode_change_message(applied, effective),
+                    })),
                 )))
             }
             "agent_messages_clear" => {
@@ -6852,6 +7043,19 @@ impl AgentDaemon {
         )));
         let session = Arc::clone(&runtime.session);
         let runtime_metadata = runtime.metadata.clone();
+        // A child keeps its own model and lifecycle. Only its initial Jev
+        // comparison preference is inherited, using durable session identities.
+        if runtime_metadata.kind.as_deref() == Some("subagent") {
+            if let Some(parent_id) = runtime_metadata.parent_session_id.as_deref().filter(|id| !id.is_empty()) {
+                let bridge = crate::modes::interactive::native_host::JevModeBridge::new(
+                    std::path::Path::new(&self.agent_dir),
+                );
+                let child_id = session.session_id();
+                if bridge.settings().session_mode(&child_id).is_none() {
+                    let _ = bridge.inherit_into_child(&child_id, parent_id, None);
+                }
+            }
+        }
         let runtime_session = ActiveSessionRuntimeSession {
             session_id: session.session_id(),
             session_name: session.session_name(),
@@ -8329,12 +8533,7 @@ impl AgentDaemon {
         if session_id.is_empty() {
             return;
         }
-        let busy = busy_override.unwrap_or_else(|| {
-            session.is_session_active()
-                || session.is_streaming()
-                || session.is_compacting()
-                || session.is_bash_running()
-        });
+        let busy = busy_override.unwrap_or_else(|| worker_recovery_busy(session.as_ref()));
         journal.record(WorkerRecoveryRecordInput {
             active_session_id: entry
                 .state
@@ -10446,8 +10645,20 @@ impl AgentDaemon {
                 session.wait_for_idle().await;
             }
         } else if reason == "shutdown" || reason == "replaced" {
-            self.session_of(&state).request_abort();
-            self.session_of(&state).wait_for_idle().await;
+            let session = self.session_of(&state);
+            session.request_abort();
+            // The abort was delivered; a hung agent must not park a daemon
+            // shutdown or worker replacement forever (audit A6). The wait is
+            // bounded and a timeout is reported truthfully, with the teardown
+            // continuing at the dispose below.
+            let bounded = tokio::time::timeout(CLOSE_SETTLE_WAIT_TIMEOUT, session.wait_for_idle()).await;
+            if bounded.is_err() {
+                self.log(&format!(
+                    "Session {} still busy after abort; teardown continues after the bounded {}s wait",
+                    active_session_id,
+                    CLOSE_SETTLE_WAIT_TIMEOUT.as_secs()
+                ));
+            }
         }
         self.record_worker_recovery_state(&state, &format!("closed:{reason}"), Some(false));
         {
@@ -12813,6 +13024,11 @@ impl AgentDaemon {
         let Some(unsubscribe_child) = unsubscribe_child else {
             return false;
         };
+        // Capture the child's identity before the close: after close_session the
+        // session seam is MissingSession, whose id is empty and name is None, so
+        // the passivation log line would lose the session it acted on (audit D-05).
+        let passivated_session_id = self.session_of(state).session_id();
+        let passivated_session_name = self.session_of(state).session_name();
         let close_result = self
             .close_session(Arc::clone(state), "shutdown", true, false, None, None)
             .await;
@@ -12831,9 +13047,8 @@ impl AgentDaemon {
             return false;
         }
         self.log(&format!(
-            "Passivated idle child sessionId={} name={} idleMinutes={idle_minutes}",
-            self.session_of(state).session_id(),
-            serde_json::to_string(&self.session_of(state).session_name())
+            "Passivated idle child sessionId={passivated_session_id} name={} idleMinutes={idle_minutes}",
+            serde_json::to_string(&passivated_session_name)
                 .unwrap_or_else(|_| "\"\"".to_string()),
         ));
         residency(self) == false

@@ -321,12 +321,24 @@ fn record_orphan_process_state(pid: i32, tracked: bool) {
     crate::core::orphan_process_journal::record_orphan_process_state(pid as i64, tracked);
 }
 
+/// Absolute System32 taskkill for Windows tree kills. A bare "taskkill" name
+/// would resolve through PATH and could pick up a planted CWD taskkill.exe.
+pub fn windows_taskkill_program() -> String {
+    windows_taskkill_program_for(std::env::var("SystemRoot").ok().as_deref())
+}
+
+fn windows_taskkill_program_for(system_root: Option<&str>) -> String {
+    let system_root = system_root.unwrap_or("C:\\Windows");
+    format!("{}\\System32\\taskkill.exe", system_root.trim_end_matches('\\'))
+}
+
 /// Kill a process and all its children (cross-platform)
 pub fn kill_process_tree(pid: i32) {
     if super::pi_user_agent::process_platform() == "win32" {
-        // Use taskkill on Windows to kill process tree
+        // Use the absolute System32 taskkill on Windows to kill the process tree
+        // (audit A4: the bare-name spawn was the one unhardened sibling site).
         let _ = spawn_hidden(
-            "taskkill",
+            &windows_taskkill_program(),
             &[
                 "/F".to_string(),
                 "/T".to_string(),
@@ -335,6 +347,7 @@ pub fn kill_process_tree(pid: i32) {
             ],
             SpawnOptions {
                 detached: true,
+                env: Some(vec![("NoDefaultCurrentDirectoryInExePath".to_string(), "1".to_string())]),
                 ..Default::default()
             },
         );
@@ -380,6 +393,22 @@ mod tests {
 
         let error = get_shell_config(Some("no-such-shell-xyz")).unwrap_err();
         assert_eq!(error, "Custom shell path not found: no-such-shell-xyz");
+    }
+
+    #[test]
+    fn windows_taskkill_program_is_the_absolute_system32_path() {
+        assert_eq!(
+            windows_taskkill_program_for(None),
+            "C:\\Windows\\System32\\taskkill.exe"
+        );
+        assert_eq!(
+            windows_taskkill_program_for(Some("D:\\WinTest")),
+            "D:\\WinTest\\System32\\taskkill.exe"
+        );
+        assert_eq!(
+            windows_taskkill_program_for(Some("D:\\WinTest\\")),
+            "D:\\WinTest\\System32\\taskkill.exe"
+        );
     }
 
     #[test]

@@ -7,10 +7,11 @@ import sys
 import tempfile
 import unittest
 from pathlib import Path
+from unittest import mock
 
 from rlm import harness as package_harness
 from rlm import rlm as callable_rlm
-from rlm.harness import HarnessState, get_harness_state
+from rlm.harness import HarnessState, _state_write_lock, get_harness_state
 
 PYTHON_REFERENCE = {
     "type": "python",
@@ -372,9 +373,317 @@ class HarnessStateTest(unittest.TestCase):
 
                 self.assertEqual(state.list(), [])
                 self.assertEqual(state.refinements, [])
+                # The pre-repair content is preserved beside the rewritten file.
+                self.assertEqual(state._load_status, "corrupt")
                 # The store must remain usable and self-heal on the next write.
                 created = state.create_memory("Recovered", "Works after corruption.", id="recovered")
                 self.assertEqual(HarnessState(state_path).get("memory", "recovered").content, created.content)
+
+    def test_save_over_corrupt_state_keeps_a_recovery_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state_path.write_text("{not json", encoding="utf-8")
+
+            state = HarnessState(state_path)
+            self.assertEqual(state._load_status, "corrupt")
+            state.create_memory("Fresh", "Written after corruption.", id="fresh")
+
+            # The original bytes survive in a content-addressed recovery copy.
+            backups = sorted(Path(temp_dir).glob("harness_state.corrupt-*.json"))
+            self.assertEqual(len(backups), 1, [path.name for path in backups])
+            self.assertEqual(backups[0].read_text(encoding="utf-8"), "{not json")
+            # The rewritten state is healthy.
+            reloaded = HarnessState(state_path)
+            self.assertEqual(reloaded._load_status, "loaded")
+            self.assertEqual(reloaded.get("memory", "fresh").content, "Written after corruption.")
+
+            # Repeated corruption with identical bytes does not pile up copies.
+            state_path.write_text("{not json", encoding="utf-8")
+            HarnessState(state_path).create_memory("Again", "Second recovery.", id="again")
+            backups = sorted(Path(temp_dir).glob("harness_state.corrupt-*.json"))
+            self.assertEqual(len(backups), 1, [path.name for path in backups])
+
+    def test_save_fails_closed_when_state_is_unreadable(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            seed = HarnessState(state_path)
+            seed.create_memory("Keep", "Must remain on disk.", id="keep")
+            original_bytes = state_path.read_bytes()
+
+            # Simulate an access error (sharing violation / permissions) rather than
+            # a parse error: the bytes are unknown, so the next save must refuse and
+            # must leave the original file untouched.
+            original_open = Path.open
+
+            def failing_open(self: Path, *args: object, **kwargs: object) -> object:
+                if self == state_path:
+                    raise PermissionError(13, "file is locked")
+                return original_open(self, *args, **kwargs)
+
+            Path.open = failing_open  # type: ignore[assignment]
+            try:
+                state = HarnessState(state_path)
+                self.assertEqual(state._load_status, "unreadable")
+                self.assertEqual(state.list(), [])
+                with self.assertRaisesRegex(RuntimeError, "refusing to overwrite unreadable state"):
+                    state.create_memory("Blocked", "Must not replace unknown bytes.", id="blocked")
+            finally:
+                Path.open = original_open
+            self.assertEqual(state_path.read_bytes(), original_bytes)
+            self.assertEqual(
+                list(Path(temp_dir).glob("harness_state.corrupt-*.json")),
+                [],
+                "an unreadable file is never quarantined or replaced",
+            )
+
+    def test_invalid_utf8_state_is_corrupt_not_unreadable(self) -> None:
+        # Review defect D1 (review-glm, parity): bytes that are not valid UTF-8
+        # are readable corruption - quarantine preserves them exactly and the
+        # save proceeds, instead of a permanent refusal with no recovery copy.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            original = b"\xff\xfe{not utf8"
+            state_path.write_bytes(original)
+
+            state = HarnessState(state_path)
+            self.assertEqual(state._load_status, "corrupt")
+            created = state.create_memory("Recovered", "Works after bad UTF-8.", id="recovered")
+
+            backups = sorted(Path(temp_dir).glob("harness_state.corrupt-*.json"))
+            self.assertEqual(len(backups), 1, [path.name for path in backups])
+            self.assertEqual(backups[0].read_bytes(), original)
+            reloaded = HarnessState(state_path)
+            self.assertEqual(reloaded._load_status, "loaded")
+            self.assertEqual(reloaded.get("memory", "recovered").content, created.content)
+
+    def test_quarantine_copy_is_rewritten_when_torn(self) -> None:
+        # Review defect D2 (review-glm): a partial recovery copy from a killed
+        # process must never be pinned by an exists() skip; the content-addressed
+        # rewrite goes through temp + fsync + the bounded rename retry.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            corrupt = b"{not json"
+            state_path.write_bytes(corrupt)
+            HarnessState(state_path).create_memory("First", "First recovery.", id="first")
+            backups = sorted(Path(temp_dir).glob("harness_state.corrupt-*.json"))
+            self.assertEqual(len(backups), 1)
+            backup = backups[0]
+            # Simulate a torn copy: half the bytes.
+            backup.write_bytes(corrupt[: len(corrupt) // 2])
+
+            # The same corrupt bytes arrive again; the recovery copy is repaired.
+            state_path.write_bytes(corrupt)
+            HarnessState(state_path).create_memory("Second", "Second recovery.", id="second")
+            self.assertEqual(backup.read_bytes(), corrupt)
+
+    def test_save_reclassifies_corrupt_bytes_that_preserve_mtime(self) -> None:
+        # Review defect D3 (review-glm): a writer that corrupts the file while
+        # preserving its mtime must not escape quarantine behind the cached
+        # load-time status; the save classifies the bytes on disk right now.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            seed = HarnessState(state_path)
+            seed.create_memory("Keep", "Healthy first.", id="keep")
+            preserved_mtime_ns = state_path.stat().st_mtime_ns
+
+            state_path.write_text("{torn by a mtime-preserving writer", encoding="utf-8")
+            os.utime(state_path, ns=(preserved_mtime_ns, preserved_mtime_ns))
+
+            state = HarnessState(state_path)
+            self.assertEqual(state._load_status, "corrupt")
+            state.create_memory("After", "Saved after hidden corruption.", id="after")
+            backups = sorted(Path(temp_dir).glob("harness_state.corrupt-*.json"))
+            self.assertEqual(len(backups), 1, "the hidden corrupt bytes are quarantined")
+            self.assertEqual(
+                backups[0].read_text(encoding="utf-8"),
+                "{torn by a mtime-preserving writer",
+            )
+            reloaded = HarnessState(state_path)
+            self.assertEqual(reloaded.get("memory", "after").content, "Saved after hidden corruption.")
+
+    def test_stat_denied_state_is_unreadable_not_missing(self) -> None:
+        # Review defect D4 (review-glm, Python side): a stat denial is an access
+        # failure, not an empty store. exists() would classify it as missing and
+        # let the save replace bytes it never saw.
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            seed = HarnessState(state_path)
+            seed.create_memory("Keep", "Must remain on disk.", id="keep")
+            original_bytes = state_path.read_bytes()
+
+            original_lstat = os.lstat
+
+            def denying_lstat(path: object, *args: object, **kwargs: object) -> object:
+                if Path(str(path)) == state_path:
+                    raise PermissionError(13, "stat denied")
+                return original_lstat(path, *args, **kwargs)  # type: ignore[arg-type]
+
+            os.lstat = denying_lstat  # type: ignore[assignment]
+            try:
+                state = HarnessState(state_path)
+                self.assertEqual(state._load_status, "unreadable")
+                with self.assertRaisesRegex(RuntimeError, "refusing to overwrite unreadable state"):
+                    state.create_memory("Blocked", "Must not replace unknown bytes.", id="blocked")
+            finally:
+                os.lstat = original_lstat  # type: ignore[assignment]
+            self.assertEqual(state_path.read_bytes(), original_bytes)
+
+    def test_missing_state_file_is_not_treated_as_corrupt(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            self.assertEqual(state._load_status, "missing")
+            state.create_memory("New", "First write.", id="new")
+            self.assertEqual(state._load_status, "loaded")
+            self.assertEqual(list(Path(temp_dir).glob("harness_state.corrupt-*.json")), [])
+
+    def test_persistence_recovered_read_failure_must_reload_before_save(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            HarnessState(state_path).create_memory("Keep", "Healthy memory.", id="keep")
+            original = state_path.read_bytes()
+            original_read = Path.read_bytes
+
+            def denied(path: Path) -> bytes:
+                if path == state_path:
+                    raise PermissionError(13, "transient read denial")
+                return original_read(path)
+
+            with mock.patch.object(Path, "read_bytes", denied):
+                state = HarnessState(state_path)
+                self.assertEqual(state._load_status, "unreadable")
+            # Access has recovered without a change to the file or its mtime.
+            # An empty fallback is still not a valid replacement snapshot.
+            with self.assertRaisesRegex(RuntimeError, "refusing to overwrite unreadable state"):
+                state.save()
+            self.assertEqual(state_path.read_bytes(), original)
+            state.create_memory("New", "After reloading healthy memory.", id="new")
+            saved = HarnessState(state_path)
+            self.assertEqual(saved.get("memory", "keep").content, "Healthy memory.")
+            self.assertIsNotNone(saved.get("memory", "new"))
+
+    def test_persistence_same_mtime_external_write_is_loaded_before_mutation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("First", "Original.", id="first")
+            original_mtime = state_path.stat().st_mtime_ns
+            other = HarnessState(state_path)
+            other.create_memory("External", "Preserve this.", id="external")
+            os.utime(state_path, ns=(original_mtime, original_mtime))
+            state.create_memory("Next", "Do not replace the external entry.", id="next")
+            self.assertEqual(
+                set(HarnessState(state_path).entries["memory"]), {"first", "external", "next"}
+            )
+
+    def test_persistence_writer_between_sync_and_save_is_rejected_and_cache_reloaded(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("First", "Original.", id="first")
+            other = HarnessState(state_path)
+            original_save = state.save
+            expected = []
+
+            def interleaved_save() -> HarnessState:
+                other.create_memory("External", "Must win this race.", id="external")
+                expected.append(state_path.read_bytes())
+                return original_save()
+
+            with mock.patch.object(state, "save", interleaved_save):
+                with self.assertRaisesRegex(RuntimeError, "changed since it was loaded"):
+                    state.create_memory("Pending", "Must not be reported saved.", id="pending")
+            self.assertEqual(state_path.read_bytes(), expected[0])
+            self.assertIsNone(state.get("memory", "pending"))
+            self.assertIsNotNone(state.get("memory", "external"))
+            state.create_memory("Retry", "Fresh operation succeeds.", id="retry")
+            self.assertEqual(
+                set(HarnessState(state_path).entries["memory"]), {"first", "external", "retry"}
+            )
+
+    def test_persistence_missing_baseline_does_not_overwrite_a_new_store(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            stale = HarnessState(state_path)
+            HarnessState(state_path).create_memory("Created", "Another writer.", id="created")
+            original = state_path.read_bytes()
+            with self.assertRaisesRegex(RuntimeError, "changed since it was loaded"):
+                stale.save()
+            self.assertEqual(state_path.read_bytes(), original)
+
+    def test_persistence_shared_lock_prevents_save_until_released(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            state.create_memory("Keep", "Original.", id="keep")
+            original = state_path.read_bytes()
+            with _state_write_lock(state_path):
+                with self.assertRaisesRegex(RuntimeError, "another writer"):
+                    state.create_memory("Blocked", "Not saved.", id="blocked")
+                self.assertEqual(state_path.read_bytes(), original)
+            state.create_memory("After", "Lock released.", id="after")
+            self.assertEqual(set(HarnessState(state_path).entries["memory"]), {"keep", "after"})
+            self.assertTrue(state_path.with_name("harness_state.json.lock").is_file())
+            self.assertEqual(list(Path(temp_dir).glob("*.tmp")), [])
+
+    def test_refinement_ids_use_the_canonical_timestamp_format(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state = HarnessState(Path(temp_dir) / "harness_state.json")
+            event = state.record_refinement("evidence", "change")
+            self.assertRegex(event.id, r"^refine_\d{17}$")
+            self.assertEqual(state.refinements[0].id, event.id)
+            # An explicit id is still honoured verbatim (older kernels wrote refine_NNNN).
+            legacy = state.record_refinement("evidence", "change", id="refine_0012")
+            self.assertEqual(legacy.id, "refine_0012")
+            reloaded = HarnessState(state.file_path)
+            self.assertEqual([entry.id for entry in reloaded.refinements], [event.id, "refine_0012"])
+
+    def test_save_is_durable_and_survives_a_held_destination(self) -> None:
+        with tempfile.TemporaryDirectory() as temp_dir:
+            state_path = Path(temp_dir) / "harness_state.json"
+            state = HarnessState(state_path)
+            fsynced: list[int] = []
+            original_fsync = os.fsync
+
+            def observing_fsync(fd: int) -> None:
+                fsynced.append(fd)
+                original_fsync(fd)
+
+            os.fsync = observing_fsync  # type: ignore[assignment]
+            try:
+                state.create_memory("Durable", "fsynced before the replace.", id="durable")
+            finally:
+                os.fsync = original_fsync
+            self.assertEqual(len(fsynced), 1, "one fsync of the temp file per save")
+
+            # A transient replace failure is retried instead of aborting the save.
+            replacements: list[str] = []
+            original_replace = os.replace
+
+            def flaky_replace(source: object, destination: object) -> None:
+                replacements.append(str(destination))
+                if len(replacements) == 1:
+                    raise OSError(13, "sharing violation")
+                original_replace(source, destination)
+
+            os.replace = flaky_replace  # type: ignore[assignment]
+            try:
+                state.create_memory("Retried", "Saved after a transient lock.", id="retried")
+            finally:
+                os.replace = original_replace
+            self.assertEqual(len(replacements), 2, "one transient failure then success")
+            self.assertEqual(HarnessState(state_path).get("memory", "retried").content, "Saved after a transient lock.")
+
+            # A persistent failure still raises: a lost refinement is never silent.
+            def always_failing_replace(source: object, destination: object) -> None:
+                raise OSError(13, "destination held open")
+
+            os.replace = always_failing_replace  # type: ignore[assignment]
+            try:
+                with self.assertRaises(OSError):
+                    state.create_memory("Lost", "Must raise.", id="lost")
+            finally:
+                os.replace = original_replace
 
     def test_update_skill_preserves_omitted_arguments(self) -> None:
         with tempfile.TemporaryDirectory() as temp_dir:

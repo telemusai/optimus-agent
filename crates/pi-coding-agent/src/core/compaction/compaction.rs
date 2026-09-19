@@ -1502,7 +1502,28 @@ enum SummaryFormat {
 fn validate_summary(response: &AssistantMessage, text: &str, format: SummaryFormat) -> Result<(), String> {
     let fail = |reason: &str| format!("Summarization returned an unusable handoff ({reason}); existing conversation preserved. Retry compaction or select another summarization model.");
     if response.stop_reason != pi_ai::types::STOP_REASON_STOP {
-        return Err(fail("response did not complete"));
+        // A short incomplete response is not proof of a transport failure or an
+        // exhausted output budget, so report the actual terminal verbatim (the
+        // stop_reason enum and the provider's raw finish signal, if any). A
+        // terminal with no usable enum value (for example a stream that closed
+        // mid-generation without a finish signal) reports as `unknown`, never
+        // as a blank.
+        let stop_label = match response.stop_reason.trim() {
+            "" => "unknown",
+            other => other,
+        };
+        let raw = response
+            .stop_reason_raw
+            .as_deref()
+            .map(str::trim)
+            .filter(|raw| !raw.is_empty());
+        let detail = match raw {
+            Some(raw) => format!(
+                "response did not complete (stop_reason={stop_label}, provider_status={raw})"
+            ),
+            None => format!("response did not complete (stop_reason={stop_label})"),
+        };
+        return Err(fail(&detail));
     }
     if response.error_message.as_deref().is_some_and(|message| !message.trim().is_empty()) {
         return Err(fail("provider reported an error"));
@@ -1894,6 +1915,90 @@ mod summary_retry_safety_tests {
         let mut options = CompactionOptions::default();
         options.simple.thinking_budgets = Some(pi_ai::types::ThinkingBudgets { high: Some(100_000.0), ..Default::default() });
         assert_eq!(summary_output_budgets(&model, 13_107.0, Some(&ThinkingLevel::High), Some(&options)).unwrap(), (65_536.0, 65_536.0));
+    }
+
+    #[test]
+    fn incomplete_summary_terminal_reports_the_actual_stop_reason_and_provider_status() {
+        let mut incomplete = AssistantMessage::default();
+        incomplete.stop_reason = "length".into();
+        incomplete.stop_reason_raw = Some("other".into());
+        let error = validate_summary(&incomplete, "text", SummaryFormat::Conversation).unwrap_err();
+        assert!(error.contains("unusable handoff"), "{error}");
+        assert!(
+            error.contains(
+                "response did not complete (stop_reason=length, provider_status=other)"
+            ),
+            "{error}"
+        );
+        assert!(error.contains("existing conversation preserved"), "{error}");
+
+        // A terminal without a provider status still names its stop reason.
+        incomplete.stop_reason_raw = None;
+        let error = validate_summary(&incomplete, "text", SummaryFormat::Conversation).unwrap_err();
+        assert!(
+            error.contains("response did not complete (stop_reason=length)"),
+            "{error}"
+        );
+
+        // A tool-call terminal is reported as such, not as a transport failure.
+        let mut tool_call = AssistantMessage::default();
+        tool_call.stop_reason = "toolUse".into();
+        let error = validate_summary(&tool_call, "text", SummaryFormat::Conversation).unwrap_err();
+        assert!(
+            error.contains("response did not complete (stop_reason=toolUse)"),
+            "{error}"
+        );
+
+        // A confirmed output-token exhaustion keeps the dedicated retry above;
+        // validate only reports the terminal here.
+        incomplete.stop_reason_raw = Some("max_output_tokens".into());
+        let error = validate_summary(&incomplete, "text", SummaryFormat::Conversation).unwrap_err();
+        assert!(
+            error.contains(
+                "response did not complete (stop_reason=length, provider_status=max_output_tokens)"
+            ),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn an_unknown_terminal_is_reported_as_unknown_not_as_a_blank_enum() {
+        // Incident 2026-09-19 shape: a summary call truncated at exactly the
+        // computed request budget whose terminal carried no usable enum or raw
+        // provider value. The diagnostic must name the terminal as unknown
+        // instead of rendering a blank stop_reason.
+        let mut unknown = AssistantMessage::default();
+        unknown.stop_reason = "  ".into();
+        let error = validate_summary(&unknown, "text", SummaryFormat::Conversation).unwrap_err();
+        assert!(
+            error.contains("response did not complete (stop_reason=unknown)"),
+            "{error}"
+        );
+        assert!(error.contains("unusable handoff"), "{error}");
+        assert!(error.contains("existing conversation preserved"), "{error}");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_terminal_is_not_replayed_by_the_provider_retry() {
+        // No proven exhaustion signal means the one-shot larger-output retry
+        // must not fire: exactly one provider call, then a truthful rejection.
+        let attempts = Arc::new(AtomicUsize::new(0));
+        let count = attempts.clone();
+        let call = move || -> pi_ai::types::BoxFuture<Result<AssistantMessage, String>> {
+            count.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { Ok(AssistantMessage {
+                content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(
+                    "summary cut off at the request budget",
+                ))],
+                stop_reason: String::new(),
+                ..Default::default()
+            }) })
+        };
+        let policy = ProviderRetryPolicy { base_delay_ms: 0.0, ..DEFAULT_PROVIDER_RETRY_POLICY };
+        let result = complete_with_provider_retry(&call, Some(&policy), None).await.unwrap();
+        assert_eq!(attempts.load(Ordering::SeqCst), 1, "an unknown terminal is not a replayable failure");
+        let error = validate_summary(&result, "summary cut off at the request budget", SummaryFormat::Conversation).unwrap_err();
+        assert!(error.contains("stop_reason=unknown"), "{error}");
     }
 
     #[tokio::test]

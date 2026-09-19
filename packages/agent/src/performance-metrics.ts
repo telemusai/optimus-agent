@@ -17,7 +17,7 @@ export type PerformanceMetricOperation =
 	| "ui_session_open"
 	| "recorder";
 
-export type PerformanceMetricOutcome = "success" | "failure" | "cancelled" | "unavailable";
+export type PerformanceMetricOutcome = "started" | "success" | "failure" | "cancelled" | "unavailable";
 
 export type PerformanceMetricMeasurement =
 	| "total_ms"

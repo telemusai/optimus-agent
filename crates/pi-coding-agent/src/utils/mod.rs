@@ -23,3 +23,4 @@ pub mod sleep;
 pub mod tools_manager;
 pub mod update_source;
 pub mod version_check;
+pub mod warning_limiter;

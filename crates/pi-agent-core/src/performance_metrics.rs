@@ -70,6 +70,10 @@ impl PerformanceMetricOperation {
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum PerformanceMetricOutcome {
+    /// An in-flight start row. A paired terminal row with the same correlation
+    /// IDs follows; only terminal outcomes (success/failure/cancelled/
+    /// unavailable) count as completed attempts.
+    Started,
     Success,
     Failure,
     Cancelled,
@@ -79,6 +83,7 @@ pub enum PerformanceMetricOutcome {
 impl PerformanceMetricOutcome {
     pub fn as_str(self) -> &'static str {
         match self {
+            PerformanceMetricOutcome::Started => "started",
             PerformanceMetricOutcome::Success => "success",
             PerformanceMetricOutcome::Failure => "failure",
             PerformanceMetricOutcome::Cancelled => "cancelled",
@@ -93,6 +98,7 @@ pub enum PerformanceMetricMeasurement {
     TotalMs,
     WaitMs,
     DispatchToResponseHeadersMs,
+    TransportOpenAckMs,
     DispatchToFirstEventMs,
     DispatchToFirstVisibleMs,
     DispatchToFirstRawMs,
@@ -132,6 +138,7 @@ impl PerformanceMetricMeasurement {
             PerformanceMetricMeasurement::TotalMs => "total_ms",
             PerformanceMetricMeasurement::WaitMs => "wait_ms",
             PerformanceMetricMeasurement::DispatchToResponseHeadersMs => "dispatch_to_response_headers_ms",
+            PerformanceMetricMeasurement::TransportOpenAckMs => "transport_open_ack_ms",
             PerformanceMetricMeasurement::DispatchToFirstEventMs => "dispatch_to_first_event_ms",
             PerformanceMetricMeasurement::DispatchToFirstVisibleMs => "dispatch_to_first_visible_ms",
             PerformanceMetricMeasurement::DispatchToFirstRawMs => "dispatch_to_first_raw_ms",
