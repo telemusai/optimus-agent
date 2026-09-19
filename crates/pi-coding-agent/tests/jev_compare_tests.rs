@@ -122,6 +122,23 @@ async fn wait_records_settled(agent_dir: &std::path::Path, at_least: usize) -> u
     read_record_count(agent_dir)
 }
 
+async fn wait_jev_session_settled(session: &AgentSession) {
+    for _ in 0..300 {
+        let status = pi_coding_agent::core::jev_bridge::session_status_snapshot(&session.session_id());
+        let pending = status.as_ref().map(|status| {
+            status.get("in_flight").and_then(Value::as_u64).unwrap_or(0)
+                + status.get("queue_depth").and_then(Value::as_u64).unwrap_or(0)
+        }).unwrap_or(0);
+        if pending == 0 {
+            // Status changes immediately before the synchronous terminal record write.
+            tokio::task::yield_now().await;
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    }
+    panic!("Jev scheduler did not reach a terminal state for {}", session.session_id());
+}
+
 // ---------------------------------------------------------------------------
 // Session fixture (compaction-suite pattern: real session, faux provider)
 // ---------------------------------------------------------------------------
@@ -560,6 +577,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
             }
         }).await.expect("rewritten same key must allow new mock observations");
     }
+    wait_jev_session_settled(&off.session).await;
     off.session.dispose_async(Some(false)).await;
     std::fs::remove_file(agent_dir.join("jev").join(format!("{}.{}",
         pi_jev::config::DEFAULT_KEY_ID, pi_jev::credential::CREDENTIAL_FILE_NAME))).unwrap();
@@ -589,6 +607,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
         "high-confidence answers must not change effort/thinking level"
     );
     assert_eq!(hostile_shapes.len(), 3, "no injected prompts or extra turns");
+    wait_jev_session_settled(&hostile.session).await;
     hostile.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
@@ -659,10 +678,13 @@ async fn jev_compare_e2e_parity_and_isolation() {
         }
         active_records += 1;
         let category = record["category"].as_str().unwrap_or("");
-        assert!(
-            ["tool_requirement", "complexity"].contains(&category),
-            "Active may only record an appliable category: {line}"
-        );
+        if record["applied"] == json!(true) {
+            assert!(["tool_requirement", "complexity"].contains(&category),
+                "default Active may only apply legacy categories: {line}");
+        } else {
+            assert!(record["acceptance"].is_string() || record["skipped_reason"].is_string(),
+                "record-only recommendations must state their outcome: {line}");
+        }
         assert_eq!(
             record["session_id"],
             json!(active.session.session_id()),
@@ -679,6 +701,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
     // An accepted answer is allowed to exist here (that is what Active means); the
     // point of this phase is that its effect stays inside the request body.
     let _ = active_records;
+    wait_jev_session_settled(&active.session).await;
     active.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
@@ -727,6 +750,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
         "stale answers must not trigger extra provider calls"
     );
     stale.session.wait_for_idle().await.expect("stale session idle");
+    wait_jev_session_settled(&stale.session).await;
     stale.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
@@ -774,6 +798,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
     assert!(saw_failed_skip, "malformed answers land as request_failed skips");
     assert_eq!(shapes(&malformed.session), malformed_shapes, "failures injected nothing");
     assert_eq!(malformed.provider.call_count(), 1, "failures must not trigger provider calls");
+    wait_jev_session_settled(&malformed.session).await;
     malformed.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
@@ -823,6 +848,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
             .any(|(role, text)| role == "toolResult" && text.contains("PROBE_OK")),
         "the probe tool must run in Compare"
     );
+    wait_jev_session_settled(&compare_tool.session).await;
     compare_tool.session.dispose_async(Some(false)).await;
 
     // ------------------------------------------------------------------
@@ -841,7 +867,67 @@ async fn jev_compare_e2e_parity_and_isolation() {
         "Off must stop recording immediately (no new records)"
     );
     assert_eq!(compare.provider.call_count(), 3, "the turn still ran normally");
+    wait_jev_session_settled(&compare.session).await;
     compare.session.dispose_async(Some(false)).await;
+
+    // Independent execution/compaction axes through real session hooks and native projections.
+    for mode in ["off", "compare", "active", "compare-active"] {
+        for compaction in [false, true] {
+            write_settings(&agent_dir, json!({"global_default":mode, "transport":"mock",
+                "compaction_enabled":compaction, "features":{"context_relevance":true}}));
+            let axis = build_session(&format!("jev-axis-{mode}-{compaction}"), CreationOverrides::default()).await;
+            axis.provider.set_responses(vec![FauxResponseStep::Message(reply(20))]);
+            turn(&axis.session, "synthetic independent-axis task").await;
+            wait_jev_session_settled(&axis.session).await;
+            wait_records_settled(&agent_dir, 1).await;
+            let runner = axis.session.extension_runner().expect("native runner");
+            let ctx = runner.create_context();
+            let before_request = read_record_count(&agent_dir);
+            let body = json!({"model":"faux", "tools":[{"type":"function","function":{"name":"search"}}],
+                "tool_choice":"auto", "reasoning_effort":"high", "messages":[{"role":"user","content":"unchanged"}]});
+            let outgoing = runner.emit_before_provider_request(body.clone()).await;
+            if ["active", "compare-active"].contains(&mode) {
+                assert_eq!(outgoing["reasoning_effort"],json!("xhigh"), "legacy active effect at actual provider hook");
+                assert_eq!(outgoing["tools"],body["tools"], "mock delegate recommendation keeps tools");
+                assert_eq!(outgoing["messages"],body["messages"]);
+                assert_eq!(outgoing["model"],body["model"]);
+            } else { assert_eq!(outgoing,body); }
+            let new_rows: Vec<Value> = std::fs::read_to_string(records_path(&agent_dir)).unwrap_or_default()
+                .lines().skip(before_request).filter_map(|line|serde_json::from_str(line).ok()).collect();
+            if mode == "compare-active" {
+                let answered: Vec<_> = new_rows.iter().filter(|row|row["selected_value"].is_string()).collect();
+                let ids: std::collections::BTreeSet<_> = answered.iter().filter_map(|row|row["request_id"].as_str()).collect();
+                assert_eq!(ids.len(),1,"one shared logical request at provider boundary");
+                let shadow:Vec<_>=answered.iter().filter(|row|row["schema_version"]=="jev.compare/1").collect();
+                let active:Vec<_>=answered.iter().filter(|row|row["schema_version"]=="jev.active/1").collect();
+                assert!(!shadow.is_empty()); assert_eq!(shadow.len(),active.len());
+                assert!(shadow.iter().all(|row|row["applied"]==false));
+                assert!(active.iter().all(|row|row["baseline_action"]["tools"]=="count:1"));
+                assert!(active.iter().all(|row|row["compaction_enabled"]==compaction));
+            }
+            let mut old_assistant = serde_json::to_value(faux_assistant_message(
+                FauxAssistantContent::Blocks(vec![ContentBlock::ToolCall(faux_tool_call("search",Map::new(),None))]),None)).unwrap();
+            old_assistant["content"][0]["id"]=json!("old-call");
+            let mut projection=vec![json!({"role":"user","content":"old task","timestamp":0}),old_assistant,
+                json!({"role":"toolResult","toolCallId":"old-call","toolName":"search","isError":false,
+                    "content":[{"type":"text","text":"bounded old result ".repeat(1000)}],"timestamp":0})];
+            for index in 0..8 { projection.push(json!({"role":"user","content":format!("recent pinned {index}"),"timestamp":0})); }
+            let stored_before = shapes(&axis.session);
+            let filtered=pi_coding_agent::core::jev_bridge::filter_context_candidates(ctx.clone(),projection.clone()).await;
+            assert_eq!(filtered,projection,"subthreshold optional recommendations preserve context");
+            let before_compaction=read_record_count(&agent_dir);
+            let compacted=pi_coding_agent::core::jev_compaction::compact_context(ctx,filtered,None).await;
+            assert_eq!(compacted,projection,"mock keep recommendation leaves projection intact");
+            let compaction_rows:Vec<Value>=std::fs::read_to_string(records_path(&agent_dir)).unwrap_or_default().lines()
+                .skip(before_compaction).filter_map(|line|serde_json::from_str::<Value>(line).ok())
+                .filter(|row|row["schema_version"]=="jev.compaction/1").collect();
+            assert_eq!(!compaction_rows.is_empty(),compaction,"independent compaction gate in {mode}");
+            assert_eq!(shapes(&axis.session),stored_before,"projections never change history");
+            assert_eq!(axis.provider.call_count(),1);
+            wait_jev_session_settled(&axis.session).await;
+            axis.session.dispose_async(Some(false)).await;
+        }
+    }
 
     // ------------------------------------------------------------------
     // Phase 6: Jev-owned files only under the jev dir.

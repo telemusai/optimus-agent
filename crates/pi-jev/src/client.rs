@@ -4,7 +4,7 @@
 //! Invariants enforced here:
 //! - `Off` performs no client construction, no DNS, no socket and no task spawn. The cheapest
 //!   path is `DisabledSystemOne`, which returns skips without touching the transport.
-//! - `Active` is reserved: it is refused, never silently downgraded to Compare.
+//! - Modes are explicit; the client returns data and never applies recommendations.
 //! - The credential never enters a URL, a log line, an error, an argv or the retry counters.
 //! - The response is validated in full (types.rs) before any answer is used. Failures are skips.
 //! - Every request is bounded: max payload bytes, max question count, per-attempt timeout,
@@ -510,7 +510,7 @@ impl JevSystemOne {
     ) -> Result<Self, JevError> {
         match mode {
             JevMode::Off => return Err(JevError::ModeOff),
-            JevMode::Compare | JevMode::Active => {}
+            JevMode::Compare | JevMode::Active | JevMode::CompareAndActive => {}
         }
         if credential.expose().trim().is_empty() {
             return Err(JevError::MissingCredential);
@@ -537,7 +537,7 @@ impl JevSystemOne {
     ) -> Result<Self, JevError> {
         match mode {
             JevMode::Off => return Err(JevError::ModeOff),
-            JevMode::Compare | JevMode::Active => {}
+            JevMode::Compare | JevMode::Active | JevMode::CompareAndActive => {}
         }
         let transport = JevHttpTransport::new(limits.clone(), credential.clone())?;
         Self::new(mode, credential, Arc::new(transport), limits, stats)
@@ -832,7 +832,7 @@ impl DisabledSystemOne {
     /// is enabled, because the UI and the status line read this mode back.
     pub fn new(mode: JevMode) -> Self {
         Self {
-            mode: if matches!(mode, JevMode::Compare | JevMode::Active) {
+            mode: if matches!(mode, JevMode::Compare | JevMode::Active | JevMode::CompareAndActive) {
                 JevMode::Off
             } else {
                 mode
@@ -869,7 +869,7 @@ pub fn build_system_one(
     match mode {
         // Both operative modes need a credential; without one the caller gets
         // an explicit refusal rather than a silently disabled client.
-        JevMode::Compare | JevMode::Active => {
+        JevMode::Compare | JevMode::Active | JevMode::CompareAndActive => {
             let Some(credential) = credential else {
                 return Err(JevError::MissingCredential);
             };

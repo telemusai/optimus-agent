@@ -20,7 +20,7 @@ Optimus focuses on **native Windows reliability, stronger session continuity, As
 | Rust implementation | Available on `main`, installed as `optimus-agent`; remaining parity gaps are documented |
 | Platforms | macOS, Linux, and native Windows; Windows currently requires a Bash shell such as Git Bash |
 | Memory | Session, project, and global harness memory, with optional selected sharing; authoritative project storage is JSON |
-| Jev integration | Optional Compare (shadow) and Active modes against TypeSafe System One; Compare records recommendations, Active applies a narrow reversible subset to the next request |
+| Jev integration | Optional Compare, Active, and combined modes against TypeSafe System One, with bounded native features and independent request-local compaction |
 | TencentDB-backed memory | An intended integration direction, not an implemented backend in the current `main` branch |
 
 The feature descriptions below refer to `main` unless explicitly marked as development work. Some hardened Windows installations also use deployment-specific launchers and compatibility layers that are not included in a plain source checkout.
@@ -127,38 +127,52 @@ Experimental model-facing output reduction, iterative-summary consolidation, and
 
 Optimus can put the same decision questions it is making to the TypeSafe System One ("Jev") service at `https://api.typesafe.ai/v1/systemone`, so an external recommendation can be compared against what the agent actually did.
 
-There are two operative modes. **Compare** is a shadow mode: it never changes a run, recommendations are recorded for comparison only, and each answer is stored as not applied. **Active** applies an accepted answer to the next provider request, within a narrow reversible set (below). Jev is **off by default**, and `/jev` is the only command that sets the mode.
+Jev is **off by default**. Credentials never enable it. Four modes control each chat:
+
+| Mode | Behavior |
+|---|---|
+| Off | No feature decision calls. Independent compaction keeps its own setting. |
+| Compare | Records shadow recommendations without changing the run. |
+| Active | Applies accepted decisions only at bounded native boundaries and only when their feature gate allows it. |
+| Compare + Active | Records comparisons and active outcomes from the same boundary request; it does not send a duplicate request for that comparison. |
 
 ```text
-/jev            # menu
-/jev compare    # shadow mode for this chat (also: /jev on)
-/jev active     # apply an accepted answer to the next provider request
-/jev off        # no calls, no network, no overhead beyond the mode check
-/jev status     # mode, the scope that decided it, and credential source presence
-/jev key        # enter an API key
-/jev key clear  # remove the saved key
+/jev                         # menu
+/jev compare                 # shadow-only (also: /jev on)
+/jev active                  # accepted, feature-gated native effects
+/jev compare-active          # comparison and application together
+/jev off                     # feature decisions off; compaction stays independent
+/jev compact on              # opt in to request-local compaction separately
+/jev compact off             # disable only compaction; keep the other Jev features
+/jev compact status          # effective toggle, scope and algorithm settings
+/jev feature tool_candidates on
+/jev status                  # modes, configured gates and observed/unknown counters
+/jev key                     # enter a key in the supported secure store
+/jev key clear               # remove the saved key
+/jev default compare         # default for sessions without an explicit mode
+/jev default compact off     # separate default for compaction
 ```
 
-An explicit per-session mode wins over the default for new chats, so `/jev off` in one chat does not turn Jev off elsewhere, and `/jev compare` in one chat is not cancelled by a global default of off. A key being present never enables Jev on its own. `on` is the short alias for Compare; only the explicit `/jev active` spelling selects the mode that may change a request, so nothing arms it by shorthand.
+An explicit session setting wins over its global default. `on` always means Compare, not Active. Feature gates, compaction and mode are separate controls. Enabling a feature does not change the mode. An inherited child snapshots its parent's controls; an explicit child override wins.
 
-### Active mode: what gets applied
+### Bounded native features
 
-Active applies an accepted answer to the outgoing request body, and only these two effects exist:
+`tool_requirement` and `complexity` keep their existing defaults. An accepted tool-requirement decision can withdraw the request's tool catalog. Complexity can move an already-set request reasoning effort one step without changing the selected model or session effort. New features default to **false**:
 
-| Category | Effect |
-|---|---|
-| `tool_requirement == "none"` | removes `tools` and `tool_choice` from that one request |
-| `complexity` `low` or `high` | moves an already-present `reasoning_effort` one step |
+- `tool_candidates` can filter explicitly optional tools. Mandatory/internal tools and forced tool choices stay protected.
+- `context_relevance` and `memory_relevance` filter eligible retrieval candidates for one request. They do not delete durable memory or transcript history.
+- `result_sufficiency`, `loop_control`, `retry_classification`, `verification` and `trace_observer` add bounded observations. High-impact continuation/retry/verification outcomes are advisory; they do not independently execute tools or stop the agent.
+- Compaction has its own `compaction_enabled` toggle and works independently of decision mode, including Off. It can project eligible old tool-call/result pairs into a smaller outgoing context. Recent and protected messages remain. The durable transcript and provider-native `/compact` behavior are unchanged.
 
-Nothing else is appliable. Active never adds a key it did not find, never changes the model or provider, and never writes session thinking-level state. It cannot touch permissions, context, memory, compaction, continuation, subagents, agent messages, depth, concurrency or budgets.
+These gates do not remove the existing eleven Compare categories. A gate being on is not evidence that a recommendation was applied. `/jev status` reports unknown telemetry as unknown rather than claiming success or zero work.
 
-Acceptance needs confidence of at least `0.7` and a decision no older than three seconds. A refused answer, a low-confidence answer, a missing confidence, a transport failure, a 2.5 s deadline, an open circuit breaker (three consecutive failures, 30 s cooldown) or a missing credential leaves the request unchanged and is recorded with a reason. Active decides at the provider-request boundary, so it adds latency to that turn instead of running in a background queue like Compare.
+The global policy lives in `<agent-dir>/jev/jev-settings.json`. Numeric compaction settings are `keep_threshold`, `preserve_recent_messages`, `max_state_tokens`, `max_request_tokens`, `truncate_head_chars` and `minimum_reduction_ratio`. The filtering policy includes `optional_tool_names`, `mandatory_tool_names`, `min_confidence`, `max_candidates` and `max_decision_age_ms`. Policies are validated; hard candidate, request-size and deadline limits still apply. Invalid settings fail closed and are not overwritten by a command. See [native System One design and validation](docs/JEV_SYSTEM_ONE.md) for the architecture and benchmark method.
 
-Compare mode asks bounded questions across eleven decision categories: task classification, complexity, tool requirement, tool candidates, subagent requirement, subagent model routing, context relevance, memory relevance, continue/stop/escalate, result sufficiency, and first-pass verification. Questions are grouped into bundles at defined lifecycle stages such as `turn_start`, `tool_call`, `agent_end`, and `model_select`, and each bundle carries a bounded state snapshot treated as untrusted data.
+Jev cannot change the primary model, provider, permissions, subagents, agent messages, depth, concurrency or budgets. Refused, invalid, stale, missing or unavailable answers keep the baseline behavior. Active boundaries can add bounded latency; no measured speed, quality or token-saving claim is made here.
 
 ### What leaves the machine
 
-Every operative mode sends the same summary of what the agent is doing to an external service, so the bridge keeps credential material and raw content out of the request:
+Enabled decisions and independent compaction send bounded state to an external service, so the bridge keeps credential material and raw content out of the request:
 
 - **Raw tool arguments are not observed.** The bridge records tool identity, a tool-call id, and an explicit `args_omitted` marker. Tool arguments can carry API keys, `Authorization` headers, and passwords, and the evaluators only need tool identity. A source guard fails the test suite if argument capture returns.
 - **Bound before redacting.** Excerpts read at most the first 4096 characters of a source, so a multi-megabyte tool result is never fully copied just to keep a short excerpt.
@@ -170,7 +184,7 @@ Redaction is pattern-based. It does not make arbitrary private task text safe to
 
 The credential is read from a saved credential first (the Windows DPAPI envelope at `<agent-dir>/jev/typesafe.jev-credential.json`), then from `TYPESAFE_API_KEY`, then from `JEV_API_KEY`. Windows uses the DPAPI store; macOS and Linux use the environment variables, because those builds have no DPAPI store. A hand-written `KEY=value` file at the envelope path is not read. `/jev status` reports which source is in use and never prints the secret.
 
-Local state stays under `jev/` in the agent directory: `jev-settings.json` holds the mode default for new chats, per-session modes, and the key id, and `records.jsonl` holds the records (`jev.compare/1` rows for Compare, `jev.active/1` rows for Active). Set `JEV_BASE_URL` to point a run at a staging or replay endpoint instead of the production service.
+Local state stays under `jev/` in the agent directory: `jev-settings.json` holds mode and feature defaults, per-session overrides, validated compaction/filtering policy, and credential-presence metadata, and `records.jsonl` holds the records (`jev.compare/1` rows for Compare, `jev.active/1` rows for Active). Set `JEV_BASE_URL` to point a run at a staging or replay endpoint instead of the production service.
 
 See [Jev observation data minimization](docs/JEV_DATA_MINIMIZATION.md).
 
@@ -280,7 +294,7 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 | `/heartbeat` | Configure recurring session prompts |
 | `/tree`, `/fork`, `/clone` | Navigate or branch session history |
 | `/telegram` | Manage the Telegram connection |
-| `/jev` | Configure Jev mode (off/compare/active) and its credential |
+| `/jev` | Configure Jev modes, feature gates, independent compaction and credentials |
 | `/settings`, `/mcp`, `/reload` | Configure and reload integrations and resources |
 
 ## Safety and compatibility

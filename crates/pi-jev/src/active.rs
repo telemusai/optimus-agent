@@ -28,6 +28,13 @@ pub const DEFAULT_APPLIABLE_CATEGORIES: [DecisionCategory; 2] = [
     DecisionCategory::Complexity,
 ];
 
+/// Optional categories require a candidate-bound host adapter and explicit enablement.
+pub const OPTIONAL_APPLIABLE_CATEGORIES: [DecisionCategory; 3] = [
+    DecisionCategory::ToolCandidates,
+    DecisionCategory::ContextRelevance,
+    DecisionCategory::MemoryRelevance,
+];
+
 /// Longest accepted answer value. Longer values are refused rather than
 /// truncated, because a partial value is not the answer System One returned.
 pub const MAX_VALUE_CHARS: usize = 64;
@@ -71,8 +78,7 @@ fn bound(value: String, max: usize) -> String {
 /// Active-mode acceptance policy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationPolicy {
-    /// Categories the operator allows to be applied. Empty means
-    /// [`DEFAULT_APPLIABLE_CATEGORIES`].
+    /// Categories the operator allows to be applied. Empty disables all effects.
     pub enabled_categories: BTreeSet<DecisionCategory>,
     /// Minimum answer confidence. An answer without a confidence is refused
     /// when this is set: "unknown" is not "high".
@@ -84,7 +90,7 @@ pub struct ActivationPolicy {
 impl Default for ActivationPolicy {
     fn default() -> Self {
         Self {
-            enabled_categories: BTreeSet::new(),
+            enabled_categories: DEFAULT_APPLIABLE_CATEGORIES.into_iter().collect(),
             min_confidence: 0.7,
             max_decision_age: Duration::from_secs(3),
         }
@@ -94,11 +100,7 @@ impl Default for ActivationPolicy {
 impl ActivationPolicy {
     /// Categories this policy may apply.
     pub fn appliable(&self) -> BTreeSet<DecisionCategory> {
-        if self.enabled_categories.is_empty() {
-            DEFAULT_APPLIABLE_CATEGORIES.into_iter().collect()
-        } else {
-            self.enabled_categories.clone()
-        }
+        self.enabled_categories.clone()
     }
 
     /// True when this category could be applied under this policy. A category
@@ -220,13 +222,14 @@ pub fn evaluate_answer(
     candidate: &AnswerCandidate,
     now: SystemTime,
 ) -> Acceptance {
-    if mode != crate::config::JevMode::Active {
+    if !mode.allows_active() {
         return Acceptance::Fallback(FallbackReason::ModeNotActive);
     }
-    if !DEFAULT_APPLIABLE_CATEGORIES.contains(&candidate.category) {
+    let optional = OPTIONAL_APPLIABLE_CATEGORIES.contains(&candidate.category);
+    if !DEFAULT_APPLIABLE_CATEGORIES.contains(&candidate.category) && !optional {
         return Acceptance::Fallback(FallbackReason::CategoryNotAppliable);
     }
-    if !policy.enabled_categories.is_empty() && !policy.allows(candidate.category) {
+    if !policy.allows(candidate.category) {
         return Acceptance::Fallback(FallbackReason::CategoryDisabled);
     }
     let Some(raw_value) = candidate.value.as_deref() else {
@@ -236,10 +239,23 @@ pub fn evaluate_answer(
     if value.is_empty() || value.chars().count() > MAX_VALUE_CHARS {
         return Acceptance::Fallback(FallbackReason::InvalidValue);
     }
+    if optional && (!matches!(value, "keep" | "drop")
+        || !(0..crate::filtering::MAX_FILTER_CANDIDATES).any(|index|
+            candidate.question_id == crate::evaluators::question_id(candidate.category, index)))
+    {
+        return Acceptance::Fallback(FallbackReason::InvalidValue);
+    }
     let Some(confidence) = candidate.confidence else {
         return Acceptance::Fallback(FallbackReason::MissingConfidence);
     };
-    if !confidence.is_finite() || confidence < policy.min_confidence {
+    let threshold = if optional {
+        policy.min_confidence.max(crate::filtering::MIN_FILTER_CONFIDENCE)
+    } else {
+        policy.min_confidence
+    };
+    if !policy.min_confidence.is_finite() || !confidence.is_finite()
+        || confidence < threshold || confidence > 1.0 {
+
         return Acceptance::Fallback(FallbackReason::LowConfidence);
     }
     let decision = ActiveDecision {
@@ -323,15 +339,12 @@ mod tests {
     fn category_without_reversible_effect_is_refused() {
         let policy = ActivationPolicy::default();
         for category in [
-            DecisionCategory::MemoryRelevance,
-            DecisionCategory::ContextRelevance,
             DecisionCategory::SubagentRequirement,
             DecisionCategory::SubagentModelRouting,
             DecisionCategory::ContinueStopEscalate,
             DecisionCategory::ResultSufficiency,
             DecisionCategory::FirstPassVerification,
             DecisionCategory::TaskClassification,
-            DecisionCategory::ToolCandidates,
         ] {
             let acceptance = evaluate_answer(
                 &policy,
@@ -456,6 +469,37 @@ mod tests {
         future.decided_at = SystemTime::UNIX_EPOCH + Duration::from_secs(60);
         let acceptance = evaluate_answer(&policy, JevMode::Active, &future, now());
         assert_eq!(acceptance, Acceptance::Fallback(FallbackReason::Stale));
+    }
+
+
+    #[test]
+    fn explicit_empty_categories_disable_even_legacy_effects() {
+        let policy = ActivationPolicy { enabled_categories: BTreeSet::new(), ..Default::default() };
+        for category in DEFAULT_APPLIABLE_CATEGORIES {
+            assert_eq!(evaluate_answer(&policy, JevMode::Active, &candidate(category, Some("none"), Some(1.0)), now()),
+                Acceptance::Fallback(FallbackReason::CategoryDisabled));
+        }
+    }
+
+    #[test]
+    fn optional_categories_need_explicit_enablement_and_candidate_labels() {
+        for category in OPTIONAL_APPLIABLE_CATEGORIES {
+            let mut policy = ActivationPolicy::default();
+            assert_eq!(evaluate_answer(&policy, JevMode::Active, &candidate(category, Some("drop"), Some(1.0)), now()),
+                Acceptance::Fallback(FallbackReason::CategoryDisabled));
+            policy.enabled_categories.insert(category);
+            assert!(evaluate_answer(&policy, JevMode::Active, &candidate(category, Some("drop"), Some(0.99)), now()).accepted().is_some());
+            for value in ["0", "0.1", "irrelevant", "none", "1", "true"] {
+                assert_eq!(evaluate_answer(&policy, JevMode::Active, &candidate(category, Some(value), Some(1.0)), now()),
+                    Acceptance::Fallback(FallbackReason::InvalidValue));
+            }
+            assert_eq!(evaluate_answer(&policy, JevMode::Active, &candidate(category, Some("drop"), Some(0.8)), now()),
+                Acceptance::Fallback(FallbackReason::LowConfidence));
+            let mut wrong_id = candidate(category, Some("drop"), Some(1.0));
+            wrong_id.question_id = "unbound".to_string();
+            assert_eq!(evaluate_answer(&policy, JevMode::Active, &wrong_id, now()),
+                Acceptance::Fallback(FallbackReason::InvalidValue));
+        }
     }
 
     #[test]

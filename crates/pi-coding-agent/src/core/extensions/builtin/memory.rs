@@ -50,8 +50,13 @@ fn session_key<T: ExtensionContext + ?Sized>(ctx: &Arc<T>) -> String {
 /// `Map<string, MemoryService>` bound per session.
 type ServiceMap = Arc<Mutex<HashMap<String, Arc<MemoryService>>>>;
 
-/// `Map<string, { key; recall }>` bound per session.
-type RecalledMap = Arc<Mutex<HashMap<String, (String, Arc<crate::core::memory::search::RecallResult>)>>>;
+struct CachedRecall {
+    hits: Vec<crate::core::memory::search::MemoryHit>,
+    recalled: Arc<crate::core::memory::search::RecallResult>,
+}
+
+/// The cache retains the unfiltered baseline so changing Jev mode is reversible.
+type RecalledMap = Arc<Mutex<HashMap<String, (String, Arc<CachedRecall>)>>>;
 
 /// `createMemoryExtension(agentDir, settingsManager)`.
 pub fn create_memory_extension(
@@ -394,7 +399,7 @@ fn create_memory_extension_impl(
                 });
                 // TS wraps the body in try/catch: a throw still returns the filtered
                 // messages, and reports a failed recall diagnostic.
-                let recalled = (|| -> Result<RecallOutcome, String> {
+                let recalled = async {
                     let memory = service(&ctx, &agent_dir, &services)?;
                     if !memory.store.settings().recall {
                         return Ok(RecallOutcome::Disabled);
@@ -422,19 +427,27 @@ fn create_memory_extension_impl(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .get(&session_key(&ctx))
                         .cloned();
-                    let recalled = match cached {
+                    let baseline = match cached {
                         Some((cached_key, recall)) if cached_key == key => recall,
-                        _ if !query.is_empty() => Arc::new(memory.recall(&query)),
-                        _ => Arc::new(crate::core::memory::search::RecallResult {
-                            text: String::new(),
-                            ids: Vec::new(),
-                            chars: 0,
-                        }),
+                        _ => {
+                            let mut hits = if query.is_empty() { Vec::new() } else { memory.search(&query, false) };
+                            let recalled = memory.render_recall(&hits);
+                            hits.retain(|hit| recalled.ids.contains(&hit.id));
+                            Arc::new(CachedRecall { hits, recalled: Arc::new(recalled) })
+                        }
                     };
                     recalled_turns
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .insert(session_key(&ctx), (key, recalled.clone()));
+                        .insert(session_key(&ctx), (key, baseline.clone()));
+                    let filtered = crate::core::jev_bridge::filter_memory_candidates(
+                        ctx.clone(), &query, baseline.hits.clone(),
+                    ).await;
+                    let recalled = if filtered.len() == baseline.hits.len() {
+                        baseline.recalled.clone()
+                    } else {
+                        Arc::new(memory.render_recall(&filtered))
+                    };
                     if !recalled.text.is_empty() {
                         let note: AgentMessage =
                             AgentMessage::Custom(pi_agent_core::types::CustomAgentMessage::Custom {
@@ -462,8 +475,8 @@ fn create_memory_extension_impl(
                             "latencyMs": performance_now() - started,
                         }),
                     );
-                    Ok(RecallOutcome::Done)
-                })();
+                    Ok::<RecallOutcome, String>(RecallOutcome::Done)
+                }.await;
 
                 match recalled {
                     Ok(RecallOutcome::Disabled) => Some(serde_json::json!({
@@ -841,6 +854,26 @@ mod tests {
         assert_eq!(payload.get("ids").and_then(Value::as_array).map(Vec::len), Some(2));
         let payload = memory_payload("import_prepare", "/tmp/x").unwrap();
         assert_eq!(payload.get("path"), Some(&Value::String("/tmp/x".to_string())));
+    }
+
+
+    #[test]
+    fn recall_cache_keeps_unfiltered_baseline_for_mode_reversal() {
+        let baseline = Arc::new(CachedRecall {
+            hits: Vec::new(),
+            recalled: Arc::new(crate::core::memory::search::RecallResult {
+                text: "baseline memory".to_string(), ids: vec!["original".to_string()], chars: 15,
+            }),
+        });
+        let cache: RecalledMap = Arc::new(Mutex::new(HashMap::from([
+            ("session".to_string(), ("turn".to_string(), baseline.clone())),
+        ])));
+        let filtered = crate::core::jev_retrieval::apply_memory(baseline.hits.clone(), &[0]);
+        assert!(filtered.is_empty());
+        let restored = cache.lock().unwrap().get("session").cloned().unwrap().1;
+        assert!(Arc::ptr_eq(&restored, &baseline));
+        assert_eq!(restored.recalled.text, "baseline memory");
+        assert_eq!(restored.recalled.ids, vec!["original"]);
     }
 
     #[test]

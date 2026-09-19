@@ -1,23 +1,11 @@
-//! Transport-agnostic JevObserver core (DESIGN.md section 4).
-//!
-//! Consumes event payloads as `serde_json::Value` DTOs (the adapter in
-//! pi-coding-agent builds bounded values). In Compare: capture baselines
-//! synchronously at the boundary, build one bundled request per snapshot,
-//! enqueue asynchronously, and write correlated records when results arrive.
-//! Nothing a Compare answer says can re-enter the agent loop.
-//!
-//! In Active, `decide_active` is the single decision-returning path. It makes
-//! one bounded call at the boundary, runs the answer through the acceptance
-//! policy in `crate::active`, and returns only the decisions the policy
-//! accepted. The caller owns the effect: this crate never mutates host state
-//! and never applies anything itself. Every outcome, accepted or refused, is
-//! recorded with the single reason that stopped it.
-//!
-//! In Off: a single cheap mode check and nothing else — no scheduling, no
-//! client work, no records.
+//! Bounded System One decision and observation boundaries.
+//! Compare runs asynchronously. Active and combined share one awaited result;
+//! the host applies permitted effects and reports the actual changes.
+//! Independent compaction uses a separate gate and cancellation axis.
 
 use std::collections::{BTreeMap, HashSet};
 use std::sync::{Arc, Mutex};
+use std::sync::atomic::{AtomicBool, Ordering};
 
 use serde_json::Value;
 use uuid::Uuid;
@@ -76,18 +64,29 @@ pub struct ActiveDecideOutcome {
     /// Set when no answer was obtained at all (transport, timeout, breaker,
     /// wrong mode). The caller must then behave as if Jev were absent.
     pub unavailable: Option<crate::active::FallbackReason>,
+    pub mode: JevMode,
+    pub context: Option<RequestContext>,
+    pub raw: Option<crate::types::DecisionOutcome>,
+    pub baseline_action: BTreeMap<String, String>,
+    pub compaction_enabled: Option<bool>,
+    pub terminal_reason: Option<String>,
+    pub dispatched: bool,
+    token: crate::scheduler::CancellationToken,
+    independent: bool,
+    policy_generation: String,
 }
 
 /// One refused answer.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRefusal {
     pub category: DecisionCategory,
+    pub question_id: String,
     pub reason: crate::active::FallbackReason,
 }
 
 impl ActiveRefusal {
-    pub fn new(category: DecisionCategory, reason: crate::active::FallbackReason) -> Self {
-        Self { category, reason }
+    pub fn new(category: DecisionCategory, question_id: String, reason: crate::active::FallbackReason) -> Self {
+        Self { category, question_id, reason }
     }
 }
 
@@ -95,6 +94,8 @@ impl ActiveRefusal {
 /// answers: `applied` counts boundaries where a request field actually changed.
 #[derive(Debug, Default)]
 struct ActiveCounters {
+    recommended: u64,
+    accepted: u64,
     applied: u64,
     accepted_no_effect: u64,
     refused: u64,
@@ -140,6 +141,9 @@ pub struct JevObserverConfig {
     pub on_terminal: Option<Arc<dyn Fn(&str) + Send + Sync>>,
     /// Bounds for the Active decision path. Unused in Compare and Off.
     pub active: ActiveSettings,
+    /// Independent compaction permission, also bound to credential generation.
+    pub independent_gate: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    pub policy_generation: Arc<dyn Fn(&str, bool) -> String + Send + Sync>,
 }
 
 impl Default for JevObserverConfig {
@@ -151,6 +155,8 @@ impl Default for JevObserverConfig {
             min_confidence: 0.7,
             on_terminal: None,
             active: ActiveSettings::default(),
+            independent_gate: Arc::new(|_| false),
+            policy_generation: Arc::new(|_, _| String::new()),
         }
     }
 }
@@ -164,8 +170,7 @@ impl std::fmt::Debug for JevObserverConfig {
     }
 }
 
-/// Jev comparison observer. Build once per wiring; consume events through
-/// `observe`. No method returns Jev output; nothing re-enters the loop.
+/// Shared observer and bounded decision service. The host owns every mutation.
 pub struct JevObserver {
     config: JevObserverConfig,
     correlator: Arc<Correlator>,
@@ -174,6 +179,9 @@ pub struct JevObserver {
     /// decision boundary. Unused by Compare, which goes through the queue.
     system_one: Arc<dyn crate::types::SystemOne>,
     active_breaker: Mutex<ActiveBreaker>,
+    active_sessions: Mutex<std::collections::HashMap<(String, bool), crate::scheduler::CancellationToken>>,
+    active_slots: tokio::sync::Semaphore,
+    closed: AtomicBool,
     active_counters: Mutex<std::collections::HashMap<String, ActiveCounters>>,
     sessions: Mutex<std::collections::HashMap<String, u32>>,
     skipped_categories: Mutex<std::collections::HashMap<String, BTreeMap<String, String>>>,
@@ -203,7 +211,7 @@ impl JevObserver {
             config.scheduler.clone(),
             Arc::clone(&system_one),
             sink,
-            Arc::new(move |session_id| mode_gate(Some(session_id)) == JevMode::Compare),
+            Arc::new(move |session_id| mode_gate(Some(session_id)).allows_compare()),
         );
         Arc::new(Self {
             config,
@@ -211,6 +219,9 @@ impl JevObserver {
             scheduler,
             system_one,
             active_breaker: Mutex::new(ActiveBreaker::default()),
+            active_sessions: Mutex::new(std::collections::HashMap::new()),
+            active_slots: tokio::sync::Semaphore::new(2),
+            closed: AtomicBool::new(false),
             active_counters: Mutex::new(std::collections::HashMap::new()),
             sessions: Mutex::new(std::collections::HashMap::new()),
             skipped_categories: Mutex::new(std::collections::HashMap::new()),
@@ -249,6 +260,8 @@ impl JevObserver {
         let counters = self.active_counters.lock().unwrap_or_else(|p| p.into_inner());
         let counters = counters.get(session_id)?;
         Some(serde_json::json!({
+            "recommended": counters.recommended,
+            "accepted": counters.accepted,
             "applied": counters.applied,
             "accepted_no_effect": counters.accepted_no_effect,
             "refused": counters.refused,
@@ -261,20 +274,35 @@ impl JevObserver {
     /// Drop every queued/in-flight request for a session (disposal path).
     pub fn cancel_session(&self, session_id: &str) {
         self.scheduler.cancel_session(session_id);
+        let mut active = self.active_sessions.lock().unwrap_or_else(|p| p.into_inner());
+        for independent in [false, true] {
+            if let Some(token) = active.remove(&(session_id.to_string(), independent)) { token.cancel(); }
+        }
+        drop(active);
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id);
     }
 
+    pub fn cancel_decisions(&self, session_id: &str) {
+        self.scheduler.cancel_session(session_id);
+        if let Some(token) = self.active_sessions.lock().unwrap_or_else(|p| p.into_inner()).remove(&(session_id.to_string(), false)) { token.cancel(); }
+    }
+
     /// Stop all comparison work (observer disposal).
     pub fn shutdown(&self) {
+        self.closed.store(true, Ordering::SeqCst);
+        for (_, token) in self.active_sessions.lock().unwrap_or_else(|p| p.into_inner()).drain() {
+            token.cancel();
+        }
         self.scheduler.shutdown();
     }
 
     /// Observe one event. Fire-and-forget; never blocks beyond the cheap
     /// mode check and one bounded extraction.
     pub fn observe(&self, event_type: &str, payload: &Value) {
+        if self.closed.load(Ordering::SeqCst) { return; }
         // Session disposal cancels pending work even when the mode just
         // flipped to Off; the check itself is cheap.
         if event_type == "session_shutdown" {
@@ -294,13 +322,14 @@ impl JevObserver {
             .unwrap_or("")
             .to_string();
         // Single cheap mode check first; in Off nothing else happens.
-        if (self.config.mode_gate)(if session_id.is_empty() { None } else { Some(session_id.as_str()) })
-            != JevMode::Compare
+        if !(self.config.mode_gate)(if session_id.is_empty() { None } else { Some(session_id.as_str()) })
+            .allows_compare()
         {
             return;
         }
         match event_type {
             "turn_start" => self.observe_snapshot(event_type, payload, SnapshotStage::TurnStart),
+            "turn_end" => self.observe_snapshot(event_type, payload, SnapshotStage::TurnEnd),
             "tool_call" => self.observe_snapshot(event_type, payload, SnapshotStage::ToolCall),
             "model_select" => self.observe_snapshot(event_type, payload, SnapshotStage::ModelSelect),
             "agent_end" => self.observe_snapshot(event_type, payload, SnapshotStage::AgentEnd),
@@ -444,6 +473,7 @@ impl JevObserver {
                     questions.append(&mut prepared);
                 }
                 EvaluatorOutput::Skipped(reason) => {
+                    if reason == "feature_disabled" { continue; }
                     {
                         let mut skipped = self.skipped_categories.lock().unwrap_or_else(|p| p.into_inner());
                         if skipped.len() >= 64 && !skipped.contains_key(&session_id) {
@@ -534,242 +564,256 @@ impl JevObserver {
     fn observe_snapshot(&self, _event_type: &str, payload: &Value, stage: SnapshotStage) {
         // Baselines and context were captured synchronously at the boundary;
         // the SystemOne call happens asynchronously in the scheduler.
-        if let BundlePreparation::Ready(bundle) = self.prepare_bundle(payload, stage, "compare") {
-            self.correlator.track(&bundle.ctx);
+        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
+        if let BundlePreparation::Ready(bundle) = self.prepare_bundle(payload, stage, mode.as_str()) {
+            self.correlator.track_boundary(&bundle.ctx, action_baseline(payload), payload.get("compaction_enabled").and_then(Value::as_bool));
             // Dropped requests are recorded by the scheduler sink.
             let _ = self.scheduler.enqueue(bundle.request, bundle.ctx);
         }
     }
 
-    /// Decide one boundary in Active mode and return the answers an activation
-    /// policy may apply. This is the only path in this crate that returns Jev
-    /// output to a caller, and it is reachable only when the effective mode is
-    /// `Active`.
-    ///
-    /// Bounded by `config.active.deadline`. A timeout, transport failure, open
-    /// breaker or refused answer yields no decision and a reason; the caller
-    /// must then behave exactly as if Jev were absent.
-    pub async fn decide_active(
-        &self,
-        payload: &Value,
-        stage: SnapshotStage,
-        policy: &crate::active::ActivationPolicy,
-    ) -> ActiveDecideOutcome {
-        use crate::active::FallbackReason;
+    /// Prepare explicit questions without truncating candidate IDs or question sets.
+    fn prepare_explicit(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, mode: JevMode) -> Option<PreparedBundle> {
+        let session_id = payload.get("session_id")?.as_str()?.to_string();
+        let state = payload.get("state")?.clone();
+        if session_id.is_empty() || questions.is_empty()
+            || questions.len() > self.config.scheduler.max_questions_per_request
+            || serde_json::to_vec(&state).ok()?.len() > MAX_STATE_BYTES {
+            return None;
+        }
+        let mut specs = BTreeMap::new();
+        let mut metadata = Vec::new();
+        for question in questions {
+            let category = question.question_id.rsplit_once('.')?.0;
+            if category != "compaction" { crate::types::DecisionCategory::parse(category)?; }
+            metadata.push(QuestionMeta { question_id: question.question_id.clone(), category: category.to_string() });
+            if specs.insert(question.question_id, question.spec).is_some() { return None; }
+        }
+        let request = crate::types::SystemOneRequest { state: state.clone(), model: SYSTEM_ONE_MODEL.to_string(), questions: specs };
+        if crate::types::validate_request_shape(&request).is_err() { return None; }
+        Some(PreparedBundle {
+            request,
+            ctx: RequestContext {
+                request_id: format!("jev-{}", Uuid::new_v4()), session_id,
+                turn: payload.get("turn").and_then(Value::as_u64).unwrap_or(0),
+                stage: stage.to_string(), state_fingerprint: fingerprint_of(&state),
+                state_schema_version: STATE_SCHEMA_VERSION.to_string(), prompt_version: PROMPT_VERSION.to_string(),
+                mode: mode.as_str().to_string(), questions: metadata, baselines: BTreeMap::new(),
+                request_start_ts: crate::client::utc_now_rfc3339(),
+            },
+        })
+    }
 
-        let session_id = payload
-            .get("session_id")
-            .and_then(Value::as_str)
-            .unwrap_or("")
-            .to_string();
-        let turn = payload.get("turn").and_then(Value::as_u64).unwrap_or(0);
-        let appliable: Vec<DecisionCategory> = for_boundary(stage)
-            .into_iter()
-            .map(|evaluator| evaluator.category())
-            .filter(|category| policy.appliable().contains(category))
-            .collect();
-        let mut outcome = ActiveDecideOutcome {
-            session_id: session_id.clone(),
-            turn,
-            stage: stage.as_str().to_string(),
-            request_id: None,
-            response_model: None,
-            duration_ms: None,
-            state_fingerprint: String::new(),
-            decisions: Vec::new(),
-            refusals: Vec::new(),
-            unavailable: None,
+    pub fn observe_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) {
+        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
+        if !mode.allows_compare() { return; }
+        if let Some(bundle) = self.prepare_explicit(payload, stage, questions, mode) {
+            self.correlator.track_boundary(&bundle.ctx, action_baseline(payload), payload.get("compaction_enabled").and_then(Value::as_bool));
+            let _ = self.scheduler.enqueue(bundle.request, bundle.ctx);
+        }
+    }
+
+    pub async fn decide_active(&self, payload: &Value, stage: SnapshotStage, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
+        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
+        let bundle = if mode.allows_active() {
+            match self.prepare_bundle(payload, stage, mode.as_str()) {
+                BundlePreparation::Ready(bundle) => Some(*bundle),
+                _ => None,
+            }
+        } else { None };
+        self.decide_bundle(payload, stage.as_str(), bundle, policy, mode, false).await
+    }
+
+    pub async fn decide_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
+        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
+        let bundle = if mode.allows_active() { self.prepare_explicit(payload, stage, questions, mode) } else { None };
+        self.decide_bundle(payload, stage, bundle, policy, mode, false).await
+    }
+
+    pub async fn decide_independent(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) -> ActiveDecideOutcome {
+        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let bundle = if (self.config.independent_gate)(session_id) { self.prepare_explicit(payload, stage, questions, mode) } else { None };
+        self.decide_bundle(payload, stage, bundle, &crate::active::ActivationPolicy::default(), mode, true).await
+    }
+
+    async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, mode: JevMode, independent: bool) -> ActiveDecideOutcome {
+        use crate::active::FallbackReason;
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
+        let token = {
+            let mut sessions = self.active_sessions.lock().unwrap_or_else(|p| p.into_inner());
+            let key = (session_id.clone(), independent);
+            if sessions.len() >= 64 && !sessions.contains_key(&key) {
+                if let Some(key) = sessions.keys().next().cloned() {
+                    if let Some(token) = sessions.remove(&key) { token.cancel(); }
+                }
+            }
+            sessions.entry(key).or_default().clone()
         };
-        if session_id.is_empty() {
+        let mut outcome = ActiveDecideOutcome {
+            session_id, turn: payload.get("turn").and_then(Value::as_u64).unwrap_or(0),
+            stage: stage.to_string(), request_id: None, response_model: None, duration_ms: None,
+            state_fingerprint: String::new(), decisions: Vec::new(), refusals: Vec::new(), unavailable: None,
+            mode, context: None, raw: None, baseline_action: action_baseline(payload),
+            compaction_enabled: payload.get("compaction_enabled").and_then(Value::as_bool),
+            terminal_reason: None, dispatched: false, token, independent,
+            policy_generation: payload.get("policy_generation").and_then(Value::as_str).map(str::to_string)
+                .unwrap_or_else(|| (self.config.policy_generation)(payload.get("session_id").and_then(Value::as_str).unwrap_or(""), independent)),
+        };
+        if !self.can_apply(&outcome) {
             outcome.unavailable = Some(FallbackReason::ModeNotActive);
+            outcome.terminal_reason = Some("mode_or_generation_changed".to_string());
             return outcome;
         }
-        // The gate is read again here: a caller cannot reach this path with a
-        // non-Active effective mode.
-        if (self.config.mode_gate)(Some(session_id.as_str())) != JevMode::Active {
-            outcome.unavailable = Some(FallbackReason::ModeNotActive);
+        let Some(bundle) = bundle else {
+            outcome.unavailable = Some(FallbackReason::NoAnswer);
+            outcome.terminal_reason = Some("no_eligible_questions".to_string());
             return outcome;
-        }
-        if appliable.is_empty() {
-            // Nothing at this boundary has a reversible effect, so a call
-            // could not change the request even if it succeeded.
-            outcome.unavailable = Some(FallbackReason::CategoryNotAppliable);
-            return outcome;
-        }
-        if !self.active_breaker_allows() {
-            for category in &appliable {
-                outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::Unavailable));
-            }
-            outcome.unavailable = Some(FallbackReason::Unavailable);
-            return outcome;
-        }
-        let bundle = match self.prepare_bundle(payload, stage, "active") {
-            BundlePreparation::Ready(bundle) => bundle,
-            BundlePreparation::StateTooLarge | BundlePreparation::Nothing => {
-                outcome.unavailable = Some(FallbackReason::NoAnswer);
-                return outcome;
-            }
         };
         outcome.request_id = Some(bundle.ctx.request_id.clone());
         outcome.state_fingerprint = bundle.ctx.state_fingerprint.clone();
-        let started = std::time::Instant::now();
-        let call = self.system_one.decide(crate::client::bundle_with_questions(
-            bundle.ctx.session_id.clone(),
-            bundle.ctx.turn,
-            bundle.ctx.stage.clone(),
-            bundle.request.state.clone(),
-            bundle.request.model.clone(),
-            bundle.request.questions.clone(),
-        ));
-        let decision = match tokio::time::timeout(self.config.active.deadline, call).await {
-            Ok(decision) => decision,
-            Err(_) => {
-                self.note_active_failure();
-                outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
-                for category in &appliable {
-                    outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::Unavailable));
-                }
-                outcome.unavailable = Some(FallbackReason::Unavailable);
-                return outcome;
-            }
-        };
-        outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
-        outcome.response_model = decision.response_model.clone();
-        if decision.records.is_empty() {
-            // No answer at all: transport failure, refusal to call, or an
-            // unusable response. Either way nothing may be applied.
-            self.note_active_failure();
-            for category in &appliable {
-                outcome.refusals.push(ActiveRefusal::new(*category, FallbackReason::NoAnswer));
-            }
-            outcome.unavailable = Some(FallbackReason::NoAnswer);
+        outcome.context = Some(bundle.ctx.clone());
+        if !self.active_breaker_allows() {
+            outcome.unavailable = Some(FallbackReason::Unavailable);
+            outcome.terminal_reason = Some("circuit_open".to_string());
             return outcome;
         }
-        self.note_active_success();
-        let now = std::time::SystemTime::now();
-        for record in &decision.records {
-            let confidence = record.answer.confidence();
-            let value = Some(record.answer.selected_value());
-            if !appliable.contains(&record.category) {
-                // Record-only category: answered, but this mode has no
-                // reversible effect for it.
-                let reason = if crate::active::DEFAULT_APPLIABLE_CATEGORIES.contains(&record.category) {
-                    FallbackReason::CategoryDisabled
-                } else {
-                    FallbackReason::CategoryNotAppliable
+        let Ok(_slot) = self.active_slots.try_acquire() else {
+            outcome.unavailable = Some(FallbackReason::Unavailable);
+            outcome.terminal_reason = Some("concurrency_limit".to_string());
+            return outcome;
+        };
+        let started = std::time::Instant::now();
+        outcome.dispatched = true;
+        let call = self.system_one.decide(crate::client::bundle_with_questions(
+            bundle.ctx.session_id.clone(), bundle.ctx.turn, bundle.ctx.stage.clone(),
+            bundle.request.state, bundle.request.model, bundle.request.questions,
+        ));
+        let decision = tokio::select! {
+            biased;
+            _ = outcome.token.cancelled() => None,
+            result = tokio::time::timeout(self.config.active.deadline, call) => match result {
+                Ok(result) => Some(result),
+                Err(_) => { outcome.terminal_reason = Some("timeout".to_string()); self.note_active_failure(); None }
+            },
+        };
+        outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
+        if !self.can_apply(&outcome) || decision.is_none() {
+            outcome.unavailable = Some(FallbackReason::Unavailable);
+            if outcome.terminal_reason.is_none() { outcome.terminal_reason = Some("cancelled_or_generation_changed".to_string()); }
+            return outcome;
+        }
+        let decision = decision.expect("checked decision");
+        outcome.response_model = decision.response_model.clone();
+        if decision.records.is_empty() {
+            self.note_active_failure();
+            outcome.unavailable = Some(FallbackReason::NoAnswer);
+            outcome.terminal_reason = Some(decision.skips.first().map(|(_, reason)| *reason).unwrap_or("no_answer").to_string());
+        } else { self.note_active_success(); }
+        if !independent {
+            let now = std::time::SystemTime::now();
+            for record in &decision.records {
+                let candidate = crate::active::AnswerCandidate {
+                    category: record.category, question_id: record.question_id.clone(),
+                    value: Some(record.answer.selected_value()), confidence: policy_confidence(record),
+                    response_model: record.response_model.clone(), request_id: bundle.ctx.request_id.clone(),
+                    turn: bundle.ctx.turn, decided_at: now,
                 };
-                outcome.refusals.push(ActiveRefusal::new(record.category, reason));
-                continue;
-            }
-            let candidate = crate::active::AnswerCandidate {
-                category: record.category,
-                question_id: record.question_id.clone(),
-                value,
-                confidence,
-                response_model: record.response_model.clone(),
-                request_id: bundle.ctx.request_id.clone(),
-                turn,
-                decided_at: now,
-            };
-            match crate::active::evaluate_answer(policy, JevMode::Active, &candidate, now) {
-                crate::active::Acceptance::Accepted(decision) => outcome.decisions.push(*decision),
-                crate::active::Acceptance::Fallback(reason) => {
-                    outcome.refusals.push(ActiveRefusal::new(record.category, reason));
+                let mut question_policy = policy.clone();
+                if crate::active::OPTIONAL_APPLIABLE_CATEGORIES.contains(&record.category) {
+                    if let Some(minimum) = payload.get("optional_min_confidence").and_then(Value::as_f64) {
+                        question_policy.min_confidence = question_policy.min_confidence.max(minimum);
+                    }
+                    if let Some(age) = payload.get("optional_max_decision_age_ms").and_then(Value::as_u64) {
+                        question_policy.max_decision_age = question_policy.max_decision_age.min(std::time::Duration::from_millis(age));
+                    }
+                }
+                match crate::active::evaluate_answer(&question_policy, mode, &candidate, now) {
+                    crate::active::Acceptance::Accepted(decision) => outcome.decisions.push(*decision),
+                    crate::active::Acceptance::Fallback(reason) => outcome.refusals.push(ActiveRefusal::new(record.category, record.question_id.clone(), reason)),
                 }
             }
         }
+        outcome.raw = Some(decision);
         outcome
     }
 
-    /// Write the records for one Active boundary. `effects` maps a category id
-    /// to the fields the host actually changed for that category; a category
-    /// with no entry is recorded as accepted with no changes, which is not a
-    /// success story and is visible as such.
-    pub fn record_active(
-        &self,
-        outcome: &ActiveDecideOutcome,
-        effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>,
-    ) -> usize {
-        if outcome.session_id.is_empty() {
-            return 0;
+    /// Re-check immediately before host mutation, including the captured credential generation.
+    pub fn can_apply(&self, outcome: &ActiveDecideOutcome) -> bool {
+        if outcome.session_id.is_empty() || self.closed.load(Ordering::SeqCst) || outcome.token.is_cancelled() { return false; }
+        if (self.config.policy_generation)(&outcome.session_id, outcome.independent) != outcome.policy_generation { return false; }
+        if outcome.independent { return (self.config.independent_gate)(&outcome.session_id); }
+        outcome.mode.allows_active() && (self.config.mode_gate)(Some(&outcome.session_id)) == outcome.mode
+    }
+
+    pub fn record_active(&self, outcome: &ActiveDecideOutcome, effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>) -> usize {
+        let mut actual = outcome.baseline_action.clone();
+        for effect in effects.values().flatten() { actual.insert(effect.field.clone(), effect.to.clone().unwrap_or_else(|| "absent".to_string())); }
+        self.record_active_with_action(outcome, effects, &actual)
+    }
+
+    pub fn record_active_with_action(&self, outcome: &ActiveDecideOutcome, effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>, actual: &BTreeMap<String, String>) -> usize {
+        let still_current = self.can_apply(outcome);
+        let Some(captured) = &outcome.context else { return 0; };
+        if outcome.mode.allows_compare() && !outcome.independent {
+            self.correlator.track_boundary(captured, outcome.baseline_action.clone(), outcome.compaction_enabled);
+            if let Some(raw) = &outcome.raw {
+                self.correlator.handle_result(&JobResult::Completed {
+                    ctx: captured.clone(), outcome: raw.clone(), duration_ms: outcome.duration_ms.unwrap_or(0),
+                });
+            } else {
+                self.correlator.skip_request(captured, outcome.terminal_reason.as_deref().unwrap_or("unavailable"), None);
+            }
         }
         let ctx = crate::correlate::ActiveRecordContext {
-            request_id: outcome
-                .request_id
-                .clone()
-                .unwrap_or_else(|| format!("active-{}", uuid::Uuid::new_v4())),
-            session_id: outcome.session_id.clone(),
-            turn: outcome.turn,
-            stage: outcome.stage.clone(),
-            response_model: outcome.response_model.clone(),
-            duration_ms: outcome.duration_ms,
-            state_fingerprint: outcome.state_fingerprint.clone(),
-            prompt_version: PROMPT_VERSION.to_string(),
+            request_id: captured.request_id.clone(), session_id: captured.session_id.clone(), turn: captured.turn,
+            stage: captured.stage.clone(), response_model: outcome.response_model.clone(), duration_ms: outcome.duration_ms,
+            state_fingerprint: captured.state_fingerprint.clone(), prompt_version: captured.prompt_version.clone(),
+            mode: captured.mode.clone(), request_start_ts: Some(captured.request_start_ts.clone()),
+            attempts: outcome.raw.as_ref().map(|raw| raw.attempts).unwrap_or(u32::from(outcome.dispatched)),
+            attempt_count_known: outcome.raw.is_some() || !outcome.dispatched, baselines: captured.baselines.clone(),
+            baseline_action: outcome.baseline_action.clone(), compaction_enabled: outcome.compaction_enabled,
+            observed_metrics: outcome.raw.as_ref().map(crate::correlate::usage_metrics).unwrap_or_default(),
         };
-        let mut rows: Vec<crate::correlate::ActiveRecordRow> = Vec::new();
-        for decision in &outcome.decisions {
-            let category_id = decision.category.as_str().to_string();
+        let mut rows = Vec::new();
+        for question in &captured.questions {
+            let answer = outcome.raw.as_ref().and_then(|raw| raw.records.iter().find(|record| record.question_id == question.question_id));
+            let accepted = still_current && outcome.decisions.iter().any(|decision| decision.question_id == question.question_id);
+            let applied_effects = if accepted {
+                effects.get(&question.question_id).or_else(|| effects.get(&question.category)).cloned().unwrap_or_default()
+            } else { Vec::new() };
+            let actual_action = if still_current { actual.clone() } else { outcome.baseline_action.clone() };
+            let fallback = if !still_current { Some("cancelled_or_policy_changed".to_string()) } else {
+                outcome.refusals.iter().find(|refusal| refusal.question_id == question.question_id)
+                    .map(|refusal| refusal.reason.as_str().to_string()).or_else(|| outcome.terminal_reason.clone())
+            };
+            let skipped = outcome.raw.as_ref().and_then(|raw| raw.skips.iter().find(|(id, _)| id.is_empty() || id == &question.question_id)).map(|(_, reason)| reason.to_string());
             rows.push(crate::correlate::ActiveRecordRow {
-                category: category_id.clone(),
-                question_id: decision.question_id.clone(),
-                accepted: true,
-                selected_value: Some(decision.value.clone()),
-                confidence: Some(decision.confidence),
-                fallback_reason: None,
-                applied_effects: effects.get(&category_id).cloned().unwrap_or_default(),
-            });
-        }
-        for refusal in &outcome.refusals {
-            rows.push(crate::correlate::ActiveRecordRow {
-                category: refusal.category.as_str().to_string(),
-                question_id: format!("{}.0", refusal.category.as_str()),
-                accepted: false,
-                selected_value: None,
-                confidence: None,
-                fallback_reason: Some(refusal.reason.as_str().to_string()),
-                applied_effects: Vec::new(),
+                category: question.category.clone(), question_id: question.question_id.clone(), accepted,
+                selected_value: answer.map(|record| record.answer.selected_value()), confidence: answer.and_then(|record| record.answer.confidence()),
+                fallback_reason: if accepted { None } else { fallback.or_else(|| skipped.clone()).or_else(|| Some("no_answer".to_string())) },
+                outcome: if !applied_effects.is_empty() { "applied" } else if accepted { "accepted_no_effect" } else if outcome.unavailable.is_some() { "unavailable" } else { "refused" }.to_string(),
+                applied_effects, skipped_reason: skipped, actual_action,
             });
         }
         {
             let mut counters = self.active_counters.lock().unwrap_or_else(|p| p.into_inner());
-            let entry = counters
-                .entry(outcome.session_id.clone())
-                .or_default();
-            let applied = outcome
-                .decisions
-                .iter()
-                .filter(|decision| effects.contains_key(decision.category.as_str()))
-                .count() as u64;
-            entry.applied += applied;
-            entry.accepted_no_effect += outcome.decisions.len() as u64 - applied;
-            entry.refused += outcome.refusals.len() as u64;
-            if outcome.unavailable.is_some() {
-                entry.unavailable += 1;
+            if counters.len() >= 64 && !counters.contains_key(&outcome.session_id) {
+                if let Some(key) = counters.keys().next().cloned() { counters.remove(&key); }
             }
-            entry.last_reason = outcome
-                .unavailable
-                .map(|reason| reason.as_str().to_string())
-                .or_else(|| {
-                    outcome
-                        .refusals
-                        .first()
-                        .map(|refusal| refusal.reason.as_str().to_string())
-                });
-            entry.last_category = outcome
-                .decisions
-                .first()
-                .map(|decision| decision.category.as_str().to_string())
-                .or_else(|| {
-                    outcome
-                        .refusals
-                        .first()
-                        .map(|refusal| refusal.category.as_str().to_string())
-                });
+            let entry = counters.entry(outcome.session_id.clone()).or_default();
+            entry.recommended += rows.iter().filter(|row| row.selected_value.is_some()).count() as u64;
+            entry.accepted += rows.iter().filter(|row| row.accepted).count() as u64;
+            entry.applied += rows.iter().filter(|row| !row.applied_effects.is_empty()).count() as u64;
+            entry.accepted_no_effect += rows.iter().filter(|row| row.accepted && row.applied_effects.is_empty()).count() as u64;
+            entry.refused += rows.iter().filter(|row| !row.accepted).count() as u64;
+            entry.unavailable += u64::from(outcome.unavailable.is_some());
+            entry.last_reason = outcome.terminal_reason.clone().or_else(|| rows.iter().find_map(|row| row.fallback_reason.clone()));
+            entry.last_category = rows.first().map(|row| row.category.clone());
         }
-        if rows.is_empty() {
-            return 0;
-        }
-        self.correlator.record_active_rows(&ctx, &rows)
+        let count = self.correlator.record_active_rows(&ctx, &rows);
+        if let Some(notify) = &self.config.on_terminal { notify(&outcome.session_id); }
+        count
     }
 
     /// True while the Active breaker permits a new call.
@@ -812,4 +856,20 @@ impl JevObserver {
     pub fn active_breaker_open(&self) -> bool {
         !self.active_breaker_allows()
     }
+}
+
+fn action_baseline(payload: &Value) -> BTreeMap<String, String> {
+    payload.get("baseline_action").and_then(Value::as_object).map(|object| object.iter().take(16)
+        .filter_map(|(key, value)| value.as_str().map(|value| (key.clone(), value.to_string()))).collect()).unwrap_or_default()
+}
+
+fn policy_confidence(record: &crate::types::DecisionRecord) -> Option<f64> {
+    let confidence = record.answer.confidence()?;
+    if crate::active::OPTIONAL_APPLIABLE_CATEGORIES.contains(&record.category) {
+        if let crate::types::Answer::Choice { choice, probabilities, .. } = &record.answer {
+            return probabilities.get(choice).copied().map(|probability| confidence.min(probability));
+        }
+        return None;
+    }
+    Some(confidence)
 }

@@ -864,7 +864,7 @@ impl AgentDaemon {
     /// The mode view both `jev_get_settings` and `jev_get_status` return. It reads
     /// only local settings and credential PRESENCE: no network call and no secret
     /// value. Every mode is reported as the real mode it is: `mode` and `activeMode`
-    /// carry the effective mode and whether it is Active. This view applies nothing
+    /// carry the effective mode and whether it allows Active. This view applies nothing
     /// itself, so `applied` stays false; the live Active counters ride in the
     /// `pipeline` block of `jev_get_status`.
     fn jev_settings_view(&self, session_id: &str) -> Result<Value, String> {
@@ -885,8 +885,12 @@ impl AgentDaemon {
             "credentialPresenceKnown": saved_presence_known,
             "envConflict": env.has_conflict(),
             // A real, operative mode: this reports whether THIS session's effective
-            // mode is Active. It is not a reservation or readiness marker.
-            "activeMode": resolution.mode == pi_jev::types::JevMode::Active,
+            // mode allows Active. It is not a reservation or readiness marker.
+            "activeMode": resolution.mode.allows_active(),
+            // Optional metadata; clients without jev_features keep their local settings view.
+            "compareMode": resolution.mode.allows_compare(),
+            "features": settings.effective_features(session_id),
+            "compactionEnabled": settings.effective_compaction_enabled(session_id),
             // This settings view applies nothing itself, in any mode.
             "applied": false,
             // No per-view counters: the live figures are in `pipeline.active`.
@@ -927,6 +931,10 @@ fn jev_mode_change_message(applied: bool, mode: pi_jev::types::JevMode) -> Strin
         mode.label()
     )
 }
+
+#[cfg(test)]
+#[path = "daemon_jev_settings_tests.rs"]
+mod jev_compatibility_tests;
 
 const CLIENT_CATCHUP_RETRY_MS: u64 = 250;
 const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS: u64 = 5000;
@@ -5329,7 +5337,7 @@ impl AgentDaemon {
                 let requested = body.get("mode").and_then(Value::as_str).unwrap_or("");
                 let Some(mode) = pi_jev::types::JevMode::parse(requested) else {
                     return Err(format!(
-                        "Unknown Jev mode: {requested} (expected off, compare, or active)"
+                        "Unknown Jev mode: {requested} (expected off, compare, active, or compare-active)"
                     ));
                 };
                 let session_id = self.jev_session_id(body

@@ -1,19 +1,7 @@
-//! Jev comparison adapter for pi-coding-agent (lane B).
-//!
-//! Builds a programmatic internal `Extension` (see
-//! `core/extensions/types.rs::Extension`) whose handlers observe agent events
-//! and feed the transport-agnostic `pi_jev::hooks::JevObserver`. Registration
-//! retains a dormant adapter so first-use Compare works without restart. Handlers
-//! never return Jev output (always `None`), so nothing Jev produces can
-//! re-enter the agent loop, and Off costs exactly one cheap mode check.
-//!
-//! Active mode adds one handler on `before_provider_request`
-//! ([`JEV_ACTIVE_EVENT`]). That handler makes one bounded decision call per
-//! provider request, runs the answer through `pi_jev::active` acceptance, and
-//! applies only the fields `core::jev_active` knows how to change. Every other
-//! handler, in every mode, still returns `None`. The permanent boundary is
-//! unchanged: permissions, budgets, provider choice, effort defaults,
-//! subagents, messages and compaction are never touched.
+//! Native System One adapter. Compare observes without changing execution.
+//! Active and combined modes share bounded provider/retrieval decisions with
+//! request-local transformations. Compaction has a separate opt-in gate.
+//! Credentials, cancellation and captured policy generations remain local.
 
 use std::collections::{BTreeMap, HashMap};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
@@ -26,7 +14,8 @@ use serde_json::{json, Value};
 
 use crate::config::get_agent_dir;
 use crate::core::extensions::types::SharedExtension;
-use crate::core::extensions::types::{Extension, ExtensionEvent, ExtensionHandler};
+use crate::core::extensions::types::{Extension, ExtensionContext, ExtensionEvent, ExtensionHandler};
+use crate::core::memory::search::MemoryHit;
 
 /// Path of the internal observer extension (stable, easy to spot in logs).
 pub const JEV_OBSERVER_PATH: &str = "<jev-observer-internal>";
@@ -42,24 +31,28 @@ fn live_bridges() -> &'static Mutex<Vec<Weak<JevBridgeCore>>> {
 pub fn session_status_snapshot(session_id: &str) -> Option<Value> {
     let cores: Vec<_> = live_bridges().lock().unwrap_or_else(|p| p.into_inner())
         .iter().filter_map(Weak::upgrade).collect();
+    let mut result = None;
     for core in cores {
         if let Some(build) = core.observer.lock().unwrap_or_else(|p| p.into_inner()).as_ref() {
-            if let Some(status) = build.observer.session_status(session_id) {
-                return Some(status);
+            if let Some(mut status) = build.observer.session_status(session_id) {
+                status["active_breaker_open"] = json!(build.observer.active_breaker_open());
+                result = Some(status);
+                break;
             }
         }
     }
-    None
+    if let Some(compaction) = crate::core::jev_compaction::session_status(session_id) {
+        let status = result.get_or_insert_with(|| json!({}));
+        status["compaction"] = compaction;
+    }
+    result
 }
 
 /// Metadata-only footer text. This function never creates a client or task.
 pub fn footer_status_text(session_id: &str) -> String {
     let settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
     let mode = settings.effective_mode(session_id);
-    if mode == JevMode::Active {
-        return crate::modes::interactive::theme::theme::theme().fg("accent", "\u{25cf} Jev Active");
-    }
-    let (color, label) = if mode != JevMode::Compare {
+    let (color, label) = if !mode.is_enabled() {
         ("error", "Jev Off")
     } else {
         let present = pi_jev::config::jev_dir_for(get_agent_dir()).join(format!("{}.{}",
@@ -72,7 +65,9 @@ pub fn footer_status_text(session_id: &str) -> String {
             ("warning", "Jev checking")
         } else if status.as_ref().is_some_and(|value| value["fallback_reason"].as_str().is_some_and(|reason| !reason.is_empty())) {
             ("warning", "Jev fallback")
-        } else { ("accent", "Jev Compare") }
+        } else if status.as_ref().is_some_and(|value| value["active"]["last_reason"].as_str().is_some_and(|reason| !reason.is_empty())) {
+            ("warning", "Jev fallback")
+        } else { ("accent", mode.label()) }
     };
     crate::modes::interactive::theme::theme::theme().fg(color, &format!("\u{25cf} {label}"))
 }
@@ -94,10 +89,11 @@ const SETTINGS_TTL: Duration = Duration::from_millis(250);
 /// Active mode adds one separate handler on `before_provider_request`
 /// (see [`JEV_ACTIVE_EVENT`]). It is registered in addition to these, and it
 /// is the only Jev handler in the process that may return a modified value.
-pub const JEV_EVENTS: [&str; 11] = [
+pub const JEV_EVENTS: [&str; 12] = [
     "session_start",
     "agent_start",
     "turn_start",
+    "turn_end",
     "input",
     "tool_call",
     "tool_execution_start",
@@ -154,11 +150,11 @@ pub fn invalidate_settings_cache() {
 /// True when some session or the global default is set to Active.
 fn active_mode_requested() -> bool {
     let settings = load_settings_cached();
-    settings.global_default == Some(JevMode::Active)
+    settings.global_default.is_some_and(JevMode::allows_active)
         || settings
             .sessions
             .values()
-            .any(|session| session.mode == Some(JevMode::Active))
+            .any(|session| session.mode.is_some_and(JevMode::allows_active))
 }
 
 /// Add or remove the Active provider-request handler on every live bridge.
@@ -209,6 +205,7 @@ struct SessionBook {
     last_task_excerpt: Option<String>,
     observed_tools: Vec<String>,
     turn: u64,
+    trace: pi_jev::observation::TraceObserver,
 }
 
 struct JevBridgeCore {
@@ -216,6 +213,7 @@ struct JevBridgeCore {
     /// with; a credential rotation (or transport change) rebuilds it.
     observer: Mutex<Option<ObserverBuild>>,
     sessions: Mutex<HashMap<String, SessionBook>>,
+    run_metrics: crate::core::jev_run_metrics::JevRunMetrics,
     /// Weak handle to this core's registered extension, so Active-handler
     /// presence can follow the setting at runtime.
     extension: Mutex<Weak<Mutex<Extension>>>,
@@ -236,6 +234,7 @@ impl JevBridgeCore {
         Self {
             observer: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            run_metrics: crate::core::jev_run_metrics::JevRunMetrics::new(std::path::PathBuf::from(get_agent_dir())),
             extension: Mutex::new(Weak::new()),
         }
     }
@@ -339,6 +338,64 @@ impl JevBridgeCore {
             .get(session_id).map(|book| book.turn).unwrap_or(0)
     }
 
+    fn note_observation(&self, session_id: &str, event: &ExtensionEvent) {
+        use pi_jev::observation::{ObservedStopReason, TraceEvent};
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let book = sessions.entry(session_id.to_string()).or_default();
+        match event {
+            ExtensionEvent::TurnStart(_) => book.trace.record(TraceEvent::TurnStarted),
+            ExtensionEvent::ToolExecutionEnd(payload) => book.trace.record(TraceEvent::ToolEnded { is_error: payload.is_error }),
+            ExtensionEvent::MessageEnd(payload) if payload.message.get("role").and_then(Value::as_str) == Some("assistant") => {
+                let stop = payload.message.get("stopReason").and_then(Value::as_str).unwrap_or("");
+                let kind = observed_failure_kind(&payload.message);
+                book.trace.record(TraceEvent::AssistantEnded { stop_reason: ObservedStopReason::from_stop_reason(stop), failure_kind: kind });
+            }
+            _ => {}
+        }
+    }
+
+    fn observation(&self, session_id: &str) -> pi_jev::observation::TraceSummary {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(session_id)
+            .map(|book| book.trace.summary()).unwrap_or_default()
+    }
+
+    async fn observe_optional(&self, session_id: &str, event: &ExtensionEvent,
+        ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>, handler_event: &'static str) {
+        let settings = load_settings_cached();
+        let features = settings.effective_features(session_id);
+        let stage = match event {
+            ExtensionEvent::TurnEnd(_) if features.loop_control || features.retry_classification => pi_jev::snapshot::SnapshotStage::TurnEnd,
+            ExtensionEvent::AgentEnd(_) if features.result_sufficiency || features.loop_control || features.verification
+                || features.retry_classification || features.trace_observer => pi_jev::snapshot::SnapshotStage::AgentEnd,
+            _ => return,
+        };
+        // Only explicitly enabled observational categories run in Active-only mode.
+        let Some(core) = bridge_for_session(session_id) else { return; };
+        let Some((_, mut payload)) = bridge_event(&core, event, ctx, session_id, handler_event) else { return; };
+        payload["policy_generation"] = json!(decision_policy_generation(&settings,session_id));
+        payload["state"]["features"] = json!(features);
+        let Some(observer) = self.observer(session_id, ctx.ui()) else { return; };
+        let state = payload.get("state").cloned().unwrap_or(Value::Null);
+        let Ok(snapshot) = pi_jev::snapshot::StateSnapshot::new(stage, session_id, self.turn(session_id), 0, None, state, Vec::new()) else { return; };
+        let mut questions = Vec::new();
+        for evaluator in pi_jev::evaluators::for_boundary(stage) {
+            let enabled = match evaluator.category().as_str() {
+                "result_sufficiency" => features.result_sufficiency,
+                "continue_stop_escalate" => features.loop_control,
+                "first_pass_verification" => features.verification,
+                "retry_classification" => features.retry_classification,
+                "trace_assessment" => features.trace_observer,
+                _ => false,
+            };
+            if enabled {
+                if let pi_jev::evaluators::EvaluatorOutput::Questions(mut prepared) = evaluator.evaluate(&snapshot) { questions.append(&mut prepared); }
+            }
+        }
+        let policy = pi_jev::active::ActivationPolicy { enabled_categories: Default::default(), ..Default::default() };
+        let outcome = observer.decide_prepared(&payload, stage.as_str(), questions, &policy).await;
+        observer.record_active(&outcome, &BTreeMap::new());
+    }
+
     /// Off-mode immediate effect: cancel queued/in-flight comparison work
     /// for the session and drop its bounded bookkeeping. The observer slot
     /// itself is kept (rebuilt lazily on the next Compare event).
@@ -354,6 +411,19 @@ impl JevBridgeCore {
         self.forget_session(session_id);
     }
 
+    fn drop_decision_work(&self, session_id: &str) {
+        if let Some(build) = self.observer.lock().unwrap_or_else(|p| p.into_inner()).as_ref() { build.observer.cancel_decisions(session_id); }
+        if load_settings_cached().effective_compaction_enabled(session_id) {
+            if let Some(book) = self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get_mut(session_id) { *book = SessionBook::default(); }
+        } else { self.forget_session(session_id); }
+    }
+
+    fn own_session(&self, session_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.len() >= MAX_TRACKED_SESSIONS && !sessions.contains_key(session_id) { return; }
+        sessions.entry(session_id.to_string()).or_default();
+    }
+
     /// Effective mode for one session (cheap cached settings read).
     fn effective_mode(&self, session_id: Option<&str>) -> JevMode {
         load_settings_cached().effective_mode(session_id.unwrap_or(""))
@@ -364,10 +434,7 @@ impl JevBridgeCore {
     /// nothing is ever constructed.
     fn observer(&self, session_id: &str, ui: Arc<dyn crate::core::extensions::types::ExtensionUiContext>) -> Option<Arc<JevObserver>> {
         let settings = load_settings_cached();
-        if !matches!(
-            settings.effective_mode(session_id),
-            JevMode::Compare | JevMode::Active
-        ) {
+        if !settings.effective_mode(session_id).is_enabled() && !settings.effective_compaction_enabled(session_id) {
             return None;
         }
         // Cheap change probe BEFORE any credential read or client build: the
@@ -390,9 +457,11 @@ impl JevBridgeCore {
         // key identity. Reusing that observer would reject all later work.
         let (transport, credential, _fingerprint) = build_transport(&settings);
         let effective = settings.effective_mode(session_id);
+        // The transport is data-only. Independent compaction can use it while decisions are Off.
+        let client_mode = if effective.is_enabled() { effective } else { JevMode::Compare };
         let system_one: Arc<dyn pi_jev::types::SystemOne> = match
             pi_jev::client::JevSystemOne::new(
-                effective,
+                client_mode,
                 credential,
                 transport,
                 pi_jev::client::JevLimits::default(),
@@ -407,6 +476,7 @@ impl JevBridgeCore {
         // The observer re-checks the effective mode itself; the gate reads the
         // same cached settings the handlers use (one cheap read per event).
         let observed_stamp = cheap.clone();
+        let independent_stamp = cheap.clone();
         let footer_session = session_id.to_string();
         let config = pi_jev::hooks::JevObserverConfig {
             mode_gate: Arc::new(move |session_id: Option<&str>| {
@@ -417,6 +487,18 @@ impl JevBridgeCore {
                     return JevMode::Off;
                 }
                 current.effective_mode(session_id.unwrap_or(""))
+            }),
+            policy_generation: Arc::new(|session_id, independent| {
+                let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+                if independent {
+                    compaction_policy_generation(&current, session_id)
+                } else {
+                    decision_policy_generation(&current, session_id)
+                }
+            }),
+            independent_gate: Arc::new(move |session_id| {
+                let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+                cheap_credential_stamp(&current) == independent_stamp && current.effective_compaction_enabled(session_id)
             }),
             on_terminal: Some(Arc::new(move |session_id| {
                 if session_id == footer_session {
@@ -685,12 +767,20 @@ fn make_handler(
             let core = Arc::clone(&core);
             Box::pin(async move {
                 let session_id = ctx.session_manager().get_session_id();
-                let mode = core.effective_mode(Some(&session_id));
-                if mode != JevMode::Compare && mode != JevMode::Active {
+                let settings = load_settings_cached();
+                let mode = settings.effective_mode(&session_id);
+                let _ = core.run_metrics.observe(&session_id, &event, mode, settings.effective_compaction_enabled(&session_id), settings.effective_features(&session_id));
+                if handler_event == "session_shutdown" {
+                    crate::core::jev_compaction::clear_session_status(&session_id);
+                    core.drop_session_work(&session_id);
+                    return None::<Value>;
+                }
+                if mode.is_enabled() || load_settings_cached().effective_compaction_enabled(&session_id) { core.own_session(&session_id); }
+                if !mode.is_enabled() {
                     // Off takes effect immediately: cancel/forget this
                     // session's queued and in-flight comparison work so no
                     // late result can surface after the mode changed.
-                    core.drop_session_work(&session_id);
+                    core.drop_decision_work(&session_id);
                     if handler_event == "session_start" {
                         ctx.ui().set_status("jev".into(), Some(footer_status_text(&session_id)));
                     }
@@ -717,10 +807,11 @@ fn make_handler(
                     }
                     _ => {}
                 }
-                if mode == JevMode::Active {
-                    // Active decides synchronously at the provider-request
-                    // boundary. Nothing is observed or queued from here, so
-                    // there is no shadow work and no second network call.
+                core.note_observation(&session_id, &event);
+                // The shared actionable bundle replaces the duplicate shadow turn-start call.
+                if mode.allows_active() && handler_event == "turn_start" { return None::<Value>; }
+                if !mode.allows_compare() {
+                    core.observe_optional(&session_id, &event, &ctx, handler_event).await;
                     return None::<Value>;
                 }
                 let Some(observer) = core.observer(&session_id, ctx.ui()) else {
@@ -741,7 +832,7 @@ fn make_handler(
 /// Build the one Active-mode handler.
 ///
 /// Registered in addition to the observe-only handlers, and only reached when
-/// the effective mode for this session is `Active`. In Off and Compare it
+/// the effective mode allows Active. In Off and Compare it
 /// returns the untouched payload, so the provider path is unchanged.
 fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
     Arc::new(
@@ -753,7 +844,7 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                     return None::<Value>;
                 };
                 let session_id = ctx.session_manager().get_session_id();
-                if core.effective_mode(Some(&session_id)) != JevMode::Active {
+                if !core.effective_mode(Some(&session_id)).allows_active() {
                     return None::<Value>;
                 }
                 let Some(observer) = core.observer(&session_id, ctx.ui()) else {
@@ -763,18 +854,28 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                 // One decision boundary per provider request. The snapshot is
                 // built from what the adapter already tracks plus the tool
                 // catalog actually advertised in this request.
-                let state = active_request_state(&core, &ctx, &session_id, &params);
-                let policy = pi_jev::active::ActivationPolicy::default();
-                let outcome = observer
-                    .decide_active(
-                        &state,
-                        pi_jev::snapshot::SnapshotStage::TurnStart,
-                        &policy,
-                    )
-                    .await;
+                let settings = load_settings_cached();
+                let mut state = active_request_state(&core, &ctx, &session_id, &params, &settings);
+                let features = settings.effective_features(&session_id);
+                let tool_plan = features.tool_candidates.then(|| crate::core::jev_active::prepare_tool_pruning(
+                    &params, core.task_excerpt(&session_id).as_deref().unwrap_or(""), &settings.filtering));
+                if let Some(plan) = &tool_plan { state["state"]["optional_tools"] = plan.state["optional_tools"].clone(); }
+                state["optional_min_confidence"] = json!(settings.filtering.min_confidence);
+                state["optional_max_decision_age_ms"] = json!(settings.filtering.max_decision_age_ms);
+                let policy = activation_policy(features);
+                let call = observer.decide_active(&state, pi_jev::snapshot::SnapshotStage::TurnStart, &policy);
+                let outcome = if let Some(signal) = ctx.signal() {
+                    tokio::select! { biased;
+                        _ = signal.cancelled() => { observer.cancel_decisions(&session_id); return None::<Value>; },
+                        outcome = call => outcome,
+                    }
+                } else { call.await };
                 let mut effects: BTreeMap<String, Vec<pi_jev::active::AppliedEffect>> =
                     BTreeMap::new();
                 for decision in &outcome.decisions {
+                    if !observer.can_apply(&outcome) || decision.turn != core.turn(&session_id)
+                        || !decision.is_fresh(std::time::SystemTime::now(), &policy) { break; }
+                    let before = request_action(&params);
                     let changes = crate::core::jev_active::apply_decision(
                         &mut params,
                         decision.category.as_str(),
@@ -790,14 +891,28 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                             .map(|change| {
                                 pi_jev::active::AppliedEffect::new(
                                     change.key.clone(),
-                                    change.from.clone(),
-                                    change.to.clone(),
+                                    before.get(&change.key).cloned(),
+                                    request_action(&params).get(&change.key).cloned(),
                                 )
                             })
                             .collect(),
                     );
                 }
-                observer.record_active(&outcome, &effects);
+                if let Some(plan) = &tool_plan {
+                    if observer.can_apply(&outcome) {
+                        let changes = plan.apply(&mut params, &outcome.decisions,
+                            outcome.request_id.as_deref().unwrap_or(""), core.turn(&session_id));
+                        let mut dropped: Vec<_> = outcome.decisions.iter().filter(|decision|
+                            decision.category == pi_jev::types::DecisionCategory::ToolCandidates && decision.value == "drop").collect();
+                        dropped.sort_by_key(|decision| decision.question_id.rsplit_once('.').and_then(|(_, suffix)| suffix.parse::<usize>().ok()));
+                        for (decision, change) in dropped.into_iter().zip(changes) {
+                            effects.insert(decision.question_id.clone(), vec![pi_jev::active::AppliedEffect::new(
+                                "optional_tool", change.from, Some("omitted_for_request".to_string()))]);
+                        }
+                    }
+                }
+                if !observer.can_apply(&outcome) { effects.clear(); }
+                observer.record_active_with_action(&outcome, &effects, &request_action(&params));
                 ctx.ui()
                     .set_status("jev".into(), Some(footer_status_text(&session_id)));
                 if effects.is_empty() {
@@ -812,6 +927,185 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
     )
 }
 
+fn decision_policy_generation(settings: &JevSettings, session_id: &str) -> String {
+    json!([settings.effective_features(session_id), settings.filtering]).to_string()
+}
+
+pub fn compaction_policy_generation(settings: &JevSettings, session_id: &str) -> String {
+    json!([settings.effective_compaction_enabled(session_id), settings.compaction]).to_string()
+}
+
+pub fn record_compaction_skip(ctx: Arc<dyn ExtensionContext>, reason: &str, stats: Value) {
+    let session_id = ctx.session_manager().get_session_id();
+    let settings = load_settings_cached();
+    if !settings.effective_compaction_enabled(&session_id) { return; }
+    let capture = pi_jev::scheduler::RequestContext {
+        request_id:format!("jev-{}",uuid::Uuid::new_v4()), session_id:session_id.clone(),
+        turn:bridge_for_session(&session_id).map(|core| core.turn(&session_id)).unwrap_or(0),
+        stage:"compaction".to_string(),state_fingerprint:String::new(),
+        state_schema_version:pi_jev::snapshot::STATE_SCHEMA_VERSION.to_string(),
+        prompt_version:pi_jev::hooks::PROMPT_VERSION.to_string(), mode:settings.effective_mode(&session_id).as_str().to_string(),
+        questions:Vec::new(),baselines:BTreeMap::new(),request_start_ts:pi_jev::client::utc_now_rfc3339(),
+    };
+    let records=std::path::PathBuf::from(get_agent_dir()).join("jev").join("records.jsonl");
+    pi_jev::correlate::Correlator::new(records,0.7).record_compaction(&capture,None,0,true,None,&stats,Some(reason));
+}
+
+pub struct CompactionDecision {
+    pub outcome: pi_jev::types::DecisionOutcome,
+    observer: Arc<JevObserver>,
+    boundary: pi_jev::hooks::ActiveDecideOutcome,
+    signal: Option<tokio_util::sync::CancellationToken>,
+}
+
+impl CompactionDecision {
+    pub fn can_apply(&self) -> bool {
+        self.signal.as_ref().is_none_or(|signal| !signal.is_cancelled()) && self.observer.can_apply(&self.boundary)
+    }
+
+    pub fn fallback_reason(&self) -> Option<&str> {
+        self.boundary.terminal_reason.as_deref().or_else(|| self.outcome.skips.first().map(|(_, reason)| *reason))
+    }
+
+    pub fn record_compaction(&self, mut stats: Value, fallback: Option<&str>) {
+        let Some(ctx) = &self.boundary.context else { return; };
+        let reason = if self.can_apply() { self.fallback_reason().or(fallback) } else { Some("cancelled_or_policy_changed") };
+        if self.outcome.usage.input_tokens > 0 { stats["jev_input_tokens"] = json!(self.outcome.usage.input_tokens); }
+        if self.outcome.usage.output_tokens > 0 { stats["jev_output_tokens"] = json!(self.outcome.usage.output_tokens); }
+        let attempts = self.boundary.raw.as_ref().map(|raw|raw.attempts).unwrap_or(u32::from(self.boundary.dispatched));
+        let known = self.boundary.raw.is_some() || !self.boundary.dispatched;
+        self.observer.correlator().record_compaction(ctx, self.outcome.response_model.as_deref(), attempts, known,
+            self.boundary.duration_ms, &stats, reason);
+    }
+}
+
+pub async fn decide_compaction(ctx: Arc<dyn ExtensionContext>, mut bundle: pi_jev::types::DecisionBundle,
+    signal: Option<tokio_util::sync::CancellationToken>) -> Option<CompactionDecision> {
+    let session_id = ctx.session_manager().get_session_id();
+    let settings = load_settings_cached();
+    if !settings.effective_compaction_enabled(&session_id) || signal.as_ref().is_some_and(|signal| signal.is_cancelled()) { return None; }
+    let core = bridge_for_session(&session_id)?;
+    let observer = core.observer(&session_id, ctx.ui())?;
+    let captured_generation = bundle.state.as_object_mut().and_then(|state| state.remove("_jev_policy_generation"))
+        .and_then(|value| value.as_str().map(str::to_string))?;
+    let payload = json!({"session_id":session_id, "turn":core.turn(&session_id), "state":bundle.state,
+        "compaction_enabled":true, "policy_generation":captured_generation});
+    let questions = bundle.questions.into_iter().map(|(question_id, spec)| pi_jev::evaluators::PreparedQuestion { question_id, spec }).collect();
+    let call = observer.decide_independent(&payload, "compaction", questions);
+    let boundary = if let Some(signal) = &signal {
+        tokio::select! { biased; _ = signal.cancelled() => return None, result = call => result }
+    } else { call.await };
+    let outcome = boundary.raw.clone().unwrap_or_else(|| pi_jev::types::DecisionOutcome::skipped_all("unavailable"));
+    Some(CompactionDecision { outcome, observer, boundary, signal })
+}
+
+async fn relevance_decision(ctx: &Arc<dyn ExtensionContext>, prepared: &crate::core::jev_retrieval::PreparedRelevance, settings: &JevSettings)
+    -> Option<(Arc<JevObserver>, pi_jev::hooks::ActiveDecideOutcome, Vec<usize>)> {
+    let session_id = ctx.session_manager().get_session_id();
+    let mode = settings.effective_mode(&session_id);
+    let core = bridge_for_session(&session_id)?;
+    let observer = core.observer(&session_id, ctx.ui())?;
+    let payload = json!({"session_id":session_id, "turn":core.turn(&session_id), "state":prepared.state,
+        "baseline_action":prepared.action_metadata(&[]),
+        "compaction_enabled":settings.effective_compaction_enabled(&session_id),
+        "policy_generation":decision_policy_generation(settings, &session_id)});
+    let questions = prepared.questions();
+    if questions.is_empty() { return None; }
+    if !mode.allows_active() {
+        if mode.allows_compare() { observer.observe_prepared(&payload, "retrieval", questions); }
+        return None;
+    }
+    let mut policy = activation_policy(settings.effective_features(&session_id));
+    policy.min_confidence = settings.filtering.min_confidence;
+    policy.max_decision_age = Duration::from_millis(settings.filtering.max_decision_age_ms);
+    let call = observer.decide_prepared(&payload, "retrieval", questions, &policy);
+    let outcome = if let Some(signal) = ctx.signal() {
+        tokio::select! { biased;
+            _ = signal.cancelled() => { observer.cancel_decisions(&session_id); return None; },
+            outcome = call => outcome,
+        }
+    } else { call.await };
+    let removals = if observer.can_apply(&outcome) && core.turn(&session_id) == outcome.turn {
+        prepared.removals(&outcome.decisions, outcome.request_id.as_deref().unwrap_or(""), outcome.turn)
+    } else { Vec::new() };
+    Some((observer, outcome, removals))
+}
+
+fn relevance_effects(prepared: &crate::core::jev_retrieval::PreparedRelevance, removals: &[usize]) -> BTreeMap<String, Vec<pi_jev::active::AppliedEffect>> {
+    prepared.candidate_indices.iter().enumerate().filter(|(_, index)| removals.contains(index)).map(|(ordinal, _)| {
+        let id = format!("{}.{}", prepared.category.as_str(), ordinal);
+        (id.clone(), vec![pi_jev::active::AppliedEffect::new(id, Some("included".to_string()), Some("omitted_for_request".to_string()))])
+    }).collect()
+}
+
+pub async fn filter_memory_candidates(ctx: Arc<dyn ExtensionContext>, query: &str, hits: Vec<MemoryHit>) -> Vec<MemoryHit> {
+    let session_id = ctx.session_manager().get_session_id();
+    let settings = load_settings_cached();
+    if !settings.effective_mode(&session_id).is_enabled() || !settings.effective_features(&session_id).memory_relevance { return hits; }
+    let mut prepared = crate::core::jev_retrieval::prepare_memory(&hits, query);
+    prepared.configure(&settings.filtering);
+    let Some((observer, outcome, mut removals)) = relevance_decision(&ctx, &prepared, &settings).await else { return hits; };
+    if !observer.can_apply(&outcome) { removals.clear(); }
+    let effects = relevance_effects(&prepared, &removals);
+    observer.record_active_with_action(&outcome, &effects, &prepared.action_metadata(&removals));
+    crate::core::jev_retrieval::apply_memory(hits, &removals)
+}
+
+pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages: Vec<Value>) -> Vec<Value> {
+    let session_id = ctx.session_manager().get_session_id();
+    let settings = load_settings_cached();
+    if !settings.effective_mode(&session_id).is_enabled() || !settings.effective_features(&session_id).context_relevance { return messages; }
+    let mut prepared = crate::core::jev_retrieval::prepare_context(&messages);
+    prepared.configure(&settings.filtering);
+    let Some((observer, outcome, mut removals)) = relevance_decision(&ctx, &prepared, &settings).await else { return messages; };
+    if !observer.can_apply(&outcome) { removals.clear(); }
+    let effects = relevance_effects(&prepared, &removals);
+    observer.record_active_with_action(&outcome, &effects, &prepared.action_metadata(&removals));
+    crate::core::jev_retrieval::apply_context(messages, &removals)
+}
+
+fn observed_failure_kind(message: &Value) -> Option<pi_jev::observation::RetryFailureKind> {
+    use pi_jev::observation::RetryFailureKind;
+    for diagnostic in message.get("diagnostics")?.as_array()?.iter().take(32) {
+        match diagnostic.get("type").and_then(Value::as_str) {
+            Some("agent_lifecycle_failure") => return Some(RetryFailureKind::Fatal),
+            Some("provider_stream_failure") => {
+                let kind = diagnostic.get("details").and_then(|details| details.get("kind")).and_then(Value::as_str).unwrap_or("");
+                return Some(RetryFailureKind::from_provider_kind(kind));
+            }
+            _ => {}
+        }
+    }
+    None
+}
+
+fn activation_policy(features: pi_jev::config::JevFeatures) -> pi_jev::active::ActivationPolicy {
+    use pi_jev::types::DecisionCategory;
+    let enabled_categories = [
+        (features.tool_requirement, DecisionCategory::ToolRequirement),
+        (features.complexity, DecisionCategory::Complexity),
+        (features.tool_candidates, DecisionCategory::ToolCandidates),
+        (features.context_relevance, DecisionCategory::ContextRelevance),
+        (features.memory_relevance, DecisionCategory::MemoryRelevance),
+    ].into_iter().filter_map(|(enabled, category)| enabled.then_some(category)).collect();
+    pi_jev::active::ActivationPolicy { enabled_categories, ..Default::default() }
+}
+
+fn request_action(params: &Value) -> BTreeMap<String, String> {
+    let mut result = BTreeMap::new();
+    if let Some(tools) = params.get("tools").and_then(Value::as_array) { result.insert("tools".to_string(), format!("count:{}", tools.len())); }
+    if let Some(effort) = params.get("reasoning_effort").and_then(Value::as_str) {
+        if crate::core::jev_active::REASONING_LADDER.contains(&effort) { result.insert("reasoning_effort".to_string(), effort.to_string()); }
+    }
+    if params.get("tool_choice").is_some() { result.insert("tool_choice".to_string(), "present".to_string()); }
+    result
+}
+
+fn bridge_for_session(session_id: &str) -> Option<Arc<JevBridgeCore>> {
+    let cores: Vec<_> = live_bridges().lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(Weak::upgrade).collect();
+    cores.iter().find(|core| core.sessions.lock().unwrap_or_else(|p| p.into_inner()).contains_key(session_id)).cloned()
+}
+
 /// Bounded state for one Active decision boundary at the provider edge.
 ///
 /// Reuses the same field names the Compare path sends at `turn_start`, so both
@@ -823,6 +1117,7 @@ fn active_request_state(
     ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>,
     session_id: &str,
     params: &Value,
+    settings: &JevSettings,
 ) -> Value {
     let advertised = advertised_tool_names(params);
     let observed = if advertised.is_empty() {
@@ -835,7 +1130,12 @@ fn active_request_state(
         "session_id": session_id,
         "turn": core.turn(session_id),
         "model": model_id,
+        "baseline_action": request_action(params),
+        "compaction_enabled": settings.effective_compaction_enabled(session_id),
+        "policy_generation": decision_policy_generation(settings, session_id),
         "state": {
+            "features": settings.effective_features(session_id),
+            "observation": core.observation(session_id),
             "user_text_excerpt": core.task_excerpt(session_id),
             "observed_tools": observed,
             "message_count": ctx.session_manager().get_entry_count(),
@@ -894,7 +1194,7 @@ fn bridge_event(
     // records an explicit `no_model_allowlist` skip instead of inventing
     // candidates. The selected model id is still observed for the record.
     let allowlist: Vec<String> = Vec::new();
-    match event {
+    let mut result = match event {
         ExtensionEvent::SessionStart(_) => Some((
             "session_start".to_string(),
             json!({ "session_id": session_id, "reason": "startup" }),
@@ -987,6 +1287,11 @@ fn bridge_event(
                 },
             }),
         )),
+        ExtensionEvent::TurnEnd(payload) => Some(("turn_end".to_string(), json!({
+            "session_id": session_id, "turn": payload.turn_index as u64, "model": model_id,
+            "state": { "result_excerpt": bounded_assistant_excerpt(&payload.message),
+                "user_text_excerpt": core.task_excerpt(session_id), "model_allowlist": allowlist },
+        }))),
         ExtensionEvent::AgentEnd(payload) => {
             // Bounded result summary: stop reason + excerpt of the last
             // assistant text; never full transcripts.
@@ -999,6 +1304,7 @@ fn bridge_event(
                     "model": model_id,
                     "state": {
                         "result_excerpt": summary.result_excerpt,
+                        "user_text_excerpt": core.task_excerpt(session_id),
                         "stop_reason": summary.stop_reason,
                         "message_count": message_count,
                         "model_allowlist": allowlist,
@@ -1014,7 +1320,16 @@ fn bridge_event(
             }),
         )),
         _ => None,
+    };
+    if let Some((_, payload)) = result.as_mut() {
+        let settings = load_settings_cached();
+        payload["compaction_enabled"] = json!(settings.effective_compaction_enabled(session_id));
+        if let Some(state) = payload.get_mut("state").and_then(Value::as_object_mut) {
+            state.insert("features".to_string(), json!(settings.effective_features(session_id)));
+            state.insert("observation".to_string(), json!(core.observation(session_id)));
+        }
     }
+    result
 }
 
 /// Observation state for one tool call.
@@ -1256,6 +1571,7 @@ mod no_subagent_control_tests {
             pi_jev::config::PersistedSessionMode {
                 mode: Some(JevMode::Active),
                 inherited_from: None,
+                ..Default::default()
             },
         );
         assert!(settings.wants_observer());
@@ -1268,6 +1584,7 @@ mod no_subagent_control_tests {
             pi_jev::config::PersistedSessionMode {
                 mode: Some(JevMode::Off),
                 inherited_from: None,
+                ..Default::default()
             },
         );
         assert_eq!(settings.effective_mode("any-session"), JevMode::Off);
@@ -1309,6 +1626,37 @@ mod no_subagent_control_tests {
 mod observation_redaction_tests {
     use super::*;
     use serde_json::json;
+
+    #[test]
+    fn diagnostic_observation_uses_native_shape_without_error_text() {
+        use pi_jev::observation::RetryFailureKind;
+        let message=json!({"role":"assistant","stopReason":"error","errorMessage":"secret raw provider error",
+            "diagnostics":[{"type":"provider_stream_failure","details":{"kind":"rate_limit","body":"do not copy"}}]});
+        assert_eq!(observed_failure_kind(&message),Some(RetryFailureKind::RateLimited));
+        let lifecycle=json!({"diagnostics":[{"type":"agent_lifecycle_failure","details":{"kind":"do not infer transient"}}]});
+        assert_eq!(observed_failure_kind(&lifecycle),Some(RetryFailureKind::Fatal));
+        assert_eq!(observed_failure_kind(&json!({"errorKind":"rate_limit"})),None);
+        let mut many=vec![json!({"type":"other"});32];
+        many.push(json!({"type":"provider_stream_failure","details":{"kind":"rate_limit"}}));
+        assert_eq!(observed_failure_kind(&json!({"diagnostics":many})),None);
+    }
+
+    #[test]
+    fn session_ownership_never_falls_back_to_an_unrelated_bridge() {
+        let first=Arc::new(JevBridgeCore::new(JevSettings::default()));
+        let second=Arc::new(JevBridgeCore::new(JevSettings::default()));
+        first.own_session("ownership-first-unique");
+        second.own_session("ownership-second-unique");
+        {
+            let mut bridges=live_bridges().lock().unwrap();
+            bridges.push(Arc::downgrade(&first)); bridges.push(Arc::downgrade(&second));
+        }
+        assert!(Arc::ptr_eq(&bridge_for_session("ownership-first-unique").unwrap(),&first));
+        assert!(Arc::ptr_eq(&bridge_for_session("ownership-second-unique").unwrap(),&second));
+        first.forget_session("ownership-first-unique");
+        assert!(bridge_for_session("ownership-first-unique").is_none());
+        assert!(bridge_for_session("never-registered-unique").is_none());
+    }
 
     /// Fixtures used across these tests: values that must never reach a
     /// SystemOne request built from a shadow observation.

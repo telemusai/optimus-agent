@@ -38,7 +38,7 @@ use super::jev_footer::JevFooterSnapshot;
 use super::jev_key_input::JevKeyInputComponent;
 use super::jev_menu::{
     clear_secret, is_on_shorthand, is_submit_key, jev_usage, mode_change_message,
-    parse_jev_request, render_help, render_status, CredentialStatus, JevMenuAction,
+    parse_jev_request, render_compaction_settings, render_help, render_status, require_feature_support, CredentialStatus, JevMenuAction,
     JevModeBridge, JevRequest, JevSecret, JevStatusReport, KeyInputState,
     JEV_BOUNDARY_NOTICE, JEV_ON_COMPARE_NOTICE,
 };
@@ -226,11 +226,15 @@ pub(super) async fn status_panel(
     let payload = tokio::time::timeout(std::time::Duration::from_secs(2), connection.get_jev_status())
         .await.ok().and_then(Result::ok).flatten();
     let snapshot = payload.as_ref().and_then(|value| value.get("pipeline")).filter(|value| value.is_object());
-    render_status(&JevStatusReport::local_only(
+    let mut text = render_status(&JevStatusReport::local_only(
         settings.effective_mode(session_id),
         settings.effective_mode_with_scope(session_id).scope,
         credential,
-    ).with_snapshot(snapshot))
+    ).with_settings(settings, session_id).with_snapshot(snapshot));
+    if !connection.supports_jev_features() {
+        text.push_str("\nAttached worker lacks Jev System One capability; new feature settings are local configuration only.\n");
+    }
+    text
 }
 
 /// Run `/jev`.
@@ -260,7 +264,7 @@ pub(super) async fn run(
         // Every mode is a real mode, so `active` takes the same write path as Off
         // and Compare and simply reports what was written.
         JevRequest::SetMode(mode) => {
-            let change = bridge.set_session_mode(&session_id, mode)?;
+            let change = bridge.set_session_mode_supported(&session_id, mode, connection.supports_jev_features())?;
             crate::core::jev_bridge::invalidate_settings_cache();
             // A mode change must take effect immediately: the footer is republished
             // in the same turn as the write, so nothing can render the old state.
@@ -276,6 +280,39 @@ pub(super) async fn run(
                 )));
             }
             Ok(CommandOutput::Status(message))
+        }
+        JevRequest::SetDefaultMode(mode) => {
+            let change = bridge.set_global_default_supported(mode, connection.supports_jev_features())?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            publish_footer(send, bridge.effective_mode(&session_id), credential);
+            Ok(CommandOutput::Status(mode_change_message(&change)))
+        }
+        JevRequest::SetFeature(feature, enabled) => {
+            require_feature_support(connection.supports_jev_features())?;
+            bridge.set_feature(&session_id, feature, enabled)?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            Ok(CommandOutput::Status(format!("Jev feature {}: {} (this chat). Mode and compaction are unchanged.",
+                feature.as_str(), if enabled { "on" } else { "off" })))
+        }
+        JevRequest::SetCompaction(enabled) => {
+            require_feature_support(connection.supports_jev_features())?;
+            bridge.set_compaction(&session_id, enabled)?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), &session_id)))
+        }
+        JevRequest::SetDefaultCompaction(enabled) => {
+            require_feature_support(connection.supports_jev_features())?;
+            bridge.set_default_compaction(enabled)?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            Ok(CommandOutput::Status(format!("Jev compaction default: {} (sessions without a compaction override).\n{}",
+                if enabled { "on" } else { "off" }, render_compaction_settings(&bridge.settings(), &session_id))))
+        }
+        JevRequest::CompactionStatus => {
+            let mut text = render_compaction_settings(&bridge.settings(), &session_id);
+            if !connection.supports_jev_features() {
+                text.push_str("Attached worker lacks Jev System One capability; this is local configuration only.\n");
+            }
+            Ok(CommandOutput::Panel(text))
         }
         JevRequest::Status => {
             let settings = bridge.settings();
@@ -327,11 +364,18 @@ async fn menu_dialog(
                 return Ok(CommandOutput::Status("Jev: cancelled".to_string()));
             }
             JevMenuAction::SetMode(mode) => {
-                let change = bridge.set_session_mode(session_id, mode)?;
+                let change = bridge.set_session_mode_supported(session_id, mode, connection.supports_jev_features())?;
                 crate::core::jev_bridge::invalidate_settings_cache();
                 publish_footer(send, bridge.effective_mode(session_id), credential);
                 let _ = send.send(HostEvent::CloseCommandDialog);
                 return Ok(CommandOutput::Status(mode_change_message(&change)));
+            }
+            JevMenuAction::SetCompaction(enabled) => {
+                require_feature_support(connection.supports_jev_features())?;
+                bridge.set_compaction(session_id, enabled)?;
+                crate::core::jev_bridge::invalidate_settings_cache();
+                let _ = send.send(HostEvent::CloseCommandDialog);
+                return Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), session_id)));
             }
             JevMenuAction::ShowStatus => {
                 let _ = send.send(HostEvent::CloseCommandDialog);

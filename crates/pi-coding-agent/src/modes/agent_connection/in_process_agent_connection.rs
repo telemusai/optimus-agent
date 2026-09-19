@@ -377,6 +377,10 @@ impl AgentConnection for InProcessAgentConnection {
         Box::pin(async move { Ok(state) })
     }
 
+    fn supports_jev_features(&self) -> bool {
+        true
+    }
+
     fn get_jev_status(&self) -> BoxFuture<Result<Option<Value>, String>> {
         // The header supplies canonical identity without cloning transcript or
         // provider state. A missing observation remains unknown, never zero.

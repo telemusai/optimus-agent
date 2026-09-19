@@ -1172,10 +1172,10 @@ fn mode_parsing_keeps_on_as_compare_and_active_explicit() {
     assert!(!JevMode::Active.allows_compare());
     assert!(JevMode::Compare
         .description()
-        .contains("do not change"));
+        .contains("Nothing is applied"));
     assert!(JevMode::Active
         .description()
-        .contains("applied to the next provider request"));
+        .contains("feature-gated decisions"));
     assert!(!JevMode::Active.description().contains("reserved"));
 }
 
@@ -1924,13 +1924,13 @@ fn bundle_helpers_map_question_ids_to_categories_and_keep_every_category_enabled
         DecisionCategory::ResultSufficiency
     );
     let enabled = pi_jev::compare_default_categories();
-    assert_eq!(enabled.len(), 11, "all eleven categories are enabled in Compare");
+    assert_eq!(enabled.len(), 13, "category switches include the opt-in observers");
     assert!(enabled.values().all(|value| *value));
     let request = bundle.to_request();
     let ids = bundle.enabled_question_ids(&enabled);
     assert_eq!(ids.len(), 3);
     assert!(ids.iter().all(|id| request.questions.contains_key(id)));
-    assert_eq!(DecisionCategory::all().len(), 11);
+    assert_eq!(DecisionCategory::all().len(), 13);
     assert_eq!(DecisionCategory::Complexity.question_id(2), "complexity.2");
     assert_eq!(DecisionCategory::parse("task_classification"), Some(DecisionCategory::TaskClassification));
 }

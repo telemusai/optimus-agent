@@ -1341,6 +1341,11 @@ pub trait AgentConnection: Send + Sync {
     ) -> Box<dyn Fn() + Send + Sync>;
 
     fn get_state(&self) -> pi_ai::types::BoxFuture<Result<AgentConnectionState, String>>;
+    /// Whether the current execution host understands expanded Jev settings.
+    /// Local settings writes must check this too, not only daemon RPCs.
+    fn supports_jev_features(&self) -> bool {
+        false
+    }
     /// Read-only Jev observations for this session. `None` means unsupported;
     /// `Some({"pipeline": null})` means supported but no observations yet.
     fn get_jev_status(&self) -> pi_ai::types::BoxFuture<Result<Option<Value>, String>> {

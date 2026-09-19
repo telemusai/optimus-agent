@@ -6,7 +6,7 @@
 //! size/time retention strictly confined to Jev's own files.
 
 use std::collections::BTreeMap;
-use std::io::Write;
+use std::io::{Read, Seek, SeekFrom, Write};
 use std::path::{Path, PathBuf};
 use std::sync::Mutex;
 
@@ -83,6 +83,9 @@ pub struct CorrelationRecord {
     pub schema_version: String,
     pub request_id: String,
     pub attempt: u32,
+    /// False when cancellation left only a logical dispatch count, not exact transport attempts.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_count_known: Option<bool>,
     /// Opaque local session id.
     pub session_id: String,
     pub turn: u64,
@@ -92,7 +95,7 @@ pub struct CorrelationRecord {
     pub category: String,
     pub question_id: String,
     pub prompt_version: String,
-    /// `compare` or `active`; no record is written in Off.
+    /// Captured decision mode. Independent compaction may run with decisions Off.
     pub mode: String,
     /// True only when this record describes an answer that was applied to an
     /// outgoing provider request. Every Compare record is false.
@@ -119,6 +122,19 @@ pub struct CorrelationRecord {
     /// and empty for a refused answer.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub applied_effects: Vec<crate::active::AppliedEffect>,
+    /// Bounded host configuration captured before the decision, not a semantic answer.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub baseline_action: BTreeMap<String, String>,
+    /// Configuration after the host applied the accepted decision.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub actual_action: BTreeMap<String, String>,
+    /// Application outcome only. This never claims downstream task success.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub outcome: Option<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_enabled: Option<bool>,
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub observed_metrics: BTreeMap<String, u64>,
 }
 
 /// Everything an Active record row needs that is shared across rows of one
@@ -133,6 +149,14 @@ pub struct ActiveRecordContext {
     pub duration_ms: Option<u64>,
     pub state_fingerprint: String,
     pub prompt_version: String,
+    pub mode: String,
+    pub request_start_ts: Option<String>,
+    pub attempts: u32,
+    pub attempt_count_known: bool,
+    pub baselines: BTreeMap<String, Option<String>>,
+    pub baseline_action: BTreeMap<String, String>,
+    pub compaction_enabled: Option<bool>,
+    pub observed_metrics: BTreeMap<String, u64>,
 }
 
 /// One row of an Active decision boundary: an accepted answer with the fields
@@ -146,6 +170,9 @@ pub struct ActiveRecordRow {
     pub confidence: Option<f64>,
     pub fallback_reason: Option<String>,
     pub applied_effects: Vec<crate::active::AppliedEffect>,
+    pub skipped_reason: Option<String>,
+    pub actual_action: BTreeMap<String, String>,
+    pub outcome: String,
 }
 
 /// Retention caps for Jev-owned record files.
@@ -166,6 +193,8 @@ impl Default for RetentionPolicy {
 
 struct PendingRequest {
     ctx: crate::scheduler::RequestContext,
+    baseline_action: BTreeMap<String, String>,
+    compaction_enabled: Option<bool>,
 }
 
 /// JSONL correlator. One record line per question, written exactly once.
@@ -220,6 +249,7 @@ impl Correlator {
             schema_version: RECORD_SCHEMA_VERSION.to_string(),
             request_id: ctx.request_id.clone(),
             attempt: 0,
+            attempt_count_known: None,
             session_id: ctx.session_id.clone(),
             turn: ctx.turn,
             stage: ctx.stage.clone(),
@@ -243,6 +273,11 @@ impl Correlator {
             skipped_reason: None,
             acceptance: None,
             applied_effects: Vec::new(),
+            baseline_action: BTreeMap::new(),
+            actual_action: BTreeMap::new(),
+            outcome: None,
+            compaction_enabled: None,
+            observed_metrics: BTreeMap::new(),
         }
     }
 
@@ -250,6 +285,10 @@ impl Correlator {
     /// The pending map is bounded: the oldest unsettled request is recorded
     /// as skipped when the map grows past the cap.
     pub fn track(&self, ctx: &crate::scheduler::RequestContext) {
+        self.track_boundary(ctx, BTreeMap::new(), None);
+    }
+
+    pub fn track_boundary(&self, ctx: &crate::scheduler::RequestContext, baseline_action: BTreeMap<String, String>, compaction_enabled: Option<bool>) {
         const MAX_PENDING: usize = 256;
         let mut pending = self
             .pending
@@ -271,7 +310,7 @@ impl Correlator {
                 }
             }
         }
-        pending.insert(ctx.request_id.clone(), PendingRequest { ctx: ctx.clone() });
+        pending.insert(ctx.request_id.clone(), PendingRequest { ctx: ctx.clone(), baseline_action, compaction_enabled });
     }
 
     /// Handle a scheduler outcome. Writes each question's record exactly once
@@ -329,6 +368,9 @@ impl Correlator {
                         .map(|(_, reason)| *reason)
                         .unwrap_or("answer_missing");
                     let mut record = self.base_record(ctx);
+                    record.baseline_action = sanitize_action(&entry.baseline_action);
+                    record.compaction_enabled = entry.compaction_enabled;
+                    record.observed_metrics = usage_metrics(outcome);
                     record.category = meta.category.clone();
                     record.question_id = meta.question_id.clone();
                     record.terminal_ts = Some(terminal_ts.clone());
@@ -338,6 +380,9 @@ impl Correlator {
                 };
                 let answer = &decision.answer;
                 let mut record = self.base_record(ctx);
+                    record.baseline_action = sanitize_action(&entry.baseline_action);
+                    record.compaction_enabled = entry.compaction_enabled;
+                record.observed_metrics = usage_metrics(outcome);
                 record.category = meta.category.clone();
                 record.question_id = meta.question_id.clone();
                 record.terminal_ts = Some(terminal_ts.clone());
@@ -411,6 +456,8 @@ impl Correlator {
                 .iter()
                 .map(|meta| {
                     let mut record = self.base_record(ctx);
+                    record.baseline_action = sanitize_action(&entry.baseline_action);
+                    record.compaction_enabled = entry.compaction_enabled;
                     record.category = meta.category.clone();
                     record.question_id = meta.question_id.clone();
                     record.terminal_ts = Some(terminal_ts.clone());
@@ -448,6 +495,7 @@ impl Correlator {
             schema_version: RECORD_SCHEMA_VERSION.to_string(),
             request_id: format!("skipped-{}", uuid::Uuid::new_v4()),
             attempt: 0,
+            attempt_count_known: None,
             session_id: sanitize_text(session_id, MAX_FIELD_TEXT),
             turn,
             stage: stage.to_string(),
@@ -469,16 +517,21 @@ impl Correlator {
             hypothetical_acceptance: None,
             fallback_reason: None,
             skipped_reason: Some(sanitize_text(reason, MAX_FIELD_TEXT)),
-            acceptance: Some("fallback".to_string()),
+            acceptance: None,
             applied_effects: Vec::new(),
+            baseline_action: BTreeMap::new(),
+            actual_action: BTreeMap::new(),
+            outcome: None,
+            compaction_enabled: None,
+            observed_metrics: BTreeMap::new(),
         };
         self.write_record(&record);
     }
 
     /// Write one Active decision boundary. Returns the number of rows written.
     ///
-    /// An accepted row carries `applied: true` and the fields the host
-    /// actually changed. A refused row carries `applied: false` and the single
+    /// An accepted row carries `applied: true` only when the host changed fields.
+    /// A refused or accepted-no-effect row carries `applied: false`. The single
     /// reason that stopped it. Nothing is written when there is nothing to
     /// report: an empty boundary is not an event.
     pub fn record_active_rows(&self, ctx: &ActiveRecordContext, rows: &[ActiveRecordRow]) -> usize {
@@ -488,7 +541,8 @@ impl Correlator {
             let record = CorrelationRecord {
                 schema_version: ACTIVE_RECORD_SCHEMA_VERSION.to_string(),
                 request_id: ctx.request_id.clone(),
-                attempt: 0,
+                attempt: ctx.attempts,
+                attempt_count_known: Some(ctx.attempt_count_known),
                 session_id: sanitize_text(&ctx.session_id, MAX_FIELD_TEXT),
                 turn: ctx.turn,
                 stage: ctx.stage.clone(),
@@ -497,32 +551,64 @@ impl Correlator {
                 category: sanitize_text(&row.category, MAX_FIELD_TEXT),
                 question_id: sanitize_text(&row.question_id, MAX_FIELD_TEXT),
                 prompt_version: ctx.prompt_version.clone(),
-                mode: "active".to_string(),
-                applied: row.accepted,
-                request_start_ts: None,
+                mode: ctx.mode.clone(),
+                applied: row.accepted && !row.applied_effects.is_empty(),
+                request_start_ts: ctx.request_start_ts.clone(),
                 terminal_ts: Some(terminal_ts.clone()),
                 duration_ms: ctx.duration_ms,
-                response_model: ctx.response_model.clone(),
+                response_model: ctx.response_model.as_deref().map(|value| sanitize_text(value, MAX_FIELD_TEXT)),
                 confidence: row.confidence,
                 selected_value: row
                     .selected_value
                     .as_deref()
                     .map(|value| sanitize_text(value, MAX_FIELD_TEXT)),
-                baseline_actual_choice: None,
-                agreement: None,
+                baseline_actual_choice: ctx.baselines.get(&row.question_id).cloned().flatten()
+                    .map(|value| sanitize_text(&value, MAX_FIELD_TEXT)),
+                agreement: Some(classify_agreement(row.selected_value.as_deref(),
+                    ctx.baselines.get(&row.question_id).and_then(|value| value.as_deref())).as_str().to_string()),
                 hypothetical_acceptance: None,
                 fallback_reason: row
                     .fallback_reason
                     .as_deref()
                     .map(|reason| sanitize_text(reason, MAX_FIELD_TEXT)),
-                skipped_reason: None,
+                skipped_reason: row.skipped_reason.clone(),
                 acceptance: Some(if row.accepted { "accepted".to_string() } else { "fallback".to_string() }),
-                applied_effects: if row.accepted { row.applied_effects.clone() } else { Vec::new() },
+                applied_effects: if row.accepted { row.applied_effects.iter().map(|effect| crate::active::AppliedEffect::new(
+                    sanitize_text(&effect.field, 64),
+                    effect.from.as_deref().map(sanitize_metadata),
+                    effect.to.as_deref().map(sanitize_metadata),
+                )).collect() } else { Vec::new() },
+                baseline_action: sanitize_action(&ctx.baseline_action),
+                actual_action: sanitize_action(&row.actual_action),
+                outcome: Some(sanitize_text(&row.outcome, MAX_FIELD_TEXT)),
+                compaction_enabled: ctx.compaction_enabled,
+                observed_metrics: ctx.observed_metrics.clone(),
             };
             self.write_record(&record);
             written += 1;
         }
         written
+    }
+
+    /// Independent compaction audit. Statistics are local counts, never content.
+    pub fn record_compaction(&self, ctx: &crate::scheduler::RequestContext, response_model: Option<&str>, attempts: u32, attempts_known: bool, duration_ms: Option<u64>, stats: &serde_json::Value, fallback: Option<&str>) {
+        let mut record = self.base_record(ctx);
+        record.schema_version = "jev.compaction/1".to_string();
+        record.category = "compaction".to_string();
+        record.question_id = "compaction.audit".to_string();
+        record.compaction_enabled = Some(true);
+        record.attempt = attempts;
+        record.attempt_count_known = Some(attempts_known);
+        record.response_model = response_model.map(|model| sanitize_text(model, MAX_FIELD_TEXT));
+        record.duration_ms = duration_ms;
+        record.terminal_ts = Some(Self::now_rfc3339());
+        record.applied = fallback.is_none() && stats.get("applied").and_then(serde_json::Value::as_bool) == Some(true);
+        record.outcome = Some(if record.applied { "applied" } else if fallback.is_some() { "fallback" } else { "no_effect" }.to_string());
+        record.fallback_reason = fallback.map(|reason| sanitize_text(reason, MAX_FIELD_TEXT));
+        record.observed_metrics = stats.as_object().map(|values| values.iter().take(32)
+            .filter_map(|(key, value)| value.as_u64().map(|count| (sanitize_text(key, 64), count))).collect()).unwrap_or_default();
+        record.observed_metrics.insert("question_count".to_string(), ctx.questions.len() as u64);
+        self.write_record(&record);
     }
 
     fn write_record(&self, record: &CorrelationRecord) {
@@ -592,12 +678,29 @@ impl Correlator {
     }
 }
 
+pub(crate) fn usage_metrics(outcome: &crate::types::DecisionOutcome) -> BTreeMap<String, u64> {
+    let mut metrics = BTreeMap::new();
+    // Absent wire usage defaults to zero; only nonzero measurements are known.
+    if outcome.usage.input_tokens > 0 { metrics.insert("jev_input_tokens".into(), outcome.usage.input_tokens); }
+    if outcome.usage.output_tokens > 0 { metrics.insert("jev_output_tokens".into(), outcome.usage.output_tokens); }
+    metrics
+}
+
 fn entries_collect(entries: std::fs::ReadDir) -> Vec<std::fs::DirEntry> {
     entries.filter_map(|entry| entry.ok()).collect()
 }
 
 fn entries_of(entries: &[std::fs::DirEntry]) -> &[std::fs::DirEntry] {
     entries
+}
+
+fn sanitize_metadata(value: &str) -> String {
+    sanitize_text(&crate::redact::bounded_excerpt(value, MAX_FIELD_TEXT), MAX_FIELD_TEXT)
+}
+
+fn sanitize_action(values: &BTreeMap<String, String>) -> BTreeMap<String, String> {
+    values.iter().take(16).map(|(key, value)|
+        (sanitize_text(key, 64), sanitize_metadata(value))).collect()
 }
 
 /// Truncate and strip control characters from record field values.
@@ -621,11 +724,11 @@ pub fn read_records(records_path: &Path, max_bytes: u64) -> Vec<CorrelationRecor
     };
     let file_len = meta.len();
     let skip = file_len.saturating_sub(max_bytes);
-    let Ok(bytes) = std::fs::read(records_path) else {
-        return Vec::new();
-    };
-    let slice = &bytes[skip.min(bytes.len() as u64) as usize..];
-    let text = String::from_utf8_lossy(slice);
+    let Ok(mut file) = std::fs::File::open(records_path) else { return Vec::new(); };
+    if file.seek(SeekFrom::Start(skip)).is_err() { return Vec::new(); }
+    let mut bytes = Vec::new();
+    if file.take(max_bytes).read_to_end(&mut bytes).is_err() { return Vec::new(); }
+    let text = String::from_utf8_lossy(&bytes);
     let mut start = 0usize;
     if skip > 0 {
         if let Some(pos) = text.find('\n') {

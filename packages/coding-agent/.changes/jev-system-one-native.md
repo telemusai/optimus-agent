@@ -1,0 +1,1 @@
+- Added combined Jev comparison and Active mode with bounded native feature gates, independent request-local compaction controls, and truthful status reporting.

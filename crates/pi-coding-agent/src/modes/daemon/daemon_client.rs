@@ -24,7 +24,7 @@ use uuid::Uuid;
 use crate::utils::daemon_socket_path::normalize_socket_path;
 
 use super::daemon_protocol::{
-    daemon_command_compatibility, is_daemon_mutating_command,
+    daemon_command_compatibility, daemon_jev_mode_compatibility, is_daemon_mutating_command,
     meets_daemon_command_compatibility, DaemonCommandCompatibility, DaemonCompatibilityHello, DaemonProtocolInfo,
     DaemonResponse, DaemonServerCapability, DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION, DAEMON_PROTOCOL_NAME, DAEMON_PROTOCOL_VERSION,
 };
@@ -450,6 +450,11 @@ pub(crate) fn command_compatibilities(body: &DaemonCommandBody) -> Vec<DaemonCom
     }
     if command_type == "cancel_prompt_admission" && body.get("cancelOwned") == Some(&Value::Bool(true)) {
         requirements.push(DaemonCommandCompatibility::gated(20, DaemonServerCapability::OwnedPromptCancellation));
+    }
+    if command_type == "jev_set_session_mode" {
+        if let Some(requirement) = body.get("mode").and_then(Value::as_str).and_then(daemon_jev_mode_compatibility) {
+            requirements.push(requirement);
+        }
     }
     requirements.push(daemon_command_compatibility(command_type));
     requirements
@@ -1508,6 +1513,10 @@ impl DaemonTransportClient for DaemonClient {
         }
     }
 }
+
+#[cfg(test)]
+#[path = "daemon_jev_compatibility_tests.rs"]
+mod jev_compatibility_tests;
 
 #[cfg(test)]
 mod tests {

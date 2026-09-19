@@ -4,6 +4,7 @@ use super::*;
 // read a profile, invoke a credential command, or contact Jev/the provider.
 struct StatusTransport {
     supported: bool,
+    features_supported: bool,
     response: Result<DaemonResponse, String>,
     requests: Mutex<Vec<(Value, Option<u64>, bool)>>,
     entered: Arc<tokio::sync::Semaphore>,
@@ -14,6 +15,7 @@ impl StatusTransport {
     fn new(supported: bool, data: Value) -> Arc<Self> {
         Arc::new(Self {
             supported,
+            features_supported: false,
             response: Ok(DaemonResponse::ok(data)),
             requests: Mutex::new(Vec::new()),
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -39,7 +41,13 @@ impl DaemonTransportClient for StatusTransport {
     }
     fn on_message(&self, _: Arc<dyn Fn(DaemonOutbound) + Send + Sync>) -> Box<dyn Fn() + Send + Sync> { Box::new(|| {}) }
     fn on_close(&self, _: Arc<dyn Fn(String) + Send + Sync>) -> Box<dyn Fn() + Send + Sync> { Box::new(|| {}) }
-    fn supports_server_capability(&self, capability: &str) -> bool { self.supported && capability == "jev_control" }
+    fn supports_server_capability(&self, capability: &str) -> bool {
+        match capability {
+            "jev_control" => self.supported,
+            "jev_features" => self.features_supported,
+            _ => false,
+        }
+    }
     fn hello_socket_path(&self) -> Option<String> { None }
     fn is_connected(&self) -> bool { true }
     fn enable_request_recovery(&self) {}
@@ -105,4 +113,15 @@ async fn jev_status_discards_reply_if_active_session_changed_during_request() {
     release.add_permits(1);
     let result = tokio::time::timeout(Duration::from_secs(1), request).await.unwrap().unwrap();
     assert_eq!(result.unwrap_err(), "Session changed while reading Jev status");
+}
+
+#[test]
+fn jev_feature_settings_gate_uses_the_execution_host_capability_without_requests() {
+    for (legacy_supported, features_supported) in [(false, false), (true, false), (true, true)] {
+        let mut transport = StatusTransport::new(legacy_supported, Value::Null);
+        Arc::get_mut(&mut transport).unwrap().features_supported = features_supported;
+        let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
+        assert_eq!(connection.supports_jev_features(), features_supported);
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
 }

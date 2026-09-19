@@ -178,7 +178,7 @@ fn turn_payload(session_id: &str) -> Value {
 #[test]
 fn all_eleven_categories_produce_questions() {
     let evaluators = all_evaluators();
-    assert_eq!(evaluators.len(), 11);
+    assert_eq!(evaluators.len(), 13, "legacy categories plus two opt-in observers");
 
     let ts = turn_start_snapshot();
     let mut produced: Vec<String> = Vec::new();
@@ -929,6 +929,7 @@ fn active_mode_is_operative_and_never_silently_rewritten() {
             pi_jev::config::PersistedSessionMode {
                 mode: Some(JevMode::Active),
                 inherited_from: None,
+                ..Default::default()
             },
         )]),
         ..JevSettings::default()

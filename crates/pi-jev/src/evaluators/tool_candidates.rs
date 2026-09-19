@@ -25,6 +25,13 @@ impl super::CategoryEvaluator for ToolCandidates {
         let view = StateView::new(snapshot);
         match snapshot.stage {
             crate::snapshot::SnapshotStage::TurnStart => {
+                if let Some(questions) = crate::filtering::candidate_questions(&snapshot.state, self.category(), "optional_tools") {
+                    return if questions.is_empty() {
+                        EvaluatorOutput::Skipped("no_eligible_candidates".to_string())
+                    } else {
+                        EvaluatorOutput::Questions(questions)
+                    };
+                }
                 let candidates = view.str_array("observed_tools");
                 if candidates.is_empty() {
                     return EvaluatorOutput::Skipped("no_tool_catalog_observed".to_string());
@@ -62,7 +69,7 @@ impl super::CategoryEvaluator for ToolCandidates {
                     },
                 }])
             }
-            crate::snapshot::SnapshotStage::AgentEnd | crate::snapshot::SnapshotStage::ModelSelect => {
+            crate::snapshot::SnapshotStage::AgentEnd | crate::snapshot::SnapshotStage::ModelSelect | crate::snapshot::SnapshotStage::TurnEnd => {
                 EvaluatorOutput::Skipped("stage_not_supported".to_string())
             }
         }

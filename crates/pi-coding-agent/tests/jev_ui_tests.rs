@@ -40,7 +40,7 @@ use jev_ui::{
 };
 use pi_jev::config::{
     resolve_credential_source, resolve_effective_mode, CredentialSource, EnvKeyPresence,
-    JevSettings, ModeScope,
+    JevFeature, JevSettings, ModeScope,
 };
 use pi_jev::config::DEFAULT_KEY_ID;
 use pi_jev::credential::{CredentialStore, InMemoryCredentialStore};
@@ -198,20 +198,10 @@ fn jev_on_writes_compare_and_active_writes_a_real_active_mode() {
         );
         assert!(!JEV_ACTIVE_NOTICE.contains(&forbidden), "{JEV_ACTIVE_NOTICE}");
     }
-    // The exact Active notice the brief fixes.
-    assert_eq!(
-        JEV_ACTIVE_NOTICE,
-        "Jev Active: an accepted answer is applied to the next provider request. \
-The tool catalog is withdrawn for a request whose task needs no tools, and an already-set reasoning effort may move \
-one step. A refused answer, failure or timeout leaves the request unchanged."
-    );
-    // The permanent boundary is the frozen wording, and it no longer names the
-    // two request fields Active may touch.
-    assert_eq!(
-        JEV_BOUNDARY_NOTICE,
-        "Jev never controls the primary model, provider, permissions, context, memory, compaction, \
-continuation, subagents, agent messages, depth, concurrency or budgets."
-    );
+    assert!(JEV_ACTIVE_NOTICE.contains("feature-gated decisions"));
+    assert!(JEV_ACTIVE_NOTICE.contains("failure or timeout keeps the baseline unchanged"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("never deletes durable memory or transcript history"));
+    assert!(JEV_BOUNDARY_NOTICE.contains("Compaction is request-local and separately controlled"));
 
     let dir = temp_agent_dir("mode-writes");
     let bridge = bridge_over(&dir);
@@ -442,14 +432,17 @@ fn help_and_key_clear_are_parsed_and_report_truthfully() {
 }
 
 #[test]
-fn the_menu_has_the_five_required_rows_and_selects_the_current_mode() {
-    assert_eq!(JevMenuRow::ALL.len(), 5);
+fn the_menu_exposes_modes_and_independent_compaction() {
+    assert_eq!(JevMenuRow::ALL.len(), 8);
     let titles: Vec<String> = JevMenuRow::ALL.iter().map(|row| row.title(JevMode::Off)).collect();
     assert!(titles[0].starts_with("Off"));
     assert!(titles[1].starts_with("Compare"));
     assert_eq!(titles[2], "Active");
-    assert!(titles[3].starts_with("Input API key"));
-    assert!(titles[4].starts_with("Status"));
+    assert_eq!(titles[3], "Compare + Active");
+    assert_eq!(titles[4], "Compaction on");
+    assert_eq!(titles[5], "Compaction off");
+    assert!(titles[6].starts_with("Input API key"));
+    assert!(titles[7].starts_with("Status"));
     // The Active row is a real mode row: no label may call it inert.
     for title in &titles {
         for forbidden in [inert_wording(), DISABLED_WORD.to_string()] {
@@ -479,7 +472,7 @@ fn the_menu_has_the_five_required_rows_and_selects_the_current_mode() {
 }
 
 #[test]
-fn the_menu_asks_for_exactly_the_five_actions_and_active_reports_a_mode_write() {
+fn the_menu_actions_preserve_mode_writes_and_navigation() {
     let mut state = JevMenuState::new(JevMode::Off);
 
     state.selected = 0;
@@ -505,10 +498,10 @@ fn the_menu_asks_for_exactly_the_five_actions_and_active_reports_a_mode_write() 
     assert_eq!(state.active_mode, JevMode::Compare);
 
     let mut state = JevMenuState::new(JevMode::Off);
-    state.selected = 3;
+    state.selected = 6;
     assert_eq!(state.accept(), JevMenuAction::InputKey);
     let mut state = JevMenuState::new(JevMode::Off);
-    state.selected = 4;
+    state.selected = 7;
     assert_eq!(state.accept(), JevMenuAction::ShowStatus);
 
     // Navigation is bounded and never wraps past the ends.
@@ -516,7 +509,7 @@ fn the_menu_asks_for_exactly_the_five_actions_and_active_reports_a_mode_write() 
     for _ in 0..10 {
         state.move_down();
     }
-    assert_eq!(state.selected, 4);
+    assert_eq!(state.selected, 7);
     for _ in 0..10 {
         state.move_up();
     }
@@ -1058,7 +1051,7 @@ fn the_active_mode_is_labelled_and_described_everywhere_it_can_appear() {
 
     // Help text states Active as operative and keeps the no-control boundary.
     let help = jev_ui::render_help();
-    assert!(help.contains("Active         Operative."), "{help}");
+    assert!(help.contains("Active              Accepted, feature-gated native effects."), "{help}");
     assert!(help.contains(JEV_ACTIVE_NOTICE), "{help}");
     assert!(help.contains(JEV_ON_COMPARE_NOTICE), "{help}");
     assert!(help.contains(JEV_BOUNDARY_NOTICE), "{help}");
@@ -1099,7 +1092,7 @@ fn jev_status_shows_real_active_counters_when_the_worker_reported_them() {
     assert!(text.contains("Decisions applied: 3"), "{text}");
     assert!(text.contains("Active boundaries: 3 applied, 1 accepted with no effect, 2 refused, 1 without a usable answer"), "{text}");
     assert!(text.contains("Active last: tool_requirement (confidence_below_threshold)"), "{text}");
-    assert!(text.contains("active (an accepted answer changes at most one request field)"), "{text}");
+    assert!(text.contains("active (accepted decisions remain feature-gated and bounded)"), "{text}");
     // An Active-only snapshot has no scheduler counters, so they must stay UNKNOWN
     // rather than being rendered as invented zeroes.
     assert!(text.contains("Counters: unknown"), "{text}");
@@ -1187,11 +1180,10 @@ fn negative_regression_adversarial_arguments_only_ever_reach_a_plain_mode_write(
     assert!(!JevMode::Active.allows_compare());
 }
 
-/// The settings model has no field able to carry a model, an effort, a tool, a
-/// subagent or a budget. This is the structural half of the section 11/12 boundary:
-/// a future field would fail this test instead of silently gaining reach.
+/// Settings allow explicit bounded policies, not arbitrary model, permission,
+/// subagent or budget control fields.
 #[test]
-fn negative_regression_settings_cannot_carry_model_or_subagent_control() {
+fn negative_regression_settings_only_expose_bounded_policy_not_model_or_subagent_control() {
     let settings = JevSettings {
         global_default: Some(JevMode::Compare),
         ..JevSettings::default()
@@ -1203,13 +1195,17 @@ fn negative_regression_settings_cannot_carry_model_or_subagent_control() {
     assert_eq!(
         sorted,
         vec![
+            "compaction",
+            "compaction_enabled",
             "credential_configured",
             "disclosure_shown",
+            "features",
+            "filtering",
             "global_default",
             "schema_version",
             "sessions",
         ],
-        "the settings model must hold modes and presence metadata only"
+        "settings must expose only explicit bounded policies, modes and presence metadata"
     );
     for forbidden in [
         "model",
@@ -1234,6 +1230,7 @@ fn negative_regression_settings_cannot_carry_model_or_subagent_control() {
     let entry = serde_json::to_value(pi_jev::config::PersistedSessionMode {
         mode: Some(JevMode::Compare),
         inherited_from: None,
+        ..Default::default()
     })
     .expect("serializable");
     let mut entry_keys: Vec<&str> = entry
@@ -1350,7 +1347,7 @@ fn negative_regression_baseline_delegation_is_unchanged() {
         let calls = calls_on_a_connection(&source);
         for call in &calls {
             assert!(
-                matches!(call.as_str(), "get_state" | "get_jev_status"),
+                matches!(call.as_str(), "get_state" | "get_jev_status" | "supports_jev_features"),
                 "{file} may only READ the session (found {call})"
             );
         }
@@ -1465,7 +1462,7 @@ fn the_jev_command_is_registered_and_reachable_through_the_dispatch_chain() {
     );
     assert!(registry.contains(JEV_COMMAND_DESCRIPTION), "the description must be quoted verbatim");
     assert!(
-        registry.contains("Active (applied to the next provider request)"),
+        registry.contains("Compare + Active, compaction, feature gates"),
         "the registry must name Active as an operative mode"
     );
     for forbidden in [inert_wording(), DISABLED_WORD.to_string()] {
@@ -1550,7 +1547,7 @@ fn the_jev_surface_cannot_express_a_model_or_subagent_control_action() {
     let connection_calls = calls_on_a_connection(&host);
     assert_eq!(
         connection_calls,
-        vec!["get_jev_status".to_string(), "get_state".to_string()],
+        vec!["get_jev_status".to_string(), "get_state".to_string(), "supports_jev_features".to_string()],
         "only identity and worker telemetry reads are allowed"
     );
     assert!(host.contains("connection.get_state().await?"));
@@ -1599,7 +1596,8 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
     );
     // No version bump and no schema bump for an optional additive surface.
     assert!(protocol.contains("pub const DAEMON_PROTOCOL_VERSION: u32 = 7;"));
-    assert!(protocol.contains("pub const DAEMON_SCHEMA_REVISION: u32 = 29;"));
+    assert!(protocol.contains("pub const DAEMON_SCHEMA_REVISION: u32 = 30;"));
+    assert!(protocol.contains("JevFeatures"));
     // The getters are read-only; the setter is not.
     assert!(protocol.contains("\"jev_get_settings\",\n    \"jev_get_status\","));
     let read_only_block = protocol
@@ -1645,7 +1643,7 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
     );
     // `activeMode` is the real mode report, not a reservation marker.
     assert!(
-        daemon.contains("\"activeMode\": resolution.mode == pi_jev::types::JevMode::Active"),
+        daemon.contains("\"activeMode\": resolution.mode.allows_active()"),
         "activeMode must report the effective mode"
     );
     // The live Active counters are surfaced through the shared status snapshot.
@@ -1666,7 +1664,7 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_footer_rul
     // The metadata constants are the single source the registry quotes, so a drift
     // between `slash_commands.rs` and the menu description fails here.
     assert_eq!(JEV_COMMAND_NAME, "jev");
-    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|active|on|status|key]");
+    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|active|compare-active|on|compact|feature|default|status|key]");
     let registry = crate_file("src/core/slash_commands.rs");
     assert!(registry.contains(JEV_ARGUMENT_HINT), "the hint must be quoted verbatim");
     assert!(
@@ -1776,4 +1774,155 @@ fn the_keybinding_addition_has_no_default_key_and_keeps_the_app_order() {
         .expect("the constant");
     let list = list.split("];").next().unwrap();
     assert!(list.trim_end().ends_with("\"app.jev.cancel\","), "{list}");
+}
+
+#[test]
+fn combined_mode_and_independent_compaction_commands_round_trip() {
+    for alias in ["compare-active", "compare-and-active", "compare_and_active", "both"] {
+        assert_eq!(parse_jev_request(alias), JevRequest::SetMode(JevMode::CompareAndActive));
+    }
+    assert_eq!(parse_jev_request("on"), JevRequest::SetMode(JevMode::Compare));
+    assert_eq!(parse_jev_request("compact on"), JevRequest::SetCompaction(true));
+    assert_eq!(parse_jev_request("compaction off"), JevRequest::SetCompaction(false));
+    assert_eq!(parse_jev_request("compact status"), JevRequest::CompactionStatus);
+    assert_eq!(parse_jev_request("default compact off"), JevRequest::SetDefaultCompaction(false));
+    assert_eq!(parse_jev_request("feature tool-candidates on"), JevRequest::SetFeature(JevFeature::ToolCandidates, true));
+    for bad in ["compact on; active", "feature model on", "feature tool_candidates yes", "default compact maybe", "active\ncompact on"] {
+        assert!(matches!(parse_jev_request(bad), JevRequest::Unknown(_)));
+    }
+    let dir = temp_agent_dir("independent-controls");
+    let bridge = bridge_over(&dir);
+    bridge.set_session_mode("chat", JevMode::CompareAndActive).unwrap();
+    bridge.set_feature("chat", JevFeature::ToolCandidates, true).unwrap();
+    bridge.set_compaction("chat", true).unwrap();
+    bridge.set_compaction("chat", false).unwrap();
+    assert_eq!(bridge.effective_mode("chat"), JevMode::CompareAndActive);
+    assert!(bridge.settings().effective_features("chat").tool_candidates);
+    assert!(!bridge.settings().effective_compaction_enabled("chat"));
+    bridge.set_default_compaction(true).unwrap();
+    assert!(bridge.settings().effective_compaction_enabled("other"));
+    assert!(!bridge.settings().effective_compaction_enabled("chat"));
+    bridge.set_default_compaction(false).unwrap();
+    assert!(!bridge.settings().effective_compaction_enabled("other"));
+    let status = jev_ui::render_compaction_settings(&bridge.settings(), "chat");
+    for field in ["Compaction: off", "scope: session", "keep_threshold", "max_state_tokens", "max_request_tokens", "minimum_reduction_ratio"] {
+        assert!(status.contains(field), "{status}");
+    }
+}
+
+#[test]
+fn combined_mode_menu_footer_and_status_are_distinct_and_truthful() {
+    let mut state = JevMenuState::new(JevMode::CompareAndActive);
+    assert_eq!(state.selected, 3);
+    assert_eq!(state.accept(), JevMenuAction::SetMode(JevMode::CompareAndActive));
+    for (index, enabled) in [(4, true), (5, false)] {
+        let mut state = JevMenuState::new(JevMode::CompareAndActive);
+        state.selected = index;
+        assert_eq!(state.accept(), JevMenuAction::SetCompaction(enabled));
+        assert_eq!(state.active_mode, JevMode::CompareAndActive);
+    }
+    let saved = CredentialStatus::resolve(true, false, false);
+    let none = CredentialStatus::resolve(false, false, false);
+    assert_eq!(footer_state(JevMode::CompareAndActive, &saved, &Default::default()), JevFooterState::CompareAndActive);
+    assert_eq!(footer_state(JevMode::CompareAndActive, &none, &Default::default()), JevFooterState::Unavailable);
+    assert_eq!(footer_color_key(JevFooterState::CompareAndActive), "accent");
+    assert!(footer_text(JevFooterState::CompareAndActive).contains("Compare + Active"));
+    let fresh = JevStatusReport::local_only(JevMode::CompareAndActive, ModeScope::Session, saved);
+    let text = render_status(&fresh);
+    assert!(text.contains("Decisions applied: unknown"), "{text}");
+    assert!(text.contains("Feature gates (configured; not proof"), "{text}");
+    let live = fresh.with_snapshot(Some(&serde_json::json!({
+        "success_count": 4, "failure_count": 1, "queue_capacity": 8,
+        "active": {"applied": 2, "accepted_no_effect": 1, "refused": 3, "unavailable": 1}
+    })));
+    let text = render_status(&live);
+    assert!(text.contains("Counters: 4 ok, 1 failed"));
+    assert!(text.contains("Decisions applied: 2"));
+    assert!(text.contains("Active boundaries: 2 applied"));
+    assert!(!text.contains("Compare is shadow-only; potential savings"));
+}
+
+#[test]
+fn compaction_status_distinguishes_unknown_observed_and_sparse_fallbacks() {
+    let report = JevStatusReport::local_only(JevMode::CompareAndActive, ModeScope::Session,
+        CredentialStatus::resolve(true, false, false));
+    let unknown = render_status(&report);
+    assert!(unknown.contains("Compaction last: unknown"));
+    assert!(!unknown.contains("Compaction candidates: 0"));
+    let value = serde_json::json!({"compaction": {
+        "applied": true, "estimated_tokens_before": 2000, "estimated_tokens_after": 1000,
+        "calls_evaluated": 4, "calls_removed": 2, "results_removed": 2, "results_truncated": 1,
+        "reduction_ratio": 0.5, "breaker_state": "closed"
+    }});
+    let observed = render_status(&report.clone().with_snapshot(Some(&value)));
+    assert!(observed.contains("Compaction last: applied"));
+    assert!(observed.contains("Compaction estimated tokens: 2000 -> 1000 (reduction 50.0%)"));
+    assert!(observed.contains("4 evaluated, 2 calls removed, 2 results removed, 1 results truncated"));
+    assert!(observed.contains("Compaction breaker: closed"));
+    let sparse = serde_json::json!({"compaction": {"applied": false, "fallback_reason": "circuit_open"}});
+    let fallback = render_status(&report.with_snapshot(Some(&sparse)));
+    assert!(fallback.contains("Compaction last: not applied"));
+    assert!(fallback.contains("Compaction estimated tokens: unknown -> unknown"));
+    assert!(fallback.contains("Compaction fallback: circuit_open"));
+    assert!(fallback.contains("Compaction breaker: unknown"));
+    for invalid in [serde_json::json!({}), serde_json::json!([]), serde_json::json!({"applied": "yes"})] {
+        assert!(jev_ui::CompactionStatus::from_snapshot(Some(&invalid)).is_none());
+    }
+}
+
+#[test]
+fn malformed_active_counters_are_unknown_not_zero() {
+    for value in [serde_json::json!({}), serde_json::json!({"applied": 3}),
+        serde_json::json!({"applied": 0, "accepted_no_effect": 0, "refused": 0, "unavailable": "invalid"})] {
+        assert!(ActiveCounters::from_snapshot(Some(&value)).is_none());
+        let report = JevStatusReport::local_only(JevMode::Active, ModeScope::Session,
+            CredentialStatus::resolve(true, false, false))
+            .with_snapshot(Some(&serde_json::json!({"active": value})));
+        assert!(render_status(&report).contains("Decisions applied: unknown"));
+    }
+}
+
+#[test]
+fn actual_ui_mode_write_gate_refuses_legacy_worker_without_touching_settings() {
+    let dir = temp_agent_dir("legacy-worker-gate");
+    let bridge = bridge_over(&dir);
+    assert!(bridge.set_session_mode_supported("s", JevMode::CompareAndActive, false).is_err());
+    assert!(bridge.set_global_default_supported(JevMode::CompareAndActive, false).is_err());
+    assert!(!bridge.path().exists(), "unsupported actions must not write any settings");
+    for mode in [JevMode::Off, JevMode::Compare, JevMode::Active] {
+        bridge.set_session_mode_supported("s", mode, false).unwrap();
+        assert_eq!(bridge.effective_mode("s"), mode);
+    }
+    let before = fs::read(bridge.path()).unwrap();
+    assert!(bridge.set_session_mode_supported("s", JevMode::CompareAndActive, false).is_err());
+    assert_eq!(fs::read(bridge.path()).unwrap(), before);
+    bridge.set_session_mode_supported("s", JevMode::CompareAndActive, true).unwrap();
+    assert_eq!(bridge.effective_mode("s"), JevMode::CompareAndActive);
+    assert!(jev_ui::require_feature_support(false).is_err());
+    assert!(jev_ui::require_feature_support(true).is_ok());
+    let host = jev_source("jev_host.rs");
+    assert!(host.contains("bridge.set_session_mode_supported(&session_id, mode, connection.supports_jev_features())"));
+    assert!(host.contains("bridge.set_session_mode_supported(session_id, mode, connection.supports_jev_features())"));
+    assert!(host.contains("bridge.set_global_default_supported(mode, connection.supports_jev_features())"));
+    assert_eq!(host.matches("require_feature_support(connection.supports_jev_features())?").count(), 4);
+}
+
+#[test]
+fn compaction_controls_and_status_do_not_require_an_active_mode() {
+    let mut settings = JevSettings::default();
+    settings.set_session_compaction_enabled("s", true);
+    let status = jev_ui::render_compaction_settings(&settings, "s");
+    assert!(status.contains("Compaction: on"));
+    assert!(status.contains("independent of decision mode"));
+    assert!(!status.contains("inactive in this mode"));
+    let report = JevStatusReport::local_only(JevMode::Off, ModeScope::Session,
+        CredentialStatus::resolve(true, false, false)).with_settings(&settings, "s");
+    let text = render_status(&report);
+    assert!(text.contains("decision mode off (request-local compaction independently enabled)"));
+    assert!(!text.contains("Off: no scheduling, no client, no network"));
+    settings.set_session_mode("s", JevMode::Compare);
+    let status = jev_ui::render_compaction_settings(&settings, "s");
+    assert!(status.contains("Compaction: on"));
+    assert!(status.contains("independent of decision mode"));
+    assert!(!status.contains("inactive in this mode"));
 }

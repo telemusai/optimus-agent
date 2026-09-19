@@ -3,8 +3,8 @@
 //! Precedence (binding, DESIGN.md 10.2):
 //!   resolve_effective_mode(explicit_session, inherited_or_global_default)
 //!       = explicit_session.or(global_default).unwrap_or(Off)
-//! Explicit per-session Off/Compare ALWAYS wins. A global default of Off must NOT defeat an
-//! explicit per-session Compare. API-key presence never influences any mode.
+//! Explicit per-session mode always wins. API-key presence never influences any mode.
+//! Feature and compaction controls resolve independently of mode.
 //!
 //! Credential source order (binding, DESIGN.md 3.1): saved > TYPESAFE_API_KEY > JEV_API_KEY.
 //! Key values are never written to the settings file; only key-presence metadata is.
@@ -17,62 +17,171 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-/// Authoritative mode control (DESIGN.md sections 0/3.1). `/jev` is the only writer;
-/// key presence never sets a mode.
+/// Session control. Credentials never enable a mode.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum JevMode {
     Off,
     Compare,
-    /// Reserved. Selecting it does NOT enable anything; a later reviewed activation policy
-    /// is required before any recommendation can act.
     Active,
+    #[serde(rename = "compare-active", alias = "compare_and_active", alias = "compare-and-active")]
+    CompareAndActive,
 }
 
 impl JevMode {
-    /// Stable wire/config name.
     pub fn as_str(self) -> &'static str {
         match self {
-            JevMode::Off => "off",
-            JevMode::Compare => "compare",
-            JevMode::Active => "active",
+            Self::Off => "off",
+            Self::Compare => "compare",
+            Self::Active => "active",
+            Self::CompareAndActive => "compare-active",
         }
     }
 
-    /// Parses a user-supplied mode name. `/jev on` means Compare for this release.
+    /// `on` always selects shadow-only Compare.
     pub fn parse(raw: &str) -> Option<Self> {
         match raw.trim().to_ascii_lowercase().as_str() {
-            "off" | "false" | "no" | "disabled" => Some(JevMode::Off),
-            "compare" | "comparison" | "on" | "true" | "yes" | "shadow" => Some(JevMode::Compare),
-            "active" | "enable" => Some(JevMode::Active),
+            "off" | "false" | "no" | "disabled" => Some(Self::Off),
+            "compare" | "comparison" | "on" | "true" | "yes" | "shadow" => Some(Self::Compare),
+            "active" | "enable" => Some(Self::Active),
+            "compare-active" | "compare-and-active" | "compare_and_active" | "both" => Some(Self::CompareAndActive),
             _ => None,
         }
     }
 
-    /// True when shadow evaluation may run.
     pub fn allows_compare(self) -> bool {
-        matches!(self, JevMode::Compare)
+        matches!(self, Self::Compare | Self::CompareAndActive)
     }
 
-    /// Short label for the footer. Text accompanies the colour so colour is never the only cue.
+    pub fn allows_active(self) -> bool {
+        matches!(self, Self::Active | Self::CompareAndActive)
+    }
+
+    pub fn is_enabled(self) -> bool {
+        self != Self::Off
+    }
+
     pub fn label(self) -> &'static str {
         match self {
-            JevMode::Off => "Jev Off",
-            JevMode::Compare => "Jev Compare",
-            JevMode::Active => "Jev Active",
+            Self::Off => "Jev Off",
+            Self::Compare => "Jev Compare",
+            Self::Active => "Jev Active",
+            Self::CompareAndActive => "Jev Compare + Active",
         }
     }
 
-    /// One-line explanation used by the menu and by help output.
     pub fn description(self) -> &'static str {
         match self {
-            JevMode::Off => "Jev is off: no shadow calls, no network, no overhead beyond this check.",
-            JevMode::Compare => {
-                "Jev Compare: recommendations are recorded for comparison only. Nothing Jev returns is applied; your model, tools, context and stopping behavior do not change."
-            }
-            JevMode::Active => {
-                "Jev Active: an accepted answer is applied to the next provider request. It withdraws the tool catalog when the task needs no tools, and moves an already-set reasoning effort by one step. Nothing else is applied, and a refused answer, failure or timeout leaves the request unchanged."
-            }
+            Self::Off => "Jev decision mode is off. Independent compaction keeps its own setting.",
+            Self::Compare => "Jev Compare records recommendations only. Nothing is applied.",
+            Self::Active => "Jev Active applies accepted, feature-gated decisions at bounded native boundaries. Failure leaves the baseline unchanged.",
+            Self::CompareAndActive => "Jev Compare + Active records comparisons and applies accepted, feature-gated decisions from the same boundary request.",
+        }
+    }
+}
+
+/// Operator gates for Active effects and supplemental observations. These never
+/// remove the existing Compare categories or grant model/permission control.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(default)]
+pub struct JevFeatures {
+    pub tool_requirement: bool,
+    pub complexity: bool,
+    pub tool_candidates: bool,
+    pub context_relevance: bool,
+    pub memory_relevance: bool,
+    pub result_sufficiency: bool,
+    pub loop_control: bool,
+    pub retry_classification: bool,
+    pub verification: bool,
+    pub trace_observer: bool,
+}
+
+impl Default for JevFeatures {
+    fn default() -> Self {
+        Self {
+            tool_requirement: true,
+            complexity: true,
+            tool_candidates: false,
+            context_relevance: false,
+            memory_relevance: false,
+            result_sufficiency: false,
+            loop_control: false,
+            retry_classification: false,
+            verification: false,
+            trace_observer: false,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JevFeature {
+    ToolRequirement,
+    Complexity,
+    ToolCandidates,
+    ContextRelevance,
+    MemoryRelevance,
+    ResultSufficiency,
+    LoopControl,
+    RetryClassification,
+    Verification,
+    TraceObserver,
+}
+
+impl JevFeature {
+    pub const ALL: [Self; 10] = [Self::ToolRequirement, Self::Complexity, Self::ToolCandidates,
+        Self::ContextRelevance, Self::MemoryRelevance, Self::ResultSufficiency,
+        Self::LoopControl, Self::RetryClassification, Self::Verification, Self::TraceObserver];
+
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::ToolRequirement => "tool_requirement",
+            Self::Complexity => "complexity",
+            Self::ToolCandidates => "tool_candidates",
+            Self::ContextRelevance => "context_relevance",
+            Self::MemoryRelevance => "memory_relevance",
+            Self::ResultSufficiency => "result_sufficiency",
+            Self::LoopControl => "loop_control",
+            Self::RetryClassification => "retry_classification",
+            Self::Verification => "verification",
+            Self::TraceObserver => "trace_observer",
+        }
+    }
+
+    pub fn parse(raw: &str) -> Option<Self> {
+        let normalized = raw.trim().to_ascii_lowercase().replace('-', "_");
+        Self::ALL.into_iter().find(|feature| feature.as_str() == normalized)
+    }
+}
+
+impl JevFeatures {
+    pub fn enabled(self, feature: JevFeature) -> bool {
+        match feature {
+            JevFeature::ToolRequirement => self.tool_requirement,
+            JevFeature::Complexity => self.complexity,
+            JevFeature::ToolCandidates => self.tool_candidates,
+            JevFeature::ContextRelevance => self.context_relevance,
+            JevFeature::MemoryRelevance => self.memory_relevance,
+            JevFeature::ResultSufficiency => self.result_sufficiency,
+            JevFeature::LoopControl => self.loop_control,
+            JevFeature::RetryClassification => self.retry_classification,
+            JevFeature::Verification => self.verification,
+            JevFeature::TraceObserver => self.trace_observer,
+        }
+    }
+
+    pub fn set(&mut self, feature: JevFeature, enabled: bool) {
+        match feature {
+            JevFeature::ToolRequirement => self.tool_requirement = enabled,
+            JevFeature::Complexity => self.complexity = enabled,
+            JevFeature::ToolCandidates => self.tool_candidates = enabled,
+            JevFeature::ContextRelevance => self.context_relevance = enabled,
+            JevFeature::MemoryRelevance => self.memory_relevance = enabled,
+            JevFeature::ResultSufficiency => self.result_sufficiency = enabled,
+            JevFeature::LoopControl => self.loop_control = enabled,
+            JevFeature::RetryClassification => self.retry_classification = enabled,
+            JevFeature::Verification => self.verification = enabled,
+            JevFeature::TraceObserver => self.trace_observer = enabled,
         }
     }
 }
@@ -135,13 +244,13 @@ impl CredentialSource {
     }
 }
 
-/// Which scope supplied the effective mode, for the UI "this chat vs new chats" line.
+/// Which scope supplied a resolved setting.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum ModeScope {
     /// An explicit value chosen for this session.
     Session,
-    /// The global default for new sessions.
+    /// The global default used when no session override exists.
     GlobalDefault,
     /// The built-in default (Off).
     BuiltIn,
@@ -287,21 +396,33 @@ fn env_var_non_empty(name: &str) -> bool {
 pub struct PersistedSessionMode {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub mode: Option<JevMode>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub features: Option<JevFeatures>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub compaction_enabled: Option<bool>,
     /// Opaque parent session id when the value was inherited at child creation.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub inherited_from: Option<String>,
 }
 
 /// Persisted settings. Contains NO secret material; only presence metadata.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct JevSettings {
     /// Read generation for checked saves; never part of the persisted schema.
     #[serde(skip)]
     pub loaded_generation: Option<SettingsGeneration>,
     pub schema_version: u32,
-    /// Global default for new sessions. `None` means built-in Off.
+    /// Default for sessions without an explicit mode. `None` means built-in Off.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub global_default: Option<JevMode>,
+    #[serde(default)]
+    pub features: JevFeatures,
+    #[serde(default)]
+    pub compaction_enabled: bool,
+    #[serde(default)]
+    pub compaction: crate::compaction::CompactionConfig,
+    #[serde(default)]
+    pub filtering: crate::filtering::FilteringOptions,
     /// Per-session explicit overrides, keyed by opaque session id.
     #[serde(default)]
     pub sessions: std::collections::BTreeMap<String, PersistedSessionMode>,
@@ -330,6 +451,10 @@ impl Default for JevSettings {
             loaded_generation: None,
             schema_version: SETTINGS_SCHEMA_VERSION,
             global_default: None,
+            features: JevFeatures::default(),
+            compaction_enabled: false,
+            compaction: crate::compaction::CompactionConfig::default(),
+            filtering: crate::filtering::FilteringOptions::default(),
             sessions: std::collections::BTreeMap::new(),
             credential_configured: false,
             credential_source: None,
@@ -347,19 +472,21 @@ fn settings_generation(bytes: Option<&[u8]>) -> SettingsGeneration {
 }
 
 impl JevSettings {
-    /// True when at least one Compare configuration survives mode resolution.
-    ///
-    /// Registration gate for the observer extension: an Active-only or Off
-    /// configuration registers nothing (fail closed; DESIGN.md 10/12).
     /// True when any scope resolves to an operative mode. Both `Compare`
     /// (records only) and `Active` (may apply accepted answers) need the
     /// observer and its client; `Off` never does.
     pub fn wants_observer(&self) -> bool {
-        let operative = |mode: Option<JevMode>| matches!(mode, Some(JevMode::Compare) | Some(JevMode::Active));
+        let operative = |mode: Option<JevMode>| mode.is_some_and(JevMode::is_enabled);
         if operative(self.global_default) {
             return true;
         }
         self.sessions.values().any(|entry| operative(entry.mode))
+    }
+
+    pub fn validate(&self) -> Result<(), crate::error::JevError> {
+        self.compaction.validate().map_err(|_| crate::error::JevError::config("invalid Jev compaction settings"))?;
+        self.filtering.validate().map_err(|_| crate::error::JevError::config("invalid Jev filtering settings"))?;
+        Ok(())
     }
 
     /// Settings with an explicit global default.
@@ -398,6 +525,32 @@ impl JevSettings {
     /// Effective mode with the deciding scope.
     pub fn effective_mode_with_scope(&self, session_id: &str) -> ModeResolution {
         resolve_mode(self.session_mode(session_id), self.global_default)
+    }
+
+    pub fn effective_features(&self, session_id: &str) -> JevFeatures {
+        self.sessions.get(session_id).and_then(|entry| entry.features).unwrap_or(self.features)
+    }
+
+    pub fn set_session_feature(&mut self, session_id: &str, feature: JevFeature, enabled: bool) {
+        let mut features = self.effective_features(session_id);
+        features.set(feature, enabled);
+        self.sessions.entry(session_id.to_string()).or_default().features = Some(features);
+    }
+
+    /// Resolves compaction independently of the Jev decision mode.
+    pub fn effective_compaction_enabled(&self, session_id: &str) -> bool {
+        self.effective_compaction_with_scope(session_id).0
+    }
+
+    pub fn effective_compaction_with_scope(&self, session_id: &str) -> (bool, ModeScope) {
+        match self.sessions.get(session_id).and_then(|entry| entry.compaction_enabled) {
+            Some(enabled) => (enabled, ModeScope::Session),
+            None => (self.compaction_enabled, ModeScope::GlobalDefault),
+        }
+    }
+
+    pub fn set_session_compaction_enabled(&mut self, session_id: &str, enabled: bool) {
+        self.sessions.entry(session_id.to_string()).or_default().compaction_enabled = Some(enabled);
     }
 
     /// Records key presence metadata. Never stores a key value.
@@ -459,7 +612,11 @@ pub fn inherit_mode(
     explicit_child_override: Option<JevMode>,
 ) -> JevMode {
     let inherited = explicit_child_override.unwrap_or_else(|| settings.effective_mode(parent_session_id));
+    let features = settings.effective_features(parent_session_id);
+    let compaction_enabled = settings.effective_compaction_enabled(parent_session_id);
     let entry = settings.sessions.entry(child_session_id.to_string()).or_default();
+    entry.features.get_or_insert(features);
+    entry.compaction_enabled.get_or_insert(compaction_enabled);
     entry.mode = Some(inherited);
     entry.inherited_from = Some(parent_session_id.to_string());
     inherited
@@ -519,6 +676,7 @@ impl JevSettingsStore {
         let bytes = std::fs::read(&self.path).ok();
         let mut settings = bytes.as_deref()
             .and_then(|bytes| serde_json::from_slice::<JevSettings>(bytes).ok())
+            .filter(|settings| settings.validate().is_ok())
             .unwrap_or_default();
         settings.loaded_generation = Some(settings_generation(bytes.as_deref()));
         settings
@@ -526,6 +684,7 @@ impl JevSettingsStore {
 
     /// Saves settings. Refuses to write a file that appears to contain a secret.
     pub fn save(&self, settings: &JevSettings) -> Result<(), crate::error::JevError> {
+        settings.validate()?;
         if settings.looks_like_it_contains_a_secret() {
             return Err(crate::error::JevError::CredentialStore {
                 detail: "refusing to persist settings that appear to contain a secret".to_string(),
@@ -546,7 +705,8 @@ impl JevSettingsStore {
         let current = match std::fs::read(&self.path) {
             Ok(bytes) => {
                 serde_json::from_slice::<JevSettings>(&bytes)
-                    .map_err(|_| crate::error::JevError::config("settings are corrupt; refusing to overwrite"))?;
+                    .map_err(|_| crate::error::JevError::config("settings are corrupt; refusing to overwrite"))?
+                    .validate()?;
                 Some(bytes)
             }
             Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,

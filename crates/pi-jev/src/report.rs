@@ -24,11 +24,45 @@ pub fn build_report_from(records: &[CorrelationRecord], generated_at: &str) -> V
     let mut categories: BTreeMap<String, Value> = BTreeMap::new();
     let mut skip_reasons: BTreeMap<String, u64> = BTreeMap::new();
     let mut error_kinds: BTreeMap<String, u64> = BTreeMap::new();
-    let mut durations: Vec<u64> = Vec::new();
+    let mut request_durations: BTreeMap<(String, String), u64> = BTreeMap::new();
+    let mut logical: BTreeMap<(String, String, String), &CorrelationRecord> = BTreeMap::new();
+    let mut active_records: BTreeMap<(String, String, String), &CorrelationRecord> = BTreeMap::new();
+    let mut compaction_records: BTreeMap<(String, String), &CorrelationRecord> = BTreeMap::new();
+    let mut recommended = 0u64;
+    let mut accepted = 0u64;
+    let mut applied = 0u64;
+    let mut accepted_no_effect = 0u64;
+    let mut outcomes: BTreeMap<String, u64> = BTreeMap::new();
     let mut samples: Vec<Value> = Vec::new();
     let mut modes: BTreeMap<String, u64> = BTreeMap::new();
 
     for record in records {
+        if let Some(duration) = record.duration_ms {
+            let entry = request_durations.entry((record.session_id.clone(), record.request_id.clone())).or_default();
+            *entry = (*entry).max(duration);
+        }
+        if record.schema_version == "jev.compaction/1" {
+            compaction_records.insert((record.session_id.clone(), record.request_id.clone()), record);
+            continue;
+        }
+        if record.schema_version != RECORD_SCHEMA_VERSION && record.schema_version != crate::correlate::ACTIVE_RECORD_SCHEMA_VERSION {
+            continue;
+        }
+        let key = (record.session_id.clone(), record.request_id.clone(), record.question_id.clone());
+        if record.schema_version == crate::correlate::ACTIVE_RECORD_SCHEMA_VERSION {
+            active_records.insert(key.clone(), record);
+        }
+        let entry = logical.entry(key).or_insert(record);
+        if record.schema_version == RECORD_SCHEMA_VERSION { *entry = record; }
+    }
+    for record in active_records.values() {
+        recommended += u64::from(record.selected_value.is_some());
+        accepted += u64::from(record.acceptance.as_deref() == Some("accepted"));
+        applied += u64::from(record.applied);
+        accepted_no_effect += u64::from(record.acceptance.as_deref() == Some("accepted") && !record.applied);
+        if let Some(outcome) = &record.outcome { *outcomes.entry(outcome.clone()).or_default() += 1; }
+    }
+    for record in logical.values() {
         let entry = categories
             .entry(record.category.clone())
             .or_insert_with(|| {
@@ -63,9 +97,6 @@ pub fn build_report_from(records: &[CorrelationRecord], generated_at: &str) -> V
                 *error_kinds.entry("request_failed".to_string()).or_insert(0) += 1;
             }
         }
-        if let Some(duration) = record.duration_ms {
-            durations.push(duration);
-        }
         *modes.entry(record.mode.clone()).or_insert(0) += 1;
         if record.agreement.as_deref() == Some("disagree")
             && samples.len() < MAX_SAMPLES
@@ -81,6 +112,7 @@ pub fn build_report_from(records: &[CorrelationRecord], generated_at: &str) -> V
         }
     }
 
+    let durations: Vec<u64> = request_durations.values().copied().collect();
     let durations_sorted_peek: Vec<u64> = {
         let mut bounded = durations.clone();
         bounded.sort_unstable();
@@ -97,6 +129,16 @@ pub fn build_report_from(records: &[CorrelationRecord], generated_at: &str) -> V
         "generated_at": generated_at,
         "modes": modes,
         "total_records": records.len(),
+        "logical_decisions": logical.len(),
+        "timed_requests": request_durations.len(),
+        "active": { "recommended": recommended, "accepted": accepted, "applied": applied,
+            "accepted_no_effect": accepted_no_effect, "outcomes": outcomes },
+        "compaction": {
+            "requests": compaction_records.len(),
+            "applied": compaction_records.values().filter(|record| record.applied).count(),
+            "fallback": compaction_records.values().filter(|record| record.fallback_reason.is_some()).count(),
+            "no_effect": compaction_records.values().filter(|record| !record.applied && record.fallback_reason.is_none()).count(),
+        },
         "category_coverage": categories,
         "skip_reasons": skip_reasons,
         "errors": { "by_kind": error_kinds },
@@ -105,7 +147,7 @@ pub fn build_report_from(records: &[CorrelationRecord], generated_at: &str) -> V
             "max_duration_ms": durations_sorted_peek.last().copied(),
         },
         "disagreement_samples": samples,
-        "actual_llm_calls_avoided": 0,
+        "actual_llm_calls_avoided": if records.iter().all(|record| record.schema_version == RECORD_SCHEMA_VERSION) { Some(0u64) } else { None },
         "savings_note": "hypothetical only; counterfactual downstream success requires separate evals, never measured from logs",
     })
 }

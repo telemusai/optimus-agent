@@ -17,6 +17,13 @@ impl super::CategoryEvaluator for MemoryRelevance {
     }
 
     fn evaluate(&self, snapshot: &crate::snapshot::StateSnapshot) -> EvaluatorOutput {
+        if let Some(questions) = crate::filtering::candidate_questions(&snapshot.state, self.category(), "memory_candidates") {
+            return if questions.is_empty() {
+                EvaluatorOutput::Skipped("no_eligible_candidates".to_string())
+            } else {
+                EvaluatorOutput::Questions(questions)
+            };
+        }
         let view = StateView::new(snapshot);
         let Some(memory_excerpt) = view.str_field("memory_excerpt") else {
             return EvaluatorOutput::Skipped("no_memory_state".to_string());
