@@ -17,7 +17,6 @@
 use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
-use pi_agent_core::types::AgentMessage;
 use pi_ai::providers::faux::{
     faux_assistant_message, faux_tool_call, register_faux_provider, FauxAssistantContent,
     FauxProviderRegistration, FauxResponseStep, FauxAssistantMessageOptions,
@@ -367,6 +366,7 @@ fn shapes(session: &Arc<AgentSession>) -> Vec<(String, String)> {
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn jev_compare_e2e_parity_and_isolation() {
+    pi_coding_agent::modes::interactive::theme::theme::init_theme(Some("dark"), false);
     let root = tempfile::Builder::new()
         .prefix("jev-e2e-root-")
         .tempdir()
@@ -556,6 +556,8 @@ async fn jev_compare_e2e_parity_and_isolation() {
         }).await.expect("rewritten same key must allow new mock observations");
     }
     off.session.dispose_async(Some(false)).await;
+    std::fs::remove_file(agent_dir.join("jev").join(format!("{}.{}",
+        pi_jev::config::DEFAULT_KEY_ID, pi_jev::credential::CREDENTIAL_FILE_NAME))).unwrap();
 
     // ------------------------------------------------------------------
     // Phase 3: Hostile maximum-confidence answers cannot act.

@@ -23,4 +23,8 @@ optimus_runtime_dir="${OPTIMUS_RUST_TMPDIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}/opt
 umask 077
 mkdir -p -- "$optimus_runtime_dir"
 export TMPDIR="$optimus_runtime_dir"
+if [ -f "$PRIME_AGENT_CODING_AGENT_DIR/jev/env" ]; then
+    exec "${PRIME_AGENT_KERNEL_PYTHON:-$PRIME_AGENT_KERNEL_VENV/bin/python}" \
+        "$PI_PACKAGE_DIR/scripts/launch-with-jev-env.py" "$optimus_install/bin/optimus-rust" "$@"
+fi
 exec "$optimus_install/bin/optimus-rust" "$@"

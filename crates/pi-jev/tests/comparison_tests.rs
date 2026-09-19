@@ -698,6 +698,7 @@ async fn circuit_breaker_opens_after_consecutive_failures() {
         JevMode::Compare,
         SchedulerConfig {
             max_consecutive_failures: 2,
+            concurrency: 1,
             breaker_cooldown: Duration::from_secs(30),
             request_deadline: Duration::from_secs(5),
             min_interval: Duration::ZERO,

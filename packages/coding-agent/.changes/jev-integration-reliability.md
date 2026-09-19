@@ -1,0 +1,4 @@
+- Fixed stuck Jev request counters after cancellation and retries that ignored server delays or exceeded the request budget.
+- Fixed concurrent Jev settings changes silently overwriting another chat's preferences.
+- Added private Jev environment-file loading to the installed Linux launcher.
+- Fixed pasted Jev API keys retaining terminal paste markers.
