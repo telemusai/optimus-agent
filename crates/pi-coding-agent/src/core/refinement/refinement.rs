@@ -2607,6 +2607,10 @@ pub async fn refine_harness(
     ))
 }
 
+#[cfg(all(test, windows))]
+#[path = "harness_lock_interop_tests.rs"]
+mod harness_lock_interop_tests;
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -2885,8 +2889,12 @@ mod tests {
         let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
         assert_eq!(baseline.status, HarnessStateLoadStatus::Unreadable);
         std::fs::remove_dir(&path).unwrap();
-        let healthy = br#"{"schema":1,"entries":{"memory":{"keep":{"title":"Keep","content":"Healthy"}}}}"#;
-        std::fs::write(&path, healthy).unwrap();
+        let healthy = serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "entries": {"memory": {"keep": entry_value("keep", "memory", "Keep", "Healthy")}},
+            "refinements": [],
+        })).unwrap();
+        std::fs::write(&path, &healthy).unwrap();
         let error = save_harness_state_checked(&dir_text, &baseline.state, &baseline).unwrap_err();
         assert!(error.contains("refusing to overwrite unreadable state"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), healthy);
@@ -2901,8 +2909,12 @@ mod tests {
         save_harness_state(&dir_text, &state).unwrap();
         let baseline = load_harness_state_details(&dir_text, HarnessScope::Local);
         let path = dir.join("harness_state.json");
-        let concurrent = br#"{"schema":1,"entries":{"memory":{"peer":{"title":"Peer","content":"Newer"}}}}"#;
-        std::fs::write(&path, concurrent).unwrap();
+        let concurrent = serde_json::to_vec(&serde_json::json!({
+            "schema": 1,
+            "entries": {"memory": {"peer": entry_value("peer", "memory", "Peer", "Newer")}},
+            "refinements": [],
+        })).unwrap();
+        std::fs::write(&path, &concurrent).unwrap();
         let error = save_harness_state_checked(&dir_text, &state, &baseline).unwrap_err();
         assert!(error.contains("changed since it was loaded"), "{error}");
         assert_eq!(std::fs::read(&path).unwrap(), concurrent);
