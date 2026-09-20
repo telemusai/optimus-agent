@@ -19,6 +19,17 @@ pub struct RlmParentTask {
     pub replied: bool,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub result: Option<RlmPendingResult>,
+    /// Any marker blocks automatic replay, including after a process interruption.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub result_delivery: Option<RlmResultDelivery>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "camelCase", default)]
+pub struct RlmResultDelivery {
+    pub attempt_id: String,
+    /// Content-free evidence; the retained task result is never discarded.
+    pub reason: String,
 }
 
 /// `interface RlmPendingContinuation`.
@@ -369,6 +380,40 @@ fn normalize_state_value(value: &serde_json::Value) -> serde_json::Value {
     normalized
 }
 
+/// Only authoritative receipt shapes acknowledge a result. No transport error is
+/// assumed to be a rejection unless it matches a known pre-admission route.
+pub(crate) fn rlm_result_receipt_is_valid(
+    receipt: &crate::core::agent_messages::AgentSessionMessageReceipt,
+    target: &str,
+    message: &str,
+) -> bool {
+    use crate::core::agent_messages::{AGENT_MESSAGE_SOURCE, DELIVERY_STATUS_DELIVERED, DELIVERY_STATUS_QUEUED};
+    let timestamp = match receipt.delivery_status.as_str() {
+        DELIVERY_STATUS_DELIVERED if receipt.queued_at.is_none() => receipt.delivered_at.as_deref(),
+        DELIVERY_STATUS_QUEUED if receipt.delivered_at.is_none() => receipt.queued_at.as_deref(),
+        _ => None,
+    };
+    !receipt.id.trim().is_empty()
+        && receipt.source == AGENT_MESSAGE_SOURCE
+        && !receipt.target.session_id.trim().is_empty()
+        && !receipt.target.active_session_id.trim().is_empty()
+        && (receipt.target.session_id == target
+            || receipt.target.active_session_id == target
+            || receipt.target.session_name.as_deref() == Some(target))
+        && receipt.message == message.trim()
+        && timestamp.is_some_and(|at| chrono::DateTime::parse_from_rfc3339(at).is_ok())
+}
+
+pub(crate) fn rlm_result_rejected_before_admission(error: &str) -> bool {
+    if error == "Agent messaging is paused" {
+        return true;
+    }
+    error
+        .strip_prefix("Agent messaging rate limit exceeded; retry after ")
+        .and_then(|rest| rest.strip_suffix("ms"))
+        .is_some_and(|delay| !delay.is_empty() && delay.bytes().all(|byte| byte.is_ascii_digit()))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -382,6 +427,62 @@ mod tests {
         }
     }
 
+
+    #[test]
+    fn result_delivery_marker_is_additive_and_survives_round_trip() {
+        let mut value = json!({
+            "version": 1, "tasks": [{ "id": "t", "receivedAt": 1, "replied": false }],
+            "continuationCount": 0, "taskHadLength": false
+        });
+        assert!(parse_rlm_continuation_state(&value).unwrap().tasks[0].result_delivery.is_none());
+        value["tasks"][0]["resultDelivery"] = json!({ "attemptId": "attempt-1", "reason": "acknowledgement_pending" });
+        let state = parse_rlm_continuation_state(&value).unwrap();
+        let round_trip = parse_rlm_continuation_state(&serde_json::to_value(&state).unwrap()).unwrap();
+        assert_eq!(state, round_trip);
+        assert_eq!(round_trip.tasks[0].result_delivery.as_ref().unwrap().attempt_id, "attempt-1");
+        assert!(!round_trip.tasks[0].replied);
+    }
+
+    #[test]
+    fn retry_allowlist_matches_only_exact_known_pre_admission_errors() {
+        assert!(rlm_result_rejected_before_admission("Agent messaging is paused"));
+        assert!(rlm_result_rejected_before_admission("Agent messaging rate limit exceeded; retry after 10ms"));
+        for unknown in [
+            "timeout: Agent messaging is paused", "Agent messaging is paused after submission",
+            "Agent messaging rate limit exceeded; retry after ms",
+            "Agent messaging rate limit exceeded; retry after 1ms; response lost", "connection closed",
+        ] {
+            assert!(!rlm_result_rejected_before_admission(unknown), "{unknown}");
+        }
+    }
+
+    #[test]
+    fn result_receipt_validation_rejects_incomplete_or_mismatched_acknowledgements() {
+        use crate::core::agent_messages::{AgentSessionMessageEndpoint, AgentSessionMessageReceipt};
+        let valid = AgentSessionMessageReceipt {
+            id: "agentmsg_fixture".into(), source: "agent_message".into(), message: "answer".into(),
+            target: AgentSessionMessageEndpoint {
+                session_id: "parent".into(), active_session_id: "active".into(), ..Default::default()
+            },
+            delivery_status: "queued".into(), queued_at: Some("2026-09-20T00:00:00Z".into()),
+            ..Default::default()
+        };
+        assert!(rlm_result_receipt_is_valid(&valid, "parent", "answer"));
+        for change in 0..8 {
+            let mut invalid = valid.clone();
+            match change {
+                0 => invalid.id.clear(),
+                1 => invalid.source.clear(),
+                2 => invalid.target.session_id = "other".into(),
+                3 => invalid.message = "different".into(),
+                4 => invalid.delivery_status = "unknown".into(),
+                5 => invalid.queued_at = None,
+                6 => invalid.queued_at = Some("not a timestamp".into()),
+                _ => invalid.delivered_at = invalid.queued_at.clone(),
+            }
+            assert!(!rlm_result_receipt_is_valid(&invalid, "parent", "answer"), "mutation {change}");
+        }
+    }
     #[test]
     fn empty_state_matches_the_typescript_literal() {
         let state = empty_rlm_continuation_state();

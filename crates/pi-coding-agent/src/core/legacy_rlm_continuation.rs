@@ -129,6 +129,7 @@ pub fn parse_legacy_rlm_continuation_state(
                 received_at: task["receivedAt"].as_f64().unwrap_or(0.0),
                 replied,
                 result: None,
+                result_delivery: None,
             }]
         }
     };

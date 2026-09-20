@@ -27,6 +27,9 @@ mod runtime_members;
 mod agent_handle;
 #[path = "agent_session/task_queue.rs"]
 mod task_queue;
+#[cfg(test)]
+#[path = "agent_session/rlm_result_delivery_tests.rs"]
+mod rlm_result_delivery_tests;
 
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -422,6 +425,9 @@ pub use crate::core::rlm_continuation::{
     empty_rlm_continuation_state, parse_rlm_continuation_state, read_rlm_visible_text,
     RlmChildTerminalClassification, RlmContinuationState, RlmParentTask, RlmPendingContinuation,
     RlmPendingResult, RLM_CHILD_MAX_CONTINUATIONS, RLM_CONTINUATION_STATE_CUSTOM_TYPE,
+};
+use crate::core::rlm_continuation::{
+    rlm_result_receipt_is_valid, rlm_result_rejected_before_admission, RlmResultDelivery,
 };
 pub use crate::core::legacy_rlm_continuation::{
     parse_legacy_rlm_continuation_state, LEGACY_RLM_CONTINUATION_STATE_CUSTOM_TYPE,
@@ -2379,6 +2385,8 @@ pub struct AgentSession {
     replied_to_parent_since_task: Mutex<Option<bool>>,
     parent_reply_count: AtomicU64,
     rlm_continuation: Mutex<RlmContinuationState>,
+    /// Serializes automatic reports and explicit child replies across submission.
+    rlm_parent_delivery_gate: tokio::sync::Mutex<()>,
     /// `_rlmExplicitRepliesInFlight = new Set<Promise<AgentSessionMessageReceipt>>()`.
     ///
     /// A TypeScript promise can be awaited any number of times; a Rust future
@@ -2738,6 +2746,7 @@ impl AgentSession {
             replied_to_parent_since_task: Mutex::new(replied_to_parent_since_task),
             parent_reply_count: AtomicU64::new(0),
             rlm_continuation: Mutex::new(empty_rlm_continuation_state()),
+            rlm_parent_delivery_gate: tokio::sync::Mutex::new(()),
             rlm_explicit_replies_in_flight: Mutex::new(Vec::new()),
             rlm_explicit_reply_sequence: AtomicU64::new(0),
             rlm_unindexed_child_usage: Mutex::new(HashMap::new()),
@@ -4943,57 +4952,65 @@ impl AgentSession {
         receiver_role: Option<String>,
     ) -> BoxFuture<Result<crate::core::agent_messages::AgentSessionMessageReceipt, String>> {
         let session = self.clone();
-        // `input.target` is compared against the roster below, so it is kept.
-        let requested_target = target.clone();
-        let reply: BoxFuture<
-            Result<crate::core::agent_messages::AgentSessionMessageReceipt, String>,
-        > = Box::pin(async move {
-            let payload = serde_json::json!({
-                "target": target,
-                "message": message,
-                "receiver_role": receiver_role,
-            });
-            let reply = session
-                .handle_agent_message_host_request("agent_message.send", Some(&payload))?
-                .await?;
-            let receipt: crate::core::agent_messages::AgentSessionMessageReceipt =
-                serde_json::from_value(reply).map_err(|error| error.to_string())?;
-            if session.rlm_depth > 0 {
-                let addressed_parent = match receiver_role.as_deref() {
-                    Some(crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT) => true,
-                    Some(_) => false,
-                    None => match &session.agent_message_controller {
-                        Some(controller) => match controller.roster().await {
-                            // `entry.id === input.target || entry.name === input.target`.
-                            Ok(roster) => roster.entries.iter().any(|entry| {
-                                entry.relationship
-                                    == crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT
-                                    && (entry.id == requested_target
-                                        || entry.name == requested_target)
-                            }),
-                            Err(_) => false,
+        // Correlate to the task at registration, not a follow-up arriving during send.
+        let task_ids: Vec<String> = {
+            let state = self.rlm_continuation.lock().unwrap();
+            let current_task_id = state.tasks.last().map(|task| task.id.as_str());
+            state.tasks.iter().filter(|task| {
+                !task.replied && (task.result.is_none() || current_task_id == Some(task.id.as_str()))
+            }).map(|task| task.id.clone()).collect()
+        };
+        let reply: BoxFuture<Result<AgentSessionMessageReceipt, String>> = Box::pin(async move {
+            let target = assert_direct_agent_message_target(&target)?;
+            let addressed_parent = session.rlm_depth > 0 && match receiver_role.as_deref() {
+                Some(crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT) => true,
+                Some(_) => false,
+                None => match &session.agent_message_controller {
+                    Some(controller) => match controller.roster().await {
+                        Ok(roster) => {
+                            let matches: Vec<_> = roster.entries.iter()
+                                .filter(|entry| entry.id == target || entry.name == target).collect();
+                            if matches.is_empty() && !task_ids.is_empty() {
+                                return Err("RLM parent reply was not submitted: target relationship could not be resolved; specify receiver_role=parent or a canonical roster ID/name".to_string());
+                            }
+                            matches.iter().any(|entry| {
+                                entry.relationship == crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT
+                            })
                         },
-                        None => false,
+                        Err(error) if !task_ids.is_empty() => {
+                            return Err(format!("RLM parent reply was not submitted: target relationship could not be resolved: {error}; specify receiver_role=parent or a canonical roster ID/name"));
+                        }
+                        Err(_) => false,
                     },
-                };
-                if addressed_parent {
-                    let state = session.rlm_continuation.lock().unwrap();
-                    let current_task_id = state.tasks.last().map(|task| task.id.clone());
-                    let task_ids: Vec<String> = state
-                        .tasks
-                        .iter()
-                        .filter(|task| {
-                            !task.replied
-                                && (task.result.is_none()
-                                    || current_task_id.as_deref() == Some(task.id.as_str()))
-                        })
-                        .map(|task| task.id.clone())
-                        .collect();
-                    drop(state);
-                    session.mark_explicit_rlm_parent_reply(&task_ids);
-                }
+                    None => false,
+                },
+            };
+            let payload = serde_json::json!({
+                "target": target, "message": message, "receiver_role": receiver_role,
+            });
+            // Resolve local validation before reserving a send intent.
+            let send = session.handle_agent_message_host_request("agent_message.send", Some(&payload))?;
+            let _delivery = if addressed_parent {
+                Some(session.rlm_parent_delivery_gate.lock().await)
+            } else {
+                None
+            };
+            let previous = if addressed_parent {
+                let mut state = session.rlm_continuation.lock().unwrap();
+                session.claim_rlm_parent_delivery(&mut state, &task_ids)?
+            } else {
+                Vec::new()
+            };
+            if addressed_parent && (session.disposed.load(Ordering::SeqCst) || session.disposing.load(Ordering::SeqCst)) {
+                return Err("RLM parent reply was not submitted: session is disposing".to_string());
             }
-            Ok(receipt)
+            let outcome = send.await.and_then(|value| {
+                serde_json::from_value::<AgentSessionMessageReceipt>(value).map_err(|error| error.to_string())
+            });
+            if addressed_parent {
+                session.settle_rlm_parent_delivery(&previous, &outcome, &target, &message, true);
+            }
+            outcome
         });
         // `reply` goes into the `Set` before anyone awaits it, so a parallel
         // delivery pass waits for this send instead of racing it.
@@ -5289,6 +5306,123 @@ impl AgentSession {
         );
     }
 
+    /// Caller holds the ledger lock, so no stale snapshot can become the latest
+    /// journal entry. A successful append alone is not a durable send boundary.
+    fn persist_rlm_delivery_state(&self, state: &RlmContinuationState) -> Result<(), String> {
+        let value = serde_json::to_value(state).map_err(|error| error.to_string())?;
+        let mut manager = self.session_manager.lock().unwrap();
+        if !manager.is_persisted() {
+            return Err("RLM result delivery requires a persistent session journal".to_string());
+        }
+        let path = manager.get_session_file()
+            .ok_or_else(|| "RLM result delivery requires a persistent session journal".to_string())?;
+        manager.append_custom_entry_with_rollback(
+            RLM_CONTINUATION_STATE_CUSTOM_TYPE,
+            Some(value),
+        )?;
+        // Keep the manager locked through the durability barrier: a rewrite or
+        // later ledger append must not replace the file while it is synced.
+        std::fs::OpenOptions::new().write(true).open(&path)
+            .and_then(|file| file.sync_all()).map_err(|error| error.to_string())?;
+        #[cfg(unix)]
+        if let Some(parent) = Path::new(&path).parent() {
+            std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+                .map_err(|error| error.to_string())?;
+        }
+        Ok(())
+    }
+
+    /// Keep an uncertain marker even when the write fails. No send occurs, and
+    /// any partial journal write can only suppress replay, never acknowledge it.
+    fn claim_rlm_parent_delivery(
+        &self,
+        state: &mut RlmContinuationState,
+        task_ids: &[String],
+    ) -> Result<Vec<(String, Option<RlmResultDelivery>)>, String> {
+        let mut previous = Vec::new();
+        for task in &mut state.tasks {
+            if !task.replied && task_ids.contains(&task.id) {
+                previous.push((task.id.clone(), task.result_delivery.clone()));
+                if task.result_delivery.is_none() {
+                    task.result_delivery = Some(RlmResultDelivery {
+                        attempt_id: uuid::Uuid::new_v4().to_string(),
+                        reason: "acknowledgement_pending".to_string(),
+                    });
+                }
+            }
+        }
+        if !previous.is_empty() {
+            if let Err(error) = self.persist_rlm_delivery_state(state) {
+                for task in &mut state.tasks {
+                    if previous.iter().any(|(id, old)| id == &task.id && old.is_none()) {
+                        if let Some(delivery) = &mut task.result_delivery {
+                            delivery.reason = "intent_persistence_failed_no_send".to_string();
+                        }
+                    }
+                }
+                return Err(error);
+            }
+        }
+        Ok(previous)
+    }
+
+    fn settle_rlm_parent_delivery(
+        &self,
+        previous: &[(String, Option<RlmResultDelivery>)],
+        outcome: &Result<AgentSessionMessageReceipt, String>,
+        target: &str,
+        message: &str,
+        explicit: bool,
+    ) {
+        let acknowledged = outcome.as_ref().is_ok_and(|receipt| {
+            rlm_result_receipt_is_valid(receipt, target, message)
+        });
+        if previous.is_empty() {
+            if explicit && acknowledged {
+                self.parent_reply_count.fetch_add(1, Ordering::SeqCst);
+            }
+            return;
+        }
+        let rejected = outcome.as_ref().err().is_some_and(|error| {
+            rlm_result_rejected_before_admission(error)
+        });
+        let mut state = self.rlm_continuation.lock().unwrap();
+        let mut settled = state.clone();
+        let mut newly_replied = false;
+        for task in &mut settled.tasks {
+            let Some((_, prior)) = previous.iter().find(|(id, _)| id == &task.id) else { continue };
+            if task.replied {
+                continue;
+            }
+            if acknowledged {
+                task.replied = true;
+                task.result_delivery = None;
+                newly_replied = true;
+            } else if rejected {
+                // A rejected deliberate reply must not erase earlier uncertainty.
+                task.result_delivery = prior.clone();
+            } else if let Some(delivery) = &mut task.result_delivery {
+                delivery.reason = if outcome.is_ok() { "invalid_receipt" } else { "send_error_acknowledgement_unknown" }.to_string();
+            }
+        }
+        let persisted = self.persist_rlm_delivery_state(&settled);
+        if persisted.is_ok() || acknowledged {
+            *state = settled;
+        }
+        if let Err(error) = persisted {
+            eprintln!("RLM result settlement persistence failed; durable intent prevents replay: {error}");
+        }
+        if !acknowledged && !rejected {
+            eprintln!("RLM parent result acknowledgement is uncertain; result retained and automatic replay blocked");
+        }
+        let all_replied = state.tasks.iter().all(|task| task.replied);
+        drop(state);
+        if newly_replied || (explicit && acknowledged) {
+            self.parent_reply_count.fetch_add(1, Ordering::SeqCst);
+        }
+        *self.replied_to_parent_since_task.lock().unwrap() = Some(all_replied);
+    }
+
     /// `_beginRlmParentTask`.
     fn begin_rlm_parent_task(&self, message: &AgentMessage) -> Result<(), String> {
         if self.rlm_depth == 0 || !is_agent_session_message(message) {
@@ -5322,6 +5456,7 @@ impl AgentSession {
                 received_at: timestamp as f64,
                 replied: false,
                 result: None,
+                result_delivery: None,
             });
             state.continuation_count = 0.0;
             state.last_source_key = None;
@@ -5607,57 +5742,15 @@ impl AgentSession {
         }
     }
 
-    /// `_markExplicitRlmParentReply`.
-    fn mark_explicit_rlm_parent_reply(&self, task_ids: &[String]) {
-        {
-            let mut state = self.rlm_continuation.lock().unwrap();
-            for task in state.tasks.iter_mut() {
-                if task_ids.contains(&task.id) {
-                    task.replied = true;
-                }
-            }
-        }
-        *self.replied_to_parent_since_task.lock().unwrap() = Some(
-            self.rlm_continuation
-                .lock()
-                .unwrap()
-                .tasks
-                .iter()
-                .all(|task| task.replied),
-        );
-        self.parent_reply_count.fetch_add(1, Ordering::SeqCst);
-        self.persist_rlm_continuation_state();
-    }
-
     /// `_deliverPendingRlmResults`.
     async fn deliver_pending_rlm_results(self: &Arc<Self>) {
         self.deliver_pending_rlm_results_once().await;
     }
 
     async fn deliver_pending_rlm_results_once(self: &Arc<Self>) {
-        let state = self.rlm_continuation.lock().unwrap().clone();
-        if !state
-            .tasks
-            .iter()
-            .any(|task| task.result.is_some() && !task.replied)
-            || self.disposed.load(Ordering::SeqCst)
-            || self.disposing.load(Ordering::SeqCst)
-        {
+        if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             return;
         }
-        let tasks = state.tasks.clone();
-        // An explicit reply already on the wire owns result delivery. Do not race
-        // it with an automatic report merely because the model turn has ended.
-        // `await Promise.allSettled([...this._rlmExplicitRepliesInFlight])`: the
-        // `Shared` handles are cloned out, so the live list keeps its entries.
-        let in_flight: Vec<SharedReplyFuture> = self
-            .rlm_explicit_replies_in_flight
-            .lock()
-            .unwrap()
-            .iter()
-            .map(|(_, handle)| handle.clone())
-            .collect();
-        futures::future::join_all(in_flight).await;
         let controller = match &self.agent_message_controller {
             Some(controller) => controller.clone(),
             None => return,
@@ -5666,51 +5759,70 @@ impl AgentSession {
             Ok(roster) => roster,
             Err(_) => return,
         };
-        let parent = match roster
-            .entries
-            .iter()
-            .find(|entry| entry.relationship == crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT)
-        {
+        let parent = match roster.entries.iter().find(|entry| {
+            entry.relationship == crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT
+        }) {
             Some(parent) => parent.clone(),
             None => return,
         };
-        for task in tasks.iter() {
-            // Same `await Promise.allSettled([...])` snapshot as above.
-            let in_flight: Vec<SharedReplyFuture> = self
-                .rlm_explicit_replies_in_flight
-                .lock()
-                .unwrap()
-                .iter()
-                .map(|(_, handle)| handle.clone())
-                .collect();
-            futures::future::join_all(in_flight).await;
-            let result = match &task.result {
-                Some(result) => result.clone(),
-                None => continue,
+        let task_ids: Vec<String> = self.rlm_continuation.lock().unwrap().tasks.iter()
+            .map(|task| task.id.clone()).collect();
+        for task_id in task_ids {
+            let claimed = loop {
+                let in_flight: Vec<SharedReplyFuture> = self.rlm_explicit_replies_in_flight
+                    .lock().unwrap().iter().map(|(_, handle)| handle.clone()).collect();
+                futures::future::join_all(in_flight).await;
+                let delivery = self.rlm_parent_delivery_gate.lock().await;
+                let attempt = {
+                    // Registration and claim have one ordering boundary. A
+                    // pre-existing explicit reply wins; a later deliberate send
+                    // waits for the automatic submission but is not suppressed.
+                    let replies = self.rlm_explicit_replies_in_flight.lock().unwrap();
+                    if replies.iter().any(|(_, handle)| handle.peek().is_none()) {
+                        None
+                    } else {
+                        Some((|| {
+                            let mut state = self.rlm_continuation.lock().unwrap();
+                            // Re-read live state after all explicit futures settle.
+                            let task = state.tasks.iter().find(|task| {
+                                task.id == task_id && !task.replied && task.result.is_some()
+                                    && task.result_delivery.is_none()
+                            }).cloned();
+                            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                                return Ok(None);
+                            }
+                            let Some(task) = task else { return Ok(None) };
+                            self.claim_rlm_parent_delivery(&mut state, &[task_id.clone()])
+                                .map(|previous| Some((task, previous)))
+                        })())
+                    }
+                };
+                match attempt {
+                    Some(Ok(Some((task, previous)))) => break Some((delivery, task, previous)),
+                    Some(Ok(None)) => break None,
+                    Some(Err(error)) => {
+                        eprintln!("RLM result intent persistence failed; no message sent: {error}");
+                        break None;
+                    }
+                    // Drop the gate before awaiting explicit futures that need it.
+                    None => drop(delivery),
+                }
             };
-            if task.replied || self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst)
-            {
-                continue;
+            let Some((_delivery, task, previous)) = claimed else { continue };
+            // A cancelled/disposed owner cannot report success. Its durable
+            // intent remains visible and cannot authorize a resend on reload.
+            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                return;
             }
+            let result = task.result.as_ref().expect("claimed result");
             let mut text = vec![
                 "RLM child automatic result".to_string(),
-                format!(
-                    "child_id: {}",
-                    self.rlm_parent_node_id
-                        .clone()
-                        .unwrap_or_else(|| self.session_id())
-                ),
+                format!("child_id: {}", self.rlm_parent_node_id.clone().unwrap_or_else(|| self.session_id())),
                 format!("session_name: {}", self.session_name().unwrap_or_else(|| "unnamed".to_string())),
                 format!("task_id: {}", task.id),
                 format!("terminal_status: {}", result.status),
                 format!("partial: {}", if result.partial { "yes" } else { "no" }),
-                format!(
-                    "stop_reason: {}",
-                    result
-                        .stop_reason
-                        .clone()
-                        .unwrap_or_else(|| "unknown".to_string())
-                ),
+                format!("stop_reason: {}", result.stop_reason.as_deref().unwrap_or("unknown")),
             ];
             if let Some(reason) = &result.reason {
                 text.push(format!("reason: {reason}"));
@@ -5721,31 +5833,13 @@ impl AgentSession {
             } else {
                 result.text.clone()
             });
-            let _ = controller
-                .send_agent_message(crate::core::agent_messages::AgentSessionMessageSendInput {
-                    target: parent.id.clone(),
-                    message: text.join("\n"),
-                    receiver_role: None,
-                })
-                .await;
-            {
-                let mut state = self.rlm_continuation.lock().unwrap();
-                for candidate in state.tasks.iter_mut() {
-                    if candidate.id == task.id {
-                        candidate.replied = true;
-                    }
-                }
-            }
-            self.parent_reply_count.fetch_add(1, Ordering::SeqCst);
-            *self.replied_to_parent_since_task.lock().unwrap() = Some(
-                self.rlm_continuation
-                    .lock()
-                    .unwrap()
-                    .tasks
-                    .iter()
-                    .all(|candidate| candidate.replied),
-            );
-            self.persist_rlm_continuation_state();
+            let message = text.join("\n");
+            let outcome = controller.send_agent_message(
+                crate::core::agent_messages::AgentSessionMessageSendInput {
+                    target: parent.id.clone(), message: message.clone(), receiver_role: None,
+                },
+            ).await;
+            self.settle_rlm_parent_delivery(&previous, &outcome, &parent.id, &message, false);
         }
     }
 
@@ -5920,7 +6014,9 @@ impl AgentSession {
             "continuationQueued": continuation_queued,
             "compactionReason": state.compaction_reason.clone(),
             "currentTaskId": state.tasks.last().map(|task| task.id.clone()),
-            "diagnosticState": if !self.is_streaming()
+            "diagnosticState": if state.tasks.iter().any(|task| !task.replied && task.result_delivery.is_some()) {
+                Value::String("rlm_result_acknowledgement_uncertain".to_string())
+            } else if !self.is_streaming()
                 && !self.is_compacting()
                 && state.terminal_status.is_none()
                 && !continuation_queued
@@ -22034,6 +22130,7 @@ mod rlm_session_t10_tests {
             received_at: 1.0,
             replied: false,
             result: None,
+            result_delivery: None,
         }]
     }
 
