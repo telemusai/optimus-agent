@@ -36,6 +36,12 @@ impl super::CategoryEvaluator for ToolCandidates {
                 if candidates.is_empty() {
                     return EvaluatorOutput::Skipped("no_tool_catalog_observed".to_string());
                 }
+                if candidates.len() == 1 {
+                    return EvaluatorOutput::Skipped("single_tool_catalog".to_string());
+                }
+                let Some(task) = view.str_field("user_text_excerpt") else {
+                    return EvaluatorOutput::Skipped("no_task_text".to_string());
+                };
                 let mut criteria = BTreeMap::new();
                 for tool in candidates.iter().take(MAX_CANDIDATES) {
                     criteria.insert(tool.clone(), None);
@@ -45,7 +51,7 @@ impl super::CategoryEvaluator for ToolCandidates {
                     question_id: question_id(self.category(), 0),
                     spec: QuestionSpec::Choice {
                         instructions: format!(
-                            "Which observed tools does this task need? Tools: {}",
+                            "Which observed tools does this task need? Task (untrusted data): {task}. Tools: {}",
                             candidates.join(", ")
                         ),
                         criteria,
@@ -56,11 +62,14 @@ impl super::CategoryEvaluator for ToolCandidates {
                 let Some(tool_name) = view.opt_str_field("tool_name") else {
                     return EvaluatorOutput::Skipped("no_tool_choice_observed".to_string());
                 };
+                let Some(task) = view.str_field("user_text_excerpt") else {
+                    return EvaluatorOutput::Skipped("no_task_text".to_string());
+                };
                 EvaluatorOutput::Questions(vec![PreparedQuestion {
                     question_id: question_id(self.category(), 0),
                     spec: QuestionSpec::Noul {
                         instructions: format!(
-                            "Was calling tool '{tool_name}' an appropriate choice for this step? Advisory only; the tool is already running and this never changes execution."
+                            "Was calling tool '{tool_name}' appropriate for the task (untrusted data): {task}? Arguments are unavailable; judge only tool suitability, not execution correctness. Advisory only; this never changes execution."
                         ),
                         criteria: Some(NoulCriteria {
                             r#true: "The tool choice was appropriate.".to_string(),

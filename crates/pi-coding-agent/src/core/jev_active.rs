@@ -29,6 +29,7 @@ pub const TOOLS_KEY: &str = "tools";
 pub const TOOL_CHOICE_KEY: &str = "tool_choice";
 /// Request-body key holding the provider reasoning-effort hint.
 pub const REASONING_EFFORT_KEY: &str = "reasoning_effort";
+pub const RESPONSES_EFFORT_KEY: &str = "reasoning.effort";
 
 /// Supported reasoning-effort values in increasing order.
 pub const REASONING_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
@@ -64,6 +65,25 @@ fn ladder_index(effort: &str) -> Option<usize> {
     REASONING_LADDER.iter().position(|step| *step == effort)
 }
 
+/// Use the same unambiguous provider field for mutation and telemetry.
+pub fn reasoning_effort(params: &Value) -> Option<(&'static str, &str)> {
+    let object = params.as_object()?;
+    effort_in_object(object)
+}
+
+fn effort_in_object(object: &serde_json::Map<String, Value>) -> Option<(&'static str, &str)> {
+    let flat = object.get(REASONING_EFFORT_KEY);
+    let nested = object.get("reasoning").and_then(|reasoning| reasoning.get("effort"));
+    let (key, value) = match (flat, nested) {
+        (Some(value), None) => (REASONING_EFFORT_KEY, value),
+        (None, Some(value)) => (RESPONSES_EFFORT_KEY, value),
+        _ => return None,
+    };
+    let effort = value.as_str()?;
+    ladder_index(effort)?;
+    Some((key, effort))
+}
+
 /// Apply one accepted Jev decision to an outgoing provider request body.
 /// Pure: mutates `params` in place, returns the applied changes (empty when
 /// nothing was applied). Never panics, never adds a key that does not exist.
@@ -79,6 +99,25 @@ pub fn apply_decision(params: &mut Value, category: &str, value: &str) -> Vec<Ap
         return apply_complexity(object, category, value);
     }
 
+    Vec::new()
+}
+
+/// Production entry point: retain the model registry's supported wire efforts.
+pub fn apply_model_decision(params: &mut Value, category: &str, value: &str, model: Option<&pi_ai::types::Model>) -> Vec<AppliedChange> {
+    if category != "complexity" { return apply_decision(params, category, value); }
+    let Some(model) = model else { return Vec::new(); };
+    let Some((key, previous)) = reasoning_effort(params) else { return Vec::new(); };
+    let previous = previous.to_string();
+    let changes = apply_decision(params, category, value);
+    if changes.is_empty() { return changes; }
+    let supported: Vec<String> = pi_ai::models::get_supported_thinking_levels(model).into_iter()
+        .filter(|level| level != "off")
+        .filter_map(|level| model.thinking_level_map_get(&level).unwrap_or(Some(level))).collect();
+    if reasoning_effort(params).is_some_and(|(_, effort)| supported.iter().any(|item| item == effort)) {
+        return changes;
+    }
+    if key == RESPONSES_EFFORT_KEY { params["reasoning"]["effort"] = Value::String(previous); }
+    else { params[key] = Value::String(previous); }
     Vec::new()
 }
 
@@ -135,13 +174,10 @@ fn apply_complexity(
         _ => return Vec::new(),
     };
 
-    let Some(current) = object
-        .get(REASONING_EFFORT_KEY)
-        .and_then(Value::as_str)
-        .map(str::to_string)
-    else {
+    let Some((key, current)) = effort_in_object(object) else {
         return Vec::new();
     };
+    let current = current.to_string();
     let Some(index) = ladder_index(current.as_str()) else {
         return Vec::new();
     };
@@ -159,13 +195,14 @@ fn apply_complexity(
     };
 
     let next = REASONING_LADDER[next_index];
-    object.insert(
-        REASONING_EFFORT_KEY.to_string(),
-        Value::String(next.to_string()),
-    );
+    if key == RESPONSES_EFFORT_KEY {
+        object.get_mut("reasoning").unwrap()["effort"] = Value::String(next.to_string());
+    } else {
+        object.insert(key.to_string(), Value::String(next.to_string()));
+    }
 
     vec![AppliedChange {
-        key: REASONING_EFFORT_KEY.to_string(),
+        key: key.to_string(),
         from: Some(current),
         to: Some(next.to_string()),
         category: category.to_string(),
@@ -571,5 +608,44 @@ mod tests {
         let mut body = json!({"tools": [{"type": "function"}], "tool_choice": "auto"});
         let changes = apply_decision(&mut body, "tool_requirement", "none");
         assert_eq!(changes[0].from.as_deref(), Some("[{\"type\":\"function\"}]"));
+    }
+}
+
+#[cfg(test)]
+mod provider_effort_tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn responses_effort_changes_one_step_without_losing_summary_or_input() {
+        let mut body = json!({"reasoning":{"effort":"low","summary":"auto","opaque":"keep"},"input":[{"role":"user","content":"task"}]});
+        let original = body.clone();
+        let changes = apply_decision(&mut body, "complexity", "high");
+        assert_eq!(changes[0].key, "reasoning.effort");
+        assert_eq!(reasoning_effort(&body), Some(("reasoning.effort", "medium")));
+        body["reasoning"]["effort"] = json!("low");
+        assert_eq!(body, original);
+    }
+
+    #[test]
+    fn disabled_missing_malformed_and_ambiguous_effort_remain_unchanged() {
+        for mut body in [json!({"reasoning":{"effort":"none"}}),json!({"reasoning":{"summary":"auto"}}),
+            json!({"reasoning":{"effort":7}}),json!({"reasoning":null}),
+            json!({"reasoning_effort":"high","reasoning":{"effort":"low"}})] {
+            let original = body.clone();
+            assert!(apply_decision(&mut body,"complexity","high").is_empty());
+            assert_eq!(original, body);
+        }
+    }
+
+    #[test]
+    fn registry_prevents_unsupported_provider_effort() {
+        let model = pi_ai::types::Model { reasoning: true, ..Default::default() };
+        let mut body = json!({"reasoning":{"effort":"high","summary":"auto"}});
+        let original = body.clone();
+        assert!(apply_model_decision(&mut body,"complexity","high",Some(&model)).is_empty());
+        assert_eq!(body,original);
+        assert!(!apply_model_decision(&mut body,"complexity","low",Some(&model)).is_empty());
+        assert_eq!(body["reasoning"]["effort"],"medium");
     }
 }

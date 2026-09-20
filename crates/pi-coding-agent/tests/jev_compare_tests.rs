@@ -154,6 +154,7 @@ struct Fixture {
 struct CreationOverrides {
     tools: Option<Vec<String>>,
     custom_tools: Option<Vec<ToolDefinition>>,
+    reasoning: bool,
 }
 
 async fn build_session(provider_name: &str, overrides: CreationOverrides) -> Fixture {
@@ -174,7 +175,8 @@ async fn build_session(provider_name: &str, overrides: CreationOverrides) -> Fix
         tokens_per_second: Some(0.0),
         ..Default::default()
     }));
-    let model = provider.get_model();
+    let mut model = provider.get_model();
+    model.reasoning = overrides.reasoning;
 
     let settings = Arc::new(Mutex::new(SettingsManager::in_memory(
         json!({
@@ -693,7 +695,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
         for effect in record["applied_effects"].as_array().into_iter().flatten() {
             let field = effect["field"].as_str().unwrap_or("");
             assert!(
-                ["tools", "tool_choice", "reasoning_effort"].contains(&field),
+                ["tools", "tool_choice", "reasoning_effort", "reasoning.effort"].contains(&field),
                 "Active may only change a provider-body tool/effort key: {line}"
             );
         }
@@ -807,6 +809,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
     let tool_overrides = || CreationOverrides {
         tools: Some(vec!["jev_e2e_probe".to_string()]),
         custom_tools: Some(vec![probe_tool()]),
+        ..Default::default()
     };
     let tool_steps = || {
         vec![
@@ -875,7 +878,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
         for compaction in [false, true] {
             write_settings(&agent_dir, json!({"global_default":mode, "transport":"mock",
                 "compaction_enabled":compaction, "features":{"context_relevance":true}}));
-            let axis = build_session(&format!("jev-axis-{mode}-{compaction}"), CreationOverrides::default()).await;
+            let axis = build_session(&format!("jev-axis-{mode}-{compaction}"), CreationOverrides { reasoning: true, ..Default::default() }).await;
             axis.provider.set_responses(vec![FauxResponseStep::Message(reply(20))]);
             turn(&axis.session, "synthetic independent-axis task").await;
             wait_jev_session_settled(&axis.session).await;
@@ -884,10 +887,11 @@ async fn jev_compare_e2e_parity_and_isolation() {
             let ctx = runner.create_context();
             let before_request = read_record_count(&agent_dir);
             let body = json!({"model":"faux", "tools":[{"type":"function","function":{"name":"search"}}],
-                "tool_choice":"auto", "reasoning_effort":"high", "messages":[{"role":"user","content":"unchanged"}]});
+                "tool_choice":"auto", "reasoning":{"effort":"low", "summary":"auto"}, "messages":[{"role":"user","content":"unchanged"}]});
             let outgoing = runner.emit_before_provider_request(body.clone()).await;
             if ["active", "compare-active"].contains(&mode) {
-                assert_eq!(outgoing["reasoning_effort"],json!("xhigh"), "legacy active effect at actual provider hook");
+                assert_eq!(outgoing["reasoning"]["effort"],json!("medium"), "supported Responses effort at actual provider hook");
+                assert_eq!(outgoing["reasoning"]["summary"],json!("auto"));
                 assert_eq!(outgoing["tools"],body["tools"], "mock delegate recommendation keeps tools");
                 assert_eq!(outgoing["messages"],body["messages"]);
                 assert_eq!(outgoing["model"],body["model"]);
@@ -903,6 +907,7 @@ async fn jev_compare_e2e_parity_and_isolation() {
                 assert!(!shadow.is_empty()); assert_eq!(shadow.len(),active.len());
                 assert!(shadow.iter().all(|row|row["applied"]==false));
                 assert!(active.iter().all(|row|row["baseline_action"]["tools"]=="count:1"));
+                assert!(active.iter().all(|row|row["baseline_action"]["reasoning.effort"]=="low"));
                 assert!(active.iter().all(|row|row["compaction_enabled"]==compaction));
             }
             let mut old_assistant = serde_json::to_value(faux_assistant_message(

@@ -40,8 +40,8 @@ pub const ORPHAN_PROCESS_JOURNAL_ENV: &str = "PRIME_AGENT_INTERNAL_ORPHAN_PROCES
 pub const SESSION_LEASES_ENABLED_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASES";
 pub const SESSION_LEASE_OWNER_ID_ENV: &str = "PRIME_AGENT_INTERNAL_SESSION_LEASE_OWNER_ID";
 // TODO(slice): ca-daemon-b slice, modes/daemon/daemon-protocol.ts.
-const DAEMON_PROTOCOL_VERSION: f64 = 7.0;
-const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-29-c16da0e12d5a";
+const DAEMON_PROTOCOL_VERSION: f64 = crate::modes::daemon::daemon_protocol::DAEMON_PROTOCOL_VERSION as f64;
+const DAEMON_SCHEMA_ID: &str = crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_ID;
 // TODO(slice): ca-root slice, config.ts.
 const VERSION: &str = env!("CARGO_PKG_VERSION");
 const CLIENT_ERROR_LOG_ENV: &str = "PRIME_AGENT_CLIENT_ERROR_LOG";
@@ -1504,8 +1504,8 @@ mod tests {
     fn current_hello_matches_version_schema_and_protocol() {
         let mut hello = DaemonHello {
             app_version: Some(VERSION.to_string()),
-            protocol_version: DAEMON_PROTOCOL_VERSION,
-            schema_id: Some(DAEMON_SCHEMA_ID.to_string()),
+            protocol_version: crate::modes::daemon::daemon_protocol::DAEMON_PROTOCOL_VERSION as f64,
+            schema_id: Some(crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_ID.to_string()),
             build_id: None,
             launcher_path: None,
             entrypoint_path: None,

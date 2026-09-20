@@ -36,7 +36,7 @@ pub struct PreparedRelevance {
 }
 
 impl PreparedRelevance {
-    fn new(
+    pub(crate) fn new(
         category: DecisionCategory,
         query: &str,
         candidates: Vec<(usize, String, usize)>,
@@ -152,6 +152,7 @@ fn estimate_tokens(bytes: usize) -> usize {
 fn candidate_key(category: DecisionCategory) -> &'static str {
     match category {
         DecisionCategory::ContextRelevance => "context_candidates",
+        DecisionCategory::CodeSearchRelevance => "code_search_candidates",
         DecisionCategory::MemoryRelevance => "memory_candidates",
         _ => "unsupported_candidates",
     }
@@ -284,7 +285,7 @@ fn text_excerpt(content: &Value) -> Option<String> {
     ))
 }
 
-fn query_from_messages(messages: &[Value]) -> String {
+pub(crate) fn query_from_messages(messages: &[Value]) -> String {
     messages
         .iter()
         .rev()

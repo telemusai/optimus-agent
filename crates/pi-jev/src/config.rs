@@ -89,6 +89,8 @@ pub struct JevFeatures {
     pub complexity: bool,
     pub tool_candidates: bool,
     pub context_relevance: bool,
+    pub code_search_relevance: bool,
+    pub code_search_filtering: bool,
     pub memory_relevance: bool,
     pub result_sufficiency: bool,
     pub loop_control: bool,
@@ -104,6 +106,8 @@ impl Default for JevFeatures {
             complexity: true,
             tool_candidates: false,
             context_relevance: false,
+            code_search_relevance: false,
+            code_search_filtering: false,
             memory_relevance: false,
             result_sufficiency: false,
             loop_control: false,
@@ -120,6 +124,8 @@ pub enum JevFeature {
     Complexity,
     ToolCandidates,
     ContextRelevance,
+    CodeSearchRelevance,
+    CodeSearchFiltering,
     MemoryRelevance,
     ResultSufficiency,
     LoopControl,
@@ -129,8 +135,8 @@ pub enum JevFeature {
 }
 
 impl JevFeature {
-    pub const ALL: [Self; 10] = [Self::ToolRequirement, Self::Complexity, Self::ToolCandidates,
-        Self::ContextRelevance, Self::MemoryRelevance, Self::ResultSufficiency,
+    pub const ALL: [Self; 12] = [Self::ToolRequirement, Self::Complexity, Self::ToolCandidates,
+        Self::ContextRelevance, Self::CodeSearchRelevance, Self::CodeSearchFiltering, Self::MemoryRelevance, Self::ResultSufficiency,
         Self::LoopControl, Self::RetryClassification, Self::Verification, Self::TraceObserver];
 
     pub fn as_str(self) -> &'static str {
@@ -139,6 +145,8 @@ impl JevFeature {
             Self::Complexity => "complexity",
             Self::ToolCandidates => "tool_candidates",
             Self::ContextRelevance => "context_relevance",
+            Self::CodeSearchRelevance => "code_search_relevance",
+            Self::CodeSearchFiltering => "code_search_filtering",
             Self::MemoryRelevance => "memory_relevance",
             Self::ResultSufficiency => "result_sufficiency",
             Self::LoopControl => "loop_control",
@@ -161,6 +169,8 @@ impl JevFeatures {
             JevFeature::Complexity => self.complexity,
             JevFeature::ToolCandidates => self.tool_candidates,
             JevFeature::ContextRelevance => self.context_relevance,
+            JevFeature::CodeSearchRelevance => self.code_search_relevance,
+            JevFeature::CodeSearchFiltering => self.code_search_filtering,
             JevFeature::MemoryRelevance => self.memory_relevance,
             JevFeature::ResultSufficiency => self.result_sufficiency,
             JevFeature::LoopControl => self.loop_control,
@@ -176,6 +186,8 @@ impl JevFeatures {
             JevFeature::Complexity => self.complexity = enabled,
             JevFeature::ToolCandidates => self.tool_candidates = enabled,
             JevFeature::ContextRelevance => self.context_relevance = enabled,
+            JevFeature::CodeSearchRelevance => self.code_search_relevance = enabled,
+            JevFeature::CodeSearchFiltering => self.code_search_filtering = enabled,
             JevFeature::MemoryRelevance => self.memory_relevance = enabled,
             JevFeature::ResultSufficiency => self.result_sufficiency = enabled,
             JevFeature::LoopControl => self.loop_control = enabled,

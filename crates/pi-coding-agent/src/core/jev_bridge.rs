@@ -876,10 +876,11 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                     if !observer.can_apply(&outcome) || decision.turn != core.turn(&session_id)
                         || !decision.is_fresh(std::time::SystemTime::now(), &policy) { break; }
                     let before = request_action(&params);
-                    let changes = crate::core::jev_active::apply_decision(
+                    let changes = crate::core::jev_active::apply_model_decision(
                         &mut params,
                         decision.category.as_str(),
                         &decision.value,
+                        ctx.model().as_ref(),
                     );
                     if changes.is_empty() {
                         continue;
@@ -1054,6 +1055,7 @@ pub async fn filter_memory_candidates(ctx: Arc<dyn ExtensionContext>, query: &st
 pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages: Vec<Value>) -> Vec<Value> {
     let session_id = ctx.session_manager().get_session_id();
     let settings = load_settings_cached();
+    let messages = filter_code_search_candidates(&ctx, messages, &settings).await;
     if !settings.effective_mode(&session_id).is_enabled() || !settings.effective_features(&session_id).context_relevance { return messages; }
     let mut prepared = crate::core::jev_retrieval::prepare_context(&messages);
     prepared.configure(&settings.filtering);
@@ -1062,6 +1064,96 @@ pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages:
     let effects = relevance_effects(&prepared, &removals);
     observer.record_active_with_action(&outcome, &effects, &prepared.action_metadata(&removals));
     crate::core::jev_retrieval::apply_context(messages, &removals)
+}
+
+async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut messages: Vec<Value>, settings: &JevSettings) -> Vec<Value> {
+    use futures::StreamExt;
+    use crate::core::jev_code_search;
+    let session_id = ctx.session_manager().get_session_id();
+    let mode = settings.effective_mode(&session_id);
+    let features = settings.effective_features(&session_id);
+    if !mode.is_enabled() || !features.code_search_relevance { return messages; }
+    if ctx.signal().is_some_and(|signal| signal.is_cancelled()) { return messages; }
+    let Some(core) = bridge_for_session(&session_id) else { return messages; };
+    let Some(observer) = core.observer(&session_id, ctx.ui()) else { return messages; };
+    let query = crate::core::jev_retrieval::query_from_messages(&messages);
+    let query = if query.is_empty() { core.task_excerpt(&session_id).unwrap_or_default() } else { query };
+    let presentations = jev_code_search::prepare(&messages, &query, &settings.filtering);
+    let generation = decision_policy_generation(settings, &session_id);
+    let stamp = cheap_credential_stamp(settings);
+    let started = tokio::time::Instant::now();
+    for presentation in presentations {
+        let cache_key = pi_jev::snapshot::fingerprint_of(&json!([session_id, core.turn(&session_id), mode.as_str(), generation, stamp, presentation.fingerprint]));
+        if !mode.allows_active() && jev_code_search::already_observed(&cache_key) {
+            continue;
+        }
+        let payloads: Vec<_> = presentation.batches.iter().map(|batch| json!({
+            "session_id":session_id, "turn":core.turn(&session_id), "state":batch.state,
+            "baseline_action":batch.action_metadata(&[]), "policy_generation":generation,
+            "compaction_enabled":settings.effective_compaction_enabled(&session_id)
+        })).collect();
+        if !mode.allows_active() {
+            for (batch, payload) in presentation.batches.iter().zip(&payloads) {
+                observer.observe_prepared(payload, "code_search", batch.questions());
+            }
+            jev_code_search::remember_observation(cache_key);
+            continue;
+        }
+        let policy = pi_jev::active::ActivationPolicy {
+            enabled_categories: if features.code_search_filtering { [pi_jev::types::DecisionCategory::CodeSearchRelevance].into_iter().collect() } else { Default::default() },
+            min_confidence: settings.filtering.min_confidence,
+            max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+        };
+        let signal = ctx.signal();
+        let calls: Vec<_> = payloads.into_iter().enumerate().map(|(index, payload)| {
+            let observer = observer.clone();
+            let policy = policy.clone();
+            let signal = signal.clone();
+            let questions = presentation.batches[index].questions();
+            async move {
+                let remaining = Duration::from_millis(2500).saturating_sub(started.elapsed());
+                let mut payload = payload;
+                payload["decision_timeout_ms"] = json!(if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
+                    0
+                } else { remaining.as_millis() as u64 });
+                let call = observer.decide_prepared(&payload, "code_search", questions, &policy);
+                tokio::pin!(call);
+                let outcome = if let Some(signal) = signal {
+                    tokio::select! { biased;
+                        // Register the request token before cancelling it, including
+                        // when cancellation races the first poll of this future.
+                        result = &mut call => result,
+                        _ = signal.cancelled() => {
+                            observer.cancel_decisions(payload["session_id"].as_str().unwrap_or_default());
+                            call.await
+                        }
+                    }
+                } else { call.await };
+                (index, outcome)
+            }
+        }).collect();
+        let outcomes: Vec<_> = futures::stream::iter(calls).buffer_unordered(2).collect().await;
+        let complete = outcomes.iter().all(|(_, outcome)|
+            observer.can_apply(outcome) && outcome.turn == core.turn(&session_id) && outcome.unavailable.is_none()
+                && outcome.raw.as_ref().is_some_and(|raw| raw.skips.is_empty()))
+            && signal.as_ref().is_none_or(|signal| !signal.is_cancelled());
+        let removals: Vec<_> = if complete && features.code_search_filtering {
+            outcomes.iter().flat_map(|(index, outcome)| {
+                let batch = &presentation.batches[*index];
+                batch.removals(&outcome.decisions, outcome.request_id.as_deref().unwrap_or(""), outcome.turn)
+            }).collect()
+        } else { Vec::new() };
+        let projection = presentation.project(&removals);
+        let applied = if projection.is_some() { removals } else { Vec::new() };
+        for (index, outcome) in &outcomes {
+            let batch = &presentation.batches[*index];
+            observer.record_active_with_action(outcome, &relevance_effects(batch, &applied), &batch.action_metadata(&applied));
+        }
+        if complete {
+            if let Some(content) = projection { messages[presentation.message_index]["content"] = content; }
+        }
+    }
+    messages
 }
 
 fn observed_failure_kind(message: &Value) -> Option<pi_jev::observation::RetryFailureKind> {
@@ -1094,8 +1186,8 @@ fn activation_policy(features: pi_jev::config::JevFeatures) -> pi_jev::active::A
 fn request_action(params: &Value) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
     if let Some(tools) = params.get("tools").and_then(Value::as_array) { result.insert("tools".to_string(), format!("count:{}", tools.len())); }
-    if let Some(effort) = params.get("reasoning_effort").and_then(Value::as_str) {
-        if crate::core::jev_active::REASONING_LADDER.contains(&effort) { result.insert("reasoning_effort".to_string(), effort.to_string()); }
+    if let Some((key, effort)) = crate::core::jev_active::reasoning_effort(params) {
+        result.insert(key.to_string(), effort.to_string());
     }
     if params.get("tool_choice").is_some() { result.insert("tool_choice".to_string(), "present".to_string()); }
     result
@@ -1237,7 +1329,8 @@ fn bridge_event(
         ExtensionEvent::ToolCall(tool_call) => {
             let tool_name = tool_call.tool_name().to_string();
             let tool_call_id = tool_call.tool_call_id().to_string();
-            let state = tool_call_observation(&tool_name, &tool_call_id, &allowlist);
+            let mut state = tool_call_observation(&tool_name, &tool_call_id, &allowlist);
+            state["user_text_excerpt"] = json!(core.task_excerpt(session_id));
             Some((
                 "tool_call".to_string(),
                 json!({
@@ -1751,5 +1844,20 @@ mod observation_redaction_tests {
         let state = tool_call_observation("read_file", "call-2", &allowlist);
         assert_eq!(state["model_allowlist"], json!([]));
         assert_eq!(state["tool_name"], json!("read_file"));
+    }
+}
+
+#[cfg(test)]
+mod provider_action_tests {
+    use super::*;
+    #[test]
+    fn telemetry_tracks_the_responses_field_that_actually_changes() {
+        let mut params=json!({"reasoning":{"effort":"low","summary":"auto"}});
+        let before=request_action(&params);
+        let changes=crate::core::jev_active::apply_decision(&mut params,"complexity","high");
+        let after=request_action(&params);
+        assert_eq!(before[&changes[0].key],"low");
+        assert_eq!(after[&changes[0].key],"medium");
+        assert!(!after.contains_key("reasoning_effort"));
     }
 }
