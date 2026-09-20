@@ -328,9 +328,30 @@ async fn batched_parent_instructions_each_create_a_durable_continuation_task() {
             }).expect("parent-task ledger saved before model work");
             let restored = parse_rlm_continuation_state(saved.get("data").unwrap()).unwrap();
             assert_eq!(restored.tasks, ledger.tasks);
-            // A real parent reply closes both delivered tasks. The fixture has
-            // no parent transport and must not start autonomous recovery work.
-            session.mark_explicit_rlm_parent_reply(&ids);
+            // Settle one synthetic acknowledged reply through the production
+            // claim/receipt path. This batching fixture has no parent transport.
+            let previous = {
+                let mut ledger = session.rlm_continuation.lock().unwrap();
+                session.claim_rlm_parent_delivery(&mut ledger, &ids).unwrap()
+            };
+            assert_eq!(previous.len(), 2);
+            let payload = crate::core::agent_messages::AgentSessionMessagePayload {
+                id: "agentmsg_batched-parent-fixture".into(),
+                source: "agent_message".into(),
+                message: "batched parent task result".into(),
+                target: crate::core::agent_messages::AgentSessionMessageEndpoint {
+                    session_id: "fixture-parent".into(),
+                    active_session_id: "fixture-parent-active".into(),
+                    ..Default::default()
+                },
+                ..Default::default()
+            };
+            let receipt = crate::core::agent_messages::create_agent_session_message_receipt(
+                &payload, &"delivered".to_string(), "2026-09-20T00:00:00Z",
+            );
+            session.settle_rlm_parent_delivery(
+                &previous, &Ok(receipt), &payload.target.session_id, &payload.message, true,
+            );
             response_text(model, "done\nRLM_CHILD_STATUS: complete")
         })
     }));
@@ -339,6 +360,7 @@ async fn batched_parent_instructions_each_create_a_durable_continuation_task() {
     for ticket in tickets { ticket.ticket.completed.clone().await.unwrap(); }
     assert_eq!(calls.load(Ordering::SeqCst), 1);
     assert!(session.rlm_continuation.lock().unwrap().tasks.iter().all(|task| task.replied));
+    assert_eq!(session.parent_reply_count.load(Ordering::SeqCst), 1);
     session.dispose_async(Some(false)).await;
 }
 
