@@ -1469,8 +1469,8 @@ fn expand_tilde_path(path: &str) -> String {
 
 const APP_NAME: &str = "prime-agent";
 const VERSION: &str = env!("CARGO_PKG_VERSION");
-const DAEMON_PROTOCOL_VERSION: f64 = 7.0;
-const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-29-c16da0e12d5a";
+const DAEMON_PROTOCOL_VERSION: f64 = crate::modes::daemon::daemon_protocol::DAEMON_PROTOCOL_VERSION as f64;
+const DAEMON_SCHEMA_ID: &str = crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_ID;
 
 /// Local stand-in for `DaemonRuntimeIdentity` from daemon-protocol.js.
 #[derive(Debug, Clone, Default)]
@@ -2454,8 +2454,8 @@ u_str  LISTEN 0      4096   /tmp/foreign.sock 1 * 0 users:((\"other-app\",pid=2,
     #[test]
     fn classify_reachable_requires_the_current_protocol_schema_and_version() {
         let mut probe = ProbeResult {
-            protocol_version: Some(DAEMON_PROTOCOL_VERSION),
-            schema_id: Some(DAEMON_SCHEMA_ID.to_string()),
+            protocol_version: Some(crate::modes::daemon::daemon_protocol::DAEMON_PROTOCOL_VERSION as f64),
+            schema_id: Some(crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_ID.to_string()),
             version: Some(VERSION.to_string()),
             reachable: true,
             ..ProbeResult::default()

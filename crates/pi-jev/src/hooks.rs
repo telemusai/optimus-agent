@@ -23,7 +23,7 @@ use crate::types::DecisionCategory;
 /// Default SystemOne model id from the official docs.
 pub const SYSTEM_ONE_MODEL: &str = "jev-latest";
 
-pub const PROMPT_VERSION: &str = "jev-compare-prompts/1";
+pub const PROMPT_VERSION: &str = "jev-compare-prompts/2";
 
 /// Operational bounds for the Active decision path.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -683,6 +683,14 @@ impl JevObserver {
             outcome.terminal_reason = Some("concurrency_limit".to_string());
             return outcome;
         };
+        let deadline = payload.get("decision_timeout_ms").and_then(Value::as_u64)
+            .map(std::time::Duration::from_millis).unwrap_or(self.config.active.deadline)
+            .min(self.config.active.deadline);
+        if deadline.is_zero() {
+            outcome.unavailable = Some(FallbackReason::Unavailable);
+            outcome.terminal_reason = Some("deadline_exhausted".to_string());
+            return outcome;
+        }
         let started = std::time::Instant::now();
         outcome.dispatched = true;
         let call = self.system_one.decide(crate::client::bundle_with_questions(
@@ -692,7 +700,7 @@ impl JevObserver {
         let decision = tokio::select! {
             biased;
             _ = outcome.token.cancelled() => None,
-            result = tokio::time::timeout(self.config.active.deadline, call) => match result {
+            result = tokio::time::timeout(deadline, call) => match result {
                 Ok(result) => Some(result),
                 Err(_) => { outcome.terminal_reason = Some("timeout".to_string()); self.note_active_failure(); None }
             },

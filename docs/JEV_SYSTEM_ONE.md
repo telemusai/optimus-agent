@@ -38,6 +38,8 @@ trace assessment, and model/subagent routing remain advisory.
   candidate; extension tools need an explicit optional-tool allowlist.
   The existing `tool_requirement == none` effect is separate
   and retains PR #56's full catalog withdrawal behavior.
+  Complexity supports both Chat `reasoning_effort` and Responses
+  `reasoning.effort`, preserving summary fields and the model registry's limits.
 - Retrieval filtering works on temporary, identified candidates. Memory filtering
   only considers eligible retrieved automatic memories, not user/manual entries,
   session state, prompt notes, or entries with unknown provenance. Context
@@ -77,10 +79,64 @@ can have its old text output truncated. Arbitrary Python output stays intact.
 The adapter evaluates at most eight old pairs per request. Hard byte caps apply
 in addition to the configurable token estimates.
 
+A provider checkpoint pins the prefix through that checkpoint. Complete eligible
+tool pairs after it can still be compacted; opaque items are never sent to Jev or
+rewritten. A pair crossing the boundary remains intact. The minimum reduction
+threshold applies to the eligible suffix, excluding opaque checkpoint bytes.
+Records distinguish the total serialized reduction from `eligible_reduction_ratio`
+and report `protected_messages`. No eligible old output means no network request;
+enabling compaction does not force deletion of required or recent context.
+
 A missing credential, timeout, cancellation, breaker, invalid response, stale
 settings, state-fitting failure, or insufficient reduction keeps the original
 context. Built-in compaction still operates under its existing policy. A failed
 optional optimization must not block the main provider request.
+
+## Experimental code-search relevance
+
+Search retrieves; Jev evaluates retrieved candidates. The Rust host has a separate
+`code_search_relevance` category and feature, independent of historical
+`context_relevance`. Both search switches default to off:
+
+```text
+/jev feature code_search_relevance on
+/jev feature code_search_filtering off
+/jev compare-active
+```
+
+This scores without changing search context. After benchmarking, enable
+`/jev feature code_search_filtering on` in Active or Compare + Active to allow
+high-confidence pruning. Compare always preserves every result, even when the
+filtering switch is on. No search-planning or tool-execution authority is granted.
+
+In the Python REPL, capture deterministic search output using the normal `bash()`
+interface, then present candidates in a cell with no other output:
+
+```python
+from rlm.code_search import from_ripgrep, present
+candidates = from_ripgrep(result.output)  # result from rg --json
+present(candidates)
+```
+
+AST, symbol, filename, reference and test searches can pass their own dictionaries
+to `present`: `kind` (`file`, `symbol`, `grep`, `reference`, `test`), `path`, optional
+`line`, `snippet`, and `mandatory`. Keep full results in a named Python variable.
+The helper validates the envelope and performs no search or network request.
+
+At the provider boundary the host scores at most 64 optional candidates in batches
+of at most eight, with at most two concurrent Active requests and a 2.5-second
+overall deadline. Unscored candidates, instruction files and mandatory evidence
+remain intact. Missing, stale, malformed or uncertain decisions retain the
+affected batch. Removing every candidate is refused. Original result order is
+preserved; this version prunes, it does not impose a fixed top-K cutoff.
+Only complete successful `ipython` presentations are eligible; arbitrary stdout,
+mixed output, errors and mutations stay intact. Durable transcripts and Python
+variables are unchanged. Turning the switches off restores the original context.
+
+Records use stage `code_search` and category `code_search_relevance`, with ordinal
+candidate IDs, probabilities and candidate-only size estimates. They do not store
+paths or source snippets. Compare records are suitable for collecting recommendations;
+they are not task-success labels. No production quality or cost gain is established.
 
 ## Records and measurement
 
@@ -89,6 +145,10 @@ recommendation, policy acceptance, actual effects, refusal, and fallback as
 separate facts. Combined rows share a request ID. Count network requests by
 request ID, not by record line or question. An accepted decision with no eligible
 field to change is not an applied change.
+Reasoning telemetry reports the actual provider field, including nested Responses
+effort. Single-tool catalogs skip the tool-selection comparison. Tool suitability
+requires task evidence; end-of-turn recommendations include the task and explicitly
+distinguish loop termination from successful completion.
 
 Pre-mutation request metadata is not proof of what an unmodified model would
 have done. A missing semantic baseline is noncomparable. A successful tool call

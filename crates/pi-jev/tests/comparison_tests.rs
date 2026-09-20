@@ -163,7 +163,7 @@ fn turn_payload(session_id: &str) -> Value {
         "state": {
             "user_text_excerpt": "build a parser",
             "message_count": 4,
-            "observed_tools": ["read"],
+            "observed_tools": ["read", "edit"],
             "model_allowlist": ["allow-a"],
             "memory_excerpt": "m",
             "result_excerpt": "r",
@@ -231,7 +231,7 @@ fn all_eleven_categories_produce_questions() {
     // ToolCall: category 4 produces the suitability question.
     let tool_call = snapshot(
         SnapshotStage::ToolCall,
-        json!({ "tool_name": "bash", "tool_call_id": "tc1" }),
+        json!({ "tool_name": "bash", "tool_call_id": "tc1", "user_text_excerpt": "Run the parser tests" }),
     );
     let tool_outputs: Vec<EvaluatorOutput> = for_boundary(SnapshotStage::ToolCall)
         .iter()
@@ -664,7 +664,7 @@ async fn scheduler_drops_on_full_queue_with_metric() {
             "session_id": "sess-q",
             "turn": 1,
             "tool_name": "read",
-            "state": { "tool_name": "read" },
+            "state": { "tool_name": "read", "user_text_excerpt": "Read the parser" },
         }),
     );
     tokio::time::sleep(Duration::from_millis(80)).await;
@@ -1141,7 +1141,7 @@ async fn correlation_records_have_baselines_and_applied_false() {
             "session_id": "sess-corr",
             "turn": 2,
             "tool_name": "edit",
-            "state": { "tool_name": "edit" },
+            "state": { "tool_name": "edit", "user_text_excerpt": "Fix the parser" },
         }),
     );
     let records = wait_for_records(fixture.records_path(), |record| {
@@ -1340,4 +1340,18 @@ impl<T: Transport + 'static> ObserverFixture<T> {
     fn records_path(&self) -> &std::path::Path {
         &self.records_path
     }
+}
+
+#[test]
+fn tool_choice_skips_degenerate_catalogs_and_requires_task_evidence() {
+    use pi_jev::evaluators::CategoryEvaluator;
+    let evaluator=pi_jev::evaluators::tool_candidates::ToolCandidates;
+    let single=snapshot(SnapshotStage::TurnStart,json!({"observed_tools":["ipython"],"user_text_excerpt":"task"}));
+    assert!(matches!(evaluator.evaluate(&single),EvaluatorOutput::Skipped(reason) if reason=="single_tool_catalog"));
+    let call=snapshot(SnapshotStage::ToolCall,json!({"tool_name":"ipython"}));
+    assert!(matches!(evaluator.evaluate(&call),EvaluatorOutput::Skipped(reason) if reason=="no_task_text"));
+    let call=snapshot(SnapshotStage::ToolCall,json!({"tool_name":"ipython","user_text_excerpt":"Find session expiry"}));
+    let EvaluatorOutput::Questions(questions)=evaluator.evaluate(&call) else { panic!("question"); };
+    assert!(questions[0].spec.instructions().contains("Find session expiry"));
+    assert!(questions[0].spec.instructions().contains("Arguments are unavailable"));
 }

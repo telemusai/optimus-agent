@@ -94,6 +94,8 @@ pub struct CompactionStats {
     pub results_removed: usize,
     pub results_truncated: usize,
     pub reduction_ratio: f64,
+    pub protected_messages: usize,
+    pub eligible_reduction_ratio: f64,
 }
 
 #[derive(Debug, Clone)]
@@ -111,6 +113,7 @@ pub struct PreparedCompaction {
     config: CompactionConfig,
     pairs: Vec<NativePair>,
     fingerprint: [u8; 32],
+    eligible_chars_before: usize,
 }
 
 #[derive(Debug, Clone)]
@@ -294,16 +297,22 @@ pub fn prepare_context(
 ) -> Result<PreparedCompaction, CompactionSkip> {
     config.validate()?;
     let (source_fingerprint, chars_before) = fingerprint(messages)?;
+    // A checkpoint summarizes an immutable prefix. Only complete pairs after
+    // the last checkpoint are eligible; opaque checkpoint items never leave here.
+    let protected_end = messages.iter().rposition(|message| matches!(message,
+        AgentMessage::Message(Message::User(user)) if user.provider_context.is_some()
+    ) || matches!(message,
+        AgentMessage::Custom(CustomAgentMessage::CompactionSummary { provider_context: Some(_), .. })
+    )).map_or(0, |index| index + 1);
+    let eligible_chars_before = if protected_end == 0 { chars_before } else { fingerprint(&messages[protected_end..])?.1 };
     let mut calls: BTreeMap<&str, (usize, usize, &ToolCall)> = BTreeMap::new();
     let mut results: BTreeMap<&str, usize> = BTreeMap::new();
     let mut history = Vec::new();
     let mut blocks_seen = 0usize;
     for (index, message) in messages.iter().enumerate() {
+        if index < protected_end { continue; }
         let text = match message {
             AgentMessage::Message(Message::User(user)) => {
-                if user.provider_context.is_some() {
-                    return Err(CompactionSkip::ProtectedContext);
-                }
                 match &user.content {
                     UserContent::Text(text) => pi_jev::redact::bounded_excerpt(text, 400),
                     UserContent::Blocks(blocks) => {
@@ -346,12 +355,6 @@ pub fn prepare_context(
                 }
                 String::new()
             }
-            AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
-                provider_context: Some(_),
-                ..
-            }) => {
-                return Err(CompactionSkip::ProtectedContext);
-            }
             // Custom messages may contain hidden memory and private tool output.
             // They are retained locally and represented only by their role.
             AgentMessage::Custom(_) => String::new(),
@@ -381,6 +384,14 @@ pub fn prepare_context(
     }
     for (id, result_index) in &results {
         let Some((call_index, _, call)) = calls.get(id) else {
+            // A result may finish a call already covered by the checkpoint.
+            // Pin that result while continuing to consider independent pairs.
+            let covered_call = messages[..protected_end].iter().any(|message| match message {
+                AgentMessage::Message(Message::Assistant(assistant)) => assistant.content.iter().any(|block|
+                    matches!(block, ContentBlock::ToolCall(call) if call.id == *id)),
+                _ => false,
+            });
+            if covered_call { continue; }
             return Err(CompactionSkip::InvalidPair);
         };
         let AgentMessage::Message(Message::ToolResult(result)) = &messages[*result_index] else {
@@ -459,7 +470,7 @@ pub fn prepare_context(
         .iter()
         .map(|(_, _, _, _, chars, _)| chars.saturating_sub(config.truncate_head_chars + 160))
         .sum();
-    if reclaimable as f64 / (chars_before.max(1) as f64) < config.minimum_reduction_ratio {
+    if reclaimable as f64 / (eligible_chars_before.max(1) as f64) < config.minimum_reduction_ratio {
         return Err(CompactionSkip::InsufficientReduction);
     }
     let mut pairs = Vec::new();
@@ -491,12 +502,14 @@ pub fn prepare_context(
             estimated_tokens_before: chars_before.div_ceil(4),
             estimated_tokens_after: chars_before.div_ceil(4),
             calls_evaluated: pairs.len(),
+            protected_messages: protected_end,
             ..Default::default()
         },
         plan,
         config: config.clone(),
         pairs,
         fingerprint: source_fingerprint,
+        eligible_chars_before,
     })
 }
 
@@ -591,8 +604,9 @@ pub fn apply_context(
     stats.estimated_tokens_after = chars_after.div_ceil(4);
     stats.reduction_ratio =
         stats.chars_before.saturating_sub(chars_after) as f64 / stats.chars_before.max(1) as f64;
+    stats.eligible_reduction_ratio = stats.chars_before.saturating_sub(chars_after) as f64 / prepared.eligible_chars_before.max(1) as f64;
     if chars_after >= stats.chars_before
-        || stats.reduction_ratio < prepared.config.minimum_reduction_ratio
+        || stats.eligible_reduction_ratio < prepared.config.minimum_reduction_ratio
     {
         return Err(CompactionSkip::InsufficientReduction);
     }
@@ -640,7 +654,10 @@ pub async fn compact_context(
     };
     let prepared = match prepare_context(&messages, &settings.compaction) {
         Ok(prepared) => prepared,
-        Err(CompactionSkip::NoCandidates | CompactionSkip::InsufficientReduction) => return values,
+        Err(reason @ (CompactionSkip::NoCandidates | CompactionSkip::InsufficientReduction)) => {
+            note_status(&session_id, None, Some(reason.as_str()));
+            return values;
+        }
         Err(reason) => {
             note_status(&session_id, None, Some(reason.as_str()));
             crate::core::jev_bridge::record_compaction_skip(

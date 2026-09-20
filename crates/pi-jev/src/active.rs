@@ -29,9 +29,10 @@ pub const DEFAULT_APPLIABLE_CATEGORIES: [DecisionCategory; 2] = [
 ];
 
 /// Optional categories require a candidate-bound host adapter and explicit enablement.
-pub const OPTIONAL_APPLIABLE_CATEGORIES: [DecisionCategory; 3] = [
+pub const OPTIONAL_APPLIABLE_CATEGORIES: [DecisionCategory; 4] = [
     DecisionCategory::ToolCandidates,
     DecisionCategory::ContextRelevance,
+    DecisionCategory::CodeSearchRelevance,
     DecisionCategory::MemoryRelevance,
 ];
 

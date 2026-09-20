@@ -24,6 +24,7 @@ pub mod goals;
 pub mod jev_active;
 pub mod jev_bridge;
 pub mod jev_compaction;
+pub mod jev_code_search;
 pub mod jev_retrieval;
 pub mod jev_run_metrics;
 pub mod kernel;

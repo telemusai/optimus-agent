@@ -528,10 +528,12 @@ fn incomplete_calls_and_provider_checkpoints_are_never_rewritten() {
     if let AgentMessage::Message(Message::User(user)) = &mut messages[0] {
         user.provider_context = Some(checkpoint.clone());
     }
-    assert_eq!(
-        prepare_context(&messages, &CompactionConfig::default()).unwrap_err(),
-        CompactionSkip::ProtectedContext
-    );
+    let prepared = prepare_context(&messages, &CompactionConfig::default()).unwrap();
+    let compacted = apply_context(messages.clone(), &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap();
+    assert_eq!(compacted.messages[0], messages[0]);
+    assert_eq!(compacted.stats.calls_removed, 1);
+    assert_eq!(compacted.stats.protected_messages, 1);
+    assert!(!prepared.plan.state.to_string().contains("opaque"));
     messages[0] = AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
         summary: "summary".into(),
         provider_context: Some(checkpoint),
@@ -541,8 +543,34 @@ fn incomplete_calls_and_provider_checkpoints_are_never_rewritten() {
         harness_digest: None,
         timestamp: 0,
     });
-    assert_eq!(
-        prepare_context(&messages, &CompactionConfig::default()).unwrap_err(),
-        CompactionSkip::ProtectedContext
-    );
+    let prepared = prepare_context(&messages, &CompactionConfig::default()).unwrap();
+    let compacted = apply_context(messages.clone(), &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap();
+    assert_eq!(compacted.messages[0], messages[0]);
+    assert_eq!(compacted.stats.calls_removed, 1);
+    assert_eq!(compacted.stats.protected_messages, 1);
+    assert!(!prepared.plan.state.to_string().contains("opaque"));
+}
+
+#[test]
+fn checkpoint_prefix_and_cross_boundary_pairs_stay_verbatim_while_suffix_shrinks() {
+    let checkpoint = pi_ai::compaction::ProviderCompactionCheckpoint {
+        version: 1, provider: "fixture".into(), api: "faux".into(), model: "fixture".into(),
+        base_url: "https://invalid.test".into(), endpoint: None,
+        items: vec![json!({"opaque":"ENCRYPTED".repeat(100_000)}).as_object().unwrap().clone()],
+        estimated_tokens: 100.0,
+    };
+    let mut marker = UserMessage::new(UserContent::Text("checkpoint".into()), 1);
+    marker.provider_context = Some(checkpoint);
+    let prefix = vec![user("Keep constraints"), call("covered", "read_file"), marker.into(), result("covered", "read_file", "keep this pair")];
+    let mut messages = prefix.clone();
+    messages.extend(transcript("read_file").into_iter().skip(1));
+    let prepared = prepare_context(&messages, &CompactionConfig::default()).unwrap();
+    let compacted = apply_context(messages.clone(), &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap();
+    assert_eq!(&compacted.messages[..prefix.len()], prefix.as_slice());
+    assert_eq!(compacted.stats.calls_removed, 1);
+    assert!(compacted.stats.reduction_ratio < 0.25);
+    assert!(compacted.stats.eligible_reduction_ratio > 0.8);
+    let mut changed = messages;
+    changed[0] = user("Changed constraints");
+    assert_eq!(apply_context(changed, &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap_err(), CompactionSkip::StaleContext);
 }

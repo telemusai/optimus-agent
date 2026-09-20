@@ -800,6 +800,7 @@ pub enum DecisionCategory {
     SubagentRequirement,
     SubagentModelRouting,
     ContextRelevance,
+    CodeSearchRelevance,
     MemoryRelevance,
     ContinueStopEscalate,
     ResultSufficiency,
@@ -819,6 +820,7 @@ impl DecisionCategory {
             DecisionCategory::SubagentRequirement => "subagent_requirement",
             DecisionCategory::SubagentModelRouting => "subagent_model_routing",
             DecisionCategory::ContextRelevance => "context_relevance",
+            DecisionCategory::CodeSearchRelevance => "code_search_relevance",
             DecisionCategory::MemoryRelevance => "memory_relevance",
             DecisionCategory::ContinueStopEscalate => "continue_stop_escalate",
             DecisionCategory::ResultSufficiency => "result_sufficiency",
@@ -829,7 +831,7 @@ impl DecisionCategory {
     }
 
     /// All categories in canonical order.
-    pub fn all() -> [DecisionCategory; 13] {
+    pub fn all() -> [DecisionCategory; 14] {
         [
             DecisionCategory::TaskClassification,
             DecisionCategory::Complexity,
@@ -838,6 +840,7 @@ impl DecisionCategory {
             DecisionCategory::SubagentRequirement,
             DecisionCategory::SubagentModelRouting,
             DecisionCategory::ContextRelevance,
+            DecisionCategory::CodeSearchRelevance,
             DecisionCategory::MemoryRelevance,
             DecisionCategory::ContinueStopEscalate,
             DecisionCategory::ResultSufficiency,
