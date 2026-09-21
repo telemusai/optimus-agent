@@ -18,7 +18,7 @@
 //! lock BEFORE any effect is authorized; snapshots never mint maxima (a
 //! session without trusted durable accounting is zero-headroom and control
 //! effects stay refused while the ordinary baseline continues); records are
-//! bounded, content-free, validated, and selected by a monotonic per-session
+//! bounded, content-free, validated, and selected by a monotonic ledger-wide
 //! sequence instead of timestamps.
 //!
 //! It deliberately does NOT call the observer/bridge deeper than the
@@ -129,7 +129,7 @@ struct SessionControl {
 ///   durable state authoritative and reports "no budget"; the in-memory copy
 ///   never becomes authoritative after a durable failure.
 /// - The ledger stores one latest record per session with a monotonic
-///   per-session `seq`. Recovery selects the highest `seq` — never a
+///   ledger-wide `seq`. Compaction retains the highest `seq` — never a
 ///   timestamp — so clock rollback or reordered records cannot restore older
 ///   higher remaining counts.
 /// - Records are validated on load (version, session bounds, epoch/seq >= 1,
@@ -274,7 +274,7 @@ impl ControlBook {
             }
             let next = current.consume(kind);
             let mut updated = record.clone();
-            updated.seq = record.seq.saturating_add(1);
+            updated.seq = next_ledger_sequence(records, 0)?;
             updated.feedback_remaining = next.feedback_remaining;
             updated.verification_remaining = next.verification_remaining;
             updated.nonprogress_remaining = next.nonprogress_remaining;
@@ -366,7 +366,7 @@ impl ControlBook {
             let mut attempts = record.veto_attempts.clone();
             attempts.push(attempt);
             let mut updated = record.clone();
-            updated.seq = record.seq.saturating_add(1);
+            updated.seq = next_ledger_sequence(records, 0)?;
             updated.veto_attempts = trim_consults(attempts);
             records[index] = updated.clone();
             // Cache install happens only after the durable commit succeeds.
@@ -542,11 +542,14 @@ impl ControlBook {
             let durable = records
                 .iter()
                 .find(|record| record.session == session_id);
-            let (durable_epoch, durable_seq) = durable
-                .map(|record| (record.epoch, record.seq))
-                .unwrap_or((0, 0));
-            let epoch = durable_epoch.max(entry_epoch).saturating_add(1);
-            let seq = durable_seq.max(entry_seq).saturating_add(1);
+            let seq = next_ledger_sequence(records, entry_seq.max(entry_epoch))?;
+            let epoch = match durable {
+                Some(record) => record.epoch.max(entry_epoch).checked_add(1).ok_or(())?,
+                // Compaction may have removed this session's entire history,
+                // including its cached epoch. The retained ledger high-water
+                // mark prevents an old decision from matching a new task.
+                None => seq,
+            };
             let snapshot = ControlBudgetSnapshot::fresh_maxima(epoch_id(session_id, epoch));
             let record = DurableRecord {
                 session: session_id.to_string(),
@@ -785,6 +788,21 @@ impl DurableRecord {
     }
 }
 
+/// Every committed mutation advances a ledger-wide high-water mark. The
+/// newest record survives compaction, so missing sessions can allocate an
+/// epoch above every prior committed epoch without unbounded tombstones.
+/// Exhaustion refuses the transaction instead of reusing an identity.
+fn next_ledger_sequence(records: &[DurableRecord], floor: u64) -> Result<u64, ()> {
+    records
+        .iter()
+        .map(|record| record.seq.max(record.epoch))
+        .chain(std::iter::once(floor))
+        .max()
+        .unwrap_or(0)
+        .checked_add(1)
+        .ok_or(())
+}
+
 /// Bound the write set: one latest record per session, the
 /// [`MAX_TRACKED_SESSIONS`] freshest sessions by seq, and at most
 /// [`MAX_LEDGER_BYTES`] bytes. The session being written always survives;
@@ -794,9 +812,9 @@ fn compact_for_write(records: &mut Vec<DurableRecord>, session_id: &str) -> Resu
     // The vec arrives in file order (chronologically oldest first) with the
     // record being committed appended last. Reverse FIRST so the STABLE
     // seq-descending sort keeps the NEWEST record at the front of every
-    // equal-seq tie group (seq is per-session, so fresh activations tie at
-    // seq 1): the bound then drops the OLDEST sessions and never the record
-    // that is being written right now.
+    // equal-seq tie group in older ledgers. New writes allocate a ledger-wide
+    // sequence, so the current record is newest and preserves the high-water
+    // mark even after every other session has been evicted.
     records.reverse();
     records.sort_by(|a, b| b.seq.cmp(&a.seq));
     records.truncate(MAX_TRACKED_SESSIONS);

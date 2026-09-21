@@ -34,6 +34,7 @@ use pi_coding_agent::core::model_registry::ModelRegistry;
 use pi_coding_agent::core::resource_loader::DefaultResourceLoaderOptions;
 use pi_coding_agent::core::session_manager::SessionManager;
 use pi_coding_agent::core::settings_manager::SettingsManager;
+use pi_jev::search::{SearchBudget, SHARED_SEARCH_BUDGET_MS};
 use serde_json::{json, Map, Value};
 
 // ---------------------------------------------------------------------------
@@ -918,7 +919,8 @@ async fn jev_compare_e2e_parity_and_isolation() {
                     "content":[{"type":"text","text":"bounded old result ".repeat(1000)}],"timestamp":0})];
             for index in 0..8 { projection.push(json!({"role":"user","content":format!("recent pinned {index}"),"timestamp":0})); }
             let stored_before = shapes(&axis.session);
-            let filtered=pi_coding_agent::core::jev_bridge::filter_context_candidates(ctx.clone(),projection.clone()).await;
+            let budget = SearchBudget::from_now(Duration::from_millis(SHARED_SEARCH_BUDGET_MS));
+            let filtered=pi_coding_agent::core::jev_bridge::filter_context_candidates(ctx.clone(),projection.clone(), &budget).await;
             assert_eq!(filtered,projection,"subthreshold optional recommendations preserve context");
             let before_compaction=read_record_count(&agent_dir);
             let compacted=pi_coding_agent::core::jev_compaction::compact_context(ctx,filtered,None).await;
