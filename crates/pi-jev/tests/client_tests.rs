@@ -8,21 +8,29 @@ use std::collections::BTreeMap;
 use std::sync::Arc;
 use std::time::Duration;
 
-use pi_jev::client::{accepted_answers, parse_systemone_body};
+use pi_jev::client::{accepted_answers, jittered_backoff, parse_retry_after_ms, parse_systemone_body};
+use pi_jev::error::{http_status_kind, sanitize_opaque_header_value};
 use pi_jev::mock::{
     choice_question, fingerprint, mutate, noul_question, raw_huge_extra_ids_body, raw_injection_body,
-    raw_noul_non_finite_body, raw_truncated_body, raw_wrong_shape_body, score_question, valid_response_for,
-    MockJevTransport, MockMutation, MockStep, MOCK_RESPONSE_MODEL,
+    raw_malformed_answer_body, raw_missing_usage_body, raw_noul_non_finite_body, raw_null_usage_body,
+    raw_object_legend_body, raw_truncated_body, raw_unknown_answer_type_body, raw_wrong_shape_body,
+    score_question, valid_response_for, MockJevTransport, MockMutation, MockStep, MOCK_RESPONSE_MODEL,
+};
+use pi_jev::types::{
+    EntryValue, Usage, MAX_CHOICES_PER_QUESTION, MAX_ENTRY_JSON_BYTES, MAX_ENTRY_JSON_DEPTH,
+    MAX_SCORE_LEVELS, QUANTIZED_ARGMAX_TOLERANCE, REQUEST_TOKEN_CEILING,
 };
 use pi_jev::{
     decide_with, model_drift, refuse_subagent_control, resolve_credential_source, resolve_effective_mode,
-    redact_authorization, retry_decision, sanitize_detail, sanitize_url, validate_answer, validate_response, Answer,
-    AnswerIssue, CredentialSource, CredentialStore, DecisionBundle, DecisionCategory, DecisionOutcome,
-    DisabledSystemOne, DpapiCredentialStore, EnvKeyPresence, InMemoryCredentialStore, JevError, JevLimits, JevMode,
-    JevSettings, JevSettingsStore, JevStats, JevSystemOne, QuestionSpec, RetryDecision, SecretString,
-    SubagentControlRequest, SubagentObservation, SystemOne, SystemOneRequest, SystemOneResponse, Transport,
+    redact_authorization, retry_decision, sanitize_detail, sanitize_url, validate_answer,
+    validate_request_shape, validate_response, Answer, AnswerIssue, CredentialSource, CredentialStore,
+    DecisionBundle, DecisionCategory, DecisionOutcome, DisabledSystemOne, DpapiCredentialStore, EnvKeyPresence,
+    InMemoryCredentialStore, JevError, JevLimits, JevMode, JevSettings, JevSettingsStore, JevStats,
+    JevSystemOne, NoulCriteria, QuestionSpec, RetryDecision, SecretString, SubagentControlRequest,
+    SubagentObservation, SystemOne, SystemOneRequest, SystemOneResponse, Transport,
     UnavailableCredentialStore, FORBIDDEN_SUBAGENT_CAPABILITIES,
 };
+use serde_json::json;
 
 // ---------------------------------------------------------------------------
 // Fixture helpers
@@ -145,8 +153,8 @@ async fn score_fixture_is_a_probability_weighted_value_with_a_matching_legend() 
         panic!("expected a score answer");
     };
     assert_eq!(legend.len(), 3);
-    assert_eq!(legend["0"], "low");
-    assert_eq!(legend["2"], "high");
+    assert_eq!(legend["0"], EntryValue::text("low"));
+    assert_eq!(legend["2"], EntryValue::text("high"));
     let weighted: f64 = probabilities
         .iter()
         .map(|(key, probability)| key.parse::<f64>().unwrap() * probability)
@@ -255,9 +263,12 @@ async fn nan_and_infinite_values_are_skipped() {
     let question = score_question("How complex?", &["low", "high"]);
     let answer = Answer::Score {
         score: f64::NAN,
-        legend: [("0".to_string(), "low".to_string()), ("1".to_string(), "high".to_string())]
-            .into_iter()
-            .collect(),
+        legend: [
+            ("0".to_string(), EntryValue::text("low")),
+            ("1".to_string(), EntryValue::text("high")),
+        ]
+        .into_iter()
+        .collect(),
         probabilities: [("0".to_string(), 0.5), ("1".to_string(), 0.5)].into_iter().collect(),
         confidence: 0.5,
     };
@@ -418,7 +429,7 @@ async fn a_401_is_terminal_so_a_bad_key_does_not_burn_the_retry_budget() {
     )
     .await;
     assert!(outcome.is_empty());
-    assert_eq!(outcome.skips[0].1, "http_status");
+    assert_eq!(outcome.skips[0].1, "http_status_401");
     assert_eq!(transport.call_count(), 1, "a 401 must not be retried");
     assert_eq!(stats.snapshot().retries, 0);
 }
@@ -562,6 +573,7 @@ async fn retry_after_hint_is_never_shortened_to_the_backoff_ceiling() {
         status: 429,
         detail: "rate limited".to_string(),
         retry_after: Some(Duration::from_secs(2)),
+        server_request_id: None,
     };
     match retry_decision(&rate_limited, 0, &limits) {
         RetryDecision::RetryAfter(delay) => assert_eq!(delay, Duration::from_secs(2)),
@@ -642,7 +654,7 @@ async fn exhausted_retries_produce_a_skip_and_no_records() {
     .await;
     assert!(outcome.is_empty(), "a failed request never fabricates answers");
     assert_eq!(outcome.skips.len(), 1);
-    assert_eq!(outcome.skips[0].1, "http_status");
+    assert_eq!(outcome.skips[0].1, "http_status_500");
     assert_eq!(transport.call_count(), 2, "initial attempt plus one retry");
     assert_eq!(stats.snapshot().failures, 1);
 }
@@ -901,7 +913,9 @@ async fn off_and_compare_are_indistinguishable_except_for_jev_telemetry() {
     assert!(!compare.applied && !off.applied);
     assert!(compare.records.iter().all(|record| !record.applied));
     assert_eq!(off.response_model, None);
-    assert_eq!(off.usage.input_tokens, 0);
+    // Knownness is explicit: the Off path made no call, so usage stays UNKNOWN (None),
+    // never a fabricated zero.
+    assert_eq!(off.usage.input_tokens, None);
 }
 
 #[tokio::test]
@@ -1380,11 +1394,12 @@ fn error_text_and_log_lines_never_carry_a_secret_or_a_lengthy_body() {
         status: 401,
         detail: sanitize_detail("authorization=Bearer abcdefghijklmnopqrstuvwxyz012345"),
         retry_after: None,
+        server_request_id: None,
     };
     let line = error.log_line();
     assert!(!line.contains("abcdefghijklmnopqrstuvwxyz012345"));
     assert_eq!(error.status_code(), Some(401));
-    assert_eq!(error.kind(), "http_status");
+    assert_eq!(error.kind(), "http_status_401");
     assert!(error.is_transport_failure());
 
     // A long body is truncated, so a log line stays bounded.
@@ -1924,13 +1939,16 @@ fn bundle_helpers_map_question_ids_to_categories_and_keep_every_category_enabled
         DecisionCategory::ResultSufficiency
     );
     let enabled = pi_jev::compare_default_categories();
-    assert_eq!(enabled.len(), 14, "category switches include the opt-in observers");
+    // Live count: baseline 14 + search lane (rerank, line-find) + evidence lane
+    // (retrieval-safety, citation-check) + agent-guidance lane (skill suggestion,
+    // guardrails input/output).
+    assert_eq!(enabled.len(), 21, "category switches include the opt-in observers and the search/evidence/agent-guidance lane categories");
     assert!(enabled.values().all(|value| *value));
     let request = bundle.to_request();
     let ids = bundle.enabled_question_ids(&enabled);
     assert_eq!(ids.len(), 3);
     assert!(ids.iter().all(|id| request.questions.contains_key(id)));
-    assert_eq!(DecisionCategory::all().len(), 14);
+    assert_eq!(DecisionCategory::all().len(), 21);
     assert_eq!(DecisionCategory::Complexity.question_id(2), "complexity.2");
     assert_eq!(DecisionCategory::parse("task_classification"), Some(DecisionCategory::TaskClassification));
 }
@@ -1939,6 +1957,17 @@ fn bundle_helpers_map_question_ids_to_categories_and_keep_every_category_enabled
 fn backoff_policy_is_documented_and_finite() {
     let line = pi_jev::backoff_policy_line();
     assert!(line.contains("Retry-After"));
+    // The policy line must disclose the v5 fallback jitter truthfully: 25% subtractive,
+    // fallback branch only, server hints used as given (never jittered or shortened).
+    assert!(line.contains("25% subtractive jitter"), "jitter disclosure missing: {line}");
+    assert!(
+        line.contains("fallback delays carry 25% subtractive jitter"),
+        "the disclosure must scope the jitter to the fallback branch: {line}"
+    );
+    assert!(
+        line.contains("hints are used as given, never jittered"),
+        "the disclosure must state hints are used as given: {line}"
+    );
     let limits = JevLimits::default();
     assert!(limits.max_retries >= 1 && limits.max_retries <= 5, "retries must be finite and small");
     assert!(limits.timeout > Duration::ZERO && limits.timeout <= Duration::from_secs(60));
@@ -1950,6 +1979,617 @@ fn backoff_policy_is_documented_and_finite() {
         status: 401,
         detail: "unauthorized".to_string(),
         retry_after: None,
+        server_request_id: None,
     };
     assert_eq!(retry_decision(&unauthorized, 0, &limits), RetryDecision::Stop);
+}
+
+
+// ---------------------------------------------------------------------------
+// 12. Wire reshape tests (WIRE/TRANSPORT API CHANGE PLAN v2): EntryValue, null
+//     forms, legend widening, usage knownness, lenient parsing, pre-transport
+//     host-policy gates, argmax/expectation tolerances, request-id capture.
+// ---------------------------------------------------------------------------
+
+#[test]
+fn t1_legacy_string_wire_is_byte_identical() {
+    // Questions built through the legacy helpers serialize EXACTLY like the old
+    // shapes: bare-string instructions, string criteria, null descriptions as null.
+    let request = SystemOneRequest::new(serde_json::json!("state"), question_map());
+    let value: serde_json::Value = serde_json::to_value(&request).unwrap();
+    let noul = &value["questions"]["result_sufficiency.0"];
+    assert_eq!(noul["instructions"], "Is the result sufficient?");
+    assert_eq!(noul["criteria"]["true"], "sufficient");
+    assert_eq!(noul["criteria"]["false"], "insufficient");
+    let choice = &value["questions"]["task_classification.0"];
+    assert_eq!(choice["instructions"], "Which task type is this?");
+    assert_eq!(choice["criteria"]["coding"], "code change", "bare strings serialize as before");
+    let score = &value["questions"]["complexity.0"];
+    assert!(score["criteria"].is_array());
+    assert_eq!(score["criteria"][0], "low");
+    // The response fixture serializes usage as numbers and never adds wire fields.
+    let response = valid_response_for(&request);
+    let value: serde_json::Value = serde_json::to_value(&response).unwrap();
+    assert_eq!(value["usage"]["input_tokens"], 312);
+    assert_eq!(value["usage"]["output_tokens"], 48);
+    assert!(value.get("answer_parse_skips").is_none(), "skip state is not wire state");
+    assert!(value.get("server_request_id").is_none(), "header state is not wire state");
+}
+
+#[test]
+fn t2_documented_null_forms_roundtrip_and_null_never_becomes_json() {
+    // instructions: null, per-side null criteria, null score level, null choice value.
+    // The body text form pins the serde variant ORDER: Text first, Null second, Json last.
+    let body = format!(
+        "{{\"model\":\"{MOCK_RESPONSE_MODEL}\",\"answers\":{{\"q.0\":{{\"type\":\"noul\",\"noul\":0.5}}}},\"usage\":null}}"
+    );
+    let parsed = parse_systemone_body(body.as_bytes()).unwrap();
+    assert_eq!(parsed.usage.input_tokens, None, "null usage is UNKNOWN, not zero");
+    assert_eq!(parsed.usage.output_tokens, None);
+
+    let spec = QuestionSpec::Noul {
+        instructions: Some(EntryValue::Null),
+        criteria: Some(NoulCriteria {
+            r#true: EntryValue::Null,
+            r#false: EntryValue::text("no"),
+        }),
+    };
+    let encoded = serde_json::to_value(&spec).unwrap();
+    assert_eq!(encoded["instructions"], serde_json::Value::Null, "Null emits null");
+    assert_eq!(encoded["criteria"]["true"], serde_json::Value::Null);
+    let decoded: QuestionSpec = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, spec, "null forms roundtrip");
+
+    let choice = QuestionSpec::Choice {
+        instructions: Some(EntryValue::Json(json!({"part": ["a", "b"]}))),
+        criteria: BTreeMap::from([
+            ("keep".to_string(), EntryValue::Null),
+            ("drop".to_string(), EntryValue::text("drop it")),
+        ]),
+    };
+    let encoded = serde_json::to_value(&choice).unwrap();
+    assert_eq!(encoded["instructions"], json!({"part": ["a", "b"]}));
+    assert_eq!(encoded["criteria"]["keep"], serde_json::Value::Null);
+    let decoded: QuestionSpec = serde_json::from_value(encoded).unwrap();
+    assert_eq!(decoded, choice);
+
+    // Absent instructions deserialize to None and re-serialize as an omitted field.
+    let bare: QuestionSpec =
+        serde_json::from_value(json!({"type": "score", "criteria": ["low", "high"]})).unwrap();
+    let QuestionSpec::Score { instructions, criteria } = &bare else { panic!("score") };
+    assert!(instructions.is_none());
+    assert_eq!(criteria.len(), 2);
+    let re = serde_json::to_value(&bare).unwrap();
+    assert!(re.get("instructions").is_none(), "None omits the field");
+}
+
+#[test]
+fn t3_validate_shape_enforces_documented_semantics_plus_host_policy_bounds() {
+    // Bare strings: non-empty-trim (pre-existing policy).
+    let empty = QuestionSpec::Noul {
+        instructions: Some(EntryValue::text("   ")),
+        criteria: Some(NoulCriteria::text("yes", "no")),
+    };
+    assert!(empty.validate_shape().is_err());
+    // Null instructions and null criteria sides are documented and pass.
+    let nulls = QuestionSpec::Noul {
+        instructions: Some(EntryValue::Null),
+        criteria: Some(NoulCriteria {
+            r#true: EntryValue::Null,
+            r#false: EntryValue::text("no"),
+        }),
+    };
+    assert!(nulls.validate_shape().is_ok());
+    // All-null Noul criteria are documented nowhere and are refused.
+    let all_null = QuestionSpec::Noul {
+        instructions: Some(EntryValue::text("q")),
+        criteria: Some(NoulCriteria {
+            r#true: EntryValue::Null,
+            r#false: EntryValue::Null,
+        }),
+    };
+    assert!(all_null.validate_shape().is_err());
+    // Structured entries must be object/array, non-empty.
+    let scalar = QuestionSpec::Choice {
+        instructions: Some(EntryValue::Json(json!(42))),
+        criteria: BTreeMap::from([("a".to_string(), EntryValue::text("x"))]),
+    };
+    assert!(scalar.validate_shape().is_err());
+    let empty_object = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("q")),
+        criteria: vec![EntryValue::Json(json!({})), EntryValue::text("high")],
+    };
+    assert!(empty_object.validate_shape().is_err());
+    let empty_array = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("q")),
+        criteria: vec![EntryValue::Json(json!([])), EntryValue::text("high")],
+    };
+    assert!(empty_array.validate_shape().is_err());
+    // HOST POLICY bounds: Json size and depth caps; strings are never size-capped.
+    let oversized = EntryValue::Json(json!({"blob": "x".repeat(MAX_ENTRY_JSON_BYTES)}));
+    let oversized_question = QuestionSpec::Score {
+        instructions: Some(oversized.clone()),
+        criteria: vec![EntryValue::text("low"), EntryValue::text("high")],
+    };
+    assert!(oversized_question.validate_shape().is_err(), "oversized Json entry refused");
+    let mut deep = json!("leaf");
+    for _ in 0..=MAX_ENTRY_JSON_DEPTH {
+        deep = json!({"nested": deep});
+    }
+    let deep_question = QuestionSpec::Choice {
+        instructions: Some(EntryValue::Json(deep)),
+        criteria: BTreeMap::from([("a".to_string(), EntryValue::text("x"))]),
+    };
+    assert!(deep_question.validate_shape().is_err(), "over-deep Json entry refused");
+    let big_string = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("x".repeat(MAX_ENTRY_JSON_BYTES * 4))),
+        criteria: vec![EntryValue::text("low"), EntryValue::text("high")],
+    };
+    assert!(big_string.validate_shape().is_ok(), "bare strings are not size-capped");
+    // Documented API caps, enforced pre-transport: choice <= 255 options (api.md
+    // "Request body"; choice.md corroborates), score 2..=10 levels (api.md; score.md
+    // corroborates). Only Json entry size/depth above are host policy.
+    let mut many = BTreeMap::new();
+    for index in 0..=MAX_CHOICES_PER_QUESTION {
+        many.insert(format!("opt-{index}"), EntryValue::Null);
+    }
+    let too_many = QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("q")),
+        criteria: many,
+    };
+    assert!(too_many.validate_shape().is_err(), "256 options refused");
+    let at_cap = QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("q")),
+        criteria: too_many_criteria_minus_one(),
+    };
+    assert!(at_cap.validate_shape().is_ok(), "255 options accepted");
+    let eleven: Vec<EntryValue> = (0..=MAX_SCORE_LEVELS)
+        .map(|index| EntryValue::text(format!("level-{index}")))
+        .collect();
+    let too_many_levels = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("q")),
+        criteria: eleven,
+    };
+    assert!(too_many_levels.validate_shape().is_err(), "11 levels refused");
+}
+
+fn too_many_criteria_minus_one() -> BTreeMap<String, EntryValue> {
+    (0..MAX_CHOICES_PER_QUESTION)
+        .map(|index| (format!("opt-{index}"), EntryValue::Null))
+        .collect()
+}
+
+#[test]
+fn t4_argmax_and_expectation_follow_documented_rounding_tolerances() {
+    // Doc-exact choice: 0.85/0.15, choice = peak. Accepted.
+    let question = choice_question("Which?", &[("keep", None), ("drop", None)]);
+    let answer = Answer::Choice {
+        choice: "keep".to_string(),
+        probabilities: BTreeMap::from([("keep".to_string(), 0.85), ("drop".to_string(), 0.15)]),
+        confidence: 0.9,
+    };
+    assert!(validate_answer("q.0", &question, &answer).is_ok());
+    // Quantized within-tolerance: peak 0.45, chosen 0.44 (diff 0.01). Accepted ONLY
+    // under the rounding-derived slack; the strict bound would refuse it.
+    let answer = Answer::Choice {
+        choice: "level-1".to_string(),
+        probabilities: BTreeMap::from([
+            ("level-0".to_string(), 0.45),
+            ("level-1".to_string(), 0.44),
+            ("level-2".to_string(), 0.11),
+        ]),
+        confidence: 0.9,
+    };
+    let quantized_question = QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("q")),
+        criteria: BTreeMap::from([
+            ("level-0".to_string(), EntryValue::Null),
+            ("level-1".to_string(), EntryValue::Null),
+            ("level-2".to_string(), EntryValue::Null),
+        ]),
+    };
+    assert!(validate_answer("q.0", &quantized_question, &answer).is_ok());
+    // Genuine mismatch: 0.25 vs peak 0.45 (diff 0.20 > 0.01). Refused.
+    let answer = Answer::Choice {
+        choice: "level-2".to_string(),
+        probabilities: BTreeMap::from([
+            ("level-0".to_string(), 0.45),
+            ("level-1".to_string(), 0.30),
+            ("level-2".to_string(), 0.25),
+        ]),
+        confidence: 0.9,
+    };
+    let issue = validate_answer("q.0", &quantized_question, &answer).unwrap_err();
+    assert_eq!(issue.reason(), "choice_not_peak");
+    // Full-precision distribution: tight 1e-9 bound. 0.605 is NOT 2-decimal-quantized,
+    // and the reported choice names the NON-peak option, so the tight bound refuses it.
+    let answer = Answer::Choice {
+        choice: "b".to_string(),
+        probabilities: BTreeMap::from([("a".to_string(), 0.605), ("b".to_string(), 0.395)]),
+        confidence: 0.9,
+    };
+    let full = QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("q")),
+        criteria: BTreeMap::from([("a".to_string(), EntryValue::Null), ("b".to_string(), EntryValue::Null)]),
+    };
+    let issue = validate_answer("q.0", &full, &answer).unwrap_err();
+    assert_eq!(issue.reason(), "choice_not_peak");
+    assert_eq!(QUANTIZED_ARGMAX_TOLERANCE, 0.01);
+
+    // Doc-exact score: score.md example shape, index-weighted sum. Accepted.
+    let score_question = score_question("How complex?", &["low", "medium", "high"]);
+    let answer = Answer::Score {
+        score: 1.43,
+        legend: BTreeMap::from([
+            ("0".to_string(), EntryValue::text("low")),
+            ("1".to_string(), EntryValue::text("medium")),
+            ("2".to_string(), EntryValue::text("high")),
+        ]),
+        probabilities: BTreeMap::from([
+            ("0".to_string(), 0.0),
+            ("1".to_string(), 0.57),
+            ("2".to_string(), 0.43),
+        ]),
+        confidence: 0.9,
+    };
+    assert!(validate_answer("q.0", &score_question, &answer).is_ok());
+    // Quantized display rounding: reported score 1.4286 vs weighted 1.43 (diff 0.0014
+    // <= 0.005*(3*2/2) + 0.005). Accepted.
+    let answer = Answer::Score {
+        score: 1.4286,
+        legend: BTreeMap::from([
+            ("0".to_string(), EntryValue::text("low")),
+            ("1".to_string(), EntryValue::text("medium")),
+            ("2".to_string(), EntryValue::text("high")),
+        ]),
+        probabilities: BTreeMap::from([
+            ("0".to_string(), 0.0),
+            ("1".to_string(), 0.57),
+            ("2".to_string(), 0.43),
+        ]),
+        confidence: 0.9,
+    };
+    assert!(validate_answer("q.0", &score_question, &answer).is_ok());
+    // Genuine expectation mismatch: score 0.0 with weighted 1.2. Refused.
+    let answer = Answer::Score {
+        score: 0.0,
+        legend: BTreeMap::from([
+            ("0".to_string(), EntryValue::text("low")),
+            ("1".to_string(), EntryValue::text("medium")),
+            ("2".to_string(), EntryValue::text("high")),
+        ]),
+        probabilities: BTreeMap::from([
+            ("0".to_string(), 0.2),
+            ("1".to_string(), 0.4),
+            ("2".to_string(), 0.4),
+        ]),
+        confidence: 0.9,
+    };
+    let issue = validate_answer("q.0", &score_question, &answer).unwrap_err();
+    assert_eq!(issue.reason(), "score_not_expectation");
+}
+
+#[test]
+fn t5_structured_and_null_legend_entries_parse_and_validate() {
+    // Object legend echo (score.md structured example) against matching object criteria.
+    let question = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("q")),
+        criteria: vec![
+            EntryValue::Json(json!({"label": "low"})),
+            EntryValue::Json(json!({"label": "high"})),
+        ],
+    };
+    let parsed = parse_systemone_body(raw_object_legend_body("q.0").as_bytes()).unwrap();
+    let validation = validate_response(
+        &SystemOneRequest::new(json!("state"), BTreeMap::from([("q.0".to_string(), question)])),
+        &parsed,
+    );
+    assert!(
+        validation.skipped.is_empty(),
+        "object legend echo must validate: {:?}",
+        validation.skip_reasons()
+    );
+    // Null legend echo equals a Null criteria entry.
+    let question = QuestionSpec::Score {
+        instructions: Some(EntryValue::text("q")),
+        criteria: vec![EntryValue::Null, EntryValue::text("high")],
+    };
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": { "q.0": {
+            "type": "score", "score": 0.5,
+            "legend": { "0": null, "1": "high" },
+            "probabilities": { "0": 0.5, "1": 0.5 },
+            "confidence": 0.9
+        }}
+    });
+    let parsed = parse_systemone_body(body.to_string().as_bytes()).unwrap();
+    let validation = validate_response(
+        &SystemOneRequest::new(json!("state"), BTreeMap::from([("q.0".to_string(), question)])),
+        &parsed,
+    );
+    assert!(validation.skipped.is_empty(), "{:?}", validation.skip_reasons());
+}
+
+#[tokio::test]
+async fn t6_undocumented_state_shapes_are_refused_before_the_transport() {
+    let transport = Arc::new(MockJevTransport::all_valid());
+    let stats = Arc::new(JevStats::default());
+    for state in [json!(42), json!(true), json!(null), json!(3.5)] {
+        let mut questions = BTreeMap::new();
+        questions.insert("complexity.0".to_string(), score_question("How complex?", &["low", "high"]));
+        let mut bundle = bundle(questions);
+        bundle.state = state;
+        let outcome = run(transport.clone(), limits_with_timeout(Duration::from_millis(50), 0, Duration::from_millis(1)), &stats, bundle).await;
+        assert!(outcome.is_empty());
+        assert_eq!(outcome.skips[0].1, "invalid_state_shape");
+    }
+    assert_eq!(transport.call_count(), 0, "an undocumented state shape is never sent");
+    // Documented shapes pass request validation (an empty question map still errors).
+    let mut questions = BTreeMap::new();
+    questions.insert("complexity.0".to_string(), score_question("How complex?", &["low", "high"]));
+    let request = SystemOneRequest::new(json!({"structured": ["state"]}), questions.clone());
+    assert!(validate_request_shape(&request).is_ok());
+    let request = SystemOneRequest::new(json!(["plain", "array"]), questions);
+    assert!(validate_request_shape(&request).is_ok());
+}
+
+#[tokio::test]
+async fn t7_request_token_ceiling_skips_before_the_transport() {
+    let transport = Arc::new(MockJevTransport::all_valid());
+    let stats = Arc::new(JevStats::default());
+    let mut questions = BTreeMap::new();
+    questions.insert("complexity.0".to_string(), score_question("How complex?", &["low", "high"]));
+    let mut limits = limits_with_timeout(Duration::from_millis(100), 0, Duration::from_millis(1));
+    // HOST POLICY: tunable only downward; the ceiling itself never rises above the default.
+    limits.max_request_tokens = Some(10);
+    let outcome = run(transport.clone(), limits, &stats, bundle(questions)).await;
+    assert!(outcome.is_empty());
+    assert_eq!(outcome.skips[0].1, "request_token_limit");
+    assert_eq!(outcome.attempts, 0, "no transport call happens");
+    assert_eq!(transport.call_count(), 0);
+    assert_eq!(stats.snapshot().validation_skips, 1);
+    // Above-ceiling configuration values are refused by limits validation.
+    let mut limits = JevLimits::default();
+    limits.max_request_tokens = Some(REQUEST_TOKEN_CEILING + 1);
+    assert!(limits.validate().is_err());
+    limits.max_request_tokens = Some(0);
+    assert!(limits.validate().is_err());
+    limits.max_request_tokens = Some(1);
+    assert!(limits.validate().is_ok());
+}
+
+#[tokio::test]
+async fn t8_cap_boundaries_pass_and_one_past_fails_pre_transport() {
+    // 255 options and 10 levels are accepted and sent; 256/11 are refused with no call.
+    let transport = Arc::new(MockJevTransport::all_valid());
+    let stats = Arc::new(JevStats::default());
+    let mut questions = BTreeMap::new();
+    questions.insert("choice.0".to_string(), QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("pick")),
+        criteria: too_many_criteria_minus_one(),
+    });
+    questions.insert("score.0".to_string(), score_question("rate", &["0", "1", "2", "3", "4", "5", "6", "7", "8", "9"]));
+    let outcome = run(transport.clone(), limits_with_timeout(Duration::from_millis(100), 0, Duration::from_millis(1)), &stats, bundle(questions)).await;
+    assert_eq!(transport.call_count(), 1, "at-cap shapes are sent");
+    assert_eq!(outcome.records.len(), 2, "at-cap shapes produce answers");
+
+    let transport = Arc::new(MockJevTransport::all_valid());
+    let stats = Arc::new(JevStats::default());
+    let mut questions = BTreeMap::new();
+    let mut many = BTreeMap::new();
+    for index in 0..=MAX_CHOICES_PER_QUESTION {
+        many.insert(format!("opt-{index}"), EntryValue::Null);
+    }
+    questions.insert("choice.0".to_string(), QuestionSpec::Choice {
+        instructions: Some(EntryValue::text("pick")),
+        criteria: many,
+    });
+    let outcome = run(transport.clone(), limits_with_timeout(Duration::from_millis(100), 0, Duration::from_millis(1)), &stats, bundle(questions)).await;
+    assert!(outcome.is_empty());
+    assert_eq!(outcome.skips[0].1, "validation", "over-cap shapes fail request validation");
+    assert_eq!(transport.call_count(), 0);
+}
+
+#[test]
+fn t9_prompt_hash_input_covers_text_json_and_null_forms() {
+    let text = QuestionSpec::noul("plain text", NoulCriteria::text("yes", "no"));
+    assert_eq!(text.instructions(), "plain text");
+    let structured = QuestionSpec::Score {
+        instructions: Some(EntryValue::Json(json!({"b": 1, "a": 2}))),
+        criteria: vec![EntryValue::text("low"), EntryValue::text("high")],
+    };
+    // Canonical JSON: keys sorted, so hash input is stable regardless of insertion order.
+    assert_eq!(structured.instructions(), "{\"a\":2,\"b\":1}");
+    let nulled = QuestionSpec::Choice {
+        instructions: Some(EntryValue::Null),
+        criteria: BTreeMap::new(),
+    };
+    assert_eq!(nulled.instructions(), "null");
+    let absent = QuestionSpec::Score {
+        instructions: None,
+        criteria: vec![EntryValue::text("low"), EntryValue::text("high")],
+    };
+    assert_eq!(absent.instructions(), "");
+    assert_eq!(EntryValue::Null.instructions_hash_input(), "null");
+    assert_eq!(EntryValue::Json(json!({"z": 1, "a": 2})).instructions_hash_input(), "{\"a\":2,\"z\":1}");
+}
+
+#[tokio::test]
+async fn t10_usage_knownness_is_preserved_end_to_end() {
+    // Null usage on the wire stays UNKNOWN (None), and a measured zero stays Some(0).
+    let parsed = parse_systemone_body(raw_null_usage_body("q.0").as_bytes()).unwrap();
+    assert_eq!(parsed.usage.input_tokens, None);
+    assert_eq!(parsed.usage.output_tokens, None);
+    let parsed = parse_systemone_body(raw_missing_usage_body("q.0").as_bytes()).unwrap();
+    assert_eq!(parsed.usage.input_tokens, None);
+    let measured_zero = SystemOneResponse {
+        usage: Usage { input_tokens: Some(0), output_tokens: Some(0) },
+        ..SystemOneResponse::default()
+    };
+    assert_eq!(measured_zero.usage.input_tokens, Some(0), "a real zero is a known zero");
+    let re = serde_json::to_value(&measured_zero).unwrap();
+    assert_eq!(re["usage"]["input_tokens"], 0, "Some(0) serializes as a real zero");
+    let unknown = SystemOneResponse::default();
+    let re = serde_json::to_value(&unknown).unwrap();
+    assert!(re.get("usage").is_none() || re["usage"] == json!({}), "unknown usage emits nothing");
+}
+
+#[test]
+fn t11_lenient_parsing_skips_one_bad_answer_and_keeps_the_rest() {
+    // Mix: one malformed known-type answer, one unknown-type answer, one valid answer.
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            "q.valid": { "type": "noul", "noul": 0.5 },
+            "q.malformed": { "type": "choice", "choice": "coding" },
+            "q.unknown": { "type": "weather", "forecast": "sunny" }
+        },
+        "usage": { "input_tokens": 1, "output_tokens": 1 }
+    });
+    let parsed = parse_systemone_body(body.to_string().as_bytes()).unwrap();
+    assert_eq!(parsed.answers.len(), 1, "only the valid answer parses");
+    assert_eq!(parsed.answer_parse_skips.len(), 2);
+    let reasons: Vec<&str> = parsed.answer_parse_skips.iter().map(|(_, issue)| issue.reason()).collect();
+    assert!(reasons.contains(&"malformed_answer"));
+    assert!(reasons.contains(&"unknown_answer_type"));
+    // The skips flow through validate_response as ordinary per-answer skips.
+    let mut questions = BTreeMap::new();
+    questions.insert("q.valid".to_string(), noul_question("Is it?", "yes", "no"));
+    questions.insert("q.malformed".to_string(), choice_question("Pick", &[("coding", None)]));
+    questions.insert("q.unknown".to_string(), noul_question("Weather?", "yes", "no"));
+    let request = SystemOneRequest::new(json!("state"), questions);
+    let validation = validate_response(&request, &parsed);
+    assert_eq!(validation.accepted.len(), 1);
+    let reasons = validation.skip_reasons();
+    assert!(reasons.contains(&("q.malformed".to_string(), "malformed_answer")));
+    assert!(reasons.contains(&("q.unknown".to_string(), "unknown_answer_type")));
+    // Single-purpose fixtures behave the same way.
+    let parsed = parse_systemone_body(raw_unknown_answer_type_body("q.0").as_bytes()).unwrap();
+    assert_eq!(parsed.answer_parse_skips[0].1.reason(), "unknown_answer_type");
+    let parsed = parse_systemone_body(raw_malformed_answer_body("q.0").as_bytes()).unwrap();
+    assert_eq!(parsed.answer_parse_skips[0].1.reason(), "malformed_answer");
+    // Structural failures still fail the WHOLE body (MalformedResponse).
+    let truncated = parse_systemone_body(raw_truncated_body().as_bytes()).unwrap_err();
+    assert_eq!(truncated.kind(), "malformed_response");
+}
+
+#[test]
+fn t12_server_request_id_is_bounded_sanitized_and_never_logged() {
+    // A UUID-shaped id survives; control characters and CRLF are stripped; credential
+    // echoes are refused; the value is length-capped; empty is None.
+    let uuid = "3f2504e0-4f89-11d3-9a0c-0305e82c3301";
+    assert_eq!(sanitize_opaque_header_value(uuid).as_deref(), Some(uuid));
+    assert_eq!(
+        sanitize_opaque_header_value("  ab\r\ncd\u{0}ef  ").as_deref(),
+        Some("abcdef")
+    );
+    assert_eq!(sanitize_opaque_header_value("Bearer abc123"), None);
+    assert_eq!(sanitize_opaque_header_value("authorization=x"), None);
+    assert_eq!(sanitize_opaque_header_value("sk-live-abcdef"), None);
+    assert_eq!(sanitize_opaque_header_value(""), None);
+    assert_eq!(sanitize_opaque_header_value("   "), None);
+    let long = "a".repeat(200);
+    let capped = sanitize_opaque_header_value(&long).unwrap();
+    assert_eq!(capped.chars().count(), 64, "opaque values are length-capped");
+    // The error Display/log line never carries the id even when it is stored.
+    let error = JevError::HttpStatus {
+        status: 503,
+        detail: "service unavailable".to_string(),
+        retry_after: None,
+        server_request_id: Some(uuid.to_string()),
+    };
+    let rendered = error.log_line();
+    assert!(!rendered.contains(uuid), "request id never reaches log lines: {rendered}");
+    assert_eq!(error.server_request_id(), Some(uuid));
+}
+
+#[tokio::test]
+async fn t13_mock_steps_carry_the_request_id_into_outcomes() {
+    // Success path: the captured id lands on the response and then the outcome.
+    let transport = Arc::new(MockJevTransport::scripted(vec![
+        MockStep::ValidWithRequestId {
+            server_request_id: "3f2504e0-4f89-11d3-9a0c-0305e82c3301".to_string(),
+        },
+    ]));
+    let stats = Arc::new(JevStats::default());
+    let outcome = run(transport.clone(), limits_with_timeout(Duration::from_millis(100), 0, Duration::from_millis(1)), &stats, default_bundle()).await;
+    assert_eq!(
+        outcome.server_request_id.as_deref(),
+        Some("3f2504e0-4f89-11d3-9a0c-0305e82c3301")
+    );
+    // Error path: a generic HttpStatus step carries the id into the terminal error.
+    let transport = Arc::new(MockJevTransport::scripted(vec![MockStep::HttpStatus {
+        status: 429,
+        retry_after_ms: Some(1500),
+        server_request_id: Some("mock-req-id".to_string()),
+    }]));
+    let stats = Arc::new(JevStats::default());
+    let limits = limits_with_timeout(Duration::from_millis(200), 0, Duration::from_millis(1));
+    let outcome = run(transport.clone(), limits, &stats, default_bundle()).await;
+    assert!(outcome.is_empty());
+    assert_eq!(outcome.skips[0].1, "http_status_429");
+    assert_eq!(outcome.server_request_id.as_deref(), Some("mock-req-id"));
+}
+
+#[test]
+fn t14_retry_after_ms_is_parsed_and_preferred_over_the_seconds_form() {
+    assert_eq!(parse_retry_after_ms("1500"), Some(Duration::from_millis(1500)));
+    assert_eq!(parse_retry_after_ms(" 42 "), Some(Duration::from_millis(42)));
+    assert_eq!(parse_retry_after_ms("soon"), None);
+    assert_eq!(parse_retry_after_ms("-5"), None);
+    // A hostile value clamps to the documented maximum (and therefore stops the retry).
+    assert_eq!(parse_retry_after_ms("999999999999"), Some(pi_jev::MAX_RETRY_AFTER));
+    // The generic HttpStatus mock step honors an ms hint verbatim (never jittered).
+    let error = JevError::HttpStatus {
+        status: 429,
+        detail: "hint".to_string(),
+        retry_after: Some(Duration::from_millis(1500)),
+        server_request_id: None,
+    };
+    match retry_decision(&error, 0, &JevLimits::default()) {
+        RetryDecision::RetryAfter(delay) => assert_eq!(delay, Duration::from_millis(1500)),
+        RetryDecision::Stop => panic!("the ms hint must be honored"),
+    }
+}
+
+#[test]
+fn t15_fallback_backoff_jitter_is_subtractive_and_bounded() {
+    // HOST POLICY: jitter applies to the fallback branch only and never lengthens a delay.
+    for _ in 0..64 {
+        let jittered = jittered_backoff(Duration::from_secs(8));
+        assert!(jittered >= Duration::from_millis(6000), "never below 0.75x base: {jittered:?}");
+        assert!(jittered <= Duration::from_secs(8), "never above the documented base: {jittered:?}");
+    }
+    assert_eq!(jittered_backoff(Duration::ZERO), Duration::ZERO);
+    // Server hints are never jittered (already covered by t14's exact-delay assertion).
+}
+
+#[test]
+fn t16_status_specific_kinds_do_not_change_retryability() {
+    assert_eq!(http_status_kind(400), "http_status_400");
+    assert_eq!(http_status_kind(401), "http_status_401");
+    assert_eq!(http_status_kind(429), "http_status_429");
+    assert_eq!(http_status_kind(529), "http_status_529");
+    assert_eq!(http_status_kind(418), "http_status_4xx");
+    assert_eq!(http_status_kind(599), "http_status_5xx");
+    assert_eq!(http_status_kind(302), "http_status");
+    // Retryability is unchanged: only the diagnostic code is finer grained.
+    let terminal = JevError::HttpStatus {
+        status: 404,
+        detail: "missing".to_string(),
+        retry_after: None,
+        server_request_id: None,
+    };
+    assert_eq!(retry_decision(&terminal, 0, &JevLimits::default()), RetryDecision::Stop);
+    let retryable = JevError::HttpStatus {
+        status: 503,
+        detail: "overloaded".to_string(),
+        retry_after: None,
+        server_request_id: None,
+    };
+    match retry_decision(&retryable, 0, &JevLimits::default()) {
+        RetryDecision::RetryAfter(_) => {}
+        RetryDecision::Stop => panic!("503 stays retryable"),
+    }
 }

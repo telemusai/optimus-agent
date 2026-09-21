@@ -2,6 +2,13 @@
 
 use std::collections::BTreeSet;
 
+/// ROOT-CONTRACT v7 (Agent-guidance lane): the advisory hint block's OWNED
+/// markers. `format_skill_hint` renders exactly these delimiters, so the
+/// request-local refresh can find, replace or remove its OWN block without
+/// ever regex-stripping user-supplied text.
+pub const JEV_SKILL_HINT_BLOCK_START: &str = "<jev_skill_hint>";
+pub const JEV_SKILL_HINT_BLOCK_END: &str = "</jev_skill_hint>";
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::prompts::rlm::{build_child_agent_doctrine, build_rlm_prompt, build_subagent_guidance, ChildAgentDoctrineOptions, RlmPromptOptions, SubagentGuidanceOptions};
@@ -40,6 +47,10 @@ pub struct BuildSystemPromptOptions {
     /// Pre-loaded skills.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub skills: Option<Vec<Skill>>,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): advisory skill hint block.
+    /// Appended AFTER the roster block, never inside it; assessment only.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub skill_hint: Option<String>,
     /// Whether to include the model-facing rlm recursion guidance.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub allow_recursion: Option<bool>,
@@ -132,6 +143,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         };
         if custom_prompt_has_file_access && !skills.is_empty() {
             prompt.push_str(&format_skills_for_prompt(&skills));
+            if let Some(hint) = &options.skill_hint { prompt.push_str(hint); }
         }
 
         // Add date and working directory last.
@@ -250,6 +262,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let has_file_access = tools.iter().any(|tool| tool == "ipython" || tool == "bash");
     if has_file_access && !skills.is_empty() {
         prompt.push_str(&format_skills_for_prompt(&skills));
+        if let Some(hint) = &options.skill_hint { prompt.push_str(hint); }
     }
 
     if !append_section.is_empty() {

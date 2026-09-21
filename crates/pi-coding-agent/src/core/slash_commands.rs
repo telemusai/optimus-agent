@@ -412,9 +412,9 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
     // what the UI accepts.
     push(
         "jev",
-        "Jev System One: Off, Compare, Active, Compare + Active, compaction, feature gates, API key and status"
+        "Jev System One: Off, Compare, Active, Compare + Active, compaction, feature gates, the global full-jev overlay, API key, the requested Jev model (model status/set/reset) and the model catalog"
             .to_string(),
-        Some("[off|compare|active|compare-active|on|compact|feature|default|status|key]"),
+        Some("[off|compare|active|compare-active|on|compact|feature|default|full-jev|status|key|models|model]"),
         Some(true),
     );
     push("quit", format!("Quit {APP_NAME}"), None, None);
@@ -525,9 +525,23 @@ pub fn parse_slash_command(text: &str) -> Option<ParsedSlashCommand> {
         }
         tail.trim_start_matches(char::is_whitespace).to_string()
     };
+    // Model IDs are exact identifiers. Preserve trailing bytes only for the
+    // narrow `/jev model set <id>` arm so whitespace-bearing IDs reach its
+    // validator and are refused instead of being silently normalized into a
+    // different accepted ID. Every other slash command keeps the established
+    // outer-lexer trimming rule.
+    let preserve_model_id_trailing = name == "jev"
+        && args
+            .get(.."model set ".len())
+            .map(|prefix| prefix.eq_ignore_ascii_case("model set "))
+            .unwrap_or(false);
     Some(ParsedSlashCommand {
         name: name.to_string(),
-        args: args.trim().to_string(),
+        args: if preserve_model_id_trailing {
+            args
+        } else {
+            args.trim().to_string()
+        },
     })
 }
 
@@ -654,6 +668,21 @@ mod tests {
         assert_eq!(no_args.args, "");
         assert!(parse_slash_command("not a command").is_none());
         assert!(parse_slash_command("/").is_none());
+    }
+
+    #[test]
+    fn jev_model_set_preserves_trailing_id_whitespace_for_refusal() {
+        let trailing_space = parse_slash_command("/jev model set jev-safe ").unwrap();
+        assert_eq!(trailing_space.args, "model set jev-safe ");
+        let trailing_tab = parse_slash_command("/jev model set jev-safe\t").unwrap();
+        assert_eq!(trailing_tab.args, "model set jev-safe\t");
+        let safe = parse_slash_command("/jev model set jev-safe").unwrap();
+        assert_eq!(safe.args, "model set jev-safe");
+        // The established lexer rule is unchanged outside this narrow arm.
+        assert_eq!(
+            parse_slash_command("/compact keep the plan  ").unwrap().args,
+            "keep the plan"
+        );
     }
 
     #[test]

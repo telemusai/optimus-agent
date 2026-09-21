@@ -97,6 +97,33 @@ pub struct JevFeatures {
     pub retry_classification: bool,
     pub verification: bool,
     pub trace_observer: bool,
+    /// Full-jev search flag (ROOT-CONTRACT v1): re-rank code-search candidates
+    /// with real per-query scores. Defaults to `false`; the full-jev overlay
+    /// forces it on.
+    pub code_search_reranking: bool,
+    /// Full-jev search flag (ROOT-CONTRACT v1): line-level semantic find over
+    /// the actual native source-read path. Defaults to `false`; the full-jev
+    /// overlay forces it on.
+    pub line_find: bool,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): advisory skill hint from the
+    /// already-loaded roster. Defaults to `false`; the full-jev overlay
+    /// forces it on. Never loads or executes a skill.
+    pub skill_suggestion: bool,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): input guardrail battery.
+    /// Defaults to `false`; the full-jev overlay forces it on.
+    pub guardrails_input: bool,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): output guardrail battery
+    /// (post-hoc assessment). Defaults to `false`; the full-jev overlay
+    /// forces it on.
+    pub guardrails_output: bool,
+    /// ROOT-CONTRACT v6 (Evidence lane): candidate-bound retrieval-safety
+    /// battery over the code-search filter request. Defaults to `false`; the
+    /// full-jev overlay forces it on.
+    pub retrieval_safety: bool,
+    /// ROOT-CONTRACT v6 (Evidence lane): advisory citation check over the
+    /// actual supplied source span. Defaults to `false`; the full-jev
+    /// overlay forces it on.
+    pub citation_check: bool,
 }
 
 impl Default for JevFeatures {
@@ -114,6 +141,13 @@ impl Default for JevFeatures {
             retry_classification: false,
             verification: false,
             trace_observer: false,
+            code_search_reranking: false,
+            line_find: false,
+            skill_suggestion: false,
+            guardrails_input: false,
+            guardrails_output: false,
+            retrieval_safety: false,
+            citation_check: false,
         }
     }
 }
@@ -132,12 +166,42 @@ pub enum JevFeature {
     RetryClassification,
     Verification,
     TraceObserver,
+    CodeSearchReranking,
+    LineFind,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): skill suggestion hint.
+    SkillSuggestion,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): input guardrail battery.
+    GuardrailsInput,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): output guardrail battery.
+    GuardrailsOutput,
+    /// ROOT-CONTRACT v6 (Evidence lane): retrieval-safety battery.
+    RetrievalSafety,
+    /// ROOT-CONTRACT v6 (Evidence lane): citation check.
+    CitationCheck,
 }
 
 impl JevFeature {
-    pub const ALL: [Self; 12] = [Self::ToolRequirement, Self::Complexity, Self::ToolCandidates,
-        Self::ContextRelevance, Self::CodeSearchRelevance, Self::CodeSearchFiltering, Self::MemoryRelevance, Self::ResultSufficiency,
-        Self::LoopControl, Self::RetryClassification, Self::Verification, Self::TraceObserver];
+    pub const ALL: [Self; 19] = [
+        Self::ToolRequirement,
+        Self::Complexity,
+        Self::ToolCandidates,
+        Self::ContextRelevance,
+        Self::CodeSearchRelevance,
+        Self::CodeSearchFiltering,
+        Self::MemoryRelevance,
+        Self::ResultSufficiency,
+        Self::LoopControl,
+        Self::RetryClassification,
+        Self::Verification,
+        Self::TraceObserver,
+        Self::CodeSearchReranking,
+        Self::LineFind,
+        Self::SkillSuggestion,
+        Self::GuardrailsInput,
+        Self::GuardrailsOutput,
+        Self::RetrievalSafety,
+        Self::CitationCheck,
+    ];
 
     pub fn as_str(self) -> &'static str {
         match self {
@@ -153,6 +217,13 @@ impl JevFeature {
             Self::RetryClassification => "retry_classification",
             Self::Verification => "verification",
             Self::TraceObserver => "trace_observer",
+            Self::CodeSearchReranking => "code_search_reranking",
+            Self::LineFind => "line_find",
+            Self::SkillSuggestion => "skill_suggestion",
+            Self::GuardrailsInput => "guardrails_input",
+            Self::GuardrailsOutput => "guardrails_output",
+            Self::RetrievalSafety => "retrieval_safety",
+            Self::CitationCheck => "citation_check",
         }
     }
 
@@ -177,6 +248,13 @@ impl JevFeatures {
             JevFeature::RetryClassification => self.retry_classification,
             JevFeature::Verification => self.verification,
             JevFeature::TraceObserver => self.trace_observer,
+            JevFeature::CodeSearchReranking => self.code_search_reranking,
+            JevFeature::LineFind => self.line_find,
+            JevFeature::SkillSuggestion => self.skill_suggestion,
+            JevFeature::GuardrailsInput => self.guardrails_input,
+            JevFeature::GuardrailsOutput => self.guardrails_output,
+            JevFeature::RetrievalSafety => self.retrieval_safety,
+            JevFeature::CitationCheck => self.citation_check,
         }
     }
 
@@ -194,6 +272,13 @@ impl JevFeatures {
             JevFeature::RetryClassification => self.retry_classification = enabled,
             JevFeature::Verification => self.verification = enabled,
             JevFeature::TraceObserver => self.trace_observer = enabled,
+            JevFeature::CodeSearchReranking => self.code_search_reranking = enabled,
+            JevFeature::LineFind => self.line_find = enabled,
+            JevFeature::SkillSuggestion => self.skill_suggestion = enabled,
+            JevFeature::GuardrailsInput => self.guardrails_input = enabled,
+            JevFeature::GuardrailsOutput => self.guardrails_output = enabled,
+            JevFeature::RetrievalSafety => self.retrieval_safety = enabled,
+            JevFeature::CitationCheck => self.citation_check = enabled,
         }
     }
 }
@@ -266,6 +351,9 @@ pub enum ModeScope {
     GlobalDefault,
     /// The built-in default (Off).
     BuiltIn,
+    /// The `/jev full-jev` overlay, which resolves ABOVE every session,
+    /// global and inherited override while it is installed.
+    FullJevOverlay,
 }
 
 impl ModeScope {
@@ -274,9 +362,71 @@ impl ModeScope {
             ModeScope::Session => "session",
             ModeScope::GlobalDefault => "global_default",
             ModeScope::BuiltIn => "built_in_default",
+            ModeScope::FullJevOverlay => "full_jev_overlay",
         }
     }
 }
+
+/// The `/jev full-jev` global overlay (ROOT-CONTRACT v1): a persisted, named
+/// profile that resolves ABOVE every per-session, global and inherited
+/// override while it is installed. The base settings — `global_default`,
+/// `features`, `compaction_enabled` and the whole `sessions` map — are never
+/// rewritten by full-on or full-off, so removing the overlay restores the
+/// pre-existing resolution exactly.
+///
+/// Resolution reads the FIXED [`FULL_JEV_MODE`], [`FULL_JEV_FEATURES`] and
+/// [`FULL_JEV_COMPACTION_ENABLED`] constants, never these persisted fields,
+/// so a hand-edited or downgraded file can never weaken what "full" means;
+/// the stored fields exist for truthful status and forward compatibility.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct FullJevProfile {
+    /// True while the overlay is installed. Removal retains the block with
+    /// `enabled: false`; `None` on `JevSettings` means the profile was never
+    /// installed. Resolution and status treat both states as "off".
+    pub enabled: bool,
+    /// The operative mode the overlay resolves to: always [`FULL_JEV_MODE`].
+    pub mode: JevMode,
+    /// Every feature gate the overlay forces on (all 14).
+    pub features: JevFeatures,
+    /// Independent compaction the overlay forces on.
+    pub compaction_enabled: bool,
+    /// Install counter for the cheap change stamp: every full-on/full-off
+    /// cycle moves it, so cached work stamped with an older revision can be
+    /// invalidated the same way a credential rotation is. No secrets.
+    pub revision: u64,
+}
+
+/// The mode the full-jev overlay resolves to. Not a new `JevMode` variant
+/// (ROOT-CONTRACT v1): the overlay means combined mode.
+pub const FULL_JEV_MODE: JevMode = JevMode::CompareAndActive;
+
+/// Every feature gate the full-jev overlay forces on, including the two
+/// full-jev flags that default to `false` outside the overlay.
+pub const FULL_JEV_FEATURES: JevFeatures = JevFeatures {
+    tool_requirement: true,
+    complexity: true,
+    tool_candidates: true,
+    context_relevance: true,
+    code_search_relevance: true,
+    code_search_filtering: true,
+    memory_relevance: true,
+    result_sufficiency: true,
+    loop_control: true,
+    retry_classification: true,
+    verification: true,
+    trace_observer: true,
+    code_search_reranking: true,
+    line_find: true,
+    skill_suggestion: true,
+    guardrails_input: true,
+    guardrails_output: true,
+    retrieval_safety: true,
+    citation_check: true,
+};
+
+/// Compaction under the full-jev overlay: on, still request-local and
+/// independent of the decision mode.
+pub const FULL_JEV_COMPACTION_ENABLED: bool = true;
 
 /// Result of mode resolution, including which scope decided.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -455,6 +605,38 @@ pub struct JevSettings {
     /// grants any capability (DESIGN.md 11/12).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub transport: Option<String>,
+    /// The `/jev full-jev` overlay: absent while the profile was never
+    /// installed; RETAINED with `enabled: false` after `/jev full-jev off` so
+    /// the persisted `revision` keeps its identity role across off->on cycles.
+    /// See [`FullJevProfile`].
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub full_jev: Option<FullJevProfile>,
+    /// ROOT-CONTRACT v9 durable write identity: every authoritative save
+    /// persists the previous file's revision + 1 (1 for the first write).
+    /// Monotonic across processes; a reader that misses intermediate writes
+    /// still observes a strictly larger revision on return, so work or hints
+    /// stamped with an older revision are rejected even for A->B->A where the
+    /// serialized VALUES return to identical bytes. Hand-edited files keep
+    /// their stated revision; only the save path advances authority.
+    #[serde(default, skip_serializing_if = "is_zero_u64")]
+    pub write_revision: u64,
+    /// ROOT-CONTRACT v9: the explicitly requested Jev SystemOne model for this
+    /// agent dir, set by `/jev model set <id>` and removed by `/jev model
+    /// reset`. `None` means the built-in native default
+    /// [`crate::types::DEFAULT_MODEL`] (`jev-latest`). This selects the
+    /// `model` field of JEV SystemOne requests ONLY: it is never the user's
+    /// primary chat model, provider or effort (DESIGN.md section 11), it is
+    /// never selected automatically (no startup probe, no catalog auto-pick,
+    /// no live call), and the `/jev full-jev` overlay neither reads, writes
+    /// nor masks it — an explicit operator selection is independent and
+    /// deliberate. Model writes never refill or reset control budgets.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub requested_model: Option<String>,
+}
+
+/// serde helper for the durable write revision default skip.
+fn is_zero_u64(value: &u64) -> bool {
+    *value == 0
 }
 
 impl Default for JevSettings {
@@ -472,6 +654,9 @@ impl Default for JevSettings {
             credential_source: None,
             disclosure_shown: false,
             transport: None,
+            full_jev: None,
+            write_revision: 0,
+            requested_model: None,
         }
     }
 }
@@ -488,6 +673,9 @@ impl JevSettings {
     /// (records only) and `Active` (may apply accepted answers) need the
     /// observer and its client; `Off` never does.
     pub fn wants_observer(&self) -> bool {
+        if self.full_jev_active() {
+            return true;
+        }
         let operative = |mode: Option<JevMode>| mode.is_some_and(JevMode::is_enabled);
         if operative(self.global_default) {
             return true;
@@ -498,6 +686,21 @@ impl JevSettings {
     pub fn validate(&self) -> Result<(), crate::error::JevError> {
         self.compaction.validate().map_err(|_| crate::error::JevError::config("invalid Jev compaction settings"))?;
         self.filtering.validate().map_err(|_| crate::error::JevError::config("invalid Jev filtering settings"))?;
+        // ROOT-CONTRACT v9: a persisted requested-model id must satisfy the
+        // SAME exact-identifier rule the catalog parser and the setter use.
+        // A hand-edited hostile value (control characters, bidi controls,
+        // ambiguous/invisible whitespace, credential echoes, empty, over-cap)
+        // makes the WHOLE file load as defaults — the documented corrupt-file
+        // fail-safe: the native default `jev-latest` then governs, nothing
+        // blocks startup, and no value is normalized into a different
+        // selectable id. The bounded reason never echoes the hostile text.
+        if let Some(id) = self.requested_model.as_deref() {
+            crate::models::validate_requested_model_id(id).map_err(|reason| {
+                crate::error::JevError::config(format!(
+                    "invalid requested Jev model selection: {reason}"
+                ))
+            })?;
+        }
         Ok(())
     }
 
@@ -512,6 +715,14 @@ impl JevSettings {
     /// Explicit per-session override, if any.
     pub fn session_mode(&self, session_id: &str) -> Option<JevMode> {
         self.sessions.get(session_id).and_then(|entry| entry.mode)
+    }
+
+    /// The session's SAVED compaction decision, if any. This is the raw
+    /// persisted value, not the overlay-aware resolution.
+    pub fn session_compaction_enabled(&self, session_id: &str) -> Option<bool> {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.compaction_enabled)
     }
 
     /// Sets an explicit per-session override.
@@ -529,24 +740,159 @@ impl JevSettings {
         }
     }
 
-    /// Effective mode for a session. See `resolve_effective_mode`.
+    /// True while the full-jev overlay is installed and active. Cheap: one
+    /// `Option` check, no allocation, callable on hot paths.
+    pub fn full_jev_active(&self) -> bool {
+        self.full_jev
+            .as_ref()
+            .is_some_and(|profile| profile.enabled)
+    }
+
+    /// Stable cheap change stamp for the full-jev overlay: presence plus the
+    /// install revision, e.g. `full-jev:0` / `full-jev:3`. Equality on this
+    /// string answers "did the overlay state change since this was stamped?"
+    /// with no secrets and no hashing on the hot path. A full toggle must
+    /// invalidate cached decisions the same way a credential rotation does
+    /// (ROOT-CONTRACT v1), so the bridge folds this into its cheap stamp.
+    pub fn full_jev_stamp(&self) -> String {
+        match &self.full_jev {
+            Some(profile) if profile.enabled => format!("full-jev:{}", profile.revision),
+            _ => "full-jev:0".to_string(),
+        }
+    }
+
+    /// Install the full-jev overlay. Idempotent: an already-active profile is
+    /// left untouched and `false` is returned, so nothing is rewritten and no
+    /// revision is churned. Each fresh activation bumps `revision`, which the
+    /// removal path RETAINS disabled, so every off->on cycle yields a new
+    /// persisted activation identity (no ABA for stamped cached work, even
+    /// when a consumer misses the intermediate Off). The base settings fields
+    /// are NEVER touched; the documented one-way exception is the first-use
+    /// notice flag.
+    /// Returns `true` when this call installed the overlay.
+    pub fn full_jev_install(&mut self) -> bool {
+        if self.full_jev_active() {
+            return false;
+        }
+        let revision = self
+            .full_jev
+            .as_ref()
+            .map_or(1, |profile| profile.revision + 1);
+        self.full_jev = Some(FullJevProfile {
+            enabled: true,
+            mode: FULL_JEV_MODE,
+            features: FULL_JEV_FEATURES,
+            compaction_enabled: FULL_JEV_COMPACTION_ENABLED,
+            revision,
+        });
+        self.disclosure_shown = true;
+        true
+    }
+
+    /// Remove the full-jev overlay. Idempotent: returns `false` when it was
+    /// not active. The profile block is RETAINED DISABLED instead of deleted:
+    /// its persisted `revision` survives off->on cycles, so every fresh
+    /// activation gets a new durable identity (an off->on cycle never repeats a
+    /// stamp; a consumer that misses the Off cannot accept first-activation
+    /// work in the second activation). Resolution ignores the block while
+    /// disabled, so the pre-overlay resolution returns exactly and no base
+    /// field is touched.
+    /// Returns `true` when this call deactivated the overlay.
+    pub fn full_jev_remove(&mut self) -> bool {
+        match &mut self.full_jev {
+            Some(profile) if profile.enabled => {
+                profile.enabled = false;
+                true
+            }
+            _ => false,
+        }
+    }
+
+    /// The explicit per-session decisions the overlay is currently masking,
+    /// as opaque session ids, for truthful status. Empty when the overlay is
+    /// not active. Masked values are still SAVED — they resolve again the
+    /// moment the overlay is removed.
+    pub fn full_jev_masked_sessions(&self) -> Vec<&str> {
+        if !self.full_jev_active() {
+            return Vec::new();
+        }
+        self.sessions
+            .iter()
+            .filter(|(_, entry)| {
+                entry.mode.is_some()
+                    || entry.features.is_some()
+                    || entry.compaction_enabled.is_some()
+            })
+            .map(|(session_id, _)| session_id.as_str())
+            .collect()
+    }
+
+    /// Effective mode for a session. See `resolve_effective_mode`. The active
+    /// full-jev overlay resolves ABOVE every session, global and inherited
+    /// override.
     pub fn effective_mode(&self, session_id: &str) -> JevMode {
+        if self.full_jev_active() {
+            return FULL_JEV_MODE;
+        }
         resolve_effective_mode(self.session_mode(session_id), self.global_default)
     }
 
     /// Effective mode with the deciding scope.
     pub fn effective_mode_with_scope(&self, session_id: &str) -> ModeResolution {
+        if self.full_jev_active() {
+            return ModeResolution {
+                mode: FULL_JEV_MODE,
+                scope: ModeScope::FullJevOverlay,
+            };
+        }
         resolve_mode(self.session_mode(session_id), self.global_default)
     }
 
+    /// Effective features for a session. The active full-jev overlay forces
+    /// every gate on, even where saved session settings say off.
     pub fn effective_features(&self, session_id: &str) -> JevFeatures {
-        self.sessions.get(session_id).and_then(|entry| entry.features).unwrap_or(self.features)
+        if self.full_jev_active() {
+            return FULL_JEV_FEATURES;
+        }
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.features)
+            .unwrap_or(self.features)
+    }
+
+    /// The session's own effective mode with the full-jev overlay EXCLUDED:
+    /// the baseline a child inherits or a masked-override status reports.
+    /// Overlay settings are never materialized into children or the base
+    /// fields (ROOT-CONTRACT v1).
+    pub fn base_effective_mode(&self, session_id: &str) -> JevMode {
+        resolve_effective_mode(self.session_mode(session_id), self.global_default)
+    }
+
+    /// Overlay-excluded features baseline. See [`Self::base_effective_mode`].
+    pub fn base_effective_features(&self, session_id: &str) -> JevFeatures {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.features)
+            .unwrap_or(self.features)
+    }
+
+    /// Overlay-excluded compaction baseline. See [`Self::base_effective_mode`].
+    pub fn base_effective_compaction_enabled(&self, session_id: &str) -> bool {
+        self.sessions
+            .get(session_id)
+            .and_then(|entry| entry.compaction_enabled)
+            .unwrap_or(self.compaction_enabled)
     }
 
     pub fn set_session_feature(&mut self, session_id: &str, feature: JevFeature, enabled: bool) {
-        let mut features = self.effective_features(session_id);
+        // Snapshot the BASE features: overlay values must never be
+        // materialized into a session entry (ROOT-CONTRACT v1).
+        let mut features = self.base_effective_features(session_id);
         features.set(feature, enabled);
-        self.sessions.entry(session_id.to_string()).or_default().features = Some(features);
+        self.sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .features = Some(features);
     }
 
     /// Resolves compaction independently of the Jev decision mode.
@@ -555,7 +901,14 @@ impl JevSettings {
     }
 
     pub fn effective_compaction_with_scope(&self, session_id: &str) -> (bool, ModeScope) {
-        match self.sessions.get(session_id).and_then(|entry| entry.compaction_enabled) {
+        if self.full_jev_active() {
+            return (FULL_JEV_COMPACTION_ENABLED, ModeScope::FullJevOverlay);
+        }
+        match self
+            .sessions
+            .get(session_id)
+            .and_then(|entry| entry.compaction_enabled)
+        {
             Some(enabled) => (enabled, ModeScope::Session),
             None => (self.compaction_enabled, ModeScope::GlobalDefault),
         }
@@ -569,6 +922,50 @@ impl JevSettings {
     pub fn set_credential_metadata(&mut self, configured: bool, source: CredentialSource) {
         self.credential_configured = configured;
         self.credential_source = Some(source);
+    }
+
+    /// ROOT-CONTRACT v9: the requested Jev model native SystemOne requests
+    /// carry — the explicit `/jev model set <id>` selection when present,
+    /// otherwise the documented native default `jev-latest`
+    /// ([`crate::types::DEFAULT_MODEL`]). Resolution is PURE and LOCAL: no
+    /// network, no probe, no availability claim. Callers MUST capture this
+    /// value from the SAME authoritative settings snapshot they resolve the
+    /// mode/gates/revision from, BEFORE any await, and must not re-read it
+    /// late into an already-captured payload.
+    pub fn requested_model_or_default(&self) -> &str {
+        self.requested_model.as_deref().unwrap_or(crate::types::DEFAULT_MODEL)
+    }
+
+    /// Sets the requested Jev model to an already-captured operator value
+    /// (the `/jev model set <id>` path). Validates with the SAME
+    /// exact-identifier rule the catalog parser uses
+    /// ([`crate::models::validate_requested_model_id`]); the bounded refusal
+    /// reason NEVER contains the supplied text. Returns `Ok(true)` when the
+    /// value changed and `Ok(false)` when it was already set (an idempotent
+    /// no-op: the caller's save is then skipped, so the durable write
+    /// revision does not move). Credential-overlap protection against the
+    /// EFFECTIVE credential is a CALLER duty
+    /// ([`crate::models::id_overlaps_credential`]) because this method never
+    /// loads a credential. Zero network, zero probe, no availability claim,
+    /// no budget effect, no overlay interaction.
+    pub fn set_requested_model(&mut self, raw: &str) -> Result<bool, crate::error::JevError> {
+        crate::models::validate_requested_model_id(raw).map_err(|reason| {
+            crate::error::JevError::config(format!("requested Jev model refused: {reason}"))
+        })?;
+        let changed = self.requested_model.as_deref() != Some(raw);
+        if changed {
+            self.requested_model = Some(raw.to_string());
+        }
+        Ok(changed)
+    }
+
+    /// Removes the explicit requested-model selection (the `/jev model reset`
+    /// tombstone): the native default `jev-latest` governs again. Returns
+    /// `true` when an explicit selection was actually removed and `false`
+    /// when none was set (the caller's save is then skipped). No network, no
+    /// probe, no budget effect, no overlay interaction.
+    pub fn clear_requested_model(&mut self) -> bool {
+        self.requested_model.take().is_some()
     }
 
     /// True when the serialized form looks like it carries credential material.
@@ -623,9 +1020,15 @@ pub fn inherit_mode(
     parent_session_id: &str,
     explicit_child_override: Option<JevMode>,
 ) -> JevMode {
-    let inherited = explicit_child_override.unwrap_or_else(|| settings.effective_mode(parent_session_id));
-    let features = settings.effective_features(parent_session_id);
-    let compaction_enabled = settings.effective_compaction_enabled(parent_session_id);
+    // Baseline inheritance (ROOT-CONTRACT v1): the child snapshots the
+    // parent's overlay-EXCLUDED effective values, so full-jev settings are
+    // never materialized into the child's saved entry. While the overlay is
+    // active the child still RESOLVES through it like every other session;
+    // removing the overlay returns the child to this inherited baseline.
+    let inherited =
+        explicit_child_override.unwrap_or_else(|| settings.base_effective_mode(parent_session_id));
+    let features = settings.base_effective_features(parent_session_id);
+    let compaction_enabled = settings.base_effective_compaction_enabled(parent_session_id);
     let entry = settings.sessions.entry(child_session_id.to_string()).or_default();
     entry.features.get_or_insert(features);
     entry.compaction_enabled.get_or_insert(compaction_enabled);
@@ -728,7 +1131,20 @@ impl JevSettingsStore {
             *generation != settings_generation(current.as_deref())) {
             return Err(crate::error::JevError::config("settings changed; reload and retry the change"));
         }
-        let serialized = serde_json::to_vec_pretty(settings).map_err(|_| {
+        // ROOT-CONTRACT v9: every authoritative save advances the durable
+        // write revision (previous file's revision + 1; 1 when absent). This
+        // is the settings identity stamps compare against: it moves on EVERY
+        // authoritative write, including model A->B->A and reset tombstones,
+        // regardless of whether the serialized values change.
+        let previous_revision = current.as_deref()
+            .and_then(|bytes| serde_json::from_slice::<JevSettings>(bytes).ok())
+            .map(|settings| settings.write_revision)
+            .unwrap_or(0);
+        // The caller's value stays untouched; the PERSISTED file carries the
+        // advanced revision, observed by the next authoritative load.
+        let mut persisted = settings.clone();
+        persisted.write_revision = previous_revision + 1;
+        let serialized = serde_json::to_vec_pretty(&persisted).map_err(|_| {
             crate::error::JevError::config("cannot serialize settings")
         })?;
         let temp = self.path.with_extension(format!("{}.tmp", uuid::Uuid::new_v4()));
@@ -749,4 +1165,348 @@ impl JevSettingsStore {
 /// Convenience: shared settings store for an agent dir.
 pub fn settings_store(agent_dir: impl AsRef<Path>) -> Arc<JevSettingsStore> {
     Arc::new(JevSettingsStore::new(agent_dir))
+}
+
+#[cfg(test)]
+mod full_jev_tests {
+    use super::*;
+
+    /// A settings value with saved decisions the overlay must mask:
+    /// session "alpha" explicitly Off with compaction off and verification
+    /// explicitly on, plus a global default of Compare.
+    fn saved_baseline() -> JevSettings {
+        let mut settings = JevSettings::default();
+        settings.global_default = Some(JevMode::Compare);
+        settings.set_session_mode("alpha", JevMode::Off);
+        settings.set_session_compaction_enabled("alpha", false);
+        settings.set_session_feature("alpha", JevFeature::Verification, true);
+        settings
+    }
+
+    #[test]
+    fn full_jev_install_resolves_above_every_saved_override() {
+        let mut settings = saved_baseline();
+        assert!(settings.full_jev_install());
+        // The overlay masks the explicit Off, the explicit compaction off and
+        // the global default: everything resolves to the fixed constants.
+        assert_eq!(settings.effective_mode("alpha"), JevMode::CompareAndActive);
+        assert_eq!(
+            settings.effective_mode_with_scope("alpha").scope,
+            ModeScope::FullJevOverlay
+        );
+        for feature in JevFeature::ALL {
+            assert!(
+                settings.effective_features("alpha").enabled(feature),
+                "{}",
+                feature.as_str()
+            );
+        }
+        assert!(settings.effective_features("alpha").code_search_reranking);
+        assert!(settings.effective_features("alpha").line_find);
+        assert!(settings.effective_compaction_enabled("alpha"));
+        assert_eq!(
+            settings.effective_compaction_with_scope("alpha").1,
+            ModeScope::FullJevOverlay
+        );
+        assert!(settings.wants_observer());
+    }
+
+    #[test]
+    fn full_jev_remove_restores_saved_resolution_exactly() {
+        let mut settings = saved_baseline();
+        let before = settings.clone();
+        assert!(settings.full_jev_install());
+        assert!(settings.full_jev_remove());
+        // The base fields and the sessions map are untouched by full-on/off,
+        // so removal restores the pre-existing resolution byte-for-byte.
+        assert_eq!(settings.global_default, before.global_default);
+        assert_eq!(settings.features, before.features);
+        assert_eq!(settings.compaction_enabled, before.compaction_enabled);
+        assert_eq!(settings.sessions, before.sessions);
+        assert_eq!(settings.effective_mode("alpha"), JevMode::Off);
+        assert!(!settings.effective_compaction_enabled("alpha"));
+        assert!(settings.effective_features("alpha").verification);
+        assert!(!settings.effective_features("alpha").code_search_reranking);
+        assert!(!settings.effective_features("alpha").line_find);
+        assert_eq!(
+            settings.effective_mode_with_scope("alpha").scope,
+            ModeScope::Session
+        );
+    }
+
+    #[test]
+    fn full_jev_install_is_idempotent_and_keeps_one_revision() {
+        let mut settings = JevSettings::default();
+        assert!(settings.full_jev_install());
+        let revision = settings.full_jev.as_ref().expect("profile").revision;
+        assert!(settings.disclosure_shown);
+        assert!(!settings.full_jev_install());
+        assert_eq!(
+            settings.full_jev.as_ref().expect("profile").revision,
+            revision
+        );
+        assert_eq!(settings.full_jev_stamp(), format!("full-jev:{revision}"));
+    }
+
+    #[test]
+    fn full_jev_remove_without_profile_is_a_truthful_noop() {
+        let mut settings = saved_baseline();
+        let before = settings.clone();
+        assert!(!settings.full_jev_remove());
+        assert_eq!(settings, before);
+        assert_eq!(settings.full_jev_stamp(), "full-jev:0");
+    }
+
+    #[test]
+    fn full_jev_revision_and_stamp_move_across_cycles() {
+        let mut settings = JevSettings::default();
+        let stamps = |settings: &JevSettings| {
+            (
+                settings.full_jev_stamp(),
+                settings.full_jev.as_ref().map(|profile| profile.revision),
+            )
+        };
+        assert_eq!(settings.full_jev_stamp(), "full-jev:0");
+        assert!(settings.full_jev_install());
+        let (on_one, rev_one) = stamps(&settings);
+        assert_eq!(rev_one, Some(1));
+        assert!(settings.full_jev_remove());
+        assert_eq!(settings.full_jev_stamp(), "full-jev:0");
+        assert!(settings.full_jev_install());
+        let (on_two, rev_two) = stamps(&settings);
+        assert_eq!(rev_two, Some(2));
+        assert_ne!(on_one, on_two);
+    }
+
+    #[test]
+    fn full_jev_masked_sessions_reports_saved_decisions_only() {
+        let mut settings = saved_baseline();
+        assert!(settings.full_jev_masked_sessions().is_empty());
+        assert!(settings.full_jev_install());
+        let masked = settings.full_jev_masked_sessions();
+        assert_eq!(masked, vec!["alpha"]);
+        // Inherited-only entries with no explicit value stay unreported:
+        // nothing of theirs is masked.
+        settings
+            .sessions
+            .entry("beta".to_string())
+            .or_default()
+            .inherited_from = Some("alpha".to_string());
+        assert_eq!(settings.full_jev_masked_sessions(), vec!["alpha"]);
+        assert!(settings.full_jev_remove());
+        assert!(settings.full_jev_masked_sessions().is_empty());
+    }
+
+    #[test]
+    fn full_jev_never_materializes_into_children_or_session_entries() {
+        let mut settings = saved_baseline();
+        assert!(settings.full_jev_install());
+        // The child inherits the parent's BASELINE, not the overlay values.
+        let inherited = inherit_mode(&mut settings, "child", "alpha", None);
+        assert_eq!(inherited, JevMode::Off);
+        let child = settings.sessions.get("child").expect("child entry");
+        assert_eq!(child.mode, Some(JevMode::Off));
+        // alpha's saved baseline has verification ON, and the child inherits
+        // the BASELINE, never the overlay values.
+        assert!(child.features.expect("features").verification);
+        assert_eq!(child.compaction_enabled, Some(false));
+        // While the overlay is active the child still RESOLVES through it...
+        assert_eq!(settings.effective_mode("child"), JevMode::CompareAndActive);
+        assert!(settings.effective_compaction_enabled("child"));
+        // ...and falls back to the inherited baseline once it is removed.
+        assert!(settings.full_jev_remove());
+        assert_eq!(settings.effective_mode("child"), JevMode::Off);
+        assert!(!settings.effective_compaction_enabled("child"));
+    }
+
+    #[test]
+    fn full_jev_set_session_feature_snapshots_the_baseline() {
+        let mut settings = JevSettings::default();
+        assert!(settings.full_jev_install());
+        // A feature write during the overlay records a BASE features value,
+        // never the overlay's forced-on set.
+        settings.set_session_feature("alpha", JevFeature::ToolCandidates, true);
+        let saved = settings
+            .sessions
+            .get("alpha")
+            .expect("entry")
+            .features
+            .expect("features");
+        assert!(saved.tool_candidates);
+        assert!(!saved.code_search_reranking);
+        assert!(!saved.line_find);
+        // The snapshot is the BASE features: tool_requirement defaults TRUE
+        // (JevFeatures::default), so it is snapshotted TRUE, not overlay-on.
+        assert!(saved.tool_requirement);
+    }
+
+    #[test]
+    fn new_search_flags_default_off_and_round_trip_by_name() {
+        let features = JevFeatures::default();
+        assert!(!features.code_search_reranking);
+        assert!(!features.line_find);
+        assert_eq!(
+            JevFeature::parse("code_search_reranking"),
+            Some(JevFeature::CodeSearchReranking)
+        );
+        assert_eq!(
+            JevFeature::parse("code-search-reranking"),
+            Some(JevFeature::CodeSearchReranking)
+        );
+        assert_eq!(JevFeature::parse("line_find"), Some(JevFeature::LineFind));
+        assert_eq!(JevFeature::parse("line-find"), Some(JevFeature::LineFind));
+        assert_eq!(JevFeature::parse("nope"), None);
+        assert_eq!(JevFeature::ALL.len(), 14);
+        // FULL_JEV_FEATURES turns every gate on, including the new two.
+        for feature in JevFeature::ALL {
+            assert!(FULL_JEV_FEATURES.enabled(feature), "{}", feature.as_str());
+        }
+        assert_eq!(FULL_JEV_MODE, JevMode::CompareAndActive);
+        assert!(FULL_JEV_COMPACTION_ENABLED);
+    }
+
+    #[test]
+    fn full_jev_settings_survive_store_reload_and_absent_field_loads_as_none() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut settings = saved_baseline();
+        assert!(settings.full_jev_install());
+        store.save(&settings).unwrap();
+        let loaded = store.load();
+        assert!(loaded.full_jev_active());
+        assert_eq!(loaded.effective_mode("alpha"), JevMode::CompareAndActive);
+        assert_eq!(loaded.full_jev.as_ref().expect("profile").revision, 1);
+        // Old-reader tolerance: a file without the field loads with None.
+        let mut legacy = serde_json::to_value(&settings).unwrap();
+        assert!(legacy.as_object_mut().unwrap().remove("full_jev").is_some());
+        std::fs::write(
+            directory.path().join("jev").join(SETTINGS_FILE_NAME),
+            serde_json::to_string_pretty(&legacy).unwrap(),
+        )
+        .unwrap();
+        let old_loaded = store.load();
+        assert!(!old_loaded.full_jev_active());
+        assert!(old_loaded.full_jev.is_none());
+        assert_eq!(old_loaded.effective_mode("alpha"), JevMode::Off);
+        // skip_serializing_if: a None overlay never writes the field.
+        assert!(!serde_json::to_string(&JevSettings::default())
+            .unwrap()
+            .contains("full_jev"));
+    }
+
+    #[test]
+    fn concurrent_writers_through_separate_stores_settle_on_one_generation() {
+        // ROOT-CONTRACT v1: prove atomic/conflict-safe writes. Two snapshots
+        // LOADED from ONE starting generation race through separate store
+        // instances; exactly one save wins, the other is refused by the
+        // generation check, and the bounded-retry discipline (reload,
+        // re-apply, save) lands the loser's change WITHOUT overwriting the
+        // winner's fields.
+        let directory = tempfile::tempdir().unwrap();
+        let store_a = JevSettingsStore::new(directory.path());
+        let store_b = JevSettingsStore::new(directory.path());
+        let mut base = saved_baseline();
+        store_a.save(&base).unwrap();
+        // Both writers hold loaded snapshots of the SAME generation.
+        let mut writer_a = store_a.load();
+        let mut writer_b = store_b.load();
+        assert!(writer_a.full_jev_install(), "A installs the overlay");
+        writer_b.global_default = Some(JevMode::Off);
+        // One save wins the generation race...
+        store_a.save(&writer_a).expect("the first save wins");
+        // ...the other is refused, never silently overwriting the winner.
+        let refused = store_b.save(&writer_b);
+        assert!(
+            refused.is_err(),
+            "the moved generation must refuse the stale save"
+        );
+        // The bounded retry: reload, re-apply, save.
+        let mut retried = store_b.load();
+        assert!(retried.full_jev_active(), "the winner's overlay survived");
+        retried.global_default = Some(JevMode::Off);
+        store_b.save(&retried).expect("the fresh retry saves");
+        // BOTH changes are on disk; neither overwrote the other.
+        let settled = store_a.load();
+        assert!(settled.full_jev_active());
+        assert_eq!(settled.global_default, Some(JevMode::Off));
+        assert_eq!(settled.effective_mode("alpha"), JevMode::CompareAndActive);
+    }
+
+    #[test]
+    fn stale_loaded_snapshot_is_refused_until_the_retry_reloads() {
+        // Sequential form of the conflict proof: a LOADED snapshot (with a
+        // real loaded generation, unlike an in-memory construct) is refused
+        // after another writer moves the generation, then the reload-retry
+        // succeeds and preserves the winner's overlay.
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut base = saved_baseline();
+        store.save(&base).unwrap();
+        // A snapshot LOADED at the starting generation.
+        let mut stale = store.load();
+        // Another writer moves the generation (the overlay toggle).
+        let mut writer = store.load();
+        assert!(writer.full_jev_install());
+        store.save(&writer).unwrap();
+        // The stale save is refused...
+        assert!(
+            store.save(&stale).is_err(),
+            "a stale LOADED snapshot must not overwrite the winner"
+        );
+        // ...and the bounded-retry discipline re-applies it cleanly.
+        let mut retried = store.load();
+        retried.global_default = Some(JevMode::Off);
+        store.save(&retried).unwrap();
+        let settled = store.load();
+        assert!(settled.full_jev_active());
+        assert_eq!(settled.global_default, Some(JevMode::Off));
+    }
+
+    #[test]
+    fn full_jev_activation_identity_is_fresh_across_off_on_and_reloads() {
+        // Root B1 (activation-stamp ABA): an off->on cycle must NEVER repeat
+        // a stamp, even for a consumer that never observes the intermediate
+        // Off, and the identity must survive store reloads.
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        store.save(&JevSettings::default()).unwrap();
+        // First activation.
+        let mut activation_one = store.load();
+        assert!(activation_one.full_jev_install());
+        let stamp_one = activation_one.full_jev_stamp();
+        assert_eq!(stamp_one, "full-jev:1");
+        store.save(&activation_one).unwrap();
+        // Idempotent already-on: the stamp is stable, nothing is rewritten.
+        let mut already_on = store.load();
+        assert!(!already_on.full_jev_install());
+        assert_eq!(already_on.full_jev_stamp(), stamp_one);
+        // The Off cycle, observed only through later reloads.
+        let mut off_cycle = store.load();
+        assert!(off_cycle.full_jev_remove());
+        store.save(&off_cycle).unwrap();
+        let after_off = store.load();
+        assert!(!after_off.full_jev_active());
+        assert_eq!(after_off.full_jev_stamp(), "full-jev:0");
+        // Second activation: fresh persisted identity, visible to a consumer
+        // that captured stamp_one and never saw the Off state.
+        let mut activation_two = store.load();
+        assert!(activation_two.full_jev_install());
+        let stamp_two = activation_two.full_jev_stamp();
+        assert_ne!(stamp_two, stamp_one, "no activation may repeat a stamp");
+        assert_ne!(stamp_two, "full-jev:0");
+        store.save(&activation_two).unwrap();
+        assert_eq!(
+            store.load().full_jev_stamp(),
+            stamp_two,
+            "identity survives reloads"
+        );
+        // Third cycle proves the identity keeps moving.
+        let mut third = store.load();
+        assert!(third.full_jev_remove());
+        store.save(&third).unwrap();
+        let mut activation_three = store.load();
+        assert!(activation_three.full_jev_install());
+        assert_ne!(activation_three.full_jev_stamp(), stamp_two);
+        assert_ne!(activation_three.full_jev_stamp(), stamp_one);
+    }
 }

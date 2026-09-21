@@ -27,25 +27,28 @@ use std::fs;
 use std::path::{Path, PathBuf};
 
 use jev_ui::{
-    clear_secret, env_presence, footer_clear_payload, footer_color_key, footer_segment, footer_state,
-    footer_status_payload, footer_text, is_cancel_key, is_on_shorthand, is_submit_key, mask_value,
-    jev_usage, mode_change_message, parse_jev_request, redact_reason, render_help, render_status,
-    store_secret,
-    ActiveCounters, CredentialStatus, JevFooterState, JevKeyInputState, JevMenuAction, JevMenuRow,
-    JevMenuState, JevModeBridge, JevPipelineStatus, JevRequest, JevSecret, JevStatusReport,
-    KeyInputState,
-    JEV_ACTIVE_NOTICE, JEV_ACTIVE_UNKNOWN_NOTE, JEV_ARGUMENT_HINT, JEV_BOUNDARY_NOTICE,
-    JEV_COMMAND_DESCRIPTION, JEV_COMMAND_NAME, JEV_FOOTER_RULE_NOTICE, JEV_ON_COMPARE_NOTICE,
-    JEV_STATUS_KEY, FOOTER_LABEL_MIN_COLUMNS, MASK_LENGTH,
+    clear_secret, compaction_state, env_presence, footer_clear_payload, footer_color_key,
+    footer_compaction_clear_payload, footer_compaction_segment, footer_compaction_status_payload,
+    footer_compaction_text, footer_segment, footer_state, footer_status_payload, footer_text,
+    is_cancel_key, is_on_shorthand, is_submit_key, jev_usage, mask_value, mode_change_message,
+    parse_jev_request, redact_reason, render_full_jev_status, render_help, render_status,
+    store_secret, ActiveCounters, CredentialStatus, FullJevChange, JevCompactionState,
+    JevFooterState, JevKeyInputState, JevMenuAction, JevMenuRow, JevMenuState, JevModeBridge,
+    JevPipelineStatus, JevRequest, JevSecret, JevStatusReport, KeyInputState,
+    FOOTER_LABEL_MIN_COLUMNS, JEV_ACTIVE_NOTICE, JEV_ACTIVE_UNKNOWN_NOTE, JEV_ARGUMENT_HINT,
+    JEV_BOUNDARY_NOTICE, JEV_COMMAND_DESCRIPTION, JEV_COMMAND_NAME, JEV_COMPACT_STATUS_KEY,
+    JEV_DISCLOSURE_NOTICE, JEV_FOOTER_RULE_NOTICE, JEV_FULL_JEV_ALREADY_OFF_NOTICE,
+    JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE, JEV_FULL_JEV_OFF_NOTICE, JEV_FULL_JEV_ON_NOTICE,
+    JEV_FULL_JEV_REJECTION, JEV_ON_COMPARE_NOTICE, JEV_STATUS_KEY, MASK_LENGTH,
 };
+use jev_ui::{mode_label, ModeChange};
+use pi_jev::config::DEFAULT_KEY_ID;
 use pi_jev::config::{
     resolve_credential_source, resolve_effective_mode, CredentialSource, EnvKeyPresence,
     JevFeature, JevSettings, ModeScope,
 };
-use pi_jev::config::DEFAULT_KEY_ID;
 use pi_jev::credential::{CredentialStore, InMemoryCredentialStore};
 use pi_jev::types::JevMode;
-use jev_ui::{mode_label, ModeChange};
 
 // ---------------------------------------------------------------------------
 // helpers
@@ -753,7 +756,7 @@ fn status_with(credential: CredentialStatus, pipeline: JevPipelineStatus) -> (Cr
 }
 
 #[test]
-fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
+fn the_footer_truth_table_shows_green_on_red_off_and_truthful_modes() {
     let none = CredentialStatus::resolve(false, false, false);
     let saved = CredentialStatus::resolve(true, false, false);
     let default_pipeline = JevPipelineStatus::default();
@@ -766,6 +769,8 @@ fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
     assert_eq!(footer_state(JevMode::Off, &none, &default_pipeline), JevFooterState::Off);
     assert_eq!(footer_state(JevMode::Off, &none, &default_pipeline).color_key(), "error");
     assert_eq!(footer_text(JevFooterState::Off), "\u{25cf} Jev Off");
+    assert!(!JevFooterState::Off.is_green());
+    assert_ne!(footer_color_key(JevFooterState::Off), "success");
 
     // No credential: amber unavailable, never green.
     assert_eq!(
@@ -809,17 +814,17 @@ fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
     // Healthy Compare: accent, and `Jev Compare` is a distinct label from `Jev On`.
     let healthy = footer_state(JevMode::Compare, &saved, &default_pipeline);
     assert_eq!(healthy, JevFooterState::Compare);
-    assert_eq!(healthy.color_key(), "accent");
-    assert!(!healthy.color_key().contains("success"), "no state is green");
-    assert_eq!(footer_text(healthy), "\u{25cf} Jev Compare");
+    assert_eq!(footer_color_key(healthy), "success");
+    assert!(healthy.is_green());
+    assert_eq!(footer_text(healthy), "\u{25cf} Jev On (Compare)");
 
     // Healthy Active: the SAME accent colour, a distinct label, and the very same
     // credential / checking / fallback ladder Compare uses.
     let active_healthy = footer_state(JevMode::Active, &saved, &default_pipeline);
     assert_eq!(active_healthy, JevFooterState::Active);
-    assert_eq!(active_healthy.color_key(), "accent");
-    assert_eq!(active_healthy.color_key(), healthy.color_key());
-    assert_eq!(footer_text(active_healthy), "\u{25cf} Jev Active");
+    assert_eq!(footer_color_key(active_healthy), "success");
+    assert_eq!(footer_color_key(active_healthy), footer_color_key(healthy));
+    assert_eq!(footer_text(active_healthy), "\u{25cf} Jev On (Active)");
     assert_ne!(active_healthy.label(), healthy.label());
     for (credential, pipeline, expected) in [
         (&none, &default_pipeline, JevFooterState::Unavailable),
@@ -836,35 +841,37 @@ fn the_footer_truth_table_matches_the_brief_and_never_shows_green() {
             footer_state(JevMode::Active, credential, pipeline).color_key(),
             expected.color_key()
         );
+        assert!(!expected.is_green(), "{expected:?} is degraded, not green");
     }
 
-    // No reachable state is green, and none says "Jev On".
+    // Healthy Compare + Active: green, and it names the combined mode.
+    let both = footer_state(JevMode::CompareAndActive, &saved, &default_pipeline);
+    assert_eq!(both, JevFooterState::CompareAndActive);
+    assert!(both.is_green());
+    assert_eq!(footer_text(both), "\u{25cf} Jev On (Compare + Active)");
+
+    // Degraded states never claim green or a healthy "Jev On" label.
     for state in [
-        JevFooterState::Off,
-        JevFooterState::Compare,
-        JevFooterState::Active,
         JevFooterState::Unavailable,
         JevFooterState::Checking,
         JevFooterState::Fallback,
     ] {
-        assert!(!state.is_green(), "{state:?} must never be green");
-        assert_ne!(state.color_key(), "success");
-        assert!(
-            !state.label().contains("Jev On"),
-            "{state:?} must never claim Jev On"
-        );
-        // The mode + credential + pipeline cross product is covered above; this
-        // asserts the same for every (mode, credential) pair.
-        for mode in [JevMode::Off, JevMode::Compare, JevMode::Active] {
-            for credential in [&none, &saved] {
-                let derived = footer_state(mode, credential, &default_pipeline);
-                assert!(!derived.is_green(), "{mode:?}/{derived:?} must never be green");
-            }
-        }
+        assert!(!state.is_green(), "{state:?} must not be green");
+        assert_eq!(state.color_key(), "warning");
+        assert!(!state.label().contains("Jev On"), "{state:?}");
     }
-    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev Active"));
+    // The label always names the truthful effective mode.
+    assert!(JevFooterState::Compare.label().contains("Compare"));
+    assert!(JevFooterState::Active.label().contains("Active"));
+    assert!(JevFooterState::CompareAndActive
+        .label()
+        .contains("Compare + Active"));
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev On (Active)"));
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev On (Compare)"));
     assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev Off"));
     assert_eq!(JEV_STATUS_KEY, "jev");
+    assert_eq!(JEV_COMPACT_STATUS_KEY, "jev-compact");
+    assert_ne!(JEV_STATUS_KEY, JEV_COMPACT_STATUS_KEY);
 }
 
 #[test]
@@ -880,6 +887,7 @@ fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
             JevFooterState::Off,
             JevFooterState::Compare,
             JevFooterState::Active,
+            JevFooterState::CompareAndActive,
             JevFooterState::Unavailable,
             JevFooterState::Checking,
             JevFooterState::Fallback,
@@ -890,24 +898,54 @@ fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
                 "{state:?} at {columns} columns overflowed: {segment:?}"
             );
         }
+        for state in [
+            JevCompactionState::On,
+            JevCompactionState::Off,
+            JevCompactionState::Unknown,
+        ] {
+            let segment = footer_compaction_segment(state, columns);
+            assert!(
+                pi_tui::utils::visible_width(&segment) <= columns.max(1),
+                "{state:?} at {columns} columns overflowed: {segment:?}"
+            );
+        }
     }
     // `Jev Active` is wider than `Jev Off` but still inside the labelled form.
     assert_eq!(
         footer_segment(JevFooterState::Active, FOOTER_LABEL_MIN_COLUMNS),
-        "\u{25cf} Jev Active"
+        "\u{25cf} Jev On (Active)"
     );
     assert_eq!(footer_segment(JevFooterState::Active, 39), "\u{25cf}");
-    // Every state is distinguishable without colour.
+    // The compaction dot follows the same width rule.
+    assert_eq!(
+        footer_compaction_segment(JevCompactionState::On, FOOTER_LABEL_MIN_COLUMNS),
+        "\u{25cf} Jev compact on"
+    );
+    assert_eq!(
+        footer_compaction_segment(JevCompactionState::On, 39),
+        "\u{25cf}"
+    );
+    // Every state is distinguishable without colour, across BOTH segments.
     let labels: Vec<String> = [
         JevFooterState::Off,
         JevFooterState::Compare,
         JevFooterState::Active,
+        JevFooterState::CompareAndActive,
         JevFooterState::Unavailable,
         JevFooterState::Checking,
         JevFooterState::Fallback,
     ]
     .iter()
     .map(|state| state.label().to_string())
+    .chain(
+        [
+            JevCompactionState::On,
+            JevCompactionState::Off,
+            JevCompactionState::Unknown,
+        ]
+        .iter()
+        .map(|state| state.label().to_string()),
+    )
     .collect();
     let mut unique = labels.clone();
     unique.sort();
@@ -919,16 +957,50 @@ fn the_footer_is_width_safe_and_carries_the_state_in_text_not_only_colour() {
 fn the_footer_payload_uses_the_existing_setstatus_surface_and_does_no_io() {
     let payload = footer_status_payload(JevFooterState::Compare, 120);
     assert_eq!(payload["statusKey"], serde_json::json!("jev"));
-    assert_eq!(payload["statusText"], serde_json::json!("\u{25cf} Jev Compare"));
+    assert_eq!(
+        payload["statusText"],
+        serde_json::json!("\u{25cf} Jev On (Compare)")
+    );
+    // The optional narrow form rides the SAME payload, so the tray row can
+    // collapse the segment without a second round trip. It is SHORT LABELLED,
+    // never a bare dot.
+    assert_eq!(
+        payload["statusCompactText"],
+        serde_json::json!("\u{25cf} Jev C On")
+    );
     // Removal is explicit null, which `Surfaces::set_status` deletes on.
     let cleared = footer_clear_payload();
     assert_eq!(cleared["statusKey"], serde_json::json!("jev"));
     assert_eq!(cleared["statusText"], serde_json::Value::Null);
 
+    // The compaction dot is a separate key with its own payload and removal.
+    let compact = footer_compaction_status_payload(JevCompactionState::On, 120);
+    assert_eq!(
+        compact["statusKey"],
+        serde_json::json!(JEV_COMPACT_STATUS_KEY)
+    );
+    assert_eq!(
+        compact["statusText"],
+        serde_json::json!("\u{25cf} Jev compact on")
+    );
+    assert_eq!(
+        compact["statusCompactText"],
+        serde_json::json!("\u{25cf} Jev Cmp on")
+    );
+    let compact_cleared = footer_compaction_clear_payload();
+    assert_eq!(
+        compact_cleared["statusKey"],
+        serde_json::json!(JEV_COMPACT_STATUS_KEY)
+    );
+    assert_eq!(compact_cleared["statusText"], serde_json::Value::Null);
+
     // The labelled (unmeasured) form is what the live publisher sends, because the
     // dispatch task cannot measure the terminal.
     let labelled = footer_status_payload(JevFooterState::Compare, usize::MAX);
-    assert_eq!(labelled["statusText"], serde_json::json!("\u{25cf} Jev Compare"));
+    assert_eq!(
+        labelled["statusText"],
+        serde_json::json!("\u{25cf} Jev On (Compare)")
+    );
     // Below the threshold the CALLER keeps only the dot, so a narrow terminal
     // cannot lose layout; at and above it the label is used.
     assert_eq!(footer_segment(JevFooterState::Compare, 39), "\u{25cf}");
@@ -1034,7 +1106,8 @@ fn the_active_mode_is_labelled_and_described_everywhere_it_can_appear() {
     // The plain label: no surface may show Active as inert.
     assert_eq!(jev_ui::mode_label(JevMode::Active), "Active");
     assert_eq!(JevMode::Active.label(), "Jev Active");
-    assert_eq!(JevFooterState::Active.label(), "Jev Active");
+    // The footer label names the truthful effective mode after the On state.
+    assert_eq!(JevFooterState::Active.label(), "Jev On (Active)");
 
     // A fresh Active session with no telemetry: the notice, and honest unknowns.
     let active = render_status(&JevStatusReport::local_only(
@@ -1246,9 +1319,11 @@ fn negative_regression_settings_only_expose_bounded_policy_not_model_or_subagent
     let refused = pi_jev::types::refuse_subagent_control(
         &pi_jev::types::SubagentControlRequest::Spawn {
             role: "reviewer".to_string(),
-        },
+        });
+    assert!(
+        refused.is_err(),
+        "spawning a child through Jev must be impossible"
     );
-    assert!(refused.is_err(), "spawning a child through Jev must be impossible");
     assert!(matches!(
         refused.expect_err("refused"),
         pi_jev::error::JevError::SubagentControlForbidden { .. }
@@ -1304,9 +1379,10 @@ fn negative_regression_a_hand_edited_active_mode_is_active_and_bounded() {
     let credential = CredentialStatus::resolve(true, false, false);
     let state = footer_state(JevMode::Active, &credential, &JevPipelineStatus::default());
     assert_eq!(state, JevFooterState::Active);
-    assert_eq!(state.color_key(), "accent");
-    assert!(!state.is_green());
-    assert!(!footer_color_key(state).contains("success"));
+    assert_eq!(state.color_key(), "success");
+    assert!(state.is_green());
+    assert_eq!(footer_color_key(state), "success");
+    assert!(footer_text(state).contains("Jev On (Active)"));
     assert_eq!(mode_label(JevMode::Active), "Active");
 
     // A child of that session inherits Active and is never silently turned into
@@ -1664,7 +1740,10 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_footer_rul
     // The metadata constants are the single source the registry quotes, so a drift
     // between `slash_commands.rs` and the menu description fails here.
     assert_eq!(JEV_COMMAND_NAME, "jev");
-    assert_eq!(JEV_ARGUMENT_HINT, "[off|compare|active|compare-active|on|compact|feature|default|status|key]");
+    assert_eq!(
+        JEV_ARGUMENT_HINT,
+        "[off|compare|active|compare-active|on|compact|feature|default|full-jev|status|key|models|model]"
+    );
     let registry = crate_file("src/core/slash_commands.rs");
     assert!(registry.contains(JEV_ARGUMENT_HINT), "the hint must be quoted verbatim");
     assert!(
@@ -1695,16 +1774,39 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_footer_rul
     assert_eq!(footer_text(JevFooterState::Off), "\u{25cf} Jev Off");
     assert_eq!(
         footer_text(JevFooterState::Compare),
-        "\u{25cf} Jev Compare"
+        "\u{25cf} Jev On (Compare)"
+    );
+    assert_eq!(
+        footer_compaction_text(JevCompactionState::On),
+        "\u{25cf} Jev compact on"
+    );
+    assert_eq!(
+        footer_compaction_text(JevCompactionState::Off),
+        "\u{25cf} Jev compact off"
     );
     assert_eq!(FOOTER_LABEL_MIN_COLUMNS, 40);
-    assert_eq!(footer_clear_payload()["statusKey"], serde_json::json!(JEV_STATUS_KEY));
-    // `render_help` names the real footer states and never advertises a green
-    // "Jev On".
+    assert_eq!(
+        footer_clear_payload()["statusKey"],
+        serde_json::json!(JEV_STATUS_KEY)
+    );
+    assert_eq!(
+        footer_compaction_clear_payload()["statusKey"],
+        serde_json::json!(JEV_COMPACT_STATUS_KEY)
+    );
+    // `render_help` names the real footer states, including the green On labels
+    // and the independent compaction dot.
     let help = render_help();
     assert!(help.contains(JEV_FOOTER_RULE_NOTICE), "{help}");
     assert!(help.contains(JEV_ON_COMPARE_NOTICE), "{help}");
     assert!(help.contains(JEV_ACTIVE_NOTICE), "{help}");
+    assert!(
+        JEV_FOOTER_RULE_NOTICE.contains("Jev compact on"),
+        "{JEV_FOOTER_RULE_NOTICE}"
+    );
+    assert!(
+        JEV_FOOTER_RULE_NOTICE.contains("Jev compact off"),
+        "{JEV_FOOTER_RULE_NOTICE}"
+    );
 
     // The credential DELETE path exists and is the inverse of the write path.
     let store = InMemoryCredentialStore::new();
@@ -1715,9 +1817,9 @@ fn the_command_metadata_and_footer_helpers_match_the_registry_and_the_footer_rul
 }
 
 #[test]
-fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
-    // Every reachable state, including the Active and healthy-pipeline
-    // combinations, must avoid the green "Jev On" footer.
+fn an_operative_footer_is_green_names_its_mode_and_off_is_red() {
+    // Every healthy operative state is green and names its truthful effective
+    // mode; Off alone is red; degraded states stay amber.
     let credential = CredentialStatus::resolve(true, false, false);
     let healthy = JevPipelineStatus {
         last_success_at: Some("2026-09-19T00:00:00Z".to_string()),
@@ -1727,30 +1829,62 @@ fn the_footer_never_renders_green_or_a_plain_jev_on_in_this_release() {
         queue_capacity: 8,
         ..JevPipelineStatus::default()
     };
-    let states = [
-        footer_state(JevMode::Off, &credential, &healthy),
-        footer_state(JevMode::Compare, &credential, &healthy),
-        footer_state(JevMode::Active, &credential, &healthy),
-        footer_state(JevMode::Compare, &CredentialStatus::resolve(false, false, false), &healthy),
+    let operative = [
+        (
+            JevMode::Compare,
+            JevFooterState::Compare,
+            "Jev On (Compare)",
+        ),
+        (JevMode::Active, JevFooterState::Active, "Jev On (Active)"),
+        (
+            JevMode::CompareAndActive,
+            JevFooterState::CompareAndActive,
+            "Jev On (Compare + Active)",
+        ),
     ];
-    for state in states {
-        assert!(!state.is_green(), "{state:?} must never be green");
-        assert_ne!(state.color_key(), "success", "{state:?}");
+    for (mode, expected_state, expected_label) in operative {
+        let state = footer_state(mode, &credential, &healthy);
+        assert_eq!(state, expected_state, "{mode:?}");
+        assert!(
+            state.is_green(),
+            "{state:?} is healthy and operative: green"
+        );
         // The LIVE colour path goes through `footer_color_key`, which consults
-        // `is_green` first: it cannot return `success` while that is a constant false.
-        assert_ne!(footer_color_key(state), "success", "{state:?}");
-        assert!(!state.label().eq_ignore_ascii_case("Jev On"), "{state:?}");
-        assert!(!footer_text(state).contains("Jev On"), "{state:?}");
+        // `is_green` first: a healthy operative state cannot be anything but green.
+        assert_eq!(footer_color_key(state), "success", "{state:?}");
+        assert_eq!(
+            footer_text(state),
+            format!("\u{25cf} {expected_label}"),
+            "{state:?}"
+        );
+        // The label carries the mode, so the text alone distinguishes On states.
+        assert!(state.label().contains("Jev On"), "{state:?}");
     }
-    // The healthy+pipeline combinations are the two accent states, never a green On.
-    assert_eq!(states[1], JevFooterState::Compare);
-    assert_eq!(states[2], JevFooterState::Active);
-    assert_ne!(states[1].label(), states[2].label());
-    assert_eq!(states[2].color_key(), states[1].color_key());
-    // The red Off segment belongs to the Off mode alone.
-    assert_eq!(states[0], JevFooterState::Off);
-    assert_eq!(states[0].color_key(), "error");
-    assert!(JEV_FOOTER_RULE_NOTICE.contains("No green"));
+    // Off alone is red and never claims to be on.
+    let off = footer_state(JevMode::Off, &credential, &healthy);
+    assert_eq!(off, JevFooterState::Off);
+    assert_eq!(off.color_key(), "error");
+    assert!(!off.is_green());
+    assert!(!off.label().contains("Jev On"));
+    // A credential-less operative session degrades to amber, not green.
+    let degraded = footer_state(
+        JevMode::Active,
+        &CredentialStatus::resolve(false, false, false),
+        &healthy,
+    );
+    assert_eq!(degraded, JevFooterState::Unavailable);
+    assert_eq!(degraded.color_key(), "warning");
+    assert!(!degraded.is_green());
+    assert!(!degraded.label().contains("Jev On"));
+    // The compaction dot mirrors the same colours independently.
+    assert!(JevCompactionState::On.is_green());
+    assert_eq!(JevCompactionState::On.color_key(), "success");
+    assert_eq!(JevCompactionState::Off.color_key(), "error");
+    assert!(!JevCompactionState::Off.is_green());
+    assert_eq!(JevCompactionState::Unknown.color_key(), "warning");
+    assert!(!JevCompactionState::Unknown.is_green());
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev On (Compare)"));
+    assert!(JEV_FOOTER_RULE_NOTICE.contains("Jev Off"));
 }
 
 #[test]
@@ -1823,9 +1957,18 @@ fn combined_mode_menu_footer_and_status_are_distinct_and_truthful() {
     }
     let saved = CredentialStatus::resolve(true, false, false);
     let none = CredentialStatus::resolve(false, false, false);
-    assert_eq!(footer_state(JevMode::CompareAndActive, &saved, &Default::default()), JevFooterState::CompareAndActive);
-    assert_eq!(footer_state(JevMode::CompareAndActive, &none, &Default::default()), JevFooterState::Unavailable);
-    assert_eq!(footer_color_key(JevFooterState::CompareAndActive), "accent");
+    assert_eq!(
+        footer_state(JevMode::CompareAndActive, &saved, &Default::default()),
+        JevFooterState::CompareAndActive
+    );
+    assert_eq!(
+        footer_state(JevMode::CompareAndActive, &none, &Default::default()),
+        JevFooterState::Unavailable
+    );
+    assert_eq!(
+        footer_color_key(JevFooterState::CompareAndActive),
+        "success"
+    );
     assert!(footer_text(JevFooterState::CompareAndActive).contains("Compare + Active"));
     let fresh = JevStatusReport::local_only(JevMode::CompareAndActive, ModeScope::Session, saved);
     let text = render_status(&fresh);
@@ -1925,4 +2068,793 @@ fn compaction_controls_and_status_do_not_require_an_active_mode() {
     assert!(status.contains("Compaction: on"));
     assert!(status.contains("independent of decision mode"));
     assert!(!status.contains("inactive in this mode"));
+}
+
+// ---------------------------------------------------------------------------
+// 7. tray-row footer: two independent dots, effective per-session state
+// ---------------------------------------------------------------------------
+
+#[test]
+fn the_compaction_dot_is_independent_of_the_decision_dot() {
+    // Decision OFF with compaction ON: two separate segments, two separate
+    // colours, and the decision-off state never removes or flips the compaction
+    // dot. This is the JEV_SYSTEM_ONE.md rule: changing one axis does not change
+    // the other.
+    let decision = footer_state(
+        JevMode::Off,
+        &CredentialStatus::resolve(false, false, false),
+        &JevPipelineStatus::default(),
+    );
+    assert_eq!(decision, JevFooterState::Off);
+    assert_eq!(footer_text(decision), "\u{25cf} Jev Off");
+    assert_eq!(footer_text(JevFooterState::Off), "\u{25cf} Jev Off");
+    assert_eq!(
+        footer_compaction_text(JevCompactionState::On),
+        "\u{25cf} Jev compact on"
+    );
+    assert_ne!(
+        footer_text(decision),
+        footer_compaction_text(JevCompactionState::On)
+    );
+    assert_eq!(decision.color_key(), "error");
+    assert_eq!(JevCompactionState::On.color_key(), "success");
+    // Same for the reverse: decisions on with compaction off.
+    assert_eq!(
+        footer_compaction_text(JevCompactionState::Off),
+        "\u{25cf} Jev compact off"
+    );
+    assert_eq!(JevCompactionState::Off.color_key(), "error");
+    // Unknown is its own label; it is never rendered as on or off.
+    assert_eq!(
+        footer_compaction_text(JevCompactionState::Unknown),
+        "\u{25cf} Jev compact unknown"
+    );
+    assert_eq!(JevCompactionState::Unknown.color_key(), "warning");
+    // The segments publish under different keys, so one refresh can never
+    // clobber the other.
+    assert_ne!(JEV_STATUS_KEY, JEV_COMPACT_STATUS_KEY);
+}
+
+#[test]
+fn the_compaction_dot_shows_the_effective_per_session_setting() {
+    // Session override wins over the global default; without an override the
+    // global default applies; nothing is inferred from unrelated state.
+    let mut override_on = JevSettings::default();
+    override_on.compaction_enabled = false;
+    override_on.set_session_compaction_enabled("s", true);
+    assert_eq!(compaction_state(&override_on, "s"), JevCompactionState::On);
+    // A DIFFERENT session has no override: the global default (off) applies, so
+    // the same settings object yields different dots per session.
+    assert_eq!(
+        compaction_state(&override_on, "other"),
+        JevCompactionState::Off
+    );
+
+    let mut override_off = JevSettings::default();
+    override_off.compaction_enabled = true;
+    override_off.set_session_compaction_enabled("s", false);
+    assert_eq!(
+        compaction_state(&override_off, "s"),
+        JevCompactionState::Off
+    );
+    assert_eq!(
+        compaction_state(&override_off, "other"),
+        JevCompactionState::On
+    );
+
+    let defaults = JevSettings::default();
+    assert_eq!(compaction_state(&defaults, "s"), JevCompactionState::Off);
+    // The decision mode is irrelevant to this resolution.
+    let mut decisions_on = JevSettings::default();
+    decisions_on.set_session_mode("s", JevMode::CompareAndActive);
+    assert_eq!(
+        compaction_state(&decisions_on, "s"),
+        JevCompactionState::Off
+    );
+}
+
+#[test]
+fn the_tray_row_pulls_the_jev_segments_onto_the_model_effort_row() {
+    // The status row component pulls exactly the two Jev keys onto the tray row
+    // (same baseline as the model/effort label) and renders every other
+    // extension status on its own line below, as before.
+    let source = crate_file("src/modes/interactive/native_host_extensions.rs");
+    // Immutable key lookups move the segments onto the row; the map is NEVER
+    // mutated or reordered per paint, and the two keys are excluded from the
+    // plain status line, so each Jev label is painted exactly once.
+    assert!(
+        source.contains("fn split_status_row"),
+        "one split decides row vs plain line"
+    );
+    assert!(
+        source.contains(".get(JEV_STATUS_KEY)"),
+        "decision segment read by key"
+    );
+    assert!(
+        source.contains(".get(JEV_COMPACT_STATUS_KEY)"),
+        "compaction segment read by key"
+    );
+    // The render path itself never mutates the map (immutable `get` only);
+    // `shift_remove(JEV_` appears ONLY in `reset_keeping_jev`, which removes
+    // and re-inserts the two keys around the blanket reset.
+    let split_fn = source
+        .split("fn split_status_row")
+        .nth(1)
+        .expect("split_status_row exists")
+        .split("pub(super) struct Statuses")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        !split_fn.contains("shift_remove"),
+        "render never mutates the map"
+    );
+    let reset_fn = source
+        .split("fn reset_keeping_jev")
+        .nth(1)
+        .expect("reset_keeping_jev exists")
+        .split("pub(super) struct Widgets")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        reset_fn.contains("shift_remove(JEV_STATUS_KEY)"),
+        "same-session reset retains by key"
+    );
+    assert!(
+        reset_fn.contains("insert(JEV_STATUS_KEY"),
+        "and re-inserts the decision segment"
+    );
+    assert!(
+        reset_fn.contains("insert(JEV_COMPACT_STATUS_KEY"),
+        "and re-inserts the compaction segment"
+    );
+    assert!(
+        source.contains("render_row("),
+        "the row merge goes through Tray::render_row"
+    );
+    assert!(
+        source.contains("ExtensionStatus"),
+        "statuses carry an optional compact form"
+    );
+    // The keys match the ones the Jev publisher uses, so a rename on one side
+    // fails here.
+    let menu = jev_source("jev_menu.rs");
+    assert!(menu.contains("pub const JEV_STATUS_KEY: &str = \"jev\";"));
+    assert!(menu.contains("pub const JEV_COMPACT_STATUS_KEY: &str = \"jev-compact\";"));
+    // The tray row composes the counter on the same line; the counter is never
+    // a separate lower-left line.
+    let tray = crate_file("src/modes/interactive/native_host.rs");
+    assert!(
+        tray.contains("fn render_row("),
+        "Tray renders the merged row"
+    );
+    assert!(
+        tray.contains("get_tray_context_usage_text()"),
+        "the counter comes from the connection state"
+    );
+    assert!(tray.contains("tray_row::compose_tray_row"));
+    let mode = crate_file("src/modes/interactive/interactive_mode.rs");
+    assert!(
+        mode.contains("fn get_tray_context_usage_text("),
+        "the counter text is its own accessor"
+    );
+}
+
+#[test]
+fn the_setstatus_payload_carries_an_optional_compact_form() {
+    // The host reads the optional field; senders without it (old daemons,
+    // generic extensions) keep working and degrade to left-truncation.
+    let tray = crate_file("src/modes/interactive/native_host.rs");
+    assert!(
+        tray.contains("\"statusCompactText\""),
+        "the host reads the optional narrow form"
+    );
+    // The compact form is SHORT LABELLED, never a bare dot: two bare dots
+    // cannot be told apart and the state must stay readable in text.
+    let menu = jev_source("jev_menu.rs");
+    assert!(
+        menu.contains("\"Jev C On\""),
+        "short labelled decision compact form"
+    );
+    assert!(
+        menu.contains("\"Jev A On\""),
+        "short labelled Active compact form"
+    );
+    assert!(
+        menu.contains("\"Jev C+A On\""),
+        "short labelled combined compact form"
+    );
+    assert!(
+        menu.contains("\"Jev Cmp on\"") && menu.contains("\"Jev Cmp off\""),
+        "short labelled compaction compact form"
+    );
+    assert!(
+        menu.contains("fn footer_compact_text")
+            && menu.contains("fn footer_compaction_compact_text")
+    );
+    // The publisher provides it on both segments.
+    let footer = jev_source("jev_footer.rs");
+    assert!(
+        footer.contains("\"statusCompactText\": self.themed_compact()"),
+        "the decision payload carries the narrow form"
+    );
+    assert!(
+        footer.contains("\"statusCompactText\": self.themed_compaction_compact()"),
+        "the compaction payload carries the narrow form"
+    );
+    // The daemon attach publish provides all four forms from ONE snapshot.
+    let daemon = crate_file("src/modes/daemon/daemon_mode.rs");
+    assert!(
+        daemon.contains("\"jev-compact\""),
+        "the daemon publishes the independent compaction dot"
+    );
+    assert!(
+        daemon.contains("footer_status_forms("),
+        "one settings snapshot for all four texts"
+    );
+    assert!(daemon.contains("statusCompactText"), "and its narrow form");
+    // A daemon-side session replacement resets every attached UI's status
+    // surface, so the authoritative footer for the NEW session must FOLLOW the
+    // replace frame, per client, inside the broadcast loop.
+    let broadcast_fn = daemon
+        .split("fn broadcast_to_session")
+        .nth(1)
+        .expect("broadcast_to_session exists")
+        .split("fn clone_arc")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        broadcast_fn.contains("publish_jev_attach_footer(&client, &state)"),
+        "the footer follows the replace frame per client"
+    );
+    assert!(
+        broadcast_fn.contains("type_name() == \"session_replaced\""),
+        "the push is keyed on the replacement frame"
+    );
+    let bridge = crate_file("src/core/jev_bridge.rs");
+    assert!(
+        bridge.contains("pub fn footer_status_forms"),
+        "the bridge builds the forms"
+    );
+}
+
+#[test]
+fn the_footer_refreshes_after_a_compaction_setting_change() {
+    // Every compaction write republishes the footer in the same turn, exactly
+    // like a mode write already does.
+    let host = jev_source("jev_host.rs");
+    let set_compaction_arm = host
+        .split("JevRequest::SetCompaction(enabled) =>")
+        .nth(1)
+        .expect("SetCompaction arm exists")
+        .split("JevRequest::SetDefaultCompaction")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_compaction_arm.contains("publish_footer("),
+        "the command path refreshes the footer: {set_compaction_arm}"
+    );
+    let set_default_arm = host
+        .split("JevRequest::SetDefaultCompaction(enabled) =>")
+        .nth(1)
+        .expect("SetDefaultCompaction arm exists")
+        .split("JevRequest::CompactionStatus")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        set_default_arm.contains("publish_footer("),
+        "the default-compaction path refreshes the footer"
+    );
+    let menu_arm = host
+        .split("JevMenuAction::SetCompaction(enabled) =>")
+        .nth(1)
+        .expect("menu compaction action exists")
+        .split("JevMenuAction::ShowStatus")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        menu_arm.contains("publish_footer("),
+        "the menu path refreshes the footer"
+    );
+    // Mode writes keep their existing refresh.
+    assert!(host.contains("publish_footer(send, &bridge, &session_id, credential);"));
+    // The host publishes the CURRENT effective segments on startup and on a
+    // session change, gated to the in-process connection so an attached daemon
+    // is never overridden.
+    let tray = crate_file("src/modes/interactive/native_host.rs");
+    assert_eq!(
+        tray.matches("publish_session_footer").count(),
+        2,
+        "startup publish + session-change publish (the definition lives in jev_host.rs)"
+    );
+    assert!(
+        tray.contains("in_process_connection.is_some()"),
+        "daemon-attached UIs are not overridden"
+    );
+}
+
+#[test]
+fn the_row_ladder_keeps_the_counter_visible_and_the_baseline_shared() {
+    // The pure row module pins the layout contract: right-aligned counter on the
+    // SAME row, compact segments before left truncation, no stray lower-left
+    // wrap. The wiring audit only checks the tray row delegates to it.
+    let row_source = crate_file("src/modes/interactive/tray_row.rs");
+    assert!(row_source.contains("pub fn compose_tray_row"));
+    assert!(
+        row_source.contains("statusCompactText"),
+        "the compact form contract is documented"
+    );
+    // The tray renders ONE line for the row plus at most the goal/heartbeat
+    // line: the counter can never move to a lower-left row of its own.
+    let tray = crate_file("src/modes/interactive/native_host.rs");
+    let render_row = tray
+        .split("fn render_row(")
+        .nth(1)
+        .expect("render_row exists")
+        .split("fn invalidate")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(
+        render_row.contains("get_tray_context_label()"),
+        "goal/heartbeat keep their line"
+    );
+    assert_eq!(
+        render_row.matches("lines.push").count(),
+        1,
+        "exactly one extra line: goal/heartbeat only"
+    );
+}
+
+#[test]
+fn the_runtime_rebind_resets_blanket_and_the_same_session_reload_keeps_the_jev_segments() {
+    let tray = crate_file("src/modes/interactive/native_host.rs");
+    // The rebind callback (fork / new / resume) sends the DISTINCT event, not
+    // the same-session reload reset.
+    let rebind = tray
+        .split("runtime_set_rebind_session(Some(Arc::new(move || {")
+        .nth(1)
+        .expect("rebind callback exists")
+        .split("let connection = weak.upgrade();")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(rebind.contains("Event::RuntimeRebound"), "{rebind}");
+    // The reset arm keeps the two contracts distinct: same-session reload
+    // retains the segments, a runtime rebind blanket-resets.
+    assert!(tray.contains("event @ (Event::Reset | Event::RuntimeRebound)"));
+    assert!(tray.contains("matches!(&event, Event::RuntimeRebound)"));
+    let arm = tray
+        .split("event @ (Event::Reset | Event::RuntimeRebound) => {")
+        .nth(1)
+        .expect("combined reset arm exists")
+        .split("bridge.reset()")
+        .next()
+        .unwrap()
+        .to_string();
+    assert!(arm.contains("reset_keeping_jev()"), "{arm}");
+    assert!(arm.contains(".reset();"), "{arm}");
+    // /new and /resume hand the new runtime to the refresh arm like fork does:
+    // the rebind reset lands first, then RefreshSnapshot republishes the NEW
+    // session's authoritative state, including the Jev footer.
+    assert_eq!(
+        tray.matches("Runtime rebind handoff (same as fork)")
+            .count(),
+        2,
+        "the /new and /resume command paths hand off a fresh snapshot"
+    );
+    for handoff in [
+        tray.split("Runtime rebind handoff (same as fork)").nth(1),
+        tray.split("Runtime rebind handoff (same as fork)").nth(2),
+    ] {
+        let handoff = handoff.expect("both /new and /resume hand off a fresh snapshot");
+        assert!(
+            handoff.contains("HostEvent::RefreshSnapshot("),
+            "the handoff sends the refresh snapshot: {handoff}"
+        );
+        assert!(
+            handoff.contains("connection.get_initial_snapshot().await?"),
+            "the handoff fetches the new session snapshot: {handoff}"
+        );
+    }
+    // And the refresh arm republishes the new session's footer (startup +
+    // session change, gated to the in-process connection).
+    assert_eq!(tray.matches("publish_session_footer").count(), 2);
+}
+
+
+// ---------------------------------------------------------------------------
+// 10. full-jev global overlay (ROOT-CONTRACT v1): the persisted named
+//     profile that resolves ABOVE every saved override, the emergency
+//     exit, the conflicting-write rejections and the truthful panels.
+// ---------------------------------------------------------------------------
+
+/// Saved decisions the overlay must mask while active: session "alpha"
+/// explicitly Off + compaction off + verification on, session "beta"
+/// explicitly Compare + compaction on, global default Compare.
+fn full_jev_saved_baseline(bridge: &JevModeBridge) {
+    bridge
+        .set_global_default(JevMode::Compare)
+        .expect("global default");
+    bridge
+        .set_session_mode("alpha", JevMode::Off)
+        .expect("alpha mode");
+    bridge
+        .set_compaction("alpha", false)
+        .expect("alpha compaction");
+    bridge
+        .set_feature("alpha", JevFeature::Verification, true)
+        .expect("alpha feature");
+    bridge
+        .set_session_mode("beta", JevMode::Compare)
+        .expect("beta mode");
+    bridge
+        .set_compaction("beta", true)
+        .expect("beta compaction");
+}
+
+#[test]
+fn full_jev_arguments_parse_with_bare_meaning_on() {
+    for args in [
+        "full-jev",
+        "fulljev",
+        "full_jev",
+        "full-jev on",
+        "FULL-JEV",
+        " full-jev  on ",
+    ] {
+        assert_eq!(
+            parse_jev_request(args),
+            JevRequest::SetFullJev(true),
+            "`{args}` must install the overlay; bare full-jev means on"
+        );
+    }
+    for args in ["full-jev off", "fulljev off", "full_jev off"] {
+        assert_eq!(parse_jev_request(args), JevRequest::SetFullJev(false));
+    }
+    for args in ["full-jev status", "fulljev status", "full_jev status"] {
+        assert_eq!(parse_jev_request(args), JevRequest::FullJevStatus);
+    }
+    // No silent rewrites: unknown spellings stay unknown, and the usage text
+    // names the new command.
+    assert!(matches!(
+        parse_jev_request("full-jev bogus"),
+        JevRequest::Unknown(_)
+    ));
+    assert!(
+        JEV_ARGUMENT_HINT.contains("full-jev"),
+        "{}",
+        JEV_ARGUMENT_HINT
+    );
+    assert!(jev_usage().contains("full-jev"));
+}
+
+#[test]
+fn full_jev_masks_saved_overrides_and_off_restores_them_exactly() {
+    let dir = temp_agent_dir("full-jev-mask");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    let saved_alpha = bridge.settings();
+
+    // Install: everything resolves above the saved decisions (contract: all
+    // gates on even where saved session settings say off).
+    assert_eq!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    );
+    assert_eq!(bridge.effective_mode("alpha"), JevMode::CompareAndActive);
+    assert_eq!(bridge.scope("alpha"), ModeScope::FullJevOverlay);
+    assert!(bridge.settings().effective_compaction_enabled("alpha"));
+    assert!(bridge.settings().effective_features("alpha").verification);
+    assert!(
+        bridge
+            .settings()
+            .effective_features("alpha")
+            .code_search_reranking
+    );
+    assert!(bridge.settings().effective_features("alpha").line_find);
+    assert_eq!(bridge.effective_mode("beta"), JevMode::CompareAndActive);
+    // The masked saved values are visible, not hidden.
+    assert_eq!(
+        bridge.settings().full_jev_masked_sessions(),
+        vec!["alpha", "beta"]
+    );
+
+    // Remove: the saved decisions resolve again, byte-identically.
+    assert_eq!(
+        bridge.set_full_jev(false).expect("remove"),
+        FullJevChange::Removed { was_active: true }
+    );
+    let restored = bridge.settings();
+    assert_eq!(restored.effective_mode("alpha"), JevMode::Off);
+    assert!(!restored.effective_compaction_enabled("alpha"));
+    assert!(restored.effective_features("alpha").verification);
+    assert_eq!(restored.effective_mode("beta"), JevMode::Compare);
+    assert!(restored.effective_compaction_enabled("beta"));
+    assert_eq!(
+        restored.global_default, saved_alpha.global_default,
+        "the base global fields are never rewritten by full-on/full-off"
+    );
+    assert_eq!(restored.sessions, saved_alpha.sessions);
+    // Idempotence in both directions reports the truth and writes nothing.
+    assert_eq!(
+        bridge.set_full_jev(false).expect("remove again"),
+        FullJevChange::Removed { was_active: false }
+    );
+}
+
+#[test]
+fn full_jev_rejects_conflicting_changes_with_an_explicit_recovery_path() {
+    let dir = temp_agent_dir("full-jev-reject");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    assert!(matches!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+    // Every write the overlay would mask is REJECTED with the same message:
+    // the command surface and the menu surface share this one bridge.
+    for result in [
+        bridge.set_session_mode("alpha", JevMode::Compare).map(|_| ()),
+        bridge.set_session_mode("alpha", JevMode::Active).map(|_| ()),
+        bridge.set_session_mode("alpha", JevMode::CompareAndActive).map(|_| ()),
+        bridge.set_global_default(JevMode::Off).map(|_| ()),
+        bridge.set_feature("alpha", JevFeature::Verification, false),
+        bridge.set_compaction("alpha", true),
+        bridge.set_default_compaction(false),
+        bridge.clear_session_mode("alpha").map(|_| ()),
+    ] {
+        let error = result.expect_err("a masked write must be rejected");
+        assert_eq!(
+            error, JEV_FULL_JEV_REJECTION,
+            "one shared rejection message"
+        );
+    }
+    // The rejection points at the recovery path and never claims success.
+    assert!(JEV_FULL_JEV_REJECTION.contains("/jev full-jev off"));
+    assert!(JEV_FULL_JEV_REJECTION.contains("nothing was changed"));
+    // Nothing was written by the rejected calls.
+    assert!(bridge.settings().full_jev_active());
+    assert_eq!(
+        bridge.settings().sessions.get("alpha").expect("entry").mode,
+        Some(JevMode::Off)
+    );
+}
+
+#[test]
+fn jev_off_while_full_active_is_the_atomic_emergency_exit() {
+    let dir = temp_agent_dir("full-jev-emergency");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    assert!(matches!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+
+    // `/jev off` while full is active: ONE compound write.
+    let change = bridge
+        .set_session_mode("alpha", JevMode::Off)
+        .expect("emergency exit");
+    assert_eq!(change, ModeChange::EmergencyExit { mode: JevMode::Off });
+    let message = mode_change_message(&change);
+    assert!(
+        message.contains(JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE),
+        "{message}"
+    );
+    assert!(message.contains("Jev mode: Off"), "{message}");
+    // Scope truth: the overlay is gone GLOBALLY...
+    assert!(!bridge.settings().full_jev_active());
+    // ...THIS chat is explicitly Off with compaction false...
+    assert_eq!(bridge.effective_mode("alpha"), JevMode::Off);
+    assert!(!bridge.settings().effective_compaction_enabled("alpha"));
+    assert_eq!(
+        bridge.settings().sessions.get("alpha").expect("entry").mode,
+        Some(JevMode::Off)
+    );
+    // ...and OTHER sessions return to their saved settings untouched.
+    assert_eq!(bridge.effective_mode("beta"), JevMode::Compare);
+    assert!(bridge.settings().effective_compaction_enabled("beta"));
+
+    // After the exit, individual settings work again (no stuck overlay).
+    assert!(bridge.set_compaction("alpha", true).is_ok());
+    assert!(bridge.settings().effective_compaction_enabled("alpha"));
+    assert!(bridge.set_session_mode("alpha", JevMode::Compare).is_ok());
+}
+
+#[test]
+fn jev_off_outside_full_keeps_the_existing_semantics() {
+    let dir = temp_agent_dir("full-jev-off-baseline");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    // No overlay: `/jev off` writes the session mode only; compaction keeps
+    // its independent setting (the documented pre-full behavior).
+    let change = bridge
+        .set_session_mode("beta", JevMode::Off)
+        .expect("plain off");
+    assert!(matches!(
+        change,
+        ModeChange::Applied {
+            mode: JevMode::Off,
+            scope: ModeScope::Session
+        }
+    ));
+    assert_eq!(bridge.effective_mode("beta"), JevMode::Off);
+    assert!(
+        bridge.settings().effective_compaction_enabled("beta"),
+        "outside full, /jev off never touches the independent compaction setting"
+    );
+    let message = mode_change_message(&change);
+    assert!(!message.contains("Emergency exit"), "{message}");
+}
+
+#[test]
+fn full_jev_status_panel_reports_constant_truth_and_masked_sessions() {
+    let dir = temp_agent_dir("full-jev-status");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    let credential = CredentialStatus::resolve(false, false, false);
+
+    // While inactive: the panel says so and promises the right shape.
+    let inactive = render_full_jev_status(&bridge.settings(), "alpha", credential);
+    assert!(inactive.contains("Profile: not installed"), "{inactive}");
+    assert!(inactive.contains("Compare + Active"), "{inactive}");
+
+    assert!(matches!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+    let active = render_full_jev_status(&bridge.settings(), "alpha", credential);
+    assert!(active.contains("Profile: active (revision 1)"), "{active}");
+    // The overlay facts come from the FIXED constants, never the persisted
+    // fields, so a hand-edited block cannot make status lie.
+    assert!(active.contains("Mode: Compare + Active"), "{active}");
+    assert!(active.contains("Feature gates: all on"), "{active}");
+    assert!(active.contains("Compaction: on"), "{active}");
+    // Masked saved decisions are listed, not hidden.
+    assert!(
+        active.contains("Saved decisions masked by the overlay: 2"),
+        "{active}"
+    );
+    assert!(active.contains("- alpha"), "{active}");
+    assert!(active.contains("- beta"), "{active}");
+    // This chat's effective values and the credential absence are truthful.
+    assert!(
+        active.contains("This chat resolves: Compare + Active (scope: full_jev_overlay)"),
+        "{active}"
+    );
+    assert!(active.contains("No API key is configured"), "{active}");
+    assert!(active.contains(JEV_DISCLOSURE_NOTICE), "{active}");
+    assert!(active.contains(JEV_BOUNDARY_NOTICE), "{active}");
+}
+
+#[test]
+fn full_jev_notices_state_consent_scope_and_recovery() {
+    // ON names what is enabled and what happens to saved values.
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("Compare + Active"));
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("candidate reranking"));
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("line-level semantic find"));
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("resolves ABOVE every saved"));
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("/jev full-jev off"));
+    // OFF states the exact restore.
+    assert!(JEV_FULL_JEV_OFF_NOTICE.contains("without touching any saved setting"));
+    // The already-off case is a truthful no-change, never a silent success.
+    assert!(JEV_FULL_JEV_ALREADY_OFF_NOTICE.contains("nothing was changed"));
+    // The emergency exit names its global scope and the follow-ups.
+    assert!(JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE.contains("global overlay"));
+    assert!(JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE.contains("compaction off"));
+    assert!(JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE.contains("Other chats"));
+    assert!(JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE.contains("/jev compact on"));
+}
+
+#[test]
+fn full_jev_children_inherit_the_baseline_never_the_overlay() {
+    let dir = temp_agent_dir("full-jev-inherit");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    assert!(matches!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+    // A child of masked "alpha" snapshots alpha's SAVED baseline (Off,
+    // compaction off), never the overlay values...
+    let inherited = bridge
+        .inherit_into_child("child", "alpha", None)
+        .expect("inherit");
+    assert_eq!(inherited, JevMode::Off);
+    let child = bridge
+        .settings()
+        .sessions
+        .get("child")
+        .expect("child entry")
+        .clone();
+    assert_eq!(child.mode, Some(JevMode::Off));
+    assert_eq!(child.compaction_enabled, Some(false));
+    // ...while the overlay is active the child still RESOLVES through it...
+    assert_eq!(bridge.effective_mode("child"), JevMode::CompareAndActive);
+    assert!(bridge.settings().effective_compaction_enabled("child"));
+    // ...and removing the overlay returns the child to that baseline.
+    assert!(matches!(
+        bridge.set_full_jev(false).expect("remove"),
+        FullJevChange::Removed { was_active: true }
+    ));
+    assert_eq!(bridge.effective_mode("child"), JevMode::Off);
+    assert!(!bridge.settings().effective_compaction_enabled("child"));
+}
+
+#[test]
+fn full_jev_footer_and_status_labels_cover_the_overlay_scope() {
+    // The mode-change scope label and the status panel both name the overlay.
+    let overlay_message = mode_change_message(&ModeChange::Applied {
+        mode: JevMode::CompareAndActive,
+        scope: ModeScope::FullJevOverlay,
+    });
+    assert!(
+        overlay_message.contains("the global full-jev overlay"),
+        "{overlay_message}"
+    );
+    let dir = temp_agent_dir("full-jev-labels");
+    let bridge = bridge_over(&dir);
+    full_jev_saved_baseline(&bridge);
+    assert!(matches!(
+        bridge.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+    let report = JevStatusReport::local_only(
+        bridge.settings().effective_mode("alpha"),
+        bridge.settings().effective_mode_with_scope("alpha").scope,
+        CredentialStatus::resolve(false, false, false),
+    )
+    .with_settings(&bridge.settings(), "alpha");
+    let panel = render_status(&report);
+    assert!(panel.contains("full_jev_overlay"), "{panel}");
+    assert!(
+        panel.contains("the global full-jev overlay; it resolves above every saved setting"),
+        "{panel}"
+    );
+    assert!(panel.contains("Full-jev overlay: active"), "{panel}");
+}
+
+#[test]
+fn full_jev_concurrent_bridge_instances_see_each_others_writes() {
+    // The write path reloads per attempt, so a second bridge over the same
+    // agent dir observes the overlay and never resurrects a stale state.
+    let dir = temp_agent_dir("full-jev-concurrent");
+    let bridge_a = bridge_over(&dir);
+    let bridge_b = bridge_over(&dir);
+    assert!(matches!(
+        bridge_a.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: false
+        }
+    ));
+    // Bridge B sees A's overlay: a second install is an idempotent no-write.
+    assert_eq!(
+        bridge_b.set_full_jev(true).expect("install"),
+        FullJevChange::Installed {
+            already_active: true
+        }
+    );
+    // And B's removal is visible to A immediately (single source of truth).
+    assert!(matches!(
+        bridge_b.set_full_jev(false).expect("remove"),
+        FullJevChange::Removed { was_active: true }
+    ));
+    assert!(!bridge_a.settings().full_jev_active());
 }

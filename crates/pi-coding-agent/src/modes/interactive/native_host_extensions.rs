@@ -7,10 +7,24 @@ use crate::modes::interactive::components::bash_execution::{
     BashExecutionComponent, BashExecutionOptions,
 };
 use crate::modes::interactive::components::side_question::SideQuestionComponent;
+use super::native_commands::jev_menu::{JEV_COMPACT_STATUS_KEY, JEV_STATUS_KEY};
+
+/// One extension status entry.
+///
+/// `text` is the full labelled form. `compact` is the OPTIONAL narrow form the
+/// tray row uses when the whole row does not fit (`statusCompactText` in the
+/// `setStatus` payload). Senders that do not provide one — old daemons, generic
+/// extensions — leave it absent, and the row then falls back to truncating the
+/// left label instead of collapsing the segment.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ExtensionStatus {
+    pub text: String,
+    pub compact: Option<String>,
+}
 
 #[derive(Default)]
 pub(super) struct Surfaces {
-    statuses: indexmap::IndexMap<String, String>,
+    statuses: indexmap::IndexMap<String, ExtensionStatus>,
     widgets: indexmap::IndexMap<String, (bool, Box<dyn TuiComponent>)>,
     pub header: Option<Box<dyn TuiComponent>>,
     pub footer: Option<Box<dyn TuiComponent>>,
@@ -26,9 +40,9 @@ impl TuiComponent for Lines {
     fn invalidate(&mut self) {}
 }
 impl Surfaces {
-    pub fn set_status(&mut self, key: String, text: Option<String>) {
+    pub fn set_status(&mut self, key: String, text: Option<String>, compact: Option<String>) {
         if let Some(text) = text {
-            self.statuses.insert(key, text);
+            self.statuses.insert(key, ExtensionStatus { text, compact });
         } else {
             self.statuses.shift_remove(&key);
         }
@@ -60,6 +74,25 @@ impl Surfaces {
         self.footer = None;
         self.header = None;
     }
+
+    /// Blanket reset that RETAINS the two host-published Jev segments.
+    ///
+    /// For SAME-SESSION resets (`/reload`, an extension Reset event, the update
+    /// path): the session and its settings are unchanged, so the segments stay
+    /// truthful and are refreshed by key on the next publish. A SESSION SWITCH
+    /// must use [`Surfaces::reset`]: old-session labels are never kept, and an
+    /// attached daemon pushes the new session's authoritative footer itself.
+    pub fn reset_keeping_jev(&mut self) {
+        let keep_decision = self.statuses.shift_remove(JEV_STATUS_KEY);
+        let keep_compaction = self.statuses.shift_remove(JEV_COMPACT_STATUS_KEY);
+        self.reset();
+        if let Some(decision) = keep_decision {
+            self.statuses.insert(JEV_STATUS_KEY.to_string(), decision);
+        }
+        if let Some(compaction) = keep_compaction {
+            self.statuses.insert(JEV_COMPACT_STATUS_KEY.to_string(), compaction);
+        }
+    }
 }
 pub(super) struct Widgets(pub Rc<RefCell<Surfaces>>, pub bool);
 impl TuiComponent for Widgets {
@@ -74,6 +107,32 @@ impl TuiComponent for Widgets {
     }
     fn invalidate(&mut self) {}
 }
+/// Splits the extension status map for ONE paint: the two Jev segments for the
+/// tray row (immutable lookups by key, the map is never mutated or reordered)
+/// and every OTHER status for the plain line below. Returning the remaining
+/// line together with the row segments is what keeps each Jev label painted
+/// exactly once: the plain line excludes the two keys the row already shows.
+pub(super) fn split_status_row(
+    statuses: &indexmap::IndexMap<String, ExtensionStatus>,
+) -> (
+    Option<(&str, Option<&str>)>,
+    Option<(&str, Option<&str>)>,
+    Vec<String>,
+) {
+    let decision_row = statuses
+        .get(JEV_STATUS_KEY)
+        .map(|status| (status.text.as_str(), status.compact.as_deref()));
+    let compaction_row = statuses
+        .get(JEV_COMPACT_STATUS_KEY)
+        .map(|status| (status.text.as_str(), status.compact.as_deref()));
+    let other_lines = statuses
+        .iter()
+        .filter(|(key, _)| *key != JEV_STATUS_KEY && *key != JEV_COMPACT_STATUS_KEY)
+        .map(|(_, status)| status.text.clone())
+        .collect();
+    (decision_row, compaction_row, other_lines)
+}
+
 pub(super) struct Statuses(pub Rc<RefCell<Surfaces>>, pub(super) Tray);
 impl TuiComponent for Statuses {
     fn render(&mut self, width: f64) -> Vec<String> {
@@ -81,22 +140,17 @@ impl TuiComponent for Statuses {
         if let Some(footer) = &mut state.footer {
             return footer.render(width);
         }
-        let mut lines = self.1.render(width);
-        if !state.statuses.is_empty() {
-            lines.extend(
-                TuiText::new(
-                    state
-                        .statuses
-                        .values()
-                        .cloned()
-                        .collect::<Vec<_>>()
-                        .join(" "),
-                    1,
-                    0,
-                    None,
-                )
-                .render(width),
-            );
+        // The two Jev segments ride ON the tray row, on the same baseline as the
+        // navigation/model/effort label, so the context counter can be
+        // right-aligned beside them. The map is only READ here (immutable key
+        // lookups, no shift_remove/extend per paint): a status refresh still
+        // overwrites the segments by key, the key order is untouched, and the
+        // plain status line below EXCLUDES the two keys the row already shows,
+        // so each Jev label is painted exactly once.
+        let (decision_row, compaction_row, other_lines) = split_status_row(&state.statuses);
+        let mut lines = self.1.render_row(width, decision_row, compaction_row);
+        if !other_lines.is_empty() {
+            lines.extend(TuiText::new(other_lines.join(" "), 1, 0, None).render(width));
         }
         lines
     }

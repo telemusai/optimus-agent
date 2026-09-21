@@ -27,6 +27,11 @@ pub(super) enum Event {
     Paste(String),
     ToolsExpanded(bool),
     Reset,
+    /// The in-process runtime was REBOUND to a different session (fork, /new,
+    /// in-chat /resume). Unlike [`Event::Reset`] (same-session reload), the old
+    /// session's host-published state must never survive into the new
+    /// session's first frame, so the receiver blanket-resets the surfaces.
+    RuntimeRebound,
 }
 
 pub(super) struct Bridge {

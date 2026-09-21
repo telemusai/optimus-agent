@@ -4,6 +4,8 @@
 //! Credentials, cancellation and captured policy generations remain local.
 
 use std::collections::{BTreeMap, HashMap};
+use std::sync::atomic::{AtomicU64, Ordering};
+use tokio_util::sync::CancellationToken;
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
@@ -16,13 +18,221 @@ use crate::config::get_agent_dir;
 use crate::core::extensions::types::SharedExtension;
 use crate::core::extensions::types::{Extension, ExtensionContext, ExtensionEvent, ExtensionHandler};
 use crate::core::memory::search::MemoryHit;
+use crate::core::skills::Skill;
 
 /// Path of the internal observer extension (stable, easy to spot in logs).
 pub const JEV_OBSERVER_PATH: &str = "<jev-observer-internal>";
 
+/// Observed-change component of the settings identity: advances only when a
+/// reload observes a settings VALUE that differs from the previous snapshot
+/// (never on unchanged TTL re-reads). Combined with the DURABLE persisted
+/// `write_revision` this gives hints/decisions a host settings identity that
+/// moves on every authoritative write — including model A->B->A where the
+/// serialized values return to identical bytes — and on any in-process
+/// change this process observes.
+static SETTINGS_REVISION: AtomicU64 = AtomicU64::new(1);
+
+/// The current settings revision label for hint stamps: the durable
+/// persisted write revision plus this process's observed-change counter.
+pub fn settings_revision() -> String {
+    let durable = load_settings_cached().write_revision;
+    format!("w{}:o{}", durable, SETTINGS_REVISION.load(Ordering::SeqCst))
+}
+
+    /// ROOT-CONTRACT v7 (Agent-guidance lane) — the awaited pre-context
+    /// assessment seam, called from the session's `before_request` agent hook
+    /// (one assessment per provider request at the boundary that BUILDS the
+    /// request). Active modes only: the decide is awaited here, the store
+    /// + listener refresh happen BEFORE the loop builds the request context,
+    /// so the very request this boundary serves carries the assessed hint.
+    /// The stamp is CAPTURED before the await and re-checked post-await
+    /// against FRESHLY loaded settings and the consumer-noted roster; the
+    /// origin stamp stays immutable. Per-loop-turn cadence: one assessment
+    /// per provider request, replacing the old per-provider-boundary decide.
+    pub async fn before_request_assessment(
+        session_id: &str,
+        request_turn: u64,
+        signal: Option<CancellationToken>,
+    ) {
+        let Some(core) = bridge_for_session(session_id) else { return };
+        let settings_at_capture = load_settings_cached();
+        let features_at_capture = settings_at_capture.effective_features(session_id);
+        if !features_at_capture.skill_suggestion {
+            // ROOT-CONTRACT v7: feature off — drop any cached hint so the
+            // system prompt cannot keep rendering one that is no longer
+            // governed. No decide runs while the feature is off.
+            core.store_skill_hint(session_id, request_turn, None);
+            core.notify_hint_listener(session_id);
+            return;
+        }
+        let mode_at_capture = settings_at_capture.effective_mode(session_id);
+        if !mode_at_capture.is_enabled() {
+            // Off mode: clear and stop (Off removes an old hint).
+            core.store_skill_hint(session_id, request_turn, None);
+            core.notify_hint_listener(session_id);
+            return;
+        }
+        if !mode_at_capture.allows_active() {
+            // Compare-only: the TurnStart battery records; the hint lane
+            // never installs from compare-only observations.
+            return;
+        }
+        let roster_at_capture = core.cached_skill_roster();
+        if roster_at_capture.is_empty() { return; }
+        let Some(prepared) = crate::core::jev_agent_guidance::prepare_skill_suggestion(
+            core.task_excerpt(session_id).as_deref().unwrap_or(""), &roster_at_capture,
+        ) else { return; };
+        let Some(observer) = core.observer(session_id, None) else { return };
+        // The hook aligns the book turn with the loop's actual request index
+        // synchronously (the queued TurnStart bookkeeping may lag the loop).
+        core.note_turn(session_id, request_turn);
+        let dispatch_payload = serde_json::json!({
+            "session_id": session_id,
+            "turn": request_turn,
+            // The verified state IS the outgoing state: the exact bytes
+            // verify_guidance_request validated with these questions.
+            "state": prepared.state,
+            "policy_generation": decision_policy_generation(&settings_at_capture, session_id),
+        });
+        let policy = pi_jev::active::ActivationPolicy {
+            enabled_categories: Default::default(),
+            ..Default::default()
+        };
+        // The stamp CAPTURED here identifies the REQUEST inputs (revision,
+        // mode, feature, turn, task, catalog) BEFORE the decide is awaited;
+        // the hint carries THIS captured stamp, immutable.
+        let request_stamp = core.current_hint_stamp_with(
+            session_id,
+            &settings_at_capture,
+            features_at_capture.skill_suggestion,
+            request_turn,
+            &roster_at_capture,
+        );
+        let decide = observer.decide_prepared(&dispatch_payload, "skill_suggestion", prepared.questions, &policy);
+        let outcome = if let Some(signal) = signal {
+            tokio::select! { biased;
+                _ = signal.cancelled() => {
+                    observer.cancel_decisions(session_id);
+                    // Best-effort bounded state event. The outer loop may win
+                    // the same abort race and drop this hook before it writes.
+                    observer.correlator().record_skipped_category(
+                        session_id,
+                        request_turn,
+                        "skill_suggestion",
+                        pi_jev::types::DecisionCategory::SkillSuggestion,
+                        "assessment_cancelled",
+                        pi_jev::hooks::PROMPT_VERSION,
+                        mode_at_capture.as_str(),
+                    );
+                    return;
+                }
+                outcome = decide => outcome,
+            }
+        } else { decide.await };
+        let fresh = observer.can_apply(&outcome) && outcome.turn == request_turn;
+        let budget_ok = outcome.unavailable.is_none();
+        // At store time the CURRENT facts are FRESHLY resolved (durable
+        // settings load, not the TTL cache; the consumer-noted roster) and
+        // compared against the captured origin stamp: a settings flip
+        // (Off->On or A->B->A), task switch or roster change between the
+        // capture and the store means the answers belong to a superseded
+        // request and install nothing (NoHint clears). The catalog identity
+        // is authoritatively re-checked at the consumer seam too
+        // (`skill_hint_for_render` against the ACTUAL loaded skills).
+        let fresh_settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+        let fresh_roster = core.cached_skill_roster();
+        let facts_stable = core.current_hint_stamp_with(
+            session_id,
+            &fresh_settings,
+            fresh_settings.effective_features(session_id).skill_suggestion,
+            request_turn,
+            &fresh_roster,
+        ) == request_stamp;
+        let records: &[pi_jev::types::DecisionRecord] = outcome.raw.as_ref()
+            .map(|raw| raw.records.as_slice()).unwrap_or(&[]);
+        match crate::core::jev_agent_guidance::skill_hint_from_raw(
+            records,
+            fresh && facts_stable,
+            budget_ok,
+            &fresh_roster,
+            pi_jev::agent_guidance::CapturedSkillHintStamp::capture(request_stamp),
+        ) {
+            pi_jev::agent_guidance::SkillHintOutcome::Hint(hint) => {
+                core.store_skill_hint(session_id, request_turn, Some(hint));
+                core.notify_hint_listener(session_id);
+                // This row records only the bounded host-state update. It is
+                // not evidence of prompt rendering, provider receipt, or tool
+                // execution; those boundaries have separate native captures.
+                observer.correlator().record_skipped_category(
+                    session_id,
+                    request_turn,
+                    "skill_suggestion",
+                    pi_jev::types::DecisionCategory::SkillSuggestion,
+                    "hint_state_updated",
+                    pi_jev::hooks::PROMPT_VERSION,
+                    mode_at_capture.as_str(),
+                );
+            }
+            pi_jev::agent_guidance::SkillHintOutcome::NoHint(_) => {
+                core.store_skill_hint(session_id, request_turn, None);
+                core.notify_hint_listener(session_id);
+                observer.correlator().record_skipped_category(
+                    session_id,
+                    request_turn,
+                    "skill_suggestion",
+                    pi_jev::types::DecisionCategory::SkillSuggestion,
+                    "no_hint_state_updated",
+                    pi_jev::hooks::PROMPT_VERSION,
+                    mode_at_capture.as_str(),
+                );
+            }
+        }
+    }
+
 fn live_bridges() -> &'static Mutex<Vec<Weak<JevBridgeCore>>> {
     static BRIDGES: OnceLock<Mutex<Vec<Weak<JevBridgeCore>>>> = OnceLock::new();
     BRIDGES.get_or_init(|| Mutex::new(Vec::new()))
+}
+
+fn control_terminal_statuses() -> &'static Mutex<HashMap<String, Value>> {
+    static STATUS: OnceLock<Mutex<HashMap<String, Value>>> = OnceLock::new();
+    STATUS.get_or_init(|| Mutex::new(HashMap::new()))
+}
+
+/// Surface the existing typed CONTROL terminal outcome without inventing
+/// verification, completion, or execution authority. Values are bounded enums
+/// and booleans only; no prompt or result content is retained.
+pub(crate) fn note_control_terminal_outcome(
+    session_id: &str,
+    outcome: &crate::core::jev_control::ControlAgentEndResult,
+) {
+    if session_id.is_empty() || session_id.len() > 128 {
+        return;
+    }
+    let verification_state = match &outcome.verification_state {
+        pi_jev::control::ControlVerificationState::Unknown => "unknown",
+        pi_jev::control::ControlVerificationState::NotApplicable => "not_applicable",
+        pi_jev::control::ControlVerificationState::Unverified => "unverified",
+        pi_jev::control::ControlVerificationState::Verified(_) => "verified",
+        pi_jev::control::ControlVerificationState::Failed(_) => "failed",
+    };
+    let pause = outcome.pause.map(pi_jev::control::PauseReason::as_str);
+    let attention_required = outcome.escalate || pause.is_some();
+    let status = json!({
+        "verification_state": verification_state,
+        "terminal_annotation": outcome.terminal_annotation,
+        "attention_required": attention_required,
+        "pause": pause,
+    });
+    let mut statuses = control_terminal_statuses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    if statuses.len() >= MAX_TRACKED_SESSIONS && !statuses.contains_key(session_id) {
+        if let Some(oldest) = statuses.keys().next().cloned() {
+            statuses.remove(&oldest);
+        }
+    }
+    statuses.insert(session_id.to_string(), status);
 }
 
 /// Worker-local read-only telemetry. None means no observed request in this
@@ -45,31 +255,149 @@ pub fn session_status_snapshot(session_id: &str) -> Option<Value> {
         let status = result.get_or_insert_with(|| json!({}));
         status["compaction"] = compaction;
     }
+    if let Some(control) = control_terminal_statuses()
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .get(session_id)
+        .cloned()
+    {
+        let status = result.get_or_insert_with(|| json!({}));
+        status["controlTerminal"] = control;
+    }
+    // Full-jev overlay status truth: presence plus its persisted stamp and
+    // how many saved session values are currently masked. Read from the same
+    // cached settings every other consumer uses, so the footer, daemon view
+    // and decisions cannot disagree. The None/no-activity semantics for a
+    // non-overlay Off run are preserved: the block only materializes when
+    // there is already status content or the overlay is actually on.
+    {
+        let settings = load_settings_cached();
+        if result.is_some() || settings.full_jev_active() {
+            let masked = settings.full_jev_masked_sessions();
+            let status = result.get_or_insert_with(|| json!({}));
+            status["fullJev"] = json!({
+                "enabled": settings.full_jev_active(),
+                "stamp": settings.full_jev_stamp(),
+                "maskedSessionCount": masked.len(),
+            });
+        }
+    }
     result
 }
 
-/// Metadata-only footer text. This function never creates a client or task.
-pub fn footer_status_text(session_id: &str) -> String {
-    let settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+/// The decision-segment state for a session: settings truth, credential
+/// PRESENCE and worker telemetry, mapped onto the pure module's footer states.
+/// Metadata only: this never creates a client or task.
+fn footer_decision_state(
+    settings: &pi_jev::config::JevSettings,
+    session_id: &str,
+) -> crate::modes::interactive::native_host::JevFooterState {
+    use crate::modes::interactive::native_host::JevFooterState;
     let mode = settings.effective_mode(session_id);
-    let (color, label) = if !mode.is_enabled() {
-        ("error", "Jev Off")
-    } else {
-        let present = pi_jev::config::jev_dir_for(get_agent_dir()).join(format!("{}.{}",
-            pi_jev::config::DEFAULT_KEY_ID, pi_jev::credential::CREDENTIAL_FILE_NAME)).is_file()
-            || pi_jev::config::EnvKeyPresence::from_env() != pi_jev::config::EnvKeyPresence::default();
-        let status = session_status_snapshot(session_id);
-        if !present && !(cfg!(debug_assertions) && settings.transport.as_deref().is_some_and(|value| value.starts_with("mock"))) {
-            ("warning", "Jev unavailable")
-        } else if status.as_ref().is_some_and(|value| value["in_flight"].as_u64().unwrap_or(0) > 0) {
-            ("warning", "Jev checking")
-        } else if status.as_ref().is_some_and(|value| value["fallback_reason"].as_str().is_some_and(|reason| !reason.is_empty())) {
-            ("warning", "Jev fallback")
-        } else if status.as_ref().is_some_and(|value| value["active"]["last_reason"].as_str().is_some_and(|reason| !reason.is_empty())) {
-            ("warning", "Jev fallback")
-        } else { ("accent", mode.label()) }
+    if !mode.is_enabled() {
+        return JevFooterState::Off;
+    }
+    let present = pi_jev::config::jev_dir_for(get_agent_dir())
+        .join(format!(
+            "{}.{}",
+            pi_jev::config::DEFAULT_KEY_ID,
+            pi_jev::credential::CREDENTIAL_FILE_NAME
+        ))
+        .is_file()
+        || pi_jev::config::EnvKeyPresence::from_env() != pi_jev::config::EnvKeyPresence::default();
+    let status = session_status_snapshot(session_id);
+    if !present
+        && !(cfg!(debug_assertions)
+            && settings
+                .transport
+                .as_deref()
+                .is_some_and(|value| value.starts_with("mock")))
+    {
+        return JevFooterState::Unavailable;
+    }
+    if status
+        .as_ref()
+        .is_some_and(|value| value["in_flight"].as_u64().unwrap_or(0) > 0)
+    {
+        return JevFooterState::Checking;
+    }
+    if status.as_ref().is_some_and(|value| {
+        value["fallback_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    }) {
+        return JevFooterState::Fallback;
+    }
+    if status.as_ref().is_some_and(|value| {
+        value["active"]["last_reason"]
+            .as_str()
+            .is_some_and(|reason| !reason.is_empty())
+    }) {
+        return JevFooterState::Fallback;
+    }
+    match mode {
+        JevMode::Compare => JevFooterState::Compare,
+        JevMode::Active => JevFooterState::Active,
+        JevMode::CompareAndActive => JevFooterState::CompareAndActive,
+        JevMode::Off => JevFooterState::Off,
+    }
+}
+
+/// Metadata-only decision footer text (labelled form).
+///
+/// Labels, dot glyph and colours come from the same pure module the interactive
+/// tray renders, so a daemon-pushed footer and a locally published one can never
+/// disagree about wording: healthy operative modes are green and name their
+/// effective mode, Off is red, degraded states stay amber.
+pub fn footer_status_text(session_id: &str) -> String {
+    use crate::modes::interactive::native_host::footer_color_key;
+    let settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+    let state = footer_decision_state(&settings, session_id);
+    crate::modes::interactive::theme::theme::theme().fg(
+        footer_color_key(state),
+        &crate::modes::interactive::native_host::footer_text(state),
+    )
+}
+
+/// All four themed footer segment texts for a session: decision (full + short
+/// labelled narrow form) and the independent compaction state (full + short
+/// labelled narrow form).
+///
+/// Built from ONE settings snapshot: a concurrent setting change can never make
+/// the two segments on the same row disagree. The in-process publisher reads one
+/// snapshot the same way, so the one-snapshot claim holds on every publish path.
+/// Metadata only: no client, no task, no network.
+pub struct FooterStatusForms {
+    pub decision_text: String,
+    pub decision_compact_text: String,
+    pub compaction_text: String,
+    pub compaction_compact_text: String,
+}
+
+pub fn footer_status_forms(session_id: &str) -> FooterStatusForms {
+    use crate::modes::interactive::native_host::{
+        compaction_state, footer_color_key, footer_compact_text, footer_compaction_compact_text,
+        footer_compaction_text, footer_text,
     };
-    crate::modes::interactive::theme::theme::theme().fg(color, &format!("\u{25cf} {label}"))
+    let settings = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+    let decision_state = footer_decision_state(&settings, session_id);
+    let compaction = compaction_state(&settings, session_id);
+    FooterStatusForms {
+        decision_text: crate::modes::interactive::theme::theme::theme().fg(
+            footer_color_key(decision_state),
+            &footer_text(decision_state),
+        ),
+        decision_compact_text: crate::modes::interactive::theme::theme::theme().fg(
+            footer_color_key(decision_state),
+            &footer_compact_text(decision_state),
+        ),
+        compaction_text: crate::modes::interactive::theme::theme::theme()
+            .fg(compaction.color_key(), &footer_compaction_text(compaction)),
+        compaction_compact_text: crate::modes::interactive::theme::theme::theme().fg(
+            compaction.color_key(),
+            &footer_compaction_compact_text(compaction),
+        ),
+    }
 }
 
 /// The one event the Active handler subscribes to. Registering it makes the
@@ -121,22 +449,50 @@ fn settings_cache() -> &'static Mutex<Option<CachedSettings>> {
 /// Load Jev settings with a tiny TTL cache. Off-mode cost: one cached read
 /// per event; no client, no network, no tasks.
 fn load_settings_cached() -> JevSettings {
-    {
-        let cache = settings_cache().lock().unwrap_or_else(|p| p.into_inner());
+    let (settings, resync_handlers) = {
+        let mut cache = settings_cache().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(cached) = cache.as_ref() {
             if cached.loaded.elapsed() < SETTINGS_TTL {
                 return cached.settings.clone();
             }
         }
+        let agent_dir = get_agent_dir();
+        let settings = pi_jev::config::JevSettingsStore::new(&agent_dir).load();
+        // Host-authoritative settings revision: advances ONLY when the
+        // reloaded settings VALUE differs from the previously observed one.
+        // An external settings change (including Off->On with no consumer
+        // visit during Off) therefore always moves the revision, while TTL
+        // re-reads of unchanged settings do not invalidate live stamps.
+        let changed = cache.as_ref().is_none_or(|cached| cached.settings != settings);
+        if changed {
+            SETTINGS_REVISION.fetch_add(1, Ordering::SeqCst);
+        }
+        // Cross-process toggle: another process may have changed Active
+        // presence between the expired snapshot and this fresh read. The
+        // comparison happens BEFORE the cache is replaced, and the resync
+        // runs only after the settings lock is dropped, so the nested
+        // `active_mode_requested` finds the fresh value: no recursion and
+        // no lock held during the sync.
+        let was_active = cache.as_ref().is_some_and(|cached| active_requested_from(&cached.settings));
+        let now_active = active_requested_from(&settings);
+        let resync_handlers = was_active != now_active;
+        *cache = Some(CachedSettings {
+            loaded: Instant::now(),
+            settings: settings.clone(),
+        });
+        (settings, resync_handlers)
+    };
+    if resync_handlers {
+        sync_active_handlers();
     }
-    let agent_dir = get_agent_dir();
-    let settings = pi_jev::config::JevSettingsStore::new(&agent_dir).load();
-    let mut cache = settings_cache().lock().unwrap_or_else(|p| p.into_inner());
-    *cache = Some(CachedSettings {
-        loaded: Instant::now(),
-        settings: settings.clone(),
-    });
     settings
+}
+
+/// Session-resolved full-jev overlay truth for host bookkeeping gates. Reads
+/// the same cached settings truth every other consumer (decide_control, footer,
+/// daemon view) uses, so bookkeeping can never disagree with decisions.
+pub(crate) fn session_full_jev_active() -> bool {
+    load_settings_cached().full_jev_active()
 }
 
 /// Invalidate the settings cache; the /jev UI lane can call this after
@@ -147,14 +503,21 @@ pub fn invalidate_settings_cache() {
     sync_active_handlers();
 }
 
-/// True when some session or the global default is set to Active.
-fn active_mode_requested() -> bool {
-    let settings = load_settings_cached();
-    settings.global_default.is_some_and(JevMode::allows_active)
+/// True when Active is requested through any scope: the full-jev overlay
+/// (CompareAndActive while on), the global default, or a saved session
+/// override. The overlay sits above every saved scope, so it is checked
+/// first; handler presence follows settings.
+fn active_requested_from(settings: &JevSettings) -> bool {
+    settings.full_jev_active()
+        || settings.global_default.is_some_and(JevMode::allows_active)
         || settings
             .sessions
             .values()
             .any(|session| session.mode.is_some_and(JevMode::allows_active))
+}
+
+fn active_mode_requested() -> bool {
+    active_requested_from(&load_settings_cached())
 }
 
 /// Add or remove the Active provider-request handler on every live bridge.
@@ -206,6 +569,22 @@ struct SessionBook {
     observed_tools: Vec<String>,
     turn: u64,
     trace: pi_jev::observation::TraceObserver,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): latest advisory skill hint.
+    /// Assessment only — it never loads or executes a skill.
+    skill_hint: Option<pi_jev::agent_guidance::SkillHint>,
+    /// The turn the stored hint was assessed for. A hint is served to the
+    /// system prompt only while the session is still on that turn, so a new
+    /// task never inherits the previous task's hint (root wiring contract).
+    skill_hint_turn: u64,
+    /// ROOT blocker-3: local fingerprint of the FULL host task text (the raw
+    /// Input text, hashed in-process; no raw text is stored or sent). The
+    /// hint stamp binds to this identity, so two different tasks that share
+    /// a bounded-excerpt prefix hash apart.
+    task_identity: Option<String>,
+    /// ROOT blocker-3 delivery identity: the host delivery (prepared turn
+    /// action) id currently executing. Two genuinely new deliveries with
+    /// byte-identical text can never reuse the previous hint.
+    delivery_id: Option<String>,
 }
 
 struct JevBridgeCore {
@@ -213,10 +592,19 @@ struct JevBridgeCore {
     /// with; a credential rotation (or transport change) rebuilds it.
     observer: Mutex<Option<ObserverBuild>>,
     sessions: Mutex<HashMap<String, SessionBook>>,
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): the session's already-loaded
+    /// model-visible skill roster, pushed by the host before prompt build.
+    /// Catalog metadata only — no filesystem authority, no load capability.
+    skill_roster: Mutex<Vec<Skill>>,
     run_metrics: crate::core::jev_run_metrics::JevRunMetrics,
     /// Weak handle to this core's registered extension, so Active-handler
     /// presence can follow the setting at runtime.
     extension: Mutex<Weak<Mutex<Extension>>>,
+    /// Per-session hint listeners registered by the host session (root
+    /// blocker-1 seam): invoked whenever a session's stored hint state
+    /// changes, so the session re-derives its request system prompt and the
+    /// NEXT provider request consumes the new state.
+    hint_listeners: Mutex<HashMap<String, Arc<dyn Fn() + Send + Sync>>>,
 }
 
 struct ObserverBuild {
@@ -234,8 +622,10 @@ impl JevBridgeCore {
         Self {
             observer: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            skill_roster: Mutex::new(Vec::new()),
             run_metrics: crate::core::jev_run_metrics::JevRunMetrics::new(std::path::PathBuf::from(get_agent_dir())),
             extension: Mutex::new(Weak::new()),
+            hint_listeners: Mutex::new(HashMap::new()),
         }
     }
 
@@ -288,6 +678,29 @@ impl JevBridgeCore {
         // Redacted while the excerpt is built: this text is later sent to
         // SystemOne as `user_text_excerpt`.
         book.last_task_excerpt = Some(pi_jev::redact::bounded_excerpt(text, 400));
+        // Root blocker-3: the STAMP binds to the FULL task text, fingerprinted
+        // locally (the raw text never leaves the process in the stamp).
+        book.task_identity = Some(pi_jev::agent_guidance::guidance_stamp_hash(&[text]));
+    }
+
+    /// Root blocker-3: the full host task text's local fingerprint (the
+    /// stamp's task identity), recorded at Input time.
+    fn task_identity(&self, session_id: &str) -> Option<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .and_then(|book| book.task_identity.clone())
+    }
+
+    /// Root blocker-3: the CURRENT host delivery id for stamp binding.
+    fn delivery_id(&self, session_id: &str) -> String {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .and_then(|book| book.delivery_id.clone())
+            .unwrap_or_default()
     }
 
     fn task_excerpt(&self, session_id: &str) -> Option<String> {
@@ -321,11 +734,133 @@ impl JevBridgeCore {
             .unwrap_or_default()
     }
 
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): cache the session's
+    /// model-visible roster (already-loaded metadata; bounded defensively).
+    fn set_skill_roster(&self, skills: &[Skill]) {
+        const MAX_ROSTER_CACHE: usize = 128;
+        let mut roster = self.skill_roster.lock().unwrap_or_else(|p| p.into_inner());
+        *roster = skills.iter().take(MAX_ROSTER_CACHE).cloned().collect();
+    }
+
+    fn cached_skill_roster(&self) -> Vec<Skill> {
+        self.skill_roster.lock().unwrap_or_else(|p| p.into_inner()).clone()
+    }
+
+    fn store_skill_hint(&self, session_id: &str, turn: u64, hint: Option<pi_jev::agent_guidance::SkillHint>) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if sessions.len() >= MAX_TRACKED_SESSIONS && !sessions.contains_key(session_id) { return; }
+        let book = sessions.entry(session_id.to_string()).or_default();
+        book.skill_hint = hint;
+        book.skill_hint_turn = turn;
+    }
+
+    /// Root blocker-1 seam, host side: the session registers a listener so a
+    /// hint-state change can refresh the request-local prompt derivation.
+    fn set_hint_listener(&self, session_id: &str, listener: Arc<dyn Fn() + Send + Sync>) {
+        self.hint_listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .insert(session_id.to_string(), listener);
+    }
+
+    fn notify_hint_listener(&self, session_id: &str) {
+        let listener = self
+            .hint_listeners
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .cloned();
+        if let Some(listener) = listener {
+            listener();
+        }
+    }
+
+    /// The hint is served only while the session is still on the turn it was
+    /// assessed for: a new task (turn advanced) never inherits it.
+    fn skill_hint_for(&self, session_id: &str) -> Option<pi_jev::agent_guidance::SkillHint> {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(session_id)
+            .filter(|book| book.turn == book.skill_hint_turn)
+            .and_then(|book| book.skill_hint.clone())
+    }
+
+    /// Advisory skill suggestion over the already-loaded roster: Compare only
+    /// OBSERVES the closed-set question; Active additionally DECIDES it with an
+    /// empty appliable policy (nothing can ever apply) and stores the hint for
+    /// the system prompt. Assessment only — never loads or executes a skill.
+    /// The CURRENT authoritative hint-stamp facts for this session (root
+    /// wiring contract). Production captures it BEFORE the decide is awaited
+    /// and compares a freshly resolved copy at store; consumption re-derives
+    /// it per request. Strict equality only: any drift fails open to NoHint.
+    fn current_hint_stamp_with(
+        &self,
+        session_id: &str,
+        settings: &JevSettings,
+        feature_enabled: bool,
+        turn: u64,
+        roster: &[Skill],
+    ) -> pi_jev::agent_guidance::SkillHintStamp {
+        // Root blocker-3: the catalog identity covers id AND description
+        // (the assessed entries), and the task identity is the FULL host
+        // task text's local fingerprint, not the bounded presentation excerpt.
+        // The revision label derives from the PASSED settings' durable write
+        // revision plus the process observed-change counter, so a post-await
+        // re-derivation from a FRESH durable load catches any authoritative
+        // write (including A->B->A) that happened during the await.
+        let catalog =
+            crate::core::jev_agent_guidance::skill_roster_view_with_skips(roster).0;
+        let task_identity = self.task_identity(session_id).unwrap_or_default();
+        let revision = format!("w{}:o{}", settings.write_revision, SETTINGS_REVISION.load(Ordering::SeqCst));
+        crate::core::jev_agent_guidance::skill_hint_stamp(
+            &revision,
+            settings.effective_mode(session_id).as_str(),
+            feature_enabled,
+            turn,
+            &self.delivery_id(session_id),
+            &task_identity,
+            &catalog,
+        )
+    }
+
+    /// ROOT-CONTRACT v7 (Agent-guidance lane), compare-only battery: record the
+    /// skill-suggestion assessment as a record-only comparison. The outgoing
+    /// state IS the adapter's verified state (`PreparedGuidance.state`) — the
+    /// exact bytes `verify_guidance_request` validated — merged into a clone of
+    /// the real event envelope (session/turn/correlation untouched).
+    async fn observe_skill_suggestion_compare(
+        &self,
+        session_id: &str,
+        payload: &Value,
+        observer: &Arc<JevObserver>,
+        mode: JevMode,
+    ) {
+        let roster = self.cached_skill_roster();
+        if roster.is_empty() { return; }
+        let Some(prepared) = crate::core::jev_agent_guidance::prepare_skill_suggestion(
+            self.task_excerpt(session_id).as_deref().unwrap_or(""), &roster,
+        ) else { return; };
+        let mut dispatch_payload = payload.clone();
+        dispatch_payload["state"] = prepared.state.clone();
+        observer.observe_prepared(&dispatch_payload, "skill_suggestion", prepared.questions);
+    }
+
+
     fn forget_session(&self, session_id: &str) {
         self.sessions
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .remove(session_id);
+    }
+
+    /// Root blocker-3: note the CURRENT host delivery id (prepared turn
+    /// action) so the hint stamp binds to the genuine delivery, not just the
+    /// task text. Called at the commit seam before each real run.
+    fn note_delivery(&self, session_id: &str, delivery_id: &str) {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .entry(session_id.to_string())
+            .or_default()
+            .delivery_id = Some(delivery_id.to_string());
     }
 
     fn note_turn(&self, session_id: &str, turn: u64) {
@@ -371,10 +906,10 @@ impl JevBridgeCore {
         };
         // Only explicitly enabled observational categories run in Active-only mode.
         let Some(core) = bridge_for_session(session_id) else { return; };
-        let Some((_, mut payload)) = bridge_event(&core, event, ctx, session_id, handler_event) else { return; };
+        let Some((_, mut payload)) = bridge_event(&core, event, ctx, session_id, handler_event, &settings) else { return; };
         payload["policy_generation"] = json!(decision_policy_generation(&settings,session_id));
         payload["state"]["features"] = json!(features);
-        let Some(observer) = self.observer(session_id, ctx.ui()) else { return; };
+        let Some(observer) = self.observer(session_id, Some(ctx.ui())) else { return; };
         let state = payload.get("state").cloned().unwrap_or(Value::Null);
         let Ok(snapshot) = pi_jev::snapshot::StateSnapshot::new(stage, session_id, self.turn(session_id), 0, None, state, Vec::new()) else { return; };
         let mut questions = Vec::new();
@@ -432,15 +967,15 @@ impl JevBridgeCore {
     /// Lazily construct the observer on the first Compare-mode event, and
     /// rebuild it when the effective credential changes (rotation). In Off
     /// nothing is ever constructed.
-    fn observer(&self, session_id: &str, ui: Arc<dyn crate::core::extensions::types::ExtensionUiContext>) -> Option<Arc<JevObserver>> {
+    fn observer(&self, session_id: &str, ui: Option<Arc<dyn crate::core::extensions::types::ExtensionUiContext>>) -> Option<Arc<JevObserver>> {
         let settings = load_settings_cached();
         if !settings.effective_mode(session_id).is_enabled() && !settings.effective_compaction_enabled(session_id) {
             return None;
         }
-        // Cheap change probe BEFORE any credential read or client build: the
-        // transport selector, the credential envelope's stamp and the env
-        // presence booleans. No DPAPI decrypt and no reqwest client on the
-        // hot path when nothing changed.
+        // Cached fast path: the cheap change probe (transport selector,
+        // credential envelope stamp, env presence booleans) before any
+        // credential read or client build. No DPAPI decrypt and no reqwest
+        // client on the hot path when nothing changed.
         let cheap = cheap_credential_stamp(&settings);
         if let Some(cached) = self
             .observer
@@ -477,16 +1012,34 @@ impl JevBridgeCore {
         // same cached settings the handlers use (one cheap read per event).
         let observed_stamp = cheap.clone();
         let independent_stamp = cheap.clone();
+        let authoritative_stamp = cheap.clone();
         let footer_session = session_id.to_string();
+        let on_terminal = ui.map(|ui| {
+            let footer_session = footer_session.clone();
+            Arc::new(move |session_id: &str| {
+                if session_id == footer_session {
+                    ui.set_status("jev".into(), Some(footer_status_text(session_id)));
+                }
+            }) as Arc<dyn Fn(&str) + Send + Sync>
+        });
         let config = pi_jev::hooks::JevObserverConfig {
             mode_gate: Arc::new(move |session_id: Option<&str>| {
                 // Dispatch and completion use current settings, not the event
                 // cache: a queued request cannot outlive Off/key rotation.
+                // ROOT-CONTRACT v9: the SAME single load also resolves the
+                // requested Jev model, so a request's mode gate and its
+                // `model` field can never disagree; both are captured at the
+                // boundary BEFORE any await. No late global getter is mixed
+                // into an old payload; the durable write_revision invalidates
+                // held work across model A->B->A at the apply boundary.
                 let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
                 if cheap_credential_stamp(&current) != observed_stamp {
-                    return JevMode::Off;
+                    return (JevMode::Off, current.requested_model_or_default().to_string());
                 }
-                current.effective_mode(session_id.unwrap_or(""))
+                (
+                    current.effective_mode(session_id.unwrap_or("")),
+                    current.requested_model_or_default().to_string(),
+                )
             }),
             policy_generation: Arc::new(|session_id, independent| {
                 let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
@@ -496,15 +1049,42 @@ impl JevBridgeCore {
                     decision_policy_generation(&current, session_id)
                 }
             }),
+            authoritative_gate: Some(Arc::new(move |session_id, independent| {
+                // One durable snapshot supplies mode, requested model, feature/
+                // compaction generation and permission. This prevents a newer
+                // model from being combined with features/generation captured
+                // by an older payload.
+                let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
+                let session_id = session_id.unwrap_or("");
+                let credential_current =
+                    cheap_credential_stamp(&current) == authoritative_stamp;
+                let mode = if credential_current {
+                    current.effective_mode(session_id)
+                } else {
+                    JevMode::Off
+                };
+                let policy_generation = if independent {
+                    compaction_policy_generation(&current, session_id)
+                } else {
+                    decision_policy_generation(&current, session_id)
+                };
+                let allowed = if independent {
+                    credential_current && current.effective_compaction_enabled(session_id)
+                } else {
+                    credential_current && mode.is_enabled()
+                };
+                pi_jev::hooks::JevRequestGate {
+                    mode,
+                    requested_model: current.requested_model_or_default().to_string(),
+                    policy_generation,
+                    allowed,
+                }
+            })),
             independent_gate: Arc::new(move |session_id| {
                 let current = pi_jev::config::JevSettingsStore::new(get_agent_dir()).load();
                 cheap_credential_stamp(&current) == independent_stamp && current.effective_compaction_enabled(session_id)
             }),
-            on_terminal: Some(Arc::new(move |session_id| {
-                if session_id == footer_session {
-                    ui.set_status("jev".into(), Some(footer_status_text(session_id)));
-                }
-            })),
+            on_terminal,
             ..pi_jev::hooks::JevObserverConfig::default()
         };
         let records_path = std::path::Path::new(&get_agent_dir())
@@ -555,11 +1135,14 @@ fn credential_stamp_at(settings: &JevSettings, agent_dir: &std::path::Path) -> S
         .map(|value| pi_jev::credential::SecretString::new(value).key_fingerprint())
         .unwrap_or_default();
     format!(
-        "cheap:{transport_selector}:{modified}:{len}:{typesafe}:{jev}",
+        "cheap:{transport_selector}:{modified}:{len}:{typesafe}:{jev}:{full_jev}",
         modified = envelope.0,
         len = envelope.1,
         typesafe = env_fingerprint(pi_jev::config::ENV_TYPESAFE_API_KEY),
         jev = env_fingerprint(pi_jev::config::ENV_JEV_API_KEY),
+        // The full-jev overlay changes every effective resolution; a toggle
+        // must invalidate in-flight work exactly like a key rotation.
+        full_jev = settings.full_jev_stamp(),
     )
 }
 
@@ -637,6 +1220,36 @@ fn build_transport(
                     "mock-malformed".to_string(),
                 );
             }
+            // Test-only fixture for the native skill-hint wiring capture: a
+            // REQUEST-AWARE transport that answers suggestion decides with a
+            // fixed hint/no-hint/hint sequence (need high, inverse low, act
+            // high, decisive rank on alpha-skill; then rank `none`; then hint)
+            // and answers every OTHER shadow-battery request with valid
+            // per-type fixture answers. Debug assertions only; production
+            // ignores unknown transport values entirely.
+            Some("mock-hint") => {
+                return (
+                    Arc::new(HintFixtureTransport::default()),
+                    synthetic_credential(),
+                    "mock-hint".to_string(),
+                );
+            }
+            // Test-only fixture for the native CONTROL/compaction held-identity
+            // regressions: a REQUEST-AWARE transport. The test installs an
+            // optional response callback (used to perform REAL authoritative
+            // settings saves from inside the decide await) and every call is
+            // recorded (question ids + the v9 requested-model stamp only; no
+            // raw state content is retained). Without a callback it answers
+            // every request with valid per-type fixture answers, exactly like
+            // the hint fixture's shadow batteries. Debug assertions only;
+            // production ignores unknown transport values entirely.
+            Some("mock-control") => {
+                return (
+                    Arc::new(ControlFixtureTransport),
+                    synthetic_credential(),
+                    "mock-control".to_string(),
+                );
+            }
             _ => {}
         }
     }
@@ -665,6 +1278,64 @@ fn build_transport(
     }
 }
 
+#[cfg(test)]
+static TEST_CATALOG_TRANSPORT: OnceLock<Mutex<Option<Arc<dyn pi_jev::types::Transport>>>> =
+    OnceLock::new();
+
+/// Install or clear the native-command catalog transport in library tests.
+/// This seam is compiled out of non-test builds; it exists only so the real
+/// `/jev models` dispatch can prove one successful provider call offline.
+#[cfg(test)]
+pub(crate) fn set_test_catalog_transport(
+    transport: Option<Arc<dyn pi_jev::types::Transport>>,
+) {
+    *TEST_CATALOG_TRANSPORT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = transport;
+}
+
+/// ROOT-CONTRACT v9: transport + limits for the EXPLICIT `/jev models` catalog
+/// command ONLY. Reuses the single `build_transport` selection path: debug
+/// mock selectors stay debug-only (a scripted mock either serves a catalog
+/// step or reports an honest `Internal`), and release builds use the SAME
+/// credential order (saved credential, then env) against the documented
+/// endpoint with the default limits. Returns `None` when no usable credential
+/// is configured so the command reports honest unavailability WITHOUT any
+/// network attempt. This helper performs no I/O of its own; the single bounded
+/// catalog fetch happens only in the explicit command handler. Nothing here
+/// selects a model or writes settings.
+pub(crate) fn catalog_transport_for_command(
+    settings: &JevSettings,
+) -> Option<(
+    Arc<dyn pi_jev::types::Transport>,
+    pi_jev::client::JevLimits,
+)> {
+    #[cfg(test)]
+    if let Some(transport) = TEST_CATALOG_TRANSPORT
+        .get_or_init(|| Mutex::new(None))
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        return Some((transport, pi_jev::client::JevLimits::default()));
+    }
+    let (transport, _credential, fingerprint) = build_transport(settings);
+    if fingerprint == "no_credential" || fingerprint == "unavailable" {
+        return None;
+    }
+    Some((transport, pi_jev::client::JevLimits::default()))
+}
+
+/// ROOT-CONTRACT v9: the effective credential for the `/jev model set`
+/// credential-overlap refusal ONLY. The value stays in memory inside the
+/// `SecretString`; it is never logged, echoed or persisted. Returns `None`
+/// when no credential is configured — the overlap check then cannot fire,
+/// which is safe because there is no secret to overlap.
+pub(crate) fn credential_for_model_overlap() -> Option<pi_jev::credential::SecretString> {
+    load_credential()
+}
+
 /// Development/test-only transport: valid-shaped, maximum-confidence
 /// adversarial answers (mock-hostile). Proves nothing Jev says can act.
 /// Selected only via the settings `transport` override; never by default.
@@ -682,7 +1353,378 @@ impl pi_jev::types::Transport for HostileTestTransport {
     }
 }
 
-/// Deterministic truncated payload for the mock-malformed test transport.
+/// Fixed decide-answer bodies for the debug-only `mock-hint` transport:
+/// a HINT-shaped set (decisive rank on alpha-skill; need high, inverse low,
+/// act high, fit high) and a NO-HINT set (rank abstains to `none`).
+/// Test-only request-aware fixture transport for `mock-hint` (debug builds).
+/// The suggestion decide is keyed on the request's ACTUAL assessed state —
+/// `request.state["user_text_excerpt"]`, the verified `PreparedGuidance.state`
+/// the adapter disclosed — so the fixture answers by task identity, never by
+/// call order: an excerpt containing "alpha retry policy" gets the
+/// hint-shaped answer set, "beta cleanup flow" gets the rank-`none` set, and
+/// every other (shadow-battery) request gets valid per-type fixture answers.
+#[derive(Default)]
+struct HintFixtureTransport;
+
+/// Test-only scratchpad for the `mock-hint` fixture transport (debug builds):
+/// the state and question ids of the most recent skill-suggestion decide that
+/// reached the transport.
+#[cfg(debug_assertions)]
+static HINT_FIXTURE_LAST_SUGGESTION: std::sync::Mutex<Option<(serde_json::Value, Vec<String>)>> =
+    std::sync::Mutex::new(None);
+
+impl HintFixtureTransport {
+    /// The rank answer is built from the request's ACTUAL criteria: the
+    /// catalog is whatever roster the consumer seam noted (project skills plus
+    /// any user-scope skills), so the fixture can never assume fixed ids. The
+    /// hint case ranks the first catalog id decisively; the none case ranks
+    /// `none`. Both keep the documented shape: choice = argmax, distribution
+    /// keys = criteria keys, sum 1, confidence in range.
+    fn suggestion_body(excerpt: &str, criteria_keys: &[String]) -> serde_json::Value {
+        let hint = excerpt.contains("alpha retry policy");
+        let ranked: String = criteria_keys
+            .iter()
+            .filter(|id| id.as_str() != "none")
+            .next()
+            .cloned()
+            .unwrap_or_else(|| "none".to_string());
+        // Every criteria key is present; the mass concentrates on the choice
+        // so the documented argmax rule holds and the sum is exactly 1.
+        let mut probabilities = std::collections::BTreeMap::new();
+        for id in criteria_keys {
+            probabilities.insert(id.clone(), 0.0_f64);
+        }
+        if hint {
+            *probabilities.entry(ranked.clone()).or_insert(0.0) = 0.9;
+            *probabilities.entry("none".to_string()).or_insert(0.0) = 0.1;
+        } else {
+            *probabilities.entry("none".to_string()).or_insert(0.0) = 1.0;
+        }
+        let choice = if hint { ranked } else { "none".to_string() };
+        // The adapter prepares rank + three gates (ids .0-.3); the fit second
+        // pass (.4) is never prepared by the adapter, so it is never answered.
+        json!({
+            "model": "jev-mock-hint/1",
+            "answers": {
+                "skill_suggestion.0": {
+                    "type": "choice",
+                    "choice": choice,
+                    "probabilities": probabilities,
+                    "confidence": 0.9
+                },
+                "skill_suggestion.1": {"type": "noul", "noul": 0.9},
+                "skill_suggestion.2": {"type": "noul", "noul": 0.1},
+                "skill_suggestion.3": {"type": "noul", "noul": 0.9}
+            },
+            "usage": {"input_tokens": 5, "output_tokens": 5}
+        })
+    }
+}
+
+impl pi_jev::types::Transport for HintFixtureTransport {
+    fn post(
+        &self,
+        request: &pi_jev::types::SystemOneRequest,
+        _timeout: Duration,
+    ) -> pi_jev::types::BoxFuture<Result<pi_jev::types::SystemOneResponse, pi_jev::error::JevError>> {
+        let is_suggestion = request
+            .questions
+            .keys()
+            .any(|id| id.starts_with("skill_suggestion."));
+        if is_suggestion {
+            let excerpt = request
+                .state
+                .get("user_text_excerpt")
+                .and_then(serde_json::Value::as_str)
+                .unwrap_or("")
+                .to_string();
+            #[cfg(debug_assertions)]
+            {
+                *HINT_FIXTURE_LAST_SUGGESTION
+                    .lock()
+                    .unwrap_or_else(|p| p.into_inner()) =
+                    Some((request.state.clone(), request.questions.keys().cloned().collect()));
+                HINT_FIXTURE_SUGGESTION_CALLS
+                    .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                // Clone under the fixture mutex, then drop the guard before
+                // invoking user test code. The callback may inspect fixture
+                // state or schedule an abort and must never self-deadlock.
+                let callback = {
+                    HINT_FIXTURE_ON_SUGGESTION
+                        .lock()
+                        .unwrap_or_else(|p| p.into_inner())
+                        .clone()
+                };
+                if let Some(callback) = callback {
+                    callback();
+                }
+            }
+            let criteria_keys: Vec<String> = request
+                .questions
+                .get("skill_suggestion.0")
+                .and_then(|spec| match spec {
+                    pi_jev::types::QuestionSpec::Choice { criteria, .. } => {
+                        Some(criteria.keys().cloned().collect())
+                    }
+                    _ => None,
+                })
+                .unwrap_or_default();
+            let response = {
+                let raw = Self::suggestion_body(&excerpt, &criteria_keys);
+                pi_jev::client::parse_systemone_body(raw.to_string().as_bytes())
+                    .unwrap_or_else(|_| pi_jev::types::SystemOneResponse::default())
+            };
+            #[cfg(debug_assertions)]
+            let hold = std::time::Duration::from_millis(
+                HINT_FIXTURE_HOLD_MS.load(std::sync::atomic::Ordering::SeqCst),
+            );
+            return Box::pin(async move {
+                #[cfg(debug_assertions)]
+                if !hold.is_zero() {
+                    tokio::time::sleep(hold).await;
+                }
+                Ok(response)
+            });
+        }
+        // Shadow batteries: valid per-type fixture answers for the actual
+        // request's question specs (never the suggestion bodies).
+        let mut answers = std::collections::BTreeMap::new();
+        for (id, spec) in &request.questions {
+            answers.insert(id.clone(), pi_jev::mock::valid_answer_for(spec));
+        }
+        let response = pi_jev::types::SystemOneResponse {
+            model: "jev-mock-hint/1".to_string(),
+            answers,
+            usage: pi_jev::types::Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(5),
+            },
+            ..pi_jev::types::SystemOneResponse::default()
+        };
+        Box::pin(async move { Ok(response) })
+    }
+}
+
+/// Test-only accessors for the `mock-hint` fixture transport of the LIVE
+/// bridge core (debug builds): the state and question ids of the most recent
+/// skill-suggestion decide that reached the transport. The hint-lane capture
+/// test asserts the wire state equals the adapter's verified state and that
+/// the request survived native bounding.
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_last_suggestion() -> Option<(serde_json::Value, Vec<String>)> {
+    HINT_FIXTURE_LAST_SUGGESTION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner())
+        .clone()
+}
+
+/// Test-only cancellation window for the `mock-hint` fixture transport
+/// (debug builds). The timer-backed hold is explicitly capped, defaults to
+/// zero, and changes no production cadence in release builds.
+#[cfg(debug_assertions)]
+static HINT_FIXTURE_ON_SUGGESTION:
+    std::sync::Mutex<Option<std::sync::Arc<dyn Fn() + Send + Sync>>> =
+    std::sync::Mutex::new(None);
+#[cfg(debug_assertions)]
+const HINT_FIXTURE_MAX_HOLD_MS: u64 = 5_000;
+#[cfg(debug_assertions)]
+static HINT_FIXTURE_HOLD_MS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+#[cfg(debug_assertions)]
+static HINT_FIXTURE_SUGGESTION_CALLS: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_on_suggestion(
+    callback: Option<std::sync::Arc<dyn Fn() + Send + Sync>>,
+) {
+    *HINT_FIXTURE_ON_SUGGESTION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = callback;
+}
+
+/// Set a debug-only post-callback fixture hold. Values above five seconds are
+/// capped; zero restores the unchanged default behavior.
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_set_hold_ms(ms: u64) {
+    HINT_FIXTURE_HOLD_MS.store(
+        ms.min(HINT_FIXTURE_MAX_HOLD_MS),
+        std::sync::atomic::Ordering::SeqCst,
+    );
+}
+
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_suggestion_calls() -> u64 {
+    HINT_FIXTURE_SUGGESTION_CALLS.load(std::sync::atomic::Ordering::SeqCst)
+}
+
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_reset() {
+    *HINT_FIXTURE_LAST_SUGGESTION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    *HINT_FIXTURE_ON_SUGGESTION
+        .lock()
+        .unwrap_or_else(|p| p.into_inner()) = None;
+    HINT_FIXTURE_HOLD_MS.store(0, std::sync::atomic::Ordering::SeqCst);
+    HINT_FIXTURE_SUGGESTION_CALLS.store(0, std::sync::atomic::Ordering::SeqCst);
+}
+
+/// Debug-build disclosure derived from the ACTUAL model-visible roster most
+/// recently pushed by the session consumer seam. Uses the production
+/// visibility, safe-id and truncation rules rather than a second loader.
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_roster_disclosure(
+    session_id: &str,
+) -> Option<(usize, bool, usize)> {
+    let core = bridge_for_session(session_id)?;
+    let roster = core.cached_skill_roster();
+    let (entries, truncated, skipped) =
+        crate::core::jev_agent_guidance::skill_roster_view_with_skips(&roster);
+    Some((entries.len(), truncated, skipped))
+}
+
+/// Bounded scheduler counters for native hint fixture settlement checks. No
+/// request state, roster text, prompt content, or credential is exposed.
+#[cfg(debug_assertions)]
+pub fn debug_hint_fixture_observer_status(session_id: &str) -> Option<Value> {
+    let core = bridge_for_session(session_id)?;
+    let observer = core.observer(session_id, None)?;
+    observer.session_status(session_id)
+}
+
+/// Test-only scratchpad for the `mock-control` fixture transport (debug
+/// builds): an optional response callback plus one bounded capture entry per
+/// call (question ids + the v9 requested-model stamp). No raw state content,
+/// no credential, no ordering assumptions — the test reads the capture after
+/// the turn settles.
+#[cfg(debug_assertions)]
+struct ControlFixtureScript {
+    respond: Option<
+        Arc<
+            dyn Fn(
+                    &pi_jev::types::SystemOneRequest,
+                ) -> Option<pi_jev::types::SystemOneResponse>
+                + Send
+                + Sync,
+        >,
+    >,
+    calls: Vec<serde_json::Value>,
+}
+
+#[cfg(debug_assertions)]
+static CONTROL_FIXTURE: std::sync::Mutex<Option<ControlFixtureScript>> =
+    std::sync::Mutex::new(None);
+
+/// Fixture transport for the CONTROL/compaction held-identity regressions.
+/// Answers from the test callback when installed, otherwise with valid
+/// per-type fixture answers (shadow-battery discipline). Never fabricated
+/// provenance: it is data-only, like every mock selector here.
+#[derive(Default)]
+struct ControlFixtureTransport;
+
+impl pi_jev::types::Transport for ControlFixtureTransport {
+    fn post(
+        &self,
+        request: &pi_jev::types::SystemOneRequest,
+        _timeout: std::time::Duration,
+    ) -> pi_jev::types::BoxFuture<
+        Result<pi_jev::types::SystemOneResponse, pi_jev::error::JevError>,
+    > {
+        #[cfg(debug_assertions)]
+        {
+            let respond = {
+                let mut guard = CONTROL_FIXTURE
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner());
+                let script = guard.get_or_insert_with(|| ControlFixtureScript {
+                    respond: None,
+                    calls: Vec::new(),
+                });
+                // Bounded capture: question ids + requested-model identity.
+                script.calls.push(serde_json::json!({
+                    "question_ids": request
+                        .questions
+                        .keys()
+                        .cloned()
+                        .collect::<Vec<String>>(),
+                    "model": request.model.clone(),
+                    "fixture_lane": request.state
+                        .get("_jev_fixture_lane")
+                        .and_then(serde_json::Value::as_str),
+                }));
+                script.respond.clone()
+            };
+            // The callback can inspect capture and save authoritative settings,
+            // so never invoke it while the fixture scratchpad lock is held.
+            if let Some(response) = respond.and_then(|respond| respond(request)) {
+                return Box::pin(async move { Ok(response) });
+            }
+        }
+        let mut answers = std::collections::BTreeMap::new();
+        for (id, spec) in &request.questions {
+            answers.insert(id.clone(), pi_jev::mock::valid_answer_for(spec));
+        }
+        let response = pi_jev::types::SystemOneResponse {
+            model: "jev-mock-control/1".to_string(),
+            answers,
+            usage: pi_jev::types::Usage {
+                input_tokens: Some(5),
+                output_tokens: Some(5),
+            },
+            ..pi_jev::types::SystemOneResponse::default()
+        };
+        Box::pin(async move { Ok(response) })
+    }
+}
+
+/// Install the test's response callback for the `mock-control` transport
+/// (debug builds). The callback may perform REAL authoritative settings saves
+/// through independent store instances — this is the mid-await write window
+/// the held-identity regressions exercise. Pass `None` to use the valid
+/// per-type fallback answers only.
+#[cfg(debug_assertions)]
+pub fn debug_control_fixture_set_respond(
+    respond: Option<
+        Box<
+            dyn Fn(
+                    &pi_jev::types::SystemOneRequest,
+                ) -> Option<pi_jev::types::SystemOneResponse>
+                + Send
+                + Sync,
+        >,
+    >,
+) {
+    let mut guard = CONTROL_FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let script = guard.get_or_insert_with(|| ControlFixtureScript {
+        respond: None,
+        calls: Vec::new(),
+    });
+    script.respond = respond.map(Arc::from);
+}
+
+/// The bounded call capture so far (question ids + requested-model stamp).
+#[cfg(debug_assertions)]
+pub fn debug_control_fixture_calls() -> Vec<serde_json::Value> {
+    CONTROL_FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .as_ref()
+        .map(|script| script.calls.clone())
+        .unwrap_or_default()
+}
+
+/// Clear the callback and the capture between tests.
+#[cfg(debug_assertions)]
+pub fn debug_control_fixture_reset() {
+    *CONTROL_FIXTURE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+}
+
+/// Deterministic truncated payload for the mock-malformed test transport./// Deterministic truncated payload for the mock-malformed test transport./// Deterministic truncated payload for the mock-malformed test transport.
 const TRUNCATED_MALFORMED_BODY: &str =
     r#"{"model":"jev-latest","answers":{"task_classification.0":{"#;
 
@@ -781,6 +1823,9 @@ fn make_handler(
                     // session's queued and in-flight comparison work so no
                     // late result can surface after the mode changed.
                     core.drop_decision_work(&session_id);
+                    // ROOT-CONTRACT v7: an Off session never keeps an advisory
+                    // skill hint cached — the next On activation starts clean.
+                    core.store_skill_hint(&session_id, 0, None);
                     if handler_event == "session_start" {
                         ctx.ui().set_status("jev".into(), Some(footer_status_text(&session_id)));
                     }
@@ -814,13 +1859,44 @@ fn make_handler(
                     core.observe_optional(&session_id, &event, &ctx, handler_event).await;
                     return None::<Value>;
                 }
-                let Some(observer) = core.observer(&session_id, ctx.ui()) else {
+                let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else {
                     return None::<Value>;
                 };
-                if let Some((event_type, payload)) =
-                    bridge_event(&core, &event, &ctx, &session_id, handler_event)
+                if let Some((event_type, mut payload)) =
+                    bridge_event(&core, &event, &ctx, &session_id, handler_event, &settings)
                 {
                     observer.observe(&event_type, &payload);
+                    // ROOT-CONTRACT v7 (Agent-guidance lane): the guardrail
+                    // batteries ride the existing boundary dispatch as their
+                    // OWN explicit requests (scheduler-cap aware; Compare and
+                    // CompareAndActive observe; nothing ever applies).
+                    let features = settings.effective_features(&session_id);
+                    payload["policy_generation"] = json!(decision_policy_generation(&settings, &session_id));
+                    if features.guardrails_input
+                        && matches!(event, ExtensionEvent::TurnStart(_) | ExtensionEvent::TurnEnd(_))
+                    {
+                        if let Some(excerpt) = payload.get("state")
+                            .and_then(|state| state.get("user_text_excerpt"))
+                            .and_then(Value::as_str)
+                        {
+                            if let Some(prepared) = crate::core::jev_agent_guidance::prepare_guardrail_battery("guardrails_input", excerpt) {
+                                observer.observe_prepared(&payload, "guardrails_input", prepared.questions);
+                            }
+                        }
+                    }
+                    if features.guardrails_output && matches!(event, ExtensionEvent::AgentEnd(_)) {
+                        if let Some(excerpt) = payload.get("state")
+                            .and_then(|state| state.get("result_excerpt"))
+                            .and_then(Value::as_str)
+                        {
+                            if let Some(prepared) = crate::core::jev_agent_guidance::prepare_guardrail_battery("guardrails_output", excerpt) {
+                                observer.observe_prepared(&payload, "guardrails_output", prepared.questions);
+                            }
+                        }
+                    }
+                    if features.skill_suggestion && matches!(event, ExtensionEvent::TurnStart(_)) {
+                        core.observe_skill_suggestion_compare(&session_id, &payload, &observer, mode).await;
+                    }
                     ctx.ui().set_status("jev".into(), Some(footer_status_text(&session_id)));
                 }
                 None::<Value>
@@ -847,7 +1923,7 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                 if !core.effective_mode(Some(&session_id)).allows_active() {
                     return None::<Value>;
                 }
-                let Some(observer) = core.observer(&session_id, ctx.ui()) else {
+                let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else {
                     return None::<Value>;
                 };
                 let mut params = payload.payload;
@@ -914,6 +1990,12 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                 }
                 if !observer.can_apply(&outcome) { effects.clear(); }
                 observer.record_active_with_action(&outcome, &effects, &request_action(&params));
+                // ROOT-CONTRACT v7 (Agent-guidance lane): the skill suggestion
+                // is its OWN awaited request at the pre-context
+                // `before_request` seam (agent_session hook), NOT here: this
+                // late boundary cannot change the request context already
+                // built for this request, and one assessment per provider
+                // request lives at that seam only.
                 ctx.ui()
                     .set_status("jev".into(), Some(footer_status_text(&session_id)));
                 if effects.is_empty() {
@@ -929,11 +2011,127 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
 }
 
 fn decision_policy_generation(settings: &JevSettings, session_id: &str) -> String {
-    json!([settings.effective_features(session_id), settings.filtering]).to_string()
+    // Bound to the SAME supplied authoritative snapshot (control-lane ABA
+    // finding): the durable write revision moves on every authoritative save,
+    // so an Off->On cycle or a model A->B->A reset changes this generation
+    // even when the serialized feature/filtering values return to identical
+    // bytes, and can_apply's fresh recheck refuses to apply any decision that
+    // crossed an Off window. The overlay stamp is included so overlay
+    // installs/removals are visible. No separate process counter and no fresh
+    // global getter is mixed into this snapshot; callers that need a fresh
+    // apply check load a fresh snapshot and call this with it.
+    json!([
+        settings.write_revision,
+        settings.full_jev_stamp(),
+        settings.effective_features(session_id),
+        settings.filtering,
+        settings.requested_model_or_default()
+    ]).to_string()
 }
 
 pub fn compaction_policy_generation(settings: &JevSettings, session_id: &str) -> String {
-    json!([settings.effective_compaction_enabled(session_id), settings.compaction]).to_string()
+    // Same-snapshot identity (control-lane ABA finding): the durable write
+    // revision + overlay stamp ride the independent-compaction generation so
+    // an Off->On or A->B->A authoritative write invalidates held independent
+    // work even when the serialized values return to identical bytes.
+    json!([
+        settings.write_revision,
+        settings.full_jev_stamp(),
+        settings.effective_compaction_enabled(session_id),
+        settings.compaction,
+        settings.requested_model_or_default()
+    ]).to_string()
+}
+
+/// ROOT-CONTRACT v7 (Agent-guidance lane): the host pushes the session's
+/// already-loaded model-visible skill roster before the prompt build. Catalog
+/// metadata only; the suggestion pool equals the prompt roster.
+pub fn note_session_skill_roster(session_id: &str, skills: &[Skill]) {
+    let Some(core) = bridge_for_session(session_id) else { return; };
+    core.set_skill_roster(skills);
+}
+
+/// The latest advisory skill hint for the session, if any. Assessment only.
+/// Served only while the guidance feature is enabled for the session and the
+/// hint belongs to the CURRENT turn; a disabled feature clears the cache so
+/// an Off->On activation never resurrects an ungoverned hint.
+pub fn current_skill_hint(session_id: &str) -> Option<pi_jev::agent_guidance::SkillHint> {
+    if !load_settings_cached().effective_features(session_id).skill_suggestion {
+        if let Some(core) = bridge_for_session(session_id) {
+            core.store_skill_hint(session_id, 0, None);
+        }
+        return None;
+    }
+    let core = bridge_for_session(session_id)?;
+    core.skill_hint_for(session_id)
+}
+
+/// The host notes the CURRENT delivery id (prepared turn action) at the
+/// commit seam (root blocker-3): the hint stamp binds to the genuine
+/// delivery, so two new deliveries with byte-identical task text can never
+/// reuse the previous request's hint.
+pub fn note_session_delivery(session_id: &str, delivery_id: &str) {
+    let Some(core) = bridge_for_session(session_id) else { return; };
+    core.note_delivery(session_id, delivery_id);
+}
+
+/// The host session registers a prompt-refresh listener for the session
+/// (root blocker-1): the bridge invokes it whenever the stored hint state
+/// changes, so the session re-derives the request prompt and the next
+/// provider request consumes it.
+pub fn set_skill_hint_listener(
+    session_id: &str,
+    listener: Arc<dyn Fn() + Send + Sync>,
+) {
+    let Some(core) = bridge_for_session(session_id) else { return; };
+    core.set_hint_listener(session_id, listener);
+}
+
+/// The CURRENT authoritative hint-stamp facts for the session (root wiring
+/// contract): settings revision, mode, feature flag, turn, bounded task
+/// excerpt and roster-identity hash. Production and consumption derive this
+/// the same way, so a stored hint renders only while every fact still
+/// matches; any drift fails open to no hint.
+pub fn current_skill_hint_stamp(
+    session_id: &str,
+    skills: &[crate::core::skills::Skill],
+) -> pi_jev::agent_guidance::SkillHintStamp {
+    let settings = load_settings_cached();
+    let features = settings.effective_features(session_id);
+    let mode = settings.effective_mode(session_id);
+    let revision = settings_revision();
+    // Root blocker-3: the catalog identity derives from the ACTUAL loaded
+    // skills the caller passes (the same list rendering the roster block),
+    // never from a possibly-stale bridge cache.
+    let catalog = crate::core::jev_agent_guidance::skill_roster_view_with_skips(skills).0;
+    let Some(core) = bridge_for_session(session_id) else {
+        return crate::core::jev_agent_guidance::skill_hint_stamp(
+            &revision,
+            mode.as_str(),
+            features.skill_suggestion,
+            0,
+            "",
+            "",
+            &catalog,
+        );
+    };
+    let task_identity = core.task_identity(session_id).unwrap_or_default();
+    crate::core::jev_agent_guidance::skill_hint_stamp(
+        &revision,
+        mode.as_str(),
+        features.skill_suggestion,
+        core.turn(session_id),
+        &core.delivery_id(session_id),
+        &task_identity,
+        &catalog,
+    )
+}
+
+/// v5 usage knownness for compaction stats: Some(n) — including a measured
+/// zero — is emitted; None (UNKNOWN) is omitted. Never fabricates a zero.
+fn record_usage_stats(usage: &pi_jev::types::Usage, stats: &mut Value) {
+    if let Some(tokens) = usage.input_tokens { stats["jev_input_tokens"] = json!(tokens); }
+    if let Some(tokens) = usage.output_tokens { stats["jev_output_tokens"] = json!(tokens); }
 }
 
 pub fn record_compaction_skip(ctx: Arc<dyn ExtensionContext>, reason: &str, stats: Value) {
@@ -946,6 +2144,8 @@ pub fn record_compaction_skip(ctx: Arc<dyn ExtensionContext>, reason: &str, stat
         stage:"compaction".to_string(),state_fingerprint:String::new(),
         state_schema_version:pi_jev::snapshot::STATE_SCHEMA_VERSION.to_string(),
         prompt_version:pi_jev::hooks::PROMPT_VERSION.to_string(), mode:settings.effective_mode(&session_id).as_str().to_string(),
+        requested_model:settings.requested_model_or_default().to_string(),
+        policy_generation:compaction_policy_generation(&settings, &session_id),
         questions:Vec::new(),baselines:BTreeMap::new(),request_start_ts:pi_jev::client::utc_now_rfc3339(),
     };
     let records=std::path::PathBuf::from(get_agent_dir()).join("jev").join("records.jsonl");
@@ -971,8 +2171,8 @@ impl CompactionDecision {
     pub fn record_compaction(&self, mut stats: Value, fallback: Option<&str>) {
         let Some(ctx) = &self.boundary.context else { return; };
         let reason = if self.can_apply() { self.fallback_reason().or(fallback) } else { Some("cancelled_or_policy_changed") };
-        if self.outcome.usage.input_tokens > 0 { stats["jev_input_tokens"] = json!(self.outcome.usage.input_tokens); }
-        if self.outcome.usage.output_tokens > 0 { stats["jev_output_tokens"] = json!(self.outcome.usage.output_tokens); }
+        // v5 usage knownness: Some(n) (including a measured zero) is emitted, None (UNKNOWN) is omitted.
+        record_usage_stats(&self.outcome.usage, &mut stats);
         let attempts = self.boundary.raw.as_ref().map(|raw|raw.attempts).unwrap_or(u32::from(self.boundary.dispatched));
         let known = self.boundary.raw.is_some() || !self.boundary.dispatched;
         self.observer.correlator().record_compaction(ctx, self.outcome.response_model.as_deref(), attempts, known,
@@ -986,7 +2186,7 @@ pub async fn decide_compaction(ctx: Arc<dyn ExtensionContext>, mut bundle: pi_je
     let settings = load_settings_cached();
     if !settings.effective_compaction_enabled(&session_id) || signal.as_ref().is_some_and(|signal| signal.is_cancelled()) { return None; }
     let core = bridge_for_session(&session_id)?;
-    let observer = core.observer(&session_id, ctx.ui())?;
+    let observer = core.observer(&session_id, Some(ctx.ui()))?;
     let captured_generation = bundle.state.as_object_mut().and_then(|state| state.remove("_jev_policy_generation"))
         .and_then(|value| value.as_str().map(str::to_string))?;
     let payload = json!({"session_id":session_id, "turn":core.turn(&session_id), "state":bundle.state,
@@ -1005,7 +2205,7 @@ async fn relevance_decision(ctx: &Arc<dyn ExtensionContext>, prepared: &crate::c
     let session_id = ctx.session_manager().get_session_id();
     let mode = settings.effective_mode(&session_id);
     let core = bridge_for_session(&session_id)?;
-    let observer = core.observer(&session_id, ctx.ui())?;
+    let observer = core.observer(&session_id, Some(ctx.ui()))?;
     let payload = json!({"session_id":session_id, "turn":core.turn(&session_id), "state":prepared.state,
         "baseline_action":prepared.action_metadata(&[]),
         "compaction_enabled":settings.effective_compaction_enabled(&session_id),
@@ -1052,10 +2252,21 @@ pub async fn filter_memory_candidates(ctx: Arc<dyn ExtensionContext>, query: &st
     crate::core::jev_retrieval::apply_memory(hits, &removals)
 }
 
-pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages: Vec<Value>) -> Vec<Value> {
+pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages: Vec<Value>, budget: &pi_jev::search::SearchBudget) -> Vec<Value> {
     let session_id = ctx.session_manager().get_session_id();
     let settings = load_settings_cached();
-    let messages = filter_code_search_candidates(&ctx, messages, &settings).await;
+    // Capture citation provenance from the strict, unannotated input before
+    // any request-local Jev stage can add a prefix-shaped advisory block.
+    let citation_basis = prepare_citation_basis(&ctx, &messages, &settings);
+    // ROOT CONTRACT v1 (Search): ONE shared provider-context deadline across
+    // filtering, reranking and line matching. No independent stage stacks.
+    let messages = filter_code_search_candidates(&ctx, messages, &settings, budget).await;
+    let messages = annotate_line_find_candidates(&ctx, messages, &settings, budget).await;
+    // ROOT-CONTRACT v6 (Evidence lane): bounded citation assessment over the
+    // ACTUAL ipython source-read path. At most ONE citation judgment per
+    // provider request, funded from the ONE shared provider-context deadline.
+    // Advisory only: never verification, never a gate, never a drop.
+    let messages = annotate_citation_check(&ctx, messages, &settings, budget, citation_basis).await;
     if !settings.effective_mode(&session_id).is_enabled() || !settings.effective_features(&session_id).context_relevance { return messages; }
     let mut prepared = crate::core::jev_retrieval::prepare_context(&messages);
     prepared.configure(&settings.filtering);
@@ -1066,7 +2277,7 @@ pub async fn filter_context_candidates(ctx: Arc<dyn ExtensionContext>, messages:
     crate::core::jev_retrieval::apply_context(messages, &removals)
 }
 
-async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut messages: Vec<Value>, settings: &JevSettings) -> Vec<Value> {
+async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut messages: Vec<Value>, settings: &JevSettings, budget: &pi_jev::search::SearchBudget) -> Vec<Value> {
     use futures::StreamExt;
     use crate::core::jev_code_search;
     let session_id = ctx.session_manager().get_session_id();
@@ -1075,13 +2286,12 @@ async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut mess
     if !mode.is_enabled() || !features.code_search_relevance { return messages; }
     if ctx.signal().is_some_and(|signal| signal.is_cancelled()) { return messages; }
     let Some(core) = bridge_for_session(&session_id) else { return messages; };
-    let Some(observer) = core.observer(&session_id, ctx.ui()) else { return messages; };
+    let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else { return messages; };
     let query = crate::core::jev_retrieval::query_from_messages(&messages);
     let query = if query.is_empty() { core.task_excerpt(&session_id).unwrap_or_default() } else { query };
     let presentations = jev_code_search::prepare(&messages, &query, &settings.filtering);
     let generation = decision_policy_generation(settings, &session_id);
     let stamp = cheap_credential_stamp(settings);
-    let started = tokio::time::Instant::now();
     for presentation in presentations {
         let cache_key = pi_jev::snapshot::fingerprint_of(&json!([session_id, core.turn(&session_id), mode.as_str(), generation, stamp, presentation.fingerprint]));
         if !mode.allows_active() && jev_code_search::already_observed(&cache_key) {
@@ -1095,6 +2305,39 @@ async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut mess
         if !mode.allows_active() {
             for (batch, payload) in presentation.batches.iter().zip(&payloads) {
                 observer.observe_prepared(payload, "code_search", batch.questions());
+            }
+            // ROOT-CONTRACT v6 (Evidence lane): Compare observes the safety
+            // battery too — as its own explicit request under the scheduler
+            // cap; nothing applies.
+            if features.retrieval_safety {
+                let battery_is_cancelled = || ctx.signal().is_some_and(|signal| signal.is_cancelled());
+                let battery_inputs = crate::core::jev_evidence::BatteryInputs {
+                    observer: Arc::clone(&observer),
+                    session_id: session_id.as_str(),
+                    turn: core.turn(&session_id),
+                    mode,
+                    policy_generation: generation.as_str(),
+                    max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+                    budget,
+                    is_cancelled: &battery_is_cancelled,
+                };
+                crate::core::jev_evidence::observe_safety_battery(&battery_inputs, &presentation);
+            }
+            if features.code_search_reranking {
+                // Compare observes the rerank questions too; nothing applies.
+                let inputs = presentation.rerank_inputs(pi_jev::search::MAX_RERANK_CANDIDATES, &[]);
+                for chunk in inputs.chunks(pi_jev::search::RERANK_BATCH) {
+                    let excerpts: Vec<String> = chunk.iter().map(|(_, excerpt)| excerpt.clone()).collect();
+                    let state = pi_jev::search::rerank_batch_state(&query, &excerpts);
+                    if let Some(questions) = pi_jev::search::rerank_batch_questions(&state) {
+                        if !questions.is_empty() {
+                            observer.observe_prepared(&json!({
+                                "session_id": session_id, "turn": core.turn(&session_id),
+                                "state": state, "policy_generation": generation
+                            }), "code_search_rerank", questions);
+                        }
+                    }
+                }
             }
             jev_code_search::remember_observation(cache_key);
             continue;
@@ -1111,7 +2354,7 @@ async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut mess
             let signal = signal.clone();
             let questions = presentation.batches[index].questions();
             async move {
-                let remaining = Duration::from_millis(2500).saturating_sub(started.elapsed());
+                let remaining = budget.remaining();
                 let mut payload = payload;
                 payload["decision_timeout_ms"] = json!(if signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
                     0
@@ -1143,17 +2386,525 @@ async fn filter_code_search_candidates(ctx: &Arc<dyn ExtensionContext>, mut mess
                 batch.removals(&outcome.decisions, outcome.request_id.as_deref().unwrap_or(""), outcome.turn)
             }).collect()
         } else { Vec::new() };
-        let projection = presentation.project(&removals);
-        let applied = if projection.is_some() { removals } else { Vec::new() };
+        // ROOT-CONTRACT v6 (Evidence lane): the safety battery is its OWN
+        // typed request under the scheduler's per-request question cap — it
+        // never rides the filter request (a combined request would be
+        // silently refused and kill the filter under the flag). Planned
+        // drops are covered first (the veto targets), then retained
+        // candidates up to the explicit battery cap; the subset and its
+        // coverage are disclosed in the annotation and metadata. Fail-open:
+        // any refused, skipped, stale or cancelled battery leaves the
+        // removals untouched.
+        let battery_is_cancelled = || ctx.signal().is_some_and(|signal| signal.is_cancelled());
+        let battery_inputs = crate::core::jev_evidence::BatteryInputs {
+            observer: Arc::clone(&observer),
+            session_id: session_id.as_str(),
+            turn: core.turn(&session_id),
+            mode,
+            policy_generation: generation.as_str(),
+            max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+            budget,
+            is_cancelled: &battery_is_cancelled,
+        };
+        // ROOT-CONTRACT v6 (Evidence lane): the correlated battery outcome is
+        // RETURNED so the effect site can fold its freshness into
+        // still_current and record the attach state. Refused rounds carry
+        // None and stay fail-open; removals are never increased.
+        let (removals, safety_annotation, safety_metadata, battery_outcome) = if features.retrieval_safety {
+            crate::core::jev_evidence::run_safety_veto(&battery_inputs, &presentation, removals).await
+        } else { (removals, None, BTreeMap::new(), None) };
+        // Rerank stage (ROOT CONTRACT v1, Search): absolute per-pair Noul
+        // scores over the RETAINED scored candidates; every failure keeps the
+        // original surviving order. The stage name is in the observation
+        // cache key so rerank never shadows the filter.
+        let mut order: Option<Vec<usize>> = None;
+        let mut rerank_model: Option<String> = None;
+        let mut rerank_records: Vec<(std::collections::BTreeMap<String, String>, pi_jev::hooks::ActiveDecideOutcome)> = Vec::new();
+        if complete && features.code_search_reranking && !budget.expired() {
+            let inputs = presentation.rerank_inputs(pi_jev::search::MAX_RERANK_CANDIDATES, &removals);
+            let mut scores: Vec<pi_jev::search::ScoredCandidate> = Vec::new();
+            let mut rerank_complete = true;
+            for (batch_index, chunk) in inputs.chunks(pi_jev::search::RERANK_BATCH).enumerate() {
+                if budget.expired() || ctx.signal().is_some_and(|signal| signal.is_cancelled()) {
+                    rerank_complete = false;
+                    break;
+                }
+                let excerpts: Vec<String> = chunk.iter().map(|(_, excerpt)| excerpt.clone()).collect();
+                let state = pi_jev::search::rerank_batch_state(&query, &excerpts);
+                let questions = pi_jev::search::rerank_batch_questions(&state).unwrap_or_default();
+                if questions.is_empty() { rerank_complete = false; break; }
+                let candidate_indices: Vec<usize> = chunk.iter().map(|(ordinal, _)| *ordinal).collect();
+                let mut payload = json!({
+                    "session_id": session_id, "turn": core.turn(&session_id), "state": state,
+                    "policy_generation": generation
+                });
+                payload["decision_timeout_ms"] = json!(budget.remaining_ms());
+                let rerank_policy = pi_jev::active::ActivationPolicy {
+                    enabled_categories: [pi_jev::types::DecisionCategory::CodeSearchRerank].into_iter().collect(),
+                    // Typed acceptance; a Noul is never confidence-gated.
+                    min_confidence: 0.0,
+                    max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+                };
+                let outcome = observer.decide_prepared(&payload, "code_search_rerank", questions, &rerank_policy).await;
+                let usable = observer.can_apply(&outcome)
+                    && outcome.unavailable.is_none()
+                    && outcome.raw.as_ref().is_some_and(|raw| raw.skips.is_empty());
+                if !usable { rerank_complete = false; break; }
+                scores.extend(pi_jev::search::scored_candidates_from_decisions(
+                    &outcome.decisions, &candidate_indices, pi_jev::types::DecisionCategory::CodeSearchRerank,
+                ));
+                if rerank_model.is_none() { rerank_model = outcome.response_model.clone(); }
+                rerank_records.push((std::collections::BTreeMap::from([
+                    ("rerank_batch".to_string(), batch_index.to_string()),
+                    ("rerank_scored".to_string(), chunk.len().to_string()),
+                ]), outcome));
+            }
+            if rerank_complete && !inputs.is_empty() && scores.len() == inputs.len() {
+                order = pi_jev::search::reranked_order(
+                    &scores, inputs.len(), core.turn(&session_id),
+                    std::time::SystemTime::now(),
+                    Duration::from_millis(settings.filtering.max_decision_age_ms),
+                );
+            }
+        }
+        // Truthful scope: when the shared candidate cap means only a prefix
+        // of the retained scored set was scored, the label must say "prefix".
+        let scope = if order.as_ref().is_some_and(|order| {
+            order.len() < presentation.rerank_inputs(usize::MAX, &removals).len()
+        }) {
+            "prefix"
+        } else {
+            "all"
+        };
+        let projection = presentation.project_with_order(&removals, order.as_deref(), rerank_model.as_deref(), order.as_ref().map(|_| scope));
+        let applied = if projection.is_some() { removals.clone() } else { Vec::new() };
+        // ROOT CONTRACT v1: before ANY effect, re-check the current gates. A
+        // settings/feature toggle off->on (policy generation), a mode flip, or
+        // cancellation between decision and application drops the effect; the
+        // original request copy stays untouched (fail open). ROOT-CONTRACT v6
+        // (Evidence lane): the correlated battery outcome folds into the same
+        // gate so a stale battery decision can never un-drop at projection
+        // time; a refused battery (None) imposes no freshness constraint.
+        let still_current = complete
+            && outcomes.iter().all(|(_, outcome)| observer.can_apply(outcome))
+            && rerank_records.iter().all(|(_, outcome)| observer.can_apply(outcome))
+            && battery_outcome.as_ref().map(|outcome| observer.can_apply(outcome)).unwrap_or(true)
+            && !ctx.signal().is_some_and(|signal| signal.is_cancelled());
+        // ROOT-CONTRACT v6 (Evidence lane): additive advisory safety
+        // annotation on the request copy only. Same one-annotation discipline
+        // as line-find (single-block toolResult guard); originals are
+        // preserved and nothing is dropped or rewritten. The attach result is
+        // recorded, never assumed.
+        let mut safety_attached = false;
+        if still_current {
+            if let Some(content) = projection { messages[presentation.message_index]["content"] = content; }
+            if features.retrieval_safety {
+                if let Some(block) = safety_annotation.clone() {
+                    safety_attached = crate::core::jev_evidence::attach_safety_block(
+                        &mut messages, presentation.message_index, block);
+                }
+            }
+        }
+        // ROOT-CONTRACT v6 (Evidence lane): the battery's own correlated
+        // record carries the attach state distinctly (attached /
+        // skipped_multi_block / withheld_stale_gates) — assessment and
+        // annotation are never conflated and no attached claim is made when
+        // the effect gates went stale.
+        if let Some(outcome) = &battery_outcome {
+            let mut battery_record = safety_metadata.clone();
+            if safety_annotation.is_some() {
+                battery_record.insert(
+                    "jev_safety_annotation".to_string(),
+                    if !still_current {
+                        "withheld_stale_gates".to_string()
+                    } else if safety_attached {
+                        "attached".to_string()
+                    } else {
+                        "skipped_multi_block".to_string()
+                    },
+                );
+            }
+            observer.record_active_with_action(outcome, &std::collections::BTreeMap::new(), &battery_record);
+        }
         for (index, outcome) in &outcomes {
             let batch = &presentation.batches[*index];
-            observer.record_active_with_action(outcome, &relevance_effects(batch, &applied), &batch.action_metadata(&applied));
+            let mut filter_metadata = batch.action_metadata(&applied);
+            if battery_outcome.is_none() {
+                // A refused battery round is disclosed on the filter record
+                // that funded it; flag-off rounds merge an empty map (no-op).
+                filter_metadata.extend(safety_metadata.clone());
+            }
+            observer.record_active_with_action(outcome, &relevance_effects(batch, &applied), &filter_metadata);
         }
-        if complete {
-            if let Some(content) = projection { messages[presentation.message_index]["content"] = content; }
+        let rerank_metadata = presentation.rerank_action_metadata(&removals, order.as_deref(), scope);
+        for (batch_metadata, outcome) in &rerank_records {
+            let mut merged = batch_metadata.clone();
+            merged.extend(rerank_metadata.clone());
+            observer.record_active_with_action(outcome, &std::collections::BTreeMap::new(), &merged);
         }
     }
     messages
+}
+
+// ROOT CONTRACT v1 (Search): line-level semantic find over explicitly supplied
+// text. At most ONE judgment per provider request, funded from the ONE shared
+// provider-context deadline. Fail-open everywhere: nothing is removed or
+// rewritten; the annotation is additive to the request copy only, and session
+// history keeps the original. In Compare mode the questions are observed but
+// nothing is applied; for windowed texts Compare observes the window question
+// (the second pass depends on the unasked window answer, so it is not observed).
+
+async fn annotate_line_find_candidates(
+    ctx: &Arc<dyn ExtensionContext>,
+    mut messages: Vec<Value>,
+    settings: &JevSettings,
+    budget: &pi_jev::search::SearchBudget,
+) -> Vec<Value> {
+    use crate::core::{jev_code_search, jev_line_find};
+    let session_id = ctx.session_manager().get_session_id();
+    let mode = settings.effective_mode(&session_id);
+    let features = settings.effective_features(&session_id);
+    if !mode.is_enabled() || !features.line_find { return messages; }
+    if ctx.signal().is_some_and(|signal| signal.is_cancelled()) { return messages; }
+    let Some(core) = bridge_for_session(&session_id) else { return messages; };
+    let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else { return messages; };
+    let query = crate::core::jev_retrieval::query_from_messages(&messages);
+    let query = if query.is_empty() { core.task_excerpt(&session_id).unwrap_or_default() } else { query };
+    let options = pi_jev::search::LineFindOptions::default();
+    if options.validate().is_err() { return messages; }
+    // Primary reachability: the deterministic ipython source-read idiom
+    // (this runtime has no read/read_file tools; source is read via the REPL).
+    let mut presentations = jev_line_find::prepare(&messages, &query, &options);
+    // Secondary: the top file candidate of the CURRENT (filtered+reranked)
+    // code-search envelope - an explicit presentation snippet.
+    if presentations.is_empty() && features.code_search_relevance {
+        // The CURRENT (filtered+reranked) envelope: the projection adds
+        // disclosure keys, so the strict two-key `prepare` cannot see it. The
+        // top candidate is the first NON-pinned `file` candidate; pinned
+        // anchors are never line-matched (jev_line_find re-checks too).
+        if let Some((index, envelope)) = jev_code_search::recent_code_search_envelope(&messages) {
+            let candidate = envelope["candidates"].as_array().and_then(|items| {
+                items
+                    .iter()
+                    .find(|candidate| candidate["kind"] == "file" && !jev_code_search::pinned(candidate))
+                    .cloned()
+            });
+            if let Some(candidate) = candidate {
+                if let Some(presentation) = jev_line_find::prepare_from_snippet(&candidate, index, &query, &options) {
+                    presentations.push(presentation);
+                }
+            }
+        }
+    }
+    // ONE line-find judgment per provider request (ROOT CONTRACT bound).
+    let Some(presentation) = presentations.first() else { return messages; };
+    let generation = decision_policy_generation(settings, &session_id);
+    let stamp = cheap_credential_stamp(settings);
+    let cache_key = pi_jev::snapshot::fingerprint_of(&json!([
+        session_id, core.turn(&session_id), mode.as_str(), generation, stamp,
+        "code_line_find", presentation.fingerprint
+    ]));
+    if !mode.allows_active() && jev_code_search::already_observed(&cache_key) { return messages; }
+    let policy = pi_jev::active::ActivationPolicy {
+        enabled_categories: [pi_jev::types::DecisionCategory::CodeLineFind].into_iter().collect(),
+        // Typed acceptance; the existence Noul is never confidence-gated.
+        min_confidence: 0.0,
+        max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+    };
+    let payload_for = |state: &Value| {
+        let mut payload = json!({
+            "session_id": session_id, "turn": core.turn(&session_id),
+            "policy_generation": generation
+        });
+        payload["state"] = state.clone();
+        payload["decision_timeout_ms"] = json!(budget.remaining_ms());
+        payload
+    };
+    // Cascade pass 1 (windows) when the supplied text exceeds one Choice request.
+    let window = if presentation.needs_window_pass() {
+        let Some((state, questions)) = presentation.pass1() else { return messages; };
+        if !mode.allows_active() {
+            observer.observe_prepared(&payload_for(&state), "code_line_find", questions);
+            jev_code_search::remember_observation(cache_key);
+            return messages;
+        }
+        if budget.expired() { return messages; }
+        let first = observer.decide_prepared(&payload_for(&state), "code_line_find", questions, &policy).await;
+        // ROOT CONTRACT v1 (Search): the pass-1 window Choice is consumed at
+        // set level from the RAW record (the typed pair acceptance covers only
+        // the pass-2 pair), and only a complete finite normalized distribution
+        // over exactly the supplied windows may narrow the cascade.
+        let window_distribution = first.raw.as_ref()
+            .and_then(|raw| raw.records.iter().find(|record| record.question_id == pi_jev::search::WINDOW_QUESTION_ID))
+            .and_then(|record| match &record.answer {
+                pi_jev::Answer::Choice { probabilities, .. } => Some(probabilities.clone()),
+                _ => None,
+            })
+            .and_then(|probabilities| pi_jev::search::validate_window_distribution(&probabilities, presentation.text.windows()));
+        let usable = !ctx.signal().is_some_and(|signal| signal.is_cancelled())
+            && observer.can_apply(&first)
+            && first.unavailable.is_none()
+            && first.raw.as_ref().is_some_and(|raw| raw.skips.is_empty())
+            && window_distribution.is_some();
+        if !usable { return messages; }
+        match first.raw.as_ref()
+            .and_then(|raw| raw.records.iter().find(|record| record.question_id == pi_jev::search::WINDOW_QUESTION_ID))
+            .map(|record| jev_line_find::narrow(&record.answer.selected_value()))
+        {
+            Some(Some(window)) => Some(window),
+            _ => return messages,
+        }
+    } else { None };
+    // Pass 2: judge ONLY the inspected window (or the whole small text).
+    let Some((state, questions)) = presentation.pass2(window) else { return messages; };
+    let Some(entries) = presentation.pass2_entries(window) else { return messages; };
+    if !mode.allows_active() {
+        observer.observe_prepared(&payload_for(&state), "code_line_find", questions);
+        jev_code_search::remember_observation(cache_key);
+        return messages;
+    }
+    if budget.expired() { return messages; }
+    let outcome = observer.decide_prepared(&payload_for(&state), "code_line_find", questions, &policy).await;
+    let usable = !ctx.signal().is_some_and(|signal| signal.is_cancelled())
+        && observer.can_apply(&outcome)
+        && outcome.unavailable.is_none()
+        && outcome.raw.as_ref().is_some_and(|raw| raw.skips.is_empty());
+    if !usable { return messages; }
+    let where_decision = outcome.decisions.iter()
+        .find(|decision| decision.question_id == pi_jev::search::WHERE_QUESTION_ID);
+    let exists_decision = outcome.decisions.iter()
+        .find(|decision| decision.question_id == pi_jev::search::EXISTS_QUESTION_ID);
+    // The full Choice distribution comes from the raw outcome record.
+    let where_probabilities = outcome.raw.as_ref()
+        .and_then(|raw| raw.records.iter().find(|record| record.question_id == pi_jev::search::WHERE_QUESTION_ID))
+        .and_then(|record| match &record.answer {
+            pi_jev::Answer::Choice { probabilities, .. } => Some(probabilities.clone()),
+            _ => None,
+        });
+    let (Some(where_decision), Some(exists_decision), Some(where_probabilities)) =
+        (where_decision, exists_decision, where_probabilities)
+    else { return messages; };
+    let Some(request_id) = outcome.request_id.clone() else { return messages; };
+    let Some(annotation) = presentation.annotate(
+        where_decision,
+        exists_decision,
+        Some(&where_probabilities),
+        &entries,
+        &request_id,
+        outcome.turn,
+        std::time::SystemTime::now(),
+        policy.max_decision_age,
+        outcome.response_model.as_deref(),
+        &options,
+    ) else { return messages; };
+    let block = match serde_json::to_string(&annotation) {
+        Ok(text) => json!({"type": "text", "text": text}),
+        Err(_) => return messages,
+    };
+    let verdict_text = annotation["jev_line_find"]["verdict"].as_str().unwrap_or_default();
+    let Some(verdict) = pi_jev::search::LineFindVerdict::parse(verdict_text) else { return messages; };
+    let exists_noul = annotation["jev_line_find"]["exists_noul"].as_f64().unwrap_or_default();
+    let top = annotation["jev_line_find"]["top_lines"].as_array()
+        .and_then(|lines| lines.first())
+        .and_then(|line| line["id"].as_str());
+    let metadata = presentation.action_metadata(verdict, exists_noul, top, entries.windowed());
+    if presentation.attach(&mut messages, block).is_none() { return messages; }
+    observer.record_active_with_action(&outcome, &std::collections::BTreeMap::new(), &metadata);
+    messages
+}
+
+
+/// CONTROL seam (API-HANDOFF B7): one applied-control decision at a turn
+/// boundary, returning the typed answers for the CONTROL resolvers.
+/// None whenever gates are closed, no questions are eligible, or the
+/// decision could not complete. Effects are never guessed here.
+pub struct ControlDecision {
+    pub answers: Vec<pi_jev::active::AnswerCandidate>,
+    pub question_ids: Vec<String>,
+    pub request_id: String,
+    pub turn: u64,
+    pub evidence_description: String,
+    pub features: pi_jev::control::ControlFeatures,
+    pub mode: pi_jev::config::JevMode,
+    pub epoch_id: String,
+    pub policy_generation: String,
+    pub full_jev_stamp: String,
+}
+
+/// Capture a citation basis before code-search, line-find, or safety can add
+/// request-local annotation blocks. This is local provenance only: no read,
+/// provider call, budget, or capability is added.
+fn prepare_citation_basis(
+    ctx: &Arc<dyn ExtensionContext>,
+    messages: &[Value],
+    settings: &JevSettings,
+) -> Option<(String, crate::core::jev_evidence::CitationPresentation)> {
+    let session_id = ctx.session_manager().get_session_id();
+    let mode = settings.effective_mode(&session_id);
+    let features = settings.effective_features(&session_id);
+    if !mode.is_enabled()
+        || !features.citation_check
+        || ctx.signal().is_some_and(|signal| signal.is_cancelled())
+    {
+        return None;
+    }
+    let core = bridge_for_session(&session_id)?;
+    let claim = crate::core::jev_retrieval::query_from_messages(messages);
+    let claim = if claim.is_empty() {
+        core.task_excerpt(&session_id).unwrap_or_default()
+    } else {
+        claim
+    };
+    if claim.trim().is_empty() {
+        return None;
+    }
+    let presentation = crate::core::jev_evidence::prepare_original_citation(messages, &claim)?;
+    Some((claim, presentation))
+}
+
+/// ROOT-CONTRACT v6 (Evidence lane): bounded citation assessment over the
+/// ACTUAL ipython source-read path (the same deterministic `print(open(..)
+/// .read())` idiom line-find recognizes, mirrored by jev_evidence's own
+/// reachability copy). One judgment per provider request, funded from the ONE
+/// shared provider-context deadline. Advisory only: the annotation never
+/// verifies, never gates an effect, never claims document-wide absence, and
+/// the claim and the supplied span stay untrusted data. Fail-open everywhere.
+async fn annotate_citation_check(
+    ctx: &Arc<dyn ExtensionContext>,
+    messages: Vec<Value>,
+    settings: &JevSettings,
+    budget: &pi_jev::search::SearchBudget,
+    citation_basis: Option<(String, crate::core::jev_evidence::CitationPresentation)>,
+) -> Vec<Value> {
+    let session_id = ctx.session_manager().get_session_id();
+    let mode = settings.effective_mode(&session_id);
+    let features = settings.effective_features(&session_id);
+    if !mode.is_enabled() || !features.citation_check { return messages; }
+    if ctx.signal().is_some_and(|signal| signal.is_cancelled()) { return messages; }
+    let Some((claim, presentation)) = citation_basis else { return messages; };
+    let Some(core) = bridge_for_session(&session_id) else { return messages; };
+    let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else { return messages; };
+    let generation = decision_policy_generation(settings, &session_id);
+    let is_cancelled = || ctx.signal().is_some_and(|signal| signal.is_cancelled());
+    let inputs = crate::core::jev_evidence::CitationStageInputs {
+        observer,
+        session_id: session_id.as_str(),
+        turn: core.turn(&session_id),
+        mode,
+        policy_generation: generation.as_str(),
+        max_decision_age: Duration::from_millis(settings.filtering.max_decision_age_ms),
+        budget,
+        claim: claim.as_str(),
+        pre_annotation_presentation: Some(presentation),
+        is_cancelled: &is_cancelled,
+    };
+    crate::core::jev_evidence::annotate_citation_check(messages, &inputs).await
+}
+
+pub async fn decide_control(
+    session_id: &str,
+    event: &ExtensionEvent,
+    ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>,
+    only_categories: &[&str],
+) -> Option<ControlDecision> {
+    let settings = load_settings_cached();
+    let raw_features = settings.effective_features(session_id);
+    let mode = settings.effective_mode(session_id);
+    let features = pi_jev::control::ControlFeatures {
+        result_sufficiency: raw_features.result_sufficiency,
+        loop_control: raw_features.loop_control,
+        verification: raw_features.verification,
+        retry_classification: raw_features.retry_classification,
+        full_jev_active: settings.full_jev_active(),
+    };
+    if !pi_jev::control::control_gates_open(&features, mode) { return None; }
+    let stage = match event {
+        ExtensionEvent::TurnEnd(_) if raw_features.loop_control || raw_features.retry_classification
+            => pi_jev::snapshot::SnapshotStage::TurnEnd,
+        ExtensionEvent::AgentEnd(_)
+            if raw_features.result_sufficiency || raw_features.loop_control
+                || raw_features.verification || raw_features.retry_classification
+            => pi_jev::snapshot::SnapshotStage::AgentEnd,
+        _ => return None,
+    };
+    let core = bridge_for_session(session_id)?;
+    let Some((_, mut payload)) = bridge_event(&core, event, ctx, session_id, "decide_control", &settings) else { return None; };
+    #[cfg(debug_assertions)]
+    if settings.transport.as_deref() == Some("mock-control") {
+        payload["state"]["_jev_fixture_lane"] = json!("explicit_control");
+    }
+    payload["policy_generation"] = json!(decision_policy_generation(&settings, session_id));
+    let observer = core.observer(session_id, Some(ctx.ui()))?;
+    let state = payload.get("state").cloned().unwrap_or(Value::Null);
+    let turn = payload.get("turn").and_then(Value::as_u64).unwrap_or(0);
+    let Ok(snapshot) = pi_jev::snapshot::StateSnapshot::new(stage, session_id, turn, 0, None, state, Vec::new()) else { return None; };
+    let mut questions = Vec::new();
+    for evaluator in pi_jev::evaluators::for_boundary(stage) {
+        let category = evaluator.category().as_str();
+        let enabled = match category {
+            "result_sufficiency" => features.result_sufficiency,
+            "continue_stop_escalate" => features.loop_control,
+            "first_pass_verification" => features.verification,
+            "retry_classification" => features.retry_classification,
+            _ => false,
+        } && (only_categories.is_empty() || only_categories.contains(&category));
+        if enabled {
+            if let pi_jev::evaluators::EvaluatorOutput::Questions(mut prepared) = evaluator.evaluate(&snapshot) {
+                questions.append(&mut prepared);
+            }
+        }
+    }
+    if questions.is_empty() { return None; }
+    // H-CONTROL-3: capture the immutable task epoch BEFORE the provider await.
+    // The decision is bound to this epoch; consumption re-reads current durable
+    // state and refuses any mismatch, so a stale decision can never spend
+    // whichever epoch happens to be current at consume time.
+    let captured_epoch_id = crate::core::jev_control::ControlBook::global().snapshot(session_id).epoch_id;
+    let policy = pi_jev::active::ActivationPolicy { enabled_categories: Default::default(), ..Default::default() };
+    let outcome = observer.decide_prepared(&payload, stage.as_str(), questions.clone(), &policy).await;
+    observer.record_active(&outcome, &std::collections::BTreeMap::new());
+    // Staleness re-check at consume time (N2): current mode/settings must
+    // still open the gates and the outcome must still be applicable.
+    if !observer.can_apply(&outcome) { return None; }
+    let raw = outcome.raw.as_ref()?;
+    let request_id = outcome.request_id.clone()?;
+    let question_ids: Vec<String> = questions.iter().map(|q| q.question_id.clone()).collect();
+    let now = std::time::SystemTime::now();
+    // Inline of hooks::policy_confidence (private there): optional
+    // categories report min(answer confidence, selected probability).
+    let answers = raw.records.iter().map(|record| {
+        let mut confidence = record.answer.confidence();
+        if pi_jev::active::OPTIONAL_APPLIABLE_CATEGORIES.contains(&record.category) {
+            if let pi_jev::types::Answer::Choice { choice, probabilities, .. } = &record.answer {
+                confidence = probabilities.get(choice).copied().map(|p| confidence.unwrap_or(p).min(p));
+            } else {
+                confidence = None;
+            }
+        }
+        pi_jev::active::AnswerCandidate {
+            category: record.category,
+            question_id: record.question_id.clone(),
+            value: Some(record.answer.selected_value()),
+            confidence,
+            response_model: record.response_model.clone(),
+            request_id: request_id.clone(),
+            turn: outcome.turn,
+            decided_at: now,
+        }
+    }).collect();
+    let evidence_description = core.observation(session_id).evidence_description();
+    Some(ControlDecision {
+        answers,
+        question_ids,
+        request_id,
+        turn: outcome.turn,
+        evidence_description,
+        features,
+        mode,
+        epoch_id: captured_epoch_id,
+        policy_generation: outcome.policy_generation.clone(),
+        full_jev_stamp: settings.full_jev_stamp(),
+    })
 }
 
 fn observed_failure_kind(message: &Value) -> Option<pi_jev::observation::RetryFailureKind> {
@@ -1277,6 +3028,7 @@ fn bridge_event(
     ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>,
     session_id: &str,
     handler_event: &'static str,
+    settings: &JevSettings,
 ) -> Option<(String, Value)> {
     let _ = handler_event;
     let model_id = ctx.model().map(|model| model.id.clone());
@@ -1415,8 +3167,11 @@ fn bridge_event(
         _ => None,
     };
     if let Some((_, payload)) = result.as_mut() {
-        let settings = load_settings_cached();
+        // All request identity and feature bytes derive from the caller's ONE
+        // settings snapshot. Hooks compare this generation with the single-load
+        // authoritative gate before any dispatch.
         payload["compaction_enabled"] = json!(settings.effective_compaction_enabled(session_id));
+        payload["policy_generation"] = json!(decision_policy_generation(settings, session_id));
         if let Some(state) = payload.get_mut("state").and_then(Value::as_object_mut) {
             state.insert("features".to_string(), json!(settings.effective_features(session_id)));
             state.insert("observation".to_string(), json!(core.observation(session_id)));
@@ -1555,9 +3310,13 @@ fn hostile_response_for(request: &pi_jev::types::SystemOneRequest) -> pi_jev::ty
         model: "jev-mock-hostile/1".to_string(),
         answers,
         usage: pi_jev::types::Usage {
-            input_tokens: 1,
-            output_tokens: 1,
+            input_tokens: Some(1),
+            output_tokens: Some(1),
         },
+        // The hostile fixture parses every answer; no recorded parse skips and
+        // no captured server request id.
+        answer_parse_skips: Vec::new(),
+        server_request_id: None,
     }
 }
 
@@ -1683,7 +3442,175 @@ mod no_subagent_control_tests {
         assert_eq!(settings.effective_mode("any-session"), JevMode::Off);
     }
 
-    /// The provider-request handler exists only while Active is requested.
+    #[cfg(test)]
+mod full_jev_overlay_wiring_tests {
+    use super::*;
+    use pi_jev::config::{JevSettings, JevSettingsStore};
+    use std::path::Path;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Serializes tests that mutate the process-wide agent-dir environment
+    /// variable and the global settings cache (the migrations.rs ENV_LOCK
+    /// pattern): one env-mutating bridge test at a time.
+    static ENV_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+    fn env_lock() -> &'static Mutex<()> {
+        ENV_LOCK.get_or_init(|| Mutex::new(()))
+    }
+
+    fn handler_count(extension: &SharedExtension) -> usize {
+        extension
+            .lock()
+            .unwrap()
+            .handlers
+            .get(JEV_ACTIVE_EVENT)
+            .map(|handlers| handlers.len())
+            .unwrap_or(0)
+    }
+
+    fn test_settings(agent_dir: &Path) -> JevSettings {
+        JevSettingsStore::new(agent_dir).load()
+    }
+
+    /// ROOT-CONTRACT staleness condition (root ABA finding): the persisted
+    /// overlay identity must be FRESH on every off->on transition. A consumer
+    /// that never observed the intermediate Off must still reject work that
+    /// was captured under a previous activation. Verified across store
+    /// reloads, because a separate process only ever sees persisted state.
+    #[test]
+    fn full_stamp_differs_between_separate_activations() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path();
+
+        // First activation through a real persisted store.
+        let mut first = test_settings(agent_dir);
+        assert!(first.full_jev_install());
+        JevSettingsStore::new(agent_dir).save(&first).expect("save first");
+        let first_stamp = first.full_jev_stamp();
+        let first_cheap = credential_stamp_at(&first, agent_dir);
+
+        // Off through a distinct loaded snapshot (a writer that missed the
+        // first activation, e.g. another process).
+        let mut off = test_settings(agent_dir);
+        assert!(off.full_jev_remove());
+        JevSettingsStore::new(agent_dir).save(&off).expect("save off");
+
+        // Second activation, again from a fresh persisted load.
+        let mut second = test_settings(agent_dir);
+        assert!(second.full_jev_install());
+        JevSettingsStore::new(agent_dir).save(&second).expect("save second");
+        let second_stamp = second.full_jev_stamp();
+        let second_cheap = credential_stamp_at(&second, agent_dir);
+
+        assert_ne!(
+            first_stamp, second_stamp,
+            "off->on must mint a fresh activation identity; equal stamps let a consumer that missed the Off accept stale first-activation work"
+        );
+        assert_ne!(
+            first_cheap, second_cheap,
+            "the bridge cheap stamp must change across an activation cycle so in-flight work is invalidated like a key rotation"
+        );
+    }
+
+    /// Idempotent already-on installs must not churn the stamp, and removing
+    /// twice is a truthful no-op.
+    #[test]
+    fn full_jev_install_remove_idempotency_keeps_stamps_stable() {
+        let mut settings = JevSettings::default();
+        assert!(settings.full_jev_install());
+        let stamp_on = settings.full_jev_stamp();
+        assert!(!settings.full_jev_install(), "already-active install is a no-op");
+        assert_eq!(settings.full_jev_stamp(), stamp_on, "no-op install must not churn the stamp");
+        assert!(settings.full_jev_remove());
+        assert!(!settings.full_jev_remove(), "second remove is a no-op");
+        assert_eq!(settings.full_jev_stamp(), "full-jev:0");
+    }
+
+    /// Cross-process Off->Full: a distinct store instance installs the overlay
+    /// (simulating another process writing settings). After the 250ms settings
+    /// TTL expires, the next settings read must resync Active-handler presence
+    /// on live bridges WITHOUT any same-process invalidate call.
+    #[test]
+    fn ttl_reload_resyncs_handlers_off_to_full() {
+        let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().to_path_buf();
+        std::env::set_var(crate::config::env_agent_dir(), agent_dir.clone());
+        invalidate_settings_cache();
+
+        // Base: everything Off, saved once.
+        let store = JevSettingsStore::new(&agent_dir);
+        store.save(&JevSettings::default()).expect("save base");
+        invalidate_settings_cache();
+
+        let mut extensions: Vec<SharedExtension> = Vec::new();
+        maybe_register_jev_observer(&mut extensions);
+        let extension = extensions
+            .first()
+            .expect("observer extension registered")
+            .clone();
+        assert_eq!(handler_count(&extension), 0, "Off baseline installs no handler");
+
+        // A DISTINCT store instance (another process) installs full-jev.
+        let mut writer = JevSettingsStore::new(&agent_dir).load();
+        assert!(writer.full_jev_install());
+        JevSettingsStore::new(&agent_dir).save(&writer).expect("save full");
+        // No invalidate_settings_cache() here: the TTL path is under test.
+
+        std::thread::sleep(SETTINGS_TTL + Duration::from_millis(40));
+        assert!(active_mode_requested(), "fresh read sees the overlay");
+        assert_eq!(
+            handler_count(&extension),
+            1,
+            "TTL reload must resync handler presence without a same-process invalidate"
+        );
+
+        invalidate_settings_cache();
+        std::env::remove_var(crate::config::env_agent_dir());
+    }
+
+    /// Cross-process Full->Off: the reverse direction of the same contract.
+    #[test]
+    fn ttl_reload_resyncs_handlers_full_to_off() {
+        let _guard = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().expect("tempdir");
+        let agent_dir = dir.path().to_path_buf();
+        std::env::set_var(crate::config::env_agent_dir(), agent_dir.clone());
+        invalidate_settings_cache();
+
+        // Base: full-jev already installed by a previous writer.
+        let mut initial = JevSettings::default();
+        assert!(initial.full_jev_install());
+        let store = JevSettingsStore::new(&agent_dir);
+        store.save(&initial).expect("save full base");
+        invalidate_settings_cache();
+
+        let mut extensions: Vec<SharedExtension> = Vec::new();
+        maybe_register_jev_observer(&mut extensions);
+        let extension = extensions
+            .first()
+            .expect("observer extension registered")
+            .clone();
+        assert_eq!(handler_count(&extension), 1, "overlay-active baseline installs the handler");
+
+        // A DISTINCT store instance removes full-jev.
+        let mut writer = JevSettingsStore::new(&agent_dir).load();
+        assert!(writer.full_jev_remove());
+        JevSettingsStore::new(&agent_dir).save(&writer).expect("save off");
+
+        std::thread::sleep(SETTINGS_TTL + Duration::from_millis(40));
+        assert!(!active_mode_requested(), "fresh read sees the removal");
+        assert_eq!(
+            handler_count(&extension),
+            0,
+            "TTL reload must remove handler presence after a cross-process full-off"
+        );
+
+        invalidate_settings_cache();
+        std::env::remove_var(crate::config::env_agent_dir());
+    }
+}
+
+/// The provider-request handler exists only while Active is requested.
     ///
     /// Its presence alone tells the runner that a request body may change,
     /// which also gates retry reuse of semantic edges. A process where nobody
@@ -1719,6 +3646,18 @@ mod no_subagent_control_tests {
 mod observation_redaction_tests {
     use super::*;
     use serde_json::json;
+
+    /// v5 usage knownness: compaction stats keep measured zeros, omit UNKNOWN.
+    #[test]
+    fn compaction_usage_stats_keep_known_zeros_and_omit_unknown() {
+        let mut stats = json!({"reason": "x"});
+        record_usage_stats(&pi_jev::types::Usage::unknown(), &mut stats);
+        assert!(stats.get("jev_input_tokens").is_none(), "UNKNOWN usage is omitted, not fabricated as 0");
+        assert!(stats.get("jev_output_tokens").is_none(), "UNKNOWN usage is omitted, not fabricated as 0");
+        record_usage_stats(&pi_jev::types::Usage { input_tokens: Some(0), output_tokens: Some(7) }, &mut stats);
+        assert_eq!(stats["jev_input_tokens"], json!(0), "a measured zero is a known zero and is kept");
+        assert_eq!(stats["jev_output_tokens"], json!(7));
+    }
 
     #[test]
     fn diagnostic_observation_uses_native_shape_without_error_text() {

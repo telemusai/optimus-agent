@@ -74,6 +74,7 @@ fn outcome(prepared: &PreparedCompaction, call: f64, result: f64) -> DecisionOut
         usage: Default::default(),
         applied: false,
         attempts: 1,
+        server_request_id: None,
     }
 }
 fn tool_text(message: &AgentMessage) -> String {
@@ -573,4 +574,147 @@ fn checkpoint_prefix_and_cross_boundary_pairs_stay_verbatim_while_suffix_shrinks
     let mut changed = messages;
     changed[0] = user("Changed constraints");
     assert_eq!(apply_context(changed, &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap_err(), CompactionSkip::StaleContext);
+}
+
+// ---------------------------------------------------------------------------
+// Sanitized regression fixture for the tool-ID length guard (auditor proposal,
+// reports/FLASH-COMPACTION-FIXTURE-PROPOSED.rs, adapted to local helpers;
+// Synthetic IDs mirror the native openai-responses shape `{call_id}|{item_id}`
+// (446 bytes, which is what `str::len` guards on); no private data.
+// ---------------------------------------------------------------------------
+
+/// 446 chars, same length class as native openai-responses tool IDs.
+fn long_pipe_id(seed: &str) -> String {
+    let filler = "abcdefghij".repeat(45); // 450 chars
+    format!("{seed}|{filler}")[..446].to_string()
+}
+
+fn call_args(id: &str, name: &str, arguments: serde_json::Value) -> AgentMessage {
+    AssistantMessage {
+        content: vec![ContentBlock::ToolCall(ToolCall::new(
+            id,
+            name,
+            arguments.as_object().unwrap().clone(),
+        ))],
+        stop_reason: "toolUse".into(),
+        ..Default::default()
+    }
+    .into()
+}
+
+fn long_id_read_transcript(id: &str) -> Vec<AgentMessage> {
+    // The read pair must sit OUTSIDE the default 6-message recent window to be
+    // an eligible candidate at all; trailing filler turns provide that distance
+    // without touching the pinned latest request.
+    vec![
+        user("Diagnose the parser."),
+        call_args(id, "read", json!({"path": "src/parser.rs"})),
+        result(id, "read", &"old source output\n".repeat(1200)),
+        user("Second request."),
+        user("Third request."),
+        user("Fourth request."),
+        user("Fifth request."),
+        user("Sixth request."),
+        user("Seventh request."),
+        user("Eighth request."),
+    ]
+}
+
+#[test]
+fn long_pipe_pair_applies() {
+    let id = long_pipe_id("call_alpha");
+    let messages = long_id_read_transcript(&id);
+    assert!(matches!(
+        prepare_context(&messages, &CompactionConfig::default()),
+        Ok(_)
+    ));
+}
+
+#[test]
+fn duplicate_long_id_still_refused() {
+    let id = long_pipe_id("call_beta");
+    let mut messages = long_id_read_transcript(&id);
+    messages.insert(3, messages[1].clone());
+    assert_eq!(
+        prepare_context(&messages, &CompactionConfig::default()).unwrap_err(),
+        CompactionSkip::InvalidPair
+    );
+}
+
+#[test]
+fn id_over_cap_still_refused() {
+    // Explicitly over-cap ID: 13 + 1 + 520 = 534 chars > 512.
+    let over = format!("call_{}|{}", "g".repeat(8), "abcdefghij".repeat(52));
+    let messages = long_id_read_transcript(&over);
+    assert_eq!(
+        prepare_context(&messages, &CompactionConfig::default()).unwrap_err(),
+        CompactionSkip::InvalidPair
+    );
+}
+
+#[test]
+fn non_read_ipython_still_refused() {
+    let id = long_pipe_id("call_delta");
+    let messages = vec![
+        user("Run the kernel."),
+        call_args(id.as_str(), "ipython", json!({"code": "print(1+1)"})),
+        result(id.as_str(), "ipython", &"kernel output\n".repeat(600)),
+        user("Third request."),
+    ];
+    assert_eq!(
+        prepare_context(&messages, &CompactionConfig::default()).unwrap_err(),
+        CompactionSkip::NoCandidates
+    );
+}
+
+fn long_transcript(name: &str, id: &str) -> Vec<AgentMessage> {
+    // Exact NATIVE ipython surface: the only registered native tool, whose
+    // schema carries ONLY `code` (IPYTHON_SCHEMA required ["code"]) with the
+    // strict recognized-read shape. Only the synthetic ID length differs.
+    let arguments = if name == "ipython" {
+        json!({"code":"from pathlib import Path\nprint(Path(\"src/parser.rs\").read_text())"})
+    } else {
+        json!({"path":"src/parser.rs"})
+    };
+    let mut messages = vec![
+        user("Keep exact constraints. Diagnose the parser."),
+        call_args(id, name, arguments),
+        result(id, name, &"old source output\n".repeat(1200)),
+    ];
+    for i in 0..7 {
+        messages.push(assistant(&format!("Recent reasoning {i}")));
+    }
+    messages
+}
+
+/// ROOT requirement: the reachable native ipython recognized-read path with
+/// native openai-responses-length IDs must actually project (truncate the old
+/// successful result) and populate stats — not just pass the length guard.
+#[test]
+fn native_ipython_recognized_read_with_native_length_ids_truncates() {
+    let id = long_pipe_id("call_ipy");
+    let messages = long_transcript("ipython", &id);
+    let original = messages.clone();
+    let prepared = prepare_context(&messages, &CompactionConfig::default()).unwrap();
+    let compacted = apply_context(messages, &prepared, &outcome(&prepared, 0.1, 0.1)).unwrap();
+    assert_eq!(compacted.messages.len(), original.len());
+    assert_eq!(compacted.messages[1], original[1]);
+    assert!(tool_text(&compacted.messages[2]).contains(TRUNCATION_MARKER));
+    assert_eq!(compacted.stats.calls_removed, 0);
+    assert_eq!(compacted.stats.results_truncated, 1);
+    assert_eq!(compacted.messages[0], original[0]);
+}
+
+/// ROOT requirement: fail-open with the ORIGINAL context preserved when the
+/// decision cannot apply (missing answer record), even with native-length IDs.
+#[test]
+fn native_length_ids_fail_open_on_incomplete_answers_preserving_original() {
+    let id = long_pipe_id("call_keep");
+    let messages = long_transcript("read_file", &id);
+    let original = messages.clone();
+    let prepared = prepare_context(&messages, &CompactionConfig::default()).unwrap();
+    let mut missing = outcome(&prepared, 0.1, 0.1);
+    missing.records.pop();
+    assert!(apply_context(messages.clone(), &prepared, &missing).is_err());
+    assert_eq!(messages, original);
 }

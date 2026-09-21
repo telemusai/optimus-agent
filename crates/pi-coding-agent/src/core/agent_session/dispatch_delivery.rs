@@ -31,32 +31,69 @@ pub(super) fn compatible_family_message_actions(
 
 impl AgentSession {
     pub(super) fn is_dispatched_input(&self, message: &AgentMessage) -> bool {
-        if !matches!(message.role(), "user" | "custom") { return false; }
-        self.action_store.lock().unwrap().actions_for_message(&delivery_message_of(message)).iter().any(|action| {
-            matches!(action.lifecycle.state(), ActionLifecycleState::Committing | ActionLifecycleState::Running | ActionLifecycleState::Failed)
-        })
+        if !matches!(message.role(), "user" | "custom") {
+            return false;
+        }
+        self.action_store
+            .lock()
+            .unwrap()
+            .actions_for_message(&delivery_message_of(message))
+            .iter()
+            .any(|action| {
+                matches!(
+                    action.lifecycle.state(),
+                    ActionLifecycleState::Committing
+                        | ActionLifecycleState::Running
+                        | ActionLifecycleState::Failed
+                )
+            })
     }
 
     // Initial input persistence runs inside the awaited lower-agent callback,
     // before it may request a model response. The queued event carries the same
     // result so later extension/event processing cannot append it a second time.
-    pub(super) fn persist_dispatch_message(&self, message: &AgentMessage) -> Result<String, String> {
+    pub(super) fn persist_dispatch_message(
+        &self,
+        message: &AgentMessage,
+    ) -> Result<String, String> {
         let mut manager = self.session_manager.lock().unwrap();
         let appended = match message {
-            AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, content, display, details, .. }) => {
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type,
+                content,
+                display,
+                details,
+                ..
+            }) => {
                 use crate::core::session_manager::CustomMessageEntryContent;
                 let content = match content {
-                    CustomMessageContent::Text(text) => CustomMessageEntryContent::Text(text.clone()),
+                    CustomMessageContent::Text(text) => {
+                        CustomMessageEntryContent::Text(text.clone())
+                    }
                     CustomMessageContent::Blocks(blocks) => CustomMessageEntryContent::Blocks(
-                        blocks.iter().map(|block| match block {
-                            pi_agent_core::types::ContentBlock::Text(text) => serde_json::json!({"type":"text", "text":text.text}),
-                            pi_agent_core::types::ContentBlock::Image(image) => serde_json::to_value(image).unwrap_or(Value::Null),
-                        }).collect(),
+                        blocks
+                            .iter()
+                            .map(|block| match block {
+                                pi_agent_core::types::ContentBlock::Text(text) => {
+                                    serde_json::json!({"type":"text", "text":text.text})
+                                }
+                                pi_agent_core::types::ContentBlock::Image(image) => {
+                                    serde_json::to_value(image).unwrap_or(Value::Null)
+                                }
+                            })
+                            .collect(),
                     ),
                 };
-                manager.append_custom_message_entry(custom_type, &content, *display, details.clone())
+                manager.append_custom_message_entry(
+                    custom_type,
+                    &content,
+                    *display,
+                    details.clone(),
+                )
             }
-            AgentMessage::Message(Message::User(_) | Message::Assistant(_) | Message::ToolResult(_)) => manager.append_message(message.clone()),
+            AgentMessage::Message(
+                Message::User(_) | Message::Assistant(_) | Message::ToolResult(_),
+            ) => manager.append_message(message.clone()),
             _ => return Ok(String::new()),
         };
         let entry_id = appended.and_then(|entry_id| manager.flush_now().map(|()| entry_id))?;
@@ -67,7 +104,11 @@ impl AgentSession {
         Ok(entry_id)
     }
 
-    pub(super) fn record_dispatch_persistence(&self, message: &AgentMessage, persisted: &Result<String, String>) {
+    pub(super) fn record_dispatch_persistence(
+        &self,
+        message: &AgentMessage,
+        persisted: &Result<String, String>,
+    ) {
         let mut delivered = Vec::new();
         let mut failed = Vec::new();
         {
@@ -81,10 +122,15 @@ impl AgentSession {
             };
             let key = agent_message_key_of(message);
             for mut action in actions {
-                if !matches!(action.lifecycle.state(), ActionLifecycleState::Committing | ActionLifecycleState::Running) {
+                if !matches!(
+                    action.lifecycle.state(),
+                    ActionLifecycleState::Committing | ActionLifecycleState::Running
+                ) {
                     continue;
                 }
-                let QueuedActionPayload::Turn(turn) = &mut action.payload else { continue; };
+                let QueuedActionPayload::Turn(turn) = &mut action.payload else {
+                    continue;
+                };
                 match persisted {
                     Ok(_) => {
                         let mut primary = false;
@@ -96,18 +142,26 @@ impl AgentSession {
                         }
                         if primary {
                             if action.lifecycle.state() == ActionLifecycleState::Committing {
-                                let _ = transition_session_action(&mut action, ActionLifecycle::Running {
-                                    execution: ActionExecutionAlias::AgentTurn,
-                                }, &TransitionOptions::default());
+                                let _ = transition_session_action(
+                                    &mut action,
+                                    ActionLifecycle::Running {
+                                        execution: ActionExecutionAlias::AgentTurn,
+                                    },
+                                    &TransitionOptions::default(),
+                                );
                             }
                             delivered.push((action.clone(), store.ticket_for(&action).ok()));
                         }
                     }
                     Err(error) => {
                         let error = format!("Session transcript persistence failed for action {}: {error}. Unsaved transcript entries remain in memory; this entry was not confirmed saved and will not be replayed automatically.", action.id);
-                        let _ = transition_session_action(&mut action, ActionLifecycle::Failed {
-                            error: error.clone(),
-                        }, &TransitionOptions::default());
+                        let _ = transition_session_action(
+                            &mut action,
+                            ActionLifecycle::Failed {
+                                error: error.clone(),
+                            },
+                            &TransitionOptions::default(),
+                        );
                         failed.push((action.clone(), error, store.ticket_for(&action).ok()));
                     }
                 }
@@ -115,11 +169,15 @@ impl AgentSession {
             }
         }
         for (action, ticket) in delivered {
-            if let Some(ticket) = ticket { ticket.settle_delivered(DeliveryOutcome::Delivered); }
+            if let Some(ticket) = ticket {
+                ticket.settle_delivered(DeliveryOutcome::Delivered);
+            }
             self.settle_agent_message(action.agent_message_id.as_deref(), "delivery", None);
         }
         for (action, error, ticket) in &failed {
-            if let Some(ticket) = ticket { ticket.reject_delivered(error.clone()); }
+            if let Some(ticket) = ticket {
+                ticket.reject_delivered(error.clone());
+            }
             self.settle_agent_message(action.agent_message_id.as_deref(), "delivery", Some(error));
         }
         if !failed.is_empty() {
@@ -134,29 +192,51 @@ impl AgentSession {
     }
 
     pub(super) fn failed_dispatch_persistence_error(&self) -> Option<String> {
-        self.action_store.lock().unwrap().owned_actions().iter().find_map(|action| {
-            match &action.lifecycle {
-                ActionLifecycle::Failed { error } if error.starts_with("Session transcript persistence failed for action ") => Some(error.clone()),
+        self.action_store
+            .lock()
+            .unwrap()
+            .owned_actions()
+            .iter()
+            .find_map(|action| match &action.lifecycle {
+                ActionLifecycle::Failed { error }
+                    if error.starts_with("Session transcript persistence failed for action ") =>
+                {
+                    Some(error.clone())
+                }
                 _ => None,
-            }
-        })
+            })
     }
 
-    pub(super) fn settled_turn_delivery_error(&self, actions: &[QueuedSessionAction]) -> Option<String> {
+    pub(super) fn settled_turn_delivery_error(
+        &self,
+        actions: &[QueuedSessionAction],
+    ) -> Option<String> {
         let store = self.action_store.lock().unwrap();
         let current = store.owned_actions();
         for dispatched in actions {
             let action = current.iter().find(|action| action.id == dispatched.id);
             if let Some(action) = action {
-                if action.lifecycle.state() == ActionLifecycleState::Cancelled { continue; }
-                if let ActionLifecycle::Failed { error } = &action.lifecycle { return Some(error.clone()); }
+                if action.lifecycle.state() == ActionLifecycleState::Cancelled {
+                    continue;
+                }
+                if let ActionLifecycle::Failed { error } = &action.lifecycle {
+                    return Some(error.clone());
+                }
                 // Read the live record by stable identity. The dispatch snapshot
                 // predates persistence; active model context can be compacted.
-                if let (Ok(original), Ok(receipt)) = (primary_delivery_record(dispatched), primary_delivery_record(action)) {
-                    if original.id == receipt.id && receipt.durable { continue; }
+                if let (Ok(original), Ok(receipt)) = (
+                    primary_delivery_record(dispatched),
+                    primary_delivery_record(action),
+                ) {
+                    if original.id == receipt.id && receipt.durable {
+                        continue;
+                    }
                 }
             }
-            return Some(format!("Session input dispatch settled without durable delivery (action {})", dispatched.id));
+            return Some(format!(
+                "Session input dispatch settled without durable delivery (action {})",
+                dispatched.id
+            ));
         }
         None
     }

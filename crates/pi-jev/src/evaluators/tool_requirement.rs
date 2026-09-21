@@ -25,14 +25,14 @@ impl super::CategoryEvaluator for ToolRequirement {
         };
         let mut criteria = BTreeMap::new();
         for option in OPTIONS {
-            criteria.insert(option.to_string(), None);
+            criteria.insert(option.to_string(), crate::types::EntryValue::Null);
         }
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Choice {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "What tool support does this task need? Bounded task excerpt: {task_text}"
-                ),
+                ))),
                 criteria,
             },
         }])

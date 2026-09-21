@@ -5,6 +5,9 @@ filtering, or compaction. No Jev decision can execute a tool, generate tool
 arguments, change permissions, select a primary/child model, spawn children,
 raise retry limits, or stop an agent.
 
+Question catalogs, evaluator thresholds, and suppression floors are documented
+in [JEV_QUESTIONS_AND_THRESHOLDS.md](JEV_QUESTIONS_AND_THRESHOLDS.md).
+
 ## Independent controls
 
 | Command | Compare | Active |
@@ -23,6 +26,26 @@ default. Existing tool-requirement and complexity effects retain their defaults.
 still needs Active mode and an accepted, current answer. Compare never changes
 the request. Result sufficiency, loop control, retry classification, verification,
 trace assessment, and model/subagent routing remain advisory.
+
+## Requested Jev model and catalog
+
+`/jev model status`, `/jev model set <id>`, and `/jev model reset` are local
+settings operations. They make no catalog or decision request. `set` preserves
+the exact safe identifier; whitespace, controls, bidi/invisible formatting and
+credential-shaped values are rejected without echoing the supplied value.
+`reset` selects the documented native default, `jev-latest`. Model settings do
+not enable Jev or change the full-jev overlay.
+
+Every decision lane captures mode, requested model, feature/compaction policy
+and the durable settings identity from one authoritative snapshot before any
+await. The captured model is sent on that request. A later settings write,
+including model A-to-B-to-A, makes the held result stale and prevents its effect.
+
+`/jev models` is the only catalog command. It performs at most one bounded,
+read-only catalog fetch when a credential is available. It never auto-selects a
+model and never writes settings. With no credential it reports unavailability
+without a fetch. Catalog output is bounded and hostile identifiers or prose are
+not repeated.
 
 ## Integration boundaries
 
@@ -91,6 +114,23 @@ A missing credential, timeout, cancellation, breaker, invalid response, stale
 settings, state-fitting failure, or insufficient reduction keeps the original
 context. Built-in compaction still operates under its existing policy. A failed
 optional optimization must not block the main provider request.
+
+### Search/evidence composition
+
+Line-find and citation checks are advisory request-local annotations. When both
+are enabled, they may assess the same otherwise-eligible native source-read
+result. Eligibility and provenance stay anchored to the immutable original text
+block and its captured fingerprint; one annotation cannot turn arbitrary
+pre-existing multi-block, image, error, mutation or unsigned content into an
+eligible source. Each accepted annotation is a separate bounded block on the
+provider-request copy. Source code and saved history remain unchanged.
+
+Native compaction treats recognized line-find, retrieval-safety and citation
+annotations as protected. It does not erase those annotations later in the same
+provider-context pipeline. Missing, malformed, stale, cancelled, oversized or
+deadline-expired assessments fail open to the unmodified input. This does not
+create a source artifact, perform another source read, verify a claim, or add
+new drop or execution authority.
 
 ## Experimental code-search relevance
 
@@ -198,6 +238,74 @@ policy still apply at consumption. This change reuses answers at shared
 boundaries; it does not speculate across changed request/context snapshots.
 Latency records provide the baseline for a later fingerprint-bound prefetch
 experiment. No latency improvement from speculative execution is claimed.
+
+## CONTROL and terminal status
+
+CONTROL decisions require the full-jev profile and an Active-capable mode. The
+host owns fixed corrective-feedback text, per-session durable budgets, epoch
+correlation and every effect. A result can request a queued follow-up only after
+a fresh authoritative apply check. It cannot execute tools, refill a budget,
+widen retries, terminate a tool mid-call, or mark a goal complete.
+
+Verification states are honest: `unknown`, `not_applicable`, `unverified`,
+`verified`, or `failed`. Verified/failed require explicit correlated evidence;
+a successful tool name or model answer is not enough. Existing terminal
+annotation, pause, escalation/attention and verification state are exposed as
+bounded worker status. These fields report the resolver outcome and never
+fabricate completion or execution authority.
+
+## Daemon and live-service limits
+
+Daemon Jev settings and status are capability- and schema-gated. Older peers
+keep the legacy command behavior. Worker-local telemetry is returned by the
+session worker; a supervisor must not fabricate an empty healthy snapshot.
+Catalog selection remains local except for the explicit `/jev models` fetch.
+
+The checked regression suite uses injected transports, local faux providers and
+mock Jev responses. It does not establish compatibility, availability, latency
+or quality for the live Jev service. Live service health and compatibility are
+unverified in this candidate. No live inference or catalog probe, installation,
+restart, activation or cutover is part of these instructions or receipts.
+
+## Full-jev global overlay (opt-in; ROOT-CONTRACT v1)
+
+`/jev full-jev on` installs a persisted named overlay profile for this agentDir;
+`/jev full-jev off` removes it; `/jev full-jev status` reports truth. The overlay
+is NOT a new `JevMode` and it never edits the built-in defaults, the saved global
+fields or the per-session map: while installed it is resolved ABOVE every saved
+session, global and inherited override (mode Compare + Active, all feature gates
+on including the new `code_search_reranking` and `line_find`, compaction on).
+Removing it restores the exact prior resolution because nothing was overwritten.
+Off does NOT delete the persisted block text: it is retained as an INACTIVE
+tombstone (enabled: false) carrying a durable revision, so the activation
+history survives restarts. An inactive block never masks anything and the
+resolution equals the exact pre-overlay result; the retained revision only
+prevents ABA reuse — a later `/jev full-jev on` reactivates with a NEW
+revision so stale stamps from the earlier activation (cheap caches, in-flight
+decisions) invalidate exactly like a key rotation.
+
+- Emergency exit: `/jev off` while the overlay is active atomically removes the
+  overlay AND sets the issuing session's decisions Off and compaction false;
+  other sessions return to their saved values.
+- While the overlay is active, mode/feature/compaction/default change requests
+  are refused with an explicit no-change message pointing to `/jev full-jev off`;
+  status/key operations still work. No success is reported for a change the
+  overlay would hide.
+- Staleness: every effect re-checks current settings, credentials and the
+  overlay revision (`full_jev_stamp`) at apply time — a toggle invalidates
+  in-flight work exactly like a key rotation; stale pre-toggle decisions cannot
+  apply. Same-process refresh is immediate; a different process picks the change
+  up at its next settings read, bounded by the 250 ms settings cache TTL.
+- Inheritance: children inherit the overlay-EXCLUDED baseline only; overlay
+  values are never materialized into sessions or children, which resolve the
+  live overlay like every other session.
+- Versioning: the overlay is understood by THIS source build. An already-running
+  older executable does not gain these features because settings JSON changed;
+  upgrade requires the new binary (mixed-version writers are outside the
+  supported live-reload contract).
+- Credentials: absent key means the footer reports unavailable and every
+  decision fails closed until `/jev key`; enabled configuration never fabricates
+  answers.
 
 ## Reference installation
 

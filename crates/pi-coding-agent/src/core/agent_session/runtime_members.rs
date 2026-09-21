@@ -5,6 +5,15 @@ use super::*;
 #[path = "subagent_runs.rs"]
 mod subagent_runs;
 
+use crate::core::agent_messages::{AgentSessionMessageAgentSummary, RUNTIME_KIND_SUBAGENT};
+use crate::core::extensions::types::{
+    AppendEntryHandler, CompactOptions, CustomMessagePayload, ExtensionActions,
+    ExtensionContextActions, GetActiveToolsHandler, GetAllToolsHandler, GetCommandsHandler,
+    GetSessionNameHandler, GetThinkingLevelHandler, ProviderActions, RefreshToolsHandler,
+    SendMessageHandler, SendMessageOptions, SendUserMessageHandler, SendUserMessageOptions,
+    SetActiveToolsHandler, SetLabelHandler, SetModelHandler, SetSessionNameHandler,
+    SetThinkingLevelHandler,
+};
 use crate::core::extensions::types::{
     ProviderConfig as ExtensionProviderConfig, SessionEntry as ExtensionSessionEntry,
 };
@@ -18,15 +27,6 @@ use crate::core::rlm_runtime::{
     normalize_requested_rlm_subagent_session_name, normalize_requested_rlm_subagent_thinking_level,
     CreateRlmRootSessionOptions, DELETE_OUTCOME_DELETED, DELETE_OUTCOME_SKIPPED_RUNNING,
     RLM_SUBAGENT_STATUS_COMPLETED, RLM_SUBAGENT_STATUS_ERROR, RLM_SUBAGENT_STATUS_RUNNING,
-};
-use crate::core::agent_messages::{AgentSessionMessageAgentSummary, RUNTIME_KIND_SUBAGENT};
-use crate::core::extensions::types::{
-    AppendEntryHandler, CompactOptions, CustomMessagePayload, ExtensionActions,
-    ExtensionContextActions, GetAllToolsHandler, GetActiveToolsHandler, GetCommandsHandler,
-    GetSessionNameHandler, GetThinkingLevelHandler, ProviderActions, RefreshToolsHandler,
-    SendMessageHandler, SendMessageOptions, SendUserMessageHandler, SendUserMessageOptions,
-    SetActiveToolsHandler, SetLabelHandler, SetModelHandler, SetSessionNameHandler,
-    SetThinkingLevelHandler,
 };
 use crate::core::session_stats::SessionStatsTokens;
 use crate::core::skills::Skill;
@@ -133,11 +133,13 @@ impl crate::core::extensions::types::ModelRegistry for RuntimeModelRegistry {
                 Box::pin(async move { registry.get_api_key_and_headers(&model).await })
             })
             .await
-            .unwrap_or_else(|error| crate::core::model_registry::ResolvedRequestAuth {
-                ok: false,
-                api_key: None,
-                headers: None,
-                error: Some(error),
+            .unwrap_or_else(|error| {
+                crate::core::model_registry::ResolvedRequestAuth {
+                    ok: false,
+                    api_key: None,
+                    headers: None,
+                    error: Some(error),
+                }
             });
             Ok(serde_json::json!({
                 "ok": resolved.ok,
@@ -148,7 +150,6 @@ impl crate::core::extensions::types::ModelRegistry for RuntimeModelRegistry {
         })
     }
 }
-
 
 /// `createSyntheticSourceInfo` for the two synthetic tool sources the runtime
 /// registers: `"<builtin:name>"` and `"<sdk:name>"` (agent-session.ts:9962-9986).
@@ -177,7 +178,10 @@ fn with_session<R>(
 
 /// `runner.getRegisteredCommands()` + prompt templates + skills as
 /// `SlashCommandInfo[]` (agent-session.ts:9847-9870).
-fn runtime_extension_commands(session: &Arc<AgentSession>, runner: &ExtensionRunner) -> Vec<SlashCommandInfo> {
+fn runtime_extension_commands(
+    session: &Arc<AgentSession>,
+    runner: &ExtensionRunner,
+) -> Vec<SlashCommandInfo> {
     let mut commands: Vec<SlashCommandInfo> = runner
         .get_registered_commands()
         .into_iter()
@@ -188,12 +192,17 @@ fn runtime_extension_commands(session: &Arc<AgentSession>, runner: &ExtensionRun
             source_info: command.command.source_info.clone(),
         })
         .collect();
-    commands.extend(session.prompt_templates().into_iter().map(|template| SlashCommandInfo {
-        name: template.name,
-        description: Some(template.description),
-        source: crate::core::slash_commands::SLASH_COMMAND_SOURCE_PROMPT.to_string(),
-        source_info: template.source_info,
-    }));
+    commands.extend(
+        session
+            .prompt_templates()
+            .into_iter()
+            .map(|template| SlashCommandInfo {
+                name: template.name,
+                description: Some(template.description),
+                source: crate::core::slash_commands::SLASH_COMMAND_SOURCE_PROMPT.to_string(),
+                source_info: template.source_info,
+            }),
+    );
     commands.extend(
         session
             .resource_loader
@@ -220,8 +229,8 @@ fn runtime_extension_commands(session: &Arc<AgentSession>, runner: &ExtensionRun
 fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) -> ExtensionActions {
     let send_runner = runner.clone();
     let send_weak = weak.clone();
-    let send_message: crate::core::extensions::types::SendMessageHandler =
-        Arc::new(move |message: CustomMessagePayload, options: Option<SendMessageOptions>| {
+    let send_message: crate::core::extensions::types::SendMessageHandler = Arc::new(
+        move |message: CustomMessagePayload, options: Option<SendMessageOptions>| {
             let runner = send_runner.clone();
             let session = send_weak.upgrade();
             let Some(session) = session else { return };
@@ -238,7 +247,10 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
                 None => (None, None),
             };
             tokio::task::spawn(async move {
-                if let Err(error) = session.send_custom_message(custom, trigger_turn, deliver_as).await {
+                if let Err(error) = session
+                    .send_custom_message(custom, trigger_turn, deliver_as)
+                    .await
+                {
                     runner.emit_error(ExtensionError {
                         extension_path: "<runtime>".to_string(),
                         event: "send_message".to_string(),
@@ -247,15 +259,20 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
                     });
                 }
             });
-        });
+        },
+    );
     let send_user_runner = runner.clone();
     let send_user_weak = weak.clone();
-    let send_user_message: crate::core::extensions::types::SendUserMessageHandler =
-        Arc::new(move |content: Value, options: Option<SendUserMessageOptions>| {
+    let send_user_message: crate::core::extensions::types::SendUserMessageHandler = Arc::new(
+        move |content: Value, options: Option<SendUserMessageOptions>| {
             let runner = send_user_runner.clone();
-            let Some(session) = send_user_weak.upgrade() else { return };
+            let Some(session) = send_user_weak.upgrade() else {
+                return;
+            };
             let parts: Vec<pi_ai::types::ImageOrTextContent> = match &content {
-                Value::String(text) => vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new(text))],
+                Value::String(text) => vec![pi_ai::types::ImageOrTextContent::Text(
+                    TextContent::new(text),
+                )],
                 Value::Array(_) => serde_json::from_value(content.clone()).unwrap_or_default(),
                 _ => Vec::new(),
             };
@@ -276,7 +293,8 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
                     });
                 }
             });
-        });
+        },
+    );
     let append_weak = weak.clone();
     let append_entry: crate::core::extensions::types::AppendEntryHandler =
         Arc::new(move |custom_type: String, data: Option<Value>| {
@@ -313,14 +331,19 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
         });
     let active_weak = weak.clone();
     let get_active_tools: crate::core::extensions::types::GetActiveToolsHandler =
-        Arc::new(move || with_session(&active_weak, |session| session.get_active_tool_names()).unwrap_or_default());
+        Arc::new(move || {
+            with_session(&active_weak, |session| session.get_active_tool_names())
+                .unwrap_or_default()
+        });
     let all_weak = weak.clone();
     let get_all_tools: crate::core::extensions::types::GetAllToolsHandler = Arc::new(move || {
         with_session(&all_weak, |session| {
             session
                 .get_all_tools()
                 .into_iter()
-                .filter_map(|tool| serde_json::from_value::<crate::core::extensions::types::ToolInfo>(tool).ok())
+                .filter_map(|tool| {
+                    serde_json::from_value::<crate::core::extensions::types::ToolInfo>(tool).ok()
+                })
                 .collect()
         })
         .unwrap_or_default()
@@ -328,7 +351,9 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
     let set_active_weak = weak.clone();
     let set_active_tools: crate::core::extensions::types::SetActiveToolsHandler =
         Arc::new(move |tool_names: Vec<String>| {
-            let _ = with_session(&set_active_weak, |session| session.set_active_tools_by_name(&tool_names));
+            let _ = with_session(&set_active_weak, |session| {
+                session.set_active_tools_by_name(&tool_names)
+            });
         });
     let refresh_weak = weak.clone();
     let refresh_tools: crate::core::extensions::types::RefreshToolsHandler = Arc::new(move || {
@@ -345,16 +370,25 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
         .unwrap_or_default()
     });
     let set_model_weak = weak.clone();
-    let set_model: crate::core::extensions::types::SetModelHandler = Arc::new(move |model: Model| {
-        let session = set_model_weak.upgrade();
-        Box::pin(async move {
-            let Some(session) = session else { return false };
-            if !session.model_registry.lock().unwrap().has_configured_auth(&model) {
-                return false;
-            }
-            session.set_model(model, ModelSelectOptions::default()).await.is_ok()
-        }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
-    });
+    let set_model: crate::core::extensions::types::SetModelHandler =
+        Arc::new(move |model: Model| {
+            let session = set_model_weak.upgrade();
+            Box::pin(async move {
+                let Some(session) = session else { return false };
+                if !session
+                    .model_registry
+                    .lock()
+                    .unwrap()
+                    .has_configured_auth(&model)
+                {
+                    return false;
+                }
+                session
+                    .set_model(model, ModelSelectOptions::default())
+                    .await
+                    .is_ok()
+            }) as std::pin::Pin<Box<dyn std::future::Future<Output = bool> + Send>>
+        });
     let get_thinking_weak = weak.clone();
     let get_thinking_level: crate::core::extensions::types::GetThinkingLevelHandler =
         Arc::new(move || {
@@ -390,16 +424,20 @@ fn build_extension_actions(weak: Weak<AgentSession>, runner: ExtensionRunner) ->
 /// `_bindExtensionCore` context-action half (agent-session.ts:9921-9943).
 fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContextActions {
     let model_weak = weak.clone();
-    let get_model = Arc::new(move || with_session(&model_weak, |session| session.model()).flatten());
+    let get_model =
+        Arc::new(move || with_session(&model_weak, |session| session.model()).flatten());
     let idle_weak = weak.clone();
     let is_idle = Arc::new(move || {
         with_session(&idle_weak, |session| !session.is_streaming()).unwrap_or(true)
     });
     let signal_weak = weak.clone();
-    let get_signal = Arc::new(move || with_session(&signal_weak, |session| session.agent.signal()).flatten());
+    let get_signal =
+        Arc::new(move || with_session(&signal_weak, |session| session.agent.signal()).flatten());
     let abort_weak = weak.clone();
     let abort = Arc::new(move || {
-        let Some(session) = abort_weak.upgrade() else { return };
+        let Some(session) = abort_weak.upgrade() else {
+            return;
+        };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
             handle.spawn(async move {
                 let _ = session.abort().await;
@@ -419,19 +457,25 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
     let shutdown: crate::core::extensions::runner::ShutdownHandler = Arc::new(|| {});
     let usage_weak = weak.clone();
     let get_context_usage = Arc::new(move || {
-        with_session(&usage_weak, |session| session.get_context_usage()).flatten().map(
-            |usage| crate::core::extensions::types::ContextUsage {
+        with_session(&usage_weak, |session| session.get_context_usage())
+            .flatten()
+            .map(|usage| crate::core::extensions::types::ContextUsage {
                 tokens: usage.tokens,
                 context_window: usage.context_window,
                 percent: usage.percent,
-            },
-        )
+            })
     });
     let compact_weak = weak.clone();
     let compact = Arc::new(move |options: Option<CompactOptions>| {
-        let Some(session) = compact_weak.upgrade() else { return };
+        let Some(session) = compact_weak.upgrade() else {
+            return;
+        };
         let (custom_instructions, on_complete, on_error) = match options {
-            Some(options) => (options.custom_instructions, options.on_complete, options.on_error),
+            Some(options) => (
+                options.custom_instructions,
+                options.on_complete,
+                options.on_error,
+            ),
             None => (None, None, None),
         };
         if let Ok(handle) = tokio::runtime::Handle::try_current() {
@@ -478,15 +522,27 @@ fn build_extension_context_actions(weak: Weak<AgentSession>) -> ExtensionContext
 fn build_provider_actions(weak: Weak<AgentSession>) -> ProviderActions {
     let register_weak = weak.clone();
     let register_provider = Arc::new(move |name: String, config: ExtensionProviderConfig| {
-        let Some(session) = register_weak.upgrade() else { return };
+        let Some(session) = register_weak.upgrade() else {
+            return;
+        };
         let input = crate::core::agent_session_services::provider_config_input(&config);
-        let _ = session.model_registry.lock().unwrap().register_provider(&name, input);
+        let _ = session
+            .model_registry
+            .lock()
+            .unwrap()
+            .register_provider(&name, input);
         session.refresh_current_model_from_registry();
     });
     let unregister_weak = weak;
     let unregister_provider = Arc::new(move |name: String| {
-        let Some(session) = unregister_weak.upgrade() else { return };
-        session.model_registry.lock().unwrap().unregister_provider(&name);
+        let Some(session) = unregister_weak.upgrade() else {
+            return;
+        };
+        session
+            .model_registry
+            .lock()
+            .unwrap()
+            .unregister_provider(&name);
         session.refresh_current_model_from_registry();
     });
     ProviderActions {
@@ -553,61 +609,113 @@ impl crate::core::tools::BashOperations for ExtensionBashOperations {
 }
 
 impl AgentSession {
-    pub async fn bind_extensions(self: &Arc<Self>, bindings: &ExtensionBindings) -> Result<(), String> {
-        let Some(runner) = self.extension_runner() else { return Ok(()); };
-        if let Some(ui) = &bindings.ui_context { runner.set_ui_context(Some(ui.clone())); }
-        if let Some(actions) = &bindings.command_context_actions { runner.bind_command_context(Some(actions.clone())); }
-        if let Some(listener) = &bindings.on_error { runner.on_error(listener.clone()); }
+    pub async fn bind_extensions(
+        self: &Arc<Self>,
+        bindings: &ExtensionBindings,
+    ) -> Result<(), String> {
+        let Some(runner) = self.extension_runner() else {
+            return Ok(());
+        };
+        if let Some(ui) = &bindings.ui_context {
+            runner.set_ui_context(Some(ui.clone()));
+        }
+        if let Some(actions) = &bindings.command_context_actions {
+            runner.bind_command_context(Some(actions.clone()));
+        }
+        if let Some(listener) = &bindings.on_error {
+            runner.on_error(listener.clone());
+        }
         let event = serde_json::from_value(self.session_start_event.clone())
             .map_err(|error| error.to_string())?;
         runner.emit(event).await;
         self.extend_resources_from_extensions("startup").await
     }
 
-    pub(super) async fn extend_resources_from_extensions(self: &Arc<Self>, reason: &str) -> Result<(), String> {
-        let Some(runner) = self.extension_runner() else { return Ok(()); };
-        if !runner.has_handlers("resources_discover") { return Ok(()); }
-        let paths = runner.emit_resources_discover(self.cwd.clone(), reason.to_string()).await;
-        self.resource_loader.extend_resources(crate::core::resource_loader::ResourceExtensionPaths {
-            skill_paths: Some(self.build_extension_resource_paths(&paths.skill_paths)),
-            prompt_paths: Some(self.build_extension_resource_paths(&paths.prompt_paths)),
-            theme_paths: Some(self.build_extension_resource_paths(&paths.theme_paths)),
-        });
+    pub(super) async fn extend_resources_from_extensions(
+        self: &Arc<Self>,
+        reason: &str,
+    ) -> Result<(), String> {
+        let Some(runner) = self.extension_runner() else {
+            return Ok(());
+        };
+        if !runner.has_handlers("resources_discover") {
+            return Ok(());
+        }
+        let paths = runner
+            .emit_resources_discover(self.cwd.clone(), reason.to_string())
+            .await;
+        self.resource_loader.extend_resources(
+            crate::core::resource_loader::ResourceExtensionPaths {
+                skill_paths: Some(self.build_extension_resource_paths(&paths.skill_paths)),
+                prompt_paths: Some(self.build_extension_resource_paths(&paths.prompt_paths)),
+                theme_paths: Some(self.build_extension_resource_paths(&paths.theme_paths)),
+            },
+        );
         let prompt = self.rebuild_system_prompt(&self.get_active_tool_names());
         *self.base_system_prompt.lock().unwrap() = prompt.clone();
-        let mut state = self.agent.state(); state.system_prompt = prompt; self.agent.set_state(state);
+        let mut state = self.agent.state();
+        state.system_prompt = prompt;
+        self.agent.set_state(state);
         Ok(())
     }
 
-    pub(super) fn build_extension_resource_paths(&self, entries: &[crate::core::extensions::runner::ResourcePathEntry])
-        -> Vec<crate::core::resource_loader::ResourcePathEntry> {
-        entries.iter().map(|entry| crate::core::resource_loader::ResourcePathEntry {
-            path: entry.path.clone(), metadata: crate::core::package_manager::PathMetadata {
-                source: self.get_extension_source_label(&entry.extension_path),
-                scope: "temporary".to_string(), origin: "top-level".to_string(),
-                base_dir: if entry.extension_path.starts_with('<') { None } else {
-                    Path::new(&entry.extension_path).parent().map(|path| path.to_string_lossy().into_owned())
+    pub(super) fn build_extension_resource_paths(
+        &self,
+        entries: &[crate::core::extensions::runner::ResourcePathEntry],
+    ) -> Vec<crate::core::resource_loader::ResourcePathEntry> {
+        entries
+            .iter()
+            .map(|entry| crate::core::resource_loader::ResourcePathEntry {
+                path: entry.path.clone(),
+                metadata: crate::core::package_manager::PathMetadata {
+                    source: self.get_extension_source_label(&entry.extension_path),
+                    scope: "temporary".to_string(),
+                    origin: "top-level".to_string(),
+                    base_dir: if entry.extension_path.starts_with('<') {
+                        None
+                    } else {
+                        Path::new(&entry.extension_path)
+                            .parent()
+                            .map(|path| path.to_string_lossy().into_owned())
+                    },
                 },
-            },
-        }).collect()
+            })
+            .collect()
     }
 
     pub(super) fn get_extension_source_label(&self, path: &str) -> String {
-        if path.starts_with('<') { return format!("extension:{}", path.replace(['<', '>'], "")); }
-        let name = Path::new(path).file_name().unwrap_or_default().to_string_lossy();
-        let name = name.strip_suffix(".ts").or_else(|| name.strip_suffix(".js")).unwrap_or(&name);
+        if path.starts_with('<') {
+            return format!("extension:{}", path.replace(['<', '>'], ""));
+        }
+        let name = Path::new(path)
+            .file_name()
+            .unwrap_or_default()
+            .to_string_lossy();
+        let name = name
+            .strip_suffix(".ts")
+            .or_else(|| name.strip_suffix(".js"))
+            .unwrap_or(&name);
         format!("extension:{name}")
     }
 
     pub(super) fn apply_extension_bindings(&self, runner: &ExtensionRunner) {
         runner.bind_command_context(self.extension_command_context_actions.clone());
-        if let Some(listener) = &self.extension_error_listener { runner.on_error(listener.clone()); }
+        if let Some(listener) = &self.extension_error_listener {
+            runner.on_error(listener.clone());
+        }
     }
 
     pub(super) fn refresh_current_model_from_registry(self: &Arc<Self>) {
         if let Some(current) = self.model() {
-            if let Some(model) = self.model_registry.lock().unwrap().find(&current.provider, &current.id) {
-                let mut state = self.agent.state(); state.model = model; self.agent.set_state(state);
+            if let Some(model) = self
+                .model_registry
+                .lock()
+                .unwrap()
+                .find(&current.provider, &current.id)
+            {
+                let mut state = self.agent.state();
+                state.model = model;
+                self.agent.set_state(state);
             }
         }
     }
@@ -622,39 +730,85 @@ impl AgentSession {
         );
     }
 
-    pub(super) fn refresh_tool_registry(self: &Arc<Self>, include_all: bool, active_tool_names: Option<Vec<String>>) {
+    pub(super) fn refresh_tool_registry(
+        self: &Arc<Self>,
+        include_all: bool,
+        active_tool_names: Option<Vec<String>>,
+    ) {
         use crate::core::extensions::types::RegisteredTool;
         use crate::core::extensions::wrapper::{wrap_registered_tools, RunnerSource};
-        let Some(runner) = self.extension_runner() else { return; };
-        let previous: HashSet<String> = self.tool_registry.lock().unwrap().keys().cloned().collect();
-        let mut active = active_tool_names.clone().unwrap_or_else(|| self.get_active_tool_names());
+        let Some(runner) = self.extension_runner() else {
+            return;
+        };
+        let previous: HashSet<String> =
+            self.tool_registry.lock().unwrap().keys().cloned().collect();
+        let mut active = active_tool_names
+            .clone()
+            .unwrap_or_else(|| self.get_active_tool_names());
         let allowed = self.allowed_tool_names.lock().unwrap().clone();
         let permitted = |name: &str| allowed.as_ref().map_or(true, |names| names.contains(name));
-        let mut entries: Vec<RegisteredTool> = self.base_tool_definitions.lock().unwrap().iter()
-            .filter(|(name, _)| permitted(name)).map(|(name, definition)| RegisteredTool {
-                definition: definition.clone(), source_info: runtime_source_info(name, "builtin"),
-            }).collect();
+        let mut entries: Vec<RegisteredTool> = self
+            .base_tool_definitions
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|(name, _)| permitted(name))
+            .map(|(name, definition)| RegisteredTool {
+                definition: definition.clone(),
+                source_info: runtime_source_info(name, "builtin"),
+            })
+            .collect();
         let mut custom = runner.get_all_registered_tools();
-        custom.extend(self.custom_tools.iter().chain(self.acp_mcp_tools.lock().unwrap().iter()).map(|definition| RegisteredTool {
-            definition: definition.clone(), source_info: runtime_source_info(&definition.name, "sdk"),
-        }));
+        custom.extend(
+            self.custom_tools
+                .iter()
+                .chain(self.acp_mcp_tools.lock().unwrap().iter())
+                .map(|definition| RegisteredTool {
+                    definition: definition.clone(),
+                    source_info: runtime_source_info(&definition.name, "sdk"),
+                }),
+        );
         custom.retain(|entry| permitted(&entry.definition.name));
-        if include_all { active.extend(custom.iter().map(|entry| entry.definition.name.clone())); }
+        if include_all {
+            active.extend(custom.iter().map(|entry| entry.definition.name.clone()));
+        }
         entries.extend(custom);
-        *self.tool_definitions.lock().unwrap() = entries.iter().map(|entry| (entry.definition.name.clone(), ToolDefinitionEntry {
-            definition: entry.definition.clone(), source_info: entry.source_info.clone(),
-        })).collect();
+        *self.tool_definitions.lock().unwrap() = entries
+            .iter()
+            .map(|entry| {
+                (
+                    entry.definition.name.clone(),
+                    ToolDefinitionEntry {
+                        definition: entry.definition.clone(),
+                        source_info: entry.source_info.clone(),
+                    },
+                )
+            })
+            .collect();
         let tools = wrap_registered_tools(&entries, RunnerSource::Runner(runner));
         if allowed.is_some() || active_tool_names.is_none() {
-            active.extend(tools.iter().filter(|tool| allowed.is_some() || !previous.contains(&tool.name)).map(|tool| tool.name.clone()));
+            active.extend(
+                tools
+                    .iter()
+                    .filter(|tool| allowed.is_some() || !previous.contains(&tool.name))
+                    .map(|tool| tool.name.clone()),
+            );
         }
-        *self.tool_registry.lock().unwrap() = tools.into_iter().map(|tool| (tool.name.clone(), tool)).collect();
+        *self.tool_registry.lock().unwrap() = tools
+            .into_iter()
+            .map(|tool| (tool.name.clone(), tool))
+            .collect();
         active.retain(|name| permitted(name));
-        let mut seen = HashSet::new(); active.retain(|name| seen.insert(name.clone()));
+        let mut seen = HashSet::new();
+        active.retain(|name| seen.insert(name.clone()));
         self.set_active_tools_by_name(&active);
     }
 
-    pub fn build_runtime(self: &Arc<Self>, active_tool_names: Option<Vec<String>>, include_all: bool) {
+    pub fn build_runtime(
+        self: &Arc<Self>,
+        active_tool_names: Option<Vec<String>>,
+        include_all: bool,
+    ) {
         let definitions: BTreeMap<String, crate::core::extensions::types::ToolDefinition> = match &self.base_tools_override {
             Some(tools) => tools.iter().map(|(name, tool)| (name.clone(),
                 crate::core::tools::tool_definition_wrapper::create_tool_definition_from_agent_tool(tool).into())).collect(),
@@ -759,9 +913,15 @@ impl AgentSession {
         // The runner reaches both owners through the `extensions::types` traits;
         // the two adapters declared above forward every call to the canonical owners.
         let runner = crate::core::extensions::runner::create_extension_runner(
-            loaded.extensions, loaded.runtime, self.cwd.clone(),
-            Arc::new(RuntimeSessionManager { manager: self.session_manager.clone() }),
-            Arc::new(RuntimeModelRegistry { registry: self.model_registry.clone() }),
+            loaded.extensions,
+            loaded.runtime,
+            self.cwd.clone(),
+            Arc::new(RuntimeSessionManager {
+                manager: self.session_manager.clone(),
+            }),
+            Arc::new(RuntimeModelRegistry {
+                registry: self.model_registry.clone(),
+            }),
         );
         self.extension_runner_ref.set(Some(runner.clone()));
         self.bind_extension_core(&runner);
@@ -786,7 +946,12 @@ impl AgentSession {
         }
         let acp_mcp_tool_definitions: Vec<crate::core::extensions::types::ToolDefinition> =
             if self.ipython_kernel_provisioner.lock().unwrap().is_some() {
-                let acp_provisioner = self.ipython_kernel_provisioner.lock().unwrap().clone().unwrap();
+                let acp_provisioner = self
+                    .ipython_kernel_provisioner
+                    .lock()
+                    .unwrap()
+                    .clone()
+                    .unwrap();
                 crate::core::tools::acp_mcp::create_acp_mcp_tool_definitions(
                     &acp_mcp_tool_configs(&acp_servers),
                     acp_provisioner,
@@ -815,8 +980,12 @@ impl AgentSession {
             }
         }
         *self.acp_mcp_tools.lock().unwrap() = acp_mcp_tool_definitions;
-        let active = active_tool_names.unwrap_or_else(|| self.base_tools_override.as_ref()
-            .map(|tools| tools.iter().map(|(name, _)| name.clone()).collect()).unwrap_or_else(|| vec!["ipython".to_string()]));
+        let active = active_tool_names.unwrap_or_else(|| {
+            self.base_tools_override
+                .as_ref()
+                .map(|tools| tools.iter().map(|(name, _)| name.clone()).collect())
+                .unwrap_or_else(|| vec!["ipython".to_string()])
+        });
         self.refresh_tool_registry(include_all, Some(active.clone()));
         // TS agent-session.ts:10159-10167: prewarm when configured, or whenever
         // we're resuming a session that already has a kernel snapshot - so its
@@ -828,7 +997,12 @@ impl AgentSession {
             .lock()
             .unwrap()
             .get_session_artifact_dir()
-            .map(|artifact_dir| std::path::Path::new(&crate::core::kernel::state_snapshot::snapshot_path_in(&artifact_dir)).exists())
+            .map(|artifact_dir| {
+                std::path::Path::new(&crate::core::kernel::state_snapshot::snapshot_path_in(
+                    &artifact_dir,
+                ))
+                .exists()
+            })
             .unwrap_or(false);
         if (prewarm_ipython_kernel || has_snapshot) && active.iter().any(|name| name == "ipython") {
             if let Some(provisioner) = self.ipython_kernel_provisioner.lock().unwrap().clone() {
@@ -857,13 +1031,22 @@ impl AgentSession {
             })
         }));
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.run".to_string(), create_rlm_run_host_handler(Arc::new(move |request| {
-            let weak = weak.clone(); Box::pin(async move {
-                let session = weak.upgrade().ok_or("Parent session disposed")?;
-                let kwargs = request.kwargs.as_object().cloned().unwrap_or_default();
-                serde_json::to_value(session.start_rlm_child_run(&request.prompt, &kwargs, request.cell_source_code).await?).map_err(|error| error.to_string())
-            })
-        })));
+        handlers.insert(
+            "rlm.run".to_string(),
+            create_rlm_run_host_handler(Arc::new(move |request| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    let session = weak.upgrade().ok_or("Parent session disposed")?;
+                    let kwargs = request.kwargs.as_object().cloned().unwrap_or_default();
+                    serde_json::to_value(
+                        session
+                            .start_rlm_child_run(&request.prompt, &kwargs, request.cell_source_code)
+                            .await?,
+                    )
+                    .map_err(|error| error.to_string())
+                })
+            })),
+        );
         // `bash.completed` (agent-session.ts:10208-10232): a finished background shell
         // injects one canonical completion message onto the steering lane and returns
         // after acceptance. An admission-pause rejection is retried until admission is
@@ -948,32 +1131,75 @@ impl AgentSession {
             })
         })));
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.create_session".to_string(), create_rlm_create_session_host_handler(Arc::new(move |request| {
-            let weak = weak.clone(); Box::pin(async move {
-                weak.upgrade().ok_or("Parent session disposed")?.create_rlm_session(&request.prompt,
-                    &request.kwargs.as_object().cloned().unwrap_or_default()).await
-            })
-        })));
+        handlers.insert(
+            "rlm.create_session".to_string(),
+            create_rlm_create_session_host_handler(Arc::new(move |request| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    weak.upgrade()
+                        .ok_or("Parent session disposed")?
+                        .create_rlm_session(
+                            &request.prompt,
+                            &request.kwargs.as_object().cloned().unwrap_or_default(),
+                        )
+                        .await
+                })
+            })),
+        );
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.find_models".into(), create_rlm_find_models_host_handler(Arc::new(move |query, limit| {
-            let weak = weak.clone();
-            Box::pin(async move { weak.upgrade().ok_or("Parent session disposed")?.find_rlm_models(&query, limit as i64).await })
-        })));
+        handlers.insert(
+            "rlm.find_models".into(),
+            create_rlm_find_models_host_handler(Arc::new(move |query, limit| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    weak.upgrade()
+                        .ok_or("Parent session disposed")?
+                        .find_rlm_models(&query, limit as i64)
+                        .await
+                })
+            })),
+        );
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.list_subagents".into(), create_rlm_list_subagents_host_handler(Arc::new(move || {
-            let weak = weak.clone();
-            Box::pin(async move { weak.upgrade().ok_or("Parent session disposed")?.list_rlm_subagents().await })
-        })));
+        handlers.insert(
+            "rlm.list_subagents".into(),
+            create_rlm_list_subagents_host_handler(Arc::new(move || {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    weak.upgrade()
+                        .ok_or("Parent session disposed")?
+                        .list_rlm_subagents()
+                        .await
+                })
+            })),
+        );
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.delete_subagent".into(), create_rlm_delete_subagent_host_handler(Arc::new(move |target| {
-            let weak = weak.clone();
-            Box::pin(async move { weak.upgrade().ok_or("Parent session disposed")?.delete_rlm_subagent(&target).await })
-        })));
+        handlers.insert(
+            "rlm.delete_subagent".into(),
+            create_rlm_delete_subagent_host_handler(Arc::new(move |target| {
+                let weak = weak.clone();
+                Box::pin(async move {
+                    weak.upgrade()
+                        .ok_or("Parent session disposed")?
+                        .delete_rlm_subagent(&target)
+                        .await
+                })
+            })),
+        );
         let weak = Arc::downgrade(self);
-        handlers.insert("rlm.collect".into(), crate::core::rlm_runtime::create_rlm_collect_host_handler(Arc::new(move |targets, timeout_ms| {
-            let weak = weak.clone();
-            Box::pin(async move { weak.upgrade().ok_or("Parent session disposed")?.collect_rlm_children(&targets, timeout_ms).await })
-        })));
+        handlers.insert(
+            "rlm.collect".into(),
+            crate::core::rlm_runtime::create_rlm_collect_host_handler(Arc::new(
+                move |targets, timeout_ms| {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        weak.upgrade()
+                            .ok_or("Parent session disposed")?
+                            .collect_rlm_children(&targets, timeout_ms)
+                            .await
+                    })
+                },
+            )),
+        );
         // TS agent-session.ts:10267-10272: the agent_message handlers install only
         // when the controller exists AND the agent-message skill is visible to the
         // model (disableModelInvocation skills are not kernel-reachable).
@@ -987,33 +1213,72 @@ impl AgentSession {
             .map(|skill| skill.name().to_string())
             .collect();
         if self.agent_message_controller.is_some()
-            && visible_kernel_skill_names.contains(crate::core::agent_messages::AGENT_MESSAGE_SKILL_NAME)
+            && visible_kernel_skill_names
+                .contains(crate::core::agent_messages::AGENT_MESSAGE_SKILL_NAME)
         {
-            handlers.extend(create_agent_message_host_handlers(Arc::new(subagent_runs::SessionMessageController(Arc::downgrade(self)))));
+            handlers.extend(create_agent_message_host_handlers(Arc::new(
+                subagent_runs::SessionMessageController(Arc::downgrade(self)),
+            )));
         }
         if let Some(controller) = &self.agent_observe_controller {
             handlers.extend(create_agent_observe_host_handlers(controller.clone()));
         }
-        for operation in ["goal.get", "goal.create", "goal.complete", "compact.run", "compact.status", "refine.run", "refine.status",
-            "rlm_heartbeat.list", "rlm_heartbeat.create", "rlm_heartbeat.update", "rlm_heartbeat.delete"] {
-            if operation.starts_with("goal.") && !self.include_goals { continue; }
-            if operation.starts_with("compact.") && !self.include_compact_skill { continue; }
+        for operation in [
+            "goal.get",
+            "goal.create",
+            "goal.complete",
+            "compact.run",
+            "compact.status",
+            "refine.run",
+            "refine.status",
+            "rlm_heartbeat.list",
+            "rlm_heartbeat.create",
+            "rlm_heartbeat.update",
+            "rlm_heartbeat.delete",
+        ] {
+            if operation.starts_with("goal.") && !self.include_goals {
+                continue;
+            }
+            if operation.starts_with("compact.") && !self.include_compact_skill {
+                continue;
+            }
             // TS agent-session.ts:10252-10255: refine handlers are gated on
             // `_autoRefineAllowedForSession()`.
-            if operation.starts_with("refine.") && !self.auto_refine_allowed_for_session() { continue; }
-            if operation.starts_with("rlm_heartbeat.") && self.rlm_heartbeat_controller.lock().unwrap().is_none() { continue; }
+            if operation.starts_with("refine.") && !self.auto_refine_allowed_for_session() {
+                continue;
+            }
+            if operation.starts_with("rlm_heartbeat.")
+                && self.rlm_heartbeat_controller.lock().unwrap().is_none()
+            {
+                continue;
+            }
             let weak = Arc::downgrade(self);
-            handlers.insert(operation.to_string(), Arc::new(move |payload: Value| {
-                let weak = weak.clone(); Box::pin(async move {
-                    let session = weak.upgrade().ok_or_else(|| KernelError::new("Session disposed"))?;
-                    let result = if operation.starts_with("goal.") {
-                        session.handle_goal_host_request(operation, Some(&payload)).and_then(|response| serde_json::to_value(response).map_err(|error| error.to_string()))
-                    } else if operation.starts_with("compact.") { session.handle_compact_host_request(operation, Some(&payload)) }
-                    else if operation.starts_with("refine.") { session.handle_refine_host_request(operation, Some(&payload)) }
-                    else { session.handle_rlm_heartbeat_host_request(operation, Some(&payload)) };
-                    result.map_err(KernelError::new)
-                })
-            }));
+            handlers.insert(
+                operation.to_string(),
+                Arc::new(move |payload: Value| {
+                    let weak = weak.clone();
+                    Box::pin(async move {
+                        let session = weak
+                            .upgrade()
+                            .ok_or_else(|| KernelError::new("Session disposed"))?;
+                        let result = if operation.starts_with("goal.") {
+                            session
+                                .handle_goal_host_request(operation, Some(&payload))
+                                .and_then(|response| {
+                                    serde_json::to_value(response)
+                                        .map_err(|error| error.to_string())
+                                })
+                        } else if operation.starts_with("compact.") {
+                            session.handle_compact_host_request(operation, Some(&payload))
+                        } else if operation.starts_with("refine.") {
+                            session.handle_refine_host_request(operation, Some(&payload))
+                        } else {
+                            session.handle_rlm_heartbeat_host_request(operation, Some(&payload))
+                        };
+                        result.map_err(KernelError::new)
+                    })
+                }),
+            );
         }
         // TS 10337-10339: `if (this._mcpManager) Object.assign(handlers, this._mcpManager.hostHandlers())`.
         // The MCP manager owns mcp.refresh/mcp.config/mcp.begin_login; a manager-less
@@ -1025,7 +1290,10 @@ impl AgentSession {
         handlers
     }
 
-    pub async fn reload_with_options(self: &Arc<Self>, rebind: Option<ExtensionBindings>) -> Result<(), String> {
+    pub async fn reload_with_options(
+        self: &Arc<Self>,
+        rebind: Option<ExtensionBindings>,
+    ) -> Result<(), String> {
         // `await emitSessionShutdownEvent(this._extensionRunner, { type:
         // "session_shutdown", reason: "reload" })` (agent-session.ts:10344-10348).
         // The helper emits only when handlers exist and returns false otherwise.
@@ -1043,7 +1311,9 @@ impl AgentSession {
         }
         self.resource_loader.reload().await;
         self.build_runtime(Some(self.get_active_tool_names()), true);
-        if let Some(bindings) = rebind { self.bind_extensions(&bindings).await?; }
+        if let Some(bindings) = rebind {
+            self.bind_extensions(&bindings).await?;
+        }
         self.extend_resources_from_extensions("reload").await
     }
 
@@ -1051,11 +1321,17 @@ impl AgentSession {
     pub(super) fn rlm_kernel_env(&self) -> HashMap<String, String> {
         let mut env = HashMap::from([
             ("RLM_DEPTH".to_string(), self.rlm_depth.to_string()),
-            ("RLM_MAX_DEPTH".to_string(), self.rlm_max_depth().to_string()),
+            (
+                "RLM_MAX_DEPTH".to_string(),
+                self.rlm_max_depth().to_string(),
+            ),
             // TS agent-session.ts:10382: getGlobalHarnessStateDir() is called with no
             // argument, so it resolves to the process-level getAgentDir() (absolute),
             // never the scoped session agent dir.
-            ("RLM_GLOBAL_HARNESS_STATE_DIR".to_string(), get_global_harness_state_dir(&crate::config::get_agent_dir())),
+            (
+                "RLM_GLOBAL_HARNESS_STATE_DIR".to_string(),
+                get_global_harness_state_dir(&crate::config::get_agent_dir()),
+            ),
         ]);
         if let Some(dir) = self.rlm_session_dir_for_reading() {
             env.insert("RLM_SESSION_DIR".to_string(), dir.clone());
@@ -1076,7 +1352,10 @@ impl AgentSession {
     /// `_addWebsearchKeyEnv(env)` (agent-session.ts:10396-10417).
     pub(super) fn add_websearch_key_env(&self, env: &mut HashMap<String, String>) {
         if let Some(agent_dir) = &self.agent_dir {
-            env.insert("PRIME_AGENT_CODING_AGENT_DIR".to_string(), agent_dir.clone());
+            env.insert(
+                "PRIME_AGENT_CODING_AGENT_DIR".to_string(),
+                agent_dir.clone(),
+            );
         }
         if std::env::var(SERPER_ENV_VAR)
             .map(|value| !value.trim().is_empty())
@@ -1095,7 +1374,12 @@ impl AgentSession {
         if !websearch_loaded {
             return;
         }
-        let credential = self.model_registry.lock().unwrap().auth_storage().get(SERPER_CREDENTIAL_ID);
+        let credential = self
+            .model_registry
+            .lock()
+            .unwrap()
+            .auth_storage()
+            .get(SERPER_CREDENTIAL_ID);
         let Some(crate::core::auth_storage::AuthCredential::ApiKey { key, .. }) = credential else {
             return;
         };
@@ -1109,7 +1393,9 @@ impl AgentSession {
 
     /// `_createChildRlmSessionDir()`.
     pub(super) fn create_child_rlm_session_dir(&self) -> Result<String, String> {
-        let parent = self.rlm_session_dir_for_reading().map(Ok)
+        let parent = self
+            .rlm_session_dir_for_reading()
+            .map(Ok)
             .unwrap_or_else(|| self.create_ephemeral_rlm_session_dir())?;
         std::fs::create_dir_all(&parent).map_err(|error| error.to_string())?;
         for _ in 0..100 {
@@ -1126,24 +1412,32 @@ impl AgentSession {
 
     /// `_createEphemeralRlmSessionDir()`.
     pub(super) fn create_ephemeral_rlm_session_dir(&self) -> Result<String, String> {
-        let dir = PathBuf::from(std::env::temp_dir()).join(format!(
-            "prime-agent-rlm-{}",
-            uuid::Uuid::new_v4()
-        ));
+        let dir = PathBuf::from(std::env::temp_dir())
+            .join(format!("prime-agent-rlm-{}", uuid::Uuid::new_v4()));
         std::fs::create_dir_all(&dir).map_err(|error| error.to_string())?;
         Ok(dir.to_string_lossy().to_string())
     }
 
     /// `_contextTokensForCurrentMessages()`.
     pub fn context_tokens_for_current_messages(&self) -> Option<f64> {
-        self.find_last_assistant_message().map(|message| calculate_context_tokens(&message.usage))
+        self.find_last_assistant_message()
+            .map(|message| calculate_context_tokens(&message.usage))
     }
 
     /// `setCurrentRecap(recap)`.
     pub fn set_current_recap(&self, recap: Option<String>) {
-        let changed = { let mut current = self.recap.lock().unwrap();
-            if *current == recap { false } else { *current = recap.clone(); true } };
-        if changed { self.emit(AgentSessionEvent::RecapUpdate { recap }); }
+        let changed = {
+            let mut current = self.recap.lock().unwrap();
+            if *current == recap {
+                false
+            } else {
+                *current = recap.clone();
+                true
+            }
+        };
+        if changed {
+            self.emit(AgentSessionEvent::RecapUpdate { recap });
+        }
     }
 
     /// `get repliedToParentSinceTask()`.
@@ -1188,29 +1482,52 @@ impl AgentSession {
 
     /// `_createRlmSubagentRuntimeOptions(options)`.
     pub(super) fn create_rlm_subagent_runtime_options(
-        self: &Arc<Self>, options: RlmSubagentRuntimeOptionsInput,
+        self: &Arc<Self>,
+        options: RlmSubagentRuntimeOptionsInput,
     ) -> Result<CreateRlmSubagentRuntimeOptions, String> {
-        let thinking_level = options.thinking_level.unwrap_or_else(|| self.thinking_level());
+        let thinking_level = options
+            .thinking_level
+            .unwrap_or_else(|| self.thinking_level());
         Ok(CreateRlmSubagentRuntimeOptions {
-            parent_session: self.clone(), id: options.id.clone(), prompt: options.prompt,
-            session_name: options.session_name, session_dir: options.session_dir, model: options.model,
-            thinking_level, service_tier: self.service_tier(),
-            scoped_models: self.scoped_models.iter().map(|entry| crate::core::rlm_runtime::ScopedModelEntry {
-                model: entry.model.clone(), thinking_level: entry.thinking_level.clone(),
-            }).collect(),
+            parent_session: self.clone(),
+            id: options.id.clone(),
+            prompt: options.prompt,
+            session_name: options.session_name,
+            session_dir: options.session_dir,
+            model: options.model,
+            thinking_level,
+            service_tier: self.service_tier(),
+            scoped_models: self
+                .scoped_models
+                .iter()
+                .map(|entry| crate::core::rlm_runtime::ScopedModelEntry {
+                    model: entry.model.clone(),
+                    thinking_level: entry.thinking_level.clone(),
+                })
+                .collect(),
             active_tool_names: self.get_active_tool_names(),
-            allowed_tool_names: self.allowed_tool_names.lock().unwrap().clone().map(|names| names.into_iter().collect()),
-            custom_tools: self.custom_tools.clone(), include_goals: self.include_goals,
+            allowed_tool_names: self
+                .allowed_tool_names
+                .lock()
+                .unwrap()
+                .clone()
+                .map(|names| names.into_iter().collect()),
+            custom_tools: self.custom_tools.clone(),
+            include_goals: self.include_goals,
             include_compact_skill: self.include_compact_skill,
-            rlm_depth: (self.rlm_depth + 1) as f64, rlm_max_depth: self.rlm_max_depth() as f64,
-            rlm_parent_node_id: options.id, spawned_by_request_id: options.spawned_by_request_id,
-            spawn_code: options.spawn_code, on_session_published: None,
+            rlm_depth: (self.rlm_depth + 1) as f64,
+            rlm_max_depth: self.rlm_max_depth() as f64,
+            rlm_parent_node_id: options.id,
+            spawned_by_request_id: options.spawned_by_request_id,
+            spawn_code: options.spawn_code,
+            on_session_published: None,
         })
     }
 
     /// `_createRlmSubagentRuntime(options)`.
     pub(super) async fn create_rlm_subagent_runtime(
-        self: &Arc<Self>, options: CreateRlmSubagentRuntimeOptions,
+        self: &Arc<Self>,
+        options: CreateRlmSubagentRuntimeOptions,
     ) -> Result<RlmSubagentRuntime, String> {
         let host = self.subagent_runtime_host.lock().unwrap().clone();
         match host {
@@ -1221,7 +1538,8 @@ impl AgentSession {
 
     /// `_createInlineRlmSubagentRuntime(options)`.
     pub(super) fn create_inline_rlm_subagent_runtime(
-        self: &Arc<Self>, options: CreateRlmSubagentRuntimeOptions,
+        self: &Arc<Self>,
+        options: CreateRlmSubagentRuntimeOptions,
     ) -> Result<RlmSubagentRuntime, String> {
         let mut manager = SessionManager::create(&self.cwd, Some(&options.session_dir))?;
         manager.append_model_change(&options.model.provider, &options.model.id)?;
@@ -1235,32 +1553,62 @@ impl AgentSession {
         state.thinking_level = options.thinking_level;
         state.service_tier = options.service_tier;
         let agent = pi_agent_core::agent::Agent::new(pi_agent_core::agent::AgentOptions {
-            initial_state: Some(state), stream_fn: Some(self.agent.stream_fn()),
-            session_id: Some(manager.get_session_id()), ..Default::default()
+            initial_state: Some(state),
+            stream_fn: Some(self.agent.stream_fn()),
+            session_id: Some(manager.get_session_id()),
+            ..Default::default()
         });
         let child = AgentSession::new(AgentSessionConfig {
-            agent: Arc::new(agent), session_manager: Arc::new(Mutex::new(manager)),
-            settings_manager: self.settings_manager.clone(), service_tier_preference: None,
-            cwd: self.cwd.clone(), agent_dir: self.agent_dir.clone(),
-            scoped_models: Some(options.scoped_models.into_iter().map(|entry| ScopedModel {
-                model: entry.model, thinking_level: entry.thinking_level,
-            }).collect()),
-            resource_loader: self.resource_loader.clone(), custom_tools: Some(options.custom_tools),
-            model_registry: self.model_registry.clone(), initial_active_tool_names: Some(options.active_tool_names),
-            allowed_tool_names: options.allowed_tool_names, include_goals: Some(options.include_goals),
-            include_compact_skill: Some(options.include_compact_skill), agent_message_controller: None,
-            agent_observe_controller: None, rlm_heartbeat_controller: None, mcp_manager: None,
-            base_tools_override: self.base_tools_override.clone(), extension_runner_ref: None,
-            session_start_event: Some(serde_json::json!({"type":"session_start", "reason":"startup"})),
-            rlm_depth: Some(options.rlm_depth as i64), rlm_max_depth: Some(options.rlm_max_depth as i64),
-            rlm_session_dir: Some(options.session_dir), rlm_parent_node_id: Some(options.rlm_parent_node_id),
+            agent: Arc::new(agent),
+            session_manager: Arc::new(Mutex::new(manager)),
+            settings_manager: self.settings_manager.clone(),
+            service_tier_preference: None,
+            cwd: self.cwd.clone(),
+            agent_dir: self.agent_dir.clone(),
+            scoped_models: Some(
+                options
+                    .scoped_models
+                    .into_iter()
+                    .map(|entry| ScopedModel {
+                        model: entry.model,
+                        thinking_level: entry.thinking_level,
+                    })
+                    .collect(),
+            ),
+            resource_loader: self.resource_loader.clone(),
+            custom_tools: Some(options.custom_tools),
+            model_registry: self.model_registry.clone(),
+            initial_active_tool_names: Some(options.active_tool_names),
+            allowed_tool_names: options.allowed_tool_names,
+            include_goals: Some(options.include_goals),
+            include_compact_skill: Some(options.include_compact_skill),
+            agent_message_controller: None,
+            agent_observe_controller: None,
+            rlm_heartbeat_controller: None,
+            mcp_manager: None,
+            base_tools_override: self.base_tools_override.clone(),
+            extension_runner_ref: None,
+            session_start_event: Some(
+                serde_json::json!({"type":"session_start", "reason":"startup"}),
+            ),
+            rlm_depth: Some(options.rlm_depth as i64),
+            rlm_max_depth: Some(options.rlm_max_depth as i64),
+            rlm_session_dir: Some(options.session_dir),
+            rlm_parent_node_id: Some(options.rlm_parent_node_id),
             rlm_parent_agent: Some(self.session_name().unwrap_or_else(|| self.session_id())),
-            semantic_parent_session_id: Some(self.session_id()), semantic_spawned_by_request_id: options.spawned_by_request_id,
-            subagent_runtime_host: None, autonomous: None, prewarm_ipython_kernel: None,
-            auto_refine_reviewer: None, serialized_refine: None, initial_goal: None,
+            semantic_parent_session_id: Some(self.session_id()),
+            semantic_spawned_by_request_id: options.spawned_by_request_id,
+            subagent_runtime_host: None,
+            autonomous: None,
+            prewarm_ipython_kernel: None,
+            auto_refine_reviewer: None,
+            serialized_refine: None,
+            initial_goal: None,
         })?;
         child.set_session_name(&options.session_name)?;
-        if let Some(published) = options.on_session_published { published(&child); }
+        if let Some(published) = options.on_session_published {
+            published(&child);
+        }
         Ok(RlmSubagentRuntime { session: child })
     }
 
@@ -1289,11 +1637,20 @@ impl AgentSession {
 
     /// `_cancelRlmChildRun(run, reason)`.
     pub(super) fn cancel_rlm_child_run(&self, run: &RlmChildRun, reason: &str) -> bool {
-        let current = self.active_rlm_child_runs.lock().unwrap().get(&run.id).cloned();
-        let Some(current) = current else { return false; };
+        let current = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .get(&run.id)
+            .cloned();
+        let Some(current) = current else {
+            return false;
+        };
         let abort = {
             let mut current = current.lock().unwrap();
-            if matches!(current.status.as_str(), "done" | "error" | "cancelled") { return false; }
+            if matches!(current.status.as_str(), "done" | "error" | "cancelled") {
+                return false;
+            }
             current.status = RLM_CHILD_AGENT_STATUS_CANCELLED.to_string();
             current.error = Some(reason.to_string());
             current.abort.clone()
@@ -1314,17 +1671,34 @@ impl AgentSession {
     /// `_currentActiveSessionId()`.
     pub(super) async fn current_active_session_id(&self) -> Option<String> {
         match &self.agent_message_controller {
-            Some(controller) => controller.list_agents().await.ok().flatten().and_then(|listed| listed.current.map(|current| current.active_session_id)),
+            Some(controller) => controller
+                .list_agents()
+                .await
+                .ok()
+                .flatten()
+                .and_then(|listed| listed.current.map(|current| current.active_session_id)),
             None => None,
         }
     }
 
     /// `_awaitPendingRlmChildPublication(selector)`.
-    pub(super) async fn await_pending_rlm_child_publication(&self, selector: &str) -> Result<Option<String>, String> {
-        let run = self.active_rlm_child_runs.lock().unwrap().values()
-            .find(|run| { let run = run.lock().unwrap(); run.id == selector || run.session_name == selector })
+    pub(super) async fn await_pending_rlm_child_publication(
+        &self,
+        selector: &str,
+    ) -> Result<Option<String>, String> {
+        let run = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .values()
+            .find(|run| {
+                let run = run.lock().unwrap();
+                run.id == selector || run.session_name == selector
+            })
             .cloned();
-        let Some(run) = run else { return Ok(None); };
+        let Some(run) = run else {
+            return Ok(None);
+        };
         let publication = run.lock().unwrap().publication.clone();
         publication.wait().await?;
         let child = run.lock().unwrap().session.clone();
@@ -1351,11 +1725,18 @@ impl AgentSession {
             .and_then(|listed| listed.current.as_ref())
             .map(|current| current.active_session_id.clone());
         if let Some(parent_active_session_id) = parent_active_session_id {
-            for agent in listed_agents.as_ref().map(|listed| listed.agents.iter()).into_iter().flatten() {
+            for agent in listed_agents
+                .as_ref()
+                .map(|listed| listed.agents.iter())
+                .into_iter()
+                .flatten()
+            {
                 if agent.runtime_kind.as_deref() != Some(RUNTIME_KIND_SUBAGENT) {
                     continue;
                 }
-                if agent.parent_active_session_id.as_deref() != Some(parent_active_session_id.as_str()) {
+                if agent.parent_active_session_id.as_deref()
+                    != Some(parent_active_session_id.as_str())
+                {
                     continue;
                 }
                 if let Some(child_id) = agent.rlm_child_id.clone() {
@@ -1374,7 +1755,11 @@ impl AgentSession {
             .map(|run| run.lock().unwrap().clone())
             .collect();
         for run in runs.iter() {
-            if self.deleting_rlm_children.lock().unwrap().contains_key(&run.id)
+            if self
+                .deleting_rlm_children
+                .lock()
+                .unwrap()
+                .contains_key(&run.id)
                 || run.detached_deletion.is_some()
                 || run.status == RLM_CHILD_AGENT_STATUS_CANCELLED
             {
@@ -1405,9 +1790,17 @@ impl AgentSession {
             recorded.insert(run.id.clone());
         }
         for (child_id, retained) in self.rlm_child_sessions.lock().unwrap().iter() {
-            if self.deleting_rlm_children.lock().unwrap().contains_key(child_id)
+            if self
+                .deleting_rlm_children
+                .lock()
+                .unwrap()
+                .contains_key(child_id)
                 || recorded.contains(child_id)
-                || self.rlm_child_cleanup_failures.lock().unwrap().contains_key(child_id)
+                || self
+                    .rlm_child_cleanup_failures
+                    .lock()
+                    .unwrap()
+                    .contains_key(child_id)
             {
                 continue;
             }
@@ -1425,9 +1818,7 @@ impl AgentSession {
                 session_name: daemon_child
                     .and_then(|child| child.session_name.clone())
                     .or_else(|| retained.session.session_name())
-                    .unwrap_or_else(|| {
-                        create_default_rlm_subagent_session_name("", child_id)
-                    }),
+                    .unwrap_or_else(|| create_default_rlm_subagent_session_name("", child_id)),
                 session_dir,
                 status: RLM_SUBAGENT_STATUS_COMPLETED.to_string(),
             });
@@ -1435,9 +1826,21 @@ impl AgentSession {
         }
         for (child_id, daemon_child) in daemon_children.iter() {
             if recorded.contains(child_id)
-                || self.deleting_rlm_children.lock().unwrap().contains_key(child_id)
-                || self.deleted_rlm_child_ids.lock().unwrap().contains(child_id)
-                || self.rlm_child_cleanup_failures.lock().unwrap().contains_key(child_id)
+                || self
+                    .deleting_rlm_children
+                    .lock()
+                    .unwrap()
+                    .contains_key(child_id)
+                || self
+                    .deleted_rlm_child_ids
+                    .lock()
+                    .unwrap()
+                    .contains(child_id)
+                || self
+                    .rlm_child_cleanup_failures
+                    .lock()
+                    .unwrap()
+                    .contains_key(child_id)
             {
                 continue;
             }
@@ -1466,7 +1869,11 @@ impl AgentSession {
     }
 
     /// `_rlmSubagentMatchesTarget(entry, target)`.
-    pub(super) fn rlm_subagent_matches_target(&self, entry: &RlmSubagentRegistryEntry, target: &str) -> bool {
+    pub(super) fn rlm_subagent_matches_target(
+        &self,
+        entry: &RlmSubagentRegistryEntry,
+        target: &str,
+    ) -> bool {
         entry.rlm_child_id == target
             || entry.active_session_id.as_deref() == Some(target)
             || entry.session_id.as_deref() == Some(target)
@@ -1497,7 +1904,10 @@ impl AgentSession {
                 )
                 .collect();
             for child in children {
-                if visited.iter().any(|candidate| Arc::ptr_eq(candidate, &child)) {
+                if visited
+                    .iter()
+                    .any(|candidate| Arc::ptr_eq(candidate, &child))
+                {
                     continue;
                 }
                 visited.push(child.clone());
@@ -1598,11 +2008,13 @@ impl AgentSession {
                     }),
                 )
                 .await?;
-            return Ok(if result.outcome.as_deref() == Some(DELETE_OUTCOME_SKIPPED_RUNNING) {
-                DELETE_OUTCOME_RUNNING_LITERAL.to_string()
-            } else {
-                DELETE_OUTCOME_DELETED.to_string()
-            });
+            return Ok(
+                if result.outcome.as_deref() == Some(DELETE_OUTCOME_SKIPPED_RUNNING) {
+                    DELETE_OUTCOME_RUNNING_LITERAL.to_string()
+                } else {
+                    DELETE_OUTCOME_DELETED.to_string()
+                },
+            );
         }
         Ok(DELETE_OUTCOME_NOT_FOUND_LITERAL.to_string())
     }
@@ -1734,10 +2146,16 @@ impl AgentSession {
         };
         if existing {
             deletion.wait().await?;
-            return Ok(RlmDeleteSubagentResult { subagent: subagent.clone(), outcome: None });
+            return Ok(RlmDeleteSubagentResult {
+                subagent: subagent.clone(),
+                outcome: None,
+            });
         }
         let result = start_deletion(self.clone()).await;
-        match &result { Ok(_) => deletion.resolve(), Err(error) => deletion.reject(error.clone()) }
+        match &result {
+            Ok(_) => deletion.resolve(),
+            Err(error) => deletion.reject(error.clone()),
+        }
         // `finally`: release the reservation unless the detached run still owns
         // the selector until its deletion reservation settles.
         let detached = self
@@ -1769,7 +2187,11 @@ impl AgentSession {
                         .map(|accepted| Arc::ptr_eq(&accepted, &deletion))
                         .unwrap_or(false)
                     {
-                        session.deleting_rlm_children.lock().unwrap().remove(&child_id);
+                        session
+                            .deleting_rlm_children
+                            .lock()
+                            .unwrap()
+                            .remove(&child_id);
                     }
                 });
             }
@@ -1812,15 +2234,24 @@ impl AgentSession {
         run: &RlmChildRun,
         session: &Arc<AgentSession>,
     ) -> Arc<AgentMessageDeferred> {
-        let current = self.active_rlm_child_runs.lock().unwrap().get(&run.id).cloned();
+        let current = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .get(&run.id)
+            .cloned();
         let cleanup = if let Some(current) = current {
             let mut current = current.lock().unwrap();
-            if let Some(cleanup) = &current.deletion_cleanup { return cleanup.clone(); }
+            if let Some(cleanup) = &current.deletion_cleanup {
+                return cleanup.clone();
+            }
             let cleanup = Arc::new(create_agent_message_deferred());
             current.deletion_cleanup = Some(cleanup.clone());
             cleanup
         } else {
-            if let Some(cleanup) = &run.deletion_cleanup { return cleanup.clone(); }
+            if let Some(cleanup) = &run.deletion_cleanup {
+                return cleanup.clone();
+            }
             Arc::new(create_agent_message_deferred())
         };
         let session_for_cleanup = session.clone();
@@ -1883,7 +2314,13 @@ impl AgentSession {
             .lock()
             .unwrap()
             .get(&run.id)
-            .and_then(|entry| entry.lock().unwrap().report_deletion_cleanup_failure.clone());
+            .and_then(|entry| {
+                entry
+                    .lock()
+                    .unwrap()
+                    .report_deletion_cleanup_failure
+                    .clone()
+            });
         if let Some(report) = report {
             report(error.to_string()).await;
         }
@@ -1900,7 +2337,12 @@ impl AgentSession {
         if let Some(complete_deletion) = complete_deletion {
             complete_deletion().await;
         }
-        let current = self.active_rlm_child_runs.lock().unwrap().get(&run.id).cloned();
+        let current = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .get(&run.id)
+            .cloned();
         if let Some(current) = current {
             let snapshot = {
                 let mut current = current.lock().unwrap();
@@ -1987,22 +2429,24 @@ impl AgentSession {
     }
 
     /// `_removeRlmSubagentTracking(childId, run?)`.
-    pub(super) fn remove_rlm_subagent_tracking(self: &Arc<Self>, child_id: &str, run: Option<&RlmChildRun>) {
+    pub(super) fn remove_rlm_subagent_tracking(
+        self: &Arc<Self>,
+        child_id: &str,
+        run: Option<&RlmChildRun>,
+    ) {
         if let Some(run) = run {
             if let Some(unsubscribe) = run.unsubscribe.clone() {
                 unsubscribe();
             }
         }
-        if let Some(unsubscribe) = self
-            .rlm_child_unsubscribes
-            .lock()
-            .unwrap()
-            .remove(child_id)
-        {
+        if let Some(unsubscribe) = self.rlm_child_unsubscribes.lock().unwrap().remove(child_id) {
             unsubscribe();
         }
         self.rlm_child_sessions.lock().unwrap().remove(child_id);
-        self.rlm_child_cleanup_failures.lock().unwrap().remove(child_id);
+        self.rlm_child_cleanup_failures
+            .lock()
+            .unwrap()
+            .remove(child_id);
         self.abandoned_rlm_quiescence_child_ids
             .lock()
             .unwrap()
@@ -2109,7 +2553,10 @@ impl AgentSession {
                     entry.settlement = create_agent_message_deferred();
                     entry.settled = false;
                 }
-                self.unsettled_rlm_child_runs.lock().unwrap().push(run.clone());
+                self.unsettled_rlm_child_runs
+                    .lock()
+                    .unwrap()
+                    .push(run.clone());
             }
             if let Some(live_session) = live_session {
                 self.continue_finished_rlm_run_deletion(
@@ -2168,13 +2615,24 @@ impl AgentSession {
 
     /// `releaseRlmChildSession(childId, session)`.
     pub fn release_rlm_child_session(
-        self: &Arc<Self>, child_id: &str, session: &Arc<AgentSession>,
+        self: &Arc<Self>,
+        child_id: &str,
+        session: &Arc<AgentSession>,
     ) -> Option<Box<dyn Fn() + Send + Sync>> {
-        let run = self.active_rlm_child_runs.lock().unwrap().get(child_id).cloned();
+        let run = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .get(child_id)
+            .cloned();
         if let Some(run) = run {
             let matches = {
                 let current = run.lock().unwrap();
-                current.status == "done" && current.session.as_ref().is_some_and(|child| Arc::ptr_eq(child, session))
+                current.status == "done"
+                    && current
+                        .session
+                        .as_ref()
+                        .is_some_and(|child| Arc::ptr_eq(child, session))
             };
             if matches {
                 let weak = Arc::downgrade(self);
@@ -2183,13 +2641,28 @@ impl AgentSession {
                     let unsubscribe = run.lock().unwrap().unsubscribe.take();
                     if let Some(parent) = weak.upgrade() {
                         let mut runs = parent.active_rlm_child_runs.lock().unwrap();
-                        if runs.get(&child_id).is_some_and(|current| Arc::ptr_eq(current, &run)) { runs.remove(&child_id); }
+                        if runs
+                            .get(&child_id)
+                            .is_some_and(|current| Arc::ptr_eq(current, &run))
+                        {
+                            runs.remove(&child_id);
+                        }
                     }
-                    if let Some(unsubscribe) = unsubscribe { unsubscribe(); }
+                    if let Some(unsubscribe) = unsubscribe {
+                        unsubscribe();
+                    }
                 }));
             }
         }
-        if !self.rlm_child_sessions.lock().unwrap().get(child_id).is_some_and(|child| Arc::ptr_eq(&child.session, session)) { return None; }
+        if !self
+            .rlm_child_sessions
+            .lock()
+            .unwrap()
+            .get(child_id)
+            .is_some_and(|child| Arc::ptr_eq(&child.session, session))
+        {
+            return None;
+        }
         let weak = Arc::downgrade(self);
         let child_id = child_id.to_string();
         let session = session.clone();
@@ -2197,27 +2670,59 @@ impl AgentSession {
             if let Some(parent) = weak.upgrade() {
                 let removed = {
                     let mut children = parent.rlm_child_sessions.lock().unwrap();
-                    if children.get(&child_id).is_some_and(|child| Arc::ptr_eq(&child.session, &session)) { children.remove(&child_id).is_some() } else { false }
+                    if children
+                        .get(&child_id)
+                        .is_some_and(|child| Arc::ptr_eq(&child.session, &session))
+                    {
+                        children.remove(&child_id).is_some()
+                    } else {
+                        false
+                    }
                 };
                 if removed {
-                    let unsubscribe = parent.rlm_child_unsubscribes.lock().unwrap().remove(&child_id);
-                    if let Some(unsubscribe) = unsubscribe { unsubscribe(); }
+                    let unsubscribe = parent
+                        .rlm_child_unsubscribes
+                        .lock()
+                        .unwrap()
+                        .remove(&child_id);
+                    if let Some(unsubscribe) = unsubscribe {
+                        unsubscribe();
+                    }
                 }
             }
         }))
     }
 
     /// A read-only, bounded fan-in. Collection never delivers another parent message.
-    pub async fn collect_rlm_children(&self, targets: &[String], timeout_ms: u64) -> Result<crate::core::rlm_runtime::RlmCollectResult, String> {
+    pub async fn collect_rlm_children(
+        &self,
+        targets: &[String],
+        timeout_ms: u64,
+    ) -> Result<crate::core::rlm_runtime::RlmCollectResult, String> {
         use crate::core::rlm_runtime::{RlmCollectResult, RlmCollectResultEntry};
-        let mut candidates: std::collections::BTreeMap<_, _> = self.active_rlm_child_runs.lock().unwrap().iter()
-            .map(|(id, run)| (id.clone(), run.clone())).collect();
+        let mut candidates: std::collections::BTreeMap<_, _> = self
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|(id, run)| (id.clone(), run.clone()))
+            .collect();
         let retained = self.rlm_child_sessions.lock().unwrap().clone();
         for (id, child) in &retained {
-            if let Some(run) = &child.run { candidates.entry(id.clone()).or_insert_with(|| run.clone()); }
+            if let Some(run) = &child.run {
+                candidates.entry(id.clone()).or_insert_with(|| run.clone());
+            }
         }
-        let deleting: HashSet<_> = self.deleting_rlm_children.lock().unwrap().keys().cloned().collect();
-        candidates.retain(|id, run| !deleting.contains(id) && run.lock().unwrap().detached_deletion.is_none());
+        let deleting: HashSet<_> = self
+            .deleting_rlm_children
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
+        candidates.retain(|id, run| {
+            !deleting.contains(id) && run.lock().unwrap().detached_deletion.is_none()
+        });
         let mut runs = std::collections::BTreeMap::new();
         if targets.is_empty() {
             runs = candidates;
@@ -2226,45 +2731,73 @@ impl AgentSession {
                 let mut matches = Vec::new();
                 for (id, run) in &candidates {
                     let snapshot = run.lock().unwrap().clone();
-                    let child = snapshot.session.or_else(|| retained.get(id).map(|entry| entry.session.clone()));
-                    if id == target || snapshot.session_name == *target || child.as_ref().is_some_and(|child| child.session_id() == *target || child.session_name().as_deref() == Some(target)) {
+                    let child = snapshot
+                        .session
+                        .or_else(|| retained.get(id).map(|entry| entry.session.clone()));
+                    if id == target
+                        || snapshot.session_name == *target
+                        || child.as_ref().is_some_and(|child| {
+                            child.session_id() == *target
+                                || child.session_name().as_deref() == Some(target)
+                        })
+                    {
                         matches.push((id.clone(), run.clone()));
                     }
                 }
                 if matches.len() != 1 {
-                    return Err(format!("RLM child selector {target:?} {} in the current parent session", if matches.is_empty() { "matches no direct child" } else { "is ambiguous" }));
+                    return Err(format!(
+                        "RLM child selector {target:?} {} in the current parent session",
+                        if matches.is_empty() {
+                            "matches no direct child"
+                        } else {
+                            "is ambiguous"
+                        }
+                    ));
                 }
                 let (id, run) = matches.pop().unwrap();
                 runs.insert(id, run);
             }
         }
         if timeout_ms > 0 {
-            let settlements: Vec<_> = runs.values().filter_map(|run| {
-                let run = run.lock().unwrap();
-                (!run.settled).then(|| run.settlement.clone())
-            }).collect();
-            let wait = futures::future::join_all(settlements.iter().map(AgentMessageDeferred::wait));
+            let settlements: Vec<_> = runs
+                .values()
+                .filter_map(|run| {
+                    let run = run.lock().unwrap();
+                    (!run.settled).then(|| run.settlement.clone())
+                })
+                .collect();
+            let wait =
+                futures::future::join_all(settlements.iter().map(AgentMessageDeferred::wait));
             tokio::select! {
                 _ = tokio::time::timeout(std::time::Duration::from_millis(timeout_ms.min(2_147_483_647)), wait) => {}
                 _ = self.session_action_commit_dispose_abort.cancelled() => {}
             }
         }
-        let results = runs.into_values().map(|run| {
-            let run = run.lock().unwrap().clone();
-            let child = run.session.as_ref().or_else(|| retained.get(&run.id).map(|entry| &entry.session));
-            RlmCollectResultEntry {
-                rlm_child_id: run.id,
-                session_name: child.and_then(|child| child.session_name()).or(Some(run.session_name)),
-                session_dir: run.session_dir,
-                status: run.status,
-                settled: run.settled,
-                answer_preview: run.answer_preview.map(|text| compact_rlm_text(&text, 160)),
-                error: run.error.map(|text| compact_rlm_text(&text, 2000)),
-                duration_ms: run.duration_ms,
-                tool_use_count: Some(run.tool_use_count),
-                replied_since_task: child.and_then(|child| child.replied_to_parent_since_task()),
-            }
-        }).collect();
+        let results = runs
+            .into_values()
+            .map(|run| {
+                let run = run.lock().unwrap().clone();
+                let child = run
+                    .session
+                    .as_ref()
+                    .or_else(|| retained.get(&run.id).map(|entry| &entry.session));
+                RlmCollectResultEntry {
+                    rlm_child_id: run.id,
+                    session_name: child
+                        .and_then(|child| child.session_name())
+                        .or(Some(run.session_name)),
+                    session_dir: run.session_dir,
+                    status: run.status,
+                    settled: run.settled,
+                    answer_preview: run.answer_preview.map(|text| compact_rlm_text(&text, 160)),
+                    error: run.error.map(|text| compact_rlm_text(&text, 2000)),
+                    duration_ms: run.duration_ms,
+                    tool_use_count: Some(run.tool_use_count),
+                    replied_since_task: child
+                        .and_then(|child| child.replied_to_parent_since_task()),
+                }
+            })
+            .collect();
         Ok(RlmCollectResult { results })
     }
 
@@ -2274,15 +2807,13 @@ impl AgentSession {
         run: &RlmChildRun,
         child: Option<Arc<AgentSession>>,
     ) -> RlmChildAgentSnapshot {
-        let child = child
-            .or_else(|| run.session.clone())
-            .or_else(|| {
-                self.rlm_child_sessions
-                    .lock()
-                    .unwrap()
-                    .get(&run.id)
-                    .map(|retained| retained.session.clone())
-            });
+        let child = child.or_else(|| run.session.clone()).or_else(|| {
+            self.rlm_child_sessions
+                .lock()
+                .unwrap()
+                .get(&run.id)
+                .map(|retained| retained.session.clone())
+        });
         let model = child
             .as_ref()
             .and_then(|child| child.model())
@@ -2370,13 +2901,7 @@ impl AgentSession {
             session_dir: child
                 .rlm_session_dir
                 .clone()
-                .unwrap_or_else(|| {
-                    child
-                        .session_manager
-                        .lock()
-                        .unwrap()
-                        .get_session_dir()
-                }),
+                .unwrap_or_else(|| child.session_manager.lock().unwrap().get_session_dir()),
             // No run exists (e.g. a child rehydrated after daemon recovery), so live
             // session state is the only source for in-flight follow-up work.
             activity: if child.is_session_active() {
@@ -2396,13 +2921,15 @@ impl AgentSession {
         }
     }
 
-
-
     /// `_isUnboundTerminalRlmChildRun(run)`.
     pub(super) fn is_unbound_terminal_rlm_child_run(&self, run: &RlmChildRun) -> bool {
         matches!(run.status.as_str(), "done" | "error" | "cancelled")
             && run.session.is_none()
-            && !self.rlm_child_sessions.lock().unwrap().contains_key(&run.id)
+            && !self
+                .rlm_child_sessions
+                .lock()
+                .unwrap()
+                .contains_key(&run.id)
     }
 
     /// `hasRunningRlmChildren()`.
@@ -2411,12 +2938,7 @@ impl AgentSession {
             .lock()
             .unwrap()
             .values()
-            .any(|run| {
-                matches!(
-                    run.lock().unwrap().status.as_str(),
-                    "queued" | "running"
-                )
-            })
+            .any(|run| matches!(run.lock().unwrap().status.as_str(), "queued" | "running"))
     }
 
     /// `_rlmChildSessionSnapshot()`.
@@ -2432,7 +2954,8 @@ impl AgentSession {
     /// `_hasUnsettledRlmQuiescenceWork()`.
     pub(super) fn has_unsettled_rlm_quiescence_work(&self) -> bool {
         !self.unsettled_rlm_child_runs.lock().unwrap().is_empty()
-            || !self.abandoned_rlm_quiescence_child_ids
+            || !self
+                .abandoned_rlm_quiescence_child_ids
                 .lock()
                 .unwrap()
                 .is_empty()
@@ -2452,8 +2975,18 @@ impl AgentSession {
                 .unwrap()
                 .contains(name)
         };
-        if pending || self.list_rlm_subagents().await?.subagents.iter().any(|child| child.session_name == name) {
-            return Err(format_agent_session_name_unavailable(name, (self.rlm_depth + 1) as f64));
+        if pending
+            || self
+                .list_rlm_subagents()
+                .await?
+                .subagents
+                .iter()
+                .any(|child| child.session_name == name)
+        {
+            return Err(format_agent_session_name_unavailable(
+                name,
+                (self.rlm_depth + 1) as f64,
+            ));
         }
         Ok(())
     }
@@ -2464,8 +2997,18 @@ impl AgentSession {
     }
 
     /// `findRlmModels(query, limit)`.
-    pub async fn find_rlm_models(self: &Arc<Self>, query: &str, limit: i64) -> Result<RlmFindModelsResult, String> {
-        Ok(RlmFindModelsResult { models: crate::core::rlm_runtime::find_rlm_model_matches(query, &self.authenticated_rlm_models().await, limit as f64) })
+    pub async fn find_rlm_models(
+        self: &Arc<Self>,
+        query: &str,
+        limit: i64,
+    ) -> Result<RlmFindModelsResult, String> {
+        Ok(RlmFindModelsResult {
+            models: crate::core::rlm_runtime::find_rlm_model_matches(
+                query,
+                &self.authenticated_rlm_models().await,
+                limit as f64,
+            ),
+        })
     }
 
     /// `_resolveRlmSubagentModel(reference, target)` (agent-session.ts:11418-11446).
@@ -2476,12 +3019,17 @@ impl AgentSession {
     ) -> Result<RlmSubagentModelSelection, String> {
         let parent_model = self.model().ok_or_else(format_no_model_selected_message)?;
         let Some(reference) = reference else {
-            return Ok(RlmSubagentModelSelection { model: parent_model });
+            return Ok(RlmSubagentModelSelection {
+                model: parent_model,
+            });
         };
         let normalized_reference = reference.to_lowercase();
-        let parent_selector = format!("{}/{}", parent_model.provider, parent_model.id).to_lowercase();
+        let parent_selector =
+            format!("{}/{}", parent_model.provider, parent_model.id).to_lowercase();
         if parent_selector == normalized_reference {
-            return Ok(RlmSubagentModelSelection { model: parent_model });
+            return Ok(RlmSubagentModelSelection {
+                model: parent_model,
+            });
         }
         let model = self
             .authenticated_rlm_models()
@@ -2552,10 +3100,8 @@ impl AgentSession {
             return Err("rlm.create_session requires a daemon-backed depth-0 session".to_string());
         };
 
-        let session_name = normalize_requested_rlm_subagent_session_name(
-            kwargs.get("name"),
-            Some(operation),
-        )?;
+        let session_name =
+            normalize_requested_rlm_subagent_session_name(kwargs.get("name"), Some(operation))?;
         let requested_model =
             normalize_requested_rlm_subagent_model(kwargs.get("model"), Some(operation))?;
         let requested_thinking_level = normalize_requested_rlm_subagent_thinking_level(
@@ -2566,7 +3112,11 @@ impl AgentSession {
             assert_direct_agent_message_target(session_name)?;
         }
         if let Some(raw_cwd) = kwargs.get("cwd") {
-            if raw_cwd.as_str().map(|value| value.trim().is_empty()).unwrap_or(true) {
+            if raw_cwd
+                .as_str()
+                .map(|value| value.trim().is_empty())
+                .unwrap_or(true)
+            {
                 return Err("rlm.create_session cwd must be a non-empty string".to_string());
             }
         }
@@ -2632,7 +3182,10 @@ impl AgentSession {
         if message.stop_reason != STOP_REASON_ERROR || message.error_message.is_none() {
             return false;
         }
-        let context_window = self.model().map(|model| model.context_window).unwrap_or(0.0);
+        let context_window = self
+            .model()
+            .map(|model| model.context_window)
+            .unwrap_or(0.0);
         if pi_ai::utils::overflow::is_context_overflow(message, Some(context_window)) {
             return false;
         }
@@ -2659,16 +3212,23 @@ impl AgentSession {
     }
 
     /// `_getProviderStreamFailureKind(message)`.
-    pub(super) fn get_provider_stream_failure_kind(&self, message: &AssistantMessage) -> Option<String> {
+    pub(super) fn get_provider_stream_failure_kind(
+        &self,
+        message: &AssistantMessage,
+    ) -> Option<String> {
         provider_stream_failure_kind(message)
     }
 
     /// `_isStructuredPermanentProviderRetryExhausted(message)`.
-    pub(super) fn is_structured_permanent_provider_retry_exhausted(&self, message: &AssistantMessage) -> bool {
-        crate::core::provider_retry::cannot_replay_provider_failure(message) || is_permanent_provider_failure_kind(
-            self.get_provider_stream_failure_kind(message).as_deref(),
-            self.retry_attempt.load(Ordering::SeqCst) as f64,
-        )
+    pub(super) fn is_structured_permanent_provider_retry_exhausted(
+        &self,
+        message: &AssistantMessage,
+    ) -> bool {
+        crate::core::provider_retry::cannot_replay_provider_failure(message)
+            || is_permanent_provider_failure_kind(
+                self.get_provider_stream_failure_kind(message).as_deref(),
+                self.retry_attempt.load(Ordering::SeqCst) as f64,
+            )
     }
 
     /// `_isConcreteProviderAuthFailure(message)`.
@@ -2681,7 +3241,10 @@ impl AgentSession {
     }
 
     /// `_captureRetryAuthFailureSource(message)` (agent-session.ts:12043-12060).
-    pub(super) fn capture_retry_auth_failure_source(&self, message: &AssistantMessage) -> Option<AuthSourceToken> {
+    pub(super) fn capture_retry_auth_failure_source(
+        &self,
+        message: &AssistantMessage,
+    ) -> Option<AuthSourceToken> {
         let token = self
             .model_registry
             .lock()
@@ -2740,7 +3303,10 @@ impl AgentSession {
     }
 
     /// `_markProviderAuthStaleForRetryFailure(message, options?)` (agent-session.ts:12084-12101).
-    pub(super) fn mark_provider_auth_stale_for_retry_failure(&self, message: &AssistantMessage) -> bool {
+    pub(super) fn mark_provider_auth_stale_for_retry_failure(
+        &self,
+        message: &AssistantMessage,
+    ) -> bool {
         let tokens = self.retry_auth_failure_sources.lock().unwrap().clone();
         if tokens.is_empty() {
             return false;
@@ -2792,7 +3358,9 @@ impl AgentSession {
             return;
         }
         if let Some(message) = self.retry_metric_message.lock().unwrap().clone() {
-            pi_agent_core::agent_loop::finalize_performance_metric_logical_request(&message, outcome);
+            pi_agent_core::agent_loop::finalize_performance_metric_logical_request(
+                &message, outcome,
+            );
         }
         if let Some(metrics) = self.agent.performance_metrics() {
             self.agent.set_performance_metrics(Some(
@@ -2804,7 +3372,10 @@ impl AgentSession {
     }
 
     /// `_handleRetryableError(message, options?)` (agent-session.ts:12118-12253).
-    pub(super) async fn handle_retryable_error(self: &Arc<Self>, message: &AssistantMessage) -> bool {
+    pub(super) async fn handle_retryable_error(
+        self: &Arc<Self>,
+        message: &AssistantMessage,
+    ) -> bool {
         // Every path that ends the retry instead of starting another attempt must close
         // the host-owned group. Otherwise the group's id, settlement and attempt ordinal
         // stay live after the retry is over and later turns reuse them (B6).
@@ -3058,11 +3629,13 @@ impl AgentSession {
     }
 
     pub async fn execute_bash(
-        self: &Arc<Self>, command: &str,
+        self: &Arc<Self>,
+        command: &str,
         on_chunk: Option<Arc<dyn Fn(&str) + Send + Sync>>,
         exclude_from_context: Option<bool>,
     ) -> Result<BashResult, String> {
-        self.execute_bash_with_operations(command, on_chunk, exclude_from_context, None).await
+        self.execute_bash_with_operations(command, on_chunk, exclude_from_context, None)
+            .await
     }
 
     /// `executeBash(command, onChunk, { excludeFromContext, operations, transient })`
@@ -3080,22 +3653,42 @@ impl AgentSession {
         operations: Option<Arc<dyn crate::core::tools::BashOperations>>,
     ) -> Result<BashResult, String> {
         let controller = CancellationToken::new();
-        self.bash_abort_controllers.lock().unwrap().push(controller.clone());
-        let (prefix, shell_path) = { let settings = self.settings_manager.lock().unwrap();
-            (settings.get_shell_command_prefix(), settings.get_shell_path()) };
-        let resolved = prefix.filter(|prefix| !prefix.is_empty())
-            .map(|prefix| format!("{prefix}\n{command}")).unwrap_or_else(|| command.to_string());
+        self.bash_abort_controllers
+            .lock()
+            .unwrap()
+            .push(controller.clone());
+        let (prefix, shell_path) = {
+            let settings = self.settings_manager.lock().unwrap();
+            (
+                settings.get_shell_command_prefix(),
+                settings.get_shell_path(),
+            )
+        };
+        let resolved = prefix
+            .filter(|prefix| !prefix.is_empty())
+            .map(|prefix| format!("{prefix}\n{command}"))
+            .unwrap_or_else(|| command.to_string());
         // `options?.operations ?? createLocalBashOperations({ shellPath })` (agent-session.ts:12339).
         let operations = operations.unwrap_or_else(|| {
-            crate::core::tools::create_local_bash_operations(Some(crate::core::tools::LocalBashOperationsOptions { shell_path }))
+            crate::core::tools::create_local_bash_operations(Some(
+                crate::core::tools::LocalBashOperationsOptions { shell_path },
+            ))
         });
         let result = crate::core::bash_executor::execute_bash_with_operations(
-            &resolved, &self.cwd,
+            &resolved,
+            &self.cwd,
             operations,
-            Some(crate::core::bash_executor::BashExecutorOptions { on_chunk, signal: Some(controller.clone()) }),
-        ).await;
+            Some(crate::core::bash_executor::BashExecutorOptions {
+                on_chunk,
+                signal: Some(controller.clone()),
+            }),
+        )
+        .await;
         controller.cancel();
-        self.bash_abort_controllers.lock().unwrap().retain(|token| !token.is_cancelled());
+        self.bash_abort_controllers
+            .lock()
+            .unwrap()
+            .retain(|token| !token.is_cancelled());
         self.notify_session_input_checkpoint_change();
         let result = result?;
         self.record_bash_result(command, &result, exclude_from_context);
@@ -3103,23 +3696,34 @@ impl AgentSession {
     }
 
     pub async fn run_user_bash(
-        self: &Arc<Self>, command: &str, exclude_from_context: Option<bool>,
+        self: &Arc<Self>,
+        command: &str,
+        exclude_from_context: Option<bool>,
     ) -> Result<BashResult, String> {
         if self.user_bash_running.swap(true, Ordering::SeqCst) {
             return Err("A bash command is already running".to_string());
         }
-        self.user_bash_abort_requested.store(false, Ordering::SeqCst);
-        let result = self.run_user_bash_locked(command, exclude_from_context, CancellationToken::new()).await;
+        self.user_bash_abort_requested
+            .store(false, Ordering::SeqCst);
+        let result = self
+            .run_user_bash_locked(command, exclude_from_context, CancellationToken::new())
+            .await;
         self.user_bash_running.store(false, Ordering::SeqCst);
         self.notify_session_input_checkpoint_change();
         let result = result?;
         self.emit(AgentSessionEvent::BashEnd {
-            exit_code: result.exit_code, cancelled: result.cancelled, truncated: result.truncated,
-            full_output_path: result.full_output_path.clone(), error_message: None,
-            transient: None, run_id: None,
+            exit_code: result.exit_code,
+            cancelled: result.cancelled,
+            truncated: result.truncated,
+            full_output_path: result.full_output_path.clone(),
+            error_message: None,
+            transient: None,
+            run_id: None,
         });
         let session = self.clone();
-        tokio::spawn(async move { session.drain_queued_messages_after_bash().await; });
+        tokio::spawn(async move {
+            session.drain_queued_messages_after_bash().await;
+        });
         Ok(result)
     }
 
@@ -3129,21 +3733,26 @@ impl AgentSession {
     }
 
     pub(super) async fn run_user_bash_locked(
-        self: &Arc<Self>, command: &str, exclude_from_context: Option<bool>, _controller: CancellationToken,
+        self: &Arc<Self>,
+        command: &str,
+        exclude_from_context: Option<bool>,
+        _controller: CancellationToken,
     ) -> Result<BashResult, String> {
         // `const eventResult = await this._extensionRunner.emitUserBash({...})` (agent-session.ts:12415-12420).
         // Extensions may replace the result outright (`result`) or supply the operations
         // `executeBash` should run instead of the built-in local shell (`operations`, types.ts
         // `UserBashEventResult`). Without this dispatch both are unreachable.
         let event_result = match self.extension_runner() {
-            Some(runner) => runner
-                .emit_user_bash(serde_json::json!({
-                    "type": "user_bash",
-                    "command": command,
-                    "excludeFromContext": exclude_from_context.unwrap_or(false),
-                    "cwd": self.session_manager.lock().unwrap().get_cwd(),
-                }))
-                .await,
+            Some(runner) => {
+                runner
+                    .emit_user_bash(serde_json::json!({
+                        "type": "user_bash",
+                        "command": command,
+                        "excludeFromContext": exclude_from_context.unwrap_or(false),
+                        "cwd": self.session_manager.lock().unwrap().get_cwd(),
+                    }))
+                    .await
+            }
             None => None,
         };
         // NOTE: `this._extensionRunner.emitUserBash(...)` is unguarded in the TypeScript;
@@ -3154,11 +3763,16 @@ impl AgentSession {
         // (agent-session.ts:12428-12433), so a handler that runs for the whole dispatch window
         // is not reported as an already-started bash.
         self.emit(AgentSessionEvent::BashStart {
-            command: command.to_string(), exclude_from_context: exclude_from_context.unwrap_or(false),
-            transient: None, run_id: None,
+            command: command.to_string(),
+            exclude_from_context: exclude_from_context.unwrap_or(false),
+            transient: None,
+            run_id: None,
         });
         // `if (eventResult?.result) { ... }` (agent-session.ts:12436-12448).
-        if let Some(result) = event_result.as_ref().and_then(|result| result.result.as_ref()) {
+        if let Some(result) = event_result
+            .as_ref()
+            .and_then(|result| result.result.as_ref())
+        {
             let result = BashResult {
                 output: result.output.clone(),
                 exit_code: result.exit_code,
@@ -3167,7 +3781,9 @@ impl AgentSession {
                 full_output_path: result.full_output_path.clone(),
             };
             if !result.output.is_empty() {
-                self.emit(AgentSessionEvent::BashOutput { chunk: result.output.clone() });
+                self.emit(AgentSessionEvent::BashOutput {
+                    chunk: result.output.clone(),
+                });
             }
             self.record_bash_result(command, &result, exclude_from_context);
             return Ok(result);
@@ -3175,8 +3791,13 @@ impl AgentSession {
         // `if (this._userBashAbortRequested)` (agent-session.ts:12452-12460): an abort that
         // arrived during the extension dispatch has no abort controller to act on yet.
         if self.user_bash_abort_requested.load(Ordering::SeqCst) {
-            let result = BashResult { output: String::new(), exit_code: None, cancelled: true,
-                truncated: false, full_output_path: None };
+            let result = BashResult {
+                output: String::new(),
+                exit_code: None,
+                cancelled: true,
+                truncated: false,
+                full_output_path: None,
+            };
             self.record_bash_result(command, &result, exclude_from_context);
             return Ok(result);
         }
@@ -3188,30 +3809,58 @@ impl AgentSession {
                     as Arc<dyn crate::core::tools::BashOperations>
             });
         let weak = Arc::downgrade(self);
-        match self.execute_bash_with_operations(command, Some(Arc::new(move |chunk| {
-            if let Some(session) = weak.upgrade() {
-                session.emit(AgentSessionEvent::BashOutput { chunk: chunk.to_string() });
-            }
-        })), exclude_from_context, operations).await {
+        match self
+            .execute_bash_with_operations(
+                command,
+                Some(Arc::new(move |chunk| {
+                    if let Some(session) = weak.upgrade() {
+                        session.emit(AgentSessionEvent::BashOutput {
+                            chunk: chunk.to_string(),
+                        });
+                    }
+                })),
+                exclude_from_context,
+                operations,
+            )
+            .await
+        {
             Ok(result) => Ok(result),
             Err(error) => {
-                let result = BashResult { output: format!("bash failed: {error}"), exit_code: None,
-                    cancelled: false, truncated: false, full_output_path: None };
+                let result = BashResult {
+                    output: format!("bash failed: {error}"),
+                    exit_code: None,
+                    cancelled: false,
+                    truncated: false,
+                    full_output_path: None,
+                };
                 self.record_bash_result(command, &result, exclude_from_context);
                 Ok(result)
             }
         }
     }
 
-    pub fn record_bash_result(&self, command: &str, result: &BashResult, exclude_from_context: Option<bool>) {
+    pub fn record_bash_result(
+        &self,
+        command: &str,
+        result: &BashResult,
+        exclude_from_context: Option<bool>,
+    ) {
         let message = BashExecutionMessage {
-            role: "bashExecution".to_string(), command: command.to_string(), output: result.output.clone(),
-            exit_code: result.exit_code, cancelled: result.cancelled, truncated: result.truncated,
-            full_output_path: result.full_output_path.clone(), timestamp: now_ms_i64(), exclude_from_context,
+            role: "bashExecution".to_string(),
+            command: command.to_string(),
+            output: result.output.clone(),
+            exit_code: result.exit_code,
+            cancelled: result.cancelled,
+            truncated: result.truncated,
+            full_output_path: result.full_output_path.clone(),
+            timestamp: now_ms_i64(),
+            exclude_from_context,
         };
-        if self.is_streaming() { self.pending_bash_messages.lock().unwrap().push(message); }
-        else {
-            let message = agent_message_from_value(&serde_json::to_value(message).expect("bash message"));
+        if self.is_streaming() {
+            self.pending_bash_messages.lock().unwrap().push(message);
+        } else {
+            let message =
+                agent_message_from_value(&serde_json::to_value(message).expect("bash message"));
             let mut state = self.agent.state();
             state.messages.push(message.clone());
             self.agent.set_state(state);
@@ -3222,7 +3871,8 @@ impl AgentSession {
     pub(super) fn flush_pending_bash_messages(&self) {
         let pending = std::mem::take(&mut *self.pending_bash_messages.lock().unwrap());
         for bash in pending {
-            let message = agent_message_from_value(&serde_json::to_value(bash).expect("bash message"));
+            let message =
+                agent_message_from_value(&serde_json::to_value(bash).expect("bash message"));
             let mut state = self.agent.state();
             state.messages.push(message.clone());
             self.agent.set_state(state);
@@ -3234,11 +3884,14 @@ impl AgentSession {
         if self.user_bash_running.load(Ordering::SeqCst) {
             self.user_bash_abort_requested.store(true, Ordering::SeqCst);
         }
-        for controller in self.bash_abort_controllers.lock().unwrap().iter() { controller.cancel(); }
+        for controller in self.bash_abort_controllers.lock().unwrap().iter() {
+            controller.cancel();
+        }
     }
 
     pub fn is_bash_running(&self) -> bool {
-        self.user_bash_running.load(Ordering::SeqCst) || !self.bash_abort_controllers.lock().unwrap().is_empty()
+        self.user_bash_running.load(Ordering::SeqCst)
+            || !self.bash_abort_controllers.lock().unwrap().is_empty()
     }
 
     pub fn has_pending_bash_messages(&self) -> bool {
@@ -3284,7 +3937,8 @@ impl AgentSession {
         *self.base_system_prompt.lock().unwrap() = rebuilt;
         {
             let mut state = self.agent.state();
-            state.system_prompt = self.refresh_extension_system_prompt(&state.system_prompt, &old_base);
+            state.system_prompt =
+                self.refresh_extension_system_prompt(&state.system_prompt, &old_base);
             self.agent.set_state(state);
         }
 
@@ -3324,7 +3978,10 @@ impl AgentSession {
 
     /// `setSessionName(name)`.
     pub fn set_session_name(&self, name: &str) -> Result<(), String> {
-        self.session_manager.lock().unwrap().append_session_info(name)?;
+        self.session_manager
+            .lock()
+            .unwrap()
+            .append_session_info(name)?;
         // Synchronous subscribers read the persisted name through the same mutex.
         self.emit(AgentSessionEvent::SessionInfoChanged {
             name: Some(name.to_string()),
@@ -3435,9 +4092,7 @@ impl AgentSession {
                     "readFiles": result.read_files.clone().unwrap_or_default(),
                     "modifiedFiles": result.modified_files.clone().unwrap_or_default(),
                 }));
-                let new_leaf_id: Option<&str> = if target_entry
-                    .get("type")
-                    .and_then(Value::as_str)
+                let new_leaf_id: Option<&str> = if target_entry.get("type").and_then(Value::as_str)
                     == Some("message")
                     && target_entry
                         .get("message")
@@ -3446,7 +4101,8 @@ impl AgentSession {
                         == Some("user")
                 {
                     target_entry.get("parentId").and_then(Value::as_str)
-                } else if target_entry.get("type").and_then(Value::as_str) == Some("custom_message") {
+                } else if target_entry.get("type").and_then(Value::as_str) == Some("custom_message")
+                {
                     target_entry.get("parentId").and_then(Value::as_str)
                 } else {
                     Some(target_id)
@@ -3460,9 +4116,7 @@ impl AgentSession {
                 );
             }
         } else {
-            let new_leaf_id: Option<&str> = if target_entry
-                .get("type")
-                .and_then(Value::as_str)
+            let new_leaf_id: Option<&str> = if target_entry.get("type").and_then(Value::as_str)
                 == Some("message")
                 && target_entry
                     .get("message")
@@ -3552,7 +4206,9 @@ impl AgentSession {
                 .iter()
                 .filter_map(|part| {
                     if part.get("type").and_then(Value::as_str) == Some("text") {
-                        part.get("text").and_then(Value::as_str).map(|text| text.to_string())
+                        part.get("text")
+                            .and_then(Value::as_str)
+                            .map(|text| text.to_string())
                     } else {
                         None
                     }
@@ -3569,10 +4225,7 @@ impl AgentSession {
         let messages = self.messages();
         let user_messages = messages.iter().filter(|m| m.role() == "user").count() as i64;
         let assistant_messages = messages.iter().filter(|m| m.role() == "assistant").count() as i64;
-        let tool_results = messages
-            .iter()
-            .filter(|m| m.role() == "toolResult")
-            .count() as i64;
+        let tool_results = messages.iter().filter(|m| m.role() == "toolResult").count() as i64;
         let mut tool_calls = 0i64;
         let mut total_input = 0.0;
         let mut total_output = 0.0;
@@ -3641,7 +4294,9 @@ impl AgentSession {
                     if entry.get("type").and_then(Value::as_str) == Some("message") {
                         if let Some(message) = entry.get("message") {
                             match agent_message_from_value(message) {
-                                AgentMessage::Message(pi_ai::types::Message::Assistant(assistant)) => {
+                                AgentMessage::Message(pi_ai::types::Message::Assistant(
+                                    assistant,
+                                )) => {
                                     if assistant.stop_reason != STOP_REASON_ABORTED
                                         && assistant.stop_reason != STOP_REASON_ERROR
                                     {
@@ -3675,9 +4330,12 @@ impl AgentSession {
 
     /// `_rlmSessionDirForReading()`.
     pub(super) fn rlm_session_dir_for_reading(&self) -> Option<String> {
-        self.rlm_session_dir
-            .clone()
-            .or_else(|| self.session_manager.lock().unwrap().get_session_artifact_dir())
+        self.rlm_session_dir.clone().or_else(|| {
+            self.session_manager
+                .lock()
+                .unwrap()
+                .get_session_artifact_dir()
+        })
     }
 
     /// `_contextWindowResolver()`.
@@ -3693,7 +4351,11 @@ impl AgentSession {
     }
 
     /// `_subtractUnindexedChildUsage(ownUsage, entries)`.
-    pub(super) fn subtract_unindexed_child_usage(&self, own_usage: Usage, entries: &[SessionEntry]) -> Usage {
+    pub(super) fn subtract_unindexed_child_usage(
+        &self,
+        own_usage: Usage,
+        entries: &[SessionEntry],
+    ) -> Usage {
         let unindexed = self.rlm_unindexed_child_usage.lock().unwrap();
         if unindexed.is_empty() {
             return own_usage;
@@ -3784,7 +4446,9 @@ mod tests {
         }
     }
 
-    fn recording_operations(exit_code: i64) -> (Arc<RecordingExtensionOperations>, Arc<AtomicUsize>) {
+    fn recording_operations(
+        exit_code: i64,
+    ) -> (Arc<RecordingExtensionOperations>, Arc<AtomicUsize>) {
         let calls = Arc::new(AtomicUsize::new(0));
         let operations = Arc::new(RecordingExtensionOperations {
             command: Mutex::new(String::new()),

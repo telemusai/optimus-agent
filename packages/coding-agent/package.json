@@ -5,7 +5,8 @@
 	"type": "module",
 	"piConfig": {
 		"name": "prime-agent",
-		"configDir": ".prime/agent"
+		"configDir": ".prime/agent",
+		"title": "Optimus - Agent"
 	},
 	"bin": {
 		"pi": "dist/bundle/cli.js"

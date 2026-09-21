@@ -847,17 +847,36 @@ impl AgentDaemon {
         if !client.capabilities_for_session(&active_session_id).contains("extension_ui") {
             return;
         }
-        let message = DaemonOutbound::ExtensionUiRequest {
-            active_session_id: active_session_id.clone(),
-            id: format!("jev-attach-{}", self.next_id()),
-            method: "setStatus".to_string(),
-            payload: serde_json::json!({
-                "statusKey": "jev",
-                "statusText": crate::core::jev_bridge::footer_status_text(&self.session_of(state).session_id()),
-            }),
-        };
-        if !self.defer_snapshot_frame(client, &active_session_id, &message) {
-            self.write(client, &message);
+        let session_id = self.session_of(state).session_id();
+        // TWO independent segments: the decision mode and the independent
+        // compaction state. `statusCompactText` is the optional SHORT LABELLED
+        // narrow form (`Jev C On` / `Jev Cmp on`), never a bare dot; a client
+        // that does not know the field ignores it. ALL FOUR texts come from ONE
+        // settings snapshot, so a concurrent setting change can never make the
+        // two segments on the same row disagree.
+        let forms = crate::core::jev_bridge::footer_status_forms(&session_id);
+        let messages = [
+            ("jev", forms.decision_text, forms.decision_compact_text),
+            (
+                "jev-compact",
+                forms.compaction_text,
+                forms.compaction_compact_text,
+            ),
+        ];
+        for (index, (status_key, status_text, status_compact)) in messages.into_iter().enumerate() {
+            let message = DaemonOutbound::ExtensionUiRequest {
+                active_session_id: active_session_id.clone(),
+                id: format!("jev-attach-{}-{index}", self.next_id()),
+                method: "setStatus".to_string(),
+                payload: serde_json::json!({
+                    "statusKey": status_key,
+                    "statusText": status_text,
+                    "statusCompactText": status_compact,
+                }),
+            };
+            if !self.defer_snapshot_frame(client, &active_session_id, &message) {
+                self.write(client, &message);
+            }
         }
     }
 
@@ -891,6 +910,19 @@ impl AgentDaemon {
             "compareMode": resolution.mode.allows_compare(),
             "features": settings.effective_features(session_id),
             "compactionEnabled": settings.effective_compaction_enabled(session_id),
+            // Full-jev overlay truth: presence, the overlay's fixed profile
+            // constants, its persisted revision, and how many saved session
+            // values it currently masks. `mode`/`activeMode`/`features`/
+            // `compactionEnabled` above are already overlay-resolved by
+            // config.rs, so nothing here recomputes them.
+            "fullJev": serde_json::json!({
+                "enabled": settings.full_jev_active(),
+                "mode": pi_jev::config::FULL_JEV_MODE.as_str(),
+                "features": pi_jev::config::FULL_JEV_FEATURES,
+                "compactionEnabled": pi_jev::config::FULL_JEV_COMPACTION_ENABLED,
+                "revision": settings.full_jev.as_ref().map_or(0, |profile| profile.revision),
+                "maskedSessionCount": settings.full_jev_masked_sessions().len(),
+            }),
             // This settings view applies nothing itself, in any mode.
             "applied": false,
             // No per-view counters: the live figures are in `pipeline.active`.
@@ -905,15 +937,36 @@ impl AgentDaemon {
         &self,
         session_id: &str,
         requested: pi_jev::types::JevMode,
-    ) -> Result<(bool, pi_jev::types::JevMode), String> {
+    ) -> Result<(bool, pi_jev::types::JevMode, bool), String> {
         let store = self.jev_settings_store();
         let mut settings = store.load();
+        // The optional daemon Jev surface follows the same overlay rules as
+        // the interactive bridge (ROOT-CONTRACT v1): while the global full-jev
+        // overlay is active a non-Off write is REJECTED (the overlay would mask
+        // it, so reporting success would be a lie), and Off is the atomic
+        // emergency exit: overlay removed, this chat Off, compaction off, in
+        // ONE save. Off is never capability-gated.
+        if settings.full_jev_active() {
+            if requested != pi_jev::types::JevMode::Off {
+                return Err(
+                    crate::modes::interactive::native_host::JEV_FULL_JEV_REJECTION.to_string(),
+                );
+            }
+            settings.full_jev_remove();
+            settings.set_session_mode(session_id, requested);
+            settings.set_session_compaction_enabled(session_id, false);
+            store.save(&settings).map_err(|error| error.log_line())?;
+            // The interactive host caches settings for 250ms; a daemon-side write
+            // must invalidate it so both surfaces agree immediately.
+            crate::core::jev_bridge::invalidate_settings_cache();
+            return Ok((true, requested, true));
+        }
         settings.set_session_mode(session_id, requested);
         store.save(&settings).map_err(|error| error.log_line())?;
         // The interactive host caches settings for 250ms; a daemon-side write
         // must invalidate it so both surfaces agree immediately.
         crate::core::jev_bridge::invalidate_settings_cache();
-        Ok((true, requested))
+        Ok((true, requested, false))
     }
 }
 
@@ -5344,7 +5397,17 @@ impl AgentDaemon {
                     .get("activeSessionId")
                     .and_then(Value::as_str)
                     .unwrap_or(""))?;
-                let (applied, effective) = self.jev_apply_session_mode(&session_id, mode)?;
+                let (applied, effective, emergency_exit) =
+                    self.jev_apply_session_mode(&session_id, mode)?;
+                // The footer must reflect the new effective mode in the same
+                // turn as the write, exactly like the interactive `/jev` path.
+                let selector = body
+                    .get("activeSessionId")
+                    .and_then(Value::as_str)
+                    .unwrap_or("");
+                if let Ok(bound) = self.get_bound_session_state(selector) {
+                    self.publish_jev_attach_footer(client, &bound);
+                }
                 let store = self.jev_settings_store();
                 let resolution = store.load().effective_mode_with_scope(&session_id);
                 Ok(Some(DaemonResponse::success(
@@ -5356,7 +5419,15 @@ impl AgentDaemon {
                         "scope": resolution.scope.as_str(),
                         // Every mode, Active included, is applied on request.
                         "applied": applied,
-                        "message": jev_mode_change_message(applied, effective),
+                        "message": if emergency_exit {
+                            format!(
+                                "Jev mode: {} (scope: this chat)\n{}",
+                                effective.label(),
+                                crate::modes::interactive::native_host::JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE
+                            )
+                        } else {
+                            jev_mode_change_message(applied, effective)
+                        },
                     })),
                 )))
             }
@@ -8185,6 +8256,16 @@ impl AgentDaemon {
                     .clone();
                 self.write_serialized(&client, &line, Some(&sequenced));
             }
+            if sequenced.type_name() == "session_replaced" {
+                // A daemon-side session replacement gives the client a NEW
+                // session id: the client reset its status surface while
+                // applying the replacement, so the authoritative Jev footer
+                // (decision mode + independent compaction, from ONE settings
+                // snapshot) must FOLLOW the replace frame, exactly like the
+                // attach push. Without this the footer stays blank until
+                // re-attach or the next /jev write.
+                self.publish_jev_attach_footer(&client, &state);
+            }
         }
         drop(published);
     }
@@ -9658,6 +9739,20 @@ impl AgentDaemon {
             self.queue_client_catchup(client, &active_session_id, if purpose == "replacement" { "replacement" } else { "resync" });
         }
         self.finish_snapshot_and_replay(client, &active_session_id, last_event_sequence, &event_generation, !completed || transfer_signal.is_cancelled());
+        // A COMPLETED replacement/catch-up transfer just replaced the
+        // client's session view (the client applies the chunked snapshot as
+        // a replace or resync once `session_snapshot_end` lands, and that
+        // application resets the status surface), so the authoritative Jev
+        // footer must follow the stream. Attach keeps its own push at the
+        // attach arm. An aborted transfer must NOT push here: its queued
+        // catch-up delivers a fresh frame and pushes after that delivery,
+        // and a premature push would be wiped by the later frame's reset.
+        // The push runs AFTER `finish_snapshot_and_replay` returned, so the
+        // streaming mark is already cleared and the footer frames are never
+        // deferred into an entry the replay removed.
+        if completed && (purpose == "replacement" || purpose == "catchup") {
+            self.publish_jev_attach_footer(client, &state);
+        }
         if !client.snapshot_streaming() {
             // Box only this edge of the catch-up cycle; every call and await stays the same.
             let catchup = Box::pin(self.catch_up_backpressured_client(Arc::clone(client)));
@@ -14187,6 +14282,16 @@ impl AgentDaemon {
                 }
                 return "retry-later".to_string();
             }
+            // The delivered catch-up frame (`session_replaced` or
+            // `session_resynced`) resets the client's status surface, so the
+            // authoritative Jev footer for THIS session must follow the
+            // frame, exactly like the healthy broadcast path: backpressured
+            // and deferred clients must not keep a blank or stale footer
+            // until the next /jev write or re-attach. Both purposes reset the
+            // surface, and the push re-reads one settings snapshot keyed by
+            // the delivered session, so a resync can never leave the old
+            // session's labels behind either.
+            self.publish_jev_attach_footer(client, &state);
         }
         "drained".to_string()
     }
@@ -14282,7 +14387,14 @@ impl AgentDaemon {
                         .map(|entry| Arc::ptr_eq(&entry.state, &state))
                         .unwrap_or(false);
                     if !client.writer.destroyed() && resident {
-                        daemon.write(&client, &message);
+                        if daemon.write(&client, &message) {
+                            // The raw fallback delivered the replacement
+                            // frame, so the authoritative footer must follow
+                            // it here too; a failed write re-converges
+                            // through the catch-up path, which pushes after
+                            // its own delivery.
+                            daemon.publish_jev_attach_footer(&client, &state);
+                        }
                     }
                     let has_catchup = client
                         .state
@@ -17265,6 +17377,11 @@ mod agent_observe_parity_tests {
         fn set_get_continuation_messages(
             &self,
             _hook: crate::core::agent_session::GetContinuationMessagesHook,
+        ) {
+        }
+        fn set_before_request(
+            &self,
+            _hook: crate::core::agent_session::BeforeRequestHook,
         ) {
         }
         fn set_should_stop_before_turn(&self, _hook: Arc<dyn Fn() -> bool + Send + Sync>) {}

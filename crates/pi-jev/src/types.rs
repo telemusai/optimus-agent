@@ -28,42 +28,350 @@ pub const DEFAULT_MODEL: &str = "jev-latest";
 /// a real distribution stays far inside this bound.
 pub const PROBABILITY_TOLERANCE: f64 = 1e-6;
 
+/// Host-policy argmax tolerance for FULL-PRECISION distributions (no 2-decimal
+/// quantization detected). Float noise between the server's argmax computation and the
+/// reported values is far below this bound. Quantized distributions use the wider,
+/// rounding-derived `QUANTIZED_ARGMAX_TOLERANCE` instead.
+pub const ARGMAX_TOLERANCE: f64 = 1e-9;
+
 /// Maximum accepted sub-question count per request (speculative fan-out stays bounded).
 pub const MAX_QUESTIONS_PER_REQUEST: usize = 64;
 
+/// HOST POLICY, not an API guarantee: upper bound for one structured (object/array) entry
+/// when it is serialized for hashing and size checks. The official docs define no wire size
+/// limit for entries; this bound exists so a hostile builder cannot blow up hashing.
+/// Bare-string entries are NOT size-capped here (legacy valid strings are never rejected).
+pub const MAX_ENTRY_JSON_BYTES: usize = 2048;
+
+/// HOST POLICY, not an API guarantee: nesting-depth cap for structured (object/array) entry
+/// forms. Applies to Json variants only; bare strings are unaffected.
+pub const MAX_ENTRY_JSON_DEPTH: usize = 6;
+
+/// Documented API limit, enforced BEFORE the transport call (mirrors the official
+/// contract): api.md "Request body", Choice criteria - "You can have a maximum of 255
+/// options per Choice"; choice.md corroborates - "A Choice question accepts up to 255
+/// options". The cap also keeps speculative fan-out bounded. Documented valid shapes
+/// below the cap are untouched.
+pub const MAX_CHOICES_PER_QUESTION: usize = 255;
+
+/// Documented API limits, enforced BEFORE the transport call (mirrors the official
+/// contract): api.md Score criteria - "A Score should have at least two levels; the API
+/// accepts up to 10"; score.md corroborates - "Should have at least two levels; the API
+/// accepts up to 10" and "Use as many levels as you can describe distinctly, up to 10".
+/// The 10-level ceiling also bounds distribution size and the expectation-tolerance
+/// math. Documented examples use 2-5 levels.
+pub const MAX_SCORE_LEVELS: usize = 10;
+
+/// HOST POLICY, not an API guarantee: default ceiling on the ESTIMATED token size of one
+/// request (state + questions). The estimate is a heuristic (see `estimate_tokens`); the
+/// client skips the transport call when the estimate exceeds the ceiling. `JevLimits`
+/// may lower it (`max_request_tokens`); values above the default are ignored.
+pub const REQUEST_TOKEN_CEILING: usize = 30_000;
+
+/// Host-policy tolerance for the Choice argmax check on distributions whose values are
+/// all exact to two decimal places (the documented examples all display 2-decimal values).
+/// A displayed value rounds by at most 0.005, so the reported peak can differ from the
+/// true argmax by at most 0.01.
+pub const QUANTIZED_ARGMAX_TOLERANCE: f64 = 0.01;
+
+/// Absolute float-noise slack for tolerance comparisons. Probability deltas that matter
+/// are >= 0.01 (quantized) or >= 1e-6 (full precision), while f64 noise on values <= 1
+/// stays around 1e-16 even after a handful of operations; 1e-12 sits far below any
+/// meaningful delta and above the noise, so an exact-boundary case (gap == tolerance)
+/// is accepted deterministically instead of flipping on one ULP.
+pub const FLOAT_NOISE_SLACK: f64 = 1e-12;
+
+/// Host-policy tolerance for the Score expectation check on 2-decimal-quantized
+/// distributions: worst case `sum(|i * delta_i|) = 0.005 * (N(N-1)/2)` from rounding each
+/// probability plus 0.005 from the score's own display rounding.
+pub fn quantized_expectation_tolerance(levels: usize) -> f64 {
+    0.005 * ((levels as f64) * ((levels as f64) - 1.0) / 2.0) + 0.005
+}
+
+/// True when every probability is within 1e-9 of an exact two-decimal value, i.e. the
+/// server most likely displayed (and rounded) the values at 2 decimal places.
+pub fn is_two_decimal_quantized(values: impl IntoIterator<Item = f64>) -> bool {
+    values.into_iter().all(|value| {
+        if !value.is_finite() {
+            return false;
+        }
+        let rounded = (value * 100.0).round() / 100.0;
+        (value - rounded).abs() <= 1e-9
+    })
+}
+
 // ---------------------------------------------------------------------------
-// Wire request
+// Entry values (string | object | array | null)
 // ---------------------------------------------------------------------------
 
+/// One entry value as the wire accepts it: a bare string, `null`, or structured JSON.
+///
+/// Untagged with `Text` FIRST: a bare string serializes exactly as before (byte-identical
+/// legacy wire), `null` serializes as `null`, and structured values serialize as JSON.
+/// The `Null` variant is declared BEFORE `Json` so untagged deserialization maps JSON
+/// `null` to `Null` instead of letting `Value::Null` be swallowed by the `Json` arm.
+/// There is no implicit `String -> EntryValue` conversion on the wire; builders convert
+/// explicitly (`EntryValue::from(...)`, `EntryValue::text(...)`, or the question helpers).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum EntryValue {
+    /// Bare string (legacy form; byte-identical serialization).
+    Text(String),
+    /// Documented `null` form.
+    Null,
+    /// Structured form: a JSON object or array (validate_shape rejects scalars here).
+    Json(Value),
+}
+
+impl EntryValue {
+    /// Convenience constructor for the bare-string form.
+    pub fn text(value: impl Into<String>) -> Self {
+        EntryValue::Text(value.into())
+    }
+
+    /// The bare string, when this entry is one.
+    pub fn as_text(&self) -> Option<&str> {
+        match self {
+            EntryValue::Text(text) => Some(text),
+            _ => None,
+        }
+    }
+
+    /// True for the documented `null` form.
+    pub fn is_null(&self) -> bool {
+        matches!(self, EntryValue::Null)
+    }
+
+    /// The semantic JSON value of this entry (`Text("x")` == `Json(Value::String("x"))`).
+    pub fn canonical_value(&self) -> Value {
+        match self {
+            EntryValue::Text(text) => Value::String(text.clone()),
+            EntryValue::Null => Value::Null,
+            EntryValue::Json(value) => value.clone(),
+        }
+    }
+
+    /// Semantic equality: two entries are equal when their canonical JSON values are equal,
+    /// so a Text echo of an object-valued legend entry still compares equal.
+    pub fn equivalent(&self, other: &EntryValue) -> bool {
+        self.canonical_value() == other.canonical_value()
+    }
+
+    /// HOST POLICY depth of this value (strings count as depth 0).
+    pub fn json_depth(&self) -> usize {
+        fn depth(value: &Value) -> usize {
+            match value {
+                Value::Object(map) => 1 + map.values().map(depth).max().unwrap_or(0),
+                Value::Array(items) => 1 + items.iter().map(depth).max().unwrap_or(0),
+                _ => 0,
+            }
+        }
+        match self {
+            EntryValue::Json(value) => depth(value),
+            _ => 0,
+        }
+    }
+
+    /// HOST POLICY serialized size of this value.
+    pub fn json_size(&self) -> usize {
+        serde_json::to_string(&self.canonical_value())
+            .map(|encoded| encoded.len())
+            .unwrap_or(usize::MAX)
+    }
+}
+
+impl Default for EntryValue {
+    /// `null` is the neutral entry value (an absent or empty side is `Null`, not a guess).
+    fn default() -> Self {
+        EntryValue::Null
+    }
+}
+
+impl From<String> for EntryValue {
+    fn from(value: String) -> Self {
+        EntryValue::Text(value)
+    }
+}
+
+impl From<&str> for EntryValue {
+    fn from(value: &str) -> Self {
+        EntryValue::Text(value.to_string())
+    }
+}
+
+/// Canonical JSON encoding for prompt hashing: object keys sorted, arrays preserved.
+/// Reuses the mock's canonicalizer so hash input is stable regardless of key insertion order.
+pub fn canonical_entry_json(value: &Value) -> String {
+    serde_json::to_string(&crate::mock::canonicalize(value)).unwrap_or_default()
+}
+
+/// Validates one entry against the documented semantics plus the HOST POLICY bounds.
+///
+/// Documented semantics (applied to all forms): bare strings must be non-empty after
+/// trimming (pre-existing meaningful-builder policy). `null` entries are a documented
+/// form and pass. Structured entries must be an object or an array and non-empty
+/// (a bare scalar is accepted by the docs' string form only as a bare string).
+/// Size/depth caps apply to Json variants only (HOST POLICY; strings are untouched).
+pub fn validate_entry_shape(entry: &EntryValue, what: &str) -> Result<(), JevError> {
+    match entry {
+        EntryValue::Null => Ok(()),
+        EntryValue::Text(text) => {
+            if text.trim().is_empty() {
+                return Err(JevError::validation(format!("{what} is an empty string")));
+            }
+            Ok(())
+        }
+        EntryValue::Json(value) => match value {
+            Value::Object(map) if map.is_empty() => {
+                Err(JevError::validation(format!("{what} is an empty object")))
+            }
+            Value::Array(items) if items.is_empty() => {
+                Err(JevError::validation(format!("{what} is an empty array")))
+            }
+            Value::Object(_) | Value::Array(_) => {
+                if entry.json_size() > MAX_ENTRY_JSON_BYTES {
+                    return Err(JevError::validation(format!(
+                        "{what} exceeds the host-policy structured entry size limit ({MAX_ENTRY_JSON_BYTES} bytes)"
+                    )));
+                }
+                if entry.json_depth() > MAX_ENTRY_JSON_DEPTH {
+                    return Err(JevError::validation(format!(
+                        "{what} exceeds the host-policy structured entry depth limit ({MAX_ENTRY_JSON_DEPTH})"
+                    )));
+                }
+                Ok(())
+            }
+            _ => Err(JevError::validation(format!(
+                "{what} must be a string, object, array, or null"
+            ))),
+        },
+    }
+}
+
+/// Validates instructions: absent or `null` is a documented form and passes; a bare
+/// string must be non-empty after trimming (pre-existing policy); structured entries
+/// obey the documented object/array requirement plus the host-policy bounds.
+pub fn validate_instructions_entry(instructions: Option<&EntryValue>) -> Result<(), JevError> {
+    match instructions {
+        None => Ok(()),
+        Some(entry) => validate_entry_shape(entry, "instructions"),
+    }
+}
+
+/// Deserializes a PRESENT instructions field: JSON `null` maps to `Some(EntryValue::Null)`
+/// (the documented null form), NOT to `None`. Field absence is handled separately by
+/// `#[serde(default)]` (-> `None`), so the null form and the absent form stay
+/// distinguishable and both roundtrip faithfully.
+fn deserialize_present_entry<'de, D>(deserializer: D) -> Result<Option<EntryValue>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    Ok(Some(EntryValue::deserialize(deserializer)?))
+}
+
 /// `{"true": .., "false": ..}` descriptions for a Noul question.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Each side is an `EntryValue`: the documented per-side `null` form is `EntryValue::Null`
+/// and an absent side deserializes to `Null` (`#[serde(default)]`). Both sides always
+/// serialize (a `Null` side emits `null`), so legacy both-string criteria stay
+/// byte-identical. At least one side must be non-Null (validated in `validate_shape`).
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct NoulCriteria {
-    #[serde(rename = "true")]
-    pub r#true: String,
-    #[serde(rename = "false")]
-    pub r#false: String,
+    #[serde(default, rename = "true")]
+    pub r#true: EntryValue,
+    #[serde(default, rename = "false")]
+    pub r#false: EntryValue,
+}
+
+impl NoulCriteria {
+    /// Convenience constructor for the legacy both-strings form.
+    pub fn text(yes: impl Into<String>, no: impl Into<String>) -> Self {
+        Self {
+            r#true: EntryValue::text(yes),
+            r#false: EntryValue::text(no),
+        }
+    }
 }
 
 /// One typed question. Serde writes `{"type": ..., "instructions": ..., "criteria": ...}`.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// `instructions` accepts the documented string, object, array, and `null` forms plus
+/// absence (`None` serializes as an omitted field). A bare string serializes exactly as
+/// before, so every legacy builder stays byte-identical on the wire.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum QuestionSpec {
     Noul {
-        instructions: String,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_entry"
+        )]
+        instructions: Option<EntryValue>,
         #[serde(default, skip_serializing_if = "Option::is_none")]
         criteria: Option<NoulCriteria>,
     },
     Choice {
-        instructions: String,
-        criteria: BTreeMap<String, Option<String>>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_entry"
+        )]
+        instructions: Option<EntryValue>,
+        /// Option descriptions: `EntryValue::Null` is the documented null description.
+        criteria: BTreeMap<String, EntryValue>,
     },
     Score {
-        instructions: String,
-        criteria: Vec<String>,
+        #[serde(
+            default,
+            skip_serializing_if = "Option::is_none",
+            deserialize_with = "deserialize_present_entry"
+        )]
+        instructions: Option<EntryValue>,
+        /// Ordered level descriptions; a `Null` element is the documented null level.
+        criteria: Vec<EntryValue>,
     },
 }
 
 impl QuestionSpec {
+    /// Convenience constructor: Noul question with bare-string instructions and criteria.
+    pub fn noul(instructions: impl Into<EntryValue>, criteria: NoulCriteria) -> Self {
+        QuestionSpec::Noul {
+            instructions: Some(instructions.into()),
+            criteria: Some(criteria),
+        }
+    }
+
+    /// Convenience constructor: Choice question with bare-string instructions and
+    /// `(option, description)` pairs (a `None` description becomes `EntryValue::Null`).
+    pub fn choice(
+        instructions: impl Into<EntryValue>,
+        options: impl IntoIterator<Item = (impl Into<String>, Option<impl Into<String>>)>,
+    ) -> Self {
+        QuestionSpec::Choice {
+            instructions: Some(instructions.into()),
+            criteria: options
+                .into_iter()
+                .map(|(option, description)| {
+                    (
+                        option.into(),
+                        description
+                            .map(|value| EntryValue::Text(value.into()))
+                            .unwrap_or(EntryValue::Null),
+                    )
+                })
+                .collect(),
+        }
+    }
+
+    /// Convenience constructor: Score question with bare-string instructions and levels.
+    pub fn score(instructions: impl Into<EntryValue>, levels: impl IntoIterator<Item = impl Into<String>>) -> Self {
+        QuestionSpec::Score {
+            instructions: Some(instructions.into()),
+            criteria: levels.into_iter().map(|level| EntryValue::Text(level.into())).collect(),
+        }
+    }
+
     /// Wire type tag of this question.
     pub fn question_type(&self) -> QuestionType {
         match self {
@@ -73,12 +381,31 @@ impl QuestionSpec {
         }
     }
 
-    /// Instructions text (used for prompt-version hashing by lane B).
-    pub fn instructions(&self) -> &str {
-        match self {
+    /// Hash input for prompt-versioning: the bare string for `Text`, canonical JSON for
+    /// `Json` and `Null` forms, and the empty string for absent instructions. The return
+    /// type is owned because structured entries have no stable borrowed text form.
+    pub fn instructions(&self) -> String {
+        let entry = match self {
             QuestionSpec::Noul { instructions, .. }
             | QuestionSpec::Choice { instructions, .. }
             | QuestionSpec::Score { instructions, .. } => instructions,
+        };
+        match entry {
+            Some(EntryValue::Text(text)) => text.clone(),
+            Some(EntryValue::Null) => "null".to_string(),
+            Some(EntryValue::Json(value)) => canonical_entry_json(value),
+            None => String::new(),
+        }
+    }
+
+    /// The bare instruction text, when the instructions are a bare string.
+    pub fn instructions_text(&self) -> Option<&str> {
+        match self {
+            QuestionSpec::Noul { instructions, .. }
+            | QuestionSpec::Choice { instructions, .. }
+            | QuestionSpec::Score { instructions, .. } => {
+                instructions.as_ref().and_then(EntryValue::as_text)
+            }
         }
     }
 
@@ -94,36 +421,64 @@ impl QuestionSpec {
     }
 
     /// Rejects shapes the API would reject (so the client never sends them).
+    ///
+    /// Documented semantics, enforced pre-transport: non-empty-trim instructions (bare
+    /// strings stay non-empty-trim, pre-existing policy), `null`/absent forms pass,
+    /// structured entries must be object/array and non-empty, Noul criteria keep at
+    /// least one non-null side, choice options <= 255 and score levels 2..=10 (both
+    /// documented limits, see the `MAX_CHOICES_PER_QUESTION` / `MAX_SCORE_LEVELS` doc
+    /// comments). Only the structured-entry SIZE/DEPTH bounds are host policy
+    /// (`MAX_ENTRY_JSON_BYTES` / `MAX_ENTRY_JSON_DEPTH`); all-null criteria are
+    /// documented nowhere and are refused.
     pub fn validate_shape(&self) -> Result<(), JevError> {
         match self {
-            QuestionSpec::Noul { instructions, .. } => {
-                if instructions.trim().is_empty() {
-                    return Err(JevError::validation("noul question has empty instructions"));
+            QuestionSpec::Noul { instructions, criteria } => {
+                validate_instructions_entry(instructions.as_ref())?;
+                if let Some(criteria) = criteria {
+                    let both_null = criteria.r#true.is_null() && criteria.r#false.is_null();
+                    if both_null {
+                        return Err(JevError::validation(
+                            "noul criteria must keep at least one non-null side (documented: an object with true and false descriptions)",
+                        ));
+                    }
+                    validate_entry_shape(&criteria.r#true, "noul criteria true side")?;
+                    validate_entry_shape(&criteria.r#false, "noul criteria false side")?;
                 }
                 Ok(())
             }
             QuestionSpec::Choice { instructions, criteria } => {
-                if instructions.trim().is_empty() {
-                    return Err(JevError::validation("choice question has empty instructions"));
-                }
+                validate_instructions_entry(instructions.as_ref())?;
                 if criteria.is_empty() {
                     return Err(JevError::validation("choice question has no criteria options"));
+                }
+                if criteria.len() > MAX_CHOICES_PER_QUESTION {
+                    return Err(JevError::validation(format!(
+                        "choice question has {} options, limit is {MAX_CHOICES_PER_QUESTION}",
+                        criteria.len()
+                    )));
                 }
                 if criteria.keys().any(|key| key.is_empty()) {
                     return Err(JevError::validation("choice question has an empty option key"));
                 }
+                for (key, entry) in criteria {
+                    validate_entry_shape(entry, &format!("choice option `{key}` description"))?;
+                }
                 Ok(())
             }
             QuestionSpec::Score { instructions, criteria } => {
-                if instructions.trim().is_empty() {
-                    return Err(JevError::validation("score question has empty instructions"));
-                }
+                validate_instructions_entry(instructions.as_ref())?;
                 // The API requires at least two ordered levels.
                 if criteria.len() < 2 {
                     return Err(JevError::validation("score question needs at least two levels"));
                 }
-                if criteria.iter().any(|level| level.trim().is_empty()) {
-                    return Err(JevError::validation("score question has an empty level description"));
+                if criteria.len() > MAX_SCORE_LEVELS {
+                    return Err(JevError::validation(format!(
+                        "score question has {} levels, limit is {MAX_SCORE_LEVELS}",
+                        criteria.len()
+                    )));
+                }
+                for (index, entry) in criteria.iter().enumerate() {
+                    validate_entry_shape(entry, &format!("score level {index} description"))?;
                 }
                 Ok(())
             }
@@ -174,12 +529,23 @@ impl SystemOneRequest {
 // ---------------------------------------------------------------------------
 
 /// Token usage for a request.
+///
+/// Knownness is explicit END-TO-END (root decision): a missing or `null` field
+/// deserializes to `None` (UNKNOWN, never fabricated 0), and `Some(0)` is a real
+/// measured zero. Fields are omitted from serialization when unknown.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Usage {
-    #[serde(default)]
-    pub input_tokens: u64,
-    #[serde(default)]
-    pub output_tokens: u64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input_tokens: Option<u64>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub output_tokens: Option<u64>,
+}
+
+impl Usage {
+    /// UNKNOWN usage (absent or null on the wire): no token count is fabricated.
+    pub fn unknown() -> Self {
+        Self::default()
+    }
 }
 
 /// Wire type tag of a question or an answer.
@@ -210,6 +576,46 @@ impl fmt::Display for QuestionType {
     }
 }
 
+/// Typed acceptance for ONE rerank Noul score (ROOT CONTRACT v1, Search).
+/// A Noul probability is NEVER converted into legacy Choice confidence and is
+/// never gated by a Choice-confidence threshold; the legacy `evaluate_answer`
+/// path stays untouched. An incomplete set retains the original order.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct RerankAssessment {
+    /// Local ordinal inside the batch (`code_search_rerank.<id>`).
+    pub candidate_id: usize,
+    /// Raw Noul probability in [0,1]; not a confidence.
+    pub noul: f64,
+    /// The answer existed and parsed as a finite in-range Noul.
+    pub complete: bool,
+    /// Same request and turn as the decision context it was answered in.
+    pub correlated: bool,
+    /// Within the decision-age bound.
+    pub fresh: bool,
+}
+
+/// Typed acceptance for ONE line-find pair (where Choice + existence Noul,
+/// answered together in a single request). A partial pair never applies.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct LineFindAssessment {
+    /// The selected where-line id (e.g. `L0123`), when the pair is complete.
+    pub where_line: Option<String>,
+    /// The independent existence Noul; `None` when the pair is incomplete.
+    pub existence_noul: Option<f64>,
+    /// Both answers of the pair arrived and parsed.
+    pub complete: bool,
+    /// Same request and turn as the decision context.
+    pub correlated: bool,
+    /// Within the decision-age bound.
+    pub fresh: bool,
+    /// The judgment covered one cascade window, not the whole text.
+    pub windowed: bool,
+    /// A supplied line was truncated before asking (disclosed).
+    pub truncated: bool,
+}
+
 /// One typed answer. A Noul answer has NO confidence field (official docs).
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -224,7 +630,10 @@ pub enum Answer {
     },
     Score {
         score: f64,
-        legend: BTreeMap<String, String>,
+        /// Level descriptions echoed by position. Structured entries are a documented
+        /// form (score.md structured example); a `null` echo compares equal to a `Null`
+        /// criteria entry.
+        legend: BTreeMap<String, EntryValue>,
         probabilities: BTreeMap<String, f64>,
         confidence: f64,
     },
@@ -267,7 +676,12 @@ impl Answer {
 }
 
 /// One response from the SystemOne endpoint.
-#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+///
+/// The two trailing fields are NOT part of the wire contract: `answer_parse_skips` is
+/// filled by the production parser (lenient per-answer parsing) and `server_request_id`
+/// by the HTTP transport from the untrusted `x-typesafe-request-id` header. Both are
+/// `#[serde(skip)]` so the wire serialization is unchanged.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SystemOneResponse {
     #[serde(default)]
     pub model: String,
@@ -275,6 +689,14 @@ pub struct SystemOneResponse {
     pub answers: BTreeMap<String, Answer>,
     #[serde(default)]
     pub usage: Usage,
+    /// Per-answer parse failures recorded by the production parser (fail-open within
+    /// the skip-not-fail rule: one malformed answer never invalidates the whole body).
+    #[serde(skip)]
+    pub answer_parse_skips: Vec<(String, AnswerIssue)>,
+    /// Bounded, sanitized value of the untrusted `x-typesafe-request-id` response
+    /// header, when the transport captured one. None when absent or refused.
+    #[serde(skip)]
+    pub server_request_id: Option<String>,
 }
 
 // ---------------------------------------------------------------------------
@@ -330,6 +752,29 @@ pub enum AnswerIssue {
     },
     /// The noul value is NaN, infinite or outside [0, 1].
     NoulOutOfRange { question_id: String, value: f64 },
+    /// The reported choice is not the distribution's argmax (within the documented
+    /// rounding tolerance). The distribution itself was valid; the selection is not.
+    ChoiceNotPeak {
+        question_id: String,
+        choice: String,
+        peak: String,
+    },
+    /// The reported score is not the probability-weighted expected level (within the
+    /// documented rounding tolerance).
+    ScoreNotExpectation {
+        question_id: String,
+        value: f64,
+        expected: f64,
+    },
+    /// A known answer `type` tag arrived with a payload that failed to parse
+    /// (per-answer skip; the rest of the body is unaffected). `detail` is the
+    /// bounded serde_json error class (one of io/syntax/data/eof).
+    MalformedAnswer {
+        question_id: String,
+        detail: &'static str,
+    },
+    /// The answer's `type` tag is not a documented answer type (per-answer skip).
+    UnknownAnswerType { question_id: String },
     /// The response carried no model identifier, so drift cannot be recorded.
     MissingResponseModel,
 }
@@ -350,6 +795,10 @@ impl AnswerIssue {
             AnswerIssue::ScoreNotFinite { .. } => "score_not_finite",
             AnswerIssue::ScoreOutOfRange { .. } => "score_out_of_range",
             AnswerIssue::NoulOutOfRange { .. } => "noul_out_of_range",
+            AnswerIssue::ChoiceNotPeak { .. } => "choice_not_peak",
+            AnswerIssue::ScoreNotExpectation { .. } => "score_not_expectation",
+            AnswerIssue::MalformedAnswer { .. } => "malformed_answer",
+            AnswerIssue::UnknownAnswerType { .. } => "unknown_answer_type",
             AnswerIssue::MissingResponseModel => "missing_response_model",
         }
     }
@@ -369,7 +818,11 @@ impl AnswerIssue {
             | AnswerIssue::LegendMismatch { question_id, .. }
             | AnswerIssue::ScoreNotFinite { question_id, .. }
             | AnswerIssue::ScoreOutOfRange { question_id, .. }
-            | AnswerIssue::NoulOutOfRange { question_id, .. } => Some(question_id),
+            | AnswerIssue::NoulOutOfRange { question_id, .. }
+            | AnswerIssue::ChoiceNotPeak { question_id, .. }
+            | AnswerIssue::ScoreNotExpectation { question_id, .. }
+            | AnswerIssue::MalformedAnswer { question_id, .. }
+            | AnswerIssue::UnknownAnswerType { question_id } => Some(question_id),
         }
     }
 }
@@ -428,6 +881,32 @@ impl fmt::Display for AnswerIssue {
             } => write!(f, "score {value} for `{question_id}` is outside 0..={max}"),
             AnswerIssue::NoulOutOfRange { question_id, value } => {
                 write!(f, "noul {value} for `{question_id}` is out of range")
+            }
+            AnswerIssue::ChoiceNotPeak {
+                question_id,
+                choice,
+                peak,
+            } => write!(
+                f,
+                "choice `{choice}` for `{question_id}` is not the distribution peak (`{peak}`)"
+            ),
+            AnswerIssue::ScoreNotExpectation {
+                question_id,
+                value,
+                expected,
+            } => write!(
+                f,
+                "score {value} for `{question_id}` is not the weighted expected level {expected}"
+            ),
+            AnswerIssue::MalformedAnswer {
+                question_id,
+                detail,
+            } => write!(
+                f,
+                "answer `{question_id}` failed to parse ({detail}); the rest of the body is unaffected"
+            ),
+            AnswerIssue::UnknownAnswerType { question_id } => {
+                write!(f, "answer `{question_id}` carries an unknown answer type")
             }
             AnswerIssue::MissingResponseModel => write!(f, "response did not carry a model id"),
         }
@@ -513,8 +992,18 @@ pub fn validate_response(request: &SystemOneRequest, response: &SystemOneRespons
         }
     }
 
+    // Per-answer parse failures recorded by the production parser become skips here, so
+    // a single malformed or unknown-typed answer never invalidates the whole body.
+    for (question_id, issue) in &response.answer_parse_skips {
+        skipped.push((question_id.clone(), issue.clone()));
+    }
+    let parse_skipped: BTreeSet<String> = response
+        .answer_parse_skips
+        .iter()
+        .map(|(question_id, _)| question_id.clone())
+        .collect();
     for question_id in request.questions.keys() {
-        if !response.answers.contains_key(question_id) {
+        if !response.answers.contains_key(question_id) && !parse_skipped.contains(question_id) {
             skipped.push((
                 question_id.clone(),
                 AnswerIssue::MissingId {
@@ -576,6 +1065,34 @@ pub fn validate_answer(
                     value: *confidence,
                 });
             }
+            // Documented semantic constraint: the reported choice must be the argmax of the
+            // reported distribution. Tolerance follows the docs' 2-decimal example rounding
+            // (0.01 slack) when every probability is exactly 2-decimal-quantized, and a
+            // tight bound for full-precision distributions. Ties stay valid.
+            let tolerance = if is_two_decimal_quantized(probabilities.values().copied()) {
+                QUANTIZED_ARGMAX_TOLERANCE
+            } else {
+                ARGMAX_TOLERANCE
+            };
+            // `validate_distribution` above guarantees a finite, summing-to-one,
+            // key-matching distribution, so the peak is a real value here.
+            let peak_value = probabilities
+                .values()
+                .copied()
+                .fold(f64::NEG_INFINITY, f64::max);
+            let peak = probabilities
+                .iter()
+                .find(|(_, probability)| **probability == peak_value)
+                .map(|(key, _)| key.clone())
+                .unwrap_or_default();
+            let chosen = probabilities.get(choice).copied().unwrap_or(0.0);
+            if chosen < peak_value - tolerance - FLOAT_NOISE_SLACK {
+                return Err(AnswerIssue::ChoiceNotPeak {
+                    question_id: question_id.to_string(),
+                    choice: choice.clone(),
+                    peak,
+                });
+            }
             Ok(())
         }
         (
@@ -603,8 +1120,13 @@ pub fn validate_answer(
                     continue;
                 };
                 let index: usize = key.parse().unwrap_or(usize::MAX);
-                let expected_description = criteria.get(index);
-                if expected_description != Some(description) {
+                // Semantic equality: a Text echo equals a Json string echo, and a `null`
+                // echo equals a `Null` criteria entry.
+                let matches = match criteria.get(index) {
+                    Some(expected_entry) => expected_entry.equivalent(description),
+                    None => false,
+                };
+                if !matches {
                     return Err(AnswerIssue::LegendMismatch {
                         question_id: question_id.to_string(),
                         missing: Vec::new(),
@@ -631,6 +1153,28 @@ pub fn validate_answer(
                 return Err(AnswerIssue::ConfidenceOutOfRange {
                     question_id: question_id.to_string(),
                     value: *confidence,
+                });
+            }
+            // Documented semantic constraint: the score is the probability-weighted expected
+            // level, `sum(index * p_index)` over the 0-based positions. The tolerance follows
+            // the docs' 2-decimal example rounding for quantized distributions and the strict
+            // probability tolerance for full-precision ones.
+            let expected: f64 = probabilities
+                .iter()
+                .map(|(key, probability)| {
+                    key.parse::<usize>().map_or(0.0, |index| index as f64) * probability
+                })
+                .sum();
+            let tolerance = if is_two_decimal_quantized(probabilities.values().copied()) {
+                quantized_expectation_tolerance(criteria.len())
+            } else {
+                PROBABILITY_TOLERANCE
+            };
+            if (score - expected).abs() > tolerance + FLOAT_NOISE_SLACK {
+                return Err(AnswerIssue::ScoreNotExpectation {
+                    question_id: question_id.to_string(),
+                    value: *score,
+                    expected,
                 });
             }
             Ok(())
@@ -700,7 +1244,77 @@ pub fn validate_request_shape(request: &SystemOneRequest) -> Result<(), JevError
         }
         question.validate_shape()?;
     }
+    validate_state_shape(&request.state)?;
     Ok(())
+}
+
+/// Validates the `state` shape: a plain string, a JSON object, or a JSON array
+/// (api.md: "A plain string for text, or structured data (object/array)"; the
+/// SDK `JSONContent` schema is string | object | array). Bare scalars (`null`,
+/// number, boolean) are documented nowhere and are refused before transport.
+pub fn validate_state_shape(state: &Value) -> Result<(), JevError> {
+    match state {
+        Value::String(_) | Value::Object(_) | Value::Array(_) => Ok(()),
+        _ => Err(JevError::validation(
+            "state must be a string, object, or array (api.md Request body)",
+        )),
+    }
+}
+
+/// Convenience check used by the client's pre-transport gate.
+pub fn state_shape_is_valid(state: &Value) -> bool {
+    validate_state_shape(state).is_ok()
+}
+
+/// Estimates the prompt-token size of one request with the crate's documented heuristic
+/// (`crate::compaction::estimate_tokens`, "Heuristic only; byte limits are enforced
+/// separately on the serialized request").
+///
+/// The result is an ESTIMATE, never an exact count: it is used only for the host-policy
+/// `request_token_limit` pre-transport skip, never to claim a server-side guarantee.
+pub fn estimate_request_tokens(request: &SystemOneRequest) -> usize {
+    let mut text = String::new();
+    match &request.state {
+        Value::String(state) => text.push_str(state),
+        value @ (Value::Object(_) | Value::Array(_)) => text.push_str(&canonical_entry_json(value)),
+        _ => {}
+    }
+    text.push_str(&request.model);
+    for (id, question) in &request.questions {
+        text.push_str(id);
+        text.push_str(&question.instructions());
+        match question {
+            QuestionSpec::Noul { criteria: Some(criteria), .. } => {
+                text.push_str(&criteria.r#true.instructions_hash_input());
+                text.push_str(&criteria.r#false.instructions_hash_input());
+            }
+            QuestionSpec::Choice { criteria, .. } => {
+                for (option, entry) in criteria {
+                    text.push_str(option);
+                    text.push_str(&entry.instructions_hash_input());
+                }
+            }
+            QuestionSpec::Score { criteria, .. } => {
+                for entry in criteria {
+                    text.push_str(&entry.instructions_hash_input());
+                }
+            }
+            _ => {}
+        }
+    }
+    crate::compaction::estimate_tokens(&text)
+}
+
+impl EntryValue {
+    /// Hash input for one entry: the bare string for `Text`, canonical JSON for `Json`
+    /// and `Null` forms. Mirrors `QuestionSpec::instructions` semantics at entry level.
+    pub fn instructions_hash_input(&self) -> String {
+        match self {
+            EntryValue::Text(text) => text.clone(),
+            EntryValue::Null => "null".to_string(),
+            EntryValue::Json(value) => canonical_entry_json(value),
+        }
+    }
 }
 
 /// Model configuration drift: what the caller asked for versus what answered.
@@ -801,6 +1415,26 @@ pub enum DecisionCategory {
     SubagentModelRouting,
     ContextRelevance,
     CodeSearchRelevance,
+    CodeSearchRerank,
+    CodeLineFind,
+    /// ROOT-CONTRACT v6 (Evidence lane): untrusted-retrieval safety battery
+    /// (possible prompt injection / premise contradiction / evidence
+    /// usefulness). Noul-only typed acceptance; advisory labels only — never
+    /// a drop, never a verification, never an authority claim.
+    CodeRetrievalSafety,
+    /// ROOT-CONTRACT v6 (Evidence lane): citation relation over the ACTUAL
+    /// supplied source span (supports / contradicts / unclear). Choice
+    /// answer; advisory labels only — never verification, never a gate.
+    CodeCitationCheck,
+    /// Agent-guidance lane: advisory skill suggestion over bounded task
+    /// metadata; recommendation only — never installs, executes or spawns.
+    SkillSuggestion,
+    /// Agent-guidance lane: advisory guardrail battery over bounded input
+    /// excerpts; annotation only — never blocks, never modifies behavior.
+    GuardrailsInput,
+    /// Agent-guidance lane: advisory guardrail battery over bounded output
+    /// excerpts (AgentEnd); annotation only — never blocks, never modifies.
+    GuardrailsOutput,
     MemoryRelevance,
     ContinueStopEscalate,
     ResultSufficiency,
@@ -821,6 +1455,13 @@ impl DecisionCategory {
             DecisionCategory::SubagentModelRouting => "subagent_model_routing",
             DecisionCategory::ContextRelevance => "context_relevance",
             DecisionCategory::CodeSearchRelevance => "code_search_relevance",
+            DecisionCategory::CodeSearchRerank => "code_search_rerank",
+            DecisionCategory::CodeLineFind => "code_line_find",
+            DecisionCategory::CodeRetrievalSafety => "code_retrieval_safety",
+            DecisionCategory::CodeCitationCheck => "code_citation_check",
+            DecisionCategory::SkillSuggestion => "skill_suggestion",
+            DecisionCategory::GuardrailsInput => "guardrails_input",
+            DecisionCategory::GuardrailsOutput => "guardrails_output",
             DecisionCategory::MemoryRelevance => "memory_relevance",
             DecisionCategory::ContinueStopEscalate => "continue_stop_escalate",
             DecisionCategory::ResultSufficiency => "result_sufficiency",
@@ -831,7 +1472,7 @@ impl DecisionCategory {
     }
 
     /// All categories in canonical order.
-    pub fn all() -> [DecisionCategory; 14] {
+    pub fn all() -> [DecisionCategory; 21] {
         [
             DecisionCategory::TaskClassification,
             DecisionCategory::Complexity,
@@ -841,6 +1482,13 @@ impl DecisionCategory {
             DecisionCategory::SubagentModelRouting,
             DecisionCategory::ContextRelevance,
             DecisionCategory::CodeSearchRelevance,
+            DecisionCategory::CodeSearchRerank,
+            DecisionCategory::CodeLineFind,
+            DecisionCategory::CodeRetrievalSafety,
+            DecisionCategory::CodeCitationCheck,
+            DecisionCategory::SkillSuggestion,
+            DecisionCategory::GuardrailsInput,
+            DecisionCategory::GuardrailsOutput,
             DecisionCategory::MemoryRelevance,
             DecisionCategory::ContinueStopEscalate,
             DecisionCategory::ResultSufficiency,
@@ -1079,6 +1727,10 @@ pub struct DecisionOutcome {
     /// validation skips). The client owns retries, so this is the truthful
     /// attempt number for correlation records.
     pub attempts: u32,
+    /// Bounded, sanitized server-provided request id from the response
+    /// (`x-typesafe-request-id`), when the transport captured one. Untrusted
+    /// server data: it is bounded, control-char free and credential-echo safe.
+    pub server_request_id: Option<String>,
 }
 
 impl DecisionOutcome {
@@ -1099,6 +1751,7 @@ impl DecisionOutcome {
             usage: Usage::default(),
             applied: false,
             attempts: 0,
+            server_request_id: None,
         }
     }
 
@@ -1120,6 +1773,19 @@ pub type BoxFuture<T> = Pin<Box<dyn Future<Output = T> + Send>>;
 pub trait Transport: Send + Sync {
     /// Sends one request and returns one validated-parsed response.
     fn post(&self, request: &SystemOneRequest, timeout: std::time::Duration) -> BoxFuture<Result<SystemOneResponse, JevError>>;
+
+    /// Explicit read-only model-catalog fetch (`GET /v1/models`, ROOT-CONTRACT v9). Returns
+    /// the RAW response body; parsing and validation happen in `crate::models`.
+    ///
+    /// Default: unsupported. A transport that cannot fetch the catalog reports `Internal`
+    /// instead of fabricating an empty catalog, so unknowns are never invented.
+    fn get_models(&self, _timeout: std::time::Duration) -> BoxFuture<Result<Vec<u8>, JevError>> {
+        Box::pin(async {
+            Err(JevError::Internal {
+                detail: "model catalog fetch is not supported by this transport".to_string(),
+            })
+        })
+    }
 }
 
 /// System One abstraction: `DisabledSystemOne` (Off) and `JevSystemOne` (Compare).

@@ -165,6 +165,79 @@ pub fn sanitize_detail(raw: &str) -> String {
     }
 }
 
+/// Status-specific kind code for an `HttpStatus` failure.
+///
+/// Known diagnostic statuses get their own code (`http_status_401`, ...); unknown
+/// statuses fall back to the generic class (`http_status_4xx` / `http_status_5xx` /
+/// `http_status`). This is diagnostics only: retryability is decided by
+/// `is_retryable_status`, which this function never widens.
+pub fn http_status_kind(status: u16) -> &'static str {
+    match status {
+        400 => "http_status_400",
+        401 => "http_status_401",
+        403 => "http_status_403",
+        404 => "http_status_404",
+        408 => "http_status_408",
+        422 => "http_status_422",
+        425 => "http_status_425",
+        429 => "http_status_429",
+        500 => "http_status_500",
+        502 => "http_status_502",
+        503 => "http_status_503",
+        504 => "http_status_504",
+        529 => "http_status_529",
+        status if (400..500).contains(&status) => "http_status_4xx",
+        status if (500..600).contains(&status) => "http_status_5xx",
+        _ => "http_status",
+    }
+}
+
+/// Upper bound for an opaque header value copied into a record (e.g. a server-provided
+/// request id). HOST POLICY: the official docs define no length limit for
+/// `x-typesafe-request-id`; 64 covers the documented UUID form with margin.
+const MAX_OPAQUE_HEADER_VALUE_CHARS: usize = 64;
+
+/// Header-value fragments that mark a value as a credential echo. A server-controlled
+/// header carrying any of these is refused outright instead of copied.
+const OPAQUE_VALUE_CREDENTIAL_MARKERS: [&str; 8] = [
+    "bearer ",
+    "authorization",
+    "password",
+    "secret",
+    "token=",
+    "api-key",
+    "apikey",
+    "sk-",
+];
+
+/// Sanitizes an UNTRUSTED opaque header value (e.g. `x-typesafe-request-id`) so it can be
+/// stored in a record: strips control characters (including CR/LF header-injection), trims,
+/// refuses credential-echo shapes, and caps the length. `None` means "do not record".
+///
+/// Do NOT route this through `sanitize_detail`: its long-token redaction would rewrite a
+/// legitimate 36-character UUID request id into `<redacted>`.
+pub fn sanitize_opaque_header_value(raw: &str) -> Option<String> {
+    let cleaned: String = raw.chars().filter(|c| !c.is_control()).collect();
+    let trimmed = cleaned.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let lower = trimmed.to_ascii_lowercase();
+    if OPAQUE_VALUE_CREDENTIAL_MARKERS.iter().any(|marker| lower.contains(marker)) {
+        return None;
+    }
+    Some(trimmed.chars().take(MAX_OPAQUE_HEADER_VALUE_CHARS).collect())
+}
+
+/// Credential-echo test for UNTRUSTED text that may be copied into user-visible metadata
+/// (e.g. model-catalog names/descriptions). Same marker list as `sanitize_opaque_header_value`.
+pub fn looks_like_credential_echo(raw: &str) -> bool {
+    let lower = raw.to_ascii_lowercase();
+    OPAQUE_VALUE_CREDENTIAL_MARKERS
+        .iter()
+        .any(|marker| lower.contains(marker))
+}
+
 /// Error type for every Jev / TypeSafe client path.
 ///
 /// `detail` fields must already be sanitized (`sanitize_detail`); they never carry a
@@ -190,11 +263,18 @@ pub enum JevError {
     #[error("jev config error: {detail}")]
     Config { detail: String },
     /// HTTP status error; `detail` is a sanitized, bounded snippet.
+    ///
+    /// `server_request_id` is the bounded, sanitized value of the untrusted
+    /// `x-typesafe-request-id` response header, when one was captured. It is
+    /// deliberately NOT part of the `Display`/log output: the server controls
+    /// that header, so it is stored for correlation only and never formatted
+    /// into an error line.
     #[error("jev http status {status}: {detail}")]
     HttpStatus {
         status: u16,
         detail: String,
         retry_after: Option<Duration>,
+        server_request_id: Option<String>,
     },
     /// The per-attempt deadline elapsed.
     #[error("jev request timeout: {detail}")]
@@ -234,7 +314,7 @@ impl JevError {
             JevError::CredentialStore { .. } => "credential_store_error",
             JevError::InvalidKeyId => "invalid_key_id",
             JevError::Config { .. } => "config",
-            JevError::HttpStatus { .. } => "http_status",
+            JevError::HttpStatus { status, .. } => http_status_kind(*status),
             JevError::Timeout { .. } => "timeout",
             JevError::Connection { .. } => "connection",
             JevError::MalformedResponse { .. } => "malformed_response",
@@ -258,6 +338,15 @@ impl JevError {
     pub fn retry_after(&self) -> Option<Duration> {
         match self {
             JevError::HttpStatus { retry_after, .. } => *retry_after,
+            _ => None,
+        }
+    }
+
+    /// Bounded, sanitized server-provided request id, when the transport captured one
+    /// from the `x-typesafe-request-id` response header. Correlation only.
+    pub fn server_request_id(&self) -> Option<&str> {
+        match self {
+            JevError::HttpStatus { server_request_id, .. } => server_request_id.as_deref(),
             _ => None,
         }
     }

@@ -1970,7 +1970,7 @@ impl<'a> AgentsViewMode<'a> {
         editor.set_text(persistent_state.query.clone().unwrap_or_default().as_str());
         editor.set_placeholder(SEARCH_PROMPT_PLACEHOLDER);
         let editor_placeholder_for_test = Some(SEARCH_PROMPT_PLACEHOLDER.to_string());
-        terminal.set_title("π - Agents");
+        terminal.set_title(crate::config::app_display_title());
         let mut mode = Self {
             selected_row_identity: persistent_state.selected_row_identity.clone(),
             selected_session_key: persistent_state.selected_session_key.clone(),
@@ -5175,6 +5175,7 @@ mod tests {
     struct TestTerminal {
         rows: usize,
         renders: StdMutex<usize>,
+        titles: StdMutex<Vec<String>>,
     }
 
     impl AgentsViewTerminal for TestTerminal {
@@ -5184,7 +5185,9 @@ mod tests {
         fn request_render(&self, _force: bool) {
             *self.renders.lock().unwrap() += 1;
         }
-        fn set_title(&self, _title: &str) {}
+        fn set_title(&self, title: &str) {
+            self.titles.lock().unwrap().push(title.to_string());
+        }
         fn columns(&self) -> usize { 80 }
         fn poll_input(&self) -> Result<Option<Vec<String>>, String> { Ok(Some(Vec::new())) }
         fn present(&self, _lines: Vec<String>, _dock: Vec<String>) -> Result<(), String> { Ok(()) }
@@ -5448,7 +5451,7 @@ mod tests {
         let mut mode = AgentsViewMode::new(
             options,
             persistent_state,
-            Arc::new(TestTerminal { rows: 30, renders: StdMutex::new(0) }),
+            Arc::new(TestTerminal { rows: 30, renders: StdMutex::new(0), titles: StdMutex::new(Vec::new()) }),
             Box::new(TestEditor::default()),
             Arc::new(PlainAgentsViewTheme),
             transport.clone(),
@@ -6361,7 +6364,7 @@ mod tests {
         let mut mode = AgentsViewMode::new(
             options,
             AgentsViewPersistentState::default(),
-            Arc::new(TestTerminal { rows: 30, renders: StdMutex::new(0) }),
+            Arc::new(TestTerminal { rows: 30, renders: StdMutex::new(0), titles: StdMutex::new(Vec::new()) }),
             Box::new(TestEditor::default()),
             Arc::new(PlainAgentsViewTheme),
             transport,
@@ -6371,6 +6374,43 @@ mod tests {
         );
         let error = mode.run().await.unwrap_err();
         assert_eq!(error, STALE_ROSTER_DAEMON_MESSAGE);
+    }
+
+    #[tokio::test]
+    async fn startup_titles_the_terminal_with_the_app_identity() {
+        let options = AgentsViewModeOptions {
+            socket_path: Some("pipe".to_string()),
+            config: AgentsViewRuntimeConfig::default(),
+            ui_services: Arc::new(TestUiServices),
+            migrated_providers: None,
+            model_fallback_message: None,
+            startup_model_id: None,
+            verbose: None,
+            reconnect_timeout_ms: None,
+            initial_session: None,
+            initial_scope_key: None,
+        };
+        let terminal = Arc::new(TestTerminal { rows: 30, renders: StdMutex::new(0), titles: StdMutex::new(Vec::new()) });
+        let transport = FakeTransport::new(&[]);
+        let mut interactive = interactive_factory();
+        let _mode = AgentsViewMode::new(
+            options,
+            AgentsViewPersistentState::default(),
+            terminal.clone(),
+            Box::new(TestEditor::default()),
+            Arc::new(PlainAgentsViewTheme),
+            transport,
+            &FAKE_CONNECTION_FACTORY,
+            &mut interactive,
+            None,
+        );
+        let titles = terminal.titles.lock().unwrap().clone();
+        assert_eq!(titles, vec![crate::config::app_display_title()]);
+        assert!(
+            titles[0].contains("Optimus"),
+            "agents view title must be Optimus-branded, got {titles:?}"
+        );
+        assert_ne!(titles[0], "π - Agents");
     }
 
     #[test]

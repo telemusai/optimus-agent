@@ -68,6 +68,11 @@ pub struct RequestContext {
     pub state_schema_version: String,
     pub prompt_version: String,
     pub mode: String,
+    /// Requested Jev model captured with this request's authoritative policy
+    /// generation. The scheduler dispatch gate rechecks both before send and
+    /// after completion, so queued Compare work cannot cross a model write.
+    pub requested_model: String,
+    pub policy_generation: String,
     pub questions: Vec<QuestionMeta>,
     /// question_id -> actual observed choice at the boundary (None = unknown).
     pub baselines: BTreeMap<String, Option<String>>,
@@ -173,7 +178,7 @@ struct Shared {
     cancelled_sessions: Mutex<HashMap<String, Instant>>,
     in_flight: Mutex<HashMap<(String, String), CancellationToken>>,
     closed: AtomicBool,
-    dispatch_gate: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+    dispatch_gate: Arc<dyn Fn(&RequestContext) -> bool + Send + Sync>,
     status: Arc<Mutex<HashMap<String, SessionStatus>>>,
 }
 
@@ -247,7 +252,7 @@ impl JevScheduler {
         config: SchedulerConfig,
         system_one: Arc<dyn SystemOne>,
         sink: ResultSink,
-        dispatch_gate: Arc<dyn Fn(&str) -> bool + Send + Sync>,
+        dispatch_gate: Arc<dyn Fn(&RequestContext) -> bool + Send + Sync>,
     ) -> Self {
         let (tx, rx) = mpsc::channel::<Job>(config.queue_capacity);
         let status: Arc<Mutex<HashMap<String, SessionStatus>>> = Arc::new(Mutex::new(HashMap::new()));
@@ -569,7 +574,7 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
         .cancelled_sessions.lock().unwrap_or_else(|p| p.into_inner())
         .get(&session_id).is_some_and(|at| job.enqueued_at < *at);
     if cancelled_before_start || shared.closed.load(Ordering::SeqCst)
-        || !(shared.dispatch_gate)(&session_id)
+        || !(shared.dispatch_gate)(&job.ctx)
     {
         token.cancel();
     }
@@ -600,7 +605,7 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
     let verdict = {
         let remaining = total_deadline.saturating_duration_since(Instant::now());
         if token.is_cancelled() || shared.closed.load(Ordering::SeqCst)
-            || !(shared.dispatch_gate)(&session_id)
+            || !(shared.dispatch_gate)(&job.ctx)
         {
             JobVerdict::Cancelled
         } else if remaining.is_zero() {
@@ -622,7 +627,7 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
                 waited = tokio::time::timeout(remaining, attempt_future) => match waited {
                     Ok(outcome) if !token.is_cancelled()
                         && !shared.closed.load(Ordering::SeqCst)
-                        && (shared.dispatch_gate)(&session_id) =>
+                        && (shared.dispatch_gate)(&job.ctx) =>
                         JobVerdict::Completed(outcome, started.elapsed().as_millis() as u64),
                     Ok(_) => JobVerdict::Cancelled,
                     Err(_elapsed) => {
@@ -732,8 +737,9 @@ mod lifecycle_tests {
             request_id: id.into(), session_id: "session".into(), turn: 0,
             stage: "turn_start".into(), state_fingerprint: String::new(),
             state_schema_version: "test".into(), prompt_version: "test".into(),
-            mode: "compare".into(), questions: Vec::new(), baselines: BTreeMap::new(),
-            request_start_ts: String::new(),
+            mode: "compare".into(), requested_model: "mock".into(),
+            policy_generation: "test".into(), questions: Vec::new(),
+            baselines: BTreeMap::new(), request_start_ts: String::new(),
          })
     }
 

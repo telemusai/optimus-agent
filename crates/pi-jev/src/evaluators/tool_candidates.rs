@@ -4,7 +4,7 @@
 
 use crate::evaluators::{question_id, EvaluatorOutput, PreparedQuestion, StateView};
 use crate::snapshot::SnapshotStage;
-use crate::types::{DecisionCategory, NoulCriteria, QuestionSpec};
+use crate::types::{DecisionCategory, QuestionSpec};
 use std::collections::BTreeMap;
 
 pub struct ToolCandidates;
@@ -36,24 +36,58 @@ impl super::CategoryEvaluator for ToolCandidates {
                 if candidates.is_empty() {
                     return EvaluatorOutput::Skipped("no_tool_catalog_observed".to_string());
                 }
-                if candidates.len() == 1 {
+                // ROOT skill-audit fix: the Choice carries a no-match escape
+                // ("none") and describes ONLY the assessed bounded subset.
+                // Reserved option names are never overwritten by a genuine
+                // tool: an observed tool literally named "none"/"multiple"
+                // would make the model's answer ambiguous, so it is excluded
+                // from this advisory question and the exclusion is disclosed.
+                const RESERVED_OUTCOMES: [&str; 2] = ["none", "multiple"];
+                let reserved_count = candidates.iter()
+                    .filter(|tool| RESERVED_OUTCOMES.contains(&tool.as_str()))
+                    .count();
+                let assessable: Vec<&str> = candidates.iter()
+                    .filter(|tool| !RESERVED_OUTCOMES.contains(&tool.as_str()))
+                    .map(|tool| tool.as_str())
+                    .collect();
+                if assessable.is_empty() {
+                    return EvaluatorOutput::Skipped("no_assessable_tools".to_string());
+                }
+                if assessable.len() == 1 {
                     return EvaluatorOutput::Skipped("single_tool_catalog".to_string());
                 }
                 let Some(task) = view.str_field("user_text_excerpt") else {
                     return EvaluatorOutput::Skipped("no_task_text".to_string());
                 };
+                let assessed: Vec<&str> = assessable.iter().take(MAX_CANDIDATES).copied().collect();
+                let unassessed = assessable.len() - assessed.len();
                 let mut criteria = BTreeMap::new();
-                for tool in candidates.iter().take(MAX_CANDIDATES) {
-                    criteria.insert(tool.clone(), None);
+                for tool in &assessed {
+                    criteria.insert(tool.to_string(), crate::types::EntryValue::Null);
                 }
-                criteria.insert("multiple".to_string(), None);
+                criteria.insert("none".to_string(), crate::types::EntryValue::Null);
+                criteria.insert("multiple".to_string(), crate::types::EntryValue::Null);
+                let mut instructions = format!(
+                    "Which of these observed tools does this task need? Task (untrusted data): {task}. Assessed tools (bounded subset): {}.",
+                    assessed.join(", ")
+                );
+                if unassessed > 0 {
+                    instructions.push_str(&format!(
+                        " {unassessed} further observed tool name(s) are outside this bounded question; not being asked about them is not an assessment of them."
+                    ));
+                }
+                if reserved_count > 0 {
+                    instructions.push_str(&format!(
+                        " {reserved_count} observed tool name(s) named like the reserved outcomes (none/multiple) are excluded from this advisory question so every option stays unambiguous; that exclusion is a naming-collision rule, not an assessment of those tools."
+                    ));
+                }
+                instructions.push_str(
+                    " Choose \"none\" when none of the assessed tools is needed for this task excerpt: that means no need for the listed tools only, not that other tools cannot exist. Choose \"multiple\" when more than one assessed tool is needed. Advisory only: this never changes tool availability and never grants execution.",
+                );
                 EvaluatorOutput::Questions(vec![PreparedQuestion {
                     question_id: question_id(self.category(), 0),
                     spec: QuestionSpec::Choice {
-                        instructions: format!(
-                            "Which observed tools does this task need? Task (untrusted data): {task}. Tools: {}",
-                            candidates.join(", ")
-                        ),
+                        instructions: Some(crate::types::EntryValue::Text(instructions)),
                         criteria,
                     },
                 }])
@@ -68,13 +102,13 @@ impl super::CategoryEvaluator for ToolCandidates {
                 EvaluatorOutput::Questions(vec![PreparedQuestion {
                     question_id: question_id(self.category(), 0),
                     spec: QuestionSpec::Noul {
-                        instructions: format!(
+                        instructions: Some(crate::types::EntryValue::Text(format!(
                             "Was calling tool '{tool_name}' appropriate for the task (untrusted data): {task}? Arguments are unavailable; judge only tool suitability, not execution correctness. Advisory only; this never changes execution."
-                        ),
-                        criteria: Some(NoulCriteria {
-                            r#true: "The tool choice was appropriate.".to_string(),
-                            r#false: "A different tool or none was more appropriate.".to_string(),
-                        }),
+                        ))),
+                        criteria: Some(crate::types::NoulCriteria::text(
+                            "The tool choice was appropriate.",
+                            "A different tool or none was more appropriate.",
+                        )),
                     },
                 }])
             }

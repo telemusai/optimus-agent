@@ -44,6 +44,7 @@ fn outcome(plan: &CompactionPlan, call: f64, result: f64) -> DecisionOutcome {
         usage: Default::default(),
         applied: false,
         attempts: 1,
+        server_request_id: None,
     }
 }
 

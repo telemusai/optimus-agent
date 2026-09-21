@@ -5,23 +5,45 @@
 //! pi-coding-agent and calls into this crate.
 
 pub mod active;
+pub mod agent_guidance;
 pub mod client;
 pub mod compaction;
 pub mod config;
+pub mod control;
 pub mod correlate;
 pub mod credential;
 pub mod error;
+pub mod evidence;
 pub mod evaluators;
 pub mod filtering;
 pub mod hooks;
 pub mod mock;
+pub mod models;
 pub mod observation;
 pub mod redact;
 pub mod report;
 pub mod scheduler;
+pub mod search;
 pub mod snapshot;
 pub mod types;
 
+pub use evidence::{
+    CitationQuotePresence, CitationVerdict, SafetyLabels, SAFETY_QUESTIONS_PER_CANDIDATE,
+    safety_questions,
+};
+pub use agent_guidance::{
+    choice_abstention, compose_fixed_weighted, guardrail_route, guidance_stamp_hash, noul_band,
+    skill_hint, skill_hint_is_current, ChoiceAbstention, GuardrailAssessment, GuardrailInput,
+    GuardrailPolicy, GuardrailRoute, GuidanceThresholds, NoHintReason, NoulBand, SkillAnswerSet,
+    CapturedSkillHintStamp, SkillCatalogEntry, SkillHint, SkillHintOutcome, SkillHintStamp,
+    TimingLabel,
+    WeightedComposition, MAX_GUIDANCE_CATALOG, MAX_GUIDANCE_TEXT_CHARS,
+};
+pub use models::{
+    fetch_model_catalog, parse_model_catalog, ModelCard, ModelCatalog, MODEL_CATALOG_PATH,
+    MAX_MODEL_CATALOG_ENTRIES, MAX_MODEL_DATE_CHARS, MAX_MODEL_DESCRIPTION_CHARS,
+    MAX_MODEL_NAME_CHARS,
+};
 pub use active::{
     evaluate_answer, Acceptance, ActivationPolicy, ActiveDecision, AnswerCandidate, AppliedEffect,
     FallbackReason, DEFAULT_APPLIABLE_CATEGORIES, MAX_EFFECT_CHARS, MAX_VALUE_CHARS,
@@ -41,6 +63,18 @@ pub use config::{
     JevMode, JevSettings, JevSettingsStore, ModeResolution, ModeScope, PersistedSessionMode,
     DEFAULT_AGENT_DIR_NAME, DEFAULT_KEY_ID, ENV_AGENT_DIR, ENV_JEV_API_KEY, ENV_TYPESAFE_API_KEY,
     SETTINGS_FILE_NAME, SETTINGS_SCHEMA_VERSION,
+};
+pub use control::{
+    combine_sufficiency, control_gates_open, evaluate_control_answer, nonprogress_verdict,
+    verification_need, CorrelatedVerificationEvidence, ControlAcceptance, ControlBoundary,
+    ControlBudgetKind, ControlBudgetSnapshot, ControlBudgets, ControlEffectKind, ControlFeatures,
+    ControlPolicy, ControlProvenance, ControlRefusal, ControlVerificationState, ControlVerdict,
+    FeedbackKind, HostControlFacts, NonprogressVerdict, PauseReason, SufficiencyVerdict,
+    TurnSignature, VerificationNeed, VerificationSourceKind, CONTROL_ACT_MIN_CONFIDENCE,
+    CONTROL_HIGH_IMPACT_MIN_CONFIDENCE, CONTROL_MAX_DECISION_AGE, CONTROL_MAX_FEEDBACK,
+    CONTROL_MAX_NONPROGRESS_CORRECTIONS, CONTROL_MAX_RETRY_VETOES,
+    CONTROL_MAX_VERIFICATION_REQUESTS, CONTROL_NONPROGRESS_MIN_IDENTICAL_TURNS,
+    CONTROL_NONPROGRESS_WINDOW,
 };
 pub use credential::{
     default_credential_store,
@@ -77,3 +111,16 @@ pub use types::{
     DEFAULT_MODEL, FORBIDDEN_SUBAGENT_CAPABILITIES, MAX_QUESTIONS_PER_REQUEST,
     PROBABILITY_TOLERANCE, SYSTEMONE_PATH,
 };
+
+pub use search::{
+    build_line_find_text, line_find_questions, line_state, rerank_batch_questions,
+    rerank_batch_state, reranked_order, scored_candidates_from_decisions, top_lines,
+    validate_where_distribution, validate_window_distribution, verdict, window_questions,
+    window_state, LineEntry,
+    LineFindOptions, LineFindText, LineFindVerdict, RerankOptions, ScoredCandidate,
+    SearchBudget, WindowEntries, EXISTS_ABSENT, EXISTS_FOUND, EXISTS_QUESTION_ID,
+    LINE_EXCERPT_CHARS, LINE_FIND_CATEGORY, LINE_WINDOW, MAX_LINE_FIND_LINES,
+    MAX_LINE_STATE_BYTES, MAX_RERANK_CANDIDATES, PROMPT_VERSION_SEARCH, RERANK_BATCH,
+    RERANK_CATEGORY, SHARED_SEARCH_BUDGET_MS, WHERE_QUESTION_ID, WINDOW_QUESTION_ID,
+};
+pub use types::{LineFindAssessment, RerankAssessment};

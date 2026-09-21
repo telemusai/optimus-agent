@@ -65,6 +65,8 @@ pub struct ActiveDecideOutcome {
     /// wrong mode). The caller must then behave as if Jev were absent.
     pub unavailable: Option<crate::active::FallbackReason>,
     pub mode: JevMode,
+    /// Requested Jev model captured with `policy_generation` before dispatch.
+    pub requested_model: String,
     pub context: Option<RequestContext>,
     pub raw: Option<crate::types::DecisionOutcome>,
     pub baseline_action: BTreeMap<String, String>,
@@ -73,7 +75,9 @@ pub struct ActiveDecideOutcome {
     pub dispatched: bool,
     token: crate::scheduler::CancellationToken,
     independent: bool,
-    policy_generation: String,
+    /// Decision-policy generation captured for this outcome; consumed by the
+    /// host control seam (jev_bridge decide_control) for correlation.
+    pub policy_generation: String,
 }
 
 /// One refused answer.
@@ -127,11 +131,34 @@ struct PreparedBundle {
     ctx: RequestContext,
 }
 
+/// One authoritative request snapshot. Production hosts construct all four
+/// fields from ONE settings-store load before any await. `policy_generation`
+/// includes the durable write identity and effective feature/compaction
+/// policy; `allowed` covers mode/credential or independent-compaction gates.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JevRequestGate {
+    pub mode: JevMode,
+    pub requested_model: String,
+    pub policy_generation: String,
+    pub allowed: bool,
+}
+
 /// Observer configuration.
 #[derive(Clone)]
 pub struct JevObserverConfig {
-    /// Cheap effective-mode check invoked once per observed event.
-    pub mode_gate: Arc<dyn Fn(Option<&str>) -> JevMode + Send + Sync>,
+    /// Cheap effective-mode AND requested-Jev-model resolution, invoked once
+    /// per observed event (ROOT-CONTRACT v9). Both values MUST come from ONE
+    /// authoritative settings snapshot: the host resolves them together so a
+    /// request's mode gate and its `model` field can never disagree, and the
+    /// capture happens at the boundary BEFORE any await. The requested model
+    /// is stamped into every prepared request (compare queue, active decide,
+    /// guidance, control, search, evidence, independent compaction); a late
+    /// selection change cannot mix into an already-captured payload — the
+    /// durable `write_revision` carried by the policy generation invalidates
+    /// such work at the apply boundary instead. The default returns
+    /// `(JevMode::Off, SYSTEM_ONE_MODEL)` so unchanged hosts stay
+    /// byte-equivalent.
+    pub mode_gate: Arc<dyn Fn(Option<&str>) -> (JevMode, String) + Send + Sync>,
     /// Categories to observe; empty set means all eligible by default.
     pub enabled_categories: HashSet<String>,
     pub scheduler: SchedulerConfig,
@@ -144,12 +171,18 @@ pub struct JevObserverConfig {
     /// Independent compaction permission, also bound to credential generation.
     pub independent_gate: Arc<dyn Fn(&str) -> bool + Send + Sync>,
     pub policy_generation: Arc<dyn Fn(&str, bool) -> String + Send + Sync>,
+    /// Production-only single-load gate. When present, it is authoritative
+    /// for mode, requested model, durable policy generation and permission.
+    /// The legacy closures remain as a compatibility fallback for isolated
+    /// embedders and fixtures.
+    pub authoritative_gate:
+        Option<Arc<dyn Fn(Option<&str>, bool) -> JevRequestGate + Send + Sync>>,
 }
 
 impl Default for JevObserverConfig {
     fn default() -> Self {
         Self {
-            mode_gate: Arc::new(|_| JevMode::Off),
+            mode_gate: Arc::new(|_| (JevMode::Off, SYSTEM_ONE_MODEL.to_string())),
             enabled_categories: HashSet::new(),
             scheduler: SchedulerConfig::default(),
             min_confidence: 0.7,
@@ -157,6 +190,7 @@ impl Default for JevObserverConfig {
             active: ActiveSettings::default(),
             independent_gate: Arc::new(|_| false),
             policy_generation: Arc::new(|_, _| String::new()),
+            authoritative_gate: None,
         }
     }
 }
@@ -167,6 +201,41 @@ impl std::fmt::Debug for JevObserverConfig {
             .field("enabled_categories", &self.enabled_categories)
             .field("scheduler", &self.scheduler.request_deadline)
             .finish()
+    }
+}
+
+fn resolve_request_gate(
+    config: &JevObserverConfig,
+    session_id: Option<&str>,
+    independent: bool,
+) -> JevRequestGate {
+    if let Some(gate) = &config.authoritative_gate {
+        return gate(session_id, independent);
+    }
+    let (mode, requested_model) = (config.mode_gate)(session_id);
+    let id = session_id.unwrap_or("");
+    let policy_generation = (config.policy_generation)(id, independent);
+    let allowed = if independent {
+        (config.independent_gate)(id)
+    } else {
+        mode.is_enabled()
+    };
+    JevRequestGate {
+        mode,
+        requested_model,
+        policy_generation,
+        allowed,
+    }
+}
+
+fn payload_matches_gate(
+    config: &JevObserverConfig,
+    payload: &Value,
+    gate: &JevRequestGate,
+) -> bool {
+    match payload.get("policy_generation").and_then(Value::as_str) {
+        Some(captured) => captured == gate.policy_generation,
+        None => config.authoritative_gate.is_none(),
     }
 }
 
@@ -206,12 +275,22 @@ impl JevObserver {
                 notify(&ctx.session_id);
             }
         });
-        let mode_gate = Arc::clone(&config.mode_gate);
+        let scheduler_gate_config = config.clone();
         let scheduler = JevScheduler::new_with_gate(
             config.scheduler.clone(),
             Arc::clone(&system_one),
             sink,
-            Arc::new(move |session_id| mode_gate(Some(session_id)).allows_compare()),
+            Arc::new(move |ctx| {
+                let gate = resolve_request_gate(
+                    &scheduler_gate_config,
+                    Some(&ctx.session_id),
+                    false,
+                );
+                gate.allowed
+                    && gate.mode.allows_compare()
+                    && gate.requested_model == ctx.requested_model
+                    && gate.policy_generation == ctx.policy_generation
+            }),
         );
         Arc::new(Self {
             config,
@@ -321,10 +400,13 @@ impl JevObserver {
             .and_then(Value::as_str)
             .unwrap_or("")
             .to_string();
-        // Single cheap mode check first; in Off nothing else happens.
-        if !(self.config.mode_gate)(if session_id.is_empty() { None } else { Some(session_id.as_str()) })
-            .allows_compare()
-        {
+        // Single authoritative gate check first; in Off nothing else happens.
+        let gate = resolve_request_gate(
+            &self.config,
+            if session_id.is_empty() { None } else { Some(session_id.as_str()) },
+            false,
+        );
+        if !gate.allowed || !gate.mode.allows_compare() {
             return;
         }
         match event_type {
@@ -361,7 +443,14 @@ impl JevObserver {
     /// path so both ask the same thing of the same snapshot.
     ///
     /// Every refusal to ask is recorded here rather than silently dropped.
-    fn prepare_bundle(&self, payload: &Value, stage: SnapshotStage, mode: &str) -> BundlePreparation {
+    fn prepare_bundle(
+        &self,
+        payload: &Value,
+        stage: SnapshotStage,
+        mode: &str,
+        requested_model: &str,
+        policy_generation: &str,
+    ) -> BundlePreparation {
         let session_id = payload
             .get("session_id")
             .and_then(Value::as_str)
@@ -528,9 +617,14 @@ impl JevObserver {
         for question in &questions {
             specs.insert(question.question_id.clone(), question.spec.clone());
         }
+        // ROOT-CONTRACT v9: the request carries the requested Jev model
+        // captured with the mode gate BEFORE the request is queued. The
+        // scheduler sends it as-is (no late getter) and the durable
+        // `write_revision` invalidates it when the selection changes
+        // meanwhile — including A->B->A — at the apply boundary.
         let request = crate::types::SystemOneRequest {
             state: state.clone(),
-            model: SYSTEM_ONE_MODEL.to_string(),
+            model: requested_model.to_string(),
             questions: specs,
         };
         let ctx = RequestContext {
@@ -542,6 +636,8 @@ impl JevObserver {
             state_schema_version: STATE_SCHEMA_VERSION.to_string(),
             prompt_version: PROMPT_VERSION.to_string(),
             mode: mode.to_string(),
+            requested_model: requested_model.to_string(),
+            policy_generation: policy_generation.to_string(),
             questions: questions
                 .iter()
                 .map(|question| QuestionMeta {
@@ -562,18 +658,41 @@ impl JevObserver {
     /// Observe one boundary in Compare mode: capture baselines synchronously,
     /// hand the request to the bounded queue, and return. Fire-and-forget.
     fn observe_snapshot(&self, _event_type: &str, payload: &Value, stage: SnapshotStage) {
-        // Baselines and context were captured synchronously at the boundary;
-        // the SystemOne call happens asynchronously in the scheduler.
-        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
-        if let BundlePreparation::Ready(bundle) = self.prepare_bundle(payload, stage, mode.as_str()) {
+        // Production resolves mode + requested model + durable generation from
+        // ONE settings snapshot. A payload built from an older feature snapshot
+        // is refused before queueing rather than mixed with the newer model.
+        let gate = resolve_request_gate(
+            &self.config,
+            payload.get("session_id").and_then(Value::as_str),
+            false,
+        );
+        if !gate.allowed || !gate.mode.allows_compare() || !payload_matches_gate(&self.config, payload, &gate) {
+            return;
+        }
+        if let BundlePreparation::Ready(bundle) = self.prepare_bundle(
+            payload,
+            stage,
+            gate.mode.as_str(),
+            &gate.requested_model,
+            &gate.policy_generation,
+        ) {
             self.correlator.track_boundary(&bundle.ctx, action_baseline(payload), payload.get("compaction_enabled").and_then(Value::as_bool));
-            // Dropped requests are recorded by the scheduler sink.
+            // Dropped requests are recorded by the scheduler sink. Its dispatch
+            // gate rechecks model + generation both before send and on return.
             let _ = self.scheduler.enqueue(bundle.request, bundle.ctx);
         }
     }
 
     /// Prepare explicit questions without truncating candidate IDs or question sets.
-    fn prepare_explicit(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, mode: JevMode) -> Option<PreparedBundle> {
+    fn prepare_explicit(
+        &self,
+        payload: &Value,
+        stage: &str,
+        questions: Vec<PreparedQuestion>,
+        mode: JevMode,
+        requested_model: &str,
+        policy_generation: &str,
+    ) -> Option<PreparedBundle> {
         let session_id = payload.get("session_id")?.as_str()?.to_string();
         let state = payload.get("state")?.clone();
         if session_id.is_empty() || questions.is_empty()
@@ -589,7 +708,10 @@ impl JevObserver {
             metadata.push(QuestionMeta { question_id: question.question_id.clone(), category: category.to_string() });
             if specs.insert(question.question_id, question.spec).is_some() { return None; }
         }
-        let request = crate::types::SystemOneRequest { state: state.clone(), model: SYSTEM_ONE_MODEL.to_string(), questions: specs };
+        // ROOT-CONTRACT v9: explicit-questions requests (guidance, control,
+        // search, evidence and independent-compaction decides) carry the
+        // requested Jev model captured with the SAME gate snapshot.
+        let request = crate::types::SystemOneRequest { state: state.clone(), model: requested_model.to_string(), questions: specs };
         if crate::types::validate_request_shape(&request).is_err() { return None; }
         Some(PreparedBundle {
             request,
@@ -598,46 +720,96 @@ impl JevObserver {
                 turn: payload.get("turn").and_then(Value::as_u64).unwrap_or(0),
                 stage: stage.to_string(), state_fingerprint: fingerprint_of(&state),
                 state_schema_version: STATE_SCHEMA_VERSION.to_string(), prompt_version: PROMPT_VERSION.to_string(),
-                mode: mode.as_str().to_string(), questions: metadata, baselines: BTreeMap::new(),
+                mode: mode.as_str().to_string(), requested_model: requested_model.to_string(),
+                policy_generation: policy_generation.to_string(), questions: metadata,
+                baselines: BTreeMap::new(),
                 request_start_ts: crate::client::utc_now_rfc3339(),
             },
         })
     }
 
     pub fn observe_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) {
-        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
-        if !mode.allows_compare() { return; }
-        if let Some(bundle) = self.prepare_explicit(payload, stage, questions, mode) {
+        let gate = resolve_request_gate(
+            &self.config,
+            payload.get("session_id").and_then(Value::as_str),
+            false,
+        );
+        if !gate.allowed || !gate.mode.allows_compare() || !payload_matches_gate(&self.config, payload, &gate) {
+            return;
+        }
+        if let Some(bundle) = self.prepare_explicit(
+            payload,
+            stage,
+            questions,
+            gate.mode,
+            &gate.requested_model,
+            &gate.policy_generation,
+        ) {
             self.correlator.track_boundary(&bundle.ctx, action_baseline(payload), payload.get("compaction_enabled").and_then(Value::as_bool));
             let _ = self.scheduler.enqueue(bundle.request, bundle.ctx);
         }
     }
 
     pub async fn decide_active(&self, payload: &Value, stage: SnapshotStage, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
-        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
-        let bundle = if mode.allows_active() {
-            match self.prepare_bundle(payload, stage, mode.as_str()) {
+        let gate = resolve_request_gate(
+            &self.config,
+            payload.get("session_id").and_then(Value::as_str),
+            false,
+        );
+        let bundle = if gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
+            match self.prepare_bundle(
+                payload,
+                stage,
+                gate.mode.as_str(),
+                &gate.requested_model,
+                &gate.policy_generation,
+            ) {
                 BundlePreparation::Ready(bundle) => Some(*bundle),
                 _ => None,
             }
         } else { None };
-        self.decide_bundle(payload, stage.as_str(), bundle, policy, mode, false).await
+        self.decide_bundle(payload, stage.as_str(), bundle, policy, gate, false).await
     }
 
     pub async fn decide_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
-        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
-        let bundle = if mode.allows_active() { self.prepare_explicit(payload, stage, questions, mode) } else { None };
-        self.decide_bundle(payload, stage, bundle, policy, mode, false).await
+        let gate = resolve_request_gate(
+            &self.config,
+            payload.get("session_id").and_then(Value::as_str),
+            false,
+        );
+        let bundle = if gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
+            self.prepare_explicit(
+                payload,
+                stage,
+                questions,
+                gate.mode,
+                &gate.requested_model,
+                &gate.policy_generation,
+            )
+        } else { None };
+        self.decide_bundle(payload, stage, bundle, policy, gate, false).await
     }
 
     pub async fn decide_independent(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) -> ActiveDecideOutcome {
-        let mode = (self.config.mode_gate)(payload.get("session_id").and_then(Value::as_str));
-        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
-        let bundle = if (self.config.independent_gate)(session_id) { self.prepare_explicit(payload, stage, questions, mode) } else { None };
-        self.decide_bundle(payload, stage, bundle, &crate::active::ActivationPolicy::default(), mode, true).await
+        let gate = resolve_request_gate(
+            &self.config,
+            payload.get("session_id").and_then(Value::as_str),
+            true,
+        );
+        let bundle = if gate.allowed && payload_matches_gate(&self.config, payload, &gate) {
+            self.prepare_explicit(
+                payload,
+                stage,
+                questions,
+                gate.mode,
+                &gate.requested_model,
+                &gate.policy_generation,
+            )
+        } else { None };
+        self.decide_bundle(payload, stage, bundle, &crate::active::ActivationPolicy::default(), gate, true).await
     }
 
-    async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, mode: JevMode, independent: bool) -> ActiveDecideOutcome {
+    async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool) -> ActiveDecideOutcome {
         use crate::active::FallbackReason;
         let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
         let token = {
@@ -650,15 +822,21 @@ impl JevObserver {
             }
             sessions.entry(key).or_default().clone()
         };
+        let mode = gate.mode;
+        let captured_generation = payload
+            .get("policy_generation")
+            .and_then(Value::as_str)
+            .map(str::to_string)
+            .unwrap_or_else(|| gate.policy_generation.clone());
         let mut outcome = ActiveDecideOutcome {
             session_id, turn: payload.get("turn").and_then(Value::as_u64).unwrap_or(0),
             stage: stage.to_string(), request_id: None, response_model: None, duration_ms: None,
             state_fingerprint: String::new(), decisions: Vec::new(), refusals: Vec::new(), unavailable: None,
-            mode, context: None, raw: None, baseline_action: action_baseline(payload),
+            mode, requested_model: gate.requested_model, context: None, raw: None,
+            baseline_action: action_baseline(payload),
             compaction_enabled: payload.get("compaction_enabled").and_then(Value::as_bool),
             terminal_reason: None, dispatched: false, token, independent,
-            policy_generation: payload.get("policy_generation").and_then(Value::as_str).map(str::to_string)
-                .unwrap_or_else(|| (self.config.policy_generation)(payload.get("session_id").and_then(Value::as_str).unwrap_or(""), independent)),
+            policy_generation: captured_generation,
         };
         if !self.can_apply(&outcome) {
             outcome.unavailable = Some(FallbackReason::ModeNotActive);
@@ -693,9 +871,11 @@ impl JevObserver {
         }
         let started = std::time::Instant::now();
         outcome.dispatched = true;
+        // Clone the moved request fields: the typed acceptance borrows below
+        // still need the prepared bundle intact (same request identity).
         let call = self.system_one.decide(crate::client::bundle_with_questions(
             bundle.ctx.session_id.clone(), bundle.ctx.turn, bundle.ctx.stage.clone(),
-            bundle.request.state, bundle.request.model, bundle.request.questions,
+            bundle.request.state.clone(), bundle.request.model.clone(), bundle.request.questions.clone(),
         ));
         let decision = tokio::select! {
             biased;
@@ -720,7 +900,33 @@ impl JevObserver {
         } else { self.note_active_success(); }
         if !independent {
             let now = std::time::SystemTime::now();
+            let mut line_find_records: Vec<&crate::types::DecisionRecord> = Vec::new();
             for record in &decision.records {
+                // ROOT CONTRACT v1 (Search): scored categories take the typed
+                // acceptance path. A Noul is never refused for lacking Choice
+                // confidence and never gated by a confidence threshold; the
+                // legacy path below is byte-identical for all other categories.
+                // ROOT-CONTRACT v6 (Evidence lane): the citation check is a
+                // Choice-category advisory assessment with its own typed
+                // assessor (never a Noul, never a keep/drop effect).
+                if record.category == crate::types::DecisionCategory::CodeCitationCheck {
+                    match assess_citation_record(record, &bundle, policy, mode, now) {
+                        crate::active::Acceptance::Accepted(decision) => outcome.decisions.push(*decision),
+                        crate::active::Acceptance::Fallback(reason) => outcome.refusals.push(ActiveRefusal::new(record.category, record.question_id.clone(), reason)),
+                    }
+                    continue;
+                }
+                if crate::active::SCORED_SEARCH_CATEGORIES.contains(&record.category) {
+                    if record.category == crate::types::DecisionCategory::CodeLineFind {
+                        line_find_records.push(record);
+                        continue;
+                    }
+                    match assess_scored_record(record, &bundle, policy, mode, now) {
+                        crate::active::Acceptance::Accepted(decision) => outcome.decisions.push(*decision),
+                        crate::active::Acceptance::Fallback(reason) => outcome.refusals.push(ActiveRefusal::new(record.category, record.question_id.clone(), reason)),
+                    }
+                    continue;
+                }
                 let candidate = crate::active::AnswerCandidate {
                     category: record.category, question_id: record.question_id.clone(),
                     value: Some(record.answer.selected_value()), confidence: policy_confidence(record),
@@ -741,17 +947,48 @@ impl JevObserver {
                     crate::active::Acceptance::Fallback(reason) => outcome.refusals.push(ActiveRefusal::new(record.category, record.question_id.clone(), reason)),
                 }
             }
+            if !line_find_records.is_empty() {
+                // The where-Choice and existence-Noul of one line-find request
+                // are accepted as ONE typed pair: a partial pair never applies.
+                match assess_line_find_pair(&line_find_records, &bundle, policy, mode, now) {
+                    LineFindAcceptance::Accepted(mut decisions) => outcome.decisions.append(&mut decisions),
+                    LineFindAcceptance::Fallback(reason) => {
+                        for record in line_find_records {
+                            outcome.refusals.push(ActiveRefusal::new(record.category, record.question_id.clone(), reason));
+                        }
+                    }
+                }
+            }
         }
         outcome.raw = Some(decision);
         outcome
     }
 
-    /// Re-check immediately before host mutation, including the captured credential generation.
+    /// Re-check immediately before host mutation from one authoritative
+    /// settings snapshot, including credential, durable write/model identity,
+    /// mode and independent-compaction permission.
     pub fn can_apply(&self, outcome: &ActiveDecideOutcome) -> bool {
-        if outcome.session_id.is_empty() || self.closed.load(Ordering::SeqCst) || outcome.token.is_cancelled() { return false; }
-        if (self.config.policy_generation)(&outcome.session_id, outcome.independent) != outcome.policy_generation { return false; }
-        if outcome.independent { return (self.config.independent_gate)(&outcome.session_id); }
-        outcome.mode.allows_active() && (self.config.mode_gate)(Some(&outcome.session_id)) == outcome.mode
+        if outcome.session_id.is_empty()
+            || self.closed.load(Ordering::SeqCst)
+            || outcome.token.is_cancelled()
+        {
+            return false;
+        }
+        let current = resolve_request_gate(
+            &self.config,
+            Some(&outcome.session_id),
+            outcome.independent,
+        );
+        if !current.allowed
+            || current.policy_generation != outcome.policy_generation
+            || current.requested_model != outcome.requested_model
+        {
+            return false;
+        }
+        if outcome.independent {
+            return true;
+        }
+        outcome.mode.allows_active() && current.mode == outcome.mode
     }
 
     pub fn record_active(&self, outcome: &ActiveDecideOutcome, effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>) -> usize {
@@ -880,4 +1117,164 @@ fn policy_confidence(record: &crate::types::DecisionRecord) -> Option<f64> {
         return None;
     }
     Some(confidence)
+}
+
+// ROOT CONTRACT v1 (Search): typed acceptance for scored categories. This
+// never weakens the legacy Choice path; a Noul is never converted into
+// Choice confidence and never gated by a confidence threshold.
+enum LineFindAcceptance {
+    Accepted(Vec<crate::active::ActiveDecision>),
+    Fallback(crate::active::FallbackReason),
+}
+
+fn assess_scored_record(
+    record: &crate::types::DecisionRecord,
+    bundle: &PreparedBundle,
+    policy: &crate::active::ActivationPolicy,
+    mode: JevMode,
+    now: std::time::SystemTime,
+) -> crate::active::Acceptance {
+    use crate::active::{ActiveDecision, FallbackReason};
+    if !mode.allows_active() {
+        return crate::active::Acceptance::Fallback(FallbackReason::ModeNotActive);
+    }
+    if !policy.allows(record.category) {
+        return crate::active::Acceptance::Fallback(FallbackReason::CategoryDisabled);
+    }
+    let noul = match &record.answer {
+        crate::types::Answer::Noul { noul } if noul.is_finite() && (0.0..=1.0).contains(noul) => *noul,
+        _ => return crate::active::Acceptance::Fallback(FallbackReason::InvalidValue),
+    };
+    let assessment = crate::types::RerankAssessment {
+        candidate_id: record
+            .question_id
+            .rsplit_once('.')
+            .and_then(|(_, id)| id.parse().ok())
+            .unwrap_or(usize::MAX),
+        noul,
+        complete: true,
+        correlated: true,
+        fresh: true,
+    };
+    // The legacy confidence slot carries the raw Noul for record continuity;
+    // no gate ever compares it to a Choice-confidence threshold (the typed
+    // struct above carries the acceptance truth).
+    crate::active::Acceptance::Accepted(Box::new(ActiveDecision {
+        category: record.category,
+        question_id: record.question_id.clone(),
+        value: record.answer.selected_value(),
+        confidence: assessment.noul,
+        response_model: record.response_model.clone(),
+        request_id: bundle.ctx.request_id.clone(),
+        turn: bundle.ctx.turn,
+        decided_at: now,
+    }))
+}
+
+/// ROOT-CONTRACT v6 (Evidence lane): typed acceptance for the advisory
+/// citation-relation record (Choice: supports / contradicts / unclear).
+/// Mirrors the scored path's policy/mode checks. It is never a keep/drop
+/// effect and never a verification: the chosen criterion string is carried
+/// as the decision value and consumers label it advisory-only.
+fn assess_citation_record(
+    record: &crate::types::DecisionRecord,
+    bundle: &PreparedBundle,
+    policy: &crate::active::ActivationPolicy,
+    mode: JevMode,
+    now: std::time::SystemTime,
+) -> crate::active::Acceptance {
+    use crate::active::{ActiveDecision, FallbackReason};
+    if !mode.allows_active() {
+        return crate::active::Acceptance::Fallback(FallbackReason::ModeNotActive);
+    }
+    if !policy.allows(record.category) {
+        return crate::active::Acceptance::Fallback(FallbackReason::CategoryDisabled);
+    }
+    let value = match &record.answer {
+        crate::types::Answer::Choice { choice, confidence, .. }
+            if confidence.is_finite()
+                && (0.0..=1.0).contains(confidence)
+                && !choice.trim().is_empty()
+                && choice.trim().chars().count() <= crate::active::MAX_VALUE_CHARS =>
+        {
+            choice.trim().to_string()
+        }
+        _ => return crate::active::Acceptance::Fallback(FallbackReason::InvalidValue),
+    };
+    crate::active::Acceptance::Accepted(Box::new(ActiveDecision {
+        category: record.category,
+        question_id: record.question_id.clone(),
+        value,
+        confidence: record.answer.confidence().unwrap_or(0.0),
+        response_model: record.response_model.clone(),
+        request_id: bundle.ctx.request_id.clone(),
+        turn: bundle.ctx.turn,
+        decided_at: now,
+    }))
+}
+
+fn assess_line_find_pair(
+    records: &[&crate::types::DecisionRecord],
+    bundle: &PreparedBundle,
+    policy: &crate::active::ActivationPolicy,
+    mode: JevMode,
+    now: std::time::SystemTime,
+) -> LineFindAcceptance {
+    use crate::active::{ActiveDecision, FallbackReason};
+    if !mode.allows_active() {
+        return LineFindAcceptance::Fallback(FallbackReason::ModeNotActive);
+    }
+    if records.iter().any(|record| !policy.allows(record.category)) {
+        return LineFindAcceptance::Fallback(FallbackReason::CategoryDisabled);
+    }
+    let where_record = records
+        .iter()
+        .find(|record| record.question_id == crate::search::WHERE_QUESTION_ID);
+    let exists_record = records
+        .iter()
+        .find(|record| record.question_id == crate::search::EXISTS_QUESTION_ID);
+    let (Some(where_record), Some(exists_record)) = (where_record, exists_record) else {
+        return LineFindAcceptance::Fallback(FallbackReason::NoAnswer);
+    };
+    let crate::types::Answer::Choice { choice, confidence, .. } = &where_record.answer else {
+        return LineFindAcceptance::Fallback(FallbackReason::InvalidValue);
+    };
+    let crate::types::Answer::Noul { noul } = &exists_record.answer else {
+        return LineFindAcceptance::Fallback(FallbackReason::InvalidValue);
+    };
+    if !noul.is_finite() || !(0.0..=1.0).contains(noul) || choice.is_empty() {
+        return LineFindAcceptance::Fallback(FallbackReason::InvalidValue);
+    }
+    let _assessment = crate::types::LineFindAssessment {
+        where_line: Some(choice.clone()),
+        existence_noul: Some(*noul),
+        complete: true,
+        correlated: true,
+        fresh: true,
+        windowed: false, // set by the bridge from presentation facts
+        truncated: false,
+    };
+    LineFindAcceptance::Accepted(vec![
+        ActiveDecision {
+            category: where_record.category,
+            question_id: where_record.question_id.clone(),
+            value: where_record.answer.selected_value(),
+            confidence: *confidence,
+            response_model: where_record.response_model.clone(),
+            request_id: bundle.ctx.request_id.clone(),
+            turn: bundle.ctx.turn,
+            decided_at: now,
+        },
+        ActiveDecision {
+            category: exists_record.category,
+            question_id: exists_record.question_id.clone(),
+            value: exists_record.answer.selected_value(),
+            // The Noul rides the legacy slot for record continuity only.
+            confidence: *noul,
+            response_model: exists_record.response_model.clone(),
+            request_id: bundle.ctx.request_id.clone(),
+            turn: bundle.ctx.turn,
+            decided_at: now,
+        },
+    ])
 }

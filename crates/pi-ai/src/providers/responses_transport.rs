@@ -3,7 +3,7 @@ use std::collections::HashMap;
 use std::sync::{Arc, OnceLock};
 use std::time::{Duration, Instant};
 
-use futures::{SinkExt, StreamExt};
+use futures::{future::FutureExt, SinkExt, StreamExt};
 use indexmap::IndexMap;
 use reqwest::header::{HeaderMap, HeaderName, HeaderValue, AUTHORIZATION};
 use serde_json::{json, Map, Value};
@@ -298,6 +298,144 @@ fn connection(key: &str) -> Option<OwnedMutexGuard<Connection>> {
     None
 }
 
+/// Blackout the capability cache after a failed connection attempt. An
+/// unsuccessful HTTP upgrade cannot have submitted model work.
+async fn disable_capability_cache(account_key: &str) {
+    CAPABILITIES.get().unwrap().lock().await.insert(
+        account_key.to_owned(),
+        Capability {
+            models: vec![],
+            expires: Instant::now() + Duration::from_secs(30),
+        },
+    );
+}
+
+/// Open the Responses WebSocket. `Ok(None)` reports an unsuccessful upgrade,
+/// which cannot have submitted model work.
+async fn establish_connection(
+    base_url: &str,
+    headers: &HeaderMap,
+    signal: Option<&tokio_util::sync::CancellationToken>,
+    account_key: &str,
+) -> Result<Option<Socket>, TransportError> {
+    let mut url = url::Url::parse(&format!(
+        "{}/responses",
+        base_url.trim_end_matches('/')
+    ))
+    .map_err(|_| "Invalid Responses URL")?;
+    let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
+    url.set_scheme(scheme)
+        .map_err(|_| "Invalid Responses scheme")?;
+    let mut request = url
+        .as_str()
+        .into_client_request()
+        .map_err(|_| "Invalid WebSocket request")?;
+    for (name, value) in headers {
+        if !matches!(
+            name.as_str(),
+            "accept" | "content-type" | "content-length" | "connection" | "upgrade" | "host"
+        ) {
+            request.headers_mut().insert(name.clone(), value.clone());
+        }
+    }
+    let connect = tokio::time::timeout(Duration::from_secs(5), connect_async(request));
+    let result = if let Some(signal) = signal {
+        tokio::select! { _ = signal.cancelled() => return Err("Request was aborted".into()), result = connect => result }
+    } else {
+        connect.await
+    };
+    let Ok(Ok((socket, _response))) = result else {
+        disable_capability_cache(account_key).await;
+        return Ok(None);
+    };
+    Ok(Some(socket))
+}
+
+/// A pooled socket may have been closed by the peer after the previous
+/// response completed - with a close frame, a bare TCP FIN, or a reset - or
+/// may carry frames still queued from that response. Submitting a new request
+/// into such a socket is acknowledged locally and then fails as an
+/// unrecoverable reset during read ("Connection reset without closing
+/// handshake"). Before any submission the socket is drained: an immediate read
+/// surfaces signals that already arrived (close frame, EOF, reset, stale
+/// payload frames), and a short bounded grace covers a teardown still in
+/// flight from a just-completed response. Silence is NOT proof of liveness;
+/// the drain only rejects sockets that already signalled death or litter.
+/// Pings are answered so live keepalives are not mistaken for staleness. The
+/// drain is bounded by the wall clock, the timer, and the control-frame cap
+/// together, so a peer cannot starve it by streaming always-ready frames.
+/// Both quiet exits sweep once more with a non-blocking read, so a frame that
+/// arrived between the last read and the exit cannot leak into the next
+/// stream; queued control frames are not stale model payload, but discarding
+/// on any queued frame is the cheap conservative choice. Nothing is submitted
+/// during the drain, so replacing the socket is connection setup, never a
+/// replay of model work; cancellation aborts pre-send and the in-drain socket
+/// is dropped, never pooled.
+const DRAIN_WINDOW: Duration = Duration::from_millis(25);
+
+/// Control frames (pings/pongs) tolerated during one drain. A healthy peer
+/// sends none during the window; more means the stream is flooded or littered,
+/// and the socket is discarded before anything is submitted.
+const MAX_DRAIN_CONTROL_FRAMES: usize = 8;
+
+/// Final non-blocking read before a quiet drain exit: a frame that arrived
+/// between the last loop read and this check is handled exactly like a frame
+/// read inside the loop instead of leaking into the next response stream.
+/// Queued pings/pongs are control frames, not stale model payload, but the
+/// conservative choice is still to discard the socket: a fresh handshake is
+/// cheap, while a queued payload or close frame would genuinely corrupt the
+/// next stream.
+async fn sweep_quiet(mut socket: Socket) -> Option<Socket> {
+    match socket.next().now_or_never() {
+        // A queued frame of any kind, or a stream end: do not reuse.
+        Some(_) => None,
+        // Nothing queued right now; liveness still not proven.
+        None => Some(socket),
+    }
+}
+
+async fn drain_pooled(socket: Socket) -> Option<Socket> {
+    let mut socket = socket;
+    let window = tokio::time::Instant::now() + DRAIN_WINDOW;
+    let mut control_frames = 0_usize;
+    loop {
+        // Tokio's Timeout polls a ready inner future before the timer fires,
+        // so an always-ready frame stream could starve the timer. The wall
+        // clock is checked every iteration; together with the timer and the
+        // control-frame cap the drain is bounded regardless of peer behavior.
+        if tokio::time::Instant::now() >= window {
+            return sweep_quiet(socket).await;
+        }
+        match tokio::time::timeout_at(window, socket.next()).await {
+            // No queued failure observed; liveness not proven.
+            Err(_) => return sweep_quiet(socket).await,
+            // Peer ended the stream.
+            Ok(None) => return None,
+            // Reset without a closing handshake or another transport failure.
+            Ok(Some(Err(_))) => return None,
+            Ok(Some(Ok(Message::Ping(bytes)))) => {
+                control_frames += 1;
+                if control_frames > MAX_DRAIN_CONTROL_FRAMES {
+                    return None;
+                }
+                let pong = tokio::time::timeout_at(window, socket.send(Message::Pong(bytes)));
+                if !matches!(pong.await, Ok(Ok(()))) {
+                    return None;
+                }
+            }
+            Ok(Some(Ok(Message::Pong(_)))) => {
+                control_frames += 1;
+                if control_frames > MAX_DRAIN_CONTROL_FRAMES {
+                    return None;
+                }
+            }
+            // A close frame or a queued payload frame: state from the previous
+            // response must never leak into the next stream.
+            Ok(Some(Ok(_))) => return None,
+        }
+    }
+}
+
 fn create_payload(params: &Map<String, Value>) -> Map<String, Value> {
     let mut payload = params.clone();
     payload.remove("stream");
@@ -324,8 +462,12 @@ pub(crate) async fn try_websocket(
     params: &Map<String, Value>,
     options: &OpenAIResponsesOptions,
 ) -> Result<Option<(ResponsesEventStream, ProviderResponse)>, TransportError> {
+    // Prefer SSE for GitHub's default transport. Explicit WebSocket requests
+    // remain capability-gated; never change transport after sending model work.
     if !opted_in(&model.provider)
         || matches!(options.stream.transport.as_deref(), Some("sse" | "http"))
+        || (model.provider == "github-copilot"
+            && matches!(options.stream.transport.as_deref(), None | Some("auto")))
     {
         return Ok(None);
     }
@@ -368,47 +510,44 @@ pub(crate) async fn try_websocket(
         owner.socket = None;
     }
     let socket = if let Some(socket) = owner.socket.take() {
-        socket
-    } else {
-        let mut url = url::Url::parse(&format!(
-            "{}/responses",
-            client.base_url.trim_end_matches('/')
-        ))
-        .map_err(|_| "Invalid Responses URL")?;
-        let scheme = if url.scheme() == "https" { "wss" } else { "ws" };
-        url.set_scheme(scheme)
-            .map_err(|_| "Invalid Responses scheme")?;
-        let mut request = url
-            .as_str()
-            .into_client_request()
-            .map_err(|_| "Invalid WebSocket request")?;
-        for (name, value) in &headers {
-            if !matches!(
-                name.as_str(),
-                "accept" | "content-type" | "content-length" | "connection" | "upgrade" | "host"
-            ) {
-                request.headers_mut().insert(name.clone(), value.clone());
+        // GitHub only: validate the pooled socket before reuse. Azure's reuse
+        // behavior is unchanged by this request; Codex is not opted in.
+        if model.provider == "github-copilot" {
+            let drained = if let Some(signal) = &options.stream.signal {
+                tokio::select! {
+                    biased; _ = signal.cancelled() => return Err("Request was aborted".into()),
+                    drained = drain_pooled(socket) => drained,
+                }
+            } else {
+                drain_pooled(socket).await
+            };
+            match drained {
+                Some(socket) => socket,
+                None => {
+                    // The pooled socket is dead or carries stale frames from
+                    // the previous response. Nothing has been submitted for
+                    // this request: reconnecting is connection setup, not a
+                    // replay.
+                    match establish_connection(&client.base_url, &headers, options.stream.signal.as_ref(), &account_key).await? {
+                        Some(socket) => {
+                            owner.born = Some(Instant::now());
+                            socket
+                        }
+                        None => return Ok(None),
+                    }
+                }
             }
-        }
-        let connect = tokio::time::timeout(Duration::from_secs(5), connect_async(request));
-        let result = if let Some(signal) = &options.stream.signal {
-            tokio::select! { _ = signal.cancelled() => return Err("Request was aborted".into()), result = connect => result }
         } else {
-            connect.await
-        };
-        let Ok(Ok((socket, _response))) = result else {
-            // An unsuccessful HTTP upgrade cannot have submitted model work.
-            CAPABILITIES.get().unwrap().lock().await.insert(
-                account_key,
-                Capability {
-                    models: vec![],
-                    expires: Instant::now() + Duration::from_secs(30),
-                },
-            );
-            return Ok(None);
-        };
-        owner.born = Some(Instant::now());
-        socket
+            socket
+        }
+    } else {
+        match establish_connection(&client.base_url, &headers, options.stream.signal.as_ref(), &account_key).await? {
+            Some(socket) => {
+                owner.born = Some(Instant::now());
+                socket
+            }
+            None => return Ok(None),
+        }
     };
     let mut lease = Lease {
         socket,
@@ -452,6 +591,22 @@ pub(crate) async fn try_websocket(
     let events = futures::stream::unfold(Some(lease), |state| async move {
         let mut lease = state?;
         loop {
+            // Tokio's Timeout only fires when the inner read is still pending
+            // at the deadline; an always-ready control-frame flood after the
+            // send would otherwise starve it and the stream would never
+            // terminate. The explicit check keeps the post-send deadline
+            // final under any peer behavior. The guard is shared by both
+            // opted-in providers on this transport (recorded in
+            // reports/websocket.md; not byte-identical with any other
+            // provider's generic loop). Nothing here replays model work.
+            if tokio::time::Instant::now() >= lease.deadline {
+                return Some((
+                    transport_error(
+                        "WebSocket response deadline expired before response completion; request not replayed",
+                    ),
+                    None,
+                ));
+            }
             let next = tokio::time::timeout_at(lease.deadline, lease.socket.next());
             let next = if let Some(signal) = &lease.signal {
                 tokio::select! { biased; _ = signal.cancelled() => return Some((transport_error("Request was aborted"), None)), result = next => result }
@@ -482,6 +637,20 @@ pub(crate) async fn try_websocket(
                         pong.await
                     };
                     if !matches!(pong, Ok(Ok(()))) {
+                        // A pong that fails at or after the deadline is the
+                        // deadline expiry observed by a control action that
+                        // straddled it: report the deadline, so the B7
+                        // classification (deadline vs close) cannot be masked
+                        // by backpressured keepalive traffic. Only a pong
+                        // failure before the deadline is a distinct fault.
+                        if tokio::time::Instant::now() >= lease.deadline {
+                            return Some((
+                                transport_error(
+                                    "WebSocket response deadline expired before response completion; request not replayed",
+                                ),
+                                None,
+                            ));
+                        }
                         return Some((transport_error("WebSocket pong failed"), None));
                     }
                     continue;
@@ -722,6 +891,7 @@ mod tests {
         let options = OpenAIResponsesOptions {
             stream: crate::types::StreamOptions {
                 session_id: Some("fake-chat".into()),
+                transport: Some("websocket".into()),
                 timeout_ms: Some(1000.0),
                 ..Default::default()
             },
@@ -733,6 +903,39 @@ mod tests {
                 .unwrap()
                 .clone();
         (model, client, options, params)
+    }
+
+    #[tokio::test]
+    async fn github_default_transport_uses_sse_before_headers_or_network() {
+        let (mut model, mut client, mut options, params) =
+            fake_request("https://example.invalid");
+        // Invalid headers stop every eligible WS path before any network access.
+        // GitHub's default must bypass even header preparation.
+        client.default_headers.insert("invalid header".into(), Some("value".into()));
+        for transport in [None, Some("auto"), Some("sse"), Some("http")] {
+            options.stream.transport = transport.map(str::to_owned);
+            assert!(try_websocket(&model, &client, &params, &options)
+                .await.unwrap().is_none());
+        }
+        for transport in ["websocket", "websocket-cached"] {
+            options.stream.transport = Some(transport.into());
+            let error = match try_websocket(&model, &client, &params, &options).await {
+                Err(error) => error,
+                Ok(_) => panic!("explicit WebSocket must remain eligible"),
+            };
+            assert_eq!(error.message, "Invalid header name");
+            assert!(!error.sent);
+        }
+        model.provider = "azure-openai-managed".into();
+        for transport in [None, Some("auto")] {
+            options.stream.transport = transport.map(str::to_owned);
+            let error = match try_websocket(&model, &client, &params, &options).await {
+                Err(error) => error,
+                Ok(_) => panic!("Azure default must remain eligible"),
+            };
+            assert_eq!(error.message, "Invalid header name");
+            assert!(!error.sent);
+        }
     }
 
     #[tokio::test]
@@ -990,5 +1193,581 @@ mod tests {
             identity(&model, &client, &request_headers(&client).unwrap())
         );
         assert!(!first.contains("one"));
+    }
+
+    /// What the fixture peer does after completing the first served response.
+    #[derive(Clone, Copy)]
+    enum AfterFirst {
+        /// Drop the TCP stream without a WebSocket closing handshake.
+        DropQuietly,
+        /// Complete the RFC 6455 closing handshake.
+        CloseFrame,
+        /// Queue an unexpected payload frame after the completed response.
+        StaleFrame,
+        /// Send a keepalive ping after the completed response.
+        Ping,
+        /// Stream pong control frames continuously after the completed
+        /// response, until the peer drops the socket.
+        PongFlood,
+        /// Send two spaced pings and queue one stale payload frame behind
+        /// them, then stay idle. All frames are ordered and arrive well
+        /// inside the client drain window on every schedule.
+        SlowControlFrames,
+    }
+
+    /// A Responses endpoint whose peer closes or litters the pooled socket
+    /// after the first served response, exactly once for the whole fixture.
+    /// Later sockets behave healthily so tests can exercise both teardown and
+    /// regular reuse. Request ids increment across the whole fixture; `pongs`
+    /// counts pong frames the peer received; `teardown` is notified after the
+    /// peer-side teardown action completed, so tests synchronize on events
+    /// instead of wall-clock sleeps. `GET /health` answers the Azure
+    /// capability probe; `GET /models` answers the GitHub catalogue probe.
+    async fn lifecycle_endpoint(
+        after_first: AfterFirst,
+    ) -> (
+        String,
+        Arc<AtomicUsize>,
+        Arc<AtomicUsize>,
+        Arc<tokio::sync::Notify>,
+        tokio::task::JoinHandle<()>,
+    ) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let pongs = Arc::new(AtomicUsize::new(0));
+        let teardown = Arc::new(tokio::sync::Notify::new());
+        let counter = connections.clone();
+        let pong_counter = pongs.clone();
+        let teardown_counter = teardown.clone();
+        let served = Arc::new(AtomicUsize::new(0));
+        let armed = Arc::new(std::sync::atomic::AtomicBool::new(true));
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let pong_counter = pong_counter.clone();
+                let teardown_counter = teardown_counter.clone();
+                let served = served.clone();
+                let armed = armed.clone();
+                children.spawn(async move {
+                    let mut buf = [0; 4096];
+                    let count = tcp.peek(&mut buf).await.unwrap();
+                    let request_line = String::from_utf8_lossy(&buf[..count]).to_string();
+                    let (body, probe) = if request_line.starts_with("GET /models ") {
+                        (r#"{"data":[{"id":"model","policy":{"state":"enabled"},"supported_endpoints":["ws:/responses"]}]}"#.to_string(), true)
+                    } else if request_line.starts_with("GET /health ") {
+                        (r#"{"responsesWebSocket":{"enabled":true,"store":false,"version":1,"path":"/azure-openai/v1/responses","maxInFlightPerConnection":1,"models":["model"]}}"#.to_string(), true)
+                    } else {
+                        (String::new(), false)
+                    };
+                    if probe {
+                        let _ = tcp.read(&mut buf).await.unwrap();
+                        tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    loop {
+                        match ws.next().await {
+                            Some(Ok(Message::Text(text))) => {
+                                let request: Value = serde_json::from_str(&text).unwrap();
+                                assert_eq!(request["type"], "response.create");
+                                assert_eq!(request["store"], false);
+                                assert!(request.get("stream").is_none());
+                                let id =
+                                    format!("response-{}", served.fetch_add(1, Ordering::SeqCst) + 1);
+                                for event in [json!({"type":"response.created","response":{"id":id}}), json!({"type":"response.output_text.delta","delta":"ok"})] {
+                                    ws.send(Message::Text(event.to_string().into())).await.unwrap();
+                                }
+                                ws.send(Message::Text(json!({"type":"response.completed","response":{"id":id,"status":"completed"}}).to_string().into())).await.unwrap();
+                                if armed.swap(false, Ordering::SeqCst) {
+                                    match after_first {
+                                        AfterFirst::DropQuietly => {
+                                            drop(ws);
+                                            teardown_counter.notify_one();
+                                            return;
+                                        }
+                                        AfterFirst::CloseFrame => {
+                                            let _ = ws.close(None).await;
+                                            drop(ws);
+                                            teardown_counter.notify_one();
+                                            return;
+                                        }
+                                        AfterFirst::StaleFrame => {
+                                            ws.send(Message::Text(json!({"type":"response.output_text.delta","delta":"STALE"}).to_string().into())).await.unwrap();
+                                            teardown_counter.notify_one();
+                                        }
+                                        AfterFirst::Ping => {
+                                            ws.send(Message::Ping(b"keepalive".to_vec().into())).await.unwrap();
+                                            teardown_counter.notify_one();
+                                        }
+                                        AfterFirst::PongFlood => {
+                                            // Stream control frames without
+                                            // bound until the peer drops the
+                                            // socket; the client drain must
+                                            // stay bounded and reconnect
+                                            // before submitting anything.
+                                            loop {
+                                                if ws.send(Message::Pong(b"flood".to_vec().into())).await.is_err() {
+                                                    break;
+                                                }
+                                            }
+                                            teardown_counter.notify_one();
+                                            return;
+                                        }
+                                        AfterFirst::SlowControlFrames => {
+                                            // Two spaced pings with one stale
+                                            // payload frame queued behind
+                                            // them, then idle. The payload is
+                                            // discarded with the socket, never
+                                            // leaked into the next stream.
+                                            ws.send(Message::Ping(b"slow1".to_vec().into())).await.unwrap();
+                                            tokio::time::sleep(Duration::from_millis(10)).await;
+                                            ws.send(Message::Ping(b"slow2".to_vec().into())).await.unwrap();
+                                            tokio::time::sleep(Duration::from_millis(2)).await;
+                                            ws.send(Message::Text(json!({"type":"response.output_text.delta","delta":"STALE"}).to_string().into())).await.unwrap();
+                                            teardown_counter.notify_one();
+                                        }
+                                    }
+                                }
+                            }
+                            Some(Ok(Message::Pong(_))) => {
+                                pong_counter.fetch_add(1, Ordering::SeqCst);
+                            }
+                            _ => return,
+                        }
+                    }
+                });
+            }
+        });
+        (
+            format!("http://{address}"),
+            connections,
+            pongs,
+            teardown,
+            server,
+        )
+    }
+
+    /// A peer that tears down the TCP connection after a completed response,
+    /// without a WebSocket closing handshake, used to make the next request
+    /// fail after submission with "WebSocket protocol error: Connection reset
+    /// without closing handshake". The drain must detect the dead pooled
+    /// socket before anything is submitted and establish a fresh connection;
+    /// the replacement socket then behaves healthily and is reused normally.
+    #[tokio::test]
+    async fn websocket_peer_closed_pooled_socket_is_replaced_before_next_submission() {
+        let (base, connections, _pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::DropQuietly).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        // The peer teardown completed before this barrier fired; the FIN has
+        // been initiated and the bounded drain window observes it.
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("peer teardown must be signalled");
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-2");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 3 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 3 stream must finish");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-3");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A close frame queued after a completed response must be drained instead
+    /// of being read as the terminal frame of the next response.
+    #[tokio::test]
+    async fn websocket_close_frame_after_completed_is_drained_and_socket_replaced() {
+        let (base, connections, _pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::CloseFrame).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("peer close must be signalled");
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["response"]["id"], "response-2");
+        assert_eq!(events[2]["type"], "response.completed");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A payload frame queued after a completed response is stale state of the
+    /// previous response: it must be discarded with the socket instead of
+    /// leaking into the next response stream.
+    #[tokio::test]
+    async fn websocket_stale_queued_frame_never_leaks_into_the_next_response() {
+        let (base, connections, _pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::StaleFrame).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("stale frame must be signalled");
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["response"]["id"], "response-2");
+        assert_eq!(events[1]["delta"], "ok");
+        assert_eq!(events[2]["type"], "response.completed");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        server.abort();
+    }
+
+    /// A keepalive ping arriving on a pooled socket is answered with a pong
+    /// during the drain, and the socket stays reusable without a reconnect.
+    #[tokio::test]
+    async fn websocket_drain_answers_ping_and_keeps_the_socket_reusable() {
+        let (base, connections, pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::Ping).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("ping must be signalled");
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["response"]["id"], "response-2");
+        assert_eq!(events[2]["type"], "response.completed");
+        assert_eq!(connections.load(Ordering::SeqCst), 1);
+        assert!(pongs.load(Ordering::SeqCst) >= 1);
+        server.abort();
+    }
+
+    /// A peer streaming control frames cannot starve the drain: the wall
+    /// clock and the control-frame cap bound it regardless of the timer, the
+    /// flooded socket is discarded before anything is submitted, and the turn
+    /// completes on a fresh connection without replaying model work.
+    #[tokio::test]
+    async fn websocket_control_frame_flood_is_bounded_and_socket_discarded_before_submission() {
+        let (base, connections, _pongs, _teardown, server) =
+            lifecycle_endpoint(AfterFirst::PongFlood).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        // The flood starts immediately after response-1, so frames are queued
+        // while the pooled socket waits; the drain must hit its cap (or its
+        // window) and reconnect pre-submission. The outer timeout bounds the
+        // whole turn.
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete despite the flood")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["response"]["id"], "response-2");
+        assert_eq!(events[2]["type"], "response.completed");
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            2,
+            "the flooded socket must be discarded, not submitted into"
+        );
+        server.abort();
+    }
+
+    /// A stale payload frame queued behind slow control frames is drained as
+    /// a queued frame and the socket is discarded, so the payload can never
+    /// become the first event of the next response stream.
+    #[tokio::test]
+    async fn websocket_stale_payload_behind_slow_control_frames_is_discarded_before_reuse() {
+        let (base, connections, pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::SlowControlFrames).await;
+        let (model, client, options, params) = fake_request(&base);
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("stale payload behind pings must be signalled");
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 2 stream must finish");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["response"]["id"], "response-2");
+        assert_eq!(events[1]["delta"], "ok");
+        assert_eq!(events[2]["type"], "response.completed");
+        assert_eq!(connections.load(Ordering::SeqCst), 2);
+        // The drain answered the two queued pings before discarding the
+        // socket at the payload frame.
+        assert!(pongs.load(Ordering::SeqCst) >= 2);
+        server.abort();
+    }
+
+    /// A post-send control-frame flood must not starve the response deadline:
+    /// the explicit deadline check terminates the stream with the final
+    /// deadline error, which is never replayed (the peer received exactly one
+    /// response.create).
+    #[tokio::test]
+    async fn websocket_post_send_control_flood_cannot_starve_the_response_deadline() {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let connections = Arc::new(AtomicUsize::new(0));
+        let requests = Arc::new(AtomicUsize::new(0));
+        let counter = connections.clone();
+        let request_counter = requests.clone();
+        let server = tokio::spawn(async move {
+            let mut children = tokio::task::JoinSet::new();
+            while let Ok((mut tcp, _)) = listener.accept().await {
+                let counter = counter.clone();
+                let request_counter = request_counter.clone();
+                children.spawn(async move {
+                    let mut buf = [0; 4096];
+                    let count = tcp.peek(&mut buf).await.unwrap();
+                    if String::from_utf8_lossy(&buf[..count]).starts_with("GET /models ") {
+                        let _ = tcp.read(&mut buf).await.unwrap();
+                        let body = r#"{"data":[{"id":"model","policy":{"state":"enabled"},"supported_endpoints":["ws:/responses"]}]}"#;
+                        tcp.write_all(format!("HTTP/1.1 200 OK\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}", body.len(), body).as_bytes()).await.unwrap();
+                        return;
+                    }
+                    counter.fetch_add(1, Ordering::SeqCst);
+                    let mut ws = tokio_tungstenite::accept_async(tcp).await.unwrap();
+                    while let Some(Ok(Message::Text(text))) = ws.next().await {
+                        let request: Value = serde_json::from_str(&text).unwrap();
+                        assert_eq!(request["type"], "response.create");
+                        request_counter.fetch_add(1, Ordering::SeqCst);
+                        for event in [json!({"type":"response.created","response":{"id":"resp-flood"}}), json!({"type":"response.output_text.delta","delta":"partial"})] {
+                            ws.send(Message::Text(event.to_string().into())).await.unwrap();
+                        }
+                        // Never complete the response: flood pings back to
+                        // back until the peer drops the socket at the
+                        // deadline, so every read is ready and only the
+                        // explicit deadline check can terminate the stream.
+                        loop {
+                            if ws.send(Message::Ping(b"flood".to_vec().into())).await.is_err() {
+                                break;
+                            }
+                        }
+                    }
+                });
+            }
+        });
+        let base = format!("http://{address}");
+        let (model, client, options, params) = fake_request(&base);
+        let (events, metadata) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("the flooded turn must resolve")
+        .unwrap()
+        .unwrap();
+        assert_eq!(metadata.status, 101);
+        assert_eq!(
+            metadata.headers.get("x-optimus-response-edge").map(String::as_str),
+            Some("transport_send_ack"),
+            "the flood begins after a locally acknowledged send"
+        );
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("the explicit response deadline must terminate the stream");
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0]["type"], "response.created");
+        assert_eq!(events[1]["delta"], "partial");
+        let terminal = events.last().unwrap();
+        assert_eq!(terminal["type"], "error");
+        assert_eq!(terminal["code"], "responses_request_interrupted");
+        let message = terminal["message"].as_str().unwrap();
+        assert!(message.contains("deadline expired"), "{message}");
+        assert!(message.contains("request not replayed"), "{message}");
+        assert!(
+            !message.contains("closed before"),
+            "a deadline must stay distinguishable from a socket close: {message}"
+        );
+        assert_eq!(
+            requests.load(Ordering::SeqCst),
+            1,
+            "the payload is sent once and never replayed"
+        );
+        server.abort();
+    }
+
+    /// The drain is scoped to github-copilot: the adjacent Azure provider
+    /// keeps its exact previous reuse behavior. When the peer tears the socket
+    /// down after a completed response, Azure still submits into the pooled
+    /// socket, never reconnects (no second connection), and never replays -
+    /// the turn ends as a responses_request_interrupted failure.
+    #[tokio::test]
+    async fn azure_websocket_reuse_behavior_is_unchanged_by_the_github_drain() {
+        let (base, connections, _pongs, teardown, server) =
+            lifecycle_endpoint(AfterFirst::DropQuietly).await;
+        let azure_base = format!("{base}/azure-openai/v1");
+        let (mut model, client, options, params) = fake_request(&azure_base);
+        model.provider = "azure-openai-managed".into();
+        let (events, _) = tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 1 must complete")
+        .unwrap()
+        .unwrap();
+        let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+            .await
+            .expect("turn 1 stream must finish");
+        assert_eq!(events.last().unwrap()["type"], "response.completed");
+        assert_eq!(events.last().unwrap()["response"]["id"], "response-1");
+        tokio::time::timeout(Duration::from_secs(5), teardown.notified())
+            .await
+            .expect("peer teardown must be signalled");
+        // No drain for Azure: the dead pooled socket is used as before, the
+        // send is locally acknowledged, and the outcome is a final interrupt
+        // (either a failed send error or an error event) with no reconnect.
+        match tokio::time::timeout(
+            Duration::from_secs(5),
+            try_websocket(&model, &client, &params, &options),
+        )
+        .await
+        .expect("turn 2 must resolve")
+        {
+            Err(error) => {
+                assert!(error.sent, "an Azure submit into a dead socket stays final");
+                assert!(error.message.contains("not replayed"), "{error:?}");
+            }
+            Ok(Some((events, _))) => {
+                let events = tokio::time::timeout(Duration::from_secs(5), events.collect::<Vec<_>>())
+                    .await
+                    .expect("turn 2 stream must finish");
+                assert_eq!(events.last().unwrap()["code"], "responses_request_interrupted");
+            }
+            Ok(None) => panic!("Azure must not fall back to SSE before submitting"),
+        }
+        assert_eq!(
+            connections.load(Ordering::SeqCst),
+            1,
+            "Azure must not reconnect before submitting"
+        );
+        server.abort();
     }
 }

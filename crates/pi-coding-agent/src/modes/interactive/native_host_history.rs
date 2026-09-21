@@ -4,6 +4,35 @@ use super::*;
 const INITIAL_DISPLAY_MESSAGES: usize = 40;
 const INITIAL_DISPLAY_BYTES: usize = 8 * 1024;
 
+/// One visible page plus roughly one prefetch page above the initial viewport.
+const INITIAL_FILL_PAGES: usize = 2;
+/// Serialized allowance for ONE prefetch growth step above an already rendered
+/// page. The optional prefetch page is the only place a payload bound applies:
+/// below one rendered page the viewport minimum wins and every message is
+/// admitted regardless of payload, so collapsed or hidden rows carrying huge
+/// flat payloads (for example image results that render one fallback line)
+/// can never starve the first paint. PageUp keeps rejected rows reachable.
+const INITIAL_PREFETCH_MESSAGE_BYTES: usize = 64 * 1024;
+/// Hard bound on the number of messages the fill may include, keeping the
+/// measure loop finite for histories that render zero lines.
+const INITIAL_FILL_MAX_MESSAGES: usize = 200;
+
+/// Terminal shape the initial history fill sizes against.
+#[derive(Clone, Copy)]
+pub(super) struct ViewportFill {
+    pub(super) width: usize,
+    pub(super) rows: usize,
+}
+
+impl ViewportFill {
+    pub(super) fn from_tui(ui: &TUI) -> Self {
+        Self {
+            width: ui.terminal.columns().max(1),
+            rows: ui.terminal.rows().max(1),
+        }
+    }
+}
+
 pub(super) struct HistoryRuntime {
     connection: Arc<dyn wire::AgentConnection>,
     loaded: Option<LoadedAgentConnectionHistory>,
@@ -68,6 +97,7 @@ impl HistoryRuntime {
         messages: Vec<AgentMessage>,
         transcript: &Rc<RefCell<Transcript>>,
         editor: &Rc<RefCell<CustomEditor>>,
+        viewport: Option<ViewportFill>,
     ) -> Option<String> {
         self.generation = self.generation.wrapping_add(1);
         if let Some(task) = self.task.take() {
@@ -76,6 +106,7 @@ impl HistoryRuntime {
         let previous = self.loaded.take();
         let previous_full = self.full_history.take();
         self.full_history_requested = false;
+        let mode = transcript.borrow().mode.clone();
         let session_id = transcript.borrow().mode.borrow().connection_state.as_ref()
             .map(|state| state.session_id.clone());
         let same_session = self.session_id == session_id;
@@ -111,7 +142,7 @@ impl HistoryRuntime {
                 retain_loaded_prefix(&mut history, &mut messages, previous);
             }
             let start = display_count.map(|count| display_start(&messages, count))
-                .unwrap_or_else(|| initial_display_start(&messages));
+                .unwrap_or_else(|| initial_display_start(&messages, &mode, viewport));
             history.start_index += start as f64;
             history.entry_ids.drain(..start);
             history.has_older = history.start_index > 0.0;
@@ -128,12 +159,13 @@ impl HistoryRuntime {
             );
         } else {
             // Legacy/supervisor attachments do not supply wire history ranges.
-            // Keep their complete snapshot locally, but apply the same small
-            // first paint. Older rows remain available without a daemon request.
+            // Keep their complete snapshot locally, but fill the first paint
+            // from the viewport the same way. Older rows remain available
+            // without a daemon request.
             let start = previous_full.as_ref()
                 .filter(|previous| same_session && messages.starts_with(&previous.messages))
                 .map(|previous| previous.start)
-                .unwrap_or_else(|| initial_display_start(&messages));
+                .unwrap_or_else(|| initial_display_start(&messages, &mode, viewport));
             transcript.borrow_mut().replace(Vec::new());
             transcript.borrow_mut().replace_history(messages[start..].to_vec(), messages.len() as f64);
             self.full_history = Some(FullHistory { messages, start });
@@ -262,10 +294,71 @@ fn retain_loaded_prefix(
     history.has_older = old.has_older;
 }
 
-fn initial_display_start(messages: &[AgentMessage]) -> usize {
-    // A count alone still renders megabytes from a few long messages before the
-    // input loop starts. PageUp retains the full snapshot and uses normal pages.
-    // Always show the last message; tool-call linkage may exceed this soft budget.
+/// Sizes the first paint from the terminal viewport: include recent messages,
+/// newest first, until their rendered lines cover about
+/// `INITIAL_FILL_PAGES` terminal pages (one visible page plus roughly one
+/// prefetch page above ready to scroll). The latest message is always shown;
+/// tool-call linkage may extend the slice further.
+///
+/// The only stop below one rendered page is the local history end or the
+/// message cap: the viewport minimum always wins over payload size, so
+/// collapsed or hidden huge rows cannot starve the first paint. Above one
+/// rendered page the optional prefetch grows one message at a time and stops
+/// when the added messages alone carry a huge flat payload; PageUp retains
+/// the full snapshot and uses normal pages.
+fn initial_display_start(
+    messages: &[AgentMessage],
+    mode: &Rc<RefCell<InteractiveMode>>,
+    viewport: Option<ViewportFill>,
+) -> usize {
+    let Some(viewport) = viewport else {
+        // No terminal shape available: keep the small legacy byte-budget slice.
+        return byte_budget_display_start(messages);
+    };
+    if messages.is_empty() {
+        return 0;
+    }
+    let page_lines = viewport.rows.max(1);
+    let target_lines = page_lines.saturating_mul(INITIAL_FILL_PAGES);
+    let cap = messages.len().min(INITIAL_FILL_MAX_MESSAGES);
+    let mut count = 1usize;
+    let mut start = display_start(messages, count);
+    loop {
+        if start == 0 {
+            return 0;
+        }
+        let rendered = measure_slice_lines(&messages[start..], mode, viewport.width);
+        if rendered >= target_lines {
+            return start;
+        }
+        // Below one rendered page: double unconditionally so the visible page
+        // fills fast. Above it: add one message at a time so no fitting
+        // intermediate slice is skipped and each prefetch message is judged
+        // individually.
+        let next_count = if rendered >= page_lines {
+            count.saturating_add(1)
+        } else {
+            count.saturating_mul(2)
+        }
+        .min(cap);
+        if next_count == count {
+            return start;
+        }
+        let next_start = display_start(messages, next_count);
+        if rendered >= page_lines
+            && added_payload_bytes(&messages[next_start..start]) > INITIAL_PREFETCH_MESSAGE_BYTES
+        {
+            return start;
+        }
+        count = next_count;
+        start = next_start;
+    }
+}
+
+/// Viewport-less fallback with the original fixed budget: a count alone still
+/// renders megabytes from a few long messages before the input loop starts.
+/// Always shows the last message; tool-call linkage may exceed this soft budget.
+fn byte_budget_display_start(messages: &[AgentMessage]) -> usize {
     let mut bytes = 0usize;
     let mut count = 0usize;
     for message in messages.iter().rev().take(INITIAL_DISPLAY_MESSAGES) {
@@ -277,6 +370,40 @@ fn initial_display_start(messages: &[AgentMessage]) -> usize {
         count += 1;
     }
     display_start(messages, count)
+}
+
+/// Rendered line count of `messages` exactly as the history transcript builds
+/// them (fresh components, default collapsed states), so the fill measures the
+/// real first-paint height instead of a byte proxy.
+fn measure_slice_lines(
+    messages: &[AgentMessage],
+    mode: &Rc<RefCell<InteractiveMode>>,
+    width: usize,
+) -> usize {
+    let mut scratch = Transcript::new(mode.clone());
+    for message in messages {
+        scratch.message_anchored(message.clone(), false, "initial-fill-measure");
+    }
+    scratch
+        .rows
+        .iter_mut()
+        .map(|row| row.render(width.max(1) as f64).len())
+        .sum()
+}
+
+/// Serialized size of the messages one growth step would add, with an early
+/// exit once the prefetch allowance is exceeded, so a huge flat payload is
+/// rejected without repeatedly measuring bytes that will never be admitted.
+fn added_payload_bytes(messages: &[AgentMessage]) -> usize {
+    let mut total = 0usize;
+    for message in messages {
+        total = total
+            .saturating_add(serde_json::to_vec(message).map(|value| value.len()).unwrap_or(0));
+        if total > INITIAL_PREFETCH_MESSAGE_BYTES {
+            break;
+        }
+    }
+    total
 }
 
 fn display_start(messages: &[AgentMessage], count: usize) -> usize {
@@ -325,7 +452,8 @@ fn validate(history: &wire::AgentConnectionHistoryWindow, messages: usize) -> Re
 mod tests {
     use super::*;
     use pi_ai::types::{
-        AssistantMessage, ContentBlock, Message as AiMessage, TextContent, UserContent, UserMessage,
+        AssistantMessage, ContentBlock, ImageContent, ImageOrTextContent, Message as AiMessage,
+        TextContent, ToolCall, ToolResultMessage, UserContent, UserMessage,
     };
 
     /// A connection that a test never calls: `reset` is pure transcript work.
@@ -407,6 +535,35 @@ mod tests {
         (history, messages)
     }
 
+    /// Deterministic terminal shape for the viewport-sized initial fill.
+    const TEST_VIEWPORT: ViewportFill = ViewportFill { width: 80, rows: 24 };
+
+    fn rendered_line_count(transcript: &Rc<RefCell<Transcript>>) -> usize {
+        transcript.borrow_mut().render(80.0).len()
+    }
+
+    fn tool_call_message(id: &str) -> AgentMessage {
+        AgentMessage::Message(AiMessage::Assistant(AssistantMessage {
+            content: vec![ContentBlock::ToolCall(ToolCall::new(id, "bash", Default::default()))],
+            ..Default::default()
+        }))
+    }
+
+    /// An image result carries a huge serialized payload but renders one
+    /// fallback line, the flat-but-huge shape that must never starve the fill.
+    fn image_tool_result(id: &str, payload: usize) -> AgentMessage {
+        AgentMessage::Message(AiMessage::ToolResult(ToolResultMessage::new(
+            id,
+            "bash",
+            vec![ImageOrTextContent::Image(ImageContent::new(
+                format!("IMGDATA_{}", "A".repeat(payload)),
+                "image/png",
+            ))],
+            false,
+            0,
+        )))
+    }
+
     #[test]
     fn native_remote_short_tail_backfill_keeps_follow_or_manual_reading_intent() {
         for browsing in [false, true] {
@@ -418,7 +575,7 @@ mod tests {
                 ..history.clone()
             };
             h.editor.borrow_mut().editor_mut().set_text("remote draft");
-            apply_history_snapshot(Some(tail), messages[78..].to_vec(), Some(streaming_assistant_message("LIVE_REPLY")), &h.transcript, &h.editor, &mut runtime);
+            apply_history_snapshot(Some(tail), messages[78..].to_vec(), Some(streaming_assistant_message("LIVE_REPLY")), &h.transcript, &h.editor, &mut runtime, Some(TEST_VIEWPORT));
             let before = h.paint();
             let anchor_row = before.iter().position(|line| line.contains("MESSAGE_078")).unwrap();
             if browsing {
@@ -458,7 +615,7 @@ mod tests {
             });
             let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
             let (_, messages) = large_snapshot(100);
-            runtime.reset(None, messages, &transcript, &editor);
+            runtime.reset(None, messages, &transcript, &editor, None);
             editor.borrow_mut().editor_mut().set_text("keep draft");
             transcript.borrow_mut().message(user_message("LIVE_TURN"), false);
             runtime.request(&mode.borrow());
@@ -481,7 +638,7 @@ mod tests {
         });
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
         let (history, messages) = large_snapshot(100);
-        runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor);
+        runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor, None);
         transcript.borrow_mut().message(user_message("LIVE_TURN"), false);
         runtime.request(&mode.borrow());
         let request = runtime.task.take().expect("busy state must still schedule the pinned remote history request");
@@ -504,18 +661,20 @@ mod tests {
     }
 
     #[test]
-    fn oversized_first_paint_is_bounded_and_pageup_retains_every_message() {
+    fn viewport_fill_shows_a_page_filling_long_message_and_pageup_retains_everything() {
         let (transcript, editor, mut runtime) = fixture("large-payload-first");
         let (_, mut messages) = large_snapshot(6);
         messages[4] = user_message(&format!("LARGE_{}", "x".repeat(INITIAL_DISPLAY_BYTES)));
-        runtime.reset(None, messages.clone(), &transcript, &editor);
+        runtime.reset(None, messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT));
         assert_eq!(runtime.full_history.as_ref().unwrap().messages, messages);
-        assert_eq!(runtime.full_history.as_ref().unwrap().start, 5);
-        assert!(!transcript_text(&transcript).contains("LARGE_"));
+        // The long message is recent content that fills the visible page, so the
+        // viewport-sized first paint shows it instead of an almost empty screen.
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 4);
+        assert!(transcript_text(&transcript).contains("LARGE_"));
         assert!(transcript_text(&transcript).contains("MESSAGE_005"));
-        // Same-session refresh must retain the budgeted slice, not expand to 40.
-        runtime.reset(None, messages.clone(), &transcript, &editor);
-        assert_eq!(runtime.full_history.as_ref().unwrap().start, 5);
+        // Same-session refresh must retain the viewport slice, not expand to all.
+        runtime.reset(None, messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT));
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 4);
         let mode = transcript.borrow().mode.clone();
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
         runtime.request(&mode.borrow());
@@ -525,7 +684,7 @@ mod tests {
         assert_eq!(rendered.matches("LARGE_").count(), 1);
         assert_eq!(rendered.matches("MESSAGE_005").count(), 1);
         assert!(runtime.task.is_none());
-        runtime.reset(None, messages, &transcript, &editor);
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
         assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
     }
 
@@ -534,16 +693,20 @@ mod tests {
         let (transcript, editor, mut runtime) = fixture("large-payload-remote");
         let (history, mut messages) = large_snapshot(6);
         messages[4] = user_message(&"x".repeat(INITIAL_DISPLAY_BYTES));
-        runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor);
+        runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT));
         let loaded = runtime.loaded.as_ref().unwrap();
-        assert_eq!(loaded.messages, messages[5..]);
-        assert_eq!(loaded.window.entry_ids, history.entry_ids[5..]);
-        assert_eq!(loaded.window.start_index, 5.0);
+        assert_eq!(loaded.messages, messages[4..]);
+        assert_eq!(loaded.window.entry_ids, history.entry_ids[4..]);
+        assert_eq!(loaded.window.start_index, 4.0);
         assert!(loaded.window.has_older);
-        runtime.reset(Some(history), messages.clone(), &transcript, &editor);
-        assert_eq!(runtime.loaded.as_ref().unwrap().messages, messages[5..]);
-        assert_eq!(initial_display_start(&[user_message(&"x".repeat(INITIAL_DISPLAY_BYTES * 2))]), 0,
-            "the latest message is never hidden even when it exceeds the soft budget");
+        runtime.reset(Some(history), messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT));
+        assert_eq!(runtime.loaded.as_ref().unwrap().messages, messages[4..]);
+        let mode = transcript.borrow().mode.clone();
+        assert_eq!(
+            initial_display_start(&[user_message(&"x".repeat(INITIAL_DISPLAY_BYTES * 2))], &mode, Some(TEST_VIEWPORT)),
+            0,
+            "the latest message is never hidden even when it exceeds the fill budget",
+        );
     }
 
     #[test]
@@ -551,10 +714,16 @@ mod tests {
         let (transcript, editor, mut runtime) = fixture("full-first");
         let (_, messages) = large_snapshot(100);
         assert_eq!(apply_history_snapshot(None, messages.clone(),
-            Some(streaming_assistant_message("LIVE_REPLY")), &transcript, &editor, &mut runtime), None);
+            Some(streaming_assistant_message("LIVE_REPLY")), &transcript, &editor, &mut runtime, Some(TEST_VIEWPORT)), None);
         assert_eq!(runtime.full_history.as_ref().unwrap().messages, messages);
-        assert_eq!(runtime.full_history.as_ref().unwrap().start, 60);
+        let initial = runtime.full_history.as_ref().unwrap().start;
+        assert!(initial > 0 && initial < messages.len(), "the fill must be bounded: {initial}");
         assert!(runtime.loaded.is_none());
+        // The first paint covers one visible page plus the prefetch page.
+        assert!(
+            rendered_line_count(&transcript) >= TEST_VIEWPORT.rows * INITIAL_FILL_PAGES,
+            "the viewport-sized first paint must fill about two pages",
+        );
         let recent = transcript_text(&transcript);
         assert!(!recent.contains("MESSAGE_000"));
         assert!(recent.contains("MESSAGE_099"));
@@ -562,7 +731,13 @@ mod tests {
         transcript.borrow_mut().message(user_message("AFTER_ATTACH_TURN"), false);
         let mode = transcript.borrow().mode.clone();
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
-        for expected in [20, 0, 0] {
+        let mut expected_pages = Vec::new();
+        let mut current = initial;
+        for _ in 0..3 {
+            current = display_start(&messages, messages.len() - current + INITIAL_DISPLAY_MESSAGES);
+            expected_pages.push(current);
+        }
+        for expected in expected_pages {
             runtime.request(&mode.borrow());
             runtime.poll(&mode, &transcript, &ui);
             assert_eq!(runtime.full_history.as_ref().unwrap().start, expected);
@@ -583,16 +758,16 @@ mod tests {
         });
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
         let (_, mut messages) = large_snapshot(100);
-        runtime.reset(None, messages.clone(), &transcript, &editor);
+        runtime.reset(None, messages.clone(), &transcript, &editor, None);
         runtime.request(&mode.borrow());
         runtime.poll(&mode, &transcript, &ui);
         assert_eq!(runtime.full_history.as_ref().unwrap().start, 20);
         messages.push(user_message("NEW_TURN"));
-        runtime.reset(None, messages, &transcript, &editor);
+        runtime.reset(None, messages, &transcript, &editor, None);
         assert_eq!(runtime.full_history.as_ref().unwrap().start, 20);
         assert!(transcript_text(&transcript).contains("MESSAGE_020"));
         runtime.request(&mode.borrow());
-        runtime.reset(None, vec![user_message("COMPACTED_HISTORY")], &transcript, &editor);
+        runtime.reset(None, vec![user_message("COMPACTED_HISTORY")], &transcript, &editor, None);
         runtime.poll(&mode, &transcript, &ui);
         assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
         let compacted = transcript_text(&transcript);
@@ -600,27 +775,33 @@ mod tests {
         assert!(!compacted.contains("MESSAGE_020"));
         assert!(!compacted.contains("NEW_TURN"));
         let (_, messages) = large_snapshot(100);
-        runtime.reset(None, messages.clone(), &transcript, &editor);
+        runtime.reset(None, messages.clone(), &transcript, &editor, None);
         runtime.request(&mode.borrow());
         runtime.poll(&mode, &transcript, &ui);
         mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
             session_id: "different".into(), ..Default::default()
         });
-        runtime.reset(None, messages, &transcript, &editor);
+        runtime.reset(None, messages, &transcript, &editor, None);
         assert_eq!(runtime.full_history.as_ref().unwrap().start, 60);
     }
 
     #[test]
-    fn first_paint_uses_recent_40_and_backfill_restores_every_message_once() {
+    fn first_paint_fills_the_viewport_and_backfill_restores_every_message_once() {
         let (transcript, editor, mut runtime) = fixture("recent-first");
         let (history, messages) = large_snapshot(100);
         assert_eq!(apply_history_snapshot(Some(history.clone()), messages.clone(),
-            Some(streaming_assistant_message("LIVE_REPLY")), &transcript, &editor, &mut runtime), None);
+            Some(streaming_assistant_message("LIVE_REPLY")), &transcript, &editor, &mut runtime, Some(TEST_VIEWPORT)), None);
         let loaded = runtime.loaded.as_ref().unwrap();
-        assert_eq!(loaded.messages, messages[60..]);
-        assert_eq!(loaded.window.start_index, 60.0);
-        assert_eq!(loaded.window.entry_ids, history.entry_ids[60..]);
+        let initial = loaded.window.start_index as usize;
+        assert!(initial > 0 && initial < messages.len(), "the fill must be bounded: {initial}");
+        assert_eq!(loaded.messages, messages[initial..]);
+        assert_eq!(loaded.window.entry_ids, history.entry_ids[initial..]);
         assert!(loaded.window.has_older);
+        // The first paint covers one visible page plus the prefetch page.
+        assert!(
+            rendered_line_count(&transcript) >= TEST_VIEWPORT.rows * INITIAL_FILL_PAGES,
+            "the viewport-sized first paint must fill about two pages",
+        );
         let recent = transcript_text(&transcript);
         assert!(!recent.contains("MESSAGE_000"));
         assert!(recent.contains("MESSAGE_099"));
@@ -630,9 +811,9 @@ mod tests {
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
         let range = wire::AgentConnectionHistoryRange {
             window: wire::AgentConnectionHistoryWindow {
-                entry_ids: history.entry_ids[..60].to_vec(), ..history.clone()
+                entry_ids: history.entry_ids[..initial].to_vec(), ..history.clone()
             },
-            messages: messages[..60].to_vec(),
+            messages: messages[..initial].to_vec(),
         };
         runtime.send.send((runtime.generation, Ok(range))).unwrap();
         runtime.poll(&mode, &transcript, &ui);
@@ -654,7 +835,7 @@ mod tests {
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
         for metadata in [None, Some(history)] {
             let malformed = metadata.is_some();
-            assert_eq!(runtime.reset(metadata, messages.clone(), &transcript, &editor).is_some(), malformed);
+            assert_eq!(runtime.reset(metadata, messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT)).is_some(), malformed);
             assert!(runtime.loaded.is_none());
             assert_eq!(runtime.full_history.as_ref().unwrap().messages, messages);
             for _ in 0..3 {
@@ -668,7 +849,6 @@ mod tests {
 
     #[test]
     fn first_paint_retains_tool_calls_for_results_crossing_the_display_boundary() {
-        use pi_ai::types::{ToolCall, ToolResultMessage};
         let (_, mut messages) = large_snapshot(100);
         let call = |id: &str| AgentMessage::Message(AiMessage::Assistant(AssistantMessage {
             content: vec![ContentBlock::ToolCall(ToolCall::new(id, "bash", Default::default()))],
@@ -688,23 +868,49 @@ mod tests {
             user_message(&"x".repeat(INITIAL_DISPLAY_BYTES)),
             result("large-call"),
         ];
-        assert_eq!(initial_display_start(&oversized_linked), 1,
-            "a visible result keeps its call even across an oversized intervening message");
+        let measure_mode = Rc::new(RefCell::new(super::super::tests::stash_mode("fill-measure-mode")));
+        assert_eq!(
+            initial_display_start(&oversized_linked, &measure_mode, Some(TEST_VIEWPORT)),
+            1,
+            "a visible result keeps its call even across an oversized intervening message",
+        );
+        // Viewport-sized fill: result/call pairs near the tail so every display
+        // boundary the fill picks must keep each rendered result next to its
+        // call row.
+        let pairs: Vec<(usize, usize)> = vec![(85, 87), (90, 92), (95, 97), (98, 99)];
+        let mut fill_messages = (0..100)
+            .map(|index| user_message(&format!("MESSAGE_{index:03}")))
+            .collect::<Vec<_>>();
+        for (call_index, result_index) in &pairs {
+            fill_messages[*call_index] = call(&format!("pair-call-{call_index}"));
+            fill_messages[*result_index] = result(&format!("pair-call-{call_index}"));
+        }
         let (transcript, editor, mut runtime) = fixture("recent-first-tools");
         let (history, _) = large_snapshot(100);
-        assert_eq!(runtime.reset(Some(history), messages.clone(), &transcript, &editor), None);
-        let loaded = runtime.loaded.as_ref().unwrap();
-        assert_eq!(loaded.window.start_index, 55.0);
-        assert_eq!(loaded.messages, messages[55..]);
-        let history = transcript.borrow();
-        assert_eq!(history.history.as_ref().unwrap().tools.len(), 2);
+        assert_eq!(runtime.reset(Some(history), fill_messages, &transcript, &editor, Some(TEST_VIEWPORT)), None);
+        let start = runtime.loaded.as_ref().unwrap().window.start_index as usize;
+        assert!(start > 0, "the fill must be bounded: {start}");
+        let included_pairs = pairs
+            .iter()
+            .filter(|(_, result_index)| *result_index >= start)
+            .count();
+        for (call_index, result_index) in &pairs {
+            if *result_index >= start {
+                assert!(
+                    *call_index >= start,
+                    "result {result_index} rendered without its call {call_index}: start {start}",
+                );
+            }
+        }
+        assert_eq!(transcript.borrow().history.as_ref().unwrap().tools.len(), included_pairs);
+        assert!(rendered_line_count(&transcript) >= TEST_VIEWPORT.rows);
     }
 
     #[test]
     fn first_paint_refresh_retains_loaded_scrollback_and_never_reuses_another_pin() {
         let (transcript, editor, mut runtime) = fixture("recent-first-refresh");
         let (history, messages) = large_snapshot(100);
-        assert_eq!(runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor), None);
+        assert_eq!(runtime.reset(Some(history.clone()), messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
         // Represent a user who has paged back to entry 20.
         runtime.loaded = Some(LoadedAgentConnectionHistory {
             window: window(wire::AgentConnectionHistoryWindow {
@@ -716,14 +922,14 @@ mod tests {
             start_index: 60.0, has_older: true, entry_ids: history.entry_ids[60..].to_vec(),
             ..history.clone()
         };
-        assert_eq!(runtime.reset(Some(shorter.clone()), messages[60..].to_vec(), &transcript, &editor), None);
+        assert_eq!(runtime.reset(Some(shorter.clone()), messages[60..].to_vec(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
         assert_eq!(runtime.loaded.as_ref().unwrap().messages, messages[20..]);
-        assert_eq!(runtime.reset(Some(history), messages.clone(), &transcript, &editor), None);
+        assert_eq!(runtime.reset(Some(history), messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
         assert_eq!(runtime.loaded.as_ref().unwrap().messages, messages[20..]);
         let another_pin = wire::AgentConnectionHistoryWindow {
             generation: "different-generation".into(), ..shorter
         };
-        assert_eq!(runtime.reset(Some(another_pin), messages[60..].to_vec(), &transcript, &editor), None);
+        assert_eq!(runtime.reset(Some(another_pin), messages[60..].to_vec(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
         assert_eq!(runtime.loaded.as_ref().unwrap().messages, messages[60..]);
     }
 
@@ -746,6 +952,7 @@ mod tests {
             &transcript,
             &editor,
             &mut runtime,
+            Some(TEST_VIEWPORT),
         );
 
         assert_eq!(
@@ -778,6 +985,7 @@ mod tests {
             &transcript,
             &editor,
             &mut runtime,
+            Some(TEST_VIEWPORT),
         );
         assert_eq!(error, None, "the window is valid");
         let rendered = transcript_text(&transcript);
@@ -800,6 +1008,7 @@ mod tests {
             &transcript,
             &editor,
             &mut runtime,
+            Some(TEST_VIEWPORT),
         );
         assert_eq!(error, None, "no window means nothing to validate");
         let rendered = transcript_text(&transcript);
@@ -842,10 +1051,193 @@ mod tests {
         let before = editor.borrow().editor().get_cursor();
         for _ in 0..10 {
             assert_eq!(apply_history_snapshot(None, vec![user_message("previous prompt")],
-                Some(streaming_assistant_message("stream update")), &transcript, &editor, &mut runtime), None);
+                Some(streaming_assistant_message("stream update")), &transcript, &editor, &mut runtime, Some(TEST_VIEWPORT)), None);
             assert_eq!(editor.borrow().editor().get_cursor(), before);
             assert_eq!(editor.borrow().editor().get_text(), "/telegram pairing");
         }
         assert!(transcript_text(&transcript).contains("stream update"));
+    }
+
+    /// The reported defect: a 313-message attach rendered "Showing 2 of 313"
+    /// over an almost blank viewport. The fill must render at least one visible
+    /// page plus roughly one prefetch page, in chronological order, without
+    /// pulling the whole conversation into the first paint.
+    #[test]
+    fn initial_fill_covers_one_visible_page_plus_prefetch_for_313_messages() {
+        let (transcript, editor, mut runtime) = fixture("viewport-313");
+        let (_, messages) = large_snapshot(313);
+        assert_eq!(runtime.reset(None, messages.clone(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
+        let start = runtime.full_history.as_ref().unwrap().start;
+        assert!(start > 0, "the fill must not load the entire conversation: {start}");
+        let rendered = rendered_line_count(&transcript);
+        assert!(
+            rendered >= TEST_VIEWPORT.rows * INITIAL_FILL_PAGES,
+            "the first paint must cover a page plus prefetch: {rendered} lines",
+        );
+        let text = transcript_text(&transcript);
+        assert!(text.contains("MESSAGE_312"), "the newest message must be visible");
+        assert!(!text.contains("MESSAGE_000"), "the fill must stay bounded");
+        assert!(text.contains(&format!("Showing {} of 313 messages.", 313 - start)));
+        let first_shown = text.find("MESSAGE_").unwrap();
+        assert!(
+            first_shown < text.find("MESSAGE_312").unwrap(),
+            "history must stay chronological: {text:?}",
+        );
+        // Same-session refresh keeps the filled slice instead of collapsing.
+        assert_eq!(runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT)), None);
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, start);
+    }
+
+    /// Different terminal heights fill different amounts of history.
+    #[test]
+    fn initial_fill_sizes_to_the_terminal_height() {
+        let mut starts = Vec::new();
+        for rows in [10usize, 24, 48] {
+            let (transcript, editor, mut runtime) = fixture(&format!("viewport-rows-{rows}"));
+            let (_, messages) = large_snapshot(313);
+            runtime.reset(None, messages, &transcript, &editor, Some(ViewportFill { width: 80, rows }));
+            let rendered = rendered_line_count(&transcript);
+            assert!(rendered >= rows, "rows {rows}: first paint below one page: {rendered}");
+            starts.push(runtime.full_history.as_ref().unwrap().start);
+        }
+        assert!(
+            starts[0] >= starts[1] && starts[1] >= starts[2] && starts[0] > starts[2],
+            "taller terminals must include more history: {starts:?}",
+        );
+    }
+
+    /// A long latest message is never hidden, and PageUp still restores the rest.
+    #[test]
+    fn initial_fill_always_shows_the_latest_long_message_and_pages_the_rest() {
+        let (transcript, editor, mut runtime) = fixture("viewport-long-latest");
+        let (_, mut messages) = large_snapshot(6);
+        messages[5] = user_message(&format!("HUGE_TAIL_{}", "x".repeat(INITIAL_PREFETCH_MESSAGE_BYTES)));
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 5);
+        assert!(transcript_text(&transcript).contains("HUGE_TAIL_"));
+        let mode = transcript.borrow().mode.clone();
+        let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
+        runtime.request(&mode.borrow());
+        runtime.poll(&mode, &transcript, &ui);
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
+        assert!(transcript_text(&transcript).contains("MESSAGE_000"));
+    }
+
+    /// A short latest message with a huge collapsed image result directly
+    /// above it and plenty of older visible history must still fill the
+    /// viewport: collapsed or hidden huge rows can never starve the fill.
+    #[test]
+    fn initial_fill_fills_the_viewport_past_a_huge_collapsed_tool_history() {
+        let (transcript, editor, mut runtime) = fixture("viewport-huge-collapsed-middle");
+        let (_, mut messages) = large_snapshot(60);
+        messages[57] = tool_call_message("huge-collapsed-call");
+        messages[58] = image_tool_result("huge-collapsed-call", 96 * 1024);
+        messages[59] = user_message("LATEST_SHORT");
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
+        let start = runtime.full_history.as_ref().unwrap().start;
+        assert!(start <= 57, "the collapsed huge result must not block the fill: {start}");
+        let rendered = rendered_line_count(&transcript);
+        assert!(
+            rendered >= TEST_VIEWPORT.rows * INITIAL_FILL_PAGES,
+            "the first paint must fill a page plus prefetch: {rendered}",
+        );
+        let text = transcript_text(&transcript);
+        assert!(text.contains("LATEST_SHORT"), "the newest message must be visible");
+        assert!(text.contains(&format!("MESSAGE_{start:03}")), "the oldest rendered message must show");
+        assert!(!text.contains("MESSAGE_000"), "the fill must stay bounded");
+    }
+
+    /// An oversized collapsed newest message is never hidden, and older visible
+    /// history still fills the viewport behind it.
+    #[test]
+    fn initial_fill_fills_the_viewport_behind_an_oversized_collapsed_newest() {
+        let (transcript, editor, mut runtime) = fixture("viewport-huge-collapsed-latest");
+        let (_, mut messages) = large_snapshot(60);
+        messages[58] = tool_call_message("huge-latest-call");
+        messages[59] = image_tool_result("huge-latest-call", 256 * 1024);
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
+        let start = runtime.full_history.as_ref().unwrap().start;
+        assert!(start <= 58, "the oversized newest message is never hidden: {start}");
+        let rendered = rendered_line_count(&transcript);
+        assert!(
+            rendered >= TEST_VIEWPORT.rows * INITIAL_FILL_PAGES,
+            "the first paint must fill a page plus prefetch: {rendered}",
+        );
+        let text = transcript_text(&transcript);
+        assert!(text.contains(&format!("MESSAGE_{start:03}")), "the oldest rendered message must show");
+        assert!(!text.contains("MESSAGE_000"), "the fill must stay bounded");
+        let mode = transcript.borrow().mode.clone();
+        let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
+        runtime.request(&mode.borrow());
+        runtime.poll(&mode, &transcript, &ui);
+        // PageUp is lazy and bounded: one cycle expands the window by exactly
+        // INITIAL_DISPLAY_MESSAGES older messages, so the start moves earlier
+        // without ever loading the whole conversation at once.
+        let mid = runtime.full_history.as_ref().unwrap().start;
+        assert!(mid < start, "one PageUp cycle must move the window earlier: {mid} !< {start}");
+        // A second cycle keeps paging until the oldest message is on screen.
+        runtime.request(&mode.borrow());
+        runtime.poll(&mode, &transcript, &ui);
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
+        assert!(transcript_text(&transcript).contains("MESSAGE_000"));
+    }
+
+    /// Above an already rendered page the optional prefetch stops at a huge
+    /// flat payload instead of cloning it; PageUp still restores it.
+    #[test]
+    fn initial_fill_keeps_a_huge_flat_prefetch_message_behind_pageup() {
+        let (transcript, editor, mut runtime) = fixture("viewport-huge-prefetch");
+        let (_, mut messages) = large_snapshot(60);
+        messages[43] = tool_call_message("huge-flat-call");
+        messages[44] = image_tool_result("huge-flat-call", 256 * 1024);
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
+        let start = runtime.full_history.as_ref().unwrap().start;
+        assert!(start > 44, "the huge flat prefetch row must stay behind PageUp: {start}");
+        assert!(rendered_line_count(&transcript) >= TEST_VIEWPORT.rows, "the page itself must stay filled");
+        assert!(
+            !transcript.borrow().history.as_ref().unwrap().tools.contains_key("huge-flat-call"),
+            "the huge flat row must not render in the first paint",
+        );
+        assert!(transcript_text(&transcript).contains(&format!("MESSAGE_{start:03}")));
+        let mode = transcript.borrow().mode.clone();
+        let ui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
+        runtime.request(&mode.borrow());
+        runtime.poll(&mode, &transcript, &ui);
+        // PageUp is lazy and bounded: one cycle moves the window earlier by a
+        // bounded step, and the huge flat row must already be restored by the
+        // FIRST cycle — before any second one runs.
+        let mid = runtime.full_history.as_ref().unwrap().start;
+        assert!(mid < start, "one PageUp cycle must move the window earlier: {mid} !< {start}");
+        assert!(
+            transcript.borrow().history.as_ref().unwrap().tools.contains_key("huge-flat-call"),
+            "PageUp must restore the huge flat row on the first cycle",
+        );
+        // One more cycle reaches the very beginning of the fixture.
+        runtime.request(&mode.borrow());
+        runtime.poll(&mode, &transcript, &ui);
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
+        assert!(
+            transcript.borrow().history.as_ref().unwrap().tools.contains_key("huge-flat-call"),
+            "PageUp must still keep the huge flat row restored",
+        );
+    }
+
+    /// Short and empty histories show everything without a paging notice.
+    #[test]
+    fn initial_fill_short_or_empty_history_shows_everything_without_paging_notice() {
+        let (transcript, editor, mut runtime) = fixture("viewport-short");
+        let (_, messages) = large_snapshot(3);
+        runtime.reset(None, messages, &transcript, &editor, Some(TEST_VIEWPORT));
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
+        let text = transcript_text(&transcript);
+        for i in 0..3 {
+            assert!(text.contains(&format!("MESSAGE_{i:03}")));
+        }
+        assert!(!text.contains("Showing"), "a complete short history needs no paging notice");
+
+        let (transcript, editor, mut runtime) = fixture("viewport-empty");
+        assert_eq!(runtime.reset(None, Vec::new(), &transcript, &editor, Some(TEST_VIEWPORT)), None);
+        assert_eq!(runtime.full_history.as_ref().unwrap().start, 0);
+        assert!(rendered_line_count(&transcript) > 0, "an empty session still renders its header");
     }
 }

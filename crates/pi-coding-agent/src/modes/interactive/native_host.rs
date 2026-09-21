@@ -5,6 +5,10 @@
 //! enqueue owned data and never borrow the UI while it is rendering.
 
 use super::*;
+// `tray_row` is a sibling module of the parent that owns this file; the bare
+// `tray_row::` paths below resolve through this explicit import (the glob
+// above only reaches the owning parent's own items).
+use crate::modes::interactive::tray_row;
 use crate::main_entry::InteractiveModeSeamOptions;
 use crate::modes::agent_connection::types as wire;
 use crate::modes::interactive::components::{
@@ -74,7 +78,14 @@ mod native_state;
 mod native_commands;
 // Child-session mode inheritance (integration hunk C-4) uses the /jev mode
 // bridge from core paths that cannot see the private `native_commands` module.
-pub(crate) use native_commands::jev_menu::JevModeBridge;
+// The footer helpers are re-exported for the same reason: the daemon-side
+// footer text in core/jev_bridge.rs must use the exact labels and colours the
+// interactive tray renders (full + compact forms included).
+pub(crate) use native_commands::jev_menu::{
+    compaction_state, footer_color_key, footer_compact_text, footer_compaction_compact_text,
+    footer_compaction_text, footer_text, JevFooterState, JevModeBridge,
+    JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE, JEV_FULL_JEV_REJECTION,
+};
 #[path = "native_host_extensions.rs"]
 mod native_extensions;
 #[path = "native_host_extension_bridge.rs"]
@@ -594,20 +605,43 @@ impl TuiComponent for Transcript {
 }
 
 struct Tray(Rc<RefCell<InteractiveMode>>, Rc<RefCell<CustomEditor>>);
-impl TuiComponent for Tray {
-    fn render(&mut self, width: f64) -> Vec<String> {
+impl Tray {
+    /// The bottom row. The navigation/model/effort label, the two Jev segments
+    /// (decision mode + independent compaction, published through the extension
+    /// status surface) and the context usage counter share ONE baseline: the
+    /// counter is right-aligned on the same row, never on a separate lower-left
+    /// line and never hidden behind a full-width left string. The narrow
+    /// fallback ladder (full -> compact segments -> left truncation) lives in
+    /// the pure `tray_row` module.
+    fn render_row(
+        &mut self,
+        width: f64,
+        jev_decision: Option<(&str, Option<&str>)>,
+        jev_compaction: Option<(&str, Option<&str>)>,
+    ) -> Vec<String> {
         let mode = self.0.borrow();
-        let text = mode
+        let left = mode
             .get_tray_override_label(&self.1.borrow().editor().get_text())
             .or_else(|| mode.get_tray_location_label())
             .unwrap_or_default();
-        let mut lines = vec![truncate_to_width(
-            &theme().fg("dim", &text),
-            width,
-            "…",
-            false,
-        )];
+        let usage = mode.get_tray_context_usage_text();
+        let left_themed = theme().fg("dim", &left);
+        let usage_themed = usage.as_deref().map(|usage| theme().fg("dim", usage));
+        let composed = tray_row::compose_tray_row(
+            tray_row::TrayRow {
+                left: &left_themed,
+                jev_decision: jev_decision
+                    .map(|(full, compact)| tray_row::TraySegment { full, compact }),
+                jev_compaction: jev_compaction
+                    .map(|(full, compact)| tray_row::TraySegment { full, compact }),
+                right: usage_themed.as_deref(),
+            },
+            width as usize,
+        );
+        let mut lines = vec![composed];
         if let Some(context) = mode.get_tray_context_label() {
+            // Goal/heartbeat labels keep their own line above the counter row;
+            // the usage counter itself moved onto the row above.
             lines.push(truncate_to_width(
                 &theme().fg("dim", &context),
                 width,
@@ -616,6 +650,14 @@ impl TuiComponent for Tray {
             ));
         }
         lines
+    }
+}
+impl TuiComponent for Tray {
+    fn render(&mut self, width: f64) -> Vec<String> {
+        // A bare Tray (e.g. the settings view) has no extension status surface,
+        // so no Jev segments are available here; the row still carries the
+        // right-aligned context counter.
+        self.render_row(width, None, None)
     }
     fn invalidate(&mut self) {}
 }
@@ -1261,8 +1303,9 @@ fn apply_history_snapshot(
     transcript: &Rc<RefCell<Transcript>>,
     editor: &Rc<RefCell<CustomEditor>>,
     history_runtime: &mut native_history::HistoryRuntime,
+    viewport: Option<native_history::ViewportFill>,
 ) -> Option<String> {
-    let error = history_runtime.reset(history, messages, transcript, editor);
+    let error = history_runtime.reset(history, messages, transcript, editor, viewport);
     if let Some(message) = streaming_message {
         transcript.borrow_mut().message(message, true);
     }
@@ -1379,6 +1422,9 @@ async fn run_terminal(
         Box::new(pi_tui::terminal::ProcessTerminal::new()),
         None,
     )));
+    // The chat view owns the title from startup on, so a stale view title never
+    // survives opening a chat (TS rebindCurrentSession -> updateTerminalTitle).
+    refresh_terminal_title(&mode, &ui);
     let editor = Rc::new(RefCell::new(CustomEditor::new(
         ui.clone(),
         editor_theme(),
@@ -1416,6 +1462,7 @@ async fn run_terminal(
         &transcript,
         &editor,
         &mut history_runtime,
+        Some(native_history::ViewportFill::from_tui(&ui.borrow())),
     ) {
         // Optional history metadata never aborts attachment. The reference
         // reports and continues instead: the interactive event handler catches
@@ -1562,7 +1609,12 @@ async fn run_terminal(
         let weak = Arc::downgrade(local);
         let reset = send.clone();
         local.runtime_host().runtime_set_rebind_session(Some(Arc::new(move || {
-            let _ = reset.send(HostEvent::Extension(native_extension_bridge::Event::Reset));
+            // A rebind means fork / new / resume: the SESSION changed, so the
+            // receiver must blanket-reset instead of keeping the old session's
+            // Jev segments (Event::Reset stays the same-session reload path).
+            let _ = reset.send(HostEvent::Extension(
+                native_extension_bridge::Event::RuntimeRebound,
+            ));
             let connection = weak.upgrade(); let bindings = bindings.clone();
             Box::pin(async move { if let Some(connection) = connection { let _ = connection.bind_headless_extensions(bindings).await; } })
         })));
@@ -1666,6 +1718,14 @@ async fn run_terminal(
         onboarding_settled = Some(settled);
     }
     let mut exit_error = None;
+    // Publish the CURRENT effective Jev footer segments (decision mode +
+    // independent compaction) once, so the tray row shows the real per-session
+    // settings from the first frame, before any `/jev` command runs. Only the
+    // in-process connection publishes here: an attached daemon pushes its own
+    // footer for the session it binds, so the UI never overrides it.
+    if in_process_connection.is_some() {
+        native_commands::jev_host::publish_session_footer(&send, &current_session_id);
+    }
     loop {
         match ui.borrow_mut().terminal.poll_input() {
             Ok(true) => {}
@@ -2076,8 +2136,26 @@ async fn run_terminal(
                     use native_extension_bridge::Event;
                     use crate::core::extensions::types::ExtensionUiContext;
                     match event {
-                        Event::Reset => {
-                            extension_surfaces.borrow_mut().reset();
+                        event @ (Event::Reset | Event::RuntimeRebound) => {
+                            // TWO different reset contracts, kept distinct:
+                            // * `Event::Reset` (/reload, extension re-init)
+                            //   resets the SAME session: the session and its
+                            //   settings are unchanged, so the host-published
+                            //   Jev segments are retained and refreshed by key
+                            //   on the next publish.
+                            // * `Event::RuntimeRebound` (fork, /new, in-chat
+                            //   /resume rebuilt the runtime) changed the
+                            //   SESSION: blanket reset, because old-session
+                            //   values must never survive into the new
+                            //   session's first frame. The new session's
+                            //   authoritative footer arrives right after: fork
+                            //   and branch send RefreshSnapshot from the
+                            //   command, and /new and /resume now do too.
+                            if matches!(&event, Event::RuntimeRebound) {
+                                extension_surfaces.borrow_mut().reset();
+                            } else {
+                                extension_surfaces.borrow_mut().reset_keeping_jev();
+                            }
                             if let Some(bridge) = &local_extension_bridge { bridge.reset(); }
                             if let Some((_, _, handle, reply)) = custom_extension.take() { handle.hide(); let _ = reply.send(None); }
                             early_custom_results.clear();
@@ -2188,7 +2266,9 @@ async fn run_terminal(
                         Ok(None) => {
                             let fullscreen = mode.borrow().fullscreen_enabled;
                             native_settings::fullscreen(fullscreen, &mode, &editor, &ui, &transcript);
-                            extension_surfaces.borrow_mut().reset(); submit(&connection, &send, "/reload".into(), false, None);
+                            // Same-session reload: keep the Jev segments (see
+                            // the Event::Reset arm).
+                            extension_surfaces.borrow_mut().reset_keeping_jev(); submit(&connection, &send, "/reload".into(), false, None);
                         }
                         Err(error) => {
                             let fullscreen = mode.borrow().fullscreen_enabled;
@@ -2242,7 +2322,14 @@ async fn run_terminal(
                         queue_runtime.observe_queue_change();
                     }
                     let finished = event.type_name() == "agent_end";
+                    let renamed = matches!(
+                        &event,
+                        wire::AgentConnectionSessionEvent::SessionInfoChanged { .. }
+                    );
                     apply_event(&mode, &transcript, event);
+                    if renamed {
+                        refresh_terminal_title(&mode, &ui);
+                    }
                     if finished {
                         state_refresh.request(connection.clone(), current_session_id.clone());
                     }
@@ -2288,6 +2375,7 @@ async fn run_terminal(
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
                         .apply_connection_state_snapshot(project_state(state));
+                    refresh_terminal_title(&mode, &ui);
                     if let Some(error) = apply_history_snapshot(
                         None,
                         messages,
@@ -2295,6 +2383,7 @@ async fn run_terminal(
                         &transcript,
                         &editor,
                         &mut history_runtime,
+                        Some(native_history::ViewportFill::from_tui(&ui.borrow())),
                     ) {
                         mode.borrow_mut().show_error(&error);
                     }
@@ -2305,11 +2394,22 @@ async fn run_terminal(
                         ui.borrow_mut().scroll_to_bottom();
                         extension_surfaces.borrow_mut().reset();
                         side_pane.borrow_mut().close(connection.clone());
+                        // The reset cleared the Jev segments; republish the new
+                        // session's effective settings so the row is never
+                        // stale across a session switch (in-process only: an
+                        // attached daemon pushes its own footer per attach).
+                        if in_process_connection.is_some() {
+                            native_commands::jev_host::publish_session_footer(
+                                &send,
+                                &snapshot.state.session_id,
+                            );
+                        }
                     }
                     current_session_id = snapshot.state.session_id.clone();
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
                         .apply_connection_state_snapshot(project_state(snapshot.state));
+                    refresh_terminal_title(&mode, &ui);
                     if let Some(error) = apply_history_snapshot(
                         snapshot.history,
                         snapshot.messages,
@@ -2317,6 +2417,7 @@ async fn run_terminal(
                         &transcript,
                         &editor,
                         &mut history_runtime,
+                        Some(native_history::ViewportFill::from_tui(&ui.borrow())),
                     ) {
                         mode.borrow_mut().show_error(&error);
                     }
@@ -2331,7 +2432,17 @@ async fn run_terminal(
                     request,
                 }) => match request.method.as_str() {
                     "setStatus" => {
-                        if let Some(key) = optional_string(&request.payload, "statusKey") { extension_surfaces.borrow_mut().set_status(key, optional_string(&request.payload, "statusText")); }
+                        if let Some(key) = optional_string(&request.payload, "statusKey") {
+                            // `statusCompactText` is an optional backward-compatible
+                            // field: senders without it (old daemons, generic
+                            // extensions) degrade to left-truncation instead of
+                            // segment compaction on narrow rows.
+                            extension_surfaces.borrow_mut().set_status(
+                                key,
+                                optional_string(&request.payload, "statusText"),
+                                optional_string(&request.payload, "statusCompactText"),
+                            );
+                        }
                     }
                     "setWidget" => {
                         if let Some(key) = optional_string(&request.payload, "widgetKey") {
@@ -3934,6 +4045,12 @@ async fn run_builtin_command(
             if connection.switch_session(&session_path, None).await? {
                 return Ok(CommandOutput::Status("Resume cancelled".to_string()));
             }
+            // Runtime rebind handoff (same as fork): the rebind's blanket reset
+            // lands first, then this snapshot republishes the resumed session's
+            // authoritative state, including the Jev footer.
+            let _ = send.send(HostEvent::RefreshSnapshot(
+                connection.get_initial_snapshot().await?,
+            ));
             Ok(CommandOutput::Status("Resumed session".to_string()))
         }
         // `commandName === "reload"` (interactive-mode.ts:4996-4999, 9124-9133).
@@ -3991,6 +4108,13 @@ async fn run_builtin_command(
             if connection.new_session(None).await? {
                 return Ok(CommandOutput::Nothing);
             }
+            // Runtime rebind handoff (same as fork): the rebind's blanket reset
+            // lands first, then this snapshot resets and republishes the NEW
+            // session's authoritative state, including the Jev footer. Without
+            // it the new session would start with no footer until a /jev write.
+            let _ = send.send(HostEvent::RefreshSnapshot(
+                connection.get_initial_snapshot().await?,
+            ));
             if let Some(name) = parsed.name {
                 connection.set_session_name(&name).await?;
             }
@@ -4213,6 +4337,14 @@ fn project_state(state: wire::AgentConnectionState) -> local::AgentConnectionSta
     }
 }
 
+/// Re-apply the branded terminal title after session state changes, then sync
+/// the recorded title to the real terminal like the extension Reset path does.
+fn refresh_terminal_title(mode: &Rc<RefCell<InteractiveMode>>, ui: &Rc<RefCell<TUI>>) {
+    mode.borrow_mut().update_terminal_title();
+    let title = mode.borrow().ui.terminal.title.clone();
+    ui.borrow_mut().terminal.set_title(&title);
+}
+
 fn apply_event(
     mode: &Rc<RefCell<InteractiveMode>>,
     transcript: &Rc<RefCell<Transcript>>,
@@ -4369,6 +4501,11 @@ fn apply_event(
             mode.show_warning(&string(&value, "errorMessage"));
         }
         "auto_retry_end" => mode.borrow_mut().patch_connection_state(|s| s.retry_attempt = 0.0),
+        "session_info_changed" => {
+            if let wire::AgentConnectionSessionEvent::SessionInfoChanged { name } = event {
+                mode.borrow_mut().patch_connection_state(|s| s.session_name = name.clone());
+            }
+        }
         _ => {}
     }
 }
@@ -6347,6 +6484,33 @@ mod tests {
         assert!(mode.borrow().restored_draft_notice.borrow().is_none());
     }
 
+    #[test]
+    fn session_info_changed_updates_the_session_name_state() {
+        let mode = Rc::new(RefCell::new(stash_mode("rename-state")));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: "one".into(), ..Default::default()
+        });
+        let transcript = Rc::new(RefCell::new(Transcript::new(mode.clone())));
+        apply_event(
+            &mode,
+            &transcript,
+            wire::AgentConnectionSessionEvent::SessionInfoChanged { name: Some("renamed".into()) },
+        );
+        assert_eq!(
+            mode.borrow().connection_state.as_ref().and_then(|s| s.session_name.clone()).as_deref(),
+            Some("renamed")
+        );
+        apply_event(
+            &mode,
+            &transcript,
+            wire::AgentConnectionSessionEvent::SessionInfoChanged { name: None },
+        );
+        assert_eq!(
+            mode.borrow().connection_state.as_ref().and_then(|s| s.session_name.clone()).as_deref(),
+            None
+        );
+    }
+
     /// An auto-stash for the agents view survives a reopen: the handoff stashes the
     /// draft (`interactive-mode.ts:7122`), the reopen restores it on open
     /// (`interactive-mode.ts:1628-1630`).
@@ -6941,4 +7105,667 @@ mod tests {
         );
     }
 
+    /// Painted regression for the status-surface merge: each Jev label appears
+    /// exactly ONCE (on the tray row, next to the right-aligned counter), other
+    /// extension statuses keep their own line below, and no Jev label leaks
+    /// into that line.
+    #[test]
+    fn the_painted_status_surface_shows_each_jev_label_once_and_others_below() {
+        let mut mode = stash_mode("footer-paint");
+        mode.apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: "footer-paint".into(),
+            active_session_id: Some("active-footer-paint".into()),
+            context_usage: local::ContextUsage {
+                tokens: Some(146_000.0),
+                context_window: 1_000_000.0,
+                percent: Some(14.0),
+            },
+            ..Default::default()
+        });
+        let mode = Rc::new(RefCell::new(mode));
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let editor = Rc::new(RefCell::new(CustomEditor::new(
+            ui,
+            editor_theme(),
+            CustomEditorOptions::default(),
+        )));
+        let mut surfaces = native_extensions::Surfaces::default();
+        surfaces.set_status(
+            native_commands::jev_menu::JEV_STATUS_KEY.to_string(),
+            Some("\u{25cf} Jev On (Compare)".to_string()),
+            Some("\u{25cf} Jev C On".to_string()),
+        );
+        surfaces.set_status(
+            native_commands::jev_menu::JEV_COMPACT_STATUS_KEY.to_string(),
+            Some("\u{25cf} Jev compact on".to_string()),
+            Some("\u{25cf} Jev Cmp on".to_string()),
+        );
+        surfaces.set_status(
+            "tools".to_string(),
+            Some("\u{25cf} tools ready".to_string()),
+            None,
+        );
+        let mut statuses =
+            native_extensions::Statuses(Rc::new(RefCell::new(surfaces)), Tray(mode, editor));
+        let lines = TuiComponent::render(&mut statuses, 120.0);
+        let plain: Vec<String> = lines.iter().map(|line| plain_line(line)).collect();
+        let all = plain.join("\n");
+        // Each FULL Jev label exactly once in the wide painted output; the
+        // compact forms ride the same payload but paint only when the row
+        // narrows below the full-fit width (the tray ladder's second rung).
+        assert_eq!(all.matches("Jev On (Compare)").count(), 1, "{all:?}");
+        assert_eq!(all.matches("Jev compact on").count(), 1, "{all:?}");
+        assert_eq!(all.matches("Jev C On").count(), 0, "{all:?}");
+        assert_eq!(all.matches("Jev Cmp on").count(), 0, "{all:?}");
+        // The tray row carries both segments and the right-aligned counter.
+        let row = plain
+            .iter()
+            .find(|line| line.contains("Jev On (Compare)"))
+            .expect("tray row line");
+        assert!(row.contains("Jev compact on"), "{row:?}");
+        assert!(row.ends_with("146k (14%)"), "{row:?}");
+        assert!(!row.contains("tools ready"), "{row:?}");
+        // At the verified compact rung each compact label paints exactly
+        // once, the full-only forms are gone, and the counter and the other
+        // status keep their places.
+        let narrow = TuiComponent::render(&mut statuses, 60.0);
+        let narrow_all = narrow
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(narrow_all.matches("Jev C On").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev Cmp on").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev On (Compare)").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev compact on").count(), 0, "{narrow_all:?}");
+        let narrow_row = narrow
+            .iter()
+            .map(|line| plain_line(line))
+            .find(|line| line.contains("Jev C On"))
+            .expect("narrow tray row line");
+        assert!(narrow_row.ends_with("146k (14%)"), "{narrow_row:?}");
+        assert!(narrow_all.contains("tools ready"), "{narrow_all:?}");
+        let narrow_tools = narrow
+            .iter()
+            .map(|line| plain_line(line))
+            .find(|line| line.contains("tools ready"))
+            .expect("other status keeps its own line at every width");
+        assert!(!narrow_tools.contains("Jev"), "{narrow_tools:?}");
+        // The other status keeps its own line below, with no Jev label on it.
+        let tools_line = plain
+            .iter()
+            .find(|line| line.contains("tools ready"))
+            .expect("other status line");
+        assert!(!tools_line.contains("Jev"), "{tools_line:?}");
+    }
+
+    /// ANSI-stripped copy of one painted line, for plain-text assertions.
+    fn plain_line(line: &str) -> String {
+        let mut out = String::new();
+        let mut chars = line.chars().peekable();
+        while let Some(ch) = chars.next() {
+            if ch == '\u{1b}' {
+                for escape in chars.by_ref() {
+                    if escape.is_ascii_alphabetic() {
+                        break;
+                    }
+                }
+            } else {
+                out.push(ch);
+            }
+        }
+        out
+    }
+
+    /// A SAME-SESSION extension reset (`/reload`, an extension Reset event, the
+    /// settings-change reload path) keeps the two host-published Jev segments:
+    /// the session and its settings are unchanged, so the segments stay
+    /// truthful and are refreshed by key on the next publish. Extension-owned
+    /// statuses are cleared. A session switch uses the blanket
+    /// `Surfaces::reset`, which clears them too: old-session labels never
+    /// persist, and an attached daemon pushes the new session's footer itself.
+    #[test]
+    fn the_same_session_extension_reset_keeps_the_jev_segments_and_clears_others() {
+        let mut mode = stash_mode("footer-reset");
+        mode.apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: "footer-reset".into(),
+            active_session_id: Some("active-footer-reset".into()),
+            context_usage: local::ContextUsage {
+                tokens: Some(146_000.0),
+                context_window: 1_000_000.0,
+                percent: Some(14.0),
+            },
+            ..Default::default()
+        });
+        let mode = Rc::new(RefCell::new(mode));
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let editor = Rc::new(RefCell::new(CustomEditor::new(
+            ui,
+            editor_theme(),
+            CustomEditorOptions::default(),
+        )));
+        let surfaces = Rc::new(RefCell::new(native_extensions::Surfaces::default()));
+        {
+            let mut surfaces = surfaces.borrow_mut();
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev On (Compare)".to_string()),
+                Some("\u{25cf} Jev C On".to_string()),
+            );
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_COMPACT_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev compact on".to_string()),
+                Some("\u{25cf} Jev Cmp on".to_string()),
+            );
+            surfaces.set_status(
+                "tools".to_string(),
+                Some("\u{25cf} tools ready".to_string()),
+                None,
+            );
+        }
+        let mut statuses =
+            native_extensions::Statuses(Rc::clone(&surfaces), Tray(mode, editor));
+        let before = TuiComponent::render(&mut statuses, 120.0);
+        assert!(
+            before
+                .iter()
+                .any(|line| plain_line(line).contains("tools ready")),
+            "the extension status is painted before the reset"
+        );
+        surfaces.borrow_mut().reset_keeping_jev();
+        let after = TuiComponent::render(&mut statuses, 120.0);
+        let all = after
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(all.matches("Jev On (Compare)").count(), 1, "{all:?}");
+        assert_eq!(all.matches("Jev compact on").count(), 1, "{all:?}");
+        assert_eq!(all.matches("Jev C On").count(), 0, "{all:?}");
+        assert_eq!(all.matches("Jev Cmp on").count(), 0, "{all:?}");
+        assert!(
+            !all.contains("tools ready"),
+            "extension-owned status cleared: {all:?}"
+        );
+        // The kept Jev payloads still carry their compact forms: at the
+        // verified compact rung each paints exactly once, the full-only forms
+        // are gone, and the cleared extension status stays cleared.
+        let narrow = TuiComponent::render(&mut statuses, 60.0);
+        let narrow_all = narrow
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(narrow_all.matches("Jev C On").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev Cmp on").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev On (Compare)").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev compact on").count(), 0, "{narrow_all:?}");
+        assert!(
+            !narrow_all.contains("tools ready"),
+            "the cleared extension status must stay cleared at every width: {narrow_all:?}"
+        );
+        // The blanket reset (session switch) clears the Jev segments as well:
+        // old-session labels never persist across a session switch; an
+        // attached daemon pushes the new session's authoritative footer.
+        surfaces.borrow_mut().reset();
+        let cleared = TuiComponent::render(&mut statuses, 120.0);
+        let all = cleared
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert!(
+            !all.contains("Jev"),
+            "blanket reset clears the Jev segments: {all:?}"
+        );
+    }
+
+    /// Runtime rebind regression (fork, /new, in-chat /resume): session A ran
+    /// with operative Compare and compaction on; the rebind blanket-resets the
+    /// surface and the NEW session B publishes its OWN authoritative settings
+    /// (Off + compaction off here). The first painted frame of B must show
+    /// ONLY B's labels - none of session A's may survive.
+    #[test]
+    fn a_runtime_rebind_never_carries_the_old_session_jev_labels_into_the_new_session() {
+        let mut mode = stash_mode("footer-rebind");
+        mode.apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: "session-b".into(),
+            active_session_id: Some("active-session-b".into()),
+            context_usage: local::ContextUsage {
+                tokens: Some(146_000.0),
+                context_window: 1_000_000.0,
+                percent: Some(14.0),
+            },
+            ..Default::default()
+        });
+        let mode = Rc::new(RefCell::new(mode));
+        let ui = Rc::new(RefCell::new(TUI::new(
+            Box::new(pi_tui::terminal::ProcessTerminal::new()),
+            None,
+        )));
+        let editor = Rc::new(RefCell::new(CustomEditor::new(
+            ui,
+            editor_theme(),
+            CustomEditorOptions::default(),
+        )));
+        let surfaces = Rc::new(RefCell::new(native_extensions::Surfaces::default()));
+        {
+            // Session A: Compare + compaction on (full and short forms).
+            let mut surfaces = surfaces.borrow_mut();
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev On (Compare)".to_string()),
+                Some("\u{25cf} Jev C On".to_string()),
+            );
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_COMPACT_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev compact on".to_string()),
+                Some("\u{25cf} Jev Cmp on".to_string()),
+            );
+        }
+        let mut statuses =
+            native_extensions::Statuses(Rc::clone(&surfaces), Tray(mode, editor));
+        // The runtime rebind (Event::RuntimeRebound) blanket-resets: no
+        // old-session label may survive into the new session's first frame.
+        surfaces.borrow_mut().reset();
+        // Session B publishes its OWN authoritative settings through the
+        // normal setStatus path (the same payload the startup publisher sends).
+        {
+            let mut surfaces = surfaces.borrow_mut();
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev Off".to_string()),
+                Some("\u{25cf} Jev Off".to_string()),
+            );
+            surfaces.set_status(
+                native_commands::jev_menu::JEV_COMPACT_STATUS_KEY.to_string(),
+                Some("\u{25cf} Jev compact off".to_string()),
+                Some("\u{25cf} Jev Cmp off".to_string()),
+            );
+        }
+        let lines = TuiComponent::render(&mut statuses, 120.0);
+        let all = lines
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(all.matches("Jev Off").count(), 1, "B's decision label only: {all:?}");
+        assert_eq!(all.matches("Jev compact off").count(), 1, "{all:?}");
+        assert_eq!(all.matches("Jev Cmp off").count(), 0, "{all:?}");
+        assert!(
+            !all.contains("Jev On (Compare)") && !all.contains("Jev C On"),
+            "session A's decision label must not survive: {all:?}"
+        );
+        assert!(
+            !all.contains("Jev compact on") && !all.contains("Jev Cmp on"),
+            "session A's compaction label must not survive: {all:?}"
+        );
+        // At the verified compact rung B's compacts paint exactly once. B's
+        // decision label is shared between its full and compact forms, so it
+        // is asserted PRESENT, never absent; session A's labels (full and
+        // compact) stay absent at every width.
+        let narrow = TuiComponent::render(&mut statuses, 60.0);
+        let narrow_all = narrow
+            .iter()
+            .map(|line| plain_line(line))
+            .collect::<Vec<_>>()
+            .join("\n");
+        assert_eq!(narrow_all.matches("Jev Off").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev Cmp off").count(), 1, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev compact off").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev On (Compare)").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev C On").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev compact on").count(), 0, "{narrow_all:?}");
+        assert_eq!(narrow_all.matches("Jev Cmp on").count(), 0, "{narrow_all:?}");
+    }
+
+    // ----------------------------------------------------------------------
+    // ROOT-CONTRACT v9 model controls (PATCH-v2-ADDENDUM): REAL host-dispatch
+    // tests. These drive the production slash-command chain
+    // (`run_builtin_command` -> native_commands::run -> jev_host::run ->
+    // parse_jev_request -> the model arms -> the durable settings store), not
+    // parser helpers. The agent dir is scoped to a per-test tempdir through
+    // the same environment variable the TS tests and the agent-session tests
+    // use (agent_session.rs `std::env::set_var(env_agent_dir(), ..)`), held
+    // under a module-level lock and always restored on drop.
+    static AGENT_DIR_TEST_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    struct ScopedAgentDir {
+        previous: Option<String>,
+        root: std::path::PathBuf,
+        _guard: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl ScopedAgentDir {
+        fn in_temp(label: &str) -> Self {
+            let guard = AGENT_DIR_TEST_LOCK
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            let previous = std::env::var(crate::config::env_agent_dir()).ok();
+            let unique = format!(
+                "jev-model-dispatch-{label}-{}-{}",
+                std::process::id(),
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .unwrap()
+                    .as_nanos()
+            );
+            let root = std::env::temp_dir().join(unique);
+            std::fs::create_dir_all(root.join("agent")).expect("temp agent dir");
+            std::env::set_var(crate::config::env_agent_dir(), root.join("agent"));
+            Self { previous, root, _guard: guard }
+        }
+    }
+
+    impl Drop for ScopedAgentDir {
+        fn drop(&mut self) {
+            match &self.previous {
+                Some(value) => std::env::set_var(crate::config::env_agent_dir(), value),
+                None => std::env::remove_var(crate::config::env_agent_dir()),
+            }
+            let _ = std::fs::remove_dir_all(&self.root);
+        }
+    }
+
+    fn scoped_settings_file(scope: &ScopedAgentDir) -> std::path::PathBuf {
+        scope.root.join("agent").join("jev").join("jev-settings.json")
+    }
+
+    fn read_scoped_settings(scope: &ScopedAgentDir) -> Option<serde_json::Value> {
+        let raw = std::fs::read_to_string(scoped_settings_file(scope)).ok()?;
+        serde_json::from_str(&raw).ok()
+    }
+
+    struct TestCatalogTransportGuard;
+
+    impl TestCatalogTransportGuard {
+        fn install(transport: Arc<dyn pi_jev::types::Transport>) -> Self {
+            crate::core::jev_bridge::set_test_catalog_transport(Some(transport));
+            Self
+        }
+    }
+
+    impl Drop for TestCatalogTransportGuard {
+        fn drop(&mut self) {
+            crate::core::jev_bridge::set_test_catalog_transport(None);
+        }
+    }
+
+    #[tokio::test]
+    async fn jev_model_set_persists_exactly_through_the_real_dispatch() {
+        let scope = ScopedAgentDir::in_temp("set");
+        let recorder = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let (send, _receive) = mpsc::channel();
+        let raw = "/jev model set jev-two";
+        let parsed = crate::core::slash_commands::parse_slash_command(raw)
+            .expect("the real slash boundary parses /jev");
+        assert_eq!(parsed.args, "model set jev-two");
+        let output = run_builtin_command(
+            &connection,
+            &send,
+            raw,
+            &parsed.name,
+            &parsed.args,
+        )
+        .await
+        .expect("the real dispatch must not error for a safe id");
+        let text = match output {
+            CommandOutput::Status(text) => text,
+            other => panic!("expected a status panel, got {other:?}"),
+        };
+        assert!(
+            text.contains("Requested Jev model: jev-two"),
+            "the exact id is echoed from the persisted outcome: {text}"
+        );
+        assert!(text.contains("No network call was made"), "{text}");
+        let saved = read_scoped_settings(&scope).expect("the durable store exists");
+        assert_eq!(
+            saved["requested_model"],
+            serde_json::json!("jev-two"),
+            "the id persists byte-for-byte (no normalization)"
+        );
+        assert_eq!(saved["write_revision"], serde_json::json!(1));
+        // Status reads the durable truth through the SAME real dispatch.
+        let status = run_builtin_command(
+            &connection,
+            &send,
+            "/jev model status",
+            "jev",
+            "model status",
+        )
+        .await
+        .unwrap();
+        let panel = match status {
+            CommandOutput::Panel(panel) => panel,
+            other => panic!("expected a panel, got {other:?}"),
+        };
+        assert!(
+            panel.contains("Requested Jev model: jev-two (explicit /jev model set selection)"),
+            "{panel}"
+        );
+        assert!(panel.contains("Durable settings write revision: 1"), "{panel}");
+        // An identical set is a truthful no-op: nothing written, revision unmoved.
+        let again = run_builtin_command(
+            &connection,
+            &send,
+            "/jev model set jev-two",
+            "jev",
+            "model set jev-two",
+        )
+        .await
+        .unwrap();
+        match again {
+            CommandOutput::Status(text) => assert!(
+                text.contains("already jev-two")
+                    && text.contains("nothing was written"),
+                "{text}"
+            ),
+            other => panic!("expected a status panel, got {other:?}"),
+        }
+        assert_eq!(
+            read_scoped_settings(&scope).unwrap()["write_revision"],
+            serde_json::json!(1),
+            "an identical set must not move the durable revision"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_model_set_refuses_hostile_ids_through_the_real_dispatch() {
+        // Exact-ID rejection is exercised through the REAL chain: the parser
+        // hands the id byte-for-byte to the validator, and every
+        // whitespace-bearing id (tab-prefixed, plain-space interior) is
+        // REFUSED - never trimmed, folded or normalized into acceptance -
+        // with nothing persisted and no value echoed.
+        let scope = ScopedAgentDir::in_temp("refuse");
+        let recorder = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let (send, _receive) = mpsc::channel();
+        for (label, args, raw_id) in [
+            ("tab-prefixed", "model set \tjev-latest", "\tjev-latest"),
+            ("leading space", "model set  jev-latest", " jev-latest"),
+            ("interior space", "model set my model", "my model"),
+            ("trailing space", "model set jev-latest ", "jev-latest "),
+            ("trailing tab", "model set jev-latest\t", "jev-latest\t"),
+        ] {
+            let raw = format!("/jev {args}");
+            let parsed = crate::core::slash_commands::parse_slash_command(&raw)
+                .expect("the real slash boundary parses /jev");
+            assert_eq!(parsed.name, "jev");
+            let result = run_builtin_command(
+                &connection,
+                &send,
+                &raw,
+                &parsed.name,
+                &parsed.args,
+            )
+            .await;
+            match result {
+                Ok(CommandOutput::Error(text)) => {
+                    assert!(
+                        text.contains("Jev model id refused"),
+                        "{label}: {text}"
+                    );
+                    assert!(
+                        !text.contains(raw_id),
+                        "{label}: the refused id must never be echoed: {text}"
+                    );
+                }
+                Err(error) => {
+                    assert!(error.contains("Jev model id refused"), "{label}: {error}");
+                    assert!(
+                        !error.contains(raw_id),
+                        "{label}: the refused id must never be echoed: {error}"
+                    );
+                }
+                other => panic!("{label}: expected a refusal, got {other:?}"),
+            }
+            assert!(
+                read_scoped_settings(&scope).is_none(),
+                "{label}: a refused id must persist nothing"
+            );
+        }
+        // The bare `model set` form stays a usage error through the real arm.
+        let usage = run_builtin_command(&connection, &send, "/jev model set", "jev", "model set")
+            .await
+            .unwrap();
+        match usage {
+            CommandOutput::Error(text) => assert!(text.contains("Usage: /jev model set <id>"), "{text}"),
+            other => panic!("expected the usage error, got {other:?}"),
+        }
+        assert!(read_scoped_settings(&scope).is_none(), "usage must write nothing");
+    }
+
+    #[tokio::test]
+    async fn jev_models_success_routes_once_through_the_real_dispatch_without_selection() {
+        let scope = ScopedAgentDir::in_temp("models-success");
+        let recorder = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let (send, _receive) = mpsc::channel();
+        let mock = Arc::new(pi_jev::mock::MockJevTransport::scripted(vec![
+            pi_jev::mock::MockStep::ModelsBody(
+                serde_json::json!({
+                    "models": [{
+                        "name": "jev-native-positive",
+                        "description": "Offline native command fixture.",
+                        "release_date": "2026-09-21"
+                    }]
+                })
+                .to_string(),
+            ),
+        ]));
+        let _catalog_guard = TestCatalogTransportGuard::install(
+            mock.clone() as Arc<dyn pi_jev::types::Transport>,
+        );
+        let raw = "/jev models";
+        let parsed = crate::core::slash_commands::parse_slash_command(raw)
+            .expect("the real slash boundary parses /jev models");
+        let output = run_builtin_command(
+            &connection,
+            &send,
+            raw,
+            &parsed.name,
+            &parsed.args,
+        )
+        .await
+        .expect("the injected offline catalog succeeds");
+        let panel = match output {
+            CommandOutput::Panel(panel) => panel,
+            other => panic!("expected the catalog panel, got {other:?}"),
+        };
+        assert!(panel.contains("jev-native-positive"), "{panel}");
+        assert_eq!(mock.models_call_count(), 1, "one explicit catalog GET");
+        assert_eq!(mock.call_count(), 0, "the decision endpoint was untouched");
+        assert!(
+            read_scoped_settings(&scope).is_none(),
+            "catalog success must not select a model or write settings"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_models_reports_honest_unavailability_without_any_fetch_through_the_real_dispatch() {
+        // The only networked command, driven through the REAL arm with no
+        // credential configured: an honest unavailable panel, no transport
+        // construction, no fetch, and no settings write of any kind.
+        let scope = ScopedAgentDir::in_temp("models");
+        let recorder = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let (send, _receive) = mpsc::channel();
+        let output = run_builtin_command(&connection, &send, "/jev models", "jev", "models")
+            .await
+            .unwrap();
+        match output {
+            CommandOutput::Error(text) => {
+                assert!(
+                    text.contains("Model catalog unavailable: no Jev credential is configured"),
+                    "{text}"
+                );
+                assert!(text.contains("Nothing was fetched"), "{text}");
+            }
+            other => panic!("expected the honest unavailable panel, got {other:?}"),
+        }
+        assert!(
+            read_scoped_settings(&scope).is_none(),
+            "the catalog query must write nothing"
+        );
+    }
+
+    #[tokio::test]
+    async fn jev_model_reset_restores_the_native_default_through_the_real_dispatch() {
+        let scope = ScopedAgentDir::in_temp("reset");
+        let recorder = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+        let (send, _receive) = mpsc::channel();
+        run_builtin_command(
+            &connection,
+            &send,
+            "/jev model set jev-two",
+            "jev",
+            "model set jev-two",
+        )
+        .await
+        .unwrap();
+        let reset = run_builtin_command(&connection, &send, "/jev model reset", "jev", "model reset")
+            .await
+            .unwrap();
+        match reset {
+            CommandOutput::Status(text) => assert!(
+                text.contains("Requested Jev model reset to the native default jev-latest"),
+                "{text}"
+            ),
+            other => panic!("expected a status panel, got {other:?}"),
+        }
+        let saved = read_scoped_settings(&scope).unwrap();
+        let cleared = saved
+            .get("requested_model")
+            .map(|value| value.is_null())
+            .unwrap_or(true);
+        assert!(cleared, "the tombstone removes the explicit selection: {saved}");
+        assert_eq!(
+            saved["write_revision"],
+            serde_json::json!(2),
+            "a real reset advances the durable revision"
+        );
+        // An already-default reset is a truthful no-op (no write, no revision move).
+        let again = run_builtin_command(&connection, &send, "/jev model reset", "jev", "model reset")
+            .await
+            .unwrap();
+        match again {
+            CommandOutput::Status(text) => assert!(
+                text.contains("already the native default") && text.contains("nothing was written"),
+                "{text}"
+            ),
+            other => panic!("expected a status panel, got {other:?}"),
+        }
+        assert_eq!(
+            read_scoped_settings(&scope).unwrap()["write_revision"],
+            serde_json::json!(2),
+        );
+    }
 }

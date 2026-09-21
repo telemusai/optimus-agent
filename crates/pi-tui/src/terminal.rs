@@ -392,6 +392,45 @@ fn compute_write_log_path() -> String {
     env
 }
 
+/// Maximum characters kept in a terminal title so long titles truncate instead
+/// of corrupting narrow tab bars.
+pub const MAX_TITLE_CHARS: usize = 256;
+
+/// Strip C0/C1 control characters (including ESC and BEL) plus zero-width and
+/// bidi-formatting characters from terminal title text, so a title containing
+/// escape sequences cannot smuggle terminal commands through the OSC 0 write.
+/// Stops scanning as soon as MAX_TITLE_CHARS accepted characters are stored, so
+/// an arbitrarily long title neither allocates nor scans unboundedly.
+pub fn sanitize_title_text(title: &str) -> String {
+    let mut out = String::with_capacity(title.len().min(MAX_TITLE_CHARS * 4));
+    let mut accepted = 0usize;
+    for character in title.chars() {
+        if accepted == MAX_TITLE_CHARS {
+            break;
+        }
+        if matches!(
+            character,
+            '\u{0}'..='\u{1f}'
+                | '\u{7f}'
+                | '\u{80}'..='\u{9f}'
+                | '\u{200b}'..='\u{200f}'
+                | '\u{202a}'..='\u{202e}'
+                | '\u{2066}'..='\u{2069}'
+                | '\u{feff}'
+        ) {
+            continue;
+        }
+        out.push(character);
+        accepted += 1;
+    }
+    out
+}
+
+/// OSC 0 window-title sequence for `title` with the sanitized payload.
+pub fn title_osc_sequence(title: &str) -> String {
+    format!("\x1b]0;{}\x07", sanitize_title_text(title))
+}
+
 impl ProcessTerminal {
     pub fn new() -> Self {
         Self {
@@ -1045,7 +1084,7 @@ impl Terminal for ProcessTerminal {
 
     fn set_title(&mut self, title: &str) {
         // OSC 0;title BEL - set terminal window title
-        self.write(&format!("\x1b]0;{title}\x07"));
+        self.write(&title_osc_sequence(title));
     }
 
     fn set_progress(&mut self, active: bool) {
@@ -1303,5 +1342,53 @@ mod tests {
     fn write_log_path_falls_back_to_env() {
         std::env::remove_var("PI_TUI_WRITE_LOG");
         assert_eq!(compute_write_log_path(), "");
+    }
+
+    #[test]
+    fn title_sanitization_removes_control_and_escape_payloads() {
+        assert_eq!(sanitize_title_text("Optimus - Agent"), "Optimus - Agent");
+        let cleaned = sanitize_title_text("App\x1b]0;evil\x07name\u{202e}spoof\x00\x1b[31m\u{feff}");
+        assert_eq!(cleaned, "App]0;evilnamespoof[31m");
+        assert!(!cleaned.contains('\x1b'));
+        assert!(!cleaned.contains('\x07'));
+    }
+
+    #[test]
+    fn title_osc_sequence_frames_the_sanitized_title() {
+        assert_eq!(title_osc_sequence("Optimus - Agent"), "\x1b]0;Optimus - Agent\x07");
+        let sequence = title_osc_sequence("bad\x1b]2;inject\x07");
+        let payload = sequence
+            .trim_start_matches("\x1b]0;")
+            .trim_end_matches('\x07');
+        assert_eq!(payload, "bad]2;inject");
+        assert!(!payload.contains('\x1b') && !payload.contains('\x07'));
+    }
+
+    #[test]
+    fn title_sanitization_caps_length() {
+        let long = "x".repeat(MAX_TITLE_CHARS + 50);
+        assert_eq!(sanitize_title_text(&long).chars().count(), MAX_TITLE_CHARS);
+    }
+
+    #[test]
+    fn title_sanitization_counts_unicode_characters_not_bytes() {
+        // Four-byte emoji count as one character each: the cap is characters,
+        // not bytes, and the result keeps whole emoji.
+        let emoji = "\u{1f600}".repeat(MAX_TITLE_CHARS + 50);
+        let cleaned = sanitize_title_text(&emoji);
+        assert_eq!(cleaned.chars().count(), MAX_TITLE_CHARS);
+        assert_eq!(cleaned.len(), MAX_TITLE_CHARS * 4);
+        assert!(cleaned.starts_with("\u{1f600}"));
+        assert!(cleaned.ends_with("\u{1f600}"));
+    }
+
+    #[test]
+    fn title_sanitization_strips_control_and_bidi_around_unicode_text() {
+        // ESC, BEL, NUL, bidi override, zero-width, and FEFF are removed; plain
+        // text and printable Unicode (including the pi letter) are kept.
+        let mixed = "a\u{202e}b\x1b[31m\u{3c0}\u{200b}c\x07d\u{feff}\u{1f600}";
+        assert_eq!(sanitize_title_text(mixed), "ab[31m\u{3c0}cd\u{1f600}");
+        let trailing = "Optimus - Agent\u{1f600}\u{202e}\u{200b}";
+        assert_eq!(sanitize_title_text(trailing), "Optimus - Agent\u{1f600}");
     }
 }
