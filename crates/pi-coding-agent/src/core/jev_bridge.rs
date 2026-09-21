@@ -55,6 +55,9 @@ pub fn settings_revision() -> String {
         signal: Option<CancellationToken>,
     ) {
         let Some(core) = bridge_for_session(session_id) else { return };
+        // Request identity must advance even without a skill assessment. Queued
+        // TurnStart events can lag this awaited boundary and must not overwrite it.
+        core.note_request_turn(session_id, request_turn);
         let settings_at_capture = load_settings_cached();
         let features_at_capture = settings_at_capture.effective_features(session_id);
         if !features_at_capture.skill_suggestion {
@@ -83,9 +86,6 @@ pub fn settings_revision() -> String {
             core.task_excerpt(session_id).as_deref().unwrap_or(""), &roster_at_capture,
         ) else { return; };
         let Some(observer) = core.observer(session_id, None) else { return };
-        // The hook aligns the book turn with the loop's actual request index
-        // synchronously (the queued TurnStart bookkeeping may lag the loop).
-        core.note_turn(session_id, request_turn);
         let dispatch_payload = serde_json::json!({
             "session_id": session_id,
             "turn": request_turn,
@@ -568,6 +568,8 @@ struct SessionBook {
     last_task_excerpt: Option<String>,
     observed_tools: Vec<String>,
     turn: u64,
+    /// Authoritative provider index once the awaited request hook has run.
+    request_turn: Option<u64>,
     trace: pi_jev::observation::TraceObserver,
     /// ROOT-CONTRACT v7 (Agent-guidance lane): latest advisory skill hint.
     /// Assessment only — it never loads or executes a skill.
@@ -585,6 +587,12 @@ struct SessionBook {
     /// action) id currently executing. Two genuinely new deliveries with
     /// byte-identical text can never reuse the previous hint.
     delivery_id: Option<String>,
+}
+
+impl SessionBook {
+    fn current_turn(&self) -> u64 {
+        self.request_turn.unwrap_or(self.turn)
+    }
 }
 
 struct JevBridgeCore {
@@ -779,7 +787,7 @@ impl JevBridgeCore {
     /// assessed for: a new task (turn advanced) never inherits it.
     fn skill_hint_for(&self, session_id: &str) -> Option<pi_jev::agent_guidance::SkillHint> {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(session_id)
-            .filter(|book| book.turn == book.skill_hint_turn)
+            .filter(|book| book.current_turn() == book.skill_hint_turn)
             .and_then(|book| book.skill_hint.clone())
     }
 
@@ -868,9 +876,14 @@ impl JevBridgeCore {
             .entry(session_id.to_string()).or_default().turn = turn;
     }
 
+    fn note_request_turn(&self, session_id: &str, turn: u64) {
+        self.sessions.lock().unwrap_or_else(|p| p.into_inner())
+            .entry(session_id.to_string()).or_default().request_turn = Some(turn);
+    }
+
     fn turn(&self, session_id: &str) -> u64 {
         self.sessions.lock().unwrap_or_else(|p| p.into_inner())
-            .get(session_id).map(|book| book.turn).unwrap_or(0)
+            .get(session_id).map(SessionBook::current_turn).unwrap_or(0)
     }
 
     fn note_observation(&self, session_id: &str, event: &ExtensionEvent) {
