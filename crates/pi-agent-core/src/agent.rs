@@ -11,8 +11,8 @@ use std::sync::{Arc, Mutex, OnceLock};
 
 use futures::future::BoxFuture;
 use pi_ai::types::{
-    AssistantMessage, ImageContent, ImageOrTextContent, Message, Model, TextContent, ThinkingBudgets,
-    Usage, UserContent, UserMessage,
+    AssistantMessage, ImageContent, ImageOrTextContent, Message, Model, TextContent,
+    ThinkingBudgets, Usage, UserContent, UserMessage,
 };
 use serde_json::Value;
 use tokio_util::sync::CancellationToken;
@@ -125,7 +125,10 @@ impl PendingMessageQueue {
     }
 
     /// `removeWhere(predicate)`.
-    pub fn remove_where(&mut self, predicate: &(dyn Fn(&AgentMessage) -> bool + Send + Sync)) -> Vec<AgentMessage> {
+    pub fn remove_where(
+        &mut self,
+        predicate: &(dyn Fn(&AgentMessage) -> bool + Send + Sync),
+    ) -> Vec<AgentMessage> {
         let mut removed: Vec<AgentMessage> = Vec::new();
         let mut retained: Vec<Vec<AgentMessage>> = Vec::new();
         for batch in self.batches.drain(..) {
@@ -144,22 +147,67 @@ impl PendingMessageQueue {
 #[derive(Clone)]
 pub struct AgentOptions {
     pub initial_state: Option<AgentState>,
-    pub convert_to_llm: Option<Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>>,
-    pub transform_context:
-        Option<Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>>,
+    pub convert_to_llm:
+        Option<Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>>,
+    pub transform_context: Option<
+        Arc<
+            dyn Fn(
+                    Vec<AgentMessage>,
+                    Option<CancellationToken>,
+                ) -> BoxFuture<'static, Vec<AgentMessage>>
+                + Send
+                + Sync,
+        >,
+    >,
     pub stream_fn: Option<StreamFn>,
-    pub get_api_key: Option<Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>>,
+    pub get_api_key:
+        Option<Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>>,
     pub on_payload: Option<pi_ai::types::OnPayload>,
     pub on_response: Option<pi_ai::types::OnResponse>,
-    pub before_tool_call:
-        Option<Arc<dyn Fn(BeforeToolCallContext, Option<CancellationToken>) -> BoxFuture<'static, anyhow::Result<Option<BeforeToolCallResult>>> + Send + Sync>>,
-    pub after_tool_call:
-        Option<Arc<dyn Fn(AfterToolCallContext, Option<CancellationToken>) -> BoxFuture<'static, anyhow::Result<Option<AfterToolCallResult>>> + Send + Sync>>,
+    pub before_tool_call: Option<
+        Arc<
+            dyn Fn(
+                    BeforeToolCallContext,
+                    Option<CancellationToken>,
+                )
+                    -> BoxFuture<'static, anyhow::Result<Option<BeforeToolCallResult>>>
+                + Send
+                + Sync,
+        >,
+    >,
+    pub after_tool_call: Option<
+        Arc<
+            dyn Fn(
+                    AfterToolCallContext,
+                    Option<CancellationToken>,
+                )
+                    -> BoxFuture<'static, anyhow::Result<Option<AfterToolCallResult>>>
+                + Send
+                + Sync,
+        >,
+    >,
     pub should_stop_after_turn:
         Option<Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>>,
     pub should_stop_before_turn: Option<Arc<dyn Fn() -> bool + Send + Sync>>,
     pub get_continuation_messages: Option<
-        Arc<dyn Fn(GetContinuationMessagesContext, Option<CancellationToken>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>,
+        Arc<
+            dyn Fn(
+                    GetContinuationMessagesContext,
+                    Option<CancellationToken>,
+                ) -> BoxFuture<'static, Vec<AgentMessage>>
+                + Send
+                + Sync,
+        >,
+    >,
+    pub before_request: Option<
+        Arc<
+            dyn Fn(
+                    u64,
+                    Option<tokio_util::sync::CancellationToken>,
+                ) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+                + Send
+                + Sync,
+        >,
     >,
     pub steering_mode: Option<QueueMode>,
     pub follow_up_mode: Option<QueueMode>,
@@ -185,6 +233,7 @@ impl Default for AgentOptions {
             should_stop_after_turn: None,
             should_stop_before_turn: None,
             get_continuation_messages: None,
+            before_request: None,
             steering_mode: None,
             follow_up_mode: None,
             session_id: None,
@@ -230,28 +279,83 @@ struct ActiveRun {
 
 /// `class Agent`.
 pub struct Agent {
-    state: Mutex<AgentState>,
+    state: Arc<Mutex<AgentState>>,
     listeners: Mutex<Vec<ListenerEntry>>,
     steering_queue: Arc<Mutex<PendingMessageQueue>>,
     follow_up_queue: Arc<Mutex<PendingMessageQueue>>,
-    pub convert_to_llm: Mutex<Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>>,
-    pub transform_context:
-        Mutex<Option<Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>>>,
+    pub convert_to_llm:
+        Mutex<Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<'static, Vec<Message>> + Send + Sync>>,
+    pub transform_context: Mutex<
+        Option<
+            Arc<
+                dyn Fn(
+                        Vec<AgentMessage>,
+                        Option<CancellationToken>,
+                    ) -> BoxFuture<'static, Vec<AgentMessage>>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
     pub stream_fn: Mutex<StreamFn>,
-    pub get_api_key: Mutex<Option<Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>>>,
+    pub get_api_key:
+        Mutex<Option<Arc<dyn Fn(String) -> BoxFuture<'static, Option<String>> + Send + Sync>>>,
     pub on_payload: Mutex<Option<pi_ai::types::OnPayload>>,
     pub on_response: Mutex<Option<pi_ai::types::OnResponse>>,
     pub before_tool_call: Mutex<
-        Option<Arc<dyn Fn(BeforeToolCallContext, Option<CancellationToken>) -> BoxFuture<'static, anyhow::Result<Option<BeforeToolCallResult>>> + Send + Sync>>,
+        Option<
+            Arc<
+                dyn Fn(
+                        BeforeToolCallContext,
+                        Option<CancellationToken>,
+                    )
+                        -> BoxFuture<'static, anyhow::Result<Option<BeforeToolCallResult>>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
     pub after_tool_call: Mutex<
-        Option<Arc<dyn Fn(AfterToolCallContext, Option<CancellationToken>) -> BoxFuture<'static, anyhow::Result<Option<AfterToolCallResult>>> + Send + Sync>>,
+        Option<
+            Arc<
+                dyn Fn(
+                        AfterToolCallContext,
+                        Option<CancellationToken>,
+                    )
+                        -> BoxFuture<'static, anyhow::Result<Option<AfterToolCallResult>>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
-    pub should_stop_after_turn:
-        Mutex<Option<Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>>>,
+    pub should_stop_after_turn: Mutex<
+        Option<Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<'static, bool> + Send + Sync>>,
+    >,
     pub should_stop_before_turn: Mutex<Option<Arc<dyn Fn() -> bool + Send + Sync>>>,
     pub get_continuation_messages: Mutex<
-        Option<Arc<dyn Fn(GetContinuationMessagesContext, Option<CancellationToken>) -> BoxFuture<'static, Vec<AgentMessage>> + Send + Sync>>,
+        Option<
+            Arc<
+                dyn Fn(
+                        GetContinuationMessagesContext,
+                        Option<CancellationToken>,
+                    ) -> BoxFuture<'static, Vec<AgentMessage>>
+                    + Send
+                    + Sync,
+            >,
+        >,
+    >,
+    pub before_request: Mutex<
+        Option<
+            Arc<
+                dyn Fn(
+                        u64,
+                        Option<tokio_util::sync::CancellationToken>,
+                    )
+                        -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+                    + Send
+                    + Sync,
+            >,
+        >,
     >,
     active_run: Mutex<Option<Arc<ActiveRun>>>,
     pub session_id: Mutex<Option<String>>,
@@ -265,13 +369,16 @@ pub struct Agent {
 /// observable because listeners are awaited in subscription order.
 struct ListenerEntry {
     id: u64,
-    listener: Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<'static, ()> + Send + Sync>,
+    listener:
+        Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<'static, ()> + Send + Sync>,
 }
 
 fn next_listener_id() -> u64 {
     static NEXT: OnceLock<Mutex<u64>> = OnceLock::new();
     let counter = NEXT.get_or_init(|| Mutex::new(0));
-    let mut guard = counter.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    let mut guard = counter
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
     *guard += 1;
     *guard
 }
@@ -288,17 +395,13 @@ impl Agent {
         let follow_up_mode = options.follow_up_mode.unwrap_or(QueueMode::OneAtATime);
 
         let agent = Arc::new(Self {
-            state: Mutex::new(initial_state),
+            state: Arc::new(Mutex::new(initial_state)),
             listeners: Mutex::new(Vec::new()),
             steering_queue: Arc::new(Mutex::new(PendingMessageQueue::new(steering_mode))),
             follow_up_queue: Arc::new(Mutex::new(PendingMessageQueue::new(follow_up_mode))),
-            convert_to_llm: Mutex::new(
-                options
-                    .convert_to_llm
-                    .unwrap_or_else(|| Arc::new(|messages| {
-                        Box::pin(async move { default_convert_to_llm(messages) })
-                    })),
-            ),
+            convert_to_llm: Mutex::new(options.convert_to_llm.unwrap_or_else(|| {
+                Arc::new(|messages| Box::pin(async move { default_convert_to_llm(messages) }))
+            })),
             transform_context: Mutex::new(options.transform_context),
             // `options.streamFn ?? streamSimple` - the loop resolves the default.
             stream_fn: Mutex::new(options.stream_fn.unwrap_or_else(default_stream_fn)),
@@ -310,11 +413,16 @@ impl Agent {
             should_stop_after_turn: Mutex::new(options.should_stop_after_turn),
             should_stop_before_turn: Mutex::new(options.should_stop_before_turn),
             get_continuation_messages: Mutex::new(options.get_continuation_messages),
+            before_request: Mutex::new(options.before_request),
             active_run: Mutex::new(None),
             session_id: Mutex::new(options.session_id),
             thinking_budgets: Mutex::new(options.thinking_budgets),
             transport: Mutex::new(options.transport.unwrap_or_else(|| "auto".to_string())),
-            tool_execution: Mutex::new(options.tool_execution.unwrap_or(ToolExecutionMode::Parallel)),
+            tool_execution: Mutex::new(
+                options
+                    .tool_execution
+                    .unwrap_or(ToolExecutionMode::Parallel),
+            ),
             performance_metrics: Mutex::new(options.performance_metrics),
         });
         agent
@@ -323,7 +431,9 @@ impl Agent {
     /// `subscribe(listener)` - returns the unsubscribe function.
     pub fn subscribe(
         self: &Arc<Self>,
-        listener: Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<'static, ()> + Send + Sync>,
+        listener: Arc<
+            dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<'static, ()> + Send + Sync,
+        >,
     ) -> UnsubscribeHandle {
         let id = next_listener_id();
         self.listeners
@@ -337,7 +447,10 @@ impl Agent {
     }
 
     fn remove_listener(&self, id: u64) {
-        let mut listeners = self.listeners.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut listeners = self
+            .listeners
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         listeners.retain(|entry| entry.id != id);
     }
 
@@ -353,7 +466,10 @@ impl Agent {
     /// Read a small state projection without cloning the conversation. The
     /// callback must not call back into the agent or hold this lock across IO.
     pub fn read_state<T>(&self, read: impl FnOnce(&AgentState) -> T) -> T {
-        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         read(&state)
     }
 
@@ -362,13 +478,19 @@ impl Agent {
     pub fn set_state(&self, mut state: AgentState) {
         state.tools = state.tools.clone();
         state.messages = state.messages.clone();
-        *self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
+        *self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = state;
     }
 
     /// Mutate the state in place - the Rust equivalent of field assignment on the
     /// live object (`agent.state.messages.push(...)`).
     pub fn update_state<F: FnOnce(&mut AgentState)>(&self, update: F) {
-        let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         update(&mut state);
     }
 
@@ -517,7 +639,10 @@ impl Agent {
     /// `reset()`.
     pub fn reset(&self) {
         {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.messages = Vec::new();
             state.is_streaming = false;
             state.streaming_message = None;
@@ -544,12 +669,16 @@ impl Agent {
         if self.is_running() {
             return Err(AgentContinueError {
                 code: AgentContinueErrorCode::Busy,
-                message: "Agent is already processing. Wait for completion before continuing.".to_string(),
+                message: "Agent is already processing. Wait for completion before continuing."
+                    .to_string(),
             });
         }
 
         let last_message = {
-            let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.messages.last().cloned()
         };
         let Some(last_message) = last_message else {
@@ -576,10 +705,12 @@ impl Agent {
             return Ok(());
         }
 
-        self.run_continuation().await.map_err(|error| AgentContinueError {
-            code: AgentContinueErrorCode::Busy,
-            message: error.to_string(),
-        })
+        self.run_continuation()
+            .await
+            .map_err(|error| AgentContinueError {
+                code: AgentContinueErrorCode::Busy,
+                message: error.to_string(),
+            })
     }
 }
 
@@ -655,7 +786,8 @@ impl Agent {
             PromptInput::Messages(messages) => messages,
             PromptInput::Message(message) => vec![*message],
             PromptInput::Text { input, images } => {
-                let mut content: Vec<ImageOrTextContent> = vec![ImageOrTextContent::Text(TextContent::new(input))];
+                let mut content: Vec<ImageOrTextContent> =
+                    vec![ImageOrTextContent::Text(TextContent::new(input))];
                 // `content.push(...images)`
                 content.extend(images.into_iter().map(ImageOrTextContent::Image));
                 vec![AgentMessage::from(UserMessage {
@@ -683,10 +815,16 @@ impl Agent {
             idle: Arc::new(tokio::sync::Notify::new()),
             settled: Arc::new(AtomicBool::new(false)),
         });
-        *self.active_run.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(run.clone());
+        *self
+            .active_run
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(run.clone());
 
         {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.is_streaming = true;
             state.streaming_message = None;
             state.error_message = None;
@@ -707,7 +845,10 @@ impl Agent {
     /// `handleRunFailure(error, aborted)`.
     async fn handle_run_failure(self: &Arc<Self>, error: anyhow::Error, aborted: bool) {
         let model = {
-            let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.model.clone()
         };
         let error_message = error.to_string();
@@ -722,15 +863,20 @@ impl Agent {
             diagnostics: if aborted {
                 None
             } else {
-                Some(vec![pi_ai::utils::diagnostics::create_assistant_message_diagnostic(
-                    "agent_lifecycle_failure",
-                    &pi_ai::utils::diagnostics::ThrownValue::Text(&error_message),
-                    Some({
-                        let mut details = serde_json::Map::new();
-                        details.insert("source".to_string(), Value::String("run_with_lifecycle".to_string()));
-                        details
-                    }),
-                )])
+                Some(vec![
+                    pi_ai::utils::diagnostics::create_assistant_message_diagnostic(
+                        "agent_lifecycle_failure",
+                        &pi_ai::utils::diagnostics::ThrownValue::Text(&error_message),
+                        Some({
+                            let mut details = serde_json::Map::new();
+                            details.insert(
+                                "source".to_string(),
+                                Value::String("run_with_lifecycle".to_string()),
+                            );
+                            details
+                        }),
+                    ),
+                ])
             },
             usage: Usage::zero(),
             stop_reason: if aborted {
@@ -744,7 +890,10 @@ impl Agent {
         });
 
         {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.error_message = Some(error_message);
         }
         // `await this.processEvents(...).catch(() => undefined)` - `process_events` is
@@ -766,7 +915,10 @@ impl Agent {
     /// `finishRun()`.
     fn finish_run(&self) {
         {
-            let mut state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut state = self
+                .state
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             state.is_streaming = false;
             state.streaming_message = None;
             state.pending_tool_calls = BTreeSet::new();
@@ -813,7 +965,9 @@ impl Agent {
             }
             AgentEvent::TurnEnd { message, .. } => {
                 let error_message = match message {
-                    AgentMessage::Message(Message::Assistant(assistant)) => assistant.error_message.clone(),
+                    AgentMessage::Message(Message::Assistant(assistant)) => {
+                        assistant.error_message.clone()
+                    }
                     _ => None,
                 };
                 if let Some(error_message) = error_message {
@@ -914,7 +1068,10 @@ impl Agent {
 
     /// `createContextSnapshot()`.
     fn create_context_snapshot(&self) -> AgentContext {
-        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         AgentContext {
             system_prompt: state.system_prompt.clone(),
             messages: state.messages.clone(),
@@ -925,7 +1082,10 @@ impl Agent {
     /// `createLoopConfig(options)`.
     fn create_loop_config(&self, options: Option<bool>) -> AgentLoopConfig {
         let skip_initial_steering_poll = Arc::new(AtomicBool::new(options.unwrap_or(false)));
-        let state = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let state = self
+            .state
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let service_tier = state.service_tier.clone();
         let model = state.model.clone();
         let thinking_level = state.thinking_level;
@@ -1007,12 +1167,12 @@ impl Agent {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             // `async (context) => this.shouldStopAfterTurn?.(context) ?? false`
-            config.should_stop_after_turn = Some(Arc::new(move |context: ShouldStopAfterTurnContext| {
-                match hook.as_ref() {
+            config.should_stop_after_turn = Some(Arc::new(
+                move |context: ShouldStopAfterTurnContext| match hook.as_ref() {
                     Some(hook) => hook(context),
                     None => Box::pin(async { false }),
-                }
-            }));
+                },
+            ));
         }
         {
             let hook = self
@@ -1020,20 +1180,36 @@ impl Agent {
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
-            config.should_stop_before_turn =
-                Some(Arc::new(move || hook.as_ref().map(|hook| hook()).unwrap_or(false)));
+            config.should_stop_before_turn = Some(Arc::new(move || {
+                hook.as_ref().map(|hook| hook()).unwrap_or(false)
+            }));
         }
         {
             // `getSystemPrompt: () => this._state.systemPrompt` - the loop already
             // falls back to `context.systemPrompt`, which is the state snapshot, so
             // the hook is only installed when the state carries one.
-            let state_system_prompt = self
-                .state
+            // ROOT-CONTRACT v7/v9 request-local derivation: resolve the state's
+            // system prompt LIVE at every provider request (including inner
+            // tool/continuation turns), so a host that refreshes
+            // `state.system_prompt` after an assessment (e.g. a skill hint
+            // store) is consumed by the NEXT request, while the canonical
+            // base content itself is owned by the host session.
+            let state = self.state.clone();
+            config.get_system_prompt = Some(Arc::new(move || {
+                state
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .system_prompt
+                    .clone()
+            }));
+        }
+        {
+            let hook = self
+                .before_request
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
-                .system_prompt
                 .clone();
-            config.get_system_prompt = Some(Arc::new(move || state_system_prompt.clone()));
+            config.before_request = hook;
         }
         {
             let steering_queue = self.steering_queue.clone();
@@ -1071,7 +1247,8 @@ impl Agent {
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .clone();
             config.get_continuation_messages = Some(Arc::new(
-                move |context: GetContinuationMessagesContext, signal: Option<CancellationToken>| {
+                move |context: GetContinuationMessagesContext,
+                      signal: Option<CancellationToken>| {
                     match hook.as_ref() {
                         Some(hook) => hook(context, signal),
                         None => Box::pin(async { Vec::new() }),
@@ -1105,10 +1282,15 @@ pub mod idle_wait_probe {
 
     /// Arm the probe. The next `wait_for_idle` call that observes `settled == false`
     /// signals `reached` and then blocks until `resume` has a permit.
-    pub fn arm() -> (std::sync::Arc<tokio::sync::Semaphore>, std::sync::Arc<tokio::sync::Semaphore>) {
+    pub fn arm() -> (
+        std::sync::Arc<tokio::sync::Semaphore>,
+        std::sync::Arc<tokio::sync::Semaphore>,
+    ) {
         let reached = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
         let resume = std::sync::Arc::new(tokio::sync::Semaphore::new(0));
-        *slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Probe {
+        *slot()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = Some(Probe {
             reached: reached.clone(),
             resume: resume.clone(),
         });
@@ -1117,7 +1299,9 @@ pub mod idle_wait_probe {
 
     pub(super) fn after_settled_check() {
         let probe = {
-            let mut slot = slot().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+            let mut slot = slot()
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
             slot.take()
         };
         if let Some(probe) = probe {
@@ -1138,7 +1322,8 @@ pub mod idle_wait_probe {
 mod rlm_t10_tests {
     use super::*;
     use pi_ai::providers::faux::{
-        faux_assistant_message, register_faux_provider, FauxAssistantMessageOptions, FauxResponseStep,
+        faux_assistant_message, register_faux_provider, FauxAssistantMessageOptions,
+        FauxResponseStep,
     };
     use std::time::Duration;
     use tokio::sync::Semaphore;
@@ -1311,7 +1496,10 @@ mod tests {
         assert_eq!(agent.steering_mode(), QueueMode::OneAtATime);
         assert_eq!(agent.follow_up_mode(), QueueMode::OneAtATime);
         assert_eq!(*agent.transport.lock().unwrap(), "auto");
-        assert_eq!(*agent.tool_execution.lock().unwrap(), ToolExecutionMode::Parallel);
+        assert_eq!(
+            *agent.tool_execution.lock().unwrap(),
+            ToolExecutionMode::Parallel
+        );
     }
 
     #[test]
@@ -1325,7 +1513,9 @@ mod tests {
             parameters: json!({}),
             label: "Bash".to_string(),
             prepare_arguments: None,
-            execute: Arc::new(|_, _, _, _| Box::pin(async { Ok(AgentToolResult::new(Vec::new(), json!({}))) })),
+            execute: Arc::new(|_, _, _, _| {
+                Box::pin(async { Ok(AgentToolResult::new(Vec::new(), json!({}))) })
+            }),
             execution_mode: None,
         });
         state.tools = Some(tools);
@@ -1333,14 +1523,21 @@ mod tests {
         let first = agent.state().tools.clone().unwrap();
         let mut second = first.clone();
         second.push(first[0].clone());
-        assert_eq!(agent.state().tools.as_ref().unwrap().len(), 1, "the stored array is copied");
+        assert_eq!(
+            agent.state().tools.as_ref().unwrap().len(),
+            1,
+            "the stored array is copied"
+        );
     }
 
     #[test]
     fn pending_message_queue_drains_by_mode() {
         let mut queue = PendingMessageQueue::new(QueueMode::All);
         queue.enqueue_one(AgentMessage::from(assistant("a")));
-        queue.enqueue(vec![AgentMessage::from(assistant("b")), AgentMessage::from(assistant("c"))]);
+        queue.enqueue(vec![
+            AgentMessage::from(assistant("b")),
+            AgentMessage::from(assistant("c")),
+        ]);
         assert!(queue.has_items());
         assert_eq!(queue.drain().len(), 3);
         assert!(!queue.has_items());
@@ -1486,7 +1683,10 @@ mod tests {
 
         agent.update_state(|state| state.messages.push(AgentMessage::from(assistant("a"))));
         let error = runtime.block_on(agent.continue_()).unwrap_err();
-        assert_eq!(error.message, "Cannot continue from message role: assistant");
+        assert_eq!(
+            error.message,
+            "Cannot continue from message role: assistant"
+        );
     }
 
     async fn assert_async_stop_hook(first_stop: Option<bool>) {
@@ -1574,19 +1774,27 @@ mod tests {
         let run = tokio::spawn({
             let agent = agent.clone();
             async move {
-                agent.prompt(PromptInput::Text {
-                    input: "echo something".to_string(),
-                    images: Vec::new(),
-                }).await
+                agent
+                    .prompt(PromptInput::Text {
+                        input: "echo something".to_string(),
+                        images: Vec::new(),
+                    })
+                    .await
             }
         });
         timeout(Duration::from_secs(5), started.acquire())
-            .await.expect("async stop hook did not start").unwrap().forget();
+            .await
+            .expect("async stop hook did not start")
+            .unwrap()
+            .forget();
 
         assert!(!run.is_finished(), "the run must await the pending hook");
         assert!(agent.state().is_streaming);
         assert_eq!(provider.call_count(), 1);
-        assert!(matches!(events.lock().unwrap().last(), Some(AgentEvent::TurnEnd { .. })));
+        assert!(matches!(
+            events.lock().unwrap().last(),
+            Some(AgentEvent::TurnEnd { .. })
+        ));
         {
             let contexts = contexts.lock().unwrap();
             let context = &contexts[0];
@@ -1595,7 +1803,12 @@ mod tests {
             assert_eq!(context.tool_results[0].tool_call_id, "echo-1");
             assert!(!context.tool_results[0].is_error);
             assert_eq!(
-                context.context.messages.iter().map(AgentMessage::role).collect::<Vec<_>>(),
+                context
+                    .context
+                    .messages
+                    .iter()
+                    .map(AgentMessage::role)
+                    .collect::<Vec<_>>(),
                 ["user", "assistant", "toolResult"],
             );
             assert_eq!(context.new_messages, context.context.messages);
@@ -1608,7 +1821,10 @@ mod tests {
             release.add_permits(1);
         }
         timeout(Duration::from_secs(5), run)
-            .await.expect("pending hook blocked run settlement").unwrap().unwrap();
+            .await
+            .expect("pending hook blocked run settlement")
+            .unwrap()
+            .unwrap();
         let expected_turns = if first_stop == Some(false) { 2 } else { 1 };
         assert_eq!(provider.call_count(), expected_turns);
         assert_eq!(contexts.lock().unwrap().len(), expected_turns as usize);
@@ -1617,19 +1833,37 @@ mod tests {
         assert!(state.error_message.is_none());
         assert!(state.pending_tool_calls.is_empty());
         assert_eq!(state.messages.len(), expected_turns as usize + 2);
-        assert!(agent.has_queued_messages(), "stopping must retain queued follow-ups");
+        assert!(
+            agent.has_queued_messages(),
+            "stopping must retain queued follow-ups"
+        );
         let events = events.lock().unwrap();
-        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::TurnEnd { .. })).count(), expected_turns as usize);
-        assert_eq!(events.iter().filter(|event| matches!(event, AgentEvent::AgentEnd { .. })).count(), 1);
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::TurnEnd { .. }))
+                .count(),
+            expected_turns as usize
+        );
+        assert_eq!(
+            events
+                .iter()
+                .filter(|event| matches!(event, AgentEvent::AgentEnd { .. }))
+                .count(),
+            1
+        );
         match events.last().unwrap() {
             AgentEvent::AgentEnd { messages } => assert_eq!(messages, &state.messages),
             event => panic!("expected agent_end, got {event:?}"),
         }
-        assert!(!state.messages.iter().any(|message| matches!(
-            message,
-            AgentMessage::Message(Message::Assistant(message))
-                if message.stop_reason == "aborted" || message.stop_reason == "error"
-        )), "post-turn cancellation must not append an aborted assistant");
+        assert!(
+            !state.messages.iter().any(|message| matches!(
+                message,
+                AgentMessage::Message(Message::Assistant(message))
+                    if message.stop_reason == "aborted" || message.stop_reason == "error"
+            )),
+            "post-turn cancellation must not append an aborted assistant"
+        );
         provider.unregister();
     }
 
@@ -1654,8 +1888,11 @@ mod tests {
         provider.set_responses(vec![
             FauxResponseStep::Message(faux_assistant_message(
                 pi_ai::types::ContentBlock::ToolCall(pi_ai::types::ToolCall::new(
-                    "echo-1", "echo", serde_json::Map::new(),
-                )).into(),
+                    "echo-1",
+                    "echo",
+                    serde_json::Map::new(),
+                ))
+                .into(),
                 Some(FauxAssistantMessageOptions {
                     stop_reason: Some("toolUse".to_string()),
                     ..Default::default()
@@ -1673,13 +1910,34 @@ mod tests {
                     label: "Echo".to_string(),
                     parameters: json!({"type": "object", "properties": {}}),
                     prepare_arguments: None,
-                    execute: Arc::new(|_, _, _, _| Box::pin(async {
-                        Ok(AgentToolResult::new(vec![crate::types::ContentBlock::text("original")], json!({})))
-                    })),
+                    execute: Arc::new(|_, _, _, _| {
+                        Box::pin(async {
+                            Ok(AgentToolResult::new(
+                                vec![crate::types::ContentBlock::text("original")],
+                                json!({}),
+                            ))
+                        })
+                    }),
                     execution_mode: None,
                 }]),
                 ..Default::default()
             }),
+            before_request: Some(Arc::new({
+                let trace = trace.clone();
+                move |request_index, signal| {
+                    let trace = trace.clone();
+                    Box::pin(async move {
+                        tokio::task::yield_now().await;
+                        assert!(signal.is_some());
+                        trace.lock().unwrap().push(if request_index == 0 {
+                            "request-0"
+                        } else {
+                            "request-1"
+                        });
+                        Ok(())
+                    })
+                }
+            })),
             transform_context: Some(Arc::new({
                 let trace = trace.clone();
                 move |messages, signal| {
@@ -1760,8 +2018,13 @@ mod tests {
                         }
                         assert_eq!(context.new_messages.len(), 3);
                         assert!(context.tool_results[0].is_error);
-                        assert_eq!(context.tool_results[0].details, Some(json!({"changed": true})));
-                        assert!(matches!(&context.tool_results[0].content[0], ImageOrTextContent::Text(text) if text.text == "overridden"));
+                        assert_eq!(
+                            context.tool_results[0].details,
+                            Some(json!({"changed": true}))
+                        );
+                        assert!(
+                            matches!(&context.tool_results[0].content[0], ImageOrTextContent::Text(text) if text.text == "overridden")
+                        );
                         vec![AgentMessage::from(UserMessage {
                             role: "user".to_string(),
                             content: UserContent::Text("continue".to_string()),
@@ -1773,18 +2036,44 @@ mod tests {
             })),
             ..Default::default()
         });
-        timeout(Duration::from_secs(5), agent.prompt(PromptInput::Text {
-            input: "start".to_string(), images: Vec::new(),
-        })).await.expect("async hook pipeline did not settle").unwrap();
+        timeout(
+            Duration::from_secs(5),
+            agent.prompt(PromptInput::Text {
+                input: "start".to_string(),
+                images: Vec::new(),
+            }),
+        )
+        .await
+        .expect("async hook pipeline did not settle")
+        .unwrap();
         assert_eq!(provider.call_count(), 2);
         assert!(agent.state().error_message.is_none());
-        assert_eq!(*trace.lock().unwrap(), [
-            "transform", "convert", "auth", "before", "after", "continuation",
-            "transform", "convert", "auth", "continuation",
-        ]);
-        assert_eq!(agent.state().messages.iter().map(AgentMessage::role).collect::<Vec<_>>(), [
-            "user", "assistant", "toolResult", "user", "assistant",
-        ]);
+        assert_eq!(
+            *trace.lock().unwrap(),
+            [
+                "request-0",
+                "transform",
+                "convert",
+                "auth",
+                "before",
+                "after",
+                "continuation",
+                "request-1",
+                "transform",
+                "convert",
+                "auth",
+                "continuation",
+            ]
+        );
+        assert_eq!(
+            agent
+                .state()
+                .messages
+                .iter()
+                .map(AgentMessage::role)
+                .collect::<Vec<_>>(),
+            ["user", "assistant", "toolResult", "user", "assistant",]
+        );
         provider.unregister();
     }
 

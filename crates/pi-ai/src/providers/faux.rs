@@ -764,6 +764,16 @@ pub fn register_faux_provider(options: Option<RegisterFauxProviderOptions>) -> F
 			// unexpected failure is a panic inside the task, and an uncaught panic would kill
 			// the task without ending the stream.
 			let body = async {
+				// TS parity: the request payload edge must be observable even for the
+				// scripted provider, so extension handlers (e.g. pi-jev
+				// `before_provider_request`) see the boundary. The faux provider has no
+				// wire request to replace: the returned payload is discarded and the
+				// scripted responses are used as-is.
+				if let Some(on_payload) = stream_options.as_ref().and_then(|o| o.on_payload.clone()) {
+					let payload = serde_json::to_value(&context).unwrap_or_else(|_| serde_json::json!({}));
+					let _ = on_payload(payload, &request_model).await;
+				}
+
 				if let Some(on_response) = stream_options.as_ref().and_then(|o| o.on_response.clone()) {
 					on_response(
 						crate::types::ProviderResponse {

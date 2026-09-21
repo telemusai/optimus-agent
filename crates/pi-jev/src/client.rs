@@ -21,11 +21,12 @@ use parking_lot::Mutex;
 use serde_json::Value;
 
 use crate::credential::SecretString;
-use crate::error::{sanitize_detail, sanitize_url, JevError};
+use crate::error::{sanitize_detail, sanitize_opaque_header_value, sanitize_url, JevError};
 use crate::types::{
-    validate_request_shape, validate_response, Answer, BoxFuture, DecisionBundle, DecisionCategory,
-    DecisionOutcome, DecisionRecord, JevMode, SystemOne, SystemOneRequest, SystemOneResponse, Transport,
-    DEFAULT_MODEL, MAX_QUESTIONS_PER_REQUEST, SYSTEMONE_PATH,
+    estimate_request_tokens, state_shape_is_valid, validate_request_shape, validate_response,
+    Answer, AnswerIssue, BoxFuture, DecisionBundle, DecisionCategory, DecisionOutcome,
+    DecisionRecord, JevMode, SystemOne, SystemOneRequest, SystemOneResponse, Transport, Usage,
+    DEFAULT_MODEL, MAX_QUESTIONS_PER_REQUEST, REQUEST_TOKEN_CEILING, SYSTEMONE_PATH,
 };
 
 /// Production base URL.
@@ -56,8 +57,12 @@ pub const RETRYABLE_STATUSES: [u16; 6] = [408, 425, 429, 500, 502, 503];
 pub const STATUS_OVERLOADED: u16 = 529;
 
 /// Documented backoff policy, quoted in status output and in the lane report.
+///
+/// The disclosed jitter is the v5 fallback-branch jitter (see `jittered_backoff`): 25%
+/// subtractive, applied ONLY to computed fallback delays. Server retry-after hints are
+/// used as given and are never jittered or shortened.
 pub fn backoff_policy_line() -> &'static str {
-    "exponential backoff from 500ms doubling to an 8s ceiling, finite retries, honoring Retry-After on 429/529"
+    "exponential backoff from 500ms doubling to an 8s ceiling, finite retries, honoring Retry-After on 429/529; fallback delays carry 25% subtractive jitter (server retry-after hints are used as given, never jittered)"
 }
 
 /// Opaque local request id. Used for correlation records; carries no user content.
@@ -101,6 +106,10 @@ pub struct JevLimits {
     pub max_response_bytes: usize,
     /// Max questions per request.
     pub max_questions: usize,
+    /// HOST POLICY cap on the ESTIMATED request token size. `None` uses the default
+    /// ceiling; a configured value is honored only DOWNWARD (larger values are refused
+    /// by `validate`). The estimate is heuristic and never an exact count.
+    pub max_request_tokens: Option<usize>,
 }
 
 impl Default for JevLimits {
@@ -114,6 +123,7 @@ impl Default for JevLimits {
             max_payload_bytes: DEFAULT_MAX_PAYLOAD_BYTES,
             max_response_bytes: DEFAULT_MAX_RESPONSE_BYTES,
             max_questions: MAX_QUESTIONS_PER_REQUEST,
+            max_request_tokens: None,
         }
     }
 }
@@ -122,6 +132,18 @@ impl JevLimits {
     /// Endpoint URL. The credential never appears here.
     pub fn endpoint(&self) -> String {
         format!("{}{}", self.base_url.trim_end_matches('/'), SYSTEMONE_PATH)
+    }
+
+    /// Model-catalog endpoint (`GET /v1/models`). The credential never appears here.
+    ///
+    /// Used ONLY by the explicit `crate::models::fetch_model_catalog` path (ROOT-CONTRACT
+    /// v9): no startup, status, turn, or background call ever touches this URL.
+    pub fn models_endpoint(&self) -> String {
+        format!(
+            "{}{}",
+            self.base_url.trim_end_matches('/'),
+            crate::models::MODEL_CATALOG_PATH
+        )
     }
 
     /// Rejects limits that would make the client unbounded.
@@ -144,6 +166,16 @@ impl JevLimits {
             return Err(JevError::config(format!(
                 "max questions must be between 1 and {MAX_QUESTIONS_PER_REQUEST}"
             )));
+        }
+        if let Some(max_request_tokens) = self.max_request_tokens {
+            if max_request_tokens == 0 {
+                return Err(JevError::config("max request tokens must be greater than zero"));
+            }
+            if max_request_tokens > REQUEST_TOKEN_CEILING {
+                return Err(JevError::config(format!(
+                    "max request tokens must not exceed the host-policy ceiling {REQUEST_TOKEN_CEILING}"
+                )));
+            }
         }
         Ok(())
     }
@@ -247,7 +279,10 @@ pub fn retry_decision(
         Some(hint) => hint,
         None => {
             let factor = 1u32 << attempt.min(16);
-            limits.backoff_initial.saturating_mul(factor).min(limits.backoff_max)
+            let base = limits.backoff_initial.saturating_mul(factor).min(limits.backoff_max);
+            // HOST POLICY: subtractive jitter on the fallback branch only. A server hint
+            // takes the branch above and is honored verbatim (never jittered, never shortened).
+            jittered_backoff(base)
         }
     };
     RetryDecision::RetryAfter(delay)
@@ -278,6 +313,32 @@ pub fn parse_retry_after(value: &str) -> Option<Duration> {
     // `Duration::from_secs_f64` panics above its representable range, so clamp before converting.
     let bounded = seconds.min(MAX_RETRY_AFTER.as_secs_f64());
     Some(Duration::from_secs_f64(bounded))
+}
+
+/// Reads a `retry-after-ms` header (milliseconds). Invalid values are ignored; very large
+/// delays are clamped to `MAX_RETRY_AFTER` (which makes the retry policy stop).
+pub fn parse_retry_after_ms(value: &str) -> Option<Duration> {
+    let millis = value.trim().parse::<u64>().ok()?;
+    let clamped = millis.min(MAX_RETRY_AFTER.as_millis() as u64);
+    Some(Duration::from_millis(clamped))
+}
+
+/// HOST POLICY: subtractive jitter for the FALLBACK exponential branch ONLY.
+///
+/// The effective delay is `base * (1 - U * 0.25)` for a uniform `U` in `[0, 1)`: every
+/// jittered delay lies in `[0.75 x base, base]`, so the documented backoff is never
+/// exceeded and never shortened below three quarters. This is intentionally NOT zero-mean
+/// around `base` and is NEVER applied to a server-provided retry-after hint. Entropy comes
+/// from a v4 UUID (`uuid` is already a dependency); no RNG dependency is added.
+pub fn jittered_backoff(base: Duration) -> Duration {
+    if base.is_zero() {
+        return base;
+    }
+    let bytes = uuid::Uuid::new_v4().into_bytes();
+    let sample = u64::from_be_bytes(bytes[0..8].try_into().unwrap_or([0; 8]));
+    let unit = (sample % 10_000) as f64 / 10_000.0;
+    let scaled = (base.as_secs_f64() * (1.0 - 0.25 * unit)).max(0.0);
+    Duration::try_from_secs_f64(scaled).unwrap_or(base)
 }
 
 /// Production HTTP transport. Only this type touches the network.
@@ -398,56 +459,144 @@ impl Transport for JevHttpTransport {
                 })?;
 
             let status = response.status();
+            // The server controls this header: bound, strip control characters and refuse
+            // credential-echo shapes before it is stored anywhere (never logged, never in Display).
+            let server_request_id = response
+                .headers()
+                .get("x-typesafe-request-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(sanitize_opaque_header_value);
             if !status.is_success() {
+                // `retry-after-ms` (milliseconds) is preferred over the seconds form when
+                // both are present; both are clamped to MAX_RETRY_AFTER.
                 let retry_after = response
                     .headers()
-                    .get(reqwest::header::RETRY_AFTER)
+                    .get("retry-after-ms")
                     .and_then(|value| value.to_str().ok())
-                    .and_then(parse_retry_after);
+                    .and_then(parse_retry_after_ms)
+                    .or_else(|| {
+                        response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(parse_retry_after)
+                    });
                 // The error body may echo the key; never include it. Status code is enough.
                 return Err(JevError::HttpStatus {
                     status: status.as_u16(),
                     detail: sanitize_detail(&format!("systemone returned http {}", status.as_u16())),
                     retry_after,
+                    server_request_id,
                 });
             }
 
-            let mut response = response;
-            let mut buffer: Vec<u8> = Vec::new();
-            loop {
-                let chunk = response.chunk().await.map_err(|error| {
-                    let kind = error_kind(&error);
-                    if kind == "timeout" {
-                        JevError::Timeout {
-                            detail: sanitize_detail("response body exceeded its timeout"),
-                        }
-                    } else {
-                        JevError::Connection {
-                            detail: sanitize_detail(&format!("response body read failed: {kind}")),
-                        }
-                    }
-                })?;
-                let Some(chunk) = chunk else {
-                    break;
-                };
-                if buffer.len() + chunk.len() > limits.max_response_bytes {
-                    return Err(JevError::MalformedResponse {
-                        detail: format!(
-                            "response body exceeds {} bytes",
-                            limits.max_response_bytes
-                        ),
-                    });
-                }
-                buffer.extend_from_slice(&chunk);
-            }
+            let buffer = read_bounded_body(response, limits.max_response_bytes).await?;
 
-            let parsed = parse_systemone_body(&buffer)?;
+            let mut parsed = parse_systemone_body(&buffer)?;
+            parsed.server_request_id = server_request_id;
             Ok(parsed)
+        })
+    }
+
+    /// Explicit read-only model-catalog fetch (`GET {base}/v1/models`).
+    ///
+    /// Single bounded attempt: no retries, no backoff, no status widening (ROOT-CONTRACT
+    /// v9). The credential goes into the `Authorization` header only; the URL stays
+    /// unparameterized. The body is read under the same per-attempt timeout and the same
+    /// hard byte cap as `post`. Parsing/validation is the caller's job
+    /// (`crate::models::parse_model_catalog`).
+    fn get_models(&self, timeout: Duration) -> BoxFuture<Result<Vec<u8>, JevError>> {
+        let client = self.client.clone();
+        let credential = self.credential.clone();
+        let limits = self.limits.clone();
+        Box::pin(async move {
+            let url = limits.models_endpoint();
+            let response = client
+                .get(&url)
+                .header(reqwest::header::ACCEPT, "application/json")
+                .bearer_auth(credential.expose())
+                .timeout(timeout)
+                .send()
+                .await
+                .map_err(|error| match error_kind(&error) {
+                    "timeout" => JevError::Timeout {
+                        detail: sanitize_detail("request exceeded its timeout"),
+                    },
+                    kind => JevError::Connection {
+                        // The raw reqwest error can carry a URL with a query string; never store it.
+                        detail: sanitize_detail(&format!("transport failure: {kind}")),
+                    },
+                })?;
+            let status = response.status();
+            // Same untrusted-header handling as `post`: bound, strip control characters,
+            // refuse credential-echo shapes, never logged, never in Display.
+            let server_request_id = response
+                .headers()
+                .get("x-typesafe-request-id")
+                .and_then(|value| value.to_str().ok())
+                .and_then(sanitize_opaque_header_value);
+            if !status.is_success() {
+                let retry_after = response
+                    .headers()
+                    .get("retry-after-ms")
+                    .and_then(|value| value.to_str().ok())
+                    .and_then(parse_retry_after_ms)
+                    .or_else(|| {
+                        response
+                            .headers()
+                            .get(reqwest::header::RETRY_AFTER)
+                            .and_then(|value| value.to_str().ok())
+                            .and_then(parse_retry_after)
+                    });
+                return Err(JevError::HttpStatus {
+                    status: status.as_u16(),
+                    detail: sanitize_detail(&format!(
+                        "model catalog returned http {}",
+                        status.as_u16()
+                    )),
+                    retry_after,
+                    server_request_id,
+                });
+            }
+            read_bounded_body(response, limits.max_response_bytes).await
         })
     }
 }
 
-fn classify_kind(error: &serde_json::Error) -> &'static str {
+/// Reads a response body to the hard cap. Shared by the SystemOne POST and the explicit
+/// model-catalog GET so both paths enforce the same socket-read bound and timeout mapping.
+async fn read_bounded_body(
+    mut response: reqwest::Response,
+    max_response_bytes: usize,
+) -> Result<Vec<u8>, JevError> {
+    let mut buffer: Vec<u8> = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            let kind = error_kind(&error);
+            if kind == "timeout" {
+                JevError::Timeout {
+                    detail: sanitize_detail("response body exceeded its timeout"),
+                }
+            } else {
+                JevError::Connection {
+                    detail: sanitize_detail(&format!("response body read failed: {kind}")),
+                }
+            }
+        })?;
+        let Some(chunk) = chunk else {
+            break;
+        };
+        if buffer.len() + chunk.len() > max_response_bytes {
+            return Err(JevError::MalformedResponse {
+                detail: format!("response body exceeds {max_response_bytes} bytes"),
+            });
+        }
+        buffer.extend_from_slice(&chunk);
+    }
+    Ok(buffer)
+}
+
+pub(crate) fn classify_kind(error: &serde_json::Error) -> &'static str {
     use serde_json::error::Category;
     match error.classify() {
         Category::Io => "io",
@@ -461,14 +610,82 @@ fn classify_kind(error: &serde_json::Error) -> &'static str {
 ///
 /// Used by the HTTP transport and by `MockJevTransport`, so a mock scripted with a raw body
 /// exercises the same parsing path a real response would.
+///
+/// Parsing is LENIENT PER ANSWER: structural failures (not JSON, not an object, no answers
+/// map, non-object usage) fail the whole body as `MalformedResponse`, but ONE answer with a
+/// broken payload or an unknown `type` tag is recorded as a per-answer skip in
+/// `SystemOneResponse::answer_parse_skips` (fail-open within the skip-not-fail rule) while
+/// every other answer still parses. `validate_response` merges those skips into its result.
 pub fn parse_systemone_body(bytes: &[u8]) -> Result<SystemOneResponse, JevError> {
-    serde_json::from_slice::<SystemOneResponse>(bytes).map_err(|error| {
+    let value: serde_json::Value = serde_json::from_slice(bytes).map_err(|error| {
         JevError::MalformedResponse {
             detail: sanitize_detail(&format!(
                 "response is not a valid systemone payload: {}",
                 classify_kind(&error)
             )),
         }
+    })?;
+    let Some(object) = value.as_object() else {
+        return Err(JevError::malformed(
+            "response is not a valid systemone payload: not an object",
+        ));
+    };
+    let model = object
+        .get("model")
+        .and_then(serde_json::Value::as_str)
+        .unwrap_or_default()
+        .to_string();
+    let Some(answers) = object.get("answers").and_then(serde_json::Value::as_object) else {
+        return Err(JevError::malformed(
+            "response is not a valid systemone payload: answers missing or not an object",
+        ));
+    };
+    // Absent or null usage is UNKNOWN (Usage::default()), never fabricated zero.
+    // A non-object usage is a structural failure of the documented response shape.
+    let usage = match object.get("usage") {
+        Some(usage) if !usage.is_null() => {
+            serde_json::from_value::<Usage>(usage.clone()).map_err(|error| {
+                JevError::MalformedResponse {
+                    detail: sanitize_detail(&format!(
+                        "response usage is not a valid systemone payload: {}",
+                        classify_kind(&error)
+                    )),
+                }
+            })?
+        }
+        _ => Usage::default(),
+    };
+    let mut parsed = BTreeMap::new();
+    let mut answer_parse_skips: Vec<(String, AnswerIssue)> = Vec::new();
+    for (question_id, raw) in answers {
+        match serde_json::from_value::<Answer>(raw.clone()) {
+            Ok(answer) => {
+                parsed.insert(question_id.clone(), answer);
+            }
+            Err(error) => {
+                // A documented tag with a broken payload is a malformed answer; anything
+                // else (missing or unknown tag) is an unknown answer type.
+                let tag = raw.get("type").and_then(serde_json::Value::as_str).unwrap_or("");
+                let issue = if matches!(tag, "noul" | "choice" | "score") {
+                    AnswerIssue::MalformedAnswer {
+                        question_id: question_id.clone(),
+                        detail: classify_kind(&error),
+                    }
+                } else {
+                    AnswerIssue::UnknownAnswerType {
+                        question_id: question_id.clone(),
+                    }
+                };
+                answer_parse_skips.push((question_id.clone(), issue));
+            }
+        }
+    }
+    Ok(SystemOneResponse {
+        model,
+        answers: parsed,
+        usage,
+        answer_parse_skips,
+        server_request_id: None,
     })
 }
 
@@ -614,6 +831,23 @@ pub async fn decide_with(
 
     // One conversion site, shared with lane B's `DecisionBundle::to_request`.
     let request = bundle.to_request();
+
+    // Host-policy state-shape gate FIRST, so an undocumented state shape reports its
+    // precise reason ("invalid_state_shape") instead of the generic validation kind.
+    // validate_request_shape re-checks the state for every other caller.
+    if !state_shape_is_valid(&request.state) {
+        stats.validation_skips.fetch_add(1, Ordering::Relaxed);
+        return DecisionOutcome {
+            records: Vec::new(),
+            skips: vec![(String::new(), "invalid_state_shape")],
+            response_model: None,
+            usage: Default::default(),
+            applied: false,
+            attempts: 0,
+            server_request_id: None,
+        };
+    }
+
     if let Err(error) = validate_request_shape(&request) {
         stats.validation_skips.fetch_add(1, Ordering::Relaxed);
         return DecisionOutcome {
@@ -624,6 +858,7 @@ pub async fn decide_with(
             usage: Default::default(),
             applied: false,
             attempts: 0,
+            server_request_id: None,
         };
     }
 
@@ -638,6 +873,7 @@ pub async fn decide_with(
                 usage: Default::default(),
                 applied: false,
                 attempts: 0,
+                server_request_id: None,
             };
         }
         Ok(_) => {}
@@ -650,8 +886,30 @@ pub async fn decide_with(
                 usage: Default::default(),
                 applied: false,
                 attempts: 0,
+                server_request_id: None,
             };
         }
+    }
+
+    // HOST POLICY (not an API guarantee): the ESTIMATED prompt-token size of the request
+    // must fit under the ceiling. The estimate is heuristic (`estimate_request_tokens`);
+    // the request is skipped before transport when it exceeds the limit. Configurable only
+    // downward via `JevLimits::max_request_tokens` (validated in `JevLimits::validate`).
+    let ceiling = limits
+        .max_request_tokens
+        .unwrap_or(REQUEST_TOKEN_CEILING)
+        .min(REQUEST_TOKEN_CEILING);
+    if estimate_request_tokens(&request) > ceiling {
+        stats.validation_skips.fetch_add(1, Ordering::Relaxed);
+        return DecisionOutcome {
+            records: Vec::new(),
+            skips: vec![(String::new(), "request_token_limit")],
+            response_model: None,
+            usage: Default::default(),
+            applied: false,
+            attempts: 0,
+            server_request_id: None,
+        };
     }
 
     let outcome = send_with_retries(transport, limits, stats, &request).await;
@@ -688,6 +946,7 @@ pub async fn decide_with(
                 usage: response.usage,
                 applied: false,
                 attempts: client_attempts,
+                server_request_id: response.server_request_id.clone(),
             }
         }
         Err(attempted) => {
@@ -698,6 +957,11 @@ pub async fn decide_with(
                 usage: Default::default(),
                 applied: false,
                 attempts: attempted.attempts,
+                // Captured from the failing response's header, sanitized and bounded.
+                server_request_id: attempted
+                    .error
+                    .server_request_id()
+                    .map(str::to_string),
             }
         }
     }

@@ -1,0 +1,1 @@
+- Changed the terminal and tab title to Optimus - Agent in agents view, startup, and chat, with an optional PRIME_AGENT_APP_TITLE override for Optimus - Assistant.

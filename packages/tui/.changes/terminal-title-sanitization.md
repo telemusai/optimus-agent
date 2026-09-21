@@ -1,0 +1,1 @@
+- Fixed terminal titles dropping escape and control sequences before writing the OSC 0 title sequence.

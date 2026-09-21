@@ -76,6 +76,20 @@ fn bound(value: String, max: usize) -> String {
     truncated
 }
 
+/// Categories accepted through the typed scored path (ROOT CONTRACT v1,
+/// Search): Noul probabilities, never Choice confidence. Kept OUT of
+/// OPTIONAL_APPLIABLE_CATEGORIES and DEFAULT_APPLIABLE_CATEGORIES so the
+/// legacy acceptance thresholds are never applied to them.
+pub const SCORED_SEARCH_CATEGORIES: [DecisionCategory; 3] = [
+    DecisionCategory::CodeSearchRerank,
+    DecisionCategory::CodeLineFind,
+    // ROOT-CONTRACT v6 (Evidence lane): the retrieval-safety battery is a
+    // Noul-only typed assessment over the same filter candidates; v2 sends it
+    // as its OWN typed request under the scheduler cap (never rides the
+    // filter request).
+    DecisionCategory::CodeRetrievalSafety,
+];
+
 /// Active-mode acceptance policy.
 #[derive(Debug, Clone, PartialEq)]
 pub struct ActivationPolicy {

@@ -30,11 +30,11 @@ impl super::CategoryEvaluator for RetryClassification {
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Choice {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "Classify the observed failure, not whether to execute a retry. Use unknown when metadata is insufficient. Transient does not mean replay is safe: interrupted or partial responses remain subject to host replay protection. Do not change backoff, retry limits, permissions or credentials. Observed metadata: {}",
                     observation.evidence_description(),
-                ),
-                criteria: RetryFailureKind::ALL.into_iter().map(|kind| (kind.as_str().to_string(), None)).collect(),
+                ))),
+                criteria: RetryFailureKind::ALL.into_iter().map(|kind| (kind.as_str().to_string(), crate::types::EntryValue::Null)).collect(),
             },
         }])
     }

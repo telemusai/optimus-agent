@@ -18,7 +18,7 @@ use std::sync::{Arc, Mutex};
 use pi_agent_core::types::{AgentMessage, ThinkingLevel};
 use pi_ai::types::{ImageContent, Model, ServiceTier};
 
-use crate::config::{APP_TITLE, VERSION};
+use crate::config::VERSION;
 use crate::utils::paths::get_cwd_relative_path;
 
 use super::agent_activity::format_token_count;
@@ -2258,11 +2258,11 @@ impl InteractiveMode {
     pub fn update_terminal_title(&mut self) {
         let cwd_basename = basename(&self.get_current_cwd());
         let session_name = self.get_current_session_name();
-        let title = match session_name {
-            Some(session_name) => format!("{APP_TITLE} - {session_name} - {cwd_basename}"),
-            None => format!("{APP_TITLE} - {cwd_basename}"),
-        };
-        self.ui.terminal.set_title(title);
+        self.ui.terminal.set_title(terminal_title_text(
+            crate::config::app_display_title(),
+            session_name.as_deref(),
+            &cwd_basename,
+        ));
     }
 
     /// Port of `formatGoalElapsed`.
@@ -2360,23 +2360,38 @@ impl InteractiveMode {
         ))
     }
 
-    /// Port of `getTrayContextLabel`.
+    /// Port of `getTrayContextLabel`, minus the usage counter.
+    ///
+    /// Goal and heartbeat labels keep their own line above the tray row; the
+    /// context usage counter moved onto the tray row itself, right-aligned
+    /// beside the model/effort label (`get_tray_context_usage_text`).
     pub fn get_tray_context_label(&self) -> Option<String> {
         let goal_label = self.get_tray_goal_label();
         let heartbeat_label = self.get_tray_heartbeat_label();
-        let usage = self.get_connection_context_usage();
-        let context_label = match usage {
-            Some(usage) => match (usage.tokens, usage.percent) {
-                (Some(tokens), Some(percent)) => Some(format!("{} ({}%)", format_token_count(tokens), percent.round() as i64)),
-                _ => None,
-            },
-            None => None,
-        };
-        let labels: Vec<String> = [goal_label, heartbeat_label, context_label].into_iter().flatten().collect();
+        let labels: Vec<String> = [goal_label, heartbeat_label]
+            .into_iter()
+            .flatten()
+            .collect();
         if labels.is_empty() {
             None
         } else {
             Some(labels.join(" \u{b7} "))
+        }
+    }
+
+    /// The context usage counter for the tray row: `146k (14%)`.
+    ///
+    /// `None` while the connection has no usage snapshot: unknown is never
+    /// rendered as zero, and no setting is changed to produce a value.
+    pub fn get_tray_context_usage_text(&self) -> Option<String> {
+        let usage = self.get_connection_context_usage()?;
+        match (usage.tokens, usage.percent) {
+            (Some(tokens), Some(percent)) => Some(format!(
+                "{} ({}%)",
+                format_token_count(tokens),
+                percent.round() as i64
+            )),
+            _ => None,
         }
     }
 
@@ -3665,6 +3680,15 @@ fn basename(path: &str) -> String {
     path.replace('\\', "/").split('/').next_back().unwrap_or("").to_string()
 }
 
+/// Terminal/tab title for the interactive chat view: app identity, the current
+/// session name when known, then the working directory basename.
+fn terminal_title_text(app_title: &str, session_name: Option<&str>, cwd_basename: &str) -> String {
+    match session_name {
+        Some(session_name) => format!("{app_title} - {session_name} - {cwd_basename}"),
+        None => format!("{app_title} - {cwd_basename}"),
+    }
+}
+
 
 
 fn resolve_path(path: &str) -> String {
@@ -4347,6 +4371,22 @@ mod tests {
             false,
             0,
         )))
+    }
+
+    #[test]
+    fn terminal_title_keeps_the_app_identity_in_every_state() {
+        assert_eq!(
+            terminal_title_text("Optimus - Agent", Some("fix batch"), "workspace"),
+            "Optimus - Agent - fix batch - workspace"
+        );
+        assert_eq!(
+            terminal_title_text("Optimus - Agent", None, "workspace"),
+            "Optimus - Agent - workspace"
+        );
+        assert_eq!(
+            terminal_title_text("Optimus - Assistant", Some("resume"), "profile"),
+            "Optimus - Assistant - resume - profile"
+        );
     }
 
     fn user_message(text: &str) -> AgentMessage {

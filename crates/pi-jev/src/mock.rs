@@ -22,7 +22,8 @@ use sha2::{Digest, Sha256};
 use crate::client::parse_systemone_body;
 use crate::error::JevError;
 use crate::types::{
-    Answer, BoxFuture, NoulCriteria, QuestionSpec, SystemOneRequest, SystemOneResponse, Transport, Usage,
+    Answer, BoxFuture, EntryValue, NoulCriteria, QuestionSpec, SystemOneRequest, SystemOneResponse,
+    Transport, Usage,
 };
 
 /// Versioned model id reported by the mock, so model drift is visible in records.
@@ -57,6 +58,15 @@ pub enum MockStep {
     Overloaded { retry_after_secs: u64 },
     /// Any non-success status without a hint.
     ServerError { status: u16 },
+    /// Any non-success status with an explicit `retry-after-ms` hint and an
+    /// (untrusted, pre-sanitized by the test) server request id.
+    HttpStatus {
+        status: u16,
+        retry_after_ms: Option<u64>,
+        server_request_id: Option<String>,
+    },
+    /// Valid answers that carry a server-provided request id (success path).
+    ValidWithRequestId { server_request_id: String },
     /// No response before the deadline.
     Timeout,
     /// Connection dropped before a response was read.
@@ -65,6 +75,17 @@ pub enum MockStep {
     SlowResponse { delay_ms: u64 },
     /// Valid base fixture with one deliberate mutation.
     Mutation(MockMutation),
+    /// Raw model-catalog body for the explicit `GET /v1/models` path; parsed by the
+    /// production catalog parser in `crate::models`.
+    ModelsBody(String),
+    /// Non-success status on the model-catalog path with an (untrusted, pre-sanitized by
+    /// the test) server request id. The mock passes the value through verbatim; the
+    /// PRODUCTION transport sanitizes header values (`sanitize_opaque_header_value`)
+    /// before any error is constructed, and that refusal is asserted at the sanitizer.
+    ModelsHttpStatus {
+        status: u16,
+        server_request_id: Option<String>,
+    },
 }
 
 /// Deliberate defect applied to an otherwise valid fixture.
@@ -104,6 +125,7 @@ struct MockState {
     steps: Vec<MockStep>,
     cursor: usize,
     calls: Vec<RecordedCall>,
+    models_calls: usize,
 }
 
 /// Scripted, deterministic transport.
@@ -135,6 +157,7 @@ impl MockJevTransport {
                 steps,
                 cursor: 0,
                 calls: Vec::new(),
+                models_calls: 0,
             })),
         }
     }
@@ -142,6 +165,12 @@ impl MockJevTransport {
     /// Number of calls made so far (retries included).
     pub fn call_count(&self) -> usize {
         self.state.lock().calls.len()
+    }
+
+    /// Number of EXPLICIT model-catalog fetches so far. Decide paths never touch this
+    /// counter: a nonzero value always means `get_models` was called on purpose.
+    pub fn models_call_count(&self) -> usize {
+        self.state.lock().models_calls
     }
 
     /// Every recorded call, in order.
@@ -167,6 +196,10 @@ impl MockJevTransport {
             state.cursor += 1;
         }
         step
+    }
+
+    fn record_models_call(&self) {
+        self.state.lock().models_calls += 1;
     }
 
     fn record(&self, request: &SystemOneRequest, timeout: Duration) {
@@ -204,6 +237,54 @@ impl Transport for MockJevTransport {
             }
         })
     }
+
+    /// Explicit read-only model-catalog fetch through the same scripted-step machinery
+    /// and the same per-attempt deadline enforcement the decide path uses.
+    fn get_models(&self, timeout: Duration) -> BoxFuture<Result<Vec<u8>, JevError>> {
+        let transport = self.clone();
+        Box::pin(async move {
+            transport.record_models_call();
+            let step = transport.next_step();
+            let action = execute_models_step(&step);
+            match tokio::time::timeout(timeout, action).await {
+                Ok(result) => result,
+                Err(_) => Err(JevError::Timeout {
+                    detail: "mock transport deadline elapsed".to_string(),
+                }),
+            }
+        })
+    }
+}
+
+/// Runs one scripted step on the explicit model-catalog path. No lock is held across an
+/// await point. Decide-path steps are refused here so the two lanes cannot silently feed
+/// each other wrong fixtures.
+async fn execute_models_step(step: &MockStep) -> Result<Vec<u8>, JevError> {
+    match step {
+        MockStep::ModelsBody(body) => Ok(body.clone().into_bytes()),
+        MockStep::ModelsHttpStatus {
+            status,
+            server_request_id,
+        } => Err(JevError::HttpStatus {
+            status: *status,
+            detail: format!("mock http {status}"),
+            retry_after: None,
+            server_request_id: server_request_id.clone(),
+        }),
+        MockStep::Timeout => {
+            // Longer than any test deadline; the surrounding timeout fires first.
+            tokio::time::sleep(Duration::from_secs(30)).await;
+            Err(JevError::Timeout {
+                detail: "mock timeout".to_string(),
+            })
+        }
+        MockStep::DroppedConnection => Err(JevError::Connection {
+            detail: "mock connection dropped".to_string(),
+        }),
+        _ => Err(JevError::Internal {
+            detail: "mock step is not a model-catalog step".to_string(),
+        }),
+    }
 }
 
 /// Runs one scripted step. No lock is held across an await point.
@@ -216,17 +297,35 @@ async fn execute_step(step: &MockStep, request: &SystemOneRequest) -> Result<Sys
             status: 429,
             detail: "mock rate limit".to_string(),
             retry_after: Some(Duration::from_secs(*retry_after_secs)),
+            server_request_id: None,
         }),
         MockStep::Overloaded { retry_after_secs } => Err(JevError::HttpStatus {
             status: 529,
             detail: "mock overloaded".to_string(),
             retry_after: Some(Duration::from_secs(*retry_after_secs)),
+            server_request_id: None,
         }),
         MockStep::ServerError { status } => Err(JevError::HttpStatus {
             status: *status,
             detail: "mock server error".to_string(),
             retry_after: None,
+            server_request_id: None,
         }),
+        MockStep::HttpStatus {
+            status,
+            retry_after_ms,
+            server_request_id,
+        } => Err(JevError::HttpStatus {
+            status: *status,
+            detail: format!("mock http {status}"),
+            retry_after: retry_after_ms.map(Duration::from_millis),
+            server_request_id: server_request_id.clone(),
+        }),
+        MockStep::ValidWithRequestId { server_request_id } => {
+            let mut response = valid_response_for(request);
+            response.server_request_id = Some(server_request_id.clone());
+            Ok(response)
+        }
         MockStep::Timeout => {
             // Longer than any test deadline; the surrounding timeout fires first.
             tokio::time::sleep(Duration::from_secs(30)).await;
@@ -242,6 +341,11 @@ async fn execute_step(step: &MockStep, request: &SystemOneRequest) -> Result<Sys
             Ok(valid_response_for(request))
         }
         MockStep::Mutation(mutation) => Ok(mutate(valid_response_for(request), mutation)),
+        MockStep::ModelsBody(_) | MockStep::ModelsHttpStatus { .. } => {
+            Err(JevError::Internal {
+                detail: "mock model-catalog step consumed on the decide path".to_string(),
+            })
+        }
     }
 }
 
@@ -286,9 +390,10 @@ pub fn valid_response_for(request: &SystemOneRequest) -> SystemOneResponse {
         model: MOCK_RESPONSE_MODEL.to_string(),
         answers,
         usage: Usage {
-            input_tokens: 312,
-            output_tokens: 48,
+            input_tokens: Some(312),
+            output_tokens: Some(48),
         },
+        ..SystemOneResponse::default()
     }
 }
 
@@ -309,7 +414,7 @@ pub fn valid_answer_for(question: &QuestionSpec) -> Answer {
         QuestionSpec::Score { criteria, .. } => {
             let keys: Vec<String> = (0..criteria.len()).map(|index| index.to_string()).collect();
             let probabilities = distribute(&keys, 0.65);
-            let legend: BTreeMap<String, String> = criteria
+            let legend: BTreeMap<String, EntryValue> = criteria
                 .iter()
                 .enumerate()
                 .map(|(index, description)| (index.to_string(), description.clone()))
@@ -372,7 +477,7 @@ pub fn low_confidence_response_for(request: &SystemOneRequest) -> SystemOneRespo
                 let share = 1.0 / keys.len().max(1) as f64;
                 let probabilities: BTreeMap<String, f64> =
                     keys.iter().map(|key| (key.clone(), share)).collect();
-                let legend: BTreeMap<String, String> = criteria
+                let legend: BTreeMap<String, EntryValue> = criteria
                     .iter()
                     .enumerate()
                     .map(|(index, description)| (index.to_string(), description.clone()))
@@ -391,6 +496,7 @@ pub fn low_confidence_response_for(request: &SystemOneRequest) -> SystemOneRespo
         model: MOCK_RESPONSE_MODEL.to_string(),
         answers,
         usage: Usage::default(),
+        ..SystemOneResponse::default()
     }
 }
 
@@ -544,29 +650,107 @@ pub fn raw_injection_body(question_id: &str) -> String {
     body.to_string()
 }
 
+/// Raw body with an answer whose `type` tag is not a documented answer type.
+/// The production parser must record a per-answer skip, not fail the whole body.
+pub fn raw_unknown_answer_type_body(question_id: &str) -> String {
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            question_id: { "type": "weather", "forecast": "sunny" }
+        },
+        "usage": { "input_tokens": 7, "output_tokens": 3 }
+    });
+    body.to_string()
+}
+
+/// Raw body whose answer is a documented type with a malformed payload
+/// (a Choice answer missing its required fields).
+pub fn raw_malformed_answer_body(question_id: &str) -> String {
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            question_id: { "type": "choice", "choice": "coding" }
+        },
+        "usage": { "input_tokens": 7, "output_tokens": 3 }
+    });
+    body.to_string()
+}
+
+/// Raw body with a known-type answer and a null-token usage object: both token
+/// fields are `null`, which the wire documents. Knownness must stay explicit.
+pub fn raw_null_usage_body(question_id: &str) -> String {
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            question_id: { "type": "noul", "noul": 0.5 }
+        },
+        "usage": { "input_tokens": null, "output_tokens": null }
+    });
+    body.to_string()
+}
+
+/// Raw body with NO usage object at all (also UNKNOWN, never fabricated zero).
+pub fn raw_missing_usage_body(question_id: &str) -> String {
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            question_id: { "type": "noul", "noul": 0.5 }
+        }
+    });
+    body.to_string()
+}
+
+/// Raw body whose Score legend carries structured (object) echo values, exactly
+/// like the documented structured legend example in score.md.
+pub fn raw_object_legend_body(question_id: &str) -> String {
+    let body = json!({
+        "model": MOCK_RESPONSE_MODEL,
+        "answers": {
+            question_id: {
+                "type": "score",
+                "score": 0.5,
+                "legend": {
+                    "0": { "label": "low" },
+                    "1": { "label": "high" }
+                },
+                "probabilities": { "0": 0.5, "1": 0.5 },
+                "confidence": 0.9
+            }
+        },
+        "usage": { "input_tokens": 5, "output_tokens": 2 }
+    });
+    body.to_string()
+}
+
 /// Convenience: distinct question ids for a fixture bundle.
 pub fn question_ids(request: &SystemOneRequest) -> BTreeSet<String> {
     request.questions.keys().cloned().collect()
 }
 
-/// Convenience: a Noul question with criteria, for tests and lane B.
+/// Convenience: a Noul question with bare-string instructions and criteria
+/// (the legacy byte-identical wire form).
 pub fn noul_question(instructions: &str, yes: &str, no: &str) -> QuestionSpec {
     QuestionSpec::Noul {
-        instructions: instructions.to_string(),
-        criteria: Some(NoulCriteria {
-            r#true: yes.to_string(),
-            r#false: no.to_string(),
-        }),
+        instructions: Some(EntryValue::text(instructions)),
+        criteria: Some(NoulCriteria::text(yes, no)),
     }
 }
 
-/// Convenience: a Choice question from `(option, rubric)` pairs.
+/// Convenience: a Choice question from `(option, rubric)` pairs. A `None` rubric
+/// becomes the documented null description (`EntryValue::Null`).
 pub fn choice_question(instructions: &str, options: &[(&str, Option<&str>)]) -> QuestionSpec {
     QuestionSpec::Choice {
-        instructions: instructions.to_string(),
+        instructions: Some(EntryValue::text(instructions)),
         criteria: options
             .iter()
-            .map(|(option, rubric)| (option.to_string(), rubric.map(|value| value.to_string())))
+            .map(|(option, rubric)| {
+                (
+                    option.to_string(),
+                    rubric
+                        .map(|value| EntryValue::text(value))
+                        .unwrap_or(EntryValue::Null),
+                )
+            })
             .collect(),
     }
 }
@@ -574,7 +758,7 @@ pub fn choice_question(instructions: &str, options: &[(&str, Option<&str>)]) -> 
 /// Convenience: a Score question from ordered level descriptions.
 pub fn score_question(instructions: &str, levels: &[&str]) -> QuestionSpec {
     QuestionSpec::Score {
-        instructions: instructions.to_string(),
-        criteria: levels.iter().map(|level| level.to_string()).collect(),
+        instructions: Some(EntryValue::text(instructions)),
+        criteria: levels.iter().map(|level| EntryValue::text(*level)).collect(),
     }
 }

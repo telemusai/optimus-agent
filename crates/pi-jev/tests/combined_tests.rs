@@ -56,7 +56,7 @@ impl Fixture {
         .unwrap();
         let observer = JevObserver::new(
             JevObserverConfig {
-                mode_gate: Arc::new(move |_| *gate.lock().unwrap()),
+                mode_gate: Arc::new(move |_| (*gate.lock().unwrap(), pi_jev::hooks::SYSTEM_ONE_MODEL.to_string())),
                 independent_gate: Arc::new(|_| true),
                 policy_generation: Arc::new(move |_, independent| {
                     if independent {
@@ -443,9 +443,14 @@ async fn optional_drop_requires_selected_label_probability() {
     assert!(outcome.decisions.is_empty());
     fixture.observer.record_active(&outcome, &BTreeMap::new());
     let rows = fixture.records();
-    assert_eq!(rows[1].selected_value.as_deref(), Some("drop"));
-    assert_eq!(rows[1].confidence, Some(1.0));
-    assert_eq!(rows[1].fallback_reason.as_deref(), Some("low_confidence"));
+    // The chosen label has zero probability and is not the distribution
+    // peak, so the response is rejected at native answer validation before an
+    // optional effect can be considered. The untrusted selected value and
+    // confidence are deliberately not repeated as accepted telemetry.
+    assert_eq!(rows[0].skipped_reason.as_deref(), Some("choice_not_peak"));
+    assert_eq!(rows[1].selected_value, None);
+    assert_eq!(rows[1].confidence, None);
+    assert_eq!(rows[1].fallback_reason.as_deref(), Some("choice_not_peak"));
 }
 
 #[tokio::test]

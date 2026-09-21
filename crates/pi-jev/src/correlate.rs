@@ -135,6 +135,11 @@ pub struct CorrelationRecord {
     pub compaction_enabled: Option<bool>,
     #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
     pub observed_metrics: BTreeMap<String, u64>,
+    /// Bounded, sanitized server-provided request id (`x-typesafe-request-id`),
+    /// when the transport captured one. Untrusted server data: control chars
+    /// stripped, length-capped, credential echoes refused. Correlation only.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub server_request_id: Option<String>,
 }
 
 /// Everything an Active record row needs that is shared across rows of one
@@ -278,6 +283,7 @@ impl Correlator {
             outcome: None,
             compaction_enabled: None,
             observed_metrics: BTreeMap::new(),
+            server_request_id: None,
         }
     }
 
@@ -383,6 +389,10 @@ impl Correlator {
                     record.baseline_action = sanitize_action(&entry.baseline_action);
                     record.compaction_enabled = entry.compaction_enabled;
                 record.observed_metrics = usage_metrics(outcome);
+                record.server_request_id = outcome
+                    .server_request_id
+                    .as_deref()
+                    .map(|value| sanitize_text(value, MAX_FIELD_TEXT));
                 record.category = meta.category.clone();
                 record.question_id = meta.question_id.clone();
                 record.terminal_ts = Some(terminal_ts.clone());
@@ -524,6 +534,7 @@ impl Correlator {
             outcome: None,
             compaction_enabled: None,
             observed_metrics: BTreeMap::new(),
+            server_request_id: None,
         };
         self.write_record(&record);
     }
@@ -583,6 +594,9 @@ impl Correlator {
                 outcome: Some(sanitize_text(&row.outcome, MAX_FIELD_TEXT)),
                 compaction_enabled: ctx.compaction_enabled,
                 observed_metrics: ctx.observed_metrics.clone(),
+                // Active rows carry the sanitized server id through the context when
+                // the host wires it; the field stays additive and optional here.
+                server_request_id: None,
             };
             self.write_record(&record);
             written += 1;
@@ -680,9 +694,15 @@ impl Correlator {
 
 pub(crate) fn usage_metrics(outcome: &crate::types::DecisionOutcome) -> BTreeMap<String, u64> {
     let mut metrics = BTreeMap::new();
-    // Absent wire usage defaults to zero; only nonzero measurements are known.
-    if outcome.usage.input_tokens > 0 { metrics.insert("jev_input_tokens".into(), outcome.usage.input_tokens); }
-    if outcome.usage.output_tokens > 0 { metrics.insert("jev_output_tokens".into(), outcome.usage.output_tokens); }
+    // Knownness is explicit END-TO-END (root decision): absent or null usage is UNKNOWN
+    // and emits NO metric (it is never fabricated as 0). `Some(0)` is a real measured
+    // zero and IS emitted, so records can distinguish measured-zero from unknown.
+    if let Some(input_tokens) = outcome.usage.input_tokens {
+        metrics.insert("jev_input_tokens".into(), input_tokens);
+    }
+    if let Some(output_tokens) = outcome.usage.output_tokens {
+        metrics.insert("jev_output_tokens".into(), output_tokens);
+    }
     metrics
 }
 

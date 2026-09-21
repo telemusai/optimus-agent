@@ -14,7 +14,7 @@ use pi_jev::compaction::{
     self, CallAction, CompactionConfig, CompactionPlan, CompactionSkip, HistoryExcerpt,
     PairCandidate, MAX_CANDIDATES, MAX_HISTORY_ENTRIES, MIN_CANDIDATE_CHARS,
 };
-use pi_jev::types::{DecisionBundle, DecisionCategory, DecisionOutcome, DEFAULT_MODEL};
+use pi_jev::types::{DecisionBundle, DecisionCategory, DecisionOutcome};
 use serde::Serialize;
 use serde_json::{json, Value};
 use sha2::{Digest, Sha256};
@@ -26,6 +26,10 @@ const MAX_MESSAGES: usize = 4096;
 const MAX_BLOCKS: usize = 16384;
 const MAX_CONTEXT_BYTES: usize = 16 * 1024 * 1024;
 const COMPACTION_DEADLINE: Duration = Duration::from_millis(2500);
+/// Native openai-responses IDs are `{call_id}|{item_id}` and reach ~446 bytes.
+/// The cap is a defensive byte bound (`str::len` measures bytes); IDs never
+/// leave this module.
+const MAX_TOOL_ID_BYTES: usize = 512;
 
 type StatusEntries = HashMap<String, (Instant, Value)>;
 
@@ -332,7 +336,7 @@ pub fn prepare_context(
                 for (block_index, block) in assistant.content.iter().enumerate() {
                     if let ContentBlock::ToolCall(call) = block {
                         if call.id.is_empty()
-                            || call.id.len() > 256
+                            || call.id.len() > MAX_TOOL_ID_BYTES
                             || call.name.len() > 128
                             || calls.insert(&call.id, (index, block_index, call)).is_some()
                         {
@@ -348,7 +352,7 @@ pub fn prepare_context(
             AgentMessage::Message(Message::ToolResult(result)) => {
                 blocks_seen += result.content.len();
                 if result.tool_call_id.is_empty()
-                    || result.tool_call_id.len() > 256
+                    || result.tool_call_id.len() > MAX_TOOL_ID_BYTES
                     || results.insert(&result.tool_call_id, index).is_some()
                 {
                     return Err(CompactionSkip::InvalidPair);
@@ -434,6 +438,12 @@ pub fn prepare_context(
                 ImageOrTextContent::Text(text) => {
                     text.text_signature.is_some()
                         || text.text.contains(compaction::TRUNCATION_MARKER)
+                        // ROOT-CONTRACT v6 (Evidence lane): a tool result
+                        // carrying an advisory evidence annotation is left
+                        // untouched — never truncated, never dropped. This
+                        // only SHRINKS the eligible set (compaction reclaims
+                        // less); history and caps are unchanged.
+                        || crate::core::jev_evidence::is_evidence_annotation_text(&text.text)
                 }
             })
         {
@@ -688,7 +698,12 @@ pub async fn compact_context(
             turn: 0,
             stage: "compaction".into(),
             state,
-            model: DEFAULT_MODEL.into(),
+            // ROOT-CONTRACT v9: the SAME authoritative settings snapshot this
+            // function already loaded (the snapshot the compaction policy
+            // generation rides) supplies the requested Jev model. The wire
+            // request itself is rebuilt by the observer's decide_independent
+            // from the gate snapshot; this bundle never hardcodes a default.
+            model: settings.requested_model_or_default().to_string(),
             question_categories: questions
                 .keys()
                 .map(|id| (id.clone(), DecisionCategory::ContextRelevance))

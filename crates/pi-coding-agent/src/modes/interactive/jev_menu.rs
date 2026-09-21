@@ -13,10 +13,16 @@
 //! * section 0 / 10.2 - `/jev` is the only mode control; key presence NEVER
 //!   enables Jev; explicit per-session mode > explicit global default >
 //!   built-in `Off`.
-//! * section 11 - NO model control: the user's primary model/provider/effort
-//!   stays authoritative. Nothing here reads or writes a model.
+//! * section 11 - NO PRIMARY-model control: the user's primary model,
+//!   provider and effort stay authoritative. ROOT-CONTRACT v9 adds exactly
+//!   one bounded, operator-initiated Jev-model surface here: the requested
+//!   JEV SystemOne request model (`/jev model status|set <id>|reset`, agent
+//!   dir-persistent, default `jev-latest`, zero network) and the explicit
+//!   `/jev models` catalog query (the only networked model command). Nothing
+//!   here reads or writes the primary chat model, provider or effort, and
+//!   nothing selects a model automatically.
 //! * section 12 - NO subagent control: this module has no spawn/delete/cancel/
-//!   model/task/message/budget surface. Category 5/6 assessments are advisory
+//!   task/message/budget surface. Category 5/6 assessments are advisory
 //!   records in Compare and are never converted into commands.
 
 use std::path::{Path, PathBuf};
@@ -36,11 +42,11 @@ pub const JEV_COMMAND_NAME: &str = "jev";
 
 /// Autocomplete argument hint. `on` is the short form of `compare`; only the
 /// explicit `active` spelling selects the mode that changes a request.
-pub const JEV_ARGUMENT_HINT: &str = "[off|compare|active|compare-active|on|compact|feature|default|status|key]";
+pub const JEV_ARGUMENT_HINT: &str =
+    "[off|compare|active|compare-active|on|compact|feature|default|full-jev|status|key|models|model]";
 
 /// Autocomplete description. It names the modes, the key entry and status.
-pub const JEV_COMMAND_DESCRIPTION: &str =
-    "Jev System One: Off, Compare, Active, Compare + Active, compaction, feature gates, API key and status";
+pub const JEV_COMMAND_DESCRIPTION: &str = "Jev System One: Off, Compare, Active, Compare + Active, compaction, feature gates, the global full-jev overlay, API key, the requested Jev model (model status/set/reset) and the model catalog";
 
 /// The one line `/jev on` adds after the Compare confirmation, so the shorthand
 /// cannot be mistaken for the request-changing mode.
@@ -72,6 +78,26 @@ pub const JEV_DISCLOSURE_NOTICE: &str = "Disclosure: Jev decisions and independe
 
 pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, provider, permissions, subagents, agent messages, depth, concurrency or budgets. It never deletes durable memory or transcript history. Compaction is request-local and separately controlled; continuation and verification remain advisory.";
 
+/// What `/jev full-jev` (and its explicit `on` spelling) print on install.
+/// Bare full-jev is explicit consent (ROOT-CONTRACT v1): no extra modal.
+pub const JEV_FULL_JEV_ON_NOTICE: &str = "Full-jev is now active globally for this agent dir: mode Compare + Active, every feature gate on (including candidate reranking and line-level semantic find), and independent request-local compaction on. The overlay resolves ABOVE every saved per-session, global and inherited override; those saved values stay on disk unchanged and resolve again the moment you run /jev full-jev off.";
+
+/// What `/jev full-jev off` prints when the overlay was removed.
+pub const JEV_FULL_JEV_OFF_NOTICE: &str = "Full-jev is now off. The overlay was removed without touching any saved setting, so every chat resolves from its own saved values again.";
+
+/// What `/jev full-jev off` prints when nothing was active: a truthful
+/// no-change message, never a silent success.
+pub const JEV_FULL_JEV_ALREADY_OFF_NOTICE: &str = "Full-jev was not active; nothing was changed.";
+
+/// The rejection every conflicting mode/feature/compaction/default change
+/// gets while the overlay is active (ROOT-CONTRACT v1): an explicit
+/// no-change message with the recovery path, never a hidden success.
+pub const JEV_FULL_JEV_REJECTION: &str = "Full-jev is active, so this saved setting is currently masked by the global overlay and nothing was changed. Turn the overlay off first with /jev full-jev off, then set per-session values again. (/jev key, /jev status and /jev full-jev status still work.)";
+
+/// What `/jev off` prints when it acts as the emergency exit while full-jev
+/// is active (ROOT-CONTRACT v1).
+pub const JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE: &str = "Emergency exit: full-jev was active, so /jev off disabled the global overlay and set THIS chat to decisions Off and compaction off in one atomic write. Other chats now resolve from their own saved settings again. Use /jev compact on to re-enable compaction for this chat; the overlay stays off until /jev full-jev.";
+
 /// One parsed `/jev` request.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum JevRequest {
@@ -86,10 +112,31 @@ pub enum JevRequest {
     CompactionStatus,
     /// `/jev status`.
     Status,
+    /// `/jev full-jev` / `/jev full-jev on`: install the global overlay.
+    /// `/jev full-jev off`: remove it.
+    SetFullJev(bool),
+    /// `/jev full-jev status`: the overlay's local-only truth panel.
+    FullJevStatus,
     /// `/jev key`: masked credential entry.
     InputKey,
     /// `/jev key clear`: delete the stored credential.
     ClearKey,
+    /// `/jev models`: EXPLICIT operator-initiated read-only catalog query —
+    /// the ONLY `/jev` command that may touch the network (one bounded
+    /// single-attempt `GET /v1/models`). Never automatic, never a selection,
+    /// never a settings write.
+    Models,
+    /// `/jev model` / `/jev model status`: the requested-model panel. Local
+    /// settings truth plus the in-process comparison snapshot when this
+    /// process holds it; no RPC, no catalog, no network.
+    ModelStatus,
+    /// `/jev model set <id>`: durable requested-Jev-model write. Local only;
+    /// validates the exact identifier; no probe, no availability claim, no
+    /// budget effect, no overlay interaction.
+    ModelSet(String),
+    /// `/jev model reset`: remove the explicit selection; the native default
+    /// `jev-latest` governs again. Local only.
+    ModelReset,
     /// `/jev help`.
     Help,
     /// An unrecognised argument, with the usage text to show.
@@ -112,6 +159,21 @@ pub fn jev_usage() -> String {
 /// [`JevMode::Active`] and prints [`JEV_ACTIVE_NOTICE`]. No form is silently
 /// rewritten to another mode.
 pub fn parse_jev_request(args: &str) -> JevRequest {
+    // ROOT-CONTRACT v9: the requested model id is an EXACT identifier, so the
+    // `model set` arm never case-folds, trims or otherwise normalizes it. Only
+    // leading command whitespace is ignored. Everything after the literal
+    // `model set ` delimiter is passed byte-for-byte to the safe-id validator;
+    // any whitespace in the id is refused without echo.
+    // `to_ascii_lowercase` is byte-preserving, so this byte arithmetic is exact.
+    let command = args.trim_start();
+    let lowered_command = command.to_ascii_lowercase();
+    if lowered_command == "model set" {
+        return JevRequest::ModelSet(String::new());
+    }
+    if lowered_command.starts_with("model set ") {
+        let id = &command["model set ".len()..];
+        return JevRequest::ModelSet(id.to_string());
+    }
     let normalized = args.trim().to_ascii_lowercase();
     let parts: Vec<&str> = normalized.split(' ').filter(|part| !part.is_empty()).collect();
     let toggle = |value: &str| match value { "on" => Some(true), "off" => Some(false), _ => None };
@@ -127,6 +189,15 @@ pub fn parse_jev_request(args: &str) -> JevRequest {
         ["default", "compact" | "compaction", value] if toggle(value).is_some() => JevRequest::SetDefaultCompaction(toggle(value).unwrap()),
         ["default", mode] if JevMode::parse(mode).is_some() => JevRequest::SetDefaultMode(JevMode::parse(mode).unwrap()),
         ["feature", feature, value] if JevFeature::parse(feature).is_some() && toggle(value).is_some() => JevRequest::SetFeature(JevFeature::parse(feature).unwrap(), toggle(value).unwrap()),
+        // Bare `full-jev` means ON, exactly like `on` means Compare: no silent
+        // shorthand arms a request-changing state (ROOT-CONTRACT v1).
+        ["full-jev" | "fulljev" | "full_jev"] => JevRequest::SetFullJev(true),
+        ["full-jev" | "fulljev" | "full_jev", "on"] => JevRequest::SetFullJev(true),
+        ["full-jev" | "fulljev" | "full_jev", "off"] => JevRequest::SetFullJev(false),
+        ["full-jev" | "fulljev" | "full_jev", "status"] => JevRequest::FullJevStatus,
+        ["models"] => JevRequest::Models,
+        ["model"] | ["model", "status"] => JevRequest::ModelStatus,
+        ["model", "reset"] => JevRequest::ModelReset,
         ["key" | "key-input"] => JevRequest::InputKey,
         ["key", "clear"] | ["key-clear" | "clear-key"] => JevRequest::ClearKey,
         ["help" | "-h" | "--help"] => JevRequest::Help,
@@ -378,7 +449,7 @@ impl JevPipelineStatus {
     pub fn known(&self) -> bool {
         self.counters_known() || self.active.is_some() || self.compaction.is_some()
     }
-    /// In-flight work makes the footer amber/checking rather than accent.
+    /// In-flight work makes the footer amber/checking rather than green.
     pub fn checking(&self) -> bool {
         self.in_flight > 0
     }
@@ -411,6 +482,9 @@ pub struct JevStatusReport {
     /// Where the pipeline figures came from, or why they are empty. Kept in the
     /// report so an empty counter set is never read as "all healthy".
     pub pipeline_note: Option<String>,
+    /// True while the global full-jev overlay is active, so the panel can say
+    /// so instead of letting the scope line carry it alone.
+    pub full_jev_active: bool,
 }
 
 impl JevStatusReport {
@@ -433,6 +507,7 @@ impl JevStatusReport {
                 "Worker telemetry is unavailable or no comparison has been observed in this worker yet. Unknown is not zero."
                     .to_string(),
             ),
+            full_jev_active: false,
         }
     }
 
@@ -440,6 +515,11 @@ impl JevStatusReport {
         self.features = settings.effective_features(session_id);
         self.compaction_config = settings.compaction.clone();
         (self.compaction_enabled, self.compaction_scope) = settings.effective_compaction_with_scope(session_id);
+        self.full_jev_active = settings.full_jev_active();
+        // ROOT-CONTRACT v9: the requested model is the persisted explicit
+        // selection or the native default, resolved from the SAME settings
+        // snapshot the rest of this panel reads. Local only.
+        self.requested_model = settings.requested_model_or_default().to_string();
         self
     }
 
@@ -462,8 +542,13 @@ pub fn render_status(report: &JevStatusReport) -> String {
             ModeScope::Session => "an explicit per-session setting",
             ModeScope::GlobalDefault => "no per-session setting; this is the global default",
             ModeScope::BuiltIn => "no per-session setting and no global default; this is the built-in default",
+            ModeScope::FullJevOverlay =>
+                "the global full-jev overlay; it resolves above every saved setting",
         }
     ));
+    if report.full_jev_active {
+        text.push_str("Full-jev overlay: active; run /jev full-jev status for the overlay panel\n");
+    }
     if report.mode.allows_active() {
         text.push_str(&format!("{JEV_ACTIVE_NOTICE}\n"));
     }
@@ -594,6 +679,187 @@ pub fn render_status(report: &JevStatusReport) -> String {
     text
 }
 
+/// The `/jev full-jev status` panel. Pure and local-only: one settings
+/// snapshot in, text out — no network call, no secret, no worker telemetry.
+/// It reports the overlay truth, this chat's effective values, and the saved
+/// decisions the overlay is currently masking (they return on removal).
+pub fn render_full_jev_status(
+    settings: &JevSettings,
+    session_id: &str,
+    credential: CredentialStatus,
+) -> String {
+    let active = settings.full_jev_active();
+    let resolution = settings.effective_mode_with_scope(session_id);
+    let masked = settings.full_jev_masked_sessions();
+    let mut text = String::new();
+    text.push_str("Jev full-jev Status\n\n");
+    if active {
+        let revision = settings
+            .full_jev
+            .as_ref()
+            .map(|profile| profile.revision)
+            .unwrap_or(0);
+        text.push_str(&format!("Profile: active (revision {revision})\n"));
+        text.push_str("Resolves above every saved session, global and inherited override:\n");
+        text.push_str(&format!(
+            "  Mode: {}\n",
+            mode_label(pi_jev::types::JevMode::CompareAndActive)
+        ));
+        text.push_str("  Feature gates: all on\n");
+        text.push_str("  Compaction: on (request-local, independent of the decision mode)\n");
+    } else {
+        text.push_str("Profile: not installed\n");
+        text.push_str(
+            "While active it would resolve: mode Compare + Active, every feature gate on, compaction on.\n",
+        );
+    }
+    text.push_str(&format!(
+        "This chat resolves: {} (scope: {})\n",
+        mode_label(resolution.mode),
+        resolution.scope.as_str()
+    ));
+    let (compaction_enabled, compaction_scope) = settings.effective_compaction_with_scope(session_id);
+    text.push_str(&render_compaction_status(compaction_enabled, compaction_scope));
+    if active {
+        if masked.is_empty() {
+            text.push_str("Saved decisions masked by the overlay: none\n");
+        } else {
+            text.push_str(&format!(
+                "Saved decisions masked by the overlay: {} (they resolve again when the overlay is removed)\n",
+                masked.len()
+            ));
+            for session in masked.iter().take(8) {
+                text.push_str(&format!("  - {session}\n"));
+            }
+            if masked.len() > 8 {
+                text.push_str(&format!("  - ... and {} more\n", masked.len() - 8));
+            }
+        }
+    }
+    text.push_str(&format!("{}\n", credential.describe()));
+    if !credential.present() {
+        text.push_str(
+            "No API key is configured: the footer shows unavailable and every decision fails closed until /jev key.\n",
+        );
+    }
+    text.push_str("\n");
+    text.push_str(JEV_DISCLOSURE_NOTICE);
+    text.push_str("\n\n");
+    text.push_str(JEV_BOUNDARY_NOTICE);
+    text.push('\n');
+    text
+}
+
+// ---------------------------------------------------------------------------
+// Requested Jev model + explicit catalog (ROOT-CONTRACT v9)
+// ---------------------------------------------------------------------------
+
+/// HOST POLICY display cap for `/jev models` (presentation ONLY: the parsed
+/// catalog is already capped at [`pi_jev::models::MAX_MODEL_CATALOG_ENTRIES`];
+/// this caps only what the panel renders). Entries beyond the cap are
+/// disclosed with a truthful overflow note, never dropped silently.
+pub const MAX_MODEL_CATALOG_DISPLAY: usize = 32;
+
+/// Renders the parsed catalog for `/jev models`. Pure presentation of
+/// ALREADY-sanitized data: entries carry host-bounded prose, names are exact
+/// identifiers (never normalized), and rejected reasons are bounded strings
+/// that never echo the rejected text. No network, no settings write, no
+/// selection (ROOT-CONTRACT v9).
+pub fn render_model_catalog(catalog: &pi_jev::models::ModelCatalog) -> String {
+    let mut text = String::new();
+    text.push_str("Jev model catalog\n\n");
+    if catalog.models.is_empty() {
+        text.push_str(
+            "No selectable models were returned. Nothing was selected automatically.\n",
+        );
+    }
+    for (index, card) in catalog.models.iter().enumerate() {
+        if index == MAX_MODEL_CATALOG_DISPLAY {
+            text.push_str(&format!(
+                "... and {} more entries (host display cap {MAX_MODEL_CATALOG_DISPLAY}; the parsed list is bounded at {})\n",
+                catalog.models.len() - index,
+                pi_jev::models::MAX_MODEL_CATALOG_ENTRIES,
+            ));
+            break;
+        }
+        text.push_str(&format!(
+            "- {} — {} (released {})\n",
+            card.name, card.description, card.release_date
+        ));
+    }
+    if !catalog.rejected.is_empty() {
+        text.push_str("\nRejected entries (bounded reasons; the unsafe values are never shown):\n");
+        for (index, reason) in catalog.rejected.iter().enumerate() {
+            if index == MAX_MODEL_CATALOG_DISPLAY {
+                text.push_str(&format!(
+                    "... and {} more rejection reasons (host display cap {MAX_MODEL_CATALOG_DISPLAY})\n",
+                    catalog.rejected.len() - index,
+                ));
+                break;
+            }
+            text.push_str(&format!("- {reason}\n"));
+        }
+    }
+    text.push_str("\nIDs are exact server-listed identifiers; a listed alias is not a resolved version. Set one explicitly with /jev model set <id>. This command only lists: nothing was selected, written or probed.\n");
+    text
+}
+
+/// Everything `/jev model` (model status) needs. LOCAL only: settings truth
+/// plus the in-process comparison snapshot when this process holds it; no
+/// RPC, no catalog, no network of any kind (ROOT-CONTRACT v9).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct JevModelStatusReport {
+    /// The resolved requested model: the explicit selection or the native
+    /// default. This is the id native SystemOne requests carry.
+    pub requested: String,
+    /// The explicit selection exactly as persisted, when one is set.
+    pub explicit: Option<String>,
+    /// Durable write identity of the settings snapshot the requested model
+    /// came from (advances on every authoritative save, so held decisions
+    /// can be invalidated by model A->B->A).
+    pub write_revision: u64,
+    /// Last server-reported model id from the in-process comparison status,
+    /// when THIS process observed any. Unknown otherwise, never fabricated.
+    pub reported: Option<String>,
+}
+
+/// Renders the requested-model panel. Pure: same input, same text, no I/O.
+pub fn render_model_status(report: &JevModelStatusReport) -> String {
+    let mut text = String::new();
+    text.push_str("Jev Model\n\n");
+    match report.explicit.as_deref() {
+        Some(id) => text.push_str(&format!(
+            "Requested Jev model: {id} (explicit /jev model set selection)\n"
+        )),
+        None => text.push_str(&format!(
+            "Requested Jev model: {} (native default; nothing explicitly set)\n",
+            report.requested
+        )),
+    }
+    text.push_str(&format!(
+        "Durable settings write revision: {}\n",
+        report.write_revision
+    ));
+    text.push_str(&format!(
+        "Model reported by server: {}\n",
+        report
+            .reported
+            .clone()
+            .unwrap_or_else(|| "unknown (no comparison observed in this worker)".to_string())
+    ));
+    if let Some(reported) = report.reported.as_deref() {
+        if reported != report.requested {
+            text.push_str(
+                "Note: the server-reported id differs from the requested id; it is the response model of the last observed comparison, and identifier equality would not prove identical behavior anyway.\n",
+            );
+        }
+    }
+    text.push_str(
+        "\nBoundaries: this selection is the Jev SystemOne request model only; it never selects the primary chat model, provider or effort. status/set/reset perform no network call, no probe and no budget change; set/reset write only this field atomically and are idempotent.\n",
+    );
+    text
+}
+
 /// Help/hotkey text: the modes and their real scope, with no model or
 /// subagent claims (sections 11 and 12).
 pub fn render_help() -> String {
@@ -609,6 +875,8 @@ Commands: /jev off|compare|active|compare-active|on|status|key|help\n\
 /jev default <mode>          Default for sessions without a mode override.\n\
 /jev default compact on|off  Default independent compaction toggle.\n\
 /jev key clear              Remove the saved credential.\n\
+/jev models                  Explicit one-shot model-catalog query (the only networked /jev model command).\n\
+/jev model [status|set <id>|reset]  Requested Jev model: local panel, durable set, reset to native jev-latest (zero network).\n\
 Numeric compaction/filtering policy is configured in jev-settings.json.\n\
 {JEV_ON_COMPARE_NOTICE}\nFooter: {JEV_FOOTER_RULE_NOTICE}\n\n{JEV_BOUNDARY_NOTICE}\n")
 }
@@ -651,6 +919,8 @@ pub fn mode_change_message(change: &ModeChange) -> String {
                 ModeScope::Session => "this chat",
                 ModeScope::GlobalDefault => "default for sessions without an override",
                 ModeScope::BuiltIn => "built-in default",
+                ModeScope::FullJevOverlay =>
+                    "the global full-jev overlay (above every saved setting)",
             },
             match mode {
                 JevMode::Compare => format!("\n{JEV_DISCLOSURE_NOTICE}"),
@@ -659,6 +929,10 @@ pub fn mode_change_message(change: &ModeChange) -> String {
                 JevMode::Off => String::new(),
             },
         ),
+        ModeChange::EmergencyExit { mode } => format!(
+            "Jev mode: {} (scope: this chat)\n{JEV_FULL_JEV_EMERGENCY_EXIT_NOTICE}",
+            mode_label(*mode)
+        ),
     }
 }
 
@@ -666,10 +940,44 @@ pub fn mode_change_message(change: &ModeChange) -> String {
 ///
 /// `Applied` means the requested value was written to the store. Every mode is
 /// writable, so there is no refusal variant: a mode is never silently rewritten
-/// into another one.
+/// into another one. The one compound case is the full-jev emergency exit:
+/// `/jev off` while the overlay is active disables the overlay globally and
+/// writes this session Off (decisions and compaction) in the same atomic save
+/// (ROOT-CONTRACT v1).
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ModeChange {
     Applied { mode: JevMode, scope: ModeScope },
+    /// `/jev off` acted as the emergency exit: the global full-jev overlay was
+    /// removed AND this session's decisions and compaction were set off in
+    /// one atomic write. Other sessions resolve from saved settings again.
+    EmergencyExit {
+        mode: JevMode,
+    },
+}
+
+/// The outcome of one `/jev full-jev` request. Never a silent success: the
+/// `already_active`/`was_active` flags say whether anything was written.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FullJevChange {
+    /// The overlay install request. `already_active == true` means it was
+    /// already on and NOTHING was written (idempotent install).
+    Installed { already_active: bool },
+    /// The overlay removal request. `was_active == false` means it was
+    /// already off and NOTHING was written.
+    Removed { was_active: bool },
+}
+
+/// The outcome of one `/jev model set|reset` (ROOT-CONTRACT v9). `written`
+/// is false for a truthful no-op (the selection was already in the requested
+/// state); no save happened in that case, so the durable write revision did
+/// not move and held decisions were not invalidated.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ModelSetOutcome {
+    pub written: bool,
+    /// The requested id exactly as it will persist (`DEFAULT_MODEL` for a
+    /// reset). Never secret material: the setter refuses credential-shaped
+    /// ids before anything is stored or rendered.
+    pub requested: String,
 }
 
 pub fn require_feature_support(supported: bool) -> Result<(), String> {
@@ -723,14 +1031,99 @@ impl JevModeBridge {
         self.set_global_default(requested)
     }
 
+    /// One bounded load->mutate->save transaction over the generation-checked
+    /// store (ROOT-CONTRACT v1: prove atomic/conflict-safe writes). A concurrent
+    /// writer either moves the settings generation or holds the advisory lock;
+    /// both surface as store errors, so instead of losing the change or
+    /// overwriting the newer write, the bounded ceiling reloads and re-applies.
+    /// `mutate` returns whether anything changed; a no-change request never
+    /// writes. Returns true when a write happened.
+    fn write_with_retry(&self, mut mutate: impl FnMut(&mut JevSettings) -> bool) -> Result<bool, String> {
+        const WRITE_ATTEMPTS: usize = 3;
+        let mut last_error = String::new();
+        for _ in 0..WRITE_ATTEMPTS {
+            let mut settings = self.store.load();
+            if !mutate(&mut settings) {
+                return Ok(false);
+            }
+            match self.store.save(&settings) {
+                Ok(()) => return Ok(true),
+                Err(error) => last_error = describe_error(error),
+            }
+        }
+        Err(last_error)
+    }
+
+    /// True when the global full-jev overlay is active; used to reject
+    /// conflicting writes it would mask (never a hidden success).
+    fn full_jev_would_mask(&self) -> bool {
+        self.store.load().full_jev_active()
+    }
+
+    /// Install or remove the global full-jev overlay (ROOT-CONTRACT v1).
+    ///
+    /// The overlay is a persisted block the resolver reads ABOVE every saved
+    /// session, global and inherited override; the base settings and the
+    /// sessions map are never rewritten, so removal restores the prior
+    /// resolution exactly. Both directions are idempotent and the result
+    /// reports whether anything was written.
+    pub fn set_full_jev(&self, enabled: bool) -> Result<FullJevChange, String> {
+        let written = self.write_with_retry(|settings| {
+            if enabled {
+                settings.full_jev_install()
+            } else {
+                settings.full_jev_remove()
+            }
+        })?;
+        Ok(if enabled {
+            FullJevChange::Installed {
+                already_active: !written,
+            }
+        } else {
+            FullJevChange::Removed {
+                was_active: written,
+            }
+        })
+    }
+
     /// Write an explicit per-session mode. Every mode is written, including
     /// `Active`: the store is the only source of truth, and no request is
     /// silently redirected to a different mode.
+    ///
+    /// Two full-jev rules (ROOT-CONTRACT v1) live here so the command path
+    /// and the menu path can never disagree:
+    /// - `Off` while the overlay is active is the EMERGENCY EXIT: remove the
+    ///   overlay globally and set THIS session's decisions Off and compaction
+    ///   false in one atomic save.
+    /// - Any other mode while the overlay is active is REJECTED with the
+    ///   no-change message: the overlay would mask the write, so reporting
+    ///   success would be a lie.
     pub fn set_session_mode(
         &self,
         session_id: &str,
         requested: JevMode,
     ) -> Result<ModeChange, String> {
+        if requested == JevMode::Off && self.full_jev_would_mask() {
+            // Every required mutation contributes to the changed flag. If a
+            // concurrent writer removes the overlay between the guard and the
+            // fresh load, full_jev_remove() is false, and reporting the
+            // emergency exit without committing the session writes would be a
+            // success with zero writes (root F1): the changed flag is the OR
+            // of the actual changes, never only the overlay removal.
+            self.write_with_retry(|settings| {
+                let removed = settings.full_jev_remove();
+                let mode_written = settings.session_mode(session_id) != Some(JevMode::Off);
+                let compaction_written =
+                    settings.session_compaction_enabled(session_id) != Some(false);
+                settings.set_session_mode(session_id, JevMode::Off);
+                settings.set_session_compaction_enabled(session_id, false);
+                removed || mode_written || compaction_written
+            })?;
+            return Ok(ModeChange::EmergencyExit { mode: JevMode::Off });
+        }
+        if requested != JevMode::Off && self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.set_session_mode(session_id, requested);
         self.store.save(&settings).map_err(describe_error)?;
@@ -741,8 +1134,12 @@ impl JevModeBridge {
     }
 
     /// Write the global default for sessions with no explicit value. `Active`
-    /// is written like every other mode.
+    /// is written like every other mode. Rejected while the full-jev overlay
+    /// is active: it would mask the write, so success would be a lie.
     pub fn set_global_default(&self, requested: JevMode) -> Result<ModeChange, String> {
+        if self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.global_default = Some(requested);
         self.store.save(&settings).map_err(describe_error)?;
@@ -752,26 +1149,97 @@ impl JevModeBridge {
         })
     }
 
-    pub fn set_feature(&self, session_id: &str, feature: JevFeature, enabled: bool) -> Result<(), String> {
+    pub fn set_feature(
+        &self,
+        session_id: &str,
+        feature: JevFeature,
+        enabled: bool,
+    ) -> Result<(), String> {
+        if self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.set_session_feature(session_id, feature, enabled);
         self.store.save(&settings).map_err(describe_error)
     }
 
     pub fn set_compaction(&self, session_id: &str, enabled: bool) -> Result<(), String> {
+        if self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.set_session_compaction_enabled(session_id, enabled);
         self.store.save(&settings).map_err(describe_error)
     }
 
     pub fn set_default_compaction(&self, enabled: bool) -> Result<(), String> {
+        if self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.compaction_enabled = enabled;
         self.store.save(&settings).map_err(describe_error)
     }
 
-    /// Clear the explicit per-session mode so the global default applies again.
+    /// ROOT-CONTRACT v9: set the requested Jev model. Zero network, zero
+    /// probe, zero availability claim; the only effects are validation and at
+    /// most ONE atomic generation-checked durable write. The id is validated
+    /// with the catalog parser's exact-identifier rule; when the EFFECTIVE
+    /// credential is available, a credential-overlap id is refused with a
+    /// GENERIC reason (never echoing the supplied value, never persisting or
+    /// displaying it). Identical writes short-circuit BEFORE the save (no
+    /// revision churn). The full-jev overlay neither masks nor selects this
+    /// field — an operator selection is independent and deliberate — and
+    /// model changes never touch control budgets.
+    pub fn set_requested_model(
+        &self,
+        raw: &str,
+        credential: Option<&SecretString>,
+    ) -> Result<ModelSetOutcome, String> {
+        if let Err(reason) = pi_jev::models::validate_requested_model_id(raw) {
+            return Err(format!("Jev model id refused: {reason}"));
+        }
+        if let Some(secret) = credential {
+            if pi_jev::models::id_overlaps_credential(raw, secret) {
+                return Err(
+                    "Jev model id refused: the supplied id looks like a credential; nothing was saved or displayed."
+                        .to_string(),
+                );
+            }
+        }
+        let written = self.write_with_retry(|settings| {
+            let changed = settings.requested_model.as_deref() != Some(raw);
+            if changed {
+                settings.requested_model = Some(raw.to_string());
+            }
+            changed
+        })?;
+        Ok(ModelSetOutcome {
+            written,
+            requested: raw.to_string(),
+        })
+    }
+
+    /// ROOT-CONTRACT v9: reset to the native default `jev-latest` (a durable
+    /// tombstone; a real write advances the persisted write revision, so held
+    /// decisions are invalidated exactly like any authoritative save). Zero
+    /// network, zero probe; an already-default reset is a truthful no-op.
+    pub fn reset_requested_model(&self) -> Result<ModelSetOutcome, String> {
+        let written = self.write_with_retry(|settings| settings.clear_requested_model())?;
+        Ok(ModelSetOutcome {
+            written,
+            requested: pi_jev::types::DEFAULT_MODEL.to_string(),
+        })
+    }
+
+    /// Clear the explicit per-session mode so the global default applies
+    /// again. Rejected while the full-jev overlay is active: the overlay
+    /// decides the effective mode right now, so a "cleared" report would be
+    /// a hidden no-change success.
     pub fn clear_session_mode(&self, session_id: &str) -> Result<(), String> {
+        if self.full_jev_would_mask() {
+            return Err(JEV_FULL_JEV_REJECTION.to_string());
+        }
         let mut settings = self.store.load();
         settings.clear_session_mode(session_id);
         self.store.save(&settings).map_err(describe_error)
@@ -803,7 +1271,8 @@ pub fn describe_error(error: JevError) -> String {
     error.log_line()
 }
 
-/// Operative modes use accent; no state claims healthy-green merely from configuration.
+/// Operative modes are green (`success`); Off is red (`error`). The label text
+/// always names the state too, so colour is never the sole indicator.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum JevFooterState {
     Off,
@@ -816,28 +1285,49 @@ pub enum JevFooterState {
 }
 
 impl JevFooterState {
-    /// Text label. Text AND colour both carry the meaning.
+    /// Text label. Text AND colour both carry the meaning. A healthy operative
+    /// mode says `Jev On` and names its truthful effective mode, so the label
+    /// can never claim a mode the session is not in.
     pub fn label(self) -> &'static str {
         match self {
             JevFooterState::Off => "Jev Off",
-            JevFooterState::Compare => "Jev Compare",
-            JevFooterState::Active => "Jev Active",
-            JevFooterState::CompareAndActive => "Jev Compare + Active",
+            JevFooterState::Compare => "Jev On (Compare)",
+            JevFooterState::Active => "Jev On (Active)",
+            JevFooterState::CompareAndActive => "Jev On (Compare + Active)",
             JevFooterState::Unavailable => "Jev unavailable",
             JevFooterState::Checking => "Jev checking",
             JevFooterState::Fallback => "Jev fallback",
         }
     }
 
-    /// Theme colour key. Green (`success`) is never returned here: Active is an
-    /// accent state, not a green one.
+    /// Theme colour key. Healthy operative modes are green (`success`); a
+    /// credential-less or degraded operative mode falls to the amber ladder;
+    /// Off is red (`error`).
     pub fn color_key(self) -> &'static str {
         match self {
             JevFooterState::Off => "error",
-            JevFooterState::Compare | JevFooterState::Active | JevFooterState::CompareAndActive => "accent",
+            JevFooterState::Compare | JevFooterState::Active | JevFooterState::CompareAndActive => {
+                "success"
+            }
             JevFooterState::Unavailable | JevFooterState::Checking | JevFooterState::Fallback => {
                 "warning"
             }
+        }
+    }
+
+    /// Short labelled form for narrow rows. Still names the state in text, so
+    /// the identity and the On/Off meaning survive when the full label does not
+    /// fit: a bare dot would be indistinguishable from the compaction dot.
+    /// Degraded states keep their full label; they are rare and amber.
+    pub fn compact_label(self) -> &'static str {
+        match self {
+            JevFooterState::Off => "Jev Off",
+            JevFooterState::Compare => "Jev C On",
+            JevFooterState::Active => "Jev A On",
+            JevFooterState::CompareAndActive => "Jev C+A On",
+            JevFooterState::Unavailable => "Jev unavailable",
+            JevFooterState::Checking => "Jev checking",
+            JevFooterState::Fallback => "Jev fallback",
         }
     }
 
@@ -846,11 +1336,82 @@ impl JevFooterState {
         "\u{25cf}"
     }
 
-    /// True only for a state that is both active and healthy-green. This release
-    /// marks no state green, so the rule holds by construction and
-    /// [`footer_color_key`] can never return `success`.
+    /// True for a healthy operative mode (the green dot states). Degraded
+    /// operative modes (`Unavailable`/`Checking`/`Fallback`) stay amber, and Off
+    /// stays red.
     pub fn is_green(self) -> bool {
-        false
+        matches!(
+            self,
+            JevFooterState::Compare | JevFooterState::Active | JevFooterState::CompareAndActive
+        )
+    }
+}
+
+/// The independent Jev compaction state the second footer dot shows.
+///
+/// This is the CONFIGURED effective state for the current session (explicit
+/// session override first, else the global default), never an inference from
+/// the decision mode: `/jev off` does not imply compaction off.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum JevCompactionState {
+    On,
+    Off,
+    /// Only when no settings source could resolve the state. Never rendered as
+    /// on or off.
+    Unknown,
+}
+
+impl JevCompactionState {
+    /// Text label. Text AND colour both carry the meaning.
+    pub fn label(self) -> &'static str {
+        match self {
+            JevCompactionState::On => "Jev compact on",
+            JevCompactionState::Off => "Jev compact off",
+            JevCompactionState::Unknown => "Jev compact unknown",
+        }
+    }
+
+    /// Short labelled form for narrow rows. `Jev Cmp on/off` stays distinct
+    /// from the decision segment's `Jev C On` / `Jev A On` / `Jev C+A On`, so
+    /// the two dots can never be confused by width pressure. Unknown keeps its
+    /// full label.
+    pub fn compact_label(self) -> &'static str {
+        match self {
+            JevCompactionState::On => "Jev Cmp on",
+            JevCompactionState::Off => "Jev Cmp off",
+            JevCompactionState::Unknown => "Jev compact unknown",
+        }
+    }
+
+    /// Theme colour key: on is green, off is red, unknown is amber.
+    pub fn color_key(self) -> &'static str {
+        match self {
+            JevCompactionState::On => "success",
+            JevCompactionState::Off => "error",
+            JevCompactionState::Unknown => "warning",
+        }
+    }
+
+    /// The dot glyph prefix (same glyph as the decision segment).
+    pub fn dot(self) -> &'static str {
+        "\u{25cf}"
+    }
+
+    /// True only for the on state.
+    pub fn is_green(self) -> bool {
+        matches!(self, JevCompactionState::On)
+    }
+}
+
+/// The effective compaction state from already-loaded settings.
+///
+/// The store resolves an explicit session override first, then the global
+/// default; the standard (non-Jev) auto-compaction setting is a different
+/// surface and is never read here.
+pub fn compaction_state(settings: &JevSettings, session_id: &str) -> JevCompactionState {
+    match settings.effective_compaction_with_scope(session_id) {
+        (true, _) => JevCompactionState::On,
+        (false, _) => JevCompactionState::Off,
     }
 }
 
@@ -859,14 +1420,20 @@ impl JevFooterState {
 /// Rules, in order:
 /// * `Off` -> red dot + `Jev Off`, always. Off does no work, so the credential and
 ///   the pipeline cannot change that.
-/// * `Active` -> accent `Jev Active` once the credential and the pipeline allow it;
-///   otherwise the same amber unavailable / checking / fallback states Compare uses.
-/// * `Compare` -> accent `Jev Compare` under the same credential and pipeline rules.
+/// * `Active` -> green `Jev On (Active)` once the credential and the pipeline
+///   allow it; otherwise the same amber unavailable / checking / fallback states
+///   Compare uses.
+/// * `Compare` -> green `Jev On (Compare)` under the same credential and
+///   pipeline rules.
+/// * `CompareAndActive` -> green `Jev On (Compare + Active)` under the same rules.
 /// * No credential -> amber `Jev unavailable`.
 /// * In-flight work -> amber `Jev checking`.
 /// * Recorded fallback/failure -> amber `Jev fallback`.
-/// Green is never produced.
-pub fn footer_state(mode: JevMode, credential: &CredentialStatus, pipeline: &JevPipelineStatus) -> JevFooterState {
+pub fn footer_state(
+    mode: JevMode,
+    credential: &CredentialStatus,
+    pipeline: &JevPipelineStatus,
+) -> JevFooterState {
     let healthy = match mode {
         JevMode::Off => return JevFooterState::Off,
         JevMode::Compare => JevFooterState::Compare,
@@ -891,6 +1458,24 @@ pub fn footer_text(state: JevFooterState) -> String {
     format!("{} {}", state.dot(), state.label())
 }
 
+/// Narrow decision segment: `\u{25cf} Jev C On`. A SHORT LABELLED form, never a
+/// bare dot: the state and the mode stay readable when the full label cannot
+/// fit, and the segment stays distinguishable from the compaction segment.
+pub fn footer_compact_text(state: JevFooterState) -> String {
+    format!("{} {}", state.dot(), state.compact_label())
+}
+
+/// Plain-text compaction segment: `\u{25cf} Jev compact on`. No ANSI.
+pub fn footer_compaction_text(state: JevCompactionState) -> String {
+    format!("{} {}", state.dot(), state.label())
+}
+
+/// Narrow compaction segment: `\u{25cf} Jev Cmp on`. Short labelled form, see
+/// [`footer_compact_text`].
+pub fn footer_compaction_compact_text(state: JevCompactionState) -> String {
+    format!("{} {}", state.dot(), state.compact_label())
+}
+
 /// Minimum terminal columns needed to render the labelled form; below this the
 /// caller keeps only the dot so narrow terminals do not lose layout.
 pub const FOOTER_LABEL_MIN_COLUMNS: usize = 40;
@@ -907,6 +1492,16 @@ pub fn footer_segment(state: JevFooterState, terminal_columns: usize) -> String 
         state.dot().to_string()
     } else {
         text
+    }
+}
+
+/// Narrow-terminal-safe compaction render, same rule as [`footer_segment`].
+#[allow(dead_code)]
+pub fn footer_compaction_segment(state: JevCompactionState, terminal_columns: usize) -> String {
+    if terminal_columns < FOOTER_LABEL_MIN_COLUMNS {
+        state.dot().to_string()
+    } else {
+        footer_compaction_text(state)
     }
 }
 
@@ -1434,17 +2029,23 @@ pub fn binding_hint(keybinding: &str, description: &str) -> String {
 /// The extension status key the Jev footer publishes under.
 pub const JEV_STATUS_KEY: &str = "jev";
 
+/// The extension status key the INDEPENDENT Jev compaction dot publishes under.
+///
+/// A separate key on purpose: a decision-mode refresh must never clobber the
+/// compaction state and vice versa, and `Jev Off` must never remove the
+/// compaction dot.
+pub const JEV_COMPACT_STATUS_KEY: &str = "jev-compact";
+
 /// Documentation of the footer colour rule (asserted by the tests). The callers
 /// prefix it with `Footer: `, so it does not repeat that word itself.
 pub const JEV_FOOTER_RULE_NOTICE: &str =
-    "red \"Jev Off\", accent \"Jev Compare\", accent \"Jev Active\"/\"Jev Compare + Active\", amber \"Jev unavailable\"/\"Jev checking\"/\"Jev fallback\". No green \"Jev On\" state is produced by this release.";
+    "green \"Jev On (Compare)\"/\"Jev On (Active)\"/\"Jev On (Compare + Active)\", red \"Jev Off\", amber \"Jev unavailable\"/\"Jev checking\"/\"Jev fallback\". A second dot shows compaction: green \"Jev compact on\", red \"Jev compact off\". The two are independent: turning one off never turns the other off. On narrow rows the short forms \"Jev C On\"/\"Jev A On\"/\"Jev C+A On\" and \"Jev Cmp on\"/\"Jev Cmp off\" keep both states readable in text; never two bare dots.";
 
 /// The theme colour key for the footer segment.
 ///
-/// This is the one place the no-green rule is enforced in the LIVE path:
 /// `success` is returned only when [`JevFooterState::is_green`] says the state is
-/// a green one, and that method is a constant `false` in this release. Active is
-/// an accent state, so a green footer would require changing the pure module.
+/// a green one (a healthy operative mode). Degraded operative modes stay amber,
+/// so a red or amber state can never masquerade as healthy.
 pub fn footer_color_key(state: JevFooterState) -> &'static str {
     if state.is_green() {
         "success"
@@ -1455,17 +2056,22 @@ pub fn footer_color_key(state: JevFooterState) -> &'static str {
 
 /// The `setStatus` payload that publishes the footer segment.
 ///
-/// `native_host.rs:2327-2331` routes it into `extension_surfaces.set_status`, and
-/// `native_host_extensions::Statuses` renders it directly under the model/effort
-/// tray, so the segment needs no new host surface. Kept as a `serde_json::Value`
-/// so the tests pin the exact payload the host receives. The live publisher in
-/// `jev_footer.rs` uses the labelled form, because the dispatch task cannot
-/// measure the terminal; this measured form is the contract for a caller that can.
+/// The host routes it into `extension_surfaces.set_status`, and
+/// `native_host_extensions::Statuses` renders it ON the model/effort tray row
+/// (after the effort label), so the segment needs no new host surface. Kept as a
+/// `serde_json::Value` so the tests pin the exact payload the host receives. The
+/// live publisher in `jev_footer.rs` uses the labelled form, because the dispatch
+/// task cannot measure the terminal; this measured form is the contract for a
+/// caller that can. `statusCompactText` is the optional SHORT LABELLED narrow form
+/// (`\u{25cf} Jev C On`): receivers that do not know it ignore the field, and
+/// senders that omit it degrade to left-truncation instead of segment
+/// compaction. Never a bare dot: two bare dots cannot be told apart.
 #[allow(dead_code)]
 pub fn footer_status_payload(state: JevFooterState, terminal_columns: usize) -> serde_json::Value {
     serde_json::json!({
         "statusKey": JEV_STATUS_KEY,
         "statusText": footer_segment(state, terminal_columns),
+        "statusCompactText": footer_compact_text(state),
     })
 }
 
@@ -1473,6 +2079,25 @@ pub fn footer_status_payload(state: JevFooterState, terminal_columns: usize) -> 
 pub fn footer_clear_payload() -> serde_json::Value {
     serde_json::json!({
         "statusKey": JEV_STATUS_KEY,
+        "statusText": serde_json::Value::Null,
+    })
+}
+
+/// The `setStatus` payload for the independent compaction dot. Same optional
+/// `statusCompactText` contract as [`footer_status_payload`].
+#[allow(dead_code)]
+pub fn footer_compaction_status_payload(state: JevCompactionState, terminal_columns: usize) -> serde_json::Value {
+    serde_json::json!({
+        "statusKey": JEV_COMPACT_STATUS_KEY,
+        "statusText": footer_compaction_segment(state, terminal_columns),
+        "statusCompactText": footer_compaction_compact_text(state),
+    })
+}
+
+/// The `setStatus` payload that removes the compaction dot.
+pub fn footer_compaction_clear_payload() -> serde_json::Value {
+    serde_json::json!({
+        "statusKey": JEV_COMPACT_STATUS_KEY,
         "statusText": serde_json::Value::Null,
     })
 }
@@ -1632,5 +2257,97 @@ mod worker_status_tests {
         oversized.paste(&"x".repeat(pi_jev::credential::MAX_SECRET_LEN + 1));
         assert!(oversized.value_is_empty());
         assert!(matches!(oversized.state(), KeyInputState::Failed(_)));
+    }
+}
+
+#[cfg(test)]
+mod full_jev_write_retry_tests {
+    use super::*;
+
+    /// Deterministic interleaving (root F2): a concurrent writer lands BETWEEN
+    /// this bridge's load and its save — exactly like a second process racing
+    /// the settings file. The bounded retry must re-apply on a fresh load
+    /// without losing either writer's fields.
+    #[test]
+    fn write_with_retry_reapplies_after_a_concurrent_writer_moves_the_generation() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bridge = JevModeBridge::new(directory.path());
+        let racer = JevSettingsStore::new(directory.path());
+        let mut injected = false;
+        let wrote = bridge
+            .write_with_retry(|settings| {
+                if !injected {
+                    injected = true;
+                    let mut winner = racer.load();
+                    winner.set_session_mode("racer", JevMode::Compare);
+                    racer
+                        .save(&winner)
+                        .expect("concurrent writer wins the race");
+                }
+                settings.set_session_mode("target", JevMode::Off);
+                true
+            })
+            .expect("the bounded retry commits");
+        assert!(wrote);
+        let settled = racer.load();
+        assert_eq!(
+            settled.session_mode("racer"),
+            Some(JevMode::Compare),
+            "the concurrent writer's change survives the retry"
+        );
+        assert_eq!(
+            settled.session_mode("target"),
+            Some(JevMode::Off),
+            "the retried write is re-applied on the fresh load"
+        );
+    }
+
+    /// Root F1 regression: the emergency-exit mutation shape (the closure in
+    /// [`JevModeBridge::set_session_mode`]) must commit the session Off and
+    /// compaction-off writes even when a concurrent writer removes the
+    /// overlay between the guard and the fresh load, so the reported
+    /// `ModeChange::EmergencyExit` never describes zero writes.
+    #[test]
+    fn emergency_exit_commits_session_writes_when_the_overlay_vanishes_mid_flight() {
+        let directory = tempfile::tempdir().expect("tempdir");
+        let bridge = JevModeBridge::new(directory.path());
+        let racer = JevSettingsStore::new(directory.path());
+        // alpha holds an explicit saved Compare + compaction on that the exit
+        // must flip; the overlay is active on disk.
+        let mut base = racer.load();
+        base.set_session_mode("alpha", JevMode::Compare);
+        base.set_session_compaction_enabled("alpha", true);
+        assert!(base.full_jev_install());
+        racer.save(&base).expect("base save");
+        let mut injected = false;
+        let wrote = bridge
+            .write_with_retry(|settings| {
+                if !injected {
+                    injected = true;
+                    // The concurrent removal lands between this closure's
+                    // fresh load and its save.
+                    let mut other = racer.load();
+                    assert!(other.full_jev_remove());
+                    racer.save(&other).expect("racer save");
+                }
+                // The production emergency-exit closure shape: the changed
+                // flag is the OR of every required mutation.
+                let removed = settings.full_jev_remove();
+                let mode_written = settings.session_mode("alpha") != Some(JevMode::Off);
+                let compaction_written =
+                    settings.session_compaction_enabled("alpha") != Some(false);
+                settings.set_session_mode("alpha", JevMode::Off);
+                settings.set_session_compaction_enabled("alpha", false);
+                removed || mode_written || compaction_written
+            })
+            .expect("the bounded retry commits");
+        assert!(wrote, "the session writes are required mutations");
+        let settled = racer.load();
+        assert!(
+            !settled.full_jev_active(),
+            "the concurrent removal stands; the retry does not resurrect the overlay"
+        );
+        assert_eq!(settled.session_mode("alpha"), Some(JevMode::Off));
+        assert_eq!(settled.session_compaction_enabled("alpha"), Some(false));
     }
 }

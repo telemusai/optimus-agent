@@ -32,7 +32,7 @@ impl super::CategoryEvaluator for SubagentModelRouting {
         let mut criteria = BTreeMap::new();
         for model in &allowlist {
             if model != "none" && valid_model_id(model) {
-                criteria.insert(model.clone(), None);
+                criteria.insert(model.clone(), crate::types::EntryValue::Null);
             }
             if criteria.len() == MAX_ROUTING_CANDIDATES {
                 break;
@@ -58,7 +58,7 @@ impl super::CategoryEvaluator for SubagentModelRouting {
             }
         }
         for (model, description) in &mut criteria {
-            *description = Some(match metrics.get(model) {
+            *description = crate::types::EntryValue::Text(match metrics.get(model) {
                 Some(metric) => format!(
                     "Measured local sample only: {}; observed success rate={}. Missing measurements are unknown; no savings estimate.",
                     serde_json::to_string(metric).unwrap_or_default(),
@@ -69,15 +69,15 @@ impl super::CategoryEvaluator for SubagentModelRouting {
         }
         criteria.insert(
             "none".to_string(),
-            Some("No supported suitable candidate.".to_string()),
+            crate::types::EntryValue::Text("No supported suitable candidate.".to_string()),
         );
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Choice {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "Advisory only: which user-approved candidate is suitable for the observed subagent role? Candidates: {}. Choose none when role or suitability evidence is missing. Measured samples do not guarantee future reliability or savings. This never switches any model, effort or role and never spawns a child.",
                     candidates.join(", ")
-                ),
+                ))),
                 criteria,
             },
         }])

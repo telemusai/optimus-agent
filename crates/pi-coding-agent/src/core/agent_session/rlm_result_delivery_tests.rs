@@ -47,6 +47,7 @@ impl AgentHandle for ScriptedAgent {
     fn set_before_tool_call(&self, _hook: BeforeToolCallHook) {}
     fn set_after_tool_call(&self, _hook: AfterToolCallHook) {}
     fn set_get_continuation_messages(&self, _hook: GetContinuationMessagesHook) {}
+    fn set_before_request(&self, _hook: BeforeRequestHook) {}
     fn set_should_stop_before_turn(&self, _hook: Arc<dyn Fn() -> bool + Send + Sync>) {}
     fn set_should_stop_after_turn(
         &self,

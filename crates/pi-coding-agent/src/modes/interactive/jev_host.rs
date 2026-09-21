@@ -3,12 +3,14 @@
 //! Everything the command needs lives here, so `native_host_commands.rs` keeps
 //! only a small dispatch arm, two `Dialog` variants and two mount branches.
 //!
-//! Boundaries this file obeys (DESIGN.md sections 11 and 12):
-//!
-//! * NO model control. There is no primary-model, scoped-model, thinking-level
-//!   or service-tier call here. The user's primary model, provider and effort
-//!   stay authoritative, and category 6 stays an advisory record that is never
-//!   executed.
+//! * NO PRIMARY-model control (DESIGN.md section 11; ROOT-CONTRACT v9 adds
+//!   exactly one bounded Jev-model surface: `/jev models` is the single
+//!   explicit networked catalog command, and `/jev model status|set|reset`
+//!   writes only the agent-dir-persistent requested JEV SystemOne model with
+//!   zero network, zero probe and no budget effect). The user's primary
+//!   model, provider and effort stay authoritative, and category 6 stays an
+//!   advisory record that is never executed. There is no primary-model,
+//!   scoped-model, thinking-level or service-tier call here.
 //! * NO subagent control. There is no create / delete / cancel / pause / resume,
 //!   no child model / effort / task / message / depth / concurrency / budget
 //!   call, and no way for a configuration flag to grant one. This file cannot
@@ -37,10 +39,13 @@ use super::Dialog;
 use super::jev_footer::JevFooterSnapshot;
 use super::jev_key_input::JevKeyInputComponent;
 use super::jev_menu::{
-    clear_secret, is_on_shorthand, is_submit_key, jev_usage, mode_change_message,
-    parse_jev_request, render_compaction_settings, render_help, render_status, require_feature_support, CredentialStatus, JevMenuAction,
-    JevModeBridge, JevRequest, JevSecret, JevStatusReport, KeyInputState,
-    JEV_BOUNDARY_NOTICE, JEV_ON_COMPARE_NOTICE,
+    clear_secret, compaction_state, is_on_shorthand, is_submit_key, jev_usage, mode_change_message,
+    parse_jev_request, render_compaction_settings, render_full_jev_status, render_help,
+    render_model_catalog, render_model_status, render_status, require_feature_support,
+    CredentialStatus, FullJevChange, JevCompactionState, JevMenuAction, JevModeBridge,
+    JevModelStatusReport, JevRequest, JevSecret, JevStatusReport, KeyInputState,
+    JEV_ACTIVE_NOTICE, JEV_BOUNDARY_NOTICE, JEV_DISCLOSURE_NOTICE, JEV_FULL_JEV_ALREADY_OFF_NOTICE,
+    JEV_FULL_JEV_OFF_NOTICE, JEV_FULL_JEV_ON_NOTICE, JEV_ON_COMPARE_NOTICE,
 };
 use super::jev_menu_component::JevMenuComponent;
 // `CommandOutput` and `HostEvent` are declared by the host module that owns this
@@ -190,26 +195,62 @@ pub(super) fn saved_credential_present(store: &dyn CredentialStore) -> bool {
     store.is_available() && store.exists(pi_jev::config::DEFAULT_KEY_ID).unwrap_or(false)
 }
 
-/// The footer snapshot for a mode. Pure local reads.
-pub(super) fn footer_snapshot(mode: JevMode, credential: CredentialStatus) -> JevFooterSnapshot {
+/// The footer snapshot for a session. Pure local reads.
+pub(super) fn footer_snapshot(
+    mode: JevMode,
+    credential: CredentialStatus,
+    compaction: JevCompactionState,
+) -> JevFooterSnapshot {
     JevFooterSnapshot {
         mode,
         credential,
         pipeline: Default::default(),
+        compaction,
     }
 }
 
-/// Publish the footer segment through the EXISTING extension status surface
-/// (`ExtensionUiRequest { method: "setStatus" }`), which renders directly under
-/// the model/effort tray. No `native_host.rs` edit is needed for this, and the
-/// host's status row truncates the text to the live width.
+/// Publish BOTH footer segments (decision + independent compaction) through the
+/// EXISTING extension status surface (`ExtensionUiRequest { method: "setStatus"
+/// }`). `native_host_extensions::Statuses` renders them ON the model/effort tray
+/// row and truncates to the live width. No new host surface, no RPC.
 fn publish_footer(
     send: &mpsc::Sender<HostEvent>,
-    mode: JevMode,
+    bridge: &JevModeBridge,
+    session_id: &str,
     credential: CredentialStatus,
 ) {
-    let event = footer_snapshot(mode, credential).published_event();
-    let _ = send.send(HostEvent::Connection(event));
+    let settings = bridge.settings();
+    publish_footer_from_settings(send, &settings, session_id, credential);
+}
+
+/// Publish from one already-loaded settings snapshot, so the decision mode and
+/// the compaction state always come from the same read.
+fn publish_footer_from_settings(
+    send: &mpsc::Sender<HostEvent>,
+    settings: &pi_jev::config::JevSettings,
+    session_id: &str,
+    credential: CredentialStatus,
+) {
+    let snapshot = footer_snapshot(
+        settings.effective_mode(session_id),
+        credential,
+        compaction_state(settings, session_id),
+    );
+    for event in snapshot.published_events() {
+        let _ = send.send(HostEvent::Connection(event));
+    }
+}
+
+/// Publish the CURRENT effective segments for a session: the interactive host
+/// calls this on startup and on a session change, so the row shows the actual
+/// per-session settings (overrides included) before any `/jev` command runs.
+/// One local settings read plus one credential-presence probe; no RPC, no
+/// network, and no settings change.
+pub(crate) fn publish_session_footer(send: &mpsc::Sender<HostEvent>, session_id: &str) {
+    let bridge = JevModeBridge::new(&agent_dir());
+    let store = default_credential_store(agent_dir());
+    let credential = credential_status(saved_credential_present(store.as_ref()));
+    publish_footer(send, &bridge, session_id, credential);
 }
 
 /// The `/jev status` panel, built from local state only: no network call and no
@@ -268,7 +309,7 @@ pub(super) async fn run(
             crate::core::jev_bridge::invalidate_settings_cache();
             // A mode change must take effect immediately: the footer is republished
             // in the same turn as the write, so nothing can render the old state.
-            publish_footer(send, bridge.effective_mode(&session_id), credential);
+            publish_footer(send, &bridge, &session_id, credential);
             let message = mode_change_message(&change);
             // `/jev active` needs no extra wording: `mode_change_message` already
             // appends the exact Active notice and the permanent boundary for it.
@@ -284,7 +325,7 @@ pub(super) async fn run(
         JevRequest::SetDefaultMode(mode) => {
             let change = bridge.set_global_default_supported(mode, connection.supports_jev_features())?;
             crate::core::jev_bridge::invalidate_settings_cache();
-            publish_footer(send, bridge.effective_mode(&session_id), credential);
+            publish_footer(send, &bridge, &session_id, credential);
             Ok(CommandOutput::Status(mode_change_message(&change)))
         }
         JevRequest::SetFeature(feature, enabled) => {
@@ -298,12 +339,18 @@ pub(super) async fn run(
             require_feature_support(connection.supports_jev_features())?;
             bridge.set_compaction(&session_id, enabled)?;
             crate::core::jev_bridge::invalidate_settings_cache();
+            // The compaction dot refreshes in the same turn as the write, so the
+            // row can never render the previous state. The decision segment is
+            // republished from the same read and stays unchanged.
+            publish_footer(send, &bridge, &session_id, credential);
             Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), &session_id)))
         }
         JevRequest::SetDefaultCompaction(enabled) => {
             require_feature_support(connection.supports_jev_features())?;
             bridge.set_default_compaction(enabled)?;
             crate::core::jev_bridge::invalidate_settings_cache();
+            // Sessions without an override see the new default immediately.
+            publish_footer(send, &bridge, &session_id, credential);
             Ok(CommandOutput::Status(format!("Jev compaction default: {} (sessions without a compaction override).\n{}",
                 if enabled { "on" } else { "off" }, render_compaction_settings(&bridge.settings(), &session_id))))
         }
@@ -313,6 +360,119 @@ pub(super) async fn run(
                 text.push_str("Attached worker lacks Jev System One capability; this is local configuration only.\n");
             }
             Ok(CommandOutput::Panel(text))
+        }
+        JevRequest::Models => {
+            // ROOT-CONTRACT v9: the EXPLICIT operator-initiated read-only
+            // catalog query — the ONLY /jev command that may touch the
+            // network, and only here: one bounded single-attempt GET
+            // /v1/models through the existing transport/limits abstractions.
+            // No prompt/history/tool data leaves; no selection; no settings
+            // write; no mode/feature/compaction change; no budget effect. A
+            // missing credential reports honest unavailability with NO fetch.
+            let settings = bridge.settings();
+            let Some((transport, limits)) =
+                crate::core::jev_bridge::catalog_transport_for_command(&settings)
+            else {
+                return Ok(CommandOutput::Error(format!(
+                    "Model catalog unavailable: no Jev credential is configured. Set one with /jev key. Nothing was fetched and no settings were changed.\n{JEV_BOUNDARY_NOTICE}"
+                )));
+            };
+            match pi_jev::models::fetch_model_catalog(transport.as_ref(), &limits).await {
+                Ok(catalog) => Ok(CommandOutput::Panel(render_model_catalog(&catalog))),
+                Err(error) => Ok(CommandOutput::Error(format!(
+                    "Model catalog unavailable ({}). Nothing was changed and nothing was selected.\n{JEV_BOUNDARY_NOTICE}",
+                    error.log_line()
+                ))),
+            }
+        }
+        JevRequest::ModelStatus => {
+            // LOCAL only: settings truth plus the in-process comparison
+            // snapshot when this process holds it. No RPC, no catalog, no
+            // network of any kind (ROOT-CONTRACT v9).
+            let settings = bridge.settings();
+            let reported = crate::core::jev_bridge::session_status_snapshot(&session_id)
+                .as_ref()
+                .and_then(|snapshot| snapshot.get("response_model"))
+                .and_then(|value| value.as_str())
+                .map(str::to_string);
+            Ok(CommandOutput::Panel(render_model_status(&JevModelStatusReport {
+                requested: settings.requested_model_or_default().to_string(),
+                explicit: settings.requested_model.clone(),
+                write_revision: settings.write_revision,
+                reported,
+            })))
+        }
+        JevRequest::ModelSet(id) => {
+            if id.is_empty() {
+                return Ok(CommandOutput::Error(format!(
+                    "Usage: /jev model set <id>\n{JEV_BOUNDARY_NOTICE}"
+                )));
+            }
+            // The effective credential is loaded ONLY for the overlap refusal
+            // check; it is never logged, echoed or persisted (ROOT-CONTRACT
+            // v9). No network call, no probe, no availability claim.
+            let overlap_secret = crate::core::jev_bridge::credential_for_model_overlap();
+            let outcome = bridge.set_requested_model(&id, overlap_secret.as_ref())?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            Ok(CommandOutput::Status(if outcome.written {
+                format!(
+                    "Requested Jev model: {}. Native SystemOne requests now carry it; the primary chat model/provider stays authoritative. No network call was made and no budget was changed.\n{JEV_BOUNDARY_NOTICE}",
+                    outcome.requested
+                )
+            } else {
+                format!(
+                    "Requested Jev model is already {}; nothing was written (the durable write revision did not move).\n{JEV_BOUNDARY_NOTICE}",
+                    outcome.requested
+                )
+            }))
+        }
+        JevRequest::ModelReset => {
+            let outcome = bridge.reset_requested_model()?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            Ok(CommandOutput::Status(if outcome.written {
+                format!(
+                    "Requested Jev model reset to the native default {}. Nothing was probed, no network call was made and no budget was changed.\n{JEV_BOUNDARY_NOTICE}",
+                    outcome.requested
+                )
+            } else {
+                format!(
+                    "Requested Jev model was already the native default {}; nothing was written.\n{JEV_BOUNDARY_NOTICE}",
+                    outcome.requested
+                )
+            }))
+        }
+        JevRequest::SetFullJev(enabled) => {
+            let change = bridge.set_full_jev(enabled)?;
+            crate::core::jev_bridge::invalidate_settings_cache();
+            // Same-turn refresh: the footer must render the new effective
+            // state in the same turn as the write, exactly like every other
+            // /jev write. Other chats refresh at their next footer boundary.
+            publish_footer(send, &bridge, &session_id, credential);
+            Ok(CommandOutput::Status(match change {
+                FullJevChange::Installed { already_active: false } => format!(
+                    "{JEV_FULL_JEV_ON_NOTICE}\n{JEV_DISCLOSURE_NOTICE}\n{JEV_ACTIVE_NOTICE}\n{JEV_BOUNDARY_NOTICE}{}",
+                    if credential.present() {
+                        String::new()
+                    } else {
+                        "\nNo API key is configured: the footer shows unavailable and every decision fails closed until /jev key.".to_string()
+                    }
+                ),
+                FullJevChange::Installed { already_active: true } => format!(
+                    "Full-jev is already active; nothing was changed. Use /jev full-jev off to remove it.\n{JEV_DISCLOSURE_NOTICE}"
+                ),
+                FullJevChange::Removed { was_active: true } => JEV_FULL_JEV_OFF_NOTICE.to_string(),
+                FullJevChange::Removed { was_active: false } => {
+                    JEV_FULL_JEV_ALREADY_OFF_NOTICE.to_string()
+                }
+            }))
+        }
+        JevRequest::FullJevStatus => {
+            let settings = bridge.settings();
+            Ok(CommandOutput::Panel(render_full_jev_status(
+                &settings,
+                &session_id,
+                credential,
+            )))
         }
         JevRequest::Status => {
             let settings = bridge.settings();
@@ -330,11 +490,7 @@ pub(super) async fn run(
             let before = saved_credential_present(store.as_ref());
             clear_secret(store.as_ref()).map_err(|error| error.log_line())?;
             let credential = credential_status(false);
-            publish_footer(
-                send,
-                bridge.effective_mode(&session_id),
-                credential,
-            );
+            publish_footer(send, &bridge, &session_id, credential);
             Ok(CommandOutput::Status(format!(
                 "Jev API key removed from the credential store (was {before}). Mode is unchanged: {}.",
                 super::jev_menu::mode_label(bridge.effective_mode(&session_id))
@@ -366,7 +522,7 @@ async fn menu_dialog(
             JevMenuAction::SetMode(mode) => {
                 let change = bridge.set_session_mode_supported(session_id, mode, connection.supports_jev_features())?;
                 crate::core::jev_bridge::invalidate_settings_cache();
-                publish_footer(send, bridge.effective_mode(session_id), credential);
+                publish_footer(send, bridge, session_id, credential);
                 let _ = send.send(HostEvent::CloseCommandDialog);
                 return Ok(CommandOutput::Status(mode_change_message(&change)));
             }
@@ -374,6 +530,8 @@ async fn menu_dialog(
                 require_feature_support(connection.supports_jev_features())?;
                 bridge.set_compaction(session_id, enabled)?;
                 crate::core::jev_bridge::invalidate_settings_cache();
+                // Same-turn refresh, identical to the command path.
+                publish_footer(send, bridge, session_id, credential);
                 let _ = send.send(HostEvent::CloseCommandDialog);
                 return Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), session_id)));
             }
@@ -455,10 +613,8 @@ async fn key_dialog(
             // The key now exists, so the footer must stop reading "unavailable".
             // The MODE is re-read from the store: a stored key never changes it.
             let now = credential_status(true);
-            let mode = JevModeBridge::new(&agent_dir()).effective_mode(session_id);
-            let _ = send.send(HostEvent::Connection(
-                footer_snapshot(mode, now).published_event(),
-            ));
+            let bridge = JevModeBridge::new(&agent_dir());
+            publish_footer(send, &bridge, session_id, now);
             Ok(CommandOutput::Status(format!(
                 "API key stored in the {backend} credential store. Live validation against TypeSafe is not performed in this build."
             )))

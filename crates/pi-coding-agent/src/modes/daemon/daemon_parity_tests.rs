@@ -1511,3 +1511,706 @@ fn recovery_busy_matches_the_typescript_predicate() {
         "a fully settled session with no children is not busy"
     );
 }
+
+// ---------------------------------------------------------------------------
+// B1 (UI-002/UI-003 rev4): after EVERY replacement/resync delivery the daemon
+// republishes the authoritative Jev footer. The regressions below drive the
+// REAL daemon seams (`queue_client_catchup`, `catch_up_backpressured_client`,
+// `broadcast_to_session`, `stream_worker_snapshot`) over the real
+// `ParityFixture`, so every frame asserted is a real wire frame.
+// ---------------------------------------------------------------------------
+
+/// The four env-mutating B1 regressions share the process environment:
+/// `JevFooterEnvGuard` re-points `PRIME_AGENT_CODING_AGENT_DIR`, so their
+/// set/restore windows take turns (the migrations.rs `ENV_LOCK` pattern).
+static B1_ENV_LOCK: StdMutex<()> = StdMutex::new(());
+
+/// Points `crate::config::get_agent_dir()` — and therefore the Jev settings
+/// store the footer forms read — at this fixture's private agent dir for the
+/// duration of one test, then restores the previous value.
+struct JevFooterEnvGuard {
+    previous: Option<std::ffi::OsString>,
+}
+
+impl JevFooterEnvGuard {
+    fn new(agent_dir: &std::path::Path) -> Self {
+        let previous = std::env::var_os("PRIME_AGENT_CODING_AGENT_DIR");
+        std::fs::create_dir_all(agent_dir).expect("agent dir");
+        std::env::set_var("PRIME_AGENT_CODING_AGENT_DIR", agent_dir);
+        Self { previous }
+    }
+}
+
+impl Drop for JevFooterEnvGuard {
+    fn drop(&mut self) {
+        match self.previous.take() {
+            Some(value) => std::env::set_var("PRIME_AGENT_CODING_AGENT_DIR", value),
+            None => std::env::remove_var("PRIME_AGENT_CODING_AGENT_DIR"),
+        }
+    }
+}
+
+/// Writes `<agent>/jev/jev-settings.json` with explicit per-session Jev
+/// overrides (decision mode + INDEPENDENT compaction), merged onto the
+/// crate's own default settings so the persisted schema stays valid.
+fn b1_write_jev_settings(
+    agent_dir: &std::path::Path,
+    overrides: &[(&str, Option<pi_jev::config::JevMode>, bool)],
+) {
+    let mut settings = pi_jev::config::JevSettings::default();
+    for (session_id, mode, compaction_enabled) in overrides {
+        let entry = settings.sessions.entry(session_id.to_string()).or_default();
+        entry.mode = *mode;
+        entry.compaction_enabled = Some(*compaction_enabled);
+    }
+    let jev_dir = agent_dir.join("jev");
+    std::fs::create_dir_all(&jev_dir).expect("jev dir");
+    std::fs::write(
+        jev_dir.join(pi_jev::config::SETTINGS_FILE_NAME),
+        serde_json::to_string_pretty(&settings).expect("settings serialize"),
+    )
+    .expect("settings write");
+}
+
+/// The decision segment only turns green when a saved credential PRESENCE
+/// file exists (`footer_decision_state`); the value is never read.
+fn b1_write_credential_presence(agent_dir: &std::path::Path) {
+    let jev_dir = agent_dir.join("jev");
+    std::fs::create_dir_all(&jev_dir).expect("jev dir");
+    std::fs::write(
+        jev_dir.join(format!(
+            "{}.{}",
+            pi_jev::config::DEFAULT_KEY_ID,
+            pi_jev::credential::CREDENTIAL_FILE_NAME
+        )),
+        "{\"presenceOnly\":true}\n",
+    )
+    .expect("credential presence write");
+}
+
+/// Registers a resident scripted session (this file's own `ReportingSession`)
+/// into the fixture daemon, mirroring `ScriptedDaemonFixture`'s registration,
+/// and returns the daemon state for it.
+fn b1_register_scripted_session(
+    daemon: &Arc<AgentDaemon>,
+    root: &std::path::Path,
+    active_session_id: &str,
+    session_id: &str,
+) -> Arc<StdMutex<ActiveSessionState>> {
+    let sessions_dir = root.join("sessions");
+    std::fs::create_dir_all(&sessions_dir).expect("sessions dir");
+    let session_file = sessions_dir.join(format!("{active_session_id}.jsonl"));
+    std::fs::write(&session_file, "{}\n").expect("session file");
+    let session = ReportingSession::arc(
+        active_session_id,
+        session_id,
+        &session_file.to_string_lossy(),
+        None,
+        None,
+    );
+    let state = Arc::new(StdMutex::new(ActiveSessionState::new(
+        active_session_id.to_string(),
+        crate::modes::daemon::active_session_state::AgentSessionRuntime {
+            session: ActiveSessionRuntimeSession {
+                session_id: session_id.to_string(),
+                session_name: Some(active_session_id.to_string()),
+                session_file: session.session_file(),
+                ..ActiveSessionRuntimeSession::default()
+            },
+            metadata: Some(AgentSessionRuntimeMetadata {
+                kind: Some("top-level".to_string()),
+                ..AgentSessionRuntimeMetadata::default()
+            }),
+            model_fallback_message: None,
+        },
+    )));
+    daemon.sessions.lock().expect("sessions poisoned").insert(
+        active_session_id.to_string(),
+        Arc::new(DaemonSessionState {
+            state: Arc::clone(&state),
+            session: Arc::clone(&session) as Arc<dyn DaemonSession>,
+            runtime_metadata: AgentSessionRuntimeMetadata {
+                kind: Some("top-level".to_string()),
+                ..AgentSessionRuntimeMetadata::default()
+            },
+            snapshot_boundary: StdMutex::new(None),
+        }),
+    );
+    state
+}
+
+/// Attaches the fixture viewer to one session with `extension_ui` (plus any
+/// extra capabilities), mirroring the attach arm's own bookkeeping
+/// (`state.clients` + `attached_active_session_ids` + session capabilities).
+fn b1_attach_viewer(
+    client: &Arc<DaemonClientHandle>,
+    state: &Arc<StdMutex<ActiveSessionState>>,
+    active_session_id: &str,
+    capabilities: &[&str],
+) {
+    {
+        let mut guard = state.lock().expect("active session poisoned");
+        if !guard
+            .clients
+            .iter()
+            .any(|candidate| Arc::ptr_eq(candidate, &client.state))
+        {
+            guard.clients.push(Arc::clone(&client.state));
+        }
+    }
+    client
+        .state
+        .lock()
+        .expect("daemon client poisoned")
+        .attached_active_session_ids
+        .insert(active_session_id.to_string());
+    let requested: HashSet<String> = capabilities.iter().map(|name| name.to_string()).collect();
+    set_daemon_client_session_capabilities(
+        client,
+        active_session_id,
+        normalize_client_capabilities(Some(&requested), Some(true)),
+    );
+}
+
+/// Decodes the private frames a private-framed fixture client received into
+/// their JSON payloads (the wire format `encode_private_frame` writes).
+fn b1_decode_private_frames(buffers: &[Vec<u8>]) -> Vec<Value> {
+    let mut frames = Vec::new();
+    for buffer in buffers {
+        let mut offset = 0usize;
+        while buffer.len().saturating_sub(offset) >= 8 {
+            let header_length =
+                u32::from_be_bytes(buffer[offset..offset + 4].try_into().expect("4 bytes"))
+                    as usize;
+            let payload_length =
+                u32::from_be_bytes(buffer[offset + 4..offset + 8].try_into().expect("4 bytes"))
+                    as usize;
+            let payload_start = offset + 8 + header_length;
+            if buffer.len() < payload_start + payload_length {
+                break;
+            }
+            if let Ok(value) = serde_json::from_slice::<Value>(
+                &buffer[payload_start..payload_start + payload_length],
+            ) {
+                frames.push(value);
+            }
+            offset = payload_start + payload_length;
+        }
+    }
+    frames
+}
+
+/// Every `setStatus` footer frame a client received, as
+/// (statusKey, statusText, statusCompactText) tuples, in wire order.
+fn b1_footer_pairs(frames: &[Value]) -> Vec<(String, String, String)> {
+    frames
+        .iter()
+        .filter(|frame| {
+            frame.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+                && frame.get("method").and_then(Value::as_str) == Some("setStatus")
+        })
+        .filter_map(|frame| {
+            let payload = frame.get("payload")?;
+            Some((
+                payload
+                    .get("statusKey")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payload
+                    .get("statusText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+                payload
+                    .get("statusCompactText")
+                    .and_then(Value::as_str)
+                    .unwrap_or("")
+                    .to_string(),
+            ))
+        })
+        .collect()
+}
+
+fn b1_frame_index(frames: &[Value], frame_type: &str) -> Option<usize> {
+    frames
+        .iter()
+        .position(|frame| frame.get("type").and_then(Value::as_str) == Some(frame_type))
+}
+
+fn b1_footer_positions(frames: &[Value]) -> Vec<usize> {
+    frames
+        .iter()
+        .enumerate()
+        .filter(|(_, frame)| {
+            frame.get("type").and_then(Value::as_str) == Some("extension_ui_request")
+        })
+        .map(|(index, _)| index)
+        .collect()
+}
+
+/// B1a: a backpressured viewer converges through catch-up, and the repushed
+/// footer carries the NEW session's effective values. Session A (Compare +
+/// compaction on) is replaced by session B (Off + compaction off): A's pair
+/// must show A's labels, B's pair must show B's labels and none of A's.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b1_backpressured_replacement_catchup_republishes_the_new_session_footer() {
+    let _env_lock = B1_ENV_LOCK.lock().unwrap();
+    crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+    let case = "b1-replacement-catchup";
+    let root = state_root(case);
+    let _guard = JevFooterEnvGuard::new(&root.join("agent"));
+    let mut fixture = ParityFixture::new(case).await;
+    let daemon = Arc::clone(&fixture.daemon);
+    let client = Arc::clone(&fixture.client);
+    let session_a_id = daemon.session_of(&fixture.state).session_id();
+    let session_b_active = "b1-session-b";
+    let session_b_id = "b1-session-b-durable";
+    b1_write_jev_settings(
+        &root.join("agent"),
+        &[
+            (&session_a_id, Some(pi_jev::config::JevMode::Compare), true),
+            (session_b_id, Some(pi_jev::config::JevMode::Off), false),
+        ],
+    );
+    b1_write_credential_presence(&root.join("agent"));
+    let state_b = b1_register_scripted_session(&daemon, &root, session_b_active, session_b_id);
+    b1_attach_viewer(
+        &client,
+        &fixture.state,
+        &fixture.active_session_id,
+        &["extension_ui"],
+    );
+    b1_attach_viewer(&client, &state_b, session_b_active, &["extension_ui"]);
+
+    // The OLD session's catch-up first: its pair must carry A's values.
+    client.set_backpressured(true);
+    daemon.queue_client_catchup(&client, &fixture.active_session_id, "replacement");
+    client.set_backpressured(false);
+    daemon
+        .catch_up_backpressured_client(Arc::clone(&client))
+        .await
+        .expect("catch-up drained");
+    let frames_a = fixture.drain();
+    let replaced_a = b1_frame_index(&frames_a, "session_replaced")
+        .expect("A catch-up delivered a replace frame");
+    let pairs_a = b1_footer_pairs(&frames_a);
+    assert_eq!(
+        pairs_a.len(),
+        2,
+        "decision + compaction segments: {frames_a:?}"
+    );
+    assert_eq!(
+        b1_footer_positions(&frames_a),
+        vec![replaced_a + 1, replaced_a + 2],
+        "the footer pair must follow the replace frame: {frames_a:?}"
+    );
+    assert_eq!(pairs_a[0].0, "jev");
+    assert!(
+        pairs_a[0].1.contains("Jev On (Compare)"),
+        "A full decision text: {:?}",
+        pairs_a[0].1
+    );
+    assert!(
+        pairs_a[0].2.contains("Jev C On"),
+        "A compact decision text: {:?}",
+        pairs_a[0].2
+    );
+    assert_eq!(pairs_a[1].0, "jev-compact");
+    assert!(
+        pairs_a[1].1.contains("Jev compact on"),
+        "A compaction text: {:?}",
+        pairs_a[1].1
+    );
+    assert!(
+        pairs_a[1].2.contains("Jev Cmp on"),
+        "A compact compaction: {:?}",
+        pairs_a[1].2
+    );
+
+    // The NEW session's replacement catch-up: B's pair replaces A's labels.
+    client.set_backpressured(true);
+    daemon.queue_client_catchup(&client, session_b_active, "replacement");
+    client.set_backpressured(false);
+    daemon
+        .catch_up_backpressured_client(Arc::clone(&client))
+        .await
+        .expect("catch-up drained");
+    let frames_b = fixture.drain();
+    let replaced_b = b1_frame_index(&frames_b, "session_replaced")
+        .expect("B catch-up delivered a replace frame");
+    assert_eq!(
+        frames_b[replaced_b]
+            .get("activeSessionId")
+            .and_then(Value::as_str),
+        Some(session_b_active)
+    );
+    let pairs_b = b1_footer_pairs(&frames_b);
+    assert_eq!(
+        pairs_b.len(),
+        2,
+        "decision + compaction segments: {frames_b:?}"
+    );
+    assert_eq!(
+        b1_footer_positions(&frames_b),
+        vec![replaced_b + 1, replaced_b + 2],
+        "the footer pair must follow the replace frame: {frames_b:?}"
+    );
+    assert_eq!(pairs_b[0].0, "jev");
+    assert!(
+        pairs_b[0].1.contains("Jev Off"),
+        "B full decision text: {:?}",
+        pairs_b[0].1
+    );
+    assert!(
+        pairs_b[0].2.contains("Jev Off"),
+        "B compact decision text: {:?}",
+        pairs_b[0].2
+    );
+    assert!(
+        !pairs_b[0].1.contains("Jev On (Compare)"),
+        "no A decision label may leak into B: {:?}",
+        pairs_b[0].1
+    );
+    assert!(
+        !pairs_b[0].2.contains("Jev C On"),
+        "no A compact decision label may leak into B: {:?}",
+        pairs_b[0].2
+    );
+    assert_eq!(pairs_b[1].0, "jev-compact");
+    assert!(
+        pairs_b[1].1.contains("Jev compact off"),
+        "B compaction text: {:?}",
+        pairs_b[1].1
+    );
+    assert!(
+        pairs_b[1].2.contains("Jev Cmp off"),
+        "B compact compaction: {:?}",
+        pairs_b[1].2
+    );
+    assert!(
+        !pairs_b[1].1.contains("Jev compact on"),
+        "no A compaction label may leak into B: {:?}",
+        pairs_b[1].1
+    );
+}
+
+/// B1b: a resync catch-up republishes the footer with the two segments
+/// INDEPENDENT: decision Off (red) while the session's own compaction
+/// setting is ON (green).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b1_resync_catchup_republishes_independent_decision_and_compaction() {
+    let _env_lock = B1_ENV_LOCK.lock().unwrap();
+    crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+    let case = "b1-resync-catchup";
+    let root = state_root(case);
+    let _guard = JevFooterEnvGuard::new(&root.join("agent"));
+    let mut fixture = ParityFixture::new(case).await;
+    let daemon = Arc::clone(&fixture.daemon);
+    let client = Arc::clone(&fixture.client);
+    let session_c_active = "b1-session-c";
+    let session_c_id = "b1-session-c-durable";
+    b1_write_jev_settings(
+        &root.join("agent"),
+        &[(session_c_id, Some(pi_jev::config::JevMode::Off), true)],
+    );
+    b1_write_credential_presence(&root.join("agent"));
+    let state_c = b1_register_scripted_session(&daemon, &root, session_c_active, session_c_id);
+    b1_attach_viewer(&client, &state_c, session_c_active, &["extension_ui"]);
+
+    client.set_backpressured(true);
+    daemon.queue_client_catchup(&client, session_c_active, "resync");
+    client.set_backpressured(false);
+    daemon
+        .catch_up_backpressured_client(Arc::clone(&client))
+        .await
+        .expect("catch-up drained");
+    let frames = fixture.drain();
+    let resynced =
+        b1_frame_index(&frames, "session_resynced").expect("the catch-up delivered a resync frame");
+    assert_eq!(
+        frames[resynced]
+            .get("activeSessionId")
+            .and_then(Value::as_str),
+        Some(session_c_active)
+    );
+    let pairs = b1_footer_pairs(&frames);
+    assert_eq!(pairs.len(), 2, "decision + compaction segments: {frames:?}");
+    assert_eq!(
+        b1_footer_positions(&frames),
+        vec![resynced + 1, resynced + 2],
+        "the footer pair must follow the resync frame: {frames:?}"
+    );
+    assert_eq!(pairs[0].0, "jev");
+    assert!(
+        pairs[0].1.contains("Jev Off"),
+        "decision stays Off: {:?}",
+        pairs[0].1
+    );
+    assert!(
+        !pairs[0].1.contains("Jev On"),
+        "decision off must never claim on: {:?}",
+        pairs[0].1
+    );
+    assert_eq!(pairs[1].0, "jev-compact");
+    assert!(
+        pairs[1].1.contains("Jev compact on"),
+        "compaction is independently ON: {:?}",
+        pairs[1].1
+    );
+    assert!(
+        pairs[1].2.contains("Jev Cmp on"),
+        "compact compaction is independently ON: {:?}",
+        pairs[1].2
+    );
+    assert!(
+        !pairs[1].2.contains("Jev Cmp off"),
+        "compaction on must never render off: {:?}",
+        pairs[1].2
+    );
+}
+
+/// B1c: a chunked-snapshot client receives the footer only AFTER the
+/// replacement snapshot stream completes (the client applies the chunked
+/// snapshot as the replacement when `session_snapshot_end` lands, and that
+/// application resets the status surface).
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b1_chunked_replacement_snapshot_republishes_the_footer_after_the_stream() {
+    let _env_lock = B1_ENV_LOCK.lock().unwrap();
+    crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+    let case = "b1-chunked-replacement";
+    let root = state_root(case);
+    let _guard = JevFooterEnvGuard::new(&root.join("agent"));
+    let mut fixture = ParityFixture::new(case).await;
+    let daemon = Arc::clone(&fixture.daemon);
+    let client = Arc::clone(&fixture.client);
+    let session_b_active = "b1-chunked-session-b";
+    let session_b_id = "b1-chunked-b-durable";
+    b1_write_jev_settings(
+        &root.join("agent"),
+        &[(session_b_id, Some(pi_jev::config::JevMode::Off), false)],
+    );
+    b1_write_credential_presence(&root.join("agent"));
+    let state_b = b1_register_scripted_session(&daemon, &root, session_b_active, session_b_id);
+    {
+        let mut client_state = client.state.lock().expect("daemon client poisoned");
+        client_state.transport = Some("private-framed".to_string());
+    }
+    b1_attach_viewer(
+        &client,
+        &state_b,
+        session_b_active,
+        &["extension_ui", "chunked_snapshot"],
+    );
+
+    client.set_backpressured(true);
+    daemon.queue_client_catchup(&client, session_b_active, "replacement");
+    client.set_backpressured(false);
+    daemon
+        .catch_up_backpressured_client(Arc::clone(&client))
+        .await
+        .expect("catch-up drained");
+
+    let mut buffers = Vec::new();
+    while let Ok(frame) = fixture.outbound.try_recv() {
+        buffers.push(frame);
+    }
+    let frames = b1_decode_private_frames(&buffers);
+    let replaced = b1_frame_index(&frames, "session_replaced")
+        .expect("the catch-up delivered a replace frame announcing the snapshot");
+    assert_eq!(
+        frames[replaced]
+            .get("snapshotFollows")
+            .and_then(Value::as_bool),
+        Some(true)
+    );
+    let begin =
+        b1_frame_index(&frames, "session_snapshot_begin").expect("the snapshot stream began");
+    assert_eq!(
+        frames[begin].get("purpose").and_then(Value::as_str),
+        Some("replacement")
+    );
+    let end =
+        b1_frame_index(&frames, "session_snapshot_end").expect("the snapshot stream completed");
+    assert!(replaced < begin && begin < end, "stream order: {frames:?}");
+    let pairs = b1_footer_pairs(&frames);
+    assert_eq!(pairs.len(), 2, "decision + compaction segments: {frames:?}");
+    assert_eq!(
+        b1_footer_positions(&frames),
+        vec![end + 1, end + 2],
+        "the footer pair must follow the completed snapshot stream: {frames:?}"
+    );
+    assert_eq!(pairs[0].0, "jev");
+    assert!(
+        pairs[0].1.contains("Jev Off") && pairs[0].2.contains("Jev Off"),
+        "B decision full + compact: {:?} / {:?}",
+        pairs[0].1,
+        pairs[0].2
+    );
+    assert_eq!(pairs[1].0, "jev-compact");
+    assert!(
+        pairs[1].1.contains("Jev compact off") && pairs[1].2.contains("Jev Cmp off"),
+        "B compaction full + compact: {:?} / {:?}",
+        pairs[1].1,
+        pairs[1].2
+    );
+}
+
+/// B1d: a viewer that is mid-snapshot-stream when the daemon-side replacement
+/// lands gets NOTHING inline (the deferred frames are cleared and the
+/// replacement converges into the catch-up queue); once the stream finishes,
+/// the catch-up delivers the replace frame and the footer pair.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b1_snapshot_streaming_client_converges_to_catchup_footer() {
+    let _env_lock = B1_ENV_LOCK.lock().unwrap();
+    crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+    let case = "b1-deferred-convergence";
+    let root = state_root(case);
+    let _guard = JevFooterEnvGuard::new(&root.join("agent"));
+    let mut fixture = ParityFixture::new(case).await;
+    let daemon = Arc::clone(&fixture.daemon);
+    let client = Arc::clone(&fixture.client);
+    let session_b_active = "b1-deferred-session-b";
+    let session_b_id = "b1-deferred-b-durable";
+    b1_write_jev_settings(
+        &root.join("agent"),
+        &[(session_b_id, Some(pi_jev::config::JevMode::Off), false)],
+    );
+    b1_write_credential_presence(&root.join("agent"));
+    let state_b = b1_register_scripted_session(&daemon, &root, session_b_active, session_b_id);
+    b1_attach_viewer(&client, &state_b, session_b_active, &["extension_ui"]);
+
+    mark_client_snapshot_streaming(&client, session_b_active);
+    let entry = daemon
+        .sessions
+        .lock()
+        .expect("sessions poisoned")
+        .get(session_b_active)
+        .cloned()
+        .expect("registered entry");
+    daemon.broadcast_to_session(
+        &entry,
+        DaemonOutbound::SessionReplaced {
+            active_session_id: session_b_active.to_string(),
+            state: Value::Null,
+            messages: Vec::new(),
+        },
+    );
+    assert!(
+        fixture.drain().is_empty(),
+        "nothing may be written while the client is snapshot-streaming"
+    );
+    {
+        let state = client.state.lock().expect("daemon client poisoned");
+        assert!(
+            state
+                .catchup_active_session_ids
+                .as_ref()
+                .is_some_and(|ids| ids.contains(session_b_active)),
+            "the replacement must converge into the catch-up queue"
+        );
+    }
+    let mut client_mut = Arc::clone(&client);
+    finish_client_snapshot_streaming(&mut client_mut, session_b_active);
+    daemon
+        .catch_up_backpressured_client(Arc::clone(&client))
+        .await
+        .expect("catch-up drained");
+    let frames = fixture.drain();
+    let replaced = b1_frame_index(&frames, "session_replaced")
+        .expect("the catch-up delivered the replace frame");
+    assert_eq!(
+        frames[replaced]
+            .get("activeSessionId")
+            .and_then(Value::as_str),
+        Some(session_b_active)
+    );
+    let pairs = b1_footer_pairs(&frames);
+    assert_eq!(pairs.len(), 2, "decision + compaction segments: {frames:?}");
+    assert_eq!(
+        b1_footer_positions(&frames),
+        vec![replaced + 1, replaced + 2],
+        "the footer pair must follow the replace frame: {frames:?}"
+    );
+    assert!(
+        pairs[0].1.contains("Jev Off") && pairs[0].2.contains("Jev Off"),
+        "B decision full + compact: {:?} / {:?}",
+        pairs[0].1,
+        pairs[0].2
+    );
+    assert!(
+        pairs[1].1.contains("Jev compact off") && pairs[1].2.contains("Jev Cmp off"),
+        "B compaction full + compact: {:?} / {:?}",
+        pairs[1].1,
+        pairs[1].2
+    );
+}
+
+/// B1e (fail-closed): an ABORTED replacement transfer delivers its failure
+/// frame but must NOT publish a premature footer pair — the trailing catch-up
+/// delivers fresh state and pushes after its own delivery — and a cancelled
+/// transfer must not strand a catch-up either.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn b1_aborted_snapshot_transfer_never_publishes_a_premature_footer() {
+    let case = "b1-aborted-transfer";
+    let mut fixture = ParityFixture::new(case).await;
+    let signal = tokio_util::sync::CancellationToken::new();
+    signal.cancel();
+    let snapshot = serde_json::json!({
+        "lastEventSequence": 1,
+        "lastEventCursor": { "generation": "b1", "sequence": 1 },
+        "messages": [],
+    });
+    let transcript = create_snapshot_transcript_chunks(CreateSnapshotTranscriptChunksOptions {
+        active_session_id: fixture.active_session_id.clone(),
+        snapshot_id: "b1-aborted-snapshot".to_string(),
+        messages: Vec::new(),
+        target_chunk_bytes: Some(SNAPSHOT_TARGET_CHUNK_BYTES),
+        aborted: signal.is_cancelled(),
+    });
+    // R1 (test validity): fixture defaults grant only {attach_snapshot,
+    // event_sequence} and `capabilities_for_session` falls back to the global
+    // set, which would mask the completed-transfer footer gate — without an
+    // explicit extension_ui grant the no-footer assert below is vacuous.
+    b1_attach_viewer(
+        &fixture.client,
+        &fixture.state,
+        &fixture.active_session_id,
+        &["extension_ui"],
+    );
+    fixture
+        .daemon
+        .stream_worker_snapshot(
+            &fixture.client,
+            &fixture.state,
+            "b1-aborted-snapshot",
+            snapshot,
+            0,
+            transcript,
+            "replacement",
+            signal,
+            false,
+        )
+        .await
+        .expect("the aborted transfer completes without error");
+    let frames = fixture.drain();
+    assert!(
+        frames
+            .iter()
+            .any(|frame| frame.get("type").and_then(Value::as_str)
+                == Some("session_snapshot_failed")),
+        "the aborted transfer reports its failure: {frames:?}"
+    );
+    assert!(
+        b1_footer_pairs(&frames).is_empty(),
+        "no footer pair may be published for an aborted transfer: {frames:?}"
+    );
+    let state = fixture.client.state.lock().expect("daemon client poisoned");
+    assert!(
+        state
+            .catchup_active_session_ids
+            .as_ref()
+            .map_or(true, |ids| ids.is_empty()),
+        "a cancelled transfer must not strand a catch-up"
+    );
+}

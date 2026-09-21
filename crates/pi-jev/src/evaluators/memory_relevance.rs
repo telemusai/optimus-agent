@@ -3,7 +3,7 @@
 
 use crate::evaluators::{question_id, EvaluatorOutput, PreparedQuestion, StateView};
 use crate::snapshot::SnapshotStage;
-use crate::types::{DecisionCategory, NoulCriteria, QuestionSpec};
+use crate::types::{DecisionCategory, QuestionSpec};
 
 pub struct MemoryRelevance;
 
@@ -31,13 +31,13 @@ impl super::CategoryEvaluator for MemoryRelevance {
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Noul {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "Is stored memory relevant to this task? Bounded memory summary: {memory_excerpt}"
-                ),
-                criteria: Some(NoulCriteria {
-                    r#true: "Stored memory is relevant.".to_string(),
-                    r#false: "Stored memory is not relevant.".to_string(),
-                }),
+                ))),
+                criteria: Some(crate::types::NoulCriteria::text(
+                    "Stored memory is relevant.",
+                    "Stored memory is not relevant.",
+                )),
             },
         }])
     }

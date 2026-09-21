@@ -606,7 +606,13 @@ pub async fn create_agent_session_with_factories(
                     };
                     let values = runner.emit_context(values).await;
                     let ctx = runner.create_context();
-                    let values = crate::core::jev_bridge::filter_context_candidates(ctx.clone(), values).await;
+                    // ROOT CONTRACT v1 (Search): ONE shared provider-context
+                    // deadline across filtering, reranking and line matching;
+                    // every stage spends from this single token.
+                    let search_budget = pi_jev::search::SearchBudget::from_now(
+                        std::time::Duration::from_millis(pi_jev::search::SHARED_SEARCH_BUDGET_MS),
+                    );
+                    let values = crate::core::jev_bridge::filter_context_candidates(ctx.clone(), values, &search_budget).await;
                     let values = crate::core::jev_compaction::compact_context(ctx, values, signal).await;
                     values.into_iter().map(serde_json::from_value).collect::<Result<Vec<_>, _>>().unwrap_or(messages)
                 }) as BoxFuture<Vec<AgentMessage>>

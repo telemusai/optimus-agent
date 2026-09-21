@@ -21,15 +21,15 @@
 
 #![allow(clippy::too_many_arguments)]
 
-#[path = "agent_session/runtime_members.rs"]
-mod runtime_members;
 #[path = "agent_session/agent_handle.rs"]
 mod agent_handle;
-#[path = "agent_session/task_queue.rs"]
-mod task_queue;
 #[cfg(test)]
 #[path = "agent_session/rlm_result_delivery_tests.rs"]
 mod rlm_result_delivery_tests;
+#[path = "agent_session/runtime_members.rs"]
+mod runtime_members;
+#[path = "agent_session/task_queue.rs"]
+mod task_queue;
 
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -49,33 +49,15 @@ use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use tokio_util::sync::CancellationToken;
 
-use crate::core::extensions::runner::{ExtensionErrorListener, ShutdownHandler};
-use crate::core::extensions::types::{
-    AgentEndPayload, ExtensionCommandContextActions, ExtensionError, ExtensionEvent,
-    ExtensionUiContext, MessageStartPayload, MessageUpdatePayload, ModelSelectPayload,
-    ToolCallEvent, ToolExecutionEndPayload, ToolExecutionStartPayload, ToolExecutionUpdatePayload,
-    ToolResultEvent, TurnEndPayload, TurnStartPayload,
-};
 use crate::core::agent_messages::{
-    AGENT_MESSAGE_CUSTOM_TYPE,
-    AGENT_MESSAGE_SKILL_NAME,
-    AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
-    AgentFamilyCatalogEntry,
-    AgentSessionMessageListResult,
-    AgentSessionMessageReceipt,
-    AgentSessionNameAvailabilityInput,
-    AgentSessionNameScope,
-    DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
-    assert_agent_message_queue_capacity,
-    assert_agent_session_name_available,
-    assert_direct_agent_message_target,
-    create_agent_message_host_handlers,
-    format_agent_session_name_unavailable,
-    is_agent_session_message,
-    is_agent_session_message_prompt,
-    normalize_agent_session_message,
-    parse_agent_session_message_prompt_id,
-    starts_agent_run,
+    assert_agent_message_queue_capacity, assert_agent_session_name_available,
+    assert_direct_agent_message_target, create_agent_message_host_handlers,
+    format_agent_session_name_unavailable, is_agent_session_message,
+    is_agent_session_message_prompt, normalize_agent_session_message,
+    parse_agent_session_message_prompt_id, starts_agent_run, AgentFamilyCatalogEntry,
+    AgentSessionMessageListResult, AgentSessionMessageReceipt, AgentSessionNameAvailabilityInput,
+    AgentSessionNameScope, AGENT_MESSAGE_CUSTOM_TYPE, AGENT_MESSAGE_RECEIVED_PREVIEW_LABEL,
+    AGENT_MESSAGE_SKILL_NAME, DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
 };
 use crate::core::agent_observe::{
     create_agent_observe_host_handlers, normalize_observe_limit, normalize_observe_max_chars,
@@ -88,10 +70,6 @@ use crate::core::auth_guidance::{
     is_likely_authentication_error,
 };
 use crate::core::auth_storage::AuthSourceToken;
-use crate::core::kernel::shared::HostRequestHandlers;
-use crate::core::kernel::state_snapshot::RestoreResult;
-pub use crate::core::resource_loader::{ResourceLoader, ResourceExtensionPaths};
-pub use crate::core::rlm_runtime::{SubagentRuntimeHost, RlmSubagentRuntime, RlmSpawnHandle, CreateRlmSubagentRuntimeOptions, RlmSubagentRegistryEntry, RlmCreateSessionResult, RlmDeleteSubagentResult, RlmFindModelsResult, RlmListSubagentsResult, ScopedModelEntry as ScopedModel};
 pub use crate::core::bash_executor::BashResult;
 use crate::core::compaction::branch_summarization::{
     collect_entries_for_branch_summary, generate_branch_summary, prepare_branch_entries,
@@ -108,61 +86,45 @@ use crate::core::context_tree::{
     compute_own_and_total_usage, load_context_tree_child_from_disk,
     load_context_tree_children_from_disk, ContextTreeNode, ContextUsage, ContextWindowResolver,
 };
+use crate::core::cron_jobs::normalize_heartbeat_delivery_mode;
+use crate::core::extensions::runner::{ExtensionErrorListener, ShutdownHandler};
+use crate::core::extensions::types::InputEventResult;
+use crate::core::extensions::types::{
+    AgentEndPayload, ExtensionCommandContextActions, ExtensionError, ExtensionEvent,
+    ExtensionUiContext, MessageStartPayload, MessageUpdatePayload, ModelSelectPayload,
+    ToolCallEvent, ToolExecutionEndPayload, ToolExecutionStartPayload, ToolExecutionUpdatePayload,
+    ToolResultEvent, TurnEndPayload, TurnStartPayload,
+};
 use crate::core::goals::{
     create_goal_context_message, empty_goal_state, goal_host_response, goal_token_delta_for_usage,
     is_persisted_goal_state, normalize_goal_state, validate_goal_budget, validate_goal_objective,
     GoalContextKind, GoalHostResponse, GoalState, GoalStatus, GOAL_CONTEXT_CUSTOM_TYPE,
-    GOAL_CONTEXT_PREVIEW_LABEL,
-    GOAL_SKILL_NAME, GOAL_STATE_CUSTOM_TYPE,
+    GOAL_CONTEXT_PREVIEW_LABEL, GOAL_SKILL_NAME, GOAL_STATE_CUSTOM_TYPE,
 };
+use crate::core::kernel::shared::HostRequestHandlers;
+use crate::core::kernel::state_snapshot::RestoreResult;
 use crate::core::messages::{
-    ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
-    REFINEMENT_SOURCE_AUTO,
-    REFINEMENT_SOURCE_USER,
-    ASYNC_BASH_COMPLETION_PREVIEW_LABEL,
-    AsyncBashCompletionDetails,
-    BashExecutionMessage,
-    CompactionOutcome,
-    CompactionOutcomeDetails,
-    CompactionOutcomeReason,
-    CustomMessage,
-    HARNESS_DIGEST_CUSTOM_TYPE,
-    HEARTBEAT_PROMPT_CUSTOM_TYPE,
-    HEARTBEAT_PROMPT_PREVIEW_LABEL,
-    HarnessDigestDetails,
-    IPYTHON_STATE_RESTORED_CUSTOM_TYPE,
-    REFINEMENT_SOURCE_SELF,
-    RLM_CHILD_FAILURE_CUSTOM_TYPE,
-    RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE,
-    RefinementSource,
-    RlmChildFailureDetails,
-    RlmChildTerminalNoticeDetails,
-    SESSION_SLASH_COMMAND_CUSTOM_TYPE,
+    convert_to_llm, create_async_bash_completion_message, create_compaction_outcome_message,
+    create_custom_message, create_harness_digest_message, create_heartbeat_prompt_message,
+    create_refinement_notice_message, create_refinement_outcome_message,
+    create_rlm_child_failure_message, create_rlm_child_terminal_notice_message,
+    create_session_slash_command_message, create_session_slash_command_result_message,
+    is_compaction_outcome_message, is_session_slash_command, is_session_slash_command_message,
+    without_harness_digests_for_compaction, AsyncBashCompletionDetails, BashExecutionMessage,
+    CompactionOutcome, CompactionOutcomeDetails, CompactionOutcomeReason, CustomMessage,
+    HarnessDigestDetails, RefinementSource, RlmChildFailureDetails, RlmChildTerminalNoticeDetails,
+    SessionSlashCommandResultDetails, ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+    ASYNC_BASH_COMPLETION_PREVIEW_LABEL, HARNESS_DIGEST_CUSTOM_TYPE, HEARTBEAT_PROMPT_CUSTOM_TYPE,
+    HEARTBEAT_PROMPT_PREVIEW_LABEL, IPYTHON_STATE_RESTORED_CUSTOM_TYPE, REFINEMENT_SOURCE_AUTO,
+    REFINEMENT_SOURCE_SELF, REFINEMENT_SOURCE_USER, RLM_CHILD_FAILURE_CUSTOM_TYPE,
+    RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE, SESSION_SLASH_COMMAND_CUSTOM_TYPE,
     SESSION_SLASH_COMMAND_RESULT_CUSTOM_TYPE,
-    SessionSlashCommandResultDetails,
-    convert_to_llm,
-    create_async_bash_completion_message,
-    create_compaction_outcome_message,
-    create_custom_message,
-    create_harness_digest_message,
-    create_heartbeat_prompt_message,
-    create_refinement_notice_message,
-    create_refinement_outcome_message,
-    create_rlm_child_failure_message,
-    create_rlm_child_terminal_notice_message,
-    create_session_slash_command_message,
-    create_session_slash_command_result_message,
-    is_compaction_outcome_message,
-    is_session_slash_command,
-    is_session_slash_command_message,
-    without_harness_digests_for_compaction,
 };
 use crate::core::model_tool_output_policy::{
     apply_model_tool_output_policy, ModelToolOutputPolicy, ModelToolOutputPolicyOptions,
     ModelToolOutputScope,
 };
 use crate::core::prompt_templates::{expand_prompt_template, PromptTemplate};
-use crate::core::extensions::types::InputEventResult;
 #[cfg(test)]
 use crate::core::refinement::refinement::save_harness_state;
 use crate::core::refinement::refinement::{
@@ -173,49 +135,35 @@ use crate::core::refinement::refinement::{
     normalize_refinement_proposal, plan_refinement, review_auto_refine, save_harness_state_checked,
     ApplyRefinementOptions, AutoRefineReason, AutoRefineReview, AutoRefineReviewContext,
     CompletionFn, HarnessScope, HarnessState, PlanRefinementRequest, ProviderRetryPolicy,
-    RefineModel, RefinementCompletionRequest, RefinementFailureError,
-    RefinementPlan, RefinementProposal, RefinementResult, RefineOptions, ReviewAutoRefineRequest,
-    REFINE_SKILL_NAME, REFINEMENT_CUSTOM_TYPE, REFINEMENT_FAILURE_CUSTOM_TYPE,
+    RefineModel, RefineOptions, RefinementCompletionRequest, RefinementFailureError,
+    RefinementPlan, RefinementProposal, RefinementResult, ReviewAutoRefineRequest,
+    REFINEMENT_CUSTOM_TYPE, REFINEMENT_FAILURE_CUSTOM_TYPE, REFINE_SKILL_NAME,
+};
+pub use crate::core::resource_loader::{ResourceExtensionPaths, ResourceLoader};
+pub use crate::core::rlm_runtime::{
+    CreateRlmSubagentRuntimeOptions, RlmCreateSessionResult, RlmDeleteSubagentResult,
+    RlmFindModelsResult, RlmListSubagentsResult, RlmSpawnHandle, RlmSubagentRegistryEntry,
+    RlmSubagentRuntime, ScopedModelEntry as ScopedModel, SubagentRuntimeHost,
 };
 use crate::core::session_action_store::TransitionOptions;
 use crate::core::session_action_store::{
-    ActionLifecycle,
-    ActionStore,
-    ActionTicket,
-    DeliveryMessage,
-    DeliveryPolicy,
-    DeliveryRecord,
-    DeliveryRecordRole,
-    QueuedMessageLane,
-    QueuedMessageMutation,
-    QueuedMessageMutationStatus,
-    RollbackProof,
-    RuntimeActivity,
-    SessionAction,
-    SessionActionPayload,
-    SessionActionPhase,
-    SessionActionSnapshot,
-    SessionActionSnapshotActive,
-    SessionActionSnapshotKind,
-    SessionCommandPayload,
-    SessionTurnPayload,
-    WakePolicy,
-    ActionLifecycleState,
-    DeliveryOutcome,
-    can_select_session_action,
-    queued_message_lane_delivery_policy,
-    transition_session_action,
+    can_select_session_action, queued_message_lane_delivery_policy, transition_session_action,
+    ActionLifecycle, ActionLifecycleState, ActionStore, ActionTicket, DeliveryMessage,
+    DeliveryOutcome, DeliveryPolicy, DeliveryRecord, DeliveryRecordRole, QueuedMessageLane,
+    QueuedMessageMutation, QueuedMessageMutationStatus, RollbackProof, RuntimeActivity,
+    SessionAction, SessionActionPayload, SessionActionPhase, SessionActionSnapshot,
+    SessionActionSnapshotActive, SessionActionSnapshotKind, SessionCommandPayload,
+    SessionTurnPayload, WakePolicy,
 };
-use crate::core::skills::Skill;
 use crate::core::session_manager::{
     get_latest_compaction_entry, SessionContext, SessionEntry, SessionManager,
     CURRENT_SESSION_VERSION,
 };
 use crate::core::session_stats::SessionStats;
+use crate::core::skills::Skill;
 use crate::core::slash_commands::{
-    RefineCommandOptions,
     parse_refine_command_options, parse_session_slash_command, parse_slash_command,
-    SessionSlashCommand, SlashCommandInfo,
+    RefineCommandOptions, SessionSlashCommand, SlashCommandInfo,
 };
 use crate::core::source_info::{create_synthetic_source_info, SourceInfo};
 use crate::core::system_prompt::{build_system_prompt, BuildSystemPromptOptions};
@@ -223,8 +171,9 @@ use crate::core::usage::{
     add_assistant_usage, clone_usage, empty_usage, session_usage_summary_from,
     subtract_assistant_usage, SessionUsageSummary,
 };
-use crate::core::websearch_credential::{SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME};
-use crate::core::cron_jobs::normalize_heartbeat_delivery_mode;
+use crate::core::websearch_credential::{
+    SERPER_CREDENTIAL_ID, SERPER_ENV_VAR, WEBSEARCH_SKILL_NAME,
+};
 use crate::modes::agent_connection::daemon_agent_connection::now_iso;
 use crate::utils::warning_limiter::{limited_warning, wall_clock_ms, DEFAULT_WARNING_WINDOW_MS};
 use pi_ai::models::{
@@ -239,32 +188,82 @@ use pi_ai::utils::overflow::is_context_overflow;
 // TypeScript member names so the mapping stays recognisable.
 // ---------------------------------------------------------------------------
 
+/// `AgentContinueError` from `@earendil-works/pi-agent-core` (agent.ts:177-186),
+/// re-exported so the session's `AgentHandle::continue_` seam keeps its typed code.
+pub use pi_agent_core::agent::{AgentContinueError, AgentContinueErrorCode};
+pub use pi_agent_core::performance_metrics::{
+    AgentLoopPerformanceMetrics, PerformanceMetricRecorder,
+};
 pub use pi_agent_core::types::{
     AfterToolCallContext, AfterToolCallResult, BeforeToolCallContext, BeforeToolCallResult,
     GetContinuationMessagesContext, ShouldStopAfterTurnContext,
 };
-pub use pi_agent_core::performance_metrics::{AgentLoopPerformanceMetrics, PerformanceMetricRecorder};
-/// `AgentContinueError` from `@earendil-works/pi-agent-core` (agent.ts:177-186),
-/// re-exported so the session's `AgentHandle::continue_` seam keeps its typed code.
-pub use pi_agent_core::agent::{AgentContinueError, AgentContinueErrorCode};
 
-pub type BeforeToolCallHook = Arc<dyn Fn(BeforeToolCallContext, Option<CancellationToken>) -> BoxFuture<Result<Option<BeforeToolCallResult>, String>> + Send + Sync>;
-pub type AfterToolCallHook = Arc<dyn Fn(AfterToolCallContext, Option<CancellationToken>) -> BoxFuture<Result<Option<AfterToolCallResult>, String>> + Send + Sync>;
-pub type GetContinuationMessagesHook = Arc<dyn Fn(GetContinuationMessagesContext, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>> + Send + Sync>;
+pub type BeforeToolCallHook = Arc<
+    dyn Fn(
+            BeforeToolCallContext,
+            Option<CancellationToken>,
+        ) -> BoxFuture<Result<Option<BeforeToolCallResult>, String>>
+        + Send
+        + Sync,
+>;
+pub type AfterToolCallHook = Arc<
+    dyn Fn(
+            AfterToolCallContext,
+            Option<CancellationToken>,
+        ) -> BoxFuture<Result<Option<AfterToolCallResult>, String>>
+        + Send
+        + Sync,
+>;
+pub type GetContinuationMessagesHook = Arc<
+    dyn Fn(
+            GetContinuationMessagesContext,
+            Option<CancellationToken>,
+        ) -> BoxFuture<Vec<AgentMessage>>
+        + Send
+        + Sync,
+>;
+/// AWAITED once per provider request before the request context is built.
+/// The zero-based request index matches the session turn counter (reset at
+/// AgentStart, incremented at TurnEnd). Errors abort the request loop.
+pub type BeforeRequestHook = Arc<
+    dyn Fn(u64, Option<CancellationToken>) -> BoxFuture<Result<(), anyhow::Error>> + Send + Sync,
+>;
 
 pub trait AgentHandle: Send + Sync {
     /// Snapshot the live callbacks copied by TypeScript's standalone side agent.
-    fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> { None }
+    fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> {
+        None
+    }
     fn state(&self) -> AgentState;
-    fn model(&self) -> Model { self.state().model }
-    fn thinking_level(&self) -> ThinkingLevel { self.state().thinking_level }
-    fn service_tier(&self) -> ServiceTier { self.state().service_tier }
-    fn system_prompt(&self) -> String { self.state().system_prompt }
-    fn message_count(&self) -> usize { self.state().messages.len() }
-    fn messages(&self) -> Vec<AgentMessage> { self.state().messages }
-    fn streaming_message(&self) -> Option<AgentMessage> { self.state().streaming_message }
+    fn model(&self) -> Model {
+        self.state().model
+    }
+    fn thinking_level(&self) -> ThinkingLevel {
+        self.state().thinking_level
+    }
+    fn service_tier(&self) -> ServiceTier {
+        self.state().service_tier
+    }
+    fn system_prompt(&self) -> String {
+        self.state().system_prompt
+    }
+    fn message_count(&self) -> usize {
+        self.state().messages.len()
+    }
+    fn messages(&self) -> Vec<AgentMessage> {
+        self.state().messages
+    }
+    fn streaming_message(&self) -> Option<AgentMessage> {
+        self.state().streaming_message
+    }
     fn active_tool_names(&self) -> Vec<String> {
-        self.state().tools.unwrap_or_default().into_iter().map(|tool| tool.name).collect()
+        self.state()
+            .tools
+            .unwrap_or_default()
+            .into_iter()
+            .map(|tool| tool.name)
+            .collect()
     }
     fn set_state(&self, state: AgentState);
     /// Atomic live-field mutation. Callbacks must not re-enter the agent. The
@@ -275,12 +274,19 @@ pub trait AgentHandle: Send + Sync {
         update(&mut state);
         self.set_state(state);
     }
-    fn subscribe(&self, listener: Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>) -> Box<dyn Fn() + Send + Sync>;
+    fn subscribe(
+        &self,
+        listener: Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>,
+    ) -> Box<dyn Fn() + Send + Sync>;
     fn set_before_tool_call(&self, hook: BeforeToolCallHook);
     fn set_after_tool_call(&self, hook: AfterToolCallHook);
     fn set_get_continuation_messages(&self, hook: GetContinuationMessagesHook);
+    fn set_before_request(&self, hook: BeforeRequestHook);
     fn set_should_stop_before_turn(&self, hook: Arc<dyn Fn() -> bool + Send + Sync>);
-    fn set_should_stop_after_turn(&self, hook: Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<bool> + Send + Sync>);
+    fn set_should_stop_after_turn(
+        &self,
+        hook: Arc<dyn Fn(ShouldStopAfterTurnContext) -> BoxFuture<bool> + Send + Sync>,
+    );
     fn set_stream_fn(&self, stream_fn: pi_agent_core::types::StreamFn);
     fn stream_fn(&self) -> pi_agent_core::types::StreamFn;
     fn abort(&self);
@@ -293,13 +299,29 @@ pub trait AgentHandle: Send + Sync {
     fn is_streaming(&self) -> bool;
     fn has_queued_messages(&self) -> bool;
     fn clear_all_queues(&self);
-    fn remove_queued_messages(&self, predicate: Arc<dyn Fn(&AgentMessage) -> bool + Send + Sync>) -> Vec<AgentMessage>;
+    fn remove_queued_messages(
+        &self,
+        predicate: Arc<dyn Fn(&AgentMessage) -> bool + Send + Sync>,
+    ) -> Vec<AgentMessage>;
     fn follow_up(&self, message: AgentMessage);
     fn set_follow_up_mode(&self, mode: String);
     fn set_steering_mode(&self, mode: String);
-    fn set_convert_to_llm(&self, convert: Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<Vec<Message>> + Send + Sync>);
-    fn set_transform_context(&self, transform: Arc<dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>> + Send + Sync>);
-    fn set_get_api_key(&self, get_api_key: Arc<dyn Fn(String) -> BoxFuture<Option<String>> + Send + Sync>);
+    fn set_convert_to_llm(
+        &self,
+        convert: Arc<dyn Fn(Vec<AgentMessage>) -> BoxFuture<Vec<Message>> + Send + Sync>,
+    );
+    fn set_transform_context(
+        &self,
+        transform: Arc<
+            dyn Fn(Vec<AgentMessage>, Option<CancellationToken>) -> BoxFuture<Vec<AgentMessage>>
+                + Send
+                + Sync,
+        >,
+    );
+    fn set_get_api_key(
+        &self,
+        get_api_key: Arc<dyn Fn(String) -> BoxFuture<Option<String>> + Send + Sync>,
+    );
     fn set_on_payload(&self, hook: pi_ai::types::OnPayload);
     fn set_on_response(&self, hook: pi_ai::types::OnResponse);
     fn set_tool_execution(&self, mode: String);
@@ -338,7 +360,6 @@ pub struct PerformanceMetricUsageV1 {
     pub cached_input_included_in_input: Option<bool>,
     pub reasoning_included_in_output: Option<bool>,
 }
-
 
 /// `ExtensionRunner` - the session holds the runner behind an `Arc`.
 pub type ExtensionRunner = Arc<crate::core::extensions::runner::ExtensionRunner>;
@@ -420,6 +441,9 @@ pub use crate::core::cron_jobs::{AgentCronJob, AgentRlmHeartbeatController};
 // `core/rlm-continuation.ts` are owned by the dedicated `core::rlm_continuation`
 // slice. The session re-exports the canonical shapes instead of keeping a lossy
 // local copy, so the persisted ledger and the session state cannot diverge.
+pub use crate::core::legacy_rlm_continuation::{
+    parse_legacy_rlm_continuation_state, LEGACY_RLM_CONTINUATION_STATE_CUSTOM_TYPE,
+};
 pub use crate::core::rlm_continuation::{
     classify_rlm_child_terminal, create_rlm_child_continuation_message,
     empty_rlm_continuation_state, parse_rlm_continuation_state, read_rlm_visible_text,
@@ -428,9 +452,6 @@ pub use crate::core::rlm_continuation::{
 };
 use crate::core::rlm_continuation::{
     rlm_result_receipt_is_valid, rlm_result_rejected_before_admission, RlmResultDelivery,
-};
-pub use crate::core::legacy_rlm_continuation::{
-    parse_legacy_rlm_continuation_state, LEGACY_RLM_CONTINUATION_STATE_CUSTOM_TYPE,
 };
 
 pub fn bounded_rlm_visible_text(text: &str, max_length: usize) -> String {
@@ -809,7 +830,10 @@ pub enum SerializedBackgroundPlanResult {
 }
 
 pub type AutoRefineReviewer = Arc<
-    dyn Fn(AutoRefineReviewRequest, Option<CancellationToken>) -> BoxFuture<Result<AutoRefineReview, String>>
+    dyn Fn(
+            AutoRefineReviewRequest,
+            Option<CancellationToken>,
+        ) -> BoxFuture<Result<AutoRefineReview, String>>
         + Send
         + Sync,
 >;
@@ -955,13 +979,16 @@ const DEFERRED_SESSION_INPUT_ERROR_MESSAGE: &str = "Session input paused before 
 const COMPACTION_CANCELLED_ERROR_MESSAGE: &str = "Compaction cancelled";
 /// `abort_error()` in the compaction module: the summary call's cancellation text.
 const ABORTED_ERROR_MESSAGE: &str = "Aborted";
-const COMPACTION_SKIPPED_ERROR_MESSAGE: &str = "Session is too short to compact — try again once it grows";
+const COMPACTION_SKIPPED_ERROR_MESSAGE: &str =
+    "Session is too short to compact — try again once it grows";
 /// `CompactionSkippedError("Already compacted")` (agent-session.ts:8245).
 const COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE: &str = "Already compacted";
 
-
 /// `turnExecutionPoliciesEqual`.
-pub fn turn_execution_policies_equal(left: &TurnExecutionPolicy, right: &TurnExecutionPolicy) -> bool {
+pub fn turn_execution_policies_equal(
+    left: &TurnExecutionPolicy,
+    right: &TurnExecutionPolicy,
+) -> bool {
     left.preparation.initial_refine_barrier == right.preparation.initial_refine_barrier
         && left.preparation.flush_pending_bash_before_validation
             == right.preparation.flush_pending_bash_before_validation
@@ -1293,7 +1320,6 @@ pub use crate::core::autonomous::{
     refresh_autonomous_quality_gates, set_autonomous_enabled, AgentAutonomousStatus,
 };
 
-
 /// `AgentSessionConfig`.
 pub struct AgentSessionConfig {
     pub agent: Arc<dyn AgentHandle>,
@@ -1344,7 +1370,9 @@ pub struct InitialGoal {
 // ---------------------------------------------------------------------------
 
 /// `safePerformanceMetricNow`.
-pub fn safe_performance_metric_now(recorder: Option<&Arc<dyn PerformanceMetricRecorder>>) -> Option<f64> {
+pub fn safe_performance_metric_now(
+    recorder: Option<&Arc<dyn PerformanceMetricRecorder>>,
+) -> Option<f64> {
     let value = recorder?.monotonic_now();
     if value.is_finite() {
         Some(value)
@@ -1358,9 +1386,14 @@ pub fn performance_metric_usage_from_compaction(
     usage: Option<&Usage>,
 ) -> Option<PerformanceMetricUsageV1> {
     let usage = usage?;
-    let has_authoritative_usage = [usage.input, usage.cache_read, usage.output, usage.total_tokens]
-        .iter()
-        .any(|value| value.is_finite() && *value > 0.0);
+    let has_authoritative_usage = [
+        usage.input,
+        usage.cache_read,
+        usage.output,
+        usage.total_tokens,
+    ]
+    .iter()
+    .any(|value| value.is_finite() && *value > 0.0);
     if !has_authoritative_usage {
         return None;
     }
@@ -1425,7 +1458,9 @@ pub fn clone_custom_message(message: &CustomMessage) -> CustomMessage {
 /// `cloneQueuedAgentMessage`.
 pub fn clone_queued_agent_message(message: &QueuedAgentMessage) -> QueuedAgentMessage {
     match message {
-        QueuedAgentMessage::Custom(custom) => QueuedAgentMessage::Custom(clone_custom_message(custom)),
+        QueuedAgentMessage::Custom(custom) => {
+            QueuedAgentMessage::Custom(clone_custom_message(custom))
+        }
         QueuedAgentMessage::User(user) => {
             let mut clone = user.clone();
             clone.content = match &user.content {
@@ -1487,7 +1522,14 @@ pub fn normalize_message_content(
             pi_ai::types::ImageOrTextContent::Text(_) => None,
         })
         .collect::<Vec<_>>();
-    (text, if images.is_empty() { None } else { Some(images) })
+    (
+        text,
+        if images.is_empty() {
+            None
+        } else {
+            Some(images)
+        },
+    )
 }
 
 /// Adapter for `goals::CustomMessage`, which is a *minimal local shape* whose
@@ -1546,7 +1588,9 @@ pub fn custom_message_entry_content(
 }
 
 /// `convertToLlm`-style content for a custom message, as `ImageOrTextContent` parts.
-pub fn custom_message_content_parts(content: &CustomMessageContent) -> Vec<pi_ai::types::ImageOrTextContent> {
+pub fn custom_message_content_parts(
+    content: &CustomMessageContent,
+) -> Vec<pi_ai::types::ImageOrTextContent> {
     match content {
         CustomMessageContent::Text(text) => {
             vec![pi_ai::types::ImageOrTextContent::Text(
@@ -1592,7 +1636,10 @@ fn refinement_message_to_pi_ai(
             .iter()
             .filter_map(|block| {
                 if block.get("type").and_then(Value::as_str) == Some("text") {
-                    block.get("text").and_then(Value::as_str).map(str::to_string)
+                    block
+                        .get("text")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
                 } else {
                     None
                 }
@@ -1673,7 +1720,10 @@ pub fn queued_agent_message_preview(action: &QueuedSessionAction) -> String {
                     return match custom.details.as_ref() {
                         Some(details) => format!(
                             "{ASYNC_BASH_COMPLETION_PREVIEW_LABEL}: pid {}, exit {}",
-                            details.get("pid").and_then(Value::as_i64).unwrap_or_default(),
+                            details
+                                .get("pid")
+                                .and_then(Value::as_i64)
+                                .unwrap_or_default(),
                             details
                                 .get("exitCode")
                                 .and_then(Value::as_i64)
@@ -1747,7 +1797,10 @@ pub fn parse_persisted_ipython_sent_agent_message(
         "activeSessionId".to_string(),
         Value::String(active_session_id.to_string()),
     );
-    target_object.insert("sessionId".to_string(), Value::String(session_id.to_string()));
+    target_object.insert(
+        "sessionId".to_string(),
+        Value::String(session_id.to_string()),
+    );
     if let Some(session_name) = target.get("sessionName").and_then(Value::as_str) {
         target_object.insert(
             "sessionName".to_string(),
@@ -1928,11 +1981,9 @@ pub async fn await_settlement(settlement: Option<AgentMessageDeferred>) {
 /// `Shared` is `Clone` and re-awaitable exactly like the promise it stands for.
 pub type SharedVoidFuture = futures::future::Shared<BoxFuture<Result<(), String>>>;
 
-
 /// `_serializedPlanInFlight`'s shared promise shape.
-pub type SharedPlanFuture = futures::future::Shared<
-    BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>>,
->;
+pub type SharedPlanFuture =
+    futures::future::Shared<BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>>>;
 
 /// The message a `session_before_refine` skip reports
 /// (`RefineSkippedError("Refinement skipped by extension")`,
@@ -1963,9 +2014,8 @@ pub fn utf16_tail(text: &str, max_units: usize) -> String {
 /// `_consumeSerializedBackgroundPlan(consume)`'s callback: it receives the
 /// settled background-plan result (`undefined` for a rejected plan) and returns
 /// whether the caller must stop (`true`) or continue (`false`).
-pub type SerializedPlanConsumer = Arc<
-    dyn Fn(Option<SerializedBackgroundPlanResult>) -> BoxFuture<bool> + Send + Sync,
->;
+pub type SerializedPlanConsumer =
+    Arc<dyn Fn(Option<SerializedBackgroundPlanResult>) -> BoxFuture<bool> + Send + Sync>;
 
 /// `_consumeSerializedBackgroundPlan`'s return value ("none" | "waited" |
 /// "continue" | "stop").
@@ -2063,7 +2113,9 @@ pub fn is_persisted_rlm_max_depth_state(value: &Value) -> bool {
 /// `parseGoalBudgetValue`.
 pub fn parse_goal_budget_value(value: &str) -> Result<f64, String> {
     let bytes = value.as_bytes();
-    if bytes.is_empty() || bytes[0] == b'0' || !value.chars().all(|character| character.is_ascii_digit())
+    if bytes.is_empty()
+        || bytes[0] == b'0'
+        || !value.chars().all(|character| character.is_ascii_digit())
     {
         return Err("Goal token budget must be a positive integer.".to_string());
     }
@@ -2135,10 +2187,7 @@ pub const RLM_CHILD_USAGE_FLUSH_MAX_PENDING_MS: f64 = 60_000.0;
 
 /// `rlmChildUsageOrigin`: label a child completion's usage by the nearest
 /// preceding prompt that triggered it.
-pub fn rlm_child_usage_origin(
-    messages: &[AgentMessage],
-    assistant_index: usize,
-) -> &'static str {
+pub fn rlm_child_usage_origin(messages: &[AgentMessage], assistant_index: usize) -> &'static str {
     let mut index = assistant_index as i64 - 1;
     while index >= 0 {
         let message = &messages[index as usize];
@@ -2173,7 +2222,10 @@ pub fn attribute_child_usage(parent_usage: &mut Usage, child_usage: &Usage) {
     let parent_context_tokens = if parent_usage.total_tokens != 0.0 {
         parent_usage.total_tokens
     } else {
-        parent_usage.input + parent_usage.output + parent_usage.cache_read + parent_usage.cache_write
+        parent_usage.input
+            + parent_usage.output
+            + parent_usage.cache_read
+            + parent_usage.cache_write
     };
     // Recursive children are launched from an assistant tool call, so the parent
     // assistant message carries their billable usage for session-level cost totals.
@@ -2231,8 +2283,7 @@ pub struct RlmChildRun {
     pub deletion_failure_notice: Option<Arc<AgentMessageDeferred>>,
     pub deletion_needs_completion_notice: Option<bool>,
     pub complete_deletion: Option<Arc<dyn Fn() -> BoxFuture<()> + Send + Sync>>,
-    pub report_deletion_cleanup_failure:
-        Option<Arc<dyn Fn(String) -> BoxFuture<()> + Send + Sync>>,
+    pub report_deletion_cleanup_failure: Option<Arc<dyn Fn(String) -> BoxFuture<()> + Send + Sync>>,
     pub emit_update: Option<Arc<dyn Fn() + Send + Sync>>,
     pub last_emitted_update: Option<String>,
     pub unsubscribe: Option<Arc<dyn Fn() + Send + Sync>>,
@@ -2249,6 +2300,15 @@ pub struct RetainedRlmChild {
 #[derive(Clone)]
 pub struct RlmSubagentModelSelection {
     pub model: Model,
+}
+
+/// The one bounded host-owned hint projection for this session. Exact-byte
+/// provenance is required before a later refresh may restore `unhinted`;
+/// marker-shaped external text alone never grants removal authority.
+#[derive(Clone)]
+struct OwnedSkillHintProjection {
+    projected: String,
+    unhinted: String,
 }
 
 #[derive(Default)]
@@ -2303,10 +2363,16 @@ pub struct AgentSession {
     /// `_agentEventQueue` - the serialized tail of agent-event work.
     agent_event_queue: Mutex<futures::future::Shared<BoxFuture<Result<(), String>>>>,
     action_store: Mutex<ActionStore<QueuedSessionAction>>,
-    action_queue_metrics: Mutex<HashMap<String, (std::time::Instant, Arc<dyn PerformanceMetricRecorder>)>>,
+    action_queue_metrics:
+        Mutex<HashMap<String, (std::time::Instant, Arc<dyn PerformanceMetricRecorder>)>>,
     session_input_pump: Mutex<futures::future::Shared<BoxFuture<Result<(), String>>>>,
     session_input_pump_requested: AtomicBool,
     session_input_pump_epoch: AtomicU64,
+    /// ROOT blocker-1: registered once; the bridge calls it on hint changes.
+    hint_listener_registered: AtomicBool,
+    /// At most one exact prompt projection plus its pre-projection composition.
+    /// This bounded provenance is the only authority to remove a host hint.
+    owned_skill_hint_projection: Mutex<Option<OwnedSkillHintProjection>>,
     session_input_arrival_epoch: AtomicU64,
     session_input_pump_suspended: AtomicBool,
     explicit_stop: Mutex<ExplicitStopState>,
@@ -2353,6 +2419,9 @@ pub struct AgentSession {
     late_ipython_sent_agent_messages: Mutex<HashMap<String, Vec<Value>>>,
     unpersisted_outcomes: Mutex<Vec<CustomMessage>>,
     harness_digest_pending: AtomicBool,
+    /// CONTROL: truthful pause accepted at the turn-end boundary
+    /// (never success, never mid-tool). ROOT CONTRACT v1 N3.
+    jev_control_pause_pending: AtomicBool,
     bash_abort_controllers: Mutex<Vec<CancellationToken>>,
     user_bash_running: AtomicBool,
     user_bash_abort_requested: AtomicBool,
@@ -2428,7 +2497,8 @@ pub struct AgentSession {
     compact_auto_refine_pending: AtomicBool,
     turn_interval_auto_refine_pending: AtomicBool,
     post_compaction_continuation_scheduled: AtomicBool,
-    post_compaction_continuation_settlement: Mutex<Option<Arc<Mutex<PostCompactionContinuationSettlement>>>>,
+    post_compaction_continuation_settlement:
+        Mutex<Option<Arc<Mutex<PostCompactionContinuationSettlement>>>>,
     post_compaction_continuation_messages: Mutex<Vec<AgentMessage>>,
     scheduled_post_compaction_continuation_messages: Mutex<Vec<AgentMessage>>,
     queued_autonomous_threshold_continuations: Mutex<HashMap<String, AgentMessage>>,
@@ -2464,7 +2534,8 @@ pub struct AgentSession {
     rlm_session_dir: Option<String>,
     rlm_parent_node_id: Option<String>,
     rlm_parent_agent: Option<String>,
-    ipython_kernel_provisioner: Mutex<Option<Arc<crate::core::tools::ipython::IpythonKernelProvisioner>>>,
+    ipython_kernel_provisioner:
+        Mutex<Option<Arc<crate::core::tools::ipython::IpythonKernelProvisioner>>>,
     exec_env_provider: Mutex<Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>>,
     auto_compaction_enabled: AtomicBool,
     last_assistant_message: Mutex<Option<AssistantMessage>>,
@@ -2581,20 +2652,18 @@ impl AgentSession {
             .unwrap()
             .get_header()
             .and_then(|header| {
-                header
-                    .get("rlmDepth")
-                    .and_then(Value::as_i64)
-                    .or_else(|| header.get("rlmDepth").and_then(Value::as_f64).map(|d| d as i64))
+                header.get("rlmDepth").and_then(Value::as_i64).or_else(|| {
+                    header
+                        .get("rlmDepth")
+                        .and_then(Value::as_f64)
+                        .map(|d| d as i64)
+                })
             });
         let rlm_depth = match config.rlm_depth {
             Some(depth) => depth,
             None => match header_rlm_depth {
                 Some(depth) if is_non_negative_integer(depth as f64) => depth,
-                _ => parse_depth(
-                    std::env::var("RLM_DEPTH").ok().as_deref(),
-                    0,
-                    "RLM_DEPTH",
-                )?,
+                _ => parse_depth(std::env::var("RLM_DEPTH").ok().as_deref(), 0, "RLM_DEPTH")?,
             },
         };
         if let Some(configured) = config.rlm_max_depth {
@@ -2609,7 +2678,11 @@ impl AgentSession {
                 .unwrap()
                 .get_compaction_agent_callable()
         });
-        let session_artifact_dir = config.session_manager.lock().unwrap().get_session_artifact_dir();
+        let session_artifact_dir = config
+            .session_manager
+            .lock()
+            .unwrap()
+            .get_session_artifact_dir();
         let session_id = config.session_manager.lock().unwrap().get_session_id();
         let ledger_path = crate::core::semantic_edges::semantic_edge_ledger_path(
             config.rlm_session_dir.as_deref(),
@@ -2668,6 +2741,8 @@ impl AgentSession {
             session_input_pump: Mutex::new(async { Ok(()) }.boxed().shared()),
             session_input_pump_requested: AtomicBool::new(false),
             session_input_pump_epoch: AtomicU64::new(0),
+            hint_listener_registered: AtomicBool::new(false),
+            owned_skill_hint_projection: Mutex::new(None),
             session_input_arrival_epoch: AtomicU64::new(0),
             session_input_pump_suspended: AtomicBool::new(false),
             explicit_stop: Mutex::new(ExplicitStopState::default()),
@@ -2714,6 +2789,7 @@ impl AgentSession {
             late_ipython_sent_agent_messages: Mutex::new(HashMap::new()),
             unpersisted_outcomes: Mutex::new(Vec::new()),
             harness_digest_pending: AtomicBool::new(false),
+            jev_control_pause_pending: AtomicBool::new(false),
             bash_abort_controllers: Mutex::new(Vec::new()),
             user_bash_running: AtomicBool::new(false),
             user_bash_abort_requested: AtomicBool::new(false),
@@ -2730,14 +2806,15 @@ impl AgentSession {
             agent_dir: config.agent_dir.clone(),
             include_goals: config.include_goals.unwrap_or(true),
             include_compact_skill,
-            session_start_event: config
-                .session_start_event
-                .unwrap_or_else(|| serde_json::json!({ "type": "session_start", "reason": "startup" })),
+            session_start_event: config.session_start_event.unwrap_or_else(
+                || serde_json::json!({ "type": "session_start", "reason": "startup" }),
+            ),
             disposed: AtomicBool::new(false),
             dispose_callbacks: Mutex::new(Vec::new()),
             disposing: AtomicBool::new(false),
             ipython_runtime_built: AtomicBool::new(false),
-            prewarm_ipython_kernel: config.prewarm_ipython_kernel.unwrap_or(false) && rlm_depth == 0,
+            prewarm_ipython_kernel: config.prewarm_ipython_kernel.unwrap_or(false)
+                && rlm_depth == 0,
             rlm_depth,
             configured_rlm_max_depth: config.rlm_max_depth,
             rlm_max_depth: Mutex::new(2),
@@ -2798,9 +2875,10 @@ impl AgentSession {
                 .unwrap_or_else(|| Arc::new(ExtensionRunnerRef::new(None))),
             initial_active_tool_names: config.initial_active_tool_names.clone(),
             allowed_tool_names: Mutex::new(
-                config.allowed_tool_names.as_ref().map(|names| {
-                    names.iter().cloned().collect::<HashSet<String>>()
-                }),
+                config
+                    .allowed_tool_names
+                    .as_ref()
+                    .map(|names| names.iter().cloned().collect::<HashSet<String>>()),
             ),
             rlm_heartbeat_controller: Mutex::new(config.rlm_heartbeat_controller.clone()),
             agent_message_controller: config.agent_message_controller.clone(),
@@ -2846,7 +2924,8 @@ impl AgentSession {
         if session.rlm_depth == 0 {
             if let Some(initial_goal) = config.initial_goal.as_ref() {
                 if session.is_branch_seedable() {
-                    let goal = session.start_goal(&initial_goal.objective, initial_goal.token_budget)?;
+                    let goal =
+                        session.start_goal(&initial_goal.objective, initial_goal.token_budget)?;
                     *session.goal_state.lock().unwrap() = goal.clone();
                     // Goal context is the model's only source of goal visibility; action
                     // admission is unavailable mid-construction, so ride the next turn.
@@ -2885,11 +2964,9 @@ impl AgentSession {
         session.install_agent_tool_hooks();
         session.install_agent_turn_hook();
         session.install_agent_continuation_hook();
+        session.install_agent_before_request_hook();
 
-        session.build_runtime(
-            session.initial_active_tool_names.clone(),
-            true,
-        );
+        session.build_runtime(session.initial_active_tool_names.clone(), true);
         session.restore_provider_context_for_model();
         session.ensure_harness_digest_context();
         session.schedule_rlm_reload_backstop();
@@ -2913,7 +2990,10 @@ impl AgentSession {
     /// Set the RLM heartbeat controller after construction. Used by
     /// print/headless mode to attach an in-process heartbeat scheduler
     /// when the session is created outside the daemon.
-    pub fn set_rlm_heartbeat_controller(self: &Arc<Self>, controller: Arc<dyn AgentRlmHeartbeatController>) {
+    pub fn set_rlm_heartbeat_controller(
+        self: &Arc<Self>,
+        controller: Arc<dyn AgentRlmHeartbeatController>,
+    ) {
         {
             let current = self.rlm_heartbeat_controller.lock().unwrap();
             if let Some(current) = current.as_ref() {
@@ -2924,7 +3004,8 @@ impl AgentSession {
         }
         *self.rlm_heartbeat_controller.lock().unwrap() = Some(controller);
         self.build_runtime(Some(self.get_active_tool_names()), true);
-        *self.base_system_prompt.lock().unwrap() = self.rebuild_system_prompt(&self.get_active_tool_names());
+        *self.base_system_prompt.lock().unwrap() =
+            self.rebuild_system_prompt(&self.get_active_tool_names());
         let mut state = self.agent.state();
         state.system_prompt = self.base_system_prompt.lock().unwrap().clone();
         self.agent.set_state(state);
@@ -2954,7 +3035,10 @@ impl AgentSession {
         let tool_configs = acp_mcp_tool_configs(servers);
         let names = crate::core::tools::acp_mcp::acp_mcp_tool_names(&tool_configs)?;
         self.assert_acp_mcp_tool_names_available(&names)?;
-        let replaced = manager.lock().unwrap().replace_acp_servers(servers, owner_id)?;
+        let replaced = manager
+            .lock()
+            .unwrap()
+            .replace_acp_servers(servers, owner_id)?;
         if !replaced {
             return Ok(());
         }
@@ -2975,7 +3059,12 @@ impl AgentSession {
         if !manager.lock().unwrap().can_release_acp_servers(owner_id) {
             return Ok(());
         }
-        if manager.lock().unwrap().replace_acp_servers(&[], owner_id).unwrap_or(false) {
+        if manager
+            .lock()
+            .unwrap()
+            .replace_acp_servers(&[], owner_id)
+            .unwrap_or(false)
+        {
             let removed_tool_names: HashSet<String> = self
                 .acp_mcp_tools
                 .lock()
@@ -2995,7 +3084,8 @@ impl AgentSession {
             }
             *self.acp_mcp_tools.lock().unwrap() = Vec::new();
             self.refresh_tool_registry(true, Some(active_tool_names));
-            *self.base_system_prompt.lock().unwrap() = self.rebuild_system_prompt(&self.get_active_tool_names());
+            *self.base_system_prompt.lock().unwrap() =
+                self.rebuild_system_prompt(&self.get_active_tool_names());
             let mut state = self.agent.state();
             state.system_prompt = self.base_system_prompt.lock().unwrap().clone();
             self.agent.set_state(state);
@@ -3110,7 +3200,8 @@ impl AgentSession {
             .collect();
         active_tool_names.extend(next_tool_names);
         self.build_runtime(Some(active_tool_names), true);
-        *self.base_system_prompt.lock().unwrap() = self.rebuild_system_prompt(&self.get_active_tool_names());
+        *self.base_system_prompt.lock().unwrap() =
+            self.rebuild_system_prompt(&self.get_active_tool_names());
         let mut state = self.agent.state();
         state.system_prompt = self.base_system_prompt.lock().unwrap().clone();
         self.agent.set_state(state);
@@ -3136,8 +3227,8 @@ impl AgentSession {
      */
     fn install_agent_tool_hooks(self: &Arc<Self>) {
         let session = self.clone();
-        self.agent
-            .set_before_tool_call(Arc::new(move |context: BeforeToolCallContext, _signal: Option<CancellationToken>| {
+        self.agent.set_before_tool_call(Arc::new(
+            move |context: BeforeToolCallContext, _signal: Option<CancellationToken>| {
                 let session = session.clone();
                 Box::pin(async move {
                     let runner = match session.extension_runner() {
@@ -3154,11 +3245,7 @@ impl AgentSession {
                         .emit_tool_call(&ToolCallEvent::Custom {
                             tool_name: context.tool_call.name.clone(),
                             tool_call_id: context.tool_call.id.clone(),
-                            input: context
-                                .args
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default(),
+                            input: context.args.as_object().cloned().unwrap_or_default(),
                         })
                         .await;
                     Ok(result.map(|result| BeforeToolCallResult {
@@ -3166,11 +3253,12 @@ impl AgentSession {
                         reason: result.reason,
                     }))
                 })
-            }));
+            },
+        ));
 
         let session = self.clone();
-        self.agent
-            .set_after_tool_call(Arc::new(move |context: AfterToolCallContext, _signal: Option<CancellationToken>| {
+        self.agent.set_after_tool_call(Arc::new(
+            move |context: AfterToolCallContext, _signal: Option<CancellationToken>| {
                 let session = session.clone();
                 Box::pin(async move {
                     let runner = match session.extension_runner() {
@@ -3185,11 +3273,7 @@ impl AgentSession {
                         .emit_tool_result(&ToolResultEvent::Custom {
                             tool_name: context.tool_call.name.clone(),
                             tool_call_id: context.tool_call.id.clone(),
-                            input: context
-                                .args
-                                .as_object()
-                                .cloned()
-                                .unwrap_or_default(),
+                            input: context.args.as_object().cloned().unwrap_or_default(),
                             content: context
                                 .result
                                 .content
@@ -3222,7 +3306,8 @@ impl AgentSession {
                         terminate: None,
                     }))
                 })
-            }));
+            },
+        ));
     }
 
     /// `_installAgentContinuationHook`.
@@ -3242,17 +3327,55 @@ impl AgentSession {
         ));
     }
 
+    /// ROOT-CONTRACT v7 (Agent-guidance lane): the AWAITED pre-context
+    /// assessment hook. Runs once per provider request BEFORE the request
+    /// context is built, so a hint assessed at this boundary is served to
+    /// THIS request by the live `get_system_prompt` hook (single-request
+    /// positive delivery). The zero-index request argument matches the
+    /// session turn counter (reset at AgentStart, incremented at TurnEnd).
+    /// No-op cost for non-Jev runs: the bridge gates on feature+mode and
+    /// returns before any work.
+    fn install_agent_before_request_hook(self: &Arc<Self>) {
+        let session = Arc::downgrade(self);
+        self.agent.set_before_request(Arc::new(
+            move |request_index: u64, signal: Option<CancellationToken>| {
+                let session = session.clone();
+                Box::pin(async move {
+                    let Some(session) = session.upgrade() else {
+                        return Ok(());
+                    };
+                    if session.disposed.load(Ordering::SeqCst) {
+                        return Ok(());
+                    }
+                    let session_id = session.session_manager.lock().unwrap().get_session_id();
+                    crate::core::jev_bridge::before_request_assessment(
+                        &session_id,
+                        request_index,
+                        signal,
+                    )
+                    .await;
+                    // Consume CURRENT gates on every provider request, including
+                    // Compare/no-roster/preparation-refusal early returns. The
+                    // renderer removes only its exact owned projection.
+                    session.refresh_request_system_prompt();
+                    Ok(())
+                })
+            },
+        ));
+    }
+
     /// `_installAgentTurnHook`.
     fn install_agent_turn_hook(self: &Arc<Self>) {
         let session = self.clone();
         self.agent
             .set_should_stop_before_turn(Arc::new(move || session.should_stop_before_turn()));
         let session = self.clone();
-        self.agent
-            .set_should_stop_after_turn(Arc::new(move |context: ShouldStopAfterTurnContext| {
+        self.agent.set_should_stop_after_turn(Arc::new(
+            move |context: ShouldStopAfterTurnContext| {
                 let session = session.clone();
                 Box::pin(async move { session.should_stop_after_turn(context).await })
-            }));
+            },
+        ));
     }
 
     /// `_emit`.
@@ -3261,7 +3384,8 @@ impl AgentSession {
         for listener in listeners {
             // A failing observer must not prevent other subscribers from
             // receiving lifecycle and persistence events.
-            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event.clone())));
+            let _ =
+                std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| listener(event.clone())));
         }
     }
 
@@ -3280,7 +3404,10 @@ impl AgentSession {
 
     /// `_restoreLateIpythonSentAgentMessages`.
     fn restore_late_ipython_sent_agent_messages(&self) {
-        self.late_ipython_sent_agent_messages.lock().unwrap().clear();
+        self.late_ipython_sent_agent_messages
+            .lock()
+            .unwrap()
+            .clear();
         for entry in self.session_manager.lock().unwrap().get_branch(None) {
             if entry.get("type").and_then(Value::as_str) != Some("custom") {
                 continue;
@@ -3301,7 +3428,11 @@ impl AgentSession {
     }
 
     /// `_rememberLateIpythonSentAgentMessage`.
-    fn remember_late_ipython_sent_agent_message(&self, tool_call_id: &str, message: &Value) -> bool {
+    fn remember_late_ipython_sent_agent_message(
+        &self,
+        tool_call_id: &str,
+        message: &Value,
+    ) -> bool {
         let mut map = self.late_ipython_sent_agent_messages.lock().unwrap();
         let messages = map.entry(tool_call_id.to_string()).or_default();
         let message_id = message.get("id").cloned().unwrap_or(Value::Null);
@@ -3316,7 +3447,9 @@ impl AgentSession {
         let message = message.clone();
         self.agent.update_state(Box::new(move |state| {
             for candidate in state.messages.iter_mut().rev() {
-                if append_sent_agent_message_to_tool_result(candidate, &tool_call_id, &message) { break; }
+                if append_sent_agent_message_to_tool_result(candidate, &tool_call_id, &message) {
+                    break;
+                }
             }
         }));
         is_new
@@ -3347,7 +3480,11 @@ impl AgentSession {
     }
 
     /// `_recordLateIpythonSentAgentMessage`.
-    fn record_late_ipython_sent_agent_message(self: &Arc<Self>, tool_call_id: &str, message: Value) {
+    fn record_late_ipython_sent_agent_message(
+        self: &Arc<Self>,
+        tool_call_id: &str,
+        message: Value,
+    ) {
         let session = self.clone();
         let tool_call_id = tool_call_id.to_string();
         self.push_agent_event_task(async move {
@@ -3402,7 +3539,10 @@ impl AgentSession {
     /// `_resolveRlmMaxDepth`.
     fn resolve_rlm_max_depth(&self) -> Result<(i64, RlmMaxDepthSource), String> {
         if let Some(persisted) = self.load_persisted_rlm_max_depth_state() {
-            return Ok((persisted.max_depth as i64, RLM_MAX_DEPTH_SOURCE_CHAT.to_string()));
+            return Ok((
+                persisted.max_depth as i64,
+                RLM_MAX_DEPTH_SOURCE_CHAT.to_string(),
+            ));
         }
         if let Some(configured) = self.configured_rlm_max_depth {
             return Ok((configured, RLM_MAX_DEPTH_SOURCE_INHERITED.to_string()));
@@ -3416,7 +3556,10 @@ impl AgentSession {
         let env = std::env::var("RLM_MAX_DEPTH").ok();
         if let Some(env) = env {
             if !env.is_empty() {
-                return Ok((parse_depth(Some(&env), 1, "RLM_MAX_DEPTH")?, RLM_MAX_DEPTH_SOURCE_ENV.to_string()));
+                return Ok((
+                    parse_depth(Some(&env), 1, "RLM_MAX_DEPTH")?,
+                    RLM_MAX_DEPTH_SOURCE_ENV.to_string(),
+                ));
             }
         }
         Ok((2, RLM_MAX_DEPTH_SOURCE_DEFAULT.to_string()))
@@ -3453,7 +3596,11 @@ impl AgentSession {
     fn is_branch_seedable(&self) -> bool {
         let branch = self.session_manager.lock().unwrap().get_branch(None);
         for entry in branch {
-            match entry.get("type").and_then(Value::as_str).unwrap_or_default() {
+            match entry
+                .get("type")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+            {
                 "model_change" | "thinking_level_change" | "service_tier_change" => continue,
                 "custom" => {
                     // The TypeScript returns false for the goal state type and for
@@ -3482,11 +3629,14 @@ impl AgentSession {
     /// `_reloadRlmMaxDepthFromBranch`.
     fn reload_rlm_max_depth_from_branch(&self) {
         let previous_max_depth = *self.rlm_max_depth.lock().unwrap();
-        let resolved = self.resolve_rlm_max_depth().unwrap_or((2, RLM_MAX_DEPTH_SOURCE_DEFAULT.to_string()));
+        let resolved = self
+            .resolve_rlm_max_depth()
+            .unwrap_or((2, RLM_MAX_DEPTH_SOURCE_DEFAULT.to_string()));
         *self.rlm_max_depth.lock().unwrap() = resolved.0;
         *self.rlm_max_depth_source.lock().unwrap() = resolved.1;
         if resolved.0 != previous_max_depth {
-            *self.base_system_prompt.lock().unwrap() = self.rebuild_system_prompt(&self.get_active_tool_names());
+            *self.base_system_prompt.lock().unwrap() =
+                self.rebuild_system_prompt(&self.get_active_tool_names());
             let mut state = self.agent.state();
             state.system_prompt = self.base_system_prompt.lock().unwrap().clone();
             self.agent.set_state(state);
@@ -3697,10 +3847,10 @@ impl AgentSession {
         actions
     }
 
-
     /// `_clearQueuedGoalContexts`.
     fn clear_queued_goal_contexts(&self) {
-        self.goal_continuation_awaits_rlm_work.store(false, Ordering::SeqCst);
+        self.goal_continuation_awaits_rlm_work
+            .store(false, Ordering::SeqCst);
         self.pending_next_turn_messages
             .lock()
             .unwrap()
@@ -3729,7 +3879,11 @@ impl AgentSession {
     }
 
     /// `_startGoal`.
-    fn start_goal(&self, objective_text: &str, token_budget: Option<f64>) -> Result<GoalState, String> {
+    fn start_goal(
+        &self,
+        objective_text: &str,
+        token_budget: Option<f64>,
+    ) -> Result<GoalState, String> {
         let objective = validate_goal_objective(objective_text)?;
         let budget = validate_goal_budget(token_budget)?;
         let now = now_ms();
@@ -3748,7 +3902,8 @@ impl AgentSession {
             last_error: None,
         };
         *self.goal_accounting_started_at.lock().unwrap() = Some(now);
-        self.goal_continuation_awaits_rlm_work.store(false, Ordering::SeqCst);
+        self.goal_continuation_awaits_rlm_work
+            .store(false, Ordering::SeqCst);
         self.set_goal_state(&goal, None);
         Ok(self.goal_state.lock().unwrap().clone())
     }
@@ -3939,7 +4094,10 @@ impl AgentSession {
     }
 
     /// `_parseAutonomousSlashCommand`.
-    fn parse_autonomous_slash_command(&self, text: &str) -> Result<Option<AutonomousSlashCommand>, String> {
+    fn parse_autonomous_slash_command(
+        &self,
+        text: &str,
+    ) -> Result<Option<AutonomousSlashCommand>, String> {
         let command = match parse_session_slash_command(text) {
             Some(command) => command,
             None => return Ok(None),
@@ -3996,12 +4154,16 @@ impl AgentSession {
                 timestamp: message.timestamp,
             }));
         self.agent.set_state(state);
-        let _ = self.session_manager.lock().unwrap().append_custom_message_entry(
-            &message.custom_type,
-            &custom_message_entry_content(&message.content),
-            message.display,
-            message.details.clone(),
-        );
+        let _ = self
+            .session_manager
+            .lock()
+            .unwrap()
+            .append_custom_message_entry(
+                &message.custom_type,
+                &custom_message_entry_content(&message.content),
+                message.display,
+                message.details.clone(),
+            );
         self.emit(AgentSessionEvent::MessageStart {
             message: AgentMessage::Custom(CustomAgentMessage::Custom {
                 custom_type: message.custom_type.clone(),
@@ -4065,25 +4227,29 @@ impl AgentSession {
             _ => return,
         };
         for message in messages {
-            let _ = self.session_manager.lock().unwrap().append_message(AgentMessage::Custom(
-                CustomAgentMessage::Custom {
+            let _ = self
+                .session_manager
+                .lock()
+                .unwrap()
+                .append_message(AgentMessage::Custom(CustomAgentMessage::Custom {
                     custom_type: message.custom_type.clone(),
                     content: custom_message_content_from_value(&message.content),
                     display: message.display,
                     details: message.details.clone(),
                     timestamp: now_ms_i64(),
-                },
-            ));
+                }));
         }
         let mut state = self.agent.state();
         for message in messages {
-            state.messages.push(AgentMessage::Custom(CustomAgentMessage::Custom {
-                custom_type: message.custom_type.clone(),
-                content: custom_message_content_from_value(&message.content),
-                display: message.display,
-                details: message.details.clone(),
-                timestamp: now_ms_i64(),
-            }));
+            state
+                .messages
+                .push(AgentMessage::Custom(CustomAgentMessage::Custom {
+                    custom_type: message.custom_type.clone(),
+                    content: custom_message_content_from_value(&message.content),
+                    display: message.display,
+                    details: message.details.clone(),
+                    timestamp: now_ms_i64(),
+                }));
         }
         self.agent.set_state(state);
     }
@@ -4114,14 +4280,18 @@ impl AgentSession {
 
     /// `_maybeResumeGoalContinuationAfterRlmWork`.
     fn maybe_resume_goal_continuation_after_rlm_work(self: &Arc<Self>) {
-        if !self.goal_continuation_awaits_rlm_work.swap(false, Ordering::SeqCst) {
+        if !self
+            .goal_continuation_awaits_rlm_work
+            .swap(false, Ordering::SeqCst)
+        {
             return;
         }
         if self.goal_state.lock().unwrap().status != GoalStatus::Active {
             return;
         }
         if self.has_running_rlm_children() {
-            self.goal_continuation_awaits_rlm_work.store(true, Ordering::SeqCst);
+            self.goal_continuation_awaits_rlm_work
+                .store(true, Ordering::SeqCst);
             return;
         }
         self.run_or_queue_goal_context("continuation", None);
@@ -4213,11 +4383,19 @@ impl AgentSession {
     /// `get _steeringStopPending()`.
     fn steering_stop_pending(&self) -> bool {
         let store = self.action_store.lock().unwrap();
-        !store.queued_actions(Some(DeliveryPolicy::NextTurnBoundary)).is_empty()
-            || store.active_actions(Some(DeliveryPolicy::NextTurnBoundary)).iter().any(|action| {
-                matches!(action.payload, QueuedActionPayload::Turn(_))
-                    && matches!(action.lifecycle.state(), ActionLifecycleState::Selected | ActionLifecycleState::Preparing)
-            })
+        !store
+            .queued_actions(Some(DeliveryPolicy::NextTurnBoundary))
+            .is_empty()
+            || store
+                .active_actions(Some(DeliveryPolicy::NextTurnBoundary))
+                .iter()
+                .any(|action| {
+                    matches!(action.payload, QueuedActionPayload::Turn(_))
+                        && matches!(
+                            action.lifecycle.state(),
+                            ActionLifecycleState::Selected | ActionLifecycleState::Preparing
+                        )
+                })
     }
 
     /// `_shouldStopBeforeTurn`.
@@ -4227,16 +4405,16 @@ impl AgentSession {
 
     /// `_shouldStopAfterTurn`.
     async fn should_stop_after_turn(self: &Arc<Self>, context: ShouldStopAfterTurnContext) -> bool {
-        if self.explicitly_stopped() { return true; }
+        if self.explicitly_stopped() {
+            return true;
+        }
         if self.stop_goal_continuation_for_terminal_message(&context.message) {
             return true;
         }
         if self.account_goal_usage_for_assistant_message(&context.message) {
-            if let Ok(message) = create_goal_context_message(
-                &self.goal_state(),
-                GoalContextKind::BudgetLimit,
-                None,
-            ) {
+            if let Ok(message) =
+                create_goal_context_message(&self.goal_state(), GoalContextKind::BudgetLimit, None)
+            {
                 let canonical = goal_context_custom_message(&message);
                 let parts = custom_message_content_parts(&canonical.content);
                 let normalized = normalize_message_content(&parts);
@@ -4260,6 +4438,12 @@ impl AgentSession {
         if self.should_stop_for_threshold_compaction(&context).await {
             return true;
         }
+        // CONTROL (ROOT CONTRACT v1 N3): a truthful pause accepted at the
+        // turn-end boundary stops the loop here — after the mandatory
+        // serialized checkpoints, before steering stops. Never mid-tool.
+        if self.jev_control_pause_pending.swap(false, Ordering::SeqCst) {
+            return true;
+        }
         // Steering stops continuation only after mandatory serialized checkpoints.
         // Returning true here still prevents the agent loop from starting another turn.
         self.steering_stop_pending()
@@ -4270,7 +4454,8 @@ impl AgentSession {
         self: &Arc<Self>,
         context: &ShouldStopAfterTurnContext,
     ) -> bool {
-        self.continue_after_threshold_compaction.store(false, Ordering::SeqCst);
+        self.continue_after_threshold_compaction
+            .store(false, Ordering::SeqCst);
         if self.pending_requested_compaction.lock().unwrap().is_none()
             && !self.threshold_compaction_needed(context).await
         {
@@ -4285,7 +4470,8 @@ impl AgentSession {
                 .and_then(|outcome| outcome.continuation)
                 .is_some();
             if continuation {
-                self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+                self.continue_after_threshold_compaction
+                    .store(true, Ordering::SeqCst);
             }
         }
         // A queued continuation disproves the assistant-last "task finished" heuristic,
@@ -4294,7 +4480,11 @@ impl AgentSession {
             .as_ref()
             .map(|message| message.role() == "assistant")
             .unwrap_or(false);
-        if !last_is_assistant && !self.continue_after_threshold_compaction.load(Ordering::SeqCst) {
+        if !last_is_assistant
+            && !self
+                .continue_after_threshold_compaction
+                .load(Ordering::SeqCst)
+        {
             self.continue_after_threshold_compaction
                 .store(true, Ordering::SeqCst);
         }
@@ -4318,8 +4508,8 @@ impl AgentSession {
             }
         }
 
-        let Some(context_tokens) = self
-            .get_threshold_context_tokens(&context.message, compaction_timestamp)
+        let Some(context_tokens) =
+            self.get_threshold_context_tokens(&context.message, compaction_timestamp)
         else {
             return false;
         };
@@ -4334,7 +4524,8 @@ impl AgentSession {
         }
 
         self.await_agent_event_queue().await;
-        let rlm_outcome = self.handle_rlm_child_turn_outcome(&context.message, true, Some("threshold"));
+        let rlm_outcome =
+            self.handle_rlm_child_turn_outcome(&context.message, true, Some("threshold"));
         let has_continuation = rlm_outcome
             .as_ref()
             .and_then(|outcome| outcome.continuation.clone())
@@ -4344,16 +4535,21 @@ impl AgentSession {
             .map(|outcome| outcome.terminal)
             .unwrap_or(false);
         if has_continuation {
-            self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
-        } else if !terminal && self.queue_goal_continuation_for_threshold_compaction(&context.message) {
-            self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+            self.continue_after_threshold_compaction
+                .store(true, Ordering::SeqCst);
+        } else if !terminal
+            && self.queue_goal_continuation_for_threshold_compaction(&context.message)
+        {
+            self.continue_after_threshold_compaction
+                .store(true, Ordering::SeqCst);
         } else if !terminal
             && self
                 .queue_autonomous_continuation_for_threshold_compaction(&context.message)
                 .await
                 .is_some()
         {
-            self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+            self.continue_after_threshold_compaction
+                .store(true, Ordering::SeqCst);
         }
         true
     }
@@ -4458,13 +4654,15 @@ impl AgentSession {
         Some(queued)
     }
 
-
     /// `_queueGoalContinuationForThresholdCompaction`.
     fn queue_goal_continuation_for_threshold_compaction(&self, message: &AssistantMessage) -> bool {
         if self.goal_state.lock().unwrap().status != GoalStatus::Active {
             return false;
         }
-        if self.goal_continuation_awaits_rlm_work.load(Ordering::SeqCst) {
+        if self
+            .goal_continuation_awaits_rlm_work
+            .load(Ordering::SeqCst)
+        {
             return false;
         }
         let goal = self.goal_state();
@@ -4501,14 +4699,21 @@ impl AgentSession {
     /// `/autonomous off` command, which the TS also services through this no-arg
     /// form, so the same three fields are cleared.
     fn clear_queued_autonomous_continuations(&self) {
-        self.queued_autonomous_threshold_continuations.lock().unwrap().clear();
-        self.queued_autonomous_continuation_snapshots.lock().unwrap().clear();
+        self.queued_autonomous_threshold_continuations
+            .lock()
+            .unwrap()
+            .clear();
+        self.queued_autonomous_continuation_snapshots
+            .lock()
+            .unwrap()
+            .clear();
         self.pending_threshold_compaction_autonomous_messages
             .lock()
             .unwrap()
             .clear();
         // TS 3141-3143: no explicit `messages` means the flag is reset.
-        self.continue_after_threshold_compaction.store(false, Ordering::SeqCst);
+        self.continue_after_threshold_compaction
+            .store(false, Ordering::SeqCst);
     }
 
     /// `_clearQueuedAutonomousContinuations({restoreAutonomousState, messages})`
@@ -4518,8 +4723,10 @@ impl AgentSession {
         restore_autonomous_state: bool,
         requested_messages: &[AgentMessage],
     ) {
-        let requested: HashSet<String> =
-            requested_messages.iter().map(agent_message_key_of).collect();
+        let requested: HashSet<String> = requested_messages
+            .iter()
+            .map(agent_message_key_of)
+            .collect();
         let queued_messages: Vec<AgentMessage> = {
             let post = self.post_compaction_continuation_messages.lock().unwrap();
             post.iter()
@@ -4556,7 +4763,10 @@ impl AgentSession {
         if restore_autonomous_state {
             // TS 3126-3134: restore the queue-time snapshot of the first match.
             let snapshot = {
-                let snapshots = self.queued_autonomous_continuation_snapshots.lock().unwrap();
+                let snapshots = self
+                    .queued_autonomous_continuation_snapshots
+                    .lock()
+                    .unwrap();
                 queued_messages
                     .iter()
                     .find_map(|message| snapshots.get(&agent_message_key_of(message)).cloned())
@@ -4567,7 +4777,10 @@ impl AgentSession {
         }
         // TS 3135-3140.
         {
-            let mut snapshots = self.queued_autonomous_continuation_snapshots.lock().unwrap();
+            let mut snapshots = self
+                .queued_autonomous_continuation_snapshots
+                .lock()
+                .unwrap();
             for message in &queued_messages {
                 snapshots.remove(&agent_message_key_of(message));
             }
@@ -4593,7 +4806,6 @@ impl AgentSession {
             self.clear_queued_autonomous_continuations_for_messages(true, queued_messages);
         }
     }
-
 
     /// `handleGoalHostRequest`.
     pub fn handle_goal_host_request(
@@ -4699,7 +4911,9 @@ impl AgentSession {
                     return Ok(serde_json::json!({ "scheduled": false, "reason": reason }));
                 }
                 *self.pending_requested_compaction.lock().unwrap() =
-                    Some(PendingRequestedCompaction { custom_instructions: instructions });
+                    Some(PendingRequestedCompaction {
+                        custom_instructions: instructions,
+                    });
                 Ok(serde_json::json!({
                     "scheduled": true,
                     "note": "Compaction runs when the current turn ends; you resume automatically afterwards. Continue working normally.",
@@ -4771,9 +4985,12 @@ impl AgentSession {
                 };
                 *self.pending_requested_refine.lock().unwrap() = Some(PendingRequestedRefine {
                     instructions: instructions.or_else(|| {
-                        previous.as_ref().and_then(|previous| previous.instructions.clone())
+                        previous
+                            .as_ref()
+                            .and_then(|previous| previous.instructions.clone())
                     }),
-                    global: global_flag.or_else(|| previous.as_ref().and_then(|previous| previous.global)),
+                    global: global_flag
+                        .or_else(|| previous.as_ref().and_then(|previous| previous.global)),
                 });
                 // In serialized mode, kick off background planning immediately
                 // (the primary response ended at message_end, tools are active).
@@ -4781,7 +4998,8 @@ impl AgentSession {
                 // for the shouldStopAfterTurn boundary.
                 if self.serialized_refine {
                     if self.serialized_plan_in_flight.lock().unwrap().is_some() {
-                        self.auto_refine_branch_version.fetch_add(1, Ordering::SeqCst);
+                        self.auto_refine_branch_version
+                            .fetch_add(1, Ordering::SeqCst);
                         self.maybe_start_serialized_background_plan();
                     } else {
                         self.maybe_start_serialized_background_plan();
@@ -4871,9 +5089,18 @@ impl AgentSession {
                     return Err("rlm_heartbeat.update id must be a string".to_string());
                 }
                 for (field, message) in [
-                    ("instruction", "rlm_heartbeat.update instruction must be a string when provided"),
-                    ("interval", "rlm_heartbeat.update interval must be a string when provided"),
-                    ("label", "rlm_heartbeat.update label must be a string when provided"),
+                    (
+                        "instruction",
+                        "rlm_heartbeat.update instruction must be a string when provided",
+                    ),
+                    (
+                        "interval",
+                        "rlm_heartbeat.update interval must be a string when provided",
+                    ),
+                    (
+                        "label",
+                        "rlm_heartbeat.update label must be a string when provided",
+                    ),
                 ] {
                     if let Some(value) = payload.get(field) {
                         if !value.is_null() && !value.is_string() {
@@ -4935,7 +5162,9 @@ impl AgentSession {
                     "heartbeat": heartbeat.as_ref().map(rlm_heartbeat_host_response),
                 }))
             }
-            _ => Err(format!("unknown RLM heartbeat request type \"{request_type}\"")),
+            _ => Err(format!(
+                "unknown RLM heartbeat request type \"{request_type}\""
+            )),
         }
     }
 
@@ -4956,40 +5185,51 @@ impl AgentSession {
         let task_ids: Vec<String> = {
             let state = self.rlm_continuation.lock().unwrap();
             let current_task_id = state.tasks.last().map(|task| task.id.as_str());
-            state.tasks.iter().filter(|task| {
-                !task.replied && (task.result.is_none() || current_task_id == Some(task.id.as_str()))
-            }).map(|task| task.id.clone()).collect()
+            state
+                .tasks
+                .iter()
+                .filter(|task| {
+                    !task.replied
+                        && (task.result.is_none() || current_task_id == Some(task.id.as_str()))
+                })
+                .map(|task| task.id.clone())
+                .collect()
         };
         let reply: BoxFuture<Result<AgentSessionMessageReceipt, String>> = Box::pin(async move {
             let target = assert_direct_agent_message_target(&target)?;
-            let addressed_parent = session.rlm_depth > 0 && match receiver_role.as_deref() {
-                Some(crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT) => true,
-                Some(_) => false,
-                None => match &session.agent_message_controller {
-                    Some(controller) => match controller.roster().await {
-                        Ok(roster) => {
-                            let matches: Vec<_> = roster.entries.iter()
-                                .filter(|entry| entry.id == target || entry.name == target).collect();
-                            if matches.is_empty() && !task_ids.is_empty() {
-                                return Err("RLM parent reply was not submitted: target relationship could not be resolved; specify receiver_role=parent or a canonical roster ID/name".to_string());
-                            }
-                            matches.iter().any(|entry| {
+            let addressed_parent = session.rlm_depth > 0
+                && match receiver_role.as_deref() {
+                    Some(crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT) => true,
+                    Some(_) => false,
+                    None => match &session.agent_message_controller {
+                        Some(controller) => match controller.roster().await {
+                            Ok(roster) => {
+                                let matches: Vec<_> = roster
+                                    .entries
+                                    .iter()
+                                    .filter(|entry| entry.id == target || entry.name == target)
+                                    .collect();
+                                if matches.is_empty() && !task_ids.is_empty() {
+                                    return Err("RLM parent reply was not submitted: target relationship could not be resolved; specify receiver_role=parent or a canonical roster ID/name".to_string());
+                                }
+                                matches.iter().any(|entry| {
                                 entry.relationship == crate::core::agent_messages::FAMILY_RELATIONSHIP_PARENT
                             })
+                            }
+                            Err(error) if !task_ids.is_empty() => {
+                                return Err(format!("RLM parent reply was not submitted: target relationship could not be resolved: {error}; specify receiver_role=parent or a canonical roster ID/name"));
+                            }
+                            Err(_) => false,
                         },
-                        Err(error) if !task_ids.is_empty() => {
-                            return Err(format!("RLM parent reply was not submitted: target relationship could not be resolved: {error}; specify receiver_role=parent or a canonical roster ID/name"));
-                        }
-                        Err(_) => false,
+                        None => false,
                     },
-                    None => false,
-                },
-            };
+                };
             let payload = serde_json::json!({
                 "target": target, "message": message, "receiver_role": receiver_role,
             });
             // Resolve local validation before reserving a send intent.
-            let send = session.handle_agent_message_host_request("agent_message.send", Some(&payload))?;
+            let send =
+                session.handle_agent_message_host_request("agent_message.send", Some(&payload))?;
             let _delivery = if addressed_parent {
                 Some(session.rlm_parent_delivery_gate.lock().await)
             } else {
@@ -5001,11 +5241,15 @@ impl AgentSession {
             } else {
                 Vec::new()
             };
-            if addressed_parent && (session.disposed.load(Ordering::SeqCst) || session.disposing.load(Ordering::SeqCst)) {
+            if addressed_parent
+                && (session.disposed.load(Ordering::SeqCst)
+                    || session.disposing.load(Ordering::SeqCst))
+            {
                 return Err("RLM parent reply was not submitted: session is disposing".to_string());
             }
             let outcome = send.await.and_then(|value| {
-                serde_json::from_value::<AgentSessionMessageReceipt>(value).map_err(|error| error.to_string())
+                serde_json::from_value::<AgentSessionMessageReceipt>(value)
+                    .map_err(|error| error.to_string())
             });
             if addressed_parent {
                 session.settle_rlm_parent_delivery(&previous, &outcome, &target, &message, true);
@@ -5046,12 +5290,9 @@ impl AgentSession {
         let payload = payload.cloned().unwrap_or(Value::Null);
         match request_type {
             "agent_message.list_agents" => Ok(Box::pin(async move {
-                controller
-                    .roster()
-                    .await
-                    .and_then(|roster| {
-                        serde_json::to_value(roster).map_err(|error| error.to_string())
-                    })
+                controller.roster().await.and_then(|roster| {
+                    serde_json::to_value(roster).map_err(|error| error.to_string())
+                })
             })),
             "agent_message.send" => {
                 let target = match payload.get("target") {
@@ -5066,16 +5307,20 @@ impl AgentSession {
                 let message = normalize_agent_session_message(&message, usize::MAX)?;
                 Ok(Box::pin(async move {
                     let receipt = controller
-                        .send_agent_message(crate::core::agent_messages::AgentSessionMessageSendInput {
-                            target,
-                            message,
-                            receiver_role: None,
-                        })
+                        .send_agent_message(
+                            crate::core::agent_messages::AgentSessionMessageSendInput {
+                                target,
+                                message,
+                                receiver_role: None,
+                            },
+                        )
                         .await?;
                     serde_json::to_value(receipt).map_err(|error| error.to_string())
                 }))
             }
-            _ => Err(format!("unknown agent message request type \"{request_type}\"")),
+            _ => Err(format!(
+                "unknown agent message request type \"{request_type}\""
+            )),
         }
     }
 
@@ -5092,10 +5337,9 @@ impl AgentSession {
         let payload = payload.cloned().unwrap_or(Value::Null);
         match request_type {
             "agent_observe.list" => Ok(Box::pin(async move {
-                controller
-                    .list_agents()
-                    .await
-                    .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                controller.list_agents().await.and_then(|result| {
+                    serde_json::to_value(result).map_err(|error| error.to_string())
+                })
             })),
             "agent_observe.get" => {
                 let target = match payload.get("target") {
@@ -5103,10 +5347,9 @@ impl AgentSession {
                     _ => return Err("agent_observe.get target must be a string".to_string()),
                 };
                 Ok(Box::pin(async move {
-                    controller
-                        .get_agent(target)
-                        .await
-                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                    controller.get_agent(target).await.and_then(|result| {
+                        serde_json::to_value(result).map_err(|error| error.to_string())
+                    })
                 }))
             }
             "agent_observe.recent" => {
@@ -5114,10 +5357,8 @@ impl AgentSession {
                     Some(Value::String(target)) => target.clone(),
                     _ => return Err("agent_observe.recent target must be a string".to_string()),
                 };
-                let limit = normalize_observe_limit(
-                    payload.get("limit").and_then(Value::as_i64),
-                    20,
-                )?;
+                let limit =
+                    normalize_observe_limit(payload.get("limit").and_then(Value::as_i64), 20)?;
                 let max_chars = normalize_observe_max_chars(
                     payload
                         .get("max_chars")
@@ -5127,21 +5368,31 @@ impl AgentSession {
                 )?;
                 Ok(Box::pin(async move {
                     controller
-                        .recent_messages(crate::core::agent_observe::AgentObserveRecentMessagesInput {
-                            target,
-                            limit: Some(limit),
-                            max_chars: Some(max_chars),
-                        })
+                        .recent_messages(
+                            crate::core::agent_observe::AgentObserveRecentMessagesInput {
+                                target,
+                                limit: Some(limit),
+                                max_chars: Some(max_chars),
+                            },
+                        )
                         .await
-                        .and_then(|result| serde_json::to_value(result).map_err(|error| error.to_string()))
+                        .and_then(|result| {
+                            serde_json::to_value(result).map_err(|error| error.to_string())
+                        })
                 }))
             }
-            _ => Err(format!("unknown agent observe request type \"{request_type}\"")),
+            _ => Err(format!(
+                "unknown agent observe request type \"{request_type}\""
+            )),
         }
     }
 
     /// `_createGoalFromHost`.
-    fn create_goal_from_host(&self, objective: &str, token_budget: Option<f64>) -> Result<GoalState, String> {
+    fn create_goal_from_host(
+        &self,
+        objective: &str,
+        token_budget: Option<f64>,
+    ) -> Result<GoalState, String> {
         match self.goal_state.lock().unwrap().status {
             GoalStatus::Active => Err(
                 "cannot create a new goal because this thread already has an active goal; run `await goal.complete()` when it is achieved, or ask the user to clear it with /goal clear"
@@ -5209,10 +5460,12 @@ impl AgentSession {
         // Delegating and ending the turn is correct behavior; hold the continuation
         // until descendants settle instead of re-prompting a waiting parent.
         if self.has_unsettled_rlm_quiescence_work() {
-            self.goal_continuation_awaits_rlm_work.store(true, Ordering::SeqCst);
+            self.goal_continuation_awaits_rlm_work
+                .store(true, Ordering::SeqCst);
             return Vec::new();
         }
-        self.goal_continuation_awaits_rlm_work.store(false, Ordering::SeqCst);
+        self.goal_continuation_awaits_rlm_work
+            .store(false, Ordering::SeqCst);
         self.ensure_goal_runtime_active(None);
         let goal = {
             let mut goal = self.goal_state.lock().unwrap().clone();
@@ -5262,7 +5515,10 @@ impl AgentSession {
             if entry.get("type").and_then(Value::as_str) != Some("custom") {
                 continue;
             }
-            let custom_type = entry.get("customType").and_then(Value::as_str).unwrap_or_default();
+            let custom_type = entry
+                .get("customType")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
             if custom_type != RLM_CONTINUATION_STATE_CUSTOM_TYPE
                 && custom_type != LEGACY_RLM_CONTINUATION_STATE_CUSTOM_TYPE
             {
@@ -5276,7 +5532,8 @@ impl AgentSession {
             };
             if let Some(state) = parsed {
                 if let Some(replied) = self.replied_to_parent_since_task.lock().unwrap().as_mut() {
-                    *replied = !state.tasks.is_empty() && state.tasks.iter().all(|task| task.replied);
+                    *replied =
+                        !state.tasks.is_empty() && state.tasks.iter().all(|task| task.replied);
                 }
                 *self.rlm_continuation.lock().unwrap() = state;
                 return;
@@ -5300,10 +5557,11 @@ impl AgentSession {
         // older snapshot must not overwrite a newly delivered parent task.
         let state = self.rlm_continuation.lock().unwrap();
         let value = serde_json::to_value(&*state).unwrap_or(Value::Null);
-        let _ = self.session_manager.lock().unwrap().append_custom_entry(
-            RLM_CONTINUATION_STATE_CUSTOM_TYPE,
-            Some(value),
-        );
+        let _ = self
+            .session_manager
+            .lock()
+            .unwrap()
+            .append_custom_entry(RLM_CONTINUATION_STATE_CUSTOM_TYPE, Some(value));
     }
 
     /// Caller holds the ledger lock, so no stale snapshot can become the latest
@@ -5314,19 +5572,22 @@ impl AgentSession {
         if !manager.is_persisted() {
             return Err("RLM result delivery requires a persistent session journal".to_string());
         }
-        let path = manager.get_session_file()
-            .ok_or_else(|| "RLM result delivery requires a persistent session journal".to_string())?;
-        manager.append_custom_entry_with_rollback(
-            RLM_CONTINUATION_STATE_CUSTOM_TYPE,
-            Some(value),
-        )?;
+        let path = manager.get_session_file().ok_or_else(|| {
+            "RLM result delivery requires a persistent session journal".to_string()
+        })?;
+        manager
+            .append_custom_entry_with_rollback(RLM_CONTINUATION_STATE_CUSTOM_TYPE, Some(value))?;
         // Keep the manager locked through the durability barrier: a rewrite or
         // later ledger append must not replace the file while it is synced.
-        std::fs::OpenOptions::new().write(true).open(&path)
-            .and_then(|file| file.sync_all()).map_err(|error| error.to_string())?;
+        std::fs::OpenOptions::new()
+            .write(true)
+            .open(&path)
+            .and_then(|file| file.sync_all())
+            .map_err(|error| error.to_string())?;
         #[cfg(unix)]
         if let Some(parent) = Path::new(&path).parent() {
-            std::fs::File::open(parent).and_then(|directory| directory.sync_all())
+            std::fs::File::open(parent)
+                .and_then(|directory| directory.sync_all())
                 .map_err(|error| error.to_string())?;
         }
         Ok(())
@@ -5354,7 +5615,10 @@ impl AgentSession {
         if !previous.is_empty() {
             if let Err(error) = self.persist_rlm_delivery_state(state) {
                 for task in &mut state.tasks {
-                    if previous.iter().any(|(id, old)| id == &task.id && old.is_none()) {
+                    if previous
+                        .iter()
+                        .any(|(id, old)| id == &task.id && old.is_none())
+                    {
                         if let Some(delivery) = &mut task.result_delivery {
                             delivery.reason = "intent_persistence_failed_no_send".to_string();
                         }
@@ -5374,23 +5638,26 @@ impl AgentSession {
         message: &str,
         explicit: bool,
     ) {
-        let acknowledged = outcome.as_ref().is_ok_and(|receipt| {
-            rlm_result_receipt_is_valid(receipt, target, message)
-        });
+        let acknowledged = outcome
+            .as_ref()
+            .is_ok_and(|receipt| rlm_result_receipt_is_valid(receipt, target, message));
         if previous.is_empty() {
             if explicit && acknowledged {
                 self.parent_reply_count.fetch_add(1, Ordering::SeqCst);
             }
             return;
         }
-        let rejected = outcome.as_ref().err().is_some_and(|error| {
-            rlm_result_rejected_before_admission(error)
-        });
+        let rejected = outcome
+            .as_ref()
+            .err()
+            .is_some_and(|error| rlm_result_rejected_before_admission(error));
         let mut state = self.rlm_continuation.lock().unwrap();
         let mut settled = state.clone();
         let mut newly_replied = false;
         for task in &mut settled.tasks {
-            let Some((_, prior)) = previous.iter().find(|(id, _)| id == &task.id) else { continue };
+            let Some((_, prior)) = previous.iter().find(|(id, _)| id == &task.id) else {
+                continue;
+            };
             if task.replied {
                 continue;
             }
@@ -5402,7 +5669,12 @@ impl AgentSession {
                 // A rejected deliberate reply must not erase earlier uncertainty.
                 task.result_delivery = prior.clone();
             } else if let Some(delivery) = &mut task.result_delivery {
-                delivery.reason = if outcome.is_ok() { "invalid_receipt" } else { "send_error_acknowledgement_unknown" }.to_string();
+                delivery.reason = if outcome.is_ok() {
+                    "invalid_receipt"
+                } else {
+                    "send_error_acknowledgement_unknown"
+                }
+                .to_string();
             }
         }
         let persisted = self.persist_rlm_delivery_state(&settled);
@@ -5410,7 +5682,9 @@ impl AgentSession {
             *state = settled;
         }
         if let Err(error) = persisted {
-            eprintln!("RLM result settlement persistence failed; durable intent prevents replay: {error}");
+            eprintln!(
+                "RLM result settlement persistence failed; durable intent prevents replay: {error}"
+            );
         }
         if !acknowledged && !rejected {
             eprintln!("RLM parent result acknowledgement is uncertain; result retained and automatic replay blocked");
@@ -5468,10 +5742,11 @@ impl AgentSession {
             let value = serde_json::to_value(&state).map_err(|error| error.to_string())?;
             // This append includes a checked flush. A failed write rolls back
             // only the new ledger entry and leaves the prior in-memory ledger.
-            self.session_manager.lock().unwrap().append_custom_entry_with_rollback(
-                RLM_CONTINUATION_STATE_CUSTOM_TYPE,
-                Some(value),
-            ).map_err(|error| format!("Parent-task ledger persistence failed: {error}"))?;
+            self.session_manager
+                .lock()
+                .unwrap()
+                .append_custom_entry_with_rollback(RLM_CONTINUATION_STATE_CUSTOM_TYPE, Some(value))
+                .map_err(|error| format!("Parent-task ledger persistence failed: {error}"))?;
             *current = state;
         }
         drop(current);
@@ -5504,7 +5779,12 @@ impl AgentSession {
 
     /// `_hasQueuedRlmContinuation`.
     fn has_queued_rlm_continuation(&self) -> bool {
-        let pending = self.rlm_continuation.lock().unwrap().pending_continuation.clone();
+        let pending = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .clone();
         self.action_store
             .lock()
             .unwrap()
@@ -5513,9 +5793,8 @@ impl AgentSession {
             .any(|action| match &action.payload {
                 QueuedActionPayload::Turn(_) => match primary_delivery_record(action) {
                     Ok(record) => match record.message {
-                        DeliveryMessage::User(user) => {
-                            self.rlm_continuation_matches(&AgentMessage::from(user), pending.as_ref())
-                        }
+                        DeliveryMessage::User(user) => self
+                            .rlm_continuation_matches(&AgentMessage::from(user), pending.as_ref()),
                         DeliveryMessage::Custom(_) => false,
                     },
                     Err(_) => false,
@@ -5536,7 +5815,12 @@ impl AgentSession {
 
     /// `_queuePendingRlmContinuation`.
     fn queue_pending_rlm_continuation(self: &Arc<Self>) -> bool {
-        let pending = self.rlm_continuation.lock().unwrap().pending_continuation.clone();
+        let pending = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .clone();
         let pending = match pending {
             Some(pending) => pending,
             None => return false,
@@ -5546,7 +5830,11 @@ impl AgentSession {
             || self.disposed.load(Ordering::SeqCst)
             || self.disposing.load(Ordering::SeqCst)
             || self.session_input_pump_suspended.load(Ordering::SeqCst)
-            || !self.session_input_admission_pauses.lock().unwrap().is_empty()
+            || !self
+                .session_input_admission_pauses
+                .lock()
+                .unwrap()
+                .is_empty()
         {
             return false;
         }
@@ -5569,7 +5857,13 @@ impl AgentSession {
         );
         // TS 3648-3655: the recovery is fronted so it precedes a later follow-up.
         self.admit_session_input_with_options(action, true, false, true, true);
-        if let Some(pending) = self.rlm_continuation.lock().unwrap().pending_continuation.as_mut() {
+        if let Some(pending) = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .as_mut()
+        {
             pending.phase = "queued".to_string();
         }
         self.persist_rlm_continuation_state();
@@ -5578,13 +5872,24 @@ impl AgentSession {
 
     /// `_consumeStartedRlmContinuation`.
     fn consume_started_rlm_continuation(&self, message: &AgentMessage) {
-        let pending = self.rlm_continuation.lock().unwrap().pending_continuation.clone();
+        let pending = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .clone();
         if !self.rlm_continuation_matches(message, pending.as_ref()) {
             return;
         }
         // Retain the record until a following assistant result is authoritative.
         // A process exiting after delivery but before that result can then resume.
-        if let Some(pending) = self.rlm_continuation.lock().unwrap().pending_continuation.as_mut() {
+        if let Some(pending) = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .as_mut()
+        {
             pending.phase = "started".to_string();
         }
         self.persist_rlm_continuation_state();
@@ -5617,7 +5922,12 @@ impl AgentSession {
                 .rev()
                 .collect::<String>()
         );
-        let last_source_key = self.rlm_continuation.lock().unwrap().last_source_key.clone();
+        let last_source_key = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .last_source_key
+            .clone();
         if last_source_key.as_deref() == Some(source_key.as_str()) {
             if queue {
                 if let Some(session) = &session {
@@ -5637,8 +5947,8 @@ impl AgentSession {
             let mut state = self.rlm_continuation.lock().unwrap();
             state.last_source_key = Some(source_key.clone());
             state.last_stop_reason = Some(message.stop_reason.clone());
-            state.task_had_length = state.task_had_length
-                || message.stop_reason == pi_ai::types::STOP_REASON_LENGTH;
+            state.task_had_length =
+                state.task_had_length || message.stop_reason == pi_ai::types::STOP_REASON_LENGTH;
             state.pending_continuation = None;
             state.continuation_count
         };
@@ -5691,11 +6001,8 @@ impl AgentSession {
             state.continuation_count += 1.0;
             state.continuation_count as i64
         };
-        let continuation = create_rlm_child_continuation_message(
-            attempt,
-            &message.stop_reason,
-            message.timestamp,
-        );
+        let continuation =
+            create_rlm_child_continuation_message(attempt, &message.stop_reason, message.timestamp);
         {
             let mut state = self.rlm_continuation.lock().unwrap();
             state.terminal_status = None;
@@ -5765,12 +6072,23 @@ impl AgentSession {
             Some(parent) => parent.clone(),
             None => return,
         };
-        let task_ids: Vec<String> = self.rlm_continuation.lock().unwrap().tasks.iter()
-            .map(|task| task.id.clone()).collect();
+        let task_ids: Vec<String> = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .tasks
+            .iter()
+            .map(|task| task.id.clone())
+            .collect();
         for task_id in task_ids {
             let claimed = loop {
-                let in_flight: Vec<SharedReplyFuture> = self.rlm_explicit_replies_in_flight
-                    .lock().unwrap().iter().map(|(_, handle)| handle.clone()).collect();
+                let in_flight: Vec<SharedReplyFuture> = self
+                    .rlm_explicit_replies_in_flight
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .map(|(_, handle)| handle.clone())
+                    .collect();
                 futures::future::join_all(in_flight).await;
                 let delivery = self.rlm_parent_delivery_gate.lock().await;
                 let attempt = {
@@ -5784,11 +6102,19 @@ impl AgentSession {
                         Some((|| {
                             let mut state = self.rlm_continuation.lock().unwrap();
                             // Re-read live state after all explicit futures settle.
-                            let task = state.tasks.iter().find(|task| {
-                                task.id == task_id && !task.replied && task.result.is_some()
-                                    && task.result_delivery.is_none()
-                            }).cloned();
-                            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                            let task = state
+                                .tasks
+                                .iter()
+                                .find(|task| {
+                                    task.id == task_id
+                                        && !task.replied
+                                        && task.result.is_some()
+                                        && task.result_delivery.is_none()
+                                })
+                                .cloned();
+                            if self.disposed.load(Ordering::SeqCst)
+                                || self.disposing.load(Ordering::SeqCst)
+                            {
                                 return Ok(None);
                             }
                             let Some(task) = task else { return Ok(None) };
@@ -5808,7 +6134,9 @@ impl AgentSession {
                     None => drop(delivery),
                 }
             };
-            let Some((_delivery, task, previous)) = claimed else { continue };
+            let Some((_delivery, task, previous)) = claimed else {
+                continue;
+            };
             // A cancelled/disposed owner cannot report success. Its durable
             // intent remains visible and cannot authorize a resend on reload.
             if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
@@ -5817,12 +6145,23 @@ impl AgentSession {
             let result = task.result.as_ref().expect("claimed result");
             let mut text = vec![
                 "RLM child automatic result".to_string(),
-                format!("child_id: {}", self.rlm_parent_node_id.clone().unwrap_or_else(|| self.session_id())),
-                format!("session_name: {}", self.session_name().unwrap_or_else(|| "unnamed".to_string())),
+                format!(
+                    "child_id: {}",
+                    self.rlm_parent_node_id
+                        .clone()
+                        .unwrap_or_else(|| self.session_id())
+                ),
+                format!(
+                    "session_name: {}",
+                    self.session_name().unwrap_or_else(|| "unnamed".to_string())
+                ),
                 format!("task_id: {}", task.id),
                 format!("terminal_status: {}", result.status),
                 format!("partial: {}", if result.partial { "yes" } else { "no" }),
-                format!("stop_reason: {}", result.stop_reason.as_deref().unwrap_or("unknown")),
+                format!(
+                    "stop_reason: {}",
+                    result.stop_reason.as_deref().unwrap_or("unknown")
+                ),
             ];
             if let Some(reason) = &result.reason {
                 text.push(format!("reason: {reason}"));
@@ -5834,11 +6173,13 @@ impl AgentSession {
                 result.text.clone()
             });
             let message = text.join("\n");
-            let outcome = controller.send_agent_message(
-                crate::core::agent_messages::AgentSessionMessageSendInput {
-                    target: parent.id.clone(), message: message.clone(), receiver_role: None,
-                },
-            ).await;
+            let outcome = controller
+                .send_agent_message(crate::core::agent_messages::AgentSessionMessageSendInput {
+                    target: parent.id.clone(),
+                    message: message.clone(),
+                    receiver_role: None,
+                })
+                .await;
             self.settle_rlm_parent_delivery(&previous, &outcome, &parent.id, &message, false);
         }
     }
@@ -5853,7 +6194,10 @@ impl AgentSession {
         }
         let state = self.rlm_continuation.lock().unwrap().clone();
         if state.pending_continuation.is_none()
-            && !state.tasks.iter().any(|task| task.result.is_some() && !task.replied)
+            && !state
+                .tasks
+                .iter()
+                .any(|task| task.result.is_some() && !task.replied)
         {
             return;
         }
@@ -5873,7 +6217,12 @@ impl AgentSession {
         {
             return;
         }
-        let pending = self.rlm_continuation.lock().unwrap().pending_continuation.clone();
+        let pending = self
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_continuation
+            .clone();
         match pending {
             // TS 3815-3858: a `started` recovery is resolved by inspecting the
             // transcript around its checkpoint; anything else is re-queued.
@@ -6038,7 +6387,10 @@ impl AgentSession {
         context: GetContinuationMessagesContext,
         signal: Option<CancellationToken>,
     ) -> Result<Vec<AgentMessage>, String> {
-        let aborted = signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false);
+        let aborted = signal
+            .as_ref()
+            .map(|signal| signal.is_cancelled())
+            .unwrap_or(false);
         if aborted || self.explicitly_stopped() {
             return Ok(Vec::new());
         }
@@ -6085,7 +6437,11 @@ impl AgentSession {
             }
             return Ok(goal_messages);
         }
-        if self.autonomous_continuation_suppression_depth.load(Ordering::SeqCst) > 0 {
+        if self
+            .autonomous_continuation_suppression_depth
+            .load(Ordering::SeqCst)
+            > 0
+        {
             return Ok(Vec::new());
         }
         Ok(Vec::new())
@@ -6104,7 +6460,10 @@ impl AgentSession {
      * Register a delivery waiter before submitting the prompt. Delivery outcomes are not retained
      * for late lookup, so callers that register after admission may wait for a future use of the id.
      */
-    pub fn wait_for_agent_message_prompt_delivery(&self, agent_message_id: &str) -> AgentMessageDeferred {
+    pub fn wait_for_agent_message_prompt_delivery(
+        &self,
+        agent_message_id: &str,
+    ) -> AgentMessageDeferred {
         let mut outcomes = self.agent_message_outcomes.lock().unwrap();
         let outcome = outcomes.entry(agent_message_id.to_string()).or_default();
         if outcome.delivery.is_none() {
@@ -6114,12 +6473,7 @@ impl AgentSession {
     }
 
     /// `_settleAgentMessage`.
-    fn settle_agent_message(
-        &self,
-        agent_message_id: Option<&str>,
-        leg: &str,
-        error: Option<&str>,
-    ) {
+    fn settle_agent_message(&self, agent_message_id: Option<&str>, leg: &str, error: Option<&str>) {
         let agent_message_id = match agent_message_id {
             Some(agent_message_id) => agent_message_id.to_string(),
             None => return,
@@ -6160,11 +6514,23 @@ impl AgentSession {
     }
 
     /// `_rejectQueuedAgentMessageDeliveries`.
-    fn reject_queued_agent_message_deliveries(&self, delivery_error: &str, completion_error: Option<&str>) {
+    fn reject_queued_agent_message_deliveries(
+        &self,
+        delivery_error: &str,
+        completion_error: Option<&str>,
+    ) {
         let completion_error = completion_error.unwrap_or(delivery_error);
         for action in self.action_store.lock().unwrap().unfinished_actions(None) {
-            self.settle_agent_message(action.agent_message_id.as_deref(), "delivery", Some(delivery_error));
-            self.settle_agent_message(action.agent_message_id.as_deref(), "completion", Some(completion_error));
+            self.settle_agent_message(
+                action.agent_message_id.as_deref(),
+                "delivery",
+                Some(delivery_error),
+            );
+            self.settle_agent_message(
+                action.agent_message_id.as_deref(),
+                "completion",
+                Some(completion_error),
+            );
         }
     }
 
@@ -6262,7 +6628,9 @@ impl AgentSession {
                 let _ = messages;
                 if !captured.is_empty() {
                     self.agent.update_state(Box::new(move |state| {
-                        state.messages.retain(|message| !captured.contains(&agent_message_key_of(message)));
+                        state
+                            .messages
+                            .retain(|message| !captured.contains(&agent_message_key_of(message)));
                     }));
                 }
             }
@@ -6319,7 +6687,9 @@ impl AgentSession {
                                 }
                             }
                         }
-                        if started_primary && action.lifecycle.state() == ActionLifecycleState::Committing {
+                        if started_primary
+                            && action.lifecycle.state() == ActionLifecycleState::Committing
+                        {
                             let _ = transition_session_action(
                                 &mut next,
                                 ActionLifecycle::Running {
@@ -6339,7 +6709,9 @@ impl AgentSession {
             _ => {}
         }
         let persisted = if let AgentEvent::MessageEnd { message } = &event {
-            if self.is_dispatched_input(message) && self.capturing_cancelled_action(message).is_none() {
+            if self.is_dispatched_input(message)
+                && self.capturing_cancelled_action(message).is_none()
+            {
                 let result = self.persist_dispatch_message(message);
                 self.record_dispatch_persistence(message, &result);
                 Some(result)
@@ -6399,7 +6771,10 @@ impl AgentSession {
     }
 
     /// `_findLastAssistantInMessages`.
-    fn find_last_assistant_in_messages(&self, messages: &[AgentMessage]) -> Option<AssistantMessage> {
+    fn find_last_assistant_in_messages(
+        &self,
+        messages: &[AgentMessage],
+    ) -> Option<AssistantMessage> {
         for message in messages.iter().rev() {
             if let AgentMessage::Message(Message::Assistant(assistant)) = message {
                 return Some(assistant.clone());
@@ -6434,11 +6809,18 @@ impl AgentSession {
         }
         let original = AgentMessage::Message(Message::Assistant(message.clone()));
         message.error_message = Some(add_login_guidance_to_auth_error(&error_message));
-        self.replace_message_in_place(&original, AgentMessage::Message(Message::Assistant(message)));
+        self.replace_message_in_place(
+            &original,
+            AgentMessage::Message(Message::Assistant(message)),
+        );
     }
 
     /// `_processAgentEvent`.
-    async fn process_agent_event(self: &Arc<Self>, event: AgentEvent, persisted: Option<Result<String, String>>) {
+    async fn process_agent_event(
+        self: &Arc<Self>,
+        event: AgentEvent,
+        persisted: Option<Result<String, String>>,
+    ) {
         let mut cleared_dispatch_ended = false;
         if let AgentEvent::MessageStart { message } | AgentEvent::MessageEnd { message } = &event {
             if let AgentMessage::Message(Message::ToolResult(_)) = message {
@@ -6453,7 +6835,9 @@ impl AgentSession {
                     if let Some(captured) = &turn.capture_run_messages {
                         let captured = captured.clone();
                         self.agent.update_state(Box::new(move |state| {
-                            state.messages.retain(|message| !captured.contains(&agent_message_key_of(message)));
+                            state.messages.retain(|message| {
+                                !captured.contains(&agent_message_key_of(message))
+                            });
                         }));
                         return;
                     }
@@ -6486,8 +6870,12 @@ impl AgentSession {
                     }
                 }
                 self.agent.update_state(Box::new(move |state| {
-                    state.messages.retain(|message| !removed.contains(&agent_message_key_of(message)));
-                    if !state.is_streaming { state.error_message = None; }
+                    state
+                        .messages
+                        .retain(|message| !removed.contains(&agent_message_key_of(message)));
+                    if !state.is_streaming {
+                        state.error_message = None;
+                    }
                 }));
                 *self.last_assistant_message.lock().unwrap() = None;
                 for message in messages {
@@ -6519,7 +6907,9 @@ impl AgentSession {
                     if let Some(captured) = &turn.capture_run_messages {
                         let captured = captured.clone();
                         self.agent.update_state(Box::new(move |state| {
-                            state.messages.retain(|message| !captured.contains(&agent_message_key_of(message)));
+                            state.messages.retain(|message| {
+                                !captured.contains(&agent_message_key_of(message))
+                            });
                         }));
                         return;
                     }
@@ -6561,7 +6951,8 @@ impl AgentSession {
                 if assistant.stop_reason != STOP_REASON_ERROR
                     && assistant.stop_reason != STOP_REASON_ABORTED
                 {
-                    self.assistant_turns_since_auto_refine.fetch_add(1, Ordering::SeqCst);
+                    self.assistant_turns_since_auto_refine
+                        .fetch_add(1, Ordering::SeqCst);
                     // In serialized mode, kick off background refinement planning
                     // immediately after the primary stream finishes, while tools
                     // are still executing. The plan is awaited at shouldStopAfterTurn
@@ -6662,18 +7053,27 @@ impl AgentSession {
             };
 
             let concrete_auth_failure = self.is_concrete_provider_auth_failure(&message);
-            let retry_concrete_auth_failure =
-                concrete_auth_failure && !self.is_structured_permanent_provider_retry_exhausted(&message);
+            let retry_concrete_auth_failure = concrete_auth_failure
+                && !self.is_structured_permanent_provider_retry_exhausted(&message);
             if self.is_retryable_error(&message) || retry_concrete_auth_failure {
                 if retry_concrete_auth_failure {
                     self.capture_retry_auth_failure_source(&message);
                 }
-                let did_retry = self
-                    // REPAIR CURSOR: TS passes `{ markAuthStaleOnFailure, authSourceTokens }`; the
-                    // canonical Rust `handle_retryable_error(message)` takes no options. Auth-source
-                    // tracking still happens above via `retry_concrete_auth_failure`.
-                    .handle_retryable_error(&message)
-                    .await;
+                // CONTROL (ROOT CONTRACT v1 N3/N6): consult-only veto. Skips
+                // ONE host-planned attempt when Jev classifies
+                // {bad_arguments, fatal} at the high-impact floor with veto
+                // budget left; never adds retries, never bypasses replay
+                // protection.
+                let did_retry = if self.jev_control_retry_veto(&message).await {
+                    false
+                } else {
+                    self
+                        // REPAIR CURSOR: TS passes `{ markAuthStaleOnFailure, authSourceTokens }`; the
+                        // canonical Rust `handle_retryable_error(message)` takes no options. Auth-source
+                        // tracking still happens above via `retry_concrete_auth_failure`.
+                        .handle_retryable_error(&message)
+                        .await
+                };
                 if did_retry {
                     // Retry was initiated, don't proceed to compaction
                     return;
@@ -6689,15 +7089,16 @@ impl AgentSession {
             // true) - Case 1 (context overflow, which strips the failed assistant
             // message and retries) runs before the requested/threshold cases.
             let settings = self.compaction_settings();
-            let compaction_will_retry = match self.check_compaction_overflow(&message, &settings).await {
-                Some(will_retry) => will_retry,
-                // TS 4300 `_checkCompaction(msg)` keeps the default
-                // `queueAutonomousContinuation = true`.
-                None => self
-                    .check_compaction(&settings, true)
-                    .await
-                    .unwrap_or(false),
-            };
+            let compaction_will_retry =
+                match self.check_compaction_overflow(&message, &settings).await {
+                    Some(will_retry) => will_retry,
+                    // TS 4300 `_checkCompaction(msg)` keeps the default
+                    // `queueAutonomousContinuation = true`.
+                    None => self
+                        .check_compaction(&settings, true)
+                        .await
+                        .unwrap_or(false),
+                };
             if compaction_will_retry && self.retry_attempt.load(Ordering::SeqCst) > 0 {
                 return;
             }
@@ -6709,6 +7110,18 @@ impl AgentSession {
                 self.deliver_pending_rlm_results().await;
             }
             if !compaction_will_retry {
+                // CONTROL (ROOT CONTRACT v1): one applied-control decision at
+                // the agent-end boundary. Typed acceptance yields exactly one
+                // of: host-authored corrective feedback continuation (defers
+                // goal finish), truthful verification-unconfirmed pause,
+                // escalate, or baseline continue. defer_goal_finish covers
+                // every continuation/pause case (the resolver sets it for all).
+                let control = self.jev_control_agent_end(&message).await;
+                if control.defer_goal_finish {
+                    // A continuation/pause owns the task; goal finish stays
+                    // deferred and no auto-refine is scheduled here.
+                    return;
+                }
                 self.finish_goal_for_terminal_assistant_message(&message);
                 // In serialized mode, agent-callable refine.run is serviced
                 // at the shouldStopAfterTurn boundary, not here at agent_end.
@@ -6720,6 +7133,217 @@ impl AgentSession {
                 }
             }
         }
+    }
+
+    /// CONTROL: turn-end gate glue. True = pause the loop at this safe
+    /// boundary (accepted stop/escalate after the correction budget is
+    /// spent). Never called without a nonprogress trigger and never when
+    /// the full profile is off (H-CONTROL-1).
+    async fn jev_control_turn_end(
+        self: &Arc<Self>,
+        message: &AgentMessage,
+        tool_results: &[pi_ai::types::ToolResultMessage],
+    ) -> bool {
+        use pi_jev::control::{ControlPolicy, HostControlFacts};
+        if !crate::core::jev_bridge::session_full_jev_active() {
+            return false;
+        }
+        let session_id = self.session_id();
+        let Some(runner) = self.extension_runner() else {
+            return false;
+        };
+        let ctx = runner.create_context();
+        let event = ExtensionEvent::TurnEnd(TurnEndPayload {
+            turn_index: self.turn_index.load(Ordering::SeqCst) as f64,
+            message: serde_json::to_value(message).unwrap_or(Value::Null),
+            tool_results: tool_results
+                .iter()
+                .map(|result| serde_json::to_value(result).unwrap_or(Value::Null))
+                .collect(),
+        });
+        let Some(decision) =
+            crate::core::jev_bridge::decide_control(&session_id, &event, &ctx, &[]).await
+        else {
+            return false;
+        };
+        // Facts come from the CAPTURED decision identity (H-CONTROL-3): the
+        // bridge captured the epoch before dispatch and carried it through.
+        let facts = HostControlFacts {
+            now: std::time::SystemTime::now(),
+            session_id: session_id.clone(),
+            turn: decision.turn,
+            expected_question_ids: decision.question_ids.clone(),
+            policy_generation: decision.policy_generation.clone(),
+            full_jev_stamp: decision.full_jev_stamp.clone(),
+            prompt_version: pi_jev::hooks::PROMPT_VERSION.to_string(),
+            epoch_id: decision.epoch_id.clone(),
+            request_id: decision.request_id.clone(),
+        };
+        let book = crate::core::jev_control::ControlBook::global();
+        let nonprogress = book.nonprogress(&session_id);
+        let result = crate::core::jev_control::resolve_turn_end(
+            book,
+            &session_id,
+            &ControlPolicy::default(),
+            &decision.features,
+            decision.mode,
+            &facts,
+            &decision.answers,
+            &nonprogress,
+        );
+        if let Some(feedback) = result.feedback {
+            // Host-authored fixed text through the EXISTING followUp surface
+            // (B7); source defaults to internal -> no epoch bump.
+            self.queue_jev_control_feedback(feedback).await;
+        }
+        result.stop_loop
+    }
+
+    /// CONTROL: agent-end gate glue. Goal finish defers while a corrective or
+    /// verification continuation is pending, or the task paused/escalated.
+    async fn jev_control_agent_end(
+        self: &Arc<Self>,
+        message: &AssistantMessage,
+    ) -> crate::core::jev_control::ControlAgentEndResult {
+        use pi_jev::control::{ControlPolicy, HostControlFacts};
+        let baseline = crate::core::jev_control::ControlAgentEndResult {
+            verdicts: Vec::new(),
+            feedback: None,
+            defer_goal_finish: false,
+            escalate: false,
+            pause: None,
+            verification_state: pi_jev::control::ControlVerificationState::Unknown,
+            terminal_annotation: None,
+        };
+        if !crate::core::jev_bridge::session_full_jev_active() {
+            return baseline;
+        }
+        let session_id = self.session_id();
+        let Some(runner) = self.extension_runner() else {
+            return baseline;
+        };
+        let ctx = runner.create_context();
+        let event = ExtensionEvent::AgentEnd(AgentEndPayload {
+            messages: vec![serde_json::to_value(message).unwrap_or(Value::Null)],
+        });
+        let Some(decision) =
+            crate::core::jev_bridge::decide_control(&session_id, &event, &ctx, &[]).await
+        else {
+            return baseline;
+        };
+        let facts = HostControlFacts {
+            now: std::time::SystemTime::now(),
+            session_id: session_id.clone(),
+            turn: decision.turn,
+            expected_question_ids: decision.question_ids.clone(),
+            policy_generation: decision.policy_generation.clone(),
+            full_jev_stamp: decision.full_jev_stamp.clone(),
+            prompt_version: pi_jev::hooks::PROMPT_VERSION.to_string(),
+            epoch_id: decision.epoch_id.clone(),
+            request_id: decision.request_id.clone(),
+        };
+        let book = crate::core::jev_control::ControlBook::global();
+        // The current selected prompt and the active lower-agent stream are
+        // still present while `agent_end` is being handled; neither is a NEW
+        // continuation. Count only queued work. Otherwise CONTROL feedback is
+        // refused as `ContinuationPending` on every real terminal turn.
+        let continuation_pending = self.queued_action_count() > 0;
+        let result = crate::core::jev_control::resolve_agent_end(
+            book,
+            &session_id,
+            &ControlPolicy::default(),
+            &decision.features,
+            decision.mode,
+            &facts,
+            &decision.answers,
+            continuation_pending,
+            &decision.evidence_description,
+        );
+        crate::core::jev_bridge::note_control_terminal_outcome(&session_id, &result);
+        if let Some(feedback) = result.feedback.clone() {
+            self.queue_jev_control_feedback(feedback).await;
+        }
+        result
+    }
+
+    /// Queue internal CONTROL feedback without awaiting the new action's
+    /// completion from inside the current action's `agent_end` callback. The
+    /// public `send_custom_message(trigger_turn=true)` waits for that ticket
+    /// when the lower agent has already stopped, which would deadlock the
+    /// current serialized action against its own follow-up.
+    async fn queue_jev_control_feedback(self: &Arc<Self>, feedback: CustomMessage) {
+        let app_message = CustomMessage {
+            role: "custom".to_string(),
+            custom_type: feedback.custom_type.clone(),
+            content: feedback.content.clone(),
+            display: feedback.display,
+            details: feedback.details.clone(),
+            timestamp: now_ms_i64(),
+        };
+        let (text, images) =
+            normalize_message_content(&custom_message_content_parts(&feedback.content));
+        self.queue_prepared_prompt(
+            SESSION_INPUT_SCHEDULE_FOLLOW_UP,
+            &text,
+            images,
+            Some(PreparedTurnActionOptions {
+                custom_message: Some(app_message),
+                resume_if_idle: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await;
+    }
+
+    /// CONTROL: retry veto consult glue. True = skip this one host-planned
+    /// attempt (within existing ceilings; never a replay bypass).
+    async fn jev_control_retry_veto(self: &Arc<Self>, message: &AssistantMessage) -> bool {
+        use pi_jev::control::{ControlPolicy, HostControlFacts};
+        if !crate::core::jev_bridge::session_full_jev_active() {
+            return false;
+        }
+        let session_id = self.session_id();
+        let Some(runner) = self.extension_runner() else {
+            return false;
+        };
+        let ctx = runner.create_context();
+        let event = ExtensionEvent::AgentEnd(AgentEndPayload {
+            messages: vec![serde_json::to_value(message).unwrap_or(Value::Null)],
+        });
+        let Some(decision) = crate::core::jev_bridge::decide_control(
+            &session_id,
+            &event,
+            &ctx,
+            &["retry_classification"],
+        )
+        .await
+        else {
+            return false;
+        };
+        let facts = HostControlFacts {
+            now: std::time::SystemTime::now(),
+            session_id: session_id.clone(),
+            turn: decision.turn,
+            expected_question_ids: decision.question_ids.clone(),
+            policy_generation: decision.policy_generation.clone(),
+            full_jev_stamp: decision.full_jev_stamp.clone(),
+            prompt_version: pi_jev::hooks::PROMPT_VERSION.to_string(),
+            epoch_id: decision.epoch_id.clone(),
+            request_id: decision.request_id.clone(),
+        };
+        let book = crate::core::jev_control::ControlBook::global();
+        let attempt = self.retry_attempt.load(Ordering::SeqCst) as u32 + 1;
+        let verdict = crate::core::jev_control::resolve_retry_veto(
+            book,
+            &session_id,
+            &ControlPolicy::default(),
+            &decision.features,
+            decision.mode,
+            &facts,
+            &decision.answers,
+            attempt,
+        );
+        verdict.veto
     }
 
     /// `_resolveRetry`.
@@ -6760,7 +7384,12 @@ impl AgentSession {
         // and the eventual SessionManager.appendMessage(event.message) persistence in sync.
         let original = original.clone();
         self.agent.update_state(Box::new(move |state| {
-            if let Some(message) = state.messages.iter_mut().rev().find(|message| **message == original) {
+            if let Some(message) = state
+                .messages
+                .iter_mut()
+                .rev()
+                .find(|message| **message == original)
+            {
                 *message = replacement;
             }
         }));
@@ -6771,20 +7400,30 @@ impl AgentSession {
     /// content, provider metadata and usage; a newer response is never popped.
     fn remove_failed_assistant_from_state(&self, failed: &AssistantMessage) {
         let failed = failed.clone();
-        let annotated_error = failed.error_message.as_deref().map(add_login_guidance_to_auth_error);
+        let annotated_error = failed
+            .error_message
+            .as_deref()
+            .map(add_login_guidance_to_auth_error);
         self.agent.update_state(Box::new(move |state| {
-            let Some(AgentMessage::Message(Message::Assistant(current))) = state.messages.last() else { return; };
-            if current.error_message != failed.error_message && current.error_message != annotated_error {
+            let Some(AgentMessage::Message(Message::Assistant(current))) = state.messages.last()
+            else {
+                return;
+            };
+            if current.error_message != failed.error_message
+                && current.error_message != annotated_error
+            {
                 return;
             }
             let mut comparable = current.clone();
             comparable.error_message = failed.error_message.clone();
-            if comparable == failed { state.messages.pop(); }
+            if comparable == failed {
+                state.messages.pop();
+            }
         }));
     }
 
     /// `_emitExtensionEvent`.
-    async fn emit_extension_event(&self, event: &AgentEvent) {
+    async fn emit_extension_event(self: &Arc<Self>, event: &AgentEvent) {
         let runner = match self.extension_runner() {
             Some(runner) => runner,
             None => return,
@@ -6792,18 +7431,28 @@ impl AgentSession {
         match event {
             AgentEvent::AgentStart => {
                 self.turn_index.store(0, Ordering::SeqCst);
-                let _ = self.session_manager.lock().unwrap().record_git_state_if_changed();
+                let _ = self
+                    .session_manager
+                    .lock()
+                    .unwrap()
+                    .record_git_state_if_changed();
                 let _ = runner.emit(ExtensionEvent::AgentStart).await;
             }
             AgentEvent::AgentEnd { messages } => {
                 // Also capture at end of turn so commits made during the run (e.g. via a bash tool) land.
-                let _ = self.session_manager.lock().unwrap().record_git_state_if_changed();
+                let _ = self
+                    .session_manager
+                    .lock()
+                    .unwrap()
+                    .record_git_state_if_changed();
                 let values = messages
                     .iter()
                     .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))
                     .collect();
                 let _ = runner
-                    .emit(ExtensionEvent::AgentEnd(AgentEndPayload { messages: values }))
+                    .emit(ExtensionEvent::AgentEnd(AgentEndPayload {
+                        messages: values,
+                    }))
                     .await;
             }
             AgentEvent::TurnStart => {
@@ -6829,6 +7478,37 @@ impl AgentSession {
                     }))
                     .await;
                 self.turn_index.fetch_add(1, Ordering::SeqCst);
+                // CONTROL: bounded content signature of the turn (tool names
+                // + args + text + thinking + results digests; raw content is
+                // never retained). The full-jev gate lives inside the book:
+                // with the overlay off nothing is hashed and nothing is
+                // recorded (H-CONTROL-1). A decision is requested ONLY when
+                // the nonprogress predicate triggers.
+                let full_jev_active = crate::core::jev_bridge::session_full_jev_active();
+                {
+                    let session_id = self.session_id();
+                    let book = crate::core::jev_control::ControlBook::global();
+                    // TurnEnd always carries the assistant response (the
+                    // agent loop emits `AgentMessage::from(assistant)`); a
+                    // non-assistant variant records no signature.
+                    if let AgentMessage::Message(Message::Assistant(assistant)) = message {
+                        book.record_turn_signature(
+                            &session_id,
+                            assistant,
+                            tool_results,
+                            full_jev_active,
+                        );
+                    }
+                    if full_jev_active
+                        && matches!(
+                            book.nonprogress(&session_id),
+                            pi_jev::control::NonprogressVerdict::Candidate { .. }
+                        )
+                        && self.jev_control_turn_end(message, tool_results).await
+                    {
+                        self.jev_control_pause_pending.store(true, Ordering::SeqCst);
+                    }
+                }
             }
             AgentEvent::MessageStart { message } => {
                 let _ = runner
@@ -6850,7 +7530,9 @@ impl AgentSession {
             }
             AgentEvent::MessageEnd { message } => {
                 let replacement = runner
-                    .emit_message_end(serde_json::json!({ "type": "message_end", "message": message }))
+                    .emit_message_end(
+                        serde_json::json!({ "type": "message_end", "message": message }),
+                    )
                     .await;
                 if let Some(replacement) = replacement {
                     if let Ok(parsed) = serde_json::from_value::<AgentMessage>(replacement) {
@@ -6864,11 +7546,13 @@ impl AgentSession {
                 args,
             } => {
                 let _ = runner
-                    .emit(ExtensionEvent::ToolExecutionStart(ToolExecutionStartPayload {
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        args: args.clone(),
-                    }))
+                    .emit(ExtensionEvent::ToolExecutionStart(
+                        ToolExecutionStartPayload {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                        },
+                    ))
                     .await;
             }
             AgentEvent::ToolExecutionUpdate {
@@ -6878,12 +7562,15 @@ impl AgentSession {
                 partial_result,
             } => {
                 let _ = runner
-                    .emit(ExtensionEvent::ToolExecutionUpdate(ToolExecutionUpdatePayload {
-                        tool_call_id: tool_call_id.clone(),
-                        tool_name: tool_name.clone(),
-                        args: args.clone(),
-                        partial_result: serde_json::to_value(partial_result).unwrap_or(Value::Null),
-                    }))
+                    .emit(ExtensionEvent::ToolExecutionUpdate(
+                        ToolExecutionUpdatePayload {
+                            tool_call_id: tool_call_id.clone(),
+                            tool_name: tool_name.clone(),
+                            args: args.clone(),
+                            partial_result: serde_json::to_value(partial_result)
+                                .unwrap_or(Value::Null),
+                        },
+                    ))
                     .await;
             }
             AgentEvent::ToolExecutionEnd {
@@ -6909,7 +7596,10 @@ impl AgentSession {
      * Session persistence is handled internally (saves messages on message_end).
      * Multiple listeners can be added. Returns unsubscribe function for this listener.
      */
-    pub fn subscribe(self: &Arc<Self>, listener: AgentSessionEventListener) -> Arc<dyn Fn() + Send + Sync> {
+    pub fn subscribe(
+        self: &Arc<Self>,
+        listener: AgentSessionEventListener,
+    ) -> Arc<dyn Fn() + Send + Sync> {
         self.event_listeners.lock().unwrap().push(listener.clone());
         let session = Arc::downgrade(self);
         Arc::new(move || {
@@ -7009,9 +7699,8 @@ impl AgentSession {
         while {
             let refine_in_flight = { self.refine_in_flight.lock().unwrap().is_some() };
             let refine_plan_in_flight = { self.refine_plan_in_flight.lock().unwrap().is_some() };
-            let serialized_plan_in_flight = {
-                self.serialized_plan_in_flight.lock().unwrap().is_some()
-            };
+            let serialized_plan_in_flight =
+                { self.serialized_plan_in_flight.lock().unwrap().is_some() };
             refine_in_flight || refine_plan_in_flight || serialized_plan_in_flight
         } {
             if { self.refine_in_flight.lock().unwrap().is_some() } {
@@ -7042,7 +7731,9 @@ impl AgentSession {
                                 // Stamp cooldown and reset counter so the interval
                                 // check below does not trigger a duplicate refine.
                                 *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                                session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                                session
+                                    .assistant_turns_since_auto_refine
+                                    .store(0, Ordering::SeqCst);
                             }
                         }
                         // Preserve a consumed explicit request when its background plan
@@ -7058,10 +7749,7 @@ impl AgentSession {
                             let no_newer_pending =
                                 session.pending_requested_refine.lock().unwrap().is_none();
                             if *branch_version == current && no_newer_pending {
-                                let mut pending = session
-                                    .pending_requested_refine
-                                    .lock()
-                                    .unwrap();
+                                let mut pending = session.pending_requested_refine.lock().unwrap();
                                 if pending.is_none() {
                                     *pending = Some(PendingRequestedRefine {
                                         instructions: options.instructions.clone(),
@@ -7070,8 +7758,9 @@ impl AgentSession {
                                 }
                             }
                         }
-                        if let Some(SerializedBackgroundPlanResult::Skip { explicit: Some(true) }) =
-                            bg_result.as_ref()
+                        if let Some(SerializedBackgroundPlanResult::Skip {
+                            explicit: Some(true),
+                        }) = bg_result.as_ref()
                         {
                             session.emit_refine_failed(REFINEMENT_SKIPPED_MESSAGE);
                         }
@@ -7082,7 +7771,9 @@ impl AgentSession {
                         ) = bg_result.as_ref()
                         {
                             *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                            session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                            session
+                                .assistant_turns_since_auto_refine
+                                .store(0, Ordering::SeqCst);
                         }
                         false
                     })
@@ -7107,11 +7798,14 @@ impl AgentSession {
                 max_output_tokens: None,
             };
             // Best-effort drain; refinement errors must not block disposal.
-            let _ = self.run_serialized_refine(&options, REFINEMENT_SOURCE_SELF).await;
+            let _ = self
+                .run_serialized_refine(&options, REFINEMENT_SOURCE_SELF)
+                .await;
             // Stamp cooldown and reset counter so the interval check below
             // does not trigger a duplicate refine after the explicit drain.
             *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-            self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+            self.assistant_turns_since_auto_refine
+                .store(0, Ordering::SeqCst);
         }
         // A serialized compaction can finish without another model turn. Drain its
         // pending review here so disposal does not silently lose the trigger.
@@ -7125,12 +7819,14 @@ impl AgentSession {
                 .unwrap()
                 .get_auto_refine_settings();
             if !compact_settings.enabled || !compact_settings.compact {
-                self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                self.compact_auto_refine_pending
+                    .store(false, Ordering::SeqCst);
             } else {
                 let now = now_ms();
                 let last = *self.last_auto_refine_review_at.lock().unwrap();
                 let under_cooldown = last > 0.0 && now - last < compact_settings.cooldown_ms;
-                self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                self.compact_auto_refine_pending
+                    .store(false, Ordering::SeqCst);
                 if !under_cooldown {
                     // Best-effort drain; refinement errors must not block disposal.
                     let _ = self
@@ -7151,11 +7847,17 @@ impl AgentSession {
         if self.disposed.load(Ordering::SeqCst) || !self.auto_refine_allowed_for_session() {
             return;
         }
-        let settings = self.settings_manager.lock().unwrap().get_auto_refine_settings();
+        let settings = self
+            .settings_manager
+            .lock()
+            .unwrap()
+            .get_auto_refine_settings();
         if !settings.enabled {
             return;
         }
-        if (self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as f64)
+        if (self
+            .assistant_turns_since_auto_refine
+            .load(Ordering::SeqCst) as f64)
             < settings.turn_interval
         {
             return;
@@ -7169,17 +7871,15 @@ impl AgentSession {
         if self.serialized_refine {
             self.run_serialized_refine_checkpoint().await;
         } else {
-            self.maybe_auto_refine(&AutoRefineReason::TurnInterval).await;
+            self.maybe_auto_refine(&AutoRefineReason::TurnInterval)
+                .await;
         }
     }
 
     /// The recursive teardown body. It returns a boxed `Send` future instead of
     /// being a plain `async fn`, so the recursive calls below have a finite,
     /// `Send` type and `dispose_async` stays usable from `Send` contexts.
-    fn dispose_async_once(
-        self: &Arc<Self>,
-        kernel_snapshot: bool,
-    ) -> BoxFuture<()> {
+    fn dispose_async_once(self: &Arc<Self>, kernel_snapshot: bool) -> BoxFuture<()> {
         let session = Arc::clone(self);
         Box::pin(async move { session.dispose_async_once_body(kernel_snapshot).await })
     }
@@ -7283,7 +7983,8 @@ impl AgentSession {
         *self.serialized_explicit_refine_options.lock().unwrap() = None;
         *self.pending_requested_refine.lock().unwrap() = None;
         self.discard_pending_auto_refine(true);
-        self.auto_refine_branch_version.fetch_add(1, Ordering::SeqCst);
+        self.auto_refine_branch_version
+            .fetch_add(1, Ordering::SeqCst);
         self.cancel_active_rlm_child_runs("Parent session disposed");
         let unsubscribes: Vec<Arc<dyn Fn() + Send + Sync>> = self
             .rlm_child_unsubscribes
@@ -7313,10 +8014,20 @@ impl AgentSession {
         let delivery_error = "Session disposed before prompt delivery.";
         let completion_error = "Session disposed before prompt completion.";
         self.reject_queued_agent_message_deliveries(delivery_error, Some(completion_error));
-        let outcomes: Vec<String> = self.agent_message_outcomes.lock().unwrap().keys().cloned().collect();
+        let outcomes: Vec<String> = self
+            .agent_message_outcomes
+            .lock()
+            .unwrap()
+            .keys()
+            .cloned()
+            .collect();
         for agent_message_id in outcomes {
             self.settle_agent_message(Some(&agent_message_id), "delivery", Some(delivery_error));
-            self.settle_agent_message(Some(&agent_message_id), "completion", Some(completion_error));
+            self.settle_agent_message(
+                Some(&agent_message_id),
+                "completion",
+                Some(completion_error),
+            );
         }
         self.cancel_session_actions(&|_| true, delivery_error, None);
         self.agent.clear_all_queues();
@@ -7458,9 +8169,16 @@ impl AgentSession {
 
     /// `get isCompacting()`.
     pub fn is_compacting(&self) -> bool {
-        self.auto_compaction_abort_controller.lock().unwrap().is_some()
+        self.auto_compaction_abort_controller
+            .lock()
+            .unwrap()
+            .is_some()
             || self.compaction_abort_controller.lock().unwrap().is_some()
-            || self.branch_summary_abort_controller.lock().unwrap().is_some()
+            || self
+                .branch_summary_abort_controller
+                .lock()
+                .unwrap()
+                .is_some()
     }
 
     /// `get messages()`.
@@ -7495,7 +8213,9 @@ impl AgentSession {
     fn merge_unpersisted_outcomes(&self, messages: &mut Vec<AgentMessage>) {
         for outcome in self.unpersisted_outcomes.lock().unwrap().iter() {
             let mut insert_at = messages.len();
-            while insert_at > 0 && agent_message_timestamp(&messages[insert_at - 1]) > outcome.timestamp {
+            while insert_at > 0
+                && agent_message_timestamp(&messages[insert_at - 1]) > outcome.timestamp
+            {
                 insert_at -= 1;
             }
             messages.insert(
@@ -7572,11 +8292,9 @@ impl AgentSession {
             cwd: Some(self.cwd.clone()),
             signal: None,
         };
-        let _ = refresh_autonomous_quality_gates(
-            &mut self.autonomous_state.lock().unwrap(),
-            options,
-        )
-        .await;
+        let _ =
+            refresh_autonomous_quality_gates(&mut self.autonomous_state.lock().unwrap(), options)
+                .await;
     }
 
     /// `_runWithAutonomousContinuationSuppressed`.
@@ -7650,8 +8368,126 @@ impl AgentSession {
         unique
     }
 
-    /// `_rebuildSystemPrompt`.
+    /// `_rebuildSystemPrompt` — the CANONICAL base prompt. It never carries
+    /// a skill hint: the advisory hint slot is derived per request from
+    /// current authoritative facts (see `refresh_request_system_prompt`), so
+    /// a stale hint can never survive in a cached prompt.
     fn rebuild_system_prompt(&self, tool_names: &[String]) -> String {
+        self.build_prompt(tool_names, None)
+    }
+
+    /// ROOT blocker-1: register the bridge's hint listener once so a hint
+    /// store/clear re-derives the request prompt while the run is live.
+    fn ensure_skill_hint_listener(self: &Arc<Self>) {
+        if self.hint_listener_registered.swap(true, Ordering::SeqCst) {
+            return;
+        }
+        let weak = Arc::downgrade(self);
+        crate::core::jev_bridge::set_skill_hint_listener(
+            &self.session_manager.lock().unwrap().get_session_id(),
+            Arc::new(move || {
+                if let Some(session) = weak.upgrade() {
+                    session.refresh_request_system_prompt();
+                }
+            }),
+        );
+    }
+
+    /// ROOT-CONTRACT v7: request-local system-prompt derivation. Rebuilds the
+    /// canonical base and re-derives the hint slot from CURRENT facts for THIS
+    /// request; any stamp drift (settings revision, mode, feature, turn, task,
+    /// catalog identity) fails open to no hint. The canonical base is never
+    /// regex-stripped and durable history is never rewritten.
+    fn refresh_request_system_prompt(&self) {
+        let jev_session_id = self.session_manager.lock().unwrap().get_session_id();
+        // Root blocker-3: the consumption stamp derives from the ACTUAL
+        // loaded skills (the same list the roster block renders), noted into
+        // the bridge cache right here at the consumer seam.
+        let loaded_skills = self.model_visible_skills();
+        crate::core::jev_bridge::note_session_skill_roster(&jev_session_id, &loaded_skills);
+        let hint = crate::core::jev_bridge::current_skill_hint(&jev_session_id).and_then(|hint| {
+            let current =
+                crate::core::jev_bridge::current_skill_hint_stamp(&jev_session_id, &loaded_skills);
+            crate::core::jev_agent_guidance::skill_hint_for_render(&hint, &current)
+        });
+
+        // The marker text is not provenance. Only the last exact prompt bytes
+        // projected by this session may be restored to their saved unhinted
+        // composition. One projection is retained; there is no prompt history.
+        let mut owned = self
+            .owned_skill_hint_projection
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if hint.is_none() && owned.is_none() {
+            return;
+        }
+        let current_prompt = self.agent.system_prompt();
+        let unhinted = match owned.as_ref() {
+            Some(projection) if projection.projected == current_prompt => {
+                projection.unhinted.clone()
+            }
+            Some(_) => {
+                // An extension or other owner changed the prompt after our
+                // projection. Drop stale authority; never infer ownership from
+                // a literal <jev_skill_hint> span in the replacement.
+                *owned = None;
+                current_prompt.clone()
+            }
+            None => current_prompt.clone(),
+        };
+
+        // Request-local derivation (ROOT-CONTRACT v7): rebuild the canonical
+        // base fresh. An extension composition is eligible only when it embeds
+        // that exact base. User-authored marker-shaped text before/after the
+        // base is preserved as part of `unhinted`.
+        let tool_names = self.get_active_tool_names();
+        let base = self.build_prompt(&tool_names, None);
+        let projection = hint.and_then(|hint| {
+            let desired = self.build_prompt(&tool_names, Some(hint));
+            let projected = if unhinted == base {
+                desired
+            } else if unhinted.contains(&base) {
+                unhinted.replacen(&base, &desired, 1)
+            } else {
+                // Unknown composition wins byte-for-byte: fail open without a
+                // host hint, even when it contains marker-shaped user text.
+                return None;
+            };
+            Some(OwnedSkillHintProjection {
+                projected,
+                unhinted: unhinted.clone(),
+            })
+        });
+        let next = projection
+            .as_ref()
+            .map(|projection| projection.projected.clone())
+            .unwrap_or(unhinted);
+
+        if next != current_prompt {
+            // Mutate only system_prompt, and only if the exact snapshot we
+            // derived from is still current. Never restore unrelated fields
+            // from a stale full AgentState clone.
+            let applied = Arc::new(AtomicBool::new(false));
+            let applied_for_update = applied.clone();
+            let expected = current_prompt;
+            let replacement = next;
+            self.agent.update_state(Box::new(move |state| {
+                if state.system_prompt == expected {
+                    state.system_prompt = replacement;
+                    applied_for_update.store(true, Ordering::SeqCst);
+                }
+            }));
+            if !applied.load(Ordering::SeqCst) {
+                *owned = None;
+                return;
+            }
+        }
+        *owned = projection;
+    }
+
+    /// `_buildSystemPrompt` body shared by the canonical rebuild and the
+    /// request-local derivation.
+    fn build_prompt(&self, tool_names: &[String], skill_hint: Option<String>) -> String {
         let valid_tool_names: Vec<String> = tool_names
             .iter()
             .filter(|name| self.tool_registry.lock().unwrap().contains_key(*name))
@@ -7674,6 +8510,10 @@ impl AgentSession {
         let append_system_prompt = (!loader_append_system_prompt.is_empty())
             .then(|| loader_append_system_prompt.join("\n\n"));
         let loaded_skills = self.model_visible_skills();
+        // ROOT-CONTRACT v7 (Agent-guidance lane): the suggestion pool equals
+        // the prompt roster; the bridge caches this already-loaded metadata.
+        let jev_session_id = self.session_manager.lock().unwrap().get_session_id();
+        crate::core::jev_bridge::note_session_skill_roster(&jev_session_id, &loaded_skills);
         let loaded_context_files = self.resource_loader.get_agents_files().agents_files;
 
         let options = BuildSystemPromptOptions {
@@ -7686,6 +8526,7 @@ impl AgentSession {
             messages_path: self.session_manager.lock().unwrap().get_session_file(),
             context_files: Some(loaded_context_files),
             skills: Some(loaded_skills),
+            skill_hint,
             allow_recursion: Some(self.rlm_depth < self.rlm_max_depth()),
             rlm_depth: Some(self.rlm_depth as f64),
             rlm_parent_agent: self.rlm_parent_agent.clone(),
@@ -7709,7 +8550,11 @@ impl AgentSession {
     }
 
     /// `_refreshExtensionSystemPrompt`.
-    fn refresh_extension_system_prompt(&self, extension_prompt: &str, base_snapshot: &str) -> String {
+    fn refresh_extension_system_prompt(
+        &self,
+        extension_prompt: &str,
+        base_snapshot: &str,
+    ) -> String {
         let base = self.base_system_prompt.lock().unwrap().clone();
         if base == base_snapshot {
             return extension_prompt.to_string();
@@ -7830,7 +8675,9 @@ impl AgentSession {
             if should_compact_for_model(tokens, &model, &settings)
                 && !self.threshold_compaction_retry_in_cooldown()
             {
-                let _ = self.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await;
+                let _ = self
+                    .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+                    .await;
             }
         }
     }
@@ -7856,16 +8703,20 @@ impl AgentSession {
                 .collect()
         };
         if !execution_policy.run_before_agent_start {
-            return Ok(active_turns(self).first().and_then(|action| match &action.payload {
-                QueuedActionPayload::Turn(turn) => turn.prepared.clone(),
-                QueuedActionPayload::SessionCommand(_) => None,
-            }));
+            return Ok(active_turns(self)
+                .first()
+                .and_then(|action| match &action.payload {
+                    QueuedActionPayload::Turn(turn) => turn.prepared.clone(),
+                    QueuedActionPayload::SessionCommand(_) => None,
+                }));
         }
         let needs_preparation = |session: &Arc<Self>| -> bool {
-            active_turns(session).iter().any(|action| match &action.payload {
-                QueuedActionPayload::Turn(turn) => turn.prepared.is_none(),
-                QueuedActionPayload::SessionCommand(_) => false,
-            })
+            active_turns(session)
+                .iter()
+                .any(|action| match &action.payload {
+                    QueuedActionPayload::Turn(turn) => turn.prepared.is_none(),
+                    QueuedActionPayload::SessionCommand(_) => false,
+                })
         };
         while needs_preparation(self) {
             if self.is_session_input_handoff_deferred(epoch) {
@@ -7931,12 +8782,7 @@ impl AgentSession {
             .clone()
             .unwrap_or_default();
         runner
-            .emit_before_agent_start(
-                prompt,
-                images,
-                base_prompt_snapshot.to_string(),
-                options,
-            )
+            .emit_before_agent_start(prompt, images, base_prompt_snapshot.to_string(), options)
             .await
     }
 
@@ -7944,7 +8790,9 @@ impl AgentSession {
         self: &Arc<Self>,
         policy: &CommitPreparationPolicy,
         prepare: impl std::future::Future<Output = Result<Option<PreparedPromptPreparation>, String>>,
-        should_commit: Option<Arc<dyn Fn(Option<&PreparedPromptPreparation>) -> bool + Send + Sync>>,
+        should_commit: Option<
+            Arc<dyn Fn(Option<&PreparedPromptPreparation>) -> bool + Send + Sync>,
+        >,
     ) -> Result<Option<PreparedPromptPreparation>, String> {
         if policy.initial_refine_barrier == REFINE_BARRIER_ALWAYS
             || (policy.initial_refine_barrier == REFINE_BARRIER_IF_IN_FLIGHT
@@ -8002,7 +8850,10 @@ impl AgentSession {
         let has_extension_prompt = if preserve_empty_extension_prompt {
             extension_prompt.is_some()
         } else {
-            extension_prompt.as_ref().map(|value| !value.is_empty()).unwrap_or(false)
+            extension_prompt
+                .as_ref()
+                .map(|value| !value.is_empty())
+                .unwrap_or(false)
         };
         let next = if has_extension_prompt && preparation.is_some() {
             self.refresh_extension_system_prompt(
@@ -8038,7 +8889,11 @@ impl AgentSession {
      * @throws Error if streaming and no streamingBehavior specified
      * @throws Error if no model selected or no API key available (when not streaming)
      */
-    pub async fn prompt(self: &Arc<Self>, text: &str, options: Option<PromptOptions>) -> Result<(), String> {
+    pub async fn prompt(
+        self: &Arc<Self>,
+        text: &str,
+        options: Option<PromptOptions>,
+    ) -> Result<(), String> {
         self.prompt_internal(text, options).await
     }
 
@@ -8049,13 +8904,8 @@ impl AgentSession {
         options: Option<PromptOptions>,
     ) -> Result<(), String> {
         let options = options.unwrap_or_default();
-        self.prompt_internal_with(
-            text,
-            options,
-            None,
-            Some(true),
-        )
-        .await
+        self.prompt_internal_with(text, options, None, Some(true))
+            .await
     }
 
     /// `promptAndWait`.
@@ -8090,9 +8940,7 @@ impl AgentSession {
         let mut prompt_options = options.clone();
         prompt_options.agent_message_id = Some(agent_message_id.clone());
         let signal = options.signal.clone();
-        let result = self
-            .prompt_until_accepted(text, Some(prompt_options))
-            .await;
+        let result = self.prompt_until_accepted(text, Some(prompt_options)).await;
         if let Err(error) = result {
             self.settle_agent_message(Some(&agent_message_id), "completion", Some(&error));
             return Err(error);
@@ -8123,10 +8971,7 @@ impl AgentSession {
                 }
             })
         });
-        let result = completion
-            .wait()
-            .await
-            .map_err(|error| error.to_string());
+        let result = completion.wait().await.map_err(|error| error.to_string());
         // TS 5218-5221 `finally`: the queued-cancel listener is detached. The Rust
         // watcher is a task, so it is aborted instead of removed from a listener list.
         if let Some(cancel_queued_prompt) = cancel_queued_prompt {
@@ -8153,10 +8998,14 @@ impl AgentSession {
         });
         if let Some(message) = &custom_message {
             let new_parent_task = self.resume_for_new_parent_task(message)?;
-            if !new_parent_task && self.defer_stopped_report(message, options.agent_message_id.as_deref())? {
+            if !new_parent_task
+                && self.defer_stopped_report(message, options.agent_message_id.as_deref())?
+            {
                 self.reject_agent_message(options.agent_message_id.as_deref(),
                     "Session stopped; report saved in the deferred-agent-report journal, not delivered to the model.");
-                if let Some(preflight) = &options.preflight_result { preflight(true, true); }
+                if let Some(preflight) = &options.preflight_result {
+                    preflight(true, true);
+                }
                 return Ok(());
             }
         }
@@ -8308,7 +9157,9 @@ impl AgentSession {
     /// `_assertRlmTerminalNotice`.
     fn assert_rlm_terminal_notice(&self, message: &CustomMessage) -> Result<(), String> {
         if !self.is_rlm_terminal_notice(message) {
-            return Err("Deferred terminal admission only accepts RLM child terminal notices.".to_string());
+            return Err(
+                "Deferred terminal admission only accepts RLM child terminal notices.".to_string(),
+            );
         }
         Ok(())
     }
@@ -8338,7 +9189,10 @@ impl AgentSession {
     }
 
     /// `_enqueueRlmTerminalNoticeAction`.
-    fn enqueue_rlm_terminal_notice_action(self: &Arc<Self>, message: CustomMessage) -> Result<(), String> {
+    fn enqueue_rlm_terminal_notice_action(
+        self: &Arc<Self>,
+        message: CustomMessage,
+    ) -> Result<(), String> {
         self.assert_rlm_terminal_notice(&message)?;
         let text = match &message.content {
             CustomMessageContent::Text(text) => text.clone(),
@@ -8363,7 +9217,8 @@ impl AgentSession {
             .unwrap()
             .insert(action.id.clone());
         // TS 5323: the durable RLM terminal notice admits with `{ wake: false }`.
-        let result = self.admit_session_input_with_options(action.clone(), true, false, false, false);
+        let result =
+            self.admit_session_input_with_options(action.clone(), true, false, false, false);
         if let Err(error) = result {
             self.durable_rlm_terminal_notice_action_ids
                 .lock()
@@ -8376,7 +9231,11 @@ impl AgentSession {
 
     /// `_flushDeferredRlmTerminalNotices`.
     fn flush_deferred_rlm_terminal_notices(self: &Arc<Self>) {
-        if !self.session_input_admission_pauses.lock().unwrap().is_empty()
+        if !self
+            .session_input_admission_pauses
+            .lock()
+            .unwrap()
+            .is_empty()
             || self.session_input_pump_suspended.load(Ordering::SeqCst)
             || !self.queued_work_pauses.lock().unwrap().is_empty()
             || self.disposed.load(Ordering::SeqCst)
@@ -8399,15 +9258,23 @@ impl AgentSession {
             if self.enqueue_rlm_terminal_notice_action(message).is_err() {
                 return;
             }
-            self.pending_next_turn_messages.lock().unwrap().remove(index);
+            self.pending_next_turn_messages
+                .lock()
+                .unwrap()
+                .remove(index);
         }
         self.schedule_session_input_pump();
     }
 
     /// `_deferRlmTerminalNotice`.
-    async fn defer_rlm_terminal_notice(self: &Arc<Self>, message: CustomMessage) -> Result<(), String> {
+    async fn defer_rlm_terminal_notice(
+        self: &Arc<Self>,
+        message: CustomMessage,
+    ) -> Result<(), String> {
         self.assert_rlm_terminal_notice(&message)?;
-        if self.defer_stopped_report(&message, None)? { return Ok(()); }
+        if self.defer_stopped_report(&message, None)? {
+            return Ok(());
+        }
         if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             return Ok(());
         }
@@ -8479,16 +9346,21 @@ impl AgentSession {
             self.resume_session_input_admission();
         }
         let admission_epoch = self.session_input_pump_epoch.load(Ordering::SeqCst);
-        let admission_fence = self
-            .acquire_direct_turn_admission_fence()
-            .await
-            .map_err(|error| {
-                if options.signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false) {
-                    "Prompt admission was cancelled".to_string()
-                } else {
-                    error
-                }
-            })?;
+        let admission_fence =
+            self.acquire_direct_turn_admission_fence()
+                .await
+                .map_err(|error| {
+                    if options
+                        .signal
+                        .as_ref()
+                        .map(|signal| signal.is_cancelled())
+                        .unwrap_or(false)
+                    {
+                        "Prompt admission was cancelled".to_string()
+                    } else {
+                        error
+                    }
+                })?;
         let report_preflight = once_preflight(options.preflight_result.clone());
         let result = async {
             if options.signal.as_ref().map(|signal| signal.is_cancelled()).unwrap_or(false) {
@@ -8627,11 +9499,16 @@ impl AgentSession {
     ) -> Result<(), String> {
         // Only fresh human admission resumes a persistent explicit stop. Injected
         // traffic and automatic checkpoint resumption cannot revoke cancellation.
-        if options.internal_prompt != Some(true) && options.custom_message.is_none()
+        if options.internal_prompt != Some(true)
+            && options.custom_message.is_none()
             && options.resume_if_idle != Some(false)
-            && !text.trim().is_empty() && !text.trim_start().starts_with('/')
-            && matches!(options.source, None | Some(crate::core::session_action_store::InputSource::Interactive)
-                | Some(crate::core::session_action_store::InputSource::Rpc))
+            && !text.trim().is_empty()
+            && !text.trim_start().starts_with('/')
+            && matches!(
+                options.source,
+                None | Some(crate::core::session_action_store::InputSource::Interactive)
+                    | Some(crate::core::session_action_store::InputSource::Rpc)
+            )
         {
             self.resume_explicit_stop()?;
         }
@@ -8646,10 +9523,7 @@ impl AgentSession {
         let commit_fence = if self.is_streaming() {
             None
         } else {
-            Some(
-                self.acquire_direct_turn_admission_fence()
-                    .await?,
-            )
+            Some(self.acquire_direct_turn_admission_fence().await?)
         };
         let report_preflight = once_preflight(options.preflight_result.clone());
         let is_internal_prompt = options.internal_prompt == Some(true);
@@ -8669,7 +9543,11 @@ impl AgentSession {
                 SUBMISSION_EXTENSION_COMMAND_POLICY_IGNORE.to_string()
             },
             input_source: if !is_internal_prompt && options.skip_input_handlers != Some(true) {
-                Some(options.source.unwrap_or(crate::core::session_action_store::InputSource::Interactive))
+                Some(
+                    options
+                        .source
+                        .unwrap_or(crate::core::session_action_store::InputSource::Interactive),
+                )
             } else {
                 None
             },
@@ -8750,7 +9628,12 @@ impl AgentSession {
                 images,
                 command,
             } => {
-                let pending_owned_work = !self.action_store.lock().unwrap().unfinished_actions(None).is_empty();
+                let pending_owned_work = !self
+                    .action_store
+                    .lock()
+                    .unwrap()
+                    .unfinished_actions(None)
+                    .is_empty();
                 let was_runtime_busy = self.is_streaming()
                     || self.is_compacting()
                     || self.is_retrying()
@@ -8769,16 +9652,14 @@ impl AgentSession {
                     images,
                     &schedule,
                     options.agent_message_id.clone(),
-                    Some(
-                        if is_internal_prompt {
-                            "internal".to_string()
-                        } else {
-                            options
-                                .source
-                                .map(|source| source.as_str().to_string())
-                                .unwrap_or_else(|| "interactive".to_string())
-                        },
-                    ),
+                    Some(if is_internal_prompt {
+                        "internal".to_string()
+                    } else {
+                        options
+                            .source
+                            .map(|source| source.as_str().to_string())
+                            .unwrap_or_else(|| "interactive".to_string())
+                    }),
                 );
                 let admission = self.admit_session_input(
                     action,
@@ -8819,8 +9700,8 @@ impl AgentSession {
             }
             NormalizedSubmission::Prompt { text, images } => {
                 let queue_for_streaming = self.is_streaming();
-                let queue_for_busy =
-                    options.queue_if_busy == Some(true) && self.is_busy_for_session_input("preflight");
+                let queue_for_busy = options.queue_if_busy == Some(true)
+                    && self.is_busy_for_session_input("preflight");
                 let visible_queued = queue_for_streaming || queue_for_busy;
                 if visible_queued && options.streaming_behavior.is_none() {
                     if let Some(fence) = commit_fence.as_ref() {
@@ -9116,9 +9997,7 @@ impl AgentSession {
             expand_skills: true,
             expand_prompt_templates: true,
         };
-        let normalized = self
-            .normalize_submission(text, images, &policy)
-            .await?;
+        let normalized = self.normalize_submission(text, images, &policy).await?;
         let (text, images) = match normalized {
             NormalizedSubmission::Prompt { text, images } => (text, images),
             _ => return Err("Queued prompt normalization did not produce a prompt".to_string()),
@@ -9237,9 +10116,9 @@ impl AgentSession {
                             owner_action_id: record.owner_action_id.clone(),
                         })
                         .collect();
-                    let custom_message = custom_message
-                        .as_ref()
-                        .and_then(|value| serde_json::from_value::<CustomMessage>(value.clone()).ok());
+                    let custom_message = custom_message.as_ref().and_then(|value| {
+                        serde_json::from_value::<CustomMessage>(value.clone()).ok()
+                    });
                     self.create_prepared_turn_action(
                         schedule,
                         text,
@@ -9250,7 +10129,8 @@ impl AgentSession {
                             content: content.clone(),
                             custom_message,
                             records: Some(delivery_records),
-                            suppress_autonomous_continuation: action.suppress_autonomous_continuation,
+                            suppress_autonomous_continuation: action
+                                .suppress_autonomous_continuation,
                             preview: preview.clone(),
                             resume_if_idle: Some(true),
                             queue_visible: Some(*queue_visible),
@@ -9287,7 +10167,11 @@ impl AgentSession {
     }
 
     /// `_restoreSessionCommand`.
-    fn restore_session_command(self: &Arc<Self>, snapshot: &RestoredPromptInput, command: SessionSlashCommand) -> bool {
+    fn restore_session_command(
+        self: &Arc<Self>,
+        snapshot: &RestoredPromptInput,
+        command: SessionSlashCommand,
+    ) -> bool {
         let action = self.create_session_command_action(
             &snapshot.text,
             command,
@@ -9358,7 +10242,9 @@ impl AgentSession {
         images: Option<&[ImageContent]>,
     ) -> Vec<pi_ai::types::ImageOrTextContent> {
         let mut content: Vec<pi_ai::types::ImageOrTextContent> =
-            vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new(text))];
+            vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new(
+                text,
+            ))];
         if let Some(images) = images {
             content.extend(
                 images
@@ -9487,9 +10373,12 @@ impl AgentSession {
                 DeliveryMessage::Custom(custom.clone())
             } else {
                 DeliveryMessage::User(UserMessage::new(
-                    UserContent::Blocks(options.content.clone().unwrap_or_else(|| {
-                        self.build_prompt_content(text, images.as_deref())
-                    })),
+                    UserContent::Blocks(
+                        options
+                            .content
+                            .clone()
+                            .unwrap_or_else(|| self.build_prompt_content(text, images.as_deref())),
+                    ),
                     now_ms_i64(),
                 ))
             };
@@ -9576,7 +10465,12 @@ impl AgentSession {
                     .to_string(),
             );
         }
-        if !self.session_input_admission_pauses.lock().unwrap().is_empty() {
+        if !self
+            .session_input_admission_pauses
+            .lock()
+            .unwrap()
+            .is_empty()
+        {
             return Err(SessionInputAdmissionPausedError {
                 message: "Cannot admit a session action while session input admission is paused."
                     .to_string(),
@@ -9604,7 +10498,14 @@ impl AgentSession {
         self: &Arc<Self>,
         action: QueuedSessionAction,
         immediately_eligible: bool,
-    ) -> Result<(bool, Option<Arc<crate::core::session_action_store::ActionTicketController>>, String), String> {
+    ) -> Result<
+        (
+            bool,
+            Option<Arc<crate::core::session_action_store::ActionTicketController>>,
+            String,
+        ),
+        String,
+    > {
         self.admit_session_input_with_options(action, immediately_eligible, false, false, true)
     }
 
@@ -9616,7 +10517,14 @@ impl AgentSession {
         restore: bool,
         front: bool,
         wake: bool,
-    ) -> Result<(bool, Option<Arc<crate::core::session_action_store::ActionTicketController>>, String), String> {
+    ) -> Result<
+        (
+            bool,
+            Option<Arc<crate::core::session_action_store::ActionTicketController>>,
+            String,
+        ),
+        String,
+    > {
         // Stop and enqueue share one short synchronous fence: a report is either
         // admitted before the stop sweep, or durably deferred after it, never lost
         // in the gap between a stop-state check and store.enqueue().
@@ -9640,7 +10548,12 @@ impl AgentSession {
                     .to_string(),
             );
         }
-        if !self.session_input_admission_pauses.lock().unwrap().is_empty() {
+        if !self
+            .session_input_admission_pauses
+            .lock()
+            .unwrap()
+            .is_empty()
+        {
             return Err(SessionInputAdmissionPausedError {
                 message: "Cannot admit a session action while session input admission is paused."
                     .to_string(),
@@ -9659,7 +10572,12 @@ impl AgentSession {
                 QueuedActionPayload::SessionCommand(_) => false,
             };
             if is_agent_session_turn {
-                let unfinished = self.action_store.lock().unwrap().unfinished_actions(None).len();
+                let unfinished = self
+                    .action_store
+                    .lock()
+                    .unwrap()
+                    .unfinished_actions(None)
+                    .len();
                 assert_agent_message_queue_capacity(
                     unfinished as f64,
                     DEFAULT_AGENT_MESSAGE_MAX_PENDING_PER_SESSION,
@@ -9680,10 +10598,16 @@ impl AgentSession {
             }
         }
         // TS 6252-6254: the unfinished count is read before the enqueue.
-        let had_no_unfinished = self.action_store.lock().unwrap().unfinished_actions(None).is_empty();
+        let had_no_unfinished = self
+            .action_store
+            .lock()
+            .unwrap()
+            .unfinished_actions(None)
+            .is_empty();
         let mut store = self.action_store.lock().unwrap();
         if front {
-            action.priority = Some(crate::core::session_action_store::SessionActionPriority::Pinned);
+            action.priority =
+                Some(crate::core::session_action_store::SessionActionPriority::Pinned);
             store.enqueue_front(action.clone())?;
         } else if restore {
             store.enqueue_tail(action.clone())?;
@@ -9692,7 +10616,9 @@ impl AgentSession {
         }
         drop(store);
         // TS 6252-6258: `immediatelyEligible` alone does not decide the disposition;
-        if !restore { self.start_action_queue_metric(&action); }
+        if !restore {
+            self.start_action_queue_metric(&action);
+        }
         drop(_stop_admission);
         // the store must also have had no unfinished action (or the action is fronted).
         // DEVIATION (named): TS 6258 also requires `selectFirst() === action`; the
@@ -9707,18 +10633,21 @@ impl AgentSession {
         // TS 6259-6264.
         let ticket = self.action_store.lock().unwrap().ticket_for(&action).ok();
         if let Some(ticket) = &ticket {
-            ticket.settle_accepted(crate::core::session_action_store::SubmissionOutcome::Accepted {
-                action_id: action.id.clone(),
-                disposition: if can_start_immediately {
-                    crate::core::session_action_store::AdmissionDisposition::StartsWhenAdmitted
-                } else {
-                    crate::core::session_action_store::AdmissionDisposition::Queued
+            ticket.settle_accepted(
+                crate::core::session_action_store::SubmissionOutcome::Accepted {
+                    action_id: action.id.clone(),
+                    disposition: if can_start_immediately {
+                        crate::core::session_action_store::AdmissionDisposition::StartsWhenAdmitted
+                    } else {
+                        crate::core::session_action_store::AdmissionDisposition::Queued
+                    },
                 },
-            });
+            );
         }
         // TS 6265-6279: a restored or non-waking admission records the arrival but
         // does not wake the pump.
-        self.session_input_arrival_epoch.fetch_add(1, Ordering::SeqCst);
+        self.session_input_arrival_epoch
+            .fetch_add(1, Ordering::SeqCst);
         self.notify_session_input_checkpoint_change();
         self.emit_queue_update();
         if !restore && wake {
@@ -9772,8 +10701,15 @@ impl AgentSession {
     /// `get hasPendingAdmissionWaiters` (agent-session.ts:6338-6344).
     pub fn has_pending_admission_waiters(&self) -> bool {
         self.session_action_commit_owner.lock().unwrap().is_some()
-            || self.pending_session_action_fence_waiters.load(Ordering::SeqCst) > 0
-            || !self.session_input_checkpoint_waiters.lock().unwrap().is_empty()
+            || self
+                .pending_session_action_fence_waiters
+                .load(Ordering::SeqCst)
+                > 0
+            || !self
+                .session_input_checkpoint_waiters
+                .lock()
+                .unwrap()
+                .is_empty()
     }
 
     /// `_scheduleSessionInputPump`.
@@ -9786,14 +10722,18 @@ impl AgentSession {
         if self.disposed.load(Ordering::SeqCst)
             || self.disposing.load(Ordering::SeqCst)
             || !self.has_selectable_session_input()
-            || self.session_input_pump_requested.swap(true, Ordering::SeqCst)
+            || self
+                .session_input_pump_requested
+                .swap(true, Ordering::SeqCst)
         {
             return;
         }
         let epoch = self.session_input_pump_epoch.load(Ordering::SeqCst);
         let session = self.clone();
         task_queue::enqueue(&self.session_input_pump, async move {
-            session.session_input_pump_requested.store(false, Ordering::SeqCst);
+            session
+                .session_input_pump_requested
+                .store(false, Ordering::SeqCst);
             session.pump_session_inputs(epoch).await;
             session.notify_session_input_checkpoint_change();
         });
@@ -9902,8 +10842,10 @@ impl AgentSession {
                 else {
                     break;
                 };
-                if !turn_execution_policies_equal(&first_turn.execution_policy, &next_turn.execution_policy)
-                {
+                if !turn_execution_policies_equal(
+                    &first_turn.execution_policy,
+                    &next_turn.execution_policy,
+                ) {
                     break;
                 }
                 match store.select_first() {
@@ -9957,12 +10899,15 @@ impl AgentSession {
                     for action in actions.iter() {
                         let current = self.action_state_of(&action.id);
                         if current == Some(ActionLifecycleState::Committing) {
-                            let durable = self.action_by_id(&action.id)
+                            let durable = self
+                                .action_by_id(&action.id)
                                 .and_then(|current| primary_delivery_record(&current).ok())
                                 .map(|record| record.durable)
                                 .unwrap_or(false);
                             if durable {
-                                let Some(mut next) = self.action_by_id(&action.id) else { continue; };
+                                let Some(mut next) = self.action_by_id(&action.id) else {
+                                    continue;
+                                };
                                 let _ = transition_session_action(
                                     &mut next,
                                     ActionLifecycle::Running {
@@ -9974,17 +10919,24 @@ impl AgentSession {
                             }
                         }
                         if self.action_state_of(&action.id) == Some(ActionLifecycleState::Running) {
-                            let Some(mut next) = self.action_by_id(&action.id) else { continue; };
+                            let Some(mut next) = self.action_by_id(&action.id) else {
+                                continue;
+                            };
                             let _ = transition_session_action(
                                 &mut next,
                                 ActionLifecycle::Completed,
                                 &TransitionOptions::default(),
                             );
                             let _ = self.action_store.lock().unwrap().update_action(&next);
-                            if let Ok(ticket) = self.action_store.lock().unwrap().ticket_for(action) {
+                            if let Ok(ticket) = self.action_store.lock().unwrap().ticket_for(action)
+                            {
                                 ticket.settle_completed(None);
                             }
-                            self.settle_agent_message(action.agent_message_id.as_deref(), "completion", None);
+                            self.settle_agent_message(
+                                action.agent_message_id.as_deref(),
+                                "completion",
+                                None,
+                            );
                         }
                     }
                 }
@@ -9992,7 +10944,9 @@ impl AgentSession {
                     let transcript = self.messages();
                     let mut undelivered: Vec<QueuedSessionAction> = Vec::new();
                     for action in actions.iter() {
-                        let Some(action) = self.action_by_id(&action.id) else { continue; };
+                        let Some(action) = self.action_by_id(&action.id) else {
+                            continue;
+                        };
                         if !matches!(action.payload, QueuedActionPayload::Turn(_))
                             || action.lifecycle.state() == ActionLifecycleState::Cancelled
                         {
@@ -10042,12 +10996,17 @@ impl AgentSession {
                     }
                     let terminal_error = self.as_error(&error);
                     for action in actions.iter() {
-                        if self.action_state_of(&action.id) == Some(ActionLifecycleState::Cancelled) {
+                        if self.action_state_of(&action.id) == Some(ActionLifecycleState::Cancelled)
+                        {
                             continue;
                         }
                         let state = self.action_state_of(&action.id);
-                        if state != Some(ActionLifecycleState::Completed) && state != Some(ActionLifecycleState::Failed) {
-                            let Some(mut next) = self.action_by_id(&action.id) else { continue; };
+                        if state != Some(ActionLifecycleState::Completed)
+                            && state != Some(ActionLifecycleState::Failed)
+                        {
+                            let Some(mut next) = self.action_by_id(&action.id) else {
+                                continue;
+                            };
                             let _ = transition_session_action(
                                 &mut next,
                                 ActionLifecycle::Failed {
@@ -10117,11 +11076,17 @@ impl AgentSession {
     }
 
     /// `_executeSelectedSessionCommand(action, epoch)`.
-    async fn execute_selected_session_command(self: &Arc<Self>, action: &QueuedSessionAction, epoch: u64) {
+    async fn execute_selected_session_command(
+        self: &Arc<Self>,
+        action: &QueuedSessionAction,
+        epoch: u64,
+    ) {
         let input = match &action.payload {
             QueuedActionPayload::SessionCommand(command) => command.clone(),
             QueuedActionPayload::Turn(_) => {
-                self.surface_session_input_error(&"Expected a selected session command".to_string());
+                self.surface_session_input_error(
+                    &"Expected a selected session command".to_string(),
+                );
                 return;
             }
         };
@@ -10131,9 +11096,8 @@ impl AgentSession {
             let session = self.clone();
             let input = input.clone();
             let work = async move {
-                let is_cancelled = || {
-                    session.action_state_of(&action_id) == Some(ActionLifecycleState::Cancelled)
-                };
+                let is_cancelled =
+                    || session.action_state_of(&action_id) == Some(ActionLifecycleState::Cancelled);
                 if is_cancelled() {
                     return;
                 }
@@ -10188,10 +11152,15 @@ impl AgentSession {
                             );
                             let _ = session.action_store.lock().unwrap().update_action(&next);
                         }
-                        if let Ok(ticket) = session.action_store.lock().unwrap().ticket_for(action) {
+                        if let Ok(ticket) = session.action_store.lock().unwrap().ticket_for(action)
+                        {
                             ticket.settle_completed(None);
                         }
-                        session.settle_agent_message(action.agent_message_id.as_deref(), "completion", None);
+                        session.settle_agent_message(
+                            action.agent_message_id.as_deref(),
+                            "completion",
+                            None,
+                        );
                     }
                     Err(error) => {
                         let command_error = session.as_error(&error);
@@ -10209,11 +11178,15 @@ impl AgentSession {
                             );
                             let _ = session.action_store.lock().unwrap().update_action(&next);
                         }
-                        if let Ok(ticket) = session.action_store.lock().unwrap().ticket_for(action) {
+                        if let Ok(ticket) = session.action_store.lock().unwrap().ticket_for(action)
+                        {
                             ticket.reject_delivered(command_error.clone());
                             ticket.settle_completed(Some(command_error.clone()));
                         }
-                        session.reject_agent_message(action.agent_message_id.as_deref(), &command_error);
+                        session.reject_agent_message(
+                            action.agent_message_id.as_deref(),
+                            &command_error,
+                        );
                     }
                 }
                 // TS 6555 `releaseTerminal(action)` runs on the same object the
@@ -10242,7 +11215,13 @@ impl AgentSession {
         action: &QueuedSessionAction,
         input: &PreparedCommandPayload,
     ) -> Result<(), String> {
-        self.append_durable_session_command_message(&input.base.text, &input.base.command, false, false, true);
+        self.append_durable_session_command_message(
+            &input.base.text,
+            &input.base.command,
+            false,
+            false,
+            true,
+        );
         if let Ok(ticket) = self.action_store.lock().unwrap().ticket_for(action) {
             ticket.settle_delivered(DeliveryOutcome::NotApplicable);
         }
@@ -10261,7 +11240,13 @@ impl AgentSession {
                 || !self.queued_work_pauses.lock().unwrap().is_empty()
                 || self.branch_summary_operation.lock().unwrap().is_some();
         }
-        external_busy || !self.action_store.lock().unwrap().unfinished_actions(None).is_empty()
+        external_busy
+            || !self
+                .action_store
+                .lock()
+                .unwrap()
+                .unfinished_actions(None)
+                .is_empty()
     }
 
     /// `_isSessionInputHandoffDeferred(epoch)`.
@@ -10359,12 +11344,14 @@ impl AgentSession {
                     self.prepare_active_turns(epoch, &execution_policy, actions)
                         .await
                 },
-                Some(Arc::new(move |_prepared: Option<&PreparedPromptPreparation>| {
-                    actions_for_should_commit.iter().any(|action| {
-                        session_for_should_commit.action_state_of(&action.id)
-                            == Some(ActionLifecycleState::Preparing)
-                    })
-                })),
+                Some(Arc::new(
+                    move |_prepared: Option<&PreparedPromptPreparation>| {
+                        actions_for_should_commit.iter().any(|action| {
+                            session_for_should_commit.action_state_of(&action.id)
+                                == Some(ActionLifecycleState::Preparing)
+                        })
+                    },
+                )),
             )
             .await;
         let prepared_turn = match prepared {
@@ -10408,7 +11395,8 @@ impl AgentSession {
                 self.await_agent_event_queue().await;
             }
             let error = self.failed_dispatch_persistence_error().unwrap_or(error);
-            let delivered: HashSet<String> = self.messages().iter().map(agent_message_key_of).collect();
+            let delivered: HashSet<String> =
+                self.messages().iter().map(agent_message_key_of).collect();
             let remaining: Vec<CustomMessage> = next_turn_messages
                 .iter()
                 .filter(|message| !delivered.contains(&custom_message_key(message)))
@@ -10489,27 +11477,30 @@ impl AgentSession {
         {
             let mut store = self.action_store.lock().unwrap();
             let first_primary_index = primary_delivery_record(&turns[0])
-                .map(|record| {
-                    match &turns[0].payload {
-                        QueuedActionPayload::Turn(turn) => turn
-                            .base
-                            .records
-                            .iter()
-                            .position(|candidate| candidate.id == record.id)
-                            .unwrap_or(0),
-                        QueuedActionPayload::SessionCommand(_) => 0,
-                    }
+                .map(|record| match &turns[0].payload {
+                    QueuedActionPayload::Turn(turn) => turn
+                        .base
+                        .records
+                        .iter()
+                        .position(|candidate| candidate.id == record.id)
+                        .unwrap_or(0),
+                    QueuedActionPayload::SessionCommand(_) => 0,
                 })
                 .unwrap_or(0);
             let mut next = turns[0].clone();
             if let QueuedActionPayload::Turn(turn) = &mut next.payload {
                 for (offset, record) in context_records.into_iter().enumerate() {
-                    turn.base.records.insert(first_primary_index + offset, record);
+                    turn.base
+                        .records
+                        .insert(first_primary_index + offset, record);
                 }
             }
             let _ = store.update_action(&next);
         }
-        let turns: Vec<_> = turns.iter().filter_map(|action| self.action_by_id(&action.id)).collect();
+        let turns: Vec<_> = turns
+            .iter()
+            .filter_map(|action| self.action_by_id(&action.id))
+            .collect();
         let prepared_messages: Vec<AgentMessage> = turns
             .iter()
             .flat_map(|action| match &action.payload {
@@ -10525,7 +11516,9 @@ impl AgentSession {
         for action in turns.iter() {
             if action.suppress_autonomous_continuation.unwrap_or(false) {
                 if let Ok(record) = primary_delivery_record(action) {
-                    self.mark_autonomous_continuation_suppressed(&agent_message_from_delivery(&record.message));
+                    self.mark_autonomous_continuation_suppressed(&agent_message_from_delivery(
+                        &record.message,
+                    ));
                 }
             }
         }
@@ -10558,6 +11551,52 @@ impl AgentSession {
         }
         self.notify_session_input_checkpoint_change();
         self.emit_queue_update();
+        // CONTROL (ROOT CONTRACT v1 N5, H-CONTROL-2): the real-user-task
+        // epoch begins at ACTUAL delivery of the queued action to the agent
+        // loop, not at enqueue. Only real user sources (interactive/rpc) bump,
+        // and only when the full overlay is active — the guard runs BEFORE any
+        // book access so non-full behavior stays byte-identical (no ledger
+        // write, no digest, no state). Steering and internal continuations
+        // never reach this note. One epoch per delivery batch; the batch is
+        // one agent-loop execution.
+        {
+            let full_jev_active = crate::core::jev_bridge::session_full_jev_active();
+            if full_jev_active {
+                use crate::core::session_action_store::ActionSource;
+                let book = crate::core::jev_control::ControlBook::global();
+                for action in turns.iter() {
+                    if !matches!(
+                        action.source,
+                        ActionSource::Input(
+                            crate::core::extensions::types::InputSource::Interactive
+                                | crate::core::extensions::types::InputSource::Rpc
+                        )
+                    ) {
+                        continue;
+                    }
+                    if let QueuedActionPayload::Turn(turn) = &action.payload {
+                        book.note_real_user_input(
+                            &self.session_id(),
+                            action.source.as_str(),
+                            &turn.base.text,
+                            true,
+                        );
+                    }
+                    break;
+                }
+            }
+        }
+        // ROOT-CONTRACT v7: derive the request's system prompt from the
+        // canonical base + CURRENT validated hint slot at the request
+        // boundary (this exact run), so an assessment that completed before
+        // this turn is consumed now and a stale one is never consumed.
+        // Root blocker-3: bind the hint stamp to THIS genuine delivery.
+        {
+            let jev_session_id = self.session_manager.lock().unwrap().get_session_id();
+            crate::core::jev_bridge::note_session_delivery(&jev_session_id, &turns[0].id);
+        }
+        self.ensure_skill_hint_listener();
+        self.refresh_request_system_prompt();
         let suppress = turns
             .iter()
             .any(|action| action.suppress_autonomous_continuation.unwrap_or(false));
@@ -10621,8 +11660,7 @@ impl AgentSession {
                 display_result = false;
             }
             "goal" => {
-                self.handle_goal_slash_command(&input.base.text)
-                    .await?;
+                self.handle_goal_slash_command(&input.base.text).await?;
                 let goal = self.goal_state();
                 result_text = Some(match goal.objective.as_deref() {
                     Some(objective) if !objective.is_empty() => {
@@ -10632,7 +11670,8 @@ impl AgentSession {
                 });
             }
             "autonomous" => {
-                self.handle_autonomous_slash_command(&input.base.text).await?;
+                self.handle_autonomous_slash_command(&input.base.text)
+                    .await?;
             }
             _ => {}
         }
@@ -10748,7 +11787,8 @@ impl AgentSession {
                 message.details.clone(),
             );
         let appended = custom_message_agent_message(&message);
-        self.agent.update_state(Box::new(move |state| state.messages.push(appended)));
+        self.agent
+            .update_state(Box::new(move |state| state.messages.push(appended)));
         self.emit(AgentSessionEvent::MessageStart {
             message: custom_message_agent_message(&message),
         });
@@ -10794,7 +11834,8 @@ impl AgentSession {
                 .unwrap()
                 .push(app_message);
         } else if self.is_streaming() {
-            let (text, images) = normalize_message_content(&custom_message_content_parts(&message.content));
+            let (text, images) =
+                normalize_message_content(&custom_message_content_parts(&message.content));
             let schedule = if deliver_as.as_deref() == Some("followUp") {
                 SESSION_INPUT_SCHEDULE_FOLLOW_UP
             } else {
@@ -10812,11 +11853,15 @@ impl AgentSession {
             )
             .await;
         } else if trigger_turn.unwrap_or(false) {
-            if !self.session_input_suspended_for_update_restart.load(Ordering::SeqCst) {
+            if !self
+                .session_input_suspended_for_update_restart
+                .load(Ordering::SeqCst)
+            {
                 self.resume_session_input_admission();
             }
             let admission_fence = self.acquire_direct_turn_admission_fence().await?;
-            let (text, images) = normalize_message_content(&custom_message_content_parts(&message.content));
+            let (text, images) =
+                normalize_message_content(&custom_message_content_parts(&message.content));
             let immediately_eligible = self.can_start_session_action_immediately();
             let action = self.create_prepared_turn_action(
                 SESSION_INPUT_SCHEDULE_FOLLOW_UP,
@@ -10851,7 +11896,8 @@ impl AgentSession {
                 details: message.details.clone(),
                 timestamp: app_message.timestamp,
             });
-            self.agent.update_state(Box::new(move |state| state.messages.push(appended)));
+            self.agent
+                .update_state(Box::new(move |state| state.messages.push(appended)));
             self.session_manager
                 .lock()
                 .unwrap()
@@ -10892,7 +11938,11 @@ impl AgentSession {
                 pi_ai::types::ImageOrTextContent::Image(image) => images.push(image),
             }
         }
-        let images = if images.is_empty() { None } else { Some(images) };
+        let images = if images.is_empty() {
+            None
+        } else {
+            Some(images)
+        };
         self.prompt(
             &text_parts.join("\n"),
             Some(PromptOptions {
@@ -10947,9 +11997,14 @@ impl AgentSession {
                 agent_message_error.clone()
             };
             self.settle_agent_message(action.agent_message_id.as_deref(), "delivery", Some(&error));
-            self.settle_agent_message(action.agent_message_id.as_deref(), "completion", Some(&error));
+            self.settle_agent_message(
+                action.agent_message_id.as_deref(),
+                "completion",
+                Some(&error),
+            );
         }
-        let clearable_ids: HashSet<String> = clearable.iter().map(|action| action.id.clone()).collect();
+        let clearable_ids: HashSet<String> =
+            clearable.iter().map(|action| action.id.clone()).collect();
         self.cancel_session_actions(
             &|action: &QueuedSessionAction| clearable_ids.contains(&action.id),
             &agent_message_error,
@@ -10957,7 +12012,10 @@ impl AgentSession {
         );
         self.agent.clear_all_queues();
         self.emit_queue_update();
-        ClearedQueue { steering, follow_up }
+        ClearedQueue {
+            steering,
+            follow_up,
+        }
     }
 
     /// `_invalidateQueuedPromptPreparation()`.
@@ -10976,8 +12034,11 @@ impl AgentSession {
 
     /// `clearQueuedAgentMessages()`.
     pub fn clear_queued_agent_messages(&self) -> ClearedQueue {
-        self.agent_message_clear_epoch.fetch_add(1, Ordering::SeqCst);
-        self.clear_queued_user_messages_matching(&|text: &str| is_agent_session_message_prompt(text))
+        self.agent_message_clear_epoch
+            .fetch_add(1, Ordering::SeqCst);
+        self.clear_queued_user_messages_matching(&|text: &str| {
+            is_agent_session_message_prompt(text)
+        })
     }
 
     /// `clearQueuedUserMessagesMatching(predicate)`.
@@ -11027,13 +12088,19 @@ impl AgentSession {
         let removed_texts = |delivery: DeliveryPolicy| -> Vec<String> {
             let mut texts: Vec<String> = matching
                 .iter()
-                .filter(|action| action.delivery == delivery && action.lifecycle.state() == ActionLifecycleState::Queued)
+                .filter(|action| {
+                    action.delivery == delivery
+                        && action.lifecycle.state() == ActionLifecycleState::Queued
+                })
                 .map(|action| action_text(action))
                 .collect();
             texts.extend(
                 matching
                     .iter()
-                    .filter(|action| action.delivery == delivery && action.lifecycle.state() != ActionLifecycleState::Queued)
+                    .filter(|action| {
+                        action.delivery == delivery
+                            && action.lifecycle.state() != ActionLifecycleState::Queued
+                    })
                     .map(|action| action_text(action)),
             );
             texts
@@ -11044,12 +12111,17 @@ impl AgentSession {
         let queued_error = "Queued agent message was cleared before delivery.".to_string();
         for action in matching.iter() {
             let error = match &action.payload {
-                QueuedActionPayload::Turn(turn) if turn.accepted_agent_message => accepted_error.clone(),
+                QueuedActionPayload::Turn(turn) if turn.accepted_agent_message => {
+                    accepted_error.clone()
+                }
                 _ => queued_error.clone(),
             };
             self.reject_agent_message(action.agent_message_id.as_deref(), &error);
         }
-        for (accepted, error) in [(true, accepted_error.clone()), (false, queued_error.clone())] {
+        for (accepted, error) in [
+            (true, accepted_error.clone()),
+            (false, queued_error.clone()),
+        ] {
             let ids: HashSet<String> = matching
                 .iter()
                 .filter(|action| match &action.payload {
@@ -11089,9 +12161,15 @@ impl AgentSession {
         mutation: &QueuedMessageMutation,
     ) -> QueuedMessageMutationStatus {
         let policy = queued_message_lane_delivery_policy(lane);
-        let queued = self.action_store.lock().unwrap().queued_actions(Some(policy));
-        let projection: Vec<QueuedSessionAction> =
-            visible_session_action_projection(&queued).into_iter().cloned().collect();
+        let queued = self
+            .action_store
+            .lock()
+            .unwrap()
+            .queued_actions(Some(policy));
+        let projection: Vec<QueuedSessionAction> = visible_session_action_projection(&queued)
+            .into_iter()
+            .cloned()
+            .collect();
         let item = if index >= 0 {
             projection.get(index as usize).cloned()
         } else {
@@ -11161,7 +12239,11 @@ impl AgentSession {
                         command.base.text = text.clone();
                         command.base.command = parsed;
                         if images.is_some() {
-                            command.images = if images.as_ref().map(|value| value.is_empty()).unwrap_or(true) {
+                            command.images = if images
+                                .as_ref()
+                                .map(|value| value.is_empty())
+                                .unwrap_or(true)
+                            {
                                 None
                             } else {
                                 images.clone()
@@ -11176,9 +12258,10 @@ impl AgentSession {
                             } else {
                                 Some(images.clone())
                             };
-                            let mut content: Vec<pi_ai::types::ImageOrTextContent> = vec![
-                                pi_ai::types::ImageOrTextContent::Text(TextContent::new(text)),
-                            ];
+                            let mut content: Vec<pi_ai::types::ImageOrTextContent> =
+                                vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new(
+                                    text,
+                                ))];
                             content.extend(
                                 images
                                     .iter()
@@ -11187,9 +12270,10 @@ impl AgentSession {
                             );
                             turn.content = Some(content);
                         } else if let Some(content) = turn.content.clone() {
-                            let mut next: Vec<pi_ai::types::ImageOrTextContent> = vec![
-                                pi_ai::types::ImageOrTextContent::Text(TextContent::new(text)),
-                            ];
+                            let mut next: Vec<pi_ai::types::ImageOrTextContent> =
+                                vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new(
+                                    text,
+                                ))];
                             next.extend(content.into_iter().filter(|block| {
                                 !matches!(block, pi_ai::types::ImageOrTextContent::Text(_))
                             }));
@@ -11225,17 +12309,13 @@ impl AgentSession {
                         .unwrap()
                         .queued_actions(Some(target_policy))
                         .len();
-                    let _ = self
-                        .action_store
-                        .lock()
-                        .unwrap()
-                        .move_queued(&mut moved, target_policy, target_index);
+                    let _ = self.action_store.lock().unwrap().move_queued(
+                        &mut moved,
+                        target_policy,
+                        target_index,
+                    );
                 } else {
-                    let _ = self
-                        .action_store
-                        .lock()
-                        .unwrap()
-                        .update_action(&moved);
+                    let _ = self.action_store.lock().unwrap().update_action(&moved);
                 }
                 self.resume_queued_work();
                 self.emit_queue_update();
@@ -11246,8 +12326,8 @@ impl AgentSession {
 
     /// `get queuedActionCount()`.
     pub fn queued_action_count(&self) -> i64 {
-        visible_session_action_projection(&self.action_store.lock().unwrap().queued_actions(None)).len()
-            as i64
+        visible_session_action_projection(&self.action_store.lock().unwrap().queued_actions(None))
+            .len() as i64
     }
 
     /// `get unfinishedActionCount()`.
@@ -11337,7 +12417,9 @@ impl AgentSession {
             .map(|action| {
                 let kind = match &action.payload {
                     QueuedActionPayload::Turn(_) => SessionActionSnapshotKind::Turn,
-                    QueuedActionPayload::SessionCommand(_) => SessionActionSnapshotKind::SessionCommand,
+                    QueuedActionPayload::SessionCommand(_) => {
+                        SessionActionSnapshotKind::SessionCommand
+                    }
                 };
                 let phase = match action.lifecycle.state() {
                     ActionLifecycleState::Preparing => SessionActionPhase::Preparing,
@@ -11428,7 +12510,10 @@ impl AgentSession {
     }
 
     /// `_waitForSessionActivityChange(signal)`.
-    async fn wait_for_session_activity_change(&self, signal: Option<&CancellationToken>) -> Result<(), String> {
+    async fn wait_for_session_activity_change(
+        &self,
+        signal: Option<&CancellationToken>,
+    ) -> Result<(), String> {
         let token = self.session_action_commit_dispose_abort.clone();
         let signal = signal.cloned();
         tokio::select! {
@@ -11526,9 +12611,7 @@ impl AgentSession {
     }
 
     /// `_acquireDirectTurnAdmissionFence(signal?)`.
-    async fn acquire_direct_turn_admission_fence(
-        self: &Arc<Self>,
-    ) -> Result<CommitFence, String> {
+    async fn acquire_direct_turn_admission_fence(self: &Arc<Self>) -> Result<CommitFence, String> {
         self.acquire_commit_fence(false).await
     }
 
@@ -11586,12 +12669,15 @@ impl AgentSession {
 
     /// `_resumeSessionInputAdmission()` (agent-session.ts:7505-7512).
     fn resume_session_input_admission(&self) {
-        if self.explicitly_stopped() { return; }
+        if self.explicitly_stopped() {
+            return;
+        }
         // TS 7506: a pump that is not suspended is left untouched.
         if !self.session_input_pump_suspended.load(Ordering::SeqCst) {
             return;
         }
-        self.session_input_pump_suspended.store(false, Ordering::SeqCst);
+        self.session_input_pump_suspended
+            .store(false, Ordering::SeqCst);
         self.session_input_suspended_for_update_restart
             .store(false, Ordering::SeqCst);
         // TS 7509-7511.
@@ -11637,7 +12723,13 @@ impl AgentSession {
                 let _ = self.agent.wait_for_idle().await;
                 continue;
             }
-            if self.action_store.lock().unwrap().unfinished_actions(None).is_empty() {
+            if self
+                .action_store
+                .lock()
+                .unwrap()
+                .unfinished_actions(None)
+                .is_empty()
+            {
                 return Ok(());
             }
             self.schedule_session_input_pump();
@@ -11666,8 +12758,14 @@ impl AgentSession {
     }
 
     /// `_forgetConsumedPostCompactionContinuations(continuationMessages)`.
-    fn forget_consumed_post_compaction_continuations(&self, continuation_messages: &[AgentMessage]) {
-        let consumed: HashSet<String> = continuation_messages.iter().map(agent_message_key_of).collect();
+    fn forget_consumed_post_compaction_continuations(
+        &self,
+        continuation_messages: &[AgentMessage],
+    ) {
+        let consumed: HashSet<String> = continuation_messages
+            .iter()
+            .map(agent_message_key_of)
+            .collect();
         self.post_compaction_continuation_messages
             .lock()
             .unwrap()
@@ -11708,7 +12806,10 @@ impl AgentSession {
             return false;
         }
         let ids: HashSet<String> = target.iter().map(|action| action.id.clone()).collect();
-        let removed = store.remove(&|action: &QueuedSessionAction| ids.contains(&action.id), None);
+        let removed = store.remove(
+            &|action: &QueuedSessionAction| ids.contains(&action.id),
+            None,
+        );
         if removed.is_err() {
             return false;
         }
@@ -11746,9 +12847,11 @@ impl AgentSession {
         for controller in self.rlm_quiescence_wait_aborts.lock().unwrap().iter() {
             controller.cancel();
         }
-        self.session_input_pump_requested.store(false, Ordering::SeqCst);
+        self.session_input_pump_requested
+            .store(false, Ordering::SeqCst);
         self.session_input_pump_epoch.fetch_add(1, Ordering::SeqCst);
-        self.session_input_pump_suspended.store(true, Ordering::SeqCst);
+        self.session_input_pump_suspended
+            .store(true, Ordering::SeqCst);
         // TS 7640: a plain requestAbort clears the update-restart marker; only
         // `abortForUpdateRestart` sets it (TS 7685).
         self.session_input_suspended_for_update_restart
@@ -11780,10 +12883,13 @@ impl AgentSession {
         self.abort_refinement();
         *self.pending_requested_compaction.lock().unwrap() = None;
         *self.pending_requested_refine.lock().unwrap() = None;
-        self.auto_refine_branch_version.fetch_add(1, Ordering::SeqCst);
+        self.auto_refine_branch_version
+            .fetch_add(1, Ordering::SeqCst);
         let error = "Session input was aborted.".to_string();
         self.reject_queued_agent_message_deliveries(&error, None);
-        if explicit { self.cancel_active_rlm_child_runs("Parent session explicitly stopped"); }
+        if explicit {
+            self.cancel_active_rlm_child_runs("Parent session explicitly stopped");
+        }
         self.agent.abort();
         drop(stop_admission);
         self.notify_session_input_checkpoint_change();
@@ -11822,10 +12928,14 @@ impl AgentSession {
         let settle = async {
             self.agent.wait_for_idle().await;
             self.await_agent_event_queue().await;
-            if let Some(operation) = compaction_operation { let _ = operation.await; }
+            if let Some(operation) = compaction_operation {
+                let _ = operation.await;
+            }
         };
         let settled = if explicit {
-            tokio::time::timeout(std::time::Duration::from_secs(10), settle).await.is_ok()
+            tokio::time::timeout(std::time::Duration::from_secs(10), settle)
+                .await
+                .is_ok()
         } else {
             settle.await;
             true
@@ -11836,7 +12946,9 @@ impl AgentSession {
             return Err("Stop requested and new work is suspended, but an active tool, event handler or compaction has not settled after 10 seconds. The session is not confirmed stopped.".into());
         }
         if let Some(error) = self.explicit_stop.lock().unwrap().persistence_error.clone() {
-            return Err(format!("Work stopped, but the durable stop checkpoint could not be saved: {error}"));
+            return Err(format!(
+                "Work stopped, but the durable stop checkpoint could not be saved: {error}"
+            ));
         }
         Ok(())
     }
@@ -11847,9 +12959,11 @@ impl AgentSession {
     /// the restart manifest, so it does not call `_cancelSessionActions`. TS 7685
     /// is the only place that sets `_sessionInputSuspendedForUpdateRestart` true.
     pub fn abort_for_update_restart(self: &Arc<Self>) {
-        self.session_input_pump_requested.store(false, Ordering::SeqCst);
+        self.session_input_pump_requested
+            .store(false, Ordering::SeqCst);
         self.session_input_pump_epoch.fetch_add(1, Ordering::SeqCst);
-        self.session_input_pump_suspended.store(true, Ordering::SeqCst);
+        self.session_input_pump_suspended
+            .store(true, Ordering::SeqCst);
         self.session_input_suspended_for_update_restart
             .store(true, Ordering::SeqCst);
         // TS 7686-7688.
@@ -11867,7 +12981,8 @@ impl AgentSession {
         // Rust-only teardown the restart path already performed.
         self.abort_compaction();
         self.abort_branch_summary();
-        let controllers: Vec<CancellationToken> = self.bash_abort_controllers.lock().unwrap().clone();
+        let controllers: Vec<CancellationToken> =
+            self.bash_abort_controllers.lock().unwrap().clone();
         for controller in controllers {
             controller.cancel();
         }
@@ -11876,7 +12991,12 @@ impl AgentSession {
     }
 
     /// `_emitModelSelect(nextModel, previousModel, source)`.
-    async fn emit_model_select(self: &Arc<Self>, next: Model, previous: Option<Model>, source: &str) {
+    async fn emit_model_select(
+        self: &Arc<Self>,
+        next: Model,
+        previous: Option<Model>,
+        source: &str,
+    ) {
         if let Some(previous) = &previous {
             if models_are_equal(Some(previous), Some(&next)) {
                 return;
@@ -11902,27 +13022,31 @@ impl AgentSession {
     ) {
         let source = source.to_string();
         let session = self.clone();
-        let emit: Arc<dyn Fn() -> BoxFuture<Result<(), String>> + Send + Sync> = Arc::new(move || {
-            let session = session.clone();
-            let next = next.clone();
-            let previous = previous.clone();
-            let source = source.clone();
-            Box::pin(async move {
-                session.emit_model_select(next, previous, &source).await;
-                Ok(())
-            })
-        });
+        let emit: Arc<dyn Fn() -> BoxFuture<Result<(), String>> + Send + Sync> =
+            Arc::new(move || {
+                let session = session.clone();
+                let next = next.clone();
+                let previous = previous.clone();
+                let source = source.clone();
+                Box::pin(async move {
+                    session.emit_model_select(next, previous, &source).await;
+                    Ok(())
+                })
+            });
         let previous = self.model_select_emit_queue.lock().unwrap().take();
         let previous: BoxFuture<Result<(), String>> = match previous {
             Some(previous) => previous,
             None => Box::pin(async { Ok(()) }),
         };
-        self.model_select_emit_queue_idle.store(false, Ordering::SeqCst);
+        self.model_select_emit_queue_idle
+            .store(false, Ordering::SeqCst);
         let session = self.clone();
         let tail: BoxFuture<Result<(), String>> = Box::pin(async move {
             let _ = previous.await;
             let result = emit().await;
-            session.model_select_emit_queue_idle.store(true, Ordering::SeqCst);
+            session
+                .model_select_emit_queue_idle
+                .store(true, Ordering::SeqCst);
             result
         });
         *self.model_select_emit_queue.lock().unwrap() = Some(tail);
@@ -12011,9 +13135,12 @@ impl AgentSession {
     ) -> Result<ModelCycleResult, String> {
         let scoped = self.scoped_models();
         if !scoped.is_empty() {
-            return self.cycle_scoped_model(direction.unwrap_or(1), options).await;
+            return self
+                .cycle_scoped_model(direction.unwrap_or(1), options)
+                .await;
         }
-        self.cycle_available_model(direction.unwrap_or(1), options).await
+        self.cycle_available_model(direction.unwrap_or(1), options)
+            .await
     }
 
     /// `_cycleScopedModel(direction, options)`.
@@ -12165,7 +13292,10 @@ impl AgentSession {
     }
 
     /// `_getThinkingLevelForModelSwitch(explicitLevel)`.
-    fn get_thinking_level_for_model_switch(&self, explicit_level: Option<ThinkingLevel>) -> ThinkingLevel {
+    fn get_thinking_level_for_model_switch(
+        &self,
+        explicit_level: Option<ThinkingLevel>,
+    ) -> ThinkingLevel {
         match explicit_level {
             Some(level) => self.clamp_thinking_level(level),
             None => self.thinking_level(),
@@ -12184,8 +13314,7 @@ impl AgentSession {
     async fn sync_kernel_state_after_compaction(self: &Arc<Self>) -> Result<(), String> {
         let provisioner = self.ipython_kernel_provisioner.lock().unwrap().clone();
         // TS 7992: no running kernel means nothing to report.
-        let Some(provisioner) = provisioner
-            .filter(|provisioner| provisioner.has_running_kernel())
+        let Some(provisioner) = provisioner.filter(|provisioner| provisioner.has_running_kernel())
         else {
             return Ok(());
         };
@@ -12196,7 +13325,10 @@ impl AgentSession {
         let abort = crate::core::kernel::shared::AbortSignal::new();
         let timer_abort = abort.clone();
         let timer = tokio::spawn(async move {
-            tokio::time::sleep(std::time::Duration::from_millis(KERNEL_STATE_LISTING_TIMEOUT_MS)).await;
+            tokio::time::sleep(std::time::Duration::from_millis(
+                KERNEL_STATE_LISTING_TIMEOUT_MS,
+            ))
+            .await;
             timer_abort.abort(None);
         });
         let names = provisioner.list_namespace_names(Some(abort)).await;
@@ -12261,12 +13393,16 @@ impl AgentSession {
             self.agent.set_state(state);
         }
         // TS 8034-8036.
-        let _ = self.session_manager.lock().unwrap().append_custom_message_entry(
-            &message.custom_type,
-            &custom_message_entry_content(&message.content),
-            message.display,
-            message.details.clone(),
-        );
+        let _ = self
+            .session_manager
+            .lock()
+            .unwrap()
+            .append_custom_message_entry(
+                &message.custom_type,
+                &custom_message_entry_content(&message.content),
+                message.display,
+                message.details.clone(),
+            );
         self.emit(AgentSessionEvent::MessageStart {
             message: agent_message.clone(),
         });
@@ -12421,13 +13557,20 @@ impl AgentSession {
             }
         };
         self.emit(outcome);
-        self.reap_deleted_rlm_subagent_runtimes_after_compaction().await;
+        self.reap_deleted_rlm_subagent_runtimes_after_compaction()
+            .await;
         result.map(|_| ())
     }
 
     /// `_reapDeletedRlmSubagentRuntimesAfterCompaction()`.
     async fn reap_deleted_rlm_subagent_runtimes_after_compaction(self: &Arc<Self>) {
-        let deleted: Vec<String> = self.deleted_rlm_child_ids.lock().unwrap().iter().cloned().collect();
+        let deleted: Vec<String> = self
+            .deleted_rlm_child_ids
+            .lock()
+            .unwrap()
+            .iter()
+            .cloned()
+            .collect();
         for child_id in deleted {
             let _ = self.delete_rlm_subagent(&child_id).await;
         }
@@ -12438,7 +13581,12 @@ impl AgentSession {
         if let Some(controller) = self.compaction_abort_controller.lock().unwrap().clone() {
             controller.cancel();
         }
-        if let Some(controller) = self.auto_compaction_abort_controller.lock().unwrap().clone() {
+        if let Some(controller) = self
+            .auto_compaction_abort_controller
+            .lock()
+            .unwrap()
+            .clone()
+        {
             controller.cancel();
         }
         self.emit(AgentSessionEvent::CompactionUpdate {
@@ -12450,7 +13598,11 @@ impl AgentSession {
     /// `_localHarnessStateDir()` (agent-session.ts:8416-8420): the session
     /// artifact dir wins; `this._rlmSessionDir` (raw field) is the fallback.
     fn local_harness_state_dir(&self) -> Option<String> {
-        let artifact_dir = self.session_manager.lock().unwrap().get_session_artifact_dir();
+        let artifact_dir = self
+            .session_manager
+            .lock()
+            .unwrap()
+            .get_session_artifact_dir();
         get_local_harness_state_dir(artifact_dir.as_deref())
             .or_else(|| get_local_harness_state_dir(self.rlm_session_dir.as_deref()))
     }
@@ -12477,11 +13629,19 @@ impl AgentSession {
     /// `_settlePostCompactionContinue(error?)` (agent-session.ts:8427-8436).
     fn settle_post_compaction_continue(&self, error: Option<&str>) {
         // TS 8428: a plain settle is a no-op while a continuation is still scheduled.
-        if error.is_none() && self.post_compaction_continuation_scheduled.load(Ordering::SeqCst) {
+        if error.is_none()
+            && self
+                .post_compaction_continuation_scheduled
+                .load(Ordering::SeqCst)
+        {
             return;
         }
         // TS 8430: no owner, or an owner that already settled, is a no-op.
-        let settlement = self.post_compaction_continuation_settlement.lock().unwrap().clone();
+        let settlement = self
+            .post_compaction_continuation_settlement
+            .lock()
+            .unwrap()
+            .clone();
         let Some(settlement) = settlement else {
             return;
         };
@@ -12551,7 +13711,8 @@ impl AgentSession {
     /// `_discardPendingAutoRefine(options)`.
     fn discard_pending_auto_refine(&self, cancel_post_compaction_continue: bool) {
         *self.pending_auto_refine_review.lock().unwrap() = None;
-        self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+        self.compact_auto_refine_pending
+            .store(false, Ordering::SeqCst);
         self.turn_interval_auto_refine_pending
             .store(false, Ordering::SeqCst);
         if cancel_post_compaction_continue {
@@ -12561,7 +13722,8 @@ impl AgentSession {
 
     /// `_invalidatePendingAutoRefineForBranchChange()`.
     async fn invalidate_pending_auto_refine_for_branch_change(self: &Arc<Self>) {
-        self.auto_refine_branch_version.fetch_add(1, Ordering::SeqCst);
+        self.auto_refine_branch_version
+            .fetch_add(1, Ordering::SeqCst);
         self.abort_refinement();
         self.discard_pending_auto_refine(true);
         self.invalidate_queued_prompt_preparation();
@@ -12600,18 +13762,23 @@ impl AgentSession {
 
     /// `_scheduleAutoRefineAfterCompaction(willContinueAfterCompaction)`
     /// (agent-session.ts:8516-8532).
-    fn schedule_auto_refine_after_compaction(self: &Arc<Self>, will_continue_after_compaction: bool) {
+    fn schedule_auto_refine_after_compaction(
+        self: &Arc<Self>,
+        will_continue_after_compaction: bool,
+    ) {
         if !self.auto_refine_allowed_for_session() {
             return;
         }
         if self.serialized_refine {
             // Serialized sessions must service compaction-triggered refinement at
             // shouldStopAfterTurn (or disposal), never through the interactive path.
-            self.compact_auto_refine_pending.store(true, Ordering::SeqCst);
+            self.compact_auto_refine_pending
+                .store(true, Ordering::SeqCst);
             return;
         }
         if will_continue_after_compaction {
-            self.compact_auto_refine_pending.store(true, Ordering::SeqCst);
+            self.compact_auto_refine_pending
+                .store(true, Ordering::SeqCst);
             return;
         }
         self.schedule_auto_refine(&AutoRefineReason::Compact, None);
@@ -12627,7 +13794,9 @@ impl AgentSession {
                 None => true,
             };
             if replace {
-                *slot = Some(Arc::new(Mutex::new(create_post_compaction_continuation_settlement())));
+                *slot = Some(Arc::new(Mutex::new(
+                    create_post_compaction_continuation_settlement(),
+                )));
             }
             replace
         };
@@ -12651,8 +13820,15 @@ impl AgentSession {
             return;
         }
         // TS 8544: snapshot the session-owned continuation messages for this run.
-        let messages = self.post_compaction_continuation_messages.lock().unwrap().clone();
-        *self.scheduled_post_compaction_continuation_messages.lock().unwrap() = messages;
+        let messages = self
+            .post_compaction_continuation_messages
+            .lock()
+            .unwrap()
+            .clone();
+        *self
+            .scheduled_post_compaction_continuation_messages
+            .lock()
+            .unwrap() = messages;
         let session = self.clone();
         let tail_settlement = settlement.clone();
         tokio::spawn(async move {
@@ -12704,7 +13880,9 @@ impl AgentSession {
         // TS 8574 is a `while` loop that re-enters after awaiting, so the recursive
         // call is boxed on this one cycle edge (E0733).
         Box::pin(async move {
-            session.run_scheduled_post_compaction_continue_inner(settlement).await
+            session
+                .run_scheduled_post_compaction_continue_inner(settlement)
+                .await
         })
     }
 
@@ -12716,7 +13894,9 @@ impl AgentSession {
         // The predicate reads are taken as owned booleans up front: a guard held
         // across the awaited body would make this future non-`Send`.
         loop {
-            if !self.post_compaction_continuation_scheduled.load(Ordering::SeqCst)
+            if !self
+                .post_compaction_continuation_scheduled
+                .load(Ordering::SeqCst)
                 || !self.settlement_is_owner(&settlement)
             {
                 return;
@@ -12754,7 +13934,9 @@ impl AgentSession {
             {
                 // TS 8590.
                 self.agent.wait_for_idle().await;
-                if !self.post_compaction_continuation_scheduled.load(Ordering::SeqCst)
+                if !self
+                    .post_compaction_continuation_scheduled
+                    .load(Ordering::SeqCst)
                     || !self.settlement_is_owner(&settlement)
                 {
                     commit_fence.release();
@@ -12814,14 +13996,21 @@ impl AgentSession {
                     .lock()
                     .unwrap()
                     .clone();
-                let continue_after_session_input = {
-                    settlement.lock().unwrap().continue_after_session_input
-                };
-                let should_continue = (continue_after_session_input && continuation_messages.is_empty())
+                let continue_after_session_input =
+                    { settlement.lock().unwrap().continue_after_session_input };
+                let should_continue = (continue_after_session_input
+                    && continuation_messages.is_empty())
                     || self.session_owns_scheduled_continuations(&continuation_messages);
                 if should_continue {
-                    let messages = self.post_compaction_continuation_messages.lock().unwrap().clone();
-                    *self.scheduled_post_compaction_continuation_messages.lock().unwrap() = messages;
+                    let messages = self
+                        .post_compaction_continuation_messages
+                        .lock()
+                        .unwrap()
+                        .clone();
+                    *self
+                        .scheduled_post_compaction_continuation_messages
+                        .lock()
+                        .unwrap() = messages;
                     continue;
                 }
                 // TS 8629-8632.
@@ -12858,10 +14047,15 @@ impl AgentSession {
                             if self.settlement_is_owner(&settlement) {
                                 self.post_compaction_continuation_scheduled
                                     .store(true, Ordering::SeqCst);
-                                let messages =
-                                    self.post_compaction_continuation_messages.lock().unwrap().clone();
-                                *self.scheduled_post_compaction_continuation_messages.lock().unwrap() =
-                                    messages;
+                                let messages = self
+                                    .post_compaction_continuation_messages
+                                    .lock()
+                                    .unwrap()
+                                    .clone();
+                                *self
+                                    .scheduled_post_compaction_continuation_messages
+                                    .lock()
+                                    .unwrap() = messages;
                             }
                             continue;
                         }
@@ -12914,9 +14108,8 @@ impl AgentSession {
                 if !self.is_busy_for_session_input("pump") {
                     wake.notify_one();
                 }
-                let settled = {
-                    settlement.map(|settlement| settlement.lock().unwrap().deferred.clone())
-                };
+                let settled =
+                    { settlement.map(|settlement| settlement.lock().unwrap().deferred.clone()) };
                 tokio::select! {
                     _ = wake.notified() => {}
                     _ = await_settlement(settled) => {}
@@ -12939,7 +14132,9 @@ impl AgentSession {
             let events = self.agent_event_queue.lock().unwrap().clone();
             let _ = events.await;
             // TS 7564-7572.
-            if self.has_unfinished_actions() || self.session_input_pump_requested.load(Ordering::SeqCst) {
+            if self.has_unfinished_actions()
+                || self.session_input_pump_requested.load(Ordering::SeqCst)
+            {
                 continue;
             }
             return;
@@ -12978,10 +14173,16 @@ impl AgentSession {
     /// `setTimeout(..., 0)` becomes a spawned task that yields once before it
     /// runs; `clearTimeout` becomes removing the timer id from
     /// `scheduled_auto_refine_timers`, which makes the task stop.
-    fn schedule_auto_refine(self: &Arc<Self>, reason: &AutoRefineReason, branch_version: Option<u64>) {
-        if self.explicitly_stopped() { return; }
-        let branch_version =
-            branch_version.unwrap_or_else(|| self.auto_refine_branch_version.load(Ordering::SeqCst));
+    fn schedule_auto_refine(
+        self: &Arc<Self>,
+        reason: &AutoRefineReason,
+        branch_version: Option<u64>,
+    ) {
+        if self.explicitly_stopped() {
+            return;
+        }
+        let branch_version = branch_version
+            .unwrap_or_else(|| self.auto_refine_branch_version.load(Ordering::SeqCst));
         let reason = *reason;
         let timer_id = self
             .auto_refine_operation_ids
@@ -13009,9 +14210,7 @@ impl AgentSession {
                 return;
             }
             let (operation_id, release) = session.create_auto_refine_operation();
-            let _ = session
-                .maybe_auto_refine(&reason)
-                .await;
+            let _ = session.maybe_auto_refine(&reason).await;
             // `operation.finally(() => this._autoRefineOperations.delete(operation))`
             // plus the resolution of the registered promise.
             session
@@ -13028,9 +14227,7 @@ impl AgentSession {
     ///
     /// Returns the shared promise the disposal drain awaits and the resolver the
     /// scheduled task fires when the operation settles.
-    fn create_auto_refine_operation(
-        &self,
-    ) -> (u64, tokio::sync::oneshot::Sender<()>) {
+    fn create_auto_refine_operation(&self) -> (u64, tokio::sync::oneshot::Sender<()>) {
         let operation_id = self
             .auto_refine_operation_ids
             .fetch_add(1, Ordering::SeqCst)
@@ -13052,7 +14249,9 @@ impl AgentSession {
 
     /// `_maybeAutoRefine(reason)` (agent-session.ts:8704-8815).
     async fn maybe_auto_refine(self: &Arc<Self>, reason: &AutoRefineReason) -> Result<(), String> {
-        if self.explicitly_stopped() { return Ok(()); }
+        if self.explicitly_stopped() {
+            return Ok(());
+        }
         if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             self.discard_pending_auto_refine(false);
             return Ok(());
@@ -13075,18 +14274,16 @@ impl AgentSession {
             || self.auto_refine_in_progress.swap(true, Ordering::SeqCst)
         {
             match reason {
-                AutoRefineReason::Compact => {
-                    self.compact_auto_refine_pending.store(true, Ordering::SeqCst)
-                }
+                AutoRefineReason::Compact => self
+                    .compact_auto_refine_pending
+                    .store(true, Ordering::SeqCst),
                 AutoRefineReason::TurnInterval => self
                     .turn_interval_auto_refine_pending
                     .store(true, Ordering::SeqCst),
             }
             return Ok(());
         }
-        let result = self
-            .maybe_auto_refine_guarded(reason, &settings)
-            .await;
+        let result = self.maybe_auto_refine_guarded(reason, &settings).await;
         self.auto_refine_in_progress.store(false, Ordering::SeqCst);
         // `finally { if (!approvedReview) this._scheduleDeferredAutoRefineIfIdle(); }`
         // runs inside `maybe_auto_refine_guarded` so it observes `approved_review`.
@@ -13116,20 +14313,23 @@ impl AgentSession {
 
         let mut reason = *reason;
         if reason == AutoRefineReason::Compact && !settings.compact {
-            self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+            self.compact_auto_refine_pending
+                .store(false, Ordering::SeqCst);
             reason = AutoRefineReason::TurnInterval;
         }
         if reason == AutoRefineReason::TurnInterval
-            && (self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as f64)
+            && (self
+                .assistant_turns_since_auto_refine
+                .load(Ordering::SeqCst) as f64)
                 < settings.turn_interval
         {
             return Ok(());
         }
         if under_cooldown {
             match reason {
-                AutoRefineReason::Compact => {
-                    self.compact_auto_refine_pending.store(true, Ordering::SeqCst)
-                }
+                AutoRefineReason::Compact => self
+                    .compact_auto_refine_pending
+                    .store(true, Ordering::SeqCst),
                 AutoRefineReason::TurnInterval => self
                     .turn_interval_auto_refine_pending
                     .store(true, Ordering::SeqCst),
@@ -13142,12 +14342,15 @@ impl AgentSession {
         }
         if self.model().is_none() {
             if reason == AutoRefineReason::Compact {
-                self.compact_auto_refine_pending.store(true, Ordering::SeqCst);
+                self.compact_auto_refine_pending
+                    .store(true, Ordering::SeqCst);
             }
             return Ok(());
         }
         self.append_harness_digest_if_stale();
-        let turns_since_last_review = self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as i64;
+        let turns_since_last_review = self
+            .assistant_turns_since_auto_refine
+            .load(Ordering::SeqCst) as i64;
         let review = self
             .review_auto_refine(
                 &AutoRefineReviewContext {
@@ -13169,17 +14372,21 @@ impl AgentSession {
                 }
                 if !review.should_refine {
                     let preserve_turn_interval_review = reason == AutoRefineReason::Compact
-                        && (self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as f64)
+                        && (self
+                            .assistant_turns_since_auto_refine
+                            .load(Ordering::SeqCst) as f64)
                             >= settings.turn_interval;
                     if preserve_turn_interval_review {
                         self.turn_interval_auto_refine_pending
                             .store(true, Ordering::SeqCst);
                     } else {
                         *self.last_auto_refine_review_at.lock().unwrap() = now;
-                        self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                        self.assistant_turns_since_auto_refine
+                            .store(0, Ordering::SeqCst);
                     }
                     if reason == AutoRefineReason::Compact {
-                        self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                        self.compact_auto_refine_pending
+                            .store(false, Ordering::SeqCst);
                     }
                     self.schedule_deferred_auto_refine_if_idle();
                     return Ok(());
@@ -13229,9 +14436,11 @@ impl AgentSession {
                 self.turn_interval_auto_refine_pending
                     .store(false, Ordering::SeqCst);
                 *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                self.assistant_turns_since_auto_refine
+                    .store(0, Ordering::SeqCst);
                 if *reason == AutoRefineReason::Compact {
-                    self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                    self.compact_auto_refine_pending
+                        .store(false, Ordering::SeqCst);
                 }
             }
             Err(error) => {
@@ -13245,9 +14454,11 @@ impl AgentSession {
                     *self.pending_auto_refine_review.lock().unwrap() = None;
                     self.turn_interval_auto_refine_pending
                         .store(false, Ordering::SeqCst);
-                    self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                    self.assistant_turns_since_auto_refine
+                        .store(0, Ordering::SeqCst);
                     if *reason == AutoRefineReason::Compact {
-                        self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                        self.compact_auto_refine_pending
+                            .store(false, Ordering::SeqCst);
                     }
                 }
             }
@@ -13335,7 +14546,10 @@ impl AgentSession {
     }
 
     fn refinement_signal(&self) -> CancellationToken {
-        self.refinement_abort_controller.lock().unwrap().child_token()
+        self.refinement_abort_controller
+            .lock()
+            .unwrap()
+            .child_token()
     }
 
     fn abort_refinement(&self) {
@@ -13351,11 +14565,9 @@ impl AgentSession {
     fn refinement_evidence_message(
         message: &AgentMessage,
     ) -> Option<crate::core::memory::evidence::AgentMessage> {
-        serde_json::to_value(message)
-            .ok()
-            .and_then(|value| {
-                serde_json::from_value::<crate::core::memory::evidence::AgentMessage>(value).ok()
-            })
+        serde_json::to_value(message).ok().and_then(|value| {
+            serde_json::from_value::<crate::core::memory::evidence::AgentMessage>(value).ok()
+        })
     }
 
     /// `providerRetryPolicy(this.settingsManager)`.
@@ -13430,7 +14642,10 @@ impl AgentSession {
             HarnessScope::Global,
         );
         match self.local_harness_state_dir() {
-            Some(dir) => merge_harness_states(&global, Some(&load_harness_state(&dir, HarnessScope::Local))),
+            Some(dir) => merge_harness_states(
+                &global,
+                Some(&load_harness_state(&dir, HarnessScope::Local)),
+            ),
             None => global,
         }
     }
@@ -13533,9 +14748,7 @@ impl AgentSession {
             .collect();
         // `if (!options.rollbackId && this._extensionRunner.hasHandlers("session_before_refine"))`
         // (agent-session.ts:9132-9158).
-        if options.rollback_id.is_none()
-            && self.has_extension_handlers("session_before_refine")
-        {
+        if options.rollback_id.is_none() && self.has_extension_handlers("session_before_refine") {
             let conversation_text = serialize_conversation(&convert_to_llm(
                 &self.agent.state().messages,
                 &Default::default(),
@@ -13558,10 +14771,8 @@ impl AgentSession {
             let emitted = match self.extension_runner() {
                 Some(runner) => {
                     let event = ExtensionEvent::SessionBeforeRefine(
-                            crate::core::extensions::types::SessionBeforeRefinePayload {
-                                preparation,
-                            },
-                        );
+                        crate::core::extensions::types::SessionBeforeRefinePayload { preparation },
+                    );
                     tokio::select! {
                         biased;
                         _ = signal.cancelled() => return Err("Refinement was aborted".to_string()),
@@ -13691,7 +14902,8 @@ impl AgentSession {
                     .map(|parent| parent.to_string_lossy().to_string());
                 if let Some(parent) = parent {
                     target_dir = Some(parent);
-                    if Path::new(&target_dir.clone().unwrap_or_default()) == Path::new(&global_dir) {
+                    if Path::new(&target_dir.clone().unwrap_or_default()) == Path::new(&global_dir)
+                    {
                         target_scope = HarnessScope::Global;
                     }
                 }
@@ -13709,7 +14921,8 @@ impl AgentSession {
         // Keep the exact read baseline through apply/save. If access failed or
         // another writer changes the bytes, a blank/stale state must never win.
         let loaded = load_harness_state_details(&target_dir, target_scope);
-        if loaded.status == crate::core::refinement::refinement::HarnessStateLoadStatus::Unreadable {
+        if loaded.status == crate::core::refinement::refinement::HarnessStateLoadStatus::Unreadable
+        {
             return Err(format!(
                 "Harness state could not be read ({}); refusing to apply refinement. Reload and retry.",
                 loaded.reason.as_deref().unwrap_or("load failed"),
@@ -13760,11 +14973,10 @@ impl AgentSession {
                 eprintln!("Warning: {warning}");
             }
         }
-        let _ = self
-            .session_manager
-            .lock()
-            .unwrap()
-            .append_custom_entry(REFINEMENT_CUSTOM_TYPE, Some(serde_json::to_value(&result).unwrap_or(Value::Null)));
+        let _ = self.session_manager.lock().unwrap().append_custom_entry(
+            REFINEMENT_CUSTOM_TYPE,
+            Some(serde_json::to_value(&result).unwrap_or(Value::Null)),
+        );
         self.record_refinement_outcome(&result);
         self.record_refinement_notice(&result, source);
         // Listener failures must not flip a successful refinement into a reported
@@ -13776,19 +14988,21 @@ impl AgentSession {
         // (agent-session.ts:9311-9322); extension emit failures are swallowed.
         if let Some(runner) = self.extension_runner() {
             runner
-                .emit(ExtensionEvent::RefineComplete(crate::core::extensions::types::RefineCompletePayload {
-                    id: result.id.clone(),
-                    summary: result.summary.clone(),
-                    applied_edits: result
-                        .applied_edits
-                        .iter()
-                        .filter(|edit| edit.applied)
-                        .count() as f64,
-                    scope: match result.scope.unwrap_or(HarnessScope::Local) {
-                        HarnessScope::Global => "global".to_string(),
-                        HarnessScope::Local => "local".to_string(),
+                .emit(ExtensionEvent::RefineComplete(
+                    crate::core::extensions::types::RefineCompletePayload {
+                        id: result.id.clone(),
+                        summary: result.summary.clone(),
+                        applied_edits: result
+                            .applied_edits
+                            .iter()
+                            .filter(|edit| edit.applied)
+                            .count() as f64,
+                        scope: match result.scope.unwrap_or(HarnessScope::Local) {
+                            HarnessScope::Global => "global".to_string(),
+                            HarnessScope::Local => "local".to_string(),
+                        },
                     },
-                }))
+                ))
                 .await;
         }
         Ok(result)
@@ -13822,9 +15036,8 @@ impl AgentSession {
         while {
             let refine_in_flight = { self.refine_in_flight.lock().unwrap().is_some() };
             let refine_plan_in_flight = { self.refine_plan_in_flight.lock().unwrap().is_some() };
-            let serialized_plan_in_flight = {
-                self.serialized_plan_in_flight.lock().unwrap().is_some()
-            };
+            let serialized_plan_in_flight =
+                { self.serialized_plan_in_flight.lock().unwrap().is_some() };
             refine_in_flight || refine_plan_in_flight || serialized_plan_in_flight
         } {
             if { self.refine_in_flight.lock().unwrap().is_some() } {
@@ -13845,12 +15058,17 @@ impl AgentSession {
                     continue;
                 }
                 let _ = self.agent.wait_for_idle().await;
-                self.serialized_explicit_refine_options.lock().unwrap().take();
+                self.serialized_explicit_refine_options
+                    .lock()
+                    .unwrap()
+                    .take();
             }
         }
 
         let signal = self.refinement_signal();
-        let plan = self.plan_refine_for_trigger(options, &source, signal.clone()).await;
+        let plan = self
+            .plan_refine_for_trigger(options, &source, signal.clone())
+            .await;
         let plan = match plan {
             Ok(plan) => plan,
             Err(error) => {
@@ -13869,10 +15087,11 @@ impl AgentSession {
                 let options = options.clone();
                 let source = source.clone();
                 let signal = signal.clone();
-                let future: BoxFuture<Result<RefinementResult, String>> =
-                    Box::pin(async move {
-                        session.apply_refine(&plan, &options, &source, Some(&signal)).await
-                    });
+                let future: BoxFuture<Result<RefinementResult, String>> = Box::pin(async move {
+                    session
+                        .apply_refine(&plan, &options, &source, Some(&signal))
+                        .await
+                });
                 future
             }
         });
@@ -13895,9 +15114,7 @@ impl AgentSession {
             let _ = rx.await;
             Ok(())
         });
-        let gen = self
-            .refine_in_flight_gen
-            .fetch_add(1, Ordering::SeqCst);
+        let gen = self.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
         *self.refine_in_flight.lock().unwrap() = Some((gen, settled.shared()));
         let tx = std::sync::Mutex::new(Some(tx));
         Arc::new(move || {
@@ -13926,9 +15143,8 @@ impl AgentSession {
         // Owned-boolean predicate: see drain_pending_refinement_for_disposal. A guard in the
         // `while` condition would be live across the awaits in the body.
         while {
-            let serialized_plan_in_flight = {
-                self.serialized_plan_in_flight.lock().unwrap().is_some()
-            };
+            let serialized_plan_in_flight =
+                { self.serialized_plan_in_flight.lock().unwrap().is_some() };
             let refine_in_flight = { self.refine_in_flight.lock().unwrap().is_some() };
             let refine_plan_in_flight = { self.refine_plan_in_flight.lock().unwrap().is_some() };
             serialized_plan_in_flight || refine_in_flight || refine_plan_in_flight
@@ -13957,7 +15173,9 @@ impl AgentSession {
             return Ok(());
         }
         let signal = self.refinement_signal();
-        let plan = self.plan_refine_for_trigger(options, source, signal.clone()).await;
+        let plan = self
+            .plan_refine_for_trigger(options, source, signal.clone())
+            .await;
         let plan = match plan {
             Ok(plan) => plan,
             Err(error) => {
@@ -13969,7 +15187,9 @@ impl AgentSession {
             self.schedule_session_input_pump();
             return Ok(());
         }
-        let outcome = self.apply_refine(&plan, options, source, Some(&signal)).await;
+        let outcome = self
+            .apply_refine(&plan, options, source, Some(&signal))
+            .await;
         self.notify_session_input_checkpoint_change();
         self.schedule_session_input_pump();
         outcome.map(|_| ())
@@ -13999,7 +15219,9 @@ impl AgentSession {
                     if *branch_version != current {
                         if session.pending_requested_refine.lock().unwrap().is_none() {
                             *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                            session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                            session
+                                .assistant_turns_since_auto_refine
+                                .store(0, Ordering::SeqCst);
                             return true;
                         }
                     } else {
@@ -14010,18 +15232,23 @@ impl AgentSession {
                             }
                         }
                         *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                        session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                        session
+                            .assistant_turns_since_auto_refine
+                            .store(0, Ordering::SeqCst);
                         if session.pending_requested_refine.lock().unwrap().is_none() {
                             return true;
                         }
                     }
                 }
-                if let Some(SerializedBackgroundPlanResult::Skip { explicit }) = bg_result.as_ref() {
+                if let Some(SerializedBackgroundPlanResult::Skip { explicit }) = bg_result.as_ref()
+                {
                     if explicit.unwrap_or(false) {
                         session.emit_refine_failed(REFINEMENT_SKIPPED_MESSAGE);
                     }
                     *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                    session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                    session
+                        .assistant_turns_since_auto_refine
+                        .store(0, Ordering::SeqCst);
                     if session.pending_requested_refine.lock().unwrap().is_none() {
                         return true;
                     }
@@ -14040,10 +15267,7 @@ impl AgentSession {
                         *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
                     }
                     let mut pending = session.pending_requested_refine.lock().unwrap();
-                    if *explicit
-                        && *branch_version == current
-                        && pending.is_none()
-                    {
+                    if *explicit && *branch_version == current && pending.is_none() {
                         *pending = Some(PendingRequestedRefine {
                             instructions: options.instructions.clone(),
                             global: options.global,
@@ -14053,10 +15277,13 @@ impl AgentSession {
                         return true;
                     }
                 }
-                if let Some(SerializedBackgroundPlanResult::Invalidated { .. }) = bg_result.as_ref() {
+                if let Some(SerializedBackgroundPlanResult::Invalidated { .. }) = bg_result.as_ref()
+                {
                     if session.pending_requested_refine.lock().unwrap().is_none() {
                         *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                        session.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                        session
+                            .assistant_turns_since_auto_refine
+                            .store(0, Ordering::SeqCst);
                         return true;
                     }
                 }
@@ -14115,7 +15342,10 @@ impl AgentSession {
             let awaited = plan_in_flight.clone();
             let outcome = awaited.await.unwrap_or(None);
             let mut slot = self.serialized_plan_in_flight.lock().unwrap();
-            if slot.as_ref().is_some_and(|current| current.ptr_eq(&plan_in_flight)) {
+            if slot
+                .as_ref()
+                .is_some_and(|current| current.ptr_eq(&plan_in_flight))
+            {
                 *slot = None;
                 *self.serialized_explicit_refine_options.lock().unwrap() = None;
             }
@@ -14165,9 +15395,7 @@ impl AgentSession {
             let waiter = settled.clone();
             Box::pin(async move { waiter.wait().await })
         };
-        let my_gen = self
-            .refine_in_flight_gen
-            .fetch_add(1, Ordering::SeqCst);
+        let my_gen = self.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
         *self.refine_in_flight.lock().unwrap() = Some((my_gen, slot_future.shared()));
         let outcome = self.apply_refine(plan, options, source, Some(abort)).await;
         settled.resolve();
@@ -14200,7 +15428,6 @@ impl AgentSession {
         }
     }
 
-
     /// `_appendHarnessDigestIfStale()`.
     fn append_harness_digest_if_stale(&self) {
         let digest = self.harness_digest();
@@ -14217,7 +15444,12 @@ impl AgentSession {
     fn latest_context_harness_digest(&self) -> Option<String> {
         let messages = self.agent.state().messages;
         for message in messages.iter().rev() {
-            if let AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, details, .. }) = message {
+            if let AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type,
+                details,
+                ..
+            }) = message
+            {
                 if custom_type == HARNESS_DIGEST_CUSTOM_TYPE {
                     return details
                         .as_ref()
@@ -14289,7 +15521,11 @@ impl AgentSession {
 
     /// `_recordRefinementOutcome(result)`.
     fn record_refinement_outcome(&self, result: &RefinementResult) {
-        self.append_durable_refine_message(&create_refinement_outcome_message(result, true, now_ms_i64()));
+        self.append_durable_refine_message(&create_refinement_outcome_message(
+            result,
+            true,
+            now_ms_i64(),
+        ));
     }
 
     /// `_appendDurableRefineMessage(message)`.
@@ -14305,13 +15541,15 @@ impl AgentSession {
                 message.details.clone(),
             );
         let mut state = self.agent.state();
-        state.messages.push(AgentMessage::Custom(CustomAgentMessage::Custom {
-            custom_type: message.custom_type.clone(),
-            content: message.content.clone(),
-            display: message.display,
-            details: message.details.clone(),
-            timestamp: message.timestamp,
-        }));
+        state
+            .messages
+            .push(AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: message.custom_type.clone(),
+                content: message.content.clone(),
+                display: message.display,
+                details: message.details.clone(),
+                timestamp: message.timestamp,
+            }));
         self.agent.set_state(state);
         self.emit(AgentSessionEvent::MessageStart {
             message: AgentMessage::Custom(CustomAgentMessage::Custom {
@@ -14343,7 +15581,9 @@ impl AgentSession {
             .iter()
             .any(|entry| {
                 entry.get("type").and_then(Value::as_str) == Some("compaction")
-                    && has_provider_checkpoint(&entry.get("details").cloned().unwrap_or(Value::Null))
+                    && has_provider_checkpoint(
+                        &entry.get("details").cloned().unwrap_or(Value::Null),
+                    )
             });
         if !has_checkpoint {
             return;
@@ -14362,7 +15602,10 @@ impl AgentSession {
     fn active_compaction_timestamp(&self) -> Option<f64> {
         // TS 9365-9366: an in-conversation compaction marker wins over the branch.
         for message in self.messages() {
-            if let AgentMessage::Custom(CustomAgentMessage::CompactionSummary { timestamp, .. }) = &message {
+            if let AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
+                timestamp, ..
+            }) = &message
+            {
                 return Some(*timestamp as f64);
             }
         }
@@ -14405,7 +15648,9 @@ impl AgentSession {
         if self.agent_observe_controller.is_none() {
             skills.retain(|skill| skill.name() != AGENT_OBSERVE_SKILL_NAME);
         }
-        if self.agent_observe_controller.is_none() || self.rlm_heartbeat_controller.lock().unwrap().is_none() {
+        if self.agent_observe_controller.is_none()
+            || self.rlm_heartbeat_controller.lock().unwrap().is_none()
+        {
             skills.retain(|skill| skill.name() != ORCHESTRATION_HEARTBEAT_SKILL_NAME);
         }
         skills
@@ -14429,7 +15674,8 @@ impl AgentSession {
                 let rebuilt_at = *self.provider_context_rebuilt_at.lock().unwrap();
                 if (rebuilt_at.is_some()
                     && (usage_message.timestamp as f64) <= rebuilt_at.unwrap_or_default())
-                    || Some(usage_message.model.clone()) != model.as_ref().map(|model| model.id.clone())
+                    || Some(usage_message.model.clone())
+                        != model.as_ref().map(|model| model.id.clone())
                     || Some(usage_message.provider.clone())
                         != model.as_ref().map(|model| model.provider.clone())
                 {
@@ -14460,12 +15706,16 @@ impl AgentSession {
         settings: &CompactionSettings,
         queue_autonomous_continuation: bool,
     ) -> Result<bool, String> {
-        if self.explicitly_stopped() { return Ok(false); }
+        if self.explicitly_stopped() {
+            return Ok(false);
+        }
         if self.pending_requested_compaction.lock().unwrap().is_some() {
             // TS 9480-9482: `_pendingRequestedCompaction` returns
             // `_runAutoCompaction("requested", false)`; this runs before the
             // enabled/threshold checks and consumes the stored instructions.
-            return Ok(self.run_auto_compaction(COMPACTION_REASON_REQUESTED, false).await);
+            return Ok(self
+                .run_auto_compaction(COMPACTION_REASON_REQUESTED, false)
+                .await);
         }
         if !settings.enabled || !self.auto_compaction_enabled.load(Ordering::SeqCst) {
             return Ok(false);
@@ -14476,7 +15726,9 @@ impl AgentSession {
         let Some(assistant) = self.find_last_assistant_message() else {
             return Ok(false);
         };
-        let Some(tokens) = self.get_threshold_context_tokens(&assistant, self.active_compaction_timestamp()) else {
+        let Some(tokens) =
+            self.get_threshold_context_tokens(&assistant, self.active_compaction_timestamp())
+        else {
             return Ok(false);
         };
         if !should_compact_for_model(tokens, &model, settings) {
@@ -14494,7 +15746,8 @@ impl AgentSession {
         // them. The pre-turn path passes `queueAutonomousContinuation: false`
         // (TS 5095), which is expressed by the `queue_autonomous_continuation` flag.
         if queue_autonomous_continuation {
-            let rlm_outcome = self.handle_rlm_child_turn_outcome(&assistant, true, Some("threshold"));
+            let rlm_outcome =
+                self.handle_rlm_child_turn_outcome(&assistant, true, Some("threshold"));
             let has_continuation = rlm_outcome
                 .as_ref()
                 .and_then(|outcome| outcome.continuation.clone())
@@ -14504,20 +15757,26 @@ impl AgentSession {
                 .map(|outcome| outcome.terminal)
                 .unwrap_or(false);
             if has_continuation {
-                self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
-            } else if !terminal && self.queue_goal_continuation_for_threshold_compaction(&assistant) {
-                self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+                self.continue_after_threshold_compaction
+                    .store(true, Ordering::SeqCst);
+            } else if !terminal && self.queue_goal_continuation_for_threshold_compaction(&assistant)
+            {
+                self.continue_after_threshold_compaction
+                    .store(true, Ordering::SeqCst);
             } else if !terminal
                 && self
                     .queue_autonomous_continuation_for_threshold_compaction(&assistant)
                     .await
                     .is_some()
             {
-                self.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+                self.continue_after_threshold_compaction
+                    .store(true, Ordering::SeqCst);
             }
         }
         // TS 9510: `_runAutoCompaction("threshold", false)`.
-        Ok(self.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await)
+        Ok(self
+            .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+            .await)
     }
 
     /// `isContextOverflow(assistantMessage, contextWindow)` + `sameModel` +
@@ -14532,7 +15791,8 @@ impl AgentSession {
         assistant: &AssistantMessage,
         settings: &CompactionSettings,
     ) -> Option<bool> {
-        self.check_compaction_overflow_with(assistant, settings, true).await
+        self.check_compaction_overflow_with(assistant, settings, true)
+            .await
     }
 
     /// `check_compaction_overflow` with the TS `skipAbortedCheck` flag
@@ -14543,7 +15803,9 @@ impl AgentSession {
         settings: &CompactionSettings,
         skip_aborted_check: bool,
     ) -> Option<bool> {
-        if self.explicitly_stopped() { return Some(false); }
+        if self.explicitly_stopped() {
+            return Some(false);
+        }
         if assistant.stop_reason == STOP_REASON_ABORTED {
             // TS 9413-9419: an abort drops any compaction and refine request the
             // turn made; the turn that would service them never runs.
@@ -14555,11 +15817,15 @@ impl AgentSession {
             }
         }
         // TS 9434: `contextWindow = this.model ? getModelInputLimit(this.model) : 0`.
-        let context_window = self.model().map(|model| get_model_input_limit(&model)).unwrap_or(0.0);
+        let context_window = self
+            .model()
+            .map(|model| get_model_input_limit(&model))
+            .unwrap_or(0.0);
         // TS 9440-9441: skip overflow for a message from a different model.
-        let same_model = self.model().map(|model| {
-            assistant.provider == model.provider && assistant.model == model.id
-        }).unwrap_or(false);
+        let same_model = self
+            .model()
+            .map(|model| assistant.provider == model.provider && assistant.model == model.id)
+            .unwrap_or(false);
         if !same_model {
             return None;
         }
@@ -14603,7 +15869,10 @@ impl AgentSession {
         // TS 9470-9476: drop the error message from agent state (history keeps it).
         self.remove_failed_assistant_from_state(assistant);
         // TS 9477.
-        Some(self.run_auto_compaction(COMPACTION_REASON_OVERFLOW, true).await)
+        Some(
+            self.run_auto_compaction(COMPACTION_REASON_OVERFLOW, true)
+                .await,
+        )
     }
 
     /// `_endCompactionUnsuccessfully(reason, outcome, message, options)`
@@ -14670,7 +15939,10 @@ impl AgentSession {
                 false,
                 now_ms_i64(),
             );
-            self.unpersisted_outcomes.lock().unwrap().push(message.clone());
+            self.unpersisted_outcomes
+                .lock()
+                .unwrap()
+                .push(message.clone());
         }
         // TS 9568-9570: message_start AND message_end, unlike a plain append.
         let agent_message = AgentMessage::Custom(CustomAgentMessage::Custom {
@@ -14696,7 +15968,9 @@ impl AgentSession {
     /// Returns the TS `boolean`: true only for a successful compaction with
     /// `willRetry` (overflow recovery), which tells the caller to keep the loop.
     async fn run_auto_compaction(self: &Arc<Self>, reason: &str, will_retry: bool) -> bool {
-        if self.explicitly_stopped() { return false; }
+        if self.explicitly_stopped() {
+            return false;
+        }
         // TS 9579-9590: any compaction consumes a pending model request and honors
         // its instructions.
         let custom_instructions = self
@@ -14707,23 +15981,31 @@ impl AgentSession {
             .and_then(|pending| pending.custom_instructions);
         let should_continue_after_compaction = (reason == COMPACTION_REASON_THRESHOLD
             || reason == COMPACTION_REASON_REQUESTED)
-            && self.continue_after_threshold_compaction.load(Ordering::SeqCst);
+            && self
+                .continue_after_threshold_compaction
+                .load(Ordering::SeqCst);
         let queued_autonomous_continuations_for_this_compaction: Vec<AgentMessage> =
             if reason == COMPACTION_REASON_THRESHOLD && should_continue_after_compaction {
-                std::mem::take(&mut *self
-                    .pending_threshold_compaction_autonomous_messages
-                    .lock()
-                    .unwrap())
+                std::mem::take(
+                    &mut *self
+                        .pending_threshold_compaction_autonomous_messages
+                        .lock()
+                        .unwrap(),
+                )
             } else {
                 Vec::new()
             };
         let queued_goal_continuation_for_this_compaction: Option<AgentMessage> =
             if reason == COMPACTION_REASON_THRESHOLD && should_continue_after_compaction {
-                self.queued_goal_threshold_continuation.lock().unwrap().clone()
+                self.queued_goal_threshold_continuation
+                    .lock()
+                    .unwrap()
+                    .clone()
             } else {
                 None
             };
-        self.continue_after_threshold_compaction.store(false, Ordering::SeqCst);
+        self.continue_after_threshold_compaction
+            .store(false, Ordering::SeqCst);
 
         // Unlike the single-threaded TS microtask queue, Tokio can run a spawned
         // continuation immediately. Publish its fence before scheduling it or
@@ -14733,7 +16015,9 @@ impl AgentSession {
             // Register cancellation atomically with the explicit-stop fence. A
             // late agent_end must not create an uncancellable cleanup request.
             let _admission = self.explicit_stop_admission.lock().unwrap();
-            if self.explicitly_stopped() { return false; }
+            if self.explicitly_stopped() {
+                return false;
+            }
             let operation = self.begin_compaction_operation();
             *self.auto_compaction_abort_controller.lock().unwrap() = Some(controller.clone());
             operation
@@ -14810,9 +16094,8 @@ impl AgentSession {
                         self.queue_pending_rlm_continuation();
                         let has_queued_messages =
                             self.agent.has_queued_messages() || self.has_pending_session_work();
-                        let will_continue = will_retry
-                            || should_continue_after_compaction
-                            || has_queued_messages;
+                        let will_continue =
+                            will_retry || should_continue_after_compaction || has_queued_messages;
                         if will_retry {
                             // TS 9651-9657: strip a trailing error assistant message.
                             let mut state = self.agent.state();
@@ -14835,7 +16118,9 @@ impl AgentSession {
                             self.schedule_auto_refine_after_compaction(will_continue);
                         } else if should_continue_after_compaction || has_queued_messages {
                             // TS 9661-9665.
-                            self.schedule_post_compaction_continue(should_continue_after_compaction);
+                            self.schedule_post_compaction_continue(
+                                should_continue_after_compaction,
+                            );
                             self.schedule_auto_refine_after_compaction(will_continue);
                         } else {
                             // TS 9666-9668.
@@ -14911,8 +16196,7 @@ impl AgentSession {
             queued_autonomous_continuations_for_this_compaction,
         );
         // Only the exact cancellation sentinels identify an aborted attempt.
-        let aborted = error == COMPACTION_CANCELLED_ERROR_MESSAGE
-            || error == ABORTED_ERROR_MESSAGE;
+        let aborted = error == COMPACTION_CANCELLED_ERROR_MESSAGE || error == ABORTED_ERROR_MESSAGE;
         if aborted {
             // A user-driven cancel is not a failed attempt; the next threshold
             // check starts without a cooldown.
@@ -14937,10 +16221,7 @@ impl AgentSession {
                 custom_instructions,
             );
             if !self.session_input_pump_suspended.load(Ordering::SeqCst) {
-                self.resume_auto_compaction_after_failure(
-                    reason,
-                    should_continue_after_compaction,
-                );
+                self.resume_auto_compaction_after_failure(reason, should_continue_after_compaction);
             }
             return;
         }
@@ -15026,7 +16307,8 @@ impl AgentSession {
     }
 
     fn threshold_compaction_retry_in_cooldown(&self) -> bool {
-        self.threshold_compaction_retry_cooldown_remaining().is_some()
+        self.threshold_compaction_retry_cooldown_remaining()
+            .is_some()
     }
 
     fn record_threshold_compaction_failure(&self) {
@@ -15048,15 +16330,14 @@ impl AgentSession {
 
     /// `setAutoCompactionEnabled(enabled)`.
     pub fn set_auto_compaction_enabled(&self, enabled: bool) {
-        self.auto_compaction_enabled.store(enabled, Ordering::SeqCst);
+        self.auto_compaction_enabled
+            .store(enabled, Ordering::SeqCst);
     }
 
     /// `get autoCompactionEnabled()`.
     pub fn auto_compaction_enabled(&self) -> bool {
         self.auto_compaction_enabled.load(Ordering::SeqCst)
     }
-
-
 }
 
 // ---------------------------------------------------------------------------
@@ -15075,10 +16356,12 @@ fn agent_message_timestamp(message: &AgentMessage) -> i64 {
         AgentMessage::Message(Message::User(message)) => message.timestamp,
         AgentMessage::Message(Message::Assistant(message)) => message.timestamp,
         AgentMessage::Message(Message::ToolResult(message)) => message.timestamp,
-        AgentMessage::Custom(CustomAgentMessage::Custom { timestamp, .. }
+        AgentMessage::Custom(
+            CustomAgentMessage::Custom { timestamp, .. }
             | CustomAgentMessage::BashExecution { timestamp, .. }
             | CustomAgentMessage::BranchSummary { timestamp, .. }
-            | CustomAgentMessage::CompactionSummary { timestamp, .. }) => *timestamp,
+            | CustomAgentMessage::CompactionSummary { timestamp, .. },
+        ) => *timestamp,
     }
 }
 
@@ -15096,7 +16379,9 @@ fn assistant_message_key(message: &AssistantMessage) -> String {
 /// `deliveryMessageOf(message)`.
 fn delivery_message_of(message: &AgentMessage) -> DeliveryMessage {
     match message {
-        AgentMessage::Message(pi_ai::types::Message::User(user)) => DeliveryMessage::User(user.clone()),
+        AgentMessage::Message(pi_ai::types::Message::User(user)) => {
+            DeliveryMessage::User(user.clone())
+        }
         other => DeliveryMessage::Custom(custom_message_of(other)),
     }
 }
@@ -15123,7 +16408,10 @@ fn record_message_custom_type(message: &DeliveryMessage) -> Option<String> {
 }
 
 /// `sessionActionSnapshotsEqual(left, right)`.
-fn session_action_snapshots_equal(left: &SessionActionSnapshot, right: &SessionActionSnapshot) -> bool {
+fn session_action_snapshots_equal(
+    left: &SessionActionSnapshot,
+    right: &SessionActionSnapshot,
+) -> bool {
     left == right
 }
 
@@ -15171,7 +16459,9 @@ fn custom_message_key(message: &CustomMessage) -> String {
 /// `agentMessageFromDelivery(message)`.
 fn agent_message_from_delivery(message: &DeliveryMessage) -> AgentMessage {
     match message {
-        DeliveryMessage::User(user) => AgentMessage::Message(pi_ai::types::Message::User(user.clone())),
+        DeliveryMessage::User(user) => {
+            AgentMessage::Message(pi_ai::types::Message::User(user.clone()))
+        }
         DeliveryMessage::Custom(custom) => AgentMessage::Custom(CustomAgentMessage::Custom {
             custom_type: custom.custom_type.clone(),
             content: custom.content.clone(),
@@ -15311,7 +16601,10 @@ fn refine_options_from_command(options: &RefineCommandOptions) -> RefineOptions 
 
 /// `providerStreamFailureKind` retryability.
 fn provider_stream_failure_kind_is_retryable(kind: &str) -> bool {
-    !matches!(kind, "authentication" | "invalid_request" | "context_overflow")
+    !matches!(
+        kind,
+        "authentication" | "invalid_request" | "context_overflow"
+    )
 }
 
 /// `sessionActionRecoveryOf(action)`.
@@ -15350,11 +16643,13 @@ fn session_action_recovery_of(action: &QueuedSessionAction) -> Option<SessionAct
             accepted_agent_message: turn.accepted_agent_message,
             accepted_before_completion: turn.accepted_before_completion,
         },
-        QueuedActionPayload::SessionCommand(command) => SessionActionRecoveryPayload::SessionCommand {
-            text: command.base.text.clone(),
-            command: command.base.command.clone(),
-            images: command.images.clone(),
-        },
+        QueuedActionPayload::SessionCommand(command) => {
+            SessionActionRecoveryPayload::SessionCommand {
+                text: command.base.text.clone(),
+                command: command.base.command.clone(),
+                images: command.images.clone(),
+            }
+        }
     };
     Some(SessionActionRecoveryAction {
         id: action.id.clone(),
@@ -15531,12 +16826,17 @@ pub type ActionExecutionAlias = crate::core::session_action_store::ActionExecuti
 
 impl AgentSession {
     /// `compact(customInstructions, options)`.
-    async fn compact(self: &Arc<Self>, custom_instructions: Option<&str>, skip_abort: bool) -> Result<crate::core::compaction::compaction::CompactionResult, String> {
+    async fn compact(
+        self: &Arc<Self>,
+        custom_instructions: Option<&str>,
+        skip_abort: bool,
+    ) -> Result<crate::core::compaction::compaction::CompactionResult, String> {
         if skip_abort && self.is_streaming() {
             return Err("Cannot compact without aborting while the agent is running.".to_string());
         }
-        let had_post_compaction_continue =
-            self.post_compaction_continuation_scheduled.load(Ordering::SeqCst);
+        let had_post_compaction_continue = self
+            .post_compaction_continuation_scheduled
+            .load(Ordering::SeqCst);
         let continue_after_session_input = self
             .post_compaction_continuation_settlement
             .lock()
@@ -15591,7 +16891,8 @@ impl AgentSession {
             }
             Err(error) => {
                 let message = self.as_error(&error);
-                let aborted = message == "Compaction cancelled" || error == COMPACTION_CANCELLED_ERROR_MESSAGE;
+                let aborted = message == "Compaction cancelled"
+                    || error == COMPACTION_CANCELLED_ERROR_MESSAGE;
                 // TS 8129: `error instanceof CompactionSkippedError`, both messages.
                 let skipped = error == COMPACTION_SKIPPED_ERROR_MESSAGE
                     || error == COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE;
@@ -15666,7 +16967,8 @@ impl AgentSession {
         // Queued agent or session-owned inputs resume the loop; defer refine
         // behind them instead of interleaving it before their turns.
         self.schedule_auto_refine_after_compaction(
-            self.goal_continuation_awaits_rlm_work.load(Ordering::SeqCst)
+            self.goal_continuation_awaits_rlm_work
+                .load(Ordering::SeqCst)
                 || had_post_compaction_continue
                 || self.agent.has_queued_messages()
                 || self.unfinished_action_count() > 0,
@@ -15730,10 +17032,12 @@ impl AgentSession {
             let policy = crate::core::model_tool_output_policy::resolve_model_tool_output_policy(
                 Some(&settings.get_model_tool_output_policy()),
             );
-            let scope = manager.get_session_artifact_dir().map(|dir| ModelToolOutputScope {
-                session_id: manager.get_session_id(),
-                session_artifact_dir: dir,
-            });
+            let scope = manager
+                .get_session_artifact_dir()
+                .map(|dir| ModelToolOutputScope {
+                    session_id: manager.get_session_id(),
+                    session_artifact_dir: dir,
+                });
             (policy, scope)
         };
         let converted = crate::core::messages::convert_to_llm(
@@ -15787,229 +17091,275 @@ impl AgentSession {
             .model()
             .ok_or_else(|| format_no_model_selected_message())?;
         let compaction_metrics = crate::core::compaction::metrics::CompactionMetrics::new(
-            self.agent.performance_metrics().map(|metrics| metrics.recorder), &model,
+            self.agent
+                .performance_metrics()
+                .map(|metrics| metrics.recorder),
+            &model,
         );
-        let total_phase = compaction_metrics.phase(pi_agent_core::performance_metrics::PerformanceMetricOperation::Compaction);
+        let total_phase = compaction_metrics
+            .phase(pi_agent_core::performance_metrics::PerformanceMetricOperation::Compaction);
         let completed = async {
-        let prepare_phase = compaction_metrics.phase(pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionPrepare);
-        let prepared = async {
-        let auth = match auth {
-            Some(auth) => auth,
-            None => self.get_required_request_auth(&model).await?,
-        };
-        // TS `_performCompaction`: the body reads the session's configured
-        // compaction settings, not the library defaults.
-        let settings = self.compaction_settings();
-        let entries = self.session_manager.lock().unwrap().get_branch(None);
-        // `pathEntries` are the branch entries; this module reads them as the
-        // compaction-module entry shapes.
-        let path_entries: Vec<CompactionSessionEntry> = entries
-            .iter()
-            .filter_map(compaction_session_entry_from)
-            .collect();
-        // tokensBefore measures the active context, including unpersisted outcomes,
-        // not transcript size. Native compaction receives this same context.
-        // Harness digests are regenerated and excluded from both.
-        let messages = without_harness_digests_for_compaction(&self.messages());
-        let preparation = prepare_compaction(
-            &path_entries,
-            &settings,
-            &|_entries: &[CompactionSessionEntry]| messages.clone(),
-        );
-        let preparation = match preparation {
-            Some(preparation) => preparation,
-            None => {
-                // TS 8243-8247 distinguishes an already-compacted branch from a
-                // session that is simply too short.
-                let last_entry = path_entries.last();
-                if matches!(last_entry, Some(CompactionSessionEntry::Compaction { .. })) {
-                    return Err(COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE.to_string());
-                }
-                return Err(COMPACTION_SKIPPED_ERROR_MESSAGE.to_string());
-            }
-        };
-        // TS 8263-8280: `session_before_compact` may cancel the compaction or supply
-        // its own compaction result. TS 8250-8251 declares the same two locals.
-        let mut extension_compaction: Option<crate::core::extensions::types::CompactionResult> = None;
-        let mut from_extension = false;
-        if let Some(runner) = self.extension_runner() {
-            if runner.has_handlers("session_before_compact") {
-                let result = runner
-                    .emit(ExtensionEvent::SessionBeforeCompact(
-                        crate::core::extensions::types::SessionBeforeCompactPayload {
-                            preparation: extension_compaction_preparation(&preparation),
-                            // `branchEntries: pathEntries` (TS 8267).
-                            branch_entries: entries
-                                .iter()
-                                .filter_map(|entry| {
-                                    serde_json::from_value(Value::Object(entry.clone())).ok()
-                                })
-                                .collect(),
-                            custom_instructions: custom_instructions.clone(),
-                        },
-                    ))
-                    .await;
-                let parsed = result
-                    .and_then(|value| {
-                        serde_json::from_value::<
-                            crate::core::extensions::types::SessionBeforeCompactResult,
-                        >(value)
-                        .ok()
-                    })
-                    .unwrap_or_default();
-                if parsed.cancel == Some(true) {
-                    return Err(COMPACTION_CANCELLED_ERROR_MESSAGE.to_string());
-                }
-                if let Some(compaction) = parsed.compaction {
-                    extension_compaction = Some(compaction);
-                    from_extension = true;
-                }
-            }
-        }
-        let headers: Option<serde_json::Map<String, Value>> = if auth.headers.is_empty() {
-            None
-        } else {
-            Some(
-                auth.headers
+            let prepare_phase = compaction_metrics.phase(
+                pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionPrepare,
+            );
+            let prepared = async {
+                let auth = match auth {
+                    Some(auth) => auth,
+                    None => self.get_required_request_auth(&model).await?,
+                };
+                // TS `_performCompaction`: the body reads the session's configured
+                // compaction settings, not the library defaults.
+                let settings = self.compaction_settings();
+                let entries = self.session_manager.lock().unwrap().get_branch(None);
+                // `pathEntries` are the branch entries; this module reads them as the
+                // compaction-module entry shapes.
+                let path_entries: Vec<CompactionSessionEntry> = entries
                     .iter()
-                    .map(|(key, value)| (key.clone(), Value::String(value.clone())))
-                    .collect(),
-            )
-        };
-        Ok::<_, String>((auth, preparation, extension_compaction, from_extension, headers, messages))
-        }.await;
-        prepare_phase.finish_result(&prepared, signal.is_cancelled() || prepared.as_ref().is_err_and(|error| error == COMPACTION_CANCELLED_ERROR_MESSAGE));
-        let (auth, preparation, extension_compaction, from_extension, headers, messages) = prepared?;
-        // TS 8322/8323-8343: the summary call carries the provider retry policy, the
-        // transformed provider context and the request options (20-minute timeout,
-        // session id, service tier and reasoning). `onPayload`/`onResponse`
-        // (TS 8339-8340) are UNRESOLVED: the `AgentHandle` trait declared in this
-        // file exposes `set_on_payload`/`set_on_response` but no getter, and the
-        // stored hooks live in `impl AgentHandle for Arc<Agent>`
-        // (`core/agent_session/agent_handle.rs:149-155`), which this file does not own.
-        let result = match extension_compaction {
-            // TS 8282-8283: an extension compaction replaces the summary call, the
-            // context and the options entirely.
-            Some(compaction) => crate::core::compaction::compaction::CompactionResult {
-                summary: compaction.summary,
-                first_kept_entry_id: compaction.first_kept_entry_id,
-                tokens_before: compaction.tokens_before,
-                details: compaction
-                    .details
-                    .clone()
-                    .and_then(|details| serde_json::from_value(details).ok()),
-                usage: compaction
-                    .usage
-                    .clone()
-                    .and_then(|usage| serde_json::from_value(usage).ok()),
-            },
-            None => {
-                let provider_context = self.compaction_provider_context(&messages, &signal).await;
-                let mut request_options = self.compaction_request_options();
-                // Native compaction does not use the text-summary call runner.
-                request_options.simple.stream.headers = if auth.headers.is_empty() {
+                    .filter_map(compaction_session_entry_from)
+                    .collect();
+                // tokensBefore measures the active context, including unpersisted outcomes,
+                // not transcript size. Native compaction receives this same context.
+                // Harness digests are regenerated and excluded from both.
+                let messages = without_harness_digests_for_compaction(&self.messages());
+                let preparation = prepare_compaction(
+                    &path_entries,
+                    &settings,
+                    &|_entries: &[CompactionSessionEntry]| messages.clone(),
+                );
+                let preparation = match preparation {
+                    Some(preparation) => preparation,
+                    None => {
+                        // TS 8243-8247 distinguishes an already-compacted branch from a
+                        // session that is simply too short.
+                        let last_entry = path_entries.last();
+                        if matches!(last_entry, Some(CompactionSessionEntry::Compaction { .. })) {
+                            return Err(COMPACTION_ALREADY_COMPACTED_ERROR_MESSAGE.to_string());
+                        }
+                        return Err(COMPACTION_SKIPPED_ERROR_MESSAGE.to_string());
+                    }
+                };
+                // TS 8263-8280: `session_before_compact` may cancel the compaction or supply
+                // its own compaction result. TS 8250-8251 declares the same two locals.
+                let mut extension_compaction: Option<
+                    crate::core::extensions::types::CompactionResult,
+                > = None;
+                let mut from_extension = false;
+                if let Some(runner) = self.extension_runner() {
+                    if runner.has_handlers("session_before_compact") {
+                        let result = runner
+                            .emit(ExtensionEvent::SessionBeforeCompact(
+                                crate::core::extensions::types::SessionBeforeCompactPayload {
+                                    preparation: extension_compaction_preparation(&preparation),
+                                    // `branchEntries: pathEntries` (TS 8267).
+                                    branch_entries: entries
+                                        .iter()
+                                        .filter_map(|entry| {
+                                            serde_json::from_value(Value::Object(entry.clone()))
+                                                .ok()
+                                        })
+                                        .collect(),
+                                    custom_instructions: custom_instructions.clone(),
+                                },
+                            ))
+                            .await;
+                        let parsed = result
+                            .and_then(|value| {
+                                serde_json::from_value::<
+                                    crate::core::extensions::types::SessionBeforeCompactResult,
+                                >(value)
+                                .ok()
+                            })
+                            .unwrap_or_default();
+                        if parsed.cancel == Some(true) {
+                            return Err(COMPACTION_CANCELLED_ERROR_MESSAGE.to_string());
+                        }
+                        if let Some(compaction) = parsed.compaction {
+                            extension_compaction = Some(compaction);
+                            from_extension = true;
+                        }
+                    }
+                }
+                let headers: Option<serde_json::Map<String, Value>> = if auth.headers.is_empty() {
                     None
                 } else {
-                    Some(auth.headers.clone())
+                    Some(
+                        auth.headers
+                            .iter()
+                            .map(|(key, value)| (key.clone(), Value::String(value.clone())))
+                            .collect(),
+                    )
                 };
-                // TS 8322: `providerRetryPolicy(this.settingsManager)`.
-                let retry = self.provider_retry_policy();
-                crate::core::compaction::compaction::compact_with_metrics(
-                    &preparation,
-                    &model,
-                    &auth.api_key,
-                    custom_instructions.as_deref(),
-                    Some(&signal),
-                    Some(&self.thinking_level()),
-                    crate::core::compaction::compaction::default_summary_call_runner(headers.clone()),
-                    Some(&crate::core::compaction::compaction::ProviderRetryPolicy {
-                        enabled: retry.enabled,
-                        max_retries: retry.max_retries,
-                        base_delay_ms: retry.base_delay_ms,
-                        max_retry_delay_ms: retry.max_retry_delay_ms,
-                    }),
-                    Some((&provider_context, Some(&request_options))),
-                    &compaction_metrics,
-                )
-                .await?
+                Ok::<_, String>((
+                    auth,
+                    preparation,
+                    extension_compaction,
+                    from_extension,
+                    headers,
+                    messages,
+                ))
             }
-        };
-        if signal.is_cancelled() {
-            return Err(COMPACTION_CANCELLED_ERROR_MESSAGE.to_string());
-        }
-        // T05-NEW-1 (coordinator-approved repair, discovered-during-validation): the
-        // Mutex guard temporary spans the whole statement, so `_harnessDigest()`
-        // (TS 8369) re-locking the same non-reentrant session manager deadlocked
-        // every durable-session compaction. Hoist the digest before the guard.
-        let harness_digest = self.harness_digest();
-        let persist_phase = compaction_metrics.phase(pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionPersist);
-        let persisted = self.session_manager.lock().unwrap().append_compaction(
-            &result.summary,
-            &result.first_kept_entry_id,
-            result.tokens_before,
-            result
-                .details
-                .as_ref()
-                .and_then(|details| serde_json::to_value(details).ok()),
-            // TS 8366: `fromExtension`.
-            Some(from_extension),
-            custom_instructions.as_deref(),
-            result.usage.as_ref(),
-
-            // TS 8369: `this._harnessDigest()`.
-            Some(&harness_digest),
-        );
-        persist_phase.finish_result(&persisted, signal.is_cancelled());
-        persisted?;
-        let restore_phase = compaction_metrics.phase(pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionRestore);
-        let restored = async {
-        // TS 8383-8386: the live conversation is replaced by the compacted context,
-        // merged with the outcomes that have not been persisted yet.
-        {
-            let context = self.build_session_context();
-            let mut state = self.agent.state();
-            state.messages = context.messages;
-            self.agent.set_state(state);
-            self.restore_late_ipython_sent_agent_messages();
-        }
-        // TS 8388-8397: the newest compaction entry is announced to extensions.
-        let saved_entry = {
-            let branch = self.session_manager.lock().unwrap().get_branch(None);
-            get_latest_compaction_entry(&branch)
-        };
-        if let Some(saved_entry) = saved_entry {
-            if saved_entry.get("summary").and_then(Value::as_str) == Some(result.summary.as_str()) {
-                if let Some(runner) = self.extension_runner() {
-                    let payload = crate::core::extensions::types::SessionCompactPayload {
-                        compaction_entry: serde_json::from_value(Value::Object(saved_entry))
-                            .unwrap_or_else(|_| crate::core::extensions::types::CompactionEntry {
-                                entry_type: "compaction".to_string(),
-                                summary: result.summary.clone(),
-                                first_kept_entry_id: result.first_kept_entry_id.clone(),
-                                tokens_before: result.tokens_before,
-                                extra: Default::default(),
-                            }),
-                        from_extension,
+            .await;
+            prepare_phase.finish_result(
+                &prepared,
+                signal.is_cancelled()
+                    || prepared
+                        .as_ref()
+                        .is_err_and(|error| error == COMPACTION_CANCELLED_ERROR_MESSAGE),
+            );
+            let (auth, preparation, extension_compaction, from_extension, headers, messages) =
+                prepared?;
+            // TS 8322/8323-8343: the summary call carries the provider retry policy, the
+            // transformed provider context and the request options (20-minute timeout,
+            // session id, service tier and reasoning). `onPayload`/`onResponse`
+            // (TS 8339-8340) are UNRESOLVED: the `AgentHandle` trait declared in this
+            // file exposes `set_on_payload`/`set_on_response` but no getter, and the
+            // stored hooks live in `impl AgentHandle for Arc<Agent>`
+            // (`core/agent_session/agent_handle.rs:149-155`), which this file does not own.
+            let result = match extension_compaction {
+                // TS 8282-8283: an extension compaction replaces the summary call, the
+                // context and the options entirely.
+                Some(compaction) => crate::core::compaction::compaction::CompactionResult {
+                    summary: compaction.summary,
+                    first_kept_entry_id: compaction.first_kept_entry_id,
+                    tokens_before: compaction.tokens_before,
+                    details: compaction
+                        .details
+                        .clone()
+                        .and_then(|details| serde_json::from_value(details).ok()),
+                    usage: compaction
+                        .usage
+                        .clone()
+                        .and_then(|usage| serde_json::from_value(usage).ok()),
+                },
+                None => {
+                    let provider_context =
+                        self.compaction_provider_context(&messages, &signal).await;
+                    let mut request_options = self.compaction_request_options();
+                    // Native compaction does not use the text-summary call runner.
+                    request_options.simple.stream.headers = if auth.headers.is_empty() {
+                        None
+                    } else {
+                        Some(auth.headers.clone())
                     };
-                    let _ = runner
-                        .emit(crate::core::extensions::types::ExtensionEvent::SessionCompact(payload))
-                        .await;
+                    // TS 8322: `providerRetryPolicy(this.settingsManager)`.
+                    let retry = self.provider_retry_policy();
+                    crate::core::compaction::compaction::compact_with_metrics(
+                        &preparation,
+                        &model,
+                        &auth.api_key,
+                        custom_instructions.as_deref(),
+                        Some(&signal),
+                        Some(&self.thinking_level()),
+                        crate::core::compaction::compaction::default_summary_call_runner(
+                            headers.clone(),
+                        ),
+                        Some(&crate::core::compaction::compaction::ProviderRetryPolicy {
+                            enabled: retry.enabled,
+                            max_retries: retry.max_retries,
+                            base_delay_ms: retry.base_delay_ms,
+                            max_retry_delay_ms: retry.max_retry_delay_ms,
+                        }),
+                        Some((&provider_context, Some(&request_options))),
+                        &compaction_metrics,
+                    )
+                    .await?
                 }
+            };
+            if signal.is_cancelled() {
+                return Err(COMPACTION_CANCELLED_ERROR_MESSAGE.to_string());
             }
+            // T05-NEW-1 (coordinator-approved repair, discovered-during-validation): the
+            // Mutex guard temporary spans the whole statement, so `_harnessDigest()`
+            // (TS 8369) re-locking the same non-reentrant session manager deadlocked
+            // every durable-session compaction. Hoist the digest before the guard.
+            let harness_digest = self.harness_digest();
+            let persist_phase = compaction_metrics.phase(
+                pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionPersist,
+            );
+            let persisted = self.session_manager.lock().unwrap().append_compaction(
+                &result.summary,
+                &result.first_kept_entry_id,
+                result.tokens_before,
+                result
+                    .details
+                    .as_ref()
+                    .and_then(|details| serde_json::to_value(details).ok()),
+                // TS 8366: `fromExtension`.
+                Some(from_extension),
+                custom_instructions.as_deref(),
+                result.usage.as_ref(),
+                // TS 8369: `this._harnessDigest()`.
+                Some(&harness_digest),
+            );
+            persist_phase.finish_result(&persisted, signal.is_cancelled());
+            persisted?;
+            let restore_phase = compaction_metrics.phase(
+                pi_agent_core::performance_metrics::PerformanceMetricOperation::CompactionRestore,
+            );
+            let restored = async {
+                // TS 8383-8386: the live conversation is replaced by the compacted context,
+                // merged with the outcomes that have not been persisted yet.
+                {
+                    let context = self.build_session_context();
+                    let mut state = self.agent.state();
+                    state.messages = context.messages;
+                    self.agent.set_state(state);
+                    self.restore_late_ipython_sent_agent_messages();
+                }
+                // TS 8388-8397: the newest compaction entry is announced to extensions.
+                let saved_entry = {
+                    let branch = self.session_manager.lock().unwrap().get_branch(None);
+                    get_latest_compaction_entry(&branch)
+                };
+                if let Some(saved_entry) = saved_entry {
+                    if saved_entry.get("summary").and_then(Value::as_str)
+                        == Some(result.summary.as_str())
+                    {
+                        if let Some(runner) = self.extension_runner() {
+                            let payload = crate::core::extensions::types::SessionCompactPayload {
+                                compaction_entry: serde_json::from_value(Value::Object(
+                                    saved_entry,
+                                ))
+                                .unwrap_or_else(|_| {
+                                    crate::core::extensions::types::CompactionEntry {
+                                        entry_type: "compaction".to_string(),
+                                        summary: result.summary.clone(),
+                                        first_kept_entry_id: result.first_kept_entry_id.clone(),
+                                        tokens_before: result.tokens_before,
+                                        extra: Default::default(),
+                                    }
+                                }),
+                                from_extension,
+                            };
+                            let _ = runner
+                                .emit(
+                                    crate::core::extensions::types::ExtensionEvent::SessionCompact(
+                                        payload,
+                                    ),
+                                )
+                                .await;
+                        }
+                    }
+                }
+                self.sync_kernel_state_after_compaction().await?;
+                self.restore_provider_context_for_model();
+                Ok::<_, String>(())
+            }
+            .await;
+            restore_phase.finish_result(&restored, signal.is_cancelled());
+            restored?;
+            Ok(result)
         }
-        self.sync_kernel_state_after_compaction().await?;
-        self.restore_provider_context_for_model();
-        Ok::<_, String>(())
-        }.await;
-        restore_phase.finish_result(&restored, signal.is_cancelled());
-        restored?;
-        Ok(result)
-        }.await;
-        total_phase.finish_result(&completed, signal.is_cancelled() || completed.as_ref().is_err_and(|error| error == COMPACTION_CANCELLED_ERROR_MESSAGE));
+        .await;
+        total_phase.finish_result(
+            &completed,
+            signal.is_cancelled()
+                || completed
+                    .as_ref()
+                    .is_err_and(|error| error == COMPACTION_CANCELLED_ERROR_MESSAGE),
+        );
         completed
     }
-
-
 }
 
 /// `_performCompaction` request auth.
@@ -16146,29 +17496,27 @@ fn compaction_session_entry_from(entry: &SessionEntry) -> Option<CompactionSessi
                 message: agent_message_from_value(message),
             })
         }
-        "custom_message" => {
-            Some(CompactionSessionEntry::CustomMessage {
-                id,
-                parent_id,
-                custom_type: entry
-                    .get("customType")
-                    .and_then(Value::as_str)
-                    .unwrap_or_default()
-                    .to_string(),
-                content: serde_json::from_value(entry.get("content").cloned().unwrap_or(Value::Null))
-                    .unwrap_or(CustomMessageContent::Text(String::new())),
-                details: entry.get("details").cloned(),
-                display: entry
-                    .get("display")
-                    .and_then(Value::as_bool)
-                    .unwrap_or(false),
-                timestamp: entry
-                    .get("timestamp")
-                    .and_then(Value::as_str)
-                    .map(str::to_string)
-                    .unwrap_or_default(),
-            })
-        }
+        "custom_message" => Some(CompactionSessionEntry::CustomMessage {
+            id,
+            parent_id,
+            custom_type: entry
+                .get("customType")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string(),
+            content: serde_json::from_value(entry.get("content").cloned().unwrap_or(Value::Null))
+                .unwrap_or(CustomMessageContent::Text(String::new())),
+            details: entry.get("details").cloned(),
+            display: entry
+                .get("display")
+                .and_then(Value::as_bool)
+                .unwrap_or(false),
+            timestamp: entry
+                .get("timestamp")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_default(),
+        }),
         "branch_summary" => Some(CompactionSessionEntry::BranchSummary {
             id,
             parent_id,
@@ -16238,29 +17586,48 @@ mod core001_entry_tests {
         let root = tempfile::tempdir().unwrap();
         let dir = root.path().to_str().unwrap();
         let mut manager = SessionManager::in_memory(Some(dir), Some(dir)).unwrap();
-        let id = manager.append_custom_message_entry(
-            "ipython_state",
-            &crate::core::session_manager::CustomMessageEntryContent::Text("restored kernel".to_string()),
-            false,
-            Some(serde_json::json!({"count": 2})),
-        ).unwrap();
-        manager.append_custom_entry("metadata", Some(serde_json::json!({"internal": true}))).unwrap();
+        let id = manager
+            .append_custom_message_entry(
+                "ipython_state",
+                &crate::core::session_manager::CustomMessageEntryContent::Text(
+                    "restored kernel".to_string(),
+                ),
+                false,
+                Some(serde_json::json!({"count": 2})),
+            )
+            .unwrap();
+        manager
+            .append_custom_entry("metadata", Some(serde_json::json!({"internal": true})))
+            .unwrap();
         let entries = manager.get_branch(None);
-        let converted: Vec<_> = entries.iter().filter_map(compaction_session_entry_from).collect();
+        let converted: Vec<_> = entries
+            .iter()
+            .filter_map(compaction_session_entry_from)
+            .collect();
         let index = converted.iter().position(|entry| entry.id() == id).unwrap();
-        let CompactionSessionEntry::CustomMessage { timestamp, display, details, .. } = &converted[index] else {
+        let CompactionSessionEntry::CustomMessage {
+            timestamp,
+            display,
+            details,
+            ..
+        } = &converted[index]
+        else {
             panic!("custom_message must be a compaction message, not Other");
         };
         assert!(chrono::DateTime::parse_from_rfc3339(timestamp).is_ok());
         assert!(!display);
         assert_eq!(details.as_ref().unwrap()["count"], 2);
-        assert_eq!(crate::core::compaction::compaction::find_turn_start_index(&converted, index, 0), Some(index));
-        assert!(matches!(converted.last(), Some(CompactionSessionEntry::Other { entry_type, .. }) if entry_type == "custom"));
+        assert_eq!(
+            crate::core::compaction::compaction::find_turn_start_index(&converted, index, 0),
+            Some(index)
+        );
+        assert!(
+            matches!(converted.last(), Some(CompactionSessionEntry::Other { entry_type, .. }) if entry_type == "custom")
+        );
     }
 }
 
 impl AgentSession {
-
     /// `_runSerializedRefineCheckpointAfterBackground(branchVersion)`
     /// (agent-session.ts:2571-2632).
     async fn run_serialized_refine_checkpoint_after_background(
@@ -16284,14 +17651,16 @@ impl AgentSession {
                 self.emit_refine_failed(&error);
             }
             *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-            self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+            self.assistant_turns_since_auto_refine
+                .store(0, Ordering::SeqCst);
             return;
         }
 
         // 3. Post-compaction auto-refine. Serialized sessions defer the compaction
         //    trigger to this boundary.
         if !self.auto_refine_allowed_for_session() {
-            self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+            self.compact_auto_refine_pending
+                .store(false, Ordering::SeqCst);
             return;
         }
         let settings = self
@@ -16300,12 +17669,14 @@ impl AgentSession {
             .unwrap()
             .get_auto_refine_settings();
         if !settings.enabled {
-            self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+            self.compact_auto_refine_pending
+                .store(false, Ordering::SeqCst);
             return;
         }
         if self.compact_auto_refine_pending.load(Ordering::SeqCst) {
             if !settings.compact {
-                self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                self.compact_auto_refine_pending
+                    .store(false, Ordering::SeqCst);
             } else {
                 let now = now_ms();
                 let last = *self.last_auto_refine_review_at.lock().unwrap();
@@ -16313,7 +17684,8 @@ impl AgentSession {
                     // Preserve the compact trigger for a later boundary.
                     return;
                 }
-                self.compact_auto_refine_pending.store(false, Ordering::SeqCst);
+                self.compact_auto_refine_pending
+                    .store(false, Ordering::SeqCst);
                 self.run_serialized_auto_refine_review(&AutoRefineReason::Compact, branch_version)
                     .await;
                 return;
@@ -16321,7 +17693,9 @@ impl AgentSession {
         }
 
         // 4. Interval-triggered auto-refine (no background plan was started).
-        if (self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as f64)
+        if (self
+            .assistant_turns_since_auto_refine
+            .load(Ordering::SeqCst) as f64)
             < settings.turn_interval
         {
             return;
@@ -16385,7 +17759,8 @@ impl AgentSession {
         }
         if !review.should_refine {
             *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-            self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+            self.assistant_turns_since_auto_refine
+                .store(0, Ordering::SeqCst);
             return Ok(());
         }
         let options = RefineOptions {
@@ -16404,14 +17779,16 @@ impl AgentSession {
         match outcome {
             Ok(()) => {
                 *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                self.assistant_turns_since_auto_refine
+                    .store(0, Ordering::SeqCst);
             }
             Err(error) => {
                 if self.auto_refine_branch_version.load(Ordering::SeqCst) == branch_version {
                     *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
                     // An extension skip is an intentional non-round, not a failure.
                     if is_refinement_skipped_error(&error) {
-                        self.assistant_turns_since_auto_refine.store(0, Ordering::SeqCst);
+                        self.assistant_turns_since_auto_refine
+                            .store(0, Ordering::SeqCst);
                     } else {
                         self.emit_refine_failed(&error);
                     }
@@ -16437,7 +17814,10 @@ impl AgentSession {
     }
 
     /// `_coalescedFollowUpOwner(action)`.
-    fn coalesced_follow_up_owner(&self, action: &QueuedSessionAction) -> Option<QueuedSessionAction> {
+    fn coalesced_follow_up_owner(
+        &self,
+        action: &QueuedSessionAction,
+    ) -> Option<QueuedSessionAction> {
         let queue_key = action.queue_key.clone()?;
         self.action_store
             .lock()
@@ -16445,7 +17825,8 @@ impl AgentSession {
             .queued_actions(Some(DeliveryPolicy::WhenRunIdle))
             .into_iter()
             .find(|candidate| {
-                candidate.id != action.id && candidate.queue_key.as_deref() == Some(queue_key.as_str())
+                candidate.id != action.id
+                    && candidate.queue_key.as_deref() == Some(queue_key.as_str())
             })
     }
 
@@ -16460,7 +17841,9 @@ impl AgentSession {
         let action = self.create_prepared_turn_action(schedule, text, images, options);
         if action.suppress_autonomous_continuation.unwrap_or(false) {
             if let Ok(record) = primary_delivery_record(&action) {
-                self.mark_autonomous_continuation_suppressed(&agent_message_from_delivery(&record.message));
+                self.mark_autonomous_continuation_suppressed(&agent_message_from_delivery(
+                    &record.message,
+                ));
             }
         }
         self.admit_session_input(action, false).is_ok()
@@ -16471,7 +17854,11 @@ impl AgentSession {
 
 impl AgentSession {
     fn action_by_id(&self, action_id: &str) -> Option<QueuedSessionAction> {
-        self.action_store.lock().unwrap().owned_actions().into_iter()
+        self.action_store
+            .lock()
+            .unwrap()
+            .owned_actions()
+            .into_iter()
             .find(|action| action.id == action_id)
     }
 
@@ -16490,7 +17877,9 @@ impl AgentSession {
     /// keep undelivered prefix records, keep delivered next-turn records,
     /// keep everything else.
     fn filter_records_after_dispatch_failure(&self, action: &QueuedSessionAction) {
-        let Some(mut next) = self.action_by_id(&action.id) else { return; };
+        let Some(mut next) = self.action_by_id(&action.id) else {
+            return;
+        };
         if let QueuedActionPayload::Turn(turn) = &mut next.payload {
             turn.base.records.retain(|record| match record.role {
                 DeliveryRecordRole::Prefix => !record.durable,
@@ -16588,11 +17977,19 @@ impl AgentSession {
         if !self.auto_refine_allowed_for_session() {
             return;
         }
-        let settings = self.settings_manager.lock().unwrap().get_auto_refine_settings();
+        let settings = self
+            .settings_manager
+            .lock()
+            .unwrap()
+            .get_auto_refine_settings();
         if !settings.enabled {
             return;
         }
-        if (self.assistant_turns_since_auto_refine.load(Ordering::SeqCst) as f64) < settings.turn_interval {
+        if (self
+            .assistant_turns_since_auto_refine
+            .load(Ordering::SeqCst) as f64)
+            < settings.turn_interval
+        {
             return;
         }
         let now = now_ms();
@@ -16632,10 +18029,13 @@ impl AgentSession {
         if !skip_review {
             let context = AutoRefineReviewContext {
                 reason: AutoRefineReason::TurnInterval,
-                turns_since_last_review: self.assistant_turns_since_auto_refine.load(Ordering::SeqCst)
-                    as i64,
+                turns_since_last_review: self
+                    .assistant_turns_since_auto_refine
+                    .load(Ordering::SeqCst) as i64,
             };
-            let review = self.review_auto_refine(&context, Some(refine_abort.clone())).await;
+            let review = self
+                .review_auto_refine(&context, Some(refine_abort.clone()))
+                .await;
             if self.disposed.load(Ordering::SeqCst)
                 || self.disposing.load(Ordering::SeqCst)
                 || refine_abort.is_cancelled()
@@ -16661,7 +18061,9 @@ impl AgentSession {
                 }
             };
             if !review.should_refine {
-                return Ok(Some(SerializedBackgroundPlanResult::Skip { explicit: Some(false) }));
+                return Ok(Some(SerializedBackgroundPlanResult::Skip {
+                    explicit: Some(false),
+                }));
             }
             *self.serialized_explicit_refine_options.lock().unwrap() = Some(RefineOptions {
                 instructions: Some(auto_refine_instructions(
@@ -16681,7 +18083,9 @@ impl AgentSession {
             .unwrap()
             .clone()
             .unwrap_or_default();
-        let plan = self.plan_refine_for_trigger(&options, REFINEMENT_SOURCE_USER, refine_abort.clone()).await;
+        let plan = self
+            .plan_refine_for_trigger(&options, REFINEMENT_SOURCE_USER, refine_abort.clone())
+            .await;
         if self.disposed.load(Ordering::SeqCst)
             || self.disposing.load(Ordering::SeqCst)
             || refine_abort.is_cancelled()
@@ -16729,7 +18133,11 @@ impl AgentSession {
 
     /// `settingsManager.getCompactionSettings()`, adapted to the compaction module shape.
     fn compaction_settings(&self) -> CompactionSettings {
-        let resolved = self.settings_manager.lock().unwrap().get_compaction_settings();
+        let resolved = self
+            .settings_manager
+            .lock()
+            .unwrap()
+            .get_compaction_settings();
         CompactionSettings {
             enabled: resolved.enabled,
             reserve_tokens: resolved.reserve_tokens,
@@ -16744,10 +18152,13 @@ impl AgentSession {
         let estimate = estimate_context_tokens(&messages);
         if let Some(index) = estimate.last_usage_index {
             let usage_message = messages.get(index)?;
-            if let AgentMessage::Message(pi_ai::types::Message::Assistant(usage_message)) = usage_message {
+            if let AgentMessage::Message(pi_ai::types::Message::Assistant(usage_message)) =
+                usage_message
+            {
                 let rebuilt_at = *self.provider_context_rebuilt_at.lock().unwrap();
                 let model = self.agent.state().model;
-                if (rebuilt_at.is_some() && usage_message.timestamp as f64 <= rebuilt_at.unwrap_or(0.0))
+                if (rebuilt_at.is_some()
+                    && usage_message.timestamp as f64 <= rebuilt_at.unwrap_or(0.0))
                     || usage_message.model != model.id
                     || usage_message.provider != model.provider
                 {
@@ -16784,7 +18195,8 @@ mod post_compaction_continuation_tests {
     use pi_ai::types::{Message, OnPayload, OnResponse};
     use std::sync::atomic::AtomicUsize;
 
-    type Listener = Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>;
+    type Listener =
+        Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>;
 
     /// `agent.continue()` scripted per call: `busy` once, then success (or any
     /// queued outcome), mirroring the TS tests at
@@ -16816,7 +18228,8 @@ mod post_compaction_continuation_tests {
     fn busy() -> AgentContinueError {
         AgentContinueError {
             code: AgentContinueErrorCode::Busy,
-            message: "Agent is already processing. Wait for completion before continuing.".to_string(),
+            message: "Agent is already processing. Wait for completion before continuing."
+                .to_string(),
         }
     }
 
@@ -16843,6 +18256,7 @@ mod post_compaction_continuation_tests {
         fn set_before_tool_call(&self, _hook: BeforeToolCallHook) {}
         fn set_after_tool_call(&self, _hook: AfterToolCallHook) {}
         fn set_get_continuation_messages(&self, _hook: GetContinuationMessagesHook) {}
+        fn set_before_request(&self, _hook: BeforeRequestHook) {}
         fn set_should_stop_before_turn(&self, _hook: Arc<dyn Fn() -> bool + Send + Sync>) {}
         fn set_should_stop_after_turn(
             &self,
@@ -16941,7 +18355,9 @@ mod post_compaction_continuation_tests {
         test_session_with_credentials_at_depth(0).await
     }
 
-    pub(super) async fn test_session_with_credentials_at_depth(rlm_depth: i64) -> Arc<AgentSession> {
+    pub(super) async fn test_session_with_credentials_at_depth(
+        rlm_depth: i64,
+    ) -> Arc<AgentSession> {
         let provider = pi_ai::providers::faux::register_faux_provider(Some(
             pi_ai::providers::faux::RegisterFauxProviderOptions {
                 provider: Some(format!("unit-{}", uuid::Uuid::new_v4())),
@@ -17080,7 +18496,9 @@ mod post_compaction_continuation_tests {
                 .clone(),
             ),
         ));
-        let manager = crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd)).unwrap();
+        let manager =
+            crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd))
+                .unwrap();
         let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
             crate::core::resource_loader::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
@@ -17149,7 +18567,11 @@ mod post_compaction_continuation_tests {
     fn settlement_of(
         session: &Arc<AgentSession>,
     ) -> Option<Arc<Mutex<PostCompactionContinuationSettlement>>> {
-        session.post_compaction_continuation_settlement.lock().unwrap().clone()
+        session
+            .post_compaction_continuation_settlement
+            .lock()
+            .unwrap()
+            .clone()
     }
 
     #[tokio::test]
@@ -17160,14 +18582,22 @@ mod post_compaction_continuation_tests {
         let events = observed.clone();
         session.subscribe(Arc::new(move |event| {
             if let AgentSessionEvent::SessionInfoChanged { name } = event {
-                let manager = manager.try_lock().expect("rename must release the manager before notifying subscribers");
+                let manager = manager
+                    .try_lock()
+                    .expect("rename must release the manager before notifying subscribers");
                 assert_eq!(manager.get_session_name(), name);
                 events.lock().unwrap().push(name);
             }
         }));
         session.set_session_name("renamed session").unwrap();
         session.set_session_name("second name").unwrap();
-        assert_eq!(*observed.lock().unwrap(), vec![Some("renamed session".to_string()), Some("second name".to_string())]);
+        assert_eq!(
+            *observed.lock().unwrap(),
+            vec![
+                Some("renamed session".to_string()),
+                Some("second name".to_string())
+            ]
+        );
         assert_eq!(session.session_name().as_deref(), Some("second name"));
         session.dispose_async(Some(false)).await;
     }
@@ -17176,7 +18606,9 @@ mod post_compaction_continuation_tests {
     async fn nine_compaction_publishes_fence_before_start_event_can_yield_to_continuation() {
         let agent = ScriptedAgent::new(vec![Ok(())]);
         let session = test_session(agent.clone());
-        session.continue_after_threshold_compaction.store(true, Ordering::SeqCst);
+        session
+            .continue_after_threshold_compaction
+            .store(true, Ordering::SeqCst);
         let started = Arc::new(tokio::sync::Notify::new());
         let event_started = started.clone();
         let (release_tx, release_rx) = std::sync::mpsc::channel();
@@ -17187,34 +18619,74 @@ mod post_compaction_continuation_tests {
                 // Hand the worker core back to Tokio: otherwise the newly spawned
                 // continuation can stay in this thread's non-stealable LIFO slot.
                 tokio::task::block_in_place(|| {
-                    release_rx.lock().unwrap().recv_timeout(std::time::Duration::from_secs(5)).expect("test releases the start-event barrier");
+                    release_rx
+                        .lock()
+                        .unwrap()
+                        .recv_timeout(std::time::Duration::from_secs(5))
+                        .expect("test releases the start-event barrier");
                 });
             }
         }));
         let owner = session.clone();
-        let compact = tokio::spawn(async move { owner.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await });
-        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified()).await.unwrap();
+        let compact = tokio::spawn(async move {
+            owner
+                .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+                .await
+        });
+        tokio::time::timeout(std::time::Duration::from_secs(2), started.notified())
+            .await
+            .unwrap();
         // Hold the synchronous event callback open while Tokio can run the
         // already-scheduled continuation on another worker.
         let runner_started = tokio::time::timeout(std::time::Duration::from_secs(2), async {
             while agent.wait_for_idle_calls.load(Ordering::SeqCst) == 0 {
                 tokio::task::yield_now().await;
             }
-        }).await.is_ok();
+        })
+        .await
+        .is_ok();
         let premature = tokio::time::timeout(std::time::Duration::from_millis(200), async {
-            while agent.continue_calls() == 0 { tokio::task::yield_now().await; }
-        }).await.is_ok();
-        release_tx.send(()).unwrap();
-        assert!(!tokio::time::timeout(std::time::Duration::from_secs(2), compact).await.unwrap().unwrap());
-        tokio::time::timeout(std::time::Duration::from_secs(2), async {
-            while session.post_compaction_continuation_scheduled.load(Ordering::SeqCst)
-                || session.post_compaction_continuation_settlement.lock().unwrap().is_some() {
+            while agent.continue_calls() == 0 {
                 tokio::task::yield_now().await;
             }
-        }).await.unwrap();
-        assert!(runner_started, "test must actually run the continuation while the start barrier is held");
-        assert!(!premature, "continuation ran before auto-compaction published its in-flight fence");
-        assert_eq!(agent.continue_calls(), 1, "auth failure resumes exactly once after the fence settles");
+        })
+        .await
+        .is_ok();
+        release_tx.send(()).unwrap();
+        assert!(
+            !tokio::time::timeout(std::time::Duration::from_secs(2), compact)
+                .await
+                .unwrap()
+                .unwrap()
+        );
+        tokio::time::timeout(std::time::Duration::from_secs(2), async {
+            while session
+                .post_compaction_continuation_scheduled
+                .load(Ordering::SeqCst)
+                || session
+                    .post_compaction_continuation_settlement
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        assert!(
+            runner_started,
+            "test must actually run the continuation while the start barrier is held"
+        );
+        assert!(
+            !premature,
+            "continuation ran before auto-compaction published its in-flight fence"
+        );
+        assert_eq!(
+            agent.continue_calls(),
+            1,
+            "auth failure resumes exactly once after the fence settles"
+        );
         session.dispose_async(Some(false)).await;
     }
 
@@ -17226,7 +18698,9 @@ mod post_compaction_continuation_tests {
         let session = test_session(agent);
         session.schedule_post_compaction_continue(false);
         let settlement = settlement_of(&session).expect("a settlement is installed");
-        session.post_compaction_continuation_scheduled.store(false, Ordering::SeqCst);
+        session
+            .post_compaction_continuation_scheduled
+            .store(false, Ordering::SeqCst);
         session.settle_post_compaction_continue(None);
         assert!(
             settlement.lock().unwrap().settled,
@@ -17252,8 +18726,10 @@ mod post_compaction_continuation_tests {
     async fn cancel_clears_scheduled_messages_and_releases_waiters() {
         let agent = ScriptedAgent::new(vec![]);
         let session = test_session(agent);
-        *session.post_compaction_continuation_messages.lock().unwrap() =
-            vec![user_message("session-owned continuation")];
+        *session
+            .post_compaction_continuation_messages
+            .lock()
+            .unwrap() = vec![user_message("session-owned continuation")];
         session.schedule_post_compaction_continue(false);
         let settlement = settlement_of(&session).expect("a settlement is installed");
         let deferred = settlement.lock().unwrap().deferred.clone();
@@ -17261,7 +18737,9 @@ mod post_compaction_continuation_tests {
         session.cancel_post_compaction_continue();
 
         assert!(
-            !session.post_compaction_continuation_scheduled.load(Ordering::SeqCst),
+            !session
+                .post_compaction_continuation_scheduled
+                .load(Ordering::SeqCst),
             "the scheduled flag is cleared (TS 8439)"
         );
         assert!(
@@ -17290,8 +18768,10 @@ mod post_compaction_continuation_tests {
     async fn scheduled_runner_calls_continue_and_forgets_consumed_messages() {
         let agent = ScriptedAgent::new(vec![Ok(())]);
         let session = test_session(agent.clone());
-        *session.post_compaction_continuation_messages.lock().unwrap() =
-            vec![user_message("session-owned continuation")];
+        *session
+            .post_compaction_continuation_messages
+            .lock()
+            .unwrap() = vec![user_message("session-owned continuation")];
         session.schedule_post_compaction_continue(false);
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
         while agent.continue_calls() == 0 && tokio::time::Instant::now() < deadline {
@@ -17303,13 +18783,21 @@ mod post_compaction_continuation_tests {
             "the scheduled runner calls agent.continue_ (TS 8613)"
         );
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while !session.post_compaction_continuation_messages.lock().unwrap().is_empty()
+        while !session
+            .post_compaction_continuation_messages
+            .lock()
+            .unwrap()
+            .is_empty()
             && tokio::time::Instant::now() < deadline
         {
             tokio::time::sleep(std::time::Duration::from_millis(10)).await;
         }
         assert!(
-            session.post_compaction_continuation_messages.lock().unwrap().is_empty(),
+            session
+                .post_compaction_continuation_messages
+                .lock()
+                .unwrap()
+                .is_empty(),
             "consumed continuations are forgotten (TS 8638)"
         );
         assert!(
@@ -17458,11 +18946,13 @@ mod post_compaction_continuation_tests {
     // T03: session <-> ipython kernel provisioner ownership (agent-session.ts:10061-10102)
     // ---------------------------------------------------------------------------
 
-    use crate::core::kernel::shared::{ExecuteResult, ExecuteStatus, KernelError, KernelStartOptions};
-    use crate::core::tools::ipython::KernelClient;
     use crate::core::extensions::types::ExtensionContext as ExtensionContextTrait;
-    use crate::core::extensions::types::ReadonlySessionManager as ReadonlySessionManagerTrait;
     use crate::core::extensions::types::ModelRegistry as ModelRegistryTrait;
+    use crate::core::extensions::types::ReadonlySessionManager as ReadonlySessionManagerTrait;
+    use crate::core::kernel::shared::{
+        ExecuteResult, ExecuteStatus, KernelError, KernelStartOptions,
+    };
+    use crate::core::tools::ipython::KernelClient;
 
     /// Global serialization for tests that install the kernel-client factory
     /// override (process-global state; parallel tests must not race on it).
@@ -17483,17 +18973,28 @@ mod post_compaction_continuation_tests {
         fn is_defunct(&self) -> bool {
             false
         }
-        fn start(&self, _options: KernelStartOptions) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
-            self.events.lock().unwrap().push(format!("start:{}", self.id));
+        fn start(
+            &self,
+            _options: KernelStartOptions,
+        ) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", self.id));
             Box::pin(async { Ok(()) })
         }
         fn execute(
             &self,
             code: &str,
             _signal: Option<crate::core::kernel::shared::AbortSignal>,
-            _on_stream: Option<Arc<dyn Fn(&str, crate::core::kernel::shared::StreamName) + Send + Sync>>,
+            _on_stream: Option<
+                Arc<dyn Fn(&str, crate::core::kernel::shared::StreamName) + Send + Sync>,
+            >,
         ) -> futures::future::BoxFuture<'static, Result<ExecuteResult, KernelError>> {
-            self.events.lock().unwrap().push(format!("execute:{}:{}", self.id, code));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("execute:{}:{}", self.id, code));
             Box::pin(async move {
                 Ok(ExecuteResult {
                     stdout: String::new(),
@@ -17509,11 +19010,23 @@ mod post_compaction_continuation_tests {
                 })
             })
         }
-        fn restore_state(&self) -> futures::future::BoxFuture<'static, Result<Option<crate::core::kernel::state_snapshot::RestoreResult>, KernelError>> {
-            self.events.lock().unwrap().push(format!("restore:{}", self.id));
+        fn restore_state(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Option<crate::core::kernel::state_snapshot::RestoreResult>, KernelError>,
+        > {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("restore:{}", self.id));
             Box::pin(async { Ok(None) })
         }
-        fn shutdown(&self, snapshot: bool, drain_host_requests: bool) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
+        fn shutdown(
+            &self,
+            snapshot: bool,
+            drain_host_requests: bool,
+        ) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
             self.alive.store(false, Ordering::SeqCst);
             self.events.lock().unwrap().push(format!(
                 "shutdown:{}:snapshot={}:drain={}",
@@ -17523,10 +19036,18 @@ mod post_compaction_continuation_tests {
         }
         fn kill(&self) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
             self.alive.store(false, Ordering::SeqCst);
-            self.events.lock().unwrap().push(format!("kill:{}", self.id));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("kill:{}", self.id));
             Box::pin(async { Ok(()) })
         }
-        fn prune_oversized_variables(&self) -> futures::future::BoxFuture<'static, Result<Option<crate::core::tools::ipython::PruneResult>, KernelError>> {
+        fn prune_oversized_variables(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Option<crate::core::tools::ipython::PruneResult>, KernelError>,
+        > {
             Box::pin(async { Ok(None) })
         }
         fn list_namespace_names(
@@ -17560,7 +19081,10 @@ mod post_compaction_continuation_tests {
         let next_id = Arc::new(AtomicU64::new(1));
         let factory: crate::core::tools::ipython::KernelClientFactory = Arc::new(move |options| {
             let id = next_id.fetch_add(1, Ordering::SeqCst);
-            factory_events.lock().unwrap().push(format!("create:{}", id));
+            factory_events
+                .lock()
+                .unwrap()
+                .push(format!("create:{}", id));
             recorded.lock().unwrap().push(options.clone());
             Arc::new(RecordingKernelClient {
                 id,
@@ -17641,7 +19165,9 @@ mod post_compaction_continuation_tests {
     /// dispose and reload address the exact kernel the tool drives.
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn session_and_tool_share_one_provisioner() {
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (factory, events) = recording_kernel_factory();
         crate::core::tools::ipython::set_kernel_client_factory_override(Some(factory));
         let session = test_session(ScriptedAgent::new(vec![]));
@@ -17664,7 +19190,10 @@ mod post_compaction_continuation_tests {
         );
         let first_run = events.lock().unwrap().clone();
         assert_eq!(
-            first_run.iter().filter(|event| event.starts_with("create:")).count(),
+            first_run
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             1,
             "one kernel client serves the session-owned provisioner: {first_run:?}"
         );
@@ -17673,7 +19202,9 @@ mod post_compaction_continuation_tests {
             "the tool call started the kernel: {first_run:?}"
         );
         assert!(
-            first_run.iter().any(|event| event.contains("+1") && event.starts_with("execute:")),
+            first_run
+                .iter()
+                .any(|event| event.contains("+1") && event.starts_with("execute:")),
             "the tool's cell executed through the recorded client: {first_run:?}"
         );
 
@@ -17683,7 +19214,10 @@ mod post_compaction_continuation_tests {
         session.build_runtime(Some(session.get_active_tool_names()), true);
         let rebuilt = events.lock().unwrap().clone();
         assert_eq!(
-            rebuilt.iter().filter(|event| event.starts_with("create:")).count(),
+            rebuilt
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             1,
             "a rebuild must not eagerly spawn a replacement kernel: {rebuilt:?}"
         );
@@ -17695,13 +19229,21 @@ mod post_compaction_continuation_tests {
         );
         let reloaded = events.lock().unwrap().clone();
         assert_eq!(
-            reloaded.iter().filter(|event| event.starts_with("create:")).count(),
+            reloaded
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             2,
             "the rebuilt provisioner starts its own kernel: {reloaded:?}"
         );
-        let old_shutdown = reloaded.iter().position(|event| event.starts_with("shutdown:1:"));
+        let old_shutdown = reloaded
+            .iter()
+            .position(|event| event.starts_with("shutdown:1:"));
         let new_create = reloaded.iter().rposition(|event| *event == "create:2");
-        let (old_shutdown, new_create) = (old_shutdown.expect("the old kernel was disposed"), new_create.expect("a second kernel was created"));
+        let (old_shutdown, new_create) = (
+            old_shutdown.expect("the old kernel was disposed"),
+            new_create.expect("a second kernel was created"),
+        );
         assert!(
             old_shutdown < new_create,
             "the previous kernel's dispose must complete before the replacement starts: {reloaded:?}"
@@ -17712,11 +19254,16 @@ mod post_compaction_continuation_tests {
         session.dispose_async(None).await;
         let disposed = events.lock().unwrap().clone();
         assert!(
-            disposed.iter().any(|event| *event == "shutdown:2:snapshot=true:drain=true"),
+            disposed
+                .iter()
+                .any(|event| *event == "shutdown:2:snapshot=true:drain=true"),
             "session dispose disposes the tool's kernel with a snapshot flush: {disposed:?}"
         );
         assert_eq!(
-            disposed.iter().filter(|event| event.starts_with("create:")).count(),
+            disposed
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             2,
             "no extra kernel was ever created: {disposed:?}"
         );
@@ -17762,22 +19309,38 @@ mod post_compaction_continuation_tests {
     impl crate::core::agent_messages::AgentSessionMessageController for NoMessagesController {
         fn roster(
             &self,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::core::agent_messages::AgentFamilyRosterResult, String>> + Send>> {
-            Box::pin(async {
-                Ok(crate::core::agent_messages::AgentFamilyRosterResult::default())
-            })
+        ) -> std::pin::Pin<
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::core::agent_messages::AgentFamilyRosterResult,
+                            String,
+                        >,
+                    > + Send,
+            >,
+        > {
+            Box::pin(async { Ok(crate::core::agent_messages::AgentFamilyRosterResult::default()) })
         }
         fn await_pending_child_publication(
             &self,
             _selector: String,
-        ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send>> {
+        ) -> std::pin::Pin<
+            Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send>,
+        > {
             Box::pin(async { Ok(None) })
         }
         fn send_agent_message(
             &self,
             _input: crate::core::agent_messages::AgentSessionMessageSendInput,
         ) -> std::pin::Pin<
-            Box<dyn std::future::Future<Output = Result<crate::core::agent_messages::AgentSessionMessageReceipt, String>> + Send>,
+            Box<
+                dyn std::future::Future<
+                        Output = Result<
+                            crate::core::agent_messages::AgentSessionMessageReceipt,
+                            String,
+                        >,
+                    > + Send,
+            >,
         > {
             Box::pin(async { Err("test controller sends nothing".to_string()) })
         }
@@ -17802,15 +19365,23 @@ mod post_compaction_continuation_tests {
     async fn kernel_settings_and_environment_propagate() {
         use crate::core::auth_storage::{AuthCredential, AuthStorage, AuthStorageData};
 
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let env_guard = EnvVarGuard::set(
             "PRIME_AGENT_CODING_AGENT_DIR",
-            std::env::temp_dir().join("t03-agent-dir-sentinel").to_string_lossy().into_owned(),
+            std::env::temp_dir()
+                .join("t03-agent-dir-sentinel")
+                .to_string_lossy()
+                .into_owned(),
         );
 
         let cwd = std::env::temp_dir().to_string_lossy().into_owned();
         let fixture_agent_dir = std::env::temp_dir().join("t03-websearch-skill-fixture");
-        fixture_skill_markdown(&fixture_agent_dir, crate::core::websearch_credential::WEBSEARCH_SKILL_NAME);
+        fixture_skill_markdown(
+            &fixture_agent_dir,
+            crate::core::websearch_credential::WEBSEARCH_SKILL_NAME,
+        );
 
         let settings = Arc::new(Mutex::new(
             crate::core::settings_manager::SettingsManager::in_memory(
@@ -17838,10 +19409,17 @@ mod post_compaction_continuation_tests {
         );
         let manager = crate::core::session_manager::SessionManager::create(
             &cwd,
-            Some(&std::env::temp_dir().join("t03-sessions-persist").to_string_lossy().into_owned()),
+            Some(
+                &std::env::temp_dir()
+                    .join("t03-sessions-persist")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         )
         .expect("persistent session manager");
-        let artifact_dir = manager.get_session_artifact_dir().expect("a persistent session has an artifact dir");
+        let artifact_dir = manager
+            .get_session_artifact_dir()
+            .expect("a persistent session has an artifact dir");
         let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
             crate::core::resource_loader::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
@@ -17870,7 +19448,10 @@ mod post_compaction_continuation_tests {
             resource_loader: loader,
             custom_tools: None,
             model_registry: Arc::new(Mutex::new(
-                crate::core::model_registry::ModelRegistry::in_memory(AuthStorage::in_memory(credentials, None)),
+                crate::core::model_registry::ModelRegistry::in_memory(AuthStorage::in_memory(
+                    credentials,
+                    None,
+                )),
             )),
             initial_active_tool_names: None,
             allowed_tool_names: None,
@@ -17910,7 +19491,12 @@ mod post_compaction_continuation_tests {
             "the ipython tool call must succeed: {:?}",
             result.err()
         );
-        let options = recorded_options.lock().unwrap().last().cloned().expect("kernel options recorded");
+        let options = recorded_options
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("kernel options recorded");
         let env = options.env.clone().expect("kernel env is set");
 
         // G-16: the global harness state dir resolves to the process-level agent
@@ -17936,16 +19522,24 @@ mod post_compaction_continuation_tests {
         // G-15: the sentinel Serper credential resolves only because the fixture
         // websearch skill is loaded, and the resolved literal is injected.
         assert_eq!(
-            env.get(crate::core::websearch_credential::SERPER_ENV_VAR).map(String::as_str),
+            env.get(crate::core::websearch_credential::SERPER_ENV_VAR)
+                .map(String::as_str),
             Some("sentinel-serper-key"),
             "the sentinel Serper credential is injected only when the skill is loaded"
         );
         // G-17b: RLM_SESSION_DIR is the session artifact dir; the local harness
         // state dir prefers the artifact dir.
-        let rlm_session_dir = env.get("RLM_SESSION_DIR").cloned().expect("RLM_SESSION_DIR");
-        assert_eq!(rlm_session_dir, artifact_dir, "RLM_SESSION_DIR is the artifact dir");
-        let expected_local = crate::core::refinement::refinement::get_local_harness_state_dir(Some(&artifact_dir))
-            .expect("artifact dir yields a local harness dir");
+        let rlm_session_dir = env
+            .get("RLM_SESSION_DIR")
+            .cloned()
+            .expect("RLM_SESSION_DIR");
+        assert_eq!(
+            rlm_session_dir, artifact_dir,
+            "RLM_SESSION_DIR is the artifact dir"
+        );
+        let expected_local =
+            crate::core::refinement::refinement::get_local_harness_state_dir(Some(&artifact_dir))
+                .expect("artifact dir yields a local harness dir");
         assert_eq!(
             env.get("RLM_HARNESS_STATE_DIR").map(String::as_str),
             Some(expected_local.as_str()),
@@ -17954,13 +19548,24 @@ mod post_compaction_continuation_tests {
         assert!(std::path::Path::new(&expected_local).is_absolute());
         // Settings: the resolved model-tool-output policy reaches the provisioner.
         assert_eq!(
-            session.ipython_kernel_provisioner.lock().unwrap().as_ref().expect("provisioner").model_tool_output_policy(),
+            session
+                .ipython_kernel_provisioner
+                .lock()
+                .unwrap()
+                .as_ref()
+                .expect("provisioner")
+                .model_tool_output_policy(),
             crate::core::model_tool_output_policy::REPEATED_LARGE_TEXT_POLICY,
             "the settings-configured tool-output policy resolves on the session-owned provisioner"
         );
         // G-18a/G-17c: the refine handlers are gated on the depth-0 local-harness
         // check, which passes for this persistent session.
-        let handler_keys: Vec<String> = options.host_handlers.clone().expect("handlers").into_keys().collect();
+        let handler_keys: Vec<String> = options
+            .host_handlers
+            .clone()
+            .expect("handlers")
+            .into_keys()
+            .collect();
         assert!(
             handler_keys.iter().any(|key| *key == "refine.run"),
             "refine handlers install for a depth-0 session with a local harness dir: {handler_keys:?}"
@@ -17968,7 +19573,11 @@ mod post_compaction_continuation_tests {
         // No python skill fixture: the recorded python skills list is empty and no
         // non-mentionable skill leaks into the kernel options.
         assert!(
-            options.python_skills.as_ref().map(Vec::is_empty).unwrap_or(true),
+            options
+                .python_skills
+                .as_ref()
+                .map(Vec::is_empty)
+                .unwrap_or(true),
             "no python skills are advertised when only markdown skills are loaded"
         );
 
@@ -17992,7 +19601,9 @@ mod post_compaction_continuation_tests {
                 .clone(),
             ),
         ));
-        let manager2 = crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd)).unwrap();
+        let manager2 =
+            crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd))
+                .unwrap();
         let loader2 = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
             crate::core::resource_loader::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
@@ -18018,7 +19629,10 @@ mod post_compaction_continuation_tests {
             resource_loader: loader2,
             custom_tools: None,
             model_registry: Arc::new(Mutex::new(
-                crate::core::model_registry::ModelRegistry::in_memory(AuthStorage::in_memory(Default::default(), None)),
+                crate::core::model_registry::ModelRegistry::in_memory(AuthStorage::in_memory(
+                    Default::default(),
+                    None,
+                )),
             )),
             initial_active_tool_names: None,
             allowed_tool_names: None,
@@ -18048,11 +19662,27 @@ mod post_compaction_continuation_tests {
         .unwrap();
         session2.build_runtime(Some(session2.get_active_tool_names()), true);
         let result2 = execute_ipython_tool(&session2, "call-env2", "2+2").await;
-        assert!(result2.is_ok(), "the second tool call must succeed: {:?}", result2.err());
-        let options2 = recorded2.lock().unwrap().last().cloned().expect("options2 recorded");
-        let handler_keys2: Vec<String> = options2.host_handlers.clone().expect("handlers2").into_keys().collect();
         assert!(
-            handler_keys2.iter().all(|key| !key.starts_with("agent_message.")),
+            result2.is_ok(),
+            "the second tool call must succeed: {:?}",
+            result2.err()
+        );
+        let options2 = recorded2
+            .lock()
+            .unwrap()
+            .last()
+            .cloned()
+            .expect("options2 recorded");
+        let handler_keys2: Vec<String> = options2
+            .host_handlers
+            .clone()
+            .expect("handlers2")
+            .into_keys()
+            .collect();
+        assert!(
+            handler_keys2
+                .iter()
+                .all(|key| !key.starts_with("agent_message.")),
             "agent-message handlers must not install without the visible skill: {handler_keys2:?}"
         );
         assert!(
@@ -18083,17 +19713,28 @@ mod post_compaction_continuation_tests {
         fn is_defunct(&self) -> bool {
             false
         }
-        fn start(&self, _options: KernelStartOptions) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
-            self.events.lock().unwrap().push(format!("start:{}", self.id));
+        fn start(
+            &self,
+            _options: KernelStartOptions,
+        ) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("start:{}", self.id));
             Box::pin(async { Ok(()) })
         }
         fn execute(
             &self,
             code: &str,
             _signal: Option<crate::core::kernel::shared::AbortSignal>,
-            _on_stream: Option<Arc<dyn Fn(&str, crate::core::kernel::shared::StreamName) + Send + Sync>>,
+            _on_stream: Option<
+                Arc<dyn Fn(&str, crate::core::kernel::shared::StreamName) + Send + Sync>,
+            >,
         ) -> futures::future::BoxFuture<'static, Result<ExecuteResult, KernelError>> {
-            self.events.lock().unwrap().push(format!("execute:{}:{}", self.id, code));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("execute:{}:{}", self.id, code));
             Box::pin(async move {
                 Ok(ExecuteResult {
                     stdout: String::new(),
@@ -18109,8 +19750,16 @@ mod post_compaction_continuation_tests {
                 })
             })
         }
-        fn restore_state(&self) -> futures::future::BoxFuture<'static, Result<Option<crate::core::kernel::state_snapshot::RestoreResult>, KernelError>> {
-            self.events.lock().unwrap().push(format!("restore:{}", self.id));
+        fn restore_state(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Option<crate::core::kernel::state_snapshot::RestoreResult>, KernelError>,
+        > {
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("restore:{}", self.id));
             let restored_names = self.restored_names.clone();
             Box::pin(async move {
                 if restored_names.is_empty() {
@@ -18129,7 +19778,11 @@ mod post_compaction_continuation_tests {
                 }
             })
         }
-        fn shutdown(&self, snapshot: bool, drain_host_requests: bool) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
+        fn shutdown(
+            &self,
+            snapshot: bool,
+            drain_host_requests: bool,
+        ) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
             self.events.lock().unwrap().push(format!(
                 "shutdown-pending:{}:snapshot={}:drain={}",
                 self.id, snapshot, drain_host_requests
@@ -18161,10 +19814,18 @@ mod post_compaction_continuation_tests {
         }
         fn kill(&self) -> futures::future::BoxFuture<'static, Result<(), KernelError>> {
             self.alive.store(false, Ordering::SeqCst);
-            self.events.lock().unwrap().push(format!("kill:{}", self.id));
+            self.events
+                .lock()
+                .unwrap()
+                .push(format!("kill:{}", self.id));
             Box::pin(async { Ok(()) })
         }
-        fn prune_oversized_variables(&self) -> futures::future::BoxFuture<'static, Result<Option<crate::core::tools::ipython::PruneResult>, KernelError>> {
+        fn prune_oversized_variables(
+            &self,
+        ) -> futures::future::BoxFuture<
+            'static,
+            Result<Option<crate::core::tools::ipython::PruneResult>, KernelError>,
+        > {
             Box::pin(async { Ok(None) })
         }
         fn list_namespace_names(
@@ -18183,7 +19844,9 @@ mod post_compaction_continuation_tests {
     async fn reload_waits_for_old_snapshot_writer() {
         use crate::core::kernel::state_snapshot::snapshot_path_in;
 
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
         let next_id = Arc::new(AtomicU64::new(1));
@@ -18226,7 +19889,12 @@ mod post_compaction_continuation_tests {
         ));
         let manager = crate::core::session_manager::SessionManager::create(
             &cwd,
-            Some(&std::env::temp_dir().join("t03-reload-sessions").to_string_lossy().into_owned()),
+            Some(
+                &std::env::temp_dir()
+                    .join("t03-reload-sessions")
+                    .to_string_lossy()
+                    .into_owned(),
+            ),
         )
         .expect("persistent session manager");
         let artifact_dir = manager
@@ -18295,12 +19963,24 @@ mod post_compaction_continuation_tests {
         // Plant a snapshot state file so the second start's restore path treats the
         // snapshot as existing (the fake client's restore_state reports the revived
         // names).
-        std::fs::write(snapshot_path_in(&artifact_dir), "t03-fixture-snapshot-state").expect("fixture snapshot state file");
-        std::fs::write(snapshot_path_in(&artifact_dir), "t03-fixture-snapshot-state").expect("fixture snapshot state file");
+        std::fs::write(
+            snapshot_path_in(&artifact_dir),
+            "t03-fixture-snapshot-state",
+        )
+        .expect("fixture snapshot state file");
+        std::fs::write(
+            snapshot_path_in(&artifact_dir),
+            "t03-fixture-snapshot-state",
+        )
+        .expect("fixture snapshot state file");
 
         // Kernel 1 through the tool.
         let result = execute_ipython_tool(&session, "call-1", "1+1").await;
-        assert!(result.is_ok(), "first tool call must succeed: {:?}", result.err());
+        assert!(
+            result.is_ok(),
+            "first tool call must succeed: {:?}",
+            result.err()
+        );
         let first = events.lock().unwrap().clone();
         assert!(
             first.iter().any(|event| event.starts_with("start:1")),
@@ -18328,7 +20008,10 @@ mod post_compaction_continuation_tests {
         for _ in 0..200 {
             tokio::time::sleep(std::time::Duration::from_millis(25)).await;
             let snapshot_events = events.lock().unwrap().clone();
-            if snapshot_events.iter().any(|event| event.starts_with("shutdown-pending:1")) {
+            if snapshot_events
+                .iter()
+                .any(|event| event.starts_with("shutdown-pending:1"))
+            {
                 engaged = true;
                 break;
             }
@@ -18349,12 +20032,17 @@ mod post_compaction_continuation_tests {
         let _ = release_tx.send(true);
         let call2 = tokio::time::timeout(std::time::Duration::from_secs(10), pending_call).await;
         assert!(
-            call2.as_ref().map(|outcome| outcome.is_ok()).unwrap_or(false),
+            call2
+                .as_ref()
+                .map(|outcome| outcome.is_ok())
+                .unwrap_or(false),
             "the gated tool call resolves after the barrier releases: {:?}",
             call2.map(|outcome| outcome.as_ref().map(|inner| inner.is_ok()).unwrap_or(false))
         );
         let final_events = events.lock().unwrap().clone();
-        let shutdown1 = final_events.iter().position(|event| event.starts_with("shutdown:1:"));
+        let shutdown1 = final_events
+            .iter()
+            .position(|event| event.starts_with("shutdown:1:"));
         let create2 = final_events.iter().position(|event| *event == "create:2");
         let (shutdown1, create2) = (
             shutdown1.expect("kernel 1's snapshot flush completed"),
@@ -18366,7 +20054,10 @@ mod post_compaction_continuation_tests {
         );
         // Exactly one writer per snapshot: kernel 1 shut down exactly once.
         assert_eq!(
-            final_events.iter().filter(|event| event.starts_with("shutdown:1:")).count(),
+            final_events
+                .iter()
+                .filter(|event| event.starts_with("shutdown:1:"))
+                .count(),
             1,
             "the old kernel is disposed exactly once: {final_events:?}"
         );
@@ -18381,7 +20072,9 @@ mod post_compaction_continuation_tests {
         );
         // The current kernel remains usable (the cell executed through kernel 2).
         assert!(
-            final_events.iter().any(|event| event.starts_with("execute:2:")),
+            final_events
+                .iter()
+                .any(|event| event.starts_with("execute:2:")),
             "the tool's cell executed on the replacement kernel: {final_events:?}"
         );
         session.dispose_async(None).await;
@@ -18492,7 +20185,9 @@ mod post_compaction_continuation_tests {
     #[tokio::test]
     async fn resume_and_compact_kernel_notices() {
         use crate::core::kernel::state_snapshot::snapshot_path_in;
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (release_tx, release_rx) = tokio::sync::watch::channel(false);
         let _ = release_tx.send(true);
         let events: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
@@ -18541,12 +20236,8 @@ mod post_compaction_continuation_tests {
             )
             .expect("persistent session manager"),
         ));
-        let (session_a, provider_a) = credentials_session_with_manager(
-            &cwd,
-            &agent_dir,
-            Arc::clone(&manager_a),
-        )
-        .await;
+        let (session_a, provider_a) =
+            credentials_session_with_manager(&cwd, &agent_dir, Arc::clone(&manager_a)).await;
 
         // The faux provider pops one queued response per provider call, and a turn
         // without a queued response ends in a provider error. Queue one reply per
@@ -18597,9 +20288,17 @@ mod post_compaction_continuation_tests {
             .expect("the seed cell executes");
 
         // Flush + dispose; the fake writer commits the snapshot shape the resume reads.
-        let artifact_dir_a = manager_a.lock().unwrap().get_session_artifact_dir().expect("artifact dir");
+        let artifact_dir_a = manager_a
+            .lock()
+            .unwrap()
+            .get_session_artifact_dir()
+            .expect("artifact dir");
         std::fs::write(snapshot_path_in(&artifact_dir_a), b"{}").unwrap();
-        let session_file = manager_a.lock().unwrap().get_session_file().expect("session file");
+        let session_file = manager_a
+            .lock()
+            .unwrap()
+            .get_session_file()
+            .expect("session file");
         session_a.dispose_async(Some(true)).await;
 
         // Session B: resume through the real session APIs (open the persisted file).
@@ -18611,12 +20310,8 @@ mod post_compaction_continuation_tests {
             )
             .expect("resumed session manager"),
         ));
-        let (session_b, provider_b) = credentials_session_with_manager(
-            &cwd,
-            &agent_dir,
-            Arc::clone(&manager_b),
-        )
-        .await;
+        let (session_b, provider_b) =
+            credentials_session_with_manager(&cwd, &agent_dir, Arc::clone(&manager_b)).await;
         // One reply for the post-resume turn, one for the compaction summary call.
         provider_b.set_responses(
             (0..2)
@@ -18641,7 +20336,7 @@ mod post_compaction_continuation_tests {
         // the conversation only when the next turn starts.
         let mut restored_pending: Vec<String> = Vec::new();
         for _ in 0..100 {
-                restored_pending = session_b
+            restored_pending = session_b
                 .pending_next_turn_messages
                 .lock()
                 .unwrap()
@@ -18692,12 +20387,16 @@ mod post_compaction_continuation_tests {
             restore_notices.len(),
             1,
             "the next turn must surface exactly one revive notice: {:?}",
-            session_b.messages().iter().map(|m| match m {
-                AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. }) => {
-                    format!("custom:{}", custom_type)
-                }
-                _ => "other".to_string(),
-            }).collect::<Vec<_>>()
+            session_b
+                .messages()
+                .iter()
+                .map(|m| match m {
+                    AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. }) => {
+                        format!("custom:{}", custom_type)
+                    }
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
         );
 
         // A real compaction through the session API appends exactly one kernel-state
@@ -18727,12 +20426,15 @@ mod post_compaction_continuation_tests {
             compact_notices.len(),
             1,
             "the kernel persisted through compaction and must be reported exactly once: {:?}",
-            messages_after.iter().map(|m| match m {
-                AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. }) => {
-                    format!("custom:{}", custom_type)
-                }
-                _ => "other".to_string(),
-            }).collect::<Vec<_>>()
+            messages_after
+                .iter()
+                .map(|m| match m {
+                    AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. }) => {
+                        format!("custom:{}", custom_type)
+                    }
+                    _ => "other".to_string(),
+                })
+                .collect::<Vec<_>>()
         );
         let compact_message = match &messages_after[compact_notices[0]] {
             AgentMessage::Custom(CustomAgentMessage::Custom { content, .. }) => match content {
@@ -18756,7 +20458,9 @@ mod post_compaction_continuation_tests {
             .expect("the kernel executes right after compaction");
         let final_events = events.lock().unwrap().clone();
         assert!(
-            final_events.iter().any(|event| event.starts_with("execute:2:")),
+            final_events
+                .iter()
+                .any(|event| event.starts_with("execute:2:")),
             "the post-compaction cell ran on the resumed kernel: {final_events:?}"
         );
 
@@ -18770,7 +20474,9 @@ mod post_compaction_continuation_tests {
     /// (re)builds the runtime so the tools land in the registry.
     #[tokio::test]
     async fn acp_mcp_reaches_owned_kernel() {
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (factory, events) = recording_kernel_factory();
         crate::core::tools::ipython::set_kernel_client_factory_override(Some(factory));
         let mcp_manager = Arc::new(Mutex::new(crate::core::mcp::mcp_manager::McpManager::new(
@@ -18816,7 +20522,9 @@ mod post_compaction_continuation_tests {
             "ACP MCP tool names: {acp_names:?}"
         );
         assert!(
-            session.get_active_tool_names().contains(&"mcp_list_tools_alpha".to_string()),
+            session
+                .get_active_tool_names()
+                .contains(&"mcp_list_tools_alpha".to_string()),
             "the ACP MCP tool joined the active tool set: {:?}",
             session.get_active_tool_names()
         );
@@ -18859,7 +20567,10 @@ mod post_compaction_continuation_tests {
         // awaits its ready gate (agent-session.ts:10071-10091). So: two creates, the
         // ACP cells on the replacement, and exactly one seed-kernel shutdown.
         assert_eq!(
-            final_run.iter().filter(|event| event.starts_with("create:")).count(),
+            final_run
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             2,
             "the seed kernel plus the rebuild's replacement, nothing more: {final_run:?}"
         );
@@ -18881,7 +20592,10 @@ mod post_compaction_continuation_tests {
             "the ACP tools must not ride the pre-rebuild kernel: {final_run:?}"
         );
         assert_eq!(
-            final_run.iter().filter(|event| event.starts_with("shutdown:1")).count(),
+            final_run
+                .iter()
+                .filter(|event| event.starts_with("shutdown:1"))
+                .count(),
             1,
             "the seed kernel is disposed exactly once, gating the replacement start: {final_run:?}"
         );
@@ -18897,7 +20611,9 @@ mod post_compaction_continuation_tests {
     /// production callers on both sides - classified unproven, never called).
     #[tokio::test]
     async fn prewarm_dispose_and_export_contract() {
-        let _factory_guard = KERNEL_FACTORY_TEST_LOCK.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _factory_guard = KERNEL_FACTORY_TEST_LOCK
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let (factory, events) = recording_kernel_factory();
         crate::core::tools::ipython::set_kernel_client_factory_override(Some(factory));
         let session = test_session_inner(ScriptedAgent::new(vec![]), None, true);
@@ -18918,7 +20634,10 @@ mod post_compaction_continuation_tests {
             "prewarm must start the kernel before any tool call: {prewarm_events:?}"
         );
         assert_eq!(
-            prewarm_events.iter().filter(|event| event.starts_with("create:")).count(),
+            prewarm_events
+                .iter()
+                .filter(|event| event.starts_with("create:"))
+                .count(),
             1,
             "prewarm starts exactly one kernel: {prewarm_events:?}"
         );
@@ -18942,7 +20661,9 @@ mod post_compaction_continuation_tests {
             "the dispose flush requests the kernel snapshot with host-request drain: {dispose_events:?}"
         );
         assert!(
-            !dispose_events.iter().any(|event| event.starts_with("kill:")),
+            !dispose_events
+                .iter()
+                .any(|event| event.starts_with("kill:")),
             "dispose flushes gracefully instead of killing: {dispose_events:?}"
         );
 
@@ -18970,23 +20691,36 @@ mod post_compaction_continuation_tests {
             fn start<'a>(
                 &'a self,
                 _options: crate::core::kernel::shared::KernelStartOptions,
-            ) -> futures::future::BoxFuture<'a, Result<(), crate::core::kernel::shared::KernelError>> {
+            ) -> futures::future::BoxFuture<'a, Result<(), crate::core::kernel::shared::KernelError>>
+            {
                 Box::pin(async { Err(crate::core::kernel::shared::KernelError::new("probe")) })
             }
             fn execute<'a>(
                 &'a self,
                 _code: String,
                 _opts: crate::core::kernel::shared::ExecuteOptions,
-            ) -> futures::future::BoxFuture<'a, Result<crate::core::kernel::shared::ExecuteResult, crate::core::kernel::shared::KernelError>> {
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<
+                    crate::core::kernel::shared::ExecuteResult,
+                    crate::core::kernel::shared::KernelError,
+                >,
+            > {
                 Box::pin(async { Err(crate::core::kernel::shared::KernelError::new("probe")) })
             }
             fn shutdown<'a>(
                 &'a self,
                 _opts: crate::core::kernel::shared::KernelShutdownOptions,
-            ) -> futures::future::BoxFuture<'a, Result<bool, crate::core::kernel::shared::KernelError>> {
+            ) -> futures::future::BoxFuture<
+                'a,
+                Result<bool, crate::core::kernel::shared::KernelError>,
+            > {
                 Box::pin(async { Ok(false) })
             }
-            fn restart<'a>(&'a self) -> futures::future::BoxFuture<'a, Result<(), crate::core::kernel::shared::KernelError>> {
+            fn restart<'a>(
+                &'a self,
+            ) -> futures::future::BoxFuture<'a, Result<(), crate::core::kernel::shared::KernelError>>
+            {
                 Box::pin(async { Err(crate::core::kernel::shared::KernelError::new("probe")) })
             }
             fn kill<'a>(&'a self) -> futures::future::BoxFuture<'a, ()> {
@@ -18995,18 +20729,27 @@ mod post_compaction_continuation_tests {
             fn dispose_sync(&self) {}
             fn snapshot_state<'a>(
                 &'a self,
-            ) -> futures::future::BoxFuture<'a, Option<crate::core::kernel::state_snapshot::SnapshotResult>> {
+            ) -> futures::future::BoxFuture<
+                'a,
+                Option<crate::core::kernel::state_snapshot::SnapshotResult>,
+            > {
                 Box::pin(async { None })
             }
             fn prune_oversized_variables<'a>(
                 &'a self,
-            ) -> futures::future::BoxFuture<'a, Option<crate::core::kernel::state_snapshot::SnapshotResult>> {
+            ) -> futures::future::BoxFuture<
+                'a,
+                Option<crate::core::kernel::state_snapshot::SnapshotResult>,
+            > {
                 Box::pin(async { None })
             }
             fn restore_state<'a>(
                 &'a self,
                 _options: crate::core::kernel::shared::KernelRestoreOptions,
-            ) -> futures::future::BoxFuture<'a, Option<crate::core::kernel::state_snapshot::RestoreResult>> {
+            ) -> futures::future::BoxFuture<
+                'a,
+                Option<crate::core::kernel::state_snapshot::RestoreResult>,
+            > {
                 Box::pin(async { None })
             }
             fn list_namespace_names<'a>(
@@ -19020,7 +20763,9 @@ mod post_compaction_continuation_tests {
         }
         let probe: Arc<dyn crate::core::kernel::shared::KernelClient> = Arc::new(LegacyExportProbe);
         let export = probe
-            .export_state_for_legacy_runtime(crate::core::kernel::state_snapshot::LegacyExportSource::Current)
+            .export_state_for_legacy_runtime(
+                crate::core::kernel::state_snapshot::LegacyExportSource::Current,
+            )
             .await;
         assert!(
             export.is_none(),
@@ -19051,7 +20796,10 @@ mod post_compaction_continuation_tests {
         );
         let _venv_guard = EnvVarGuard::set(
             "PRIME_AGENT_KERNEL_VENV",
-            root.path().join("kernel-venv").to_string_lossy().into_owned(),
+            root.path()
+                .join("kernel-venv")
+                .to_string_lossy()
+                .into_owned(),
         );
 
         // Private managed venv: the ambient network is unavailable in validation, so
@@ -19062,7 +20810,11 @@ mod post_compaction_continuation_tests {
         let production_python = ambient_kernel_python.clone();
         let production_venv = production_python
             .as_ref()
-            .and_then(|python| std::path::Path::new(python).parent().map(|dir| dir.to_path_buf()))
+            .and_then(|python| {
+                std::path::Path::new(python)
+                    .parent()
+                    .map(|dir| dir.to_path_buf())
+            })
             .map(|scripts| scripts.parent().map(|dir| dir.to_path_buf()))
             .flatten();
         let production_venv = match production_venv {
@@ -19121,7 +20873,10 @@ mod post_compaction_continuation_tests {
         );
 
         // Helper: a plain recursive directory copy (std has none).
-        fn copy_dir_recursive(source: &std::path::Path, target: &std::path::Path) -> std::io::Result<()> {
+        fn copy_dir_recursive(
+            source: &std::path::Path,
+            target: &std::path::Path,
+        ) -> std::io::Result<()> {
             std::fs::create_dir_all(target)?;
             for entry in std::fs::read_dir(source)? {
                 let entry = entry?;
@@ -19155,7 +20910,9 @@ mod post_compaction_continuation_tests {
                 .clone(),
             ),
         ));
-        let manager = crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd)).unwrap();
+        let manager =
+            crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd))
+                .unwrap();
         let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
             crate::core::resource_loader::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
@@ -19230,21 +20987,29 @@ mod post_compaction_continuation_tests {
         // The provisioner-side runtime info must match the version file the private
         // venv advertises (path-string equality is what python_skills_match needs).
         assert_eq!(
-            python_info.package_path, skill_dir.to_string_lossy(),
+            python_info.package_path,
+            skill_dir.to_string_lossy(),
             "loader package_path must equal the fixture skill dir: loader={:?} fixture={:?}",
-            python_info.package_path, skill_dir.to_string_lossy()
+            python_info.package_path,
+            skill_dir.to_string_lossy()
         );
         assert_eq!(
-            python_info.pyproject_path, pyproject_path.to_string_lossy(),
+            python_info.pyproject_path,
+            pyproject_path.to_string_lossy(),
             "loader pyproject_path must equal the fixture pyproject: loader={:?} fixture={:?}",
-            python_info.pyproject_path, pyproject_path.to_string_lossy()
+            python_info.pyproject_path,
+            pyproject_path.to_string_lossy()
         );
 
         // REAL round trip: no factory override - the real managed venv boots and the
         // cell imports the skill package installed into it.
         let result = tokio::time::timeout(
             std::time::Duration::from_secs(600),
-            execute_ipython_tool(&session, "call-1", "import t03_marker_skill as _skill; print(_skill.SKILL_MARKER)"),
+            execute_ipython_tool(
+                &session,
+                "call-1",
+                "import t03_marker_skill as _skill; print(_skill.SKILL_MARKER)",
+            ),
         )
         .await
         .expect("the real kernel round trip must settle inside 600s");
@@ -19258,670 +21023,1145 @@ mod post_compaction_continuation_tests {
         session.dispose_async(None).await;
     }
 
-// ---------------------------------------------------------------------------
-// Bounded retry pacing for automatic threshold compaction (CF-01 repair).
-//
-// The gate, the streak bookkeeping and the exemption of requested/overflow
-// compaction are exercised directly against the in-memory scripted fixture:
-// no network, no credentials, no production paths.
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod compaction_retry_backoff_tests {
-    use super::*;
-    use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
-    use pi_ai::utils::event_stream::AssistantMessageEventStream;
-    use std::sync::atomic::AtomicUsize;
+    // ---------------------------------------------------------------------------
+    // Bounded retry pacing for automatic threshold compaction (CF-01 repair).
+    //
+    // The gate, the streak bookkeeping and the exemption of requested/overflow
+    // compaction are exercised directly against the in-memory scripted fixture:
+    // no network, no credentials, no production paths.
+    // ---------------------------------------------------------------------------
+    #[cfg(test)]
+    mod compaction_retry_backoff_tests {
+        use super::*;
+        use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
+        use pi_ai::utils::event_stream::AssistantMessageEventStream;
+        use std::sync::atomic::AtomicUsize;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn failed_threshold_summary_preserves_history_and_delivers_queued_human_input() {
-        const HUMAN: &str = "Keep this queued human request after failed summarization.";
-        let session = post_compaction_continuation_tests::test_session_with_credentials().await;
-        let api = format!("summary-queued-human-{}", uuid::Uuid::new_v4());
-        let summary_calls = Arc::new(AtomicUsize::new(0));
-        let release_summary = CancellationToken::new();
-        let calls = summary_calls.clone();
-        let release = release_summary.clone();
-        register_api_provider_simple(ApiProviderSimple {
-            api: api.clone().into(),
-            stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
-            stream_simple: Arc::new(move |model, _, _| {
-                calls.fetch_add(1, Ordering::SeqCst);
-                let model = model.clone();
-                let stream = AssistantMessageEventStream::new();
-                let output = stream.clone();
-                let release = release.clone();
-                tokio::spawn(async move {
-                    release.cancelled().await;
-                    let mut message = AssistantMessage::new(model.api, model.provider, model.id, 0);
-                    message.stop_reason = "length".into();
-                    message.stop_reason_raw = Some("other".into());
-                    message.content = vec![pi_ai::types::ContentBlock::Text(
-                        pi_ai::types::TextContent::new("An incomplete handoff must not replace history."),
-                    )];
-                    output.push(pi_ai::types::AssistantMessageEvent::Done { reason: "length".into(), message });
-                    output.end(None);
-                });
-                stream
-            }),
-            compact: None,
-            supports_compaction: None,
-        }, None);
-        session.settings_manager.lock().unwrap().apply_overrides(
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn failed_threshold_summary_preserves_history_and_delivers_queued_human_input() {
+            const HUMAN: &str = "Keep this queued human request after failed summarization.";
+            let session = post_compaction_continuation_tests::test_session_with_credentials().await;
+            let api = format!("summary-queued-human-{}", uuid::Uuid::new_v4());
+            let summary_calls = Arc::new(AtomicUsize::new(0));
+            let release_summary = CancellationToken::new();
+            let calls = summary_calls.clone();
+            let release = release_summary.clone();
+            register_api_provider_simple(
+                ApiProviderSimple {
+                    api: api.clone().into(),
+                    stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                    stream_simple: Arc::new(move |model, _, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let model = model.clone();
+                        let stream = AssistantMessageEventStream::new();
+                        let output = stream.clone();
+                        let release = release.clone();
+                        tokio::spawn(async move {
+                            release.cancelled().await;
+                            let mut message =
+                                AssistantMessage::new(model.api, model.provider, model.id, 0);
+                            message.stop_reason = "length".into();
+                            message.stop_reason_raw = Some("other".into());
+                            message.content = vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new(
+                                    "An incomplete handoff must not replace history.",
+                                ),
+                            )];
+                            output.push(pi_ai::types::AssistantMessageEvent::Done {
+                                reason: "length".into(),
+                                message,
+                            });
+                            output.end(None);
+                        });
+                        stream
+                    }),
+                    compact: None,
+                    supports_compaction: None,
+                },
+                None,
+            );
+            session.settings_manager.lock().unwrap().apply_overrides(
             serde_json::json!({"compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 100}})
                 .as_object().unwrap(),
         );
-        let mut state = session.agent.state();
-        state.model.api = api;
-        state.model.context_window = 100_000.0;
-        state.model.max_tokens = 4_000.0;
-        for turn in 0..2 {
-            let mut manager = session.session_manager.lock().unwrap();
-            manager.append_message(AgentMessage::Message(Message::User(UserMessage::new(
-                UserContent::Text(format!("preserved user turn {turn} ").repeat(200)), turn,
-            )))).unwrap();
-            let mut assistant = AssistantMessage::new(state.model.api.clone(), state.model.provider.clone(), state.model.id.clone(), turn);
-            assistant.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(format!("preserved reply {turn}")))];
-            assistant.usage.input = 99_900.0;
-            manager.append_message(AgentMessage::Message(Message::Assistant(assistant))).unwrap();
-        }
-        state.messages = session.session_manager.lock().unwrap().build_session_context(Some(&state.model)).messages;
-        session.agent.set_state(state);
-        let before = session.session_manager.lock().unwrap().get_entries();
-        let delivered_calls = Arc::new(AtomicUsize::new(0));
-        let delivered = delivered_calls.clone();
-        session.agent.set_stream_fn(Arc::new(move |model, context, _| {
-            let delivered = delivered.clone();
-            Box::pin(async move {
-                assert!(serde_json::to_string(&context.messages).unwrap().contains(HUMAN), "queued human input reaches the model");
-                delivered.fetch_add(1, Ordering::SeqCst);
-                let stream = AssistantMessageEventStream::new();
-                let mut message = AssistantMessage::new(model.api, model.provider, model.id, 5);
-                message.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new("Queued human request received."))];
-                stream.push(pi_ai::types::AssistantMessageEvent::Done { reason: "stop".into(), message });
-                stream.end(None);
-                stream
-            })
-        }));
-        let compact_session = session.clone();
-        let compaction = tokio::spawn(async move {
-            compact_session.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await
-        });
-        tokio::time::timeout(std::time::Duration::from_secs(3), async {
-            while summary_calls.load(Ordering::SeqCst) == 0 {
-                tokio::task::yield_now().await;
+            let mut state = session.agent.state();
+            state.model.api = api;
+            state.model.context_window = 100_000.0;
+            state.model.max_tokens = 4_000.0;
+            for turn in 0..2 {
+                let mut manager = session.session_manager.lock().unwrap();
+                manager
+                    .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                        UserContent::Text(format!("preserved user turn {turn} ").repeat(200)),
+                        turn,
+                    ))))
+                    .unwrap();
+                let mut assistant = AssistantMessage::new(
+                    state.model.api.clone(),
+                    state.model.provider.clone(),
+                    state.model.id.clone(),
+                    turn,
+                );
+                assistant.content = vec![pi_ai::types::ContentBlock::Text(
+                    pi_ai::types::TextContent::new(format!("preserved reply {turn}")),
+                )];
+                assistant.usage.input = 99_900.0;
+                manager
+                    .append_message(AgentMessage::Message(Message::Assistant(assistant)))
+                    .unwrap();
             }
-        }).await.expect("isolated summary request started");
-        session.steer(HUMAN, None, None, None, Some(true)).await.unwrap();
-        assert_eq!(delivered_calls.load(Ordering::SeqCst), 0, "human input waits for the compaction fence");
-        release_summary.cancel();
-        assert!(!tokio::time::timeout(std::time::Duration::from_secs(3), compaction)
-            .await.expect("compaction bounded").expect("compaction joined"));
-        tokio::time::timeout(std::time::Duration::from_secs(3), session.wait_for_idle())
-            .await.expect("queued input drains").expect("session settles");
-        let after = session.session_manager.lock().unwrap().get_entries();
-        assert_eq!(&after[..before.len()], before.as_slice(), "old durable entries remain unchanged");
-        assert!(!after.iter().any(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction")),
-            "unusable summary never becomes the durable context head");
-        assert_eq!(summary_calls.load(Ordering::SeqCst), 1, "unknown truncation is not replayed during cooldown");
-        assert_eq!(delivered_calls.load(Ordering::SeqCst), 1, "queued human input is delivered exactly once");
-        assert!(session.threshold_compaction_retry_in_cooldown());
-        session.dispose_async(Some(false)).await;
-    }
-
-    #[test]
-    fn threshold_compaction_retry_backoff_doubles_and_caps() {
-        let delay = |count| threshold_compaction_retry_backoff_delay(count);
-        assert_eq!(delay(1), std::time::Duration::from_millis(5_000));
-        assert_eq!(delay(2), std::time::Duration::from_millis(10_000));
-        assert_eq!(delay(3), std::time::Duration::from_millis(20_000));
-        assert_eq!(delay(4), std::time::Duration::from_millis(40_000));
-        assert_eq!(delay(5), std::time::Duration::from_millis(80_000));
-        assert_eq!(delay(6), std::time::Duration::from_millis(120_000));
-        assert_eq!(
-            delay(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
-            std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
-        );
-    }
-
-    #[tokio::test]
-    async fn failure_streak_is_capped_and_the_gate_reopens_after_the_cooldown() {
-        let agent = ScriptedAgent::new(vec![]);
-        let session = test_session(agent);
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
-            session.record_threshold_compaction_failure();
-        }
-        assert_eq!(
+            state.messages = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .build_session_context(Some(&state.model))
+                .messages;
+            session.agent.set_state(state);
+            let before = session.session_manager.lock().unwrap().get_entries();
+            let delivered_calls = Arc::new(AtomicUsize::new(0));
+            let delivered = delivered_calls.clone();
             session
+                .agent
+                .set_stream_fn(Arc::new(move |model, context, _| {
+                    let delivered = delivered.clone();
+                    Box::pin(async move {
+                        assert!(
+                            serde_json::to_string(&context.messages)
+                                .unwrap()
+                                .contains(HUMAN),
+                            "queued human input reaches the model"
+                        );
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                        let stream = AssistantMessageEventStream::new();
+                        let mut message =
+                            AssistantMessage::new(model.api, model.provider, model.id, 5);
+                        message.content = vec![pi_ai::types::ContentBlock::Text(
+                            pi_ai::types::TextContent::new("Queued human request received."),
+                        )];
+                        stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                            reason: "stop".into(),
+                            message,
+                        });
+                        stream.end(None);
+                        stream
+                    })
+                }));
+            let compact_session = session.clone();
+            let compaction = tokio::spawn(async move {
+                compact_session
+                    .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(3), async {
+                while summary_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("isolated summary request started");
+            session
+                .steer(HUMAN, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(
+                delivered_calls.load(Ordering::SeqCst),
+                0,
+                "human input waits for the compaction fence"
+            );
+            release_summary.cancel();
+            assert!(
+                !tokio::time::timeout(std::time::Duration::from_secs(3), compaction)
+                    .await
+                    .expect("compaction bounded")
+                    .expect("compaction joined")
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(3), session.wait_for_idle())
+                .await
+                .expect("queued input drains")
+                .expect("session settles");
+            let after = session.session_manager.lock().unwrap().get_entries();
+            assert_eq!(
+                &after[..before.len()],
+                before.as_slice(),
+                "old durable entries remain unchanged"
+            );
+            assert!(
+                !after
+                    .iter()
+                    .any(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction")),
+                "unusable summary never becomes the durable context head"
+            );
+            assert_eq!(
+                summary_calls.load(Ordering::SeqCst),
+                1,
+                "unknown truncation is not replayed during cooldown"
+            );
+            assert_eq!(
+                delivered_calls.load(Ordering::SeqCst),
+                1,
+                "queued human input is delivered exactly once"
+            );
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[test]
+        fn threshold_compaction_retry_backoff_doubles_and_caps() {
+            let delay = |count| threshold_compaction_retry_backoff_delay(count);
+            assert_eq!(delay(1), std::time::Duration::from_millis(5_000));
+            assert_eq!(delay(2), std::time::Duration::from_millis(10_000));
+            assert_eq!(delay(3), std::time::Duration::from_millis(20_000));
+            assert_eq!(delay(4), std::time::Duration::from_millis(40_000));
+            assert_eq!(delay(5), std::time::Duration::from_millis(80_000));
+            assert_eq!(delay(6), std::time::Duration::from_millis(120_000));
+            assert_eq!(
+                delay(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
+                std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
+            );
+        }
+
+        #[tokio::test]
+        async fn failure_streak_is_capped_and_the_gate_reopens_after_the_cooldown() {
+            let agent = ScriptedAgent::new(vec![]);
+            let session = test_session(agent);
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
+                session.record_threshold_compaction_failure();
+            }
+            assert_eq!(
+                session
+                    .threshold_compaction_failure_streak
+                    .lock()
+                    .unwrap()
+                    .as_ref()
+                    .unwrap()
+                    .consecutive_failures,
+                THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES,
+                "the streak stops growing at the cap"
+            );
+            let remaining = session
+                .threshold_compaction_retry_cooldown_remaining()
+                .expect("a capped failure streak is cooling down");
+            assert!(
+                remaining
+                    > std::time::Duration::from_millis(
+                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000
+                    )
+            );
+            assert!(
+                remaining
+                    <= std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
+            );
+            // Backdate the last failure past the ceiling: the gate opens again and
+            // the next turn end may retry compaction.
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(
+                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS + 1,
+                    ))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            session.clear_threshold_compaction_failure_streak();
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            assert!(session
                 .threshold_compaction_failure_streak
                 .lock()
                 .unwrap()
-                .as_ref()
-                .unwrap()
-                .consecutive_failures,
-            THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES,
-            "the streak stops growing at the cap"
-        );
-        let remaining = session
-            .threshold_compaction_retry_cooldown_remaining()
-            .expect("a capped failure streak is cooling down");
-        assert!(remaining > std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000));
-        assert!(remaining <= std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS));
-        // Backdate the last failure past the ceiling: the gate opens again and
-        // the next turn end may retry compaction.
-        {
-            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
-            let state = streak.as_mut().unwrap();
-            state.last_failure = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_millis(
-                    THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS + 1,
-                ))
-                .expect("the backdated instant stays representable");
+                .is_none());
         }
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        session.clear_threshold_compaction_failure_streak();
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        assert!(session.threshold_compaction_failure_streak.lock().unwrap().is_none());
-    }
 
-    /// A session whose settings enable compaction and whose scripted state holds
-    /// an assistant turn above the (tiny) model threshold.
-    async fn gated_session() -> (Arc<AgentSession>, Arc<Mutex<Vec<AgentSessionEvent>>>) {
-        let agent = ScriptedAgent::new(vec![]);
-        let session = test_session(agent);
-        session
-            .settings_manager
-            .lock()
-            .unwrap()
-            .set_compaction_enabled(true);
-        let mut model = Model::new(
-            "unit-compaction-gate",
-            "unit-compaction-gate",
-            "faux",
-            "faux",
-            "https://fixture.invalid",
-        );
-        model.context_window = 1_000.0;
-        model.max_tokens = 500.0;
-        let mut assistant = AssistantMessage::new("faux", "faux", model.id.clone(), 0);
-        assistant.stop_reason = STOP_REASON_STOP.to_string();
-        assistant.usage.input = 900.0;
-        let mut state = session.agent.state();
-        state.model = model;
-        state.messages = vec![
-            AgentMessage::Message(Message::User(UserMessage::new(
-                UserContent::Text("Please keep working on this task.".to_string()),
-                0,
-            ))),
-            AgentMessage::Message(Message::Assistant(assistant)),
-        ];
-        session.agent.set_state(state);
-        let events = Arc::new(Mutex::new(Vec::new()));
-        let sink = events.clone();
-        session.subscribe(Arc::new(move |event| {
-            sink.lock().unwrap().push(event);
-        }));
-        (session, events)
-    }
-
-    fn compaction_starts(events: &[AgentSessionEvent]) -> Vec<String> {
-        events
-            .iter()
-            .filter_map(|event| match event {
-                AgentSessionEvent::CompactionStart { reason, .. } => Some(reason.clone()),
-                _ => None,
-            })
-            .collect()
-    }
-
-    #[tokio::test]
-    async fn threshold_compaction_is_skipped_during_the_cooldown_and_retried_after_it() {
-        let (session, events) = gated_session().await;
-        let settings = session.compaction_settings();
-        // Two failed threshold attempts arm a 10s cooldown.
-        session.record_threshold_compaction_failure();
-        session.record_threshold_compaction_failure();
-        assert!(session.threshold_compaction_retry_in_cooldown());
-        assert!(!session.check_compaction(&settings, false).await.unwrap());
-        assert_eq!(
-            compaction_starts(&events.lock().unwrap()),
-            Vec::<String>::new(),
-            "no summary call is made while the cooldown runs"
-        );
-
-        // Backdate the last failure past the cooldown: the same check now runs
-        // the automatic threshold compaction (it fails at the auth pre-check,
-        // which is fine here; only the attempt boundary is under test).
-        {
-            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
-            let state = streak.as_mut().unwrap();
-            state.last_failure = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(11))
-                .expect("the backdated instant stays representable");
-        }
-        let _ = session.check_compaction(&settings, false).await.unwrap();
-        assert_eq!(
-            compaction_starts(&events.lock().unwrap()),
-            vec![COMPACTION_REASON_THRESHOLD.to_string()]
-        );
-        session.dispose_async(Some(false)).await;
-    }
-
-    /// The turn-end stop decision must respect the cooldown like the other
-    /// threshold paths: during a cooldown the session is not stopped for a
-    /// compaction that cannot run, and the conversation stays untouched.
-    #[tokio::test]
-    async fn cooldown_gates_the_turn_end_stop_decision() {
-        let (session, _events) = gated_session().await;
-        session.record_threshold_compaction_failure();
-        session.record_threshold_compaction_failure();
-        assert!(session.threshold_compaction_retry_in_cooldown());
-        let message = match &session.agent.state().messages[1] {
-            AgentMessage::Message(Message::Assistant(assistant)) => assistant.clone(),
-            _ => panic!("fixture assistant turn missing"),
-        };
-        let context = ShouldStopAfterTurnContext {
-            message,
-            tool_results: vec![],
-            context: AgentContext::default(),
-            new_messages: vec![],
-        };
-        let before = serde_json::to_string(&session.agent.state().messages).unwrap();
-        assert!(
-            !session.should_stop_after_turn(context.clone()).await,
-            "a cooling-down session is not stopped for a compaction that cannot run"
-        );
-        assert!(!session.threshold_compaction_needed(&context).await);
-        // Backdate past the cooldown: the same decision path may stop again.
-        {
-            let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
-            let state = streak.as_mut().unwrap();
-            state.last_failure = std::time::Instant::now()
-                .checked_sub(std::time::Duration::from_secs(11))
-                .expect("the backdated instant stays representable");
-        }
-        assert!(session.threshold_compaction_needed(&context).await);
-        // The gated turn left the conversation byte-identical.
-        let after = serde_json::to_string(&session.agent.state().messages).unwrap();
-        assert_eq!(before, after, "the gated turn must not mutate the conversation");
-        session.dispose_async(Some(false)).await;
-    }
-
-    #[tokio::test]
-    async fn requested_and_overflow_compaction_ignore_the_threshold_cooldown() {
-        let (session, events) = gated_session().await;
-        session.record_threshold_compaction_failure();
-        session.record_threshold_compaction_failure();
-        assert!(session.threshold_compaction_retry_in_cooldown());
-
-        // Manual/requested compaction is never gated.
-        *session.pending_requested_compaction.lock().unwrap() =
-            Some(PendingRequestedCompaction { custom_instructions: None });
-        session.check_compaction(&session.compaction_settings(), false).await.unwrap();
-        assert_eq!(compaction_starts(&events.lock().unwrap()), vec![COMPACTION_REASON_REQUESTED.to_string()]);
-
-        // Overflow recovery is never gated, even with the cooldown armed.
-        let _ = session
-            .run_auto_compaction(COMPACTION_REASON_OVERFLOW, true)
-            .await;
-        assert_eq!(
-            compaction_starts(&events.lock().unwrap()),
-            vec![
-                COMPACTION_REASON_REQUESTED.to_string(),
-                COMPACTION_REASON_OVERFLOW.to_string()
-            ]
-        );
-        session.dispose_async(Some(false)).await;
-    }
-
-    #[tokio::test]
-    async fn threshold_failure_records_the_streak_and_cancel_skip_overflow_do_not() {
-        let (session, _events) = gated_session().await;
-        session.handle_auto_compaction_failure(
-            COMPACTION_REASON_THRESHOLD,
-            "provider failure",
-            None,
-            false,
-            &[],
-            None,
-        );
-        assert!(session.threshold_compaction_retry_in_cooldown());
-        // Cancelled and skipped attempts are not failures.
-        session.handle_auto_compaction_failure(
-            COMPACTION_REASON_THRESHOLD,
-            COMPACTION_CANCELLED_ERROR_MESSAGE,
-            None,
-            false,
-            &[],
-            None,
-        );
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        session.handle_auto_compaction_failure(
-            COMPACTION_REASON_THRESHOLD,
-            COMPACTION_SKIPPED_ERROR_MESSAGE,
-            None,
-            false,
-            &[],
-            None,
-        );
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        // Overflow failures never arm the threshold cooldown.
-        session.handle_auto_compaction_failure(
-            COMPACTION_REASON_OVERFLOW,
-            "provider failure",
-            None,
-            false,
-            &[],
-            None,
-        );
-        assert!(!session.threshold_compaction_retry_in_cooldown());
-        session.dispose_async(Some(false)).await;
-    }
-
-    /// A fully seeded in-memory session whose summary call succeeds: proves a
-    /// successful threshold compaction clears the cooldown so later failures
-    /// start a fresh streak instead of inheriting the old one.
-    #[tokio::test]
-    async fn successful_threshold_compaction_clears_the_streak() {
-        const VALID_SUMMARY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
-        let api = "summary-backoff-success";
-        let registered = api.to_string();
-        let _ = register_api_provider_simple(
-            ApiProviderSimple {
-                api: registered.clone().into(),
-                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
-                stream_simple: Arc::new(move |_, _, _| {
-                    let stream = AssistantMessageEventStream::new();
-                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
-                        reason: STOP_REASON_STOP.to_string(),
-                        message: AssistantMessage {
-                            content: vec![pi_ai::types::ContentBlock::Text(
-                                pi_ai::types::TextContent::new(VALID_SUMMARY),
-                            )],
-                            stop_reason: STOP_REASON_STOP.to_string(),
-                            ..Default::default()
-                        },
-                    });
-                    stream
-                }),
-                compact: None,
-                supports_compaction: None,
-            },
-            None,
-        );
-        let agent = ScriptedAgent::new(vec![]);
-        let session = test_session(agent);
-        session.model_registry.lock().unwrap().set_runtime_api_key("faux", "unit-faux-key");
-        let overrides = serde_json::json!({
-            "autoRefine": {"enabled": false},
-            "retry": {"enabled": false},
-            "compaction": {"enabled": true, "reserveTokens": 500.0, "keepRecentTokens": 100.0},
-            "telemetryEnabled": false,
-            "agentTracesEnabled": false,
-        })
-        .as_object()
-        .unwrap()
-        .clone();
-        session
-            .settings_manager
-            .lock()
-            .unwrap()
-            .apply_overrides(&overrides);
-        let mut model = Model::new(
-            "unit-backoff-success-model",
-            "unit-backoff-success-model",
-            api,
-            "faux",
-            "https://fixture.invalid",
-        );
-        model.context_window = 100_000.0;
-        model.max_tokens = 4_000.0;
-        // Seed durable turns so prepare_compaction has history to cut: the
-        // second turn must cross the 100-token keep-recent window so the cut
-        // lands on it and the first turn gets summarized.
-        for turn in 0..2 {
-            let mut manager = session.session_manager.lock().unwrap();
-            let text = format!("user turn {turn} ").repeat(200);
-            manager
-                .append_message(AgentMessage::Message(Message::User(
-                    UserMessage::new(UserContent::Text(text), 0),
-                )))
-                .unwrap();
-            manager
-                .append_message(AgentMessage::Message(Message::Assistant(AssistantMessage {
-                    content: vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
-                        format!("assistant reply {turn}"),
-                    ))],
-                    api: model.api.clone(),
-                    provider: model.provider.clone(),
-                    model: model.id.clone(),
-                    stop_reason: STOP_REASON_STOP.to_string(),
-                    timestamp: turn,
-                    usage: Usage { input: 900.0, ..Default::default() },
-                    ..Default::default()
-                })))
-                .unwrap();
-        }
-        let mut state = session.agent.state();
-        state.model = model;
-        session.agent.set_state(state);
-
-        // Arm the cooldown, then succeed: the streak must be gone afterwards.
-        session.record_threshold_compaction_failure();
-        session.record_threshold_compaction_failure();
-        assert!(session.threshold_compaction_retry_in_cooldown());
-        let _ = session.run_auto_compaction(COMPACTION_REASON_THRESHOLD, false).await;
-        assert!(
-            !session.threshold_compaction_retry_in_cooldown(),
-            "a successful threshold compaction clears the backoff"
-        );
-        session.dispose_async(Some(false)).await;
-    }
-}
-
-// ---------------------------------------------------------------------------
-// T11 refinement and extension lifecycle parity (H-01, H-02, H-03, H-04,
-// H-08, H-09, H-13).
-//
-// Reference: agent-session.ts line ranges named per test.
-//
-// Fixtures are REAL production wiring:
-//  - a persisted SessionManager (`<case>/sessions/<id>.jsonl`, artifact dir
-//    `<case>/session-artifacts/<id>`),
-//  - a faux provider so planning/review run through the real
-//    `pi_ai::stream::complete_simple` call inside `refinement_completion_fn`,
-//  - extensions registered as factories on the resource loader, exactly like a
-//    shipped extension, so runner wiring is the production wiring.
-// ---------------------------------------------------------------------------
-#[cfg(test)]
-mod t11_refinement_lifecycle_tests {
-    use super::*;
-    use pi_ai::providers::faux::{
-        faux_assistant_message, register_faux_provider, FauxAssistantContent, FauxProviderRegistration,
-        FauxResponseStep, RegisterFauxProviderOptions,
-    };
-    use std::sync::atomic::AtomicUsize;
-
-    /// A logged session event, so tests can assert on emitted events.
-    fn refine_events(session: &Arc<AgentSession>) -> Arc<Mutex<Vec<String>>> {
-        let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
-        let sink = Arc::clone(&seen);
-        session.subscribe(Arc::new(move |event: AgentSessionEvent| {
-            sink.lock().unwrap().push(event.type_name().to_string());
-        }));
-        seen
-    }
-
-    /// Extension events a test extension observed (`{ type, ... }` records).
-    type EventLog = Arc<Mutex<Vec<Value>>>;
-
-    /// A real extension factory that registers handlers on the given event
-    /// types and logs every event it receives. This is the same mechanism every
-    /// shipped extension uses.
-    fn logging_extension(event_types: &[&str], log: EventLog, reply: Option<Value>) -> crate::core::extensions::types::ExtensionFactory {
-        let event_types: Vec<String> = event_types.iter().map(|name| (*name).to_string()).collect();
-        Arc::new(move |pi: Arc<dyn crate::core::extensions::types::ExtensionApi>| {
-            let log = Arc::clone(&log);
-            let reply = reply.clone();
-            for event_type in &event_types {
-                let log = Arc::clone(&log);
-                let reply = reply.clone();
-                let event_type = event_type.clone();
-                pi.on(
-                    &event_type,
-                    Arc::new(move |event, _ctx| {
-                        let log = Arc::clone(&log);
-                        let reply = reply.clone();
-                        Box::pin(async move {
-                            log.lock()
-                                .unwrap()
-                                .push(serde_json::to_value(&event).unwrap_or(Value::Null));
-                            reply.clone()
-                        })
-                    }),
-                );
-            }
-            Box::pin(async { Ok(()) })
-        })
-    }
-
-    /// The extension events observed so far, as `{ type: ... }` strings.
-    fn event_types(log: &EventLog) -> Vec<String> {
-        log.lock()
-            .unwrap()
-            .iter()
-            .filter_map(|event| event.get("type").and_then(Value::as_str).map(str::to_string))
-            .collect()
-    }
-
-    fn t11_state_root() -> &'static std::path::Path {
-        static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
-        ROOT.get_or_init(|| {
-            tempfile::Builder::new().prefix("optimus-t11-").tempdir().expect("private T11 root")
-        }).path()
-    }
-
-    /// The `agentDir` `T11Session::new` provisions for a case, without wiping it.
-    /// Extensions that write session state resolve paths from this directory, so a
-    /// test that installs a shipped factory needs the same string.
-    fn t11_case_agent_dir(case: &str) -> String {
-        t11_state_root().join(case)
-        .join("agent")
-        .to_string_lossy()
-        .to_string()
-    }
-
-    /// Private writable case root (V00).
-    fn t11_case_root(case: &str) -> std::path::PathBuf {
-        let root = t11_state_root().join(case);
-        let _ = std::fs::remove_dir_all(&root);
-        std::fs::create_dir_all(&root).unwrap();
-        root
-    }
-
-    /// The T11 fixture: a persisted session over a faux provider, with the
-    /// given extension factories loaded through the real resource loader.
-    struct T11Session {
-        session: Arc<AgentSession>,
-        manager: Arc<Mutex<SessionManager>>,
-        provider: FauxProviderRegistration,
-        agent: Arc<ScriptedAgent>,
-    }
-
-    impl T11Session {
-        async fn new(
-            case: &str,
-            serialized_refine: bool,
-            auto_refine: Value,
-            extension_factories: Vec<crate::core::extensions::types::ExtensionFactory>,
-        ) -> Self {
+        /// A session whose settings enable compaction and whose scripted state holds
+        /// an assistant turn above the (tiny) model threshold.
+        async fn gated_session() -> (Arc<AgentSession>, Arc<Mutex<Vec<AgentSessionEvent>>>) {
             let agent = ScriptedAgent::new(vec![]);
-            let provider = register_faux_provider(Some(RegisterFauxProviderOptions {
-                provider: Some(format!("t11-{}", uuid::Uuid::new_v4())),
-                tokens_per_second: Some(0.0),
-                ..Default::default()
-            }));
-            let model = provider.get_model();
-            let root = t11_case_root(case);
-            let cwd_path = root.join("workspace");
-            let agent_dir_path = root.join("agent");
-            let sessions_path = root.join("sessions");
-            for dir in [&cwd_path, &agent_dir_path, &sessions_path] {
-                std::fs::create_dir_all(dir).unwrap();
-            }
-            let cwd = cwd_path.to_string_lossy().to_string();
-            let agent_dir = agent_dir_path.to_string_lossy().to_string();
-            let sessions = sessions_path.to_string_lossy().to_string();
-            // TS tests scope `getAgentDir()` through `process.env[ENV_AGENT_DIR]`
-            // (test/suite/agent-session-prompt.test.ts,
-            // test/project-memory-runtime.test.ts): the production harness state
-            // flow reads the user config dir, so the fixture scopes it to the case
-            // root instead of the real user dir.
-            std::env::set_var(crate::config::env_agent_dir(), &agent_dir);
-
-            let settings = Arc::new(Mutex::new(
-                crate::core::settings_manager::SettingsManager::in_memory(
-                    serde_json::json!({
-                        "autoRefine": auto_refine,
-                        "retry": {"enabled": false},
-                        "compaction": {"enabled": false},
-                        "telemetryEnabled": false,
-                        "agentTracesEnabled": false,
-                    })
-                    .as_object()
-                    .unwrap()
-                    .clone(),
-                ),
-            ));
-            let manager = Arc::new(Mutex::new(
-                crate::core::session_manager::SessionManager::create(&cwd, Some(&sessions))
-                    .expect("persisted session manager"),
-            ));
-            let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
-                crate::core::resource_loader::DefaultResourceLoaderOptions {
-                    cwd: cwd.clone(),
-                    agent_dir: agent_dir.clone(),
-                    settings_manager: Some(Arc::clone(&settings)),
-                    no_extensions: true,
-                    no_skills: true,
-                    no_prompt_templates: true,
-                    no_themes: true,
-                    no_context_files: true,
-                    bundled_skills_dir: Some(None),
-                    extension_factories,
-                    ..Default::default()
-                },
-            ));
-            // The production loader path: `agent-session-services.rs:391`
-            // `resource_loader.reload().await` loads the registered extensions
-            // before the session is built, so the runner has its handlers.
-            loader.reload().await;
-            let auth_storage = Arc::new(Mutex::new(
-                crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
-            ));
-            let model_registry = Arc::new(Mutex::new(
-                crate::core::model_registry::ModelRegistry::in_memory(
-                    crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
-                ),
-            ));
-            model_registry
+            let session = test_session(agent);
+            session
+                .settings_manager
                 .lock()
                 .unwrap()
-                .set_runtime_api_key(&model.provider, "t11-faux-key");
-            let mut state = agent.state();
-            state.model = model.clone();
-            agent.set_state(state);
-            let session = AgentSession::new(AgentSessionConfig {
-                agent: Arc::clone(&agent) as Arc<dyn AgentHandle>,
-                session_manager: Arc::clone(&manager),
-                settings_manager: settings,
+                .set_compaction_enabled(true);
+            let mut model = Model::new(
+                "unit-compaction-gate",
+                "unit-compaction-gate",
+                "faux",
+                "faux",
+                "https://fixture.invalid",
+            );
+            model.context_window = 1_000.0;
+            model.max_tokens = 500.0;
+            let mut assistant = AssistantMessage::new("faux", "faux", model.id.clone(), 0);
+            assistant.stop_reason = STOP_REASON_STOP.to_string();
+            assistant.usage.input = 900.0;
+            let mut state = session.agent.state();
+            state.model = model;
+            state.messages = vec![
+                AgentMessage::Message(Message::User(UserMessage::new(
+                    UserContent::Text("Please keep working on this task.".to_string()),
+                    0,
+                ))),
+                AgentMessage::Message(Message::Assistant(assistant)),
+            ];
+            session.agent.set_state(state);
+            let events = Arc::new(Mutex::new(Vec::new()));
+            let sink = events.clone();
+            session.subscribe(Arc::new(move |event| {
+                sink.lock().unwrap().push(event);
+            }));
+            (session, events)
+        }
+
+        fn compaction_starts(events: &[AgentSessionEvent]) -> Vec<String> {
+            events
+                .iter()
+                .filter_map(|event| match event {
+                    AgentSessionEvent::CompactionStart { reason, .. } => Some(reason.clone()),
+                    _ => None,
+                })
+                .collect()
+        }
+
+        #[tokio::test]
+        async fn threshold_compaction_is_skipped_during_the_cooldown_and_retried_after_it() {
+            let (session, events) = gated_session().await;
+            let settings = session.compaction_settings();
+            // Two failed threshold attempts arm a 10s cooldown.
+            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure();
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            assert!(!session.check_compaction(&settings, false).await.unwrap());
+            assert_eq!(
+                compaction_starts(&events.lock().unwrap()),
+                Vec::<String>::new(),
+                "no summary call is made while the cooldown runs"
+            );
+
+            // Backdate the last failure past the cooldown: the same check now runs
+            // the automatic threshold compaction (it fails at the auth pre-check,
+            // which is fine here; only the attempt boundary is under test).
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(11))
+                    .expect("the backdated instant stays representable");
+            }
+            let _ = session.check_compaction(&settings, false).await.unwrap();
+            assert_eq!(
+                compaction_starts(&events.lock().unwrap()),
+                vec![COMPACTION_REASON_THRESHOLD.to_string()]
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        /// The turn-end stop decision must respect the cooldown like the other
+        /// threshold paths: during a cooldown the session is not stopped for a
+        /// compaction that cannot run, and the conversation stays untouched.
+        #[tokio::test]
+        async fn cooldown_gates_the_turn_end_stop_decision() {
+            let (session, _events) = gated_session().await;
+            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure();
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            let message = match &session.agent.state().messages[1] {
+                AgentMessage::Message(Message::Assistant(assistant)) => assistant.clone(),
+                _ => panic!("fixture assistant turn missing"),
+            };
+            let context = ShouldStopAfterTurnContext {
+                message,
+                tool_results: vec![],
+                context: AgentContext::default(),
+                new_messages: vec![],
+            };
+            let before = serde_json::to_string(&session.agent.state().messages).unwrap();
+            assert!(
+                !session.should_stop_after_turn(context.clone()).await,
+                "a cooling-down session is not stopped for a compaction that cannot run"
+            );
+            assert!(!session.threshold_compaction_needed(&context).await);
+            // Backdate past the cooldown: the same decision path may stop again.
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_secs(11))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(session.threshold_compaction_needed(&context).await);
+            // The gated turn left the conversation byte-identical.
+            let after = serde_json::to_string(&session.agent.state().messages).unwrap();
+            assert_eq!(
+                before, after,
+                "the gated turn must not mutate the conversation"
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test]
+        async fn requested_and_overflow_compaction_ignore_the_threshold_cooldown() {
+            let (session, events) = gated_session().await;
+            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure();
+            assert!(session.threshold_compaction_retry_in_cooldown());
+
+            // Manual/requested compaction is never gated.
+            *session.pending_requested_compaction.lock().unwrap() =
+                Some(PendingRequestedCompaction {
+                    custom_instructions: None,
+                });
+            session
+                .check_compaction(&session.compaction_settings(), false)
+                .await
+                .unwrap();
+            assert_eq!(
+                compaction_starts(&events.lock().unwrap()),
+                vec![COMPACTION_REASON_REQUESTED.to_string()]
+            );
+
+            // Overflow recovery is never gated, even with the cooldown armed.
+            let _ = session
+                .run_auto_compaction(COMPACTION_REASON_OVERFLOW, true)
+                .await;
+            assert_eq!(
+                compaction_starts(&events.lock().unwrap()),
+                vec![
+                    COMPACTION_REASON_REQUESTED.to_string(),
+                    COMPACTION_REASON_OVERFLOW.to_string()
+                ]
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test]
+        async fn threshold_failure_records_the_streak_and_cancel_skip_overflow_do_not() {
+            let (session, _events) = gated_session().await;
+            session.handle_auto_compaction_failure(
+                COMPACTION_REASON_THRESHOLD,
+                "provider failure",
+                None,
+                false,
+                &[],
+                None,
+            );
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            // Cancelled and skipped attempts are not failures.
+            session.handle_auto_compaction_failure(
+                COMPACTION_REASON_THRESHOLD,
+                COMPACTION_CANCELLED_ERROR_MESSAGE,
+                None,
+                false,
+                &[],
+                None,
+            );
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            session.handle_auto_compaction_failure(
+                COMPACTION_REASON_THRESHOLD,
+                COMPACTION_SKIPPED_ERROR_MESSAGE,
+                None,
+                false,
+                &[],
+                None,
+            );
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            // Overflow failures never arm the threshold cooldown.
+            session.handle_auto_compaction_failure(
+                COMPACTION_REASON_OVERFLOW,
+                "provider failure",
+                None,
+                false,
+                &[],
+                None,
+            );
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            session.dispose_async(Some(false)).await;
+        }
+
+        /// A fully seeded in-memory session whose summary call succeeds: proves a
+        /// successful threshold compaction clears the cooldown so later failures
+        /// start a fresh streak instead of inheriting the old one.
+        #[tokio::test]
+        async fn successful_threshold_compaction_clears_the_streak() {
+            const VALID_SUMMARY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
+            let api = "summary-backoff-success";
+            let registered = api.to_string();
+            let _ = register_api_provider_simple(
+                ApiProviderSimple {
+                    api: registered.clone().into(),
+                    stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                    stream_simple: Arc::new(move |_, _, _| {
+                        let stream = AssistantMessageEventStream::new();
+                        stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                            reason: STOP_REASON_STOP.to_string(),
+                            message: AssistantMessage {
+                                content: vec![pi_ai::types::ContentBlock::Text(
+                                    pi_ai::types::TextContent::new(VALID_SUMMARY),
+                                )],
+                                stop_reason: STOP_REASON_STOP.to_string(),
+                                ..Default::default()
+                            },
+                        });
+                        stream
+                    }),
+                    compact: None,
+                    supports_compaction: None,
+                },
+                None,
+            );
+            let agent = ScriptedAgent::new(vec![]);
+            let session = test_session(agent);
+            session
+                .model_registry
+                .lock()
+                .unwrap()
+                .set_runtime_api_key("faux", "unit-faux-key");
+            let overrides = serde_json::json!({
+                "autoRefine": {"enabled": false},
+                "retry": {"enabled": false},
+                "compaction": {"enabled": true, "reserveTokens": 500.0, "keepRecentTokens": 100.0},
+                "telemetryEnabled": false,
+                "agentTracesEnabled": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone();
+            session
+                .settings_manager
+                .lock()
+                .unwrap()
+                .apply_overrides(&overrides);
+            let mut model = Model::new(
+                "unit-backoff-success-model",
+                "unit-backoff-success-model",
+                api,
+                "faux",
+                "https://fixture.invalid",
+            );
+            model.context_window = 100_000.0;
+            model.max_tokens = 4_000.0;
+            // Seed durable turns so prepare_compaction has history to cut: the
+            // second turn must cross the 100-token keep-recent window so the cut
+            // lands on it and the first turn gets summarized.
+            for turn in 0..2 {
+                let mut manager = session.session_manager.lock().unwrap();
+                let text = format!("user turn {turn} ").repeat(200);
+                manager
+                    .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                        UserContent::Text(text),
+                        0,
+                    ))))
+                    .unwrap();
+                manager
+                    .append_message(AgentMessage::Message(Message::Assistant(
+                        AssistantMessage {
+                            content: vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new(format!("assistant reply {turn}")),
+                            )],
+                            api: model.api.clone(),
+                            provider: model.provider.clone(),
+                            model: model.id.clone(),
+                            stop_reason: STOP_REASON_STOP.to_string(),
+                            timestamp: turn,
+                            usage: Usage {
+                                input: 900.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )))
+                    .unwrap();
+            }
+            let mut state = session.agent.state();
+            state.model = model;
+            session.agent.set_state(state);
+
+            // Arm the cooldown, then succeed: the streak must be gone afterwards.
+            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure();
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            let _ = session
+                .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+                .await;
+            assert!(
+                !session.threshold_compaction_retry_in_cooldown(),
+                "a successful threshold compaction clears the backoff"
+            );
+            session.dispose_async(Some(false)).await;
+        }
+    }
+
+    // ---------------------------------------------------------------------------
+    // T11 refinement and extension lifecycle parity (H-01, H-02, H-03, H-04,
+    // H-08, H-09, H-13).
+    //
+    // Reference: agent-session.ts line ranges named per test.
+    //
+    // Fixtures are REAL production wiring:
+    //  - a persisted SessionManager (`<case>/sessions/<id>.jsonl`, artifact dir
+    //    `<case>/session-artifacts/<id>`),
+    //  - a faux provider so planning/review run through the real
+    //    `pi_ai::stream::complete_simple` call inside `refinement_completion_fn`,
+    //  - extensions registered as factories on the resource loader, exactly like a
+    //    shipped extension, so runner wiring is the production wiring.
+    // ---------------------------------------------------------------------------
+    #[cfg(test)]
+    mod t11_refinement_lifecycle_tests {
+        use super::*;
+        use pi_ai::providers::faux::{
+            faux_assistant_message, register_faux_provider, FauxAssistantContent,
+            FauxProviderRegistration, FauxResponseStep, RegisterFauxProviderOptions,
+        };
+        use std::sync::atomic::AtomicUsize;
+
+        /// A logged session event, so tests can assert on emitted events.
+        fn refine_events(session: &Arc<AgentSession>) -> Arc<Mutex<Vec<String>>> {
+            let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+            let sink = Arc::clone(&seen);
+            session.subscribe(Arc::new(move |event: AgentSessionEvent| {
+                sink.lock().unwrap().push(event.type_name().to_string());
+            }));
+            seen
+        }
+
+        /// Extension events a test extension observed (`{ type, ... }` records).
+        type EventLog = Arc<Mutex<Vec<Value>>>;
+
+        /// A real extension factory that registers handlers on the given event
+        /// types and logs every event it receives. This is the same mechanism every
+        /// shipped extension uses.
+        fn logging_extension(
+            event_types: &[&str],
+            log: EventLog,
+            reply: Option<Value>,
+        ) -> crate::core::extensions::types::ExtensionFactory {
+            let event_types: Vec<String> =
+                event_types.iter().map(|name| (*name).to_string()).collect();
+            Arc::new(
+                move |pi: Arc<dyn crate::core::extensions::types::ExtensionApi>| {
+                    let log = Arc::clone(&log);
+                    let reply = reply.clone();
+                    for event_type in &event_types {
+                        let log = Arc::clone(&log);
+                        let reply = reply.clone();
+                        let event_type = event_type.clone();
+                        pi.on(
+                            &event_type,
+                            Arc::new(move |event, _ctx| {
+                                let log = Arc::clone(&log);
+                                let reply = reply.clone();
+                                Box::pin(async move {
+                                    log.lock()
+                                        .unwrap()
+                                        .push(serde_json::to_value(&event).unwrap_or(Value::Null));
+                                    reply.clone()
+                                })
+                            }),
+                        );
+                    }
+                    Box::pin(async { Ok(()) })
+                },
+            )
+        }
+
+        /// The extension events observed so far, as `{ type: ... }` strings.
+        fn event_types(log: &EventLog) -> Vec<String> {
+            log.lock()
+                .unwrap()
+                .iter()
+                .filter_map(|event| {
+                    event
+                        .get("type")
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
+                .collect()
+        }
+
+        fn t11_state_root() -> &'static std::path::Path {
+            static ROOT: std::sync::OnceLock<tempfile::TempDir> = std::sync::OnceLock::new();
+            ROOT.get_or_init(|| {
+                tempfile::Builder::new()
+                    .prefix("optimus-t11-")
+                    .tempdir()
+                    .expect("private T11 root")
+            })
+            .path()
+        }
+
+        /// The `agentDir` `T11Session::new` provisions for a case, without wiping it.
+        /// Extensions that write session state resolve paths from this directory, so a
+        /// test that installs a shipped factory needs the same string.
+        fn t11_case_agent_dir(case: &str) -> String {
+            t11_state_root()
+                .join(case)
+                .join("agent")
+                .to_string_lossy()
+                .to_string()
+        }
+
+        /// Private writable case root (V00).
+        fn t11_case_root(case: &str) -> std::path::PathBuf {
+            let root = t11_state_root().join(case);
+            let _ = std::fs::remove_dir_all(&root);
+            std::fs::create_dir_all(&root).unwrap();
+            root
+        }
+
+        /// The T11 fixture: a persisted session over a faux provider, with the
+        /// given extension factories loaded through the real resource loader.
+        struct T11Session {
+            session: Arc<AgentSession>,
+            manager: Arc<Mutex<SessionManager>>,
+            provider: FauxProviderRegistration,
+            agent: Arc<ScriptedAgent>,
+        }
+
+        impl T11Session {
+            async fn new(
+                case: &str,
+                serialized_refine: bool,
+                auto_refine: Value,
+                extension_factories: Vec<crate::core::extensions::types::ExtensionFactory>,
+            ) -> Self {
+                let agent = ScriptedAgent::new(vec![]);
+                let provider = register_faux_provider(Some(RegisterFauxProviderOptions {
+                    provider: Some(format!("t11-{}", uuid::Uuid::new_v4())),
+                    tokens_per_second: Some(0.0),
+                    ..Default::default()
+                }));
+                let model = provider.get_model();
+                let root = t11_case_root(case);
+                let cwd_path = root.join("workspace");
+                let agent_dir_path = root.join("agent");
+                let sessions_path = root.join("sessions");
+                for dir in [&cwd_path, &agent_dir_path, &sessions_path] {
+                    std::fs::create_dir_all(dir).unwrap();
+                }
+                let cwd = cwd_path.to_string_lossy().to_string();
+                let agent_dir = agent_dir_path.to_string_lossy().to_string();
+                let sessions = sessions_path.to_string_lossy().to_string();
+                // TS tests scope `getAgentDir()` through `process.env[ENV_AGENT_DIR]`
+                // (test/suite/agent-session-prompt.test.ts,
+                // test/project-memory-runtime.test.ts): the production harness state
+                // flow reads the user config dir, so the fixture scopes it to the case
+                // root instead of the real user dir.
+                std::env::set_var(crate::config::env_agent_dir(), &agent_dir);
+
+                let settings = Arc::new(Mutex::new(
+                    crate::core::settings_manager::SettingsManager::in_memory(
+                        serde_json::json!({
+                            "autoRefine": auto_refine,
+                            "retry": {"enabled": false},
+                            "compaction": {"enabled": false},
+                            "telemetryEnabled": false,
+                            "agentTracesEnabled": false,
+                        })
+                        .as_object()
+                        .unwrap()
+                        .clone(),
+                    ),
+                ));
+                let manager = Arc::new(Mutex::new(
+                    crate::core::session_manager::SessionManager::create(&cwd, Some(&sessions))
+                        .expect("persisted session manager"),
+                ));
+                let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
+                    crate::core::resource_loader::DefaultResourceLoaderOptions {
+                        cwd: cwd.clone(),
+                        agent_dir: agent_dir.clone(),
+                        settings_manager: Some(Arc::clone(&settings)),
+                        no_extensions: true,
+                        no_skills: true,
+                        no_prompt_templates: true,
+                        no_themes: true,
+                        no_context_files: true,
+                        bundled_skills_dir: Some(None),
+                        extension_factories,
+                        ..Default::default()
+                    },
+                ));
+                // The production loader path: `agent-session-services.rs:391`
+                // `resource_loader.reload().await` loads the registered extensions
+                // before the session is built, so the runner has its handlers.
+                loader.reload().await;
+                let auth_storage = Arc::new(Mutex::new(
+                    crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
+                ));
+                let model_registry = Arc::new(Mutex::new(
+                    crate::core::model_registry::ModelRegistry::in_memory(
+                        crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
+                    ),
+                ));
+                model_registry
+                    .lock()
+                    .unwrap()
+                    .set_runtime_api_key(&model.provider, "t11-faux-key");
+                let mut state = agent.state();
+                state.model = model.clone();
+                agent.set_state(state);
+                let session = AgentSession::new(AgentSessionConfig {
+                    agent: Arc::clone(&agent) as Arc<dyn AgentHandle>,
+                    session_manager: Arc::clone(&manager),
+                    settings_manager: settings,
+                    service_tier_preference: None,
+                    cwd,
+                    agent_dir: Some(agent_dir),
+                    scoped_models: None,
+                    resource_loader: loader,
+                    custom_tools: None,
+                    model_registry,
+                    initial_active_tool_names: None,
+                    allowed_tool_names: None,
+                    include_goals: Some(false),
+                    agent_message_controller: None,
+                    agent_observe_controller: None,
+                    include_compact_skill: Some(false),
+                    rlm_heartbeat_controller: None,
+                    mcp_manager: None,
+                    base_tools_override: None,
+                    extension_runner_ref: None,
+                    session_start_event: None,
+                    rlm_depth: Some(0),
+                    rlm_max_depth: Some(2),
+                    rlm_session_dir: None,
+                    rlm_parent_node_id: None,
+                    rlm_parent_agent: None,
+                    semantic_parent_session_id: None,
+                    semantic_spawned_by_request_id: None,
+                    subagent_runtime_host: None,
+                    autonomous: None,
+                    prewarm_ipython_kernel: Some(false),
+                    auto_refine_reviewer: None,
+                    serialized_refine: Some(serialized_refine),
+                    initial_goal: None,
+                })
+                .expect("agent session");
+                // Persist the transcript immediately: `flushNow()` is the production
+                // persist call, so the session file exists as a FILE.
+                manager.lock().unwrap().flush_now();
+                let _ = &auth_storage;
+                Self {
+                    session,
+                    manager,
+                    provider,
+                    agent,
+                }
+            }
+
+            /// Queue the JSON text the next real model call must return.
+            fn queue_json(&self, value: Value) {
+                self.provider
+                    .append_responses(vec![FauxResponseStep::Message(faux_assistant_message(
+                        FauxAssistantContent::Text(value.to_string()),
+                        None,
+                    ))]);
+            }
+
+            fn transcript(&self) -> String {
+                self.manager
+                    .lock()
+                    .unwrap()
+                    .get_session_file()
+                    .expect("persisted session has a transcript")
+            }
+
+            fn artifact_dir(&self) -> String {
+                self.manager
+                    .lock()
+                    .unwrap()
+                    .get_session_artifact_dir()
+                    .expect("persisted session has an artifact dir")
+            }
+
+            fn local_harness_dir(&self) -> String {
+                crate::core::refinement::refinement::get_local_harness_state_dir(Some(
+                    &self.artifact_dir(),
+                ))
+                .expect("artifact dir yields a local harness dir")
+            }
+
+            fn local_harness(&self) -> crate::core::refinement::refinement::HarnessState {
+                crate::core::refinement::refinement::load_harness_state(
+                    &self.local_harness_dir(),
+                    crate::core::refinement::refinement::HarnessScope::Local,
+                )
+            }
+        }
+
+        /// The review the faux provider returns for a "should refine" round.
+        fn review_json(should_refine: bool) -> Value {
+            serde_json::json!({
+                "shouldRefine": should_refine,
+                "rationale": if should_refine { "evidence found" } else { "nothing to keep" },
+            })
+        }
+
+        /// The proposal the faux provider returns for a planning round.
+        fn proposal_json(id: &str) -> Value {
+            serde_json::json!({
+                "summary": "t11 refinement",
+                "rationale": "t11 fixture",
+                "expectedOutcome": "t11 outcome",
+                "edits": [{
+                    "action": "create",
+                    "kind": "memory",
+                    "id": id,
+                    "title": "t11 memory",
+                    "content": "written by the t11 fixture",
+                    "metadata": {"projectReusable": true, "evidenceStatus": "cited"}
+                }]
+            })
+        }
+
+        /// One synthetic user turn so the planner/reviewer have a conversation.
+        fn append_user_turn(t: &T11Session) {
+            let message = AgentMessage::Message(Message::User(pi_ai::types::UserMessage::new(
+                pi_ai::types::UserContent::Text("t11 fixture user turn".to_string()),
+                now_ms_i64(),
+            )));
+            {
+                let mut manager = t.manager.lock().unwrap();
+                // `flushNow()` is the production persist call (`SessionManager`), so the
+                // transcript exists as a FILE - the shape H-01's teeth depend on.
+                manager.flush_now();
+                manager.append_message(message.clone()).unwrap();
+            }
+            let mut state = t.agent.state();
+            state.messages.push(message);
+            t.agent.set_state(state);
+        }
+
+        // =======================================================================
+        // H-01 harness_paths_agree
+        // =======================================================================
+
+        /// H-01: `_localHarnessStateDir()` derives from the session ARTIFACT
+        /// directory (agent-session.ts:8416-8421), never from the transcript file.
+        /// The transcript is a FILE, so a transcript-derived root would name a
+        /// non-existent `transcript.jsonl/harness` directory.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_harness_paths_agree_uses_the_artifact_dir() {
+            let t = T11Session::new(
+                "h01-paths",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            let artifact_dir = t.artifact_dir();
+            let transcript = t.transcript();
+            assert!(
+                std::path::Path::new(&transcript).is_file(),
+                "precondition: the transcript is a FILE"
+            );
+
+            let expected = crate::core::refinement::refinement::get_local_harness_state_dir(Some(
+                &artifact_dir,
+            ))
+            .expect("artifact dir");
+            let observed = t
+                .session
+                .local_harness_state_dir()
+                .expect("H-01: the session must resolve a local harness dir");
+
+            assert_eq!(
+            observed.replace('\\', "/"),
+            expected.replace('\\', "/"),
+            "H-01: `_localHarnessStateDir()` must use `getSessionArtifactDir()` ({artifact_dir}); \
+             the port used the transcript file ({transcript})"
+        );
+            // Reverting only the source of the directory must fail this.
+            let from_transcript = format!("{}/harness", transcript.replace('\\', "/"));
+            assert_ne!(
+                observed.replace('\\', "/"),
+                from_transcript,
+                "H-01: a transcript-derived harness root must not be used"
+            );
+            // No directory named after the transcript may exist.
+            assert!(
+                !std::path::Path::new(&format!("{transcript}/harness")).exists(),
+                "H-01: no `transcript.jsonl/harness` path may be created"
+            );
+
+            // Apply one valid local change, then read it back through the two other
+            // consumers of the same root: the kernel env and the memory service.
+            let mut state = t.local_harness();
+            let now = now_iso();
+            let entry = crate::core::refinement::refinement::HarnessEntry {
+                id: "t11-probe".to_string(),
+                kind: crate::core::refinement::refinement::RefinementKind::Memory,
+                scope: Some(crate::core::refinement::refinement::HarnessScope::Local),
+                title: "t11 probe".to_string(),
+                content: "local harness round trip".to_string(),
+                path: "general".to_string(),
+                reference: serde_json::Map::new(),
+                arguments: serde_json::Map::new(),
+                metadata: serde_json::Map::new(),
+                source: "t11".to_string(),
+                created_at: now.clone(),
+                updated_at: now,
+                version: 1,
+            };
+            state
+                .entries
+                .get_mut("memory")
+                .expect("memory bucket")
+                .insert("t11-probe".to_string(), entry);
+            crate::core::refinement::refinement::save_harness_state(&t.local_harness_dir(), &state)
+                .expect("save harness state");
+
+            let env = t.session.rlm_kernel_env();
+            assert_eq!(
+                env.get("RLM_SESSION_DIR").map(String::as_str),
+                Some(artifact_dir.as_str()),
+                "H-01: the kernel's session dir must be the artifact dir"
+            );
+            assert_eq!(
+                env.get("RLM_HARNESS_STATE_DIR")
+                    .map(|dir| dir.replace('\\', "/")),
+                Some(t.local_harness_dir().replace('\\', "/")),
+                "H-01: the kernel harness dir must be the session's local harness dir"
+            );
+            // The memory service (a second, independent consumer).
+            let memory = crate::core::memory::service::MemoryService::new(
+                &t.session.cwd,
+                t.session.agent_dir.as_deref().unwrap_or_default(),
+                t.manager.lock().unwrap().get_session_artifact_dir(),
+            )
+            .expect("memory service");
+            let memory_dir = crate::core::refinement::refinement::get_local_harness_state_dir(
+                memory.session_artifact_dir.as_deref(),
+            )
+            .expect("memory harness dir");
+            assert_eq!(
+                memory_dir.replace('\\', "/"),
+                t.local_harness_dir().replace('\\', "/"),
+                "H-01: the memory extension must resolve the same local harness root"
+            );
+            let reread = crate::core::refinement::refinement::load_harness_state(
+                &memory_dir,
+                crate::core::refinement::refinement::HarnessScope::Local,
+            );
+            assert!(
+                reread
+                    .entries
+                    .get("memory")
+                    .map(|bucket| bucket.contains_key("t11-probe"))
+                    .unwrap_or(false),
+                "H-01: the memory consumer must read the entry the session wrote"
+            );
+            // The harness root must stay inside the private case root.
+            let case_root = std::path::Path::new(&t.session.cwd)
+                .parent()
+                .expect("case workspace parent")
+                .canonicalize()
+                .expect("private case root");
+            let harness_root = std::path::Path::new(&t.local_harness_dir())
+                .canonicalize()
+                .expect("persisted local harness root");
+            assert!(
+                harness_root.starts_with(&case_root),
+                "V00: the local harness root stays inside the private case root"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        // =======================================================================
+        // H-09 auto-refine eligibility
+        // =======================================================================
+
+        /// H-09: `_autoRefineAllowedForSession()` is `rlmDepth === 0 && local dir`
+        /// (agent-session.ts:8423-8425).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_auto_refine_requires_root_depth() {
+            let t = T11Session::new(
+                "h09-depth",
+                false,
+                serde_json::json!({"enabled": true}),
+                vec![],
+            )
+            .await;
+            assert_eq!(t.session.rlm_depth(), 0);
+            assert!(
+                t.session.auto_refine_allowed_for_session(),
+                "precondition: a depth-0 session with a local harness dir is eligible"
+            );
+
+            // Same manager and harness root, non-root depth. Forged through the real
+            // config field the constructor reads.
+            let root = t11_case_root("h09-depth-child");
+            let cwd = root.join("workspace");
+            std::fs::create_dir_all(&cwd).unwrap();
+            let cwd = cwd.to_string_lossy().to_string();
+            let child = AgentSession::new(AgentSessionConfig {
+                agent: Arc::clone(&t.agent) as Arc<dyn AgentHandle>,
+                session_manager: Arc::clone(&t.manager),
+                settings_manager: Arc::clone(&t.session.settings_manager),
                 service_tier_preference: None,
                 cwd,
-                agent_dir: Some(agent_dir),
+                agent_dir: t.session.agent_dir.clone(),
                 scoped_models: None,
-                resource_loader: loader,
+                resource_loader: Arc::clone(&t.session.resource_loader),
                 custom_tools: None,
-                model_registry,
+                model_registry: Arc::clone(&t.session.model_registry),
+                initial_active_tool_names: None,
+                allowed_tool_names: None,
+                include_goals: Some(false),
+                agent_message_controller: None,
+                agent_observe_controller: None,
+                include_compact_skill: Some(false),
+                rlm_heartbeat_controller: None,
+                mcp_manager: None,
+                base_tools_override: None,
+                extension_runner_ref: None,
+                session_start_event: None,
+                rlm_depth: Some(1),
+                rlm_max_depth: Some(2),
+                rlm_session_dir: None,
+                rlm_parent_node_id: None,
+                rlm_parent_agent: None,
+                semantic_parent_session_id: None,
+                semantic_spawned_by_request_id: None,
+                subagent_runtime_host: None,
+                autonomous: None,
+                prewarm_ipython_kernel: Some(false),
+                auto_refine_reviewer: None,
+                serialized_refine: Some(false),
+                initial_goal: None,
+            })
+            .expect("nested session");
+            assert_eq!(child.rlm_depth(), 1);
+            assert!(
+                child.local_harness_state_dir().is_some(),
+                "precondition: the nested session still resolves a local harness dir"
+            );
+            assert!(
+                !child.auto_refine_allowed_for_session(),
+                "H-09: a non-root session must be ineligible (agent-session.ts:8424 requires \
+             `this._rlmDepth === 0`); the port tested only the harness directory"
+            );
+
+            // Negative control: a session with no artifact dir is ineligible.
+            let detached_root = t11_case_root("h09-empty");
+            let detached_cwd = detached_root.to_string_lossy().to_string();
+            let detached = AgentSession::new(AgentSessionConfig {
+                agent: Arc::clone(&t.agent) as Arc<dyn AgentHandle>,
+                session_manager: Arc::new(Mutex::new(
+                    crate::core::session_manager::SessionManager::in_memory(
+                        Some(&detached_cwd),
+                        Some(&detached_cwd),
+                    )
+                    .unwrap(),
+                )),
+                settings_manager: Arc::clone(&t.session.settings_manager),
+                service_tier_preference: None,
+                cwd: detached_cwd.clone(),
+                agent_dir: Some(detached_cwd),
+                scoped_models: None,
+                resource_loader: Arc::clone(&t.session.resource_loader),
+                custom_tools: None,
+                model_registry: Arc::clone(&t.session.model_registry),
                 initial_active_tool_names: None,
                 allowed_tool_names: None,
                 include_goals: Some(false),
@@ -19944,1169 +22184,902 @@ mod t11_refinement_lifecycle_tests {
                 autonomous: None,
                 prewarm_ipython_kernel: Some(false),
                 auto_refine_reviewer: None,
-                serialized_refine: Some(serialized_refine),
+                serialized_refine: Some(false),
                 initial_goal: None,
             })
-            .expect("agent session");
-            // Persist the transcript immediately: `flushNow()` is the production
-            // persist call, so the session file exists as a FILE.
-            manager.lock().unwrap().flush_now();
-            let _ = &auth_storage;
-            Self {
-                session,
-                manager,
-                provider,
-                agent,
-            }
+            .expect("session without an artifact dir");
+            assert!(
+                detached.local_harness_state_dir().is_none(),
+                "precondition: an unpersisted session has no local harness dir"
+            );
+            assert!(
+                !detached.auto_refine_allowed_for_session(),
+                "H-09 negative control: no local harness dir means ineligible"
+            );
+
+            child.dispose_async(Some(false)).await;
+            detached.dispose_async(Some(false)).await;
+            t.session.dispose_async(Some(false)).await;
         }
 
-        /// Queue the JSON text the next real model call must return.
-        fn queue_json(&self, value: Value) {
-            self.provider
-                .append_responses(vec![FauxResponseStep::Message(faux_assistant_message(
-                    FauxAssistantContent::Text(value.to_string()),
-                    None,
-                ))]);
-        }
+        // =======================================================================
+        // H-02 auto_refine_runs_when_eligible
+        // =======================================================================
 
-        fn transcript(&self) -> String {
-            self.manager
-                .lock()
-                .unwrap()
-                .get_session_file()
-                .expect("persisted session has a transcript")
-        }
-
-        fn artifact_dir(&self) -> String {
-            self.manager
-                .lock()
-                .unwrap()
-                .get_session_artifact_dir()
-                .expect("persisted session has an artifact dir")
-        }
-
-        fn local_harness_dir(&self) -> String {
-            crate::core::refinement::refinement::get_local_harness_state_dir(Some(
-                &self.artifact_dir(),
-            ))
-            .expect("artifact dir yields a local harness dir")
-        }
-
-        fn local_harness(&self) -> crate::core::refinement::refinement::HarnessState {
-            crate::core::refinement::refinement::load_harness_state(
-                &self.local_harness_dir(),
-                crate::core::refinement::refinement::HarnessScope::Local,
+        /// H-02: `_scheduleAutoRefineAfterAgentEnd()` must SCHEDULE the run. The
+        /// reference falls through to `_scheduleAutoRefine("turn_interval")`
+        /// (agent-session.ts:8513), which runs `_maybeAutoRefine` through the real
+        /// review call.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_agent_end_schedules_the_turn_interval_run() {
+            let t = T11Session::new(
+                "h02-agent-end",
+                false,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
             )
-        }
-    }
+            .await;
+            let events = refine_events(&t.session);
+            append_user_turn(&t);
+            t.queue_json(review_json(true));
+            t.queue_json(proposal_json("t11-agent-end"));
+            t.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            let before = t.provider.call_count();
 
-    /// The review the faux provider returns for a "should refine" round.
-    fn review_json(should_refine: bool) -> Value {
-        serde_json::json!({
-            "shouldRefine": should_refine,
-            "rationale": if should_refine { "evidence found" } else { "nothing to keep" },
-        })
-    }
+            t.session.schedule_auto_refine_after_agent_end();
 
-    /// The proposal the faux provider returns for a planning round.
-    fn proposal_json(id: &str) -> Value {
-        serde_json::json!({
-            "summary": "t11 refinement",
-            "rationale": "t11 fixture",
-            "expectedOutcome": "t11 outcome",
-            "edits": [{
-                "action": "create",
-                "kind": "memory",
-                "id": id,
-                "title": "t11 memory",
-                "content": "written by the t11 fixture",
-                "metadata": {"projectReusable": true, "evidenceStatus": "cited"}
-            }]
-        })
-    }
-
-    /// One synthetic user turn so the planner/reviewer have a conversation.
-    fn append_user_turn(t: &T11Session) {
-        let message = AgentMessage::Message(Message::User(pi_ai::types::UserMessage::new(
-            pi_ai::types::UserContent::Text("t11 fixture user turn".to_string()),
-            now_ms_i64(),
-        )));
-        {
-            let mut manager = t.manager.lock().unwrap();
-            // `flushNow()` is the production persist call (`SessionManager`), so the
-            // transcript exists as a FILE - the shape H-01's teeth depend on.
-            manager.flush_now();
-            manager.append_message(message.clone()).unwrap();
-        }
-        let mut state = t.agent.state();
-        state.messages.push(message);
-        t.agent.set_state(state);
-    }
-
-    // =======================================================================
-    // H-01 harness_paths_agree
-    // =======================================================================
-
-    /// H-01: `_localHarnessStateDir()` derives from the session ARTIFACT
-    /// directory (agent-session.ts:8416-8421), never from the transcript file.
-    /// The transcript is a FILE, so a transcript-derived root would name a
-    /// non-existent `transcript.jsonl/harness` directory.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_harness_paths_agree_uses_the_artifact_dir() {
-        let t = T11Session::new("h01-paths", false, serde_json::json!({"enabled": false}), vec![]).await;
-        let artifact_dir = t.artifact_dir();
-        let transcript = t.transcript();
-        assert!(
-            std::path::Path::new(&transcript).is_file(),
-            "precondition: the transcript is a FILE"
-        );
-
-        let expected = crate::core::refinement::refinement::get_local_harness_state_dir(Some(
-            &artifact_dir,
-        ))
-        .expect("artifact dir");
-        let observed = t
-            .session
-            .local_harness_state_dir()
-            .expect("H-01: the session must resolve a local harness dir");
-
-        assert_eq!(
-            observed.replace('\\', "/"),
-            expected.replace('\\', "/"),
-            "H-01: `_localHarnessStateDir()` must use `getSessionArtifactDir()` ({artifact_dir}); \
-             the port used the transcript file ({transcript})"
-        );
-        // Reverting only the source of the directory must fail this.
-        let from_transcript = format!("{}/harness", transcript.replace('\\', "/"));
-        assert_ne!(
-            observed.replace('\\', "/"),
-            from_transcript,
-            "H-01: a transcript-derived harness root must not be used"
-        );
-        // No directory named after the transcript may exist.
-        assert!(
-            !std::path::Path::new(&format!("{transcript}/harness")).exists(),
-            "H-01: no `transcript.jsonl/harness` path may be created"
-        );
-
-        // Apply one valid local change, then read it back through the two other
-        // consumers of the same root: the kernel env and the memory service.
-        let mut state = t.local_harness();
-        let now = now_iso();
-        let entry = crate::core::refinement::refinement::HarnessEntry {
-            id: "t11-probe".to_string(),
-            kind: crate::core::refinement::refinement::RefinementKind::Memory,
-            scope: Some(crate::core::refinement::refinement::HarnessScope::Local),
-            title: "t11 probe".to_string(),
-            content: "local harness round trip".to_string(),
-            path: "general".to_string(),
-            reference: serde_json::Map::new(),
-            arguments: serde_json::Map::new(),
-            metadata: serde_json::Map::new(),
-            source: "t11".to_string(),
-            created_at: now.clone(),
-            updated_at: now,
-            version: 1,
-        };
-        state
-            .entries
-            .get_mut("memory")
-            .expect("memory bucket")
-            .insert("t11-probe".to_string(), entry);
-        crate::core::refinement::refinement::save_harness_state(&t.local_harness_dir(), &state)
-            .expect("save harness state");
-
-        let env = t.session.rlm_kernel_env();
-        assert_eq!(
-            env.get("RLM_SESSION_DIR").map(String::as_str),
-            Some(artifact_dir.as_str()),
-            "H-01: the kernel's session dir must be the artifact dir"
-        );
-        assert_eq!(
-            env.get("RLM_HARNESS_STATE_DIR")
-                .map(|dir| dir.replace('\\', "/")),
-            Some(t.local_harness_dir().replace('\\', "/")),
-            "H-01: the kernel harness dir must be the session's local harness dir"
-        );
-        // The memory service (a second, independent consumer).
-        let memory = crate::core::memory::service::MemoryService::new(
-            &t.session.cwd,
-            t.session.agent_dir.as_deref().unwrap_or_default(),
-            t.manager.lock().unwrap().get_session_artifact_dir(),
-        )
-        .expect("memory service");
-        let memory_dir = crate::core::refinement::refinement::get_local_harness_state_dir(
-            memory.session_artifact_dir.as_deref(),
-        )
-        .expect("memory harness dir");
-        assert_eq!(
-            memory_dir.replace('\\', "/"),
-            t.local_harness_dir().replace('\\', "/"),
-            "H-01: the memory extension must resolve the same local harness root"
-        );
-        let reread = crate::core::refinement::refinement::load_harness_state(
-            &memory_dir,
-            crate::core::refinement::refinement::HarnessScope::Local,
-        );
-        assert!(
-            reread
-                .entries
-                .get("memory")
-                .map(|bucket| bucket.contains_key("t11-probe"))
-                .unwrap_or(false),
-            "H-01: the memory consumer must read the entry the session wrote"
-        );
-        // The harness root must stay inside the private case root.
-        let case_root = std::path::Path::new(&t.session.cwd)
-            .parent().expect("case workspace parent")
-            .canonicalize().expect("private case root");
-        let harness_root = std::path::Path::new(&t.local_harness_dir())
-            .canonicalize().expect("persisted local harness root");
-        assert!(
-            harness_root.starts_with(&case_root),
-            "V00: the local harness root stays inside the private case root"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    // =======================================================================
-    // H-09 auto-refine eligibility
-    // =======================================================================
-
-    /// H-09: `_autoRefineAllowedForSession()` is `rlmDepth === 0 && local dir`
-    /// (agent-session.ts:8423-8425).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_auto_refine_requires_root_depth() {
-        let t = T11Session::new("h09-depth", false, serde_json::json!({"enabled": true}), vec![]).await;
-        assert_eq!(t.session.rlm_depth(), 0);
-        assert!(
-            t.session.auto_refine_allowed_for_session(),
-            "precondition: a depth-0 session with a local harness dir is eligible"
-        );
-
-        // Same manager and harness root, non-root depth. Forged through the real
-        // config field the constructor reads.
-        let root = t11_case_root("h09-depth-child");
-        let cwd = root.join("workspace");
-        std::fs::create_dir_all(&cwd).unwrap();
-        let cwd = cwd.to_string_lossy().to_string();
-        let child = AgentSession::new(AgentSessionConfig {
-            agent: Arc::clone(&t.agent) as Arc<dyn AgentHandle>,
-            session_manager: Arc::clone(&t.manager),
-            settings_manager: Arc::clone(&t.session.settings_manager),
-            service_tier_preference: None,
-            cwd,
-            agent_dir: t.session.agent_dir.clone(),
-            scoped_models: None,
-            resource_loader: Arc::clone(&t.session.resource_loader),
-            custom_tools: None,
-            model_registry: Arc::clone(&t.session.model_registry),
-            initial_active_tool_names: None,
-            allowed_tool_names: None,
-            include_goals: Some(false),
-            agent_message_controller: None,
-            agent_observe_controller: None,
-            include_compact_skill: Some(false),
-            rlm_heartbeat_controller: None,
-            mcp_manager: None,
-            base_tools_override: None,
-            extension_runner_ref: None,
-            session_start_event: None,
-            rlm_depth: Some(1),
-            rlm_max_depth: Some(2),
-            rlm_session_dir: None,
-            rlm_parent_node_id: None,
-            rlm_parent_agent: None,
-            semantic_parent_session_id: None,
-            semantic_spawned_by_request_id: None,
-            subagent_runtime_host: None,
-            autonomous: None,
-            prewarm_ipython_kernel: Some(false),
-            auto_refine_reviewer: None,
-            serialized_refine: Some(false),
-            initial_goal: None,
-        })
-        .expect("nested session");
-        assert_eq!(child.rlm_depth(), 1);
-        assert!(
-            child.local_harness_state_dir().is_some(),
-            "precondition: the nested session still resolves a local harness dir"
-        );
-        assert!(
-            !child.auto_refine_allowed_for_session(),
-            "H-09: a non-root session must be ineligible (agent-session.ts:8424 requires \
-             `this._rlmDepth === 0`); the port tested only the harness directory"
-        );
-
-        // Negative control: a session with no artifact dir is ineligible.
-        let detached_root = t11_case_root("h09-empty");
-        let detached_cwd = detached_root.to_string_lossy().to_string();
-        let detached = AgentSession::new(AgentSessionConfig {
-            agent: Arc::clone(&t.agent) as Arc<dyn AgentHandle>,
-            session_manager: Arc::new(Mutex::new(
-                crate::core::session_manager::SessionManager::in_memory(
-                    Some(&detached_cwd),
-                    Some(&detached_cwd),
-                )
-                .unwrap(),
-            )),
-            settings_manager: Arc::clone(&t.session.settings_manager),
-            service_tier_preference: None,
-            cwd: detached_cwd.clone(),
-            agent_dir: Some(detached_cwd),
-            scoped_models: None,
-            resource_loader: Arc::clone(&t.session.resource_loader),
-            custom_tools: None,
-            model_registry: Arc::clone(&t.session.model_registry),
-            initial_active_tool_names: None,
-            allowed_tool_names: None,
-            include_goals: Some(false),
-            agent_message_controller: None,
-            agent_observe_controller: None,
-            include_compact_skill: Some(false),
-            rlm_heartbeat_controller: None,
-            mcp_manager: None,
-            base_tools_override: None,
-            extension_runner_ref: None,
-            session_start_event: None,
-            rlm_depth: Some(0),
-            rlm_max_depth: Some(2),
-            rlm_session_dir: None,
-            rlm_parent_node_id: None,
-            rlm_parent_agent: None,
-            semantic_parent_session_id: None,
-            semantic_spawned_by_request_id: None,
-            subagent_runtime_host: None,
-            autonomous: None,
-            prewarm_ipython_kernel: Some(false),
-            auto_refine_reviewer: None,
-            serialized_refine: Some(false),
-            initial_goal: None,
-        })
-        .expect("session without an artifact dir");
-        assert!(
-            detached.local_harness_state_dir().is_none(),
-            "precondition: an unpersisted session has no local harness dir"
-        );
-        assert!(
-            !detached.auto_refine_allowed_for_session(),
-            "H-09 negative control: no local harness dir means ineligible"
-        );
-
-        child.dispose_async(Some(false)).await;
-        detached.dispose_async(Some(false)).await;
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    // =======================================================================
-    // H-02 auto_refine_runs_when_eligible
-    // =======================================================================
-
-    /// H-02: `_scheduleAutoRefineAfterAgentEnd()` must SCHEDULE the run. The
-    /// reference falls through to `_scheduleAutoRefine("turn_interval")`
-    /// (agent-session.ts:8513), which runs `_maybeAutoRefine` through the real
-    /// review call.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_agent_end_schedules_the_turn_interval_run() {
-        let t = T11Session::new(
-            "h02-agent-end",
-            false,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        let events = refine_events(&t.session);
-        append_user_turn(&t);
-        t.queue_json(review_json(true));
-        t.queue_json(proposal_json("t11-agent-end"));
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let before = t.provider.call_count();
-
-        t.session.schedule_auto_refine_after_agent_end();
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while t.provider.call_count() == before && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while t.provider.call_count() == before && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
             t.provider.call_count() > before,
             "H-02: `_scheduleAutoRefineAfterAgentEnd()` must schedule the run \
              (agent-session.ts:8513 `_scheduleAutoRefine(\"turn_interval\")` -> `_maybeAutoRefine`, \
              8704-8815); the port only bumped the branch version and emitted an event, and \
              `schedule_auto_refine` (`agent_session.rs:12219`) only set a pending flag it never consumed"
         );
-        let _ = &events;
-        assert_eq!(
-            t.local_harness().refinements.len(),
-            1,
-            "H-02: the scheduled run must complete the full review -> plan -> apply cycle"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    /// H-02: `_scheduleDeferredAutoRefineIfIdle()` must schedule the deferred
-    /// run when idle (agent-session.ts:8681-8689).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_deferred_idle_run_is_scheduled_not_dropped() {
-        let t = T11Session::new(
-            "h02-deferred",
-            false,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.queue_json(review_json(true));
-        t.queue_json(proposal_json("t11-deferred"));
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        t.session
-            .turn_interval_auto_refine_pending
-            .store(true, Ordering::SeqCst);
-        assert!(!t.session.is_streaming(), "precondition: the session is idle");
-        let before = t.provider.call_count();
-
-        t.session.schedule_deferred_auto_refine_if_idle();
-
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while t.provider.call_count() == before && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            let _ = &events;
+            assert_eq!(
+                t.local_harness().refinements.len(),
+                1,
+                "H-02: the scheduled run must complete the full review -> plan -> apply cycle"
+            );
+            t.session.dispose_async(Some(false)).await;
         }
-        assert!(
+
+        /// H-02: `_scheduleDeferredAutoRefineIfIdle()` must schedule the deferred
+        /// run when idle (agent-session.ts:8681-8689).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_deferred_idle_run_is_scheduled_not_dropped() {
+            let t = T11Session::new(
+                "h02-deferred",
+                false,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&t);
+            t.queue_json(review_json(true));
+            t.queue_json(proposal_json("t11-deferred"));
+            t.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            t.session
+                .turn_interval_auto_refine_pending
+                .store(true, Ordering::SeqCst);
+            assert!(
+                !t.session.is_streaming(),
+                "precondition: the session is idle"
+            );
+            let before = t.provider.call_count();
+
+            t.session.schedule_deferred_auto_refine_if_idle();
+
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while t.provider.call_count() == before && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
             t.provider.call_count() > before,
             "H-02: an idle deferred trigger must be scheduled \
              (agent-session.ts:8685-8688 clears the flag and calls \
              `_scheduleAutoRefine(\"turn_interval\")`); the port cleared the flag and dropped the run"
         );
-        t.session.dispose_async(Some(false)).await;
-    }
+            t.session.dispose_async(Some(false)).await;
+        }
 
-    /// H-02 negative controls: disabled learning, a busy session and a rejected
-    /// review must not run (agent-session.ts:8715-8731, 8777-8789).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_auto_refine_negative_controls() {
-        // (a) autoRefine disabled: `_maybeAutoRefine` must stop at the enabled gate
-        // (TS 8714-8718); the port's `maybe_auto_refine_inner` never reads the
-        // setting, so it reviews (and can refine) a disabled session.
-        let disabled = T11Session::new(
-            "h02-disabled",
-            false,
-            serde_json::json!({"enabled": false, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&disabled);
-        disabled
-            .session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let before = disabled.provider.call_count();
-        let _ = disabled
-            .session
-            .maybe_auto_refine(&AutoRefineReason::TurnInterval)
+        /// H-02 negative controls: disabled learning, a busy session and a rejected
+        /// review must not run (agent-session.ts:8715-8731, 8777-8789).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_auto_refine_negative_controls() {
+            // (a) autoRefine disabled: `_maybeAutoRefine` must stop at the enabled gate
+            // (TS 8714-8718); the port's `maybe_auto_refine_inner` never reads the
+            // setting, so it reviews (and can refine) a disabled session.
+            let disabled = T11Session::new(
+                "h02-disabled",
+                false,
+                serde_json::json!({"enabled": false, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
             .await;
-        assert_eq!(
+            append_user_turn(&disabled);
+            disabled
+                .session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            let before = disabled.provider.call_count();
+            let _ = disabled
+                .session
+                .maybe_auto_refine(&AutoRefineReason::TurnInterval)
+                .await;
+            assert_eq!(
             disabled.provider.call_count(),
             before,
             "H-02 negative control: `autoRefine.enabled=false` must not review or refine (TS 8715-8718)"
         );
-        assert!(
-            disabled.local_harness().refinements.is_empty(),
-            "H-02 negative control: a disabled session must not persist a refinement"
-        );
+            assert!(
+                disabled.local_harness().refinements.is_empty(),
+                "H-02 negative control: a disabled session must not persist a refinement"
+            );
 
-        // (b) busy session: the trigger is deferred, not executed.
-        let busy = T11Session::new(
-            "h02-busy",
-            false,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&busy);
-        busy.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let before = busy.provider.call_count();
-        {
-            let mut state = busy.agent.state();
-            state.is_streaming = true;
-            busy.agent.set_state(state);
-        }
-        assert!(busy.session.is_streaming(), "precondition: streaming");
-        busy.session.schedule_auto_refine_after_agent_end();
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert_eq!(
-            busy.provider.call_count(),
-            before,
-            "H-02 negative control: a streaming session defers the run (TS 8719-8726)"
-        );
-        assert!(
-            busy.session
-                .turn_interval_auto_refine_pending
-                .load(Ordering::SeqCst),
-            "H-02: the deferred run keeps its pending flag (TS 8723)"
-        );
-        {
-            let mut state = busy.agent.state();
-            state.is_streaming = false;
-            busy.agent.set_state(state);
-        }
-        assert!(
-            !busy.session.auto_refine_in_progress.load(Ordering::SeqCst),
-            "deferring a busy session must not claim the auto-refine owner flag"
-        );
-        busy.queue_json(review_json(false));
-        busy.session.schedule_deferred_auto_refine_if_idle();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while busy.provider.call_count() == before
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert_eq!(
-            busy.provider.call_count(),
-            before + 1,
-            "the deferred auto-refine must run once the busy session becomes idle"
-        );
-        busy.session.dispose_async(Some(false)).await;
-
-        // (c) a rejected review stamps the cooldown and never refines.
-        let rejected = T11Session::new(
-            "h02-rejected",
-            false,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 60_000}),
-            vec![],
-        ).await;
-        append_user_turn(&rejected);
-        rejected.queue_json(review_json(false));
-        rejected
-            .session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let before = rejected.provider.call_count();
-        let _ = rejected
-            .session
-            .maybe_auto_refine(&AutoRefineReason::TurnInterval)
+            // (b) busy session: the trigger is deferred, not executed.
+            let busy = T11Session::new(
+                "h02-busy",
+                false,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
             .await;
-        assert_eq!(
-            rejected.provider.call_count(),
-            before + 1,
-            "H-02: a rejected review makes exactly one review call and no planning call"
-        );
-        assert!(
-            *rejected
-                .session
-                .last_auto_refine_review_at
-                .lock()
-                .unwrap()
-                > 0.0,
-            "H-02 negative control: a rejected review stamps the cooldown (TS 8783)"
-        );
-        assert_eq!(
+            append_user_turn(&busy);
+            busy.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            let before = busy.provider.call_count();
+            {
+                let mut state = busy.agent.state();
+                state.is_streaming = true;
+                busy.agent.set_state(state);
+            }
+            assert!(busy.session.is_streaming(), "precondition: streaming");
+            busy.session.schedule_auto_refine_after_agent_end();
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(
+                busy.provider.call_count(),
+                before,
+                "H-02 negative control: a streaming session defers the run (TS 8719-8726)"
+            );
+            assert!(
+                busy.session
+                    .turn_interval_auto_refine_pending
+                    .load(Ordering::SeqCst),
+                "H-02: the deferred run keeps its pending flag (TS 8723)"
+            );
+            {
+                let mut state = busy.agent.state();
+                state.is_streaming = false;
+                busy.agent.set_state(state);
+            }
+            assert!(
+                !busy.session.auto_refine_in_progress.load(Ordering::SeqCst),
+                "deferring a busy session must not claim the auto-refine owner flag"
+            );
+            busy.queue_json(review_json(false));
+            busy.session.schedule_deferred_auto_refine_if_idle();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while busy.provider.call_count() == before && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert_eq!(
+                busy.provider.call_count(),
+                before + 1,
+                "the deferred auto-refine must run once the busy session becomes idle"
+            );
+            busy.session.dispose_async(Some(false)).await;
+
+            // (c) a rejected review stamps the cooldown and never refines.
+            let rejected = T11Session::new(
+                "h02-rejected",
+                false,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 60_000}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&rejected);
+            rejected.queue_json(review_json(false));
             rejected
                 .session
                 .assistant_turns_since_auto_refine
-                .load(Ordering::SeqCst),
-            0,
-            "H-02: a rejected review resets the turn counter (TS 8784)"
-        );
-        assert!(
-            rejected.local_harness().refinements.is_empty(),
-            "H-02 negative control: a rejected review must not persist a refinement"
-        );
+                .store(1, Ordering::SeqCst);
+            let before = rejected.provider.call_count();
+            let _ = rejected
+                .session
+                .maybe_auto_refine(&AutoRefineReason::TurnInterval)
+                .await;
+            assert_eq!(
+                rejected.provider.call_count(),
+                before + 1,
+                "H-02: a rejected review makes exactly one review call and no planning call"
+            );
+            assert!(
+                *rejected.session.last_auto_refine_review_at.lock().unwrap() > 0.0,
+                "H-02 negative control: a rejected review stamps the cooldown (TS 8783)"
+            );
+            assert_eq!(
+                rejected
+                    .session
+                    .assistant_turns_since_auto_refine
+                    .load(Ordering::SeqCst),
+                0,
+                "H-02: a rejected review resets the turn counter (TS 8784)"
+            );
+            assert!(
+                rejected.local_harness().refinements.is_empty(),
+                "H-02 negative control: a rejected review must not persist a refinement"
+            );
 
-        disabled.session.dispose_async(Some(false)).await;
-        rejected.session.dispose_async(Some(false)).await;
-    }
+            disabled.session.dispose_async(Some(false)).await;
+            rejected.session.dispose_async(Some(false)).await;
+        }
 
-    /// H-02: compaction scheduling. A serialized session keeps the trigger for
-    /// the `shouldStopAfterTurn` boundary and must not take the interactive path
-    /// (agent-session.ts:8520-8531); a session with a post-compaction
-    /// continuation defers; otherwise "compact" runs.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_compaction_schedule_matches_the_reference() {
-        // (a) serialized: pending, no interactive run.
-        let serialized = T11Session::new(
+        /// H-02: compaction scheduling. A serialized session keeps the trigger for
+        /// the `shouldStopAfterTurn` boundary and must not take the interactive path
+        /// (agent-session.ts:8520-8531); a session with a post-compaction
+        /// continuation defers; otherwise "compact" runs.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_compaction_schedule_matches_the_reference() {
+            // (a) serialized: pending, no interactive run.
+            let serialized = T11Session::new(
             "h02-compact-serialized",
             true,
             serde_json::json!({"enabled": true, "turnInterval": 1, "compact": true, "cooldownMs": 0}),
             vec![],
         ).await;
-        append_user_turn(&serialized);
-        serialized.queue_json(review_json(true));
-        serialized.queue_json(proposal_json("t11-compact-serialized"));
-        let before = serialized.provider.call_count();
-        serialized.session.schedule_auto_refine_after_compaction(false);
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert!(
+            append_user_turn(&serialized);
+            serialized.queue_json(review_json(true));
+            serialized.queue_json(proposal_json("t11-compact-serialized"));
+            let before = serialized.provider.call_count();
             serialized
                 .session
-                .compact_auto_refine_pending
-                .load(Ordering::SeqCst),
-            "H-02: a serialized session keeps the compaction trigger pending (TS 8520-8525)"
-        );
-        assert_eq!(
-            serialized.provider.call_count(),
-            before,
-            "H-02: a serialized session must not run the interactive path (TS 8521-8523)"
-        );
+                .schedule_auto_refine_after_compaction(false);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert!(
+                serialized
+                    .session
+                    .compact_auto_refine_pending
+                    .load(Ordering::SeqCst),
+                "H-02: a serialized session keeps the compaction trigger pending (TS 8520-8525)"
+            );
+            assert_eq!(
+                serialized.provider.call_count(),
+                before,
+                "H-02: a serialized session must not run the interactive path (TS 8521-8523)"
+            );
 
-        // (b) non-serialized with a post-compaction continuation: deferred.
-        let continued = T11Session::new(
+            // (b) non-serialized with a post-compaction continuation: deferred.
+            let continued = T11Session::new(
             "h02-compact-continued",
             false,
             serde_json::json!({"enabled": true, "turnInterval": 1, "compact": true, "cooldownMs": 0}),
             vec![],
         ).await;
-        append_user_turn(&continued);
-        let before = continued.provider.call_count();
-        continued.session.schedule_auto_refine_after_compaction(true);
-        tokio::time::sleep(std::time::Duration::from_millis(80)).await;
-        assert_eq!(
-            continued.provider.call_count(),
-            before,
-            "H-02: a post-compaction continuation defers the compact run (TS 8526-8529)"
-        );
-        assert!(
+            append_user_turn(&continued);
+            let before = continued.provider.call_count();
             continued
                 .session
-                .compact_auto_refine_pending
-                .load(Ordering::SeqCst),
-            "H-02: the deferred compact trigger stays pending"
-        );
+                .schedule_auto_refine_after_compaction(true);
+            tokio::time::sleep(std::time::Duration::from_millis(80)).await;
+            assert_eq!(
+                continued.provider.call_count(),
+                before,
+                "H-02: a post-compaction continuation defers the compact run (TS 8526-8529)"
+            );
+            assert!(
+                continued
+                    .session
+                    .compact_auto_refine_pending
+                    .load(Ordering::SeqCst),
+                "H-02: the deferred compact trigger stays pending"
+            );
 
-        // (c) no continuation: "compact" runs.
-        let run = T11Session::new(
+            // (c) no continuation: "compact" runs.
+            let run = T11Session::new(
             "h02-compact-run",
             false,
             serde_json::json!({"enabled": true, "turnInterval": 1, "compact": true, "cooldownMs": 0}),
             vec![],
         ).await;
-        append_user_turn(&run);
-        run.queue_json(review_json(true));
-        run.queue_json(proposal_json("t11-compact-run"));
-        run.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let before = run.provider.call_count();
-        run.session.schedule_auto_refine_after_compaction(false);
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while run.provider.call_count() == before && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
-        }
-        assert!(
-            run.provider.call_count() > before,
-            "H-02: with no post-compaction continuation the compact trigger must run \
+            append_user_turn(&run);
+            run.queue_json(review_json(true));
+            run.queue_json(proposal_json("t11-compact-run"));
+            run.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            let before = run.provider.call_count();
+            run.session.schedule_auto_refine_after_compaction(false);
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while run.provider.call_count() == before && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+            assert!(
+                run.provider.call_count() > before,
+                "H-02: with no post-compaction continuation the compact trigger must run \
              (agent-session.ts:8531)"
-        );
-
-        serialized.session.dispose_async(Some(false)).await;
-        continued.session.dispose_async(Some(false)).await;
-        run.session.dispose_async(Some(false)).await;
-    }
-
-    // =======================================================================
-    // H-03 background_plan_is_consumed_once
-    // =======================================================================
-
-    #[tokio::test]
-    async fn t11_compaction_cancel_requires_exact_sentinel() {
-        let t = T11Session::new(
-            "compaction-cancel-sentinel",
-            true,
-            serde_json::json!({"enabled": false}),
-            vec![],
-        ).await;
-        t.session.session_input_pump_suspended.store(true, Ordering::SeqCst);
-        let ends = Arc::new(Mutex::new(Vec::new()));
-        let sink = ends.clone();
-        t.session.subscribe(Arc::new(move |event| {
-            if let AgentSessionEvent::CompactionEnd { aborted, error_message, .. } = event {
-                sink.lock().unwrap().push((aborted, error_message));
-            }
-        }));
-        for (error, cancelled) in [
-            ("Aborted", true),
-            ("Compaction cancelled", true),
-            ("provider failure: Aborted is not supported", false),
-            ("server returned Compaction cancelled unexpectedly", false),
-        ] {
-            t.session.handle_auto_compaction_failure(
-                COMPACTION_REASON_THRESHOLD, error, None, false, &[], None,
             );
-            let (aborted, message) = ends.lock().unwrap().last().cloned().expect("terminal event");
-            assert_eq!(aborted, cancelled, "wrong classification for {error}");
-            assert_eq!(message.is_none(), cancelled);
+
+            serialized.session.dispose_async(Some(false)).await;
+            continued.session.dispose_async(Some(false)).await;
+            run.session.dispose_async(Some(false)).await;
         }
-        t.session.dispose_async(Some(false)).await;
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
-    async fn t11_concurrent_background_plan_has_one_consumer() {
-        let t = T11Session::new(
-            "h03-concurrent-plan",
-            true,
-            serde_json::json!({"enabled": false}),
-            vec![],
-        ).await;
-        for _ in 0..16 {
-            let (release, ready) = tokio::sync::oneshot::channel::<()>();
-            let plan: BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>> =
-                Box::pin(async move {
-                    let _ = ready.await;
-                    Ok(Some(SerializedBackgroundPlanResult::Skip { explicit: Some(false) }))
-                });
-            *t.session.serialized_plan_in_flight.lock().unwrap() = Some(plan.shared());
-            let calls = Arc::new(AtomicUsize::new(0));
-            let barrier = Arc::new(tokio::sync::Barrier::new(17));
-            let mut tasks = Vec::new();
-            for _ in 0..16 {
-                let session = t.session.clone();
-                let calls = calls.clone();
-                let barrier = barrier.clone();
-                tasks.push(tokio::spawn(async move {
-                    barrier.wait().await;
-                    let consumer: SerializedPlanConsumer = Arc::new(move |result| {
-                        let calls = calls.clone();
-                        Box::pin(async move {
-                            assert!(result.is_some());
-                            calls.fetch_add(1, Ordering::SeqCst);
-                            tokio::task::yield_now().await;
-                            false
-                        })
-                    });
-                    session.consume_serialized_background_plan(consumer).await
-                }));
-            }
-            barrier.wait().await;
-            for _ in 0..32 {
-                tokio::task::yield_now().await;
-            }
-            release.send(()).unwrap();
-            for task in tasks {
-                tokio::time::timeout(std::time::Duration::from_secs(5), task)
-                    .await.expect("concurrent plan consumer stalled")
-                    .expect("concurrent plan consumer panicked");
-            }
-            assert_eq!(calls.load(Ordering::SeqCst), 1);
-            assert!(t.session.serialized_plan_claim.lock().unwrap().is_none());
-            assert!(t.session.serialized_plan_in_flight.lock().unwrap().is_none());
-        }
-        t.session.dispose_async(Some(false)).await;
-    }
+        // =======================================================================
+        // H-03 background_plan_is_consumed_once
+        // =======================================================================
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_refine_waiters_preserve_owner_until_settled() {
-        let t = T11Session::new(
-            "h03-refine-waiters",
-            true,
-            serde_json::json!({"enabled": false}),
-            vec![],
-        ).await;
-        let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
-        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
-        let future: BoxFuture<Result<(), String>> = Box::pin(async move {
-            let _ = entered_tx.send(());
-            let _ = release_rx.await;
-            Ok(())
-        });
-        let generation = t.session.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
-        *t.session.refine_in_flight.lock().unwrap() = Some((generation, future.shared()));
-        let first = t.session.clone();
-        let first = tokio::spawn(async move { first.wait_for_refine_idle().await });
-        tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
-            .await.expect("refine waiter never polled").unwrap();
-        assert!(t.session.refine_in_flight.lock().unwrap().is_some(),
-            "waiting must not publish a false idle state");
-        let second = t.session.clone();
-        let second = tokio::spawn(async move { second.wait_for_refine_idle().await });
-        tokio::task::yield_now().await;
-        assert!(!first.is_finished());
-        assert!(!second.is_finished());
-        release_tx.send(()).unwrap();
-        for waiter in [first, second] {
-            tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
-                .await.expect("refine waiter did not settle").unwrap();
-        }
-        assert!(t.session.refine_in_flight.lock().unwrap().is_none());
-
-        let old = t.session.create_refine_settlement(Arc::new(|| Box::pin(async {
-            Err("unused settlement fixture".to_string())
-        })));
-        let new = t.session.create_refine_settlement(Arc::new(|| Box::pin(async {
-            Err("unused settlement fixture".to_string())
-        })));
-        old();
-        assert!(t.session.refine_in_flight.lock().unwrap().is_some(),
-            "an older settlement must not clear a newer refinement owner");
-        new();
-        assert!(t.session.refine_in_flight.lock().unwrap().is_none());
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    /// H-03: a ready background plan is applied exactly once at the serialized
-    /// boundary, without a second planning request
-    /// (agent-session.ts:2492-2518, 2683-2713, 2719-2737).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_background_plan_is_consumed_once() {
-        let t = T11Session::new(
-            "h03-plan-once",
-            true,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.queue_json(review_json(true));
-        t.queue_json(proposal_json("t11-plan-memory"));
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-
-        t.session.maybe_start_serialized_background_plan();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while t
-            .session
-            .serialized_plan_in_flight
-            .lock()
-            .unwrap()
-            .is_none()
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-        }
-        // The plan must still be UNCONSUMED: it is claimed at the boundary.
-        assert!(
-            t.session.serialized_plan_in_flight.lock().unwrap().is_some(),
-            "H-03 precondition: a background plan is in flight and not yet claimed"
-        );
-
-        t.session.run_serialized_refine_checkpoint().await;
-
-        let state = t.local_harness();
-        assert_eq!(
-            state.refinements.len(),
-            1,
-            "H-03: the ready plan must be applied exactly once at the boundary \
-             (agent-session.ts:2505-2516 `_applySerializedPlan`); the port awaited the plan and \
-             dropped the result (`let _ = in_flight.await`), so nothing was persisted"
-        );
-        assert!(
-            state
-                .entries
-                .get("memory")
-                .map(|bucket| bucket.contains_key("t11-plan-memory"))
-                .unwrap_or(false),
-            "H-03: the ready plan's edit must reach the local harness state"
-        );
-        assert!(
-            t.session.serialized_plan_in_flight.lock().unwrap().is_none(),
-            "H-03: the claim clears the in-flight slot (TS 2702-2705)"
-        );
-        assert_eq!(
-            t.provider.call_count(),
-            2,
-            "H-03: review + planning only; the boundary must not plan a second time \
-             (TS 2505-2508 applies the exact background plan)"
-        );
-        assert!(
+        #[tokio::test]
+        async fn t11_compaction_cancel_requires_exact_sentinel() {
+            let t = T11Session::new(
+                "compaction-cancel-sentinel",
+                true,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
             t.session
-                .serialized_explicit_refine_options
+                .session_input_pump_suspended
+                .store(true, Ordering::SeqCst);
+            let ends = Arc::new(Mutex::new(Vec::new()));
+            let sink = ends.clone();
+            t.session.subscribe(Arc::new(move |event| {
+                if let AgentSessionEvent::CompactionEnd {
+                    aborted,
+                    error_message,
+                    ..
+                } = event
+                {
+                    sink.lock().unwrap().push((aborted, error_message));
+                }
+            }));
+            for (error, cancelled) in [
+                ("Aborted", true),
+                ("Compaction cancelled", true),
+                ("provider failure: Aborted is not supported", false),
+                ("server returned Compaction cancelled unexpectedly", false),
+            ] {
+                t.session.handle_auto_compaction_failure(
+                    COMPACTION_REASON_THRESHOLD,
+                    error,
+                    None,
+                    false,
+                    &[],
+                    None,
+                );
+                let (aborted, message) = ends
+                    .lock()
+                    .unwrap()
+                    .last()
+                    .cloned()
+                    .expect("terminal event");
+                assert_eq!(aborted, cancelled, "wrong classification for {error}");
+                assert_eq!(message.is_none(), cancelled);
+            }
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+        async fn t11_concurrent_background_plan_has_one_consumer() {
+            let t = T11Session::new(
+                "h03-concurrent-plan",
+                true,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            for _ in 0..16 {
+                let (release, ready) = tokio::sync::oneshot::channel::<()>();
+                let plan: BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>> =
+                    Box::pin(async move {
+                        let _ = ready.await;
+                        Ok(Some(SerializedBackgroundPlanResult::Skip {
+                            explicit: Some(false),
+                        }))
+                    });
+                *t.session.serialized_plan_in_flight.lock().unwrap() = Some(plan.shared());
+                let calls = Arc::new(AtomicUsize::new(0));
+                let barrier = Arc::new(tokio::sync::Barrier::new(17));
+                let mut tasks = Vec::new();
+                for _ in 0..16 {
+                    let session = t.session.clone();
+                    let calls = calls.clone();
+                    let barrier = barrier.clone();
+                    tasks.push(tokio::spawn(async move {
+                        barrier.wait().await;
+                        let consumer: SerializedPlanConsumer = Arc::new(move |result| {
+                            let calls = calls.clone();
+                            Box::pin(async move {
+                                assert!(result.is_some());
+                                calls.fetch_add(1, Ordering::SeqCst);
+                                tokio::task::yield_now().await;
+                                false
+                            })
+                        });
+                        session.consume_serialized_background_plan(consumer).await
+                    }));
+                }
+                barrier.wait().await;
+                for _ in 0..32 {
+                    tokio::task::yield_now().await;
+                }
+                release.send(()).unwrap();
+                for task in tasks {
+                    tokio::time::timeout(std::time::Duration::from_secs(5), task)
+                        .await
+                        .expect("concurrent plan consumer stalled")
+                        .expect("concurrent plan consumer panicked");
+                }
+                assert_eq!(calls.load(Ordering::SeqCst), 1);
+                assert!(t.session.serialized_plan_claim.lock().unwrap().is_none());
+                assert!(t
+                    .session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_none());
+            }
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_refine_waiters_preserve_owner_until_settled() {
+            let t = T11Session::new(
+                "h03-refine-waiters",
+                true,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            let (entered_tx, entered_rx) = tokio::sync::oneshot::channel::<()>();
+            let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+            let future: BoxFuture<Result<(), String>> = Box::pin(async move {
+                let _ = entered_tx.send(());
+                let _ = release_rx.await;
+                Ok(())
+            });
+            let generation = t
+                .session
+                .refine_in_flight_gen
+                .fetch_add(1, Ordering::SeqCst);
+            *t.session.refine_in_flight.lock().unwrap() = Some((generation, future.shared()));
+            let first = t.session.clone();
+            let first = tokio::spawn(async move { first.wait_for_refine_idle().await });
+            tokio::time::timeout(std::time::Duration::from_secs(5), entered_rx)
+                .await
+                .expect("refine waiter never polled")
+                .unwrap();
+            assert!(
+                t.session.refine_in_flight.lock().unwrap().is_some(),
+                "waiting must not publish a false idle state"
+            );
+            let second = t.session.clone();
+            let second = tokio::spawn(async move { second.wait_for_refine_idle().await });
+            tokio::task::yield_now().await;
+            assert!(!first.is_finished());
+            assert!(!second.is_finished());
+            release_tx.send(()).unwrap();
+            for waiter in [first, second] {
+                tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+                    .await
+                    .expect("refine waiter did not settle")
+                    .unwrap();
+            }
+            assert!(t.session.refine_in_flight.lock().unwrap().is_none());
+
+            let old = t.session.create_refine_settlement(Arc::new(|| {
+                Box::pin(async { Err("unused settlement fixture".to_string()) })
+            }));
+            let new = t.session.create_refine_settlement(Arc::new(|| {
+                Box::pin(async { Err("unused settlement fixture".to_string()) })
+            }));
+            old();
+            assert!(
+                t.session.refine_in_flight.lock().unwrap().is_some(),
+                "an older settlement must not clear a newer refinement owner"
+            );
+            new();
+            assert!(t.session.refine_in_flight.lock().unwrap().is_none());
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        /// H-03: a ready background plan is applied exactly once at the serialized
+        /// boundary, without a second planning request
+        /// (agent-session.ts:2492-2518, 2683-2713, 2719-2737).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_background_plan_is_consumed_once() {
+            let t = T11Session::new(
+                "h03-plan-once",
+                true,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&t);
+            t.queue_json(review_json(true));
+            t.queue_json(proposal_json("t11-plan-memory"));
+            t.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+
+            t.session.maybe_start_serialized_background_plan();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while t
+                .session
+                .serialized_plan_in_flight
                 .lock()
                 .unwrap()
-                .is_none(),
-            "H-03: the consumed options are cleared (TS 2704)"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
+                .is_none()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            // The plan must still be UNCONSUMED: it is claimed at the boundary.
+            assert!(
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_some(),
+                "H-03 precondition: a background plan is in flight and not yet claimed"
+            );
 
-    /// H-03: a declined background review is a visible SKIP and leaves the
-    /// harness untouched (agent-session.ts:2520-2531, 2822-2824).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_background_plan_skip_is_visible_and_inert() {
-        let t = T11Session::new(
-            "h03-plan-skip",
-            true,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.queue_json(review_json(false));
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        t.session.maybe_start_serialized_background_plan();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-        while t
-            .session
-            .serialized_plan_in_flight
-            .lock()
-            .unwrap()
-            .is_none()
-            && tokio::time::Instant::now() < deadline
-        {
-            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            t.session.run_serialized_refine_checkpoint().await;
+
+            let state = t.local_harness();
+            assert_eq!(
+                state.refinements.len(),
+                1,
+                "H-03: the ready plan must be applied exactly once at the boundary \
+             (agent-session.ts:2505-2516 `_applySerializedPlan`); the port awaited the plan and \
+             dropped the result (`let _ = in_flight.await`), so nothing was persisted"
+            );
+            assert!(
+                state
+                    .entries
+                    .get("memory")
+                    .map(|bucket| bucket.contains_key("t11-plan-memory"))
+                    .unwrap_or(false),
+                "H-03: the ready plan's edit must reach the local harness state"
+            );
+            assert!(
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "H-03: the claim clears the in-flight slot (TS 2702-2705)"
+            );
+            assert_eq!(
+                t.provider.call_count(),
+                2,
+                "H-03: review + planning only; the boundary must not plan a second time \
+             (TS 2505-2508 applies the exact background plan)"
+            );
+            assert!(
+                t.session
+                    .serialized_explicit_refine_options
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "H-03: the consumed options are cleared (TS 2704)"
+            );
+            t.session.dispose_async(Some(false)).await;
         }
-        t.session.run_serialized_refine_checkpoint().await;
 
-        assert_eq!(
+        /// H-03: a declined background review is a visible SKIP and leaves the
+        /// harness untouched (agent-session.ts:2520-2531, 2822-2824).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_background_plan_skip_is_visible_and_inert() {
+            let t = T11Session::new(
+                "h03-plan-skip",
+                true,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&t);
+            t.queue_json(review_json(false));
+            t.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            t.session.maybe_start_serialized_background_plan();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+            while t
+                .session
+                .serialized_plan_in_flight
+                .lock()
+                .unwrap()
+                .is_none()
+                && tokio::time::Instant::now() < deadline
+            {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+            t.session.run_serialized_refine_checkpoint().await;
+
+            assert_eq!(
             t.provider.call_count(),
             1,
             "H-03: a declined review must not plan (TS 2822-2824 returns `skip` before planning)"
         );
-        let state = t.local_harness();
-        assert!(
-            state.refinements.is_empty(),
-            "H-03: a skipped background plan must not persist a refinement"
-        );
-        assert!(
-            state
-                .entries
-                .get("memory")
-                .map(|bucket| bucket.is_empty())
-                .unwrap_or(true),
-            "H-03: a skipped background plan must not mutate the harness state"
-        );
-        assert_eq!(
+            let state = t.local_harness();
+            assert!(
+                state.refinements.is_empty(),
+                "H-03: a skipped background plan must not persist a refinement"
+            );
+            assert!(
+                state
+                    .entries
+                    .get("memory")
+                    .map(|bucket| bucket.is_empty())
+                    .unwrap_or(true),
+                "H-03: a skipped background plan must not mutate the harness state"
+            );
+            assert_eq!(
+                t.session
+                    .assistant_turns_since_auto_refine
+                    .load(Ordering::SeqCst),
+                0,
+                "H-03: a skip resets the turn counter exactly once (TS 2526-2527)"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        /// H-03: a failed background plan stamps the cooldown and does not retry
+        /// synchronously, and nothing is persisted
+        /// (agent-session.ts:2533-2554, 2863-2855).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_background_plan_failure_is_visible_without_retry() {
+            let t = T11Session::new(
+                "h03-plan-failure",
+                true,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 600_000}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&t);
             t.session
                 .assistant_turns_since_auto_refine
-                .load(Ordering::SeqCst),
-            0,
-            "H-03: a skip resets the turn counter exactly once (TS 2526-2527)"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
+                .store(1, Ordering::SeqCst);
+            // Review: refine. Planning: malformed, so the background plan FAILS.
+            t.queue_json(review_json(true));
+            t.queue_json(serde_json::json!({"not": "a proposal"}));
+            t.queue_json(serde_json::json!({"still": "not a proposal"}));
+            // The background plan is an EAGER promise in the reference: it reviews and
+            // plans while the turn is still running (agent-session.ts:2533 stamps the
+            // cooldown when it settles as a failure).
+            t.session.maybe_start_serialized_background_plan();
+            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
+            while t.provider.call_count() < 2 && tokio::time::Instant::now() < deadline {
+                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
+            }
+            let planned_calls = t.provider.call_count();
+            t.session.run_serialized_refine_checkpoint().await;
 
-    /// H-03: a failed background plan stamps the cooldown and does not retry
-    /// synchronously, and nothing is persisted
-    /// (agent-session.ts:2533-2554, 2863-2855).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_background_plan_failure_is_visible_without_retry() {
-        let t = T11Session::new(
-            "h03-plan-failure",
-            true,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 600_000}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        // Review: refine. Planning: malformed, so the background plan FAILS.
-        t.queue_json(review_json(true));
-        t.queue_json(serde_json::json!({"not": "a proposal"}));
-        t.queue_json(serde_json::json!({"still": "not a proposal"}));
-        // The background plan is an EAGER promise in the reference: it reviews and
-        // plans while the turn is still running (agent-session.ts:2533 stamps the
-        // cooldown when it settles as a failure).
-        t.session.maybe_start_serialized_background_plan();
-        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-        while t.provider.call_count() < 2 && tokio::time::Instant::now() < deadline {
-            tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-        }
-        let planned_calls = t.provider.call_count();
-        t.session.run_serialized_refine_checkpoint().await;
-
-        assert!(
-            planned_calls >= 2,
-            "H-03: the background plan must run eagerly (review + plan, plus the \
+            assert!(
+                planned_calls >= 2,
+                "H-03: the background plan must run eagerly (review + plan, plus the \
              planner's single repair attempt) before the checkpoint boundary \
              (agent-session.ts:2500-2534); observed {planned_calls} model calls"
-        );
-        assert_eq!(
-            t.provider.call_count(),
-            planned_calls,
-            "H-03: consuming a failed background plan must not retry synchronously \
+            );
+            assert_eq!(
+                t.provider.call_count(),
+                planned_calls,
+                "H-03: consuming a failed background plan must not retry synchronously \
              (agent-session.ts:2533-2553 stamps the cooldown and stops)"
-        );
-        assert!(
-            *t.session.last_auto_refine_review_at.lock().unwrap() > 0.0,
-            "H-03: the failure stamps the cooldown (TS 2536-2538)"
-        );
-        assert!(
-            t.session.serialized_plan_in_flight.lock().unwrap().is_none(),
-            "H-03: the consumed plan claim is released"
-        );
-        assert!(
-            t.local_harness().refinements.is_empty(),
-            "H-03: a failed background plan must not persist a refinement"
-        );
-        // A second checkpoint must not resurrect the failed plan.
-        t.session.run_serialized_refine_checkpoint().await;
-        assert_eq!(
-            t.provider.call_count(),
-            planned_calls,
-            "H-03: the cooldown prevents an immediate synchronous retry (TS 2533-2553)"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
+            );
+            assert!(
+                *t.session.last_auto_refine_review_at.lock().unwrap() > 0.0,
+                "H-03: the failure stamps the cooldown (TS 2536-2538)"
+            );
+            assert!(
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_none(),
+                "H-03: the consumed plan claim is released"
+            );
+            assert!(
+                t.local_harness().refinements.is_empty(),
+                "H-03: a failed background plan must not persist a refinement"
+            );
+            // A second checkpoint must not resurrect the failed plan.
+            t.session.run_serialized_refine_checkpoint().await;
+            assert_eq!(
+                t.provider.call_count(),
+                planned_calls,
+                "H-03: the cooldown prevents an immediate synchronous retry (TS 2533-2553)"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
 
-    /// H-03: the planning failure path must be reported truthfully when the
-    /// provider returns an error message (the reference records a refinement
-    /// failure entry instead of a silent success).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_failed_planning_does_not_persist_a_refinement() {
-        let t = T11Session::new(
-            "h03-plan-error",
-            false,
-            serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.queue_json(review_json(true));
-        // Planning returns text that is not refinement JSON.
-        t.queue_json(serde_json::json!({"not": "a proposal"}));
-        t.queue_json(serde_json::json!({"still": "not a proposal"}));
-        t.session
-            .assistant_turns_since_auto_refine
-            .store(1, Ordering::SeqCst);
-        let outcome = t
-            .session
-            .refine_with_options(&RefineOptions::default(), false, Some(REFINEMENT_SOURCE_AUTO))
+        /// H-03: the planning failure path must be reported truthfully when the
+        /// provider returns an error message (the reference records a refinement
+        /// failure entry instead of a silent success).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_failed_planning_does_not_persist_a_refinement() {
+            let t = T11Session::new(
+                "h03-plan-error",
+                false,
+                serde_json::json!({"enabled": true, "turnInterval": 1, "cooldownMs": 0}),
+                vec![],
+            )
             .await;
-        assert!(
-            outcome.is_err(),
-            "a malformed planning response must be reported as a failure, not a success"
-        );
-        assert!(
-            t.local_harness().refinements.is_empty(),
-            "H-03: a failed planning round must leave the harness state unchanged"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
+            append_user_turn(&t);
+            t.queue_json(review_json(true));
+            // Planning returns text that is not refinement JSON.
+            t.queue_json(serde_json::json!({"not": "a proposal"}));
+            t.queue_json(serde_json::json!({"still": "not a proposal"}));
+            t.session
+                .assistant_turns_since_auto_refine
+                .store(1, Ordering::SeqCst);
+            let outcome = t
+                .session
+                .refine_with_options(
+                    &RefineOptions::default(),
+                    false,
+                    Some(REFINEMENT_SOURCE_AUTO),
+                )
+                .await;
+            assert!(
+                outcome.is_err(),
+                "a malformed planning response must be reported as a failure, not a success"
+            );
+            assert!(
+                t.local_harness().refinements.is_empty(),
+                "H-03: a failed planning round must leave the harness state unchanged"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
 
-    // =======================================================================
-    // H-04 refine_events_reach_real_memory_extension
-    // =======================================================================
+        // =======================================================================
+        // H-04 refine_events_reach_real_memory_extension
+        // =======================================================================
 
-    /// H-04: `session_before_refine` must reach the installed extension during
-    /// planning; a `skip` veto must be reported as a skip, and a supplied
-    /// `proposal` must be used instead of a planning model call
-    /// (agent-session.ts:9132-9158).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_before_refine_reaches_the_installed_extension() {
-        // (a) veto.
-        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let t = T11Session::new(
-            "h04-veto",
-            false,
-            serde_json::json!({"enabled": true}),
-            vec![logging_extension(
-                &["session_before_refine"],
-                Arc::clone(&log),
-                Some(serde_json::json!({"skip": true})),
-            )],
-        ).await;
-        append_user_turn(&t);
-        assert!(
-            t.session.has_extension_handlers("session_before_refine"),
-            "precondition: the installed extension registers `session_before_refine`"
-        );
-        // A valid planning response is queued so the ONLY reason planning is not
-        // reached is the extension veto.
-        t.queue_json(proposal_json("t11-veto-should-not-be-used"));
-        let before = t.provider.call_count();
-        let outcome = t
-            .session
-            .plan_refine_with_options(&RefineOptions::default())
+        /// H-04: `session_before_refine` must reach the installed extension during
+        /// planning; a `skip` veto must be reported as a skip, and a supplied
+        /// `proposal` must be used instead of a planning model call
+        /// (agent-session.ts:9132-9158).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_before_refine_reaches_the_installed_extension() {
+            // (a) veto.
+            let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let t = T11Session::new(
+                "h04-veto",
+                false,
+                serde_json::json!({"enabled": true}),
+                vec![logging_extension(
+                    &["session_before_refine"],
+                    Arc::clone(&log),
+                    Some(serde_json::json!({"skip": true})),
+                )],
+            )
             .await;
-        // The H-04 teeth: the installed extension never sees the event, so its veto
-        // has no effect (agent-session.ts:9130-9157).
-        assert_eq!(
-            event_types(&log),
-            vec!["session_before_refine".to_string()],
-            "H-04: `session_before_refine` must be emitted exactly once during planning"
-        );
-        let error = outcome.expect_err(
-            "H-04: a `session_before_refine` skip must reject planning \
+            append_user_turn(&t);
+            assert!(
+                t.session.has_extension_handlers("session_before_refine"),
+                "precondition: the installed extension registers `session_before_refine`"
+            );
+            // A valid planning response is queued so the ONLY reason planning is not
+            // reached is the extension veto.
+            t.queue_json(proposal_json("t11-veto-should-not-be-used"));
+            let before = t.provider.call_count();
+            let outcome = t
+                .session
+                .plan_refine_with_options(&RefineOptions::default())
+                .await;
+            // The H-04 teeth: the installed extension never sees the event, so its veto
+            // has no effect (agent-session.ts:9130-9157).
+            assert_eq!(
+                event_types(&log),
+                vec!["session_before_refine".to_string()],
+                "H-04: `session_before_refine` must be emitted exactly once during planning"
+            );
+            let error = outcome.expect_err(
+                "H-04: a `session_before_refine` skip must reject planning \
              (agent-session.ts:9148-9150 throws `RefineSkippedError`)",
-        );
-        assert_eq!(
-            error.as_str(),
-            "Refinement skipped by extension",
-            "H-04: the veto must be reported with the reference message"
-        );
-        assert_eq!(
-            t.provider.call_count(),
-            before,
-            "H-04: a veto must not reach the model"
-        );
-        let emitted = log.lock().unwrap().first().cloned().unwrap_or(Value::Null);
-        assert_eq!(
-            emitted.get("preparation").and_then(|prep| prep.get("scope")).and_then(Value::as_str),
-            Some("local"),
-            "H-04: the preparation carries the requested scope (agent-session.ts:9138)"
-        );
-        assert_eq!(
-            emitted.get("trigger").and_then(Value::as_str),
-            None,
-            "sanity: `trigger` is nested inside `preparation`, not top level"
-        );
-        assert!(
-            emitted
-                .get("preparation")
-                .and_then(|prep| prep.get("trigger"))
-                .and_then(Value::as_str)
-                .is_some(),
-            "H-04: the preparation carries the trigger (agent-session.ts:9137)"
-        );
+            );
+            assert_eq!(
+                error.as_str(),
+                "Refinement skipped by extension",
+                "H-04: the veto must be reported with the reference message"
+            );
+            assert_eq!(
+                t.provider.call_count(),
+                before,
+                "H-04: a veto must not reach the model"
+            );
+            let emitted = log.lock().unwrap().first().cloned().unwrap_or(Value::Null);
+            assert_eq!(
+                emitted
+                    .get("preparation")
+                    .and_then(|prep| prep.get("scope"))
+                    .and_then(Value::as_str),
+                Some("local"),
+                "H-04: the preparation carries the requested scope (agent-session.ts:9138)"
+            );
+            assert_eq!(
+                emitted.get("trigger").and_then(Value::as_str),
+                None,
+                "sanity: `trigger` is nested inside `preparation`, not top level"
+            );
+            assert!(
+                emitted
+                    .get("preparation")
+                    .and_then(|prep| prep.get("trigger"))
+                    .and_then(Value::as_str)
+                    .is_some(),
+                "H-04: the preparation carries the trigger (agent-session.ts:9137)"
+            );
 
-        // (b) proposal.
-        let log2: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let supplied = serde_json::json!({
-            "proposal": {
-                "summary": "extension supplied plan",
-                "rationale": "t11",
-                "expectedOutcome": "t11",
-                "edits": [{
-                    "action": "create",
-                    "kind": "memory",
-                    "id": "t11-extension-memory",
-                    "title": "extension memory",
-                    "content": "written by the extension proposal"
-                }]
-            }
-        });
-        let t2 = T11Session::new(
-            "h04-proposal",
-            false,
-            serde_json::json!({"enabled": true}),
-            vec![logging_extension(
-                &["session_before_refine"],
-                Arc::clone(&log2),
-                Some(supplied),
-            )],
-        ).await;
-        append_user_turn(&t2);
-        let before = t2.provider.call_count();
-        let plan = t2
-            .session
-            .plan_refine_with_options(&RefineOptions::default())
-            .await
-            .expect("an extension proposal must produce a plan");
-        assert_eq!(
-            t2.provider.call_count(),
-            before,
-            "H-04: an extension proposal must not trigger a planning model call \
+            // (b) proposal.
+            let log2: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let supplied = serde_json::json!({
+                "proposal": {
+                    "summary": "extension supplied plan",
+                    "rationale": "t11",
+                    "expectedOutcome": "t11",
+                    "edits": [{
+                        "action": "create",
+                        "kind": "memory",
+                        "id": "t11-extension-memory",
+                        "title": "extension memory",
+                        "content": "written by the extension proposal"
+                    }]
+                }
+            });
+            let t2 = T11Session::new(
+                "h04-proposal",
+                false,
+                serde_json::json!({"enabled": true}),
+                vec![logging_extension(
+                    &["session_before_refine"],
+                    Arc::clone(&log2),
+                    Some(supplied),
+                )],
+            )
+            .await;
+            append_user_turn(&t2);
+            let before = t2.provider.call_count();
+            let plan = t2
+                .session
+                .plan_refine_with_options(&RefineOptions::default())
+                .await
+                .expect("an extension proposal must produce a plan");
+            assert_eq!(
+                t2.provider.call_count(),
+                before,
+                "H-04: an extension proposal must not trigger a planning model call \
              (agent-session.ts:9151-9157 returns it directly)"
-        );
-        assert_eq!(
-            plan.proposal.edits.len(),
-            1,
-            "H-04: the extension proposal's edit must be used"
-        );
-        assert_eq!(
-            plan.proposal.edits[0].id.as_deref(),
-            Some("t11-extension-memory"),
-            "H-04: the extension edit id survives normalization"
-        );
-        t.session.dispose_async(Some(false)).await;
-        t2.session.dispose_async(Some(false)).await;
-    }
+            );
+            assert_eq!(
+                plan.proposal.edits.len(),
+                1,
+                "H-04: the extension proposal's edit must be used"
+            );
+            assert_eq!(
+                plan.proposal.edits[0].id.as_deref(),
+                Some("t11-extension-memory"),
+                "H-04: the extension edit id survives normalization"
+            );
+            t.session.dispose_async(Some(false)).await;
+            t2.session.dispose_async(Some(false)).await;
+        }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn core002_refinement_plans_and_baselines_use_the_requested_scope() {
-        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let t = T11Session::new(
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn core002_refinement_plans_and_baselines_use_the_requested_scope() {
+            let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let t = T11Session::new(
             "core002-scope", false, serde_json::json!({"enabled": false}),
             vec![logging_extension(&["session_before_refine"], Arc::clone(&log), Some(serde_json::json!({
                 "proposal": {
@@ -21115,308 +23088,410 @@ mod t11_refinement_lifecycle_tests {
                 }
             })))],
         ).await;
-        append_user_turn(&t);
-        let global_dir = get_global_harness_state_dir(&crate::config::get_agent_dir());
-        for (scope, dir, id) in [
-            (HarnessScope::Global, global_dir.clone(), "global-only"),
-            (HarnessScope::Local, t.local_harness_dir(), "local-only"),
-        ] {
-            let mut state = load_harness_state(&dir, scope);
-            let entry = crate::core::refinement::refinement::HarnessEntry {
-                id: id.to_string(), kind: crate::core::refinement::refinement::RefinementKind::Memory,
-                scope: Some(scope), title: id.to_string(), content: format!("original {id}"),
-                path: "general".to_string(), reference: serde_json::Map::new(),
-                arguments: serde_json::Map::new(), metadata: serde_json::Map::new(),
-                source: "core002".to_string(), created_at: now_iso(), updated_at: now_iso(), version: 1,
+            append_user_turn(&t);
+            let global_dir = get_global_harness_state_dir(&crate::config::get_agent_dir());
+            for (scope, dir, id) in [
+                (HarnessScope::Global, global_dir.clone(), "global-only"),
+                (HarnessScope::Local, t.local_harness_dir(), "local-only"),
+            ] {
+                let mut state = load_harness_state(&dir, scope);
+                let entry = crate::core::refinement::refinement::HarnessEntry {
+                    id: id.to_string(),
+                    kind: crate::core::refinement::refinement::RefinementKind::Memory,
+                    scope: Some(scope),
+                    title: id.to_string(),
+                    content: format!("original {id}"),
+                    path: "general".to_string(),
+                    reference: serde_json::Map::new(),
+                    arguments: serde_json::Map::new(),
+                    metadata: serde_json::Map::new(),
+                    source: "core002".to_string(),
+                    created_at: now_iso(),
+                    updated_at: now_iso(),
+                    version: 1,
+                };
+                state
+                    .entries
+                    .get_mut("memory")
+                    .unwrap()
+                    .insert(id.to_string(), entry);
+                save_harness_state(&dir, &state).unwrap();
+            }
+            let options = RefineOptions {
+                global: Some(true),
+                ..Default::default()
             };
-            state.entries.get_mut("memory").unwrap().insert(id.to_string(), entry);
-            save_harness_state(&dir, &state).unwrap();
+            let plan = t.session.plan_refine_with_options(&options).await.unwrap();
+            let prep = log.lock().unwrap()[0]["preparation"].clone();
+            assert!(prep["planningState"]["entries"]["memory"]
+                .get("global-only")
+                .is_some());
+            assert!(prep["planningState"]["entries"]["memory"]
+                .get("local-only")
+                .is_none());
+            let baseline = &plan.baseline_state.as_ref().unwrap().entries["memory"];
+            assert!(baseline.contains_key("global-only"));
+            assert!(!baseline.contains_key("local-only"));
+            let result = t
+                .session
+                .apply_refine(&plan, &options, REFINEMENT_SOURCE_USER, None)
+                .await
+                .unwrap();
+            assert!(
+                result.applied_edits[0].applied,
+                "global update must not fail against a local baseline: {:?}",
+                result.applied_edits
+            );
+            assert_eq!(
+                load_harness_state(&global_dir, HarnessScope::Global).entries["memory"]
+                    ["global-only"]
+                    .content,
+                "updated global fixture"
+            );
+            assert_eq!(
+                t.local_harness().entries["memory"]["local-only"].content,
+                "original local-only"
+            );
+
+            let local_plan = t
+                .session
+                .plan_refine_with_options(&RefineOptions::default())
+                .await
+                .unwrap();
+            let prep = log.lock().unwrap().last().unwrap()["preparation"].clone();
+            assert!(prep["planningState"]["entries"]["memory"]
+                .get("global-only")
+                .is_some());
+            assert!(prep["planningState"]["entries"]["memory"]
+                .get("local-only")
+                .is_some());
+            let baseline = &local_plan.baseline_state.as_ref().unwrap().entries["memory"];
+            assert!(baseline.contains_key("local-only"));
+            assert!(!baseline.contains_key("global-only"));
+
+            let mut invalid_plan = t.session.plan_refine_with_options(&options).await.unwrap();
+            invalid_plan.proposal.edits[0].id = Some("local:local-only".to_string());
+            let rejected = t
+                .session
+                .apply_refine(&invalid_plan, &options, REFINEMENT_SOURCE_USER, None)
+                .await
+                .unwrap();
+            assert!(!rejected.applied_edits[0].applied);
+            assert_eq!(
+                rejected.applied_edits[0].error.as_deref(),
+                Some("entry not found")
+            );
+            assert_eq!(
+                t.local_harness().entries["memory"]["local-only"].content,
+                "original local-only"
+            );
+            assert!(
+                !load_harness_state(&global_dir, HarnessScope::Global).entries["memory"]
+                    .contains_key("local-only")
+            );
+
+            let stale_plan = t.session.plan_refine_with_options(&options).await.unwrap();
+            let mut global = load_harness_state(&global_dir, HarnessScope::Global);
+            global
+                .entries
+                .get_mut("memory")
+                .unwrap()
+                .get_mut("global-only")
+                .unwrap()
+                .content = "newer concurrent edit".to_string();
+            save_harness_state(&global_dir, &global).unwrap();
+            let rejected = t
+                .session
+                .apply_refine(&stale_plan, &options, REFINEMENT_SOURCE_USER, None)
+                .await
+                .unwrap();
+            assert!(!rejected.applied_edits[0].applied);
+            assert_eq!(
+                rejected.applied_edits[0].error.as_deref(),
+                Some("entry changed during refinement planning")
+            );
+            assert_eq!(
+                load_harness_state(&global_dir, HarnessScope::Global).entries["memory"]
+                    ["global-only"]
+                    .content,
+                "newer concurrent edit"
+            );
+            assert_eq!(
+                t.provider.call_count(),
+                0,
+                "extension test must stay offline"
+            );
+            t.session.dispose_async(Some(false)).await;
         }
-        let options = RefineOptions { global: Some(true), ..Default::default() };
-        let plan = t.session.plan_refine_with_options(&options).await.unwrap();
-        let prep = log.lock().unwrap()[0]["preparation"].clone();
-        assert!(prep["planningState"]["entries"]["memory"].get("global-only").is_some());
-        assert!(prep["planningState"]["entries"]["memory"].get("local-only").is_none());
-        let baseline = &plan.baseline_state.as_ref().unwrap().entries["memory"];
-        assert!(baseline.contains_key("global-only"));
-        assert!(!baseline.contains_key("local-only"));
-        let result = t.session.apply_refine(&plan, &options, REFINEMENT_SOURCE_USER, None).await.unwrap();
-        assert!(result.applied_edits[0].applied, "global update must not fail against a local baseline: {:?}", result.applied_edits);
-        assert_eq!(load_harness_state(&global_dir, HarnessScope::Global).entries["memory"]["global-only"].content, "updated global fixture");
-        assert_eq!(t.local_harness().entries["memory"]["local-only"].content, "original local-only");
 
-        let local_plan = t.session.plan_refine_with_options(&RefineOptions::default()).await.unwrap();
-        let prep = log.lock().unwrap().last().unwrap()["preparation"].clone();
-        assert!(prep["planningState"]["entries"]["memory"].get("global-only").is_some());
-        assert!(prep["planningState"]["entries"]["memory"].get("local-only").is_some());
-        let baseline = &local_plan.baseline_state.as_ref().unwrap().entries["memory"];
-        assert!(baseline.contains_key("local-only"));
-        assert!(!baseline.contains_key("global-only"));
-
-        let mut invalid_plan = t.session.plan_refine_with_options(&options).await.unwrap();
-        invalid_plan.proposal.edits[0].id = Some("local:local-only".to_string());
-        let rejected = t.session.apply_refine(&invalid_plan, &options, REFINEMENT_SOURCE_USER, None).await.unwrap();
-        assert!(!rejected.applied_edits[0].applied);
-        assert_eq!(rejected.applied_edits[0].error.as_deref(), Some("entry not found"));
-        assert_eq!(t.local_harness().entries["memory"]["local-only"].content, "original local-only");
-        assert!(!load_harness_state(&global_dir, HarnessScope::Global).entries["memory"].contains_key("local-only"));
-
-        let stale_plan = t.session.plan_refine_with_options(&options).await.unwrap();
-        let mut global = load_harness_state(&global_dir, HarnessScope::Global);
-        global.entries.get_mut("memory").unwrap().get_mut("global-only").unwrap().content = "newer concurrent edit".to_string();
-        save_harness_state(&global_dir, &global).unwrap();
-        let rejected = t.session.apply_refine(&stale_plan, &options, REFINEMENT_SOURCE_USER, None).await.unwrap();
-        assert!(!rejected.applied_edits[0].applied);
-        assert_eq!(rejected.applied_edits[0].error.as_deref(), Some("entry changed during refinement planning"));
-        assert_eq!(load_harness_state(&global_dir, HarnessScope::Global).entries["memory"]["global-only"].content, "newer concurrent edit");
-        assert_eq!(t.provider.call_count(), 0, "extension test must stay offline");
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    /// H-04: `refine_complete` must reach the installed extension runner after
-    /// the result is persisted (agent-session.ts:9305-9322).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_refine_complete_reaches_the_installed_extension() {
-        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let t = T11Session::new(
-            "h04-complete",
-            false,
-            serde_json::json!({"enabled": false}),
-            vec![logging_extension(&["refine_complete"], Arc::clone(&log), None)],
-        ).await;
-        append_user_turn(&t);
-        assert!(
-            t.session.has_extension_handlers("refine_complete"),
-            "precondition: the installed extension registers `refine_complete`"
-        );
-        // A GLOBAL round is used so the only blocker is the missing emit: the
-        // local harness root is what H-01 covers, and a local round cannot be
-        // applied at baseline for that unrelated reason.
-        let options = RefineOptions {
-            global: Some(true),
-            ..Default::default()
-        };
-        t.queue_json(proposal_json("t11-complete-memory"));
-        let plan = t
-            .session
-            .plan_refine_with_options(&options)
-            .await
-            .expect("plan");
-        let result = t
-            .session
-            .apply_refine(&plan, &options, REFINEMENT_SOURCE_USER, None)
-            .await
-            .unwrap_or_else(|error| panic!("apply: {error}"));
-        assert!(
-            result.applied_edits.iter().any(|edit| edit.applied),
-            "precondition: at least one edit applied"
-        );
-        let events = log.lock().unwrap().clone();
-        let complete = events
-            .iter()
-            .find(|event| event.get("type").and_then(Value::as_str) == Some("refine_complete"))
-            .cloned();
-        let complete = complete.unwrap_or_else(|| {
-            panic!(
-                "H-04: `refine_complete` must reach the installed extension runner \
-                 (agent-session.ts:9311-9318); observed {:?}",
-                events
+        /// H-04: `refine_complete` must reach the installed extension runner after
+        /// the result is persisted (agent-session.ts:9305-9322).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_refine_complete_reaches_the_installed_extension() {
+            let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let t = T11Session::new(
+                "h04-complete",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![logging_extension(
+                    &["refine_complete"],
+                    Arc::clone(&log),
+                    None,
+                )],
             )
-        });
-        assert_eq!(
-            complete.get("id").and_then(Value::as_str),
-            Some(result.id.as_str()),
-            "H-04: the payload carries the persisted refinement id"
-        );
-        assert_eq!(
-            complete.get("scope").and_then(Value::as_str),
-            Some("global"),
-            "H-04: the payload carries the applied scope"
-        );
-        assert_eq!(
-            complete.get("appliedEdits").and_then(Value::as_f64),
-            Some(result.applied_edits.iter().filter(|edit| edit.applied).count() as f64),
-            "H-04: the payload carries the applied edit count (agent-session.ts:9316)"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
+            .await;
+            append_user_turn(&t);
+            assert!(
+                t.session.has_extension_handlers("refine_complete"),
+                "precondition: the installed extension registers `refine_complete`"
+            );
+            // A GLOBAL round is used so the only blocker is the missing emit: the
+            // local harness root is what H-01 covers, and a local round cannot be
+            // applied at baseline for that unrelated reason.
+            let options = RefineOptions {
+                global: Some(true),
+                ..Default::default()
+            };
+            t.queue_json(proposal_json("t11-complete-memory"));
+            let plan = t
+                .session
+                .plan_refine_with_options(&options)
+                .await
+                .expect("plan");
+            let result = t
+                .session
+                .apply_refine(&plan, &options, REFINEMENT_SOURCE_USER, None)
+                .await
+                .unwrap_or_else(|error| panic!("apply: {error}"));
+            assert!(
+                result.applied_edits.iter().any(|edit| edit.applied),
+                "precondition: at least one edit applied"
+            );
+            let events = log.lock().unwrap().clone();
+            let complete = events
+                .iter()
+                .find(|event| event.get("type").and_then(Value::as_str) == Some("refine_complete"))
+                .cloned();
+            let complete = complete.unwrap_or_else(|| {
+                panic!(
+                    "H-04: `refine_complete` must reach the installed extension runner \
+                 (agent-session.ts:9311-9318); observed {:?}",
+                    events
+                )
+            });
+            assert_eq!(
+                complete.get("id").and_then(Value::as_str),
+                Some(result.id.as_str()),
+                "H-04: the payload carries the persisted refinement id"
+            );
+            assert_eq!(
+                complete.get("scope").and_then(Value::as_str),
+                Some("global"),
+                "H-04: the payload carries the applied scope"
+            );
+            assert_eq!(
+                complete.get("appliedEdits").and_then(Value::as_f64),
+                Some(
+                    result
+                        .applied_edits
+                        .iter()
+                        .filter(|edit| edit.applied)
+                        .count() as f64
+                ),
+                "H-04: the payload carries the applied edit count (agent-session.ts:9316)"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
 
-    /// H-04: the SHIPPED memory extension must receive the events. Its
-    /// `session_before_refine` handler vetoes an automatic round while learning
-    /// is disabled (memory.rs:507-509) and its `refine_complete` handler
-    /// promotes a project-reusable cited entry (memory.rs:544-648). At baseline
-    /// no `session_before_refine` is ever emitted, so neither handler can run.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_memory_extension_veto_is_reachable() {
-        let agent_dir = t11_case_agent_dir("h04-memory-veto");
-        let t = T11Session::new(
-            "h04-memory-veto",
-            false,
-            serde_json::json!({"enabled": true}),
-            // The shipped factory, registered exactly like agent-session-services.rs:366.
-            vec![crate::core::extensions::builtin::memory::create_memory_extension(
-                agent_dir.clone(),
-                Arc::new(Mutex::new(
-                    crate::core::settings_manager::SettingsManager::in_memory(
-                        serde_json::json!({
-                            "autoRefine": {"enabled": true},
-                            "telemetryEnabled": false,
-                            "agentTracesEnabled": false,
-                        })
-                        .as_object()
-                        .unwrap()
-                        .clone(),
+        /// H-04: the SHIPPED memory extension must receive the events. Its
+        /// `session_before_refine` handler vetoes an automatic round while learning
+        /// is disabled (memory.rs:507-509) and its `refine_complete` handler
+        /// promotes a project-reusable cited entry (memory.rs:544-648). At baseline
+        /// no `session_before_refine` is ever emitted, so neither handler can run.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_memory_extension_veto_is_reachable() {
+            let agent_dir = t11_case_agent_dir("h04-memory-veto");
+            let t = T11Session::new(
+                "h04-memory-veto",
+                false,
+                serde_json::json!({"enabled": true}),
+                // The shipped factory, registered exactly like agent-session-services.rs:366.
+                vec![
+                    crate::core::extensions::builtin::memory::create_memory_extension(
+                        agent_dir.clone(),
+                        Arc::new(Mutex::new(
+                            crate::core::settings_manager::SettingsManager::in_memory(
+                                serde_json::json!({
+                                    "autoRefine": {"enabled": true},
+                                    "telemetryEnabled": false,
+                                    "agentTracesEnabled": false,
+                                })
+                                .as_object()
+                                .unwrap()
+                                .clone(),
+                            ),
+                        )),
                     ),
-                )),
-            )],
-        ).await;
-        // The shipped handler reads `memory.store.settings().learning`; the store
-        // reads `<agentDir>/settings.json` (store.rs:361-390), so this file is the
-        // production way to pause learning.
-        assert_eq!(
-            t.session.agent_dir.as_deref(),
-            Some(agent_dir.as_str()),
-            "precondition: the extension and the session share one agent dir"
-        );
-        std::fs::write(
-            std::path::Path::new(&agent_dir).join("settings.json"),
-            r#"{"memory":{"learning":false}}"#,
-        )
-        .expect("write the agent settings file");
-        append_user_turn(&t);
-        assert!(
+                ],
+            )
+            .await;
+            // The shipped handler reads `memory.store.settings().learning`; the store
+            // reads `<agentDir>/settings.json` (store.rs:361-390), so this file is the
+            // production way to pause learning.
+            assert_eq!(
+                t.session.agent_dir.as_deref(),
+                Some(agent_dir.as_str()),
+                "precondition: the extension and the session share one agent dir"
+            );
+            std::fs::write(
+                std::path::Path::new(&agent_dir).join("settings.json"),
+                r#"{"memory":{"learning":false}}"#,
+            )
+            .expect("write the agent settings file");
+            append_user_turn(&t);
+            assert!(
             t.session.has_extension_handlers("session_before_refine"),
             "H-04: the shipped memory extension registers `session_before_refine` \
              (memory.rs:541); the handler was unreachable because production never emitted the event"
         );
-        assert!(
-            t.session.has_extension_handlers("refine_complete"),
-            "H-04: the shipped memory extension registers `refine_complete` (memory.rs:648)"
-        );
-        // A valid planning response is queued so the ONLY reason planning is skipped
-        // is the shipped veto.
-        t.queue_json(proposal_json("t11-memory-veto-should-not-be-used"));
-        // An AUTOMATIC round must reach the shipped handler, which vetoes while
-        // learning is disabled (memory.rs:507-509).
-        let before = t.provider.call_count();
-        let outcome = t
-            .session
-            .refine_with_options(&RefineOptions::default(), false, Some(REFINEMENT_SOURCE_AUTO))
-            .await;
-        assert_eq!(
-            t.provider.call_count(),
-            before,
-            "H-04: the shipped memory extension vetoes an automatic round while learning is \
+            assert!(
+                t.session.has_extension_handlers("refine_complete"),
+                "H-04: the shipped memory extension registers `refine_complete` (memory.rs:648)"
+            );
+            // A valid planning response is queued so the ONLY reason planning is skipped
+            // is the shipped veto.
+            t.queue_json(proposal_json("t11-memory-veto-should-not-be-used"));
+            // An AUTOMATIC round must reach the shipped handler, which vetoes while
+            // learning is disabled (memory.rs:507-509).
+            let before = t.provider.call_count();
+            let outcome = t
+                .session
+                .refine_with_options(
+                    &RefineOptions::default(),
+                    false,
+                    Some(REFINEMENT_SOURCE_AUTO),
+                )
+                .await;
+            assert_eq!(
+                t.provider.call_count(),
+                before,
+                "H-04: the shipped memory extension vetoes an automatic round while learning is \
              disabled (memory.rs:507-509); the port emitted no `session_before_refine`, so the \
              gate never ran and planning called the model"
-        );
-        assert_eq!(
-            outcome.err().as_deref(),
-            Some("Refinement skipped by extension"),
-            "H-04: the machine-readable skip error must surface to the caller"
-        );
-        assert!(
-            t.local_harness().refinements.is_empty(),
-            "H-04: a vetoed round must not persist a refinement"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    // =======================================================================
-    // H-08 lifecycle_hooks_use_connected_runner
-    // =======================================================================
-
-    /// H-08: `reload()` emits `session_shutdown` with reason "reload" through
-    /// the session's connected runner (agent-session.ts:10343-10348).
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_reload_emits_session_shutdown() {
-        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let t = T11Session::new(
-            "h08-reload",
-            false,
-            serde_json::json!({"enabled": false}),
-            vec![logging_extension(&["session_shutdown"], Arc::clone(&log), None)],
-        ).await;
-        assert!(
-            t.session.has_extension_handlers("session_shutdown"),
-            "precondition: the extension registers `session_shutdown`"
-        );
-        t.session
-            .reload_with_options(None)
-            .await
-            .expect("reload must succeed");
-        let events = log.lock().unwrap().clone();
-        let shutdown = events
-            .iter()
-            .find(|event| event.get("type").and_then(Value::as_str) == Some("session_shutdown"));
-        let shutdown = shutdown.unwrap_or_else(|| {
-            panic!(
-                "H-08: `reload()` must emit `session_shutdown` \
-                 (agent-session.ts:10345-10348); observed {:?}",
-                events
-            )
-        });
-        assert_eq!(
-            shutdown.get("reason").and_then(Value::as_str),
-            Some("reload"),
-            "H-08: the reload shutdown carries reason \"reload\" (TS 10347)"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    /// H-08: the AgentSessionRuntime must forward `session_before_switch`,
-    /// `session_before_fork` and `session_shutdown` to the session's installed
-    /// runner. `RuntimeExtensionRunner` has no implementor and
-    /// `set_session_extension_runner` has no production caller, so the hooks are
-    /// dead: the runtime's own `has_handlers` probe always reports false.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_runtime_hooks_reach_the_connected_runner() {
-        let log: EventLog = Arc::new(Mutex::new(Vec::new()));
-        let t = T11Session::new(
-            "h08-runtime",
-            false,
-            serde_json::json!({"enabled": false}),
-            vec![logging_extension(
-                &[
-                    "session_before_switch",
-                    "session_before_fork",
-                    "session_shutdown",
-                ],
-                Arc::clone(&log),
-                None,
-            )],
-        ).await;
-        for event in [
-            "session_before_switch",
-            "session_before_fork",
-            "session_shutdown",
-        ] {
-            assert!(
-                t.session.has_extension_handlers(event),
-                "precondition: the extension registers `{event}`"
             );
+            assert_eq!(
+                outcome.err().as_deref(),
+                Some("Refinement skipped by extension"),
+                "H-04: the machine-readable skip error must surface to the caller"
+            );
+            assert!(
+                t.local_harness().refinements.is_empty(),
+                "H-04: a vetoed round must not persist a refinement"
+            );
+            t.session.dispose_async(Some(false)).await;
         }
-        let services = crate::core::agent_session_services::create_agent_session_services(
-            crate::core::agent_session_services::CreateAgentSessionServicesOptions {
-                cwd: t.session.cwd.clone(),
-                agent_dir: t.session.agent_dir.clone(),
-                auth_storage: None,
-                settings_manager: Some(Arc::clone(&t.session.settings_manager)),
-                model_registry: Some(Arc::clone(&t.session.model_registry)),
-                extension_flag_values: None,
-                no_builtin_herdr_reporter: Some(true),
-                telemetry_disabled: Some(true),
-                resource_loader_options: None,
-            },
-        )
-        .await
-        .expect("services");
-        // A factory that builds a fresh session from the runtime's services, the
-        // way the port's default runtime factory does.
-        let factory_settings = Arc::clone(&t.session.settings_manager);
-        let factory_registry = Arc::clone(&t.session.model_registry);
-        let factory_model = t.session.model();
-        let factory: crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory =
+
+        // =======================================================================
+        // H-08 lifecycle_hooks_use_connected_runner
+        // =======================================================================
+
+        /// H-08: `reload()` emits `session_shutdown` with reason "reload" through
+        /// the session's connected runner (agent-session.ts:10343-10348).
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_reload_emits_session_shutdown() {
+            let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let t = T11Session::new(
+                "h08-reload",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![logging_extension(
+                    &["session_shutdown"],
+                    Arc::clone(&log),
+                    None,
+                )],
+            )
+            .await;
+            assert!(
+                t.session.has_extension_handlers("session_shutdown"),
+                "precondition: the extension registers `session_shutdown`"
+            );
+            t.session
+                .reload_with_options(None)
+                .await
+                .expect("reload must succeed");
+            let events = log.lock().unwrap().clone();
+            let shutdown = events.iter().find(|event| {
+                event.get("type").and_then(Value::as_str) == Some("session_shutdown")
+            });
+            let shutdown = shutdown.unwrap_or_else(|| {
+                panic!(
+                    "H-08: `reload()` must emit `session_shutdown` \
+                 (agent-session.ts:10345-10348); observed {:?}",
+                    events
+                )
+            });
+            assert_eq!(
+                shutdown.get("reason").and_then(Value::as_str),
+                Some("reload"),
+                "H-08: the reload shutdown carries reason \"reload\" (TS 10347)"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        /// H-08: the AgentSessionRuntime must forward `session_before_switch`,
+        /// `session_before_fork` and `session_shutdown` to the session's installed
+        /// runner. `RuntimeExtensionRunner` has no implementor and
+        /// `set_session_extension_runner` has no production caller, so the hooks are
+        /// dead: the runtime's own `has_handlers` probe always reports false.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_runtime_hooks_reach_the_connected_runner() {
+            let log: EventLog = Arc::new(Mutex::new(Vec::new()));
+            let t = T11Session::new(
+                "h08-runtime",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![logging_extension(
+                    &[
+                        "session_before_switch",
+                        "session_before_fork",
+                        "session_shutdown",
+                    ],
+                    Arc::clone(&log),
+                    None,
+                )],
+            )
+            .await;
+            for event in [
+                "session_before_switch",
+                "session_before_fork",
+                "session_shutdown",
+            ] {
+                assert!(
+                    t.session.has_extension_handlers(event),
+                    "precondition: the extension registers `{event}`"
+                );
+            }
+            let services = crate::core::agent_session_services::create_agent_session_services(
+                crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                    cwd: t.session.cwd.clone(),
+                    agent_dir: t.session.agent_dir.clone(),
+                    auth_storage: None,
+                    settings_manager: Some(Arc::clone(&t.session.settings_manager)),
+                    model_registry: Some(Arc::clone(&t.session.model_registry)),
+                    extension_flag_values: None,
+                    no_builtin_herdr_reporter: Some(true),
+                    telemetry_disabled: Some(true),
+                    resource_loader_options: None,
+                },
+            )
+            .await
+            .expect("services");
+            // A factory that builds a fresh session from the runtime's services, the
+            // way the port's default runtime factory does.
+            let factory_settings = Arc::clone(&t.session.settings_manager);
+            let factory_registry = Arc::clone(&t.session.model_registry);
+            let factory_model = t.session.model();
+            let factory: crate::core::agent_session_runtime::CreateAgentSessionRuntimeFactory =
             Arc::new(move |input: crate::core::agent_session_runtime::CreateAgentSessionRuntimeInput| {
                 let settings_manager = Arc::clone(&factory_settings);
                 let model_registry = Arc::clone(&factory_registry);
@@ -21464,99 +23539,103 @@ mod t11_refinement_lifecycle_tests {
                     })
                 })
             });
-        let runtime = crate::core::agent_session_runtime::AgentSessionRuntime::new(
-            Arc::clone(&t.session),
-            Arc::new(services),
-            factory,
-            Vec::new(),
-            None,
-            None,
-            crate::core::agent_session_runtime::AgentSessionRuntimeMetadata::top_level(),
-            None,
-        );
-        // The production lifecycle entry points.
-        let replaced = runtime
-            .new_session(None)
-            .await
-            .expect("newSession must succeed");
-        assert!(!replaced.cancelled, "newSession was not cancelled");
-        runtime
-            .dispose(Some(Default::default()))
-            .await
-            .expect("runtime dispose must succeed");
+            let runtime = crate::core::agent_session_runtime::AgentSessionRuntime::new(
+                Arc::clone(&t.session),
+                Arc::new(services),
+                factory,
+                Vec::new(),
+                None,
+                None,
+                crate::core::agent_session_runtime::AgentSessionRuntimeMetadata::top_level(),
+                None,
+            );
+            // The production lifecycle entry points.
+            let replaced = runtime
+                .new_session(None)
+                .await
+                .expect("newSession must succeed");
+            assert!(!replaced.cancelled, "newSession was not cancelled");
+            runtime
+                .dispose(Some(Default::default()))
+                .await
+                .expect("runtime dispose must succeed");
 
-        let seen = event_types(&log);
-        assert!(
-            seen.iter().any(|name| name == "session_before_switch"),
-            "H-08: `newSession()` must emit `session_before_switch` through the session's \
+            let seen = event_types(&log);
+            assert!(
+                seen.iter().any(|name| name == "session_before_switch"),
+                "H-08: `newSession()` must emit `session_before_switch` through the session's \
              connected runner (agent-session-runtime.ts:170-181, read through \
              `session.extensionRunner`); observed {seen:?}. The port routes these events through \
              the `RuntimeExtensionRunner` seam, which has no implementor and no production |
              `set_session_extension_runner` caller, so nothing is emitted"
-        );
-        assert!(
-            seen.iter().any(|name| name == "session_shutdown"),
-            "H-08: replacing/disposing the session must emit `session_shutdown` through the \
-             connected runner (agent-session-runtime.ts:200-205, 689-698); observed {seen:?}"
-        );
-    }
-
-    /// H-08 negative control: with no extension handlers the reload path stays
-    /// inert and must still succeed.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_lifecycle_hooks_without_handlers_are_inert() {
-        let t = T11Session::new(
-            "h08-no-handlers",
-            false,
-            serde_json::json!({"enabled": false}),
-            vec![],
-        ).await;
-        for event in [
-            "session_shutdown",
-            "session_before_switch",
-            "session_before_fork",
-            "session_before_refine",
-            "refine_complete",
-        ] {
+            );
             assert!(
-                !t.session.has_extension_handlers(event),
-                "H-08 negative control: no handlers for `{event}`"
+                seen.iter().any(|name| name == "session_shutdown"),
+                "H-08: replacing/disposing the session must emit `session_shutdown` through the \
+             connected runner (agent-session-runtime.ts:200-205, 689-698); observed {seen:?}"
             );
         }
-        assert!(
-            t.session.reload_with_options(None).await.is_ok(),
-            "H-08 negative control: reload succeeds with no handlers attached"
-        );
-        t.session.dispose_async(Some(false)).await;
-    }
 
-    // =======================================================================
-    // H-13 refine_cancel_before_apply_is_safe
-    // =======================================================================
-
-    /// H-13: the production planning completion is uncancellable
-    /// (`complete_simple` at `agent_session.rs:12455` receives no cancellation
-    /// token; `RefineOptions` carries no signal), while the TypeScript settles
-    /// planning only through an `AbortSignal` (agent-session.ts:8463-8465,
-    /// 9143-9150). The reachable safety contract is the session-level guard:
-    /// a disposed session must never persist a planned refinement.
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn nine_refinement_provider_cancellation_reaches_planning_and_review() {
-        for mode in ["abort", "review", "dispose", "update", "branch"] {
+        /// H-08 negative control: with no extension handlers the reload path stays
+        /// inert and must still succeed.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_lifecycle_hooks_without_handlers_are_inert() {
             let t = T11Session::new(
-                &format!("nine-h13-{mode}"), false,
-                serde_json::json!({"enabled": false}), vec![],
-            ).await;
-            append_user_turn(&t);
-            let started = Arc::new(tokio::sync::Notify::new());
-            let observed = Arc::new(AtomicBool::new(false));
-            let received_signal = Arc::new(Mutex::new(None::<CancellationToken>));
-            let release = CancellationToken::new();
-            let provider_started = started.clone();
-            let provider_observed = observed.clone();
-            let provider_signal = received_signal.clone();
-            let provider_release = release.clone();
-            t.provider.append_responses(vec![FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
+                "h08-no-handlers",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            for event in [
+                "session_shutdown",
+                "session_before_switch",
+                "session_before_fork",
+                "session_before_refine",
+                "refine_complete",
+            ] {
+                assert!(
+                    !t.session.has_extension_handlers(event),
+                    "H-08 negative control: no handlers for `{event}`"
+                );
+            }
+            assert!(
+                t.session.reload_with_options(None).await.is_ok(),
+                "H-08 negative control: reload succeeds with no handlers attached"
+            );
+            t.session.dispose_async(Some(false)).await;
+        }
+
+        // =======================================================================
+        // H-13 refine_cancel_before_apply_is_safe
+        // =======================================================================
+
+        /// H-13: the production planning completion is uncancellable
+        /// (`complete_simple` at `agent_session.rs:12455` receives no cancellation
+        /// token; `RefineOptions` carries no signal), while the TypeScript settles
+        /// planning only through an `AbortSignal` (agent-session.ts:8463-8465,
+        /// 9143-9150). The reachable safety contract is the session-level guard:
+        /// a disposed session must never persist a planned refinement.
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn nine_refinement_provider_cancellation_reaches_planning_and_review() {
+            for mode in ["abort", "review", "dispose", "update", "branch"] {
+                let t = T11Session::new(
+                    &format!("nine-h13-{mode}"),
+                    false,
+                    serde_json::json!({"enabled": false}),
+                    vec![],
+                )
+                .await;
+                append_user_turn(&t);
+                let started = Arc::new(tokio::sync::Notify::new());
+                let observed = Arc::new(AtomicBool::new(false));
+                let received_signal = Arc::new(Mutex::new(None::<CancellationToken>));
+                let release = CancellationToken::new();
+                let provider_started = started.clone();
+                let provider_observed = observed.clone();
+                let provider_signal = received_signal.clone();
+                let provider_release = release.clone();
+                t.provider.append_responses(vec![FauxResponseStep::Factory(Arc::new(move |_, options, _, _| {
                 let signal = options.and_then(|options| options.signal.clone());
                 *provider_signal.lock().unwrap() = signal.clone();
                 let started = provider_started.clone();
@@ -21576,108 +23655,174 @@ mod t11_refinement_lifecycle_tests {
                     faux_assistant_message(FauxAssistantContent::Text(proposal_json("nine-cancelled-memory").to_string()), None)
                 })
             }))]);
-            let owner = t.session.clone();
-            let review = mode == "review";
-            let pending = tokio::spawn(async move {
-                if review {
-                    owner.review_auto_refine(&AutoRefineReviewContext {
-                        reason: AutoRefineReason::TurnInterval, turns_since_last_review: 1,
-                    }, None).await.map(|_| ())
-                } else {
-                    owner.refine_with_options(&RefineOptions::default(), false, None).await.map(|_| ())
+                let owner = t.session.clone();
+                let review = mode == "review";
+                let pending = tokio::spawn(async move {
+                    if review {
+                        owner
+                            .review_auto_refine(
+                                &AutoRefineReviewContext {
+                                    reason: AutoRefineReason::TurnInterval,
+                                    turns_since_last_review: 1,
+                                },
+                                None,
+                            )
+                            .await
+                            .map(|_| ())
+                    } else {
+                        owner
+                            .refine_with_options(&RefineOptions::default(), false, None)
+                            .await
+                            .map(|_| ())
+                    }
+                });
+                tokio::time::timeout(std::time::Duration::from_secs(3), started.notified())
+                    .await
+                    .expect("provider request starts");
+                match mode {
+                    "dispose" => t.session.dispose(),
+                    "update" => t.session.abort_for_update_restart(),
+                    "branch" => {
+                        t.session
+                            .invalidate_pending_auto_refine_for_branch_change()
+                            .await
+                    }
+                    _ => t.session.request_abort(),
                 }
-            });
-            tokio::time::timeout(std::time::Duration::from_secs(3), started.notified()).await.expect("provider request starts");
-            match mode {
-                "dispose" => t.session.dispose(),
-                "update" => t.session.abort_for_update_restart(),
-                "branch" => t.session.invalidate_pending_auto_refine_for_branch_change().await,
-                _ => t.session.request_abort(),
+                let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await;
+                let provider_saw_abort =
+                    tokio::time::timeout(std::time::Duration::from_secs(2), async {
+                        while !observed.load(Ordering::SeqCst) {
+                            tokio::task::yield_now().await;
+                        }
+                    })
+                    .await
+                    .is_ok();
+                release.cancel();
+                assert!(
+                    received_signal
+                        .lock()
+                        .unwrap()
+                        .as_ref()
+                        .is_some_and(CancellationToken::is_cancelled),
+                    "{mode}: provider must receive the cancelled token"
+                );
+                assert!(provider_saw_abort, "{mode}: provider observed cancellation");
+                let error = result
+                    .expect("cancelled refinement settles promptly")
+                    .unwrap()
+                    .expect_err("cancelled refinement must fail");
+                assert!(error.to_lowercase().contains("abort"), "{mode}: {error}");
+                assert_eq!(
+                    t.provider.call_count(),
+                    1,
+                    "{mode}: cancellation cannot start a corrective retry"
+                );
+                assert!(
+                    t.local_harness().refinements.is_empty(),
+                    "{mode}: cancelled result was not saved"
+                );
+                if mode == "abort" {
+                    t.queue_json(proposal_json("nine-fresh-memory"));
+                    t.session
+                        .refine_with_options(&RefineOptions::default(), false, None)
+                        .await
+                        .expect("later refinement has a fresh token");
+                    assert_eq!(t.local_harness().refinements.len(), 1);
+                }
+                t.session.dispose_async(Some(false)).await;
             }
-            let result = tokio::time::timeout(std::time::Duration::from_secs(2), pending).await;
-            let provider_saw_abort = tokio::time::timeout(std::time::Duration::from_secs(2), async {
-                while !observed.load(Ordering::SeqCst) { tokio::task::yield_now().await; }
-            }).await.is_ok();
-            release.cancel();
-            assert!(received_signal.lock().unwrap().as_ref().is_some_and(CancellationToken::is_cancelled), "{mode}: provider must receive the cancelled token");
-            assert!(provider_saw_abort, "{mode}: provider observed cancellation");
-            let error = result.expect("cancelled refinement settles promptly").unwrap().expect_err("cancelled refinement must fail");
-            assert!(error.to_lowercase().contains("abort"), "{mode}: {error}");
-            assert_eq!(t.provider.call_count(), 1, "{mode}: cancellation cannot start a corrective retry");
-            assert!(t.local_harness().refinements.is_empty(), "{mode}: cancelled result was not saved");
-            if mode == "abort" {
-                t.queue_json(proposal_json("nine-fresh-memory"));
-                t.session.refine_with_options(&RefineOptions::default(), false, None).await.expect("later refinement has a fresh token");
-                assert_eq!(t.local_harness().refinements.len(), 1);
-            }
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn nine_refinement_cancelled_serialized_plan_never_applies() {
+            let t = T11Session::new(
+                "nine-h13-before-apply",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
+            .await;
+            append_user_turn(&t);
+            t.queue_json(proposal_json("nine-cancelled-plan"));
+            let abort = t.session.refinement_signal();
+            let plan = t
+                .session
+                .plan_refine_for_trigger(
+                    &RefineOptions::default(),
+                    REFINEMENT_SOURCE_USER,
+                    abort.clone(),
+                )
+                .await
+                .unwrap();
+            t.session.request_abort();
+            let result = t
+                .session
+                .apply_serialized_plan(&SerializedBackgroundPlanResult::Plan {
+                    plan,
+                    options: RefineOptions::default(),
+                    abort,
+                    branch_version: 0,
+                    source: REFINEMENT_SOURCE_USER.to_string(),
+                })
+                .await;
+            assert!(result.unwrap_err().contains("aborted"));
+            assert!(t.local_harness().refinements.is_empty());
             t.session.dispose_async(Some(false)).await;
         }
-    }
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn nine_refinement_cancelled_serialized_plan_never_applies() {
-        let t = T11Session::new("nine-h13-before-apply", false,
-            serde_json::json!({"enabled": false}), vec![]).await;
-        append_user_turn(&t);
-        t.queue_json(proposal_json("nine-cancelled-plan"));
-        let abort = t.session.refinement_signal();
-        let plan = t.session.plan_refine_for_trigger(&RefineOptions::default(), REFINEMENT_SOURCE_USER, abort.clone()).await.unwrap();
-        t.session.request_abort();
-        let result = t.session.apply_serialized_plan(&SerializedBackgroundPlanResult::Plan {
-            plan, options: RefineOptions::default(), abort,
-            branch_version: 0, source: REFINEMENT_SOURCE_USER.to_string(),
-        }).await;
-        assert!(result.unwrap_err().contains("aborted"));
-        assert!(t.local_harness().refinements.is_empty());
-        t.session.dispose_async(Some(false)).await;
-    }
-
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn t11_cancel_before_apply_never_persists() {
-        let t = T11Session::new(
-            "h13-cancel",
-            false,
-            serde_json::json!({"enabled": false}),
-            vec![],
-        ).await;
-        append_user_turn(&t);
-        t.queue_json(proposal_json("t11-cancel-memory"));
-        let plan = t
-            .session
-            .plan_refine_with_options(&RefineOptions::default())
-            .await
-            .expect("plan");
-        let harness_dir = t.local_harness_dir();
-        // Dispose between planning and applying: the window the AbortSignal
-        // protects in the TypeScript.
-        t.session.dispose_async(Some(false)).await;
-        let outcome = t
-            .session
-            .apply_refine(&plan, &RefineOptions::default(), REFINEMENT_SOURCE_USER, None)
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn t11_cancel_before_apply_never_persists() {
+            let t = T11Session::new(
+                "h13-cancel",
+                false,
+                serde_json::json!({"enabled": false}),
+                vec![],
+            )
             .await;
-        assert!(
-            outcome.is_err(),
-            "H-13: applying a plan after disposal must fail instead of persisting \
+            append_user_turn(&t);
+            t.queue_json(proposal_json("t11-cancel-memory"));
+            let plan = t
+                .session
+                .plan_refine_with_options(&RefineOptions::default())
+                .await
+                .expect("plan");
+            let harness_dir = t.local_harness_dir();
+            // Dispose between planning and applying: the window the AbortSignal
+            // protects in the TypeScript.
+            t.session.dispose_async(Some(false)).await;
+            let outcome = t
+                .session
+                .apply_refine(
+                    &plan,
+                    &RefineOptions::default(),
+                    REFINEMENT_SOURCE_USER,
+                    None,
+                )
+                .await;
+            assert!(
+                outcome.is_err(),
+                "H-13: applying a plan after disposal must fail instead of persisting \
              (agent-session.ts:9278-9280 throws when the signal is aborted)"
-        );
-        let state = crate::core::refinement::refinement::load_harness_state(
-            &harness_dir,
-            crate::core::refinement::refinement::HarnessScope::Local,
-        );
-        assert!(
-            state.refinements.is_empty(),
-            "H-13: a cancelled round must not record a refinement"
-        );
-        assert!(
-            !state
-                .entries
-                .get("memory")
-                .map(|bucket| bucket.contains_key("t11-cancel-memory"))
-                .unwrap_or(false),
-            "H-13: a cancelled round must not mutate the harness state"
-        );
+            );
+            let state = crate::core::refinement::refinement::load_harness_state(
+                &harness_dir,
+                crate::core::refinement::refinement::HarnessScope::Local,
+            );
+            assert!(
+                state.refinements.is_empty(),
+                "H-13: a cancelled round must not record a refinement"
+            );
+            assert!(
+                !state
+                    .entries
+                    .get("memory")
+                    .map(|bucket| bucket.contains_key("t11-cancel-memory"))
+                    .unwrap_or(false),
+                "H-13: a cancelled round must not mutate the harness state"
+            );
+        }
     }
-}
 }
 // ---------------------------------------------------------------------------
 // T10 (lane rlm-session): D-01, D-02, D-04, D-05, D-09.
@@ -21701,7 +23846,8 @@ mod rlm_session_t10_tests {
     };
     use pi_ai::types::{Message, OnPayload, OnResponse, STOP_REASON_LENGTH, STOP_REASON_TOOL_USE};
 
-    type Listener = Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>;
+    type Listener =
+        Arc<dyn Fn(AgentEvent, Option<CancellationToken>) -> BoxFuture<()> + Send + Sync>;
 
     /// Minimal scripted agent: idle, no queue, `continue()` counted.
     ///
@@ -21743,6 +23889,7 @@ mod rlm_session_t10_tests {
         fn set_before_tool_call(&self, _hook: BeforeToolCallHook) {}
         fn set_after_tool_call(&self, _hook: AfterToolCallHook) {}
         fn set_get_continuation_messages(&self, _hook: GetContinuationMessagesHook) {}
+        fn set_before_request(&self, _hook: BeforeRequestHook) {}
         fn set_should_stop_before_turn(&self, _hook: Arc<dyn Fn() -> bool + Send + Sync>) {}
         fn set_should_stop_after_turn(
             &self,
@@ -21840,22 +23987,59 @@ mod rlm_session_t10_tests {
     async fn backlog_idle_wait_parks_while_external_work_blocks_input() {
         let session = t10_session(ScriptedAgent::new(), 0);
         session.user_bash_running.store(true, Ordering::SeqCst);
-        let action = session.create_prepared_turn_action(SESSION_INPUT_SCHEDULE_STEER, "queued", None, None);
-        session.action_store.lock().unwrap().enqueue(action).unwrap();
-        let waiting = tokio::spawn({ let session = session.clone(); async move { session.wait_for_idle_or_settlement(None).await } });
+        let action =
+            session.create_prepared_turn_action(SESSION_INPUT_SCHEDULE_STEER, "queued", None, None);
+        session
+            .action_store
+            .lock()
+            .unwrap()
+            .enqueue(action)
+            .unwrap();
+        let waiting = tokio::spawn({
+            let session = session.clone();
+            async move { session.wait_for_idle_or_settlement(None).await }
+        });
         tokio::task::yield_now().await;
-        assert_eq!(session.session_input_checkpoint_waiters.lock().unwrap().len(), 1);
+        assert_eq!(
+            session
+                .session_input_checkpoint_waiters
+                .lock()
+                .unwrap()
+                .len(),
+            1
+        );
         assert!(!waiting.is_finished());
-        assert_eq!(session.action_store.lock().unwrap().queued_actions(None).len(), 1);
-        session.action_store.lock().unwrap().remove(&|_| true, None).unwrap();
+        assert_eq!(
+            session
+                .action_store
+                .lock()
+                .unwrap()
+                .queued_actions(None)
+                .len(),
+            1
+        );
+        session
+            .action_store
+            .lock()
+            .unwrap()
+            .remove(&|_| true, None)
+            .unwrap();
         session.user_bash_running.store(false, Ordering::SeqCst);
         session.notify_session_input_checkpoint_change();
-        tokio::time::timeout(std::time::Duration::from_secs(2), waiting).await.unwrap().unwrap();
-        assert!(session.session_input_checkpoint_waiters.lock().unwrap().is_empty());
+        tokio::time::timeout(std::time::Duration::from_secs(2), waiting)
+            .await
+            .unwrap()
+            .unwrap();
+        assert!(session
+            .session_input_checkpoint_waiters
+            .lock()
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
-    async fn backlog_collect_reads_retained_completed_and_pending_children_without_queue_delivery() {
+    async fn backlog_collect_reads_retained_completed_and_pending_children_without_queue_delivery()
+    {
         let session = t10_session(ScriptedAgent::new(), 0);
         let child = t10_session(ScriptedAgent::new(), 1);
         let mut completed = empty_rlm_child_run("finished");
@@ -21864,19 +24048,40 @@ mod rlm_session_t10_tests {
         completed.answer_preview = Some("a".repeat(1000));
         completed.settled = true;
         completed.settlement.resolve();
-        session.rlm_child_sessions.lock().unwrap().insert("finished".into(), RetainedRlmChild { session: child, run: Some(Arc::new(Mutex::new(completed))) });
+        session.rlm_child_sessions.lock().unwrap().insert(
+            "finished".into(),
+            RetainedRlmChild {
+                session: child,
+                run: Some(Arc::new(Mutex::new(completed))),
+            },
+        );
         let mut pending = empty_rlm_child_run("pending");
         pending.status = "running".into();
         pending.session_name = "digger".into();
         pending.settled = false;
         let pending = Arc::new(Mutex::new(pending));
-        session.active_rlm_child_runs.lock().unwrap().insert("pending".into(), pending.clone());
+        session
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .insert("pending".into(), pending.clone());
         let queue_before = session.unfinished_action_count();
         let all = session.collect_rlm_children(&[], 0).await.unwrap();
         assert_eq!(all.results.len(), 2);
         assert!(all.results[0].settled);
-        assert!(all.results[0].answer_preview.as_ref().unwrap().chars().count() <= 160);
-        let timed = session.collect_rlm_children(&["digger".into()], 10).await.unwrap();
+        assert!(
+            all.results[0]
+                .answer_preview
+                .as_ref()
+                .unwrap()
+                .chars()
+                .count()
+                <= 160
+        );
+        let timed = session
+            .collect_rlm_children(&["digger".into()], 10)
+            .await
+            .unwrap();
         assert!(!timed.results[0].settled);
         {
             let mut pending = pending.lock().unwrap();
@@ -21885,10 +24090,16 @@ mod rlm_session_t10_tests {
             pending.settled = true;
             pending.settlement.reject("failed".into());
         }
-        let failed = session.collect_rlm_children(&["pending".into(), "pending".into()], 100).await.unwrap();
+        let failed = session
+            .collect_rlm_children(&["pending".into(), "pending".into()], 100)
+            .await
+            .unwrap();
         assert_eq!(failed.results.len(), 1);
         assert_eq!(failed.results[0].status, "error");
-        assert!(session.collect_rlm_children(&["not-a-child".into()], 0).await.is_err());
+        assert!(session
+            .collect_rlm_children(&["not-a-child".into()], 0)
+            .await
+            .is_err());
         assert_eq!(session.unfinished_action_count(), queue_before);
         assert!(session.messages().is_empty());
     }
@@ -21896,12 +24107,22 @@ mod rlm_session_t10_tests {
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     #[ignore = "requires a managed Python; run through the isolated acceptance harness"]
     async fn backlog_collect_round_trip_uses_packaged_python_and_real_host_bridge() {
-        use crate::core::kernel::shared::{ExecuteOptions, ExecuteStatus, KernelClient, KernelManagerOptions, KernelShutdownOptions, KernelStartOptions};
+        use crate::core::kernel::shared::{
+            ExecuteOptions, ExecuteStatus, KernelClient, KernelManagerOptions,
+            KernelShutdownOptions, KernelStartOptions,
+        };
 
-        let python = std::env::var("PRIME_AGENT_KERNEL_PYTHON").expect("isolated harness must provide kernel Python");
+        let python = std::env::var("PRIME_AGENT_KERNEL_PYTHON")
+            .expect("isolated harness must provide kernel Python");
         let runtime_src = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
-            .join("../..").join("prime-agent-runtime/src").canonicalize().unwrap();
-        let scratch = tempfile::Builder::new().prefix("backlog-collect-kernel-").tempdir().unwrap();
+            .join("../..")
+            .join("prime-agent-runtime/src")
+            .canonicalize()
+            .unwrap();
+        let scratch = tempfile::Builder::new()
+            .prefix("backlog-collect-kernel-")
+            .tempdir()
+            .unwrap();
         let session = t10_session(ScriptedAgent::new(), 0);
         let mut child = empty_rlm_child_run("ready-child");
         child.session_name = "builder".into();
@@ -21909,34 +24130,66 @@ mod rlm_session_t10_tests {
         child.answer_preview = Some("bounded result".into());
         child.settled = true;
         child.settlement.resolve();
-        session.active_rlm_child_runs.lock().unwrap().insert(child.id.clone(), Arc::new(Mutex::new(child)));
+        session
+            .active_rlm_child_runs
+            .lock()
+            .unwrap()
+            .insert(child.id.clone(), Arc::new(Mutex::new(child)));
         let env = [
-            ("PYTHONPATH".into(), runtime_src.to_string_lossy().into_owned()),
+            (
+                "PYTHONPATH".into(),
+                runtime_src.to_string_lossy().into_owned(),
+            ),
             ("PYTHONDONTWRITEBYTECODE".into(), "1".into()),
             ("PYTHONNOUSERSITE".into(), "1".into()),
-        ].into_iter().collect();
-        let kernel = crate::core::kernel::repl_manager::new_repl_kernel_manager(KernelManagerOptions {
-            python: Some(python), cwd: Some(scratch.path().to_string_lossy().into_owned()),
-            env: Some(env), session_id: Some(format!("backlog-collect-{}", uuid::Uuid::new_v4())),
-            host_handlers: Some(session.create_kernel_host_handlers()), snapshot: None,
-            ..Default::default()
-        });
-        let expected_module = serde_json::to_string(&runtime_src.join("rlm/__init__.py").to_string_lossy()).unwrap();
+        ]
+        .into_iter()
+        .collect();
+        let kernel =
+            crate::core::kernel::repl_manager::new_repl_kernel_manager(KernelManagerOptions {
+                python: Some(python),
+                cwd: Some(scratch.path().to_string_lossy().into_owned()),
+                env: Some(env),
+                session_id: Some(format!("backlog-collect-{}", uuid::Uuid::new_v4())),
+                host_handlers: Some(session.create_kernel_host_handlers()),
+                snapshot: None,
+                ..Default::default()
+            });
+        let expected_module =
+            serde_json::to_string(&runtime_src.join("rlm/__init__.py").to_string_lossy()).unwrap();
         let code = format!(
             "import rlm\nfrom pathlib import Path\nassert Path(rlm.__file__).resolve() == Path({expected_module}).resolve(), rlm.__file__\nassert callable(rlm.collect) and callable(rlm.rlm.collect)\ncollected = await rlm.collect('builder', timeout_ms=0)\nassert len(collected) == 1\nassert collected[0].rlm_child_id == 'ready-child'\nassert collected[0].status == 'done' and collected[0].settled\nassert collected[0].answer_preview == 'bounded result'\nprint('PACKAGED_COLLECT_HOST_BRIDGE_OK')"
         );
         let result = tokio::time::timeout(std::time::Duration::from_secs(45), async {
             kernel.start(KernelStartOptions::default()).await?;
             kernel.execute(code, ExecuteOptions::default()).await
-        }).await;
-        let shutdown = tokio::time::timeout(std::time::Duration::from_secs(10), kernel.shutdown(KernelShutdownOptions::default())).await;
-        if !matches!(shutdown, Ok(Ok(true))) { kernel.kill().await; }
-        assert!(!kernel.is_running(), "private kernel must be stopped before checking results");
-        let result = result.expect("private kernel round trip deadline").expect("private kernel round trip");
+        })
+        .await;
+        let shutdown = tokio::time::timeout(
+            std::time::Duration::from_secs(10),
+            kernel.shutdown(KernelShutdownOptions::default()),
+        )
+        .await;
+        if !matches!(shutdown, Ok(Ok(true))) {
+            kernel.kill().await;
+        }
+        assert!(
+            !kernel.is_running(),
+            "private kernel must be stopped before checking results"
+        );
+        let result = result
+            .expect("private kernel round trip deadline")
+            .expect("private kernel round trip");
         assert_eq!(result.status, ExecuteStatus::Ok, "{result:?}");
-        assert!(result.stdout.contains("PACKAGED_COLLECT_HOST_BRIDGE_OK"), "{result:?}");
+        assert!(
+            result.stdout.contains("PACKAGED_COLLECT_HOST_BRIDGE_OK"),
+            "{result:?}"
+        );
         assert_eq!(session.unfinished_action_count(), 0);
-        assert!(session.messages().is_empty(), "collect must not inject parent messages");
+        assert!(
+            session.messages().is_empty(),
+            "collect must not inject parent messages"
+        );
         session.dispose_async(None).await;
     }
 
@@ -21961,7 +24214,8 @@ mod rlm_session_t10_tests {
             ),
         ));
         let manager =
-            crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd)).unwrap();
+            crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&cwd))
+                .unwrap();
         let loader = Arc::new(crate::core::resource_loader::DefaultResourceLoader::new(
             crate::core::resource_loader::DefaultResourceLoaderOptions {
                 cwd: cwd.clone(),
@@ -22046,9 +24300,9 @@ mod rlm_session_t10_tests {
     ) -> AssistantMessage {
         let mut content: Vec<pi_ai::types::ContentBlock> = Vec::new();
         if !text.is_empty() {
-            content.push(pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
-                text,
-            )));
+            content.push(pi_ai::types::ContentBlock::Text(
+                pi_ai::types::TextContent::new(text),
+            ));
         }
         for (id, name) in tool_calls {
             content.push(pi_ai::types::ContentBlock::ToolCall(
@@ -22135,11 +24389,21 @@ mod rlm_session_t10_tests {
     }
 
     fn pending_result_of(session: &Arc<AgentSession>) -> Option<RlmPendingResult> {
-        session.rlm_continuation.lock().unwrap().pending_result.clone()
+        session
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .pending_result
+            .clone()
     }
 
     fn terminal_status_of(session: &Arc<AgentSession>) -> Option<String> {
-        session.rlm_continuation.lock().unwrap().terminal_status.clone()
+        session
+            .rlm_continuation
+            .lock()
+            .unwrap()
+            .terminal_status
+            .clone()
     }
 
     fn custom_message_text(content: &CustomMessageContent) -> String {
@@ -22299,14 +24563,11 @@ mod rlm_session_t10_tests {
         let session = t10_session(ScriptedAgent::new(), 0);
         let pause = session.acquire_queued_work_pause();
         let handlers = session.create_kernel_host_handlers();
-        let handler = handlers
-            .get("bash.completed")
-            .cloned()
-            .unwrap_or_else(|| {
-                panic!(
-                    "DEFECT D-01: no \"bash.completed\" handler to invoke (TS agent-session.ts:10208)"
-                )
-            });
+        let handler = handlers.get("bash.completed").cloned().unwrap_or_else(|| {
+            panic!(
+                "DEFECT D-01: no \"bash.completed\" handler to invoke (TS agent-session.ts:10208)"
+            )
+        });
         assert!(
             handler(serde_json::json!({ "pid": 1.5, "command": "npm test", "exitCode": 0 }))
                 .await
@@ -22382,14 +24643,18 @@ mod rlm_session_t10_tests {
     async fn mcp_begin_login_is_exposed_only_when_wired() {
         let without = t10_session_with_mcp(None);
         assert!(
-            !without.create_kernel_host_handlers().contains_key("mcp.begin_login"),
+            !without
+                .create_kernel_host_handlers()
+                .contains_key("mcp.begin_login"),
             "no wired login means no mcp.begin_login handler"
         );
-        let login: Arc<dyn Fn(String) -> pi_ai::types::BoxFuture<Result<(), String>> + Send + Sync> =
-            Arc::new(|_server: String| Box::pin(async { Ok(()) }));
+        let login: Arc<
+            dyn Fn(String) -> pi_ai::types::BoxFuture<Result<(), String>> + Send + Sync,
+        > = Arc::new(|_server: String| Box::pin(async { Ok(()) }));
         let with = t10_session_with_mcp(Some(login));
         assert!(
-            with.create_kernel_host_handlers().contains_key("mcp.begin_login"),
+            with.create_kernel_host_handlers()
+                .contains_key("mcp.begin_login"),
             "DEFECT D-02: a wired login must expose mcp.begin_login (TS/mcp_manager.rs:418)"
         );
     }
@@ -22492,7 +24757,11 @@ mod rlm_session_t10_tests {
                 *session.rlm_continuation.lock().unwrap()
             )
         });
-        assert_eq!(result.status, crate::core::rlm_continuation::TERMINAL_FAILED, "status (TS 3836)");
+        assert_eq!(
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_FAILED,
+            "status (TS 3836)"
+        );
         assert_eq!(
             result.reason.as_deref(),
             Some("recovery_tool_result_missing"),
@@ -22513,7 +24782,12 @@ mod rlm_session_t10_tests {
             "the ledger records the terminal status (TS 3836)"
         );
         assert!(
-            session.rlm_continuation.lock().unwrap().pending_continuation.is_none(),
+            session
+                .rlm_continuation
+                .lock()
+                .unwrap()
+                .pending_continuation
+                .is_none(),
             "a terminal failure clears the pending continuation (TS 3837)"
         );
     }
@@ -22595,7 +24869,11 @@ mod rlm_session_t10_tests {
                 *session.rlm_continuation.lock().unwrap()
             )
         });
-        assert_eq!(result.status, crate::core::rlm_continuation::TERMINAL_FAILED, "status (TS 3849)");
+        assert_eq!(
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_FAILED,
+            "status (TS 3849)"
+        );
         assert_eq!(
             result.reason.as_deref(),
             Some("recovery_checkpoint_missing"),
@@ -22622,7 +24900,10 @@ mod rlm_session_t10_tests {
             messages: Vec<AgentMessage>,
         }
         fn case(label: &'static str, timestamp: i64, mut messages: Vec<AgentMessage>) -> Case {
-            messages.insert(0, user_agent_message("RLM child continuation 1/3.", timestamp));
+            messages.insert(
+                0,
+                user_agent_message("RLM child continuation 1/3.", timestamp),
+            );
             Case {
                 label,
                 timestamp,
@@ -22681,7 +24962,10 @@ mod rlm_session_t10_tests {
             seed_child(
                 &session,
                 case.messages,
-                Some(started_pending("RLM child continuation 1/3.", case.timestamp)),
+                Some(started_pending(
+                    "RLM child continuation 1/3.",
+                    case.timestamp,
+                )),
                 one_task("task-stall"),
                 1.0,
             );
@@ -22759,7 +25043,10 @@ mod rlm_session_t10_tests {
             .iter()
             .filter(|task| task.result.is_some())
             .count();
-        assert_eq!(recorded, 1, "exactly one task result after one backstop run");
+        assert_eq!(
+            recorded, 1,
+            "exactly one task result after one backstop run"
+        );
         session.dispose_async(Some(false)).await;
     }
 
@@ -22781,8 +25068,12 @@ mod rlm_session_t10_tests {
             one_task("task-length"),
             RLM_CHILD_MAX_CONTINUATIONS as f64,
         );
-        let length_message =
-            assistant_message("truncated output", STOP_REASON_LENGTH, 1_700_001_000_000, Vec::new());
+        let length_message = assistant_message(
+            "truncated output",
+            STOP_REASON_LENGTH,
+            1_700_001_000_000,
+            Vec::new(),
+        );
         let outcome = session.handle_rlm_child_turn_outcome(&length_message, false, None);
         assert!(
             outcome.map(|outcome| outcome.terminal).unwrap_or(false),
@@ -22790,7 +25081,8 @@ mod rlm_session_t10_tests {
         );
         let result = pending_result_of(&session).expect("a terminal result is recorded");
         assert_eq!(
-            result.status, crate::core::rlm_continuation::TERMINAL_FAILED,
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_FAILED,
             "an exhausted protocol is a failed child, got {result:?}"
         );
         assert!(
@@ -22818,7 +25110,8 @@ mod rlm_session_t10_tests {
         let _ = session.handle_rlm_child_turn_outcome(&complete, false, None);
         let result = pending_result_of(&session).expect("the terminal marker records a result");
         assert_eq!(
-            result.status, crate::core::rlm_continuation::TERMINAL_COMPLETE,
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_COMPLETE,
             "an explicit terminal marker is a completed status, got {result:?}"
         );
         assert!(
@@ -22837,7 +25130,11 @@ mod rlm_session_t10_tests {
         );
         let _ = session.handle_rlm_child_turn_outcome(&clean, false, None);
         let result = pending_result_of(&session).expect("a result is recorded");
-        assert_eq!(result.status, crate::core::rlm_continuation::TERMINAL_COMPLETE, "clean completion status");
+        assert_eq!(
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_COMPLETE,
+            "clean completion status"
+        );
         assert!(
             !result.partial,
             "a clean completion with no length stop stays partial = false (TS 3701), got {result:?}"
@@ -22855,7 +25152,8 @@ mod rlm_session_t10_tests {
         let _ = session.handle_rlm_child_turn_outcome(&blocked, false, None);
         let result = pending_result_of(&session).expect("a result is recorded");
         assert_eq!(
-            result.status, crate::core::rlm_continuation::TERMINAL_BLOCKED,
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_BLOCKED,
             "blocked stays distinct from complete (TS classifyRlmChildTerminal)"
         );
         assert!(
@@ -22872,7 +25170,8 @@ mod rlm_session_t10_tests {
             one_task("task-exhausted"),
             RLM_CHILD_MAX_CONTINUATIONS as f64,
         );
-        let exhausted = assistant_message("cut off", STOP_REASON_LENGTH, 1_700_001_400_000, Vec::new());
+        let exhausted =
+            assistant_message("cut off", STOP_REASON_LENGTH, 1_700_001_400_000, Vec::new());
         let _ = session.handle_rlm_child_turn_outcome(&exhausted, false, None);
         let result = pending_result_of(&session).expect("a result is recorded");
         assert_eq!(
@@ -22915,7 +25214,11 @@ mod rlm_session_t10_tests {
             "the protocol is exhausted after {RLM_CHILD_MAX_CONTINUATIONS} continuations"
         );
         let result = pending_result_of(&session).expect("the exhausted protocol records a result");
-        assert_eq!(result.status, crate::core::rlm_continuation::TERMINAL_FAILED, "exhaustion is a failed status");
+        assert_eq!(
+            result.status,
+            crate::core::rlm_continuation::TERMINAL_FAILED,
+            "exhaustion is a failed status"
+        );
         assert_eq!(
             result.reason.as_deref(),
             Some("protocol_exhausted_after_3_continuations"),
@@ -22955,8 +25258,10 @@ mod rlm_session_t10_tests {
         fn start(
             &self,
             _options: crate::core::kernel::shared::KernelStartOptions,
-        ) -> crate::core::kernel::shared::BoxFuture<'static, Result<(), crate::core::kernel::shared::KernelError>>
-        {
+        ) -> crate::core::kernel::shared::BoxFuture<
+            'static,
+            Result<(), crate::core::kernel::shared::KernelError>,
+        > {
             Box::pin(async { Ok(()) })
         }
         fn execute(
@@ -22994,8 +25299,12 @@ mod rlm_session_t10_tests {
         > {
             Box::pin(async { Ok(true) })
         }
-        fn restart(&self) -> crate::core::kernel::shared::BoxFuture<'static, Result<(), crate::core::kernel::shared::KernelError>>
-        {
+        fn restart(
+            &self,
+        ) -> crate::core::kernel::shared::BoxFuture<
+            'static,
+            Result<(), crate::core::kernel::shared::KernelError>,
+        > {
             Box::pin(async { Ok(()) })
         }
         fn kill(&self) -> crate::core::kernel::shared::BoxFuture<'static, ()> {
@@ -23061,7 +25370,10 @@ mod rlm_session_t10_tests {
             !session.is_streaming() && !session.is_compacting(),
             "the background-helper case must not become a model activity axis (TS 7167-7168)"
         );
-        assert!(!session.is_foreground_active(), "background helpers keep residency without being shown as model work");
+        assert!(
+            !session.is_foreground_active(),
+            "background helpers keep residency without being shown as model work"
+        );
         crate::core::kernel::shared::live_kernels_delete(&owned);
 
         // A background helper owned by ANOTHER session must not make this one
@@ -23089,9 +25401,7 @@ mod rlm_session_t10_tests {
 
         // (c) refinement in flight only.
         let session = t10_session(ScriptedAgent::new(), 0);
-        let test_gen = session
-            .refine_in_flight_gen
-            .fetch_add(1, Ordering::SeqCst);
+        let test_gen = session.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
         let settled: BoxFuture<Result<(), String>> = Box::pin(async { Ok(()) });
         *session.refine_in_flight.lock().unwrap() = Some((test_gen, settled.shared()));
         assert!(session.is_foreground_active());
@@ -23113,8 +25423,12 @@ mod rlm_session_t10_tests {
 
         // (e) post-compaction settlement only.
         let session = t10_session(ScriptedAgent::new(), 0);
-        *session.post_compaction_continuation_settlement.lock().unwrap() =
-            Some(Arc::new(Mutex::new(create_post_compaction_continuation_settlement())));
+        *session
+            .post_compaction_continuation_settlement
+            .lock()
+            .unwrap() = Some(Arc::new(Mutex::new(
+            create_post_compaction_continuation_settlement(),
+        )));
         assert!(session.is_foreground_active());
         assert!(
             session.is_session_active(),
@@ -23202,16 +25516,22 @@ mod rlm_session_t10_tests {
         );
         let mut foreground = summary.clone();
         foreground["activity"] = serde_json::Value::String("working".into());
-        assert!(!crate::modes::agents_view::native_wire::is_background_only(&foreground),
-            "foreground refinement or branch work must not be mislabeled as a background helper");
+        assert!(
+            !crate::modes::agents_view::native_wire::is_background_only(&foreground),
+            "foreground refinement or branch work must not be mislabeled as a background helper"
+        );
         let normalized = crate::modes::agents_view::native_wire::normalize_browser_numbers(summary);
         assert_eq!(
-            normalized.get("statusLabel").and_then(|value| value.as_str()),
+            normalized
+                .get("statusLabel")
+                .and_then(|value| value.as_str()),
             Some("background helper"),
             "the label must be \"background helper\" (agents-view-state.ts:1109-1136)"
         );
         assert_eq!(
-            normalized.get("rosterStatus").and_then(|value| value.as_str()),
+            normalized
+                .get("rosterStatus")
+                .and_then(|value| value.as_str()),
             Some("idle"),
             "the UI-owned roster copy stays idle (native_wire.rs:19)"
         );

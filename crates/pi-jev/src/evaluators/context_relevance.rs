@@ -32,14 +32,14 @@ impl super::CategoryEvaluator for ContextRelevance {
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Score {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "How relevant is the current bounded conversation context to the task (message_count={message_count})? Bounded task excerpt: {}",
                     view.str_field("user_text_excerpt").unwrap_or_default()
-                ),
+                ))),
                 criteria: vec![
-                    "irrelevant".to_string(),
-                    "partially relevant".to_string(),
-                    "highly relevant".to_string(),
+                    crate::types::EntryValue::Text("irrelevant".to_string()),
+                    crate::types::EntryValue::Text("partially relevant".to_string()),
+                    crate::types::EntryValue::Text("highly relevant".to_string()),
                 ],
             },
         }])

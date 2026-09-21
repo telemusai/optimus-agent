@@ -772,6 +772,10 @@ async fn run_loop(
     let mut first_turn = true;
     let mut metric_state = AgentLoopMetricState::default();
     let mut last_turn: Option<crate::types::ShouldStopAfterTurnContext> = None;
+    // Zero-based provider-request index within this run. Matches the session
+    // turn counter (reset at AgentStart, incremented at TurnEnd); handed to
+    // the `before_request` hook so host-side stamps use the same counter.
+    let mut request_index: u64 = 0;
     let mut pending_messages: Vec<AgentMessage> =
         poll_messages_unless_aborted(config.get_steering_messages.clone(), signal.as_ref()).await?;
 
@@ -819,6 +823,22 @@ async fn run_loop(
                     new_messages.push(message);
                 }
             }
+
+            // AWAITED pre-context seam (ROOT-CONTRACT v7 Agent-guidance lane):
+            // runs once per provider request BEFORE the request context is
+            // built, so an assessment started here can complete and refresh
+            // host state before `get_system_prompt` serves THIS request.
+            // `None` (default) keeps the zero-overhead default path.
+            if let Some(hook) = config.before_request.as_ref() {
+                let signal_for_hook = signal.clone();
+                let request_index_for_hook = request_index;
+                maybe_abortable(
+                    async move { hook(request_index_for_hook, signal_for_hook).await },
+                    signal.clone(),
+                )
+                .await?;
+            }
+            request_index += 1;
 
             let message = stream_assistant_response(
                 current_context,

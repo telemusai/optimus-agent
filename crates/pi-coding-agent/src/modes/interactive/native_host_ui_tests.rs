@@ -181,7 +181,8 @@ fn native_two_of_eighty_attach_places_live_output_immediately_above_editor() {
             version: 1.0, generation: "g".into(), representation: "model".into(), tip_entry_id: Some("79".into()),
             total_message_count: 80.0, start_index: 78.0, entry_ids: vec!["78".into(), "79".into()], has_older: true, order: "chronological".into(),
         };
-        apply_history_snapshot(Some(window), vec![user("RECENT_78"), user("RECENT_79")], Some(assistant("LIVE_TAIL")), &h.transcript, &h.editor, &mut history);
+        apply_history_snapshot(Some(window), vec![user("RECENT_78"), user("RECENT_79")], Some(assistant("LIVE_TAIL")), &h.transcript, &h.editor, &mut history,
+            Some(native_history::ViewportFill { width: 80, rows: 24 }));
         let frame = h.paint();
         let live = frame.iter().position(|line| line.contains("LIVE_TAIL")).unwrap();
         assert!(frame.iter().any(|line| line.contains("Showing 2 of 80")));
@@ -218,7 +219,8 @@ fn native_history_prepend_and_streaming_preserve_reading_anchor_then_follow_resu
     h.editor.borrow_mut().editor_mut().set_text("history draft");
     let mut history = native_history::HistoryRuntime::new(unused_connection());
     let messages: Vec<_> = (0..80).map(|index| user(&format!("MESSAGE_{index:03} {}", "wrapped content ".repeat(10)))).collect();
-    apply_history_snapshot(None, messages, Some(assistant("LIVE_STREAM")), &h.transcript, &h.editor, &mut history);
+    apply_history_snapshot(None, messages, Some(assistant("LIVE_STREAM")), &h.transcript, &h.editor, &mut history,
+        Some(native_history::ViewportFill { width: 80, rows: 24 }));
     assert!(h.paint().iter().any(|line| line.contains("LIVE_STREAM")));
     h.key("\x1b[5~");
     let before = h.paint();
@@ -244,4 +246,39 @@ fn native_history_prepend_and_streaming_preserve_reading_anchor_then_follow_resu
     assert!(h.paint().join("\n").contains("LIVE_STREAM"));
     assert!(h.ui.borrow().get_scroll_info().unwrap().following);
     assert_eq!(h.editor.borrow().editor().get_text(), "history draft");
+}
+
+/// The reported defect: a 313-message session attached with "Showing 2 of 313"
+/// and a blank viewport. The painted first frame must fill the visible page,
+/// keep the newest message anchored at the live edge, and keep the rest of the
+/// conversation behind PageUp instead of loading it unconditionally.
+#[test]
+fn native_313_message_attach_fills_the_viewport_and_anchors_the_newest_message() {
+    let h = FrameHarness::new("fill-313");
+    let mut history = native_history::HistoryRuntime::new(unused_connection());
+    let count = 313usize;
+    let messages: Vec<_> = (0..count).map(|index| user(&format!("MESSAGE_{index:03}"))).collect();
+    let window = wire::AgentConnectionHistoryWindow {
+        version: 1.0, generation: "g".into(), representation: "model".into(), tip_entry_id: Some("312".into()),
+        total_message_count: count as f64, start_index: 0.0,
+        entry_ids: (0..count).map(|index| index.to_string()).collect(),
+        has_older: false, order: "chronological".into(),
+    };
+    apply_history_snapshot(Some(window), messages, Some(assistant("LIVE_TAIL")), &h.transcript, &h.editor, &mut history,
+        Some(native_history::ViewportFill { width: 80, rows: 24 }));
+    let frame = h.paint();
+    let painted = frame.join("\n");
+    let info = h.ui.borrow().get_scroll_info().unwrap();
+    assert!(info.following, "the newest message stays the live anchor");
+    assert_eq!(info.lines_below, 0);
+    // One page above the viewport is already rendered (the prefetch page).
+    assert!(info.lines_above >= 24, "a prefetch page must sit above the viewport: {info:?}");
+    assert!(painted.contains("MESSAGE_312"), "the newest message must be on screen: {painted:?}");
+    assert!(painted.contains("LIVE_TAIL"));
+    assert!(!painted.contains("MESSAGE_000"), "the attach must not load the whole conversation");
+    let rendered_lines = h.transcript.borrow_mut().render(80.0).len();
+    assert!(rendered_lines >= 48, "the transcript must cover about two pages: {rendered_lines}");
+    assert!(rendered_lines < count * 3, "the fill must stay bounded: {rendered_lines}");
+    let rendered = pi_tui::utils::strip_ansi(&h.transcript.borrow_mut().render(80.0).join("\n"));
+    assert!(rendered.contains("of 313 messages."));
 }

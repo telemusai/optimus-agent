@@ -2,7 +2,7 @@
 
 use crate::evaluators::{question_id, EvaluatorOutput, PreparedQuestion, StateView};
 use crate::snapshot::SnapshotStage;
-use crate::types::{DecisionCategory, NoulCriteria, QuestionSpec};
+use crate::types::{DecisionCategory, QuestionSpec};
 
 pub struct SubagentRequirement;
 
@@ -23,13 +23,13 @@ impl super::CategoryEvaluator for SubagentRequirement {
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Noul {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "Would delegating part of this task to a subagent plausibly help? Recommendation only; nothing is spawned. Bounded task excerpt: {task_text}"
-                ),
-                criteria: Some(NoulCriteria {
-                    r#true: "A subagent could plausibly help.".to_string(),
-                    r#false: "No subagent is warranted.".to_string(),
-                }),
+                ))),
+                criteria: Some(crate::types::NoulCriteria::text(
+                    "A subagent could plausibly help.",
+                    "No subagent is warranted.",
+                )),
             },
         }])
     }

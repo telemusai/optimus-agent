@@ -11,4 +11,5 @@ pub mod onboarding;
 pub mod prompt_stash_state;
 pub mod queue_selection;
 pub mod resume_hint;
+pub(crate) mod tray_row;
 pub mod theme;

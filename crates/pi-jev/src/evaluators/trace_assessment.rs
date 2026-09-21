@@ -27,11 +27,11 @@ impl super::CategoryEvaluator for TraceAssessment {
         EvaluatorOutput::Questions(vec![PreparedQuestion {
             question_id: question_id(self.category(), 0),
             spec: QuestionSpec::Choice {
-                instructions: format!(
+                instructions: Some(crate::types::EntryValue::Text(format!(
                     "Assess this bounded metadata-only trace: good, review, retry_recommended, escalate, or suspicious. These are annotations only; never execute retries, cancel work, send messages or change models. Missing evidence warrants review, not invented success. A good trace is not proof that the task or tests passed. Observed metadata: {}",
                     observation.evidence_description(),
-                ),
-                criteria: Assessment::ALL.into_iter().map(|kind| (kind.as_str().to_string(), None)).collect(),
+                ))),
+                criteria: Assessment::ALL.into_iter().map(|kind| (kind.as_str().to_string(), crate::types::EntryValue::Null)).collect(),
             },
         }])
     }

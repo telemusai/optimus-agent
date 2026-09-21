@@ -46,6 +46,100 @@ fn choice_options(question: &PreparedQuestion) -> Vec<String> {
     }
 }
 
+fn entry_text(entry: &pi_jev::types::EntryValue) -> &str {
+    match entry {
+        pi_jev::types::EntryValue::Text(text) => text,
+        other => panic!("expected text entry, got {other:?}"),
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Tool-candidates TurnStart fallback: no-match escape, bounded subset scope,
+// reserved-name collision handling (root skill-audit fix).
+// ---------------------------------------------------------------------------
+
+fn tool_candidates_turn_start(state: serde_json::Value) -> PreparedQuestion {
+    use pi_jev::evaluators::tool_candidates::ToolCandidates;
+    let state = snapshot(SnapshotStage::TurnStart, state);
+    let prepared = questions(ToolCandidates.evaluate(&state));
+    assert_eq!(prepared.len(), 1, "exactly one fallback question");
+    prepared[0].clone()
+}
+
+#[test]
+fn tool_candidates_fallback_carries_a_no_match_escape() {
+    let prepared = tool_candidates_turn_start(json!({
+        "user_text_excerpt": "fix the retry loop",
+        "observed_tools": ["bash", "ipython", "grep"],
+    }));
+    let QuestionSpec::Choice { criteria, instructions } = &prepared.spec else {
+        panic!("choice")
+    };
+    // The no-match escape exists and never shadows a genuine tool.
+    assert!(criteria.contains_key("none"));
+    assert!(criteria.contains_key("multiple"));
+    assert!(criteria.contains_key("bash"));
+    assert!(criteria.contains_key("ipython"));
+    assert!(criteria.contains_key("grep"));
+    let text = entry_text(instructions.as_ref().unwrap());
+    assert!(text.contains("Choose \"none\""), "the escape is documented");
+    assert!(text.contains("not that other tools cannot exist"), "none is scoped, not proof of absence");
+    assert!(text.contains("never changes tool availability"), "advisory boundary stated");
+}
+
+#[test]
+fn tool_candidates_fallback_discloses_the_bounded_subset() {
+    let names: Vec<String> = (0..12).map(|index| format!("tool_{index}")).collect();
+    let prepared = tool_candidates_turn_start(json!({
+        "user_text_excerpt": "assess the task",
+        "observed_tools": names,
+    }));
+    let QuestionSpec::Choice { criteria, instructions } = &prepared.spec else {
+        panic!("choice")
+    };
+    // Exactly the first 8 observed names + the two escapes are offered.
+    assert_eq!(criteria.len(), 10);
+    for index in 0..8 {
+        assert!(criteria.contains_key(&format!("tool_{index}")));
+    }
+    assert!(!criteria.contains_key("tool_8"));
+    assert!(!criteria.contains_key("tool_11"));
+    // Instructions describe ONLY the assessed subset and disclose the cap.
+    let text = entry_text(instructions.as_ref().unwrap());
+    assert!(text.contains("tool_7"));
+    assert!(!text.contains("tool_8 "), "instructions never list unassessed names as assessable");
+    assert!(text.contains("4 further observed tool name(s) are outside this bounded question"));
+}
+
+#[test]
+fn tool_candidates_fallback_never_collides_with_reserved_outcomes() {
+    // A tool literally named "none" would make the answer ambiguous: it is
+    // excluded and the exclusion is disclosed; genuine options stay intact.
+    let prepared = tool_candidates_turn_start(json!({
+        "user_text_excerpt": "assess the task",
+        "observed_tools": ["none", "bash", "ipython"],
+    }));
+    let QuestionSpec::Choice { criteria, instructions } = &prepared.spec else {
+        panic!("choice")
+    };
+    assert!(criteria.contains_key("bash"));
+    assert!(criteria.contains_key("ipython"));
+    assert!(criteria.contains_key("none"));
+    assert!(criteria.contains_key("multiple"));
+    let text = entry_text(instructions.as_ref().unwrap());
+    assert!(text.contains("1 observed tool name(s) named like the reserved outcomes"));
+    // All-reserved catalog is skipped instead of asking an impossible question.
+    use pi_jev::evaluators::EvaluatorOutput;
+    let state = snapshot(SnapshotStage::TurnStart, json!({
+        "user_text_excerpt": "assess the task",
+        "observed_tools": ["none", "multiple"],
+    }));
+    match pi_jev::evaluators::tool_candidates::ToolCandidates.evaluate(&state) {
+        EvaluatorOutput::Skipped(reason) => assert_eq!(reason, "no_assessable_tools"),
+        EvaluatorOutput::Questions(_) => panic!("expected skip"),
+    }
+}
+
 fn error_trace() -> TraceObserver {
     let mut observer = TraceObserver::default();
     observer.record(TraceEvent::TurnStarted);
@@ -357,21 +451,12 @@ fn routing_is_allowlisted_bounded_and_reports_only_actual_valid_metrics() {
         panic!("choice")
     };
     assert_eq!(criteria.len(), 9);
-    assert!(criteria["provider/model-0"]
-        .as_ref()
-        .unwrap()
-        .contains("success rate=0.75"));
-    assert!(criteria["provider/model-1"]
-        .as_ref()
-        .unwrap()
-        .contains("unknown, not zero"));
-    assert!(criteria["provider/model-2"]
-        .as_ref()
-        .unwrap()
-        .contains("unknown, not zero"));
-    assert!(!instructions.contains("model-8"));
+    assert!(entry_text(&criteria["provider/model-0"]).contains("success rate=0.75"));
+    assert!(entry_text(&criteria["provider/model-1"]).contains("unknown, not zero"));
+    assert!(entry_text(&criteria["provider/model-2"]).contains("unknown, not zero"));
+    assert!(!entry_text(instructions.as_ref().unwrap()).contains("model-8"));
     assert!(!criteria.contains_key("not-allowlisted"));
-    assert!(instructions.contains("never switches any model"));
+    assert!(entry_text(instructions.as_ref().unwrap()).contains("never switches any model"));
 }
 
 #[test]

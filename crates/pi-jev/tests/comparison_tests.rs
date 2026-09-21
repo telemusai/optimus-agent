@@ -117,7 +117,7 @@ where
         .unwrap(),
     );
     let config = JevObserverConfig {
-        mode_gate: Arc::new(move |_| mode),
+        mode_gate: Arc::new(move |_| (mode, pi_jev::hooks::SYSTEM_ONE_MODEL.to_string())),
         enabled_categories: HashSet::new(),
         scheduler,
         ..JevObserverConfig::default()
@@ -279,7 +279,10 @@ fn all_eleven_categories_produce_questions() {
     };
     assert!(criteria.contains_key("allow-a"));
     assert!(criteria.contains_key("none"));
-    assert!(instructions.contains("never switches"), "advisory wording required");
+    let pi_jev::types::EntryValue::Text(instruction_text) = instructions.as_ref().unwrap() else {
+        panic!("advisory wording required");
+    };
+    assert!(instruction_text.contains("never switches"), "advisory wording required");
 }
 
 #[test]
@@ -750,6 +753,7 @@ async fn retry_after_is_honored_before_final_success() {
                 status: 429,
                 detail: "rate limited (test)".to_string(),
                 retry_after: Some(Duration::from_millis(50)),
+                server_request_id: None,
             });
         }
         Ok(pi_jev::mock::valid_response_for(request))

@@ -778,6 +778,10 @@ struct PackageJsonPiConfig {
     name: Option<String>,
     #[serde(rename = "configDir")]
     config_dir: Option<String>,
+    /// Optional terminal/tab identity title (`piConfig.title`); the TypeScript
+    /// reference ignores this field.
+    #[serde(default)]
+    title: Option<String>,
 }
 
 #[derive(Debug, Clone, Default, serde::Deserialize)]
@@ -832,6 +836,21 @@ pub fn app_title_from_pkg(pkg: &PackageJson) -> String {
     }
 }
 
+/// Terminal/tab identity title. `PRIME_AGENT_APP_TITLE` wins when it is set and
+/// non-empty after sanitization, then `piConfig.title`, then the existing
+/// `app_title_from_pkg` behavior (`piConfig.name` or the pi letter fallback).
+pub fn app_display_title_from(pkg: &PackageJson, env_override: Option<&str>) -> String {
+    let candidates = [env_override, pkg.pi_config.as_ref().and_then(|config| config.title.as_deref())];
+    for candidate in candidates {
+        let Some(candidate) = candidate else { continue };
+        let cleaned = pi_tui::terminal::sanitize_title_text(candidate.trim()).trim().to_string();
+        if !cleaned.is_empty() {
+            return cleaned;
+        }
+    }
+    app_title_from_pkg(pkg)
+}
+
 fn config_dir_name_from(pkg: &PackageJson) -> String {
     pkg.pi_config
         .as_ref()
@@ -871,6 +890,26 @@ fn app_title_static() -> &'static str {
 /// `APP_TITLE` (`piConfig.name ? APP_NAME : "π"`).
 pub fn app_title() -> &'static str {
     app_title_static()
+}
+
+fn app_display_title_static() -> &'static str {
+    static APP_DISPLAY_TITLE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    APP_DISPLAY_TITLE.get_or_init(|| {
+        let env_override = std::env::var("PRIME_AGENT_APP_TITLE").ok();
+        app_display_title_from(&read_package_json(), env_override.as_deref())
+    })
+}
+
+/// Terminal/tab identity title (see `app_display_title_from`); resolved once at
+/// startup from the environment override, `piConfig.title`, or the name-based
+/// `APP_TITLE` fallback.
+pub fn app_display_title() -> &'static str {
+    app_display_title_static()
+}
+
+/// `app_display_title()` (String getter, see `app_title_string()`).
+pub fn app_display_title_string() -> String {
+    app_display_title().to_string()
 }
 
 fn config_dir_name_static() -> &'static str {
@@ -1198,6 +1237,7 @@ mod tests {
             pi_config: Some(PackageJsonPiConfig {
                 name: Some("prime-agent".to_string()),
                 config_dir: Some(".prime/agent".to_string()),
+                title: None,
             }),
         }
     }
@@ -1219,6 +1259,44 @@ mod tests {
         assert_eq!(app_title_from_pkg(&pkg), "\u{3c0}");
         assert_eq!(config_dir_name_from(&pkg), ".prime/agent");
         assert_eq!(version_from(&pkg), "0.0.0");
+    }
+
+    #[test]
+    fn pi_config_title_sets_the_display_identity() {
+        let mut pkg = sample_package();
+        pkg.pi_config.as_mut().unwrap().title = Some("Optimus - Agent".to_string());
+        assert_eq!(app_display_title_from(&pkg, None), "Optimus - Agent");
+    }
+
+    #[test]
+    fn app_title_env_override_wins_over_pi_config() {
+        let mut pkg = sample_package();
+        pkg.pi_config.as_mut().unwrap().title = Some("Optimus - Agent".to_string());
+        assert_eq!(app_display_title_from(&pkg, Some("Optimus - Assistant")), "Optimus - Assistant");
+    }
+
+    #[test]
+    fn app_title_sources_drop_control_and_escape_payloads() {
+        let mut pkg = sample_package();
+        pkg.pi_config.as_mut().unwrap().title = Some("\x1b]0;evil\x07Optimus - Agent".to_string());
+        let title = app_display_title_from(&pkg, None);
+        assert_eq!(title, "]0;evilOptimus - Agent");
+        assert!(!title.contains('\x1b'));
+        assert!(!title.contains('\x07'));
+        let override_title = app_display_title_from(&pkg, Some("  Optimus - Assistant \u{202e} \x1b[31m"));
+        assert_eq!(override_title, "Optimus - Assistant  [31m");
+    }
+
+    #[test]
+    fn empty_app_title_fallbacks_keep_the_existing_behavior() {
+        let pkg = sample_package();
+        assert_eq!(app_display_title_from(&pkg, None), "prime-agent");
+        assert_eq!(app_display_title_from(&pkg, Some("   ")), "prime-agent");
+        let mut pkg = sample_package();
+        pkg.pi_config.as_mut().unwrap().title = Some("  \x1b \x07 ".to_string());
+        assert_eq!(app_display_title_from(&pkg, None), "prime-agent");
+        let bare = PackageJson { name: Some("@earendil-works/pi-coding-agent".to_string()), version: None, pi_config: None };
+        assert_eq!(app_display_title_from(&bare, None), "\u{3c0}");
     }
 
     #[test]

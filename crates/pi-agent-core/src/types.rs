@@ -609,6 +609,22 @@ pub struct AgentLoopConfig {
     >,
     /// Resolves the system prompt immediately before each LLM call.
     pub get_system_prompt: Option<Arc<dyn Fn() -> String + Send + Sync>>,
+    /// AWAITED once per provider request, immediately before the request
+    /// context is built (after `turn_start` emission, before the LLM call).
+    /// Arguments: the zero-based request index within this run (matches the
+    /// session turn counter: reset at AgentStart, incremented at TurnEnd) and
+    /// the loop's cancellation signal. `None` (default) preserves the
+    /// zero-overhead default path byte-for-byte.
+    pub before_request: Option<
+        Arc<
+            dyn Fn(
+                    u64,
+                    Option<tokio_util::sync::CancellationToken>,
+                ) -> futures::future::BoxFuture<'static, anyhow::Result<()>>
+                + Send
+                + Sync,
+        >,
+    >,
     /// Resolves an API key dynamically for each LLM call.
     ///
     /// Contract: must not throw or reject. Return `None` when no key is available.
