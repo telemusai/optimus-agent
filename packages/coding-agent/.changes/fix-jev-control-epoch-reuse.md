@@ -1,0 +1,1 @@
+- Prevented stale Jev control decisions from spending a new task's budget after session eviction and restart, and kept new sessions eligible in a full control ledger.

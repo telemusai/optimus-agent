@@ -14,7 +14,7 @@
 //!   never lose writes;
 //! - a failed/corrupt/missing/truncated/oversized/above-max ledger refuses
 //!   new effects (fail-closed, zero headroom) instead of minting maxima;
-//! - monotonic per-session sequence authority: reordered records cannot
+//! - monotonic ledger-wide sequence authority: reordered records cannot
 //!   restore older higher remaining counts;
 //! - once-per-attempt veto consults are durable across books;
 //! - compaction bounds drop sessions only into fail-closed refusal, never a
@@ -297,21 +297,21 @@ fn budgets_persist_across_book_recreation_without_reload_helper() {
 fn budgets_never_leak_across_sessions() {
     let (book, _dir) = temp_book("isolation");
     book.note_real_user_input("sess-a", "interactive", "task A", true);
-    book.note_real_user_input("sess-b", "interactive", "task B", true);
+    let initial_b = book.note_real_user_input("sess-b", "interactive", "task B", true);
     book.consume("sess-a", "sess-a:1", ControlBudgetKind::RetryVeto)
         .expect("veto budget available");
     book.consume("sess-a", "sess-a:1", ControlBudgetKind::RetryVeto)
         .expect("second veto budget available");
 
     let b = book.snapshot("sess-b");
-    assert_eq!(b.epoch_id, "sess-b:1");
+    assert_eq!(b.epoch_id, initial_b.epoch_id);
     assert_eq!(b.veto_remaining, 2);
     assert_eq!(b.feedback_remaining, 2);
     assert!(book
         .consume("sess-a", "sess-a:1", ControlBudgetKind::RetryVeto)
         .is_none());
     assert!(book
-        .consume("sess-b", "sess-b:1", ControlBudgetKind::RetryVeto)
+        .consume("sess-b", &b.epoch_id, ControlBudgetKind::RetryVeto)
         .is_some());
 }
 
@@ -577,8 +577,9 @@ fn resolve_agent_end_defers_on_insufficient_results() {
     // A pending continuation owns the task: no second feedback. Fresh
     // session so the feedback budget is available and the pending-continuation
     // refusal is exercised on its own.
-    book.note_real_user_input("sess-pending", "interactive", "task", true);
-    let pending_facts = facts("sess-pending", 7, &["result_sufficiency.0"]);
+    let pending_budget = book.note_real_user_input("sess-pending", "interactive", "task", true);
+    let mut pending_facts = facts("sess-pending", 7, &["result_sufficiency.0"]);
+    pending_facts.epoch_id = pending_budget.epoch_id;
     let pending_insufficient = candidate(
         DecisionCategory::ResultSufficiency,
         "result_sufficiency.0",
@@ -1275,11 +1276,15 @@ fn conflicting_duplicate_records_fail_closed() {
 #[test]
 fn compaction_bounds_drop_only_into_fail_closed() {
     let (book, dir) = temp_book("compaction");
+    let mut epochs = Vec::new();
     for index in 0..(MAX_TRACKED_SESSIONS as u64 + 6) {
         let session = format!("sess-{index}");
-        book.note_real_user_input(&session, "interactive", "task", true);
+        let initial = book.note_real_user_input(&session, "interactive", "task", true);
+        assert!(initial.available);
+        epochs.push((session, initial.epoch_id));
     }
-    book.consume("sess-69", "sess-69:1", ControlBudgetKind::RetryVeto)
+    let (latest_session, latest_epoch) = epochs.last().unwrap();
+    book.consume(latest_session, latest_epoch, ControlBudgetKind::RetryVeto)
         .expect("veto available");
     let lines = ledger_lines(&dir);
     assert!(
@@ -1290,9 +1295,9 @@ fn compaction_bounds_drop_only_into_fail_closed() {
 
     // The most recent session recovers truthfully after restart.
     let reborn = ControlBook::new(dir.clone());
-    let latest = reborn.snapshot("sess-69");
+    let latest = reborn.snapshot(latest_session);
     assert!(latest.available);
-    assert_eq!(latest.epoch_id, "sess-69:1");
+    assert_eq!(&latest.epoch_id, latest_epoch);
     assert_eq!(latest.veto_remaining, 1);
 
     // A session dropped by the bound is fail-closed, NEVER re-minted.
@@ -1302,31 +1307,116 @@ fn compaction_bounds_drop_only_into_fail_closed() {
         .consume("sess-0", "sess-0:1", ControlBudgetKind::RetryVeto)
         .is_none());
 
-    // A genuine new real user delivery alone initializes a NEW epoch.
-    let renewed = book.note_real_user_input("sess-0", "interactive", "task again", true);
+    // Restart removes any lucky surviving cache entry: a new real user
+    // delivery must never reuse the evicted task's identity.
+    drop(book);
+    let renewed = reborn.note_real_user_input("sess-0", "interactive", "task again", true);
     assert!(renewed.available);
-    assert_eq!(renewed.epoch_id, "sess-0:2");
+    assert_ne!(renewed.epoch_id, epochs[0].1);
     assert_eq!(renewed.feedback_remaining, 2);
+    assert!(reborn
+        .consume("sess-0", &epochs[0].1, ControlBudgetKind::RetryVeto)
+        .is_none());
+    let stale_facts = facts("sess-0", 7, &["result_sufficiency.0"]);
+    let result = resolve_agent_end(
+        &reborn,
+        "sess-0",
+        &ControlPolicy::default(),
+        &features(),
+        JevMode::Active,
+        &stale_facts,
+        &[candidate(
+            DecisionCategory::ResultSufficiency,
+            "result_sufficiency.0",
+            "insufficient",
+            0.9,
+            7,
+        )],
+        false,
+        "stale decision after eviction",
+    );
+    assert!(result.feedback.is_none());
+    assert!(!result.defer_goal_finish);
+    assert_eq!(reborn.snapshot("sess-0").feedback_remaining, 2);
+    let restarted = ControlBook::new(dir);
+    assert_eq!(
+        restarted.current_epoch_id("sess-0"),
+        Some(renewed.epoch_id.clone())
+    );
+    assert!(restarted
+        .consume("sess-0", &renewed.epoch_id, ControlBudgetKind::RetryVeto)
+        .is_some());
+}
+
+#[test]
+fn new_session_survives_a_full_ledger_of_updated_sessions() {
+    let (book, dir) = temp_book("ledger-high-water");
+    let mut previous_seq = 0;
+    for index in 0..MAX_TRACKED_SESSIONS {
+        let session = format!("busy-{index}");
+        let initial = book.note_real_user_input(&session, "interactive", "task", true);
+        assert!(initial.available);
+        book.consume(&session, &initial.epoch_id, ControlBudgetKind::RetryVeto)
+            .expect("first veto");
+        assert_eq!(book.veto_consult_state(&session, 1), VetoConsultState::Fresh);
+        let row = ledger_lines(&dir)
+            .into_iter()
+            .map(|line| serde_json::from_str::<serde_json::Value>(&line).unwrap())
+            .find(|row| row["session"] == session)
+            .unwrap();
+        let seq = row["seq"].as_u64().unwrap();
+        assert_eq!(
+            seq,
+            previous_seq + 3,
+            "activation, spend and consult each advance the ledger"
+        );
+        previous_seq = seq;
+    }
+    let reborn = ControlBook::new(dir.clone());
+    let fresh = reborn.note_real_user_input("new-session", "rpc", "new task", true);
+    assert!(
+        fresh.available,
+        "an updated older session must not evict the new write"
+    );
+    assert_eq!(fresh.epoch_id, format!("new-session:{}", previous_seq + 1));
+    assert_eq!(ledger_lines(&dir).len(), MAX_TRACKED_SESSIONS);
+    assert_unavailable(&reborn.snapshot("busy-0"));
+}
+
+#[test]
+fn exhausted_ledger_sequence_refuses_mutations_without_reusing_identity() {
+    let (book, dir) = temp_book("sequence-exhausted");
+    write_ledger(&dir, &record_line("sess", 1, u64::MAX, 2, 1, 1, 2, &[]));
+    let before = std::fs::read(ledger_path(&dir)).unwrap();
+    assert!(book
+        .consume("sess", "sess:1", ControlBudgetKind::RetryVeto)
+        .is_none());
+    assert_eq!(book.veto_consult_state("sess", 1), VetoConsultState::Unavailable);
+    assert_unavailable(&book.note_real_user_input("new-session", "rpc", "task", true));
+    assert_unavailable(&book.note_real_user_input("sess", "rpc", "new task", true));
+    assert_eq!(std::fs::read(ledger_path(&dir)).unwrap(), before);
 }
 
 #[test]
 fn ledger_restores_many_sessions_across_restart() {
     let (book, dir) = temp_book("restart-many");
+    let mut epochs = Vec::new();
     // Many sessions, one consumption each: the ledger must rebuild each
     // session's freshest snapshot independently after a restart.
     for epoch in 0..40u64 {
         let session = format!("sess-{epoch}");
-        book.note_real_user_input(&session, "interactive", "task", true);
+        let initial = book.note_real_user_input(&session, "interactive", "task", true);
         book.consume(
             &session,
-            &format!("sess-{epoch}:1"),
+            &initial.epoch_id,
             ControlBudgetKind::RetryVeto,
         )
         .expect("veto budget available");
+        epochs.push(initial.epoch_id);
     }
     let reborn = ControlBook::new(dir);
     let restored = reborn.snapshot("sess-39");
-    assert_eq!(restored.epoch_id, "sess-39:1");
+    assert_eq!(restored.epoch_id, epochs[39]);
     assert_eq!(restored.veto_remaining, 1);
     let untouched = reborn.snapshot("sess-0");
     assert_eq!(untouched.epoch_id, "sess-0:1");

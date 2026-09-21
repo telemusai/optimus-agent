@@ -386,7 +386,7 @@ pub struct FullJevProfile {
     pub enabled: bool,
     /// The operative mode the overlay resolves to: always [`FULL_JEV_MODE`].
     pub mode: JevMode,
-    /// Every feature gate the overlay forces on (all 14).
+    /// Every registered feature gate the overlay forces on.
     pub features: JevFeatures,
     /// Independent compaction the overlay forces on.
     pub compaction_enabled: bool,
@@ -1356,9 +1356,13 @@ mod full_jev_tests {
         assert_eq!(JevFeature::parse("line_find"), Some(JevFeature::LineFind));
         assert_eq!(JevFeature::parse("line-find"), Some(JevFeature::LineFind));
         assert_eq!(JevFeature::parse("nope"), None);
-        assert_eq!(JevFeature::ALL.len(), 14);
+        let serialized = serde_json::to_value(features).unwrap();
+        let fields = serialized.as_object().unwrap();
+        assert_eq!(JevFeature::ALL.len(), fields.len());
         // FULL_JEV_FEATURES turns every gate on, including the new two.
         for feature in JevFeature::ALL {
+            assert!(fields.contains_key(feature.as_str()));
+            assert_eq!(JevFeature::parse(feature.as_str()), Some(feature));
             assert!(FULL_JEV_FEATURES.enabled(feature), "{}", feature.as_str());
         }
         assert_eq!(FULL_JEV_MODE, JevMode::CompareAndActive);

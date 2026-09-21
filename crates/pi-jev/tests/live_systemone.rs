@@ -91,7 +91,7 @@ async fn live_systemone_round_trip() {
         snapshot.malformed
     );
     println!(
-        "response_model={:?} input_tokens={} output_tokens={}",
+        "response_model={:?} input_tokens={:?} output_tokens={:?}",
         outcome.response_model, outcome.usage.input_tokens, outcome.usage.output_tokens
     );
     for record in &outcome.records {
