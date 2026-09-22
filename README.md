@@ -186,7 +186,6 @@ For a smaller configuration, leave the full-Jev overlay off and select individua
 /jev compare                  # shadow decisions (also: /jev on)
 /jev active
 /jev compare-active
-/jev feature tool_candidates on
 /jev compact on               # independently enable request-local compaction
 /jev compact status
 /jev compact off
@@ -196,6 +195,25 @@ For a smaller configuration, leave the full-Jev overlay off and select individua
 ```
 
 Outside full-Jev, an explicit session setting wins over its global default. Children inherit a snapshot of their parent's saved controls and can override it. `/jev on` means Compare; it does not enable full-Jev. Feature gates, mode, and compaction are separate settings. Only `tool_requirement` and `complexity` have feature defaults of true; the other gates default to false, and no decision calls occur while the mode is Off.
+
+With the full-Jev overlay off, enter these commands individually in the Optimus TUI to enable the following feature gates. Select `/jev active` or `/jev compare-active` to allow supported effects, or `/jev compare` for shadow decisions:
+
+```text
+/jev feature tool_requirement on
+/jev feature complexity on
+/jev feature tool_candidates on
+/jev feature context_relevance on
+/jev feature code_search_relevance on
+/jev feature code_search_filtering on
+/jev feature memory_relevance on
+/jev feature result_sufficiency on
+/jev feature loop_control on
+/jev feature retry_classification on
+/jev feature verification on
+/jev feature trace_observer on
+```
+
+Replace `on` with `off` to disable an individual gate, and use `/jev status` to inspect the effective settings. These commands do not enable the full-Jev overlay or independent compaction.
 
 ### What full-Jev enables
 
