@@ -1,4 +1,0 @@
-- Added Jev Active mode: `/jev active` lets an accepted System One answer change the next provider request, limited to withdrawing the tool catalog when the task needs no tools and moving one already-set reasoning effort by one step.
-- Active is opt-in per session and bounded: a refused answer, a low-confidence answer, a timeout, an open circuit breaker or a missing credential leaves the request byte-identical and is recorded with a reason.
-- Added `jev.active/1` records with the applied field list and the single fallback reason, plus live Active counters in `/jev status` and the daemon status payload.
-- `on` remains the short form of Compare; only the explicit `active` spelling selects the request-changing mode. `/jev status`, the footer, the menu and the daemon now report Active as a real mode instead of a reserved one.

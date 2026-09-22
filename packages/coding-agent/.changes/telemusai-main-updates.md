@@ -1,3 +1,0 @@
-- Changed `/update`, `prime-agent update`, and update notices to follow published builds of `telemusai/prime-agent` main, preserving model settings and authentication.
-- Fixed unavailable or invalid update manifests falling back to an unrelated npm release.
-- Added GitHub release packaging and automatic main-build publication for the TelemusAI fork.

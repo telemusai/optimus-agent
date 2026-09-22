@@ -631,13 +631,7 @@ pub fn get_update_instruction(package_name: &str) -> String {
 // Package Asset Paths (shipped with executable)
 // =============================================================================
 
-/// `__dirname` for `config.ts`.
-///
-/// The TypeScript module lives at `<packageDir>/dist/config.js` (built) or
-/// `<packageDir>/src/config.ts` (tsx), so walking up from it lands on the
-/// package root. The Rust library has no per-module directory: the port uses the
-/// `packages/coding-agent` directory of the checkout when it can find it, so
-/// `getPackageDir()` and the `src`/`dist` asset paths resolve identically.
+/// Locate the native resource bundle beside an installed binary or in a checkout.
 fn module_dir() -> String {
     static MODULE_DIR: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     MODULE_DIR
@@ -645,9 +639,17 @@ fn module_dir() -> String {
             if let Ok(dir) = std::env::var("PI_CODING_AGENT_MODULE_DIR") {
                 return dir;
             }
+            if let Ok(executable) = std::env::current_exe() {
+                for parent in executable.ancestors().skip(1) {
+                    let candidate = parent.join("resources").join("agent");
+                    if candidate.join("package.json").is_file() {
+                        return candidate.to_string_lossy().into_owned();
+                    }
+                }
+            }
             let mut dir = PathBuf::from(env!("CARGO_MANIFEST_DIR"));
             loop {
-                let candidate = dir.join("packages").join("coding-agent");
+                let candidate = dir.join("resources").join("agent");
                 if candidate.join("package.json").exists() {
                     return candidate.to_string_lossy().to_string();
                 }

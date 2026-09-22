@@ -1,9 +1,6 @@
-# Dependency update PRs wait out the same 7-day cooldown that .npmrc's
-# min-release-age enforces locally. Security-advisory PRs are exempt
-# from cooldown by design, so CVE fixes still arrive promptly.
 version: 2
 updates:
-  - package-ecosystem: npm
+  - package-ecosystem: cargo
     directory: /
     schedule:
       interval: weekly

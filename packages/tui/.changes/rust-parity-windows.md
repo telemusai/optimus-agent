@@ -1,1 +1,0 @@
-- Fixed Windows terminal key handling and filtered terminal capability replies out of editable text.

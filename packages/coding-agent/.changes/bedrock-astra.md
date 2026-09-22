@@ -1,1 +1,0 @@
-- Added AWS Bedrock GPT-6 Astra through Oregon Mantle and Sydney Global cross-region Responses endpoints, with AWS authentication, five reasoning levels, images, and tool/reasoning replay.

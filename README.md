@@ -1,10 +1,10 @@
 # Optimus Agent
 
-**A self-improving, multi-model harness for coding, research, and long-running work, with a native Rust application layer and a persistent Python runtime.**
+**A self-improving, multi-model harness for coding, research, and long-running work, implemented in Rust with a persistent Python runtime.**
 
 Maintained by [Telemus AI](https://github.com/telemusai).
 
-[Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Jev](#jev-integration) · [Rust migration](#the-rust-migration) · [Documentation](#documentation)
+[Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Jev](#jev-integration) · [Implementation](#implementation) · [Documentation](#documentation)
 
 Optimus is the layer between an AI model and real work: the tools it can use, the context it retains, the agents it coordinates, and the state it recovers when a session ends or a connection drops.
 
@@ -16,7 +16,7 @@ Optimus focuses on **native Windows reliability, stronger session continuity, As
 
 | Area | Current position |
 | --- | --- |
-| Main implementation | Native Rust application with a Python execution runtime; TypeScript/Node.js retained as the reference |
+| Main implementation | Rust application with a persistent Python execution runtime; no TypeScript application or npm workspace |
 | Rust implementation | Available on `main`, installed as `optimus-agent`; remaining parity gaps are documented |
 | Platforms | macOS, Linux, and native Windows; Windows currently requires a Bash shell such as Git Bash |
 | Memory | Session, project, and global harness memory, with optional selected sharing; authoritative project storage is JSON |
@@ -75,7 +75,7 @@ Recall and learning are independent controls. You can stop new automatic learnin
 
 Current project memory is stored in versioned JSON state. Ordinary recall does not require a separate vector database or an extra model request. **TencentDB integration is a future direction; it is not a requirement for the memory system that ships today.**
 
-See [Project memory](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/project-memory.md) for source validation, imports, backups, sharing, and the Python memory API.
+See [Project memory](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/project-memory.md) for source validation, imports, backups, sharing, and the Python memory API.
 
 ### Native Windows as a real operating environment
 
@@ -85,7 +85,7 @@ The work includes safer worker recovery, Windows path handling, bounded persiste
 
 The terminal is a client of the running agent services. A terminal disconnect and a worker failure are different events, and the harness tracks them separately. Persistent deployments must also launch those services independently of disposable editor or terminal-host processes.
 
-See [Windows setup](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/windows.md). Machine-specific gateways, credentials, scheduled tasks, and guarded installation packages are deployment configuration—not bundled public defaults.
+See [Windows setup](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/windows.md). Machine-specific gateways, credentials, scheduled tasks, and guarded installation packages are deployment configuration—not bundled public defaults.
 
 ### Long-running work with explicit controls
 
@@ -99,7 +99,7 @@ Optimus supports provider authentication, custom model definitions, and model-sp
 
 Use the model appropriate to each task: a planner or reviewer, an implementation agent, or a focused researcher. Authentication method, subscription entitlement, available models, image support, service tiers, and compaction capability vary by provider. Custom gateways require their own configuration.
 
-See [Providers](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/providers.md) and [Custom models](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/models.md).
+See [Providers](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/providers.md) and [Custom models](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/models.md).
 
 ### Efficiency you can measure
 
@@ -116,7 +116,7 @@ The performance work targets both the host runtime and the conversation it manag
 Metrics normally go to `~/.prime/agent/performance-metrics`. Summarize a collected directory with:
 
 ```bash
-node packages/coding-agent/scripts/summarize-performance-metrics.mjs --dir /path/to/performance-metrics
+node scripts/summarize-performance-metrics.mjs --dir /path/to/performance-metrics
 ```
 
 The recorder does not store prompt bodies, tool arguments, credentials, or reasoning text. Unavailable measurements remain unavailable rather than being reported as zero. Ordinary `/usage` totals are useful, but are not a substitute for this diagnostic breakdown.
@@ -150,7 +150,7 @@ optimus-agent
 
 If you already keep the key in a protected environment file, source that existing file in the same shell before launching instead. Already-running daemons/workers retain their environment; restart the relevant Optimus services with the configured environment when changing an environment-provided key.
 
-For persistent setup with the maintained `scripts/optimus-agent` launcher, its optional `<agent-dir>/jev/env` file accepts `TYPESAFE_API_KEY=your-key` (or `JEV_API_KEY=your-key`). Use a private editor to enter the key and restrict the file to its owner with `chmod 600`. It must be a regular file owned by the current user; symlinks are rejected. The launcher parses it as data, never as shell code. This file is plaintext, not an encrypted store. An existing key in the process environment takes precedence over the launcher file.
+On Linux/macOS, for persistent setup with the maintained `scripts/optimus-agent` launcher, its optional `<agent-dir>/jev/env` file accepts `TYPESAFE_API_KEY=your-key` (or `JEV_API_KEY=your-key`). Use a private editor to enter the key and restrict the file to its owner with `chmod 600`. It must be a regular file owned by the current user; symlinks are rejected. The launcher parses it as data, never as shell code. This file is plaintext, not an encrypted store. An existing key in the process environment takes precedence over the launcher file.
 
 The maintained launcher defaults `<agent-dir>` to `~/.config/optimus-rust`; `PRIME_AGENT_CODING_AGENT_DIR` overrides it. Direct/source launches normally use `~/.prime/agent` and do not automatically load the launcher's `jev/env` file. Credential lookup uses the saved Windows credential first, then `TYPESAFE_API_KEY`, then `JEV_API_KEY`. Linux/macOS do not have the Windows DPAPI store: `/jev key` cannot save a credential there, and writing `KEY=value` at the DPAPI JSON path does not configure it. Keep keys out of source control, chat messages, and browser-side code.
 
@@ -286,26 +286,25 @@ Start with `/telegram` in the terminal. Setup walks through BotFather, token ent
 
 The current connector supports one paired private account and text messages. Your computer and agent services must remain running. Pairing grants control of the connected session and its tools: keep the token and pairing link private.
 
-See [Telegram setup and recovery](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/telegram.md).
+See [Telegram setup and recovery](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/telegram.md).
 
-## The Rust migration
+## Implementation
 
-The Rust application is included on `main` alongside the TypeScript reference. Launch the installed application with `optimus-agent`; Cargo's internal executable remains `optimus-rust`. The `optimus-agent.sh` source launcher runs the TypeScript reference.
+Optimus has one application implementation: Rust. The original TypeScript application, its npm workspace, SDK examples, and Node release pipeline have been removed. Their history remains in Git.
 
-The Rust workspace is organized around four components:
-
-| Crate | Responsibility |
+| Location | Responsibility |
 | --- | --- |
-| `pi-ai` | Model providers, streaming, authentication, and request/response types |
-| `pi-agent-core` | Agent execution and tool-call orchestration |
-| `pi-tui` | Terminal rendering and interaction |
-| `pi-coding-agent` | Application runtime, sessions, daemon/workers, tools, and integrations |
+| `crates/pi-ai` | Model providers, streaming, authentication, and request/response types |
+| `crates/pi-agent-core` | Agent execution and tool-call orchestration |
+| `crates/pi-jev` | TypeSafe System One decisions and bounded native effects |
+| `crates/pi-tui` | Terminal rendering and interaction |
+| `crates/pi-coding-agent` | Application runtime, sessions, daemon/workers, tools, and integrations |
+| `prime-agent-runtime` | Persistent Python execution kernel and host bridge |
+| `resources/agent` | Bundled Python skills, themes, terminal images, HTML export assets, and reference documentation |
 
-The Python execution environment remains part of the design. Moving the harness to Rust does not mean removing Python tools or rewriting users' Python skills.
+The Python runtime remains required for executing agent-generated Python and bundled skills. The resource bundle's `package.json` contains identity metadata read by Rust; it has no npm dependencies or entry point. JavaScript in the HTML session viewer runs in the browser. Optional developer utilities and the separately configured Windows cloud-model gateway may use Node; launching and building Optimus do not require Node or npm.
 
-The objectives are clearer ownership, predictable concurrency, lower host overhead, and native deployment while preserving the existing behavioral contracts. Compilation alone does not establish parity: session recovery, compaction checkpoints, provider behavior, skills, and process cleanup still need runtime validation.
-
-See [Rust validation and remaining gaps](docs/RUST_MAIN_READINESS.md) for the verified paths and known limitations. Use an isolated profile while evaluating the port. No blanket speedup or token-saving claim is made for the migration.
+Native behavior and remaining limitations are documented in [Rust validation notes](docs/RUST_MAIN_READINESS.md). See also the [Rust-only validation record](docs/RUST_ONLY_VALIDATION.md). Removing the reference implementation does not establish feature parity for previously unsupported behavior.
 
 ## Get started
 
@@ -327,47 +326,38 @@ optimus-agent --continue
 
 Automatic continuation skips empty drafts. To choose a particular saved session, use `optimus-agent --resume /path/to/session.jsonl`.
 
-From a checkout of this repository, build with Cargo:
+### Build and run from source
+
+Install Rust/Cargo (validated with 1.95.0), Python 3.11 or newer, `uv`, and a Bash shell. Windows uses native Rust with Git Bash and the MSVC build tools. Then:
 
 ```bash
+git clone https://github.com/telemusai/optimus-agent.git
+cd optimus-agent
 cargo build --locked -p pi-coding-agent --bin optimus-rust
-./target/debug/optimus-rust --help
-./target/debug/optimus-rust --version
+./optimus-agent.sh --help
+./optimus-agent.sh
 ```
+
+`optimus-agent.sh` launches the Rust executable and preserves the caller's working directory. `OPTIMUS_RUST_BINARY` can select a release or cross-target executable. The native application prepares its Python environment through `uv` when tools first need it. Use the project's own environment when running its tests or code through Optimus.
+
+To install a release build from this checkout:
+
+```bash
+./install.sh
+```
+
+The installer builds with Cargo, stages the executable with matching resources, checks `--version`, and activates a new release under `~/.local/share/optimus-rust/releases/`. It installs the `optimus-agent` launcher under `~/.local/bin`; add that directory to PATH. Previous releases and user configuration are retained. For an already-built executable, use `./install.sh --binary /path/to/optimus-rust` (or `optimus-rust.exe` on Windows). See [installation and release bundles](docs/RUST_LAUNCHER.md).
 
 For a separate development profile on macOS/Linux:
 
 ```bash
-mkdir -p .port-env/agent
 PRIME_AGENT_CODING_AGENT_DIR="$PWD/.port-env/agent" \
-  ./target/debug/optimus-rust --daemon-socket /tmp/optimus-dev-$UID.sock
+  ./optimus-agent.sh --daemon-socket /tmp/optimus-dev-$UID.sock
 ```
 
-Configure providers with `/login` and `/model`. Keep the checkout available for the Python runtime and bundled resources; copying the executable alone is not a complete installation. See the [validation notes](docs/RUST_MAIN_READINESS.md) for toolchain details and Windows validation limits.
+Keep the resource bundle and Python runtime with the executable; copying the executable alone is not a complete installation. Existing `PRIME_AGENT_*` variables and `.prime` paths retain their names for configuration and session continuity. Do not run competing builds against the same active profile.
 
-### TypeScript reference implementation
-
-Use Node.js 22.9 or newer and a compatible npm installation. The following source-launch commands run in Bash on macOS/Linux or Git Bash on Windows:
-
-```bash
-git clone https://github.com/telemusai/optimus-agent.git optimus-agent
-cd optimus-agent
-npm ci
-./optimus-agent.sh
-```
-
-For a compiled run from the same checkout:
-
-```bash
-npm run build
-./optimus-agent.sh --dist
-```
-
-The source launcher is `optimus-agent.sh`. Configuration paths retain `.prime/agent` for compatibility.
-
-If you already use Optimus, select an isolated `PRIME_AGENT_CODING_AGENT_DIR` before experimenting with a different build. Existing `PRIME_AGENT_*` environment variables and `.prime` paths retain their names for configuration and session compatibility. Follow the [development guide](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/development.md) for profile isolation and checks, and the [Windows guide](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/windows.md) for shell setup.
-
-On first launch, use `/login` to configure a provider, `/model` to select a model, and `/effort` to choose its supported reasoning level.
+On first launch, use `/login` to configure a provider, `/model` to select a model, and `/effort` to choose its supported reasoning level. Use [the development guide](resources/agent/docs/development.md) for checks and profile isolation.
 
 ## Everyday commands
 
@@ -395,17 +385,17 @@ Preserve sessions, memory, configuration, and credentials when upgrading. New tr
 
 ## Documentation
 
-- [Documentation index](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/index.md)
-- [Architecture](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/architecture.md)
-- [RLM workflows](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/rlm.md) and [Skills](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/skills.md)
-- [Background agents](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/long-running-agents.md)
-- [Project memory](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/project-memory.md)
-- [MCP integrations](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/mcp-integrations.md)
+- [Documentation index](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/index.md)
+- [Architecture](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/architecture.md)
+- [RLM workflows](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/rlm.md) and [Skills](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/skills.md)
+- [Background agents](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/long-running-agents.md)
+- [Project memory](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/project-memory.md)
+- [MCP integrations](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/mcp-integrations.md)
 - [Jev setup and API](#jev-integration), [native integration](docs/JEV_SYSTEM_ONE.md), and [official Jev website](https://typesafe.ai/)
-- [Providers and authentication](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/providers.md)
-- [Settings](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/settings.md)
+- [Providers and authentication](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/providers.md)
+- [Settings](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/settings.md)
 - [Performance metrics](https://github.com/telemusai/optimus-agent/blob/main/docs/performance-metrics.md)
-- [Development](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/development.md)
+- [Development](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/development.md)
 
 Some linked documentation retains upstream terminology. The source of truth for Optimus development is [telemusai/optimus-agent](https://github.com/telemusai/optimus-agent).
 

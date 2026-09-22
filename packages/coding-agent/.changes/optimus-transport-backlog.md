@@ -1,6 +1,0 @@
-- Fixed busy-chat history scrolling and accepted steering-message visibility.
-- Fixed steering delivery at tool boundaries and preserved late child reports without restarting explicitly stopped work.
-- Fixed delayed state updates and completed retry waiters leaving finished sessions stuck as busy.
-- Rejected invalid or refused compaction summaries without replacing the current conversation.
-- Added action-correlated queue timing and restored raw provider usage in performance monitoring.
-- Accelerated Python snapshots containing exact standard-library dates and decimals while retaining safe fallback for custom objects.

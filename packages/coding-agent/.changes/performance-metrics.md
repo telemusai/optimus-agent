@@ -1,7 +1,0 @@
-- Added an opt-in bounded local performance metrics recorder and summary tools.
-- Improved worker persistence responsiveness, bounded retry timing, and negotiated recent-first session history.
-- Reduced repeated inline tool-result storage without rewriting existing sessions or changing visible results.
-- Added opt-in kernel snapshot and context-reduction policies while keeping their defaults disabled.
-- Fixed inactive subagents appearing as main chats while retaining their parent views.
-- Replaced the large density-shaded Optimus splash with a compact colored dot portrait.
-- Documented the exact Telegram helper entrypoint contract for guarded Windows installations.

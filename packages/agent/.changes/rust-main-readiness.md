@@ -1,1 +1,0 @@
-- Fixed workspace dependency resolution after the Optimus version reset to 0.1.0.

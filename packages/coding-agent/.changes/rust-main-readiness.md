@@ -1,4 +1,0 @@
-- Added documented opt-in Rust CLI startup and validated terminal, daemon, and Python runtime paths.
-- Fixed Rust cron scheduling to use the correct local timezone in both standard and daylight-saving time.
-- Fixed workspace dependency resolution after the Optimus version reset to 0.1.0.
-- Preserved the TypeScript release packer used by existing packaging tests and release tooling.

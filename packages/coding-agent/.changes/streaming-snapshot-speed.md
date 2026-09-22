@@ -1,3 +1,0 @@
-- Fixed large-chat streaming delays caused by copying the transcript to read its name and state.
-- Accelerated Python snapshots of builtin data without caching mutable values or disabling recovery, and eliminated repeated oversized temporary-file writes.
-- Fixed repeated Escape freezing a nonempty chat while opening the history selector.

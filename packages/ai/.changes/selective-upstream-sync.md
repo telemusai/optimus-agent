@@ -1,4 +1,0 @@
-- Added OpenCode application and conversation identification without changing other provider headers.
-- Changed builds to use the committed model catalog; fetching a replacement catalog remains an explicit generation step.
-- Fixed replay of orphaned tool results from interrupted turns while preserving native compaction checkpoints.
-- Fixed recognition of LiteLLM context-limit errors so recovery compacts instead of retrying the unchanged oversized request.

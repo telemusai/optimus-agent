@@ -1,6 +1,0 @@
-- Refresh native steering previews on live queue changes and accepted queue edits without changing the editor draft.
-- Open chats at the live bottom and retain the visible history anchor across paging and terminal resizing.
-- Confirm input delivery only after transcript persistence, including across compaction; surface real write failures without silently replaying work.
-- Batch compatible queued child reports while preserving human priority and separate delivery receipts.
-- Retain request options for text compaction, cancel sibling summaries on failure, and add content-free compaction phase/provider timing.
-- Added separate reporting for compaction provider timings and start records so summary calls do not skew ordinary request measurements.

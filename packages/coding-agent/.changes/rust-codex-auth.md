@@ -1,2 +1,0 @@
-- Fixed Rust OAuth credential lookup, login, and refresh to use the same provider registry as the model picker, including OpenAI Codex subscriptions.
-- Fixed credential-file locking through symlinks so profiles sharing a login serialize OAuth token refreshes.

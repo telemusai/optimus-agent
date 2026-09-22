@@ -31,117 +31,60 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
 
   build-check:
-    name: Build and check
+    name: Rust check (${{ matrix.os }})
     needs: trust
     if: needs.trust.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
-    steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
-        with:
-          persist-credentials: false
-
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
-        with:
-          node-version: 22
-          cache: npm
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s $(which fdfind) /usr/local/bin/fd
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Check
-        run: npm run check
-
-  test:
-    name: Test (${{ matrix.name }})
-    needs: trust
-    if: needs.trust.outputs.allowed == 'true'
-    runs-on: ubuntu-latest
-    timeout-minutes: 15
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 45
     strategy:
       fail-fast: false
       matrix:
-        include:
-          - name: agent-core
-            package: packages/agent
-            command: npm test
-            install_uv: false
-          - name: ai
-            package: packages/ai
-            command: npm test
-            install_uv: false
-          - name: tui
-            package: packages/tui
-            command: npm test
-            install_uv: false
-          - name: coding-agent 1/3
-            package: packages/coding-agent
-            command: npm run test:ci -- --shard=1/3
-            install_uv: true
-          - name: coding-agent 2/3
-            package: packages/coding-agent
-            command: npm run test:ci -- --shard=2/3
-            install_uv: true
-          - name: coding-agent 3/3
-            package: packages/coding-agent
-            command: npm run test:ci -- --shard=3/3
-            install_uv: true
-          - name: coding-agent process smoke
-            package: packages/coding-agent
-            command: npm run test:process
-            install_uv: true
-          - name: coding-agent kernel
-            package: packages/coding-agent
-            command: npm run test:kernel
-            install_uv: true
-          - name: runtime python
-            package: prime-agent-runtime
-            command: uv run python -m unittest discover -s test
-            install_uv: true
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
     steps:
-      - name: Checkout
-        uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
+      - name: Install Rust
+        run: rustup toolchain install 1.95.0 --profile minimal
+      - name: Check all native targets
+        run: cargo +1.95.0 check --locked --workspace --all-targets
+      - name: Check resources and packaging
+        shell: bash
+        run: |
+          python3 scripts/check-rust-layout.py
+          python3 -m unittest discover -s tests -p 'test_*.py'
 
-      - name: Setup Node.js
-        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+  test:
+    name: Rust and Python tests
+    needs: trust
+    if: needs.trust.outputs.allowed == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    env:
+      CARGO_INCREMENTAL: '0'
+      CARGO_PROFILE_DEV_DEBUG: '0'
+      CARGO_PROFILE_TEST_DEBUG: '0'
+      PRIME_AGENT_CODING_AGENT_DIR: ${{ runner.temp }}/optimus-ci-profile
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
-          node-version: 22
-          cache: npm
-
-      - name: Install system dependencies
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libcairo2-dev libpango1.0-dev libjpeg-dev libgif-dev librsvg2-dev fd-find ripgrep
-          sudo ln -s $(which fdfind) /usr/local/bin/fd
-
-      - name: Install dependencies
-        run: npm ci
-
-      - name: Build
-        run: npm run build
-
-      - name: Install uv
-        if: matrix.install_uv
-        run: |
-          python3 -m pip install --user uv
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
-
-      - name: Test
-        working-directory: ${{ matrix.package }}
-        run: ${{ matrix.command }}
+          persist-credentials: false
+      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: python3 -m pip install uv
+      - name: Shared crate unit tests
+        run: cargo +1.95.0 test --locked -p pi-ai -p pi-agent-core -p pi-tui -p pi-jev --lib -- --test-threads=1
+      - name: Native configuration regressions
+        run: cargo +1.95.0 test --locked -p pi-coding-agent --lib config::tests:: -- --test-threads=1
+      - name: Native resource and command regressions
+        run: cargo +1.95.0 test --locked -p pi-coding-agent --test rust_only_resources --test slash_command_matrix --test native_cli --test transcript_t06 -- --test-threads=1
+      - name: Relocated Python skill regressions
+        run: uv run --locked --project prime-agent-runtime python -m unittest discover -s prime-agent-runtime/test -p '*_skill.py'
+      - name: Python observation aliases
+        run: uv run --locked --project prime-agent-runtime python -m unittest discover -s prime-agent-runtime/test -p 'test_observation_aliases.py'
 
   build-check-test:
     name: build-check-test

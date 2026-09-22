@@ -1,2 +1,0 @@
-- Fixed Rust provider reasoning and request-option parity across Responses, completions, Google, and Mistral routes.
-- Added request-shape regression tests without paid provider calls.

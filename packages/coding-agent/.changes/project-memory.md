@@ -1,3 +1,0 @@
-- Added project and host memory with bounded keyword recall, evidence inspection, separate recall and learning controls, task handoffs, backups and rollback.
-- Added resumable selected-session recovery and optional authenticated project sharing with offline reads and revision-safe writes.
-- Fixed refinement evidence handling so injected memories are not treated as new user statements and exact duplicate entries are rejected.

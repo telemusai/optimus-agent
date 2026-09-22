@@ -1,1 +1,0 @@
-- Fixed the Rust session browser incorrectly restricting global saved-session results to the current workspace and ignoring an explicitly selected session directory.

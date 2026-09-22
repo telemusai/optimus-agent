@@ -1,4 +1,0 @@
-- Fixed Telegram long polling retaining the state lock and blocking incoming messages, reply delivery and worker progress.
-- Run literal Windows PowerShell credential scripts directly and hidden while preserving shell-expression behavior and existing deadlines.
-- Removed obsolete model-fallback notices after the active provider/model changes.
-- Apply recent-first display paging to full chat snapshots too, retaining older messages for PageUp without changing model context.

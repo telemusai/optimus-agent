@@ -1,1 +1,0 @@
-- Fixed Codex WebSocket recovery when a cached previous response is unavailable, with one fresh attempt before any response events and no replay of partially streamed work.

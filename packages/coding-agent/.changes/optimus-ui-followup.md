@@ -1,5 +1,0 @@
-- Fixed slow native-terminal typing, model search and dialog cancellation by reusing unchanged transcript line layout.
-- Changed initial chat display to a bounded recent-history window with older messages available through existing paging, without changing model context.
-- Fixed stale starting workers blocking scheduled-task refresh and heartbeat errors persisting after successful recovery.
-- Fixed saved-chat loading progress and reduced peak memory during transcript catalogue scans.
-- Clarified the GitHub Copilot domain confirmation step before device sign-in starts.

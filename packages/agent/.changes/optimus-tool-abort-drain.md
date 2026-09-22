@@ -1,1 +1,0 @@
-- Fixed cancelled tool-update drains retaining agents or delivering stale progress after the run ended, while preserving detached tool cleanup.

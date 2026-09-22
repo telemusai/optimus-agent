@@ -849,9 +849,9 @@ fn builtin_themes() -> &'static HashMap<String, ThemeJson> {
             // Native binaries need the same bundled presets as TS imports,
             // including when launched outside a source/package installation.
             let bundled = match name {
-                "prime" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/coding-agent/src/modes/interactive/theme/prime.json")),
-                "light" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/coding-agent/src/modes/interactive/theme/light.json")),
-                _ => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../packages/coding-agent/src/modes/interactive/theme/dark.json")),
+                "prime" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/prime.json")),
+                "light" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/light.json")),
+                _ => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/dark.json")),
             };
             let content = std::fs::read_to_string(&path).unwrap_or_else(|_| bundled.to_string());
             parse_theme_json(name, &serde_json::from_str(&content).unwrap_or(serde_json::Value::Null))

@@ -1,2 +1,0 @@
-- Fixed visible Windows credential-helper consoles and blocked helper output by using the shared hidden, bounded resolver.
-- Fixed Escape cancellation while a session request is preparing, without clearing queued messages.

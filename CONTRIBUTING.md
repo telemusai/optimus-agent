@@ -41,29 +41,13 @@ Contributors using coding agents or other AI-assisted development tools are welc
 
 ## Development
 
-Development setup, build instructions, and relevant commands are documented in the [development guide](packages/coding-agent/docs/development.md).
+Development setup, build instructions, and relevant commands are documented in the [development guide](resources/agent/docs/development.md).
 
 Please follow the repository's existing development and formatting conventions when making changes.
 
 ## Changelog Entries
 
-Do not edit `packages/*/CHANGELOG.md` directly.
-
-For changes requiring a changelog entry, add a fragment for each affected package:
-
-`packages/<pkg>/.changes/<slug>.md`
-
-The `<slug>` should be a short kebab-case description of the change or associated issue, for example:
-
-`fix-terminal-resize.md`
-
-Each fragment should contain the relevant changelog bullet, for example:
-
-`- Fixed terminal input handling when resizing the window.`
-
-The release process aggregates these fragments into the appropriate changelog and removes the individual fragment files.
-
-Changes to `packages/<pkg>/src` may require a changelog fragment to pass CI. Where a changelog entry is not appropriate, the `no-changelog` label may be used.
+Add `.changes/<slug>.md` for user-visible Rust or Python runtime changes. Use one bullet per change. Preserve historical release notes in `resources/agent/CHANGELOG.md`. The `no-changelog` label is available when an entry is not appropriate.
 
 ## Review
 

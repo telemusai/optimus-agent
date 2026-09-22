@@ -1,9 +1,0 @@
-- Fixed interrupted Python kernel reuse to wait passively for correlated completion instead of repeatedly interrupting it, and improved Windows interrupt and process-tree cleanup behavior.
-- Fixed snapshots traversing live Bash handles and added a guard against captured persistent PowerShell launchers blocking the Python kernel.
-- Fixed saved-session loading to retain the last complete catalog, show loading progress, and avoid rebuilding the session tree for every streamed record.
-- Fixed flushed sessions losing later pre-assistant updates, narrowed unsupported Windows directory-fsync handling, and extended non-force Windows worker shutdown grace.
-- Fixed incomplete RLM child turns losing their bounded recovery across compaction, and added durable per-task parent-result delivery with structured partial failures.
-- Fixed malformed refinement JSON with strict-first scalar compatibility and one corrective retry, and persisted explicit failure outcomes without raw response text.
-- Added backward-compatible Python observation aliases without changing daemon wire fields or inventing model identity.
-- Changed automatic compaction to trigger at 250,000 tokens or the smaller model input budget minus its configured reserve, without reducing model context windows.
-- Fixed empty-summary retry handling and retained queued work and provider context during compaction.
