@@ -318,7 +318,8 @@ impl JevObserver {
     pub fn session_status(&self, session_id: &str) -> Option<Value> {
         let scheduler_status = self.scheduler.session_status(session_id);
         let active_status = self.active_status(session_id);
-        if scheduler_status.is_none() && active_status.is_none() {
+        let usage = crate::telemetry::session_usage(session_id);
+        if scheduler_status.is_none() && active_status.is_none() && usage.is_none() {
             return None;
         }
         let mut status = scheduler_status.unwrap_or_else(|| Value::Object(Default::default()));
@@ -328,6 +329,9 @@ impl JevObserver {
         }
         if let Some(active) = active_status {
             status["active"] = active;
+        }
+        if let Some(usage) = usage {
+            status["usage"] = serde_json::to_value(usage).ok()?;
         }
         Some(status)
     }

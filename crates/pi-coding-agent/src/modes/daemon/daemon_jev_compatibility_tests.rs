@@ -73,7 +73,7 @@ fn jev_new_client_old_daemon_keeps_legacy_commands_without_enabling_combined_mod
 fn jev_expansion_requires_both_capabilities_and_schema_revision() {
     let command = mode_command("compare-active");
     assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-    assert_eq!(DAEMON_SCHEMA_REVISION, 30);
+    assert_eq!(DAEMON_SCHEMA_REVISION, 31);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevControl));
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevFeatures));
     assert!(!supported(
@@ -91,7 +91,7 @@ fn jev_expansion_requires_both_capabilities_and_schema_revision() {
 #[test]
 fn jev_old_client_new_daemon_accepts_legacy_commands_and_additive_metadata() {
     let current = hello(
-        30,
+        31,
         &["jev_control", "jev_features", "future_optional_capability"],
     );
     for mode in ["off", "on", "compare", "active"] {
@@ -242,4 +242,22 @@ async fn jev_combined_mode_is_not_replayed_to_an_older_daemon() {
     assert_no_wire_bytes(&peer);
     assert!(client.state.lock().await.pending.is_empty());
     client.close().await;
+}
+
+#[test]
+fn jev_usage_metadata_is_optional_for_both_peer_generations() {
+    let command = json!({"type":"jev_get_status", "activeSessionId":"session-a"})
+        .as_object().unwrap().clone();
+    for revision in [29, 30, 31] {
+        assert!(supported(&hello(revision, &["jev_control"]), &command));
+        assert!(!supported(&hello(revision, &[]), &command));
+    }
+    #[derive(Deserialize)]
+    struct LegacyPipeline { success_count: u64 }
+    let frame = json!({"type":"response", "command":"jev_get_status", "success":true,
+        "data":{"pipeline":{"success_count":2, "usage":{"requests":2, "input_tokens":120}}}});
+    let response = daemon_response_from_value(&frame);
+    let legacy: LegacyPipeline = serde_json::from_value(response.data.unwrap()["pipeline"].clone()).unwrap();
+    assert_eq!(legacy.success_count, 2);
+    assert_eq!(daemon_outbound_compatibility("response"), DaemonCommandCompatibility::legacy());
 }

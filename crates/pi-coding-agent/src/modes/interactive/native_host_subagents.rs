@@ -7,11 +7,37 @@ use crate::modes::interactive::components::subagent_summary_line::{
 };
 use pi_tui::tui::Focusable;
 
+#[path = "jev_activity.rs"]
+mod jev_activity;
+
+#[derive(Default)]
+struct JevBarState {
+    session_id: String,
+    status: Option<crate::modes::interactive::components::subagent_summary_line::RightStatus>,
+}
+
+impl JevBarState {
+    fn select(&mut self, session_id: String) {
+        if self.session_id != session_id {
+            self.session_id = session_id;
+            self.status = None;
+        }
+    }
+
+    fn update(&mut self, session_id: &str, status: Option<crate::modes::interactive::components::subagent_summary_line::RightStatus>) -> bool {
+        if self.session_id != session_id || self.status == status { return false; }
+        self.status = status;
+        true
+    }
+}
+
 pub(super) struct Bar {
     mode: Rc<RefCell<InteractiveMode>>,
     editor: Option<Rc<RefCell<CustomEditor>>>,
     line: SubagentSummaryLine,
     roster: Arc<Mutex<Option<Arc<dyn AgentConnectionRosterStore>>>>,
+    jev: Arc<Mutex<JevBarState>>,
+    jev_task: RefCell<Option<tokio::task::JoinHandle<()>>>,
 }
 
 impl Bar {
@@ -24,6 +50,8 @@ impl Bar {
             editor: None,
             line,
             roster: Arc::new(Mutex::new(None)),
+            jev: Arc::new(Mutex::new(JevBarState::default())),
+            jev_task: RefCell::new(None),
         }
     }
 
@@ -32,6 +60,31 @@ impl Bar {
         connection: Arc<dyn wire::AgentConnection>,
         send: mpsc::Sender<HostEvent>,
     ) {
+        let jev = self.jev.clone();
+        let status_connection = connection.clone();
+        let status_send = send.clone();
+        let task = tokio::spawn(async move {
+            loop {
+                let session_id = jev.lock().unwrap_or_else(|e| e.into_inner()).session_id.clone();
+                if !session_id.is_empty() {
+                    let settings = pi_jev::config::JevSettingsStore::new(crate::config::get_agent_dir()).load();
+                    let mode = settings.effective_mode(&session_id);
+                    let compaction = settings.effective_compaction_enabled(&session_id);
+                    let response = if mode.is_enabled() || compaction {
+                        tokio::time::timeout(Duration::from_secs(2), status_connection.get_jev_status())
+                            .await.ok().and_then(Result::ok).flatten()
+                    } else { None };
+                    let status = jev_activity::status(mode, settings.full_jev_active(), compaction, response.as_ref());
+                    let changed = {
+                        let mut state = jev.lock().unwrap_or_else(|e| e.into_inner());
+                        state.update(&session_id, status)
+                    };
+                    if changed && status_send.send(HostEvent::Render).is_err() { break; }
+                }
+                tokio::time::sleep(Duration::from_secs(1)).await;
+            }
+        });
+        if let Some(previous) = self.jev_task.borrow_mut().replace(task) { previous.abort(); }
         let slot = self.roster.clone();
         tokio::spawn(async move {
             let update = send.clone();
@@ -130,6 +183,13 @@ impl Bar {
 
 impl TuiComponent for Bar {
     fn render(&mut self, width: f64) -> Vec<String> {
+        let session_id = self.mode.borrow().connection_state.as_ref().map(|state| state.session_id.clone()).unwrap_or_default();
+        let status = {
+            let mut state = self.jev.lock().unwrap_or_else(|e| e.into_inner());
+            state.select(session_id);
+            state.status.clone()
+        };
+        self.line.set_right_status(status);
         let counts = self.counts();
         self.line.set_subagent_counts(counts);
         if !self.line.is_selectable() && self.line.focused() {
@@ -158,6 +218,12 @@ impl TuiComponent for Bar {
     }
     fn invalidate(&mut self) {
         self.line.invalidate();
+    }
+}
+
+impl Drop for Bar {
+    fn drop(&mut self) {
+        if let Some(task) = self.jev_task.get_mut().take() { task.abort(); }
     }
 }
 
@@ -200,5 +266,26 @@ pub(super) fn project_child(
             .as_ref()
             .map(|activity| activity.kind.clone()),
         error: child.error.clone(),
+    }
+}
+
+#[cfg(test)]
+mod jev_bar_tests {
+    use super::*;
+
+    #[test]
+    fn switching_sessions_clears_usage_and_rejects_the_old_poll() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let mut state = JevBarState::default();
+        state.select("a".into());
+        let status = jev_activity::status(pi_jev::config::JevMode::Compare, false, false, None);
+        assert!(state.update("a", status.clone()));
+        assert!(!state.update("a", status.clone()));
+        state.select("b".into());
+        assert!(state.status.is_none());
+        assert!(!state.update("a", status.clone()));
+        assert!(state.update("b", status));
+        assert!(state.update("b", None));
+        assert!(state.status.is_none());
     }
 }

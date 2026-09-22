@@ -29,6 +29,7 @@ use std::path::PathBuf;
 use std::rc::Rc;
 use std::sync::mpsc;
 use std::sync::Arc;
+use std::time::Duration;
 
 use pi_tui::tui::Component as TuiComponent;
 use tokio::sync::mpsc as async_mpsc;
@@ -278,6 +279,48 @@ pub(super) async fn status_panel(
     text
 }
 
+const DISCLOSURE_DURATION: Duration = Duration::from_secs(5);
+
+fn automatic_status(send: &mpsc::Sender<HostEvent>, message: String) -> CommandOutput {
+    if message.contains(JEV_DISCLOSURE_NOTICE) || message.contains(JEV_ACTIVE_NOTICE) {
+        show_disclosure(send, message, DISCLOSURE_DURATION);
+        CommandOutput::Nothing
+    } else {
+        CommandOutput::Status(message)
+    }
+}
+
+fn disclosure_widget(key: &str, lines: Option<Vec<String>>) -> HostEvent {
+    HostEvent::Connection(wire::AgentConnectionEvent::ExtensionUiRequest {
+        request: wire::AgentConnectionExtensionUiRequest {
+            id: key.to_string(),
+            method: "setWidget".to_string(),
+            payload: serde_json::json!({
+                "widgetKey": key,
+                "widgetLines": lines,
+                "widgetPlacement": "aboveEditor",
+            }),
+        },
+    })
+}
+
+fn show_disclosure(send: &mpsc::Sender<HostEvent>, message: String, duration: Duration) {
+    // Each expiry owns only its notice, even across another command or session switch.
+    let key = format!("jev-disclosure-{}", uuid::Uuid::new_v4());
+    let lines = message
+        .lines()
+        .map(|line| crate::modes::interactive::theme::theme::theme().fg("dim", line))
+        .collect();
+    if send.send(disclosure_widget(&key, Some(lines))).is_err() {
+        return;
+    }
+    let send = send.clone();
+    tokio::spawn(async move {
+        tokio::time::sleep(duration).await;
+        let _ = send.send(disclosure_widget(&key, None));
+    });
+}
+
 /// Run `/jev`.
 ///
 /// The dispatch task holds no UI handle (the host's established rule: compare
@@ -316,17 +359,17 @@ pub(super) async fn run(
             // `/jev on` stays Compare and adds the one line that explains why the
             // shorthand is not the request-changing mode.
             if mode == JevMode::Compare && is_on_shorthand(args) {
-                return Ok(CommandOutput::Status(format!(
+                return Ok(automatic_status(send, format!(
                     "{message}\n{JEV_ON_COMPARE_NOTICE}"
                 )));
             }
-            Ok(CommandOutput::Status(message))
+            Ok(automatic_status(send, message))
         }
         JevRequest::SetDefaultMode(mode) => {
             let change = bridge.set_global_default_supported(mode, connection.supports_jev_features())?;
             crate::core::jev_bridge::invalidate_settings_cache();
             publish_footer(send, &bridge, &session_id, credential);
-            Ok(CommandOutput::Status(mode_change_message(&change)))
+            Ok(automatic_status(send, mode_change_message(&change)))
         }
         JevRequest::SetFeature(feature, enabled) => {
             require_feature_support(connection.supports_jev_features())?;
@@ -343,7 +386,7 @@ pub(super) async fn run(
             // row can never render the previous state. The decision segment is
             // republished from the same read and stays unchanged.
             publish_footer(send, &bridge, &session_id, credential);
-            Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), &session_id)))
+            Ok(automatic_status(send, render_compaction_settings(&bridge.settings(), &session_id)))
         }
         JevRequest::SetDefaultCompaction(enabled) => {
             require_feature_support(connection.supports_jev_features())?;
@@ -351,7 +394,7 @@ pub(super) async fn run(
             crate::core::jev_bridge::invalidate_settings_cache();
             // Sessions without an override see the new default immediately.
             publish_footer(send, &bridge, &session_id, credential);
-            Ok(CommandOutput::Status(format!("Jev compaction default: {} (sessions without a compaction override).\n{}",
+            Ok(automatic_status(send, format!("Jev compaction default: {} (sessions without a compaction override).\n{}",
                 if enabled { "on" } else { "off" }, render_compaction_settings(&bridge.settings(), &session_id))))
         }
         JevRequest::CompactionStatus => {
@@ -448,7 +491,7 @@ pub(super) async fn run(
             // state in the same turn as the write, exactly like every other
             // /jev write. Other chats refresh at their next footer boundary.
             publish_footer(send, &bridge, &session_id, credential);
-            Ok(CommandOutput::Status(match change {
+            Ok(automatic_status(send, match change {
                 FullJevChange::Installed { already_active: false } => format!(
                     "{JEV_FULL_JEV_ON_NOTICE}\n{JEV_DISCLOSURE_NOTICE}\n{JEV_ACTIVE_NOTICE}\n{JEV_BOUNDARY_NOTICE}{}",
                     if credential.present() {
@@ -524,7 +567,7 @@ async fn menu_dialog(
                 crate::core::jev_bridge::invalidate_settings_cache();
                 publish_footer(send, bridge, session_id, credential);
                 let _ = send.send(HostEvent::CloseCommandDialog);
-                return Ok(CommandOutput::Status(mode_change_message(&change)));
+                return Ok(automatic_status(send, mode_change_message(&change)));
             }
             JevMenuAction::SetCompaction(enabled) => {
                 require_feature_support(connection.supports_jev_features())?;
@@ -533,7 +576,7 @@ async fn menu_dialog(
                 // Same-turn refresh, identical to the command path.
                 publish_footer(send, bridge, session_id, credential);
                 let _ = send.send(HostEvent::CloseCommandDialog);
-                return Ok(CommandOutput::Status(render_compaction_settings(&bridge.settings(), session_id)));
+                return Ok(automatic_status(send, render_compaction_settings(&bridge.settings(), session_id)));
             }
             JevMenuAction::ShowStatus => {
                 let _ = send.send(HostEvent::CloseCommandDialog);
@@ -623,5 +666,104 @@ async fn key_dialog(
             "Key not stored: {error}. {}",
             credential.describe()
         ))),
+    }
+}
+
+#[cfg(test)]
+mod disclosure_tests {
+    use super::super::super::native_extensions::{Surfaces, Widgets};
+    use super::*;
+
+    fn apply_widget(event: HostEvent, surfaces: &Rc<RefCell<Surfaces>>) {
+        let HostEvent::Connection(wire::AgentConnectionEvent::ExtensionUiRequest { request }) =
+            event
+        else {
+            panic!("expected a display-only widget event");
+        };
+        assert_eq!(request.method, "setWidget");
+        let lines = request.payload["widgetLines"].as_array().map(|lines| {
+            lines
+                .iter()
+                .map(|line| line.as_str().unwrap().to_string())
+                .collect()
+        });
+        surfaces.borrow_mut().set_widget(
+            request.payload["widgetKey"].as_str().unwrap().to_string(),
+            lines,
+            false,
+        );
+    }
+
+    fn render(surfaces: &Rc<RefCell<Surfaces>>) -> String {
+        Widgets(surfaces.clone(), false).render(160.0).join("\n")
+    }
+
+    async fn expiry(receive: &mpsc::Receiver<HostEvent>) -> HostEvent {
+        tokio::time::timeout(Duration::from_secs(6), async {
+            loop {
+                match receive.try_recv() {
+                    Ok(event) => return event,
+                    Err(mpsc::TryRecvError::Empty) => {
+                        tokio::time::sleep(Duration::from_millis(5)).await
+                    }
+                    Err(error) => panic!("notice channel closed before expiry: {error}"),
+                }
+            }
+        })
+        .await
+        .expect("notice must expire without keyboard input")
+    }
+
+    #[tokio::test]
+    async fn automatic_disclosure_disappears_after_five_seconds_without_input() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let (send, receive) = mpsc::channel();
+        let surfaces = Rc::new(RefCell::new(Surfaces::default()));
+        surfaces.borrow_mut().set_widget(
+            "unrelated".into(),
+            Some(vec!["Unrelated widget".into()]),
+            false,
+        );
+        let started = std::time::Instant::now();
+        let output = automatic_status(
+            &send,
+            format!("{JEV_FULL_JEV_ON_NOTICE}\n{JEV_DISCLOSURE_NOTICE}"),
+        );
+        assert!(
+            matches!(output, CommandOutput::Nothing),
+            "disclosure must not enter permanent chat status"
+        );
+        apply_widget(receive.try_recv().unwrap(), &surfaces);
+        assert!(render(&surfaces).contains("Disclosure: Jev"));
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
+        apply_widget(expiry(&receive).await, &surfaces);
+        assert!(started.elapsed() >= Duration::from_secs(5));
+        assert!(!render(&surfaces).contains("Disclosure: Jev"));
+        assert!(render(&surfaces).contains("Unrelated widget"));
+    }
+
+    #[tokio::test]
+    async fn older_expiry_does_not_remove_a_newer_notice_after_session_reset() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let (send, receive) = mpsc::channel();
+        let surfaces = Rc::new(RefCell::new(Surfaces::default()));
+        show_disclosure(&send, "Old notice".into(), Duration::from_millis(20));
+        apply_widget(receive.try_recv().unwrap(), &surfaces);
+        surfaces.borrow_mut().reset();
+        show_disclosure(&send, "New notice".into(), Duration::from_millis(150));
+        apply_widget(receive.try_recv().unwrap(), &surfaces);
+        apply_widget(expiry(&receive).await, &surfaces);
+        assert!(render(&surfaces).contains("New notice"));
+        apply_widget(expiry(&receive).await, &surfaces);
+        assert!(render(&surfaces).is_empty());
+    }
+
+    #[test]
+    fn brief_status_messages_keep_their_existing_lifetime() {
+        let (send, receive) = mpsc::channel();
+        let output = automatic_status(&send, "Jev mode: Off".into());
+        assert!(matches!(output, CommandOutput::Status(message) if message == "Jev mode: Off"));
+        assert!(matches!(receive.try_recv(), Err(mpsc::TryRecvError::Empty)));
     }
 }

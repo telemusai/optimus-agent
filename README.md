@@ -170,6 +170,10 @@ To leave full-Jev, use `/jev full-jev off`. This restores the saved settings, wh
 
 For an immediate exit from the current chat, `/jev off` **while full-Jev is active** removes the global overlay and disables both decisions and compaction in that chat. Other chats return to their saved settings. Without the overlay, `/jev off` disables only decisions: also run `/jev compact off` to disable independent compaction.
 
+The bordered agents bar keeps agent counts on the left and shows Jev on the right while decisions or independent compaction are enabled. It displays the mode, current activity, request count, API-reported input/output tokens, last request latency, and failures when space permits. Narrow terminals use compact totals or just the mode. `—` means unavailable; `+` marks partial token totals after missing usage, failed attempts, or cancellation. These are current-chat worker-lifetime counters, excluding child agents; restarting the worker resets them. Polling this display makes no extra TypeSafe requests.
+
+Automatic activation disclosures disappear after five seconds. `/jev status`, `/jev full-jev status`, and `/jev help` remain available for deliberate inspection.
+
 ### Modes and individual controls
 
 | Mode | Behavior |

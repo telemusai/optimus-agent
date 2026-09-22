@@ -1,0 +1,3 @@
+- Added right-aligned Jev mode, activity, request and token usage to the bordered agents bar, with compact layouts and unavailable/partial usage indicators.
+- Fixed automatic Jev activation disclosures remaining on screen indefinitely; they now dismiss after five seconds in both terminal layouts while explicit status and help remain available.
+- Fixed fullscreen mode omitting extension widgets and Jev footer status.

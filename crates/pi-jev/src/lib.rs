@@ -25,6 +25,7 @@ pub mod report;
 pub mod scheduler;
 pub mod search;
 pub mod snapshot;
+pub mod telemetry;
 pub mod types;
 
 pub use evidence::{

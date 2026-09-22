@@ -70,7 +70,8 @@ async fn jev_status_unsupported_connection_makes_no_request() {
 
 #[tokio::test]
 async fn jev_status_preserves_observed_or_unknown_pipeline_without_snapshot_invalidation() {
-    for pipeline in [Value::Null, json!({"completed": 3, "failed": 1})] {
+    for pipeline in [Value::Null, json!({"completed": 3, "failed": 1}),
+        json!({"usage": {"requests": 2, "input_tokens": 120, "output_tokens": 9, "in_flight": 1}})] {
         let transport = StatusTransport::new(true, json!({"pipeline": pipeline, "settings": {"mode": "comparison"}}));
         let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
         *connection.latest_snapshot_is_fresh.lock().unwrap() = true;

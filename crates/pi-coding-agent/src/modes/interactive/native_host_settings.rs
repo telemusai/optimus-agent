@@ -148,10 +148,27 @@ pub(super) fn fullscreen(
     mode.borrow_mut().fullscreen_enabled = enabled;
     if enabled {
         let dock = Rc::new(RefCell::new(pi_tui::tui::Container::new()));
+        let surfaces = transcript.borrow().extension_surfaces.clone();
+        if let Some(surfaces) = &surfaces {
+            dock.borrow_mut().add_child(Rc::new(RefCell::new(
+                native_extensions::Widgets(surfaces.clone(), false),
+            )));
+        }
         dock.borrow_mut().add_child(editor.clone());
+        if let Some(surfaces) = &surfaces {
+            dock.borrow_mut().add_child(Rc::new(RefCell::new(
+                native_extensions::Widgets(surfaces.clone(), true),
+            )));
+        }
         if let Some(bar) = &transcript.borrow().subagents { dock.borrow_mut().add_child(bar.clone()); }
-        dock.borrow_mut()
-            .add_child(Rc::new(RefCell::new(Tray(mode.clone(), editor.clone()))));
+        let tray = Tray(mode.clone(), editor.clone());
+        if let Some(surfaces) = surfaces {
+            dock.borrow_mut().add_child(Rc::new(RefCell::new(
+                native_extensions::Statuses(surfaces, tray),
+            )));
+        } else {
+            dock.borrow_mut().add_child(Rc::new(RefCell::new(tray)));
+        }
         let mouse = mode
             .borrow()
             .settings_manager()

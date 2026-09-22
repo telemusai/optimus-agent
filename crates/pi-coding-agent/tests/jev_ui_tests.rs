@@ -1670,9 +1670,9 @@ fn the_daemon_surface_is_capability_gated_and_read_only_where_it_gets() {
         protocol.contains("DaemonCommandCompatibility::capability(Capability::JevControl)"),
         "the gate must be the capability, not a schema revision"
     );
-    // No version bump and no schema bump for an optional additive surface.
+    // Optional additive metadata advances the schema without a protocol bump.
     assert!(protocol.contains("pub const DAEMON_PROTOCOL_VERSION: u32 = 7;"));
-    assert!(protocol.contains("pub const DAEMON_SCHEMA_REVISION: u32 = 30;"));
+    assert!(pi_coding_agent::modes::daemon::daemon_protocol::DAEMON_SCHEMA_REVISION >= 31);
     assert!(protocol.contains("JevFeatures"));
     // The getters are read-only; the setter is not.
     assert!(protocol.contains("\"jev_get_settings\",\n    \"jev_get_status\","));
