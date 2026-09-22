@@ -912,7 +912,9 @@ pub async fn decide_with(
         };
     }
 
-    let outcome = send_with_retries(transport, limits, stats, &request).await;
+    let mut usage = crate::telemetry::RequestUsage::begin(&bundle.session_id, &bundle.stage);
+    let outcome = send_with_retries(transport, limits, stats, &request, &usage).await;
+    usage.finish(outcome.as_ref().ok().map(|(response, _, _)| &response.usage));
     match outcome {
         Ok((response, _latency_ms, client_attempts)) => {
             let validation = validate_response(&request, &response);
@@ -996,6 +998,7 @@ async fn send_with_retries(
     limits: &JevLimits,
     stats: &Arc<JevStats>,
     request: &SystemOneRequest,
+    usage: &crate::telemetry::RequestUsage,
 ) -> Result<(SystemOneResponse, u64, u32), AttemptedError> {
     let mut attempt: u32 = 0;
     let started = Instant::now();
@@ -1011,6 +1014,7 @@ async fn send_with_retries(
             });
         }
         stats.attempts.fetch_add(1, Ordering::Relaxed);
+        usage.attempt();
         let in_flight = InFlightAttempt::new(stats);
         let attempt_started = Instant::now();
         let timeout = limits.timeout.min(remaining);
@@ -1028,6 +1032,7 @@ async fn send_with_retries(
                 return Ok((response, latency_ms, attempt + 1));
             }
             Err(error) => {
+                usage.unknown_attempt();
                 // Counted here (client level) so counters stay meaningful for every transport.
                 count_error_class(stats, &error);
                 match retry_decision(&error, attempt, limits) {

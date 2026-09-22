@@ -79,6 +79,13 @@ jobs:
         run: cargo +1.95.0 test --locked -p pi-ai -p pi-agent-core -p pi-tui -p pi-jev --lib -- --test-threads=1
       - name: Native configuration regressions
         run: cargo +1.95.0 test --locked -p pi-coding-agent --lib config::tests:: -- --test-threads=1
+      - name: Jev status and disclosure regressions
+        shell: bash
+        run: |
+          cargo +1.95.0 test --locked -p pi-jev --test usage_tests -- --test-threads=1
+          for filter in disclosure_tests jev_activity jev_bar_tests subagent_summary_line jev_status_tests jev_compatibility_tests daemon_protocol::tests; do
+            cargo +1.95.0 test --locked -p pi-coding-agent --lib "$filter" -- --test-threads=1
+          done
       - name: Native resource and command regressions
         run: cargo +1.95.0 test --locked -p pi-coding-agent --test rust_only_resources --test slash_command_matrix --test native_cli --test transcript_t06 -- --test-threads=1
       - name: Relocated Python skill regressions

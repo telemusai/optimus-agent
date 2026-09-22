@@ -142,12 +142,21 @@ pub fn count_roster_subagent_statuses<'a>(
     counts
 }
 
+/// Responsive right-aligned content inside the agents border.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RightStatus {
+    pub full: String,
+    pub compact: String,
+    pub minimal: String,
+}
+
 /// One-line entry into the current session's scoped agents view.
 pub struct SubagentSummaryLine {
     focused: bool,
     counts: SubagentSummaryCounts,
     openable: bool,
     always_visible: bool,
+    right_status: Option<RightStatus>,
     get_location_label: Box<dyn Fn() -> Option<String>>,
     get_context_label: Box<dyn Fn() -> Option<String>>,
     get_override_label: Box<dyn Fn() -> Option<String>>,
@@ -167,6 +176,7 @@ impl SubagentSummaryLine {
             counts: SubagentSummaryCounts::default(),
             openable: false,
             always_visible: false,
+            right_status: None,
             get_location_label,
             get_context_label,
             get_override_label,
@@ -178,6 +188,10 @@ impl SubagentSummaryLine {
 
     pub fn set_subagent_counts(&mut self, counts: SubagentSummaryCounts) {
         self.counts = counts;
+    }
+
+    pub fn set_right_status(&mut self, status: Option<RightStatus>) {
+        self.right_status = status;
     }
 
     pub fn set_openable(&mut self, openable: bool) {
@@ -336,7 +350,24 @@ impl Component for SubagentSummaryLine {
         };
         let gap = (inner - 2.0 - visible_width(&counts) as f64 - visible_width(&open_hint) as f64)
             .max(1.0);
-        let body = truncate_to_width(
+        let body = if let Some(status) = &self.right_status {
+            let available = (inner - 2.0).max(0.0) as usize;
+            let right = [&status.full, &status.compact, &status.minimal]
+                .into_iter()
+                .find(|text| visible_width(&counts) + 2 + visible_width(text) <= available)
+                .unwrap_or(&status.minimal);
+            let right = truncate_to_width(right, available.saturating_sub(2) as f64, "…", false);
+            let left_budget = available.saturating_sub(visible_width(&right) + 2);
+            let hint = theme().fg("dim", &open_hint);
+            let left_with_hint = format!("{counts}  {hint}");
+            let left = if !open_hint.is_empty() && visible_width(&left_with_hint) <= left_budget {
+                left_with_hint
+            } else {
+                truncate_to_width(&counts, left_budget as f64, "…", false)
+            };
+            let padding = available.saturating_sub(visible_width(&left) + visible_width(&right));
+            truncate_to_width(&format!(" {left}{}{right} ", " ".repeat(padding)), inner, "…", false)
+        } else { truncate_to_width(
             &format!(
                 " {counts}{}{} ",
                 " ".repeat(gap.floor() as usize),
@@ -345,7 +376,7 @@ impl Component for SubagentSummaryLine {
             inner,
             "\u{2026}",
             false,
-        );
+        ) };
         let pad = " ".repeat((inner - visible_width(&body) as f64).max(0.0).floor() as usize);
         // Truncation may inject full ANSI resets; wrap each segment so the
         // selection background survives past them (custom-editor precedent).
@@ -461,5 +492,33 @@ mod tests {
     fn renders_no_box_without_children() {
         let mut line = SubagentSummaryLine::default();
         assert!(line.render(20.0).is_empty());
+    }
+
+    #[test]
+    fn jev_status_is_right_aligned_inside_the_agents_border() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let mut line = SubagentSummaryLine::default();
+        line.set_always_visible(true);
+        line.set_subagent_counts(SubagentSummaryCounts { total: 11, running: 1, idle: 2, inactive: 8, ..Default::default() });
+        line.set_right_status(Some(RightStatus {
+            full: "Jev C+A · checking tools · 12 req · 1.2k in/45 out".into(),
+            compact: "Jev C+A · 12r · 1.3kt".into(),
+            minimal: "Jev on".into(),
+        }));
+        for width in [80, 120] {
+            let rows = line.render(width as f64);
+            assert_eq!(rows.len(), 3);
+            let body = &rows[1];
+            assert!(body.contains("1 running") && body.contains("2 idle") && body.contains("8 inactive"));
+            assert!(body.contains("Jev C+A"));
+            assert_eq!(visible_width(body), width);
+            let right = if width == 120 { "45 out" } else { "1.3kt" };
+            assert!(body.contains(&format!("{right} \u{1b}")), "status must end immediately before the right border: {body}");
+        }
+        for width in [2, 5, 15, 40] {
+            assert!(line.render(width as f64).iter().all(|row| visible_width(row) <= width));
+        }
+        line.set_right_status(None);
+        assert!(!line.render(80.0).join("\n").contains("Jev"));
     }
 }

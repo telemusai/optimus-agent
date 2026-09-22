@@ -62,8 +62,10 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 29 adds capability-gated, pinned recent-first history windows and older range reads.
 // Revision 30 gates combined Jev mode with jev_features. Feature and compaction
 // settings are optional response metadata; legacy Jev commands and events remain compatible.
-pub const DAEMON_SCHEMA_REVISION: u32 = 30;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-30-c16da0e12d5a";
+// Revision 31 adds optional session-local Jev usage to jev_get_status responses.
+// The existing jev_control capability gates reads; missing usage degrades locally.
+pub const DAEMON_SCHEMA_REVISION: u32 = 31;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-c16da0e12d5a";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -2150,7 +2152,11 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "get_session_tree" => DaemonCommandCompatibility::legacy(),
         // Legacy Jev control remains available without the expansion capability.
         // The free-JSON mode field has an additional gate in daemon_jev_mode_compatibility.
-        "jev_get_settings" | "jev_set_session_mode" | "jev_get_status" => {
+        "jev_get_settings" | "jev_set_session_mode" => {
+            DaemonCommandCompatibility::capability(Capability::JevControl)
+        }
+        // Revision 31 usage is optional; older workers still provide valid status.
+        "jev_get_status" => {
             DaemonCommandCompatibility::capability(Capability::JevControl)
         }
         _ => DaemonCommandCompatibility::legacy(),
@@ -2724,14 +2730,14 @@ impl DaemonOutbound {
 
 /// `DAEMON_OUTBOUND_COMPATIBILITY`. Revision 28's opaque context is owned by the
 /// worker; message/snapshot consumers may ignore it, so response and session
-/// channels retain their protocol-7 floor. Revision 30 adds no event types;
+/// channels retain their protocol-7 floor. Revisions 30 and 31 add no event types;
 /// optional Jev response metadata is ignored by legacy readers.
 pub fn daemon_outbound_compatibility(outbound: &'static str) -> DaemonCommandCompatibility {
     use DaemonServerCapability as Capability;
     match outbound {
         "heartbeats_changed" => DaemonCommandCompatibility::capability(Capability::HeartbeatCatalog),
         "roster_update" => DaemonCommandCompatibility::capability(Capability::AgentRoster),
-        // Jev feature metadata is additive; no new startup or event requirement.
+        // Jev feature/usage metadata is additive; no new startup or event requirement.
         "response" | "extension_ui_request" => DaemonCommandCompatibility::legacy(),
         _ => DaemonCommandCompatibility::legacy(),
     }
