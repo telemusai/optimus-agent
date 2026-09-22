@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch
 
 
 rlm_module = importlib.import_module("rlm")
-observe_path = Path(__file__).resolve().parents[2] / "packages/coding-agent/skills/agent-observe/src/agent_observe/__init__.py"
+observe_path = Path(__file__).resolve().parents[2] / "resources/agent/skills/agent-observe/src/agent_observe/__init__.py"
 spec = importlib.util.spec_from_file_location("agent_observe_test", observe_path)
 assert spec is not None and spec.loader is not None
 observe = importlib.util.module_from_spec(spec)

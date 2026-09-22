@@ -22,37 +22,9 @@ Defaults and hard clamps:
 
 `record()` only validates, encodes, and appends to the bounded memory buffer. File work uses asynchronous APIs on a timer, explicit `flush()`, or `close()`. There is no synchronous write per streamed token. Flush is single-flight: calls made while file I/O is pending share the same promise and coalesce into at most one boolean-requested follow-up drain, rather than building a promise queue. `close()` is best effort and resolves after its configured bound even if file I/O never settles. Full buffers, oversized records, encoding errors, rotation failures, and write failures drop disposable metrics rather than block an agent. The next successful flush writes a `recorder` record with `dropped_count`.
 
-## Common API
+## Native implementation
 
-`@earendil-works/pi-agent-core` exports these exact symbols from `packages/agent/src/performance-metrics.ts`:
-
-- `PERFORMANCE_METRICS_SCHEMA_VERSION`
-- `PerformanceMetricOperation`
-- `PerformanceMetricOutcome`
-- `PerformanceMetricMeasurement`
-- `PerformanceMetricComponent`
-- `PerformanceMetricCorrelation`
-- `PerformanceMetricIdentity`
-- `PerformanceMetricUsageV1`
-- `PerformanceMetricEvent`
-- `PerformanceMetricRecordV1`
-- `PerformanceMetricRecorder`
-- `AgentLoopLogicalRequestSettlement`
-- `AgentLoopPerformanceMetrics`
-- `elapsedMetricMs(start, end)`
-- `safeRecordPerformanceMetric(recorder, event)`
-- `performanceMetricUsageFromAssistant(message)`
-
-`@earendil-works/pi-coding-agent` exports these exact symbols from `packages/coding-agent/src/core/performance-metrics.ts`:
-
-- `PerformanceMetricFileIO`
-- `LocalPerformanceMetricRecorderOptions`
-- `EnvironmentPerformanceMetricRecorderOptions`
-- `LocalPerformanceMetricRecorder`
-- `createLocalPerformanceMetricRecorder(options)`
-- `createLocalPerformanceMetricRecorderFromEnvironment(options)`
-
-The two factory functions return `undefined` if local metrics are disabled or recorder construction is unsafe. Callers must preserve that as the normal no-metrics path.
+The Rust metric types and recorder live in `crates/pi-agent-core/src/performance_metrics.rs` and `crates/pi-coding-agent/src/core/performance_metrics.rs`. The original TypeScript SDK exports are no longer shipped. The records below describe the shared on-disk contract; retained TypeScript-shaped examples illustrate that contract, not an installable SDK.
 
 ### Operation and measurement allowlists
 
@@ -217,24 +189,18 @@ All hooks use the same recorder instance for a session.
 
 - IO: record one `file_retry` after the retry operation completes, with `retry_count` and monotonic `total_ms`. The SDK records one `session_reopen` only when `SessionManager` exposes bytes from the primary transcript read. That narrow event sets actual `read_bytes` and leaves `reopen_ms` and `total_ms` null because no shared outer load clock exists. Header and repair probes are excluded. Do not put paths or session text in a record.
 - Context: pass retry correlation into `Agent.performanceMetrics`; record one `compaction` with `total_ms` and authoritative usage if available. Text and native compaction remain distinct through `identity.component` plus the existing provider/API identity; do not add a free-form route label.
-- Kernel: record one `snapshot` after each completed/cancelled/failed snapshot with separately measured `queue_ms`, wall-clock `serialization_ms`, `serialization_cpu_ms`, `write_ms`, `serialized_bytes`, `written_bytes`, and `next_cell_delay_ms`. CPU time is the serializer thread CPU clock where the Python runtime provides it; an explicitly named process CPU fallback or null must be used otherwise. Values unavailable across the Python/TypeScript boundary stay null.
+- Kernel: record one `snapshot` after each completed/cancelled/failed snapshot with separately measured `queue_ms`, wall-clock `serialization_ms`, `serialization_cpu_ms`, `write_ms`, `serialized_bytes`, `written_bytes`, and `next_cell_delay_ms`. CPU time is the serializer thread CPU clock where the Python runtime provides it; an explicitly named process CPU fallback or null must be used otherwise. Values unavailable across the Python/Rust boundary stay null.
 
 The recorder must not become a session/recovery dependency. Flush on normal isolated disposal, but never delay or fail authoritative shutdown solely to save telemetry.
 
 ## Local reporting and benchmark
 
-Run the summary with the installation's Node binary:
+The optional reporting utility requires a separately installed Node binary:
 
 ```text
-node packages/coding-agent/scripts/summarize-performance-metrics.mjs --dir <metrics-root> --json
+node scripts/summarize-performance-metrics.mjs --dir <metrics-root> --json
 ```
 
 The summary keeps provider and estimated usage separate and never double-adds overlap categories.
 
-The bounded synthetic overhead benchmark is:
-
-```text
-npm exec -- tsx packages/coding-agent/scripts/benchmark-performance-metrics.ts --output <evidence-json>
-```
-
-It uses three synthetic sessions, at least 200 logical requests per session, warm-up, and repeated measured trials. It makes no provider calls.
+The old TypeScript synthetic benchmark was removed with the reference implementation. Run native regression tests and measure the Rust executable for current performance evidence.

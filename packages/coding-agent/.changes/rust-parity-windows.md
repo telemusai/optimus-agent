@@ -1,8 +1,0 @@
-- Fixed Rust session context replacement after compaction and restored saved provider checkpoints.
-- Fixed Python kernel ownership, reload ordering, bootstrap reuse, stale-lock recovery, and Windows subprocess cleanup.
-- Restored refinement scheduling and extension lifecycle hooks, with concurrency-safe background-plan settlement.
-- Fixed saved-session discovery, Unicode transcript references, persistence error propagation, and snapshot recovery.
-- Fixed repeated Windows saved-chat scans blocking terminal input while preserving detection of replaced session files.
-- Fixed daemon protocol-envelope handling, requested-directory catalog lookup, and messaging error reporting.
-- Fixed Telegram steering, Unicode chunking, polling cancellation, and lock ownership during renewal and release.
-- Added `/monitor` controls and preserved configured Azure reasoning levels and background-helper status labels.

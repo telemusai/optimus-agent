@@ -1,3 +1,0 @@
-- Fixed compaction summaries omitting model-facing custom notes and restored their turn boundaries, while preserving UI-only notice exclusions.
-- Fixed global refinement planning and stale-edit checks using session-local entries.
-- Fixed native compaction omitting resolved per-session request headers.

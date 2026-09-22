@@ -1,4 +1,0 @@
-- Added the Jev footer segments to the model/effort tray row: the decision label reads "Jev On (Compare/Active/Compare + Active)" in green when operative and "Jev Off" in red, next to a right-aligned context usage counter such as `146k (14%)`.
-- Added an independent Jev compaction dot (`Jev compact on/off`) that follows the effective per-session compaction setting and never changes when the decision mode changes.
-- Published both segments through the existing `setStatus` surface with a backward-compatible optional `statusCompactText` narrow form (`Jev C On`, `Jev Cmp on`) for narrow terminals.
-- Kept the footer lifecycle truthful: a daemon session replacement republishes the new session's footer right after the replace frame, a runtime rebind (fork/new/resume) never carries the old session's labels, and a same-session `/reload` keeps them.

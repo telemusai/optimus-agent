@@ -1,2 +1,0 @@
-- Fixed concurrent commands joining worker recovery while its descriptor is still being persisted.
-- Reduced the Optimus welcome and session-browser portrait to a compact header that prioritizes prompts and session rows on short terminals.

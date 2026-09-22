@@ -1,1 +1,0 @@
-- Added an opt-in performance metrics interface with request, provider-attempt, and tool lifecycle hooks.

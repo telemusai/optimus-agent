@@ -1,2 +1,0 @@
-- Support opt-in bottom alignment and stable content anchors for fullscreen transcripts without changing other components' placement.
-- Keep selection coordinates correct when short transcripts are bottom-aligned.

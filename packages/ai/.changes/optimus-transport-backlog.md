@@ -1,4 +1,0 @@
-- Added capability-gated Azure and GitHub Copilot WebSockets with account-isolated connection reuse and safe HTTP fallback before submission.
-- Fixed split Unicode and CRLF streaming frames in Codex fallback, native compaction and Bedrock readers.
-- Prevented interrupted Responses requests with potentially executed work from being automatically replayed.
-- Restored raw usage observations and added content-free transport timing measurements.

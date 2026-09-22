@@ -54,8 +54,7 @@ body:
       description: How was this Prime Agent version installed?
       options:
         - Stable release installer
-        - Beta release installer
-        - npm package
+        - Native release archive
         - From source
         - Other
     validations:

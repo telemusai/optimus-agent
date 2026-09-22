@@ -1,0 +1,11 @@
+{
+  "name": "@earendil-works/pi-coding-agent",
+  "version": "0.1.0",
+  "description": "Coding agent CLI with a persistent Python REPL kernel and session management",
+  "piConfig": {
+    "name": "prime-agent",
+    "configDir": ".prime/agent",
+    "title": "Optimus - Agent"
+  },
+  "license": "MIT"
+}

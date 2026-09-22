@@ -474,6 +474,8 @@ fn failed_rewrite_never_acknowledges_persistence() {
     }
 
     // --- Part B: replacement of an existing transcript (header migration rewrite) ---
+    // Windows denies replacement while this handle is open; Unix permits it.
+    #[cfg(windows)]
     {
         let case_dir = dir.join("replacement");
         std::fs::create_dir_all(&case_dir).unwrap();

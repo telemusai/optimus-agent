@@ -9,7 +9,7 @@ optimus-agent
 
 Use `optimus-agent --help` for command-line options. In the TUI, `/model` opens the searchable picker. Type a model ID, name, or provider; use Up/Down to navigate, Enter to select, and Escape to cancel. `/model <search>` opens a prefilled search, or switches directly when the reference is exact and unambiguous. Alt+S toggles all/scoped models when a model scope is configured; the shortcut follows the `app.model.toggleScope` keybinding. Current and recent models appear first within signed-in providers. Selecting a built-in provider that needs credentials opens its login flow.
 
-This fixes the Rust model picker. The TypeScript configuration menu's combined Providers/Models/MCP tabs are not part of this change; Rust provider login remains available through `/login` and the model picker. Other Rust parity gaps remain listed in [RUST_MAIN_READINESS.md](RUST_MAIN_READINESS.md).
+Provider login is available through `/login` and the model picker. Native limitations remain listed in [RUST_MAIN_READINESS.md](RUST_MAIN_READINESS.md).
 
 ## Linux installation layout
 
@@ -22,27 +22,39 @@ This fixes the Rust model picker. The TypeScript configuration menu's combined P
   releases/<commit>/
     COMMIT
     bin/optimus-rust
-    package.json
-    packages/coding-agent/
+    resources/agent/
+    scripts/
+    install.sh
     prime-agent-runtime/
     kernel-venv/
 ~/.config/optimus-rust/
 ```
 
-The release contains the built executable and the matching Python runtime, skills, and package resources. The launcher sets their locations, uses a separate Rust profile, and isolates daemon sockets from the TypeScript installation. Each release has its own Python environment so an upgrade can be prepared while an older session is running. The launcher preserves the caller's working directory and forwards every argument. It does not copy credentials or sessions automatically.
+The release contains the built executable and the matching Python runtime, skills, and package resources. The launcher sets their locations, uses a separate Rust profile, and isolates daemon sockets between releases. Each release gets its own Python environment on first tool use, prepared by `uv`, so an upgrade leaves the older environment intact. The launcher preserves the caller's working directory and forwards every argument. It does not copy credentials or sessions automatically.
 
-Once the release bundle and `current` link have been prepared, install or refresh the launcher with:
+## Build and install
+
+From a source checkout with Rust/Cargo, Python 3.11+, `uv`, and Bash installed:
 
 ```bash
-mkdir -p "$HOME/.local/bin"
-install -m 755 scripts/optimus-agent "$HOME/.local/bin/optimus-agent.new"
-mv -f "$HOME/.local/bin/optimus-agent.new" "$HOME/.local/bin/optimus-agent"
-optimus-agent --version
+./install.sh
 ```
 
-`~/.local/bin` must be on your shell's PATH. A source checkout alone does not prepare this release bundle; use the Cargo instructions in the [README](../README.md#get-started) to run from source. Copying only the executable is insufficient for Python tools and bundled skills.
+This builds the native release binary and installs a complete bundle. To reuse a compiled executable, pass `--binary /path/to/optimus-rust`. Add `~/.local/bin` to PATH and check `optimus-agent --version`. The installer replaces the launcher atomically without following an old symlink, and retains previous releases. It never copies or rewrites credentials, sessions, or memory.
 
-The temporary launcher replaces an older `optimus-agent -> optimus-rust` symlink without following it. After confirming the new command works, remove the old managed `~/.local/bin/optimus-rust` launcher and run `hash -r` in existing Bash shells. Only `optimus-agent` is installed on PATH. Cargo's internal executable and Linux process name remain `optimus-rust`; the existing release and configuration directories keep their names.
+Windows uses Git Bash and the MSVC Rust toolchain. The installer records `current.txt` instead of requiring Windows symlink privileges, and the launcher selects `bin/optimus-rust.exe`. Linux/macOS use the `current` symlink shown above.
+
+To create a distributable archive from a compiled binary:
+
+```bash
+python3 scripts/rust_release.py stage \
+  --binary target/release/optimus-rust \
+  --output dist --name optimus-agent-local
+```
+
+The archive contains the executable, resource bundle, Python runtime source, installer, and license, plus a SHA-256 sidecar. Release CI builds separate Linux, macOS, and Windows artifacts. Extract the archive and run its `./install.sh`; Rust is only required when compiling from source. Python and `uv` are still required for the execution runtime. Node/npm are not required.
+
+Use `--prefix` and `--bin-dir` for an isolated installation. Set `OPTIMUS_RUST_ROOT` to a custom prefix when invoking its launcher. Copying only the executable is insufficient for Python tools and bundled skills.
 
 The launcher respects `PRIME_AGENT_CODING_AGENT_DIR` and `PRIME_AGENT_KERNEL_VENV` overrides. `OPTIMUS_RUST_TMPDIR` overrides the socket directory; keep it short enough for Unix socket limits. The default is `$XDG_RUNTIME_DIR/optimus-rust/<release>`, falling back to `~/.cache/optimus-rust/<release>`. It is separate from Prime's temporary socket directory.
 

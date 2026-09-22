@@ -11,26 +11,20 @@
 
 - Read files in full before making wide-ranging changes, before editing files you have not already fully inspected, and when the user asks you to investigate or audit something. Do not rely only on search snippets for broad changes.
 - Don't be too verbose with comments in the code. Only write comments when there is serious ambiguity
-- No `any` types unless absolutely necessary
-- Check node_modules for external API type definitions instead of guessing
-- **NEVER use inline imports** - no `await import("./foo.js")`, no `import("pkg").Type` in type positions, no dynamic imports for types. Always use standard top-level imports.
+- Inspect Cargo dependencies and existing Rust interfaces before adding new APIs.
 - NEVER remove or downgrade code to fix type errors from outdated dependencies; upgrade the dependency instead
 - Always ask before removing functionality or code that appears to be intentional
 - Do not preserve backward compatibility unless the user explicitly asks for it
 - Never hardcode key checks with, eg. `matchesKey(keyData, "ctrl+x")`. All keybindings must be configurable. Add default to matching object (`DEFAULT_EDITOR_KEYBINDINGS` or `DEFAULT_APP_KEYBINDINGS`)
-- NEVER modify `packages/ai/src/models.generated.ts` directly. Update `packages/ai/scripts/generate-models.ts` instead.
 
 ## Commands
 
-- After code changes (not documentation changes): `npm run check` (get full output, no tail). Fix all errors, warnings, and infos before committing.
-- Note: `npm run check` does not run tests.
-- NEVER run: `npm run dev`, `npm run build`, `npm test`
-- Only run specific tests if user instructs: `npx tsx ../../node_modules/vitest/dist/cli.js --run test/specific.test.ts`
-- Run tests from the package root, not the repo root.
-- If you create or modify a test file, you MUST run that test file and iterate until it passes.
-- When writing tests, run them, identify issues in either the test or implementation, and iterate until fixed.
-- For `packages/coding-agent/test/suite/`, use `test/suite/harness.ts` plus the faux provider. Do not use real provider APIs, real API keys, or paid tokens.
-- Put issue-specific regressions under `packages/coding-agent/test/suite/regressions/` and name them `<issue-number>-<short-slug>.test.ts`.
+- After code changes, run `bash scripts/check.sh`: whitespace, Cargo workspace/all-target checks, packaging tests, and native resource layout validation.
+- Run focused Cargo tests for changed behavior. `./test.sh` runs workspace unit tests and the Python suites; use `--test <name>` for integration tests.
+- If you create or modify a test file, run it and iterate until it passes.
+- Use isolated temporary profiles, local provider fixtures, and synthetic credentials. Never use real provider APIs, keys, or paid tokens for regression tests.
+- Fix errors and any warnings introduced by the change; report unrelated existing failures.
+- The application is Rust-only. Do not reintroduce the TypeScript implementation or a root npm workspace.
 
 ## Daemon Protocol Changes
 
@@ -43,9 +37,9 @@
 
 ## Dependencies
 
-- A 7-day minimum release age applies to all dependency updates: `.npmrc` sets `min-release-age=7` and `.github/dependabot.yml` uses a matching `cooldown`. Never bypass it for routine updates.
-- Enforcement requires npm >= 11.10; older npm silently ignores the setting, so use a current npm when updating dependencies.
-- For an urgent security patch younger than 7 days, override explicitly: `npm install --min-release-age=0 <pkg>`.
+- A 7-day minimum release age applies to routine dependency updates. `.github/dependabot.yml` configures the matching cooldown for Cargo and uv.
+- Keep `Cargo.lock` and `prime-agent-runtime/uv.lock` checked in; use locked builds.
+- Document any urgent security exception to the release-age policy.
 
 ## GitHub Workflow
 
@@ -84,7 +78,7 @@ To test Prime Agent's TUI in a controlled terminal environment:
 tmux new-session -d -s prime-agent-test -x 80 -y 24
 
 # Start Prime Agent from source
-tmux send-keys -t prime-agent-test "cd /Users/kevin/pi/prime-agent && ./optimus-agent.sh" Enter
+tmux send-keys -t prime-agent-test "cd /path/to/optimus-agent && ./optimus-agent.sh" Enter
 
 # Wait for startup, then capture output
 sleep 3 && tmux capture-pane -t prime-agent-test -p
@@ -104,102 +98,25 @@ You, yourself, are often running into a tmux session, so be careful when killing
 
 ## Changelog
 
-Location: `packages/<pkg>/.changes/<slug>.md` (one fragment file per PR per touched package)
+- Add `.changes/<slug>.md` for user-visible changes, one fragment per PR.
+- Each fragment contains plain bullet lines beginning with Added, Changed, Fixed, or Removed.
+- Do not modify historical released entries in `resources/agent/CHANGELOG.md`.
+- Purely internal changes may opt out via the `no-changelog` PR label.
 
-### Format
+## Adding a New LLM Provider
 
-Do NOT edit `packages/*/CHANGELOG.md` directly. Instead, add a fragment file `packages/<pkg>/.changes/<slug>.md` (slug = kebab-case, branch- or ticket-derived, e.g. `eng-1234-fix-resize.md`) containing exactly the bullet line(s) for the change. Bullets are plain `- ...` lines with no `### Added` / `### Changed` / `### Fixed` / `### Removed` subsections — one bullet per change, written as a short sentence starting with a past-tense verb (Added, Changed, Fixed, Removed). Keep each bullet to one line; describe the user-visible change, not the implementation. The release script folds fragments into the release section of CHANGELOG.md and deletes them.
-
-Example fragment (`packages/coding-agent/.changes/eng-1234-effort-command.md`):
-
-```markdown
-- Added `/effort` to set the reasoning level, with autocomplete for the levels the current model supports.
-```
-
-### Rules
-
-- One fragment file per PR per touched package; a fragment may contain multiple bullets
-- NEVER modify already-released version sections in CHANGELOG.md (e.g., `## [0.2.1]`) — each is immutable once released
-- Purely internal changes may opt out via the `no-changelog` PR label
-
-### Attribution
-
-- **Internal changes (from issues)**: `Fixed foo bar ([#123](https://github.com/PrimeIntellect-ai/prime-agent/issues/123))`
-- **External contributions**: `Added feature X ([#456](https://github.com/PrimeIntellect-ai/prime-agent/pull/456) by [@username](https://github.com/username))`
-
-## Adding a New LLM Provider (packages/ai)
-
-Adding a new provider requires changes across multiple files:
-
-### 1. Core Types (`packages/ai/src/types.ts`)
-
-- Add API identifier to `Api` type union (e.g., `"bedrock-converse-stream"`)
-- Create options interface extending `StreamOptions`
-- Add mapping to `ApiOptionsMap`
-- Add provider name to `KnownProvider` type union
-
-### 2. Provider Implementation (`packages/ai/src/providers/`)
-
-Create provider file exporting:
-
-- `stream<Provider>()` function returning `AssistantMessageEventStream`
-- `streamSimple<Provider>()` for `SimpleStreamOptions` mapping
-- Provider-specific options interface
-- Message/tool conversion functions
-- Response parsing emitting standardized events (`text`, `tool_call`, `thinking`, `usage`, `stop`)
-
-### 3. Provider Exports and Lazy Registration
-
-- Add a package subpath export in `packages/ai/package.json` pointing at `./dist/providers/<provider>.js`
-- Add `export type` re-exports in `packages/ai/src/index.ts` for provider option types that should remain available from the root entry
-- Register the provider in `packages/ai/src/providers/register-builtins.ts` via lazy loader wrappers, do not statically import provider implementation modules there
-- Add credential detection in `packages/ai/src/env-api-keys.ts`
-
-### 4. Model Generation (`packages/ai/scripts/generate-models.ts`)
-
-- Add logic to fetch/parse models from provider source
-- Map to standardized `Model` interface
-
-### 5. Tests (`packages/ai/test/`)
-
-- Always add the provider to `stream.test.ts` with at least one representative model, even if it reuses an existing API implementation such as `openai-completions`.
-- Add the provider to the broader provider matrix where applicable: `tokens.test.ts`, `abort.test.ts`, `empty.test.ts`, `context-overflow.test.ts`, `image-limits.test.ts`, `unicode-surrogate.test.ts`, `tool-call-without-result.test.ts`, `image-tool-result.test.ts`, `total-tokens.test.ts`, `cross-provider-handoff.test.ts`.
-- For `cross-provider-handoff.test.ts`, add at least one provider/model pair. If the provider exposes multiple model families (for example GPT and Claude), add at least one pair per family.
-- For non-standard auth, create utility (e.g., `bedrock-utils.ts`) with credential detection.
-
-### 6. Coding Agent (`packages/coding-agent/`)
-
-- `src/core/model-resolver.ts`: Add default model ID to `defaultModelPerProvider`
-- `src/core/provider-display-names.ts`: Add API-key login display name so `/login` and related UI show the provider for built-in API-key auth.
-- `src/cli/args.ts`: Add env var documentation
-- `README.md`: Add provider setup instructions
-- `docs/providers.md`: Add setup instructions, env var, and `auth.json` key
-
-### 7. Documentation
-
-- `packages/ai/README.md`: Add to providers table, document options/auth, add env vars
-- `packages/ai/.changes/<slug>.md`: Add a changelog fragment (see Changelog above)
+- Extend the shared types and provider implementation in `crates/pi-ai/`.
+- Register credentials, model resolution, login guidance, and CLI help through the existing Rust interfaces.
+- Add offline provider fixtures covering streaming, cancellation, usage, tool calls, and errors.
+- Document setup in `resources/agent/docs/providers.md` and add a changelog fragment.
 
 ## Releasing
 
-**Lockstep versioning**: All packages always share the same version number. Every release updates all packages together.
-
-**Version semantics** (no major releases):
-
-- `patch`: Bug fixes and new features
-- `minor`: API breaking changes
-
-### Steps
-
-1. **Check fragments**: Ensure all changes since last release have fragment files in `packages/<pkg>/.changes/`
-
-2. **Run release script**:
-   ```bash
-   npm run release:patch    # Fixes and additions
-   npm run release:minor    # API breaking changes
-   ```
-
-The script handles: version bump, folding `.changes/` fragments into the release section, commit, tag, and publish.
+- Keep the workspace version in `Cargo.toml` and the resource identity in `resources/agent/package.json` aligned.
+- Run the native checks and relevant tests before building `optimus-rust` with Cargo.
+- `python3 scripts/rust_release.py stage --binary <path> --output <directory>` creates a portable archive and checksum.
+- The Build binaries workflow builds native Linux, macOS, and Windows bundles. Version tags publish GitHub Release assets; manual runs upload reviewable artifacts.
+- Release tags and publishing require user authorization. There is no npm release process.
 
 ## **CRITICAL** Git Rules for Parallel Agents **CRITICAL**
 
@@ -213,7 +130,6 @@ Multiple agents may work on different files in the same worktree simultaneously.
 - ALWAYS use `git add <specific-file-paths>` listing only files you modified
 - Before committing, run `git status` and verify you are only staging YOUR files
 - Track which files you created/modified/deleted during the session
-- It is always fine to include `packages/ai/src/models.generated.ts` in a commit alongside the actual files you want to commit
 
 ### Forbidden Git Operations
 
@@ -233,8 +149,8 @@ These commands can destroy other agents' work:
 git status
 
 # 2. Add ONLY your specific files
-git add packages/ai/src/providers/transform-messages.ts
-git add packages/ai/.changes/eng-1234-fix-resize.md
+git add crates/pi-ai/src/providers/transform_messages.rs
+git add .changes/eng-1234-fix-resize.md
 
 # 3. Commit
 git commit -m "fix(ai): description"

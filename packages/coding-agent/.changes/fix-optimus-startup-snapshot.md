@@ -1,2 +1,0 @@
-- Fixed Windows startup probes incorrectly treating an existing daemon as absent and trying to launch a duplicate.
-- Fixed session opening timing out when snapshot event sequences were encoded as whole floating-point numbers.

@@ -34,43 +34,8 @@ jobs:
               pull_number: pr.number,
               per_page: 100,
             });
-            const packages = ["agent", "ai", "coding-agent", "tui"];
-            const failing = [];
-            for (const pkg of packages) {
-              const srcPrefix = `packages/${pkg}/src/`;
-              const srcChanged = files.some(
-                (f) =>
-                  f.filename.startsWith(srcPrefix) ||
-                  (f.previous_filename !== undefined && f.previous_filename.startsWith(srcPrefix)),
-              );
-              if (!srcChanged) {
-                continue;
-              }
-              // Fragments must be direct children of .changes/ — release.mjs ignores nested paths.
-              const fragmentRe = new RegExp(`^packages/${pkg}/\\.changes/[^/]+\\.md$`);
-              const hasFragment = files.some(
-                (f) =>
-                  f.status === "added" &&
-                  f.additions > 0 &&
-                  fragmentRe.test(f.filename) &&
-                  !f.filename.endsWith("/README.md"),
-              );
-              if (!hasFragment) {
-                failing.push(pkg);
-              }
+            const changed = files.some((f) => f.filename.startsWith("crates/") || f.filename.startsWith("prime-agent-runtime/"));
+            const fragment = files.some((f) => f.status === "added" && f.additions > 0 && /^\.changes\/[^/]+\.md$/.test(f.filename));
+            if (changed && !fragment) {
+              core.setFailed("Add .changes/<slug>.md for native/runtime changes, or apply no-changelog.");
             }
-            if (failing.length === 0) {
-              core.info("Changelog fragments present for all changed packages.");
-              return;
-            }
-            core.setFailed(
-              failing
-                .map(
-                  (pkg) =>
-                    `packages/${pkg}/src changed but no changelog entry found. ` +
-                    `Add packages/${pkg}/.changes/<branch-slug>.md containing e.g. ` +
-                    "`- Fixed the frobnicator dropping input on resize.`, " +
-                    "or apply the no-changelog label.",
-                )
-                .join("\n"),
-            );

@@ -1,1 +1,0 @@
-- Replaced the startup and onboarding butterfly with the Optimus robot in neon green, scaled to fit the terminal while preserving room for session controls.

@@ -1,20 +1,26 @@
 #!/bin/sh
 set -eu
 
-optimus_root="$HOME/.local/share/optimus-rust"
-if ! optimus_install=$(CDPATH= cd -- "$optimus_root/current" 2>/dev/null && pwd -P); then
+optimus_root="${OPTIMUS_RUST_ROOT:-$HOME/.local/share/optimus-rust}"
+optimus_current="$optimus_root/current"
+if [ -f "$optimus_root/current.txt" ]; then
+    optimus_release=$(cat "$optimus_root/current.txt")
+    case "$optimus_release" in
+        ''|*[!A-Za-z0-9._-]*|.*) echo "Invalid Optimus release pointer." >&2; exit 1 ;;
+    esac
+    optimus_current="$optimus_root/releases/$optimus_release"
+fi
+if ! optimus_install=$(CDPATH= cd -- "$optimus_current" 2>/dev/null && pwd -P); then
     echo "Optimus Rust is not installed at $optimus_root/current. See docs/RUST_LAUNCHER.md." >&2
     exit 1
 fi
-export PI_PACKAGE_DIR="$optimus_install/packages/coding-agent"
+export PI_PACKAGE_DIR="$optimus_install/resources/agent"
 export PI_CODING_AGENT_MODULE_DIR="$PI_PACKAGE_DIR"
 export PRIME_AGENT_BUILD_ID="$(cat "$optimus_install/COMMIT")"
-export PRIME_AGENT_LAUNCHER_PATH="$HOME/.local/bin/optimus-agent"
+export PRIME_AGENT_LAUNCHER_PATH="$(CDPATH= cd -- "$(dirname -- "$0")" && pwd -P)/$(basename -- "$0")"
 export PRIME_AGENT_CODING_AGENT_DIR="${PRIME_AGENT_CODING_AGENT_DIR:-$HOME/.config/optimus-rust}"
 if [ -z "${PRIME_AGENT_KERNEL_VENV:-}" ]; then
     export PRIME_AGENT_KERNEL_VENV="$optimus_install/kernel-venv"
-    # Validate the installed interpreter without rebuilding the release's venv.
-    export PRIME_AGENT_KERNEL_PYTHON="${PRIME_AGENT_KERNEL_PYTHON:-$PRIME_AGENT_KERNEL_VENV/bin/python}"
 fi
 
 # Keep each installed build separate from running older daemons.
@@ -23,8 +29,11 @@ optimus_runtime_dir="${OPTIMUS_RUST_TMPDIR:-${XDG_RUNTIME_DIR:-$HOME/.cache}/opt
 umask 077
 mkdir -p -- "$optimus_runtime_dir"
 export TMPDIR="$optimus_runtime_dir"
+optimus_binary="$optimus_install/bin/optimus-rust"
+if [ -f "$optimus_binary.exe" ]; then optimus_binary="$optimus_binary.exe"; fi
 if [ -f "$PRIME_AGENT_CODING_AGENT_DIR/jev/env" ]; then
-    exec "${PRIME_AGENT_KERNEL_PYTHON:-$PRIME_AGENT_KERNEL_VENV/bin/python}" \
-        "$PI_PACKAGE_DIR/scripts/launch-with-jev-env.py" "$optimus_install/bin/optimus-rust" "$@"
+    if command -v python3 >/dev/null 2>&1; then optimus_python=python3; else optimus_python=python; fi
+    exec "$optimus_python" \
+        "$optimus_install/scripts/launch-with-jev-env.py" "$optimus_binary" "$@"
 fi
-exec "$optimus_install/bin/optimus-rust" "$@"
+exec "$optimus_binary" "$@"

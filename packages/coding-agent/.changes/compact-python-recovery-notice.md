@@ -1,2 +1,0 @@
-- Fixed restored Python variable lists flooding chat on reopen; showed a compact recovery status with expandable details and visible failure warnings.
-- Fixed automatic refinement results not appearing live and restored their expandable outcome cards.

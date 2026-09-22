@@ -1,1 +1,0 @@
-- Fixed relative Markdown links to resolve against the session directory, including Windows drive paths and paths containing spaces.

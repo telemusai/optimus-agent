@@ -1,3 +1,0 @@
-- Fixed Codex WebSocket recovery to allow one fresh pre-response reconnect while preventing replay after any provider response event.
-- Added a completed-output-item callback for Codex Responses streams.
-- Extended native compaction eligibility to Codex subscription models and increased its default request allowance to 20 minutes while preserving explicit cancellation and unsupported-provider fallback.

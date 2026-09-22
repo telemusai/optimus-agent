@@ -1,5 +1,7 @@
 # Performance and Windows continuity update
 
+Historical migration report: the TypeScript paths below identify the original changes retained in Git history. Current application code is in `crates/`; see the [Rust implementation](../README.md#implementation).
+
 This change carries the reusable source from the Windows performance work onto the fork's current `main`. It does not install a runtime, migrate user state, modify model configuration, or supply a private gateway. Optional policies remain disabled until their own quality and deployment gates pass.
 
 ## Review map
@@ -22,7 +24,7 @@ The inclusive global **250,000-token compaction trigger** remains unchanged. Sma
 
 - Inactive orphan subagents no longer appear as main chats. Their parent views remain available; running orphan children remain visible. No sessions are deleted. Explicit top-level forks remain top-level chats.
 - The Optimus splash uses the approved compact, colored dot-outline portrait, with complete size variants and monochrome fallback instead of the large density-shaded image.
-- The Telegram helper entrypoint regression test verifies the actual manager's spawn contract. Guarded Windows distributions must admit that exact helper entrypoint and its absolute profile argument without clearing `NODE_OPTIONS`; see [Windows documentation](../packages/coding-agent/docs/windows.md). The original pairing failure was in a distribution-specific preload allowlist, not the upstream Telegram manager. This PR documents and tests that contract rather than publishing a machine-specific guard.
+- The Telegram helper entrypoint regression test verifies the actual manager's spawn contract. Guarded Windows distributions must admit that exact helper entrypoint and its absolute profile argument without clearing `NODE_OPTIONS`; see [Windows documentation](../resources/agent/docs/windows.md). The original pairing failure was in a distribution-specific preload allowlist, not the upstream Telegram manager. This PR documents and tests that contract rather than publishing a machine-specific guard.
 
 ## Compatibility and limitations
 

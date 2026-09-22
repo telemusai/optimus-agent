@@ -1,2 +1,0 @@
-- Fixed the Rust model picker with searchable model and provider names, scoped filtering, current/recent ordering, sign-in prompts, and responsive terminal layout.
-- Added `/model <search>` support to the native TUI and documented the installed `optimus-rust` launcher.

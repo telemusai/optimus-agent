@@ -1,3 +1,0 @@
-- Fixed concurrent compaction summaries competing for the same Responses WebSocket by using bounded independent leases while preserving session identity and no-replay guarantees.
-- Added content-free stream timing and raw inclusive token usage observations for OpenAI-compatible completions without changing provider request payloads.
-- Preserved explicit Responses truncation reasons so summary recovery can distinguish exhausted output from cancellation, refusal and provider failures.

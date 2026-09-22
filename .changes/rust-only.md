@@ -1,0 +1,2 @@
+- Removed the TypeScript application and npm workspace; made Cargo, the native launcher, and native release bundles the supported build and installation paths.
+- Preserved the Python runtime, bundled skills, themes, documentation, and HTML export resources under the native resource layout.

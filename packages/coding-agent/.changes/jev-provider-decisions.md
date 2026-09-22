@@ -1,5 +1,0 @@
-- Fixed Jev complexity decisions and telemetry for Responses reasoning effort while respecting supported model levels.
-- Fixed Jev compaction after provider checkpoints while preserving checkpoint contents, covered history, and tool pairs.
-- Added experimental code-search relevance scoring with separate observation and filtering controls, bounded batches, and Python candidate presentation.
-- Improved Jev tool and completion comparisons with task evidence and skipped single-tool selection checks.
-- Fixed daemon startup and status checks to use the current shared protocol schema.

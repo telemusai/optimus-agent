@@ -1,3 +1,0 @@
-- Fixed native effort-selector navigation and cancellation.
-- Fixed loaded extension command autocomplete and daemon execution so `/telegram` opens its dialogs and acknowledges input.
-- Fixed Telegram launching through the native Rust worker with a real lock heartbeat.

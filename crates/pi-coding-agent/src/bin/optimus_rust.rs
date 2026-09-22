@@ -1,5 +1,9 @@
-//! optimus-rust: the port's own command (packages/coding-agent/src/cli.ts entry).
+//! Native Optimus application entry point.
 fn main() {
+    // Resolve bundled resources before any runtime threads or child processes start.
+    if std::env::var_os("PI_PACKAGE_DIR").filter(|value| !value.is_empty()).is_none() {
+        std::env::set_var("PI_PACKAGE_DIR", pi_coding_agent::config::get_package_dir());
+    }
     let args: Vec<String> = std::env::args().collect();
     if args.get(1).map(String::as_str) == Some("--internal-telegram-worker") {
         // A standalone worker must not enter the UI or start another daemon.
