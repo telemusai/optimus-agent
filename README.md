@@ -4,7 +4,7 @@
 
 Maintained by [Telemus AI](https://github.com/telemusai).
 
-[Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Rust migration](#the-rust-migration) · [Documentation](#documentation)
+[Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Jev](#jev-integration) · [Rust migration](#the-rust-migration) · [Documentation](#documentation)
 
 Optimus is the layer between an AI model and real work: the tools it can use, the context it retains, the agents it coordinates, and the state it recovers when a session ends or a connection drops.
 
@@ -20,7 +20,7 @@ Optimus focuses on **native Windows reliability, stronger session continuity, As
 | Rust implementation | Available on `main`, installed as `optimus-agent`; remaining parity gaps are documented |
 | Platforms | macOS, Linux, and native Windows; Windows currently requires a Bash shell such as Git Bash |
 | Memory | Session, project, and global harness memory, with optional selected sharing; authoritative project storage is JSON |
-| Jev integration | Optional Compare, Active, and combined modes against TypeSafe System One, with bounded native features and independent request-local compaction |
+| Jev integration | Optional TypeSafe System One decisions, code-search filtering/reranking, semantic line finding, and request-local compaction; full-Jev enables all native feature gates |
 | TencentDB-backed memory | An intended integration direction, not an implemented backend in the current `main` branch |
 
 The feature descriptions below refer to `main` unless explicitly marked as development work. Some hardened Windows installations also use deployment-specific launchers and compatibility layers that are not included in a plain source checkout.
@@ -125,68 +125,140 @@ Experimental model-facing output reduction, iterative-summary consolidation, and
 
 ## Jev integration
 
-Optimus can put the same decision questions it is making to the TypeSafe System One ("Jev") service at `https://api.typesafe.ai/v1/systemone`, so an external recommendation can be compared against what the agent actually did.
+[Jev by TypeSafe AI](https://typesafe.ai/) is a System One model that returns typed judgments and probabilities. Optimus uses those judgments for bounded decisions around tools, code search, context, and ongoing work. Your selected coding model still handles the conversation and implementation.
 
-Jev is **off by default**. Credentials never enable it. Four modes control each chat:
+**Official links:** [Jev website](https://typesafe.ai/) · [Get an API key](https://console.typesafe.ai/keys) · [Quick start](https://docs.typesafe.ai/introduction/quickstart) · [HTTP API](https://docs.typesafe.ai/api) · [Models and pricing](https://docs.typesafe.ai/models).
 
-| Mode | Behavior |
-|---|---|
-| Off | No feature decision calls. Independent compaction keeps its own setting. |
-| Compare | Records shadow recommendations without changing the run. |
-| Active | Applies accepted decisions only at bounded native boundaries and only when their feature gate allows it. |
-| Compare + Active | Records comparisons and active outcomes from the same boundary request; it does not send a duplicate request for that comparison. |
+### Install the API key
 
-```text
-/jev                         # menu
-/jev compare                 # shadow-only (also: /jev on)
-/jev active                  # accepted, feature-gated native effects
-/jev compare-active          # comparison and application together
-/jev off                     # feature decisions off; compaction stays independent
-/jev compact on              # opt in to request-local compaction separately
-/jev compact off             # disable only compaction; keep the other Jev features
-/jev compact status          # effective toggle, scope and algorithm settings
-/jev feature tool_candidates on
-/jev status                  # modes, configured gates and observed/unknown counters
-/jev key                     # enter a key in the supported secure store
-/jev key clear               # remove the saved key
-/jev default compare         # default for sessions without an explicit mode
-/jev default compact off     # separate default for compaction
+Use a current [Rust installation](#rust-implementation). The native integration is included; enabling it does not require installing a separate Jev SDK. Jev is **off by default**, and adding a credential does not enable it.
+
+1. Sign in to the [TypeSafe console and create an API key](https://console.typesafe.ai/keys).
+2. Configure the key using the platform instructions below.
+3. Open Optimus and run `/jev status` to check the credential source. Run `/jev models` for an explicit authenticated catalog request. Key presence alone does not verify API access; a catalog response verifies that request, not an inference or an applied feature.
+
+**Windows:** enter `/jev key` in Optimus, then paste the key into its credential prompt. The saved credential is encrypted with Windows DPAPI at `<agent-dir>/jev/typesafe.jev-credential.json`. `/jev key clear` removes that saved credential; an environment-provided key can still take effect.
+
+**Linux/macOS:** provide `TYPESAFE_API_KEY` in the environment used to start Optimus. For a single terminal session, this Bash example reads the key without echoing it or putting its value into shell history:
+
+```bash
+read -r -s -p "TypeSafe API key: " TYPESAFE_API_KEY
+printf '\n'
+export TYPESAFE_API_KEY
+optimus-agent
 ```
 
-An explicit session setting wins over its global default. `on` always means Compare, not Active. Feature gates, compaction and mode are separate controls. Enabling a feature does not change the mode. An inherited child snapshots its parent's controls; an explicit child override wins.
+If you already keep the key in a protected environment file, source that existing file in the same shell before launching instead. Already-running daemons/workers retain their environment; restart the relevant Optimus services with the configured environment when changing an environment-provided key.
 
-### Bounded native features
+For persistent setup with the maintained `scripts/optimus-agent` launcher, its optional `<agent-dir>/jev/env` file accepts `TYPESAFE_API_KEY=your-key` (or `JEV_API_KEY=your-key`). Use a private editor to enter the key and restrict the file to its owner with `chmod 600`. It must be a regular file owned by the current user; symlinks are rejected. The launcher parses it as data, never as shell code. This file is plaintext, not an encrypted store. An existing key in the process environment takes precedence over the launcher file.
 
-`tool_requirement` and `complexity` keep their existing defaults. An accepted tool-requirement decision can withdraw the request's tool catalog. Complexity can move an already-set request reasoning effort one step without changing the selected model or session effort. New features default to **false**:
+The maintained launcher defaults `<agent-dir>` to `~/.config/optimus-rust`; `PRIME_AGENT_CODING_AGENT_DIR` overrides it. Direct/source launches normally use `~/.prime/agent` and do not automatically load the launcher's `jev/env` file. Credential lookup uses the saved Windows credential first, then `TYPESAFE_API_KEY`, then `JEV_API_KEY`. Linux/macOS do not have the Windows DPAPI store: `/jev key` cannot save a credential there, and writing `KEY=value` at the DPAPI JSON path does not configure it. Keep keys out of source control, chat messages, and browser-side code.
 
-- `tool_candidates` can filter explicitly optional tools. Mandatory/internal tools and forced tool choices stay protected.
-- `context_relevance` and `memory_relevance` filter eligible retrieval candidates for one request. They do not delete durable memory or transcript history.
-- `result_sufficiency`, `loop_control`, `retry_classification`, `verification` and `trace_observer` add bounded observations. High-impact continuation/retry/verification outcomes are advisory; they do not independently execute tools or stop the agent.
-- Compaction has its own `compaction_enabled` toggle and works independently of decision mode, including Off. It can project eligible old tool-call/result pairs into a smaller outgoing context. Recent and protected messages remain. The durable transcript and provider-native `/compact` behavior are unchanged.
+### Enable the full Jev feature set
 
-These gates do not remove the existing eleven Compare categories. A gate being on is not evidence that a recommendation was applied. `/jev status` reports unknown telemetry as unknown rather than claiming success or zero work.
+After configuring the API key, enter these commands in the Optimus TUI:
 
-The global policy lives in `<agent-dir>/jev/jev-settings.json`. Numeric compaction settings are `keep_threshold`, `preserve_recent_messages`, `max_state_tokens`, `max_request_tokens`, `truncate_head_chars` and `minimum_reduction_ratio`. The filtering policy includes `optional_tool_names`, `mandatory_tool_names`, `min_confidence`, `max_candidates` and `max_decision_age_ms`. Policies are validated; hard candidate, request-size and deadline limits still apply. Invalid settings fail closed and are not overwritten by a command. See [native System One design and validation](docs/JEV_SYSTEM_ONE.md) for the architecture and benchmark method.
+```text
+/jev full-jev on
+/jev full-jev status
+/jev status
+```
 
-Jev cannot change the primary model, provider, permissions, subagents, agent messages, depth, concurrency or budgets. Refused, invalid, stale, missing or unavailable answers keep the baseline behavior. Active boundaries can add bounded latency; no measured speed, quality or token-saving claim is made here.
+**Full-Jev is a persisted, global overlay for the active agent directory.** It enables Compare + Active, every registered feature gate, and independent request-local compaction across sessions using that directory. Bare `/jev full-jev` also enables it. The overlay takes precedence over saved session, global, and inherited controls without overwriting them. A running older binary must be upgraded and restarted to gain the new features.
 
-### What leaves the machine
+To leave full-Jev, use `/jev full-jev off`. This restores the saved settings, which may themselves enable Jev. While the overlay is active, individual mode, feature, compaction, and default edits are refused; turn the overlay off before customizing them.
 
-Enabled decisions and independent compaction send bounded state to an external service, so the bridge keeps credential material and raw content out of the request:
+For an immediate exit from the current chat, `/jev off` **while full-Jev is active** removes the global overlay and disables both decisions and compaction in that chat. Other chats return to their saved settings. Without the overlay, `/jev off` disables only decisions: also run `/jev compact off` to disable independent compaction.
 
-- **Raw tool arguments are not observed.** The bridge records tool identity, a tool-call id, and an explicit `args_omitted` marker. Tool arguments can carry API keys, `Authorization` headers, and passwords, and the evaluators only need tool identity. A source guard fails the test suite if argument capture returns.
-- **Bound before redacting.** Excerpts read at most the first 4096 characters of a source, so a multi-megabyte tool result is never fully copied just to keep a short excerpt.
-- **Redact before the payload exists.** Credential-shaped material is replaced with `[redacted]` while the excerpt is built: authorization headers, provider key prefixes, private-key blocks, secret-named assignment values, URL userinfo, and JWT-shaped strings.
+### Modes and individual controls
 
-Redaction is pattern-based. It does not make arbitrary private task text safe to disclose, so treat an operative mode as an opt-in disclosure you control per session.
+| Mode | Behavior |
+| --- | --- |
+| Off | No feature decision calls; independent compaction keeps its own setting. |
+| Compare | Records shadow recommendations without applying feature decisions. Independently enabled compaction can still affect outgoing context. |
+| Active | Applies accepted decisions only at supported native boundaries with the relevant feature gates enabled. |
+| Compare + Active | Records comparisons and active outcomes from the same boundary request, without a duplicate comparison request. |
 
-### Credentials, settings, and records
+For a smaller configuration, leave the full-Jev overlay off and select individual controls:
 
-The credential is read from a saved credential first (the Windows DPAPI envelope at `<agent-dir>/jev/typesafe.jev-credential.json`), then from `TYPESAFE_API_KEY`, then from `JEV_API_KEY`. Windows uses the DPAPI store; macOS and Linux use the environment variables, because those builds have no DPAPI store. A hand-written `KEY=value` file at the envelope path is not read. `/jev status` reports which source is in use and never prints the secret.
+```text
+/jev                          # menu
+/jev compare                  # shadow decisions (also: /jev on)
+/jev active
+/jev compare-active
+/jev feature tool_candidates on
+/jev compact on               # independently enable request-local compaction
+/jev compact status
+/jev compact off
+/jev off
+/jev default compare          # default for sessions without an explicit mode
+/jev default compact off
+```
 
-Local state stays under `jev/` in the agent directory: `jev-settings.json` holds mode and feature defaults, per-session overrides, validated compaction/filtering policy, and credential-presence metadata, and `records.jsonl` holds the records (`jev.compare/1` rows for Compare, `jev.active/1` rows for Active). Set `JEV_BASE_URL` to point a run at a staging or replay endpoint instead of the production service.
+Outside full-Jev, an explicit session setting wins over its global default. Children inherit a snapshot of their parent's saved controls and can override it. `/jev on` means Compare; it does not enable full-Jev. Feature gates, mode, and compaction are separate settings. Only `tool_requirement` and `complexity` have feature defaults of true; the other gates default to false, and no decision calls occur while the mode is Off.
 
-See [Jev observation data minimization](docs/JEV_DATA_MINIMIZATION.md).
+### What full-Jev enables
+
+| Area | Feature gates and bounded behavior |
+| --- | --- |
+| Tools and effort | `tool_requirement` can withdraw the outgoing request's tool catalog. `complexity` can move an already-set request reasoning effort one step. `tool_candidates` filters explicitly optional tools while protecting mandatory/internal tools and forced choices. |
+| Context and memory | `context_relevance` and `memory_relevance` filter eligible historical read/search context and automatically retrieved memory for one request. They preserve durable history and stored memory. |
+| Code scanning and search | `code_search_relevance` scores supplied candidates; `code_search_filtering` permits eligible candidates to be removed; `code_search_reranking` orders eligible candidates by query relevance. `line_find` identifies relevant lines in supplied source reads, or reports that the answer is absent. |
+| Retrieved evidence | `retrieval_safety` assesses candidate usefulness, possible prompt injection, and contradictions. `citation_check` assesses a claim against its supplied source span with a native quote check. These assessments do not establish facts outside the supplied evidence. |
+| Skills and guardrails | `skill_suggestion` assesses the already-loaded skill catalog without loading or executing a skill. `guardrails_input` and `guardrails_output` add advisory input and post-output assessments; they do not grant permissions or create a security sandbox. |
+| Progress and control | `result_sufficiency`, `loop_control`, `retry_classification`, `verification`, and `trace_observer` assess outcomes and progress. With full-Jev and an Active-capable mode, accepted control decisions can produce bounded host-owned feedback, queued follow-up, pause/escalation, retry suppression, or verification status. |
+| Compaction | The separate `compaction_enabled` control projects eligible old tool-call/result pairs into smaller outgoing context. Recent/protected messages, durable transcripts, and provider-native `/compact` behavior remain intact. It can also run with decision mode Off. |
+
+Code search starts with deterministic retrieval such as `rg --json`, AST queries, or symbol tools. The Python runtime's `rlm.code_search.from_ripgrep(...)` and `rlm.code_search.present(candidates)` expose an explicit candidate set to the native host; keep the complete results in a variable and make `present(...)` the cell's only output. Jev judges bounded supplied candidates and source reads; enabling it does not create an index or scan every file automatically. Filtering requires both relevance and filtering gates plus an Active-capable mode; full-Jev supplies those settings. See the [code-search workflow](docs/JEV_SYSTEM_ONE.md#experimental-code-search-relevance).
+
+The native host owns thresholds, freshness checks, deadlines, protected entries, and per-session control budgets. It rejects invalid, stale, unavailable, or insufficient-confidence decisions and retains baseline behavior. Jev cannot change the primary model/provider, grant permissions, execute tools itself, refill budgets, or declare a goal complete. Verification needs explicit correlated evidence; a successful tool call alone is insufficient. Active boundaries add API work and may add latency; quality and savings depend on the task.
+
+### System One API and model selection
+
+Optimus sends JSON to `POST https://api.typesafe.ai/v1/systemone` with `Authorization: Bearer <API_KEY>` and `Content-Type: application/json`. The request contains a `model`, a shared `state` (text, object, or array), and a `questions` map. Each question has `type` and `instructions`; independent questions can share one request.
+
+The [three primitives](https://docs.typesafe.ai/primitives) have different meanings:
+
+| Type | Question shape | Answer fields |
+| --- | --- | --- |
+| `noul` | Yes/no judgment; optional true/false criteria | `noul`: probability of yes, from 0 to 1. Near 0.5 means uncertainty, not medium intensity. No separate confidence field. |
+| `choice` | Choose among named options in `criteria` | `choice`, option `probabilities`, and `confidence`. |
+| `score` | Assess an ordered rubric supplied in `criteria` | `score` (a probability-weighted level, possibly fractional), `legend`, `probabilities`, and `confidence`. |
+
+With `TYPESAFE_API_KEY` exported in the current shell, this standalone example sends only synthetic task text:
+
+```bash
+curl --fail-with-body --silent --show-error \
+  https://api.typesafe.ai/v1/systemone \
+  -H "Authorization: Bearer ${TYPESAFE_API_KEY:?Set TYPESAFE_API_KEY first}" \
+  -H 'Content-Type: application/json' \
+  --data-binary @- <<'JSON'
+{
+  "model": "jev-latest",
+  "state": {"task": "Explain this function using only the supplied source."},
+  "questions": {
+    "needs_file_edit": {
+      "type": "noul",
+      "instructions": "Does completing this task require modifying a source file?"
+    }
+  }
+}
+JSON
+```
+
+Read `answers.needs_file_edit.noul` from the JSON response. Answers use your question IDs; the response also identifies the resolved `model` and reports `usage.input_tokens` and `usage.output_tokens`. Probability and confidence describe model judgments, not guaranteed correctness. Application code should choose validated thresholds and preserve a fallback for uncertainty. See the [API reference](https://docs.typesafe.ai/api) and [confidence guide](https://docs.typesafe.ai/confidence).
+
+Optimus defaults to `jev-latest`. `/jev model status` shows the requested model, `/jev model set <model-id>` saves an alias or versioned ID, and `/jev model reset` restores the default. These commands are local and do not validate API access. `/jev models` explicitly fetches `GET https://api.typesafe.ai/v1/models` with the configured credential; it does not automatically select a model. Pin a versioned ID when calibrating behavior and consult the [current model catalog, pricing, and limits](https://docs.typesafe.ai/models) before changing it.
+
+For your own integrations, the official [Python SDK](https://docs.typesafe.ai/sdk/python) installs with `pip install typesafe-sdk`; the [JavaScript/TypeScript SDK](https://docs.typesafe.ai/sdk/javascript) installs with `npm install @typesafe-ai/sdk`. Both can read `TYPESAFE_API_KEY` from the server-side environment. They are optional for using Optimus's built-in Rust integration.
+
+### Data sent, settings, and records
+
+Enabled features and independent compaction send bounded task, code, context, or result excerpts to TypeSafe. The observation bridge omits raw tool arguments and redacts credential-shaped material while constructing bounded excerpts. Redaction is pattern-based: selected private text can still leave the machine. Choose modes and full-Jev's profile-wide scope with that disclosure in mind.
+
+Local Jev settings and records live under `<agent-dir>/jev/`. `jev-settings.json` holds saved controls and the full-Jev overlay; `records.jsonl` includes comparison and active-outcome records. `/jev status` reports credential source, configured gates, and observed or unknown telemetry without printing the key. Enabled, accepted, and applied are different states; an enabled gate or available credential does not prove a feature ran.
+
+See [native System One design and validation](docs/JEV_SYSTEM_ONE.md), [questions and thresholds](docs/JEV_QUESTIONS_AND_THRESHOLDS.md), and [Jev observation data minimization](docs/JEV_DATA_MINIMIZATION.md) for detailed policies and limits.
 
 ## Telegram access
 
@@ -294,7 +366,7 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 | `/heartbeat` | Configure recurring session prompts |
 | `/tree`, `/fork`, `/clone` | Navigate or branch session history |
 | `/telegram` | Manage the Telegram connection |
-| `/jev` | Configure Jev modes, feature gates, independent compaction and credentials |
+| `/jev` | Configure Jev credentials, models, full-Jev, individual feature gates, and compaction |
 | `/settings`, `/mcp`, `/reload` | Configure and reload integrations and resources |
 
 ## Safety and compatibility
@@ -311,6 +383,7 @@ Preserve sessions, memory, configuration, and credentials when upgrading. New tr
 - [Background agents](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/long-running-agents.md)
 - [Project memory](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/project-memory.md)
 - [MCP integrations](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/mcp-integrations.md)
+- [Jev setup and API](#jev-integration), [native integration](docs/JEV_SYSTEM_ONE.md), and [official Jev website](https://typesafe.ai/)
 - [Providers and authentication](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/providers.md)
 - [Settings](https://github.com/telemusai/optimus-agent/blob/main/packages/coding-agent/docs/settings.md)
 - [Performance metrics](https://github.com/telemusai/optimus-agent/blob/main/docs/performance-metrics.md)
