@@ -1438,9 +1438,15 @@ async fn generate_bounded_summary(
             return Err(abort_error());
         }
         add_assistant_usage(&mut usage, &response.usage);
+        // Chat Completions maps only finish_reason=length to this terminal and
+        // does not retain the raw reason. Responses also maps generic incomplete
+        // to length, so it still requires explicit max_output_tokens evidence.
+        let exhausted_output = response.stop_reason_raw.as_deref() == Some("max_output_tokens")
+            || (model.api == "openai-completions"
+                && matches!(response.stop_reason_raw.as_deref(), None | Some("length")));
         if !length_retry_used && retry_max_tokens > max_tokens
             && response.stop_reason == pi_ai::types::STOP_REASON_LENGTH
-            && response.stop_reason_raw.as_deref() == Some("max_output_tokens")
+            && exhausted_output
             && response.error_message.as_deref().is_none_or(str::is_empty)
             && provider_stream_failure_kind(&response).is_none()
             && !is_agent_lifecycle_failure(&response)
