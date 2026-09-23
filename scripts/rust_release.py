@@ -16,7 +16,34 @@ import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
-EXECUTABLE = "optimus-rust.exe" if os.name == "nt" else "optimus-rust"
+WINDOWS = os.name == "nt"
+EXECUTABLE = "optimus-rust.exe" if WINDOWS else "optimus-rust"
+
+
+def git_bash() -> Path:
+    """Find Git for Windows Bash, never the incompatible WSL bash.exe shim."""
+    candidates = []
+    git = shutil.which("git")
+    if git:
+        directory = Path(git).resolve().parent
+        candidates.extend((directory / "bash.exe", directory.parent / "bin/bash.exe"))
+    for variable, relative in (("ProgramFiles", "Git/bin/bash.exe"),
+                               ("ProgramFiles(x86)", "Git/bin/bash.exe"),
+                               ("LOCALAPPDATA", "Programs/Git/bin/bash.exe")):
+        if os.environ.get(variable):
+            candidates.append(Path(os.environ[variable]) / relative)
+    for candidate in candidates:
+        if candidate.is_file():
+            return candidate
+    raise ValueError("Install Git for Windows with Git Bash before installing Optimus.")
+
+
+def windows_launcher(bash: Path, launcher: Path) -> str:
+    # Literal percent signs must survive cmd.exe expansion; quoting handles spaces.
+    bash_path = bash.as_posix().replace("%", "%%")
+    script_path = launcher.as_posix().replace("%", "%%")
+    return ("@echo off\nsetlocal DisableDelayedExpansion\n"
+            f'"{bash_path}" -- "{script_path}" %*\nexit /b %errorlevel%\n')
 
 
 def source_commit(source: Path) -> str:
@@ -49,6 +76,8 @@ def stage_release(source: Path, binary: Path, destination: Path, commit: str) ->
         for name in ("install.sh", "LICENSE", "README.md"):
             shutil.copy2(source / name, destination / name)
         (destination / "COMMIT").write_text(commit + "\n")
+        if (source / "TAG").is_file():
+            shutil.copy2(source / "TAG", destination / "TAG")
     except BaseException:
         shutil.rmtree(destination)
         raise
@@ -76,6 +105,7 @@ def resolve_binary(source: Path, requested: Path | None) -> Path:
 def install_release(source: Path, binary: Path, prefix: Path, bin_dir: Path, commit: str) -> Path:
     if shutil.which("uv") is None:
         raise ValueError("Install uv first; Optimus uses it to prepare its Python runtime on first use.")
+    bash = git_bash() if WINDOWS else None
     release_name = f"{commit[:12]}-{uuid.uuid4().hex[:8]}"
     release = prefix / "releases" / release_name
     stage_release(source, binary, release, commit)
@@ -86,7 +116,7 @@ def install_release(source: Path, binary: Path, prefix: Path, bin_dir: Path, com
         bin_dir.mkdir(parents=True, exist_ok=True)
         pointer = prefix / f".current-{uuid.uuid4().hex}"
         try:
-            if os.name == "nt":
+            if WINDOWS:
                 # Git Bash works without Windows symlink privileges.
                 pointer.write_text(release_name + "\n")
                 current = prefix / "current.txt"
@@ -95,21 +125,33 @@ def install_release(source: Path, binary: Path, prefix: Path, bin_dir: Path, com
                 current = prefix / "current"
             launcher = bin_dir / "optimus-agent"
             with tempfile.TemporaryDirectory(prefix=".optimus-agent-", dir=bin_dir) as temporary:
-                candidate = Path(temporary) / "launcher"
-                previous = Path(temporary) / "previous"
-                had_launcher = launcher.exists() or launcher.is_symlink()
-                if had_launcher:
-                    shutil.copy2(launcher, previous, follow_symlinks=False)
+                staging = Path(temporary)
+                candidate = staging / "optimus-agent"
                 shutil.copyfile(release / "scripts" / "optimus-agent", candidate)
                 candidate.chmod(0o755)
-                os.replace(candidate, launcher)
+                candidates = [(candidate, launcher)]
+                if WINDOWS:
+                    command = staging / "optimus-agent.cmd"
+                    command.write_text(windows_launcher(bash, launcher), newline="\r\n")
+                    candidates.append((command, bin_dir / command.name))
+                backups = {}
+                for candidate, destination in candidates:
+                    previous = staging / (candidate.name + ".previous")
+                    if destination.exists() or destination.is_symlink():
+                        shutil.copy2(destination, previous, follow_symlinks=False)
+                        backups[destination] = previous
+                replaced = []
                 try:
+                    for candidate, destination in candidates:
+                        os.replace(candidate, destination)
+                        replaced.append(destination)
                     os.replace(pointer, current)
-                except OSError:
-                    if had_launcher:
-                        os.replace(previous, launcher)
-                    else:
-                        launcher.unlink()
+                except BaseException:
+                    for destination in reversed(replaced):
+                        if destination in backups:
+                            os.replace(backups[destination], destination)
+                        else:
+                            destination.unlink()
                     raise
         finally:
             pointer.unlink(missing_ok=True)

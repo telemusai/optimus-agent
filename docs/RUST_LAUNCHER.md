@@ -34,6 +34,19 @@ The release contains the built executable and the matching Python runtime, skill
 
 ## Build and install
 
+For installation without a checkout, use the [standalone install/update commands](../README.md#install-and-update). Both platforms resolve the highest stable `vMAJOR.MINOR.PATCH` tag, verify the checked-out commit against that tag, and build its locked Cargo dependencies locally. Annotated and lightweight tags work; prerelease tags and untagged `main` commits are excluded. The first supported standalone tag is `v0.1.1`. GitHub Actions remains disabled.
+
+The source build uses a private `.build-*` directory under the installation prefix, defaults to two Cargo jobs, and removes its source and build artifacts on success or failure. Allow several GB of free space and several minutes to compile. `CARGO_BUILD_JOBS` can override the job count. An unchanged tag/commit with installed launchers is checked with `--version` and not rebuilt.
+
+On Linux/macOS, custom installation options can be passed to the downloaded shell script:
+
+```bash
+curl -fsSL https://telemus.ai/optimus-agent/install.sh | sh -s -- \
+  --prefix "$HOME/opt/optimus" --bin-dir "$HOME/opt/bin"
+```
+
+Use `--force` to rebuild the same tag. Set `OPTIMUS_RUST_ROOT` to your custom prefix when launching. Windows uses the default user installation directories through the PowerShell one-liner.
+
 From a source checkout with Rust/Cargo, Python 3.11+, `uv`, and Bash installed:
 
 ```bash
@@ -42,7 +55,7 @@ From a source checkout with Rust/Cargo, Python 3.11+, `uv`, and Bash installed:
 
 This builds the native release binary and installs a complete bundle. To reuse a compiled executable, pass `--binary /path/to/optimus-rust`. Add `~/.local/bin` to PATH and check `optimus-agent --version`. The installer replaces the launcher atomically without following an old symlink, and retains previous releases. It never copies or rewrites credentials, sessions, or memory.
 
-Windows uses Git Bash and the MSVC Rust toolchain. The installer records `current.txt` instead of requiring Windows symlink privileges, and the launcher selects `bin/optimus-rust.exe`. Linux/macOS use the `current` symlink shown above.
+Windows uses Git Bash and the MSVC Rust toolchain. The installer records `current.txt` instead of requiring Windows symlink privileges, and the launcher selects `bin/optimus-rust.exe`. It also installs `optimus-agent.cmd`, which invokes the detected Git Bash with the shared launcher, allowing `optimus-agent` to run directly from PowerShell or Command Prompt. Both launchers are restored if activation fails. The web PowerShell installer adds the bin directory to the user's PATH. Linux/macOS use the `current` symlink shown above. Standalone installations record both `COMMIT` and `TAG` in each release.
 
 To create a distributable archive from a compiled binary:
 
@@ -52,7 +65,7 @@ python3 scripts/rust_release.py stage \
   --output dist --name optimus-agent-local
 ```
 
-The archive contains the executable, resource bundle, Python runtime source, installer, and license, plus a SHA-256 sidecar. Release CI builds separate Linux, macOS, and Windows artifacts. Extract the archive and run its `./install.sh`; Rust is only required when compiling from source. Python and `uv` are still required for the execution runtime. Node/npm are not required.
+The archive contains the executable, resource bundle, Python runtime source, installer, and license, plus a SHA-256 sidecar. The repository retains native release workflows, but GitHub Actions is disabled and the hosted installers build from source. For a manually built archive, extract it and run its `./install.sh`; Rust is only required when compiling from source. Python and `uv` are still required for the execution runtime. Node/npm are not required.
 
 Use `--prefix` and `--bin-dir` for an isolated installation. Set `OPTIMUS_RUST_ROOT` to a custom prefix when invoking its launcher. Copying only the executable is insufficient for Python tools and bundled skills.
 

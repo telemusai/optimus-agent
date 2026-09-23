@@ -4,13 +4,37 @@
 
 Maintained by [Telemus AI](https://github.com/telemusai).
 
-[Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Jev](#jev-integration) · [Implementation](#implementation) · [Documentation](#documentation)
+[Install](#install-and-update) · [Get started](#get-started) · [Memory and learning](#memory-that-you-can-inspect-and-correct) · [Jev](#jev-integration) · [Implementation](#implementation) · [Documentation](#documentation)
 
 Optimus is the layer between an AI model and real work: the tools it can use, the context it retains, the agents it coordinates, and the state it recovers when a session ends or a connection drops.
 
 It combines a persistent Python workspace, recursive subagents, inspectable memory, provider-aware context management, and background execution. Use one model to plan and review, others to investigate or build, and keep the work connected across sessions.
 
 Optimus focuses on **native Windows reliability, stronger session continuity, Astra-aware model handling, project-scoped learning, measurable efficiency, and a Rust implementation of the application layer.** See [Foundations and acknowledgements](#foundations-and-acknowledgements) for the projects it builds on.
+
+## Install and update
+
+The standalone installers select the **highest stable `vMAJOR.MINOR.PATCH` tag** from this repository and build it locally with Cargo's locked dependencies. They exclude prerelease tags and never install an untagged `main` build. Run the same command again to update; an already-installed tag is left in place. Standalone installation starts with **v0.1.1**. GitHub Actions remains disabled; no prebuilt release binary is required.
+
+Install the prerequisites first: [Rust/Cargo](https://rustup.rs/), [Python 3.11+](https://www.python.org/downloads/), [uv](https://docs.astral.sh/uv/getting-started/installation/), Git, and native C/C++ build tools. Linux also needs `curl`, Bash, `pkg-config`, and OpenSSL development headers (Ubuntu/Debian: `build-essential pkg-config libssl-dev`). macOS needs Xcode Command Line Tools. Windows needs [Git for Windows with Git Bash](https://gitforwindows.org/) and [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**, a Windows SDK, and the MSVC Rust toolchain. Reopen the terminal after installing prerequisites.
+
+**macOS / Linux — install or update**
+
+```bash
+curl -fsSL https://telemus.ai/optimus-agent/install.sh | sh
+```
+
+**Windows PowerShell — install or update**
+
+```powershell
+powershell -ExecutionPolicy ByPass -c "irm https://telemus.ai/optimus-agent/install.ps1 | iex"
+```
+
+Compilation can take several minutes and needs several GB of temporary disk space. The installer removes its source/build directory afterward and retains previous installed releases, settings, credentials, and sessions. Existing daemons are not restarted automatically.
+
+On macOS/Linux, add `~/.local/bin` to your shell's PATH if needed (`export PATH="$HOME/.local/bin:$PATH"`). Windows adds that directory to your user PATH; open a new terminal. Then run `optimus-agent` from your project directory, or `optimus-agent --continue` to reopen its last saved conversation.
+
+See the [installer source](installers/) and [launcher guide](docs/RUST_LAUNCHER.md) for details, custom installation directories, and source builds.
 
 ## Project status
 

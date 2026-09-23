@@ -1,0 +1,3 @@
+- Added macOS/Linux and Windows install/update commands hosted at telemus.ai/optimus-agent, building the latest stable version tag locally with locked dependencies.
+- Added a Windows Command Prompt/PowerShell launcher, safe activation rollback, and installed tag metadata.
+- Changed the application and Python runtime version to 0.1.1 and documented source-build prerequisites, update behavior, and build-directory cleanup.

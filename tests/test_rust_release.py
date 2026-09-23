@@ -29,6 +29,7 @@ class NativeReleaseTests(unittest.TestCase):
 
     def install(self):
         with mock.patch.object(release.shutil, 'which', return_value='/test/uv'), \
+             mock.patch.object(release, 'git_bash', return_value=Path('C:/Program Files/Git/bin/bash.exe')), \
              mock.patch.object(release.subprocess, 'run') as run:
             result = release.install_release(ROOT, self.binary, self.prefix, self.bin_dir, 'abcdef0123456789')
             self.assertEqual(run.call_args.args[0][-1], '--version')
@@ -74,6 +75,7 @@ class NativeReleaseTests(unittest.TestCase):
         launcher = self.bin_dir / 'optimus-agent'
         launcher.write_text('original launcher')
         with mock.patch.object(release.shutil, 'which', return_value='/test/uv'), \
+             mock.patch.object(release, 'git_bash', return_value=Path('C:/Program Files/Git/bin/bash.exe')), \
              mock.patch.object(release.subprocess, 'run', side_effect=subprocess.CalledProcessError(1, 'probe')):
             with self.assertRaises(subprocess.CalledProcessError):
                 release.install_release(ROOT, self.binary, self.prefix, self.bin_dir, 'abcdef0123456789')
@@ -100,6 +102,64 @@ class NativeReleaseTests(unittest.TestCase):
             self.assertEqual(pointer.read_text().strip(), first.name)
         else:
             self.assertEqual(pointer.resolve(), first)
+
+    def test_windows_launchers_activate_and_roll_back_together(self):
+        with mock.patch.object(release, 'WINDOWS', True):
+            first = self.install()
+            shell = self.bin_dir / 'optimus-agent'
+            command = self.bin_dir / 'optimus-agent.cmd'
+            self.assertIn('Program Files/Git/bin/bash.exe', command.read_text())
+            self.assertIn(' %*', command.read_text())
+            shell.write_text('old shell launcher')
+            command.write_text('old Windows launcher')
+            replace = os.replace
+            def fail_pointer(source, destination):
+                if destination == self.prefix / 'current.txt':
+                    raise OSError('pointer locked')
+                return replace(source, destination)
+            with mock.patch.object(release.os, 'replace', side_effect=fail_pointer):
+                with self.assertRaisesRegex(OSError, 'pointer locked'):
+                    self.install()
+            self.assertEqual(shell.read_text(), 'old shell launcher')
+            self.assertEqual(command.read_text(), 'old Windows launcher')
+            self.assertEqual((self.prefix / 'current.txt').read_text().strip(), first.name)
+            self.assertEqual(list((self.prefix / 'releases').iterdir()), [first])
+
+    def test_locked_windows_launcher_does_not_activate_or_leave_partial_update(self):
+        with mock.patch.object(release, 'WINDOWS', True):
+            first = self.install()
+            shell = self.bin_dir / 'optimus-agent'
+            command = self.bin_dir / 'optimus-agent.cmd'
+            shell.write_text('old shell launcher')
+            old_command = command.read_bytes()
+            replace = os.replace
+            def fail_command(source, destination):
+                if destination == command:
+                    raise PermissionError('command locked')
+                return replace(source, destination)
+            with mock.patch.object(release.os, 'replace', side_effect=fail_command):
+                with self.assertRaises(PermissionError):
+                    self.install()
+            self.assertEqual(shell.read_text(), 'old shell launcher')
+            self.assertEqual(command.read_bytes(), old_command)
+            self.assertEqual(list((self.prefix / 'releases').iterdir()), [first])
+
+    def test_windows_launcher_quotes_spaces_and_escapes_percent_paths(self):
+        script = release.windows_launcher(Path('C:/Program Files/Git/bash.exe'),
+                                          Path('C:/Users/100% real/bin/optimus-agent'))
+        self.assertIn('"C:/Program Files/Git/bash.exe"', script)
+        self.assertIn('"C:/Users/100%% real/bin/optimus-agent" %*', script)
+        self.assertIn('DisableDelayedExpansion', script)
+
+    def test_git_bash_discovery_uses_git_installation(self):
+        git = self.root / 'Git installation/cmd/git.exe'
+        bash = self.root / 'Git installation/bin/bash.exe'
+        git.parent.mkdir(parents=True)
+        bash.parent.mkdir(parents=True)
+        git.touch()
+        bash.touch()
+        with mock.patch.object(release.shutil, 'which', return_value=str(git)):
+            self.assertEqual(release.git_bash(), bash)
 
 
 if __name__ == '__main__':
