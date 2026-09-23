@@ -123,6 +123,9 @@ pub struct FullscreenViewport {
     prev_height: usize,
     last_max_scroll: usize,
     last_window_height: usize,
+    last_header_height: usize,
+    selection_columns: Vec<Option<(usize, usize)>>,
+    padding_line: String,
     last_transcript: Vec<String>,
     last_anchors: Vec<Option<ViewportAnchor>>,
     last_top_padding: usize,
@@ -155,6 +158,9 @@ impl FullscreenViewport {
             prev_height: 0,
             last_max_scroll: 0,
             last_window_height: 0,
+            last_header_height: 0,
+            selection_columns: Vec::new(),
+            padding_line: String::new(),
             last_transcript: Vec::new(),
             last_anchors: Vec::new(),
             last_top_padding: 0,
@@ -194,13 +200,34 @@ impl FullscreenViewport {
         anchors: &[Option<ViewportAnchor>],
         bottom_aligned: bool,
     ) -> Vec<String> {
+        self.compose_frame_with_header(transcript, dock, height, table_cell_selection_regions, anchors, bottom_aligned, &[])
+    }
+
+    /// Content column bounds exclude decorative gutters from selection and copying.
+    pub fn set_transcript_presentation(&mut self, columns: Vec<Option<(usize, usize)>>, padding: String) {
+        self.selection_columns = columns;
+        self.padding_line = padding;
+    }
+
+    /// Header chrome yields before the editor and minimum transcript allocation.
+    pub fn compose_frame_with_header(
+        &mut self,
+        transcript: &[String],
+        dock: &[String],
+        height: usize,
+        table_cell_selection_regions: &[TableCellSelectionRegion],
+        anchors: &[Option<ViewportAnchor>],
+        bottom_aligned: bool,
+        header: &[String],
+    ) -> Vec<String> {
         let dock_height = clipped_fullscreen_dock_height(dock.len(), height);
+        let header_height = header.len().min(height.saturating_sub(dock_height + FULLSCREEN_MIN_TRANSCRIPT_ROWS));
         let dock_lines: Vec<String> = if dock.len() > dock_height {
             dock[dock.len() - dock_height..].to_vec()
         } else {
             dock.to_vec()
         };
-        let window_height = height - dock_lines.len();
+        let window_height = height - dock_lines.len() - header_height;
         let max_scroll = transcript.len().saturating_sub(window_height);
 
         if self.following {
@@ -225,6 +252,7 @@ impl FullscreenViewport {
         }
         self.last_max_scroll = max_scroll;
         self.last_window_height = window_height;
+        self.last_header_height = header_height;
         self.last_transcript = transcript.to_vec();
         self.last_anchors = anchors.to_vec();
         self.last_bottom_aligned = bottom_aligned;
@@ -240,11 +268,12 @@ impl FullscreenViewport {
         self.highlight_selection(&mut window);
         self.last_top_padding = if bottom_aligned { window_height - window.len() } else { 0 };
         if self.last_top_padding > 0 {
-            window.splice(0..0, std::iter::repeat_n(String::new(), self.last_top_padding));
+            window.splice(0..0, std::iter::repeat_n(self.padding_line.clone(), self.last_top_padding));
         }
         while window.len() < window_height {
-            window.push(String::new());
+            window.push(self.padding_line.clone());
         }
+        window.splice(0..0, header[..header_height].iter().cloned());
         window.extend(dock_lines);
         window
     }
@@ -264,14 +293,21 @@ impl FullscreenViewport {
         if line_index < start.line || line_index > end.line {
             return None;
         }
-        Some(ColumnSpan {
+        let mut span = ColumnSpan {
             from: if line_index == start.line { start.col } else { 0 },
             to: if line_index == end.line {
                 end.col
             } else {
                 usize::MAX
             },
-        })
+        };
+        if matches!(self.selection_mode, Some(SelectionMode::Transcript | SelectionMode::Table)) {
+            if let Some(Some((from, to))) = self.selection_columns.get(line_index) {
+                span.from = span.from.max(*from);
+                span.to = span.to.min(*to);
+            }
+        }
+        (span.to >= span.from).then_some(span)
     }
 
     fn highlight_selection(&mut self, window: &mut [String]) {
@@ -582,7 +618,7 @@ impl FullscreenViewport {
         let visible_height = if self.last_frame_visible_height > 0 {
             self.last_frame_visible_height
         } else {
-            self.last_window_height
+            self.last_header_height + self.last_window_height
         };
         if visible_height == 0 {
             return None;
@@ -593,8 +629,8 @@ impl FullscreenViewport {
             0
         };
         let visible_end = visible_start + visible_height - 1;
-        let transcript_start = visible_start.max(self.last_top_padding);
-        let transcript_end = (self.last_window_height - 1).min(visible_end);
+        let transcript_start = visible_start.max(self.last_header_height + self.last_top_padding);
+        let transcript_end = (self.last_header_height + self.last_window_height - 1).min(visible_end);
         if transcript_start > transcript_end {
             return None;
         }
@@ -622,7 +658,7 @@ impl FullscreenViewport {
         if !clamp && (frame_line < bounds.transcript_start || frame_line > bounds.transcript_end) {
             return None;
         }
-        Some(self.scroll_top + frame_line.clamp(bounds.transcript_start, bounds.transcript_end) - self.last_top_padding)
+        Some(self.scroll_top + frame_line.clamp(bounds.transcript_start, bounds.transcript_end) - self.last_top_padding - self.last_header_height)
     }
 
     fn is_frame_selectable(&self, point: SelectionPoint) -> bool {
@@ -1087,6 +1123,10 @@ impl FullscreenViewport {
         self.last_window_height
     }
 
+    pub fn header_height(&self) -> usize {
+        self.last_header_height
+    }
+
     pub fn is_following(&self) -> bool {
         self.following
     }
@@ -1117,6 +1157,55 @@ mod tests {
         assert_eq!(clipped_fullscreen_dock_height(5, 10), 5);
         assert_eq!(clipped_fullscreen_dock_height(20, 10), 7);
         assert_eq!(clipped_fullscreen_dock_height(4, 2), 0);
+    }
+
+    #[test]
+    fn neon_header_stays_fixed_and_selection_uses_transcript_coordinates() {
+        let mut viewport = FullscreenViewport::new();
+        let transcript = lines(&["first", "second", "third", "fourth", "fifth"]);
+        let header = lines(&["OPTIMUS", "session"]);
+        let dock = lines(&["input", "status"]);
+        let frame = viewport.compose_frame_with_header(&transcript, &dock, 7, &[], &[], false, &header);
+        assert_eq!(frame, lines(&["OPTIMUS", "session", "third", "fourth", "fifth", "input", "status"]));
+        viewport.apply_frame_selection(&mut frame.clone(), 7, &[]);
+        assert!(!viewport.begin_selection(0, 0));
+        assert!(!viewport.begin_selection(1, 0));
+        assert!(!viewport.begin_selection(5, 0));
+        assert!(viewport.begin_selection(2, 0));
+        viewport.extend_selection(3, 6);
+        assert_eq!(viewport.end_selection().as_deref(), Some("third\nfourth"));
+        viewport.scroll_by(-1);
+        let frame = viewport.compose_frame_with_header(&transcript, &dock, 7, &[], &[], false, &header);
+        assert_eq!(&frame[..3], &lines(&["OPTIMUS", "session", "second"]));
+        assert_eq!(viewport.page_size(), 2);
+    }
+
+    #[test]
+    fn neon_header_yields_to_input_on_tiny_terminals() {
+        let mut viewport = FullscreenViewport::new();
+        for height in 0..12 {
+            let frame = viewport.compose_frame_with_header(&lines(&["message"]), &lines(&["input", "status"]), height, &[], &[], true, &lines(&["brand", "art", "session"]));
+            assert_eq!(frame.len(), height);
+            assert!(viewport.header_height() <= height.saturating_sub(5));
+            if height >= 5 {
+                assert_eq!(&frame[height - 2..], &lines(&["input", "status"]));
+            }
+        }
+    }
+
+    #[test]
+    fn neon_header_resize_preserves_follow_and_bottom_aligned_selection() {
+        let mut viewport = FullscreenViewport::new();
+        let transcript = lines(&["hello", "world"]);
+        let frame = viewport.compose_frame_with_header(&transcript, &lines(&["input"]), 8, &[], &[], true, &lines(&["brand", "session"]));
+        assert_eq!(frame, lines(&["brand", "session", "", "", "", "hello", "world", "input"]));
+        assert!(!viewport.begin_selection(4, 0));
+        assert!(viewport.begin_selection(5, 0));
+        viewport.extend_selection(6, 5);
+        assert_eq!(viewport.end_selection().as_deref(), Some("hello\nworld"));
+        let frame = viewport.compose_frame_with_header(&transcript, &lines(&["input"]), 4, &[], &[], true, &lines(&["brand", "session"]));
+        assert_eq!(frame, lines(&["", "hello", "world", "input"]));
+        assert!(viewport.is_following());
     }
 
     #[test]

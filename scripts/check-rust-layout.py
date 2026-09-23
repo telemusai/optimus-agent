@@ -15,7 +15,7 @@ assert not (root / "package.json").exists(), "The native repository must not req
 resources = root / "resources/agent"
 identity = json.loads((resources / "package.json").read_text())
 assert not any(key in identity for key in ("dependencies", "devDependencies", "scripts", "bin"))
-for name in ("prime", "dark", "light"):
+for name in ("prime", "dark", "light", "neon"):
     json.loads((resources / f"src/modes/interactive/theme/{name}.json").read_text())
 for name in ("template.html", "template.css", "template.js", "vendor/marked.min.js", "vendor/highlight.min.js"):
     assert (resources / "src/core/export-html" / name).is_file(), name

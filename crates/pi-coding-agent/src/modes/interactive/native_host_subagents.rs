@@ -55,6 +55,15 @@ impl Bar {
         }
     }
 
+    /// Reuse the bar's cached status; never trigger another poll for the header.
+    pub(super) fn compact_jev_status(&self) -> Option<String> {
+        let mode = self.mode.borrow();
+        let session_id = mode.connection_state.as_ref()?.session_id.as_str();
+        let state = self.jev.lock().unwrap_or_else(|e| e.into_inner());
+        if state.session_id != session_id { return None; }
+        state.status.as_ref().map(|status| status.minimal.clone())
+    }
+
     pub(super) fn subscribe(
         &self,
         connection: Arc<dyn wire::AgentConnection>,
@@ -272,6 +281,22 @@ pub(super) fn project_child(
 #[cfg(test)]
 mod jev_bar_tests {
     use super::*;
+
+    #[test]
+    fn neon_header_uses_only_the_current_sessions_cached_status() {
+        let mode = Rc::new(RefCell::new(super::super::tests::stash_mode("neon-bar")));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState { session_id: "a".into(), ..Default::default() });
+        let bar = Bar::new(mode.clone());
+        assert!(bar.compact_jev_status().is_none());
+        {
+            let mut state = bar.jev.lock().unwrap();
+            state.select("a".into());
+            state.update("a", jev_activity::status(pi_jev::config::JevMode::Compare, false, false, None));
+        }
+        assert!(bar.compact_jev_status().unwrap().contains("Jev"));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState { session_id: "b".into(), ..Default::default() });
+        assert!(bar.compact_jev_status().is_none());
+    }
 
     #[test]
     fn switching_sessions_clears_usage_and_rejects_the_old_poll() {

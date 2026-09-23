@@ -609,7 +609,7 @@ async fn run_on_owner_thread(options: AgentsViewSeamOptions) -> Result<(), Strin
     palette::init_theme(settings.get_theme().as_deref(), true);
     let services = Arc::new(UiServices {
         cwd,
-        theme: settings.get_theme().unwrap_or_else(|| "prime".into()),
+        theme: settings.get_theme().unwrap_or_else(|| palette::get_default_theme().into()),
         themes: palette::get_available_themes(),
         hardware_cursor: settings.get_show_hardware_cursor(),
         clear_on_shrink: settings.get_clear_on_shrink(),

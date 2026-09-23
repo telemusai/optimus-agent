@@ -849,6 +849,7 @@ fn builtin_themes() -> &'static HashMap<String, ThemeJson> {
             // Native binaries need the same bundled presets as TS imports,
             // including when launched outside a source/package installation.
             let bundled = match name {
+                "neon" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/neon.json")),
                 "prime" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/prime.json")),
                 "light" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/light.json")),
                 _ => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/dark.json")),
@@ -858,6 +859,7 @@ fn builtin_themes() -> &'static HashMap<String, ThemeJson> {
                 .unwrap_or_default()
         };
         let mut themes = HashMap::new();
+        themes.insert("neon".to_string(), load("neon"));
         themes.insert("prime".to_string(), load("prime"));
         themes.insert("dark".to_string(), load("dark"));
         themes.insert("light".to_string(), load("light"));
@@ -1141,23 +1143,9 @@ fn ensure_default_terminal_colors_subscription() {
     });
 }
 
-/// Port of `detectTerminalBackground`.
-fn detect_terminal_background() -> &'static str {
-    match get_terminal_background_kind() {
-        Some(TerminalBackgroundKind::Light) => "light",
-        Some(TerminalBackgroundKind::Dark) => "dark",
-        None => "dark",
-    }
-}
-
-/// Port of `getDefaultTheme`.
-fn get_default_theme() -> &'static str {
-    // Prime brand is dark-first; only fall back to light when the terminal is light.
-    if detect_terminal_background() == "light" {
-        "light"
-    } else {
-        "prime"
-    }
+/// First-launch presentation when the user has not selected a theme.
+pub fn get_default_theme() -> &'static str {
+    "neon"
 }
 
 // ============================================================================
@@ -1382,7 +1370,7 @@ fn start_theme_watcher() {
     let Some(watched_theme_name) = current_theme_name else {
         return;
     };
-    if watched_theme_name == "prime" || watched_theme_name == "dark" || watched_theme_name == "light" {
+    if builtin_themes().contains_key(&watched_theme_name) {
         return;
     }
 
@@ -1869,6 +1857,21 @@ mod tests {
     }
 
     #[test]
+    fn neon_preset_is_complete_and_supports_truecolor_and_256_color_terminals() {
+        let json: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/neon.json"))).unwrap();
+        let preset = parse_theme_json("neon", &json).unwrap();
+        for mode in [TerminalColorMode::Truecolor, TerminalColorMode::Color256] {
+            let palette = create_theme(&preset, Some(mode), None).unwrap();
+            for key in THEME_COLOR_KEYS {
+                if BG_COLOR_KEYS.contains(key) { assert!(!palette.get_bg_ansi(key).is_empty()); }
+                else { assert!(!palette.get_fg_ansi(key).is_empty()); }
+            }
+            assert!(palette.fg("accent", "OPTIMUS").contains("OPTIMUS"));
+        }
+        assert!(get_available_themes().contains(&"neon".to_string()));
+    }
+
+    #[test]
     fn hex_to_rgb_and_errors() {
         assert_eq!(hex_to_rgb("#ff0000").expect("hex"), Rgb { r: 255.0, g: 0.0, b: 0.0 });
         assert_eq!(hex_to_rgb("00ff00").expect("hex"), Rgb { r: 0.0, g: 255.0, b: 0.0 });
@@ -2031,10 +2034,13 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_is_prime_unless_the_terminal_is_light() {
-        let detected = detect_terminal_background();
-        let expected = if detected == "light" { "light" } else { "prime" };
-        assert_eq!(get_default_theme(), expected);
+    fn default_theme_is_neon_and_explicit_choices_are_preserved() {
+        init_theme(None, false);
+        assert_eq!(theme().name.as_deref(), Some("neon"));
+        init_theme(Some("light"), false);
+        assert_eq!(theme().name.as_deref(), Some("light"));
+        init_theme(Some("prime"), false);
+        assert_eq!(theme().name.as_deref(), Some("prime"));
     }
 
     #[test]
@@ -2120,8 +2126,8 @@ mod tests {
         );
         assert_eq!(
             get_default_theme(),
-            "light",
-            "an automatic theme must re-resolve to the light preset (theme.ts:848-858)"
+            "neon",
+            "the first-launch theme stays Neon when the terminal background probe completes"
         );
         assert_eq!(
             changes.load(Ordering::SeqCst),
