@@ -348,6 +348,8 @@ pub struct KernelManagerOptions {
     pub bootstrap_code: Option<String>,
     /// File receiving the kernel process's stderr, rotated once at each spawn.
     pub stderr_log_path: Option<String>,
+    /// Called after the last tracked background handle settles or is torn down.
+    pub on_background_work_settled: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `PythonSkillRuntimeInfo` from ../skills.ts (TODO(slice): needs core::skills).

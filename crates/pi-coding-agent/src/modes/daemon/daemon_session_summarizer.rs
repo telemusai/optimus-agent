@@ -449,10 +449,7 @@ fn provider_stream_failure_retry_after_ms(message: &AssistantMessage) -> Option<
 
 /// Deterministic rejections never retry; auth gets one retry before it can be marked stale.
 fn is_permanent_provider_failure_kind(kind: Option<&str>, retries_performed: u32) -> bool {
-    if matches!(kind, Some("invalid_request") | Some("refusal") | Some("permission")) {
-        return true;
-    }
-    retries_performed > 0 && kind == Some("auth")
+    crate::core::provider_retry::is_permanent_provider_failure_kind(kind, f64::from(retries_performed))
 }
 
 /// Delay before retry `attempt` (1-based), honoring a server-requested not-before time.
@@ -914,3 +911,26 @@ fn unused_runtime_marker(_runtime: AgentSessionRuntime) {}
 
 #[allow(dead_code)]
 fn unused_custom_content_marker(_content: CustomMessageContent) {}
+
+#[cfg(test)]
+mod retry_safety_tests {
+    use super::*;
+    #[tokio::test]
+    async fn safety_filtered_status_is_not_retried() {
+        let attempts = std::sync::atomic::AtomicUsize::new(0);
+        let call = || -> CompleteFuture {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            Box::pin(async { AssistantMessage {
+                stop_reason: "error".into(), error_message: Some("Provider safety filter".into()),
+                diagnostics: Some(vec![pi_ai::utils::diagnostics::AssistantMessageDiagnostic {
+                    type_: "provider_stream_failure".into(), timestamp: 0, error: None,
+                    details: Some(serde_json::json!({"kind":"safety"}).as_object().unwrap().clone()),
+                }]), ..Default::default()
+            } })
+        };
+        let result = complete_with_provider_retry(&call,
+            ProviderRetryPolicy { base_delay_ms: 0.0, ..DEFAULT_PROVIDER_RETRY_POLICY }, None).await;
+        assert_eq!(attempts.load(Ordering::SeqCst), 1);
+        assert_eq!(result.error_message.as_deref(), Some("Provider safety filter"));
+    }
+}

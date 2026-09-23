@@ -4,10 +4,38 @@ use super::super::*;
 use serde_json::json;
 
 impl AgentSession {
+    /// Register the notification before checking liveness to cover completion races.
+    pub(in crate::core::agent_session) async fn wait_for_background_bash_settlement(&self, arrival_epoch: Option<u64>) -> bool {
+        loop {
+            let notified = self.session_action_activity_notify.notified();
+            tokio::pin!(notified);
+            notified.as_mut().enable();
+            if self.explicitly_stopped() || self.disposed.load(Ordering::SeqCst)
+                || self.disposing.load(Ordering::SeqCst)
+                || self.agent.signal().is_some_and(|signal| signal.is_cancelled())
+                || arrival_epoch.is_some_and(|epoch| self.session_input_arrival_epoch.load(Ordering::SeqCst) != epoch)
+            {
+                return false;
+            }
+            if !self.has_live_background_bash_handles() { return true; }
+            tokio::select! {
+                _ = notified => {},
+                _ = self.session_action_commit_dispose_abort.cancelled() => return false,
+                // Covers an abort without activity and custom kernel implementations.
+                _ = tokio::time::sleep(std::time::Duration::from_millis(100)) => {},
+            }
+        }
+    }
+
     /// `waitForHeadlessIdle()`.
     pub async fn wait_for_headless_idle(self: &Arc<Self>) -> Result<(), String> {
         loop {
             self.wait_for_idle().await?;
+            let had_background_work = self.has_live_background_bash_handles();
+            if !self.wait_for_background_bash_settlement(None).await {
+                return if had_background_work { Err("Background work wait cancelled".into()) } else { Ok(()) };
+            }
+            if had_background_work { continue; }
             let settlement = self
                 .post_compaction_continuation_settlement
                 .lock()

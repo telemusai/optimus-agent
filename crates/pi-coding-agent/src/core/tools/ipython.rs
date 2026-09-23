@@ -374,6 +374,7 @@ pub struct IpythonToolOptions {
     pub ready_gate: Option<Arc<dyn Fn() -> BoxFuture<'static, ()> + Send + Sync>>,
     /// Fires once per kernel start when a previous session's namespace was revived.
     pub on_restore: Option<Arc<dyn Fn(RestoreResult) + Send + Sync>>,
+    pub on_background_work_settled: Option<Arc<dyn Fn() + Send + Sync>>,
     pub on_late_sent_agent_message:
         Option<Arc<dyn Fn(String, KernelSentAgentMessage) + Send + Sync>>,
     /// Shared provisioner owning the kernel lifecycle. When provided, the remaining options are ignored.
@@ -832,6 +833,7 @@ impl IpythonKernelProvisioner {
                 max_variable_bytes: None,
                 debounce_ms: None,
             }),
+            on_background_work_settled: self.options.as_ref().and_then(|options| options.on_background_work_settled.clone()),
             bootstrap_code: Some(bootstrap_code.clone()),
             stderr_log_path: snapshot_dir
                 .as_ref()

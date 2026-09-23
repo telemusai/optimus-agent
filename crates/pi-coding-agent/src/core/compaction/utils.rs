@@ -2,7 +2,7 @@
 //!
 //! Shared utilities for compaction and branch summarization.
 
-use std::collections::BTreeSet;
+use std::collections::{BTreeSet, HashMap};
 
 use pi_agent_core::types::{AgentMessage, CustomAgentMessage};
 use pi_ai::types::Message;
@@ -79,25 +79,46 @@ pub fn compute_file_lists(file_ops: &FileOperations) -> (Vec<String>, Vec<String
     (read_only, modified_files)
 }
 
-/// Format file operations as XML tags for summary.
+/// Bound only rendered metadata; structured file tracking retains its existing inventory.
+const FILE_LIST_MAX_CHARS: usize = 6000;
+
+fn budget_file_section(tag: &str, files: &[String], remaining: &mut usize) -> String {
+    if files.is_empty() { return String::new(); }
+    let omitted = "[additional paths omitted; see structured compaction details]";
+    let overhead = format!("\n\n<{tag}>\n\n</{tag}>").chars().count();
+    if *remaining < overhead + omitted.len() { return String::new(); }
+    let mut body = String::new();
+    for (index, path) in files.iter().enumerate() {
+        let separator = usize::from(!body.is_empty());
+        let reserve = if index + 1 < files.len() { omitted.len() + 1 } else { 0 };
+        if overhead + body.chars().count() + separator + path.chars().count() + reserve > *remaining {
+            if !body.is_empty() { body.push('\n'); }
+            body.push_str(omitted);
+            break;
+        }
+        if !body.is_empty() { body.push('\n'); }
+        body.push_str(path);
+    }
+    let section = format!("\n\n<{tag}>\n{body}\n</{tag}>");
+    *remaining -= section.chars().count();
+    section
+}
+
+/// Modified paths take precedence within the combined display budget.
 pub fn format_file_operations(read_files: &[String], modified_files: &[String]) -> String {
-    let mut sections: Vec<String> = Vec::new();
-    if !read_files.is_empty() {
-        sections.push(format!(
-            "<read-files>\n{}\n</read-files>",
-            read_files.join("\n")
-        ));
-    }
-    if !modified_files.is_empty() {
-        sections.push(format!(
-            "<modified-files>\n{}\n</modified-files>",
-            modified_files.join("\n")
-        ));
-    }
-    if sections.is_empty() {
-        return String::new();
-    }
-    format!("\n\n{}", sections.join("\n\n"))
+    let mut remaining = FILE_LIST_MAX_CHARS;
+    let modified = budget_file_section("modified-files", modified_files, &mut remaining);
+    let read = budget_file_section("read-files", read_files, &mut remaining);
+    format!("{read}{modified}")
+}
+
+/// Remove mechanically appended inventories before iterating a prose summary.
+/// File identities remain in CompactionDetails and are reattached after generation.
+pub fn strip_file_operations(summary: &str) -> String {
+    static BLOCKS: std::sync::LazyLock<regex::Regex> = std::sync::LazyLock::new(|| {
+        regex::Regex::new(r"(?ms)^<read-files>\r?\n.*?^</read-files>[ \t]*\r?$|^<modified-files>\r?\n.*?^</modified-files>[ \t]*\r?$").unwrap()
+    });
+    BLOCKS.replace_all(summary, "").trim().to_string()
 }
 
 /// Maximum characters for a tool result in serialized summaries.
@@ -132,6 +153,8 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
 /// reasonable token budgets. Full content is not needed for summarization.
 pub fn serialize_conversation(messages: &[Message]) -> String {
     let mut parts: Vec<String> = Vec::new();
+    let mut calls: HashMap<String, usize> = HashMap::new();
+    let mut next_call = 1usize;
 
     for message in messages {
         match message {
@@ -166,7 +189,10 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                                 })
                                 .collect::<Vec<_>>()
                                 .join(", ");
-                            tool_calls.push(format!("{}({args_str})", tool_call.name));
+                            let index = next_call;
+                            next_call += 1;
+                            calls.insert(tool_call.id.clone(), index);
+                            tool_calls.push(format!("#{index} {}({args_str})", tool_call.name));
                         }
                     }
                 }
@@ -195,8 +221,13 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                     .collect::<Vec<_>>()
                     .join("");
                 if !content.is_empty() {
+                    let identity = match calls.get(&tool_result.tool_call_id) {
+                        Some(index) => format!("#{index} {}", tool_result.tool_name),
+                        None => format!("{} (call outside excerpt)", tool_result.tool_name),
+                    };
                     parts.push(format!(
-                        "[Tool result]: {}",
+                        "[Tool result {identity}{}]: {}",
+                        if tool_result.is_error { " ERROR" } else { "" },
                         truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS)
                     ));
                 }
@@ -317,7 +348,7 @@ mod tests {
         let text = serialize_conversation(&messages);
         assert_eq!(
             text,
-            "[User]: hello\n\n[Assistant thinking]: why\n\n[Assistant]: answer\n\n[Assistant tool calls]: edit(path=\"a.ts\")\n\n[Tool result]: ok"
+            "[User]: hello\n\n[Assistant thinking]: why\n\n[Assistant]: answer\n\n[Assistant tool calls]: #1 edit(path=\"a.ts\")\n\n[Tool result #1 edit]: ok"
         );
     }
 
@@ -334,7 +365,40 @@ mod tests {
         let text = serialize_conversation(&messages);
         assert!(text.contains("characters truncated; first"));
         assert!(text.ends_with(&"x".repeat(500)));
-        assert!(text.chars().count() <= TOOL_RESULT_MAX_CHARS + "[Tool result]: ".len());
+        assert!(text.chars().count() <= TOOL_RESULT_MAX_CHARS + "[Tool result bash (call outside excerpt)]: ".len());
+    }
+
+    #[test]
+    fn file_inventories_are_bounded_and_not_repeated_in_summary_input() {
+        let read = vec!["read.rs".to_string(); 200];
+        let modified: Vec<String> = (0..200).map(|index| format!("src/{index}/{}.rs", "界".repeat(80))).collect();
+        let rendered = format_file_operations(&read, &modified);
+        assert!(rendered.chars().count() <= FILE_LIST_MAX_CHARS);
+        assert!(rendered.contains(&modified[0]));
+        assert!(rendered.contains("additional paths omitted"));
+        let prose = "Keep the user's constraint. The function is read-files().";
+        assert_eq!(strip_file_operations(&format!("{prose}{rendered}")), prose);
+        assert_eq!(strip_file_operations(&format!("{prose}{rendered}").replace('\n', "\r\n")), prose);
+        assert_eq!(strip_file_operations("Narrative <read-files> inline </read-files>"),
+            "Narrative <read-files> inline </read-files>");
+        assert_eq!(modified.len(), 200);
+    }
+
+    #[test]
+    fn tool_results_correlate_out_of_order_and_label_errors() {
+        use pi_ai::types::ToolResultMessage;
+        let messages = vec![
+            Message::Assistant(AssistantMessage { content: vec![
+                ContentBlock::ToolCall(ToolCall::new("a", "ipython", Default::default())),
+                ContentBlock::ToolCall(ToolCall::new("b", "ipython", Default::default())),
+            ], ..Default::default() }),
+            Message::ToolResult(ToolResultMessage::new("b", "ipython", vec![ImageOrTextContent::Text(TextContent::new("failed"))], true, 1)),
+            Message::ToolResult(ToolResultMessage::new("a", "ipython", vec![ImageOrTextContent::Text(TextContent::new("passed"))], false, 2)),
+        ];
+        let serialized = serialize_conversation(&messages);
+        assert!(serialized.contains("#1 ipython(); #2 ipython()"));
+        assert!(serialized.contains("[Tool result #2 ipython ERROR]: failed"));
+        assert!(serialized.contains("[Tool result #1 ipython]: passed"));
     }
 
     #[test]

@@ -878,6 +878,15 @@ impl AgentSession {
                             Some(&self.settings_manager.lock().unwrap().get_model_tool_output_policy()),
                         )),
                         ready_gate,
+                        on_background_work_settled: {
+                            let weak = Arc::downgrade(self);
+                            Some(Arc::new(move || {
+                                if let Some(session) = weak.upgrade() {
+                                    session.maybe_resume_goal_continuation_after_rlm_work();
+                                    session.session_action_activity_notify.notify_waiters();
+                                }
+                            }))
+                        },
                         on_restore: if notify_restore {
                             let weak = Arc::downgrade(self);
                             Some(Arc::new(move |result: crate::core::kernel::state_snapshot::RestoreResult| {

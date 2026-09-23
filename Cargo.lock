@@ -1908,7 +1908,7 @@ dependencies = [
 
 [[package]]
 name = "pi-agent-core"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1953,7 +1953,7 @@ dependencies = [
 
 [[package]]
 name = "pi-ai"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1998,7 +1998,7 @@ dependencies = [
 
 [[package]]
 name = "pi-coding-agent"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2039,7 +2039,7 @@ dependencies = [
 
 [[package]]
 name = "pi-jev"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "base64",
  "chrono",
@@ -2059,7 +2059,7 @@ dependencies = [
 
 [[package]]
 name = "pi-tui"
-version = "0.1.1"
+version = "0.1.2"
 dependencies = [
  "anyhow",
  "async-trait",

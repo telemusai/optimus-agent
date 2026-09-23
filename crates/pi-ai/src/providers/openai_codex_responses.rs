@@ -254,13 +254,6 @@ fn is_stale_codex_continuation_error(error: &CodexThrown) -> bool {
     error.name == "CodexApiError" && error.code.as_deref().is_some_and(|code| code.eq_ignore_ascii_case("previous_response_not_found"))
 }
 
-fn is_stale_continuation_rejection(event: &Value) -> bool {
-    event.get("type").and_then(Value::as_str) == Some("error")
-        && event.get("code").and_then(Value::as_str).filter(|code| !code.is_empty())
-            .or_else(|| event.get("error").and_then(|error| error.get("code").or_else(|| error.get("type"))).and_then(Value::as_str))
-            .is_some_and(|code| code.eq_ignore_ascii_case("previous_response_not_found"))
-}
-
 /// `appendAssistantMessageDiagnostic(output, createAssistantMessageDiagnostic(...))`.
 fn append_diagnostic(output: &mut AssistantMessage, type_: &str, error: &CodexThrown, details: Map<String, Value>) {
     let diagnostic = AssistantMessageDiagnostic {
@@ -908,6 +901,7 @@ async fn run_openai_codex_responses(
                     {
                         // process_web_socket_stream discarded the failed chain
                         // and connection. Retry the original full body once.
+                        output.response_id = None;
                         continue;
                     }
                     if options
@@ -2538,7 +2532,14 @@ pub fn build_cached_web_socket_request_body(
     request
 }
 
-/// `startWebSocketOutputOnFirstEvent(events, output, stream, onStart)`.
+fn is_output_producing_event(event: &Value) -> bool {
+    let kind = event.get("type").and_then(Value::as_str).unwrap_or_default();
+    matches!(kind, "response.completed" | "response.incomplete" | "response.done")
+        || ["response.output_", "response.reasoning_", "response.content_", "response.refusal.", "response.function_"]
+            .iter().any(|prefix| kind.starts_with(prefix))
+}
+
+/// Emit Start only once the provider produces output, not handshake metadata.
 pub fn start_web_socket_output_on_first_event<S>(
     events: S,
     output: AssistantMessage,
@@ -2561,13 +2562,14 @@ where
         |(mut events, started, output, stream, on_start, error_slot)| async move {
             let _ = &error_slot;
             let event = events.next().await?;
-            if !started {
+            let producing_output = is_output_producing_event(&event);
+            if !started && producing_output {
                 on_start();
                 stream.push(AssistantMessageEvent::Start {
                     partial: output.clone(),
                 });
             }
-            Some((event, (events, true, output, stream, on_start, error_slot)))
+            Some((event, (events, started || producing_output, output, stream, on_start, error_slot)))
         },
     ))
 }
@@ -2658,8 +2660,8 @@ async fn process_web_socket_stream(
         let observation_options = options.stream.clone();
         move |event| {
             if let Ok(event) = event { observe_event(&observation_options, event); }
-            // Even an extension event is evidence that a request is in flight.
-            if event.as_ref().is_ok_and(|event| !is_stale_continuation_rejection(event)) {
+            // Output may have side effects even if the shared parser ignores its subtype.
+            if event.as_ref().is_ok_and(is_output_producing_event) {
                 on_start();
             }
         }
@@ -3492,7 +3494,7 @@ mod tests {
         let runtime = tokio::runtime::Runtime::new().unwrap();
         runtime.block_on(async {
             let stale = json!({"type":"error","code":"previous_response_not_found","message":"gone"});
-            let scripts = Arc::new(Mutex::new(VecDeque::from(vec![backlog_response("r1"), vec![stale.clone()], backlog_response("r2"), backlog_response("r3")])));
+            let scripts = Arc::new(Mutex::new(VecDeque::from(vec![backlog_response("r1"), vec![json!({"type":"response.created","response":{"id":"discard-me"}}), json!({"type":"response.in_progress"}), stale.clone()], backlog_response("r2"), backlog_response("r3")])));
             let requests = Arc::new(Mutex::new(Vec::new()));
             set_web_socket_constructor(Some(Arc::new({ let scripts=scripts.clone(); let requests=requests.clone(); move |_, _| {
                 Arc::new(ScriptedBacklogSocket { inner: FakeSocket::default(), scripts:scripts.clone(), requests:requests.clone() })
@@ -3514,8 +3516,11 @@ mod tests {
             assert_eq!(sent[3]["previous_response_id"], "r2");
 
             for (name, events, expected_requests) in [
-                ("partial", vec![json!({"type":"response.created","response":{"id":"inflight"}}), stale.clone()], 1),
-                ("extension", vec![json!({"type":"unrecognized.extension"}), stale.clone()], 1),
+                ("metadata", vec![json!({"type":"response.created","response":{"id":"inflight"}}), stale.clone()], 2),
+                ("extension", vec![json!({"type":"unrecognized.extension"}), stale.clone()], 2),
+                ("text", vec![json!({"type":"response.output_text.delta","delta":"visible"}), stale.clone()], 1),
+                ("reasoning", vec![json!({"type":"response.reasoning_summary_text.delta","delta":"visible"}), stale.clone()], 1),
+                ("tool", vec![json!({"type":"response.function_call_arguments.delta","delta":"{}"}), stale.clone()], 1),
                 ("other", vec![json!({"type":"error","code":"invalid_request","message":"bad"})], 1),
                 ("repeat", vec![stale.clone()], 2),
             ] {

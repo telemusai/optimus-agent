@@ -2390,6 +2390,7 @@ pub struct AgentSession {
     goal_state: Mutex<GoalState>,
     goal_accounting_started_at: Mutex<Option<f64>>,
     goal_continuation_awaits_rlm_work: AtomicBool,
+    goal_continuation_gate: Mutex<()>,
     goal_accounted_assistant_messages: Mutex<HashSet<String>>,
     goal_abort_in_progress: AtomicBool,
     autonomous_state: Mutex<crate::core::autonomous::AutonomousRuntimeState>,
@@ -2760,6 +2761,7 @@ impl AgentSession {
             goal_state: Mutex::new(empty_goal_state()),
             goal_accounting_started_at: Mutex::new(None),
             goal_continuation_awaits_rlm_work: AtomicBool::new(false),
+            goal_continuation_gate: Mutex::new(()),
             goal_accounted_assistant_messages: Mutex::new(HashSet::new()),
             goal_abort_in_progress: AtomicBool::new(false),
             autonomous_state: Mutex::new(create_autonomous_runtime_state(
@@ -4280,6 +4282,14 @@ impl AgentSession {
 
     /// `_maybeResumeGoalContinuationAfterRlmWork`.
     fn maybe_resume_goal_continuation_after_rlm_work(self: &Arc<Self>) {
+        // Lock order: continuation gate before goal/kernel state; never held across await.
+        let _gate = self.goal_continuation_gate.lock().unwrap();
+        if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst)
+            || self.explicitly_stopped() || self.is_queued_work_suspended()
+            || self.has_unsettled_rlm_quiescence_work() || self.has_live_background_bash_handles()
+        {
+            return;
+        }
         if !self
             .goal_continuation_awaits_rlm_work
             .swap(false, Ordering::SeqCst)
@@ -4289,12 +4299,8 @@ impl AgentSession {
         if self.goal_state.lock().unwrap().status != GoalStatus::Active {
             return;
         }
-        if self.has_running_rlm_children() {
-            self.goal_continuation_awaits_rlm_work
-                .store(true, Ordering::SeqCst);
-            return;
-        }
         self.run_or_queue_goal_context("continuation", None);
+        self.session_action_activity_notify.notify_waiters();
     }
 
     /// `_runOrQueueGoalContext`.
@@ -4593,8 +4599,18 @@ impl AgentSession {
                 }
             }
         }
-        let snapshot = self.snapshot_autonomous_runtime_state();
+        if !self.autonomous_state.lock().unwrap().enabled
+            || self.goal_state.lock().unwrap().status == GoalStatus::Active
+        {
+            return None;
+        }
         let arrival_epoch = self.session_input_arrival_epoch.load(Ordering::SeqCst);
+        if !self.wait_for_background_bash_settlement(Some(arrival_epoch)).await
+            || self.session_input_arrival_epoch.load(Ordering::SeqCst) != arrival_epoch
+        {
+            return None;
+        }
+        let snapshot = self.snapshot_autonomous_runtime_state();
         let options = crate::core::autonomous::AutonomousOperationOptions {
             cwd: Some(self.cwd.clone()),
             signal: self.agent.signal(),
@@ -4656,7 +4672,12 @@ impl AgentSession {
 
     /// `_queueGoalContinuationForThresholdCompaction`.
     fn queue_goal_continuation_for_threshold_compaction(&self, message: &AssistantMessage) -> bool {
+        let _gate = self.goal_continuation_gate.lock().unwrap();
         if self.goal_state.lock().unwrap().status != GoalStatus::Active {
+            return false;
+        }
+        if self.has_unsettled_rlm_quiescence_work() || self.has_live_background_bash_handles() {
+            self.goal_continuation_awaits_rlm_work.store(true, Ordering::SeqCst);
             return false;
         }
         if self
@@ -5459,13 +5480,14 @@ impl AgentSession {
         }
         // Delegating and ending the turn is correct behavior; hold the continuation
         // until descendants settle instead of re-prompting a waiting parent.
-        if self.has_unsettled_rlm_quiescence_work() {
-            self.goal_continuation_awaits_rlm_work
-                .store(true, Ordering::SeqCst);
-            return Vec::new();
+        {
+            let _gate = self.goal_continuation_gate.lock().unwrap();
+            self.goal_continuation_awaits_rlm_work.store(true, Ordering::SeqCst);
+            if self.has_unsettled_rlm_quiescence_work() || self.has_live_background_bash_handles() {
+                return Vec::new();
+            }
+            self.goal_continuation_awaits_rlm_work.store(false, Ordering::SeqCst);
         }
-        self.goal_continuation_awaits_rlm_work
-            .store(false, Ordering::SeqCst);
         self.ensure_goal_runtime_active(None);
         let goal = {
             let mut goal = self.goal_state.lock().unwrap().clone();
@@ -12344,23 +12366,17 @@ impl AgentSession {
         self.explicitly_stopped() || !self.queued_work_pauses.lock().unwrap().is_empty()
     }
 
-    /// `get isSessionActive()` (agent-session.ts:7164-7176).
-    ///
-    /// A session is active when the model is working, when the kernel still has
-    /// background work, when bash/refine/branch-summary/settlement work is in
-    /// flight, or when an unfinished action remains. A pending admission waiter is
-    /// deliberately NOT a term here: TS 7174 counts `unfinishedActionCount` only,
-    /// so `hasPendingAdmissionWaiters` governs passivation separately.
+    /// Owner-session kernel activity, separate from foreground model work.
+    pub fn has_live_background_bash_handles(&self) -> bool {
+        let session_id = self.session_id();
+        let kernels = crate::core::kernel::shared::live_kernels().lock().unwrap().clone();
+        kernels.iter().any(|client| client.owner_session_id().as_deref() == Some(session_id.as_str())
+            && client.has_background_work())
+    }
+
+    /// Session residency includes background helpers; foreground status does not.
     pub fn is_session_active(&self) -> bool {
-        let kernel_background_work = crate::core::kernel::shared::live_kernels()
-            .lock()
-            .unwrap()
-            .iter()
-            .any(|client| {
-                client.owner_session_id().as_deref() == Some(self.session_id().as_str())
-                    && client.has_background_work()
-            });
-        kernel_background_work || self.is_foreground_active()
+        self.has_live_background_bash_handles() || self.is_foreground_active()
     }
 
     /// Display activity only. Background helpers still keep the session alive
@@ -25342,6 +25358,73 @@ mod rlm_session_t10_tests {
         ) -> crate::core::kernel::shared::BoxFuture<'static, Option<Vec<String>>> {
             Box::pin(async { None })
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn automatic_background_wait_wakes_on_settlement_and_cancels_on_stop() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        let owned: Arc<dyn crate::core::kernel::shared::KernelClient> = Arc::new(OwnedBackgroundWorkKernel {
+            session_id: session.session_id(),
+        });
+        crate::core::kernel::shared::live_kernels_add(owned.clone());
+        let waiter = { let session = session.clone(); tokio::spawn(async move {
+            session.wait_for_background_bash_settlement(None).await
+        }) };
+        tokio::task::yield_now().await;
+        assert!(!waiter.is_finished());
+        assert_eq!(session.get_autonomous_status().continuations_used, 0.0);
+        crate::core::kernel::shared::live_kernels_delete(&owned);
+        session.session_action_activity_notify.notify_waiters();
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap());
+        crate::core::kernel::shared::live_kernels_add(owned.clone());
+        let epoch = session.session_input_arrival_epoch.load(Ordering::SeqCst);
+        let waiter = { let session = session.clone(); tokio::spawn(async move {
+            session.wait_for_background_bash_settlement(Some(epoch)).await
+        }) };
+        tokio::task::yield_now().await;
+        session.session_input_arrival_epoch.fetch_add(1, Ordering::SeqCst);
+        session.session_action_activity_notify.notify_waiters();
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap());
+        let waiter = { let session = session.clone(); tokio::spawn(async move {
+            session.wait_for_background_bash_settlement(None).await
+        }) };
+        tokio::task::yield_now().await;
+        session.request_abort();
+        assert!(!tokio::time::timeout(std::time::Duration::from_secs(1), waiter).await.unwrap().unwrap());
+        crate::core::kernel::shared::live_kernels_delete(&owned);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn goal_waits_for_own_background_build_without_spending_continuations() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        session.start_goal("Finish build", Some(100000.0)).unwrap();
+        let owned: Arc<dyn crate::core::kernel::shared::KernelClient> = Arc::new(OwnedBackgroundWorkKernel {
+            session_id: session.session_id(),
+        });
+        crate::core::kernel::shared::live_kernels_add(owned.clone());
+        let message = AssistantMessage { stop_reason: "stop".into(), ..Default::default() };
+        let before = session.goal_state().continuations_used;
+        let messages = session.get_goal_continuation_messages(AgentMessage::from(message.clone()), None).await;
+        assert!(messages.is_empty());
+        assert_eq!(session.goal_state().continuations_used, before);
+        assert!(!session.queue_goal_continuation_for_threshold_compaction(&message));
+        session.maybe_resume_goal_continuation_after_rlm_work();
+        assert!(session.goal_continuation_awaits_rlm_work.load(Ordering::SeqCst));
+        crate::core::kernel::shared::live_kernels_delete(&owned);
+        let pending = session.pending_next_turn_messages.lock().unwrap().len();
+        session.maybe_resume_goal_continuation_after_rlm_work();
+        assert!(!session.goal_continuation_awaits_rlm_work.load(Ordering::SeqCst));
+        assert_eq!(session.pending_next_turn_messages.lock().unwrap().len(), pending + 1);
+        session.maybe_resume_goal_continuation_after_rlm_work();
+        assert_eq!(session.pending_next_turn_messages.lock().unwrap().len(), pending + 1);
+        let messages = session.get_goal_continuation_messages(AgentMessage::from(message), None).await;
+        assert_eq!(messages.len(), 1);
+        assert_eq!(session.goal_state().continuations_used, before + 1.0);
+        session.goal_continuation_awaits_rlm_work.store(true, Ordering::SeqCst);
+        session.request_abort();
+        let pending = session.pending_next_turn_messages.lock().unwrap().len();
+        session.maybe_resume_goal_continuation_after_rlm_work();
+        assert_eq!(session.pending_next_turn_messages.lock().unwrap().len(), pending);
     }
 
     /// TS `isSessionActive` (agent-session.ts:7164-7176) includes kernel background

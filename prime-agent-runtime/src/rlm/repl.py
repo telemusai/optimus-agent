@@ -46,6 +46,23 @@ from .snapshot_serializer import SnapshotSerializationMetrics, dump_snapshot_val
 
 PROTOCOL_VERSION = 3
 
+_STREAM_FRAME_TEXT_CAP = 64 * 1024
+_RESULT_TEXT_CAP = 1024 * 1024
+_RESULT_TRUNCATION_MARKER = f"\n[... text truncated at {_RESULT_TEXT_CAP} characters ...]"
+_PAYLOAD_CAP = 16 * 1024 * 1024
+
+
+def _check_payload(event: str, data: dict[str, Any]) -> None:
+    # ASCII JSON length includes Unicode escaping, matching the wire encoding.
+    if len(json.dumps(data, allow_nan=False)) > _PAYLOAD_CAP:
+        raise ValueError(f"{event} payload exceeds the {_PAYLOAD_CAP}-character frame cap")
+
+
+def _cap_text(text: str) -> str:
+    if len(text) > _RESULT_TEXT_CAP:
+        return text[:_RESULT_TEXT_CAP] + _RESULT_TRUNCATION_MARKER
+    return text
+
 # Names the session bootstrap re-creates on every start; never snapshotted.
 _ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
 # IPython-injected names that may appear in a snapshot payload; never restored.
@@ -104,12 +121,7 @@ def emit(data: dict[str, Any]) -> None:
     """
     if not isinstance(data, dict) or not data or not all(isinstance(k, str) for k in data):
         raise TypeError("emit() requires a non-empty dict keyed by MIME type strings")
-    # Strict-dumps validation: default allow_nan=True would let NaN/Infinity
-    # serialize as non-JSON text and tear the host's protocol framing (a
-    # non-serializable value already raises in _send before any bytes are
-    # written, so NaN is the only corruption vector). Payloads are small, so
-    # the throwaway serialization here is cheap; _send re-serializes.
-    json.dumps(data, allow_nan=False)
+    _check_payload("display", data)
     _send({"event": "display", "id": _current_cell.get(), "data": data})
 
 
@@ -132,6 +144,7 @@ async def host_request(data: dict[str, Any]) -> dict[str, Any]:
         raise RuntimeError("repl runtime is not serving")
     if _host_closed:
         raise RuntimeError("host connection closed; host_request cannot be answered")
+    _check_payload("host_request", data)
     rid = uuid.uuid4().hex
     future: asyncio.Future[dict[str, Any]] = _loop.create_future()
     _pending_host[rid] = future
@@ -295,13 +308,18 @@ class _TaggedWriter(io.TextIOBase):
     def __init__(self, stream: str, fallback_fd: int) -> None:
         self._stream = stream
         self._fallback_fd = fallback_fd
+        self._frame_lock = threading.Lock()
         self._buffer = _TaggedBuffer(fallback_fd)
 
     def write(self, text: str) -> int:
         if not isinstance(text, str):
             raise TypeError(f"write() argument must be str, not {type(text).__name__}")
         if text:
-            _send({"event": self._stream, "id": _current_cell.get(), "text": text})
+            cell_id = _current_cell.get()
+            with self._frame_lock:
+                for start in range(0, len(text), _STREAM_FRAME_TEXT_CAP):
+                    _send({"event": self._stream, "id": cell_id,
+                           "text": text[start : start + _STREAM_FRAME_TEXT_CAP]})
         return len(text)
 
     def flush(self) -> None:
@@ -480,8 +498,8 @@ def _error_event(cell_id: str, exc: BaseException) -> dict[str, Any]:
         "event": "error",
         "id": cell_id,
         "ename": type(exc).__name__,
-        "evalue": _safe_str(exc),
-        "traceback": lines,
+        "evalue": _cap_text(_safe_str(exc)),
+        "traceback": [_cap_text("".join(lines))],
     }
 
 
@@ -584,7 +602,7 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             # handler-raised KeyboardInterrupt can never tear a frame mid-_send.
             _finish_request(cell_id)
         if result_text is not None:
-            _send({"event": "result", "id": cell_id, "text": result_text})
+            _send({"event": "result", "id": cell_id, "text": _cap_text(result_text)})
         if error is not None:
             _send(error)
         _send({"event": "done", "id": cell_id, "status": status})

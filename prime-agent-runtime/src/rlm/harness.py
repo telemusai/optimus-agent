@@ -240,6 +240,34 @@ def _validate_python_skill_reference(reference: dict[str, Any] | None) -> dict[s
     return normalized
 
 
+def _require_text(entry_name: str, field_name: str, value: Any) -> None:
+    if not isinstance(value, str) or not value:
+        raise ValueError(f"Harness entry {entry_name!r}: {field_name} must be a non-empty string")
+
+
+def _entry_name(id: Any, title: Any) -> str:
+    return id if isinstance(id, str) and id else title if isinstance(title, str) else "<unnamed>"
+
+
+def _validate_entry_fields(kind: str, id: str, title: Any, content: Any, *, path: Any,
+                           reference: Any, arguments: Any, metadata: Any, source: Any,
+                           existing: HarnessEntry | None) -> None:
+    for field_name, value in (("id", id), ("title", title), ("content", content), ("source", source)):
+        _require_text(id, field_name, value)
+    if path is not None:
+        _require_text(id, "path", path)
+    for field_name, value in (("reference", reference), ("arguments", arguments), ("metadata", metadata)):
+        if value is not None:
+            if not isinstance(value, dict):
+                raise ValueError(f"Harness entry {id!r}: {field_name} must be a dict")
+            try:
+                json.dumps(value, allow_nan=False)
+            except (TypeError, ValueError) as error:
+                raise ValueError(f"Harness entry {id!r}: {field_name} must contain JSON values") from error
+    if kind == "skill" and (reference is not None or existing is None):
+        _validate_python_skill_reference(reference)
+
+
 class HarnessState:
     """CRUD store for reset-free harness refinement state."""
 
@@ -543,6 +571,7 @@ class HarnessState:
         except FileNotFoundError:
             existing_mode = None
         mode = existing_mode if existing_mode is not None else 0o600
+        serialized = json.dumps(data, indent=2, ensure_ascii=False)
         try:
             # Create no looser than the destination; retain the umask for new files.
             descriptor = os.open(temp_path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, mode)
@@ -561,7 +590,10 @@ class HarnessState:
         self._load_status = "loaded"
         self._load_reason = None
         self._loaded_mtime = self._disk_mtime()
-        self._loaded_generation = self._disk_generation()
+        # Hash the exact bytes written; a restrictive umask may make reopening
+        # this newly created file impossible even though its save succeeded.
+        written = serialized.replace("\n", os.linesep).encode("utf-8")
+        self._loaded_generation = hashlib.sha256(written).hexdigest()
         self._needs_reload = False
         return self
 
@@ -662,8 +694,13 @@ class HarnessState:
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
 
+        _require_text(_entry_name(id, title), "title", title)
+        if id is not None:
+            _require_text(_entry_name(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         existing = self.entries[kind].get(entry_id)
+        _validate_entry_fields(kind, entry_id, title, content, path=path, reference=reference,
+                               arguments=arguments, metadata=metadata, source=source, existing=existing)
         if existing:
             existing.title = title
             existing.content = content
@@ -717,6 +754,7 @@ class HarnessState:
         self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(_entry_name(id, None), "id", id)
         if id not in self.entries[kind]:
             return False
         del self.entries[kind][id]
@@ -767,6 +805,9 @@ class HarnessState:
         self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(_entry_name(id, title), "title", title)
+        if id is not None:
+            _require_text(_entry_name(id, title), "id", id)
         entry_id = id or _slug(title, kind)
         if entry_id in self.entries[kind]:
             raise ValueError(f"{kind} entry {entry_id!r} already exists")
@@ -814,6 +855,7 @@ class HarnessState:
         self._sync_from_disk()
         if kind not in self.entries:
             raise ValueError(f"unknown harness kind {kind!r}; expected one of {_KINDS}")
+        _require_text(_entry_name(id, title), "id", id)
         if id not in self.entries[kind]:
             raise ValueError(f"{kind} entry {id!r} does not exist")
         return self._upsert(
@@ -989,8 +1031,17 @@ class HarnessState:
             return target.record_refinement(trigger, changes, evidence=evidence, outcome=outcome, id=id)
         self._ensure_local_writable()
         self._sync_from_disk()
-        event_id = id or generate_refinement_id()
+        _require_text("refinement", "trigger", trigger)
+        if id is not None:
+            _require_text("refinement", "id", id)
+        if not isinstance(changes, (str, list)):
+            raise ValueError("Refinement changes must be a string or a list of strings")
         normalized_changes = [changes] if isinstance(changes, str) else list(changes)
+        for change in normalized_changes:
+            _require_text("refinement", "change", change)
+        if not isinstance(evidence, str) or not isinstance(outcome, str):
+            raise ValueError("Refinement evidence and outcome must be strings")
+        event_id = id or generate_refinement_id()
         event = RefinementEvent(
             id=event_id,
             trigger=trigger,
