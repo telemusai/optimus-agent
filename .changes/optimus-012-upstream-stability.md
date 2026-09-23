@@ -1,0 +1,9 @@
+- Changed Optimus and its Python runtime version to 0.1.2.
+- Fixed unbounded Python output, result, exception, display and host-request frames; oversized kernel protocol frames now trigger recovery, and diagnostic cell-source copies are bounded.
+- Fixed invalid memory, skill and refinement writes being saved or partially mutating in-memory entries before validation.
+- Fixed stale Codex continuation recovery after metadata events while preventing replay after visible output or tool activity.
+- Fixed compaction tool-call/result correlation, stale progress summaries and repeated generated file inventories; retained state now informs text summaries and rendered file lists have a combined budget.
+- Fixed attached terminal recovery after announced daemon shutdowns, with bounded session discovery, cancellation and update handoff.
+- Fixed automatic goal and autonomous continuation while background Bash handles are still running.
+- Fixed provider safety-filter errors entering the retry loop and added Opus 5.5 always-on adaptive-thinking payload support.
+- Fixed POSIX kernel diagnostic directory and current/rotated log permissions.

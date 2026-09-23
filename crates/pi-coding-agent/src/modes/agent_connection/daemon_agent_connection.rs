@@ -114,6 +114,7 @@ pub struct DaemonSnapshotStream {
 /// `DaemonOutbound` messages this adapter dispatches.
 #[derive(Debug, Clone, PartialEq)]
 pub enum DaemonOutbound {
+    DaemonClosing { reason: DaemonClosingReason },
     HeartbeatsChanged {
         active_session_id: Option<String>,
         meta: Option<DaemonEventMeta>,
@@ -200,6 +201,7 @@ pub struct DaemonEventMeta {
 impl DaemonOutbound {
     pub fn type_name(&self) -> &'static str {
         match self {
+            DaemonOutbound::DaemonClosing { .. } => "daemon_closing",
             DaemonOutbound::HeartbeatsChanged { .. } => "heartbeats_changed",
             DaemonOutbound::SessionEvent { .. } => "session_event",
             DaemonOutbound::SideQuestionEvent { .. } => "side_question_event",
@@ -218,6 +220,7 @@ impl DaemonOutbound {
 
     fn active_session_id(&self) -> Option<&str> {
         match self {
+            DaemonOutbound::DaemonClosing { .. } => None,
             DaemonOutbound::HeartbeatsChanged { active_session_id, .. } => active_session_id.as_deref(),
             DaemonOutbound::SessionEvent { active_session_id, .. }
             | DaemonOutbound::SideQuestionEvent { active_session_id, .. }
@@ -885,6 +888,7 @@ pub struct DaemonAgentConnection {
     attached_session_file: Arc<Mutex<Option<String>>>,
     daemon_log_path: Arc<Mutex<Option<String>>>,
     update_restart_pending: Arc<Mutex<bool>>,
+    shutdown_restart_pending: Arc<Mutex<bool>>,
     update_reconnect_failed: Arc<Mutex<bool>>,
     terminal_close_emitted: Arc<Mutex<bool>>,
     active_side_question_ids: Arc<Mutex<HashSet<String>>>,
@@ -948,6 +952,7 @@ impl DaemonAgentConnection {
             attached_session_file: Arc::new(Mutex::new(None)),
             daemon_log_path: Arc::new(Mutex::new(None)),
             update_restart_pending: Arc::new(Mutex::new(false)),
+            shutdown_restart_pending: Arc::new(Mutex::new(false)),
             update_reconnect_failed: Arc::new(Mutex::new(false)),
             terminal_close_emitted: Arc::new(Mutex::new(false)),
             active_side_question_ids: Arc::new(Mutex::new(HashSet::new())),
@@ -1005,7 +1010,13 @@ impl DaemonAgentConnection {
                 }
             }
         });
+        let notices = Arc::downgrade(this);
         let message_handle = self.client.on_message(Arc::new(move |message| {
+            // Capture the announcement before a concurrently dispatched socket close.
+            if let (Some(connection), DaemonOutbound::DaemonClosing { reason }) = (notices.upgrade(), &message) {
+                connection.observe_daemon_closing(reason);
+                return;
+            }
             let _ = send.send(message);
         }));
         *self.unsubscribe_daemon_messages.lock().unwrap() = Some(message_handle);
@@ -1444,6 +1455,7 @@ impl DaemonAgentConnection {
             let _ = store.attach(self.client.clone()).await;
         }
         if let Some(error) = self.deferred_session_events.lock().unwrap().failure.clone() { return Err(error); }
+        *self.shutdown_restart_pending.lock().unwrap() = false;
         Ok(())
     }
 
@@ -1476,11 +1488,10 @@ impl DaemonAgentConnection {
             .await;
             return;
         }
-        // An authoritative shutdown/update reason outranks the surviving direct link.
+        // Poll the same socket after an announced shutdown; never launch a daemon here.
         if get_daemon_socket_close_reason(&error) == Some(DaemonClosingReason::Shutdown) {
-            *self.terminal_close_emitted.lock().unwrap() = true;
-            let message = self.format_daemon_session_closed_error("shutdown");
-            self.emit(AgentConnectionEvent::Closed { error: Some(message) }).await;
+            *self.shutdown_restart_pending.lock().unwrap() = true;
+            let _ = self.reconnect(error).await;
             return;
         }
         let update_pending = *self.update_restart_pending.lock().unwrap();
@@ -1674,14 +1685,25 @@ fn parse_session_snapshot(value: &Value) -> Result<DaemonSessionSnapshot, String
 
 impl DaemonAgentConnection {
     async fn restore_connection_after_update(&self) -> Result<(), String> {
+        self.restore_connection_after_restart(UPDATE_RECONNECT_TIMEOUT_MS, false).await
+    }
+
+    async fn restore_connection_after_restart(&self, timeout_ms: u64, shutdown: bool) -> Result<(), String> {
+        tokio::time::timeout(Duration::from_millis(timeout_ms),
+            self.restore_connection_after_restart_inner(timeout_ms, shutdown)).await
+            .unwrap_or_else(|_| Err("the restored session did not become available before the recovery timeout".into()))
+    }
+
+    async fn restore_connection_after_restart_inner(&self, timeout_ms: u64, shutdown: bool) -> Result<(), String> {
         let session_id = self.attached_session_id.lock().unwrap().clone();
         let session_file = self.attached_session_file.lock().unwrap().clone();
         if session_id.is_none() && session_file.is_none() {
             return Err("the previous session identity is unavailable".to_string());
         }
-        let deadline = now_ms() + UPDATE_RECONNECT_TIMEOUT_MS as i64;
+        let deadline = now_ms() + timeout_ms as i64;
         let mut last_error: Option<String> = None;
         while !*self.disposed.lock().unwrap() && now_ms() < deadline {
+            if shutdown && *self.update_restart_pending.lock().unwrap() { return Ok(()); }
             let attempt: Result<bool, String> = async {
                 self.client.reconnect(1000).await?;
                 if *self.disposed.lock().unwrap() {
@@ -1725,7 +1747,8 @@ impl DaemonAgentConnection {
                         if *self.disposed.lock().unwrap() {
                             return Ok(true);
                         }
-                        *self.update_restart_pending.lock().unwrap() = false;
+                        if shutdown && *self.update_restart_pending.lock().unwrap() { return Ok(true); }
+                        if !shutdown { *self.update_restart_pending.lock().unwrap() = false; }
                         self.emit(AgentConnectionEvent::SessionResynced { snapshot }).await;
                         Ok(true)
                     }
@@ -1772,7 +1795,11 @@ impl DaemonAgentConnection {
             _ = attempt.cancel.cancelled() => Err("Daemon reconnect cancelled".to_string()),
             result = async {
                 if !*self.update_restart_pending.lock().unwrap() {
-                    self.reconnect_owner(cause).await?;
+                    if *self.shutdown_restart_pending.lock().unwrap() {
+                        self.reconnect_shutdown_owner(cause).await?;
+                    } else {
+                        self.reconnect_owner(cause).await?;
+                    }
                 }
                 if !*self.disposed.lock().unwrap() && *self.update_restart_pending.lock().unwrap() {
                     self.reconnect_update_owner().await?;
@@ -1782,6 +1809,44 @@ impl DaemonAgentConnection {
         };
         attempt.result.send_replace(Some(result.clone()));
         result
+    }
+
+    fn observe_daemon_closing(&self, reason: &DaemonClosingReason) {
+        match reason {
+            DaemonClosingReason::Shutdown => *self.shutdown_restart_pending.lock().unwrap() = true,
+            DaemonClosingReason::Update => *self.update_restart_pending.lock().unwrap() = true,
+        }
+    }
+
+    async fn reconnect_shutdown_owner(&self, cause: String) -> Result<(), String> {
+        self.emit(AgentConnectionEvent::ConnectionStatus {
+            status: "reconnecting".into(), error: Some(cause),
+        }).await;
+        let timeout_ms = self.options.lock().unwrap().reconnect_timeout_ms.unwrap_or(DAEMON_RECONNECT_TIMEOUT_MS);
+        let result = tokio::select! {
+            result = self.restore_connection_after_restart(timeout_ms, true) => result,
+            _ = async {
+                loop {
+                    if *self.update_restart_pending.lock().unwrap() { break; }
+                    tokio::time::sleep(Duration::from_millis(25)).await;
+                }
+            } => return Ok(()),
+        };
+        if *self.disposed.lock().unwrap() || *self.update_restart_pending.lock().unwrap() { return Ok(()); }
+        match result {
+            Ok(()) => {
+                self.emit(AgentConnectionEvent::ConnectionStatus { status: "connected".into(), error: None }).await;
+            }
+            Err(_) => {
+                *self.terminal_close_emitted.lock().unwrap() = true;
+                *self.shutdown_restart_pending.lock().unwrap() = false;
+                self.client.close();
+                self.emit(AgentConnectionEvent::Closed {
+                    error: Some(self.format_daemon_session_closed_error("shutdown")),
+                }).await;
+            }
+        }
+        Ok(())
     }
 
     async fn reconnect_owner(&self, cause: String) -> Result<(), String> {
@@ -2220,6 +2285,10 @@ impl DaemonAgentConnection {
     }
 
     async fn handle_daemon_message_inner(&self, message: DaemonOutbound, replaying: bool) -> Result<(), String> {
+        if let DaemonOutbound::DaemonClosing { reason } = &message {
+            if !*self.disposed.lock().unwrap() { self.observe_daemon_closing(reason); }
+            return Ok(());
+        }
         if *self.disposed.lock().unwrap() { return Ok(()); }
         // A bounded opening buffer must fail visibly, never continue beyond a
         // missing prefix. A fresh attachment explicitly resets this failure.
@@ -2476,18 +2545,26 @@ impl DaemonAgentConnection {
                 Ok(())
             }
             DaemonOutbound::SessionClosed { reason, .. } => {
-                if reason == "update" {
+                if reason == "update" || (matches!(reason.as_str(), "shutdown" | "killed")
+                    && *self.update_restart_pending.lock().unwrap())
+                {
                     self.capture_daemon_log_path();
                     *self.update_restart_pending.lock().unwrap() = true;
                     self.reconnect_after_update();
                     return Ok(());
+                }
+                if matches!(reason.as_str(), "shutdown" | "killed")
+                    && *self.shutdown_restart_pending.lock().unwrap()
+                {
+                    return self.reconnect("The daemon is restarting; waiting for this session to return.".into()).await;
                 }
                 *self.terminal_close_emitted.lock().unwrap() = true;
                 let message = self.format_daemon_session_closed_error(&reason);
                 self.emit(AgentConnectionEvent::Closed { error: Some(message) }).await;
                 Ok(())
             }
-            DaemonOutbound::HeartbeatsChanged { .. }
+            DaemonOutbound::DaemonClosing { .. }
+            | DaemonOutbound::HeartbeatsChanged { .. }
             | DaemonOutbound::SessionSnapshotBegin { .. }
             | DaemonOutbound::SessionSnapshotChunk { .. }
             | DaemonOutbound::SessionSnapshotEnd { .. }
@@ -4436,6 +4513,9 @@ pub(crate) async fn test_decode_cached_attach_frames(frames: &[Value]) -> Vec<Ag
 #[cfg(test)]
 #[path = "daemon_backlog_tests.rs"]
 mod daemon_backlog_tests;
+#[cfg(test)]
+#[path = "daemon_restart_tests.rs"]
+mod daemon_restart_tests;
 
 #[cfg(test)]
 #[path = "jev_status_tests.rs"]

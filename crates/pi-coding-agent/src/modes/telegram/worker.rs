@@ -266,7 +266,7 @@ fn connection_session_snapshot(snapshot: &ProtocolSessionSnapshot) -> Connection
 /// One wire frame as the connection slice's `DaemonOutbound`.
 ///
 /// Frames with no connection-level meaning (`response`, `daemon_hello`,
-/// `daemon_closing`, `roster_update`, `session_attached`, `session_detached`,
+/// `roster_update`, `session_attached`, `session_detached`,
 /// `session_list_progress`) read as `None`, exactly as the TypeScript connection
 /// ignores them.
 fn connection_outbound_from_wire(value: &Value) -> Option<ConnectionOutbound> {
@@ -280,6 +280,7 @@ fn connection_outbound_from_wire(value: &Value) -> Option<ConnectionOutbound> {
     }
     let outbound = ProtocolOutbound::from_value(&frame)?;
     let outbound = match outbound {
+        ProtocolOutbound::DaemonClosing { reason } => ConnectionOutbound::DaemonClosing { reason },
         ProtocolOutbound::HeartbeatsChanged { active_session_id, .. } => ConnectionOutbound::HeartbeatsChanged {
             active_session_id,
             meta,
@@ -1125,6 +1126,12 @@ mod tests {
             }
             other => panic!("unexpected frame: {other:?}"),
         }
+    }
+
+    #[test]
+    fn daemon_shutdown_notice_reaches_connection_recovery() {
+        let event = connection_outbound_from_wire(&serde_json::json!({"type":"daemon_closing","reason":"shutdown"}));
+        assert!(matches!(event, Some(ConnectionOutbound::DaemonClosing { reason: crate::modes::daemon::daemon_protocol::DaemonClosingReason::Shutdown })));
     }
 
     #[test]

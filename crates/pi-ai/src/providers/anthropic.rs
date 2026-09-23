@@ -1285,10 +1285,11 @@ fn parse_cache_creation(value: Option<&Value>) -> Option<AnthropicCacheCreationU
 
 /// TS: `isAlwaysOnAdaptiveThinkingModel(modelId)`.
 ///
-/// Fable/Mythos models think every turn and reject an explicit
+/// Opus 5.5 and Fable/Mythos models think every turn and reject an explicit
 /// `thinking: {type: "disabled"}` (and any sampling params) with a 400.
 fn is_always_on_adaptive_thinking_model(model_id: &str) -> bool {
-	model_id.contains("fable-5") || model_id.contains("mythos-5") || model_id.contains("mythos-preview")
+	model_id.contains("opus-5-5") || model_id.contains("opus-5.5")
+		|| model_id.contains("fable-5") || model_id.contains("mythos-5") || model_id.contains("mythos-preview")
 }
 
 /// Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6).
@@ -2928,6 +2929,23 @@ mod tests {
 		let always_on = test_model("anthropic", "claude-fable-5");
 		let params = build_params(&always_on, &context, false, &options, None).unwrap();
 		assert!(params.get("temperature").is_none());
+	}
+
+	#[test]
+	fn opus_55_payload_uses_always_on_adaptive_thinking() {
+		for id in ["claude-opus-5-5", "claude-opus-5.5", "claude-opus-5-5-20260922"] {
+			let model = test_model("anthropic", id);
+			let context = context_with_user("hi");
+			let mut options = AnthropicOptions::default();
+			options.stream.temperature = Some(0.5);
+			options.thinking_enabled = Some(false);
+			let params = build_params(&model, &context, false, &options, None).unwrap();
+			assert!(params.get("temperature").is_none(), "{id}");
+			assert!(params.get("thinking").is_none(), "{id}");
+			options.thinking_enabled = Some(true);
+			let params = build_params(&model, &context, false, &options, None).unwrap();
+			assert_eq!(params["thinking"]["type"], "adaptive", "{id}");
+		}
 	}
 
 	#[test]

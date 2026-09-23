@@ -81,6 +81,20 @@ synchronously — including direct fd writes — precedes its `done`. Ordering
 between a cell's Python-level writes and its raw fd writes is not guaranteed
 (two channels).
 
+## Message bounds
+
+Python stdout/stderr writes are split into frames of at most 65,536 characters
+without dropping output or changing cell attribution. Trailing results, exception
+values and the aggregate formatted traceback are capped at 1,048,576 characters
+plus an explicit truncation marker. The full result value remains in the kernel.
+
+Display and host-request payloads must be finite JSON values and serialize to at
+most 16 MiB with ASCII escaping (the wire encoding). Rejected host requests do
+not allocate pending reply state. Errors are reported to the cell and subsequent
+cells remain usable. The host rejects protocol frames exceeding 32 MiB, including
+unterminated frames, through its existing kernel repair path. Large results should
+be saved to files and inspected in bounded slices.
+
 ## Execution
 
 Cells compile with `PyCF_ALLOW_TOP_LEVEL_AWAIT` and run as tasks on the

@@ -60,6 +60,35 @@ const STARTUP_STDERR_TAIL_CHARS: usize = 1024;
 const TASKKILL_TIMEOUT_MS: u64 = 5000;
 /// Read chunk size for the child's stdout / stderr pumps.
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
+// Wire bytes, including JSON escaping. Matches the Python sender's smaller caps.
+const MAX_PROTOCOL_FRAME_BYTES: usize = 32 * 1024 * 1024;
+const MAX_CELL_SOURCE_CHARS: usize = 2048;
+
+fn cap_cell_source(code: &str) -> String {
+    let mut chars = code.chars();
+    let prefix: String = chars.by_ref().take(MAX_CELL_SOURCE_CHARS).collect();
+    if chars.next().is_some() {
+        format!("{prefix}\n[... cell source truncated ...]")
+    } else {
+        prefix
+    }
+}
+
+fn first_protocol_frame_too_large(buffer: &str) -> bool {
+    buffer.find('\n').unwrap_or(buffer.len()) > MAX_PROTOCOL_FRAME_BYTES
+}
+
+#[cfg(unix)]
+fn tighten_log_permissions(path: &std::path::Path, mode: u32) -> std::io::Result<()> {
+    use std::os::unix::fs::PermissionsExt;
+    match std::fs::metadata(path) {
+        Ok(metadata) if metadata.is_file() || (mode == 0o700 && metadata.is_dir()) =>
+            std::fs::set_permissions(path, std::fs::Permissions::from_mode(mode)),
+        Ok(_) => Ok(()),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(()),
+        Err(error) => Err(error),
+    }
+}
 
 /// Complete event vocabulary of protocol version 2 (see prime-agent-runtime/src/rlm/repl.md).
 /// The version handshake is exact, so an unknown kind is corruption, not a newer runtime.
@@ -310,6 +339,7 @@ struct ManagerOptions {
     performance_metrics: Option<Arc<dyn PerformanceMetricRecorder>>,
     bootstrap_code: Option<String>,
     stderr_log_path: Option<String>,
+    on_background_work_settled: Option<Arc<dyn Fn() + Send + Sync>>,
 }
 
 /// `{ superseded: boolean }` shared with an in-flight protocol repair.
@@ -525,6 +555,7 @@ impl KernelState {
                 performance_metrics: options.performance_metrics,
                 bootstrap_code: options.bootstrap_code,
                 stderr_log_path: options.stderr_log_path,
+                on_background_work_settled: options.on_background_work_settled,
             },
             handled_host_request_ids: Mutex::new(Vec::new()),
             child: Mutex::new(None),
@@ -579,6 +610,12 @@ impl KernelState {
         !self.background_bash_handles.lock().unwrap().is_empty()
     }
 
+    fn notify_background_work_settled(&self) {
+        if let Some(callback) = &self.options.on_background_work_settled {
+            let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| callback()));
+        }
+    }
+
     fn append_kernel_diagnostic(&self, message: &str) {
         let suffix = if message.ends_with('\n') { "" } else { "\n" };
         self.append_kernel_stderr_text(&format!("[kernel] {message}{suffix}"));
@@ -599,8 +636,20 @@ impl KernelState {
         let path = self.options.stderr_log_path.clone()?;
         let path_buf = std::path::PathBuf::from(&path);
         let result = (|| -> std::io::Result<(std::fs::File, u64)> {
-            if let Some(parent) = path_buf.parent() {
-                std::fs::create_dir_all(parent)?;
+            if let Some(parent) = path_buf.parent().filter(|parent| !parent.as_os_str().is_empty()) {
+                let mut builder = std::fs::DirBuilder::new();
+                builder.recursive(true);
+                #[cfg(unix)] {
+                    use std::os::unix::fs::DirBuilderExt;
+                    builder.mode(0o700);
+                }
+                builder.create(parent)?;
+                #[cfg(unix)]
+                tighten_log_permissions(parent, 0o700)?;
+            }
+            #[cfg(unix)] {
+                tighten_log_permissions(&path_buf, 0o600)?;
+                tighten_log_permissions(std::path::Path::new(&format!("{path}.old")), 0o600)?;
             }
             let mut size = match std::fs::metadata(&path_buf) {
                 Ok(metadata) => metadata.len(),
@@ -622,10 +671,14 @@ impl KernelState {
                     size = 0;
                 }
             }
-            let file = std::fs::OpenOptions::new()
-                .append(true)
-                .create(true)
-                .open(&path_buf)?;
+            let mut options = std::fs::OpenOptions::new();
+            options.append(true).create(true);
+            #[cfg(unix)] {
+                use std::os::unix::fs::OpenOptionsExt;
+                options.mode(0o600);
+            }
+            // Windows logs inherit the owning profile directory's ACL.
+            let file = options.open(&path_buf)?;
             Ok((file, size))
         })();
         match result {
@@ -1343,7 +1396,13 @@ impl KernelState {
                         return;
                     }
                     buffered.push_str(&decode_utf8_chunk(&mut pending, &chunk[..read]));
-                    while let Some(newline) = buffered.find('\n') {
+                    loop {
+                        if first_protocol_frame_too_large(&buffered) {
+                            this.fail_protocol_frame(&child_state,
+                                "kernel protocol frame exceeds 32 MiB; output was rejected");
+                            return;
+                        }
+                        let Some(newline) = buffered.find('\n') else { break; };
                         if !this.is_current_child(&child_state) {
                             return;
                         }
@@ -1590,6 +1649,7 @@ impl KernelState {
                                 }
                             } else {
                                 let mut handles = self.background_bash_handles.lock().unwrap();
+                                let had_work = !handles.is_empty();
                                 if handles
                                     .iter()
                                     .find(|(existing, _)| *existing == id)
@@ -1597,6 +1657,11 @@ impl KernelState {
                                     .unwrap_or(false)
                                 {
                                     ordered_delete(&mut handles, &id);
+                                }
+                                let settled = had_work && handles.is_empty();
+                                drop(handles);
+                                if settled {
+                                    self.notify_background_work_settled();
                                 }
                             }
                         }
@@ -2636,7 +2701,7 @@ impl KernelState {
         let mut payload = data.as_object().cloned().unwrap_or_default();
         match cell_source_code {
             Some(code) => {
-                payload.insert("cellSourceCode".to_string(), json!(code));
+                payload.insert("cellSourceCode".to_string(), json!(cap_cell_source(&code)));
             }
             None => {
                 payload.insert("cellSourceCode".to_string(), Value::Null);
@@ -2675,7 +2740,15 @@ impl KernelState {
             .unwrap()
             .clear();
         self.pending_done_waiters.lock().unwrap().clear();
-        self.background_bash_handles.lock().unwrap().clear();
+        let had_background_work = {
+            let mut handles = self.background_bash_handles.lock().unwrap();
+            let had_work = !handles.is_empty();
+            handles.clear();
+            had_work
+        };
+        if had_background_work {
+            self.notify_background_work_settled();
+        }
         // Stale pre-teardown background output must not surface after a restart.
         *self.pending_background_output.lock().unwrap() = String::new();
         self.pending_background_output_truncated
@@ -4089,6 +4162,84 @@ mod tests {
 
     /// Process-global lock for tests that touch ambient env vars.
     static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    #[test]
+    fn protocol_frame_limit_handles_delimiters_and_unicode() {
+        let maximum = "x".repeat(MAX_PROTOCOL_FRAME_BYTES);
+        assert!(!first_protocol_frame_too_large(&maximum));
+        assert!(!first_protocol_frame_too_large(&format!("{maximum}\nnext")));
+        assert!(first_protocol_frame_too_large(&format!("{maximum}x")));
+        assert!(first_protocol_frame_too_large(&format!("{maximum}x\n")));
+        assert!(first_protocol_frame_too_large(&"😀".repeat(MAX_PROTOCOL_FRAME_BYTES / 4 + 1)));
+        assert!(!first_protocol_frame_too_large(&format!("ok\n{maximum}")));
+        assert_eq!(cap_cell_source("small"), "small");
+        let source = "😀".repeat(MAX_CELL_SOURCE_CHARS + 1);
+        assert!(cap_cell_source(&source).starts_with(&"😀".repeat(MAX_CELL_SOURCE_CHARS)));
+        assert!(cap_cell_source(&source).ends_with("[... cell source truncated ...]"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn stderr_logs_are_private_after_creation_reopen_and_rotation() {
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let parent = dir.path().join("session");
+        let path = parent.join("kernel-stderr.log");
+        let old = parent.join("kernel-stderr.log.old");
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            stderr_log_path: Some(path.to_string_lossy().into_owned()),
+            ..Default::default()
+        });
+        let state = manager.state();
+        drop(state.open_stderr_log().unwrap());
+        assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777, 0o700);
+        assert_eq!(std::fs::metadata(&path).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::set_permissions(&parent, std::fs::Permissions::from_mode(0o755)).unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        std::fs::write(&old, "old").unwrap();
+        std::fs::set_permissions(&old, std::fs::Permissions::from_mode(0o644)).unwrap();
+        drop(state.open_stderr_log().unwrap());
+        assert_eq!(std::fs::metadata(&old).unwrap().permissions().mode() & 0o777, 0o600);
+        std::fs::OpenOptions::new().write(true).open(&path).unwrap()
+            .set_len(MAX_KERNEL_STDERR_LOG_BYTES + 1).unwrap();
+        drop(state.open_stderr_log().unwrap());
+        for file in [&path, &old] {
+            assert_eq!(std::fs::metadata(file).unwrap().permissions().mode() & 0o777, 0o600);
+        }
+        assert_eq!(std::fs::metadata(&parent).unwrap().permissions().mode() & 0o777, 0o700);
+    }
+
+    #[test]
+    fn background_settlement_notifies_once_after_last_matching_handle_and_on_teardown() {
+        let notifications = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = notifications.clone();
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            on_background_work_settled: Some(Arc::new(move || { counter.fetch_add(1, Ordering::SeqCst); })),
+            ..Default::default()
+        });
+        let state = manager.state();
+        let activity = |id: &str, pid: u32, active: bool| {
+            state.handle_event(json!({"event":"display", "data": {
+                BASH_ACTIVITY_DISPLAY_MIME: {"id": id, "pid": pid, "active": active}
+            }}).as_object().unwrap()).unwrap();
+        };
+        let a = "a".repeat(32);
+        let b = "b".repeat(32);
+        activity(&a, 1, true);
+        activity(&b, 2, true);
+        activity(&a, 1, false);
+        activity(&b, 99, false);
+        assert!(state.has_background_work());
+        assert_eq!(notifications.load(Ordering::SeqCst), 0);
+        activity(&b, 2, false);
+        activity(&b, 2, false);
+        assert!(!state.has_background_work());
+        assert_eq!(notifications.load(Ordering::SeqCst), 1);
+        activity(&a, 1, true);
+        state.cleanup_resources(None);
+        state.cleanup_resources(None);
+        assert_eq!(notifications.load(Ordering::SeqCst), 2);
+    }
 
     /// G2-03: a failed stderr-log rotation must not cost the log. TS keeps the
     /// existing file, logs `cannot rotate kernel stderr log: ...` and the write

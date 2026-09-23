@@ -94,7 +94,7 @@ fn preparation(split: bool) -> CompactionPreparation {
         },
         is_split_turn: split,
         tokens_before: 250_905.0,
-        previous_summary: None,
+        retained_state_anchor: None, previous_summary: None,
         file_ops: create_file_ops(),
         settings: default_compaction_settings(),
     }

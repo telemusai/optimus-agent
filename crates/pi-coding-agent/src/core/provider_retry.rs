@@ -98,7 +98,7 @@ pub fn provider_stream_failure_retry_after_ms(message: &AssistantMessage) -> Opt
 /// Deterministic rejections never retry; auth gets one retry before it can be
 /// marked stale.
 pub fn is_permanent_provider_failure_kind(kind: Option<&str>, retries_performed: f64) -> bool {
-    if matches!(kind, Some("invalid_request") | Some("refusal") | Some("permission") | Some("request_interrupted")) {
+    if matches!(kind, Some("invalid_request") | Some("refusal") | Some("safety") | Some("permission") | Some("request_interrupted")) {
         return true;
     }
     retries_performed > 0.0 && kind == Some("auth")
@@ -569,7 +569,7 @@ mod tests {
 
     #[test]
     fn permanent_kinds_never_retry_and_auth_gets_one_retry() {
-        for kind in ["invalid_request", "refusal", "permission"] {
+        for kind in ["invalid_request", "refusal", "safety", "permission"] {
             assert!(is_permanent_provider_failure_kind(Some(kind), 0.0));
         }
         assert!(!is_permanent_provider_failure_kind(Some("auth"), 0.0));
@@ -655,6 +655,7 @@ mod tests {
     async fn completion_retry_preserves_partial_or_uncertain_response_without_replay() {
         for (kind, content) in [
             ("request_interrupted", vec![]),
+            ("safety", vec![]),
             ("server_error", vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new("partial"))]),
             ("server_error", vec![pi_ai::types::ContentBlock::Thinking(pi_ai::types::ThinkingContent::new("partial reasoning"))]),
             ("server_error", vec![pi_ai::types::ContentBlock::ToolCall(pi_ai::types::ToolCall::new("id", "tool", Default::default()))]),

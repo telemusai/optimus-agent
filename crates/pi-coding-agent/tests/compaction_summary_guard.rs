@@ -34,7 +34,7 @@ async fn summarize(message: AssistantMessage, split: bool) -> Result<String, Str
         turn_prefix_messages: if split { messages } else { Vec::new() },
         is_split_turn: split,
         tokens_before: 250_000.0,
-        previous_summary: None,
+        retained_state_anchor: None, previous_summary: None,
         file_ops: create_file_ops(),
         settings: default_compaction_settings(),
     };
