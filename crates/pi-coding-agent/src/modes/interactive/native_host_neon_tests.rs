@@ -44,6 +44,17 @@ fn assistant(text: &str) -> AgentMessage {
 #[test]
 fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
     let _mode = mode();
+    let palette = crate::modes::interactive::theme::theme::load_theme_from_path(
+        concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/agent/src/modes/interactive/theme/neon.json"
+        ),
+        Some(crate::modes::interactive::theme::theme::TerminalColorMode::Truecolor),
+    )
+    .unwrap();
+    assert_eq!(palette.get_fg_ansi("accent"), "\x1b[38;2;0;244;119m");
+    assert_eq!(palette.get_fg_ansi("thinkingText"), "\x1b[38;2;226;1;234m");
+    assert_eq!(palette.get_fg_ansi("text"), "\x1b[38;2;179;188;199m");
     let data = HeaderData {
         cwd: "~/projects/界界界",
         session: "Long title 👩‍💻 ",
@@ -52,7 +63,9 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
         jev: Some("Jev Full · fallback"),
         clock: "12:34:56",
     };
-    for width in [1, 8, 24, 35, 36, 79, 80, 89, 90, 100, 120, 160] {
+    for width in [
+        1, 8, 24, 35, 36, 79, 80, 89, 90, 100, 109, 110, 120, 159, 160, 240,
+    ] {
         for budget in 0..12 {
             let rows = render_header(width, budget, &data);
             assert!(rows.len() <= budget);
@@ -81,6 +94,22 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
     assert!(!render_header(80, 3, &data)
         .join("\n")
         .contains("telemus.ai"));
+    let header = render_header(160, 7, &data);
+    assert!(strip_ansi(&header[0]).trim().is_empty());
+    let strip = strip_ansi(&header[4]);
+    assert!(strip.contains("● fixture-model  │  ● Jev Full · fallback"));
+    assert!(header[4].contains(&format!(
+        "{}● Jev Full · fallback",
+        theme().get_fg_ansi("warning")
+    )));
+    assert!(strip_ansi(&header[1]).trim_end().ends_with("telemus.ai"));
+    let disabled = HeaderData {
+        jev: Some("Jev Off"),
+        ..data
+    };
+    assert!(render_header(120, 7, &disabled)
+        .join("\n")
+        .contains("○ Jev Off"));
 }
 
 #[test]

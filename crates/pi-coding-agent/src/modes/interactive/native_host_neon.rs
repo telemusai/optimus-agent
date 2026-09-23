@@ -284,38 +284,62 @@ fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<Stri
         },
         &clean_label(data.phase).to_uppercase(),
     );
-    let model = palette.fg("mdLink", &clean_label(data.model));
+    let model = palette.fg("accent", &format!("● {}", clean_label(data.model)));
+    let jev = data.jev.map(|label| {
+        let lower = label.to_ascii_lowercase();
+        let (color, dot) = if lower.contains("fallback") || lower.contains("error") {
+            ("warning", "●")
+        } else if lower.contains("off") || lower.contains("disabled") {
+            ("dim", "○")
+        } else {
+            ("accent", "●")
+        };
+        palette.fg(color, &format!("{dot} {}", clean_label(label)))
+    });
     let mut rows = Vec::new();
+    if budget >= 4 {
+        rows.push(String::new());
+    }
     if budget >= 7 && width >= 110 {
         const LOGO: [&str; 3] = [
             "█▀▀█ █▀▀█ ▀▀█▀▀ ▀█▀ █▀▄▀█ █  █ █▀▀",
             "█  █ █▀▀▀   █    █  █ ▀ █ █  █ ▀▀█",
             "▀▀▀▀ ▀      ▀   ▀▀▀ ▀   ▀ ▀▀▀▀ ▀▀▀",
         ];
-        const HORIZON: [&str; 3] = [
-            "        ▄▄▄▄▄▄▄        ",
-            "   /\\  ▀▀▀▀▀▀▀  /\\   ",
-            "__/__\\___/\\___/__\\__",
-        ];
+        let brand_width = 37;
+        let caption_width = if width >= 160 { 36 } else { 0 };
         for i in 0..3 {
+            let caption = if caption_width > 0 {
+                fit(
+                    &match i {
+                        0 => palette.fg("muted", "BUILT FOR WHAT'S NEXT"),
+                        1 => palette.fg("thinkingText", "///"),
+                        _ => palette.fg("accent", "AGENTS > CODE > REASON > TEST > SHIP"),
+                    },
+                    caption_width,
+                )
+            } else {
+                String::new()
+            };
             let brand = format!(
-                " {}    {}",
-                palette.fg("accent", LOGO[i]),
-                palette.fg("thinkingText", HORIZON[i])
+                "{}{}",
+                fit(&format!(" {}", palette.fg("accent", LOGO[i])), brand_width),
+                caption,
             );
             let right = match i {
-                0 => palette.fg("mdLink", "telemus.ai"),
-                1 => format!("SYSTEM // {status}"),
-                _ => palette.fg("dim", "RUST NATIVE"),
+                0 => palette.bold(&palette.fg("accent", "telemus.ai")),
+                1 => String::new(),
+                _ => format!("SYSTEM // {status}"),
             };
             rows.push(paired(&brand, &format!("{right} "), width));
         }
-        rows.push(paired(
-            &palette.fg("accent", " BUILT FOR WHAT'S NEXT  ///"),
-            &palette.fg("dim", "AGENTS > CODE > REASON > TEST > SHIP "),
-            width,
-        ));
-        rows.push(String::new());
+        if caption_width == 0 {
+            rows.push(paired(
+                &palette.fg("muted", " BUILT FOR WHAT'S NEXT  ///"),
+                &palette.fg("accent", "AGENTS > CODE > REASON > TEST > SHIP "),
+                width,
+            ));
+        }
     } else if budget >= 3 {
         rows.push(paired(
             &palette.fg("accent", " OPTIMUS  //  BUILT FOR WHAT'S NEXT"),
@@ -325,7 +349,11 @@ fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<Stri
     }
     let session = format!("{} · {}", clean_label(data.cwd), clean_label(data.session));
     let right = if width >= 100 {
-        format!("{model} · {} · {}", data.jev.unwrap_or(&status), data.clock)
+        format!(
+            "{model}  │  {}  │  {}",
+            jev.as_deref().unwrap_or(&status),
+            data.clock
+        )
     } else if width >= 60 {
         format!("{model} · {status}")
     } else {

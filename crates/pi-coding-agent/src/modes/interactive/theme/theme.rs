@@ -1143,23 +1143,9 @@ fn ensure_default_terminal_colors_subscription() {
     });
 }
 
-/// Port of `detectTerminalBackground`.
-fn detect_terminal_background() -> &'static str {
-    match get_terminal_background_kind() {
-        Some(TerminalBackgroundKind::Light) => "light",
-        Some(TerminalBackgroundKind::Dark) => "dark",
-        None => "dark",
-    }
-}
-
-/// Port of `getDefaultTheme`.
-fn get_default_theme() -> &'static str {
-    // Prime brand is dark-first; only fall back to light when the terminal is light.
-    if detect_terminal_background() == "light" {
-        "light"
-    } else {
-        "prime"
-    }
+/// First-launch presentation when the user has not selected a theme.
+pub fn get_default_theme() -> &'static str {
+    "neon"
 }
 
 // ============================================================================
@@ -2048,10 +2034,13 @@ mod tests {
     }
 
     #[test]
-    fn default_theme_is_prime_unless_the_terminal_is_light() {
-        let detected = detect_terminal_background();
-        let expected = if detected == "light" { "light" } else { "prime" };
-        assert_eq!(get_default_theme(), expected);
+    fn default_theme_is_neon_and_explicit_choices_are_preserved() {
+        init_theme(None, false);
+        assert_eq!(theme().name.as_deref(), Some("neon"));
+        init_theme(Some("light"), false);
+        assert_eq!(theme().name.as_deref(), Some("light"));
+        init_theme(Some("prime"), false);
+        assert_eq!(theme().name.as_deref(), Some("prime"));
     }
 
     #[test]
@@ -2137,8 +2126,8 @@ mod tests {
         );
         assert_eq!(
             get_default_theme(),
-            "light",
-            "an automatic theme must re-resolve to the light preset (theme.ts:848-858)"
+            "neon",
+            "the first-launch theme stays Neon when the terminal background probe completes"
         );
         assert_eq!(
             changes.load(Ordering::SeqCst),

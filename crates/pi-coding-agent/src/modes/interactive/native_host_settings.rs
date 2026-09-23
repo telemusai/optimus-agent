@@ -90,7 +90,7 @@ pub(super) fn create(
             .iter()
             .map(|level| level.as_str().into())
             .collect(),
-        current_theme: settings.get_theme().unwrap_or_else(|| "prime".into()),
+        current_theme: settings.get_theme().unwrap_or_else(|| crate::modes::interactive::theme::theme::get_default_theme().into()),
         available_themes: get_available_themes(),
         hide_thinking_block: mode.hide_thinking_block,
         fullscreen: mode.fullscreen_enabled,

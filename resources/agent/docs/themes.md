@@ -37,26 +37,30 @@ Select a theme via `/settings` or in `settings.json`:
 }
 ```
 
-On first run, Prime Agent detects your terminal background and defaults to `prime` or `light`.
+Optimus defaults to `neon` on first run. A theme already selected in settings is
+preserved. Select `prime`, `dark`, `light`, or a custom theme via `/settings`.
 
 ## Optimus Neon
 
-Select **neon** in `/settings`, then use `/fullscreen on` for the complete layout.
+Neon is the default for new installations. To switch back to it, select **neon**
+in `/settings`, then use `/fullscreen on` for the complete layout.
 The selection is saved in your existing settings; other themes remain available.
 
-Neon provides a dark canvas with green and cyan borders, magenta thinking text,
+Neon provides a dark canvas with green (`#00f477`) borders, magenta (`#e201ea`)
+thinking text and grey (`#b3bcc7`) body text,
 a fixed Optimus banner and session/model strip, and a framed conversation timeline.
 The existing agent counts and live Jev activity stay in the bordered bottom bar,
 with Jev requests, token usage and latency aligned on the right. The context meter
 uses the session’s current token usage, including in-flight output.
 
-Wide terminals show a character-art horizon and local-time message timestamps.
+Wide terminals show a padded text banner, model and Jev status dots, and
+local-time message timestamps.
 The timestamps come from recorded messages; a live tool's start time is the time
 its execution event reaches this UI. Elapsed tool time is shown only when this UI
 observed the start and finish. Reopening a session does not invent historical
 execution durations or replace missing timestamps with the current time.
 
-On smaller terminals the art, clock, timestamp gutter and meter yield to the
+On smaller terminals the large heading, clock, timestamp gutter and meter yield to the
 conversation and editor. The usual tool/thinking expansion keys, scrolling,
 selection and copying still work; copied transcript text excludes the decorative
 rail, timestamps and borders. `/fullscreen off` keeps the Neon colours with the

@@ -1,2 +1,4 @@
-- Added the optional Optimus Neon theme with a responsive fixed banner, framed timestamped conversation timeline, live Jev status and context meter.
+- Added the Optimus Neon theme with a responsive fixed banner, framed timestamped conversation timeline, live Jev status and context meter.
 - Added fixed fullscreen header support while preserving editor space, scroll anchors and transcript copying without decorative gutters.
+- Fixed the Neon palette (green #00f477, thinking #e201ea, text #b3bcc7), added model/Jev status dots and top padding, and removed the landscape decoration.
+- Changed the first-launch default to Neon while preserving explicitly selected themes.
