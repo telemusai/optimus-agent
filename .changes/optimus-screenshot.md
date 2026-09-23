@@ -1,0 +1,1 @@
+- Added an Optimus terminal screenshot to the README introduction.

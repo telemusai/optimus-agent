@@ -12,6 +12,8 @@ It combines a persistent Python workspace, recursive subagents, inspectable memo
 
 Optimus supports **native Windows reliability, stronger session continuity, Astra-aware model handling, project-scoped learning, measurable efficiency, and a Rust implementation of the application layer.** See [Foundations and acknowledgements](#foundations-and-acknowledgements) for the projects it builds on.
 
+![Optimus Agent terminal showing Python execution, agent coordination, and Jev status](docs/images/optimus-agent.png)
+
 ## Install and update
 
 The standalone installers select the **highest stable `vMAJOR.MINOR.PATCH` tag** from this repository and build it locally with Cargo's locked dependencies. They exclude prerelease tags and never install an untagged `main` build. Run the same command again to update; an already-installed tag is left in place. Standalone installation starts with the **latest release**.
