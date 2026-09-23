@@ -1,0 +1,1 @@
+- Changed the README introduction to describe native Windows support as an existing capability.
