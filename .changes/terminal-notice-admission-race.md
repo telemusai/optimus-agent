@@ -1,0 +1,1 @@
+- Fixed child cancellation notices racing next-turn delivery and causing sessions to stop accepting input or continuations.

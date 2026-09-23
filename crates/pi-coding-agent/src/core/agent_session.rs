@@ -9302,24 +9302,24 @@ impl AgentSession {
             return;
         }
         loop {
-            let index = {
-                let pending = self.pending_next_turn_messages.lock().unwrap();
-                pending
+            let (index, message) = {
+                let mut pending = self.pending_next_turn_messages.lock().unwrap();
+                let Some(index) = pending
                     .iter()
                     .position(|message| self.is_rlm_terminal_notice(message))
+                else {
+                    break;
+                };
+                // Claim the notice before admission publishes events or another
+                // task drains next-turn context. Never retain an index across it.
+                (index, pending.remove(index))
             };
-            let index = match index {
-                Some(index) => index,
-                None => break,
-            };
-            let message = self.pending_next_turn_messages.lock().unwrap()[index].clone();
-            if self.enqueue_rlm_terminal_notice_action(message).is_err() {
+            if self.enqueue_rlm_terminal_notice_action(message.clone()).is_err() {
+                let mut pending = self.pending_next_turn_messages.lock().unwrap();
+                let restore_index = index.min(pending.len());
+                pending.insert(restore_index, message);
                 return;
             }
-            self.pending_next_turn_messages
-                .lock()
-                .unwrap()
-                .remove(index);
         }
         self.schedule_session_input_pump();
     }
