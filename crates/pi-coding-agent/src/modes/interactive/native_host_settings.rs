@@ -178,10 +178,11 @@ pub(super) fn fullscreen(
         ui.borrow_mut()
             .enter_fullscreen(pi_tui::tui::FullscreenOptions {
                 scroll: vec![transcript.clone()],
-                dock,
+                dock: Rc::new(RefCell::new(native_neon::Dock(dock))),
                 mouse,
                 viewport_controls: true,
             });
+        ui.borrow_mut().set_fullscreen_header(Some(Rc::new(RefCell::new(native_neon::Header(mode.clone(), Rc::downgrade(transcript))))));
     } else {
         ui.borrow_mut()
             .exit_fullscreen(pi_tui::tui::ExitFullscreenOptions {

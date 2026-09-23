@@ -70,6 +70,8 @@ mod native_heartbeats;
 mod native_history;
 #[path = "native_host_queue.rs"]
 mod native_queue;
+#[path = "native_host_neon.rs"]
+mod native_neon;
 #[path = "native_host_settings.rs"]
 mod native_settings;
 #[path = "native_host_state.rs"]
@@ -152,6 +154,11 @@ struct Transcript {
     mode: Rc<RefCell<InteractiveMode>>,
     rows: Vec<Box<dyn TuiComponent>>,
     row_keys: HashMap<usize, Rc<str>>,
+    row_metadata: HashMap<Rc<str>, native_neon::RowMeta>,
+    assistant_row: Option<usize>,
+    timeline: Option<native_neon::Timeline>,
+    selection_columns: Vec<Option<(usize, usize)>>,
+    connection_status: String,
     viewport_anchors: Vec<Option<pi_tui::fullscreen::ViewportAnchor>>,
     assistant: Option<Rc<RefCell<AssistantMessageComponent>>>,
     assistants: Vec<Rc<RefCell<AssistantMessageComponent>>>,
@@ -257,6 +264,11 @@ impl Transcript {
             mode,
             rows: Vec::new(),
             row_keys: HashMap::new(),
+            row_metadata: HashMap::new(),
+            assistant_row: None,
+            timeline: None,
+            selection_columns: Vec::new(),
+            connection_status: String::new(),
             viewport_anchors: Vec::new(),
             assistant: None,
             assistants: Vec::new(),
@@ -268,6 +280,8 @@ impl Transcript {
         self.history = None;
         self.rows.clear();
         self.row_keys.clear();
+        self.row_metadata.clear();
+        self.assistant_row = None;
         self.viewport_anchors.clear();
         self.tools.clear();
         self.assistant = None;
@@ -337,9 +351,17 @@ impl Transcript {
     }
     fn message_anchored(&mut self, message: AgentMessage, streaming: bool, key: &str) {
         let start = self.rows.len();
+        let meta = native_neon::RowMeta::message(&message);
+        if message.role() == "assistant" {
+            if let Some(key) = self.assistant_row.and_then(|row| self.row_keys.get(&row)) {
+                self.row_metadata.insert(key.clone(), meta.clone());
+            }
+        }
         self.append_message(message, streaming);
         for index in start..self.rows.len() {
-            self.row_keys.entry(index).or_insert_with(|| Rc::from(format!("{key}:{}", index - start)));
+            let key = self.row_keys.entry(index).or_insert_with(|| Rc::from(format!("{key}:{}", index - start)));
+            let row = self.row_metadata.entry(key.clone()).or_insert_with(|| meta.clone());
+            if row.timestamp.is_none() { row.timestamp = meta.timestamp; }
         }
     }
     fn append_message(&mut self, message: AgentMessage, streaming: bool) {
@@ -374,6 +396,7 @@ impl Transcript {
                             ..Default::default()
                         },
                     )));
+                    self.assistant_row = Some(self.rows.len());
                     self.rows.push(Box::new(SharedComponent(component.clone())));
                     self.assistants.push(component.clone());
                     self.assistant = Some(component.clone());
@@ -393,6 +416,7 @@ impl Transcript {
                 }
                 if !streaming {
                     self.assistant = None;
+                    self.assistant_row = None;
                 }
             }
             AgentMessage::Message(pi_ai::types::Message::ToolResult(result)) => {
@@ -467,7 +491,9 @@ impl Transcript {
         component.mark_execution_started();
         component.set_expanded(mode.tool_output_expanded);
         let component = Rc::new(RefCell::new(component));
-        self.row_keys.insert(self.rows.len(), Rc::from(format!("tool:{id}")));
+        let key: Rc<str> = Rc::from(format!("tool:{id}"));
+        self.row_metadata.insert(key.clone(), native_neon::RowMeta::new(native_neon::Kind::Tool, None));
+        self.row_keys.insert(self.rows.len(), key);
         self.rows.push(Box::new(ToolRow(component.clone())));
         self.tools.insert(id.to_string(), component);
     }
@@ -489,6 +515,12 @@ impl Transcript {
                 },
             )
             .collect();
+        if !partial {
+            if let Some(meta) = self.row_metadata.get_mut(format!("tool:{id}").as_str()) {
+                meta.kind = if is_error { native_neon::Kind::Error } else { native_neon::Kind::Success };
+                if let Some(started) = meta.started.take() { meta.elapsed = Some(started.elapsed()); }
+            }
+        }
         component.borrow_mut().update_result(
             ToolExecutionResult {
                 content,
@@ -501,6 +533,8 @@ impl Transcript {
 }
 impl TuiComponent for Transcript {
     fn render(&mut self, width: f64) -> Vec<String> {
+        self.timeline = (native_neon::active() && self.mode.borrow().fullscreen_enabled).then(|| native_neon::Timeline::new(width.max(1.0) as usize));
+        let width = self.timeline.map_or(width, |timeline| timeline.content_width() as f64);
         let mode = self.mode.borrow();
         let mut lines = Vec::new();
         let mut keys = Vec::new();
@@ -508,7 +542,11 @@ impl TuiComponent for Transcript {
         if let Some(surfaces) = &self.extension_surfaces {
             if let Some(header) = &mut surfaces.borrow_mut().header { lines.extend(header.render(width)); custom_header = true; }
         }
-        if !custom_header && self.rows.is_empty() && self.history.as_ref().is_none_or(|h| h.rows.is_empty()) {
+        if self.timeline.is_some() && !custom_header && self.rows.is_empty() && self.history.as_ref().is_none_or(|h| h.rows.is_empty()) {
+            lines.push(theme().fg("accent", "Ready when you are."));
+            lines.push(theme().fg("dim", "Describe a task, or use /help to explore commands."));
+        }
+        if self.timeline.is_none() && !custom_header && self.rows.is_empty() && self.history.as_ref().is_none_or(|h| h.rows.is_empty()) {
             let model = mode.get_current_model_id();
             let cwd = mode.get_current_cwd();
             let hint = mode.start_hint.to_string();
@@ -583,7 +621,22 @@ impl TuiComponent for Transcript {
         keys.resize(lines.len(), None);
         let rendered = self.wrapped_lines.render(lines, width.max(1.0) as usize);
         self.viewport_anchors = self.wrapped_lines.anchors(&keys);
-        rendered
+        self.selection_columns = if let Some(t) = self.timeline {
+            rendered.iter().map(|line| Some((t.left, t.left + pi_tui::utils::visible_width(pi_tui::utils::strip_ansi(line).trim_end()).min(t.content_width())))).collect()
+        } else { Vec::new() };
+        if let Some(timeline) = self.timeline {
+            rendered.iter().zip(&self.viewport_anchors).map(|(line, anchor)| {
+                let meta = anchor.as_ref().and_then(|anchor| self.row_metadata.get(&anchor.key)
+                    .or_else(|| self.history.as_ref().and_then(|h| h.row_metadata.get(&anchor.key))));
+                timeline.line(line, meta, anchor.as_ref().is_some_and(|a| a.offset == 0))
+            }).collect()
+        } else { rendered }
+    }
+    fn get_selection_columns(&self) -> Vec<Option<(usize, usize)>> {
+        self.selection_columns.clone()
+    }
+    fn get_fullscreen_padding(&self) -> String {
+        self.timeline.map(|t| t.padding()).unwrap_or_default()
     }
     fn get_viewport_anchors(&self) -> Vec<Option<pi_tui::fullscreen::ViewportAnchor>> {
         self.viewport_anchors.clone()
@@ -626,7 +679,9 @@ impl Tray {
             .unwrap_or_default();
         let usage = mode.get_tray_context_usage_text();
         let left_themed = theme().fg("dim", &left);
-        let usage_themed = usage.as_deref().map(|usage| theme().fg("dim", usage));
+        let usage_themed = usage.as_deref().map(|usage| if native_neon::active() {
+            native_neon::context_meter(mode.get_connection_context_usage().as_ref(), usage, width as usize)
+        } else { theme().fg("dim", usage) });
         let composed = tray_row::compose_tray_row(
             tray_row::TrayRow {
                 left: &left_themed,
@@ -2499,9 +2554,10 @@ async fn run_terminal(
                 HostEvent::Connection(wire::AgentConnectionEvent::ConnectionStatus {
                     status,
                     error,
-                }) => mode
-                    .borrow_mut()
-                    .show_status(&error.unwrap_or(status), "dim"),
+                }) => {
+                    transcript.borrow_mut().connection_status = status.clone();
+                    mode.borrow_mut().show_status(&error.unwrap_or(status), "dim");
+                }
                 HostEvent::Connection(wire::AgentConnectionEvent::SessionStatus { recap }) => {
                     mode.borrow_mut().session_recap = recap;
                     mode.borrow_mut().render_recap();
@@ -4428,11 +4484,15 @@ fn apply_event(
                 }
             }
         }
-        "tool_execution_start" => transcript.borrow_mut().tool_start(
-            &string(&value, "toolCallId"),
-            &string(&value, "toolName"),
-            value.get("args").cloned().unwrap_or_default(),
-        ),
+        "tool_execution_start" => {
+            let id = string(&value, "toolCallId");
+            let mut transcript = transcript.borrow_mut();
+            transcript.tool_start(&id, &string(&value, "toolName"), value.get("args").cloned().unwrap_or_default());
+            if let Some(meta) = transcript.row_metadata.get_mut(format!("tool:{id}").as_str()) {
+                meta.started.get_or_insert_with(Instant::now);
+                meta.timestamp = Some(now_ms() as i64);
+            }
+        },
         "tool_execution_end" | "tool_execution_update" => transcript.borrow_mut().tool_result(
             &string(&value, "toolCallId"),
             value

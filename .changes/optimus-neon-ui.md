@@ -1,0 +1,2 @@
+- Added the optional Optimus Neon theme with a responsive fixed banner, framed timestamped conversation timeline, live Jev status and context meter.
+- Added fixed fullscreen header support while preserving editor space, scroll anchors and transcript copying without decorative gutters.

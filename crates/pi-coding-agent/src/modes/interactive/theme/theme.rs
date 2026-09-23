@@ -849,6 +849,7 @@ fn builtin_themes() -> &'static HashMap<String, ThemeJson> {
             // Native binaries need the same bundled presets as TS imports,
             // including when launched outside a source/package installation.
             let bundled = match name {
+                "neon" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/neon.json")),
                 "prime" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/prime.json")),
                 "light" => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/light.json")),
                 _ => include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/dark.json")),
@@ -858,6 +859,7 @@ fn builtin_themes() -> &'static HashMap<String, ThemeJson> {
                 .unwrap_or_default()
         };
         let mut themes = HashMap::new();
+        themes.insert("neon".to_string(), load("neon"));
         themes.insert("prime".to_string(), load("prime"));
         themes.insert("dark".to_string(), load("dark"));
         themes.insert("light".to_string(), load("light"));
@@ -1382,7 +1384,7 @@ fn start_theme_watcher() {
     let Some(watched_theme_name) = current_theme_name else {
         return;
     };
-    if watched_theme_name == "prime" || watched_theme_name == "dark" || watched_theme_name == "light" {
+    if builtin_themes().contains_key(&watched_theme_name) {
         return;
     }
 
@@ -1866,6 +1868,21 @@ mod tests {
             colors_map.insert((*key).to_string(), ColorValue::Text("#112233".to_string()));
         }
         ThemeJson { name: "test".to_string(), colors: colors_map, ..Default::default() }
+    }
+
+    #[test]
+    fn neon_preset_is_complete_and_supports_truecolor_and_256_color_terminals() {
+        let json: serde_json::Value = serde_json::from_str(include_str!(concat!(env!("CARGO_MANIFEST_DIR"), "/../../resources/agent/src/modes/interactive/theme/neon.json"))).unwrap();
+        let preset = parse_theme_json("neon", &json).unwrap();
+        for mode in [TerminalColorMode::Truecolor, TerminalColorMode::Color256] {
+            let palette = create_theme(&preset, Some(mode), None).unwrap();
+            for key in THEME_COLOR_KEYS {
+                if BG_COLOR_KEYS.contains(key) { assert!(!palette.get_bg_ansi(key).is_empty()); }
+                else { assert!(!palette.get_fg_ansi(key).is_empty()); }
+            }
+            assert!(palette.fg("accent", "OPTIMUS").contains("OPTIMUS"));
+        }
+        assert!(get_available_themes().contains(&"neon".to_string()));
     }
 
     #[test]

@@ -66,9 +66,20 @@ pub trait Component {
     /// Render the component to lines for the given viewport width.
     fn render(&mut self, width: f64) -> Vec<String>;
 
+    /// Fixed chrome can yield rows to the transcript on short terminals.
+    fn render_with_height(&mut self, width: f64, _height: usize) -> Vec<String> {
+        self.render(width)
+    }
+
     fn get_selection_regions(&self) -> Vec<TableCellSelectionRegion> {
         Vec::new()
     }
+
+    /// Unselectable decorations around each rendered transcript row.
+    fn get_selection_columns(&self) -> Vec<Option<(usize, usize)>> { Vec::new() }
+
+    /// Fill unused viewport rows with the same frame as the transcript.
+    fn get_fullscreen_padding(&self) -> String { String::new() }
 
     /// Optional stable anchors corresponding to the most recently rendered lines.
     fn get_viewport_anchors(&self) -> Vec<Option<ViewportAnchor>> {
@@ -393,6 +404,7 @@ struct InlineState {
 
 struct FullscreenState {
     viewport: FullscreenViewport,
+    header: Option<Rc<RefCell<dyn Component>>>,
     scroll: Vec<Rc<RefCell<dyn Component>>>,
     dock: Rc<RefCell<dyn Component>>,
     mouse: bool,
@@ -880,6 +892,9 @@ impl TUI {
 
     pub fn invalidate(&mut self) {
         self.container.invalidate();
+        if let Some(header) = self.fullscreen.as_ref().and_then(|state| state.header.as_ref()) {
+            header.borrow_mut().invalidate();
+        }
         for entry in self.overlay_stack.iter() {
             entry.component.borrow_mut().invalidate();
         }
@@ -1071,6 +1086,7 @@ impl TUI {
         self.fullscreen_pressed_hyperlink = None;
         self.fullscreen = Some(FullscreenState {
             viewport: FullscreenViewport::new(),
+            header: None,
             scroll: options.scroll,
             dock: options.dock,
             mouse: options.mouse,
@@ -1122,6 +1138,14 @@ impl TUI {
 
     pub fn is_fullscreen(&self) -> bool {
         self.fullscreen.is_some()
+    }
+
+    /// Mount optional fixed top chrome without changing scroll or input ownership.
+    pub fn set_fullscreen_header(&mut self, header: Option<Rc<RefCell<dyn Component>>>) {
+        if let Some(state) = self.fullscreen.as_mut() {
+            state.header = header;
+            self.request_render();
+        }
     }
 
     /// Scroll the fullscreen transcript window (negative = up).
@@ -2166,6 +2190,8 @@ impl TUI {
         let mut anchors = Vec::new();
         let mut bottom_aligned = false;
         let mut selection_regions: Vec<TableCellSelectionRegion> = Vec::new();
+        let mut selection_columns = Vec::new();
+        let mut padding_line = String::new();
         let scroll_components: Vec<Rc<RefCell<dyn Component>>> = match &self.fullscreen {
             Some(fullscreen) => fullscreen.scroll.clone(),
             None => return,
@@ -2190,23 +2216,36 @@ impl TUI {
                         ..region
                     });
                 }
+                let mut columns = component.borrow().get_selection_columns();
+                columns.resize(component_lines.len(), None);
+                selection_columns.extend(columns);
+                padding_line = component.borrow().get_fullscreen_padding();
                 transcript.extend(component_lines);
             }
             dock_component.borrow_mut().render(width as f64)
         });
 
+        let header_budget = (height / 4).min(height.saturating_sub(
+            crate::fullscreen::clipped_fullscreen_dock_height(dock.len(), height)
+                + crate::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS));
+        let header = self.fullscreen.as_ref().and_then(|state| state.header.clone())
+            .map(|component| component.borrow_mut().render_with_height(width as f64, header_budget))
+            .unwrap_or_default();
+
         let (mut frame, window_height, scroll_info, viewport_controls) =
             match self.fullscreen.as_mut() {
                 Some(fullscreen) => {
-                    let frame = fullscreen.viewport.compose_frame_anchored(
+                    fullscreen.viewport.set_transcript_presentation(selection_columns, padding_line);
+                    let frame = fullscreen.viewport.compose_frame_with_header(
                         &transcript,
                         &dock,
                         height,
                         &selection_regions,
                         &anchors,
                         bottom_aligned,
+                        &header,
                     );
-                    let window_height = fullscreen.viewport.window_height();
+                    let window_height = fullscreen.viewport.window_height() + fullscreen.viewport.header_height();
                     let scroll_info = fullscreen.viewport.scroll_info();
                     (
                         frame,
@@ -3635,6 +3674,37 @@ mod tests {
         assert!(!tui.is_fullscreen());
         assert!(!terminal.borrow().alt_screen);
         assert!(!terminal.borrow().mouse_tracking);
+    }
+
+    #[test]
+    fn neon_header_integrates_with_cursor_overlays_and_mouse_copy() {
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(40, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(true));
+        let copied = Rc::new(RefCell::new(String::new()));
+        let sink = copied.clone();
+        tui.on_copy = Some(Box::new(move |text| *sink.borrow_mut() = text.into()));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(Line("hello"))), Rc::new(RefCell::new(Line("world")))],
+            dock: Rc::new(RefCell::new(Line("prompt \x1b_pi:c\x07"))),
+            mouse: true,
+            viewport_controls: true,
+        });
+        tui.set_fullscreen_header(Some(Rc::new(RefCell::new(Line("OPTIMUS")))));
+        tui.do_render();
+        assert!(terminal.borrow().written.contains("OPTIMUS"));
+        assert!(terminal.borrow().written.contains("\x1b[8;8H"), "cursor remains in the bottom dock");
+        tui.handle_fullscreen_input("\x1b[<0;1;2M");
+        tui.handle_fullscreen_input("\x1b[<32;6;3M");
+        tui.handle_fullscreen_input("\x1b[<0;6;3m");
+        assert_eq!(*copied.borrow(), "hello\nworld");
+        let overlay = tui.show_overlay(Rc::new(RefCell::new(Line("PICKER"))), OverlayOptions::default());
+        tui.do_render();
+        assert!(terminal.borrow().written.contains("PICKER"));
+        overlay.hide();
+        tui.do_render();
+        tui.set_fullscreen_header(None);
+        tui.do_render();
+        assert_eq!(tui.fullscreen.as_ref().unwrap().viewport.header_height(), 0);
     }
 
     /// TS arms a real timer in `updateSelectionAutoScroll` (tui.ts:811) and its
