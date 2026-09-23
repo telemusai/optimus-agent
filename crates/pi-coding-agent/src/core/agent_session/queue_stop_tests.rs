@@ -739,6 +739,142 @@ impl PerformanceMetricRecorder for QueueRecorder {
     fn close(&self) {}
 }
 
+fn terminal_notice(id: &str) -> CustomMessage {
+    CustomMessage {
+        custom_type: RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE.into(),
+        content: CustomMessageContent::Text(format!("Child {id} was cancelled")),
+        ..report(id)
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn terminal_notice_admission_cannot_race_next_turn_drain() {
+    let session = fixture().await;
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    install_provider(&session, contexts.clone(), 0);
+    let drained = Arc::new(Mutex::new(Vec::new()));
+    let observed = drained.clone();
+    let owner = Arc::downgrade(&session);
+    let unsubscribe = session.subscribe(Arc::new(move |event| {
+        if matches!(event, AgentSessionEvent::SessionActionUpdate { .. }) {
+            // Admission publishes before returning. Reproduce a queued turn
+            // taking its next-turn context during that window.
+            observed
+                .lock()
+                .unwrap()
+                .extend(owner.upgrade().unwrap().take_pending_next_turn_messages());
+        }
+    }));
+    session
+        .pending_next_turn_messages
+        .lock()
+        .unwrap()
+        .push(report("context"));
+    session
+        .defer_rlm_terminal_notice(terminal_notice("cancelled-child"))
+        .await
+        .unwrap();
+    unsubscribe();
+    let drained = drained.lock().unwrap().clone();
+    assert_eq!(
+        drained.len(),
+        1,
+        "the notice must have only one delivery owner"
+    );
+    assert_eq!(drained[0].custom_type, "agent_message");
+    tokio::time::timeout(std::time::Duration::from_secs(5), session.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+    session
+        .queue_jev_control_feedback(CustomMessage {
+            custom_type: "jevControl".into(),
+            content: CustomMessageContent::Text("CONTINUE_AFTER_CANCEL".into()),
+            ..report("continuation")
+        })
+        .await;
+    tokio::time::timeout(std::time::Duration::from_secs(5), session.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(
+        std::time::Duration::from_secs(5),
+        session.prompt("USER_AFTER_CANCEL", None),
+    )
+    .await
+    .unwrap()
+    .unwrap();
+    let seen = contexts.lock().unwrap();
+    assert!(seen
+        .iter()
+        .any(|context| has_text(context, "CONTINUE_AFTER_CANCEL")));
+    assert!(has_text(seen.last().unwrap(), "USER_AFTER_CANCEL"));
+    let messages = session.messages();
+    assert_eq!(messages.iter().filter(|message| {
+        matches!(message, AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. }) if custom_type == RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE)
+    }).count(), 1);
+    drop(seen);
+    assert_eq!(session.queued_action_count(), 0);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn terminal_notice_failed_admission_preserves_pending_context() {
+    let session = fixture().await;
+    install_provider(&session, Arc::new(Mutex::new(Vec::new())), 0);
+    let first = terminal_notice("first");
+    let context = report("context");
+    let second = terminal_notice("second");
+    *session.pending_next_turn_messages.lock().unwrap() =
+        vec![first, context.clone(), second.clone()];
+    let owner = Arc::downgrade(&session);
+    let unsubscribe = session.subscribe(Arc::new(move |event| {
+        if matches!(event, AgentSessionEvent::SessionActionUpdate { .. }) {
+            owner
+                .upgrade()
+                .unwrap()
+                .session_input_admission_pauses
+                .lock()
+                .unwrap()
+                .insert("notice-admission-test".into());
+        }
+    }));
+    session.flush_deferred_rlm_terminal_notices();
+    unsubscribe();
+    assert_eq!(session.get_session_action_snapshot().follow_ups.len(), 1);
+    assert_eq!(
+        *session.pending_next_turn_messages.lock().unwrap(),
+        vec![context, second]
+    );
+    assert_eq!(
+        session
+            .durable_rlm_terminal_notice_action_ids
+            .lock()
+            .unwrap()
+            .len(),
+        1
+    );
+    session
+        .session_input_admission_pauses
+        .lock()
+        .unwrap()
+        .clear();
+    session.flush_deferred_rlm_terminal_notices();
+    tokio::time::timeout(std::time::Duration::from_secs(5), session.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+    let messages = session.messages();
+    for id in ["first", "second"] {
+        assert_eq!(messages.iter().filter(|message| {
+            matches!(message, AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, content, .. })
+                if custom_type == RLM_CHILD_TERMINAL_NOTICE_CUSTOM_TYPE
+                    && *content == CustomMessageContent::Text(format!("Child {id} was cancelled")))
+        }).count(), 1);
+    }
+    session.dispose_async(Some(false)).await;
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn queue_metrics_record_actual_delivery_once_without_prompt_content() {
     use pi_agent_core::performance_metrics::{
