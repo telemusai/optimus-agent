@@ -338,6 +338,8 @@ pub struct IpythonToolDetails {
     pub kernel_restarted: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ExecErrorShape>,
+    #[serde(rename = "executionReports", default, skip_serializing_if = "Option::is_none")]
+    pub execution_reports: Option<Vec<crate::core::kernel::shared::ScriptExecutionReport>>,
 }
 
 /// `{ ename, evalue, traceback }` as serialized in the tool details.
@@ -427,6 +429,10 @@ pub trait KernelClient: Send + Sync {
         snapshot: bool,
         drain_host_requests: bool,
     ) -> BoxFuture<'static, Result<(), KernelError>>;
+    fn shutdown_and_settle(&self, _owner_session_id: &str, _timeout_ms: u64)
+        -> BoxFuture<'static, Result<crate::core::kernel::shared::KernelSettlement, KernelError>> {
+        Box::pin(async { Ok(crate::core::kernel::shared::KernelSettlement::unsupported("unowned kernel adapter")) })
+    }
     fn kill(&self) -> BoxFuture<'static, Result<(), KernelError>>;
     fn prune_oversized_variables(&self) -> BoxFuture<'static, Result<Option<PruneResult>, KernelError>>;
     fn list_namespace_names(
@@ -464,6 +470,14 @@ pub struct IpythonKernelProvisioner {
     dispose_controller: AbortSignal,
     /// Snapshot policy of the dispose that aborted a startup, honored by startKernel's failure teardown.
     dispose_snapshot: Mutex<bool>,
+    ownership: Mutex<ProvisionerOwnership>,
+    owned_tasks: pi_agent_core::execution_scope::ExecutionScope,
+}
+#[derive(Default)]
+struct ProvisionerOwnership {
+    fenced: bool,
+    clients: Vec<Arc<dyn KernelClient>>,
+    startups: Vec<Arc<StartupHandle>>,
 }
 
 struct StartupHandle {
@@ -516,6 +530,8 @@ impl IpythonKernelProvisioner {
             last_restore: Mutex::new(None),
             dispose_controller: AbortSignal::new(),
             dispose_snapshot: Mutex::new(true),
+            ownership: Mutex::new(ProvisionerOwnership::default()),
+            owned_tasks: Default::default(),
         })
     }
 
@@ -560,9 +576,9 @@ impl IpythonKernelProvisioner {
     /// Start the kernel in the background. Failures are swallowed here and surface on the next ensure().
     pub fn prewarm(self: &Arc<Self>) {
         let provisioner = self.clone();
-        tokio::spawn(async move {
+        let _ = self.owned_tasks.spawn(async move {
             let _ = provisioner.ensure(None, None).await;
-        });
+        }, true, true);
     }
 
     /// Whether a kernel has finished starting and is currently running.
@@ -592,6 +608,90 @@ impl IpythonKernelProvisioner {
             Some(handle) => handle.wait().await.ok(),
             None => None,
         }
+    }
+
+    /// Retained stop disposes execution, not history or snapshots. One deadline
+    /// covers startup plus every manager generation, including failed startup.
+    pub async fn shutdown_and_settle(&self, owner: &str, timeout_ms: u64)
+        -> Result<crate::core::kernel::shared::KernelSettlement, KernelError> {
+        use crate::core::kernel::shared::KernelSettlement;
+        if owner.is_empty()
+            || self.options.as_ref().and_then(|options| options.session_id.as_deref()) != Some(owner)
+        {
+            return Err(KernelError::new("Kernel owner mismatch"));
+        }
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.min(10000));
+        let (startups, clients) = {
+            let mut ownership = self.ownership.lock().unwrap();
+            ownership.fenced = true;
+            (ownership.startups.clone(), ownership.clients.clone())
+        };
+        *self.dispose_snapshot.lock().unwrap() = false;
+        self.dispose_controller.abort(None);
+        self.owned_tasks.request_cancel();
+        let mut result = KernelSettlement {
+            supported: cfg!(windows), settled: cfg!(windows), kernel_exited: true,
+            descendants_exited: true, local_tasks_settled: true, errors: Vec::new(),
+            ownership_scope: "native-kernel-job-members".to_string(),
+        };
+        if self.options.as_ref().and_then(|options| options.ready_gate.as_ref()).is_some() {
+            result.supported = false;
+            result.errors.push("unproved predecessor provisioner".to_string());
+        }
+        // Admit every known generation before waiting for any one result. A
+        // failed or slow adapter cannot skip another client's terminal stop.
+        let settlements = clients.into_iter().enumerate().map(|(index, client)| async move {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now()).as_millis() as u64;
+            let operation = std::panic::AssertUnwindSafe(async move {
+                client.shutdown_and_settle(owner, remaining).await
+            }).catch_unwind();
+            (index, tokio::time::timeout_at(deadline, operation).await)
+        });
+        for (index, outcome) in futures::future::join_all(settlements).await {
+            match outcome {
+                Ok(Ok(Ok(receipt))) => {
+                    result.supported &= receipt.supported;
+                    result.settled &= receipt.settled;
+                    result.kernel_exited &= receipt.kernel_exited;
+                    result.descendants_exited &= receipt.descendants_exited;
+                    result.local_tasks_settled &= receipt.local_tasks_settled;
+                    result.errors.extend(receipt.errors);
+                }
+                failure => {
+                    result.supported = false;
+                    result.settled = false;
+                    result.kernel_exited = false;
+                    result.descendants_exited = false;
+                    result.local_tasks_settled = false;
+                    let reason = match failure {
+                        Ok(Ok(Err(error))) => error.to_string(),
+                        Ok(Err(_)) => "adapter panicked".to_string(),
+                        Err(_) => "deadline expired".to_string(),
+                        Ok(Ok(Ok(_))) => unreachable!(),
+                    };
+                    result.errors.push(format!("Kernel client {index} settlement failed: {reason}"));
+                }
+            }
+        }
+        for startup in startups {
+            // Startup failure is not exit proof; every created client was included above.
+            if tokio::time::timeout_at(deadline, startup.wait()).await.is_err() {
+                result.local_tasks_settled = false;
+                result.errors.push("Kernel startup settlement timed out".to_string());
+            }
+        }
+        let local = self.owned_tasks.settle(deadline.saturating_duration_since(tokio::time::Instant::now())).await;
+        result.supported &= local.supported;
+        result.local_tasks_settled &= local.tools_settled && local.model_settled && !local.failed;
+        if !local.supported {
+            result.errors.push("Kernel provisioner has unproved local work ownership".to_string());
+        }
+        if !local.tools_settled || !local.model_settled || local.failed {
+            result.errors.push("Kernel provisioner owned tasks or streams failed or did not settle".to_string());
+        }
+        result.settled &= result.supported && result.kernel_exited && result.descendants_exited
+            && result.local_tasks_settled && result.errors.is_empty();
+        Ok(result)
     }
 
     /// Dispose the kernel owned by this provisioner, including one still starting up.
@@ -647,12 +747,28 @@ impl IpythonKernelProvisioner {
         if signal.as_ref().map(|signal| signal.is_aborted()).unwrap_or(false) {
             return Err(create_abort_error());
         }
-        // Only a terminally dead kernel drops the memo; a repairing manager (idle/starting) recovers itself.
-        let started_defunct = self.manager().map(|manager| manager.is_defunct()).unwrap_or(false);
-        if started_defunct {
-            *self.manager_promise.lock().expect("manager promise lock") = None;
-            *self.started_manager.lock().expect("started manager lock") = None;
-        }
+        let (handle, launch_startup) = {
+            let mut ownership = self.ownership.lock().unwrap();
+            if ownership.fenced {
+                return Err(KernelError::new("Kernel provisioner retained-stop fence"));
+            }
+            // Only terminally dead kernels drop the memo; repair still reuses it.
+            let started_defunct = self.manager().map(|manager| manager.is_defunct()).unwrap_or(false);
+            let mut memo = self.manager_promise.lock().expect("manager promise lock");
+            if started_defunct {
+                *memo = None;
+                *self.started_manager.lock().expect("started manager lock") = None;
+            }
+            match memo.as_ref() {
+                Some(handle) => (handle.clone(), false),
+                None => {
+                    let handle = Arc::new(StartupHandle::new());
+                    *memo = Some(handle.clone());
+                    ownership.startups.push(handle.clone());
+                    (handle, true)
+                }
+            }
+        };
 
         let mut cleanup_progress_listener: Option<crate::core::kernel::shared::AbortListener> = None;
         if let Some(on_progress) = on_progress.as_ref() {
@@ -676,35 +792,15 @@ impl IpythonKernelProvisioner {
             }
         }
 
-        let existing = self.manager_promise.lock().expect("manager promise lock").clone();
-        let handle = match existing {
-            Some(handle) => handle,
-            None => {
-                let handle = Arc::new(StartupHandle::new());
-                *self.manager_promise.lock().expect("manager promise lock") = Some(handle.clone());
-                let provisioner = self.clone();
-                let startup_handle = handle.clone();
-                let startup_signal = signal.clone();
-                tokio::spawn(async move {
-                    let outcome = provisioner.start_kernel(startup_signal).await;
-                    let failed = outcome.is_err();
-                    if !failed {
-                        if let Ok(manager) = outcome.as_ref() {
-                            let is_current = provisioner
-                                .manager_promise
-                                .lock()
-                                .expect("manager promise lock")
-                                .as_ref()
-                                .map(|current| Arc::ptr_eq(current, &startup_handle))
-                                .unwrap_or(false);
-                            if is_current {
-                                *provisioner.started_manager.lock().expect("started manager lock") =
-                                    Some(manager.clone());
-                            }
-                        }
-                    } else {
-                        // Clear the memo so the next ensure() retries instead of
-                        // rethrowing a cached rejection forever.
+        if launch_startup {
+            let provisioner = self.clone();
+            let startup_handle = handle.clone();
+            let startup_signal = signal.clone();
+            let startup_task = self.owned_tasks.spawn(async move {
+                let outcome = provisioner.start_kernel(startup_signal).await;
+                let failed = outcome.is_err();
+                if !failed {
+                    if let Ok(manager) = outcome.as_ref() {
                         let is_current = provisioner
                             .manager_promise
                             .lock()
@@ -713,15 +809,34 @@ impl IpythonKernelProvisioner {
                             .map(|current| Arc::ptr_eq(current, &startup_handle))
                             .unwrap_or(false);
                         if is_current {
-                            *provisioner.manager_promise.lock().expect("manager promise lock") = None;
+                            *provisioner.started_manager.lock().expect("started manager lock") =
+                                Some(manager.clone());
                         }
                     }
-                    provisioner.settle_startup();
-                    startup_handle.settle(outcome).await;
-                });
-                handle
+                } else {
+                    // Clear the memo so the next ensure() retries instead of
+                    // rethrowing a cached rejection forever.
+                    let is_current = provisioner
+                        .manager_promise
+                        .lock()
+                        .expect("manager promise lock")
+                        .as_ref()
+                        .map(|current| Arc::ptr_eq(current, &startup_handle))
+                        .unwrap_or(false);
+                    if is_current {
+                        *provisioner.manager_promise.lock().expect("manager promise lock") = None;
+                    }
+                }
+                provisioner.settle_startup();
+                startup_handle.settle(outcome).await;
+            }, false, true);
+            if let Err(error) = startup_task {
+                handle.settle(Err(KernelError::new(error))).await;
+                self.settle_startup();
+                if let Some(listener) = cleanup_progress_listener { listener.remove(); }
+                return Err(KernelError::new(error));
             }
-        };
+        }
 
         let result = race_with_abort(
             handle.wait().map(|value| value),
@@ -731,6 +846,9 @@ impl IpythonKernelProvisioner {
         .await;
         if let Some(listener) = cleanup_progress_listener {
             listener.remove();
+        }
+        if self.ownership.lock().unwrap().fenced {
+            return Err(KernelError::new("Kernel provisioner retained-stop fence"));
         }
         result
     }
@@ -840,7 +958,13 @@ impl IpythonKernelProvisioner {
                 .map(|snapshot_dir| format!("{}/kernel-stderr.log", snapshot_dir.trim_end_matches(['/', '\\']))),
         };
 
-        let manager = (self.factory)(manager_options);
+        let manager = {
+            let mut ownership = self.ownership.lock().unwrap();
+            if ownership.fenced { return Err(KernelError::new("Kernel provisioner retained-stop fence")); }
+            let manager = (self.factory)(manager_options);
+            ownership.clients.push(manager.clone());
+            manager
+        };
         let mut pending_restore: Option<RestoreResult> = None;
         let startup_result: Result<(), KernelError> = async {
             // Emitted synchronously (before the permit await) so a listener
@@ -1222,13 +1346,21 @@ pub async fn execute_ipython(
         };
     }
 
+    if let Some(reports) = &r.execution_reports {
+        for report in reports {
+            text += &format!("{}[script result] {}", if text.is_empty() { "" } else { "\n" },
+                serde_json::json!({"schema": report.schema, "stage": report.stage,
+                    "scriptId": report.script_id, "exitCode": report.exit_code, "isError": report.failed()}));
+        }
+    }
     let image_blocks = image_blocks_from_attachments(r.attachments.as_deref());
     let mut content: Vec<pi_agent_core::types::ContentBlock> =
         vec![pi_agent_core::types::ContentBlock::text(text.clone())];
     for image in &image_blocks {
         content.push(pi_agent_core::types::ContentBlock::Image(image.clone()));
     }
-    let is_error = r.status == ExecuteStatus::Error || r.status == ExecuteStatus::Aborted;
+    let is_error = r.status == ExecuteStatus::Error || r.status == ExecuteStatus::Aborted
+        || r.execution_reports.as_ref().is_some_and(|reports| reports.iter().any(|report| report.failed()));
     let mut model_output_artifact: Option<ModelToolOutputArtifactV1> = None;
     let background_output_empty = r
         .background_output
@@ -1268,6 +1400,7 @@ pub async fn execute_ipython(
             }
             .to_string(),
         ),
+        execution_reports: r.execution_reports.clone(),
         error_ename: r.error.as_ref().map(|error| error.ename.clone()),
         stdout: Some(r.stdout.clone()),
         stderr: Some(r.stderr.clone()),
@@ -1314,7 +1447,7 @@ pub fn create_ipython_tool_definition(
                 let input: IpythonToolInput = serde_json::from_value(params)
                     .map_err(|error| anyhow::anyhow!("ipython tool input is invalid. {error}"))?;
                 let abort_signal = signal.map(abort_signal_from_token);
-                let (content, details, _is_error) = execute_ipython(
+                let (content, details, is_error) = execute_ipython(
                     provisioner,
                     &tool_call_id,
                     &input,
@@ -1328,7 +1461,7 @@ pub fn create_ipython_tool_definition(
                 Ok(pi_agent_core::types::AgentToolResult::new(
                     content,
                     serde_json::to_value(details).unwrap_or(Value::Null),
-                ))
+                ).with_error(is_error))
             })
         },
     );
@@ -1357,7 +1490,7 @@ pub(crate) fn abort_signal_from_token(token: tokio_util::sync::CancellationToken
         return signal;
     }
     let target = signal.clone();
-    tokio::spawn(async move {
+    pi_agent_core::execution_scope::spawn_auxiliary(async move {
         token.cancelled_owned().await;
         target.abort(None);
     });
@@ -1370,6 +1503,12 @@ struct ReplKernelClient {
 }
 
 impl KernelClient for ReplKernelClient {
+    fn shutdown_and_settle(&self, owner_session_id: &str, timeout_ms: u64)
+        -> BoxFuture<'static, Result<crate::core::kernel::shared::KernelSettlement, KernelError>> {
+        let manager = self.manager.clone();
+        let owner = owner_session_id.to_string();
+        Box::pin(async move { manager.shutdown_and_settle(&owner, timeout_ms).await })
+    }
     fn is_running(&self) -> bool { self.manager.is_running() }
     fn is_defunct(&self) -> bool { self.manager.is_defunct() }
     fn start(&self, options: KernelStartOptions) -> BoxFuture<'static, Result<(), KernelError>> {
@@ -1579,6 +1718,7 @@ mod tests {
                     background_output: None,
                     status: ExecuteStatus::Ok,
                     error: None,
+                    execution_reports: None,
                     duration_ms: 3.0,
                 })
             })
@@ -1683,6 +1823,7 @@ mod tests {
                         evalue: "bad".to_string(),
                         traceback: vec!["line 1".to_string(), "line 2".to_string()],
                     }),
+                    execution_reports: None,
                     duration_ms: 9.0,
                 })
             })
@@ -1765,6 +1906,7 @@ mod tests {
                     background_output: None,
                     status: ExecuteStatus::Ok,
                     error: None,
+                    execution_reports: None,
                     duration_ms: 1.0,
                 })
             })
@@ -2227,5 +2369,215 @@ mod tests {
             .await
             .expect("preflight abort must not hang");
         assert_eq!(action, "cancel");
+    }
+
+
+    type SettlementCallback = Arc<dyn Fn(String, u64) -> BoxFuture<'static,
+        Result<crate::core::kernel::shared::KernelSettlement, KernelError>> + Send + Sync>;
+
+    struct SettlementKernelClient {
+        on_settle: SettlementCallback,
+        startup_entered: Option<Arc<tokio::sync::Notify>>,
+    }
+
+    impl KernelClient for SettlementKernelClient {
+        fn is_running(&self) -> bool { true }
+        fn is_defunct(&self) -> bool { false }
+        fn start(&self, options: KernelStartOptions) -> BoxFuture<'static, Result<(), KernelError>> {
+            match self.startup_entered.clone() {
+                None => StubKernelClient.start(options),
+                Some(entered) => Box::pin(async move {
+                    entered.notify_one();
+                    options.signal.expect("controlled startup signal").wait().await;
+                    Err(create_kernel_startup_abort_error())
+                }),
+            }
+        }
+        fn execute(&self, code: &str, signal: Option<AbortSignal>,
+            on_stream: Option<Arc<dyn Fn(&str, StreamName) + Send + Sync>>)
+            -> BoxFuture<'static, Result<ExecuteResult, KernelError>> {
+            StubKernelClient.execute(code, signal, on_stream)
+        }
+        fn restore_state(&self) -> BoxFuture<'static, Result<Option<RestoreResult>, KernelError>> {
+            StubKernelClient.restore_state()
+        }
+        fn shutdown(&self, snapshot: bool, drain: bool) -> BoxFuture<'static, Result<(), KernelError>> {
+            StubKernelClient.shutdown(snapshot, drain)
+        }
+        fn shutdown_and_settle(&self, owner: &str, timeout_ms: u64)
+            -> BoxFuture<'static, Result<crate::core::kernel::shared::KernelSettlement, KernelError>> {
+            (self.on_settle)(owner.to_string(), timeout_ms)
+        }
+        fn kill(&self) -> BoxFuture<'static, Result<(), KernelError>> { StubKernelClient.kill() }
+        fn prune_oversized_variables(&self) -> BoxFuture<'static, Result<Option<PruneResult>, KernelError>> {
+            StubKernelClient.prune_oversized_variables()
+        }
+        fn list_namespace_names(&self, signal: Option<AbortSignal>)
+            -> BoxFuture<'static, Result<Option<Vec<String>>, KernelError>> {
+            StubKernelClient.list_namespace_names(signal)
+        }
+    }
+
+    fn settlement_ok() -> crate::core::kernel::shared::KernelSettlement {
+        crate::core::kernel::shared::KernelSettlement {
+            ownership_scope: "native-kernel-job-members".into(), supported: true,
+            settled: true, kernel_exited: true, descendants_exited: true,
+            local_tasks_settled: true, errors: Vec::new(),
+        }
+    }
+
+    fn settlement_provisioner(owner: &str) -> Arc<IpythonKernelProvisioner> {
+        IpythonKernelProvisioner::new("/tmp", Some(IpythonToolOptions {
+            session_id: Some(owner.into()), ..Default::default()
+        }), Arc::new(|_| panic!("settlement-only fixture must not create a kernel")))
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_bounds_all_clients_and_aggregates_failures() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        struct Dropped(Arc<AtomicUsize>);
+        impl Drop for Dropped {
+            fn drop(&mut self) { self.0.fetch_add(1, Ordering::SeqCst); }
+        }
+        let provisioner = settlement_provisioner("owned");
+        let entered = Arc::new(Mutex::new(Vec::new()));
+        let dropped = Arc::new(AtomicUsize::new(0));
+        for index in 0..4 {
+            let entered = entered.clone();
+            let dropped = dropped.clone();
+            provisioner.ownership.lock().unwrap().clients.push(Arc::new(SettlementKernelClient {
+                startup_entered: None,
+                on_settle: Arc::new(move |owner, timeout_ms| {
+                    let entered = entered.clone();
+                    let guard = Dropped(dropped.clone());
+                    Box::pin(async move {
+                        let _guard = guard;
+                        assert_eq!(owner, "owned");
+                        assert_eq!(timeout_ms, 0);
+                        entered.lock().unwrap().push(index);
+                        match index {
+                            0 => std::future::pending().await,
+                            1 => Err(KernelError::new("controlled adapter failure")),
+                            2 => Ok(settlement_ok()),
+                            _ => panic!("controlled adapter panic"),
+                        }
+                    })
+                }),
+            }));
+        }
+        let report = tokio::time::timeout(std::time::Duration::from_secs(1),
+            provisioner.shutdown_and_settle("owned", 0)).await.unwrap().unwrap();
+        let mut seen = entered.lock().unwrap().clone();
+        seen.sort();
+        assert_eq!(seen, vec![0, 1, 2, 3], "failure must not skip later generations");
+        assert_eq!(dropped.load(Ordering::SeqCst), 4, "no timed-out adapter future is detached");
+        assert!(!report.settled && !report.kernel_exited && !report.descendants_exited && !report.local_tasks_settled);
+        assert_eq!(report.errors.len(), 3, "{report:?}");
+        for expected in ["deadline expired", "controlled adapter failure", "adapter panicked"] {
+            assert!(report.errors.iter().any(|error| error.contains(expected)), "{report:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_admits_clients_concurrently() {
+        let provisioner = settlement_provisioner("owned");
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        for _ in 0..2 {
+            let barrier = barrier.clone();
+            provisioner.ownership.lock().unwrap().clients.push(Arc::new(SettlementKernelClient {
+                startup_entered: None,
+                on_settle: Arc::new(move |_, _| {
+                    let barrier = barrier.clone();
+                    Box::pin(async move { barrier.wait().await; Ok(settlement_ok()) })
+                }),
+            }));
+        }
+        let report = provisioner.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.errors.is_empty(), "{report:?}");
+        assert!(report.kernel_exited && report.descendants_exited && report.local_tasks_settled);
+        assert_eq!(report.settled, cfg!(windows));
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_rejects_empty_or_wrong_owner_before_mutation() {
+        for (configured, supplied) in [("", ""), ("owned", "other"), ("owned", "")] {
+            let provisioner = settlement_provisioner(configured);
+            assert!(provisioner.shutdown_and_settle(supplied, 1000).await.is_err());
+            assert!(!provisioner.ownership.lock().unwrap().fenced);
+            assert!(!provisioner.dispose_controller.is_aborted());
+            assert!(!provisioner.owned_tasks.status().fenced);
+        }
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_late_ensure_cannot_publish_a_hanging_memo() {
+        let provisioner = settlement_provisioner("owned");
+        provisioner.shutdown_and_settle("owned", 1000).await.unwrap();
+        for _ in 0..2 {
+            let result = tokio::time::timeout(std::time::Duration::from_secs(1),
+                provisioner.ensure(None, None)).await.expect("late ensure must decline promptly");
+            assert!(result.err().unwrap().to_string().contains("retained-stop fence"));
+            assert!(provisioner.manager_promise.lock().unwrap().is_none());
+            assert!(provisioner.ownership.lock().unwrap().startups.is_empty());
+        }
+        assert!(provisioner.current_manager().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_startup_race_keeps_registered_client() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let entered = Arc::new(tokio::sync::Notify::new());
+        let stopped = Arc::new(AtomicUsize::new(0));
+        let stop_count = stopped.clone();
+        let client: Arc<dyn KernelClient> = Arc::new(SettlementKernelClient {
+            startup_entered: Some(entered.clone()),
+            on_settle: Arc::new(move |_, _| {
+                let stopped = stop_count.clone();
+                Box::pin(async move { stopped.fetch_add(1, Ordering::SeqCst); Ok(settlement_ok()) })
+            }),
+        });
+        let provisioner = IpythonKernelProvisioner::new("/tmp", Some(IpythonToolOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        }), Arc::new(move |_| client.clone()));
+        let starter = provisioner.clone();
+        let starting = tokio::spawn(async move { starter.ensure(None, None).await });
+        tokio::time::timeout(std::time::Duration::from_secs(1), entered.notified()).await.unwrap();
+        let report = provisioner.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert_eq!(stopped.load(Ordering::SeqCst), 1);
+        assert!(report.errors.is_empty() && report.local_tasks_settled, "{report:?}");
+        assert_eq!(report.settled, cfg!(windows));
+        assert!(tokio::time::timeout(std::time::Duration::from_secs(1), starting).await.unwrap().unwrap().is_err());
+        assert!(provisioner.ensure(None, None).await.is_err());
+        assert_eq!(provisioner.ownership.lock().unwrap().clients.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn provisioner_settlement_uncovered_completed_work_is_unsupported() {
+        let provisioner = settlement_provisioner("owned");
+        provisioner.owned_tasks.spawn(async {}, false, false).unwrap().await.unwrap();
+        let report = provisioner.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(!report.supported && !report.settled, "{report:?}");
+        assert!(report.errors.iter().any(|error| error.contains("unproved local work ownership")));
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn provisioner_settlement_requires_owned_stream_acknowledgement() {
+        let provisioner = settlement_provisioner("owned");
+        let stream = pi_ai::utils::event_stream::AssistantMessageEventStream::new_owned();
+        let receipt = stream.task_receipt();
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        stream.spawn(async move {
+            entered.send(()).unwrap();
+            let _ = blocked.recv(); // controlled non-cooperative task, released below
+        });
+        started.await.unwrap();
+        provisioner.owned_tasks.register_stream(receipt.clone()).unwrap();
+        let report = provisioner.shutdown_and_settle("owned", 0).await.unwrap();
+        let release_result = release.send(());
+        assert!(!report.settled && !report.local_tasks_settled, "{report:?}");
+        assert!(report.errors.iter().any(|error| error.contains("owned tasks or streams")));
+        release_result.unwrap();
+        assert!(receipt.settle(std::time::Duration::from_secs(1)).await.settled);
     }
 }

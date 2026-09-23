@@ -1,0 +1,7 @@
+- Added capability-gated retained child stops, generation-bound active-only diagnostics, and explicit audit resume for the supported native Windows execution profile.
+- Fixed typed Python and opt-in supervised-script errors reaching public tool results and trace metadata.
+- Fixed slow manual refinement holding prompt admission; show progress while keeping safe serialized saves and cancellation fences.
+- Fixed bounded completion checks reopening limited completed tasks and added task-scoped tool-state diagnostics.
+- Fixed heartbeat status beside context and shortened shell completion display without removing inspectable details.
+- Added reviewed GPT-6 Sol and Luna subscription metadata with provider availability checks.
+- Fixed Azure WebSocket close diagnostics while preserving retry and timeout policy.

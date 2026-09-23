@@ -64,8 +64,10 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // settings are optional response metadata; legacy Jev commands and events remain compatible.
 // Revision 31 adds optional session-local Jev usage to jev_get_status responses.
 // The existing jev_control capability gates reads; missing usage degrades locally.
-pub const DAEMON_SCHEMA_REVISION: u32 = 31;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-31-c16da0e12d5a";
+// Revision 32 adds optional typed tool isError / executionReports metadata.
+// Native lifecycle host requests are separately capability-gated and never required at startup.
+pub const DAEMON_SCHEMA_REVISION: u32 = 32;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-32-c16da0e12d5a";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;

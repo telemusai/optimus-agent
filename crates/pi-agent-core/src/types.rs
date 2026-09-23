@@ -181,6 +181,10 @@ pub struct AgentToolResult {
     pub content: Vec<ContentBlock>,
     /// Structured details for logs or UI rendering.
     pub details: Value,
+    /// Explicit tool failure, independent of transport success or printed text.
+    /// Absent preserves the legacy successful-result behavior.
+    #[serde(default, rename = "isError", skip_serializing_if = "Option::is_none")]
+    pub is_error: Option<bool>,
     /// Hint that the agent should stop after the current tool batch.
     /// Early termination only happens when every finalized tool result in the batch sets this to true.
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -192,8 +196,14 @@ impl AgentToolResult {
         Self {
             content,
             details,
+            is_error: None,
             terminate: None,
         }
+    }
+
+    pub fn with_error(mut self, is_error: bool) -> Self {
+        self.is_error = Some(is_error);
+        self
     }
 }
 
@@ -590,6 +600,7 @@ impl AgentEvent {
 /// `Send + Sync` because the loop is driven from async tasks.
 #[derive(Clone, Default)]
 pub struct AgentLoopConfig {
+    pub execution_scope: Option<crate::execution_scope::ExecutionScope>,
     /// Base simple stream options (temperature, maxTokens, headers, metadata, ...).
     pub stream_options: SimpleStreamOptions,
     pub model: Model,

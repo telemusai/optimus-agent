@@ -618,6 +618,49 @@ fn captured_texts_contain(fixture: &Fixture, index: usize, needle: &str) -> bool
 // Tests
 // ---------------------------------------------------------------------------
 
+
+/// Real host path with local providers: a terminal scope assessment prevents
+/// an inconsistent sufficiency answer from queuing a new model turn.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl001_informational_answer_is_not_reopened() {
+    let scope = begin_test_scope();
+    save_control_settings(shared_agent_dir(), JevMode::CompareAndActive, true, false, "mock-control", None);
+    pi_coding_agent::core::jev_bridge::debug_control_fixture_set_respond(Some(Box::new(|request| {
+        if !is_control_request(request) { return None; }
+        let mut response = control_round_response(request, 0);
+        for (id, spec) in &request.questions {
+            if id.starts_with("continue_stop_escalate.") {
+                response.answers.insert(id.clone(), choice_answer(spec, "stop", 0.95).unwrap());
+            }
+        }
+        Some(response)
+    })));
+    let fixture = build_fixture(vec![terminal_step("Status: not deployed. Link: https://example.invalid/status. Pending: tests.")], scope).await;
+    turn(&fixture.session, "Only report status, the link, and a list of pending work. Do not implement or test anything.").await;
+    assert_eq!(fixture.captured.lock().unwrap().len(), 1, "no extra provider turn");
+    assert_eq!(feedback_remaining_via_fresh_book(&fixture.session_id), (2, true));
+    let status = pi_coding_agent::core::jev_bridge::session_status_snapshot(&fixture.session_id).unwrap();
+    assert_eq!(status["controlTerminal"]["verification_state"], "not_applicable");
+    assert_eq!(status["controlTerminal"]["terminal_annotation"], "no_authorized_follow_up");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl001_explicit_stop_during_control_decision_cannot_restart_work() {
+    let scope = begin_test_scope();
+    save_control_settings(shared_agent_dir(), JevMode::CompareAndActive, true, false, "mock-control", None);
+    let fixture = build_fixture(vec![terminal_step("Implementation incomplete; no test outcome.")], scope).await;
+    let session = Arc::downgrade(&fixture.session);
+    pi_coding_agent::core::jev_bridge::debug_control_fixture_set_respond(Some(Box::new(move |request| {
+        if !is_control_request(request) { return None; }
+        session.upgrade().unwrap().request_abort();
+        Some(control_round_response(request, 0))
+    })));
+    let _result = tokio::time::timeout(Duration::from_secs(20), fixture.session.prompt("Implement and verify the change", None::<PromptOptions>)).await.expect("stop must settle");
+    tokio::time::timeout(Duration::from_secs(20), fixture.session.wait_for_headless_idle()).await.expect("idle wait bound").expect("idle");
+    assert_eq!(fixture.captured.lock().unwrap().len(), 1, "stop prevents a correction turn");
+    assert_eq!(feedback_remaining_via_fresh_book(&fixture.session_id), (2, true));
+}
+
 /// POSITIVE UNCHANGED CONTROL: nothing changes during the decide await, so
 /// the agent-end decision APPLIES: the corrective feedback continuation is
 /// queued through the existing followUp surface (the next outgoing provider

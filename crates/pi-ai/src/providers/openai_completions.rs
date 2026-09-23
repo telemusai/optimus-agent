@@ -23,7 +23,7 @@ use crate::types::{
 	AssistantMessage, AssistantMessageEvent, CacheRetention, ContentBlock, Context, ImageOrTextContent, InputModality,
 	Message, Model, SimpleStreamOptions, StreamOptions, TextContent, ThinkingContent, Tool, ToolCall, UserContent,
 };
-use crate::utils::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
+use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::json_parse::parse_streaming_json;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::stream_failure::{record_stream_failure, ThrownStreamError};
@@ -1562,7 +1562,7 @@ fn observe_sse_payload(observer: Option<&crate::types::OnStreamObservation>, pay
 	}));
 }
 
-fn observe_chunk_usage(raw: &Value, model: &Model, options: Option<&OpenAICompletionsOptions>) {
+fn observe_chunk_usage(raw: &Value, model: &Model, options: Option<&OpenAICompletionsOptions>, stream: &AssistantMessageEventStream) {
 	let Some(observer) = options.and_then(|options| options.stream.on_usage_observation.as_ref()) else { return; };
 	let finite = |value: Option<&Value>| value.and_then(Value::as_f64).filter(|value| value.is_finite() && *value >= 0.0);
 	let observation = crate::types::ProviderUsageObservation {
@@ -1577,8 +1577,8 @@ fn observe_chunk_usage(raw: &Value, model: &Model, options: Option<&OpenAIComple
 		reasoning_included_in_output: Some(Some(true)),
 	};
 	if let Ok(future) = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(observation, model))) {
-		// Monitoring is disposable; an observer must not block model output.
-		tokio::spawn(future);
+		// Monitoring stays off the output path, but its completion is owned.
+		stream.spawn(future);
 	}
 }
 
@@ -1600,15 +1600,18 @@ async fn read_sse_data(
 		}
 		// The SDK's AbortSignal also cancels a pending body read. Checking only
 		// between chunks leaves a stalled stream holding its connection open.
-		let next_chunk = match signal.as_ref() {
-			Some(signal) => tokio::select! {
-				chunk = response.chunk() => chunk,
-				_ = signal.cancelled() => {
-					let _ = sender.send(Err(abort_error()));
-					return;
+		let next_chunk = tokio::select! {
+			chunk = response.chunk() => chunk,
+			_ = async {
+				match signal.as_ref() {
+					Some(signal) => signal.cancelled().await,
+					None => std::future::pending::<()>().await,
 				}
-			},
-			None => response.chunk().await,
+			} => {
+				let _ = sender.send(Err(abort_error()));
+				return;
+			}
+			_ = sender.closed() => return,
 		};
 		let chunk = match next_chunk {
 			Ok(Some(chunk)) => chunk,
@@ -1845,7 +1848,7 @@ async fn run_stream_body(
 
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<String, StreamError>>();
 	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.clone());
-	tokio::spawn(read_sse_data(response, signal.clone(), sender, observer));
+	stream.spawn(read_sse_data(response, signal.clone(), sender, observer));
 	while let Some(payload) = receiver.recv().await {
 		let payload = payload?;
 		let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
@@ -1879,7 +1882,7 @@ async fn run_stream_body(
 		let chunk_usage = chunk.get("usage").filter(|value| js_truthy(value));
 		if let Some(chunk_usage) = chunk_usage {
 			output.usage = parse_chunk_usage(chunk_usage, model, cache_write_cost);
-			observe_chunk_usage(chunk_usage, model, options_ref);
+			observe_chunk_usage(chunk_usage, model, options_ref, stream);
 		}
 
 		let choice = chunk
@@ -1896,7 +1899,7 @@ async fn run_stream_body(
 		if chunk_usage.is_none() {
 			if let Some(choice_usage) = choice.get("usage").filter(|value| js_truthy(value)) {
 				output.usage = parse_chunk_usage(choice_usage, model, cache_write_cost);
-				observe_chunk_usage(choice_usage, model, options_ref);
+				observe_chunk_usage(choice_usage, model, options_ref, stream);
 			}
 		}
 
@@ -2277,11 +2280,11 @@ pub fn stream_openai_completions(
 	context: &Context,
 	options: Option<OpenAICompletionsOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let signal = options.as_ref().and_then(|options| options.stream.signal.clone());
 
 		// TS: `const output: AssistantMessage = { ... }` lives OUTSIDE the try, so the catch
@@ -2324,11 +2327,11 @@ pub fn stream_simple_openai_completions(
 	context: &Context,
 	options: Option<SimpleStreamOptions>,
 ) -> AssistantMessageEventStream {
-	let stream = create_assistant_message_event_stream();
-	let out = stream.clone();
+	let stream = AssistantMessageEventStream::new_owned();
+	let out = stream.producer_handle();
 	let model = model.clone();
 	let context = context.clone();
-	tokio::spawn(async move {
+	stream.spawn(async move {
 		let api_key = options
 			.as_ref()
 			.and_then(|options| options.stream.api_key.clone())
@@ -2393,6 +2396,156 @@ pub fn stream_simple_openai_completions(
 		}
 	});
 	stream
+}
+
+
+#[cfg(test)]
+mod provider_settlement_tests {
+    use super::*;
+    use super::tests_support::*;
+    use std::sync::{Arc, Mutex};
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::sync::oneshot;
+
+    fn keyed_options() -> OpenAICompletionsOptions {
+        OpenAICompletionsOptions {
+            stream: StreamOptions { api_key: Some("local-fixture-key".into()), ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    async fn local_sse(body: &'static str, stalled: bool) -> (Model, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    let headers = std::str::from_utf8(&request[..end]).unwrap();
+                    let length: usize = headers.lines().filter_map(|line| line.split_once(':'))
+                        .find(|(key, _)| key.eq_ignore_ascii_case("content-length"))
+                        .unwrap().1.trim().parse().unwrap();
+                    if request.len() >= end + 4 + length { break; }
+                }
+            }
+            let response = if stalled {
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n", body.len())
+            } else {
+                format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len())
+            };
+            socket.write_all(response.as_bytes()).await.unwrap();
+            if stalled {
+                let mut bytes = [0; 1];
+                assert_eq!(socket.read(&mut bytes).await.unwrap(), 0, "reader still alive after stop");
+            }
+        });
+        let mut model = base_model();
+        model.base_url = format!("http://{address}");
+        (model, server)
+    }
+
+    async fn join_server(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn owned_normal_and_simple_stop_join_producer_and_stalled_sse() {
+        for simple in [false, true] {
+            let (model, server) = local_sse("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n", true).await;
+            let ctx = context(vec![user_text("fixture")]);
+            let stream = if simple {
+                stream_simple_openai_completions(&model, &ctx, Some(SimpleStreamOptions {
+                    stream: keyed_options().stream, ..Default::default()
+                }))
+            } else {
+                stream_openai_completions(&model, &ctx, Some(keyed_options()))
+            };
+            loop {
+                let event = tokio::time::timeout(Duration::from_secs(5), stream.next()).await.unwrap().unwrap();
+                if matches!(event, AssistantMessageEvent::TextDelta { .. }) { break; }
+            }
+            let receipt = stream.task_receipt();
+            assert!(receipt.status().supported);
+            assert_eq!(receipt.status().pending_tasks, 2);
+            stream.end(None);
+            assert_eq!(receipt.status().pending_tasks, 2, "channel close is not task acknowledgement");
+            stream.request_cancel();
+            let joined = receipt.settle(Duration::from_secs(5)).await;
+            assert!(joined.settled, "{joined:?}");
+            assert_eq!(joined.completed_tasks + joined.cancelled_tasks, 2);
+            assert_eq!(receipt.request_cancel(), joined);
+            join_server(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn pending_usage_observer_is_owned_after_terminal_result() {
+        let (model, server) = local_sse("data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"stop\"}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n", false).await;
+        let mut options = keyed_options();
+        let (started, ready) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        options.stream.on_usage_observation = Some(Arc::new(move |_, _| {
+            let started = started.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                started.send(()).unwrap();
+                std::future::pending::<()>().await;
+            })
+        }));
+        let stream = stream_openai_completions(&model, &context(vec![]), Some(options));
+        ready.await.unwrap();
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.usage.input, 10.0);
+        assert_eq!(output.usage.output, 2.0);
+        let receipt = stream.task_receipt();
+        assert!(receipt.settle(Duration::ZERO).await.pending_tasks >= 1);
+        receipt.request_cancel();
+        let joined = receipt.settle(Duration::from_secs(5)).await;
+        assert!(joined.settled, "{joined:?}");
+        assert_eq!(joined.completed_tasks + joined.cancelled_tasks, 3);
+        join_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn stop_during_payload_callback_drops_request_before_any_transport() {
+        let mut options = keyed_options();
+        let (started, ready) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        options.stream.on_payload = Some(Arc::new(move |_, _| {
+            let started = started.lock().unwrap().take().unwrap();
+            Box::pin(async move {
+                started.send(()).unwrap();
+                std::future::pending::<Option<Value>>().await
+            })
+        }));
+        let stream = stream_openai_completions(&base_model(), &context(vec![]), Some(options));
+        ready.await.unwrap();
+        let receipt = stream.task_receipt();
+        receipt.request_cancel();
+        let joined = receipt.settle(Duration::from_secs(1)).await;
+        assert!(joined.settled, "{joined:?}");
+        assert_eq!(joined.cancelled_tasks, 1);
+        assert!(stream.next().await.is_none());
+    }
+
+    #[tokio::test]
+    async fn in_stream_error_does_not_leave_sse_waiting_for_more_body() {
+        let (model, server) = local_sse("data: {\"error\":{\"message\":\"fixture-error\"}}\n\n", true).await;
+        let stream = stream_openai_completions(&model, &context(vec![]), Some(keyed_options()));
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.stop_reason, "error");
+        let receipt = stream.task_receipt();
+        let joined = receipt.settle(Duration::from_secs(5)).await;
+        assert_eq!(joined.pending_tasks, 0);
+        assert_eq!(joined.completed_tasks, 2);
+        assert!(!joined.cancel_requested);
+        join_server(server).await;
+    }
 }
 
 /// Shared fixtures for the unit tests below.
@@ -2629,6 +2782,7 @@ mod tests {
 
 	#[tokio::test]
 	async fn completions_observers_preserve_unknown_and_zero_counts_and_contain_panics() {
+		let stream = AssistantMessageEventStream::new_owned();
 		let usages = std::sync::Arc::new(std::sync::Mutex::new(Vec::new()));
 		let capture = usages.clone();
 		let mut options = keyed_options();
@@ -2636,7 +2790,7 @@ mod tests {
 			capture.lock().unwrap().push(usage);
 			Box::pin(async {})
 		}));
-		observe_chunk_usage(&json!({"prompt_tokens": 0, "prompt_cache_hit_tokens": 0, "completion_tokens": -1}), &base_model(), Some(&options));
+		observe_chunk_usage(&json!({"prompt_tokens": 0, "prompt_cache_hit_tokens": 0, "completion_tokens": -1}), &base_model(), Some(&options), &stream);
 		let observations = usages.lock().unwrap();
 		assert_eq!(observations[0].input_tokens, Some(Some(0.0)));
 		assert_eq!(observations[0].cached_input_tokens, Some(Some(0.0)));
@@ -2644,7 +2798,7 @@ mod tests {
 		assert_eq!(observations[0].reasoning_tokens, Some(None));
 		drop(observations);
 		options.stream.on_usage_observation = Some(std::sync::Arc::new(|_, _| panic!("disposable observer")));
-		observe_chunk_usage(&json!({}), &base_model(), Some(&options));
+		observe_chunk_usage(&json!({}), &base_model(), Some(&options), &stream);
 		let observer: crate::types::OnStreamObservation = std::sync::Arc::new(|_| panic!("disposable observer"));
 		observe_sse_payload(Some(&observer), "[DONE]");
 	}

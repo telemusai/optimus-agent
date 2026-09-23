@@ -58,3 +58,25 @@ if child is not None:
 - Sender identity is daemon-derived and cannot be spoofed from Python.
 - The daemon enforces message size, rate, and pending-queue limits before
   accepting delivery.
+
+## Optional active-only direct-child diagnostics
+
+The default `send` behavior above is unchanged. To prevent an idle or stopped
+child from waking, query `await rlm.active_execution(child)` first. Use its
+original `execution_generation` with:
+
+```python
+await agent_message.send(
+    "bounded diagnostic", receiver_role="child", receiver_name=child.rlm_child_id,
+    wake_if_idle=False, execution_generation=active["execution_generation"],
+    message_id="unique-id",
+)
+```
+
+The client requires `rlm.active-only-message.v1` and matching native/runtime
+provenance. No ordinary-send fallback is allowed. The `optimus.active-message.v1`
+receipt is admission only; `accepted`/`duplicate` do not prove model processing.
+`declined_idle`, `declined_stopped`, `declined_generation`, and `declined_capacity`
+never start or retarget work. Do not replace an expired token with a new one.
+Only direct children are allowed. Broadcasts remain ordinary default sends.
+See `docs/native-lifecycle.md` for retained stop and explicit audit resume.

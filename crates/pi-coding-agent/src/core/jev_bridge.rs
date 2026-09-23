@@ -23,6 +23,26 @@ use crate::core::skills::Skill;
 /// Path of the internal observer extension (stable, easy to spot in logs).
 pub const JEV_OBSERVER_PATH: &str = "<jev-observer-internal>";
 
+/// Ownership-only stop fence, independent of credentials or observer replacement.
+/// The host persists retention and combines this with its other owned domains.
+pub fn request_session_retain_stop(session_id: &str) -> pi_jev::scheduler::SessionSettlementStatus {
+    pi_jev::scheduler::request_session_retain_stop(session_id)
+}
+
+pub fn session_retain_status(session_id: &str) -> pi_jev::scheduler::SessionSettlementStatus {
+    pi_jev::scheduler::session_retain_status(session_id)
+}
+
+pub async fn settle_session_retain_stop(session_id: &str, timeout: Duration) -> pi_jev::scheduler::SessionSettlementStatus {
+    pi_jev::scheduler::settle_session_retain_stop(session_id, timeout).await
+}
+
+/// Only an explicit authorized host generation may clear a retained fence.
+pub fn begin_session_retain_generation(session_id: &str, expected_generation: u64) -> bool {
+    pi_jev::scheduler::begin_session_retain_generation(session_id, expected_generation)
+}
+
+
 /// Observed-change component of the settings identity: advances only when a
 /// reload observes a settings VALUE that differs from the previous snapshot
 /// (never on unchanged TTL re-reads). Combined with the DURABLE persisted
@@ -204,10 +224,28 @@ fn control_terminal_statuses() -> &'static Mutex<HashMap<String, Value>> {
 /// and booleans only; no prompt or result content is retained.
 pub(crate) fn note_control_terminal_outcome(
     session_id: &str,
+    epoch_id: &str,
     outcome: &crate::core::jev_control::ControlAgentEndResult,
 ) {
     if session_id.is_empty() || session_id.len() > 128 {
         return;
+    }
+    if let Some(core) = bridge_for_session(session_id) {
+        let mut sessions = core.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(book) = sessions.get_mut(session_id) {
+            if book.control_epoch_id.as_deref() != Some(epoch_id) {
+                return;
+            }
+            // These are task assessments, not proof of a completed test run.
+            let observed = match &outcome.verification_state {
+                pi_jev::control::ControlVerificationState::NotApplicable => Some(pi_jev::observation::VerificationEvidence::NotNeeded),
+                pi_jev::control::ControlVerificationState::Unverified => Some(pi_jev::observation::VerificationEvidence::NotRun),
+                _ => None,
+            };
+            if let Some(outcome) = observed {
+                book.trace.record(pi_jev::observation::TraceEvent::VerificationObserved { outcome });
+            }
+        }
     }
     let verification_state = match &outcome.verification_state {
         pi_jev::control::ControlVerificationState::Unknown => "unknown",
@@ -571,6 +609,7 @@ struct SessionBook {
     /// Authoritative provider index once the awaited request hook has run.
     request_turn: Option<u64>,
     trace: pi_jev::observation::TraceObserver,
+    control_epoch_id: Option<String>,
     /// ROOT-CONTRACT v7 (Agent-guidance lane): latest advisory skill hint.
     /// Assessment only — it never loads or executes a skill.
     skill_hint: Option<pi_jev::agent_guidance::SkillHint>,
@@ -590,6 +629,13 @@ struct SessionBook {
 }
 
 impl SessionBook {
+    fn note_control_epoch(&mut self, epoch_id: &str) {
+        if !epoch_id.is_empty() && self.control_epoch_id.as_deref() != Some(epoch_id) {
+            self.trace.reset();
+            self.control_epoch_id = Some(epoch_id.to_string());
+        }
+    }
+
     fn current_turn(&self) -> u64 {
         self.request_turn.unwrap_or(self.turn)
     }
@@ -2083,6 +2129,17 @@ pub fn current_skill_hint(session_id: &str) -> Option<pi_jev::agent_guidance::Sk
 /// commit seam (root blocker-3): the hint stamp binds to the genuine
 /// delivery, so two new deliveries with byte-identical task text can never
 /// reuse the previous request's hint.
+/// Called only after a real user task epoch is committed by the host.
+/// Automatic follow-ups keep the same observation scope and verification state.
+pub fn note_control_task_epoch(session_id: &str, epoch_id: &str) {
+    if let Some(core) = bridge_for_session(session_id) {
+        let mut sessions = core.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(book) = sessions.get_mut(session_id) {
+            book.note_control_epoch(epoch_id);
+        }
+    }
+}
+
 pub fn note_session_delivery(session_id: &str, delivery_id: &str) {
     let Some(core) = bridge_for_session(session_id) else { return; };
     core.note_delivery(session_id, delivery_id);
@@ -2949,11 +3006,30 @@ fn activation_policy(features: pi_jev::config::JevFeatures) -> pi_jev::active::A
 
 fn request_action(params: &Value) -> BTreeMap<String, String> {
     let mut result = BTreeMap::new();
-    if let Some(tools) = params.get("tools").and_then(Value::as_array) { result.insert("tools".to_string(), format!("count:{}", tools.len())); }
+    let tools = params.get("tools").and_then(Value::as_array);
+    result.insert("tools".to_string(), tools.map(|tools| format!("count:{}", tools.len())).unwrap_or_else(|| "absent".to_string()));
+    result.insert("execution_tool".to_string(), if tools.is_some_and(|tools| tools.iter().any(|tool| tool.get("name").or_else(|| tool.get("function").and_then(|function| function.get("name"))).and_then(Value::as_str) == Some("ipython"))) { "ipython_advertised" } else { "ipython_not_advertised" }.to_string());
+    result.insert("tool_state_scope".to_string(), "local_request_not_provider_receipt".to_string());
     if let Some((key, effort)) = crate::core::jev_active::reasoning_effort(params) {
         result.insert(key.to_string(), effort.to_string());
     }
-    if params.get("tool_choice").is_some() { result.insert("tool_choice".to_string(), "present".to_string()); }
+    let choice = match params.get("tool_choice") {
+        None => "absent",
+        Some(Value::String(value)) => match value.as_str() {
+            "auto" => "auto",
+            "none" => "none",
+            "required" => "required",
+            _ => "unknown",
+        },
+        Some(Value::Object(value)) => match value.get("type").and_then(Value::as_str) {
+            Some("function") => "function",
+            Some("allowed_tools") => "allowed_tools",
+            Some("custom") => "custom",
+            _ => "unknown",
+        },
+        _ => "unknown",
+    };
+    result.insert("tool_choice".to_string(), choice.to_string());
     result
 }
 
@@ -2975,12 +3051,8 @@ fn active_request_state(
     params: &Value,
     settings: &JevSettings,
 ) -> Value {
-    let advertised = advertised_tool_names(params);
-    let observed = if advertised.is_empty() {
-        core.observed_tools(session_id)
-    } else {
-        advertised
-    };
+    // Request-local availability must not fall back to tools from old turns.
+    let observed = advertised_tool_names(params);
     let model_id = ctx.model().map(|model| model.id.clone());
     json!({
         "session_id": session_id,
@@ -3802,6 +3874,42 @@ mod observation_redaction_tests {
 #[cfg(test)]
 mod provider_action_tests {
     use super::*;
+
+    #[test]
+    fn ctrl001_task_epoch_resets_trace_once_not_on_internal_followups() {
+        use pi_jev::observation::{TraceEvent, VerificationEvidence};
+        let mut book = SessionBook::default();
+        book.note_control_epoch("session:1");
+        book.trace.record(TraceEvent::ToolEnded { is_error: false });
+        book.trace.record(TraceEvent::VerificationObserved { outcome: VerificationEvidence::NotNeeded });
+        book.note_control_epoch("session:1");
+        book.trace.record(TraceEvent::TurnStarted);
+        assert_eq!(book.trace.summary().tool_results, 1);
+        assert_eq!(book.trace.summary().verification, VerificationEvidence::NotNeeded);
+        book.note_control_epoch("session:2");
+        assert_eq!(book.trace.summary().tool_results, 0);
+        assert_eq!(book.trace.summary().verification, VerificationEvidence::Unknown);
+    }
+
+    #[test]
+    fn tool001_request_diagnostics_distinguish_retained_disabled_and_absent() {
+        for choice in ["auto", "none", "required"] {
+            let params = json!({"tools":[{"type":"function","name":"ipython","parameters":{"secret":"DO_NOT_LOG"}}],"tool_choice":choice});
+            let action = request_action(&params);
+            assert_eq!(action["tools"], "count:1");
+            assert_eq!(action["execution_tool"], "ipython_advertised");
+            assert_eq!(action["tool_choice"], choice);
+            assert_eq!(action["tool_state_scope"], "local_request_not_provider_receipt");
+            assert!(!format!("{action:?}").contains("DO_NOT_LOG"));
+        }
+        let absent = request_action(&json!({}));
+        assert_eq!(absent["tools"], "absent");
+        assert_eq!(absent["tool_choice"], "absent");
+        let function = request_action(&json!({"tools":[],"tool_choice":{"type":"function","name":"DO_NOT_LOG"}}));
+        assert_eq!(function["tools"], "count:0");
+        assert_eq!(function["tool_choice"], "function");
+        assert!(!format!("{function:?}").contains("DO_NOT_LOG"));
+    }
     #[test]
     fn telemetry_tracks_the_responses_field_that_actually_changes() {
         let mut params=json!({"reasoning":{"effort":"low","summary":"auto"}});
@@ -3813,3 +3921,7 @@ mod provider_action_tests {
         assert!(!after.contains_key("reasoning_effort"));
     }
 }
+
+#[cfg(test)]
+#[path = "jev_bridge/tool_error_bridge_tests.rs"]
+mod tool_error_bridge_tests;

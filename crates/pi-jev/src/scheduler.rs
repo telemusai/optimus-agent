@@ -6,6 +6,8 @@
 //! never block the caller, and cancellation cleanup on session disposal.
 
 use std::collections::{BTreeMap, HashMap};
+use std::future::Future;
+use std::task::Poll;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
@@ -155,12 +157,15 @@ struct Budget {
 }
 
 struct Job {
+    retention_cancel: CancellationToken,
     request: SystemOneRequest,
     ctx: RequestContext,
     deadline: Instant,
     /// Enqueue wall-clock marker; jobs enqueued before a session's cancel
     /// time are dropped, jobs enqueued after it run (Compare can return).
     enqueued_at: Instant,
+    // Last: a discarded queue entry drops its owned payload before acknowledgement.
+    settlement: Option<SessionWorkGuard>,
 }
 
 struct Shared {
@@ -230,6 +235,169 @@ impl CancellationToken {
         }
         notified.await;
     }
+}
+
+/// Lifecycle-only acknowledgement. Legacy telemetry counters are not a join:
+/// they can reach zero before the actual result sink returns.
+#[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize)]
+pub struct SessionSettlementStatus {
+    pub generation: u64,
+    pub cancel_requested: bool,
+    pub pending_work: usize,
+    pub completed_work: usize,
+    pub cancelled_work: usize,
+    pub failed_work: usize,
+    pub settled: bool,
+}
+
+#[derive(Default)]
+struct SessionWorkState {
+    generation: u64,
+    fenced: bool,
+    next_id: u64,
+    pending: HashMap<u64, CancellationToken>,
+    completed: usize,
+    cancelled: usize,
+    failed: usize,
+}
+
+#[derive(Default)]
+struct SessionWorkRegistry {
+    sessions: Mutex<HashMap<String, SessionWorkState>>,
+    changed: tokio::sync::Notify,
+}
+
+fn session_work_registry() -> &'static SessionWorkRegistry {
+    // Keep ownership across observer replacement; old workers may still be
+    // returning results when a new observer instance is installed.
+    static REGISTRY: std::sync::OnceLock<SessionWorkRegistry> = std::sync::OnceLock::new();
+    REGISTRY.get_or_init(SessionWorkRegistry::default)
+}
+
+pub(crate) struct SessionWorkGuard {
+    session_id: String,
+    id: u64,
+    pub(crate) generation: u64,
+    token: CancellationToken,
+    normal_cancel: Option<CancellationToken>,
+    acknowledged: bool,
+}
+
+impl SessionWorkGuard {
+    pub(crate) fn token(&self) -> CancellationToken { self.token.clone() }
+
+    pub(crate) fn finish(mut self) { self.acknowledge(true); }
+
+    pub(crate) fn bind_normal_cancel(&mut self, token: CancellationToken) {
+        self.normal_cancel = Some(token);
+    }
+
+    fn acknowledge(&mut self, success: bool) {
+        if self.acknowledged { return; }
+        self.acknowledged = true;
+        let registry = session_work_registry();
+        let mut sessions = registry.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(state) = sessions.get_mut(&self.session_id) {
+            if state.generation == self.generation && state.pending.remove(&self.id).is_some() {
+                if !success {
+                    state.failed += 1;
+                } else if self.token.is_cancelled()
+                    || self.normal_cancel.as_ref().is_some_and(CancellationToken::is_cancelled)
+                {
+                    state.cancelled += 1;
+                } else {
+                    state.completed += 1;
+                }
+            }
+        }
+        drop(sessions);
+        registry.changed.notify_waiters();
+    }
+}
+
+impl Drop for SessionWorkGuard {
+    fn drop(&mut self) {
+        // Dropping an unfinished body is only expected after cancellation.
+        // A panic or lost worker remains a failure, even if no tasks remain.
+        let cancelled = self.token.is_cancelled()
+            || self.normal_cancel.as_ref().is_some_and(CancellationToken::is_cancelled);
+        self.acknowledge(cancelled && !std::thread::panicking());
+    }
+}
+
+pub(crate) fn register_session_work(
+    session_id: &str,
+    normal_cancel: Option<CancellationToken>,
+) -> Option<SessionWorkGuard> {
+    let registry = session_work_registry();
+    let mut sessions = registry.sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let state = sessions.entry(session_id.to_string()).or_default();
+    if state.fenced { return None; }
+    let id = state.next_id;
+    state.next_id += 1;
+    let token = CancellationToken::new();
+    state.pending.insert(id, token.clone());
+    Some(SessionWorkGuard {
+        session_id: session_id.to_string(), id, generation: state.generation,
+        token, normal_cancel, acknowledged: false,
+    })
+}
+
+pub fn session_retain_status(session_id: &str) -> SessionSettlementStatus {
+    let sessions = session_work_registry().sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(state) = sessions.get(session_id) else { return SessionSettlementStatus::default(); };
+    SessionSettlementStatus {
+        generation: state.generation, cancel_requested: state.fenced,
+        pending_work: state.pending.len(), completed_work: state.completed,
+        cancelled_work: state.cancelled, failed_work: state.failed,
+        settled: state.fenced && state.pending.is_empty() && state.failed == 0,
+    }
+}
+
+pub fn request_session_retain_stop(session_id: &str) -> SessionSettlementStatus {
+    {
+        let mut sessions = session_work_registry().sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let state = sessions.entry(session_id.to_string()).or_default();
+        state.fenced = true;
+        for token in state.pending.values() { token.cancel(); }
+    }
+    session_work_registry().changed.notify_waiters();
+    session_retain_status(session_id)
+}
+
+pub async fn settle_session_retain_stop(session_id: &str, timeout: Duration) -> SessionSettlementStatus {
+    let wait = async {
+        loop {
+            let changed = session_work_registry().changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if session_retain_status(session_id).pending_work == 0 { return; }
+            changed.await;
+        }
+    };
+    let _ = tokio::time::timeout(timeout, wait).await;
+    session_retain_status(session_id)
+}
+
+/// Called only for explicit new authorized work after the host's durable fence
+/// and every local settlement domain have been checked. Never replay old work.
+pub fn begin_session_retain_generation(session_id: &str, expected_generation: u64) -> bool {
+    let mut sessions = session_work_registry().sessions.lock().unwrap_or_else(|p| p.into_inner());
+    let Some(state) = sessions.get_mut(session_id) else { return false; };
+    if state.generation != expected_generation || !state.fenced
+        || !state.pending.is_empty() || state.failed != 0 { return false; }
+    state.generation += 1;
+    state.fenced = false;
+    state.completed = 0;
+    state.cancelled = 0;
+    drop(sessions);
+    session_work_registry().changed.notify_waiters();
+    true
+}
+
+pub(crate) fn session_work_is_current(session_id: &str, generation: u64) -> bool {
+    let status = session_retain_status(session_id);
+    !status.cancel_requested && status.generation == generation
 }
 
 /// Bounded comparison scheduler. One instance per observer.
@@ -319,14 +487,7 @@ impl JevScheduler {
                         guard.recv().await
                     };
                     let Some(job) = job else { break };
-                    if shared.closed.load(Ordering::SeqCst) {
-                        (shared.sink)(JobResult::Dropped {
-                            ctx: job.ctx,
-                            reason: "cancelled".to_string(),
-                        });
-                        continue;
-                    }
-                    run_job(&shared, job).await;
+                    run_owned_job(&shared, job).await;
                 }
             });
         }
@@ -335,7 +496,23 @@ impl JevScheduler {
 
     /// Enqueue one bundle. Never blocks: a full queue drops the request with
     /// a metric. Returns false when the request was dropped.
-    pub fn enqueue(&self, mut request: SystemOneRequest, mut ctx: RequestContext) -> bool {
+    pub fn enqueue(&self, request: SystemOneRequest, ctx: RequestContext) -> bool {
+        let Some(guard) = register_session_work(&ctx.session_id, None) else {
+            // A retained session admits no new dispatch or result callback.
+            return false;
+        };
+        let mut admission = Some(guard);
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            self.enqueue_owned(request, ctx, &mut admission)
+        }));
+        if let Some(mut guard) = admission {
+            guard.acknowledge(result.is_ok());
+        }
+        result.unwrap_or(false)
+    }
+
+    fn enqueue_owned(&self, mut request: SystemOneRequest, mut ctx: RequestContext,
+        admission: &mut Option<SessionWorkGuard>) -> bool {
         if self.shared.closed.load(Ordering::SeqCst) {
             (self.shared.sink)(JobResult::Dropped { ctx, reason: "cancelled".into() });
             return false;
@@ -387,13 +564,16 @@ impl JevScheduler {
             return false;
         };
         match tx.try_send(Job {
+            retention_cancel: admission.as_ref().expect("admitted job").token(),
+            settlement: admission.take(),
             request,
             ctx,
             deadline,
             enqueued_at,
         }) {
             Ok(()) => true,
-            Err(mpsc::error::TrySendError::Full(job)) => {
+            Err(mpsc::error::TrySendError::Full(mut job)) => {
+                *admission = job.settlement.take();
                 self.shared.metrics.dropped_queue_full.fetch_add(1, Ordering::SeqCst);
                 (self.shared.sink)(JobResult::Dropped {
                     ctx: job.ctx,
@@ -401,7 +581,8 @@ impl JevScheduler {
                 });
                 false
             }
-            Err(mpsc::error::TrySendError::Closed(job)) => {
+            Err(mpsc::error::TrySendError::Closed(mut job)) => {
+                *admission = job.settlement.take();
                 (self.shared.sink)(JobResult::Dropped { ctx: job.ctx, reason: "cancelled".into() });
                 false
             },
@@ -491,6 +672,30 @@ impl Drop for JevScheduler {
     }
 }
 
+async fn run_owned_job(shared: &Arc<Shared>, mut job: Job) {
+    let mut guard = job.settlement.take().expect("queued job has ownership");
+    let key = (job.ctx.session_id.clone(), job.ctx.request_id.clone());
+    let mut future = Box::pin(async {
+        if shared.closed.load(Ordering::SeqCst) {
+            (shared.sink)(JobResult::Dropped { ctx: job.ctx, reason: "cancelled".to_string() });
+        } else {
+            run_job(shared, job).await;
+        }
+    });
+    let returned = std::future::poll_fn(|cx| {
+        match std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| future.as_mut().poll(cx))) {
+            Ok(Poll::Ready(())) => Poll::Ready(true),
+            Ok(Poll::Pending) => Poll::Pending,
+            Err(_) => Poll::Ready(false),
+        }
+    }).await;
+    let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(future))).is_ok();
+    // The contained request future and actual sink have returned/dropped now.
+    // Keep a panicking job from killing a shared worker needed by other sessions.
+    shared.in_flight.lock().unwrap_or_else(|p| p.into_inner()).remove(&key);
+    guard.acknowledge(returned && dropped);
+}
+
 async fn run_job(shared: &Arc<Shared>, job: Job) {
     let request_id = job.ctx.request_id.clone();
     let session_id = job.ctx.session_id.clone();
@@ -504,7 +709,7 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .get(&session_id)
             .copied();
-        if cancelled_at.is_some_and(|at| job.enqueued_at < at) {
+        if job.retention_cancel.is_cancelled() || cancelled_at.is_some_and(|at| job.enqueued_at < at) {
             shared.metrics.dropped_cancelled.fetch_add(1, Ordering::SeqCst);
             (shared.sink)(JobResult::Dropped {
                 ctx: job.ctx,
@@ -561,7 +766,7 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
         .unwrap_or(Duration::ZERO)
     };
 
-    let token = CancellationToken::new();
+    let token = job.retention_cancel.clone();
     shared
         .in_flight
         .lock()
@@ -701,6 +906,237 @@ async fn run_job(shared: &Arc<Shared>, job: Job) {
                 attempts: 1,
             });
         }
+    }
+}
+
+
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use tokio::sync::oneshot;
+
+    fn session() -> String { format!("retain-test-{}", uuid::Uuid::new_v4()) }
+
+    fn input(session: &str, id: &str) -> (SystemOneRequest, RequestContext) {
+        (SystemOneRequest { state: json!({}), model: "mock".into(), questions: BTreeMap::new() },
+         RequestContext {
+            request_id: id.into(), session_id: session.into(), turn: 0,
+            stage: "turn_start".into(), state_fingerprint: String::new(),
+            state_schema_version: "test".into(), prompt_version: "test".into(),
+            mode: "compare".into(), requested_model: "mock".into(),
+            policy_generation: "test".into(), questions: Vec::new(),
+            baselines: BTreeMap::new(), request_start_ts: String::new(),
+         })
+    }
+
+    struct Probe;
+    impl SystemOne for Probe {
+        fn mode(&self) -> crate::config::JevMode { crate::config::JevMode::Compare }
+        fn decide(&self, _: crate::types::DecisionBundle) -> crate::types::BoxFuture<DecisionOutcome> {
+            Box::pin(async { DecisionOutcome::skipped_all("mock") })
+        }
+    }
+
+    fn config(concurrency: usize) -> SchedulerConfig {
+        SchedulerConfig { concurrency, min_interval: Duration::ZERO, ..Default::default() }
+    }
+
+    async fn joined(session: &str) -> SessionSettlementStatus {
+        settle_session_retain_stop(session, Duration::from_secs(2)).await
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn retain_waits_for_actual_sink_and_leaves_other_session_running() {
+        let a = session();
+        let b = session();
+        let (started, ready) = oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let (release, blocked) = std::sync::mpsc::channel();
+        let blocked = Arc::new(Mutex::new(blocked));
+        let sink_a = a.clone();
+        let (b_done, b_ready) = oneshot::channel();
+        let b_done = Arc::new(Mutex::new(Some(b_done)));
+        let scheduler = JevScheduler::new(config(2), Arc::new(Probe), Arc::new(move |result| {
+            let ctx = match result { JobResult::Completed {ctx, ..} | JobResult::Failed {ctx, ..} | JobResult::Dropped {ctx, ..} => ctx };
+            if ctx.session_id == sink_a {
+                if let Some(started) = started.lock().unwrap().take() { let _ = started.send(()); }
+                blocked.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+            } else if let Some(done) = b_done.lock().unwrap().take() { let _ = done.send(()); }
+        }));
+        let (request, ctx) = input(&a, "blocked-sink");
+        assert!(scheduler.enqueue(request, ctx));
+        ready.await.unwrap();
+        assert_eq!(scheduler.session_status(&a).unwrap()["pending"], 0);
+        assert_eq!(scheduler.session_status(&a).unwrap()["in_flight"], 0);
+        assert_eq!(request_session_retain_stop(&a).pending_work, 1);
+        let timed_out = settle_session_retain_stop(&a, Duration::ZERO).await;
+        assert!(!timed_out.settled);
+        assert!(!begin_session_retain_generation(&a, timed_out.generation));
+        let mut waiter = Box::pin(settle_session_retain_stop(&a, Duration::from_secs(2)));
+        std::future::poll_fn(|cx| {
+            assert!(waiter.as_mut().poll(cx).is_pending());
+            Poll::Ready(())
+        }).await;
+        drop(waiter);
+        assert_eq!(session_retain_status(&a).pending_work, 1);
+        let (request, ctx) = input(&a, "late");
+        assert!(!scheduler.enqueue(request, ctx));
+        let (request, ctx) = input(&b, "other-session");
+        assert!(scheduler.enqueue(request, ctx));
+        tokio::time::timeout(Duration::from_secs(2), b_ready).await.unwrap().unwrap();
+        assert!(!session_retain_status(&b).cancel_requested);
+        assert!(!session_retain_status(&a).settled);
+        release.send(()).unwrap();
+        let done = joined(&a).await;
+        assert!(done.settled, "{done:?}");
+        assert_eq!(done.cancelled_work, 1);
+        assert_eq!(request_session_retain_stop(&a), done);
+        assert!(!begin_session_retain_generation(&a, done.generation + 1));
+        assert!(begin_session_retain_generation(&a, done.generation));
+        assert!(!session_work_is_current(&a, done.generation));
+        assert!(!begin_session_retain_generation(&a, done.generation));
+        assert_eq!(joined(&b).await.completed_work, 1);
+    }
+
+    struct PendingProbe { started: Mutex<Option<oneshot::Sender<()>>>, dropped: Arc<AtomicBool> }
+    impl SystemOne for PendingProbe {
+        fn mode(&self) -> crate::config::JevMode { crate::config::JevMode::Compare }
+        fn decide(&self, _: crate::types::DecisionBundle) -> crate::types::BoxFuture<DecisionOutcome> {
+            struct Mark(Arc<AtomicBool>);
+            impl Drop for Mark { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+            let guard = Mark(self.dropped.clone());
+            let started = self.started.lock().unwrap().take().expect("queued job must never dispatch");
+            Box::pin(async move {
+                let _guard = guard;
+                let _ = started.send(());
+                std::future::pending().await
+            })
+        }
+    }
+
+    #[tokio::test]
+    async fn queued_and_running_jobs_acknowledge_only_after_future_and_sink_drop() {
+        let id = session();
+        let (started, ready) = oneshot::channel();
+        let dropped = Arc::new(AtomicBool::new(false));
+        let sink_count = Arc::new(AtomicU64::new(0));
+        let count = sink_count.clone();
+        let scheduler = JevScheduler::new(config(1), Arc::new(PendingProbe { started: Mutex::new(Some(started)), dropped: dropped.clone() }), Arc::new(move |_| { count.fetch_add(1, Ordering::SeqCst); }));
+        for request_id in ["running", "queued"] {
+            let (request, ctx) = input(&id, request_id);
+            assert!(scheduler.enqueue(request, ctx));
+        }
+        ready.await.unwrap();
+        assert_eq!(request_session_retain_stop(&id).pending_work, 2);
+        let done = joined(&id).await;
+        assert!(done.settled, "{done:?}");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert_eq!(sink_count.load(Ordering::SeqCst), 2);
+        assert_eq!(done.cancelled_work, 2);
+    }
+
+    #[tokio::test]
+    async fn sink_panic_is_failed_not_settled_and_does_not_kill_shared_worker() {
+        let a = session();
+        let b = session();
+        let panic_session = a.clone();
+        let scheduler = JevScheduler::new(config(1), Arc::new(Probe), Arc::new(move |result| {
+            let ctx = match result { JobResult::Completed {ctx, ..} | JobResult::Failed {ctx, ..} | JobResult::Dropped {ctx, ..} => ctx };
+            if ctx.session_id == panic_session { panic!("synthetic sink panic"); }
+        }));
+        for id in [&a, &b] {
+            let (request, ctx) = input(id, "job");
+            assert!(scheduler.enqueue(request, ctx));
+        }
+        assert_eq!(joined(&a).await.failed_work, 1);
+        let failed = request_session_retain_stop(&a);
+        assert_eq!(failed.pending_work, 0);
+        assert!(!failed.settled);
+        assert!(!begin_session_retain_generation(&a, failed.generation));
+        assert_eq!(joined(&b).await.completed_work, 1);
+    }
+
+    #[tokio::test]
+    async fn admission_sink_panic_and_closed_queue_are_acknowledged() {
+        let failed_id = session();
+        let scheduler = JevScheduler::new(SchedulerConfig { max_payload_bytes: 0, ..config(1) }, Arc::new(Probe), Arc::new(|_| panic!("admission sink panic")));
+        let (request, ctx) = input(&failed_id, "oversize");
+        assert!(!scheduler.enqueue(request, ctx));
+        assert_eq!(session_retain_status(&failed_id).failed_work, 1);
+        assert!(!request_session_retain_stop(&failed_id).settled);
+        let closed_id = session();
+        let scheduler = JevScheduler::new(config(1), Arc::new(Probe), Arc::new(|_| {}));
+        scheduler.shutdown();
+        let (request, ctx) = input(&closed_id, "closed");
+        assert!(!scheduler.enqueue(request, ctx));
+        assert!(request_session_retain_stop(&closed_id).settled);
+    }
+
+    #[test]
+    fn fence_survives_observer_churn_and_other_session_churn() {
+        let id = session();
+        let stopped = request_session_retain_stop(&id);
+        for _ in 0..1100 {
+            let other = session();
+            register_session_work(&other, None).unwrap().finish();
+        }
+        assert_eq!(session_retain_status(&id), stopped);
+        assert!(register_session_work(&id, None).is_none());
+        assert!(begin_session_retain_generation(&id, stopped.generation));
+        register_session_work(&id, None).unwrap().finish();
+        assert!(request_session_retain_stop(&id).settled);
+    }
+
+    #[tokio::test]
+    async fn request_future_panic_is_contained_and_acknowledged_as_failed() {
+        struct PanicProbe;
+        impl SystemOne for PanicProbe {
+            fn mode(&self) -> crate::config::JevMode { crate::config::JevMode::Compare }
+            fn decide(&self, _: crate::types::DecisionBundle) -> crate::types::BoxFuture<DecisionOutcome> {
+                Box::pin(async { panic!("synthetic request panic") })
+            }
+        }
+        let id = session();
+        let scheduler = JevScheduler::new(config(1), Arc::new(PanicProbe), Arc::new(|_| {}));
+        let (request, ctx) = input(&id, "panic");
+        assert!(scheduler.enqueue(request, ctx));
+        let done = joined(&id).await;
+        assert_eq!(done.pending_work, 0);
+        assert_eq!(done.failed_work, 1);
+        assert!(!request_session_retain_stop(&id).settled);
+    }
+
+    #[test]
+    fn concurrent_admission_and_stop_never_lose_owned_work() {
+        let id = session();
+        let barrier = Arc::new(std::sync::Barrier::new(2));
+        let other_id = id.clone();
+        let other_barrier = barrier.clone();
+        let thread = std::thread::spawn(move || {
+            other_barrier.wait();
+            register_session_work(&other_id, None)
+        });
+        barrier.wait();
+        request_session_retain_stop(&id);
+        let guard = thread.join().unwrap();
+        if let Some(guard) = guard {
+            assert!(guard.token().is_cancelled());
+            assert_eq!(session_retain_status(&id).pending_work, 1);
+            guard.finish();
+        }
+        assert!(session_retain_status(&id).settled);
+        assert!(register_session_work(&id, None).is_none());
+    }
+
+    #[test]
+    fn unexpected_body_drop_fails_even_without_pending_tokens() {
+        let id = session();
+        drop(register_session_work(&id, None).unwrap());
+        let status = request_session_retain_stop(&id);
+        assert_eq!(status.pending_work, 0);
+        assert_eq!(status.failed_work, 1);
+        assert!(!status.settled);
     }
 }
 

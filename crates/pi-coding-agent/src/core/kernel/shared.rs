@@ -3,6 +3,10 @@
 //! Local stand-ins for slices that have not landed yet are marked `TODO(slice)`:
 //! they are minimal copies of the TypeScript they replace and are listed in the
 //! slice status file under `blocked_on`.
+#[path = "execution_report.rs"]
+mod execution_report;
+pub use execution_report::{parse_execution_reports, ScriptExecutionReport};
+
 use std::collections::HashMap;
 use std::future::Future;
 use std::pin::Pin;
@@ -528,6 +532,8 @@ pub struct ExecuteResult {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub error: Option<ExecError>,
     pub duration_ms: f64,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub execution_reports: Option<Vec<ScriptExecutionReport>>,
 }
 
 impl ExecuteResult {
@@ -542,6 +548,7 @@ impl ExecuteResult {
             background_output: None,
             status: ExecuteStatus::Aborted,
             error: None,
+            execution_reports: None,
             duration_ms,
         }
     }
@@ -714,6 +721,33 @@ pub fn as_metric_number(value: Option<&Value>) -> Option<f64> {
     }
 }
 
+/// A process/descendant receipt, not admission of a kill request or protocol EOF.
+#[derive(Debug, Clone, serde::Serialize, serde::Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct KernelSettlement {
+    pub ownership_scope: String,
+    pub supported: bool,
+    pub settled: bool,
+    pub kernel_exited: bool,
+    pub descendants_exited: bool,
+    pub local_tasks_settled: bool,
+    pub errors: Vec<String>,
+}
+
+impl KernelSettlement {
+    pub fn unsupported(reason: impl Into<String>) -> Self {
+        Self {
+            ownership_scope: "unproven".into(),
+            supported: false,
+            settled: false,
+            kernel_exited: false,
+            descendants_exited: false,
+            local_tasks_settled: false,
+            errors: vec![reason.into()],
+        }
+    }
+}
+
 #[derive(Clone, Default)]
 pub struct KernelShutdownOptions {
     pub snapshot: bool,
@@ -740,6 +774,22 @@ pub trait KernelClient: Send + Sync {
         opts: ExecuteOptions,
     ) -> BoxFuture<'a, Result<ExecuteResult, KernelError>>;
     fn shutdown<'a>(&'a self, opts: KernelShutdownOptions) -> BoxFuture<'a, Result<bool, KernelError>>;
+    /// Terminal stop, without executing a snapshot. Only this receipt can prove
+    /// scoped descendant settlement; legacy shutdown/kill/dispose cannot.
+    fn shutdown_and_settle<'a>(
+        &'a self,
+        owner_session_id: &'a str,
+        timeout_ms: u64,
+    ) -> BoxFuture<'a, Result<KernelSettlement, KernelError>> {
+        let owner = self.owner_session_id();
+        Box::pin(async move {
+            if owner.as_deref() != Some(owner_session_id) || owner_session_id.is_empty() {
+                return Err(KernelError::new("Kernel settlement owner mismatch"));
+            }
+            let _ = timeout_ms;
+            Ok(KernelSettlement::unsupported("Kernel backend has no scoped process settlement"))
+        })
+    }
     fn restart<'a>(&'a self) -> BoxFuture<'a, Result<(), KernelError>>;
     fn kill<'a>(&'a self) -> BoxFuture<'a, ()>;
     fn dispose_sync(&self);

@@ -242,6 +242,16 @@ impl ControlBook {
         expected_epoch_id: &str,
         kind: ControlBudgetKind,
     ) -> Option<ControlBudgetSnapshot> {
+        self.consume_with_notice(session_id, expected_epoch_id, kind, None)
+    }
+
+    fn consume_with_notice(
+        &self,
+        session_id: &str,
+        expected_epoch_id: &str,
+        kind: ControlBudgetKind,
+        notice: Option<&str>,
+    ) -> Option<ControlBudgetSnapshot> {
         if !valid_session_id(session_id) {
             return None;
         }
@@ -269,7 +279,9 @@ impl ControlBook {
                 return Ok((None, Vec::new(), false));
             }
             let current = record.budget_snapshot();
-            if !current.allows(kind) {
+            if !current.allows(kind)
+                || notice.is_some_and(|key| record.feedback_notices.iter().any(|seen| seen == key))
+            {
                 return Ok((None, Vec::new(), false));
             }
             let next = current.consume(kind);
@@ -279,6 +291,9 @@ impl ControlBook {
             updated.verification_remaining = next.verification_remaining;
             updated.nonprogress_remaining = next.nonprogress_remaining;
             updated.veto_remaining = next.veto_remaining;
+            if let Some(notice) = notice {
+                updated.feedback_notices.push(notice.to_string());
+            }
             records[index] = updated.clone();
             // Cache install happens only after the durable commit succeeds.
             Ok((Some(next), vec![updated], true))
@@ -287,6 +302,21 @@ impl ControlBook {
             Ok(inner) => inner,
             Err(()) => None,
         }
+    }
+
+    fn feedback_already_delivered(&self, session_id: &str, facts: &HostControlFacts) -> bool {
+        let keys = [
+            feedback_notice_id(facts, FeedbackKind::ResultGap),
+            feedback_notice_id(facts, FeedbackKind::VerificationMissing),
+        ];
+        self.ledger_txn(session_id, false, |records| {
+            let duplicate = records.iter().any(|record| {
+                epoch_id(&record.session, record.epoch) == facts.epoch_id
+                    && record.session == session_id
+                    && record.feedback_notices.iter().any(|key| keys.contains(key))
+            });
+            Ok((duplicate, Vec::new(), false))
+        }).unwrap_or(false)
     }
 
     /// Record one bounded turn signature for the nonprogress predicate. The
@@ -561,6 +591,7 @@ impl ControlBook {
                 nonprogress_remaining: snapshot.nonprogress_remaining,
                 veto_remaining: snapshot.veto_remaining,
                 veto_attempts: Vec::new(),
+                feedback_notices: Vec::new(),
             };
             match records
                 .iter()
@@ -594,6 +625,9 @@ impl ControlBook {
         let mut sessions = self.lock_sessions();
         let entry = self.entry_or_evict(&mut sessions, &record.session);
         if record.epoch >= entry.epoch {
+            if record.epoch != entry.epoch {
+                entry.signatures.clear();
+            }
             entry.epoch = record.epoch;
             entry.seq = entry.seq.max(record.seq);
             entry.anchor_digest = record.anchor_digest.clone();
@@ -689,6 +723,7 @@ struct DurableRecord {
     nonprogress_remaining: u8,
     veto_remaining: u8,
     veto_attempts: Vec<u32>,
+    feedback_notices: Vec<String>,
 }
 
 impl DurableRecord {
@@ -747,6 +782,16 @@ impl DurableRecord {
             }
             veto_attempts.push(ordinal);
         }
+        // Older v2 records have no notice ids. They retain their spent budgets.
+        let feedback_notices: Vec<String> = match value.get("feedback_notices") {
+            None => Vec::new(),
+            Some(value) => serde_json::from_value(value.clone()).ok()?,
+        };
+        if feedback_notices.len() > usize::from(maxima.feedback)
+            || feedback_notices.iter().any(|key| key.len() != 64 || !key.bytes().all(|c| c.is_ascii_hexdigit()))
+        {
+            return None;
+        }
         Some(DurableRecord {
             session: session.to_string(),
             epoch,
@@ -757,6 +802,7 @@ impl DurableRecord {
             nonprogress_remaining,
             veto_remaining,
             veto_attempts,
+            feedback_notices,
         })
     }
 
@@ -772,6 +818,7 @@ impl DurableRecord {
             "nonprogress": self.nonprogress_remaining,
             "veto": self.veto_remaining,
             "consults": self.veto_attempts,
+            "feedback_notices": self.feedback_notices,
         })
         .to_string()
     }
@@ -1099,6 +1146,7 @@ pub fn resolve_agent_end(
     let mut verification = VerificationNeed::Unknown;
     let mut insufficient_budget_refused = false;
     let mut verification_budget_refused = false;
+    let mut terminal_stop = false;
     for candidate in candidates {
         let verdict = evaluate_control_answer(
             policy,
@@ -1151,6 +1199,10 @@ pub fn resolve_agent_end(
                 _ => verification_budget_refused |= budget_refused,
             },
             DecisionCategory::ContinueStopEscalate => {
+                // At AgentEnd the loop has already stopped. An accepted stop
+                // must not be overridden by another category reopening it.
+                terminal_stop |= matches!(applied_effect, Some(ControlEffectKind::Continue))
+                    && candidate.value.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("stop"));
                 if matches!(applied_effect, Some(ControlEffectKind::Escalate)) {
                     result.escalate = true;
                 }
@@ -1182,8 +1234,24 @@ pub fn resolve_agent_end(
             )));
         return result;
     }
+    // Terminal safety decisions must survive a replayed feedback notice.
+    // Dedupe only the corrective continuation, never a stop or escalation.
     if result.escalate {
         result.defer_goal_finish = true;
+        return result;
+    }
+    if terminal_stop {
+        // A stop assessment is not evidence that implementation or tests passed.
+        if verification == VerificationNeed::NotRequired {
+            result.verification_state = ControlVerificationState::NotApplicable;
+        }
+        result.terminal_annotation = Some("no_authorized_follow_up");
+        return result;
+    }
+    if book.feedback_already_delivered(session_id, facts) {
+        result.verdicts.push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+            "duplicate_control_feedback",
+        )));
         return result;
     }
     if sufficiency == SufficiencyVerdict::Insufficient {
@@ -1193,10 +1261,12 @@ pub fn resolve_agent_end(
             ));
             return result;
         }
-        match book.consume(
+        let notice = feedback_notice_id(facts, FeedbackKind::ResultGap);
+        match book.consume_with_notice(
             session_id,
             &budget.epoch_id,
             ControlBudgetKind::Feedback(FeedbackKind::ResultGap),
+            Some(&notice),
         ) {
             Some(_) => {
                 result.feedback = Some(result_gap_feedback(
@@ -1227,10 +1297,12 @@ pub fn resolve_agent_end(
                     .push(ControlVerdict::Refused(ControlRefusal::ContinuationPending));
                 return result;
             }
-            match book.consume(
+            let notice = feedback_notice_id(facts, FeedbackKind::VerificationMissing);
+            match book.consume_with_notice(
                 session_id,
                 &budget.epoch_id,
                 ControlBudgetKind::Feedback(FeedbackKind::VerificationMissing),
+                Some(&notice),
             ) {
                 Some(_) => {
                     result.feedback =
@@ -1268,6 +1340,15 @@ pub fn resolve_agent_end(
         result.terminal_annotation = Some("verification_unconfirmed");
     }
     result
+}
+
+fn feedback_notice_id(facts: &HostControlFacts, kind: FeedbackKind) -> String {
+    digest_parts(&[
+        facts.epoch_id.clone(),
+        facts.request_id.clone(),
+        facts.turn.to_string(),
+        kind.as_str().to_string(),
+    ])
 }
 
 /// TurnEnd gate. The integrator calls this with the answers from ONE
@@ -1518,8 +1599,10 @@ fn control_feedback_message(body: String) -> CustomMessage {
 pub fn result_gap_feedback(assessment: &str, evidence_description: &str) -> CustomMessage {
     control_feedback_message(format!(
         "The bounded result check found this task not yet complete (assessment: {assessment}). \
-Continue the same task. Close the remaining gaps using your authorized tools, and report the \
-actual results. Observed evidence: {evidence_description}"
+Continue only the unfinished work already requested and authorized. Do not reopen a completed \
+conversation, status, link, or list answer. An explicit stop or a concrete blocker wins: report \
+it without restarting work. Do not infer missing tools, permissions, or a need to log in from \
+model prose. Use the actual request/tool outcome. Observed evidence: {evidence_description}"
     ))
 }
 
@@ -1527,9 +1610,11 @@ actual results. Observed evidence: {evidence_description}"
 /// the actual verification; success still comes only from real outcomes.
 pub fn verification_missing_feedback(evidence_description: &str) -> CustomMessage {
     control_feedback_message(format!(
-        "No explicit verification evidence was observed for this result. Run the applicable \
-verification you already have (tests, build, or checks) with your authorized tools, and report \
-the actual outcome. Do not claim success without it. Observed evidence: {evidence_description}"
+        "Verification is unreported, not failed. Run only verification applicable to the requested \
+work and already authorized. A completed conversational, status, link, or list answer needs \
+no extra implementation or test run. Respect an explicit stop or concrete blocker. Report \
+actual outcomes; never infer missing tools or login requirements from model prose. Observed \
+evidence: {evidence_description}"
     ))
 }
 

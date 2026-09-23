@@ -859,7 +859,12 @@ impl AgentSession {
                 // Only the first build (a genuine resume) surfaces the restore notice
                 // (agent-session.ts:10077-10080); a later rebuild restores silently.
                 let notify_restore = !self.ipython_runtime_built.load(Ordering::SeqCst);
-                let snapshot_dir = self.session_manager.lock().unwrap().get_session_artifact_dir();
+                let snapshot_dir = self.session_manager.lock().unwrap().get_session_artifact_dir()
+                    .map(|dir| match self.retained_kernel_epoch.lock().unwrap().as_ref() {
+                        Some(epoch) => Path::new(&dir).join(format!("audit-{epoch}"))
+                            .to_string_lossy().into_owned(),
+                        None => dir,
+                    });
                 let provisioner = crate::core::tools::ipython::IpythonKernelProvisioner::new(
                     &self.cwd,
                     Some(crate::core::tools::IpythonToolOptions {
@@ -1194,6 +1199,48 @@ impl AgentSession {
                 })
             })),
         );
+        let weak = Arc::downgrade(self);
+        handlers.insert("rlm.lifecycle_capabilities".into(), Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move { weak.upgrade().ok_or_else(|| KernelError::new("Parent disposed"))?
+                .lifecycle_capabilities(payload).await.map_err(KernelError::new) })
+        }));
+        let weak = Arc::downgrade(self);
+        handlers.insert("rlm.active_execution".into(), Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let parent = weak.upgrade().ok_or_else(|| KernelError::new("Parent disposed"))?;
+                let target = payload.get("target").and_then(Value::as_str).ok_or_else(|| KernelError::new("target required"))?;
+                parent.active_child_execution(target).map_err(KernelError::new)
+            })
+        }));
+        let weak = Arc::downgrade(self);
+        handlers.insert("rlm.send_active_message".into(), Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move { weak.upgrade().ok_or_else(|| KernelError::new("Parent disposed"))?
+                .send_active_child_message(payload).map_err(KernelError::new) })
+        }));
+        let weak = Arc::downgrade(self);
+        handlers.insert("rlm.stop_subagent".into(), Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let parent = weak.upgrade().ok_or_else(|| KernelError::new("Parent disposed"))?;
+                let selector = payload.get("target").and_then(Value::as_str).ok_or_else(|| KernelError::new("target required"))?;
+                let timeout = payload.get("timeout_ms").and_then(Value::as_u64).ok_or_else(|| KernelError::new("timeout_ms required"))?;
+                parent.stop_retained_child(selector, timeout).await.map_err(KernelError::new)
+            })
+        }));
+        let weak = Arc::downgrade(self);
+        handlers.insert("rlm.resume_subagent".into(), Arc::new(move |payload| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let parent = weak.upgrade().ok_or_else(|| KernelError::new("Parent disposed"))?;
+                let field = |name| payload.get(name).and_then(Value::as_str)
+                    .ok_or_else(|| KernelError::new(format!("{name} required")));
+                parent.resume_retained_audit(field("target")?, field("stop_generation")?, field("prompt")?)
+                    .map_err(KernelError::new)
+            })
+        }));
         let weak = Arc::downgrade(self);
         handlers.insert(
             "rlm.collect".into(),
@@ -2143,6 +2190,7 @@ impl AgentSession {
     ) -> Result<RlmDeleteSubagentResult, String> {
         let child_id = subagent.rlm_child_id.clone();
         let (deletion, existing) = {
+            let _admission = self.rlm_child_lifecycle_admission.lock().unwrap();
             let mut pending = self.deleting_rlm_children.lock().unwrap();
             match pending.get(&child_id) {
                 Some(deletion) => (deletion.clone(), true),
@@ -2511,6 +2559,12 @@ impl AgentSession {
         subagent: &RlmSubagentRegistryEntry,
     ) -> Result<RlmDeleteSubagentResult, String> {
         let child_id = subagent.rlm_child_id.clone();
+        {
+            // Explicit deletion is a separate authorized action, even after a retained stop.
+            // Later stop admission must fail before this cleanup reaches its first await.
+            let _admission = self.rlm_child_lifecycle_admission.lock().unwrap();
+            self.rlm_child_release_claims.lock().unwrap().insert(child_id.clone());
+        }
         let run = self
             .active_rlm_child_runs
             .lock()

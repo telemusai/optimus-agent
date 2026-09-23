@@ -53,4 +53,14 @@ durations describe observed blocking constraints and can overlap, so they must
 not be summed as independent wall-clock time. No prompts or credentials are
 included. Ollama does not use this limiter and is unchanged.
 
+An unexpected Azure WebSocket close records its code and timing in
+`websocket_upstream_close` and the affected `websocket_turn`. Gateway-generated
+`connectionId` and per-turn `requestId` correlate these rows with the error returned
+to the client. An idle close has no request ID. These IDs do not identify an Azure
+request or prove the remote cause. The error keeps the `connection_closed` code.
+Only exact known transport phrases are retained as `closeReason`; other remote
+text is omitted with `closeReasonDisposition: "redacted"`, because it can contain
+credentials or prompt text. Empty reasons are marked `empty`. No submitted turn
+is retried by this diagnostic path. Existing retry and timeout policies are unchanged.
+
 Protocol source: [Azure Responses WebSockets](https://learn.microsoft.com/en-us/azure/foundry/openai/how-to/websockets).

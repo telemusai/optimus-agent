@@ -208,6 +208,85 @@ test("partial provider output and disconnect are never replayed", { timeout: 500
   assert.equal(f.opens(), 1); assert.equal(f.captures.length, 1); assert.equal(f.releases(), 1);
 });
 
+test("upstream close diagnostics correlate the failed turn and retain safe code, reason and timing", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { waitedMs: 7, respond(ws, body, n) {
+    if (n === 1) ws.send(JSON.stringify(complete("first")));
+    else ws.close(1012, "Server restarting");
+  } });
+  const c = await f.connect(); c.send(request()); await c.next();
+  c.send(request());
+  const result = await c.next();
+  assert.equal(result.error.code, "connection_closed");
+  assert.match(result.error.message, /^Azure WebSocket connection closed \(code 1012; reason server restarting;/);
+  const details = result.error.upstreamClose;
+  assert.equal(details.closeCode, 1012);
+  assert.equal(details.closeReason, "server restarting");
+  assert.equal(details.closeReasonDisposition, "allowlisted");
+  assert.match(details.requestId, /^[0-9a-f-]{36}$/);
+  assert.match(details.connectionId, /^[0-9a-f-]{36}$/);
+  assert.match(result.error.message, new RegExp(details.requestId));
+  assert.ok(details.durationMs >= 0);
+  assert.ok(details.connectionDurationMs >= 0);
+  assert.equal(details.waitedMs, 7);
+  assert.equal(details.firstEventMs, undefined);
+  const close = f.logs.filter((r) => r.event === "websocket_upstream_close");
+  const turns = f.logs.filter((r) => r.event === "websocket_turn");
+  assert.equal(close.length, 1);
+  assert.equal(close[0].requestId, details.requestId);
+  assert.equal(close[0].connectionId, details.connectionId);
+  assert.equal(turns.length, 2);
+  assert.notEqual(turns[0].requestId, turns[1].requestId);
+  assert.equal(turns[0].connectionId, turns[1].connectionId);
+  assert.deepEqual(JSON.parse(JSON.stringify(turns[1].upstreamClose)), details);
+  assert.equal(turns[1].terminal, "disconnected");
+  assert.equal(f.opens(), 1); assert.equal(f.captures.length, 2); assert.equal(f.releases(), 2);
+});
+
+test("untrusted close text never leaks credentials, prompts or log controls", { timeout: 5000 }, async (t) => {
+  const reason = "Bearer isolated-azure-false\r\nprivate prompt text https://example.test/?key=secret";
+  const f = await fixture(t, { respond(ws) { ws.close(1008, reason); } });
+  const c = await f.connect(); c.send(request({ input: "private prompt text" }));
+  const result = await c.next();
+  assert.equal(result.error.upstreamClose.closeCode, 1008);
+  assert.equal(result.error.upstreamClose.closeReasonDisposition, "redacted");
+  assert.equal(result.error.upstreamClose.closeReason, undefined);
+  assert.doesNotMatch(JSON.stringify([result, f.logs]), /Bearer|isolated-azure|private prompt|example\.test|key=secret/);
+  assert.equal(f.opens(), 1); assert.equal(f.captures.length, 1); assert.equal(f.releases(), 1);
+});
+
+test("abnormal close after partial output records first event timing without replay", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t, { respond(ws) {
+    ws.send(JSON.stringify({ type: "response.output_text.delta", delta: "private output" }));
+    setTimeout(() => ws.terminate(), 10);
+  } });
+  const c = await f.connect(); c.send(request());
+  assert.equal((await c.next()).delta, "private output");
+  const result = await c.next();
+  const details = result.error.upstreamClose;
+  assert.equal(details.closeCode, 1006);
+  assert.equal(details.closeReasonDisposition, "empty");
+  assert.ok(details.firstEventMs >= 0);
+  assert.ok(details.firstTextMs >= details.firstEventMs);
+  assert.ok(details.durationMs >= details.firstTextMs);
+  assert.doesNotMatch(JSON.stringify(f.logs), /private output/);
+  assert.equal(f.opens(), 1); assert.equal(f.captures.length, 1); assert.equal(f.releases(), 1);
+});
+
+test("an idle upstream close has connection correlation but no invented turn", { timeout: 5000 }, async (t) => {
+  const f = await fixture(t); const c = await f.connect();
+  c.send(request()); await c.next();
+  f.captures[0].ws.close(1000, "normal closure");
+  const result = await c.next();
+  assert.equal(result.error.upstreamClose.requestId, undefined);
+  assert.equal(result.error.upstreamClose.durationMs, undefined);
+  assert.equal(result.error.upstreamClose.closeCode, 1000);
+  const turns = f.logs.filter((r) => r.event === "websocket_turn");
+  assert.equal(turns.length, 1);
+  assert.equal(turns[0].terminal, "completed");
+  assert.equal(turns[0].connectionId, result.error.upstreamClose.connectionId);
+  assert.equal(f.releases(), 1);
+});
+
 test("connection expiry, request timeout and connection count are bounded", { timeout: 5000 }, async (t) => {
   const f = await fixture(t, { respond() {}, webSocketOptions: { connectionLifetimeMs: 90, requestTimeoutMs: 500, maxConnections: 1 } });
   const c = await f.connect(); await assert.rejects(f.connect(), /503/);

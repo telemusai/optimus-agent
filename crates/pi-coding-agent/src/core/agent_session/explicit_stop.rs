@@ -3,11 +3,15 @@ use super::*;
 
 impl AgentSession {
     pub(super) fn explicitly_stopped(&self) -> bool {
-        self.explicit_stop.lock().unwrap().generation.is_some()
+        let state = self.explicit_stop.lock().unwrap();
+        state.generation.is_some() || state.retain_generation.is_some()
     }
 
     pub(super) fn restore_explicit_stop(&self) {
         let mut state = ExplicitStopState::default();
+        let mut retained_receipt = None;
+        let mut retained_child = None;
+        let mut audit_epoch = None;
         self.session_manager
             .lock()
             .unwrap()
@@ -35,6 +39,15 @@ impl AgentSession {
                             state.unannounced_reports = 0;
                         }
                     }
+                    Some("prime-agent.retained-stop.v1") => {
+                        state.retain_generation = data.get("generation").and_then(Value::as_str).map(str::to_string);
+                        retained_receipt = data.get("receipt").cloned();
+                        retained_child = data.get("childId").and_then(Value::as_str).map(str::to_string);
+                        if let Some(epoch) = data.get("auditEpoch").and_then(Value::as_str) {
+                            audit_epoch = Some(epoch.to_string());
+                            state.generation = None;
+                        }
+                    }
                     Some(DEFERRED_REPORT_ENTRY) => {
                         if let Some(id) = data.get("messageId").and_then(Value::as_str) {
                             if state.report_ids.insert(id.to_string()) {
@@ -45,10 +58,35 @@ impl AgentSession {
                     _ => {}
                 }
             });
-        if state.generation.is_some() {
+        if state.generation.is_some() || state.retain_generation.is_some() {
             self.session_input_pump_suspended
                 .store(true, Ordering::SeqCst);
         }
+        if let Some(generation) = state.retain_generation.as_deref() {
+            if let Some(scope) = self.agent.execution_scope() { scope.request_cancel(); }
+            let jev = crate::core::jev_bridge::request_session_retain_stop(&self.session_id());
+            let mut receipt = retained_receipt.unwrap_or_else(|| serde_json::json!({
+                "schema":"optimus.stop-retain.v1", "accepted":true, "settled":false,
+                "retained":true, "automatic_continuation_fenced":true,
+                "status":"failed_settlement", "error_code":"restored_without_settlement_proof",
+                "acknowledged":{"model":false,"tools":false,"kernel":false,
+                    "owned_processes":false,"transcript_flushed":false},
+            }));
+            receipt["rlm_child_id"] = serde_json::json!(retained_child);
+            receipt["session_id"] = serde_json::json!(self.session_id());
+            receipt["stop_generation"] = serde_json::json!(generation);
+            receipt["history"] = serde_json::json!({"session_file":self.session_file()});
+            receipt["jev_generation"] = serde_json::json!(jev.generation);
+            if !jev.settled {
+                receipt["settled"] = Value::Bool(false);
+                receipt["status"] = Value::String("failed_settlement".into());
+                receipt["error_code"] = Value::String("restored_jev_work_unsettled".into());
+                receipt["acknowledged"]["model"] = Value::Bool(false);
+                receipt["acknowledged"]["tools"] = Value::Bool(false);
+            }
+            *self.retained_stop.lock().unwrap() = Some(receipt);
+        }
+        *self.retained_kernel_epoch.lock().unwrap() = audit_epoch;
         *self.explicit_stop.lock().unwrap() = state;
     }
 
@@ -187,6 +225,9 @@ impl AgentSession {
     pub(super) fn resume_explicit_stop(&self) -> Result<(), String> {
         let _admission = self.explicit_stop_admission.lock().unwrap();
         let mut state = self.explicit_stop.lock().unwrap();
+        if state.retain_generation.is_some() {
+            return Err("Retained stop requires explicit parent audit authorization".into());
+        }
         if state.generation.is_none() {
             return Ok(());
         }
@@ -219,6 +260,7 @@ impl AgentSession {
         &self,
         message: &CustomMessage,
     ) -> Result<bool, String> {
+        if self.explicit_stop.lock().unwrap().retain_generation.is_some() { return Ok(false); }
         let is_new_parent_task = self.rlm_depth > 0
             && message
                 .details

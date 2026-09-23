@@ -43,6 +43,7 @@ pub mod refinement_outcome_message;
 pub mod scoped_models_selector;
 pub mod settings_selector;
 pub mod show_images_selector;
+pub mod shell_completion;
 pub mod side_question;
 pub mod skill_invocation_message;
 pub mod slash_command_message;

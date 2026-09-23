@@ -229,6 +229,11 @@ impl Component for CustomMessageComponent {
     }
 
     fn render(&mut self, width: f64) -> Vec<String> {
+        if !self.use_custom_component {
+            if let Some(mut notice) = super::shell_completion::ShellCompletion::from_message(&self.message) {
+                return notice.render(width);
+            }
+        }
         let mut lines = self.spacer.render(width);
         if self.use_custom_component {
             if let Some(component) = self.custom_component.as_mut() {
@@ -285,6 +290,23 @@ mod tests {
             component.render(10.0),
             vec!["".to_string(), "custom".to_string()]
         );
+    }
+
+    #[test]
+    fn shell_completion_default_is_one_line_even_when_tools_are_expanded() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let message = crate::core::messages::create_async_bash_completion_message(
+            crate::core::messages::AsyncBashCompletionDetails {
+                pid: 33504, command: "hidden command\nwith instructions".into(), exit_code: 0,
+            }, 1,
+        );
+        let mut component = CustomMessageComponent::new(message, None, get_markdown_theme());
+        for expanded in [false, true] {
+            component.set_expanded(expanded);
+            let lines = component.render(80.0);
+            assert_eq!(lines.len(), 1);
+            assert_eq!(strip_ansi(&lines[0]), "Shell finished — exit 0 (PID 33504).");
+        }
     }
 
     struct FixedComponent;

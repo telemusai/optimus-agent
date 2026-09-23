@@ -31,6 +31,7 @@ impl DaemonSubagentHost {
 }
 
 impl SubagentRuntimeHost for DaemonSubagentHost {
+    fn supports_retained_stop(&self) -> bool { cfg!(windows) }
     fn create_rlm_subagent_runtime(
         &self,
         options: CreateRlmSubagentRuntimeOptions,
@@ -108,6 +109,7 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
                 .get_rlm_child_run_status(&options.id)
                 .as_deref()
                 == Some("cancelled")
+                && options.parent_session.retained_child_stop_generation(&options.id).is_none()
             {
                 runtime.session.dispose().await;
                 return Err("RLM subagent startup was cancelled".into());
@@ -164,6 +166,7 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
                     .get_rlm_child_run_status(&options.id)
                     .as_deref()
                     == Some("cancelled")
+                    && options.parent_session.retained_child_stop_generation(&options.id).is_none()
                 {
                     return Err("RLM subagent startup was cancelled".into());
                 }
@@ -258,6 +261,10 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
         let cancelled = status == "cancelled";
         Box::pin(async move {
             let (daemon, parent) = owners?;
+            if !options.parent_session.try_claim_rlm_runtime_release(&options.id, &runtime.session) {
+                // Retention won before cleanup admission; no release await or deletion may start.
+                return Ok(());
+            }
             let deletion = if cancelled {
                 daemon
                     .record_rlm_subagent_deletion(

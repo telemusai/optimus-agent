@@ -30,6 +30,11 @@ mod rlm_result_delivery_tests;
 mod runtime_members;
 #[path = "agent_session/task_queue.rs"]
 mod task_queue;
+#[path = "agent_session/refinement_progress.rs"]
+mod refinement_progress;
+use refinement_progress::{
+    RefinementCommitFence, RefinementCurrentness, RefinementFlight, RefinementProgress,
+};
 
 use futures::FutureExt;
 use std::collections::{BTreeMap, HashMap, HashSet, VecDeque};
@@ -289,6 +294,9 @@ pub trait AgentHandle: Send + Sync {
     );
     fn set_stream_fn(&self, stream_fn: pi_agent_core::types::StreamFn);
     fn stream_fn(&self) -> pi_agent_core::types::StreamFn;
+    fn active_execution_generation(&self) -> Option<String> { None }
+    fn steer_active(&self, _generation: &str, _id: &str, _message: AgentMessage) -> &'static str { "declined_idle" }
+    fn execution_scope(&self) -> Option<pi_agent_core::execution_scope::ExecutionScope> { None }
     fn abort(&self);
     fn wait_for_idle(&self) -> BoxFuture<()>;
     fn prompt(&self, messages: Vec<AgentMessage>) -> BoxFuture<Result<(), String>>;
@@ -2320,6 +2328,7 @@ struct ExplicitStopState {
     report_ids: HashSet<String>,
     unannounced_reports: usize,
     persistence_error: Option<String>,
+    retain_generation: Option<String>,
 }
 
 const EXPLICIT_STOP_ENTRY: &str = "prime-agent.explicit-stop";
@@ -2327,6 +2336,13 @@ const DEFERRED_REPORT_ENTRY: &str = "prime-agent.deferred-agent-report";
 
 #[path = "agent_session/explicit_stop.rs"]
 mod explicit_stop;
+#[path = "agent_session/retained_stop.rs"]
+mod retained_stop;
+#[path = "agent_session/commit_fence.rs"]
+mod commit_fence;
+#[cfg(test)]
+#[path = "agent_session/retained_stop_tests.rs"]
+mod retained_stop_tests;
 
 #[path = "agent_session/queue_metrics.rs"]
 mod queue_metrics;
@@ -2376,6 +2392,13 @@ pub struct AgentSession {
     session_input_arrival_epoch: AtomicU64,
     session_input_pump_suspended: AtomicBool,
     explicit_stop: Mutex<ExplicitStopState>,
+    retained_stop: Mutex<Option<Value>>,
+    retained_stop_notify: tokio::sync::Notify,
+    retained_stop_ids: Mutex<HashMap<String, String>>,
+    // Short parent admission gate: retained stop, audit, release and explicit deletion.
+    rlm_child_lifecycle_admission: Mutex<()>,
+    rlm_child_release_claims: Mutex<HashSet<String>>,
+    retained_kernel_epoch: Mutex<Option<String>>,
     explicit_stop_admission: Mutex<()>,
     session_input_suspended_for_update_restart: AtomicBool,
     queued_work_pauses: Mutex<HashSet<String>>,
@@ -2509,6 +2532,8 @@ pub struct AgentSession {
     pending_auto_refine_review: Mutex<Option<(AutoRefineReason, AutoRefineReview)>>,
     auto_refine_branch_version: AtomicU64,
     serialized_refine: bool,
+    refinement_execution: tokio::sync::Mutex<()>,
+    refinement_progress_generation: AtomicU64,
     refine_in_flight: Mutex<Option<(u64, SharedVoidFuture)>>,
     /// TS clears `_refineInFlight` by promise identity (`agent-session.ts:2731`);
     /// boxed futures are not comparable, so each install stamps a unique
@@ -2747,6 +2772,12 @@ impl AgentSession {
             session_input_arrival_epoch: AtomicU64::new(0),
             session_input_pump_suspended: AtomicBool::new(false),
             explicit_stop: Mutex::new(ExplicitStopState::default()),
+            retained_stop: Mutex::new(None),
+            retained_stop_notify: tokio::sync::Notify::new(),
+            retained_stop_ids: Mutex::new(HashMap::new()),
+            rlm_child_lifecycle_admission: Mutex::new(()),
+            rlm_child_release_claims: Mutex::new(HashSet::new()),
+            retained_kernel_epoch: Mutex::new(None),
             explicit_stop_admission: Mutex::new(()),
             session_input_suspended_for_update_restart: AtomicBool::new(false),
             queued_work_pauses: Mutex::new(HashSet::new()),
@@ -2866,6 +2897,8 @@ impl AgentSession {
             pending_auto_refine_review: Mutex::new(None),
             auto_refine_branch_version: AtomicU64::new(0),
             serialized_refine: config.serialized_refine.unwrap_or(false),
+            refinement_execution: tokio::sync::Mutex::new(()),
+            refinement_progress_generation: AtomicU64::new(0),
             refine_in_flight: Mutex::new(None),
             refine_in_flight_gen: std::sync::atomic::AtomicU64::new(0),
             refine_plan_in_flight: Mutex::new(None),
@@ -7167,7 +7200,7 @@ impl AgentSession {
         tool_results: &[pi_ai::types::ToolResultMessage],
     ) -> bool {
         use pi_jev::control::{ControlPolicy, HostControlFacts};
-        if !crate::core::jev_bridge::session_full_jev_active() {
+        if self.explicitly_stopped() || !crate::core::jev_bridge::session_full_jev_active() {
             return false;
         }
         let session_id = self.session_id();
@@ -7190,6 +7223,7 @@ impl AgentSession {
         };
         // Facts come from the CAPTURED decision identity (H-CONTROL-3): the
         // bridge captured the epoch before dispatch and carried it through.
+        if self.explicitly_stopped() { return false; }
         let facts = HostControlFacts {
             now: std::time::SystemTime::now(),
             session_id: session_id.clone(),
@@ -7237,7 +7271,7 @@ impl AgentSession {
             verification_state: pi_jev::control::ControlVerificationState::Unknown,
             terminal_annotation: None,
         };
-        if !crate::core::jev_bridge::session_full_jev_active() {
+        if self.explicitly_stopped() || !crate::core::jev_bridge::session_full_jev_active() {
             return baseline;
         }
         let session_id = self.session_id();
@@ -7253,6 +7287,7 @@ impl AgentSession {
         else {
             return baseline;
         };
+        if self.explicitly_stopped() { return baseline; }
         let facts = HostControlFacts {
             now: std::time::SystemTime::now(),
             session_id: session_id.clone(),
@@ -7281,7 +7316,7 @@ impl AgentSession {
             continuation_pending,
             &decision.evidence_description,
         );
-        crate::core::jev_bridge::note_control_terminal_outcome(&session_id, &result);
+        crate::core::jev_bridge::note_control_terminal_outcome(&session_id, &decision.epoch_id, &result);
         if let Some(feedback) = result.feedback.clone() {
             self.queue_jev_control_feedback(feedback).await;
         }
@@ -7294,6 +7329,7 @@ impl AgentSession {
     /// when the lower agent has already stopped, which would deadlock the
     /// current serialized action against its own follow-up.
     async fn queue_jev_control_feedback(self: &Arc<Self>, feedback: CustomMessage) {
+        if self.explicitly_stopped() { return; }
         let app_message = CustomMessage {
             role: "custom".to_string(),
             custom_type: feedback.custom_type.clone(),
@@ -10534,7 +10570,7 @@ impl AgentSession {
     /// `_admitSessionInput(action, { restore, front, wake, immediatelyEligible })`.
     fn admit_session_input_with_options(
         self: &Arc<Self>,
-        mut action: QueuedSessionAction,
+        action: QueuedSessionAction,
         immediately_eligible: bool,
         restore: bool,
         front: bool,
@@ -10547,10 +10583,21 @@ impl AgentSession {
         ),
         String,
     > {
-        // Stop and enqueue share one short synchronous fence: a report is either
-        // admitted before the stop sweep, or durably deferred after it, never lost
-        // in the gap between a stop-state check and store.enqueue().
-        let _stop_admission = self.explicit_stop_admission.lock().unwrap();
+        let stop_admission = self.explicit_stop_admission.lock().unwrap();
+        self.admit_session_input_under_stop_fence(
+            action, immediately_eligible, restore, front, wake, stop_admission)
+    }
+
+    fn admit_session_input_under_stop_fence(
+        self: &Arc<Self>,
+        mut action: QueuedSessionAction,
+        immediately_eligible: bool,
+        restore: bool,
+        front: bool,
+        wake: bool,
+        _stop_admission: std::sync::MutexGuard<'_, ()>,
+    ) -> Result<(bool, Option<Arc<crate::core::session_action_store::ActionTicketController>>, String), String> {
+        // Stop and enqueue share one short synchronous fence.
         if !restore {
             if let Some(report) = Self::stopped_report(&action) {
                 if self.defer_stopped_report(&report, action.agent_message_id.as_deref())? {
@@ -11112,18 +11159,15 @@ impl AgentSession {
                 return;
             }
         };
+        self.wait_for_refine_idle().await;
         let commit_fence = self.acquire_session_action_commit_fence().await;
         if let Ok(commit_fence) = commit_fence {
             let action_id = action.id.clone();
             let session = self.clone();
             let input = input.clone();
-            let work = async move {
+            let work = async {
                 let is_cancelled =
                     || session.action_state_of(&action_id) == Some(ActionLifecycleState::Cancelled);
-                if is_cancelled() {
-                    return;
-                }
-                session.wait_for_refine_idle().await;
                 if is_cancelled() {
                     return;
                 }
@@ -11158,7 +11202,9 @@ impl AgentSession {
                 }
                 session.notify_session_input_checkpoint_change();
                 session.emit_queue_update();
-                let outcome = session.run_selected_session_command(action, &input).await;
+                let outcome = session
+                    .run_selected_session_command(action, &input, &commit_fence, epoch)
+                    .await;
                 match outcome {
                     Ok(()) => {
                         {
@@ -11236,6 +11282,8 @@ impl AgentSession {
         self: &Arc<Self>,
         action: &QueuedSessionAction,
         input: &PreparedCommandPayload,
+        commit_fence: &CommitFence,
+        epoch: u64,
     ) -> Result<(), String> {
         self.append_durable_session_command_message(
             &input.base.text,
@@ -11248,7 +11296,11 @@ impl AgentSession {
             ticket.settle_delivered(DeliveryOutcome::NotApplicable);
         }
         self.settle_agent_message(action.agent_message_id.as_deref(), "delivery", None);
-        self.execute_queued_session_command(action).await
+        if input.base.command.name == "refine" {
+            // The pump still owns execution order. Only prompt admission may proceed while planning.
+            commit_fence.release();
+        }
+        self.execute_queued_session_command(action, epoch).await
     }
 
     /// `_isBusyForSessionInput(point)`.
@@ -11597,12 +11649,15 @@ impl AgentSession {
                         continue;
                     }
                     if let QueuedActionPayload::Turn(turn) = &action.payload {
-                        book.note_real_user_input(
+                        let task_budget = book.note_real_user_input(
                             &self.session_id(),
                             action.source.as_str(),
                             &turn.base.text,
                             true,
                         );
+                        if task_budget.available {
+                            crate::core::jev_bridge::note_control_task_epoch(&self.session_id(), &task_budget.epoch_id);
+                        }
                     }
                     break;
                 }
@@ -11634,6 +11689,7 @@ impl AgentSession {
     async fn execute_queued_session_command(
         self: &Arc<Self>,
         action: &QueuedSessionAction,
+        epoch: u64,
     ) -> Result<(), String> {
         let input = match &action.payload {
             QueuedActionPayload::SessionCommand(command) => command.clone(),
@@ -11655,7 +11711,9 @@ impl AgentSession {
             "refine" => {
                 let result = match parse_refine_command_options(&input.base.command.args) {
                     Ok(options) => match self
-                        .refine_with_options(&refine_options_from_command(&options), true, None)
+                        .refine_with_options_at_epoch(
+                            &refine_options_from_command(&options), true, None, Some(epoch),
+                        )
                         .await
                     {
                         Ok(result) => result,
@@ -12634,53 +12692,6 @@ impl AgentSession {
     /// `_acquireSessionActionCommitFence(signal?)`.
     async fn acquire_session_action_commit_fence(self: &Arc<Self>) -> Result<CommitFence, String> {
         self.acquire_commit_fence(true).await
-    }
-
-    /// The shared body of both commit fences.
-    async fn acquire_commit_fence(self: &Arc<Self>, owner_id: bool) -> Result<CommitFence, String> {
-        self.pending_session_action_fence_waiters
-            .fetch_add(1, Ordering::SeqCst);
-        let previous = self.session_action_commit_tail.lock().unwrap().take();
-        let previous: BoxFuture<Result<(), String>> = match previous {
-            Some(previous) => previous,
-            None => Box::pin(async { Ok(()) }),
-        };
-        let (tx, rx) = tokio::sync::oneshot::channel::<()>();
-        // The release closure is a plain `Fn`, so the one-shot sender is taken out
-        // of a slot instead of being moved by the call.
-        let tx = std::sync::Mutex::new(Some(tx));
-        let tail: BoxFuture<Result<(), String>> = Box::pin(async move {
-            let _ = rx.await;
-            Ok(())
-        });
-        *self.session_action_commit_tail.lock().unwrap() = Some(tail);
-        let owner = uuid::Uuid::new_v4().to_string();
-        *self.session_action_commit_owner.lock().unwrap() = Some(owner.clone());
-        let result = previous.await;
-        self.pending_session_action_fence_waiters
-            .fetch_sub(1, Ordering::SeqCst);
-        self.notify_session_input_checkpoint_change();
-        result?;
-        let session = self.clone();
-        let _ = owner_id;
-        Ok(CommitFence {
-            owner: Some(owner.clone()),
-            release: Some(Arc::new(move || {
-                if session
-                    .session_action_commit_owner
-                    .lock()
-                    .unwrap()
-                    .as_deref()
-                    == Some(owner.as_str())
-                {
-                    *session.session_action_commit_owner.lock().unwrap() = None;
-                }
-                if let Some(tx) = tx.lock().unwrap().take() {
-                    let _ = tx.send(());
-                }
-                session.notify_session_input_checkpoint_change();
-            })),
-        })
     }
 
     /// `_resumeSessionInputAdmission()` (agent-session.ts:7505-7512).
@@ -13738,9 +13749,11 @@ impl AgentSession {
 
     /// `_invalidatePendingAutoRefineForBranchChange()`.
     async fn invalidate_pending_auto_refine_for_branch_change(self: &Arc<Self>) {
-        self.auto_refine_branch_version
-            .fetch_add(1, Ordering::SeqCst);
-        self.abort_refinement();
+        {
+            let _admission = self.explicit_stop_admission.lock().unwrap();
+            self.auto_refine_branch_version.fetch_add(1, Ordering::SeqCst);
+            self.abort_refinement();
+        }
         self.discard_pending_auto_refine(true);
         self.invalidate_queued_prompt_preparation();
     }
@@ -14686,6 +14699,20 @@ impl AgentSession {
         source: &str,
         signal: CancellationToken,
     ) -> Result<RefinementPlan, String> {
+        let progress = RefinementProgress::new(self);
+        progress.stage("Preparing refinement");
+        let outcome = self.plan_refine_with_progress(options, source, signal, &progress).await;
+        progress.finish_plan(&outcome);
+        outcome
+    }
+
+    async fn plan_refine_with_progress(
+        self: &Arc<Self>,
+        options: &RefineOptions,
+        source: &str,
+        signal: CancellationToken,
+        progress: &RefinementProgress,
+    ) -> Result<RefinementPlan, String> {
         if self.disposed.load(Ordering::SeqCst) {
             return Err("Cannot refine a disposed session.".to_string());
         }
@@ -14755,18 +14782,13 @@ impl AgentSession {
         };
         // The refinement slice keeps its own minimal `AgentMessage` (blocked_on:
         // pi-ai types); live messages cross the boundary by serialized shape.
-        let messages: Vec<crate::core::memory::evidence::AgentMessage> = self
-            .agent
-            .state()
-            .messages
-            .iter()
-            .filter_map(Self::refinement_evidence_message)
-            .collect();
+        let snapshot = self.agent.state();
+        progress.stage("Reviewing refinement");
         // `if (!options.rollbackId && this._extensionRunner.hasHandlers("session_before_refine"))`
         // (agent-session.ts:9132-9158).
         if options.rollback_id.is_none() && self.has_extension_handlers("session_before_refine") {
             let conversation_text = serialize_conversation(&convert_to_llm(
-                &self.agent.state().messages,
+                &snapshot.messages,
                 &Default::default(),
             ));
             let preparation = crate::core::extensions::types::RefinePreparation {
@@ -14827,6 +14849,13 @@ impl AgentSession {
                 });
             }
         }
+        // The bridge is unused for a veto/proposal, rollback, or explicitly supplied evidence.
+        let messages: Vec<crate::core::memory::evidence::AgentMessage> =
+            if options.rollback_id.is_none() && options.evidence.is_none() {
+                snapshot.messages.iter().filter_map(Self::refinement_evidence_message).collect()
+            } else {
+                Vec::new()
+            };
         let planning = plan_refinement(PlanRefinementRequest {
             messages: &messages,
             state: &planning_state,
@@ -14867,27 +14896,75 @@ impl AgentSession {
         source: &str,
         signal: Option<&CancellationToken>,
     ) -> Result<RefinementResult, String> {
+        let progress = RefinementProgress::new(self);
+        let outcome = self.apply_refine_with_context(
+            plan, options, source, signal, None, false, &progress,
+        ).await;
+        progress.finish_result(&outcome);
+        outcome
+    }
+
+    async fn apply_refine_with_context(
+        self: &Arc<Self>,
+        plan: &RefinementPlan,
+        options: &RefineOptions,
+        source: &str,
+        signal: Option<&CancellationToken>,
+        current: Option<&RefinementCurrentness>,
+        reacquire_commit: bool,
+        progress: &RefinementProgress,
+    ) -> Result<RefinementResult, String> {
         if self.disposed.load(Ordering::SeqCst) {
             return Err("Cannot refine a disposed session.".to_string());
         }
         if signal.is_some_and(CancellationToken::is_cancelled) {
             return Err("Refinement was aborted".to_string());
         }
+        if let Some(current) = current {
+            current.check(self)?;
+        }
+        let commit_fence = if reacquire_commit {
+            Some(RefinementCommitFence(self.acquire_session_action_commit_fence().await?))
+        } else {
+            None
+        };
+        progress.stage("Saving refinement");
         self.disconnect_from_agent();
-        let outcome = self.apply_refine_inner(plan, options, source, signal).await;
+        let outcome = self.apply_refine_inner(plan, options, source, signal, current);
+        drop(commit_fence);
         if !self.disposed.load(Ordering::SeqCst) {
             self.reconnect_to_agent();
         }
-        outcome
+        progress.finish_result(&outcome);
+        let result = outcome?;
+        // The save has committed. Listener latency/failure must not hold admission or undo success.
+        if let Some(runner) = self.extension_runner() {
+            runner
+                .emit(ExtensionEvent::RefineComplete(
+                    crate::core::extensions::types::RefineCompletePayload {
+                        id: result.id.clone(),
+                        summary: result.summary.clone(),
+                        applied_edits: result.applied_edits.iter().filter(|edit| edit.applied).count()
+                            as f64,
+                        scope: match result.scope.unwrap_or(HarnessScope::Local) {
+                            HarnessScope::Global => "global".to_string(),
+                            HarnessScope::Local => "local".to_string(),
+                        },
+                    },
+                ))
+                .await;
+        }
+        Ok(result)
     }
 
     /// The `_applyRefine` body between disconnect and reconnect.
-    async fn apply_refine_inner(
+    fn apply_refine_inner(
         &self,
         plan: &RefinementPlan,
         options: &RefineOptions,
         source: &str,
         signal: Option<&CancellationToken>,
+        current: Option<&RefinementCurrentness>,
     ) -> Result<RefinementResult, String> {
         let global_dir = get_global_harness_state_dir(&crate::config::get_agent_dir());
         let local_dir = self.local_harness_state_dir();
@@ -14934,6 +15011,14 @@ impl AgentSession {
                 )
             }
         };
+        // Stop and the synchronous save linearize here, never across an awaited model or extension.
+        let stop_admission = self.explicit_stop_admission.lock().unwrap();
+        if let Some(current) = current {
+            current.check(self)?;
+        }
+        if self.explicitly_stopped() || self.disposing.load(Ordering::SeqCst) {
+            return Err("Refinement was aborted because the session stopped.".to_string());
+        }
         // Keep the exact read baseline through apply/save. If access failed or
         // another writer changes the bytes, a blank/stale state must never win.
         let loaded = load_harness_state_details(&target_dir, target_scope);
@@ -14980,7 +15065,14 @@ impl AgentSession {
                 baseline_state: plan.baseline_state.clone(),
             },
         );
+        if let Some(current) = current {
+            current.check(self)?;
+        }
+        if signal.is_some_and(CancellationToken::is_cancelled) {
+            return Err("Refinement was aborted".to_string());
+        }
         result.harness_state_path = save_harness_state_checked(&target_dir, &state, &loaded)?;
+        drop(stop_admission);
         if target_scope == HarnessScope::Global {
             // The refinement is already applied and saved above. A failed history
             // append must stay visible (this event loses cross-session rollback)
@@ -15000,27 +15092,6 @@ impl AgentSession {
         self.emit(AgentSessionEvent::RefineComplete {
             result: result.clone(),
         });
-        // `await this._extensionRunner.emit({ type: "refine_complete", ... })`
-        // (agent-session.ts:9311-9322); extension emit failures are swallowed.
-        if let Some(runner) = self.extension_runner() {
-            runner
-                .emit(ExtensionEvent::RefineComplete(
-                    crate::core::extensions::types::RefineCompletePayload {
-                        id: result.id.clone(),
-                        summary: result.summary.clone(),
-                        applied_edits: result
-                            .applied_edits
-                            .iter()
-                            .filter(|edit| edit.applied)
-                            .count() as f64,
-                        scope: match result.scope.unwrap_or(HarnessScope::Local) {
-                            HarnessScope::Global => "global".to_string(),
-                            HarnessScope::Local => "local".to_string(),
-                        },
-                    },
-                ))
-                .await;
-        }
         Ok(result)
     }
 
@@ -15043,87 +15114,90 @@ impl AgentSession {
         skip_abort: bool,
         source: Option<&str>,
     ) -> Result<RefinementResult, String> {
-        let source = source.unwrap_or(REFINEMENT_SOURCE_USER).to_string();
-        if skip_abort && self.is_streaming() {
-            return Err("Cannot refine without aborting while the agent is running.".to_string());
-        }
-        // The predicate is read into owned booleans first: a guard in the `while` condition would stay
-        // live across the awaits below, so no scoping trick can make this future `Send`.
-        while {
-            let refine_in_flight = { self.refine_in_flight.lock().unwrap().is_some() };
-            let refine_plan_in_flight = { self.refine_plan_in_flight.lock().unwrap().is_some() };
-            let serialized_plan_in_flight =
-                { self.serialized_plan_in_flight.lock().unwrap().is_some() };
-            refine_in_flight || refine_plan_in_flight || serialized_plan_in_flight
-        } {
-            if { self.refine_in_flight.lock().unwrap().is_some() } {
-                self.wait_for_refine_idle().await;
-            } else if { self.refine_plan_in_flight.lock().unwrap().is_some() } {
-                let in_flight = self.refine_plan_in_flight.lock().unwrap().take();
-                if let Some(in_flight) = in_flight {
-                    let _ = in_flight.await;
-                }
-            } else {
-                let in_flight = self.serialized_plan_in_flight.lock().unwrap().take();
-                if let Some(in_flight) = in_flight {
-                    let _ = in_flight.await;
-                }
-                if self.refine_in_flight.lock().unwrap().is_some()
-                    || self.refine_plan_in_flight.lock().unwrap().is_some()
-                {
-                    continue;
-                }
-                let _ = self.agent.wait_for_idle().await;
-                self.serialized_explicit_refine_options
-                    .lock()
-                    .unwrap()
-                    .take();
-            }
-        }
+        self.refine_with_options_at_epoch(options, skip_abort, source, None).await
+    }
 
-        let signal = self.refinement_signal();
-        let plan = self
-            .plan_refine_for_trigger(options, &source, signal.clone())
-            .await;
-        let plan = match plan {
-            Ok(plan) => plan,
-            Err(error) => {
-                self.schedule_session_input_pump();
-                return Err(error);
-            }
-        };
-
-        let session = self.clone();
-        let apply = Arc::new({
-            let options = options.clone();
-            let source = source.clone();
-            move || {
-                let session = session.clone();
-                let plan = plan.clone();
-                let options = options.clone();
-                let source = source.clone();
-                let signal = signal.clone();
-                let future: BoxFuture<Result<RefinementResult, String>> = Box::pin(async move {
-                    session
-                        .apply_refine(&plan, &options, &source, Some(&signal))
-                        .await
-                });
-                future
-            }
-        });
-        let settle = self.create_refine_settlement(apply.clone());
-        let outcome = apply().await;
-        settle();
+    async fn refine_with_options_at_epoch(
+        self: &Arc<Self>,
+        options: &RefineOptions,
+        skip_abort: bool,
+        source: Option<&str>,
+        epoch: Option<u64>,
+    ) -> Result<RefinementResult, String> {
+        let progress = RefinementProgress::new(self);
+        let outcome = self.refine_with_progress(options, skip_abort, source, epoch, &progress).await;
+        progress.finish_result(&outcome);
         self.notify_session_input_checkpoint_change();
         self.schedule_session_input_pump();
         outcome
     }
 
-    /// The shared `_refineInFlight` settlement used by concurrent `refine` callers.
-    fn create_refine_settlement(
+    async fn refine_with_progress(
         self: &Arc<Self>,
-        _apply: Arc<dyn Fn() -> BoxFuture<Result<RefinementResult, String>> + Send + Sync>,
-    ) -> Arc<dyn Fn() + Send + Sync> {
+        options: &RefineOptions,
+        skip_abort: bool,
+        source: Option<&str>,
+        epoch: Option<u64>,
+        progress: &RefinementProgress,
+    ) -> Result<RefinementResult, String> {
+        let source = source.unwrap_or(REFINEMENT_SOURCE_USER);
+        // Capture before any wait: abort_refinement replaces its controller on stop.
+        let current = RefinementCurrentness::capture(self, epoch)?;
+        if skip_abort && self.is_streaming() {
+            return Err("Cannot refine without aborting while the agent is running.".to_string());
+        }
+        loop {
+            current.check(self)?;
+            let apply = self.refine_in_flight.lock().unwrap().clone();
+            let has_plan = self.refine_plan_in_flight.lock().unwrap().is_some();
+            let background = self.serialized_plan_in_flight.lock().unwrap().clone();
+            if apply.is_some() {
+                tokio::select! {
+                    biased;
+                    _ = current.signal.cancelled() => return Err("Refinement was aborted".to_string()),
+                    _ = self.wait_for_refine_idle() => {},
+                }
+            } else if has_plan {
+                let plan = self.refine_plan_in_flight.lock().unwrap().take();
+                if let Some(plan) = plan {
+                    tokio::select! {
+                        biased;
+                        _ = current.signal.cancelled() => return Err("Refinement was aborted".to_string()),
+                        _ = plan => {},
+                    }
+                }
+            } else if background.is_some() {
+                // Wait for the consumer as well as the plan; never steal another apply's claim.
+                let consumer: SerializedPlanConsumer = Arc::new(|_| Box::pin(async { false }));
+                self.consume_serialized_background_plan(consumer).await;
+                tokio::select! {
+                    biased;
+                    _ = current.signal.cancelled() => return Err("Refinement was aborted".to_string()),
+                    _ = self.agent.wait_for_idle() => {},
+                }
+            } else {
+                break;
+            }
+        }
+        let _execution = tokio::select! {
+            biased;
+            _ = current.signal.cancelled() => return Err("Refinement was aborted".to_string()),
+            guard = self.refinement_execution.lock() => guard,
+        };
+        current.check(self)?;
+        let _flight = self.create_refine_settlement();
+        progress.stage("Preparing refinement");
+        let plan = self
+            .plan_refine_with_progress(options, source, current.signal.clone(), progress)
+            .await?;
+        current.check(self)?;
+        self.apply_refine_with_context(
+            &plan, options, source, Some(&current.signal), Some(&current), skip_abort, progress,
+        ).await
+    }
+
+    /// The slot covers planning through apply. A dropped future must release its waiters too.
+    fn create_refine_settlement(self: &Arc<Self>) -> RefinementFlight {
         let session = self.clone();
         let (tx, rx) = tokio::sync::oneshot::channel::<()>();
         let settled: BoxFuture<Result<(), String>> = Box::pin(async move {
@@ -15133,7 +15207,7 @@ impl AgentSession {
         let gen = self.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
         *self.refine_in_flight.lock().unwrap() = Some((gen, settled.shared()));
         let tx = std::sync::Mutex::new(Some(tx));
-        Arc::new(move || {
+        RefinementFlight(Arc::new(move || {
             {
                 let mut slot = session.refine_in_flight.lock().unwrap();
                 if slot.as_ref().map(|(owner, _)| *owner) == Some(gen) {
@@ -15143,7 +15217,8 @@ impl AgentSession {
             if let Some(tx) = tx.lock().unwrap().take() {
                 let _ = tx.send(());
             }
-        })
+            session.notify_session_input_checkpoint_change();
+        }))
     }
 
     /// `_runSerializedRefine(options, source)` (agent-session.ts:2870-2945).
@@ -15155,6 +15230,7 @@ impl AgentSession {
         if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             return Ok(());
         }
+        let current = RefinementCurrentness::capture(self, None)?;
         // Guard: serialize against concurrent _runSerializedRefine calls.
         // Owned-boolean predicate: see drain_pending_refinement_for_disposal. A guard in the
         // `while` condition would be live across the awaits in the body.
@@ -15188,7 +15264,14 @@ impl AgentSession {
         if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             return Ok(());
         }
-        let signal = self.refinement_signal();
+        let _execution = tokio::select! {
+            biased;
+            _ = current.signal.cancelled() => return Ok(()),
+            guard = self.refinement_execution.lock() => guard,
+        };
+        current.check(self)?;
+        let _flight = self.create_refine_settlement();
+        let signal = current.signal.clone();
         let plan = self
             .plan_refine_for_trigger(options, source, signal.clone())
             .await;
@@ -15203,9 +15286,13 @@ impl AgentSession {
             self.schedule_session_input_pump();
             return Ok(());
         }
-        let outcome = self
-            .apply_refine(&plan, options, source, Some(&signal))
-            .await;
+        current.check(self)?;
+        let progress = RefinementProgress::new(self);
+        let outcome = self.apply_refine_with_context(
+            &plan, options, source, Some(&signal), Some(&current), false, &progress,
+        ).await;
+        progress.finish_result(&outcome);
+        drop(_flight);
         self.notify_session_input_checkpoint_change();
         self.schedule_session_input_pump();
         outcome.map(|_| ())
@@ -15387,43 +15474,27 @@ impl AgentSession {
         }
     }
 
-    /// `_applySerializedPlan(bgResult)` (agent-session.ts:2719-2737).
+    /// `_applySerializedPlan(bgResult)`.
     async fn apply_serialized_plan(
         self: &Arc<Self>,
         bg_result: &SerializedBackgroundPlanResult,
     ) -> Result<(), String> {
         let SerializedBackgroundPlanResult::Plan {
-            plan,
-            options,
-            source,
-            abort,
-            ..
-        } = bg_result
-        else {
+            plan, options, source, abort, branch_version,
+        } = bg_result else {
             return Ok(());
         };
-        if abort.is_cancelled() {
-            return Err("Refinement was aborted".to_string());
-        }
-        let settled = create_agent_message_deferred();
-        // `this._refineInFlight = applySettled`.
-        let slot_future: BoxFuture<Result<(), String>> = {
-            let waiter = settled.clone();
-            Box::pin(async move { waiter.wait().await })
+        let _execution = tokio::select! {
+            biased;
+            _ = abort.cancelled() => return Err("Refinement was aborted".to_string()),
+            guard = self.refinement_execution.lock() => guard,
         };
-        let my_gen = self.refine_in_flight_gen.fetch_add(1, Ordering::SeqCst);
-        *self.refine_in_flight.lock().unwrap() = Some((my_gen, slot_future.shared()));
-        let outcome = self.apply_refine(plan, options, source, Some(abort)).await;
-        settled.resolve();
-        // `if (this._refineInFlight === applySettled) this._refineInFlight = undefined;`
-        // (`agent-session.ts:2731`): clear only if this apply still owns the slot;
-        // a newer in-flight must not be cleared (identity via generation tag).
-        {
-            let mut slot = self.refine_in_flight.lock().unwrap();
-            if slot.as_ref().map(|(g, _)| *g) == Some(my_gen) {
-                slot.take();
-            }
+        if *branch_version != self.auto_refine_branch_version.load(Ordering::SeqCst) as i64 {
+            return Err("Refinement was aborted because the session changed.".to_string());
         }
+        let _flight = self.create_refine_settlement();
+        let outcome = self.apply_refine(plan, options, source, Some(abort)).await;
+        drop(_flight);
         self.notify_session_input_checkpoint_change();
         self.schedule_session_input_pump();
         outcome.map(|_| ())
@@ -18041,7 +18112,21 @@ impl AgentSession {
         skip_review: bool,
         refine_abort: CancellationToken,
     ) -> Result<Option<SerializedBackgroundPlanResult>, String> {
+        let _execution = tokio::select! {
+            biased;
+            _ = refine_abort.cancelled() => return Ok(Some(SerializedBackgroundPlanResult::Invalidated {
+                branch_version: branch_version as i64,
+            })),
+            guard = self.refinement_execution.lock() => guard,
+        };
         let branch_version_i64 = branch_version as i64;
+        if self.explicitly_stopped()
+            || branch_version != self.auto_refine_branch_version.load(Ordering::SeqCst)
+        {
+            return Ok(Some(SerializedBackgroundPlanResult::Invalidated {
+                branch_version: branch_version_i64,
+            }));
+        }
         if !skip_review {
             let context = AutoRefineReviewContext {
                 reason: AutoRefineReason::TurnInterval,
@@ -18222,6 +18307,7 @@ mod post_compaction_continuation_tests {
         outcomes: Mutex<VecDeque<Result<(), AgentContinueError>>>,
         continue_calls: AtomicUsize,
         wait_for_idle_calls: AtomicUsize,
+        prompt_batches: Mutex<Vec<Vec<AgentMessage>>>,
         stream_fn: Mutex<StreamFn>,
     }
 
@@ -18232,6 +18318,7 @@ mod post_compaction_continuation_tests {
                 outcomes: Mutex::new(outcomes.into_iter().collect()),
                 continue_calls: AtomicUsize::new(0),
                 wait_for_idle_calls: AtomicUsize::new(0),
+                prompt_batches: Mutex::new(Vec::new()),
                 stream_fn: Mutex::new(pi_agent_core::agent::default_stream_fn()),
             })
         }
@@ -18295,7 +18382,8 @@ mod post_compaction_continuation_tests {
             Box::pin(async {})
         }
 
-        fn prompt(&self, _messages: Vec<AgentMessage>) -> BoxFuture<Result<(), String>> {
+        fn prompt(&self, messages: Vec<AgentMessage>) -> BoxFuture<Result<(), String>> {
+            self.prompt_batches.lock().unwrap().push(messages);
             Box::pin(async { Ok(()) })
         }
 
@@ -18373,6 +18461,13 @@ mod post_compaction_continuation_tests {
 
     pub(super) async fn test_session_with_credentials_at_depth(
         rlm_depth: i64,
+    ) -> Arc<AgentSession> {
+        test_session_with_credentials_and_tools(rlm_depth, None).await
+    }
+
+    pub(super) async fn test_session_with_credentials_and_tools(
+        rlm_depth: i64,
+        allowed_tool_names: Option<Vec<String>>,
     ) -> Arc<AgentSession> {
         let provider = pi_ai::providers::faux::register_faux_provider(Some(
             pi_ai::providers::faux::RegisterFauxProviderOptions {
@@ -18466,6 +18561,7 @@ mod post_compaction_continuation_tests {
                     model: Some(model),
                     rlm_depth: Some(rlm_depth),
                     no_tools: Some("all".to_string()),
+                    allowed_tool_names,
                     prewarm_ipython_kernel: Some(false),
                     telemetry_disabled: Some(true),
                     ..Default::default()
@@ -19022,6 +19118,7 @@ mod post_compaction_continuation_tests {
                     background_output: None,
                     status: ExecuteStatus::Ok,
                     error: None,
+                    execution_reports: None,
                     duration_ms: 0.0,
                 })
             })
@@ -19762,6 +19859,7 @@ mod post_compaction_continuation_tests {
                     background_output: None,
                     status: ExecuteStatus::Ok,
                     error: None,
+                    execution_reports: None,
                     duration_ms: 0.0,
                 })
             })
@@ -21948,6 +22046,8 @@ mod post_compaction_continuation_tests {
             t.agent.set_state(state);
         }
 
+        include!("agent_session/refinement_tests.rs");
+
         // =======================================================================
         // H-01 harness_paths_agree
         // =======================================================================
@@ -22692,18 +22792,14 @@ mod post_compaction_continuation_tests {
             }
             assert!(t.session.refine_in_flight.lock().unwrap().is_none());
 
-            let old = t.session.create_refine_settlement(Arc::new(|| {
-                Box::pin(async { Err("unused settlement fixture".to_string()) })
-            }));
-            let new = t.session.create_refine_settlement(Arc::new(|| {
-                Box::pin(async { Err("unused settlement fixture".to_string()) })
-            }));
-            old();
+            let old = t.session.create_refine_settlement();
+            let new = t.session.create_refine_settlement();
+            drop(old);
             assert!(
                 t.session.refine_in_flight.lock().unwrap().is_some(),
                 "an older settlement must not clear a newer refinement owner"
             );
-            new();
+            drop(new);
             assert!(t.session.refine_in_flight.lock().unwrap().is_none());
             t.session.dispose_async(Some(false)).await;
         }
@@ -23603,6 +23699,21 @@ mod post_compaction_continuation_tests {
                 vec![],
             )
             .await;
+            // The production wrapper always installs Jev's local shutdown cleanup,
+            // even in Off mode. Exercise the truly empty-runner branch explicitly.
+            assert!(t.session.has_extension_handlers("session_shutdown"));
+            let loaded = t.session.resource_loader.get_extensions();
+            assert!(loaded.extensions.is_empty(), "no user extension factories in this fixture");
+            let runner = Arc::new(crate::core::extensions::runner::ExtensionRunner::new(
+                Vec::new(),
+                loaded.runtime,
+                t.session.cwd.clone(),
+                Arc::new(crate::core::extensions::runner::NullSessionManager),
+                Arc::new(crate::core::extensions::runner::NullModelRegistry),
+            ));
+            t.session.bind_extension_core(&runner);
+            t.session.apply_extension_bindings(&runner);
+            t.session.extension_runner_ref.set(Some(runner));
             for event in [
                 "session_shutdown",
                 "session_before_switch",
@@ -23619,6 +23730,12 @@ mod post_compaction_continuation_tests {
                 t.session.reload_with_options(None).await.is_ok(),
                 "H-08 negative control: reload succeeds with no handlers attached"
             );
+            assert!(
+                t.session.has_extension_handlers("session_shutdown"),
+                "reload restores the normal runner's required core cleanup handler"
+            );
+            assert!(t.agent.prompt_batches.lock().unwrap().is_empty());
+            assert_eq!(t.provider.call_count(), 0, "the empty lifecycle path does not call a model");
             t.session.dispose_async(Some(false)).await;
         }
 
@@ -23739,6 +23856,10 @@ mod post_compaction_continuation_tests {
                     "{mode}: cancelled result was not saved"
                 );
                 if mode == "abort" {
+                    assert!(t.session.refine_with_options(&RefineOptions::default(), false, None)
+                        .await.is_err());
+                    t.session.resume_explicit_stop()
+                        .expect("explicit resume before a fresh refinement");
                     t.queue_json(proposal_json("nine-fresh-memory"));
                     t.session
                         .refine_with_options(&RefineOptions::default(), false, None)
@@ -25302,6 +25423,7 @@ mod rlm_session_t10_tests {
                     background_output: None,
                     status: crate::core::kernel::shared::ExecuteStatus::Ok,
                     error: None,
+                    execution_reports: None,
                     duration_ms: 1.0,
                 })
             })

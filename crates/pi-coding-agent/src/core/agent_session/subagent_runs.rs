@@ -278,6 +278,7 @@ impl AgentSession {
             }
         }));
         let weak_run = Arc::downgrade(&run);
+        let weak_parent = Arc::downgrade(self);
         options.on_session_published = Some(Arc::new(move |child| {
             if let Some(run) = weak_run.upgrade() {
                 let weak_child = Arc::downgrade(child);
@@ -295,7 +296,13 @@ impl AgentSession {
                     run.publication.resolve();
                     run.status == "cancelled"
                 };
-                if cancelled {
+                let retained = weak_parent.upgrade().and_then(|parent| {
+                    parent.retained_stop_ids.lock().unwrap().get(&run.lock().unwrap().id).cloned()
+                });
+                if let Some(generation) = retained {
+                    let id = run.lock().unwrap().id.clone();
+                    child.request_retained_stop(&id, &generation);
+                } else if cancelled {
                     abort();
                 }
             }
@@ -668,6 +675,7 @@ impl AgentSession {
             }
             return;
         }
+        if self.finish_retained_rlm_run(&run, &current) { return; }
         let retained = completed
             && current
                 .session
@@ -685,6 +693,15 @@ impl AgentSession {
                     .insert(current.id.clone(), unsubscribe);
             }
         } else {
+            // This is the last synchronous boundary before any release await.
+            // Stop and cleanup compete under one parent admission gate.
+            if let Some(child) = &current.session {
+                if !self.try_claim_rlm_runtime_release(&current.id, child) {
+                    if self.finish_retained_rlm_run(&run, &current) { return; }
+                    // Explicit deletion may have superseded retention under the same gate.
+                    if !self.try_claim_rlm_runtime_release(&current.id, child) { return; }
+                }
+            }
             if let Some(unsubscribe) = &current.unsubscribe {
                 unsubscribe();
             }
@@ -726,6 +743,35 @@ impl AgentSession {
             .unwrap()
             .retain(|other| !Arc::ptr_eq(other, &run));
         self.maybe_resume_goal_continuation_after_rlm_work();
+    }
+
+    /// Retain the addressable child when stop wins before release admission.
+    /// No await or destructive action is allowed between that decision and registration.
+    pub(in crate::core::agent_session) fn finish_retained_rlm_run(self: &Arc<Self>, run: &Arc<Mutex<RlmChildRun>>, current: &RlmChildRun) -> bool {
+        let _admission = self.rlm_child_lifecycle_admission.lock().unwrap();
+        if self.rlm_child_release_claims.lock().unwrap().contains(&current.id) { return false; }
+        let Some(generation) = self.retained_stop_ids.lock().unwrap().get(&current.id).cloned() else { return false; };
+        if let Some(child) = &current.session {
+            child.request_retained_stop(&current.id, &generation);
+            if !self.register_rlm_child_session(&current.id, child.clone()) {
+                // A failed host row update must never turn retain into destructive release.
+                self.rlm_child_sessions.lock().unwrap().insert(current.id.clone(), RetainedRlmChild {
+                    session: child.clone(), run: Some(run.clone()),
+                });
+            }
+        }
+        if current.session.is_some() {
+            self.active_rlm_child_runs.lock().unwrap().remove(&current.id);
+        }
+        if let Some(unsubscribe) = current.unsubscribe.clone() {
+            self.rlm_child_unsubscribes.lock().unwrap().insert(current.id.clone(), unsubscribe);
+        }
+        let mut current_run = run.lock().unwrap();
+        current_run.settled = true; // Initial task only; retained stop has separate acknowledgements.
+        current_run.settlement.resolve();
+        drop(current_run);
+        self.unsettled_rlm_child_runs.lock().unwrap().retain(|other| !Arc::ptr_eq(other, run));
+        true
     }
 
     pub fn register_rlm_child_session(

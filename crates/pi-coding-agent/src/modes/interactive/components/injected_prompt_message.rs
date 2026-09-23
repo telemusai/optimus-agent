@@ -360,6 +360,9 @@ impl InjectedPromptMessageComponent {
 
 impl Component for InjectedPromptMessageComponent {
     fn render(&mut self, width: f64) -> Vec<String> {
+        if self.message.custom_type == ASYNC_BASH_COMPLETION_CUSTOM_TYPE && !self.expanded {
+            return super::shell_completion::ShellCompletion::from_details(self.message.details.as_ref()).render(width);
+        }
         let mut spacer = Spacer::new(1);
         let mut lines = spacer.render(width);
         // `this.content`: the header, then the markdown body when expanded.
@@ -590,6 +593,25 @@ mod tests {
         let collapsed = restored.render(60.0).len();
         restored.set_expanded(true);
         assert_eq!(restored.render(60.0).len(), collapsed);
+    }
+
+    #[test]
+    fn shell_completion_collapsed_is_one_line_and_explicit_inspection_keeps_details() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut shell = component(custom_message(
+            ASYNC_BASH_COMPLETION_CUSTOM_TYPE,
+            "full fixture command\nInspect the saved BashHandle",
+            serde_json::json!({"pid": 33504, "command": "full fixture command", "exitCode": 0}),
+        ));
+        for width in [8, 20, 80] {
+            let rows = shell.render(width as f64);
+            assert_eq!(rows.len(), 1);
+            assert!(visible_width(&rows[0]) <= width);
+            assert!(!rows[0].contains("fixture command"));
+        }
+        assert!(shell.render(80.0)[0].contains("Shell finished — exit 0 (PID 33504)."));
+        shell.set_expanded(true);
+        assert!(shell.render(80.0).join("\n").contains("BashHandle"));
     }
 
     #[test]

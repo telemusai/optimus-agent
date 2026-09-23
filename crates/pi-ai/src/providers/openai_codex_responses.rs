@@ -3487,6 +3487,103 @@ mod tests {
         ]
     }
 
+
+    fn tool001_context() -> Context {
+        let mut context = context();
+        context.tools = Some(vec![crate::types::Tool {
+            name: "ipython".to_string(),
+            description: "Execute local code".to_string(),
+            parameters: json!({"type":"object","properties":{"code":{"type":"string"}},"required":["code"]}),
+        }]);
+        context
+    }
+
+    #[test]
+    fn tool001_interrupted_history_keeps_definitions_and_truthful_missing_result() {
+        let model = model();
+        for stop_reason in ["aborted", "error", "toolUse"] {
+            let mut context = tool001_context();
+            context.messages.push(Message::assistant(AssistantMessage {
+                api: model.api.clone(), provider: model.provider.clone(), model: model.id.clone(),
+                stop_reason: stop_reason.to_string(),
+                content: vec![ContentBlock::ToolCall(crate::types::ToolCall::new("call_unfinished", "ipython", Map::new()))],
+                ..Default::default()
+            }));
+            context.messages.push(Message::user(UserMessage::new(UserContent::Text("Continue the requested work".to_string()), 2)));
+            let body = build_request_body(&model, &context, None).unwrap();
+            assert_eq!(body["tools"].as_array().unwrap().len(), 1);
+            assert_eq!(body["tools"][0]["name"], "ipython");
+            assert_eq!(body["tool_choice"], "auto");
+            let input = body["input"].as_array().unwrap();
+            let outputs: Vec<_> = input.iter().filter(|item| item["type"] == "function_call_output").collect();
+            if stop_reason == "toolUse" {
+                assert_eq!(outputs.len(), 1);
+                assert_eq!(outputs[0]["output"], "No result provided");
+            } else {
+                assert!(outputs.is_empty(), "aborted/error calls are not replayed as successful work");
+                assert!(!input.iter().any(|item| item["type"] == "function_call"));
+            }
+        }
+    }
+
+    #[test]
+    fn tool001_payload_hook_and_wire_retain_tools_after_interruption_and_cached_followup() {
+        let _guard = WEB_SOCKET_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());
+        let previous_constructor = get_web_socket_constructor();
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        runtime.block_on(async {
+            let scripts = Arc::new(Mutex::new(VecDeque::from(vec![
+                vec![json!({"type":"response.function_call_arguments.delta","delta":"{}"}),
+                     json!({"type":"error","code":"invalid_request","message":"fixture interruption"})],
+                backlog_response("tool001-resumed"),
+                backlog_response("tool001-cached"),
+            ])));
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            set_web_socket_constructor(Some(Arc::new({
+                let scripts = scripts.clone(); let requests = requests.clone();
+                move |_, _| Arc::new(ScriptedBacklogSocket { inner: FakeSocket::default(), scripts: scripts.clone(), requests: requests.clone() })
+            })));
+            let hooked = Arc::new(Mutex::new(Vec::new()));
+            let options = OpenAICodexResponsesOptions { stream: StreamOptions {
+                api_key: Some(token("synthetic-tool001")),
+                session_id: Some("tool001-offline-interruption".to_string()),
+                transport: Some("websocket-cached".to_string()),
+                timeout_ms: Some(1000.0),
+                on_payload: Some(Arc::new({ let hooked = hooked.clone(); move |body, _| {
+                    hooked.lock().unwrap().push(body.clone());
+                    Box::pin(async move { Some(body) })
+                }})),
+                ..Default::default()
+            }, ..Default::default() };
+            let mut context = tool001_context();
+            let mut fixture_model = model();
+            fixture_model.id = "gpt-6-astra".to_string();
+            let interrupted = stream_openai_codex_responses(&fixture_model, &context, Some(options.clone())).result().await;
+            assert_eq!(interrupted.stop_reason, "error");
+            assert_eq!(requests.lock().unwrap().len(), 1, "observed work must not be replayed");
+            context.messages.push(Message::assistant(interrupted));
+            context.messages.push(Message::user(UserMessage::new(UserContent::Text("Resume explicitly".to_string()), 2)));
+            let resumed = stream_openai_codex_responses(&fixture_model, &context, Some(options.clone())).result().await;
+            assert_ne!(resumed.stop_reason, "error", "{:?}", resumed.error_message);
+            context.messages.push(Message::user(UserMessage::new(UserContent::Text("Status only".to_string()), 3)));
+            let final_result = stream_openai_codex_responses(&fixture_model, &context, Some(options)).result().await;
+            assert_ne!(final_result.stop_reason, "error", "{:?}", final_result.error_message);
+            let sent = requests.lock().unwrap().clone();
+            assert_eq!(sent.len(), 3);
+            assert_eq!(hooked.lock().unwrap().len(), 3);
+            for (wire, hook) in sent.iter().zip(hooked.lock().unwrap().iter()) {
+                assert_eq!(wire["type"], "response.create");
+                assert_eq!(wire["tools"], hook["tools"]);
+                assert_eq!(wire["tools"][0]["name"], "ipython");
+                assert_eq!(wire["tool_choice"], "auto");
+            }
+            assert!(sent[1].get("previous_response_id").is_none());
+            assert_eq!(sent[2]["previous_response_id"], "tool001-resumed");
+            close_openai_codex_web_socket_sessions(Some("tool001-offline-interruption"));
+        });
+        set_web_socket_constructor(previous_constructor);
+    }
+
     #[test]
     fn backlog_codex_chain_reset_is_bounded_and_never_replays_observed_work() {
         let _guard = WEB_SOCKET_TEST_LOCK.lock().unwrap_or_else(|error| error.into_inner());

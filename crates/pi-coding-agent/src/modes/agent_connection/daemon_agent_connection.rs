@@ -3367,6 +3367,11 @@ impl AgentConnection for DaemonAgentConnection {
         })
     }
 
+    fn heartbeat_catalog_supported(&self) -> Option<bool> {
+        self.client.hello_socket_path().is_some()
+            .then(|| self.client.supports_server_capability("heartbeat_catalog"))
+    }
+
     fn list_heartbeats(&self) -> BoxFuture<Result<Vec<AgentConnectionHeartbeat>, String>> {
         let this = self.clone();
         // `listDaemonHeartbeats(client, this.options.ownedSession ? this.activeSessionId : undefined)`

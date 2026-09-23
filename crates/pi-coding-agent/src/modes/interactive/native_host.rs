@@ -76,6 +76,8 @@ mod native_neon;
 mod native_settings;
 #[path = "native_host_state.rs"]
 mod native_state;
+#[path = "native_host_status.rs"]
+mod native_status;
 #[path = "native_host_commands.rs"]
 mod native_commands;
 // Child-session mode inheritance (integration hunk C-4) uses the /jev mode
@@ -159,6 +161,7 @@ struct Transcript {
     timeline: Option<native_neon::Timeline>,
     selection_columns: Vec<Option<(usize, usize)>>,
     connection_status: String,
+    refinement_progress: Option<String>,
     viewport_anchors: Vec<Option<pi_tui::fullscreen::ViewportAnchor>>,
     assistant: Option<Rc<RefCell<AssistantMessageComponent>>>,
     assistants: Vec<Rc<RefCell<AssistantMessageComponent>>>,
@@ -269,6 +272,7 @@ impl Transcript {
             timeline: None,
             selection_columns: Vec::new(),
             connection_status: String::new(),
+            refinement_progress: None,
             viewport_anchors: Vec::new(),
             assistant: None,
             assistants: Vec::new(),
@@ -289,6 +293,7 @@ impl Transcript {
         self.agent_messages.clear();
         self.recovery_notices.clear();
         self.refinement_outcomes.clear();
+        self.refinement_progress = None;
         for message in initial_render_messages(messages) {
             self.message(message, false);
         }
@@ -425,6 +430,10 @@ impl Transcript {
             }
             AgentMessage::Custom(message) => {
                 if matches!(&message, pi_agent_core::types::CustomAgentMessage::Custom { display: false, .. }) {
+                    return;
+                }
+                if let Some(notice) = crate::modes::interactive::components::shell_completion::ShellCompletion::from_message(&message) {
+                    self.rows.push(Box::new(notice));
                     return;
                 }
                 if let pi_agent_core::types::CustomAgentMessage::Custom { custom_type, content: pi_agent_core::types::CustomMessageContent::Text(text), .. } = &message {
@@ -588,6 +597,9 @@ impl TuiComponent for Transcript {
         if mode.restored_draft_notice.borrow().is_some() {
             lines.push(theme().fg("dim", "Draft restored"));
         }
+        if let Some(progress) = &self.refinement_progress {
+            lines.push(truncate_to_width(&theme().fg("accent", progress), width, "…", false));
+        }
         if mode.should_show_working_loader() {
             // `createWorkingLoader` mounts the animated pi-tui `Loader`
             // (interactive-mode.ts:3305-3313); the native host renders the same
@@ -682,6 +694,7 @@ impl Tray {
         let usage_themed = usage.as_deref().map(|usage| if native_neon::active() {
             native_neon::context_meter(mode.get_connection_context_usage().as_ref(), usage, width as usize)
         } else { theme().fg("dim", usage) });
+        let right = native_status::right_status(&mode, usage_themed.as_deref(), width as usize);
         let composed = tray_row::compose_tray_row(
             tray_row::TrayRow {
                 left: &left_themed,
@@ -689,14 +702,13 @@ impl Tray {
                     .map(|(full, compact)| tray_row::TraySegment { full, compact }),
                 jev_compaction: jev_compaction
                     .map(|(full, compact)| tray_row::TraySegment { full, compact }),
-                right: usage_themed.as_deref(),
+                right: right.as_deref(),
             },
             width as usize,
         );
-        let mut lines = vec![composed];
+        let mut lines = Vec::new();
         if let Some(context) = mode.get_tray_context_label() {
-            // Goal/heartbeat labels keep their own line above the counter row;
-            // the usage counter itself moved onto the row above.
+            // Keep goal/manager detail above the bottom-right heartbeat/context status.
             lines.push(truncate_to_width(
                 &theme().fg("dim", &context),
                 width,
@@ -704,6 +716,7 @@ impl Tray {
                 false,
             ));
         }
+        lines.push(composed);
         lines
     }
 }
@@ -1712,6 +1725,8 @@ async fn run_terminal(
         >,
     > = None;
     let mut heartbeat_refresh_at: Option<Instant> = None;
+    let mut heartbeat_status_refresh = native_status::HeartbeatRefresh::new();
+    heartbeat_status_refresh.request(connection.clone(), &current_session_id, false);
     let mut settings_selector: Option<
         Rc<
             RefCell<
@@ -2184,6 +2199,14 @@ async fn run_terminal(
             ) {
                 state_refresh.invalidate();
             }
+            if matches!(&event, HostEvent::RefreshSnapshot(_)
+                | HostEvent::Connection(wire::AgentConnectionEvent::SessionResynced { .. }
+                    | wire::AgentConnectionEvent::SessionReplaced { .. })) {
+                heartbeat_status_refresh.cancel();
+                mode.borrow_mut().heartbeat_catalog.clear();
+                mode.borrow_mut().heartbeat_catalog_authoritative = false;
+                heartbeat_catalog.borrow_mut().clear();
+            }
             match event {
                 HostEvent::MenuTiming(started) => ui_metrics.menu(started),
                 HostEvent::Shutdown => mode.borrow_mut().shutdown_requested = true,
@@ -2430,6 +2453,7 @@ async fn run_terminal(
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
                         .apply_connection_state_snapshot(project_state(state));
+                    heartbeat_status_refresh.request(connection.clone(), &current_session_id, false);
                     refresh_terminal_title(&mode, &ui);
                     if let Some(error) = apply_history_snapshot(
                         None,
@@ -2464,6 +2488,7 @@ async fn run_terminal(
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
                         .apply_connection_state_snapshot(project_state(snapshot.state));
+                    heartbeat_status_refresh.request(connection.clone(), &current_session_id, false);
                     refresh_terminal_title(&mode, &ui);
                     if let Some(error) = apply_history_snapshot(
                         snapshot.history,
@@ -2563,13 +2588,7 @@ async fn run_terminal(
                     mode.borrow_mut().render_recap();
                 }
                 HostEvent::Connection(wire::AgentConnectionEvent::HeartbeatsChanged) => {
-                    let connection = connection.clone();
-                    let send = send.clone();
-                    tokio::spawn(async move {
-                        if let Ok(catalog) = connection.list_heartbeats().await {
-                            let _ = send.send(HostEvent::Heartbeats(catalog, false));
-                        }
-                    });
+                    heartbeat_status_refresh.request(connection.clone(), &current_session_id, true);
                 }
                 HostEvent::ModelSelected {
                     session_id,
@@ -2603,7 +2622,11 @@ async fn run_terminal(
                 }
                 HostEvent::Render => {}
                 HostEvent::Heartbeats(catalog, open) => {
-                    native_heartbeats::apply_catalog(&mut mode.borrow_mut(), &catalog);
+                    heartbeat_status_refresh.cancel();
+                    native_status::apply_catalog_result(
+                        &mut mode.borrow_mut(), &catalog,
+                        connection.heartbeat_catalog_supported() == Some(true),
+                    );
                     *heartbeat_catalog.borrow_mut() = catalog;
                     if open {
                         if heartbeat_manager.is_some() {
@@ -3041,6 +3064,11 @@ async fn run_terminal(
         }
         if let Some(manager) = &heartbeat_manager {
             manager.borrow_mut().poll_action();
+        }
+        if let Some((catalog, authoritative)) = heartbeat_status_refresh.poll(connection.clone(), &current_session_id).await {
+            native_status::apply_catalog_result(&mut mode.borrow_mut(), &catalog, authoritative);
+            *heartbeat_catalog.borrow_mut() = catalog;
+            ui.borrow_mut().request_render();
         }
         if heartbeat_refresh_at.is_some_and(|at| Instant::now() >= at) {
             heartbeat_refresh_at = Some(Instant::now() + Duration::from_secs(5));
@@ -4413,6 +4441,21 @@ fn apply_event(
     }
     .unwrap_or_default();
     match event.type_name() {
+        "refinement_update" => {
+            if let wire::AgentConnectionSessionEvent::RefinementUpdate { active, reason } = &event {
+                transcript.borrow_mut().refinement_progress = active.then(|| {
+                    reason.as_deref().filter(|text| !text.trim().is_empty())
+                        .unwrap_or("Refining saved knowledge")
+                        .chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect()
+                });
+            }
+        }
+        "refine_complete" | "refine_failed" => {
+            transcript.borrow_mut().refinement_progress = None;
+            if let wire::AgentConnectionSessionEvent::RefineFailed { error } = &event {
+                mode.borrow_mut().show_error(error);
+            }
+        }
         "rlm_child_update" => {
             if let wire::AgentConnectionSessionEvent::RlmChildUpdate { child } = &event {
                 mode.borrow_mut().update_subagent_summary(native_subagents::project_child(child));
@@ -4666,7 +4709,8 @@ mod tests {
     /// call also record their arguments, so a behaviour test asserts the ACTUAL
     /// connection call and its arguments rather than only the command name.
     #[derive(Default)]
-    struct RecordingConnection {
+    pub(super) struct RecordingConnection {
+        pub(super) heartbeat_catalog_support: std::sync::Mutex<Option<bool>>,
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
         state: std::sync::Mutex<wire::AgentConnectionState>,
         user_messages: std::sync::Mutex<Vec<wire::AgentConnectionUserMessage>>,
@@ -4696,7 +4740,7 @@ mod tests {
         }
 
         /// `(method, args)` pairs in call order.
-        fn calls(&self) -> Vec<(String, Vec<String>)> {
+        pub(super) fn calls(&self) -> Vec<(String, Vec<String>)> {
             self.calls.lock().unwrap().clone()
         }
 
@@ -4853,6 +4897,10 @@ mod tests {
             self.record("list_cron_jobs");
             Box::pin(async move { Ok(Vec::new()) })
         }
+        fn heartbeat_catalog_supported(&self) -> Option<bool> {
+            *self.heartbeat_catalog_support.lock().unwrap()
+        }
+
         fn list_heartbeats(
             &self,
         ) -> pi_ai::types::BoxFuture<Result<Vec<wire::AgentConnectionHeartbeat>, String>> {

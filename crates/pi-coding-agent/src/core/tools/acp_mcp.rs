@@ -247,6 +247,7 @@ mod tests {
             background_output: None,
             status,
             error,
+            execution_reports: None,
             duration_ms: 12.0,
         }
     }

@@ -539,30 +539,37 @@ fn resolve_agent_end_defers_on_insufficient_results() {
     assert_eq!(result.verification_state, ControlVerificationState::Unknown);
     assert_eq!(book.snapshot("sess").feedback_remaining, 1);
 
-    // A second gap correction is allowed; the third is refused with a
-    // truthful annotation and no silent success.
+    // A different decision may use the second correction; replay cannot.
+    let mut next_facts = fact.clone();
+    next_facts.request_id = "req-2".to_string();
+    let mut next_insufficient = insufficient.clone();
+    next_insufficient.request_id = next_facts.request_id.clone();
     let second = resolve_agent_end(
         &book,
         "sess",
         &ControlPolicy::default(),
         &features(),
         JevMode::Active,
-        &fact,
-        &[insufficient.clone()],
+        &next_facts,
+        &[next_insufficient],
         false,
         "turns=3",
     );
     assert!(second.feedback.is_some());
     assert_eq!(book.snapshot("sess").feedback_remaining, 0);
 
+    let mut third_facts = fact.clone();
+    third_facts.request_id = "req-3".to_string();
+    let mut third_insufficient = insufficient.clone();
+    third_insufficient.request_id = third_facts.request_id.clone();
     let third = resolve_agent_end(
         &book,
         "sess",
         &ControlPolicy::default(),
         &features(),
         JevMode::Active,
-        &fact,
-        &[insufficient.clone()],
+        &third_facts,
+        &[third_insufficient],
         false,
         "turns=4",
     );
@@ -638,15 +645,18 @@ fn resolve_agent_end_verification_request_and_pause_fallback() {
     assert_eq!(first.verification_state, ControlVerificationState::Unverified);
     assert_eq!(book.snapshot("sess").verification_remaining, 0);
 
-    // A further recommendation cannot be delivered: truthful pause, never a
-    // synthesized Verified and never silent success.
+    // A different recommendation cannot be delivered: truthful pause.
+    let mut next_facts = fact.clone();
+    next_facts.request_id = "req-2".to_string();
+    let mut verify = verify;
+    verify.request_id = next_facts.request_id.clone();
     let second = resolve_agent_end(
         &book,
         "sess",
         &ControlPolicy::default(),
         &features(),
         JevMode::Active,
-        &fact,
+        &next_facts,
         &[verify],
         false,
         "still no tests",
@@ -1474,6 +1484,104 @@ fn eligible_questions_mirror_legacy_gating() {
 }
 
 #[test]
+fn ctrl001_terminal_scope_wins_without_claiming_checks_passed() {
+    for task in ["Thanks", "Report status only", "Give me the link", "List the files", "Stop work"] {
+        let (book, _dir) = temp_book("terminal-scope");
+        book.note_real_user_input("sess", "interactive", task, true);
+        let fact = facts("sess", 9, &["result_sufficiency.0", "first_pass_verification.0", "continue_stop_escalate.0"]);
+        let decisions = [
+            candidate(DecisionCategory::ResultSufficiency, "result_sufficiency.0", "insufficient", 0.9, 9),
+            candidate(DecisionCategory::FirstPassVerification, "first_pass_verification.0", "none", 0.9, 9),
+            candidate(DecisionCategory::ContinueStopEscalate, "continue_stop_escalate.0", "stop", 0.9, 9),
+        ];
+        let result = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &decisions, false, "verification=Unknown");
+        assert!(result.feedback.is_none(), "{task}");
+        assert!(!result.defer_goal_finish);
+        assert_eq!(result.verification_state, ControlVerificationState::NotApplicable);
+        assert_eq!(book.snapshot("sess").feedback_remaining, 2);
+    }
+}
+
+#[test]
+fn ctrl001_blocked_or_stopped_implementation_never_claims_verified() {
+    for (scope, escalation) in [("stop", false), ("escalate", true)] {
+        let (book, _dir) = temp_book("blocked-scope");
+        book.note_real_user_input("sess", "interactive", "Implement the change", true);
+        let fact = facts("sess", 9, &["first_pass_verification.0", "continue_stop_escalate.0"]);
+        let decisions = [
+            candidate(DecisionCategory::FirstPassVerification, "first_pass_verification.0", "verify", 0.9, 9),
+            candidate(DecisionCategory::ContinueStopEscalate, "continue_stop_escalate.0", scope, 0.9, 9),
+        ];
+        let result = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &decisions, false, "verification=Unknown");
+        assert!(result.feedback.is_none());
+        assert_eq!(result.escalate, escalation);
+        assert_eq!(result.verification_state, ControlVerificationState::Unknown);
+        assert_eq!(book.snapshot("sess").verification_remaining, 1);
+    }
+}
+
+#[test]
+fn ctrl001_duplicate_notices_survive_restart_without_spending_again() {
+    for (category, id, value) in [
+        (DecisionCategory::ResultSufficiency, "result_sufficiency.0", "insufficient"),
+        (DecisionCategory::FirstPassVerification, "first_pass_verification.0", "verify"),
+    ] {
+        let (book, dir) = temp_book("notice-dedupe");
+        book.note_real_user_input("sess", "interactive", "Implement and check", true);
+        let fact = facts("sess", 9, &[id]);
+        let decisions = [candidate(category, id, value, 0.9, 9)];
+        let first = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &decisions, false, "unknown");
+        assert!(first.feedback.is_some());
+        let remaining = book.snapshot("sess");
+        let reborn = ControlBook::new(dir);
+        let duplicate = resolve_agent_end(&reborn, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &decisions, false, "unknown");
+        assert!(duplicate.feedback.is_none());
+        assert!(duplicate.pause.is_none());
+        assert!(!duplicate.defer_goal_finish);
+        assert_eq!(reborn.snapshot("sess"), remaining);
+        assert!(duplicate.verdicts.iter().any(|verdict| matches!(verdict,
+            ControlVerdict::Refused(ControlRefusal::TriggerNotMet("duplicate_control_feedback")))));
+    }
+}
+
+
+#[test]
+fn ctrl001_duplicate_feedback_never_suppresses_a_new_terminal_safety_decision() {
+    for (terminal, escalate) in [("escalate", true), ("stop", false)] {
+        let (book, dir) = temp_book("dedupe-terminal-safety");
+        book.note_real_user_input("sess", "interactive", "Implement and check", true);
+        let fact = facts("sess", 9, &["result_sufficiency.0", "continue_stop_escalate.0"]);
+        let gap = candidate(DecisionCategory::ResultSufficiency, "result_sufficiency.0", "insufficient", 0.9, 9);
+        let first = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &[gap.clone()], false, "unknown");
+        assert!(first.feedback.is_some());
+        let remaining = book.snapshot("sess");
+        let reborn = ControlBook::new(dir);
+        let safety = candidate(DecisionCategory::ContinueStopEscalate, "continue_stop_escalate.0", terminal, 0.95, 9);
+        let result = resolve_agent_end(&reborn, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &[gap, safety], false, "concrete blocker or stop");
+        assert!(result.feedback.is_none());
+        assert_eq!(result.escalate, escalate);
+        assert_eq!(result.defer_goal_finish, escalate);
+        assert_eq!(result.verification_state, ControlVerificationState::Unknown);
+        assert_eq!(reborn.snapshot("sess"), remaining);
+        if !escalate {
+            assert_eq!(result.terminal_annotation, Some("no_authorized_follow_up"));
+        }
+    }
+}
+
+#[test]
+fn ctrl001_new_task_drops_old_nonprogress_evidence() {
+    let (book, _dir) = temp_book("task-scope");
+    book.note_real_user_input("sess", "interactive", "task A", true);
+    let message = assistant_with_tool_call("ipython", "print('same')");
+    book.record_turn_signature("sess", &message, &[], true);
+    book.record_turn_signature("sess", &message, &[], true);
+    assert!(matches!(book.nonprogress("sess"), NonprogressVerdict::Candidate { .. }));
+    book.note_real_user_input("sess", "interactive", "task B", true);
+    assert_eq!(book.nonprogress("sess"), NonprogressVerdict::None);
+}
+
+#[test]
 fn feedback_templates_are_fixed_host_text() {
     let gap = result_gap_feedback("insufficient", "turns=2, tool_results=1");
     assert_eq!(gap.custom_type, CONTROL_FEEDBACK_CUSTOM_TYPE);
@@ -1491,7 +1599,7 @@ fn feedback_templates_are_fixed_host_text() {
 
     let verification = verification_missing_feedback("no tests observed");
     match &verification.content {
-        CustomMessageContent::Text(body) => assert!(body.contains("verification evidence")),
+        CustomMessageContent::Text(body) => assert!(body.contains("unreported, not failed")),
         CustomMessageContent::Blocks(_) => panic!("feedback must be plain text"),
     }
 
