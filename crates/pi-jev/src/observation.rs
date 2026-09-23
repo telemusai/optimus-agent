@@ -144,6 +144,8 @@ pub enum VerificationEvidence {
     Passed,
     Failed,
     NotRun,
+    /// Task-specific assessment: no verification is needed, not a passed check.
+    NotNeeded,
     #[default]
     Unknown,
 }
@@ -214,7 +216,8 @@ impl TraceObserver {
                 self.summary.turns = self.summary.turns.saturating_add(1);
                 self.summary.failure_kind = None;
                 self.summary.last_stop_reason = None;
-                self.summary.verification = VerificationEvidence::Unknown;
+                // Verification belongs to the task, not one provider/tool turn.
+                // The host resets the observer when a real task epoch changes.
             }
             TraceEvent::AssistantEnded {
                 stop_reason,

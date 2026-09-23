@@ -1,4 +1,4 @@
-import { timingSafeEqual } from "node:crypto";
+import { randomUUID, timingSafeEqual } from "node:crypto";
 import WebSocket, { WebSocketServer } from "ws";
 
 export const AZURE_RESPONSES_WS_PATH = "/azure-openai/v1/responses";
@@ -16,6 +16,26 @@ function authenticates(header, token) {
   const provided = Buffer.from(typeof header === "string" ? header : "");
   const expected = Buffer.from(`Bearer ${token}`);
   return token.length > 0 && provided.length === expected.length && timingSafeEqual(provided, expected);
+}
+
+// A close reason is remote, untrusted text and may echo credentials or input.
+// Keep only exact, known transport descriptions; never log arbitrary free text.
+const SAFE_CLOSE_REASONS = new Set([
+  "normal closure", "going away", "protocol error", "unsupported data",
+  "invalid payload", "policy violation", "message too big", "internal server error",
+  "service restart", "try again later", "server restarting", "server shutting down",
+  "idle timeout", "request timeout", "connection timeout", "rate limit exceeded",
+]);
+
+function closeDetails(code, reason) {
+  const text = (Buffer.isBuffer(reason) ? reason.toString("utf8") : String(reason ?? ""))
+    .replace(/[\x00-\x1f\x7f-\x9f]/g, " ").replace(/\s+/g, " ").trim().toLowerCase();
+  const allowed = SAFE_CLOSE_REASONS.has(text);
+  return {
+    closeCode: Number.isInteger(code) && code >= 1000 && code <= 4999 ? code : undefined,
+    closeReason: allowed ? text : undefined,
+    closeReasonDisposition: text ? (allowed ? "allowlisted" : "redacted") : "empty",
+  };
 }
 
 function inputItems(input) {
@@ -56,6 +76,8 @@ export function installAzureResponsesWebSockets(server, options) {
   };
 
   function attach(client) {
+    const connectionId = randomUUID();
+    let upstreamOpenedAt;
     let upstream;
     let stopped = false;
     let inFlight;
@@ -88,7 +110,9 @@ export function installAzureResponsesWebSockets(server, options) {
       turn.admission?.release();
       onActiveChange(-1);
       log("websocket_turn", {
-        route: route.name, model, reservation: turn.reservation,
+        route: route.name, model, connectionId, requestId: turn.requestId,
+        reservation: turn.reservation,
+        upstreamClose: turn.upstreamClose,
         waitedMs: turn.admission?.waitedMs, durationMs: Date.now() - turn.startedAt,
         rateWaitReasonsMs: turn.admission?.waitReasons,
         limiterAtResponse: turn.limiter?.snapshot?.(),
@@ -116,6 +140,7 @@ export function installAzureResponsesWebSockets(server, options) {
       const body = { type: "error", status: known || 502,
         error: { type: "gateway_error", code: known ? error.code ?? "gateway_error" : "gateway_error",
           message: known ? error.message : "Azure WebSocket transport failed; no request was replayed" } };
+      if (error?.upstreamClose) body.error.upstreamClose = error.upstreamClose;
       if (client.readyState === WebSocket.OPEN && client.bufferedAmount < maxBufferedBytes) {
         client.send(JSON.stringify(body));
       }
@@ -193,9 +218,24 @@ export function installAzureResponsesWebSockets(server, options) {
         });
         ws.once("open", () => {
           if (signal.aborted) return abort();
+          upstreamOpenedAt = Date.now();
           ws.on("message", observe);
-          ws.on("close", () => {
-            if (upstream === ws && !stopped) fail(failure("Azure WebSocket connection closed", "connection_closed", 502));
+          ws.on("close", (code, reason) => {
+            if (upstream !== ws || stopped) return;
+            const turn = inFlight;
+            const details = { ...closeDetails(code, reason), connectionId,
+              requestId: turn?.requestId,
+              connectionDurationMs: Math.max(0, Date.now() - upstreamOpenedAt),
+              durationMs: turn ? Math.max(0, Date.now() - turn.startedAt) : undefined,
+              waitedMs: turn?.admission?.waitedMs,
+              firstEventMs: turn?.firstEventMs, firstTextMs: turn?.firstTextMs,
+              firstThinkingMs: turn?.firstThinkingMs, firstToolMs: turn?.firstToolMs,
+            };
+            if (turn) turn.upstreamClose = details;
+            log("websocket_upstream_close", { route: route.name, model, ...details });
+            const reasonLabel = details.closeReason ?? details.closeReasonDisposition;
+            const message = `Azure WebSocket connection closed (code ${details.closeCode ?? "unknown"}; reason ${reasonLabel}; request ${details.requestId ?? "none"}; elapsed ${details.durationMs ?? details.connectionDurationMs} ms)`;
+            fail(Object.assign(failure(message, "connection_closed", 502), { upstreamClose: details }));
           });
           settle();
         });
@@ -206,7 +246,7 @@ export function installAzureResponsesWebSockets(server, options) {
     async function startTurn(data, binary) {
       if (stopped) return;
       if (inFlight) return fail(failure("Only one response may be in flight per connection", "response_in_progress", 409));
-      const turn = { startedAt: Date.now(), controller: new AbortController() };
+      const turn = { requestId: randomUUID(), startedAt: Date.now(), controller: new AbortController() };
       inFlight = turn;
       onActiveChange(1);
       turn.timer = setTimeout(() => fail(failure("Azure WebSocket request timed out", "request_timeout", 504)), requestTimeoutMs);

@@ -327,6 +327,9 @@ async def delete_subagent(target: str | RLMSubagent) -> RLMSubagent:
     return _subagent_from_payload(payload.get("subagent"), "rlm.delete_subagent")
 
 
+from .lifecycle import UnsupportedCapability, lifecycle_capabilities, stop_subagent, active_execution, resume_subagent
+
+
 class _HarnessProxy:
     """Resolve the harness state against the current environment on every access.
 
@@ -402,6 +405,23 @@ class _RLMCallable:
     async def collect(self, targets: Any = None, *, timeout_ms: int = 0) -> list[RLMChildResult]:
         return await collect(targets, timeout_ms=timeout_ms)
 
+    async def lifecycle_capabilities(self, *, model: str | None = None, target: Any = None) -> dict[str, Any]:
+        return await lifecycle_capabilities(model=model, target=target)
+
+    async def active_execution(self, target: Any) -> dict[str, Any]:
+        return await active_execution(target)
+
+    async def stop_subagent(self, target: Any, *, timeout_ms: int = 0) -> dict[str, Any]:
+        return await stop_subagent(target, timeout_ms=timeout_ms)
+
+    async def resume_subagent(self, target: Any, *, stop_generation: str, prompt: str) -> dict[str, Any]:
+        return await resume_subagent(target, stop_generation=stop_generation, prompt=prompt)
+
+    @property
+    def execution(self) -> Any:
+        from . import execution
+        return execution
+
     async def delete_subagent(self, target: str | RLMSubagent) -> RLMSubagent:
         return await delete_subagent(target)
 
@@ -439,6 +459,12 @@ __all__ = [
     "RefinementEvent",
     "bash",
     "delete_subagent",
+    "lifecycle_capabilities",
+    "stop_subagent",
+    "active_execution",
+    "resume_subagent",
+    "execution",
+    "UnsupportedCapability",
     "emit",
     "find_models",
     "get_harness_state",
@@ -455,6 +481,9 @@ _LAZY_MCP = {"McpIntegration", "McpToolError", "NotEnabled"}
 
 
 def __getattr__(name: str) -> Any:  # noqa: D401 - module-level lazy attr hook
+    if name == "execution":
+        from importlib import import_module
+        return import_module(".execution", __name__)
     if name in _LAZY_MCP:
         from . import mcp_base
 

@@ -186,6 +186,7 @@ impl ToolHtmlRenderer for DefaultToolHtmlRenderer {
                 })
                 .collect(),
             details: details.clone(),
+            is_error: Some(is_error),
             terminate: None,
         };
 

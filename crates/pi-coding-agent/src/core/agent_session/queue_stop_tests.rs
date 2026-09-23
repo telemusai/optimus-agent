@@ -46,6 +46,7 @@ fn install_tool(
                 Ok(pi_agent_core::types::AgentToolResult {
                     content: vec![pi_agent_core::types::ContentBlock::text("settled")],
                     details: Value::Null,
+                    is_error: None,
                     terminate: None,
                 })
             })

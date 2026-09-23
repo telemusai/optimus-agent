@@ -1390,6 +1390,10 @@ pub trait AgentConnection: Send + Sync {
     ) -> pi_ai::types::BoxFuture<Result<AgentConnectionSessionInputPause, String>>;
     fn list_cron_jobs(&self, include_inactive: bool) -> pi_ai::types::BoxFuture<Result<Vec<Value>, String>>;
     fn list_heartbeats(&self) -> pi_ai::types::BoxFuture<Result<Vec<AgentConnectionHeartbeat>, String>>;
+    /// Local negotiated capability; None means the transport has not established support.
+    /// Read after a successful list to distinguish an authoritative empty catalog
+    /// from the optional empty fallback on older daemons. This sends no command.
+    fn heartbeat_catalog_supported(&self) -> Option<bool> { None }
     fn manage_heartbeat(
         &self,
         active_session_id: &str,

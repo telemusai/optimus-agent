@@ -1383,6 +1383,7 @@ pub struct InteractiveMode {
     connection_models_refresh_version: u64,
     connection_models_refresh_in_flight: bool,
     heartbeat_catalog: Vec<AgentConnectionHeartbeat>,
+    heartbeat_catalog_authoritative: bool,
 
     subagent_snapshots: HashMap<String, AgentConnectionRlmChildAgentSnapshot>,
     rlm_node_id: Option<String>,
@@ -1529,6 +1530,7 @@ impl InteractiveMode {
             connection_models_refresh_version: 0,
             connection_models_refresh_in_flight: false,
             heartbeat_catalog: Vec::new(),
+            heartbeat_catalog_authoritative: false,
             subagent_snapshots: HashMap::new(),
             rlm_node_id: None,
             roster_bar: None,

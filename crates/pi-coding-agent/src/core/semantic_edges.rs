@@ -731,6 +731,36 @@ pub fn unwrap_semantic_edge_stream_fn(
         .unwrap_or_else(|| stream_fn.clone())
 }
 
+// Captured before awaiting a deferred stream, so cancellation/panic before
+// resolution also records failure. A completed result still commits if the
+// observer is cancelled after the terminal event but before it was scheduled.
+struct SemanticRequestCompletion {
+    recorder: Arc<Mutex<SemanticEdgeRecorder>>,
+    request_id: Option<String>,
+    stream: Option<pi_ai::utils::event_stream::AssistantMessageEventStream>,
+}
+
+impl SemanticRequestCompletion {
+    fn record(&mut self) {
+        let Some(request_id) = self.request_id.take() else { return; };
+        let result = self.stream.as_ref().and_then(|stream| stream.result_if_ready());
+        let mut recorder = self.recorder.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        match result {
+            Some(message) if message.stop_reason != pi_ai::types::STOP_REASON_ERROR
+                && message.stop_reason != pi_ai::types::STOP_REASON_ABORTED => {
+                recorder.finish_request(Some(&request_id));
+            }
+            _ => recorder.fail_request(Some(&request_id)),
+        }
+    }
+}
+
+impl Drop for SemanticRequestCompletion {
+    fn drop(&mut self) {
+        self.record();
+    }
+}
+
 /// Bind a stream function to one session's recorder. Re-wrapping an already
 /// wrapped function rebinds the original, so a child session that inherits its
 /// parent's streamFn attributes calls to its own ledger. request_started is
@@ -774,29 +804,22 @@ pub fn wrap_stream_fn_with_semantic_edges(
                 std::panic::resume_unwind(payload);
             }
         };
-        let recorder_for_result = recorder.clone();
-        let request_id_for_result = request_id.clone();
+        let mut completion = SemanticRequestCompletion {
+            recorder: recorder.clone(),
+            request_id: Some(request_id),
+            stream: None,
+        };
         Box::pin(async move {
-            // `observe(stream)` runs on the resolved stream, so the promise is
-            // resolved first and the same stream is handed back to the caller.
             let stream = stream_future.await;
-            let observed = stream.clone();
+            completion.stream = Some(stream.producer_handle());
+            let observed = stream.producer_handle();
             let observe = async move {
-                let message = observed.result().await;
-                let mut recorder = recorder_for_result.lock().unwrap();
-                if message.stop_reason == pi_ai::types::STOP_REASON_ERROR
-                    || message.stop_reason == pi_ai::types::STOP_REASON_ABORTED
-                {
-                    recorder.fail_request(Some(&request_id_for_result));
-                } else {
-                    recorder.finish_request(Some(&request_id_for_result));
-                }
+                // end(None) must not strand a result observer indefinitely.
+                observed.result_or_end().await;
+                completion.record();
             };
-            // The TypeScript `void stream.result().then(...)` detaches the observation.
-            // Without a runtime nothing can drive the stream, so the observation is
-            // skipped rather than blocking the caller.
-            if let Ok(handle) = tokio::runtime::Handle::try_current() {
-                handle.spawn(observe);
+            if tokio::runtime::Handle::try_current().is_ok() {
+                stream.spawn(observe);
             }
             stream
         })
@@ -1177,6 +1200,156 @@ mod tests {
         recorder.record_child_returned("child", Some("child-r1"));
         // No ledger means nothing is written, but the call must not panic.
         assert!(recorder.last_turn_request_id().is_none());
+    }
+}
+
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use std::time::Duration;
+    use futures::FutureExt;
+    use pi_ai::types::{AssistantMessage, AssistantMessageEvent, Context, Model, SimpleStreamOptions};
+    use pi_ai::utils::event_stream::{AssistantMessageEventStream, StreamTaskReceipt};
+
+    fn recorder() -> (tempfile::TempDir, Arc<Mutex<SemanticEdgeRecorder>>, String) {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("semantic-edges.jsonl").to_string_lossy().to_string();
+        let recorder = Arc::new(Mutex::new(SemanticEdgeRecorder::new(Some(path.clone()), "fixture-session".into(), None, None)));
+        (dir, recorder, path)
+    }
+
+    fn assert_terminal(path: &str, success: bool) {
+        let events = read_semantic_edge_ledger(path).unwrap();
+        let finished = events.iter().filter(|e| matches!(e, SemanticEdgeLedgerEvent::RequestFinished { .. })).count();
+        let failed = events.iter().filter(|e| matches!(e, SemanticEdgeLedgerEvent::RequestFailed { .. })).count();
+        assert_eq!((finished, failed), if success { (1, 0) } else { (0, 1) });
+    }
+
+    #[tokio::test]
+    async fn semantic_observer_is_joined_with_provider_and_preserves_commit() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new_owned();
+            let producer = stream.producer_handle();
+            stream.spawn(async move {
+                producer.push(AssistantMessageEvent::Done { reason: "stop".into(), message: AssistantMessage::default() });
+            });
+            Box::pin(async move { stream })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder.clone());
+        let receipt = StreamTaskReceipt::new_unsupported();
+        let stream = receipt.scope(async { wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await }).await;
+        stream.result().await;
+        let done = receipt.settle(Duration::from_secs(1)).await;
+        assert!(done.supported);
+        assert_eq!(done.completed_tasks, 2);
+        assert_eq!(done.pending_tasks, 0);
+        assert_terminal(&path, true);
+        assert!(recorder.lock().unwrap().last_committed_request_id().is_some());
+    }
+
+    #[tokio::test]
+    async fn semantic_stop_records_failure_before_join_acknowledgement() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new_owned();
+            stream.spawn(std::future::pending());
+            Box::pin(async move { stream })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder.clone());
+        let stream = wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await;
+        let receipt = stream.task_receipt();
+        stream.request_cancel();
+        let done = receipt.settle(Duration::from_secs(1)).await;
+        assert!(done.settled, "{done:?}");
+        assert_eq!(done.cancelled_tasks, 2);
+        assert_terminal(&path, false);
+        assert!(recorder.lock().unwrap().last_committed_request_id().is_none());
+    }
+
+    #[tokio::test]
+    async fn end_without_result_does_not_strand_the_semantic_observer() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new_owned();
+            stream.end(None);
+            Box::pin(async move { stream })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder);
+        let stream = wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await;
+        let done = stream.task_receipt().settle(Duration::from_secs(1)).await;
+        assert_eq!(done.pending_tasks, 0);
+        assert_eq!(done.completed_tasks, 1);
+        assert_terminal(&path, false);
+    }
+
+    #[tokio::test]
+    async fn stopped_unscheduled_observer_preserves_already_completed_result() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new_owned();
+            stream.end(Some(AssistantMessage::default()));
+            Box::pin(async move { stream })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder);
+        let stream = wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await;
+        stream.request_cancel();
+        assert!(stream.task_receipt().settle(Duration::from_secs(1)).await.settled);
+        assert_terminal(&path, true);
+    }
+
+    #[tokio::test]
+    async fn cancelled_deferred_wrapper_keeps_created_producer_in_scope() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new_owned();
+            stream.spawn(std::future::pending());
+            Box::pin(async move {
+                std::future::pending::<()>().await;
+                stream
+            })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder);
+        let receipt = StreamTaskReceipt::new_unsupported();
+        let mut invocation = Box::pin(receipt.scope(async {
+            wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await
+        }));
+        assert!(futures::poll!(invocation.as_mut()).is_pending());
+        assert_eq!(receipt.status().pending_tasks, 1);
+        receipt.request_cancel();
+        drop(invocation);
+        assert!(receipt.settle(Duration::from_secs(1)).await.settled);
+        assert_terminal(&path, false);
+    }
+
+    #[tokio::test]
+    async fn deferred_wrapper_panic_fails_the_ledger_instead_of_leaving_inflight() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            Box::pin(async { panic!("synthetic deferred wrapper failure") })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder);
+        let result = std::panic::AssertUnwindSafe(wrapped(Model::default(), Context::default(), SimpleStreamOptions::default())).catch_unwind().await;
+        assert!(result.is_err());
+        assert_terminal(&path, false);
+    }
+
+    #[tokio::test]
+    async fn semantic_wrapper_cannot_certify_unknown_backend() {
+        let (_dir, recorder, path) = recorder();
+        let fake: pi_agent_core::types::StreamFn = Arc::new(|_, _, _| {
+            let stream = AssistantMessageEventStream::new();
+            stream.end(Some(AssistantMessage::default()));
+            Box::pin(async move { stream })
+        });
+        let wrapped = wrap_stream_fn_with_semantic_edges(fake, recorder);
+        let stream = wrapped(Model::default(), Context::default(), SimpleStreamOptions::default()).await;
+        let receipt = stream.task_receipt();
+        receipt.settle(Duration::from_secs(1)).await;
+        assert!(!receipt.request_cancel().supported);
+        assert!(!receipt.status().settled);
+        assert_terminal(&path, true);
     }
 }
 

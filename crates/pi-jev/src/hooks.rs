@@ -74,6 +74,8 @@ pub struct ActiveDecideOutcome {
     pub terminal_reason: Option<String>,
     pub dispatched: bool,
     token: crate::scheduler::CancellationToken,
+    retention_cancel: crate::scheduler::CancellationToken,
+    retention_generation: u64,
     independent: bool,
     /// Decision-policy generation captured for this outcome; consumed by the
     /// host control seam (jev_bridge decide_control) for correlation.
@@ -385,6 +387,13 @@ impl JevObserver {
     /// Observe one event. Fire-and-forget; never blocks beyond the cheap
     /// mode check and one bounded extraction.
     pub fn observe(&self, event_type: &str, payload: &Value) {
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let Some(work) = crate::scheduler::register_session_work(session_id, None) else { return; };
+        self.observe_owned(event_type, payload);
+        work.finish();
+    }
+
+    fn observe_owned(&self, event_type: &str, payload: &Value) {
         if self.closed.load(Ordering::SeqCst) { return; }
         // Session disposal cancels pending work even when the mode just
         // flipped to Off; the check itself is cheap.
@@ -733,6 +742,13 @@ impl JevObserver {
     }
 
     pub fn observe_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) {
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let Some(work) = crate::scheduler::register_session_work(session_id, None) else { return; };
+        self.observe_prepared_owned(payload, stage, questions);
+        work.finish();
+    }
+
+    fn observe_prepared_owned(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) {
         let gate = resolve_request_gate(
             &self.config,
             payload.get("session_id").and_then(Value::as_str),
@@ -755,12 +771,14 @@ impl JevObserver {
     }
 
     pub async fn decide_active(&self, payload: &Value, stage: SnapshotStage, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let work = crate::scheduler::register_session_work(session_id, None);
         let gate = resolve_request_gate(
             &self.config,
             payload.get("session_id").and_then(Value::as_str),
             false,
         );
-        let bundle = if gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
+        let bundle = if work.is_some() && gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
             match self.prepare_bundle(
                 payload,
                 stage,
@@ -772,16 +790,18 @@ impl JevObserver {
                 _ => None,
             }
         } else { None };
-        self.decide_bundle(payload, stage.as_str(), bundle, policy, gate, false).await
+        self.decide_bundle(payload, stage.as_str(), bundle, policy, gate, false, work).await
     }
 
     pub async fn decide_prepared(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, policy: &crate::active::ActivationPolicy) -> ActiveDecideOutcome {
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let work = crate::scheduler::register_session_work(session_id, None);
         let gate = resolve_request_gate(
             &self.config,
             payload.get("session_id").and_then(Value::as_str),
             false,
         );
-        let bundle = if gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
+        let bundle = if work.is_some() && gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
             self.prepare_explicit(
                 payload,
                 stage,
@@ -791,16 +811,18 @@ impl JevObserver {
                 &gate.policy_generation,
             )
         } else { None };
-        self.decide_bundle(payload, stage, bundle, policy, gate, false).await
+        self.decide_bundle(payload, stage, bundle, policy, gate, false, work).await
     }
 
     pub async fn decide_independent(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) -> ActiveDecideOutcome {
+        let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
+        let work = crate::scheduler::register_session_work(session_id, None);
         let gate = resolve_request_gate(
             &self.config,
             payload.get("session_id").and_then(Value::as_str),
             true,
         );
-        let bundle = if gate.allowed && payload_matches_gate(&self.config, payload, &gate) {
+        let bundle = if work.is_some() && gate.allowed && payload_matches_gate(&self.config, payload, &gate) {
             self.prepare_explicit(
                 payload,
                 stage,
@@ -810,10 +832,16 @@ impl JevObserver {
                 &gate.policy_generation,
             )
         } else { None };
-        self.decide_bundle(payload, stage, bundle, &crate::active::ActivationPolicy::default(), gate, true).await
+        self.decide_bundle(payload, stage, bundle, &crate::active::ActivationPolicy::default(), gate, true, work).await
     }
 
-    async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool) -> ActiveDecideOutcome {
+    async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool, mut work: Option<crate::scheduler::SessionWorkGuard>) -> ActiveDecideOutcome {
+        let outcome = self.decide_bundle_owned(payload, stage, bundle, policy, gate, independent, &mut work).await;
+        if let Some(work) = work { work.finish(); }
+        outcome
+    }
+
+    async fn decide_bundle_owned(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool, work: &mut Option<crate::scheduler::SessionWorkGuard>) -> ActiveDecideOutcome {
         use crate::active::FallbackReason;
         let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
         let token = {
@@ -826,6 +854,13 @@ impl JevObserver {
             }
             sessions.entry(key).or_default().clone()
         };
+        if let Some(work) = work.as_mut() { work.bind_normal_cancel(token.clone()); }
+        let retention_cancel = work.as_ref().map(|work| work.token()).unwrap_or_else(|| {
+            let token = crate::scheduler::CancellationToken::new();
+            token.cancel();
+            token
+        });
+        let retention_generation = work.as_ref().map(|work| work.generation).unwrap_or_default();
         let mode = gate.mode;
         let captured_generation = payload
             .get("policy_generation")
@@ -839,7 +874,7 @@ impl JevObserver {
             mode, requested_model: gate.requested_model, context: None, raw: None,
             baseline_action: action_baseline(payload),
             compaction_enabled: payload.get("compaction_enabled").and_then(Value::as_bool),
-            terminal_reason: None, dispatched: false, token, independent,
+            terminal_reason: None, dispatched: false, token, retention_cancel, retention_generation, independent,
             policy_generation: captured_generation,
         };
         if !self.can_apply(&outcome) {
@@ -884,6 +919,7 @@ impl JevObserver {
         let decision = tokio::select! {
             biased;
             _ = outcome.token.cancelled() => None,
+            _ = outcome.retention_cancel.cancelled() => None,
             result = tokio::time::timeout(deadline, call) => match result {
                 Ok(result) => Some(result),
                 Err(_) => { outcome.terminal_reason = Some("timeout".to_string()); self.note_active_failure(); None }
@@ -975,6 +1011,8 @@ impl JevObserver {
         if outcome.session_id.is_empty()
             || self.closed.load(Ordering::SeqCst)
             || outcome.token.is_cancelled()
+            || outcome.retention_cancel.is_cancelled()
+            || !crate::scheduler::session_work_is_current(&outcome.session_id, outcome.retention_generation)
         {
             return false;
         }
@@ -1002,6 +1040,17 @@ impl JevObserver {
     }
 
     pub fn record_active_with_action(&self, outcome: &ActiveDecideOutcome, effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>, actual: &BTreeMap<String, String>) -> usize {
+        let Some(work) = crate::scheduler::register_session_work(&outcome.session_id, None) else { return 0; };
+        if work.generation != outcome.retention_generation {
+            work.finish();
+            return 0;
+        }
+        let count = self.record_active_with_action_owned(outcome, effects, actual);
+        work.finish();
+        count
+    }
+
+    fn record_active_with_action_owned(&self, outcome: &ActiveDecideOutcome, effects: &BTreeMap<String, Vec<crate::active::AppliedEffect>>, actual: &BTreeMap<String, String>) -> usize {
         let still_current = self.can_apply(outcome);
         let Some(captured) = &outcome.context else { return 0; };
         if outcome.mode.allows_compare() && !outcome.independent {
@@ -1104,6 +1153,138 @@ impl JevObserver {
     /// Breaker state, for status surfaces and tests.
     pub fn active_breaker_open(&self) -> bool {
         !self.active_breaker_allows()
+    }
+}
+
+
+
+#[cfg(test)]
+mod settlement_tests {
+    use super::*;
+    use crate::scheduler::{request_session_retain_stop, session_retain_status, settle_session_retain_stop, begin_session_retain_generation};
+    use std::sync::atomic::AtomicU64;
+    use std::time::Duration;
+
+    struct Probe {
+        calls: AtomicU64,
+        started: tokio::sync::Notify,
+        pending: bool,
+        dropped: Arc<AtomicBool>,
+    }
+    impl crate::types::SystemOne for Probe {
+        fn mode(&self) -> JevMode { JevMode::Active }
+        fn decide(&self, _: crate::types::DecisionBundle) -> crate::types::BoxFuture<crate::types::DecisionOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            struct Mark(Arc<AtomicBool>);
+            impl Drop for Mark { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+            let mark = Mark(self.dropped.clone());
+            let pending = self.pending;
+            Box::pin(async move {
+                let _mark = mark;
+                if pending { std::future::pending::<()>().await; }
+                crate::types::DecisionOutcome::skipped_all("local_mock")
+            })
+        }
+    }
+
+    fn probe(pending: bool) -> Arc<Probe> {
+        Arc::new(Probe { calls: AtomicU64::new(0), started: tokio::sync::Notify::new(), pending, dropped: Arc::new(AtomicBool::new(false)) })
+    }
+
+    fn config() -> JevObserverConfig {
+        JevObserverConfig {
+            mode_gate: Arc::new(|_| (JevMode::CompareAndActive, SYSTEM_ONE_MODEL.into())),
+            independent_gate: Arc::new(|_| true),
+            scheduler: SchedulerConfig { min_interval: Duration::ZERO, ..Default::default() },
+            ..Default::default()
+        }
+    }
+
+    fn input() -> Value {
+        serde_json::json!({"session_id": format!("hooks-retain-{}", Uuid::new_v4()), "turn": 1, "state": {"task": "synthetic"}})
+    }
+
+    fn questions() -> Vec<PreparedQuestion> {
+        vec![PreparedQuestion { question_id: "tool_requirement.0".into(), spec: crate::mock::choice_question("Need tools?", &[("none", None), ("read", None)]) }]
+    }
+
+    #[tokio::test]
+    async fn active_and_independent_cancellation_drop_actual_call_before_acknowledgement() {
+        for independent in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let client = probe(true);
+            let observer = JevObserver::new(config(), client.clone(), dir.path().join("records.jsonl"));
+            let input = input();
+            let id = input["session_id"].as_str().unwrap().to_string();
+            let captured = observer.clone();
+            let task = tokio::spawn(async move {
+                if independent { captured.decide_independent(&input, "local_fixture", questions()).await }
+                else { captured.decide_prepared(&input, "local_fixture", questions(), &crate::active::ActivationPolicy::default()).await }
+            });
+            client.started.notified().await;
+            assert_eq!(request_session_retain_stop(&id).pending_work, 1);
+            let outcome = task.await.unwrap();
+            assert!(!observer.can_apply(&outcome));
+            let done = settle_session_retain_stop(&id, Duration::from_secs(1)).await;
+            assert!(done.settled, "{done:?}");
+            assert!(client.dropped.load(Ordering::SeqCst));
+            assert_eq!(done.cancelled_work, 1);
+            assert_eq!(observer.record_active(&outcome, &BTreeMap::new()), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn observer_replacement_and_explicit_resume_do_not_revive_old_outcomes() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = probe(false);
+        let observer = JevObserver::new(config(), client.clone(), dir.path().join("first.jsonl"));
+        let input = input();
+        let id = input["session_id"].as_str().unwrap();
+        let old = observer.decide_prepared(&input, "fixture", questions(), &crate::active::ActivationPolicy::default()).await;
+        assert!(observer.can_apply(&old));
+        assert!(!session_retain_status(id).cancel_requested);
+        let stopped = request_session_retain_stop(id);
+        assert!(stopped.settled);
+        let replacement = JevObserver::new(config(), client.clone(), dir.path().join("second.jsonl"));
+        replacement.observe_prepared(&input, "fixture", questions());
+        let declined = replacement.decide_prepared(&input, "fixture", questions(), &crate::active::ActivationPolicy::default()).await;
+        assert!(!declined.dispatched);
+        assert!(!replacement.can_apply(&declined));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert!(begin_session_retain_generation(id, stopped.generation));
+        assert!(!replacement.can_apply(&old));
+        assert_eq!(replacement.record_active(&old, &BTreeMap::new()), 0);
+        let new = replacement.decide_prepared(&input, "fixture", questions(), &crate::active::ActivationPolicy::default()).await;
+        assert!(replacement.can_apply(&new));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn active_record_callback_is_tracked_until_return_even_after_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let client = probe(false);
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let mut cfg = config();
+        cfg.on_terminal = Some(Arc::new(move |_| {
+            if let Some(started) = started.lock().unwrap().take() { let _ = started.send(()); }
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let observer = JevObserver::new(cfg, client, dir.path().join("records.jsonl"));
+        let input = input();
+        let id = input["session_id"].as_str().unwrap();
+        let outcome = observer.decide_prepared(&input, "fixture", questions(), &crate::active::ActivationPolicy::default()).await;
+        let captured = observer.clone();
+        let task = tokio::spawn(async move { captured.record_active(&outcome, &BTreeMap::new()) });
+        ready.await.unwrap();
+        assert_eq!(request_session_retain_stop(id).pending_work, 1);
+        assert!(!settle_session_retain_stop(id, Duration::ZERO).await.settled);
+        release.send(()).unwrap();
+        assert!(task.await.unwrap() > 0);
+        assert!(settle_session_retain_stop(id, Duration::from_secs(1)).await.settled);
     }
 }
 

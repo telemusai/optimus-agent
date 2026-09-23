@@ -272,9 +272,23 @@ pub fn default_model() -> Model {
 
 /// `ActiveRun`.
 struct ActiveRun {
+    diagnostics: Mutex<ActiveDiagnostics>,
     aborted: CancellationToken,
     idle: Arc<tokio::sync::Notify>,
     settled: Arc<AtomicBool>,
+}
+
+struct ActiveDiagnostics {
+    generation: String,
+    closed: bool,
+    seen: std::collections::HashSet<String>,
+    messages: Vec<AgentMessage>,
+}
+impl Default for ActiveDiagnostics {
+    fn default() -> Self {
+        Self { generation: uuid::Uuid::new_v4().to_string(), closed: false,
+            seen: Default::default(), messages: Vec::new() }
+    }
 }
 
 /// `class Agent`.
@@ -358,6 +372,7 @@ pub struct Agent {
         >,
     >,
     active_run: Mutex<Option<Arc<ActiveRun>>>,
+    pub execution_scope: crate::execution_scope::ExecutionScope,
     pub session_id: Mutex<Option<String>>,
     pub thinking_budgets: Mutex<Option<ThinkingBudgets>>,
     pub transport: Mutex<String>,
@@ -415,6 +430,7 @@ impl Agent {
             get_continuation_messages: Mutex::new(options.get_continuation_messages),
             before_request: Mutex::new(options.before_request),
             active_run: Mutex::new(None),
+            execution_scope: crate::execution_scope::ExecutionScope::default(),
             session_id: Mutex::new(options.session_id),
             thinking_budgets: Mutex::new(options.thinking_budgets),
             transport: Mutex::new(options.transport.unwrap_or_else(|| "auto".to_string())),
@@ -773,6 +789,28 @@ impl Agent {
         Ok(false)
     }
 
+    pub fn active_execution_generation(&self) -> Option<String> {
+        let active = self.active_run.lock().unwrap();
+        let run = active.as_ref()?;
+        let diagnostics = run.diagnostics.lock().unwrap();
+        (!diagnostics.closed && !run.aborted.is_cancelled())
+            .then(|| diagnostics.generation.clone())
+    }
+
+    /// Only this run can drain these messages. No session/follow-up queue is used.
+    pub fn steer_active(&self, generation: &str, id: &str, message: AgentMessage) -> &'static str {
+        let active = self.active_run.lock().unwrap();
+        let Some(run) = active.as_ref() else { return "declined_idle"; };
+        let mut diagnostics = run.diagnostics.lock().unwrap();
+        if diagnostics.closed || run.aborted.is_cancelled() { return "declined_stopped"; }
+        if diagnostics.generation != generation { return "declined_generation"; }
+        if diagnostics.seen.contains(id) { return "duplicate"; }
+        if diagnostics.seen.len() >= 256 || diagnostics.messages.len() >= 32 { return "declined_capacity"; }
+        diagnostics.seen.insert(id.to_string());
+        diagnostics.messages.push(message);
+        "accepted"
+    }
+
     fn is_running(&self) -> bool {
         self.active_run
             .lock()
@@ -811,6 +849,7 @@ impl Agent {
 
         let aborted = CancellationToken::new();
         let run = Arc::new(ActiveRun {
+            diagnostics: Mutex::new(ActiveDiagnostics::default()),
             aborted: aborted.clone(),
             idle: Arc::new(tokio::sync::Notify::new()),
             settled: Arc::new(AtomicBool::new(false)),
@@ -929,6 +968,9 @@ impl Agent {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .take();
         if let Some(run) = run {
+            let mut diagnostics = run.diagnostics.lock().unwrap();
+            diagnostics.closed = true;
+            diagnostics.messages.clear();
             run.settled.store(true, AtomicOrdering::SeqCst);
             run.idle.notify_waiters();
         }
@@ -1092,6 +1134,7 @@ impl Agent {
         drop(state);
 
         let mut config = AgentLoopConfig::new(model);
+        config.execution_scope = Some(self.execution_scope.clone());
         config.stream_options.reasoning = Some(thinking_level.as_str().to_string());
         config.stream_options.stream.service_tier = service_tier;
         config.stream_options.stream.session_id = self
@@ -1213,18 +1256,24 @@ impl Agent {
         }
         {
             let steering_queue = self.steering_queue.clone();
+            let diagnostic_run = self.active_run.lock().unwrap().clone();
             let skip = skip_initial_steering_poll.clone();
             config.get_steering_messages = Some(Arc::new(move || {
                 let steering_queue = steering_queue.clone();
+                let diagnostic_run = diagnostic_run.clone();
                 let skip = skip.clone();
                 Box::pin(async move {
                     if skip.swap(false, AtomicOrdering::SeqCst) {
                         return Vec::new();
                     }
-                    steering_queue
-                        .lock()
-                        .unwrap_or_else(|poisoned| poisoned.into_inner())
-                        .drain()
+                    let mut messages = steering_queue.lock().unwrap_or_else(|poisoned| poisoned.into_inner()).drain();
+                    if let Some(run) = diagnostic_run {
+                        let mut diagnostics = run.diagnostics.lock().unwrap();
+                        if !diagnostics.closed && !run.aborted.is_cancelled() {
+                            messages.append(&mut diagnostics.messages);
+                        }
+                    }
+                    messages
                 })
             }));
         }
@@ -1637,6 +1686,53 @@ mod tests {
         }
     }
 
+    fn active_fixture(agent: &Agent) -> Arc<ActiveRun> {
+        let run = Arc::new(ActiveRun { diagnostics: Mutex::new(ActiveDiagnostics::default()),
+            aborted: CancellationToken::new(), idle: Arc::new(tokio::sync::Notify::new()),
+            settled: Arc::new(AtomicBool::new(false)) });
+        *agent.active_run.lock().unwrap() = Some(run.clone());
+        run
+    }
+    #[tokio::test]
+    async fn active_only_messages_expire_and_deduplicate_without_waking() {
+        let agent = test_agent();
+        let message = AgentMessage::from(UserMessage { role: "user".into(), content: UserContent::Text("diagnostic".into()),
+            provider_context: None, timestamp: 1 });
+        assert_eq!(agent.steer_active("no-run", "one", message.clone()), "declined_idle");
+        let run = active_fixture(&agent);
+        let generation = agent.active_execution_generation().unwrap();
+        assert_eq!(agent.steer_active("wrong", "one", message.clone()), "declined_generation");
+        assert_eq!(agent.steer_active(&generation, "one", message.clone()), "accepted");
+        assert_eq!(agent.steer_active(&generation, "one", message.clone()), "duplicate");
+        let old_config = agent.create_loop_config(None);
+        agent.finish_run();
+        active_fixture(&agent);
+        assert!(old_config.get_steering_messages.unwrap()().await.is_empty());
+        assert!(agent.create_loop_config(None).get_steering_messages.unwrap()().await.is_empty());
+        assert_eq!(agent.steer_active(&generation, "two", message), "declined_generation");
+        assert!(run.diagnostics.lock().unwrap().messages.is_empty());
+    }
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn active_only_completion_barrier_cannot_leak_to_next_run() {
+        let agent = test_agent();
+        active_fixture(&agent);
+        let generation = agent.active_execution_generation().unwrap();
+        let barrier = Arc::new(tokio::sync::Barrier::new(2));
+        let sender = agent.clone(); let gate = barrier.clone();
+        let send = tokio::spawn(async move {
+            gate.wait().await;
+            sender.steer_active(&generation, "race", AgentMessage::from(UserMessage { role:"user".into(),
+                content:UserContent::Text("diagnostic".into()), provider_context:None,timestamp:1 }))
+        });
+        barrier.wait().await;
+        agent.finish_run();
+        assert!(matches!(send.await.unwrap(), "accepted" | "declined_idle"));
+        let next = active_fixture(&agent);
+        assert!(agent.create_loop_config(None).get_steering_messages.unwrap()().await.is_empty());
+        next.aborted.cancel();
+        assert!(agent.active_execution_generation().is_none());
+    }
+
     #[test]
     fn prompt_rejects_a_second_run_while_one_is_active() {
         let agent = test_agent();
@@ -1645,6 +1741,7 @@ mod tests {
             // `activeRun` is the guard: a run in flight rejects a second prompt.
             let aborted = CancellationToken::new();
             *agent.active_run.lock().unwrap() = Some(Arc::new(ActiveRun {
+                diagnostics: Mutex::new(ActiveDiagnostics::default()),
                 aborted,
                 idle: Arc::new(tokio::sync::Notify::new()),
                 settled: Arc::new(AtomicBool::new(false)),

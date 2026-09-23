@@ -73,7 +73,7 @@ fn jev_new_client_old_daemon_keeps_legacy_commands_without_enabling_combined_mod
 fn jev_expansion_requires_both_capabilities_and_schema_revision() {
     let command = mode_command("compare-active");
     assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-    assert_eq!(DAEMON_SCHEMA_REVISION, 31);
+    assert_eq!(DAEMON_SCHEMA_REVISION, 32);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevControl));
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevFeatures));
     assert!(!supported(

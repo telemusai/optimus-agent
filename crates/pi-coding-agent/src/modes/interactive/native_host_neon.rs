@@ -216,6 +216,8 @@ impl TuiComponent for Header {
             .unwrap_or_default();
         let phase = if !transport.is_empty() && transport != "connected" {
             transport.as_str()
+        } else if self.1.upgrade().is_some_and(|t| t.borrow().refinement_progress.is_some()) {
+            "REFINING"
         } else if mode.is_agent_compacting() {
             "COMPACTING"
         } else if mode.get_retry_attempt() > 0.0 {

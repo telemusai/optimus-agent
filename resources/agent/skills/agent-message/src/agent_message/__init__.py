@@ -12,6 +12,7 @@ from rlm import host_request
 
 ReceiverRole = Literal["parent", "sibling", "child"]
 _MESSAGE_DISPLAY_MIME = "application/vnd.prime-agent.agent-message+json"
+ACTIVE_ONLY_CONTRACT = "rlm.active-only-message.v1"
 
 
 async def list_agents() -> dict[str, Any]:
@@ -25,8 +26,41 @@ async def send(
     *,
     receiver_role: ReceiverRole | str | None = None,
     receiver_name: str | None = None,
+    wake_if_idle: bool = True,
+    execution_generation: str | None = None,
+    message_id: str | None = None,
 ) -> dict[str, Any]:
     """Send one direct role-addressed message or broadcast to ``"all"``."""
+    if type(wake_if_idle) is not bool:
+        raise TypeError("wake_if_idle must be bool")
+    if not wake_if_idle:
+        if broadcast_message is not None or receiver_role != "child" or not receiver_name:
+            raise ValueError("active-only delivery requires one owned direct child")
+        if not isinstance(message, str) or not message or len(message.encode("utf-8")) > 32000:
+            raise ValueError("active-only message must be a nonempty bounded string")
+        if not isinstance(execution_generation, str) or not execution_generation or len(execution_generation) > 128:
+            raise ValueError("execution_generation is required")
+        if not isinstance(message_id, str) or not message_id or len(message_id) > 256:
+            raise ValueError("message_id is required")
+        from rlm.lifecycle import lifecycle_capabilities, UnsupportedCapability
+        capability = await lifecycle_capabilities(target=receiver_name)
+        feature = capability.get("activeOnlyMessages", {})
+        if (feature.get("capability") != ACTIVE_ONLY_CONTRACT
+                or feature.get("supported") is not True):
+            raise UnsupportedCapability("Host does not support active-only messages")
+        receipt = await host_request("rlm.send_active_message", {
+            "target": receiver_name, "message": message,
+            "execution_generation": execution_generation, "message_id": message_id,
+        })
+        if (not isinstance(receipt, dict) or receipt.get("schema") != "optimus.active-message.v1"
+                or receipt.get("wakeIfIdle") is not False
+                or receipt.get("executionGeneration") != execution_generation
+                or receipt.get("messageId") != message_id
+                or receipt.get("accepted") is not (receipt.get("deliveryStatus") in ("accepted", "duplicate"))):
+            raise UnsupportedCapability("Invalid active-only message receipt")
+        return receipt
+    if execution_generation is not None or message_id is not None:
+        raise ValueError("execution_generation/message_id require wake_if_idle=False")
     roles = ("parent", "sibling", "child")
     if broadcast_message is not None:
         if message != "all":

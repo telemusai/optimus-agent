@@ -6,6 +6,19 @@ use std::process::Stdio;
 use std::sync::Mutex;
 use std::time::{Duration, Instant};
 
+#[cfg(windows)]
+#[path = "child_process/kernel_job.rs"]
+pub mod kernel_job;
+#[cfg(windows)]
+pub use kernel_job::{spawn_kernel, KernelJob, KernelProcess};
+#[cfg(not(windows))]
+pub type KernelProcess = tokio::process::Child;
+
+#[cfg(not(windows))]
+pub fn spawn_kernel(command: &str, args: &[String], options: SpawnOptions) -> std::io::Result<KernelProcess> {
+    Ok(spawn_hidden(command, args, options)?.child)
+}
+
 pub const EXIT_STDIO_GRACE_MS: u64 = 100;
 
 /// `windowsHide` for every non-interactive spawn.

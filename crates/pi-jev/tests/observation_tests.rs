@@ -151,6 +151,33 @@ fn error_trace() -> TraceObserver {
 }
 
 #[test]
+fn ctrl001_not_needed_is_an_explicit_assessment_not_tool_success() {
+    let mut observer = TraceObserver::default();
+    observer.record(TraceEvent::ToolEnded { is_error: false });
+    assert_eq!(observer.summary().verification, VerificationEvidence::Unknown);
+    observer.record(TraceEvent::VerificationObserved { outcome: VerificationEvidence::NotNeeded });
+    observer.record(TraceEvent::TurnStarted);
+    assert_eq!(observer.summary().verification, VerificationEvidence::NotNeeded);
+    observer.reset();
+    assert_eq!(observer.summary().verification, VerificationEvidence::Unknown);
+}
+
+#[test]
+fn ctrl001_evaluators_include_task_limits_and_honest_unknown_verification() {
+    for task in ["Status only", "Give me a link", "List the files", "Stop", "Implement the parser"] {
+        let state = snapshot(SnapshotStage::AgentEnd, json!({
+            "features": {"verification":true,"result_sufficiency":true,"loop_control":true},
+            "user_text_excerpt":task, "result_excerpt":"Here is the requested response"
+        }));
+        for evaluator in [&FirstPassVerification as &dyn CategoryEvaluator, &ResultSufficiency, &ContinueStopEscalate] {
+            let prepared = questions(evaluator.evaluate(&state));
+            assert!(prepared[0].spec.instructions().contains(task));
+            assert!(prepared[0].spec.instructions().contains("untrusted evidence"));
+        }
+    }
+}
+
+#[test]
 fn classifications_are_closed_typed_vocabularies() {
     let retry = RetryFailureKind::ALL.map(|value| value.as_str());
     assert_eq!(
@@ -273,10 +300,9 @@ fn missing_verification_and_actual_retry_remain_unknown() {
     observer.record(TraceEvent::TurnStarted);
     assert_eq!(observer.summary().failure_kind, None);
     assert_eq!(observer.summary().last_stop_reason, None);
-    assert_eq!(
-        observer.summary().verification,
-        VerificationEvidence::Unknown
-    );
+    assert_eq!(observer.summary().verification, VerificationEvidence::Passed);
+    observer.reset(); // a new real task, unlike a provider/tool turn
+    assert_eq!(observer.summary().verification, VerificationEvidence::Unknown);
 }
 
 #[test]
@@ -352,7 +378,8 @@ fn result_enhancement_is_additive_and_legacy_choices_remain() {
     );
     let added = questions(ResultSufficiency.evaluate(&enhanced));
     assert_eq!(added.len(), 2);
-    assert_eq!(added[0].spec, old[0].spec);
+    assert!(added[0].spec.instructions().contains("Task excerpt: fix bug"));
+    assert!(old[0].spec.instructions().contains("Task unavailable"));
     assert_eq!(added[1].question_id, "result_sufficiency.1");
     assert_eq!(
         choice_options(&added[1]),

@@ -20,7 +20,7 @@ use crate::core::kernel::shared::{
     race_startup_with_abort, safe_metric_now, safe_record_performance_metric, AbortSignal,
     ExecError, ExecuteOptions, ExecuteResult, ExecuteStatus, HostRequestHandlers,
     InternalExecuteResult, KernelAttachment, KernelClient, KernelDiffDisplay, KernelError,
-    KernelManagerOptions, KernelRestoreOptions, KernelSentAgentMessage, KernelShutdownOptions,
+    KernelManagerOptions, KernelRestoreOptions, KernelSentAgentMessage, KernelShutdownOptions, KernelSettlement,
     KernelSnapshotConfig, KernelStartOptions, ParsedAttachment, PerformanceMetricEvent,
     PerformanceMetricOutcome, PerformanceMetricRecorder, SharedPromise, StreamName,
     AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME,
@@ -35,10 +35,12 @@ use crate::core::kernel::state_snapshot::{
     SnapshotLegacyExportResult, SnapshotPerformanceMetadata, SnapshotResult,
     DEFAULT_SNAPSHOT_MAX_BYTES, DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
 };
-use crate::core::orphan_process_journal::{
-    reap_kernel_orphan_processes, record_orphan_process_state,
-};
-use crate::utils::child_process::{spawn_hidden, spawn_sync_hidden_with_timeout, Signal, SpawnOptions};
+use crate::core::orphan_process_journal::record_orphan_process_state;
+#[cfg(not(windows))]
+use crate::core::orphan_process_journal::reap_kernel_orphan_processes;
+use crate::utils::child_process::{spawn_kernel, KernelProcess, Signal, SpawnOptions};
+#[cfg(windows)]
+use crate::utils::child_process::KernelJob;
 
 const REPL_PROTOCOL_VERSION: f64 = 3.0;
 const READY_TIMEOUT_MS: u64 = 30_000;
@@ -56,8 +58,6 @@ const KERNEL_STDERR_LOG_BUDGET_MARKER: &str = "[stderr log budget exhausted]\n";
 const STDERR_LOG_SPENT: u64 = u64::MAX;
 /// Cap on the stderr tail embedded in a startup failure message.
 const STARTUP_STDERR_TAIL_CHARS: usize = 1024;
-/// `spawnSyncHidden(taskkill, ..., { timeout: 5000 })` in `cleanupResources`.
-const TASKKILL_TIMEOUT_MS: u64 = 5000;
 /// Read chunk size for the child's stdout / stderr pumps.
 const STREAM_CHUNK_BYTES: usize = 16 * 1024;
 // Wire bytes, including JSON escaping. Matches the Python sender's smaller caps.
@@ -436,6 +436,8 @@ struct ChildState {
     /// Monotonic spawn identity, replacing `this.child !== child` reference checks.
     id: u64,
     pid: Option<u32>,
+    #[cfg(windows)]
+    containment: Option<Arc<KernelJob>>,
     stdin: Arc<tokio::sync::Mutex<Option<tokio::process::ChildStdin>>>,
     /// `stdin.destroy()` from `cleanupResources`.
     stdin_destroyed: AtomicBool,
@@ -449,6 +451,104 @@ struct ChildState {
 impl ChildState {
     async fn wait_for_stderr_close(&self) {
         self.stderr_closed.wait().await;
+    }
+}
+
+/// Every native manager task is registered before it can be polled. Closing
+/// admission and aborting a task is separate from observing its future dropped.
+#[derive(Default)]
+struct KernelTaskScope {
+    state: Mutex<KernelTaskScopeState>,
+    changed: tokio::sync::Notify,
+}
+#[derive(Default)]
+struct KernelTaskScopeState {
+    closed: bool,
+    next_id: u64,
+    tasks: HashMap<u64, tokio::task::AbortHandle>,
+    errors: Vec<String>,
+}
+
+struct KernelOwnedTask<F> {
+    future: Option<std::pin::Pin<Box<F>>>,
+    scope: Arc<KernelTaskScope>,
+    id: u64,
+}
+
+impl<F: std::future::Future> std::future::Future for KernelOwnedTask<F> {
+    type Output = F::Output;
+
+    fn poll(self: std::pin::Pin<&mut Self>, cx: &mut std::task::Context<'_>) -> std::task::Poll<Self::Output> {
+        let this = self.get_mut();
+        let polled = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
+            this.future.as_mut().expect("owned future exists").as_mut().poll(cx)
+        }));
+        match polled {
+            Ok(result) => result,
+            Err(panic) => {
+                this.scope.state.lock().unwrap().errors.push(format!("Kernel-owned task {} panicked", this.id));
+                std::panic::resume_unwind(panic)
+            }
+        }
+    }
+}
+
+impl<F> Drop for KernelOwnedTask<F> {
+    fn drop(&mut self) {
+        // A pending count is proof only AFTER the complete future and its
+        // captures have been dropped, including cancellation before first poll.
+        let dropped = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| drop(self.future.take())));
+        let mut state = self.scope.state.lock().unwrap();
+        if dropped.is_err() {
+            state.errors.push(format!("Kernel-owned task {} destructor panicked", self.id));
+        }
+        state.tasks.remove(&self.id);
+        drop(state);
+        self.scope.changed.notify_waiters();
+    }
+}
+
+/// Reject every memoized waiter even when its task panics, is cancelled, or is
+/// refused at admission. The normal outcome wins when already settled.
+struct KernelTaskPromise<T: Clone>(Arc<SharedPromise<T>>);
+impl<T: Clone> std::ops::Deref for KernelTaskPromise<T> {
+    type Target = Arc<SharedPromise<T>>;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl<T: Clone> Drop for KernelTaskPromise<T> {
+    fn drop(&mut self) {
+        self.0.settle(Err(KernelError::new("Kernel-owned task ended without a result")));
+    }
+}
+
+impl KernelTaskScope {
+    fn spawn<F, T>(self: &Arc<Self>, future: F) -> Option<tokio::task::JoinHandle<T>>
+    where F: std::future::Future<Output = T> + Send + 'static, T: Send + 'static {
+        let mut state = self.state.lock().unwrap();
+        if state.closed { return None; }
+        let id = state.next_id;
+        state.next_id += 1;
+        let handle = tokio::spawn(KernelOwnedTask {
+            future: Some(Box::pin(future)), scope: self.clone(), id,
+        });
+        state.tasks.insert(id, handle.abort_handle());
+        Some(handle)
+    }
+
+    fn cancel(&self) {
+        let mut state = self.state.lock().unwrap();
+        state.closed = true;
+        for task in state.tasks.values() { task.abort(); }
+    }
+
+    async fn wait(&self) {
+        loop {
+            let changed = self.changed.notified();
+            tokio::pin!(changed);
+            changed.as_mut().enable();
+            if self.state.lock().unwrap().tasks.is_empty() { return; }
+            changed.await;
+        }
     }
 }
 
@@ -483,6 +583,14 @@ pub struct KernelState {
     options: ManagerOptions,
     handled_host_request_ids: Mutex<Vec<String>>,
     child: Mutex<Option<Arc<ChildState>>>,
+    // Serialize native spawn + registration against terminal stop. A startup
+    // already awaiting interpreter bootstrap must re-check the terminal latch.
+    spawn_gate: Mutex<()>,
+    terminal_stop: AtomicBool,
+    owned_tasks: Arc<KernelTaskScope>,
+    bootstrap_unproven: AtomicBool,
+    owned_children: Mutex<Vec<Arc<ChildState>>>,
+    settlement_errors: Mutex<Vec<String>>,
     next_child_id: std::sync::atomic::AtomicU64,
     ready_deferred: Mutex<Option<Arc<SharedPromise<f64>>>>,
     kernel_stderr: Mutex<String>,
@@ -559,6 +667,12 @@ impl KernelState {
             },
             handled_host_request_ids: Mutex::new(Vec::new()),
             child: Mutex::new(None),
+            spawn_gate: Mutex::new(()),
+            terminal_stop: AtomicBool::new(false),
+            owned_tasks: Arc::new(KernelTaskScope::default()),
+            bootstrap_unproven: AtomicBool::new(false),
+            owned_children: Mutex::new(Vec::new()),
+            settlement_errors: Mutex::new(Vec::new()),
             next_child_id: std::sync::atomic::AtomicU64::new(1),
             ready_deferred: Mutex::new(None),
             kernel_stderr: Mutex::new(String::new()),
@@ -599,7 +713,8 @@ impl KernelState {
     }
 
     fn set_state(&self, state: State) {
-        *self.state.lock().unwrap() = state;
+        let mut current = self.state.lock().unwrap();
+        *current = if self.terminal_stop.load(Ordering::SeqCst) { State::Shutdown } else { state };
     }
 
     fn owner_session_id(&self) -> Option<String> {
@@ -742,6 +857,9 @@ impl KernelState {
         self: &Arc<Self>,
         options: KernelStartOptions,
     ) -> Result<(), KernelError> {
+        if self.terminal_stop.load(Ordering::SeqCst) {
+            return Err(KernelError::new("Kernel is terminally stopped"));
+        }
         if is_aborted(&options.signal) {
             return Err(create_kernel_startup_abort_error());
         }
@@ -752,9 +870,9 @@ impl KernelState {
                 let promise = Arc::new(SharedPromise::<()>::new());
                 *self.start_promise.lock().unwrap() = Some(promise.clone());
                 let this = self.clone();
-                let task_promise = promise.clone();
+                let task_promise = KernelTaskPromise(promise.clone());
                 let on_progress = options.on_bootstrap_progress.clone();
-                tokio::spawn(async move {
+                let admitted = self.owned_tasks.spawn(async move {
                     let outcome = this
                         .do_start(KernelStartOptions {
                             on_bootstrap_progress: on_progress,
@@ -774,6 +892,9 @@ impl KernelState {
                         }
                     }
                 });
+                if admitted.is_none() {
+                    promise.settle(Err(KernelError::new("Kernel is terminally stopped")));
+                }
                 promise
             }
         };
@@ -804,11 +925,16 @@ impl KernelState {
         let python = match configured_python {
             Some(python) => python,
             None => {
+                // This shared bootstrap is not inside a per-kernel Job. If its
+                // await is cancelled, do not turn our future drop into a claim
+                // that its external package/interpreter work was joined.
+                self.bootstrap_unproven.store(true, Ordering::SeqCst);
                 let ensure = ensure_kernel_python(EnsureKernelPythonOptions {
                     python_skills: self.options.python_skills.clone(),
                     on_progress: start_options.on_bootstrap_progress.clone(),
                 })
                 .await;
+                self.bootstrap_unproven.store(false, Ordering::SeqCst);
                 match ensure {
                     Ok(python) => {
                         if self.start_stale(generation) {
@@ -853,50 +979,76 @@ impl KernelState {
             &std::process::id().to_string(),
         );
 
-        let spawned = spawn_hidden(
-            &python,
-            &["-m".to_string(), "rlm.repl".to_string()],
-            SpawnOptions {
-                cwd: self.options.cwd.clone(),
-                env: Some(env),
-                // stdio: ["pipe", "pipe", "pipe"]
-                stdin_piped: true,
-                capture_stdout: true,
-                capture_stderr: true,
-                ..Default::default()
-            },
-        );
-        let mut child = match spawned {
-            Ok(child) => child.child,
+        let spawned = (|| -> Result<Arc<ChildState>, KernelError> {
+            let _spawn_guard = self.spawn_gate.lock().unwrap();
+            if self.terminal_stop.load(Ordering::SeqCst) || self.start_stale(generation)
+                || self.state() == State::Shutdown
+            {
+                return Err(KernelError::new("Kernel start superseded by stop"));
+            }
+            let mut child = spawn_kernel(
+                &python,
+                &["-m".to_string(), "rlm.repl".to_string()],
+                SpawnOptions {
+                    cwd: self.options.cwd.clone(),
+                    env: Some(env),
+                    stdin_piped: true,
+                    capture_stdout: true,
+                    capture_stderr: true,
+                    ..Default::default()
+                },
+            ).map_err(|error| {
+                let message = format!("Kernel contained spawn failed: {error}");
+                self.settlement_errors.lock().unwrap().push(message.clone());
+                KernelError::new(message)
+            })?;
+            let id = self.next_child_id.fetch_add(1, Ordering::SeqCst);
+            let pid = child.id();
+            let stdout = child.stdout.take();
+            let stderr = child.stderr.take();
+            let stdin = child.stdin.take();
+            let child_state = Arc::new(ChildState {
+                id,
+                pid,
+                #[cfg(windows)]
+                containment: Some(child.containment.clone()),
+                stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
+                stdin_destroyed: AtomicBool::new(false),
+                exit: ExitState::new(),
+                destroy_stdout: Latch::new(),
+                destroy_stderr: Latch::new(),
+                stderr_closed: Latch::new(),
+            });
+            self.owned_children.lock().unwrap().push(child_state.clone());
+            // Stop can expire while CreateProcess is still in flight. Retain
+            // and terminate that generation before returning from registration.
+            if self.terminal_stop.load(Ordering::SeqCst) {
+                #[cfg(windows)]
+                if let Err(error) = child.containment.terminate() {
+                    self.settlement_errors.lock().unwrap().push(format!("Late kernel Job termination: {error}"));
+                }
+                #[cfg(not(windows))]
+                let _ = child.start_kill();
+                return Err(KernelError::new("Kernel start superseded by stop"));
+            }
+            *self.child.lock().unwrap() = Some(child_state.clone());
+            if let Some(pid) = pid {
+                record_orphan_process_state(pid as i64, true);
+            }
+            *self.ready_deferred.lock().unwrap() = Some(Arc::new(SharedPromise::<f64>::new()));
+            *self.startup_protocol_error.lock().unwrap() = None;
+            self.wire_child(child_state.clone(), child, stdout, stderr);
+            Ok(child_state)
+        })();
+        let child_state = match spawned {
+            Ok(child) => child,
             Err(error) => {
-                let error = KernelError::new(error.to_string());
-                self.handle_child_error(&error);
+                if !self.start_stale(generation) {
+                    self.handle_child_error(&error);
+                }
                 return Err(self.fail_start(error, generation).await);
             }
         };
-
-        let id = self.next_child_id.fetch_add(1, Ordering::SeqCst);
-        let pid = child.id();
-        let stdout = child.stdout.take();
-        let stderr = child.stderr.take();
-        let stdin = child.stdin.take();
-        let child_state = Arc::new(ChildState {
-            id,
-            pid,
-            stdin: Arc::new(tokio::sync::Mutex::new(stdin)),
-            stdin_destroyed: AtomicBool::new(false),
-            exit: ExitState::new(),
-            destroy_stdout: Latch::new(),
-            destroy_stderr: Latch::new(),
-            stderr_closed: Latch::new(),
-        });
-        *self.child.lock().unwrap() = Some(child_state.clone());
-        if let Some(pid) = pid {
-            record_orphan_process_state(pid as i64, true);
-        }
-        *self.ready_deferred.lock().unwrap() = Some(Arc::new(SharedPromise::<f64>::new()));
-        *self.startup_protocol_error.lock().unwrap() = None;
-        self.wire_child(child_state.clone(), child, stdout, stderr);
 
         let ready = self.wait_for_ready(&child_state).await;
         let protocol = match ready {
@@ -1037,7 +1189,8 @@ impl KernelState {
         *self.protocol_repair_promise.lock().unwrap() = Some(repair.clone());
         let this = self.clone();
         let child = child.clone();
-        tokio::spawn(async move {
+        let repair = KernelTaskPromise(repair);
+        self.owned_tasks.spawn(async move {
             let outcome = this.repair_protocol_child(&child, &owner).await;
             if let Err(error) = outcome {
                 this.append_kernel_diagnostic(&format!(
@@ -1077,7 +1230,8 @@ impl KernelState {
 
         let start = {
             let this = self.clone();
-            tokio::spawn(async move { this.start_default().await })
+            self.owned_tasks.spawn(async move { this.start_default().await })
+                .ok_or_else(|| KernelError::new("Kernel is terminally stopped"))?
         };
         let generation = self.start_generation.load(Ordering::SeqCst);
         if let Ok(Err(error)) = start.await {
@@ -1226,8 +1380,8 @@ impl KernelState {
                     let task = Arc::new(SharedPromise::<bool>::new());
                     *self.rebootstrap_promise.lock().unwrap() = Some(task.clone());
                     let this = self.clone();
-                    let started = task.clone();
-                    tokio::spawn(async move {
+                    let started = KernelTaskPromise(task.clone());
+                    let admitted = self.owned_tasks.spawn(async move {
                         let ok = this.reprovision_fresh_kernel(code).await;
                         started.settle(Ok(ok));
                         let mut guard = this.rebootstrap_promise.lock().unwrap();
@@ -1239,6 +1393,7 @@ impl KernelState {
                             *guard = None;
                         }
                     });
+                    if admitted.is_none() { task.settle(Err(KernelError::new("Kernel is terminally stopped"))); }
                     task
                 }
             }
@@ -1335,7 +1490,7 @@ impl KernelState {
     /// Wait until no protocol repair is pending; resolves early when the signal aborts.
     async fn wait_for_protocol_repair(&self, signal: &Option<AbortSignal>) {
         loop {
-            if is_aborted(signal) {
+            if is_aborted(signal) || self.terminal_stop.load(Ordering::SeqCst) {
                 return;
             }
             let repair = self.protocol_repair_promise.lock().unwrap().clone();
@@ -1368,14 +1523,14 @@ impl KernelState {
     fn wire_child(
         self: &Arc<Self>,
         child: Arc<ChildState>,
-        mut process: tokio::process::Child,
+        mut process: KernelProcess,
         stdout: Option<tokio::process::ChildStdout>,
         stderr: Option<tokio::process::ChildStderr>,
     ) {
         if let Some(stdout) = stdout {
             let this = self.clone();
             let child_state = child.clone();
-            tokio::spawn(async move {
+            self.owned_tasks.spawn(async move {
                 let mut reader = stdout;
                 let mut buffered = String::new();
                 let mut pending: Vec<u8> = Vec::new();
@@ -1456,7 +1611,7 @@ impl KernelState {
         if let Some(stderr) = stderr {
             let this = self.clone();
             let child_state = child.clone();
-            tokio::spawn(async move {
+            self.owned_tasks.spawn(async move {
                 let mut reader = stderr;
                 let mut pending: Vec<u8> = Vec::new();
                 let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
@@ -1521,14 +1676,16 @@ impl KernelState {
         {
             let this = self.clone();
             let child_state = child.clone();
-            tokio::spawn(async move {
+            self.owned_tasks.spawn(async move {
                 let status = process.wait().await;
                 match status {
                     Ok(status) => {
                         let signal = node_signal_name(&status);
                         child_state.exit.settle(status.code(), signal);
                     }
-                    Err(_) => child_state.exit.settle(None, None),
+                    Err(error) => {
+                        this.settlement_errors.lock().unwrap().push(format!("Kernel process wait failed: {error}"));
+                    }
                 }
                 // One turn for the poll phase to deliver the bytes the kernel wrote
                 // before dying (the pipe buffer bounds them), then destroy: EOF may
@@ -1605,6 +1762,9 @@ impl KernelState {
         }
         let text = format!("{}\n", Value::Object(request.clone()));
         let mut guard = child.stdin.lock().await;
+        if self.terminal_stop.load(Ordering::SeqCst) || child.stdin_destroyed.load(Ordering::SeqCst) {
+            return Err(KernelError::new("Kernel is terminally stopped"));
+        }
         let Some(stdin) = guard.as_mut() else {
             return Err(KernelError::new("Kernel stdin is not connected"));
         };
@@ -1835,8 +1995,20 @@ impl KernelState {
             guard.error = Some(error);
             guard.status = ExecuteStatus::Error;
         } else if kind == "done" {
+            let report_error = crate::core::kernel::shared::parse_execution_reports(
+                event.get("executionReports"),
+            ).err();
+            let mut done = event.clone();
             let mut guard = execution.lock().unwrap();
-            guard.done_fields = Some(event.clone());
+            if let Some(reason) = report_error {
+                done.remove("executionReports");
+                guard.status = ExecuteStatus::Error;
+                guard.error = Some(ExecError {
+                    ename: "InvalidExecutionReport".to_string(), evalue: reason,
+                    traceback: Vec::new(),
+                });
+            }
+            guard.done_fields = Some(done);
             if event.get("status").and_then(|value| value.as_str()) != Some("ok")
                 && guard.status == ExecuteStatus::Ok
             {
@@ -1964,7 +2136,7 @@ impl KernelState {
                 }
             }
         }
-        let next = Arc::new(SharedPromise::<()>::new());
+        let next = KernelTaskPromise(Arc::new(SharedPromise::<()>::new()));
         *self.execution_queue.lock().unwrap() = next.clone();
         *self.execution_queue_tail_snapshot_metric.lock().unwrap() = snapshot_metric.clone();
         prev.wait().await;
@@ -1980,7 +2152,7 @@ impl KernelState {
             execution_timeout_ms,
             &mut snapshot_metric,
             started,
-            next,
+            next.clone(),
         )
         .await
     }
@@ -2060,7 +2232,7 @@ impl KernelState {
 
         // `globalThis.setTimeout(() => controller.abort(), executionTimeoutMs)`.
         let timer_target = controller.clone();
-        let timer = tokio::spawn(async move {
+        let timer = self.owned_tasks.spawn(async move {
             tokio::time::sleep(Duration::from_millis(execution_timeout_ms)).await;
             timer_target.abort(None);
         });
@@ -2073,7 +2245,7 @@ impl KernelState {
         let outcome = self
             .execute_inner(request_fields, code, &timed_opts, started)
             .await;
-        timer.abort();
+        if let Some(timer) = timer { timer.abort(); }
         outcome
     }
 
@@ -2156,12 +2328,12 @@ impl KernelState {
                     guard.interrupt_requested_at = Some(now_ms());
                 }
                 let interrupt_target = this.clone();
-                tokio::spawn(async move {
+                this.owned_tasks.spawn(async move {
                     let _ = interrupt_target.interrupt().await;
                 });
                 let target = grace_target.clone();
                 let execution = grace_execution.clone();
-                tokio::spawn(async move {
+                this.owned_tasks.spawn(async move {
                     tokio::time::sleep(Duration::from_millis(KERNEL_ABORT_GRACE_MS)).await;
                     if !ActiveExecution::same_as(&target.active_execution(), &execution) {
                         return;
@@ -2376,6 +2548,9 @@ impl KernelState {
                 },
                 status,
                 error: guard.error.clone(),
+                execution_reports: crate::core::kernel::shared::parse_execution_reports(
+                    guard.done_fields.as_ref().and_then(|fields| fields.get("executionReports")))
+                    .expect("done frame reports validated before acceptance"),
                 duration_ms: now_ms() - guard.started,
             };
             let done_fields = guard.done_fields.clone();
@@ -2495,8 +2670,8 @@ impl KernelState {
         *self.active_execution_reconciliation.lock().unwrap() = Some(operation.clone());
         let this = self.clone();
         let signal = signal.clone();
-        let started = operation.clone();
-        tokio::spawn(async move {
+        let started = KernelTaskPromise(operation.clone());
+        self.owned_tasks.spawn(async move {
             let request_id = uuid_v4();
             let done = Latch::new();
             {
@@ -2594,6 +2769,7 @@ impl KernelState {
     }
 
     fn start_host_request(self: &Arc<Self>, request_id: String, data: Option<Value>) {
+        if self.terminal_stop.load(Ordering::SeqCst) { return; }
         {
             let mut handled = self.handled_host_request_ids.lock().unwrap();
             if handled.iter().any(|existing| *existing == request_id) {
@@ -2614,8 +2790,8 @@ impl KernelState {
             .unwrap()
             .push(task.clone());
         let this = self.clone();
-        let started = task.clone();
-        tokio::spawn(async move {
+        let started = KernelTaskPromise(task.clone());
+        self.owned_tasks.spawn(async move {
             match this.handle_host_request(data).await {
                 Ok(result) => {
                     let mut request = Map::new();
@@ -2730,7 +2906,10 @@ impl KernelState {
 
 impl KernelState {
     fn cleanup_resources(self: &Arc<Self>, kill_signal: Option<Signal>) {
+        #[cfg(not(windows))]
         let kill_signal = kill_signal.unwrap_or(Signal::Term);
+        #[cfg(windows)]
+        let _ = kill_signal;
         self.start_generation.fetch_add(1, Ordering::SeqCst); // any teardown invalidates in-flight starts
         self.clear_snapshot_timer();
         *self.execution_queue_tail_snapshot_metric.lock().unwrap() = None;
@@ -2767,75 +2946,37 @@ impl KernelState {
             if !child.exit.has_exited() {
                 child.destroy_stderr.settle();
             }
-            let pid = child.pid;
-            let already_exited = child.exit.has_exited();
-            let mut signaled = already_exited;
-            let mut tree_cleanup_failed = false;
-            if cfg!(windows) && pid.is_some() && !already_exited {
-                // A venv python.exe can be a shim. Killing only it leaves the real REPL alive.
-                let taskkill = std::path::Path::new(
-                    &std::env::var("SystemRoot").unwrap_or_else(|_| "C:\\Windows".to_string()),
-                )
-                .join("System32")
-                .join("taskkill.exe");
-                let args = vec![
-                    "/PID".to_string(),
-                    pid.unwrap().to_string(),
-                    "/T".to_string(),
-                    "/F".to_string(),
-                ];
-                match spawn_sync_hidden_with_timeout(
-                    &taskkill.to_string_lossy(),
-                    &args,
-                    SpawnOptions {
-                        capture_stdout: false,
-                        capture_stderr: false,
-                        ..Default::default()
-                    },
-                    TASKKILL_TIMEOUT_MS,
-                ) {
-                    Ok(output) => {
-                        // spawnSyncHidden already waited: `result.status` is the exit code.
-                        let status = output.status.code();
-                        signaled = status == Some(0);
-                        if !signaled {
-                            tree_cleanup_failed = true;
-                            self.append_kernel_diagnostic(&format!(
-                                "Windows kernel tree cleanup failed: exit {}",
-                                node_option_string(&status)
-                            ));
-                        }
-                    }
-                    Err(error) => {
-                        tree_cleanup_failed = true;
-                        self.append_kernel_diagnostic(&format!(
-                            "Windows kernel tree cleanup failed: {}",
-                            error_message(&KernelError::new(error.to_string()))
-                        ));
+            #[cfg(windows)]
+            {
+                let result = match &child.containment {
+                    Some(job) => job.terminate(),
+                    None => Err(std::io::Error::new(std::io::ErrorKind::PermissionDenied,
+                        "Kernel has no owned native Job; refusing PID-only termination")),
+                };
+                if let Err(error) = result {
+                    let message = format!("Kernel Job termination failed: {error}");
+                    self.append_kernel_diagnostic(&message);
+                    self.settlement_errors.lock().unwrap().push(message);
+                }
+                // Only observed Job emptiness can retire the root journal record.
+                // Bash/RouteWorld nested Jobs are already inside this Job; no
+                // journal PID walk may target a recycled or unrelated process.
+                if child.containment.as_ref().and_then(|job| job.probe().ok()) == Some((true, true)) {
+                    if let Some(pid) = child.pid {
+                        record_orphan_process_state(pid as i64, false);
                     }
                 }
             }
-            if !signaled {
-                // `child.kill(killSignal)`; without a pid there is nothing to signal.
-                if let Some(pid) = pid {
-                    signaled = crate::utils::child_process::signal_process_group_or_process(
-                        pid as i32,
-                        kill_signal,
-                    );
+            #[cfg(not(windows))]
+            {
+                // Legacy POSIX cleanup remains available, but is not proof of
+                // arbitrary escaped-descendant settlement (no cgroup owner here).
+                if let Some(pid) = child.pid {
+                    let signaled = child.exit.has_exited()
+                        || crate::utils::child_process::signal_process_group_or_process(pid as i32, kill_signal);
+                    if signaled { record_orphan_process_state(pid as i64, false); }
+                    reap_kernel_orphan_processes(pid as i64);
                 }
-            }
-            // Inactive only when the signal proved the pid still named our un-reaped child.
-            // Killing a venv shim alone does not prove its CPython descendants died.
-            // Preserve recovery evidence when tree cleanup failed.
-            if let Some(pid) = pid {
-                if signaled && !tree_cleanup_failed {
-                    record_orphan_process_state(pid as i64, false);
-                }
-            }
-            // A killed/crashed kernel cannot run its own shutdown hook, so the host
-            // reaps the bash() process groups it journaled under this kernel pid.
-            if let Some(pid) = pid {
-                reap_kernel_orphan_processes(pid as i64);
             }
         }
         *self.start_promise.lock().unwrap() = None;
@@ -2856,28 +2997,15 @@ impl KernelState {
         &self,
         tasks: &[Arc<SharedPromise<()>>],
         timeout_ms: u64,
-    ) {
+    ) -> Result<(), KernelError> {
         let all = async {
-            for task in tasks {
-                task.wait().await;
-            }
-            "settled"
+            for task in tasks { task.wait().await?; }
+            Ok::<(), KernelError>(())
         };
-        let timeout = async {
-            tokio::time::sleep(Duration::from_millis(timeout_ms)).await;
-            "timeout"
-        };
-        let result = tokio::select! {
-            biased;
-            result = all => result,
-            result = timeout => result,
-        };
-        if result == "timeout" {
-            self.append_kernel_diagnostic(&format!(
-                "timed out waiting {timeout_ms}ms for {} host request task(s) during shutdown",
-                tasks.len()
-            ));
-        }
+        tokio::time::timeout(Duration::from_millis(timeout_ms), all).await
+            .map_err(|_| KernelError::new(format!(
+                "Timed out waiting {timeout_ms}ms for {} host request task(s)", tasks.len()
+            )))?
     }
 
     /// Resolves true when this call performed the cleanup (false: a concurrent
@@ -2885,7 +3013,7 @@ impl KernelState {
     async fn shutdown(self: &Arc<Self>, opts: KernelShutdownOptions) -> Result<bool, KernelError> {
         let in_flight = self.graceful_shutdown_promise.lock().unwrap().clone();
         if let Some(in_flight) = in_flight {
-            let _ = in_flight.wait().await;
+            in_flight.wait().await?;
             return Ok(false);
         }
 
@@ -2969,7 +3097,7 @@ impl KernelState {
                         &in_flight,
                         HOST_REQUEST_SHUTDOWN_TIMEOUT_MS,
                     )
-                    .await;
+                    .await?;
                 }
             }
             let child = self.child.lock().unwrap().clone();
@@ -3002,42 +3130,42 @@ impl KernelState {
                 let kernel_exit = self.wait_for_kernel_exit();
                 let graceful = async {
                     let sent = send.await;
-                    if sent.is_err() {
-                        return;
-                    }
+                    sent?;
                     done.wait().await;
+                    Ok::<(), KernelError>(())
                 };
                 tokio::pin!(graceful);
                 tokio::pin!(kernel_exit);
                 tokio::pin!(deadline);
-                tokio::select! {
+                let exited = tokio::select! {
                     biased;
-                    _ = graceful.as_mut() => {}
-                    _ = kernel_exit.as_mut() => {}
+                    result = graceful.as_mut() => { result?; false }
+                    _ = kernel_exit.as_mut() => true,
                     _ = deadline.as_mut() => {
                         return Err(KernelError::new(format!(
                             "Kernel did not shut down within {KERNEL_SHUTDOWN_TIMEOUT_MS}ms"
                         )));
                     }
-                }
-                tokio::select! {
-                    biased;
-                    _ = kernel_exit.as_mut() => {}
-                    _ = deadline.as_mut() => {
-                        return Err(KernelError::new(format!(
-                            "Kernel did not shut down within {KERNEL_SHUTDOWN_TIMEOUT_MS}ms"
-                        )));
+                };
+                if !exited {
+                    tokio::select! {
+                        biased;
+                        _ = kernel_exit.as_mut() => {}
+                        _ = deadline.as_mut() => {
+                            return Err(KernelError::new(format!(
+                                "Kernel did not shut down within {KERNEL_SHUTDOWN_TIMEOUT_MS}ms"
+                            )));
+                        }
                     }
                 }
             }
             Ok(())
         }
         .await;
-        if let Err(error) = outcome {
-            self.append_kernel_diagnostic(&format!(
-                "graceful shutdown failed (killing instead): {}",
-                error_message(&error)
-            ));
+        if let Err(error) = &outcome {
+            let message = format!("graceful shutdown failed (killing instead): {}", error_message(error));
+            self.append_kernel_diagnostic(&message);
+            self.settlement_errors.lock().unwrap().push(message);
         }
         if let Some(id) = done_waiter_id {
             let mut waiters = self.pending_done_waiters.lock().unwrap();
@@ -3054,6 +3182,10 @@ impl KernelState {
             performed_cleanup = true;
         }
 
+        outcome?;
+        if let Some(error) = self.settlement_errors.lock().unwrap().last() {
+            return Err(KernelError::new(error.clone()));
+        }
         Ok(performed_cleanup)
     }
 
@@ -3065,7 +3197,7 @@ impl KernelState {
             return Err(KernelError::new("Kernel is shutting down"));
         }
         let prev = self.execution_queue.lock().unwrap().clone();
-        let next = Arc::new(SharedPromise::<()>::new());
+        let next = KernelTaskPromise(Arc::new(SharedPromise::<()>::new()));
         *self.execution_queue.lock().unwrap() = next.clone();
         prev.wait().await;
 
@@ -3081,6 +3213,132 @@ impl KernelState {
         .await;
         next.settle(Ok(()));
         outcome
+    }
+
+    async fn shutdown_and_settle(
+        self: &Arc<Self>,
+        owner_session_id: &str,
+        timeout_ms: u64,
+    ) -> Result<KernelSettlement, KernelError> {
+        if owner_session_id.is_empty() || self.options.session_id.as_deref() != Some(owner_session_id) {
+            return Err(KernelError::new("Kernel settlement owner mismatch"));
+        }
+        let deadline = tokio::time::Instant::now()
+            .checked_add(Duration::from_millis(timeout_ms))
+            .ok_or_else(|| KernelError::new("Kernel settlement deadline overflow"))?;
+        // Set before waiting for a spawn critical section. A pending bootstrap
+        // may finish, but it can no longer create a kernel or run user code.
+        self.terminal_stop.store(true, Ordering::SeqCst);
+        self.owned_tasks.cancel();
+        let cancelled = KernelError::new("Kernel is terminally stopped");
+        if let Some(promise) = self.start_promise.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.ready_deferred.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.protocol_repair_promise.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.rebootstrap_promise.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.graceful_shutdown_promise.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.snapshot_flush_for_dispose.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        if let Some(promise) = self.active_execution_reconciliation.lock().unwrap().as_ref() { promise.settle(Err(cancelled.clone())); }
+        self.execution_queue.lock().unwrap().settle(Err(cancelled.clone()));
+        for promise in self.in_flight_host_requests.lock().unwrap().iter() { promise.settle(Err(cancelled.clone())); }
+        self.supersede_protocol_repair();
+        self.set_state(State::Shutdown);
+        self.start_generation.fetch_add(1, Ordering::SeqCst);
+        let children = loop {
+            let registered = {
+                match self.spawn_gate.try_lock() {
+                    Ok(_guard) => Some(self.owned_children.lock().unwrap().clone()),
+                    Err(std::sync::TryLockError::WouldBlock) => None,
+                    Err(std::sync::TryLockError::Poisoned(_)) => {
+                        return Err(KernelError::new("Kernel spawn ownership lock poisoned"));
+                    }
+                }
+            };
+            if let Some(children) = registered { break children; }
+            if tokio::time::Instant::now() >= deadline {
+                return Ok(KernelSettlement {
+                    ownership_scope: "native-kernel-job-members".into(),
+                    supported: cfg!(windows), settled: false,
+                    kernel_exited: false, descendants_exited: false,
+                    local_tasks_settled: false,
+                    errors: vec!["Timed out waiting for contained spawn registration".into()],
+                });
+            }
+            tokio::time::sleep_until((tokio::time::Instant::now() + Duration::from_millis(1)).min(deadline)).await;
+        };
+        self.delete_live_kernels();
+        self.cleanup_resources(Some(Signal::Kill));
+        #[cfg(not(windows))]
+        {
+            let _ = (children, deadline);
+            return Ok(KernelSettlement::unsupported(
+                "Native process cleanup requested; this platform has no owned descendant containment"));
+        }
+        #[cfg(windows)]
+        {
+            let mut report = KernelSettlement {
+                ownership_scope: "native-kernel-job-members".into(),
+                supported: true, settled: false, kernel_exited: true,
+                descendants_exited: true, local_tasks_settled: false,
+                errors: Vec::new(),
+            };
+            // Stop every still-owned generation, including an exited root whose
+            // detached children outlived a repair/restart. Never resolve by PID.
+            for child in &children {
+                match &child.containment {
+                    Some(job) => {
+                        if let Err(error) = job.terminate() {
+                            report.errors.push(format!("Kernel {} Job termination: {error}", child.id));
+                        }
+                    }
+                    None => {
+                        report.supported = false;
+                        report.errors.push(format!("Kernel {} lacks native ownership", child.id));
+                    }
+                }
+            }
+            for child in &children {
+                let Some(job) = &child.containment else {
+                    report.kernel_exited = false;
+                    report.descendants_exited = false;
+                    continue;
+                };
+                if let Err(error) = job.wait_settled(deadline).await {
+                    report.errors.push(format!("Kernel {} settlement: {error}", child.id));
+                }
+                match job.probe() {
+                    Ok((root, members)) => {
+                        report.kernel_exited &= root;
+                        report.descendants_exited &= members;
+                        if root && members {
+                            if let Some(pid) = child.pid { record_orphan_process_state(pid as i64, false); }
+                        }
+                    }
+                    Err(error) => {
+                        report.kernel_exited = false;
+                        report.descendants_exited = false;
+                        report.errors.push(format!("Kernel {} proof query: {error}", child.id));
+                    }
+                }
+            }
+            report.local_tasks_settled = tokio::time::timeout_at(deadline, self.owned_tasks.wait()).await.is_ok();
+            if !report.local_tasks_settled {
+                report.errors.push("Kernel-owned host/repair/stdio task futures did not settle before deadline".into());
+            }
+            // Read evidence after joining: an already-polling task can report a
+            // failure or begin unowned bootstrap after cancel() was requested.
+            if self.bootstrap_unproven.load(Ordering::SeqCst) {
+                report.supported = false;
+                report.errors.push("Shared interpreter bootstrap process ownership was not acknowledged".into());
+            }
+            for child in &children {
+                if let Ok(mut stdin) = child.stdin.try_lock() { stdin.take(); }
+            }
+            report.errors.extend(self.settlement_errors.lock().unwrap().iter().cloned());
+            report.errors.extend(self.owned_tasks.state.lock().unwrap().errors.iter().cloned());
+            report.settled = report.supported && report.kernel_exited
+                && report.descendants_exited && report.local_tasks_settled && report.errors.is_empty();
+            Ok(report)
+        }
     }
 
     async fn kill(self: &Arc<Self>) -> Result<(), KernelError> {
@@ -3626,6 +3884,7 @@ impl KernelState {
     }
 
     fn schedule_snapshot(self: &Arc<Self>) {
+        if self.terminal_stop.load(Ordering::SeqCst) { return; }
         let Some(cfg) = self.options.snapshot.as_ref() else {
             return;
         };
@@ -3635,7 +3894,7 @@ impl KernelState {
             existing.clear();
         }
         let this = self.clone();
-        let handle = tokio::spawn(async move {
+        let handle = self.owned_tasks.spawn(async move {
             tokio::time::sleep(Duration::from_millis(debounce)).await;
             *this.snapshot_timer.lock().unwrap() = None;
             this.capture_snapshot(CaptureSnapshotOptions {
@@ -3644,7 +3903,7 @@ impl KernelState {
             })
             .await;
         });
-        *timer = Some(SnapshotTimerHandle { handle });
+        *timer = handle.map(|handle| SnapshotTimerHandle { handle });
     }
 
     fn clear_snapshot_timer(&self) {
@@ -3661,6 +3920,7 @@ impl KernelState {
         self: &'a Arc<Self>,
     ) -> crate::core::kernel::shared::BoxFuture<'a, ()> {
         Box::pin(async move {
+            if self.terminal_stop.load(Ordering::SeqCst) { return; }
             // Concurrent teardowns (dispose vs a signal-handler shutdown) join one flush:
             // a second flusher would clear the execution guard while the first is still
             // snapshotting and enqueue a duplicate final snapshot behind it.
@@ -3671,8 +3931,8 @@ impl KernelState {
                     let flush = Arc::new(SharedPromise::<()>::new());
                     *self.snapshot_flush_for_dispose.lock().unwrap() = Some(flush.clone());
                     let this = self.clone();
-                    let started = flush.clone();
-                    tokio::spawn(async move {
+                    let started = KernelTaskPromise(flush.clone());
+                    let admitted = self.owned_tasks.spawn(async move {
                         this.run_snapshot_flush_for_dispose().await;
                         started.settle(Ok(()));
                         let mut guard = this.snapshot_flush_for_dispose.lock().unwrap();
@@ -3684,6 +3944,7 @@ impl KernelState {
                             *guard = None;
                         }
                     });
+                    if admitted.is_none() { flush.settle(Err(KernelError::new("Kernel is terminally stopped"))); }
                     flush
                 }
             };
@@ -3706,7 +3967,7 @@ impl KernelState {
         let pending_executions = self.execution_queue.lock().unwrap().clone();
         if self.active_execution().is_some() {
             let this = self.clone();
-            tokio::spawn(async move {
+            self.owned_tasks.spawn(async move {
                 let _ = this.interrupt().await;
             });
         }
@@ -3780,6 +4041,15 @@ impl KernelClient for ReplKernelManager {
     ) -> crate::core::kernel::shared::BoxFuture<'a, Result<bool, KernelError>> {
         let state = self.state.clone();
         Box::pin(async move { state.shutdown(opts).await })
+    }
+
+    fn shutdown_and_settle<'a>(
+        &'a self,
+        owner_session_id: &'a str,
+        timeout_ms: u64,
+    ) -> crate::core::kernel::shared::BoxFuture<'a, Result<KernelSettlement, KernelError>> {
+        let state = self.state.clone();
+        Box::pin(async move { state.shutdown_and_settle(owner_session_id, timeout_ms).await })
     }
 
     fn restart<'a>(
@@ -4154,14 +4424,10 @@ mod tests {
         assert_eq!(MAX_BACKGROUND_OUTPUT_CHARS, 64 * 1024);
         assert_eq!(MAX_KERNEL_STDERR_CHARS, 8 * 1024);
         assert_eq!(MAX_KERNEL_STDERR_LOG_BYTES, 5 * 1024 * 1024);
-        assert_eq!(TASKKILL_TIMEOUT_MS, 5000);
         assert_eq!(PROTOCOL_EVENT_KINDS.len(), 8);
     }
 
     // --- sessionkernel_t04 fixtures -------------------------------------------------
-
-    /// Process-global lock for tests that touch ambient env vars.
-    static TEST_ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
     #[test]
     fn protocol_frame_limit_handles_delimiters_and_unicode() {
@@ -4267,148 +4533,307 @@ mod tests {
         );
     }
 
-    /// G2-01: cleanup_resources must bound the Windows tree kill at
-    /// TASKKILL_TIMEOUT_MS and fall back to signaling the child (TS
-    /// repl-manager.ts:1412-1435). A hung taskkill must never hang teardown.
-    // Windows-only: the fixture spawns `ping -n`, waits through a Win32
-    // process handle, and asserts the taskkill fallback path.
     #[cfg(windows)]
-    #[test]
-    fn cleanup_resources_taskkill_is_bounded_and_falls_back() {
-        let _guard = TEST_ENV_LOCK.lock().unwrap();
-        let dir = tempfile::tempdir().unwrap();
-        let journal_path = dir.path().join("orphans.jsonl");
-        std::env::set_var(crate::core::orphan_process_journal::ORPHAN_PROCESS_JOURNAL_ENV, &journal_path);
+    #[tokio::test]
+    async fn kernel_settlement_wrong_owner_and_repeated_no_start() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        assert!(manager.shutdown_and_settle("different", 1000).await.is_err());
+        assert!(!manager.state.terminal_stop.load(Ordering::SeqCst));
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.settled && report.supported && report.descendants_exited);
+        assert_eq!(report.ownership_scope, "native-kernel-job-members");
+        assert_eq!(manager.shutdown_and_settle("owned", 1000).await.unwrap(), report);
+        assert!(manager.start(KernelStartOptions::default()).await.is_err());
+    }
 
-        let (helper_handle, helper_pid) = spawn_helper(20);
-        let _ = helper_handle;
-        let manager = new_repl_kernel_manager(KernelManagerOptions::default());
-        let state = manager.state();
-        let child_state = Arc::new(ChildState {
-            id: 1,
-            pid: Some(helper_pid as u32),
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_refuses_unowned_pid_even_when_it_is_our_host() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        let child = Arc::new(ChildState {
+            id: 1, pid: Some(std::process::id()), containment: None,
             stdin: Arc::new(tokio::sync::Mutex::new(None)),
-            stdin_destroyed: std::sync::atomic::AtomicBool::new(false),
-            exit: ExitState::new(),
-            destroy_stdout: Latch::new(),
-            destroy_stderr: Latch::new(),
-            stderr_closed: Latch::new(),
+            stdin_destroyed: AtomicBool::new(false), exit: ExitState::new(),
+            destroy_stdout: Latch::new(), destroy_stderr: Latch::new(), stderr_closed: Latch::new(),
         });
-        *state.child.lock().unwrap() = Some(child_state);
-        *state.state.lock().unwrap() = State::Running;
+        manager.state.owned_children.lock().unwrap().push(child.clone());
+        *manager.state.child.lock().unwrap() = Some(child);
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(!report.supported && !report.settled && !report.kernel_exited);
+        assert!(report.errors.iter().any(|error| error.contains("refusing PID-only")));
+        // Reaching this assertion proves no PID-only fallback killed the test host.
+        assert!(!manager.shutdown_and_settle("owned", 1000).await.unwrap().settled);
+    }
 
-        let hang = |command: &str, _args: &[String], _options: &SpawnOptions| {
-            if command.to_lowercase().ends_with("taskkill.exe") {
-                // Stand-in for a hung taskkill: a child that outlives the
-                // cleanup deadline. The unbounded baseline path waits on it
-                // forever; the bounded fix kills it at the timeout.
-                let mut stand_in = std::process::Command::new("ping");
-                stand_in.args(["-n", "60", "127.0.0.1"]);
-                #[cfg(windows)]
-                {
-                    use std::os::windows::process::CommandExt;
-                    stand_in.creation_flags(0x08000000);
-                }
-                stand_in
-                    .stdin(std::process::Stdio::null())
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null());
-                Some(stand_in.spawn())
-            } else {
-                None
-            }
-        };
-        crate::utils::child_process::set_sync_spawn_override_for_tests(Some(hang));
-        let (done_sender, done_receiver) = std::sync::mpsc::channel::<Duration>();
-        std::thread::spawn({
-            let state = state.clone();
-            move || {
-                let start = Instant::now();
-                state.cleanup_resources(None);
-                let _ = done_sender.send(start.elapsed());
-            }
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_fences_pending_spawn_before_any_code() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
         });
-        let elapsed = match done_receiver.recv_timeout(Duration::from_secs(30)) {
-            Ok(elapsed) => elapsed,
-            Err(_) => {
-                crate::utils::child_process::set_sync_spawn_override_for_tests(None);
-                std::env::remove_var(crate::core::orphan_process_journal::ORPHAN_PROCESS_JOURNAL_ENV);
-                panic!("cleanup_resources hung; the Windows taskkill tree kill is unbounded");
+        let state = manager.state.clone();
+        let guard = state.spawn_gate.lock().unwrap();
+        let report = manager.shutdown_and_settle("owned", 0).await.unwrap();
+        assert!(!report.settled);
+        drop(guard);
+        // A delayed startup cannot turn the timeout into an executing heap.
+        assert!(manager.start(KernelStartOptions::default()).await.is_err());
+        assert!(manager.shutdown_and_settle("owned", 1000).await.unwrap().settled);
+    }
+
+
+    #[cfg(windows)]
+    fn controlled_kernel(protocol: u32, ignore_shutdown: bool) -> (tempfile::TempDir, Arc<ReplKernelManager>) {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("rlm")).unwrap();
+        std::fs::write(dir.path().join("rlm/__init__.py"), "").unwrap();
+        let script = format!(r#"import json,sys,threading
+print(json.dumps({{"event":"ready","protocol":{protocol}}}),flush=True)
+for line in sys.stdin:
+    request=json.loads(line)
+    if request['type']=='execute':
+        print(json.dumps({{"event":"stdout","id":request['id'],"text":"message-ok"}}),flush=True)
+        print(json.dumps({{"event":"done","id":request['id'],"status":"ok"}}),flush=True)
+    elif request['type']=='shutdown':
+        if {ignore}:
+            threading.Event().wait()
+        else:
+            print(json.dumps({{"event":"done","id":request['id'],"status":"ok"}}),flush=True)
+            break
+"#, ignore = if ignore_shutdown { "True" } else { "False" });
+        std::fs::write(dir.path().join("rlm/repl.py"), script).unwrap();
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            python: Some(std::env::var("KERNEL_CONTAINMENT_TEST_PYTHON").unwrap()),
+            cwd: Some(dir.path().to_string_lossy().into()),
+            env: Some(HashMap::from([
+                ("PYTHONPATH".into(), dir.path().to_string_lossy().into()),
+                ("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL".into(), dir.path().join("orphans.jsonl").to_string_lossy().into()),
+            ])),
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        (dir, manager)
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_normal_protocol_and_prompt_stubborn_stop() {
+        let (_dir, manager) = controlled_kernel(3, true);
+        manager.start(KernelStartOptions::default()).await.unwrap();
+        let result = manager.execute("fixture request".into(), ExecuteOptions::default()).await.unwrap();
+        assert_eq!(result.status, ExecuteStatus::Ok);
+        assert_eq!(result.stdout, "message-ok");
+        let report = manager.shutdown_and_settle("owned", 5000).await.unwrap();
+        assert!(report.settled, "{report:?}");
+        assert!(manager.execute("must not run".into(), ExecuteOptions::default()).await.is_err());
+        assert_eq!(report, manager.shutdown_and_settle("owned", 5000).await.unwrap());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_preserves_graceful_shutdown_timeout() {
+        let (_dir, manager) = controlled_kernel(3, true);
+        manager.start(KernelStartOptions::default()).await.unwrap();
+        assert!(manager.shutdown(KernelShutdownOptions::default()).await.is_err());
+        let report = manager.shutdown_and_settle("owned", 5000).await.unwrap();
+        assert!(report.kernel_exited && report.descendants_exited, "{report:?}");
+        assert!(!report.settled && !report.errors.is_empty(), "{report:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_keeps_failed_start_generation() {
+        let (_dir, manager) = controlled_kernel(99, false);
+        assert!(manager.start(KernelStartOptions::default()).await.is_err());
+        assert_eq!(manager.state.owned_children.lock().unwrap().len(), 1);
+        let report = manager.shutdown_and_settle("owned", 5000).await.unwrap();
+        assert!(report.settled, "{report:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kernel_settlement_waits_for_stubborn_owned_future_not_abort_request() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let (release, block) = std::sync::mpsc::channel();
+        manager.state.owned_tasks.spawn(async move {
+            entered.send(()).unwrap();
+            block.recv().unwrap(); // controlled non-cooperative future, no idle polling
+        }).unwrap();
+        ready.await.unwrap();
+        let report = manager.shutdown_and_settle("owned", 10).await.unwrap();
+        assert!(!report.settled && report.errors.iter().any(|e| e.contains("task futures")));
+        release.send(()).unwrap();
+        let report = manager.shutdown_and_settle("owned", 5000).await.unwrap();
+        assert!(report.settled, "{report:?}");
+        assert!(manager.state.owned_tasks.spawn(async { panic!("late work ran") }).is_none());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_unproven_shared_bootstrap_fails_closed() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        manager.state.bootstrap_unproven.store(true, Ordering::SeqCst);
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(!report.supported && !report.settled);
+    }
+
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_panic_is_not_success_or_a_hanging_promise() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        let promise = Arc::new(SharedPromise::<()>::new());
+        let guard = KernelTaskPromise(promise.clone());
+        let handle = manager.state.owned_tasks.spawn(async move {
+            let _guard = guard;
+            panic!("controlled owned task panic");
+        }).unwrap();
+        assert!(handle.await.unwrap_err().is_panic());
+        assert!(promise.wait().await.is_err());
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.local_tasks_settled);
+        assert!(!report.settled && report.errors.iter().any(|e| e.contains("panicked")), "{report:?}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_cancel_before_first_poll_drops_captures() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
+        }
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        let dropped = Arc::new(AtomicBool::new(false));
+        let capture = Dropped(dropped.clone());
+        let promise = Arc::new(SharedPromise::<()>::new());
+        let guard = KernelTaskPromise(promise.clone());
+        manager.state.owned_tasks.spawn(async move {
+            let _capture = capture;
+            let _guard = guard;
+            std::future::pending::<()>().await;
+        }).unwrap();
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.settled && report.local_tasks_settled, "{report:?}");
+        assert!(dropped.load(Ordering::SeqCst));
+        assert!(promise.wait().await.is_err());
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kernel_settlement_waits_for_future_destructor() {
+        struct SlowDrop(std::sync::mpsc::Receiver<()>, Option<tokio::sync::oneshot::Sender<()>>);
+        impl Drop for SlowDrop {
+            fn drop(&mut self) {
+                self.1.take().unwrap().send(()).unwrap();
+                self.0.recv().unwrap();
             }
+        }
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        let (release, blocked) = std::sync::mpsc::channel();
+        let (entered, started) = tokio::sync::oneshot::channel();
+        let slow = SlowDrop(blocked, Some(entered));
+        manager.state.owned_tasks.spawn(async move {
+            let _slow = slow;
+            std::future::pending::<()>().await;
+        }).unwrap();
+        manager.state.owned_tasks.cancel();
+        started.await.unwrap();
+        let report = manager.shutdown_and_settle("owned", 10).await.unwrap();
+        assert!(!report.settled && !report.local_tasks_settled, "{report:?}");
+        release.send(()).unwrap();
+        assert!(manager.shutdown_and_settle("owned", 1000).await.unwrap().settled);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn kernel_settlement_stops_one_session_not_the_other() {
+        let (_a, first) = controlled_kernel(3, false);
+        let (_b, second) = controlled_kernel(3, false);
+        first.start(KernelStartOptions::default()).await.unwrap();
+        second.start(KernelStartOptions::default()).await.unwrap();
+        assert!(first.shutdown_and_settle("owned", 5000).await.unwrap().settled);
+        assert_eq!(second.execute("still owned by other session".into(), ExecuteOptions::default()).await.unwrap().status, ExecuteStatus::Ok);
+        assert!(second.shutdown(KernelShutdownOptions::default()).await.unwrap());
+        assert!(second.shutdown_and_settle("owned", 5000).await.unwrap().settled);
+    }
+
+    #[cfg(windows)]
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn kernel_settlement_start_stop_race_retains_all_generations() {
+        let (_dir, manager) = controlled_kernel(3, false);
+        let starting = {
+            let manager = manager.clone();
+            tokio::spawn(async move { manager.start(KernelStartOptions::default()).await })
         };
-        crate::utils::child_process::set_sync_spawn_override_for_tests(None);
-        assert!(
-            elapsed < Duration::from_secs(30),
-            "cleanup_resources must be bounded, took {elapsed:?}"
-        );
-        // The fallback kill must have delivered: the helper is gone.
-        assert!(
-            wait_process_gone(helper_pid, Duration::from_secs(10)),
-            "fallback kill did not terminate the kernel child"
-        );
-        // A failed tree cleanup preserves the recovery evidence: no inactive journal record.
-        let records = read_journal_records(&journal_path);
-        assert!(
-            !records.iter().any(|record| record.pid == helper_pid as i64 && !record.active),
-            "failed tree cleanup must not mark the orphan record inactive"
-        );
-        std::env::remove_var(crate::core::orphan_process_journal::ORPHAN_PROCESS_JOURNAL_ENV);
-    }
-
-    #[cfg(windows)]
-    fn spawn_helper(seconds: u32) -> (tokio::process::Child, i32) {
-        let handle = crate::utils::child_process::spawn_hidden(
-            "ping",
-            &["-n".to_string(), format!("{seconds}"), "127.0.0.1".to_string()],
-            SpawnOptions::default(),
-        )
-        .expect("helper spawn");
-        let pid = handle.child.id().expect("helper pid") as i32;
-        (handle.child, pid)
-    }
-
-    #[cfg(windows)]
-    fn read_journal_records(path: &std::path::Path) -> Vec<crate::core::orphan_process_journal::OrphanProcessRecord> {
-        match std::fs::read_to_string(path) {
-            Ok(contents) => contents
-                .lines()
-                .filter_map(|line| serde_json::from_str::<crate::core::orphan_process_journal::OrphanProcessRecord>(line).ok())
-                .collect(),
-            Err(_) => Vec::new(),
+        let report = manager.shutdown_and_settle("owned", 5000).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(1), starting).await.unwrap().unwrap();
+        assert!(report.settled && report.local_tasks_settled, "{report:?}");
+        for child in manager.state.owned_children.lock().unwrap().iter() {
+            assert_eq!(child.containment.as_ref().unwrap().probe().unwrap(), (true, true));
         }
+        assert!(manager.restart().await.is_err());
     }
 
-    /// Test liveness oracle: a terminated process whose handle is still open
-    /// (tokio reaper) reports `STILL_ACTIVE`-independent existence via
-    /// `process_id_exists`, so check the exit code like the OS task list does.
+
     #[cfg(windows)]
-    fn probe_process_running(pid: i32) -> bool {
-        use windows_sys::Win32::Foundation::CloseHandle;
-        use windows_sys::Win32::System::Threading::{
-            GetExitCodeProcess, OpenProcess, PROCESS_QUERY_LIMITED_INFORMATION,
-        };
-        const STILL_ACTIVE: u32 = 259;
-        unsafe {
-            let handle = OpenProcess(PROCESS_QUERY_LIMITED_INFORMATION, 0, pid as u32);
-            if handle.is_null() {
-                return false;
-            }
-            let mut exit_code: u32 = 0;
-            let ok = GetExitCodeProcess(handle, &mut exit_code) != 0;
-            CloseHandle(handle);
-            ok && exit_code == STILL_ACTIVE
+    #[tokio::test]
+    async fn kernel_settlement_joins_host_handler_and_refuses_late_work() {
+        struct Dropped(Arc<AtomicBool>);
+        impl Drop for Dropped {
+            fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); }
         }
+        let dropped = Arc::new(AtomicBool::new(false));
+        let started = Arc::new(Latch::new());
+        let handler_started = started.clone();
+        let handler_dropped = dropped.clone();
+        let handler: crate::core::kernel::shared::HostRequestHandler = Arc::new(move |_| {
+            let dropped = Dropped(handler_dropped.clone());
+            let started = handler_started.clone();
+            Box::pin(async move {
+                let _dropped = dropped;
+                started.settle();
+                std::future::pending::<Result<Value, KernelError>>().await
+            })
+        });
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            session_id: Some("owned".into()),
+            host_handlers: Some(HashMap::from([("fixture".into(), handler)])),
+            ..Default::default()
+        });
+        manager.state.start_host_request("first".into(), Some(json!({"type":"fixture"})));
+        started.wait().await;
+        let task = manager.state.in_flight_host_requests.lock().unwrap()[0].clone();
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.settled && dropped.load(Ordering::SeqCst), "{report:?}");
+        assert!(task.wait().await.is_err());
+        manager.state.start_host_request("late".into(), Some(json!({"type":"fixture"})));
+        assert!(!manager.state.handled_host_request_ids.lock().unwrap().iter().any(|id| id == "late"));
     }
 
     #[cfg(windows)]
-    fn wait_process_gone(pid: i32, deadline: Duration) -> bool {
-        let start = Instant::now();
-        while start.elapsed() < deadline {
-            if !probe_process_running(pid) {
-                return true;
-            }
-            std::thread::sleep(Duration::from_millis(100));
-        }
-        !probe_process_running(pid)
+    #[tokio::test]
+    async fn kernel_settlement_failed_spawn_retains_failure_receipt() {
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            python: Some("Z:\\nonexistent-kernel-fixture\\python.exe".into()),
+            session_id: Some("owned".into()), ..Default::default()
+        });
+        assert!(manager.start(KernelStartOptions::default()).await.is_err());
+        let report = manager.shutdown_and_settle("owned", 1000).await.unwrap();
+        assert!(report.kernel_exited && report.descendants_exited && report.local_tasks_settled);
+        assert!(!report.settled && report.errors.iter().any(|e| e.contains("spawn failed")), "{report:?}");
     }
 }

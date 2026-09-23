@@ -516,6 +516,8 @@ impl AgentConnection for InProcessAgentConnection {
         Box::pin(async { Ok(Vec::new()) })
     }
 
+    fn heartbeat_catalog_supported(&self) -> Option<bool> { Some(false) }
+
     fn list_heartbeats(&self) -> BoxFuture<Result<Vec<AgentConnectionHeartbeat>, String>> {
         Box::pin(async { Ok(Vec::new()) })
     }

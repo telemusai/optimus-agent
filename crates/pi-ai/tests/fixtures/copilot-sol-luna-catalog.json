@@ -1,0 +1,63 @@
+{
+  "source": "GitHub Copilot /models; one authorized read after normal provider refresh",
+  "capturedOn": "2026-09-23",
+  "receiptSha256": "b9d3711c8860cd90b1658a2a7a647be446b2e7ec5d35a7c58415e9a2c4794a30",
+  "models": [
+    {
+      "id": "gpt-6-luna",
+      "model_picker_enabled": true,
+      "preview": false,
+      "policyState": "enabled",
+      "limits": {
+        "max_context_window_tokens": 400000,
+        "max_prompt_tokens": 272000,
+        "max_output_tokens": 128000
+      },
+      "supports": {
+        "vision": true,
+        "tool_calls": true,
+        "parallel_tool_calls": true,
+        "streaming": true,
+        "reasoning_effort": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supported_endpoints": [
+        "/responses"
+      ]
+    },
+    {
+      "id": "gpt-6-sol",
+      "model_picker_enabled": true,
+      "preview": false,
+      "policyState": "enabled",
+      "limits": {
+        "max_context_window_tokens": 400000,
+        "max_prompt_tokens": 272000,
+        "max_output_tokens": 128000
+      },
+      "supports": {
+        "vision": true,
+        "tool_calls": true,
+        "parallel_tool_calls": true,
+        "streaming": true,
+        "reasoning_effort": [
+          "none",
+          "low",
+          "medium",
+          "high",
+          "xhigh",
+          "max"
+        ]
+      },
+      "supported_endpoints": [
+        "/responses"
+      ]
+    }
+  ]
+}

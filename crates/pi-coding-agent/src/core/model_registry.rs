@@ -996,13 +996,13 @@ fn read_openai_codex_account_id(token: &str) -> Option<String> {
 /// version yields a silently empty or partial list rather than an error.
 ///
 /// Shipping a new Codex model takes two edits, and both are required:
-/// 1. Add the model to `codexModels` in `packages/ai/scripts/generate-models.ts`
-///    and regenerate.
+/// 1. Add reviewed metadata to `pi-ai/src/models.subscription.json`.
 /// 2. Raise this constant to a Codex CLI release whose catalog includes that
-///    model.
+///    model. Sol/Luna are bundled in rust-v0.156.1 (PR #47332); their declared
+///    minimum client version is 0.155.0. Account rollout is still provider-owned.
 ///
 /// Catalog behaviour measured 2026-08-13; see #702.
-const OPENAI_CODEX_CLIENT_VERSION: &str = "0.153.4";
+const OPENAI_CODEX_CLIENT_VERSION: &str = "0.156.1";
 
 fn openai_codex_models_url(base_url: &str) -> String {
     let normalized = base_url.trim_end_matches('/');
@@ -3966,6 +3966,69 @@ mod tests {
         }
         // The catalog response is cached for the same credentials.
         assert!(registry.openai_codex_models_cache.is_some());
+    }
+
+    #[tokio::test]
+    async fn subscription_models_codex_discovery_preserves_exact_ids_and_fails_closed() {
+        use base64::Engine;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let payload = base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(
+            r#"{"https://api.openai.com/auth":{"chatgpt_account_id":"fixture-account"}}"#,
+        );
+        let token = format!("fixture.{}.signature", payload);
+        for (status, body, expected) in [
+            (200, json!({"models": [{"slug": "gpt-6-sol"}, {"slug": "gpt-6-luna"}]}),
+                vec!["gpt-6-sol", "gpt-6-luna"]),
+            (200, json!({"models": [{"slug": "gpt-6-sol"}]}), vec!["gpt-6-sol"]),
+            (200, json!({"models": []}), vec![]),
+            (200, json!({"unexpected": []}), vec![]),
+            (503, json!({"error": "fixture catalog unavailable"}), vec![]),
+        ] {
+            let mut storage = in_memory_auth();
+            storage.set_runtime_api_key("openai-codex", &token);
+            storage.set_runtime_api_key("anthropic", "synthetic-other");
+            let mut registry = ModelRegistry::in_memory(storage);
+            // Catalog reloads discard ad hoc pushes to registry.models. Use a
+            // persisted built-in provider as the unrelated-provider control.
+            let unrelated_before: Vec<Model> = registry.get_available().into_iter()
+                .filter(|model| model.provider == "anthropic").collect();
+            assert!(!unrelated_before.is_empty());
+            let calls = Arc::new(AtomicUsize::new(0));
+            let observed_calls = Arc::clone(&calls);
+            let expected_token = token.clone();
+            registry.set_fetch_fn(Some(Arc::new(move |request: HttpRequest| {
+                observed_calls.fetch_add(1, Ordering::SeqCst);
+                assert_eq!(request.method, "GET");
+                assert_eq!(request.url,
+                    "https://chatgpt.com/backend-api/codex/models?client_version=0.156.1");
+                assert!(request.body.is_none());
+                assert!(request.headers.contains(&(
+                    "Authorization".to_string(), format!("Bearer {}", expected_token),
+                )));
+                assert!(request.headers.contains(&(
+                    "chatgpt-account-id".to_string(), "fixture-account".to_string(),
+                )));
+                let text = body.to_string();
+                Box::pin(async move {
+                    Ok(crate::core::prime_inference_auth::HttpResponse {
+                        status, status_text: "Fixture".to_string(), headers: Vec::new(), text,
+                    })
+                }) as pi_ai::types::BoxFuture<Result<crate::core::prime_inference_auth::HttpResponse, String>>
+            })));
+            let available = registry.get_executable_models().await;
+            let actual: Vec<&str> = available.iter()
+                .filter(|model| model.provider == "openai-codex")
+                .map(|model| model.id.as_str()).collect();
+            assert_eq!(actual, expected);
+            let unrelated_after: Vec<Model> = available.iter()
+                .filter(|model| model.provider == "anthropic").cloned().collect();
+            assert_eq!(unrelated_after, unrelated_before);
+            assert_eq!(calls.load(Ordering::SeqCst), 1);
+            if registry.openai_codex_models_cache.is_some() {
+                assert_eq!(registry.get_executable_models().await, available);
+                assert_eq!(calls.load(Ordering::SeqCst), 1, "cached discovery must not fetch again");
+            }
+        }
     }
 
     #[tokio::test]

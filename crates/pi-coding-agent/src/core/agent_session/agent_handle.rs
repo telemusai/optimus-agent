@@ -17,6 +17,13 @@ use std::sync::Arc;
 use tokio_util::sync::CancellationToken;
 
 impl AgentHandle for Arc<Agent> {
+    fn active_execution_generation(&self) -> Option<String> { Agent::active_execution_generation(self) }
+    fn steer_active(&self, generation: &str, id: &str, message: AgentMessage) -> &'static str {
+        Agent::steer_active(self, generation, id, message)
+    }
+    fn execution_scope(&self) -> Option<pi_agent_core::execution_scope::ExecutionScope> {
+        Some(self.execution_scope.clone())
+    }
     fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> {
         Some(pi_agent_core::agent::AgentOptions {
             initial_state: Some(self.state()),

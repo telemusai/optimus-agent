@@ -1,4 +1,7 @@
 //! Port of packages/coding-agent/src/core/rlm-runtime.ts
+#[path = "rlm_host_capabilities.rs"]
+mod host_capabilities;
+pub use host_capabilities::native_lifecycle_capabilities;
 
 use std::sync::Arc;
 
@@ -663,6 +666,7 @@ pub struct CreateRlmRootSessionOptions {
 
 /// `interface SubagentRuntimeHost`.
 pub trait SubagentRuntimeHost: Send + Sync {
+    fn supports_retained_stop(&self) -> bool { false }
     fn create_rlm_subagent_runtime(
         &self,
         options: CreateRlmSubagentRuntimeOptions,

@@ -68,7 +68,7 @@ async fn cancellation_releases_drain(queue_update: bool) {
         args: json!({}),
         tool,
     };
-    let outcome = timeout(BUDGET, execute_prepared_tool_call(&prepared, Some(&signal), &emit))
+    let outcome = timeout(BUDGET, execute_prepared_tool_call(&prepared, Some(&signal), &emit, None))
         .await.expect("tool cancellation did not return");
     assert!(outcome.is_error);
     release_cleanup.cancel();

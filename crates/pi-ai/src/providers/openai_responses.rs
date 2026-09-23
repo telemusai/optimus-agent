@@ -479,15 +479,26 @@ pub fn stream_simple_openai_responses(
     };
 
     let base = build_base_options(model, options.as_ref(), Some(&api_key));
-    let clamped_reasoning = options
-        .as_ref()
-        .and_then(|options| options.reasoning.clone())
-        .map(|reasoning| clamp_thinking_level(model, &reasoning));
-    let reasoning_effort = clamped_reasoning.filter(|reasoning| reasoning != "off");
+    let reasoning_effort = resolve_simple_reasoning_effort(model,
+        options.as_ref().and_then(|options| options.reasoning.as_deref()));
 
     let mut typed = OpenAIResponsesOptions::from_base(&base);
     typed.reasoning_effort = reasoning_effort;
     stream_openai_responses(model, context, Some(typed))
+}
+
+fn resolve_simple_reasoning_effort(model: &Model, reasoning: Option<&str>) -> Option<String> {
+    let level = clamp_thinking_level(model, reasoning?);
+    if level != "off" {
+        return Some(level);
+    }
+    // Copilot defaults to server reasoning when omitted. Honor an explicitly
+    // advertised off mapping; absent/null mappings keep the existing behavior.
+    if model.provider == "github-copilot" {
+        model.thinking_level_map_get("off").flatten()
+    } else {
+        None
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -963,6 +974,31 @@ mod tests {
             assert!(matches!(end, Some(AssistantMessageEvent::Error { reason, .. }) if reason == "aborted"));
             assert!(events.next().await.is_none());
             server.await.unwrap();
+        }
+    }
+
+    #[test]
+    fn subscription_models_copilot_off_mapping_survives_simple_options() {
+        for id in ["gpt-6-sol", "gpt-6-luna"] {
+            let model = crate::models::get_model("github-copilot", id).unwrap();
+            for (level, expected) in [("off", "none"), ("low", "low"), ("medium", "medium"),
+                ("high", "high"), ("xhigh", "xhigh"), ("max", "max")] {
+                let options = OpenAIResponsesOptions {
+                    reasoning_effort: resolve_simple_reasoning_effort(model, Some(level)),
+                    ..Default::default()
+                };
+                let body = build_params(model, &Context::default(), Some(&options)).unwrap();
+                assert_eq!(body["model"], id);
+                assert_eq!(body["reasoning"]["effort"], expected);
+            }
+            assert_eq!(resolve_simple_reasoning_effort(model, None), None);
+            // No broad provider default change: an absent mapping still omits off.
+            let mut legacy = model.clone();
+            legacy.thinking_level_map = None;
+            assert_eq!(resolve_simple_reasoning_effort(&legacy, Some("off")), None);
+            legacy.provider = "openai".to_string();
+            legacy.thinking_level_map = model.thinking_level_map.clone();
+            assert_eq!(resolve_simple_reasoning_effort(&legacy, Some("off")), None);
         }
     }
 

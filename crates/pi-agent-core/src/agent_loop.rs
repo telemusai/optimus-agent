@@ -1176,15 +1176,23 @@ async fn stream_assistant_response_inner(
     observed: &ObservedCallbacks,
 ) -> anyhow::Result<AssistantMessage> {
     // `streamFn` may return a promise; awaiting it is part of the provider call.
-    let response = maybe_abortable(
-        async move {
-            Ok::<_, anyhow::Error>(
-                stream_function(config.model.clone(), llm_context, provider_config).await,
-            )
-        },
-        signal.cloned(),
-    )
-    .await?;
+    let receipt = pi_ai::utils::event_stream::StreamTaskReceipt::new_unsupported();
+    let model = config.model.clone();
+    let invocation = receipt.clone();
+    if let Some(scope) = &config.execution_scope {
+        scope.register_stream(receipt.clone()).map_err(anyhow::Error::msg)?;
+    }
+    let future = async move {
+        invocation.scope(async move {
+            stream_function(model, llm_context, provider_config).await
+        }).await
+    };
+    let response = if let Some(scope) = &config.execution_scope {
+        let task = scope.spawn(future, true, true).map_err(anyhow::Error::msg)?;
+        maybe_abortable(async move { task.await.map_err(anyhow::Error::from) }, signal.cloned()).await?
+    } else {
+        maybe_abortable(async move { Ok::<_, anyhow::Error>(future.await) }, signal.cloned()).await?
+    };
 
     loop {
         let next = match signal {
@@ -1194,7 +1202,7 @@ async fn stream_assistant_response_inner(
                 tokio::select! {
                     biased;
                     _ = signal.cancelled() => {
-                        response_for_close.end(None);
+                        response_for_close.request_cancel();
                         close_stream(Some(&signal));
                         return Err(create_abort_error());
                     }
@@ -1432,7 +1440,7 @@ async fn execute_tool_calls_sequential(
                 is_error: immediate.is_error,
             },
             PreparedToolCallOrImmediate::Prepared(prepared) => {
-                let executed = execute_prepared_tool_call(&prepared, signal, emit).await;
+                let executed = execute_prepared_tool_call(&prepared, signal, emit, config.execution_scope.as_ref()).await;
                 finalize_executed_tool_call(current_context, assistant_message, &prepared, executed, config, signal)
                     .await
             }
@@ -1525,7 +1533,7 @@ async fn execute_tool_calls_parallel(
                 let signal = signal.cloned();
                 let emit = emit.clone();
                 futures_vec.push(Box::pin(async move {
-                    let executed = execute_prepared_tool_call(&prepared, signal.as_ref(), &emit).await;
+                    let executed = execute_prepared_tool_call(&prepared, signal.as_ref(), &emit, config.execution_scope.as_ref()).await;
                     let finalized = finalize_executed_tool_call(
                         &context,
                         &assistant_message,
@@ -1755,6 +1763,7 @@ async fn execute_prepared_tool_call(
     prepared: &PreparedToolCall,
     signal: Option<&CancellationToken>,
     emit: &AgentEventSink,
+    scope: Option<&crate::execution_scope::ExecutionScope>,
 ) -> ExecutedToolCallOutcome {
     // `updateEvents: Promise<void>[]`. TypeScript starts `emit(...)` when the tool publishes
     // the partial result and joins the promises at the end. Each update is therefore started
@@ -1849,11 +1858,16 @@ async fn execute_prepared_tool_call(
     // TypeScript's abort race leaves the tool promise alive to finish cleanup.
     // Dropping the execution future here strands the Python kernel's queue slot.
     // A dropped JoinHandle detaches the task; the tool still receives cancellation.
-    let execution = tokio::spawn(async move {
+    let future = async move {
         execute(tool_call_id, args, signal_for_tool, Some(on_update)).await
-    });
+    };
+    let execution = match scope {
+        Some(scope) => scope.spawn(future, false, prepared.tool_call.name == "ipython")
+            .map_err(anyhow::Error::msg),
+        None => Ok(tokio::spawn(future)),
+    };
     let result = race_with_abort(
-        async move { execution.await.map_err(anyhow::Error::from)? },
+        async move { execution?.await.map_err(anyhow::Error::from)? },
         signal.cloned(),
         None,
     )
@@ -1892,8 +1906,8 @@ async fn execute_prepared_tool_call(
     match result {
         Ok(result) => {
             ExecutedToolCallOutcome {
+                is_error: result.is_error.unwrap_or(false),
                 result,
-                is_error: false,
             }
         }
         Err(error) => {
@@ -1948,6 +1962,7 @@ async fn finalize_executed_tool_call(
                     content: after_result.content.unwrap_or(result.content),
                     details: after_result.details.unwrap_or(result.details),
                     terminate: after_result.terminate.or(result.terminate),
+                    is_error: after_result.is_error.or(result.is_error),
                 };
                 is_error = after_result.is_error.unwrap_or(is_error);
             }
@@ -1967,7 +1982,7 @@ async fn finalize_executed_tool_call(
 }
 
 pub fn create_error_tool_result(message: &str) -> AgentToolResult {
-    AgentToolResult::new(vec![AgentContentBlock::text(message)], Value::Object(Map::new()))
+    AgentToolResult::new(vec![AgentContentBlock::text(message)], Value::Object(Map::new())).with_error(true)
 }
 
 async fn emit_tool_execution_end(

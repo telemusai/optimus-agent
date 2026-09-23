@@ -5,7 +5,9 @@
 //! key order, same values) and decoded lazily with serde_json, whose preserve_order
 //! feature keeps the declaration order.
 //!
-//! Do not edit manually - regenerate from packages/ai/src/models.generated.ts.
+//! The original generator was removed with the TypeScript implementation. Keep
+//! the imported base64 snapshot unchanged; reviewed subscription additions live
+//! in models.subscription.json. See resources/agent/docs/subscription-models.md.
 
 use std::sync::OnceLock;
 
@@ -171,7 +173,18 @@ fn decode_catalog_json() -> &'static str {
 pub fn models() -> &'static IndexMap<String, IndexMap<String, Model>> {
     static MODELS: OnceLock<IndexMap<String, IndexMap<String, Model>>> = OnceLock::new();
     MODELS.get_or_init(|| {
-        serde_json::from_str(decode_catalog_json()).expect("embedded catalog parses")
+        let mut catalog: IndexMap<String, IndexMap<String, Model>> =
+            serde_json::from_str(decode_catalog_json()).expect("embedded catalog parses");
+        let additions: IndexMap<String, IndexMap<String, Model>> =
+            serde_json::from_str(include_str!("models.subscription.json"))
+                .expect("subscription catalog parses");
+        for (provider, models) in additions {
+            let target = catalog.get_mut(&provider).expect("existing subscription provider");
+            for (id, model) in models {
+                assert!(target.insert(id, model).is_none(), "duplicate subscription model");
+            }
+        }
+        catalog
     })
 }
 
@@ -200,7 +213,7 @@ mod tests {
         assert_eq!(catalog.len(), 32);
         assert_eq!(catalog.keys().next().map(String::as_str), Some("amazon-bedrock"));
         assert_eq!(catalog.keys().last().map(String::as_str), Some("zai"));
-        assert_eq!(all_models().len(), 1283);
+        assert_eq!(all_models().len(), 1287);
     }
 
     #[test]

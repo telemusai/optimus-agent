@@ -78,6 +78,7 @@ class _CellExecution:
     def __init__(self) -> None:
         self.finished = asyncio.Event()
         self.owner: asyncio.Task[Any] | None = None
+        self.execution_reports: list[dict[str, Any]] = []
 
 
 # Asyncio tasks copy cell context at creation, so detached tasks retain their
@@ -605,7 +606,10 @@ async def _handle_execute(req: dict[str, Any], ns: dict[str, Any]) -> None:
             _send({"event": "result", "id": cell_id, "text": _cap_text(result_text)})
         if error is not None:
             _send(error)
-        _send({"event": "done", "id": cell_id, "status": status})
+        done: dict[str, Any] = {"event": "done", "id": cell_id, "status": status}
+        if execution.execution_reports:
+            done["executionReports"] = execution.execution_reports
+        _send(done)
     finally:
         execution.owner = None
         execution.finished.set()
