@@ -1,0 +1,1 @@
+- Fixed automatic and manual compaction failing immediately when an OpenAI-compatible Chat Completions summarizer hits its output limit. Retry the same summary once with more output space, within model limits, and preserve the conversation if the retry is still incomplete.
