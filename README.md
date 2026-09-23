@@ -14,7 +14,7 @@ Optimus supports **native Windows reliability, stronger session continuity, Astr
 
 ## Install and update
 
-The standalone installers select the **highest stable `vMAJOR.MINOR.PATCH` tag** from this repository and build it locally with Cargo's locked dependencies. They exclude prerelease tags and never install an untagged `main` build. Run the same command again to update; an already-installed tag is left in place. Standalone installation starts with **v0.1.1**. GitHub Actions remains disabled; no prebuilt release binary is required.
+The standalone installers select the **highest stable `vMAJOR.MINOR.PATCH` tag** from this repository and build it locally with Cargo's locked dependencies. They exclude prerelease tags and never install an untagged `main` build. Run the same command again to update; an already-installed tag is left in place. Standalone installation starts with the **latest release**.
 
 Install the prerequisites first: [Rust/Cargo](https://rustup.rs/), [Python 3.11+](https://www.python.org/downloads/), [uv](https://docs.astral.sh/uv/getting-started/installation/), Git, and native C/C++ build tools. Linux also needs `curl`, Bash, `pkg-config`, and OpenSSL development headers (Ubuntu/Debian: `build-essential pkg-config libssl-dev`). macOS needs Xcode Command Line Tools. Windows needs [Git for Windows with Git Bash](https://gitforwindows.org/) and [Visual Studio Build Tools](https://visualstudio.microsoft.com/visual-cpp-build-tools/) with **Desktop development with C++**, a Windows SDK, and the MSVC Rust toolchain. Reopen the terminal after installing prerequisites.
 
