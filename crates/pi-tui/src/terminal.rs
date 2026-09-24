@@ -1298,15 +1298,25 @@ mod tests {
     #[test]
     fn windows_vt_controls_and_legacy_navigation_remain_distinct() {
         let mut surrogate = None;
-        for unit in [0, 3, 10, 13, 27, 127] {
+        for unit in [0, 3, 8, 10, 13, 27, 127] {
             assert_eq!(windows_record_sequence(true, 0, unit, 0, &mut surrogate), Some(char::from_u32(u32::from(unit)).unwrap().to_string()));
         }
         for (virtual_key, name) in [(0x25, "left"), (0x26, "up"), (0x27, "right"), (0x28, "down"), (0x0d, "enter"), (0x1b, "escape")] {
             let sequence = windows_record_sequence(true, virtual_key, 0, 0, &mut surrogate).unwrap();
             assert!(crate::keys::matches_key(&sequence, name));
         }
-        let control_c = windows_record_sequence(true, 0x43, 3, 8, &mut surrogate).unwrap();
-        assert!(crate::keys::matches_key(&control_c, "ctrl+c"));
+        for (virtual_key, unit, modifiers, name) in [
+            (0x43, 3, 8, "ctrl+c"), (0x48, 8, 8, "ctrl+h"),
+            (0x4d, 13, 8, "ctrl+m"), (0x4c, 12, 24, "ctrl+shift+l"),
+        ] {
+            let sequence = windows_record_sequence(true, virtual_key, unit, modifiers, &mut surrogate).unwrap();
+            assert!(crate::keys::matches_key(&sequence, name), "{name}: {sequence:?}");
+            assert!(crate::tui::is_unambiguous_ctrl_combo(&sequence));
+        }
+        for unit in [8, 13, 127] {
+            let raw = windows_record_sequence(true, 0, unit, 0, &mut surrogate).unwrap();
+            assert!(!crate::tui::is_unambiguous_ctrl_combo(&raw), "VK=0 keeps editing bytes");
+        }
         let shift_enter = windows_record_sequence(true, 0x0d, 13, 16, &mut surrogate).unwrap();
         assert!(crate::keys::matches_key(&shift_enter, "shift+enter"));
     }

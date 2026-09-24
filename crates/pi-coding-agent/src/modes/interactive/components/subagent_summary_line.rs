@@ -84,7 +84,7 @@ pub struct RosterParent {
 /// fields `getParentKeys` reads onto an agents-view row so the shared direct-child
 /// check can run on the daemon wire row, the same bridge `InteractiveMode` uses
 /// for its roster bar.
-fn linkage_row_for_roster_summary(
+pub(crate) fn linkage_row_for_roster_summary(
     child: &SessionSummary,
 ) -> crate::modes::agents_view::agents_view_state::SessionSummary {
     let mut view = crate::modes::agents_view::agents_view_state::SessionSummary::new(

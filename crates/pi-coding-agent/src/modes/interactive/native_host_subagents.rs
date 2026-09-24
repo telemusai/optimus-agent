@@ -44,7 +44,12 @@ impl Bar {
     pub(super) fn new(mode: Rc<RefCell<InteractiveMode>>) -> Self {
         let mut line = SubagentSummaryLine::default();
         line.set_always_visible(true);
-        line.set_openable(mode.borrow().options.return_to_agents_view);
+        // The bar exists only in the workspace-attached terminal, where the
+        // sessions sidebar always serves the roster the old agents view did.
+        // `options.return_to_agents_view` describes that retired hand-off and is
+        // forced false by the workspace loop, so keying `openable` on it
+        // disabled the editor's Down-arrow path (UI006).
+        line.set_openable(true);
         Self {
             mode,
             editor: None,
@@ -164,6 +169,7 @@ impl Bar {
                 return false;
             }
             if keys.matches(data, "tui.select.confirm") || keys.matches(data, "app.agents.open") {
+                self.line.set_focused(false);
                 actions.borrow_mut().push(InputAction::Subagents);
                 return true;
             }

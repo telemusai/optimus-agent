@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import hashlib
+import json
 import os
 from pathlib import Path
 import re
@@ -12,12 +13,141 @@ import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 import uuid
 
 
 ROOT = Path(__file__).resolve().parents[1]
 WINDOWS = os.name == "nt"
 EXECUTABLE = "optimus-rust.exe" if WINDOWS else "optimus-rust"
+
+
+# Raw-byte manifests are deliberately independent of Git state and machine paths.
+PROVENANCE_SCHEMA = "optimus.build-provenance.v1"
+FINGERPRINT_FIELDS = ("sourceTreeSha256", "payloadSourceSha256", "runtimeSourceSha256",
+                      "version", "target", "profile", "rustc", "buildOptionsSha256")
+PAYLOAD_FILES = ("scripts/optimus-agent", "scripts/launch-with-jev-env.py", "scripts/rust_release.py",
+                 "install.sh", "LICENSE", "README.md")
+
+
+def ignored_input(name: str) -> bool:
+    return name in ("__pycache__", ".venv", ".pytest_cache", ".mypy_cache", ".ruff_cache") or name.endswith((".pyc", ".egg-info"))
+
+
+def input_tree(root: Path, directory: Path) -> list[str]:
+    if directory.is_symlink() or not directory.is_dir():
+        raise ValueError("Build input directory must not be a symlink")
+    files = []
+    for path in directory.iterdir():
+        if ignored_input(path.name):
+            continue
+        if path.is_symlink():
+            raise ValueError(f"Symlink build input is not supported: {path}")
+        if path.is_dir():
+            files.extend(input_tree(root, path))
+        elif path.is_file():
+            files.append(path.relative_to(root).as_posix())
+    return files
+
+
+def payload_files(source: Path) -> list[str]:
+    return sorted(list(PAYLOAD_FILES) + input_tree(source, source / "resources")
+                  + input_tree(source, source / "prime-agent-runtime"))
+
+
+def source_files(source: Path) -> list[str]:
+    files = payload_files(source) + ["Cargo.toml", "Cargo.lock"]
+    for crate in (source / "crates").iterdir():
+        if crate.is_symlink():
+            raise ValueError("Symlink crate input is not supported")
+        if not crate.is_dir() or not (crate / "Cargo.toml").is_file():
+            continue
+        for name in ("Cargo.toml", "build.rs", "build_provenance.rs"):
+            if (crate / name).is_file():
+                files.append((crate / name).relative_to(source).as_posix())
+        files.extend(input_tree(source, crate / "src"))
+    return sorted(set(files))
+
+
+def raw_aggregate(root: Path, names: list[str]) -> str:
+    digest = hashlib.sha256()
+    for name in names:
+        digest.update(name.encode("utf-8") + b"\0")
+        path = root / name
+        if path.is_symlink() or not path.is_file():
+            raise ValueError("Build input must be a regular file")
+        digest.update(hashlib.sha256(path.read_bytes()).digest())
+    return digest.hexdigest()
+
+
+def runtime_source_sha256(source: Path) -> str:
+    # Exact lifecycle.py contract: sorted immediate *.py filenames + NUL + raw digest.
+    root = source / "prime-agent-runtime/src/rlm"
+    names = sorted(path.name for path in root.glob("*.py"))
+    if "lifecycle.py" not in names or "__init__.py" not in names:
+        raise ValueError("Runtime lifecycle sources missing")
+    if any((root / name).is_symlink() or not (root / name).is_file() for name in names):
+        raise ValueError("Runtime source must contain regular files")
+    return raw_aggregate(root, names)
+
+
+def build_fingerprint(receipt: dict) -> str:
+    digest = hashlib.sha256((PROVENANCE_SCHEMA + "\0").encode())
+    for field in FINGERPRINT_FIELDS:
+        value = receipt.get(field)
+        if not isinstance(value, str) or not value:
+            raise ValueError(f"Missing native build provenance: {field}")
+        digest.update(value.encode("utf-8") + b"\0")
+    return digest.hexdigest()
+
+
+def query_build_provenance(binary: Path) -> dict:
+    # This native early exit runs before profile/auth/provider/daemon initialization.
+    result = subprocess.run([str(binary.resolve()), "--build-provenance"], check=True,
+                            capture_output=True, text=True, timeout=15)
+    try:
+        receipt = json.loads(result.stdout)
+    except (ValueError, TypeError) as error:
+        raise ValueError("Native binary has no valid embedded build provenance; rebuild it") from error
+    if not isinstance(receipt, dict):
+        raise ValueError("Native build provenance must be an object")
+    return receipt
+
+
+def verify_build_provenance(source: Path, binary: Path) -> dict:
+    receipt = query_build_provenance(binary)
+    if receipt.get("schema") != PROVENANCE_SCHEMA:
+        raise ValueError("Native build provenance schema is missing or unsupported")
+    for field in ("buildFingerprint", "sourceTreeSha256", "payloadSourceSha256",
+                  "runtimeSourceSha256", "buildOptionsSha256"):
+        if not isinstance(receipt.get(field), str) or not re.fullmatch(r"[0-9a-f]{64}", receipt[field]):
+            raise ValueError(f"Native build provenance is not pinned: {field}")
+    if receipt["buildFingerprint"] != build_fingerprint(receipt):
+        raise ValueError("Native build fingerprint does not match its embedded inputs")
+    target = receipt.get("target", "")
+    platform_matches = ((sys.platform == "win32" and "-windows-" in target)
+                        or (sys.platform == "darwin" and target.endswith("-apple-darwin"))
+                        or (sys.platform.startswith("linux") and "-linux-" in target))
+    if not platform_matches or not receipt["rustc"].startswith("rustc "):
+        raise ValueError("Native target/toolchain does not match this packaging platform")
+    if receipt.get("profile") != "release":
+        raise ValueError("A portable release requires a release-profile native binary")
+    identity = json.loads((source / "resources/agent/package.json").read_text())
+    runtime_identity = tomllib.loads((source / "prime-agent-runtime/pyproject.toml").read_text())
+    if receipt["version"] != identity.get("version") or receipt["version"] != runtime_identity.get("project", {}).get("version"):
+        raise ValueError("Native/resource/runtime version identity mismatch")
+    if receipt["runtimeSourceSha256"] != runtime_source_sha256(source):
+        raise ValueError("Runtime source does not match the native build receipt")
+    if receipt["payloadSourceSha256"] != raw_aggregate(source, payload_files(source)):
+        raise ValueError("Packaged resources/runtime do not match the native build receipt")
+    if (source / "Cargo.toml").is_file() and (source / "crates").is_dir():
+        if receipt["sourceTreeSha256"] != raw_aggregate(source, source_files(source)):
+            raise ValueError("Native source inputs do not match the binary; rebuild before staging")
+    else:
+        recorded = source / "BUILD-PROVENANCE.json"
+        if not recorded.is_file() or json.loads(recorded.read_text()) != receipt:
+            raise ValueError("Bundled install provenance does not match the native binary")
+    return receipt
 
 
 def git_bash() -> Path:
@@ -61,13 +191,16 @@ def stage_release(source: Path, binary: Path, destination: Path, commit: str) ->
         raise ValueError(f"Native executable does not exist: {binary}")
     if not re.fullmatch(r"[0-9a-fA-F]{7,64}", commit):
         raise ValueError("Expected a Git commit ID")
+    if destination.exists():
+        raise FileExistsError(destination)
+    provenance = verify_build_provenance(source, binary)
     destination.mkdir(parents=True, exist_ok=False)
     try:
         (destination / "bin").mkdir()
         shutil.copy2(binary, destination / "bin" / EXECUTABLE)
         (destination / "bin" / EXECUTABLE).chmod(0o755)
         # This allowlist excludes user configuration, build caches and Git state.
-        ignore = shutil.ignore_patterns("__pycache__", "*.pyc", ".venv", "*.egg-info")
+        ignore = lambda _directory, names: [name for name in names if ignored_input(name)]
         for directory in ("resources", "prime-agent-runtime"):
             shutil.copytree(source / directory, destination / directory, ignore=ignore)
         (destination / "scripts").mkdir()
@@ -78,6 +211,8 @@ def stage_release(source: Path, binary: Path, destination: Path, commit: str) ->
         (destination / "COMMIT").write_text(commit + "\n")
         if (source / "TAG").is_file():
             shutil.copy2(source / "TAG", destination / "TAG")
+        (destination / "BUILD-PROVENANCE.json").write_text(json.dumps(provenance, indent=2) + "\n")
+        verify_build_provenance(destination, destination / "bin" / EXECUTABLE)
     except BaseException:
         shutil.rmtree(destination)
         raise
@@ -207,6 +342,6 @@ def main() -> int:
 if __name__ == "__main__":
     try:
         raise SystemExit(main())
-    except (OSError, ValueError, subprocess.CalledProcessError) as error:
+    except (OSError, ValueError, subprocess.SubprocessError) as error:
         print(f"Optimus installation failed: {error}", file=sys.stderr)
         raise SystemExit(1)

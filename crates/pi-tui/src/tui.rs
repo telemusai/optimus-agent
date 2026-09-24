@@ -12,7 +12,8 @@ use crate::mouse::{
 use crate::selection_metadata::TableCellSelectionRegion;
 use crate::terminal::{Terminal, TerminalStopOptions};
 use crate::terminal_image::{
-    delete_kitty_image, get_capabilities, image_line_for_viewport, is_image_line, set_cell_dimensions,
+    delete_kitty_image, get_capabilities, image_line_for_viewport, image_row_count, is_image_line,
+    set_cell_dimensions,
 };
 use crate::utils::{
     extract_segments, normalize_terminal_output, slice_by_column, slice_with_width, strip_ansi,
@@ -126,6 +127,33 @@ pub fn is_focusable(component: Option<Rc<RefCell<dyn Component>>>) -> bool {
         Some(component) => component.borrow_mut().as_focusable().is_some(),
         None => false,
     }
+}
+
+/// True when `data` identifies its key unambiguously enough to act on as a
+/// sidebar shortcut (UI-010). Raw mode sends Ctrl+H as `\x08` (Backspace's
+/// code on many terminals, Ctrl+Backspace's on Windows Terminal) and Ctrl+M as
+/// `\r` (Enter's code), so a binding such as `app.sidebar.toggleSide` must not
+/// act on those raw forms or it would hijack Enter/Backspace. The
+/// self-identifying escape-sequence transports do distinguish the combos:
+/// Kitty CSI-u (`\x1b[109;5u`), modifyOtherKeys (`\x1b[27;5;109~`) and the
+/// Windows `ReadConsoleInputW` path, which re-encodes virtual-key events into
+/// the same CSI-u forms (see `terminal.rs`). Hosts should pair this with the
+/// usual key-release filter.
+pub fn is_unambiguous_ctrl_combo(data: &str) -> bool {
+    // Escape-prefixed sequences carry their own key identity (CSI-u,
+    // modifyOtherKeys, legacy arrows and function keys). Mouse reports are
+    // escape-prefixed too but never match a ctrl combo; excluding them keeps
+    // the predicate explicit about what it accepts.
+    if data.starts_with("\x1b") {
+        return !is_mouse_sequence(data);
+    }
+    // Raw legacy control bytes are ambiguous only when they are also reserved
+    // editing keys: `\r`/`\n` decode as both Ctrl+M/Ctrl+J and Enter, `\x08`
+    // as both Ctrl+H and Backspace (or Ctrl+Backspace on Windows Terminal),
+    // `\x7f` as DEL, `\t` as both Ctrl+I and Tab. Every other raw byte (for
+    // example Ctrl+G -> `\x07`) identifies exactly one key, so user remaps to
+    // those keys keep working in raw terminals.
+    !matches!(data, "\r" | "\n" | "\t" | "\x08" | "\x7f")
 }
 
 /// Cursor position marker - APC (Application Program Command) sequence.
@@ -246,6 +274,23 @@ pub struct FullscreenOptions {
 pub struct ExitFullscreenOptions {
     pub flush: bool,
     pub leave_alt_screen: bool,
+}
+
+/// Which screen edge the fullscreen session sidebar pane occupies (UI-010).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum FullscreenSidebarSide {
+    #[default]
+    Left,
+    Right,
+}
+
+/// Current screen span of the visible fullscreen sidebar pane (0-based columns).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FullscreenSidebarBounds {
+    /// 0-based first column of the pane.
+    pub col: usize,
+    /// Pane width in columns.
+    pub width: usize,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -481,6 +526,12 @@ pub struct TUI {
     fullscreen_pressed_hyperlink: Option<String>,
     overlay_selection_regions: Vec<FrameSelectionRegion>,
     fullscreen: Option<FullscreenState>,
+    /// UI-010: which screen edge the fullscreen sidebar occupies. Kept on the
+    /// TUI (not `FullscreenState`) so the placement survives fullscreen re-entry.
+    fullscreen_sidebar_side: FullscreenSidebarSide,
+    /// UI-010: hidden keeps the sidebar component mounted (selection/scroll
+    /// state intact) but releases its columns back to the content pane.
+    fullscreen_sidebar_hidden: bool,
     /// Port of `selectionAutoScrollTimer` (packages/tui/src/tui.ts:807): the
     /// armed auto-scroll timeout. TS holds a timer handle; here the handle is
     /// the deadline the owner tick waits for, paired with the scrolling
@@ -544,6 +595,8 @@ impl TUI {
             fullscreen_pressed_hyperlink: None,
             overlay_selection_regions: Vec::new(),
             fullscreen: None,
+            fullscreen_sidebar_side: FullscreenSidebarSide::Left,
+            fullscreen_sidebar_hidden: false,
             selection_auto_scroll_due_at: None,
             selection_auto_scroll_direction: None,
             selection_auto_scroll_row: 0,
@@ -1150,7 +1203,9 @@ impl TUI {
         }
     }
 
-    /// Fixed left session pane. Transcript coordinates include its reserved columns.
+    /// Session pane docked at [`FullscreenSidebarSide::Left`] or
+    /// [`FullscreenSidebarSide::Right`]. Transcript coordinates include its
+    /// reserved columns.
     pub fn set_fullscreen_sidebar(&mut self, sidebar: Option<Rc<RefCell<dyn Component>>>) {
         if let Some(state) = self.fullscreen.as_mut() {
             state.sidebar = sidebar;
@@ -1158,12 +1213,99 @@ impl TUI {
         }
     }
 
+    /// Columns the sidebar pane currently reserves. Hiding (UI-010) releases
+    /// the space back to the content pane, so a hidden sidebar reserves none.
     pub fn fullscreen_sidebar_width(&self) -> usize {
+        if self.fullscreen_sidebar_hidden {
+            return 0;
+        }
         if self.fullscreen.as_ref().is_some_and(|s| s.sidebar.is_some()) {
             // Keep both panes visible, including on narrow terminals.
             (self.terminal.columns() / 4).clamp(16, 34)
                 .min(self.terminal.columns().saturating_sub(12))
         } else { 0 }
+    }
+
+    /// Which screen edge the sidebar pane occupies (UI-010, default left).
+    pub fn fullscreen_sidebar_side(&self) -> FullscreenSidebarSide {
+        self.fullscreen_sidebar_side
+    }
+
+    /// Move the sidebar pane to a screen edge. The placement survives
+    /// fullscreen re-entry; the sidebar keeps its component and state.
+    pub fn set_fullscreen_sidebar_side(&mut self, side: FullscreenSidebarSide) {
+        if self.fullscreen_sidebar_side == side {
+            return;
+        }
+        self.fullscreen_sidebar_side = side;
+        self.request_render();
+    }
+
+    /// Toggle the sidebar between the left and right edges; returns the new side.
+    pub fn toggle_fullscreen_sidebar_side(&mut self) -> FullscreenSidebarSide {
+        let side = match self.fullscreen_sidebar_side {
+            FullscreenSidebarSide::Left => FullscreenSidebarSide::Right,
+            FullscreenSidebarSide::Right => FullscreenSidebarSide::Left,
+        };
+        self.set_fullscreen_sidebar_side(side);
+        side
+    }
+
+    /// Whether the sidebar pane is currently hidden (UI-010).
+    pub fn fullscreen_sidebar_hidden(&self) -> bool {
+        self.fullscreen_sidebar_hidden
+    }
+
+    /// Hide or show the sidebar pane. Hiding keeps the component mounted so the
+    /// selected row, folders and scroll offset survive; showing restores the
+    /// pane at its configured edge.
+    pub fn set_fullscreen_sidebar_hidden(&mut self, hidden: bool) {
+        if self.fullscreen_sidebar_hidden == hidden {
+            return;
+        }
+        self.fullscreen_sidebar_hidden = hidden;
+        self.request_render();
+    }
+
+    /// Hide when shown, show when hidden; returns the new hidden flag.
+    pub fn toggle_fullscreen_sidebar_hidden(&mut self) -> bool {
+        let hidden = !self.fullscreen_sidebar_hidden;
+        self.set_fullscreen_sidebar_hidden(hidden);
+        hidden
+    }
+
+    /// Screen span of the visible sidebar pane, or `None` while hidden or
+    /// unmounted. Columns are 0-based; a 1-based SGR mouse `x` lands inside the
+    /// pane when `x > col && x <= col + width`.
+    pub fn fullscreen_sidebar_bounds(&self) -> Option<FullscreenSidebarBounds> {
+        if self.fullscreen_sidebar_hidden {
+            return None;
+        }
+        let width = self.fullscreen_sidebar_width();
+        // `fullscreen_sidebar_width` is 0 while unmounted, so this one check
+        // covers both the "no pane" and the "narrow terminal" cases.
+        if width == 0 {
+            return None;
+        }
+        let col = match self.fullscreen_sidebar_side {
+            FullscreenSidebarSide::Left => 0,
+            FullscreenSidebarSide::Right => self.terminal.columns().saturating_sub(width),
+        };
+        Some(FullscreenSidebarBounds { col, width })
+    }
+
+    /// Whether a 1-based SGR mouse position lands inside the visible sidebar
+    /// pane (below the fullscreen header). Replaces the left-only
+    /// `mouse.x <= fullscreen_sidebar_width()` checks for both edges.
+    pub fn fullscreen_sidebar_hit(&self, x: i64, y: i64) -> bool {
+        match self.fullscreen_sidebar_bounds() {
+            Some(bounds) => {
+                y > self.fullscreen_header_height() as i64
+                    && x > bounds.col as i64
+                    && x <= (bounds.col + bounds.width) as i64
+            }
+            None => false,
+        }
     }
 
     pub fn fullscreen_header_height(&self) -> usize {
@@ -2210,8 +2352,22 @@ impl TUI {
 
         let sidebar_width = self.fullscreen_sidebar_width();
         let content_width = width.saturating_sub(sidebar_width).max(1);
-        let sidebar = self.fullscreen.as_ref().and_then(|s| s.sidebar.clone());
-        let prefix = " ".repeat(sidebar_width);
+        // UI-010: the pane docks at either edge. Content starts after a left
+        // pane and at column 0 beside a right pane; the pane itself starts at
+        // the opposite offset. Hidden => sidebar_width 0 => full-width content.
+        let (content_col, sidebar_col) = match self.fullscreen_sidebar_side {
+            FullscreenSidebarSide::Left => (sidebar_width, 0),
+            FullscreenSidebarSide::Right => (0, content_width),
+        };
+        // A hidden (or zero-width on tiny terminals) pane composites nothing:
+        // `composite_line_at` with a zero overlay width would splice bare SGR
+        // resets into content rows. The component itself stays mounted.
+        let sidebar = if sidebar_width == 0 {
+            None
+        } else {
+            self.fullscreen.as_ref().and_then(|s| s.sidebar.clone())
+        };
+        let prefix = " ".repeat(content_col);
         let mut transcript: Vec<String> = Vec::new();
         let mut anchors = Vec::new();
         let mut bottom_aligned = false;
@@ -2247,21 +2403,26 @@ impl TUI {
                 anchors.extend(component_anchors);
                 bottom_aligned |= component.borrow().bottom_align_in_fullscreen();
                 for region in component.borrow().get_selection_regions() {
+                    // Region coordinates are content-relative; both docked edges
+                    // map content onto the screen through the same offset.
                     selection_regions.push(TableCellSelectionRegion {
                         line: region.line + line_offset,
                         table_top: region.table_top + line_offset,
                         table_bottom: region.table_bottom + line_offset,
-                        col: region.col + sidebar_width,
-                        table_left: region.table_left + sidebar_width,
-                        table_right: region.table_right + sidebar_width,
+                        col: region.col + content_col,
+                        table_left: region.table_left + content_col,
+                        table_right: region.table_right + content_col,
                         ..region
                     });
                 }
                 let mut columns = component.borrow().get_selection_columns();
                 columns.resize(component_lines.len(), None);
                 selection_columns.extend(columns.into_iter().map(|column| {
-                    column.map(|(start, end)| (start + sidebar_width, end + sidebar_width))
-                        .or_else(|| (sidebar_width > 0).then_some((sidebar_width, width)))
+                    // Same content offset for regions and columns; the fallback
+                    // marks the full content span so pane columns are never
+                    // selectable transcript regardless of the docked edge.
+                    column.map(|(start, end)| (start + content_col, end + content_col))
+                        .or_else(|| (sidebar_width > 0).then_some((content_col, content_col + content_width)))
                 }));
                 padding_line = format!("{prefix}{}", component.borrow().get_fullscreen_padding());
                 transcript.extend(component_lines.into_iter().map(|line| format!("{prefix}{line}")));
@@ -2310,25 +2471,56 @@ impl TUI {
             let rows = sidebar.borrow_mut().render_with_height(sidebar_width as f64, pane_height);
             for (row, line) in rows.iter().take(pane_height).enumerate() {
                 if let Some(base) = frame.get_mut(header_height + row) {
-                    if is_image_line(base)
-                        && base.len() >= sidebar_width
-                        && base[..sidebar_width].chars().all(|c| c == ' ')
-                    {
-                        // PR78 sidebar compatibility: a graphics row must never
-                        // pass through text slicing. Replace ONLY the leading
-                        // sidebar-width prefix (plain spaces) with the clipped/
-                        // padded sidebar row plus an SGR reset and append the
-                        // graphics suffix byte-for-byte.
-                        let suffix = &base[sidebar_width..];
-                        let mut sidebar_row = line.clone();
-                        let visible = visible_width(&sidebar_row);
-                        if visible < sidebar_width {
-                            sidebar_row.push_str(&" ".repeat(sidebar_width - visible));
+                    if is_image_line(base) {
+                        if sidebar_col == 0 {
+                            if base.len() >= sidebar_width
+                                && base[..sidebar_width].chars().all(|c| c == ' ')
+                            {
+                                // PR78 sidebar compatibility: a graphics row must never
+                                // pass through text slicing. Replace ONLY the leading
+                                // sidebar-width prefix (plain spaces) with the clipped/
+                                // padded sidebar row plus an SGR reset and append the
+                                // graphics suffix byte-for-byte.
+                                let suffix = &base[sidebar_width..];
+                                let mut sidebar_row = line.clone();
+                                let visible = visible_width(&sidebar_row);
+                                if visible < sidebar_width {
+                                    sidebar_row.push_str(&" ".repeat(sidebar_width - visible));
+                                }
+                                *base = format!("{sidebar_row}\x1b[0m{suffix}");
+                            }
+                            // A left-edge graphics row without the plain prefix
+                            // cannot take pane text either; it stays untouched,
+                            // the rule overlays use for image lines.
+                            continue;
                         }
-                        *base = format!("{sidebar_row}\x1b[0m{suffix}");
-                    } else {
-                        *base = self.composite_line_at(base, line, 0, sidebar_width as i64, width as i64);
+                        if image_row_count(base).is_some() {
+                            // Right edge, managed image (cursor-save/up/payload/
+                            // restore): the payload's restore returns the cursor
+                            // to this row's start, so an absolute column move
+                            // plus the pane row paints the sidebar on the same
+                            // row without touching one payload byte.
+                            let mut sidebar_row = line.clone();
+                            let visible = visible_width(&sidebar_row);
+                            if visible < sidebar_width {
+                                sidebar_row.push_str(&" ".repeat(sidebar_width - visible));
+                            } else if visible > sidebar_width {
+                                // Clip text rows only (never a graphics payload):
+                                // `slice_by_column` wraps `slice_with_width` and
+                                // returns the clipped text directly.
+                                sidebar_row =
+                                    slice_by_column(&sidebar_row, 0, sidebar_width, true);
+                            }
+                            *base =
+                                format!("{base}\x1b[{}G{sidebar_row}\x1b[0m", sidebar_col + 1);
+                            continue;
+                        }
+                        // Unmanaged graphics have no trustworthy row bounds (the
+                        // cursor position after the payload is unknown), so the
+                        // row stays untouched - overlays use the same rule.
+                        continue;
                     }
+                    *base = self.composite_line_at(base, line, sidebar_col as i64, sidebar_width as i64, width as i64);
                 }
             }
         }
@@ -2345,7 +2537,7 @@ impl TUI {
             let label_width = visible_width(&label);
             let row = window_height.saturating_sub(1);
             if row < frame.len() && label_width <= width {
-                let col = sidebar_width + content_width.saturating_sub(label_width) / 2;
+                let col = content_col + content_width.saturating_sub(label_width) / 2;
                 frame[row] = self.composite_line_at(
                     &frame[row],
                     &format!("\x1b[7m{label}\x1b[27m"),
@@ -3784,6 +3976,213 @@ mod tests {
         tui.set_fullscreen_sidebar(None);
         tui.do_render();
         assert_eq!(tui.fullscreen_sidebar_width(), 0);
+    }
+
+    // ---- UI-010 placement/hide layout primitives (repair25-layout lane) ----
+
+    #[test]
+    fn sidebar_bounds_and_hits_track_both_edges_and_hidden() {
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(80, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(false));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(Line("hello")))],
+            dock: Rc::new(RefCell::new(Line("prompt"))),
+            mouse: true, viewport_controls: true,
+        });
+        tui.set_fullscreen_header(Some(Rc::new(RefCell::new(Line("OPTIMUS")))));
+        tui.set_fullscreen_sidebar(Some(Rc::new(RefCell::new(Line("Sessions")))));
+        tui.do_render();
+        // Left edge: pane spans columns [0, 20); hits land below the header only.
+        assert_eq!(
+            tui.fullscreen_sidebar_bounds(),
+            Some(FullscreenSidebarBounds { col: 0, width: 20 })
+        );
+        assert!(tui.fullscreen_sidebar_hit(20, 2));
+        assert!(!tui.fullscreen_sidebar_hit(21, 2), "first content column is not pane");
+        assert!(!tui.fullscreen_sidebar_hit(20, 1), "header row is not pane");
+
+        // Right edge: pane spans columns [60, 80).
+        assert_eq!(tui.toggle_fullscreen_sidebar_side(), FullscreenSidebarSide::Right);
+        tui.do_render();
+        assert_eq!(
+            tui.fullscreen_sidebar_bounds(),
+            Some(FullscreenSidebarBounds { col: 60, width: 20 })
+        );
+        assert!(tui.fullscreen_sidebar_hit(61, 2));
+        assert!(tui.fullscreen_sidebar_hit(80, 2));
+        assert!(!tui.fullscreen_sidebar_hit(60, 2), "last content column is not pane");
+        assert!(!tui.fullscreen_sidebar_hit(1, 2));
+
+        // Hidden: no bounds and no hit anywhere, width released to content.
+        assert!(tui.toggle_fullscreen_sidebar_hidden());
+        tui.do_render();
+        assert_eq!(tui.fullscreen_sidebar_width(), 0);
+        assert_eq!(tui.fullscreen_sidebar_bounds(), None);
+        assert!(!tui.fullscreen_sidebar_hit(1, 2));
+        assert!(!tui.fullscreen_sidebar_hit(80, 2));
+
+        // Unhide restores the pane on the same (right) edge; toggle returns left.
+        assert!(!tui.toggle_fullscreen_sidebar_hidden());
+        tui.do_render();
+        assert_eq!(
+            tui.fullscreen_sidebar_bounds(),
+            Some(FullscreenSidebarBounds { col: 60, width: 20 })
+        );
+        assert_eq!(tui.toggle_fullscreen_sidebar_side(), FullscreenSidebarSide::Left);
+        tui.do_render();
+        assert_eq!(
+            tui.fullscreen_sidebar_bounds(),
+            Some(FullscreenSidebarBounds { col: 0, width: 20 })
+        );
+    }
+
+    #[test]
+    fn right_edge_sidebar_composes_content_from_column_zero() {
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(80, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(true));
+        let copied = Rc::new(RefCell::new(String::new()));
+        let sink = copied.clone();
+        tui.on_copy = Some(Box::new(move |text| *sink.borrow_mut() = text.into()));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(Line("hello"))), Rc::new(RefCell::new(Line("world")))],
+            dock: Rc::new(RefCell::new(Line("prompt \x1b_pi:c\x07"))),
+            mouse: true, viewport_controls: true,
+        });
+        tui.set_fullscreen_header(Some(Rc::new(RefCell::new(Line("OPTIMUS version")))));
+        tui.set_fullscreen_sidebar(Some(Rc::new(RefCell::new(Line("Sessions")))));
+        tui.toggle_fullscreen_sidebar_side();
+        tui.do_render();
+        assert!(terminal.borrow().written.contains("Sessions"));
+        // Content starts at column 0, so the editor cursor keeps its own
+        // coordinates instead of carrying the left-pane offset.
+        assert!(terminal.borrow().written.contains("\x1b[8;8H"), "editor cursor keeps content coordinates");
+        // A drag across the content and into the pane copies content only.
+        tui.handle_fullscreen_input("\x1b[<0;1;2M");
+        tui.handle_fullscreen_input("\x1b[<32;70;3M");
+        tui.handle_fullscreen_input("\x1b[<0;70;3m");
+        assert_eq!(*copied.borrow(), "hello\nworld", "copy must exclude the right pane and header");
+    }
+
+    #[test]
+    fn hidden_sidebar_releases_content_width_without_losing_pane_state() {
+        struct PaneProbe {
+            label: &'static str,
+        }
+        impl Component for PaneProbe {
+            fn render(&mut self, _width: f64) -> Vec<String> {
+                vec![self.label.to_string()]
+            }
+            fn invalidate(&mut self) {}
+        }
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(80, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(true));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(Line("hello")))],
+            dock: Rc::new(RefCell::new(Line("prompt \x1b_pi:c\x07"))),
+            mouse: true, viewport_controls: true,
+        });
+        let pane = Rc::new(RefCell::new(PaneProbe { label: "Sessions" }));
+        let pane_dyn: Rc<RefCell<dyn Component>> = pane.clone();
+        tui.set_fullscreen_sidebar(Some(pane_dyn.clone()));
+        tui.do_render();
+        let mounted = tui.fullscreen.as_ref().and_then(|state| state.sidebar.clone()).unwrap();
+        assert!(Rc::ptr_eq(&mounted, &pane_dyn));
+        assert!(terminal.borrow().written.contains("Sessions"));
+        assert!(terminal.borrow().written.contains("\x1b[8;28H"), "shown pane shifts the editor cursor");
+
+        tui.set_fullscreen_sidebar_hidden(true);
+        tui.do_render();
+        assert_eq!(tui.fullscreen_sidebar_width(), 0);
+        // Hiding must not unmount the component: selection/folder state lives in it.
+        let still_mounted = tui.fullscreen.as_ref().and_then(|state| state.sidebar.clone()).unwrap();
+        assert!(Rc::ptr_eq(&still_mounted, &pane_dyn), "hide must not unmount the pane");
+        // Content reclaims the full width: the editor cursor loses the pane offset.
+        assert!(terminal.borrow().written.contains("\x1b[8;8H"), "hidden pane releases its columns");
+
+        tui.set_fullscreen_sidebar_hidden(false);
+        tui.do_render();
+        assert_eq!(tui.fullscreen_sidebar_width(), 20);
+        let restored = tui.fullscreen.as_ref().and_then(|state| state.sidebar.clone()).unwrap();
+        assert!(Rc::ptr_eq(&restored, &pane_dyn), "show must restore the same component");
+        assert!(terminal.borrow().written.contains("Sessions"));
+    }
+
+    #[test]
+    fn pane_graphics_rows_keep_payloads_byte_for_byte_on_both_edges() {
+        use crate::terminal_image::position_image;
+        struct ImageLine(String);
+        impl Component for ImageLine {
+            fn render(&mut self, _width: f64) -> Vec<String> {
+                vec![position_image(&self.0, 1)]
+            }
+            fn invalidate(&mut self) {}
+        }
+        let payload = "\x1b_Gf=24,s=2,v=1,i=7;QUJD\x1b\\";
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(80, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(false));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(ImageLine(payload.to_string())))],
+            dock: Rc::new(RefCell::new(Line("prompt"))),
+            mouse: true, viewport_controls: false,
+        });
+        tui.set_fullscreen_sidebar(Some(Rc::new(RefCell::new(Line("Sessions")))));
+        tui.do_render();
+        // Left edge: the PR78 splice replaces only the plain-space prefix; the
+        // payload suffix survives byte-for-byte after an SGR reset.
+        let written = terminal.borrow().written.clone();
+        assert!(
+            written.contains(&format!("Sessions{}\x1b[0m\x1b[s", " ".repeat(12))),
+            "left edge splices the padded pane row before the payload"
+        );
+        assert!(
+            written.contains(&position_image(payload, 1)),
+            "left edge keeps the payload byte-for-byte"
+        );
+
+        tui.toggle_fullscreen_sidebar_side();
+        tui.do_render();
+        // Right edge: the managed image row keeps the payload untouched and
+        // appends an absolutely-positioned pane segment after its cursor
+        // restore, so the sidebar stays visible without slicing the payload.
+        let written = terminal.borrow().written.clone();
+        assert!(
+            written.contains(&format!("\x1b[u\x1b[61GSessions{}\x1b[0m", " ".repeat(12))),
+            "right edge paints the pane on the managed image row"
+        );
+        assert!(
+            written.contains(&format!("{}\x1b[61G", position_image(payload, 1))),
+            "right edge appends the pane segment after the untouched payload"
+        );
+        assert!(written.contains(payload), "payload bytes are never rewritten");
+    }
+
+    #[test]
+    fn unambiguous_ctrl_combo_rejects_only_reserved_editing_bytes() {
+        // Self-identifying transports pass: Kitty CSI-u, modifyOtherKeys, and
+        // the Windows ReadConsoleInputW re-encoding (same CSI-u forms).
+        assert!(is_unambiguous_ctrl_combo("\x1b[104;5u"), "kitty CSI-u Ctrl+H");
+        assert!(is_unambiguous_ctrl_combo("\x1b[109;5u"), "kitty CSI-u Ctrl+M");
+        assert!(is_unambiguous_ctrl_combo("\x1b[27;5;104~"), "modifyOtherKeys Ctrl+H");
+        assert!(is_unambiguous_ctrl_combo("\x1b[27;5;109~"), "modifyOtherKeys Ctrl+M");
+        assert!(is_unambiguous_ctrl_combo("\x1b[1;5D"), "legacy ctrl+left");
+        // Raw reserved editing bytes are rejected: they decode as
+        // Enter/Backspace/DEL/Tab just as much as Ctrl+M/Ctrl+H/Ctrl+I.
+        assert!(!is_unambiguous_ctrl_combo("\r"));
+        assert!(!is_unambiguous_ctrl_combo("\n"));
+        assert!(!is_unambiguous_ctrl_combo("\x08"));
+        assert!(!is_unambiguous_ctrl_combo("\x7f"));
+        assert!(!is_unambiguous_ctrl_combo("\t"));
+        // Safe raw remaps keep working in raw terminals.
+        assert!(is_unambiguous_ctrl_combo("\x07"), "raw Ctrl+G remap");
+        assert!(is_unambiguous_ctrl_combo("\x11"), "raw Ctrl+Q remap");
+        // Mouse reports never reach a ctrl dispatch.
+        assert!(!is_unambiguous_ctrl_combo("\x1b[<0;1;1M"));
+        // The decode facts the guard encodes.
+        assert!(matches_key("\x1b[104;5u", "ctrl+h"));
+        assert!(matches_key("\x1b[109;5u", "ctrl+m"));
+        assert!(matches_key("\r", "ctrl+m"), "raw CR is ambiguous with Enter");
+        assert!(matches_key("\r", "enter"));
+        assert!(matches_key("\x08", "ctrl+h"), "raw BS is ambiguous with backspace");
     }
 
     #[test]

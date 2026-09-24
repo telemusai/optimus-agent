@@ -1,0 +1,2 @@
+- Fixed missing native capability provenance by deriving source and runtime pins in ordinary Cargo builds.
+- Added offline embedded build-receipt inspection and fail-closed source, runtime, resource, and identity checks for portable staging and reinstalls.

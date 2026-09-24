@@ -84,9 +84,19 @@ class SourceInstallTests(unittest.TestCase):
         for name in ['install.sh', 'LICENSE', 'README.md']:
             shutil.copy2(ROOT / name, self.repo / name)
         (self.repo / 'resources/agent/package.json').write_text('{"version":"0.1.1"}')
-        (self.repo / 'prime-agent-runtime/pyproject.toml').write_text('# fixture')
+        (self.repo / 'prime-agent-runtime/pyproject.toml').write_text('[project]\nversion = "0.1.1"\n')
+        runtime = self.repo / 'prime-agent-runtime/src/rlm'
+        runtime.mkdir(parents=True)
+        (runtime / '__init__.py').write_text('# synthetic runtime')
+        (runtime / 'lifecycle.py').write_text('# synthetic lifecycle')
+        (self.repo / 'Cargo.toml').write_text('# synthetic Cargo workspace')
+        (self.repo / 'Cargo.lock').write_text('# synthetic locked dependencies')
+        native = self.repo / 'crates/example/src'
+        native.mkdir(parents=True)
+        (native.parent / 'Cargo.toml').write_text('# synthetic crate')
+        (native / 'lib.rs').write_text('// synthetic native source')
         self.git('init', '--quiet')
-        self.git('add', 'resources', 'prime-agent-runtime', 'scripts', 'install.sh', 'LICENSE', 'README.md')
+        self.git('add', 'resources', 'prime-agent-runtime', 'scripts', 'install.sh', 'LICENSE', 'README.md', 'Cargo.toml', 'Cargo.lock', 'crates')
         self.git('-c', 'user.name=Installer Test', '-c', 'user.email=installer@example.invalid',
                  'commit', '--quiet', '-m', 'Synthetic release')
         self.git('tag', 'v0.1.1')
@@ -95,11 +105,22 @@ class SourceInstallTests(unittest.TestCase):
         self.commands.mkdir()
         cargo = self.commands / 'cargo'
         cargo.write_text('''#!/usr/bin/env python3
-import os
+import importlib.util, json, os, sys
 from pathlib import Path
+root = Path.cwd()
+spec = importlib.util.spec_from_file_location('rust_release', root / 'scripts/rust_release.py')
+release = importlib.util.module_from_spec(spec)
+spec.loader.exec_module(release)
+receipt = {'schema':release.PROVENANCE_SCHEMA, 'version':'0.1.1',
+    'sourceTreeSha256':release.raw_aggregate(root, release.source_files(root)),
+    'payloadSourceSha256':release.raw_aggregate(root, release.payload_files(root)),
+    'runtimeSourceSha256':release.runtime_source_sha256(root),
+    'target':'x86_64-apple-darwin' if sys.platform == 'darwin' else 'x86_64-unknown-linux-gnu',
+    'profile':'release', 'rustc':'rustc synthetic installer fixture', 'buildOptionsSha256':'1'*64}
+receipt['buildFingerprint'] = release.build_fingerprint(receipt)
 p = Path(os.environ['CARGO_TARGET_DIR']) / 'release/optimus-rust'
 p.parent.mkdir(parents=True)
-p.write_text('#!/bin/sh\\nprintf "0.1.1\\\\n"\\n')
+p.write_text('#!/usr/bin/env python3\\nimport sys\\nprint(' + repr(json.dumps(receipt)) + ' if sys.argv[1:] == ["--build-provenance"] else "0.1.1")\\n')
 p.chmod(0o755)
 ''')
         cargo.chmod(0o755)

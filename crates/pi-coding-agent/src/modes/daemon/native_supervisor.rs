@@ -44,7 +44,10 @@ use crate::core::agent_messages::{
     session_name_reservation_key, AgentFamilyCatalogEntry, AgentSessionNameAvailabilityInput,
     AgentSessionNameScope, AgentSessionMessageAgentSummary,
 };
-use super::super::rlm_ledger::{create_rlm_ledger_registry_seed_source, RlmLedgerEdge, RlmSpawnLedger};
+use super::super::rlm_ledger::{
+    create_rlm_ledger_registry_seed_source, tombstone_saved_session_delete, RlmLedgerEdge,
+    RlmSpawnLedger,
+};
 use super::super::daemon_socket::*;
 use super::super::daemon_supervisor_ownership::*;
 use super::super::daemon_worker_client::{DaemonWorkerClient, PrivateFrame};
@@ -2870,6 +2873,66 @@ impl Supervisor {
                 )
                 .await;
                 return Ok(success(Some(json!({"sessions":sessions.iter().map(serialize_saved_session_info).collect::<Vec<_>>()}))));
+            }
+            // `case "delete_saved_session"` (daemon-supervisor.ts:2677-2697): without an
+            // `activeSessionId` the supervisor owns the delete. A roster row that went
+            // active refuses, an owner worker is honoured (live client forward, else stale
+            // registration reclaim), the ledger tombstone runs before the catalog delete,
+            // and the roster row is removed only when it is still the same entry. With an
+            // `activeSessionId` the generic forward below still routes to the owning worker
+            // (UI-007: the workspace deletes saved chats without an id).
+            "delete_saved_session" if body.get("activeSessionId").and_then(Value::as_str).is_none() => {
+                let session_path = body.get("sessionPath").and_then(Value::as_str)
+                    .ok_or("sessionPath is required")?.to_string();
+                let entry = self.roster().lock().unwrap().by_session_file(&canonical_session_path(&session_path));
+                if entry.as_ref().is_some_and(|entry| entry.summary.active_session_id.is_some()) {
+                    return Err("Cannot delete the currently active session".into());
+                }
+                if let Some(owner) = self.find_worker_by_session_file(&session_path, None) {
+                    // A client-owned worker's files are invisible to other clients: a
+                    // foreign delete is an unknown target (assertWorkerAccessibleToClient).
+                    if !visible(&owner, &public.identity()) { return Err(format!("Unknown active session: {session_path}")); }
+                    let stopping = owner.descriptor.lock().unwrap().stop_requested_at.is_some();
+                    let live_client = owner.client.lock().unwrap().as_ref().is_some_and(|client| client.is_connected());
+                    if live_client && !stopping {
+                        let client = self.connected_client(&owner).await?;
+                        let mut response = client.request(body.clone(), REQUEST_TIMEOUT, DaemonClientRequestOptions::default()).await.map_err(|error| error.to_string())?;
+                        response.id = id;
+                        response.command = kind.clone();
+                        return Ok(Some(response));
+                    }
+                    if !self.reclaim_stale_worker_registration(&owner).await? {
+                        return Err(format!("Session worker is {}; retry the delete once it is reachable", self.effective_worker_state(&owner)));
+                    }
+                }
+                // No owner must also mean no ambiguous/stale identity match. Never
+                // fall through to an on-disk delete when worker identity is uncertain.
+                let _opening = self.opening.write().await;
+                let target = canonical_session_path(&session_path);
+                let roster_now = self.roster().lock().unwrap().by_session_file(&target);
+                if roster_now.as_ref().is_some_and(|row| row.summary.active_session_id.is_some()) {
+                    return Err("Cannot delete the currently active session".into());
+                }
+                if self.workers.lock().unwrap().values().any(|worker| {
+                    let descriptor = worker.descriptor.lock().unwrap();
+                    roster_now.as_ref().and_then(|row| row.worker_id.as_deref()) == Some(descriptor.worker_id.as_str())
+                        || [&descriptor.session_file, &descriptor.create_command.session_path].into_iter()
+                            .flatten().any(|path| canonical_session_path(path) == target)
+                }) {
+                    return Err("Cannot safely delete a session with a registered worker".into());
+                }
+                let known_runtime_kind = entry.as_ref().and_then(|entry| entry.summary.runtime_kind.clone());
+                let ledger = self.rlm_spawn_ledger().await?;
+                let _tombstone = tombstone_saved_session_delete(&ledger, &session_path, known_runtime_kind.as_deref()).await;
+                let result = self.catalog.delete(&session_path).await?;
+                if result.get("ok").and_then(Value::as_bool) == Some(true) {
+                    let roster = self.roster();
+                    let mut roster = roster.lock().unwrap();
+                    if let Some(entry) = &entry {
+                        if roster.get(&entry.agent_id).is_some_and(|current| current == *entry) { roster.delete(&entry.agent_id); }
+                    }
+                }
+                return Ok(success(Some(result)));
             }
             // `case "shutdown"` (daemon-supervisor.ts:2418-2420): the success reply is returned
             // immediately through `setImmediate`, the `daemon_closing` broadcast goes out BEFORE

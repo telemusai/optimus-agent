@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 pub type AppKeybinding = &'static str;
 
 /// `keyof AppKeybindings` in declaration order.
-pub const APP_KEYBINDINGS: [AppKeybinding; 62] = [
+pub const APP_KEYBINDINGS: [AppKeybinding; 65] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -51,6 +51,17 @@ pub const APP_KEYBINDINGS: [AppKeybinding; 62] = [
     "app.sidebar.focus",
     "app.sidebar.chat",
     "app.sidebar.addFolder",
+    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
+    // repair25-layout lane, root-approved): UI-010 sidebar shortcuts. Defaults
+    // are the user-requested Ctrl+H / Ctrl+M; host dispatch gates them on
+    // pi_tui::tui::is_unambiguous_ctrl_combo so the raw Enter/Backspace-class
+    // bytes they share on legacy terminals never trigger the actions.
+    "app.sidebar.toggleVisibility",
+    "app.sidebar.toggleSide",
+    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
+    // repair25-layout lane, root-approved): registered for the integrator's
+    // UI-009 full-location view; host wiring lives in the integrator's files.
+    "app.sidebar.location",
     "app.agents.delete",
     "app.agents.program",
     "app.agents.rename",
@@ -438,6 +449,23 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
         ("app.sidebar.focus", "left", "Focus sessions when the prompt cursor is at the start"),
         ("app.sidebar.chat", "right", "Return focus to the chat"),
         ("app.sidebar.addFolder", "ctrl+a", "Add an existing folder to the session sidebar"),
+    ] {
+        map.insert(id.to_string(), KeybindingDefinition {
+            default_keys: vec![key.to_string()],
+            default_keys_is_single: true,
+            description: Some(description.to_string()),
+            default_key_scope: None,
+        });
+    }
+    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
+    // repair25-layout lane, root-approved): see `APP_KEYBINDINGS`. Hosts pair
+    // these with pi_tui::tui::is_unambiguous_ctrl_combo so raw CR/BS/DEL keep
+    // their editing meaning on terminals that cannot distinguish the combos.
+    for (id, key, description) in [
+        ("app.sidebar.toggleVisibility", "ctrl+h", "Hide or show the session sidebar"),
+        ("app.sidebar.toggleSide", "ctrl+m", "Move the session sidebar to the other edge"),
+        // Registered on behalf of the integrator's UI-009 full-location view.
+        ("app.sidebar.location", "ctrl+shift+l", "Show the full location of the selected project or chat"),
     ] {
         map.insert(id.to_string(), KeybindingDefinition {
             default_keys: vec![key.to_string()],
