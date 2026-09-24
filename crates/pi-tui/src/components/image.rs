@@ -5,7 +5,7 @@ use std::cell::Cell;
 use crate::terminal_image::{
     allocate_image_id, cell_dimensions_known, get_capabilities, get_cell_dimensions, get_image_dimensions, image_fallback,
     position_image, render_image, CellDimensions, ImageDimensions, ImageProtocol, ImageRenderOptions,
-    get_sixel_limits, SixelLimits, MAX_IMAGE_ROWS,
+    get_sixel_limits, image_protocol_forced, render_ansi_image, SixelLimits, TerminalCapabilities, MAX_IMAGE_ROWS,
 };
 use crate::tui::Component;
 
@@ -67,7 +67,7 @@ pub struct Image {
     cached_lines: Option<Vec<String>>,
     cached_width: Option<usize>,
     cached_fullscreen_fallback: Option<bool>,
-    cached_geometry: Option<(Option<ImageProtocol>, CellDimensions, bool, usize, SixelLimits)>,
+    cached_geometry: Option<(TerminalCapabilities, CellDimensions, bool, usize, SixelLimits, bool)>,
 }
 
 impl Image {
@@ -107,6 +107,17 @@ impl Image {
     pub fn dimensions(&self) -> &ImageDimensions {
         &self.dimensions
     }
+
+    fn fallback_lines(&self, ansi_allowed: bool, width: usize, height: usize) -> Vec<String> {
+        if ansi_allowed {
+            if let Some(lines) = render_ansi_image(&self.base64_data, width, height) {
+                return lines;
+            }
+        }
+        vec![(self.theme.fallback_color)(&image_fallback(
+            &self.mime_type, Some(&self.dimensions), self.options.filename.as_deref(),
+        ))]
+    }
 }
 
 impl Component for Image {
@@ -116,7 +127,8 @@ impl Component for Image {
         let caps = get_capabilities();
         let height = HEIGHT_LIMIT.with(|limit| limit.get())
             .min(self.options.max_height_cells.unwrap_or(MAX_IMAGE_ROWS));
-        let geometry = (caps.images, get_cell_dimensions(), cell_dimensions_known(), height, get_sixel_limits());
+        let ansi_allowed = !fallback_flag && caps.true_color && !image_protocol_forced();
+        let geometry = (caps, get_cell_dimensions(), cell_dimensions_known(), height, get_sixel_limits(), ansi_allowed);
         if let (Some(lines), Some(cached_width), Some(cached_fallback)) = (
             &self.cached_lines,
             self.cached_width,
@@ -171,21 +183,11 @@ impl Component for Image {
                     lines = rendered;
                 }
                 None => {
-                    let fallback = image_fallback(
-                        &self.mime_type,
-                        Some(&self.dimensions),
-                        self.options.filename.as_deref(),
-                    );
-                    lines = vec![(self.theme.fallback_color)(&fallback)];
+                    lines = self.fallback_lines(ansi_allowed, max_width.max(0) as usize, height);
                 }
             }
         } else {
-            let fallback = image_fallback(
-                &self.mime_type,
-                Some(&self.dimensions),
-                self.options.filename.as_deref(),
-            );
-            lines = vec![(self.theme.fallback_color)(&fallback)];
+            lines = self.fallback_lines(ansi_allowed, max_width.max(0) as usize, height);
         }
 
         let lines: Vec<_> = lines.into_iter().map(|line| {
@@ -245,6 +247,8 @@ mod tests {
         set_capabilities(caps(None));
         let mut image = Image::new(test_png(72, 144), "image/png".into(),
             ImageTheme { fallback_color: Box::new(str::to_string) }, ImageOptions::default(), None);
+        assert!(image.render(40.0)[0].contains('▀'));
+        set_capabilities(TerminalCapabilities { images: None, true_color: false, hyperlinks: false });
         assert!(image.render(40.0)[0].contains("Cannot display image"));
         set_capabilities(caps(Some(ImageProtocol::Sixel)));
         set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });

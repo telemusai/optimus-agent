@@ -45,6 +45,12 @@ fn panel() -> (StatsPanel, mpsc::Receiver<HostEvent>) {
 #[test]
 fn panel_uses_ascii_and_fits_narrow_and_short_terminals() {
     let (mut panel, _) = panel();
+    {
+        let mut data = panel.data.lock().unwrap();
+        let snapshot = data.snapshot.as_mut().unwrap();
+        snapshot.full_jev = true;
+        snapshot.jev_mode = "compare-active".into();
+    }
     for width in [1, 10, 28, 40, 80, 160] {
         for height in [4, 8, 24, 50] {
             for page in 0..4 {
@@ -100,9 +106,24 @@ fn section_scope_and_escape_are_local_and_remappable() {
 fn missing_metrics_are_not_rendered_as_proven_savings() {
     let (mut panel, _) = panel();
     let text = panel.render_at(100, 50).join("\n");
-    assert!(text.contains("Search     unavailable"));
-    assert!(text.contains("Live JEV activity: unavailable"));
+    assert!(text.contains("Search     No measured savings yet"));
+    assert!(text.contains("Live JEV activity: no worker status available"));
     assert!(!text.contains("$0.0000"));
+    {
+        let mut data = panel.data.lock().unwrap();
+        let snapshot = data.snapshot.as_mut().unwrap();
+        snapshot.full_jev = true;
+        snapshot.jev_mode = "compare-active".into();
+        snapshot.pipeline = json!({"usage":{"activity":"idle","in_flight":0,"failed":0,"cancelled":0}});
+    }
+    panel.page = 2;
+    let text = panel.render_at(100, 50).join("\n");
+    assert!(text.contains("FULL JEV (ACTIVE + COMPARISON LOGGING)"));
+    assert!(text.contains("Full JEV includes Active; accepted decisions can apply."));
+    assert!(text.contains("Comparison logging uses the same JEV request."));
+    assert!(text.contains("Live/current chat: idle"));
+    assert!(text.contains("Search     No measured savings yet"));
+    assert!(text.contains("JEV compaction: no measured reduction yet"));
     panel.page = 3;
     assert!(panel.render_at(100, 50).join("\n").contains("#"));
 }

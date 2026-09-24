@@ -533,6 +533,9 @@ async def _run_codes(codes: list[types.CodeType], ns: dict[str, Any]) -> Any:
         value = eval(code_obj, ns)  # noqa: S307 - executing the model's cell is the runtime's job
         if code_obj.co_flags & inspect.CO_COROUTINE:
             value = await value
+    backend = sys.modules.get("rlm.matplotlib_backend")
+    if backend is not None:
+        backend.flush_figures()
     return value
 
 
@@ -1459,6 +1462,10 @@ def main() -> None:
     global _loop, _serve_task
     stdin_fd = _setup_fds()
     _start_owner_watchdog()
+
+    # pyplot imports the backend lazily. Respect an explicitly selected backend.
+    if not os.environ.get("MPLBACKEND"):
+        os.environ["MPLBACKEND"] = "module://rlm.matplotlib_backend"
 
     # Alias the executing module so an in-cell `from rlm.repl import emit`
     # binds the live module, not a second copy.

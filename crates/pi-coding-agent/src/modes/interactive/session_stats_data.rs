@@ -325,6 +325,7 @@ pub(super) struct Snapshot {
     pub jev: JevAccounting,
     pub context: Value,
     pub jev_mode: String,
+    pub full_jev: bool,
     pub jev_compaction: bool,
     pub features: Vec<(String, bool)>,
     pub pipeline: Value,
@@ -412,6 +413,7 @@ impl Loader {
         };
         let settings = pi_jev::config::JevSettingsStore::new(crate::config::get_agent_dir()).load();
         result.jev_mode = settings.effective_mode(&state.session_id).as_str().into();
+        result.full_jev = settings.full_jev_active();
         result.jev_compaction = settings.effective_compaction_enabled(&state.session_id);
         if let Ok(Value::Object(features)) =
             serde_json::to_value(settings.effective_features(&state.session_id))
