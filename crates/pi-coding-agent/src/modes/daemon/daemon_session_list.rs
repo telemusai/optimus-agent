@@ -422,7 +422,11 @@ pub fn summary_for_active_session(
         session_id: session.session_id.clone(),
         session_file: session.session_file.clone(),
         session_name: session.session_name.clone(),
-        cwd: String::new(),
+        // TS reads the live session cwd (`session.sessionManager.getCwd()`,
+        // daemon-session-list.ts:256). This builder only sees the bind-time
+        // view, so the saved twin's recorded repo cwd is the faithful value;
+        // empty stays reserved for genuinely unknown (UI008/UI011 grouping).
+        cwd: saved_session.map(|saved| saved.cwd.clone()).unwrap_or_default(),
         // `daemon-session-list.ts:257-258` copies the live model and thinking level onto
         // every summary; the `--print`/`--json` clients gate on `summary.model`
         // (`main.ts:1628`), so leaving it unset made every attach fail with
@@ -879,6 +883,19 @@ mod tests {
         let summary = summary_for_active_session(&state, None, false, false, false);
         assert_eq!(summary.activity, "working");
         assert!(summary.status_label.is_none());
+    }
+
+    #[test]
+    fn sidebar_followup_active_summary_keeps_saved_cwd_without_new_wire_fields() {
+        let mut runtime = super::super::active_session_state::AgentSessionRuntime::default();
+        runtime.session.session_id = "s".into();
+        let state = Arc::new(StdMutex::new(ActiveSessionState::new("a", runtime)));
+        let mut saved = saved_session();
+        saved.cwd = r"C:\work\distinct-project\source".into();
+        let summary = summary_for_active_session(&state, Some(&saved), false, false, false);
+        assert_eq!(summary.cwd, saved.cwd);
+        assert_eq!(serde_json::to_value(&summary).unwrap()["cwd"], saved.cwd);
+        assert!(summary_for_active_session(&state, None, false, false, false).cwd.is_empty());
     }
 
     #[test]

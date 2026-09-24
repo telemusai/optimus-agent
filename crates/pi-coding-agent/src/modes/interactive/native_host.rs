@@ -1578,7 +1578,7 @@ async fn run_terminal(
     let input_received = Rc::new(Cell::new(None::<Instant>));
     let viewport_input = Rc::new(Cell::new(false));
     let history_requested = Rc::new(Cell::new(false));
-    let sidebar_bounds = Rc::new(Cell::new((0usize, 0usize, false)));
+    let sidebar_bounds = Rc::new(Cell::new((None::<pi_tui::tui::FullscreenSidebarBounds>, 0usize, false)));
     {
         let input = input.clone();
         let mode = mode.clone();
@@ -1592,12 +1592,20 @@ async fn run_terminal(
             if !pi_tui::keys::is_key_release(data) && input_received.get().is_none() {
                 input_received.set(Some(Instant::now()));
             }
-            let (pane_width, header_height, overlay_focused) = sidebar_bounds.get();
-            if !overlay_focused && pi_tui::mouse::parse_sgr_mouse_event(data).is_some_and(|mouse|
-                mouse.x <= pane_width as i64 && mouse.y > header_height as i64)
-            {
-                input.borrow_mut().push(data.to_string());
-                return InputListenerResult { consume: true, data: None };
+            let (bounds, header_height, overlay_focused) = sidebar_bounds.get();
+            // The cached bounds mirror `fullscreen_sidebar_hit` for both edges
+            // (hidden/unmounted is `None`, so the pane never claims mouse input).
+            if !overlay_focused {
+                if let Some(mouse) = pi_tui::mouse::parse_sgr_mouse_event(data) {
+                    if bounds.is_some_and(|bounds| {
+                        mouse.y > header_height as i64
+                            && mouse.x > bounds.col as i64
+                            && mouse.x <= (bounds.col + bounds.width) as i64
+                    }) {
+                        input.borrow_mut().push(data.to_string());
+                        return InputListenerResult { consume: true, data: None };
+                    }
+                }
             }
             let keys = pi_tui::keybindings::get_keybindings();
             if keys.matches(data, "tui.viewport.pageUp")
@@ -1824,7 +1832,7 @@ async fn run_terminal(
         // (tui.ts:439) and must not steal the viewport keys.
         viewport_input
             .set(ui.borrow().is_fullscreen() && !ui.borrow().is_fullscreen_overlay_focused() && command_dialog.is_none());
-        sidebar_bounds.set((ui.borrow().fullscreen_sidebar_width(), ui.borrow().fullscreen_header_height(), ui.borrow().is_fullscreen_overlay_focused()));
+        sidebar_bounds.set((ui.borrow().fullscreen_sidebar_bounds(), ui.borrow().fullscreen_header_height(), ui.borrow().is_fullscreen_overlay_focused()));
         ui.borrow_mut().drain_input();
         if let Some(received) = input_received.take() { ui_metrics.input(received); }
         if history_requested.replace(false) {
@@ -2120,7 +2128,13 @@ async fn run_terminal(
                         tool.borrow_mut().set_agent_messages_expanded(mode.borrow().agent_messages_expanded);
                     }
                 }
-                InputAction::Subagents | InputAction::AgentsBack => {
+                // UI-006: confirming the sub-agent summary aims the sidebar at a
+                // running child of the current chat; the retired agents-view
+                // hand-off stays gone. `AgentsBack` keeps plain sidebar focus.
+                InputAction::Subagents => {
+                    workspace.focus_subagents(&editor, &ui);
+                }
+                InputAction::AgentsBack => {
                     workspace.focus(&editor);
                 }
                 // Ctrl+S: `handlePromptStash` (interactive-mode.ts:4379-4394).
@@ -7171,6 +7185,12 @@ mod tests {
         .await
         .expect("new command must succeed");
         let events = output.into_events();
+        // A new session first publishes its authoritative snapshot (including
+        // footer state), then sends the verbatim prompt to the owner loop.
+        let snapshot_event = receive
+            .recv_timeout(std::time::Duration::from_secs(5))
+            .expect("the new-session snapshot must precede its prompt");
+        assert!(matches!(snapshot_event, HostEvent::RefreshSnapshot(_)));
         let prompt_event = receive
             .recv_timeout(std::time::Duration::from_secs(5))
             .expect("the new-session prompt must be handed to the owner loop");

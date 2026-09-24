@@ -826,3 +826,171 @@ async fn saved_catalog_streams_and_preserves_descendants(non_default_dir: bool) 
         "the merged row keeps its ledger depth: {sessions:?}"
     );
 }
+
+
+fn sidebar_saved_fixture(fixture: &SupervisorFixture, name: &str, child: bool) -> SessionSummary {
+    let dir = fixture.root.join("sessions"); std::fs::create_dir_all(&dir).unwrap();
+    let path = dir.join(format!("{name}.jsonl"));
+    std::fs::write(&path, format!("{}\n", json!({"type":"session","version":3,"id":name,
+        "timestamp":"2026-09-24T00:00:00Z","cwd":fixture.root.join("workspace"),
+        "parentSessionPath":child.then(|| dir.join("parent.jsonl")),"rlmDepth":if child {1} else {0}}))).unwrap();
+    SessionSummary { id:name.into(), session_id:name.into(), session_file:Some(path.to_string_lossy().into_owned()),
+        cwd:fixture.root.join("workspace").to_string_lossy().into_owned(), lifecycle:"live".into(), activity:"idle".into(),
+        runtime_kind:Some(if child {"subagent"} else {"top-level"}.into()), ..Default::default() }
+}
+
+async fn sidebar_catalog_fixture(fixture: &SupervisorFixture, target: &str, ok: bool, ledger_path: &str) {
+    // Only this explicit, synthetic file may be removed by the scripted catalog.
+    let script = fixture.root.join("sidebar-catalog.py");
+    std::fs::write(&script, r#"import json,sys,pathlib
+allowed=pathlib.Path(sys.argv[1]).resolve()
+ledger=pathlib.Path(sys.argv[2])
+ok=sys.argv[3]=='true'
+def send(value):
+    print(json.dumps(value),flush=True)
+send({'type':'ready'})
+for line in sys.stdin:
+    req=json.loads(line)
+    if req['command']=='shutdown':
+        send({'type':'response','id':req['id'],'success':True,'data':{}})
+        break
+    assert req['command']=='delete', req
+    assert pathlib.Path(req['sessionPath']).resolve()==allowed, req
+    records=[json.loads(line) for line in ledger.read_text().splitlines()] if ledger.exists() else []
+    tombstone=any(record.get('op')=='delete' for record in records)
+    if ok: allowed.unlink()
+    send({'type':'response','id':req['id'],'success':True,'data':{'ok':ok,'method':'unlink','error':'fixture refused','tombstoneSeen':tombstone,'sessionPath':req['sessionPath']}})
+"#).unwrap();
+    fixture.supervisor.catalog.start(if cfg!(windows) {"python"} else {"python3"}, vec![script.to_string_lossy().into_owned(), target.into(), ledger_path.into(), ok.to_string()], Vec::new()).await.unwrap();
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidebar_followup_idless_saved_delete_tombstones_catalog_and_removes_only_selected_roster() {
+    let mut fixture = SupervisorFixture::new("sidebar-idless-delete").await;
+    let target = sidebar_saved_fixture(&fixture, "selected-child", true);
+    let other = sidebar_saved_fixture(&fixture, "unrelated", false);
+    let marker = fixture.root.join("workspace/repo.txt"); std::fs::write(&marker, "repository unchanged").unwrap();
+    let selected_entry = fixture.supervisor.write_roster_entry(worker_roster_entry_from_summary(&target.roster_view()), None, None);
+    let other_entry = fixture.supervisor.write_roster_entry(worker_roster_entry_from_summary(&other.roster_view()), None, None);
+    let ledger = fixture.supervisor.rlm_spawn_ledger().await.unwrap();
+    ledger.append_spawn(crate::modes::daemon::rlm_ledger::RlmSpawnInput {
+        child_id:"selected-child".into(), parent:fixture.root.join("sessions/parent.jsonl").to_string_lossy().into_owned(),
+        child:target.session_file.clone().unwrap(), depth:1, name:"selected child".into(),
+    }).await.unwrap();
+    sidebar_catalog_fixture(&fixture, target.session_file.as_deref().unwrap(), true, ledger.ledger_path()).await;
+    let response = fixture.send(json!({"type":"delete_saved_session","id":"selected-delete","sessionPath":target.session_file})).await;
+    assert_eq!(response["success"], true, "{response}"); assert_eq!(response["data"]["ok"], true);
+    assert_eq!(response["data"]["tombstoneSeen"], true, "ledger tombstone precedes catalog deletion");
+    assert!(!Path::new(target.session_file.as_deref().unwrap()).exists());
+    assert!(Path::new(other.session_file.as_deref().unwrap()).exists());
+    assert_eq!(std::fs::read_to_string(marker).unwrap(), "repository unchanged");
+    assert!(fixture.supervisor.roster().lock().unwrap().get(&selected_entry.agent_id).is_none());
+    assert!(fixture.supervisor.roster().lock().unwrap().get(&other_entry.agent_id).is_some());
+    assert!(ledger.edges(false).await.is_empty());
+    fixture.supervisor.catalog.stop().await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidebar_followup_saved_delete_refuses_active_foreign_and_uncertain_owners() {
+    let mut fixture = SupervisorFixture::new("sidebar-delete-guards").await;
+    let target = sidebar_saved_fixture(&fixture, "selected", false);
+    let active = SessionSummary { active_session_id:Some("currently-active".into()), ..target.clone() };
+    let entry = fixture.supervisor.write_roster_entry(worker_roster_entry_from_summary(&active.roster_view()), None, None);
+    let command = json!({"type":"delete_saved_session","id":"guarded","sessionPath":target.session_file});
+    let response = fixture.send(command.clone()).await;
+    assert_eq!(response["success"], false); assert!(response["error"].as_str().unwrap().contains("currently active"));
+    fixture.supervisor.roster().lock().unwrap().delete(&entry.agent_id);
+    let owner = add_descriptor_only_worker(&fixture, "private-owner", "private-active", "fixture-token", DAEMON_WORKER_LIFECYCLE_READY);
+    owner.descriptor.lock().unwrap().session_file = target.session_file.clone();
+    owner.descriptor.lock().unwrap().owner_client_id = Some("different-client".into());
+    let response = fixture.send(command.clone()).await;
+    assert_eq!(response["success"], false); assert!(response["error"].as_str().unwrap().contains("Unknown active session"));
+    assert!(Path::new(target.session_file.as_deref().unwrap()).exists());
+    // A conflicting descriptor must never turn an owned path into an unowned delete.
+    owner.descriptor.lock().unwrap().owner_client_id = None;
+    owner.descriptor.lock().unwrap().create_command.session_path = Some(fixture.root.join("different.jsonl").to_string_lossy().into_owned());
+    let response = fixture.send(command).await;
+    assert_eq!(response["success"], false); assert!(response["error"].as_str().unwrap().contains("registered worker"));
+    assert!(Path::new(target.session_file.as_deref().unwrap()).exists());
+    let missing = fixture.send(json!({"type":"delete_saved_session","id":"missing-path"})).await;
+    assert!(missing["error"].as_str().unwrap().contains("sessionPath is required"));
+    let explicit = fixture.send(json!({"type":"delete_saved_session","id":"bad-active","activeSessionId":"does-not-exist","sessionPath":target.session_file})).await;
+    assert_eq!(explicit["success"], false); assert!(explicit["error"].as_str().unwrap().contains("Unknown active session"));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidebar_followup_failed_catalog_delete_keeps_saved_file_and_roster() {
+    let mut fixture = SupervisorFixture::new("sidebar-delete-failure").await;
+    let target = sidebar_saved_fixture(&fixture, "selected", false);
+    let entry = fixture.supervisor.write_roster_entry(worker_roster_entry_from_summary(&target.roster_view()), None, None);
+    let ledger = fixture.supervisor.rlm_spawn_ledger().await.unwrap();
+    sidebar_catalog_fixture(&fixture, target.session_file.as_deref().unwrap(), false, ledger.ledger_path()).await;
+    let response = fixture.send(json!({"type":"delete_saved_session","id":"refused","sessionPath":target.session_file})).await;
+    assert_eq!(response["success"], true, "existing response contract returns data.ok=false");
+    assert_eq!(response["data"]["ok"], false);
+    assert!(Path::new(target.session_file.as_deref().unwrap()).exists());
+    assert_eq!(fixture.supervisor.roster().lock().unwrap().get(&entry.agent_id), Some(entry));
+    fixture.supervisor.catalog.stop().await;
+}
+
+
+async fn sidebar_owner_reply<S: AsyncRead + AsyncWrite + Unpin>(mut socket: S, captured: tokio::sync::oneshot::Sender<Value>) {
+    use crate::modes::daemon::daemon_worker_client::{encode_private_frame, PrivateFrameDecoder};
+    let mut decoder = PrivateFrameDecoder::new(); let mut buffer = [0; 8192];
+    loop {
+        let count = socket.read(&mut buffer).await.unwrap(); if count == 0 { return; }
+        if let Some(frame) = decoder.push(&buffer[..count]).unwrap().into_iter().next() {
+            let command: Value = serde_json::from_slice(&frame.payload).unwrap();
+            let reply = json!({"type":"response","id":command["id"],"command":command["type"],"success":true,"data":{"ok":true,"ownerHandled":true}});
+            let frame = encode_private_frame(&json!({"kind":"outbound","outboundType":"response","requestId":command["id"],"payloadEncoding":"jsonl"}), reply.to_string().as_bytes()).unwrap();
+            socket.write_all(&frame).await.unwrap(); let _ = captured.send(command);
+            // Keep the peer alive until the test explicitly drops it.
+            let _ = socket.read(&mut buffer).await;
+            return;
+        }
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn sidebar_followup_saved_delete_forwards_live_owner_then_reclaims_only_dead_failed_owner() {
+    let mut fixture = SupervisorFixture::new("sidebar-delete-owner-route").await;
+    let target = sidebar_saved_fixture(&fixture, "selected", false);
+    let worker = add_descriptor_only_worker(&fixture, "owner", "owner-active", "synthetic-token", DAEMON_WORKER_LIFECYCLE_READY);
+    worker.descriptor.lock().unwrap().session_file = target.session_file.clone();
+    let (send, received) = tokio::sync::oneshot::channel();
+    #[cfg(windows)]
+    let (socket, task) = {
+        let socket = format!(r"\\.\pipe\optimus-sidebar-owner-{}", uuid::Uuid::new_v4());
+        let server = tokio::net::windows::named_pipe::ServerOptions::new().first_pipe_instance(true).create(&socket).unwrap();
+        let task = tokio::spawn(async move { server.connect().await.unwrap(); sidebar_owner_reply(server, send).await; });
+        (socket, task)
+    };
+    #[cfg(unix)]
+    let (socket, task) = {
+        let socket = fixture.root.join("owner.sock").to_string_lossy().into_owned();
+        let server = tokio::net::UnixListener::bind(&socket).unwrap();
+        let task = tokio::spawn(async move { let (stream, _) = server.accept().await.unwrap(); sidebar_owner_reply(stream, send).await; });
+        (socket, task)
+    };
+    let client = Arc::new(DaemonWorkerClient::new(&socket)); client.connect(1000).await.unwrap();
+    worker.descriptor.lock().unwrap().socket_path = socket; *worker.client.lock().unwrap() = Some(client.clone());
+    let command = json!({"type":"delete_saved_session","id":"owner-forward","sessionPath":target.session_file});
+    let response = fixture.send(command.clone()).await;
+    assert_eq!(response["id"], "owner-forward"); assert_eq!(response["data"]["ownerHandled"], true, "{response}");
+    assert_eq!(received.await.unwrap()["sessionPath"], target.session_file.as_deref().unwrap());
+    assert!(Path::new(target.session_file.as_deref().unwrap()).exists(), "supervisor did not bypass live owner to delete itself");
+    client.close_now(); task.abort(); *worker.client.lock().unwrap() = None;
+    let response = fixture.send(command.clone()).await;
+    assert_eq!(response["success"], false); assert!(response["error"].as_str().unwrap().contains("retry the delete"));
+    {
+        let mut descriptor = worker.descriptor.lock().unwrap();
+        descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_FAILED.into(); descriptor.pid = i32::MAX; descriptor.process_start_id = None;
+    }
+    let ledger = fixture.supervisor.rlm_spawn_ledger().await.unwrap();
+    sidebar_catalog_fixture(&fixture, target.session_file.as_deref().unwrap(), true, ledger.ledger_path()).await;
+    let response = fixture.send(command).await;
+    assert_eq!(response["success"], true, "{response}"); assert_eq!(response["data"]["ok"], true);
+    assert!(!fixture.supervisor.workers.lock().unwrap().contains_key("owner"));
+    assert!(!Path::new(target.session_file.as_deref().unwrap()).exists());
+    fixture.supervisor.catalog.stop().await;
+}

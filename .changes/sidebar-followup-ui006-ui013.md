@@ -1,0 +1,4 @@
+- Fixed Down-arrow navigation from the chat editor to running direct sub-agents in the workspace.
+- Fixed saved-chat deletion routing while preserving active-session and worker ownership checks.
+- Changed session sidebar grouping, full-location access, active-chat markers, and current-chat name colour.
+- Added configurable sidebar visibility and left/right shortcuts for distinct terminal key encodings without changing raw Enter or Backspace.

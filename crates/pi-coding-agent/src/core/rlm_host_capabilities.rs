@@ -45,6 +45,18 @@ mod tests {
     }
 
     #[test]
+    fn ordinary_cargo_build_embeds_pins_without_granting_unknown_ownership() {
+        let receipt: Value = serde_json::from_str(include_str!(concat!(env!("OUT_DIR"), "/build-provenance.json"))).unwrap();
+        let value = native_lifecycle_capabilities(Some(serde_json::json!({"model":"unproven/model"})), false);
+        assert_eq!(value["provenance"]["buildFingerprint"], receipt["buildFingerprint"]);
+        assert_eq!(value["provenance"]["runtimeSourceSha256"], receipt["runtimeSourceSha256"]);
+        assert_eq!(value["activeOnlyMessages"]["supported"], true);
+        assert_eq!(value["scriptReports"]["supported"], true);
+        assert_eq!(value["supported"], false);
+        assert_eq!(value["auditResume"]["supported"], false);
+    }
+
+    #[test]
     fn native_lifecycle_new_client_accepts_old_optional_result_shapes() {
         let tool: pi_agent_core::types::AgentToolResult = serde_json::from_value(
             serde_json::json!({"content":[],"details":{}})).unwrap();

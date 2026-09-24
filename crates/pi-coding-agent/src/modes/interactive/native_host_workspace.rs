@@ -9,6 +9,7 @@ use crate::modes::daemon::daemon_client::DaemonClient;
 use crate::modes::daemon::daemon_session_list::SessionSummary;
 use crate::modes::interactive::session_sidebar::{self as sidebar, Dialog, DialogKind, Pane, State};
 use pi_tui::tui::Focusable;
+use pi_tui::utils::wrap_text_with_ansi;
 use serde_json::{json, Value};
 
 pub(super) struct Runtime {
@@ -22,9 +23,12 @@ pub(super) struct Runtime {
     refreshed: Instant,
     catalog_refreshed: Option<Instant>,
     dialog: Option<Rc<RefCell<Dialog>>>,
+    location: Option<Rc<RefCell<LocationPane>>>,
     overlay: Option<pi_tui::tui::OverlayHandle>,
     pub next: Option<Arc<dyn wire::AgentConnection>>,
     folder_generation: u64,
+    #[cfg(test)]
+    clipboard: Option<mpsc::Sender<String>>,
 }
 
 enum Reply {
@@ -32,6 +36,67 @@ enum Reply {
     Opened(Result<Arc<dyn wire::AgentConnection>, String>),
     FolderValidated(Result<String, String>, u64),
     Changed(Result<String, String>),
+    Copied(Result<String, String>),
+}
+
+/// UI-009: read-only full-location overlay. The paths wrap instead of clipping,
+/// and confirm copies the full repo path without truncation.
+struct LocationPane {
+    repo: Option<String>,
+    session_file: Option<String>,
+    status: Option<Result<String, String>>,
+}
+
+impl LocationPane {
+    fn copy_text(&self) -> Option<String> {
+        self.repo.as_ref().filter(|path| !path.trim().is_empty())
+            .or(self.session_file.as_ref()).cloned()
+    }
+}
+
+impl TuiComponent for LocationPane {
+    fn render(&mut self, width: f64) -> Vec<String> {
+        let inner = (width as usize).saturating_sub(4).max(1);
+        let mut lines = vec![theme().fg("accent", " Full location"), String::new()];
+        match (&self.repo, &self.session_file) {
+            (Some(repo), Some(file)) => {
+                lines.push(theme().fg("muted", "Project/repo path"));
+                lines.extend(wrap_text_with_ansi(repo, inner));
+                lines.push(String::new());
+                lines.push(theme().fg("muted", "Saved chat file"));
+                lines.extend(wrap_text_with_ansi(file, inner));
+            }
+            (Some(repo), None) => {
+                lines.push(theme().fg("muted", "Project/repo path"));
+                lines.extend(wrap_text_with_ansi(repo, inner));
+            }
+            (None, Some(file)) => {
+                lines.push(theme().fg("muted", "Saved chat file"));
+                lines.extend(wrap_text_with_ansi(file, inner));
+            }
+            (None, None) => lines.push(theme().fg("muted", "Nothing is selected.")),
+        }
+        if let Some(status) = &self.status {
+            lines.push(String::new());
+            let themed = match status {
+                Ok(text) => theme().fg("success", text),
+                Err(error) => theme().fg("error", error),
+            };
+            lines.extend(wrap_text_with_ansi(&themed, inner));
+        }
+        lines.push(String::new());
+        lines.push(theme().fg("dim", &format!(
+            "{} Copy path   {} Close",
+            sidebar::key_label("tui.select.confirm"),
+            sidebar::key_label("tui.select.cancel")
+        )));
+        let border = theme().fg("border", &"─".repeat(inner));
+        let mut output = vec![format!("┌{border}┐")];
+        output.extend(lines.into_iter().map(|line| format!("│{}│", truncate_to_width(&line, inner as f64, "…", true))));
+        output.push(format!("└{border}┘"));
+        output
+    }
+    fn invalidate(&mut self) {}
 }
 
 impl Runtime {
@@ -40,12 +105,29 @@ impl Runtime {
         let (send, receive) = mpsc::channel();
         Self { state: Rc::new(RefCell::new(State::new(cwd, std::path::Path::new(agent_dir).join("session-sidebar.json")))),
             socket, config, send, receive, refresh: None, operation: None, refreshed: Instant::now(),
-            catalog_refreshed: None, dialog: None, overlay: None, next: None, folder_generation: 0 }
+            catalog_refreshed: None, dialog: None, location: None, overlay: None, next: None, folder_generation: 0,
+            #[cfg(test)] clipboard: None }
     }
 
     pub fn focus(&mut self, editor: &Rc<RefCell<CustomEditor>>) {
         self.state.borrow_mut().focused = true;
         editor.borrow_mut().editor_mut().set_focused(false);
+    }
+
+    /// UI-006: the editor's Down-arrow path ends on the sub-agent summary line;
+    /// confirming it hands the keyboard to the sessions sidebar with the
+    /// selection aimed at a running child of the chat open in the main pane, so
+    /// the next confirm opens that sub-agent chat. Aiming lives in the sidebar
+    /// state (its row model owns linkage and activity facts).
+    pub fn focus_subagents(&mut self, editor: &Rc<RefCell<CustomEditor>>, ui: &Rc<RefCell<TUI>>) {
+        if self.state.borrow_mut().focus_current_running_child() {
+            ui.borrow_mut().set_fullscreen_sidebar_hidden(false);
+            self.focus(editor);
+        } else {
+            self.state.borrow_mut().focused = false;
+            self.state.borrow_mut().status = "No running child of this chat is available.".into();
+            editor.borrow_mut().editor_mut().set_focused(true);
+        }
     }
 
     pub fn set_current(&mut self, state: &wire::AgentConnectionState) {
@@ -119,6 +201,10 @@ impl Runtime {
                         Err(error) => self.report_error(error),
                     }
                 }
+                Reply::Copied(result) => {
+                    // The copy runs off the input thread; its outcome lands here.
+                    if let Some(location) = &self.location { location.borrow_mut().status = Some(result); }
+                }
             }
         }
         self.request_refresh(false);
@@ -134,6 +220,7 @@ impl Runtime {
         self.folder_generation = self.folder_generation.wrapping_add(1);
         if let Some(handle) = self.overlay.take() { handle.hide(); }
         self.dialog = None;
+        self.location = None;
     }
 
     fn show_dialog(&mut self, kind: DialogKind, ui: &Rc<RefCell<TUI>>) {
@@ -145,8 +232,78 @@ impl Runtime {
         self.dialog = Some(dialog);
     }
 
+    /// UI-009: the full location wraps instead of clipping, whatever the pane
+    /// width, and confirm copies the untruncated repo path.
+    fn show_location(&mut self, ui: &Rc<RefCell<TUI>>) {
+        self.close_dialog();
+        let (repo, session_file) = {
+            let state = self.state.borrow();
+            (state.selected_cwd(), state.selected_session_file())
+        };
+        let pane = Rc::new(RefCell::new(LocationPane { repo, session_file, status: None }));
+        self.overlay = Some(ui.borrow_mut().show_overlay(pane.clone(), pi_tui::tui::OverlayOptions {
+            width: Some(pi_tui::tui::SizeValue::Number(72.0)), ..Default::default()
+        }));
+        self.location = Some(pane);
+    }
+
     pub fn input(&mut self, data: &str, editor_at_start: bool, ui: &Rc<RefCell<TUI>>) -> bool {
+        if pi_tui::keys::is_key_release(data) { return true; }
         let keys = pi_tui::keybindings::get_keybindings();
+        // UI-010: transport-gated sidebar shortcuts. `is_unambiguous_ctrl_combo`
+        // keeps the reserved editing bytes (raw Enter/Backspace/Tab/DEL) from
+        // acting as toggles on any transport, so the defaults live only where
+        // Ctrl+H/Ctrl+M arrive self-identified, and user remaps to other raw
+        // combos stay live. The toggles also work while an overlay is open.
+        if pi_tui::tui::is_unambiguous_ctrl_combo(data)
+            && (keys.matches(data, "app.sidebar.toggleVisibility")
+                || keys.matches(data, "app.sidebar.toggleSide"))
+        {
+            if keys.matches(data, "app.sidebar.toggleVisibility") {
+                let hidden = ui.borrow_mut().toggle_fullscreen_sidebar_hidden();
+                let mut state = self.state.borrow_mut();
+                if hidden { state.focused = false; }
+                state.status = if hidden {
+                    format!("Sidebar hidden. {} shows it.", sidebar::key_label("app.sidebar.toggleVisibility"))
+                } else {
+                    "Sidebar shown.".to_string()
+                };
+            } else {
+                let side = ui.borrow_mut().toggle_fullscreen_sidebar_side();
+                let label = match side {
+                    pi_tui::tui::FullscreenSidebarSide::Left => "left",
+                    pi_tui::tui::FullscreenSidebarSide::Right => "right",
+                };
+                self.state.borrow_mut().status = format!("Sidebar moved to the {label}.");
+            }
+            return true;
+        }
+        if let Some(location) = self.location.clone() {
+            if keys.matches(data, "tui.select.cancel") {
+                self.close_dialog();
+            } else if keys.matches(data, "tui.select.confirm") {
+                let text = location.borrow().copy_text();
+                if let Some(text) = text {
+                    location.borrow_mut().status = Some(Ok("Copying full path…".into()));
+                    let send = self.send.clone();
+                    #[cfg(test)]
+                    if let Some(clipboard) = &self.clipboard {
+                        clipboard.send(text.clone()).unwrap();
+                        let _ = send.send(Reply::Copied(Ok(format!("Copied. {text}"))));
+                        return true;
+                    }
+                    tokio::spawn(async move {
+                        let result = crate::utils::clipboard::copy_to_clipboard(&text).await
+                            .map(|_| format!("Copied. {text}"))
+                            .map_err(|_| "Copy failed in this terminal. Read the full path above and copy it manually.".to_string());
+                        let _ = send.send(Reply::Copied(result));
+                    });
+                } else {
+                    location.borrow_mut().status = Some(Err("Nothing is selected to copy.".into()));
+                }
+            }
+            return true;
+        }
         if let Some(dialog) = self.dialog.clone() {
             if keys.matches(data, "tui.select.cancel") {
                 if matches!(dialog.borrow().kind, DialogKind::AddFolder) {
@@ -163,15 +320,34 @@ impl Runtime {
             return true;
         }
         if let Some(mouse) = pi_tui::mouse::parse_sgr_mouse_event(data) {
-            let ui = ui.borrow();
-            if mouse.x <= ui.fullscreen_sidebar_width() as i64 && mouse.y > ui.fullscreen_header_height() as i64 {
+            // `fullscreen_sidebar_hit` is edge- and hide-aware: a hidden or
+            // unmounted pane is never a hit, and the right edge only claims its
+            // own columns (UI-010).
+            if ui.borrow().fullscreen_sidebar_hit(mouse.x, mouse.y) {
+                let header_height = ui.borrow().fullscreen_header_height();
                 let mut state = self.state.borrow_mut();
                 state.focused = true;
-                if pi_tui::mouse::is_wheel_up(&mouse) { state.move_by(-3); }
-                else if pi_tui::mouse::is_wheel_down(&mouse) { state.move_by(3); }
-                else { state.pointer((mouse.y - ui.fullscreen_header_height() as i64 - 1) as usize); }
+                if pi_tui::mouse::is_wheel_up(&mouse) {
+                    state.move_by(-3);
+                } else if pi_tui::mouse::is_wheel_down(&mouse) {
+                    state.move_by(3);
+                } else if mouse.press && !mouse.motion && mouse.button == pi_tui::mouse::MOUSE_BUTTON_LEFT {
+                    let row = (mouse.y - header_height as i64 - 1) as usize;
+                    let pane_height = ui.borrow().terminal.rows().saturating_sub(header_height);
+                    if row == state.location_footer_row() || (pane_height >= 12 && row + 1 == pane_height) {
+                        drop(state);
+                        self.show_location(ui);
+                    } else if row < state.location_footer_row() {
+                        state.pointer(row);
+                    }
+                }
                 return true;
             }
+            return false;
+        }
+        // A hidden pane must not capture keys or trap focus (UI-010).
+        if ui.borrow().fullscreen_sidebar_hidden() {
+            self.state.borrow_mut().focused = false;
             return false;
         }
         if !self.state.borrow().focused {
@@ -188,6 +364,7 @@ impl Runtime {
         else if keys.matches(data, "tui.select.pageUp") { self.state.borrow_mut().move_by(-8); }
         else if keys.matches(data, "tui.select.pageDown") { self.state.borrow_mut().move_by(8); }
         else if keys.matches(data, "app.sidebar.addFolder") { self.show_dialog(DialogKind::AddFolder, ui); }
+        else if keys.matches(data, "app.sidebar.location") { self.show_location(ui); }
         else if keys.matches(data, "app.agents.rename") {
             let session = self.state.borrow().selected_session();
             if let Some(session) = session { self.show_dialog(DialogKind::Rename(session), ui); }

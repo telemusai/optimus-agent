@@ -27,6 +27,36 @@ Windows native kernel with retained Job containment. Other provider backends,
 including Codex/Copilot responses transports, are not certified by this feature.
 Actual unowned, timed-out, or failed work cannot report `settled=true`.
 
+## Build and package provenance
+
+Ordinary Cargo builds derive provenance automatically. No local wrapper or manual
+pin is required. The build fingerprint covers raw native source/build helpers,
+Cargo manifests/lock, the portable payload, target/profile/compiler, features and
+compile options (including `PI_BUILD_ID`). Absolute checkout paths, credentials,
+Git dirty-state labels, generated receipts, and cache files are not inputs.
+`runtimeSourceSha256` uses exactly the client's sorted immediate `rlm/*.py`
+filenames, NUL separators, and raw file digests. Line endings are not normalized.
+
+`optimus-rust --build-provenance` prints the embedded JSON receipt and exits before
+profile, daemon, auth, or provider initialization. The fingerprint is not an
+executable checksum or a signature. Review it with the source/build receipt.
+A stale explicit `OPTIMUS_BUILD_FINGERPRINT` or `OPTIMUS_RUNTIME_SOURCE_SHA256`
+override fails the build instead of stamping a different source tree.
+
+`python3 scripts/rust_release.py stage --binary <native-binary> --output <directory>`
+requires Python 3.11+ and a release binary for the executing platform. It checks
+the binary's receipt against the checkout and full portable payload, then checks
+the copied bundle again. Source archives can use `COMMIT` without a Git checkout.
+Portable reinstalls require `BUILD-PROVENANCE.json` to match both the queried
+binary and the exact bundled resources/runtime; a sidecar alone is not trusted.
+Symlink inputs and missing or mismatched pins fail closed. Rebuild an older binary
+without this interface before staging; do not reuse another build's pins.
+
+Valid pins make the public capability wrapper and active-only messaging available.
+They do not certify a target's ownership profile. `supported` and `auditResume`
+remain false for an unproven profile, including K3 unless its actual host profile
+passes the existing ownership gate. Script-report support is a separate field.
+
 ## Stop without deleting
 
 ```python
