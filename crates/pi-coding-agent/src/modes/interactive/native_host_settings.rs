@@ -154,6 +154,7 @@ pub(super) fn fullscreen(
                 native_extensions::Widgets(surfaces.clone(), false),
             )));
         }
+        dock.borrow_mut().add_child(Rc::new(RefCell::new(transcript.borrow().stats_panel.clone())));
         dock.borrow_mut().add_child(editor.clone());
         if let Some(surfaces) = &surfaces {
             dock.borrow_mut().add_child(Rc::new(RefCell::new(

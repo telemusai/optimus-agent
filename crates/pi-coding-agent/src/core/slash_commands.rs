@@ -259,6 +259,7 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
         Some(true),
     );
     push("session", "Show session info".to_string(), None, None);
+    push("stats", "Open live model usage, context, and JEV statistics; Esc closes".to_string(), None, None);
     push(
         "system-prompt",
         "Show the exact system prompt sent to the model".to_string(),

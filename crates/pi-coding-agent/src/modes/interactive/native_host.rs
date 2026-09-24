@@ -152,6 +152,7 @@ struct Transcript {
     agent_messages: Vec<Rc<RefCell<crate::modes::interactive::components::agent_message::AgentMessageComponent>>>,
     extension_surfaces: Option<Rc<RefCell<native_extensions::Surfaces>>>,
     side_pane: Option<Rc<RefCell<native_extensions::SidePane>>>,
+    stats_panel: native_commands::StatsDock,
     history: Option<Box<Transcript>>,
     mode: Rc<RefCell<InteractiveMode>>,
     rows: Vec<Box<dyn TuiComponent>>,
@@ -263,6 +264,7 @@ impl Transcript {
             agent_messages: Vec::new(),
             extension_surfaces: None,
             side_pane: None,
+            stats_panel: native_commands::StatsDock::default(),
             history: None,
             mode,
             rows: Vec::new(),
@@ -1629,6 +1631,7 @@ async fn run_terminal(
     transcript.borrow_mut().side_pane = Some(side_pane.clone());
     ui.borrow_mut().add_child(transcript.clone());
     ui.borrow_mut().add_child(Rc::new(RefCell::new(native_extensions::Widgets(extension_surfaces.clone(), false))));
+    ui.borrow_mut().add_child(Rc::new(RefCell::new(transcript.borrow().stats_panel.clone())));
     ui.borrow_mut().add_child(editor.clone());
     ui.borrow_mut().add_child(Rc::new(RefCell::new(native_extensions::Widgets(extension_surfaces.clone(), true))));
     ui.borrow_mut().add_child(subagents.clone());
@@ -1690,7 +1693,7 @@ async fn run_terminal(
     });
     let mut custom_extension: Option<(String, Rc<RefCell<dyn TuiComponent>>, pi_tui::tui::OverlayHandle, tokio::sync::oneshot::Sender<Option<serde_json::Value>>)> = None;
     let mut early_custom_results = HashMap::<String, serde_json::Value>::new();
-    let mut command_dialog: Option<(Rc<RefCell<dyn TuiComponent>>, pi_tui::tui::OverlayHandle)> = None;
+    let mut command_dialog: Option<(Rc<RefCell<dyn TuiComponent>>, Option<pi_tui::tui::OverlayHandle>)> = None;
     let mut command_cancel: Option<tokio_util::sync::CancellationToken> = None;
     let mut login_provider = String::new();
     let mut pending_relaunch = None;
@@ -1811,7 +1814,7 @@ async fn run_terminal(
         // dropdown, packages/tui/src/components/editor.ts:2352) never takes focus
         // (tui.ts:439) and must not steal the viewport keys.
         viewport_input
-            .set(ui.borrow().is_fullscreen() && !ui.borrow().is_fullscreen_overlay_focused());
+            .set(ui.borrow().is_fullscreen() && !ui.borrow().is_fullscreen_overlay_focused() && command_dialog.is_none());
         ui.borrow_mut().drain_input();
         if let Some(received) = input_received.take() { ui_metrics.input(received); }
         if history_requested.replace(false) {
@@ -2285,26 +2288,33 @@ async fn run_terminal(
                     }
                 }
                 HostEvent::CommandDialog(dialog) => {
-                    if let Some((_, handle)) = command_dialog.take() { handle.hide(); }
+                    if let Some((_, Some(handle))) = command_dialog.take() { handle.hide(); }
+                    transcript.borrow().stats_panel.clear();
                     if let Some(cancel) = command_cancel.take() { cancel.cancel(); }
+                    let docked = matches!(&dialog, native_commands::Dialog::Stats);
                     let component = native_commands::mount(dialog, ui.clone(), &mode.borrow(), connection.clone(), send.clone());
-                    let handle = ui.borrow_mut().show_overlay(component.clone(), pi_tui::tui::OverlayOptions {
+                    let handle = if docked {
+                        transcript.borrow().stats_panel.show(component.clone());
+                        None
+                    } else { Some(ui.borrow_mut().show_overlay(component.clone(), pi_tui::tui::OverlayOptions {
                         width: Some(pi_tui::tui::SizeValue::Percent("100%".into())),
                         max_height: Some(pi_tui::tui::SizeValue::Percent("100%".into())),
                         row: Some(pi_tui::tui::SizeValue::Number(0.0)), col: Some(pi_tui::tui::SizeValue::Number(0.0)),
                         ..Default::default()
-                    });
+                    })) };
                     command_dialog = Some((component, handle));
                 }
                 HostEvent::CommandBusy(message, cancel) => {
-                    if let Some((_, handle)) = command_dialog.take() { handle.hide(); }
+                    if let Some((_, Some(handle))) = command_dialog.take() { handle.hide(); }
+                    transcript.borrow().stats_panel.clear();
                     if let Some(cancel) = command_cancel.replace(cancel) { cancel.cancel(); }
                     let component: Rc<RefCell<dyn TuiComponent>> = Rc::new(RefCell::new(TuiText::new(format!("{message}\nEsc to cancel"), 1, 1, None)));
                     let handle = ui.borrow_mut().show_overlay(component.clone(), Default::default());
-                    command_dialog = Some((component, handle));
+                    command_dialog = Some((component, Some(handle)));
                 }
                 HostEvent::CloseCommandDialog => {
-                    if let Some((_, handle)) = command_dialog.take() { handle.hide(); }
+                    if let Some((_, Some(handle))) = command_dialog.take() { handle.hide(); }
+                    transcript.borrow().stats_panel.clear();
                     command_cancel = None;
                 }
                 HostEvent::EditorText(text) => editor.borrow_mut().editor_mut().set_text(&text),
@@ -3139,7 +3149,8 @@ async fn run_terminal(
     if let Some((_, _, handle, reply)) = custom_extension { handle.hide(); let _ = reply.send(None); }
     extension_surfaces.borrow_mut().reset();
     if let Some(cancel) = command_cancel { cancel.cancel(); }
-    if let Some((_, handle)) = command_dialog { handle.hide(); }
+    if let Some((_, Some(handle))) = command_dialog { handle.hide(); }
+    transcript.borrow().stats_panel.clear();
     side_pane.borrow_mut().close(connection.clone());
     let mut cancelled_dialogs = Vec::new();
     if let Some(dialog) = extension {
@@ -3879,7 +3890,7 @@ async fn run_builtin_command(
             let _ = send.send(HostEvent::MenuTiming(started));
             Ok(CommandOutput::Nothing)
         }
-        "btw" | "side" | "fork" | "logout" | "scoped-models" | "share" | "traces" | "monitor" | "tree" | "update" | "debug" | "mcp" | "jev" => native_commands::run(connection, send, if name == "side" { "btw" } else { name }, args).await,
+        "btw" | "side" | "fork" | "logout" | "scoped-models" | "share" | "traces" | "monitor" | "tree" | "update" | "debug" | "mcp" | "jev" | "stats" => native_commands::run(connection, send, if name == "side" { "btw" } else { name }, args).await,
         "settings" => {
             let started = Instant::now();
             let _ = send.send(HostEvent::Settings(connection.get_state().await?));
