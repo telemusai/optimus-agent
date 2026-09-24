@@ -851,20 +851,33 @@ mod tests {
         crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
         use base64::Engine;
         use pi_tui::terminal_image::*;
-        let mut png = std::io::Cursor::new(Vec::new());
-        image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 244, 119, 255]))
-            .write_to(&mut png, image::ImageFormat::Png).unwrap();
-        let mut component = ToolExecutionComponent::new("image-preview", "fixture", Value::Null, options(), None, "/tmp");
+        let settings = crate::core::settings_manager::SettingsManager::in_memory(Default::default());
+        assert!(settings.get_show_images(), "fresh profiles must show images by default");
+        let mut jpeg = std::io::Cursor::new(Vec::new());
+        image::RgbImage::from_pixel(1200, 642, image::Rgb([0, 244, 119]))
+            .write_to(&mut jpeg, image::ImageFormat::Jpeg).unwrap();
+        // Default image visibility must include the Python self-render shell,
+        // including large screenshots compressed to JPEG by attach_image.
+        let mut component = ToolExecutionComponent::new("ipython", "fixture",
+            serde_json::json!({"code": "print(await attach_image('quest.png'))"}),
+            ToolExecutionOptions { show_images: Some(settings.get_show_images()), ..options() }, None, "/tmp");
         component.update_result(ToolExecutionResult {
             content: vec![ResultContentBlock {
-                r#type: "image".into(), text: None, mime_type: Some("image/png".into()),
-                data: Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner())),
+                r#type: "image".into(), text: None, mime_type: Some("image/jpeg".into()),
+                data: Some(base64::engine::general_purpose::STANDARD.encode(jpeg.into_inner())),
             }], ..Default::default()
         }, false);
         set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
         set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
         assert!(component.render_lines(60.0).iter().any(|line| is_image_line(line)));
+        component.set_expanded(true);
+        assert!(component.render_lines(60.0).iter().any(|line| is_image_line(line)));
         set_capabilities(TerminalCapabilities { images: None, true_color: true, hyperlinks: true });
+        assert!(component.render_lines(60.0).iter().any(|line| line.contains('▀')));
+        component.set_show_images(false);
+        assert!(component.render_lines(60.0).iter().all(|line| !line.contains('▀')));
+        component.set_show_images(true);
+        set_capabilities(TerminalCapabilities { images: None, true_color: false, hyperlinks: true });
         assert!(component.render_lines(60.0).iter().any(|line| line.contains("Cannot display image")));
         component.set_show_images(false);
         assert!(component.render_lines(60.0).iter().all(|line| !is_image_line(line)));
@@ -872,6 +885,7 @@ mod tests {
     }
 
     fn options() -> ToolExecutionOptions {
+        crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
         ToolExecutionOptions::default()
     }
 

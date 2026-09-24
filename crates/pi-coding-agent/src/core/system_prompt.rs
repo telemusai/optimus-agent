@@ -9,6 +9,10 @@ use std::collections::BTreeSet;
 pub const JEV_SKILL_HINT_BLOCK_START: &str = "<jev_skill_hint>";
 pub const JEV_SKILL_HINT_BLOCK_END: &str = "</jev_skill_hint>";
 
+const IMAGE_DISPLAY_GUIDANCE: &str = "# Showing Images\n\nWhen the user asks to see an image, screenshot, or chart in this chat, use the attach-image skill and emit it with `print(await attach_image(path))` in the Python workspace. Wait for capture or generation to finish before attaching the file. The attachment provides the inline preview when terminal image display is enabled. Local Markdown image links such as `![Screenshot](/tmp/shot.png)` only render as text links; they do not display images. If the user asks to show it again, emit a fresh attachment in that turn. If attachment fails, report the error instead of claiming the image is shown.";
+
+const MATPLOTLIB_DISPLAY_GUIDANCE: &str = "Matplotlib figures in the Python workspace use an inline backend by default: new or changed open figures are attached when the cell finishes. Use `plt.show()` or `fig.show()` to display them explicitly or show them again. Keep the default backend for chat previews; an explicit `matplotlib.use('Agg')` or MPLBACKEND override disables automatic previews. Saved image files can be displayed with the attach-image skill when available.";
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::prompts::rlm::{build_child_agent_doctrine, build_rlm_prompt, build_subagent_guidance, ChildAgentDoctrineOptions, RlmPromptOptions, SubagentGuidanceOptions};
@@ -118,6 +122,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let has_refine_skill = visible_skills
         .iter()
         .any(|skill| skill_name(skill) == REFINE_SKILL_NAME);
+    let has_attach_image = has_ipython && visible_skills
+        .iter()
+        .any(|skill| skill_name(skill) == "attach-image");
     let generic_mcp_section = if has_ipython {
         format_generic_mcp_guidance(options.generic_mcp_servers.as_deref())
     } else {
@@ -181,6 +188,13 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
             prompt.push_str(&format!("\n\n{generic_mcp_section}"));
         }
 
+        if has_attach_image {
+            prompt.push_str(&format!("\n\n{IMAGE_DISPLAY_GUIDANCE}"));
+        }
+        if has_ipython {
+            prompt.push_str(&format!("\n\n{MATPLOTLIB_DISPLAY_GUIDANCE}"));
+        }
+
         if !append_section.is_empty() {
             prompt.push_str(&append_section);
         }
@@ -242,6 +256,13 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
     if !generic_mcp_section.is_empty() {
         prompt.push_str(&format!("\n\n{generic_mcp_section}"));
+    }
+
+    if has_attach_image {
+        prompt.push_str(&format!("\n\n{IMAGE_DISPLAY_GUIDANCE}"));
+    }
+    if has_ipython {
+        prompt.push_str(&format!("\n\n{MATPLOTLIB_DISPLAY_GUIDANCE}"));
     }
 
     let guidelines = format_prompt_guidelines(prompt_guidelines.as_deref());
@@ -477,5 +498,27 @@ mod tests {
         };
         let prompt = build_system_prompt(&options);
         assert!(!prompt.contains("<available_skills>"));
+    }
+
+    #[test]
+    fn image_display_guidance_requires_an_enabled_skill_and_python_tool() {
+        for custom_prompt in [None, Some("Custom prompt".to_string())] {
+            let mut options = BuildSystemPromptOptions {
+                custom_prompt,
+                cwd: "/work".to_string(),
+                skills: Some(vec![markdown_skill("attach-image", false)]),
+                ..Default::default()
+            };
+            let prompt = build_system_prompt(&options);
+            assert!(prompt.contains("print(await attach_image(path))"));
+            assert!(prompt.contains("emit a fresh attachment in that turn"));
+            assert!(prompt.contains("Use `plt.show()` or `fig.show()`"));
+            options.selected_tools = Some(vec!["bash".to_string()]);
+            assert!(!build_system_prompt(&options).contains("# Showing Images"));
+            assert!(!build_system_prompt(&options).contains("inline backend by default"));
+            options.selected_tools = None;
+            options.skills = Some(vec![markdown_skill("attach-image", true)]);
+            assert!(!build_system_prompt(&options).contains("# Showing Images"));
+        }
     }
 }

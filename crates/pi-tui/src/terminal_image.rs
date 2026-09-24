@@ -153,6 +153,10 @@ fn detect_environment_capabilities() -> TerminalCapabilities {
     let term = env_lower("TERM");
     let color_term = env_lower("COLORTERM");
 
+    if term == "dumb" {
+        return TerminalCapabilities { images: None, true_color: false, hyperlinks: false };
+    }
+
     // tmux and screen swallow OSC 8 by default (passthrough is opt-in and wraps
     // sequences differently). Force hyperlinks off whenever we detect them.
     let in_tmux_or_screen = std::env::var("TMUX").is_ok()
@@ -658,6 +662,41 @@ fn decode_bounded_image(base64_data: &str) -> Option<DynamicImage> {
     DynamicImage::from_decoder(decoder).ok()
 }
 
+/// A text-cell preview for true-colour terminals without a graphics protocol.
+/// Each half block represents two pixels and can scroll/clip like ordinary text.
+pub fn render_ansi_image(base64_data: &str, max_width: usize, max_height: usize) -> Option<Vec<String>> {
+    use std::fmt::Write;
+
+    let max_width = max_width.min(256);
+    let max_height = max_height.min(MAX_IMAGE_ROWS);
+    if max_width == 0 || max_height == 0 { return None; }
+    let source = decode_bounded_image(base64_data)?;
+    let cells = get_cell_dimensions();
+    let scale = (max_width as f64 * cells.width_px as f64 / f64::from(source.width()))
+        .min(max_height as f64 * cells.height_px as f64 / f64::from(source.height()));
+    let columns = (f64::from(source.width()) * scale / cells.width_px as f64).round().max(1.0) as u32;
+    let rows = (f64::from(source.height()) * scale / cells.height_px as f64).round().max(1.0) as u32;
+    let columns = columns.min(max_width as u32);
+    let rows = rows.min(max_height as u32);
+    let pixels = source.resize_exact(columns, rows * 2, image::imageops::FilterType::Triangle).to_rgba8();
+    let rgb = |pixel: &image::Rgba<u8>| {
+        let alpha = u32::from(pixel[3]);
+        [0, 1, 2].map(|channel| (u32::from(pixel[channel]) * alpha + 136 * (255 - alpha) + 127) / 255)
+    };
+    let mut lines = Vec::with_capacity(rows as usize);
+    for row in 0..rows {
+        let mut line = String::new();
+        for column in 0..columns {
+            let [r, g, b] = rgb(pixels.get_pixel(column, row * 2));
+            let [br, bg, bb] = rgb(pixels.get_pixel(column, row * 2 + 1));
+            let _ = write!(line, "\x1b[38;2;{r};{g};{b}m\x1b[48;2;{br};{bg};{bb}m▀");
+        }
+        line.push_str("\x1b[0m");
+        lines.push(line);
+    }
+    Some(lines)
+}
+
 /// Wrap text in an OSC 8 hyperlink sequence.
 pub fn hyperlink(text: &str, url: &str) -> String {
     format!("\x1b]8;;{url}\x1b\\{text}\x1b]8;;\x1b\\")
@@ -707,6 +746,27 @@ mod tests {
     use super::*;
 
     const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn ansi_preview_preserves_color_alpha_and_text_bounds() {
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        let mut png = Cursor::new(Vec::new());
+        image::RgbaImage::from_fn(1, 2, |_, y| if y == 0 {
+            image::Rgba([0, 244, 119, 255])
+        } else { image::Rgba([255, 0, 255, 0]) })
+            .write_to(&mut png, ImageFormat::Png).unwrap();
+        let data = base64::engine::general_purpose::STANDARD.encode(png.into_inner());
+        assert_eq!(render_ansi_image(&data, 1, 1).unwrap(),
+            vec!["\x1b[38;2;0;244;119m\x1b[48;2;136;136;136m▀\x1b[0m"]);
+        for (width, height) in [(1, 1), (10, 3), (60, 24)] {
+            let lines = render_ansi_image(&test_png(1200, 642), width, height).unwrap();
+            assert!(lines.len() <= height);
+            assert!(lines.iter().all(|line| !is_image_line(line) && crate::utils::visible_width(line) <= width));
+        }
+        assert!(render_ansi_image("bad", 60, 24).is_none());
+        assert!(render_ansi_image(&data, 0, 1).is_none());
+        assert!(render_ansi_image(&data, 1, 0).is_none());
+    }
 
     #[test]
     fn sixel_palette_stays_within_terminal_registers_and_preserves_primary_colors() {

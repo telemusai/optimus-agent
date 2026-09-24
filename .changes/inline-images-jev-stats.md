@@ -1,0 +1,5 @@
+- Changed empty JEV savings rows to say "No measured savings yet" and distinguish missing measurements from missing live worker status.
+- Changed the stats mode label to make clear that Full JEV includes Active decisions and comparison logging from the same request.
+- Fixed screenshot display guidance so requests to show an image, including repeated requests, emit inline attachments instead of local Markdown image links. Image previews remain enabled by default.
+- Added ANSI colour image previews for true-colour terminals without native image support, including GNOME Terminal. Native graphics remain preferred on supported terminals.
+- Added a default headless Matplotlib backend that previews new or changed figures after Python cells and supports inline `plt.show()` and `fig.show()` on Linux, macOS, and Windows. Explicit backend overrides remain respected.

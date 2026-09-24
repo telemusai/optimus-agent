@@ -170,7 +170,7 @@ impl StatsPanel {
                 lines.extend(context_lines(snapshot, width));
                 lines.push(title(&format!(
                     "JEV / {}   COMPACTION: {}",
-                    snapshot.jev_mode.to_uppercase(),
+                    jev_mode_label(snapshot),
                     on_off(snapshot.jev_compaction)
                 )));
                 lines.push(jev_activity(snapshot));
@@ -197,7 +197,7 @@ impl StatsPanel {
                     ));
                 } else {
                     lines.push(dim(
-                        "JEV history: unavailable (no retained records for this scope)",
+                        "JEV history: no retained records for this scope",
                     ));
                 }
                 if !columns {
@@ -263,8 +263,14 @@ impl StatsPanel {
             2 => {
                 lines.push(title(&format!(
                     "JEV / {}",
-                    snapshot.jev_mode.to_uppercase()
+                    jev_mode_label(snapshot)
                 )));
+                if snapshot.full_jev {
+                    lines.push(dim("Full JEV includes Active; accepted decisions can apply."));
+                }
+                if snapshot.jev_mode == "compare-active" {
+                    lines.push(dim("Comparison logging uses the same JEV request."));
+                }
                 lines.push(jev_activity(snapshot));
                 lines.push(format!(
                     "Independent compaction: {}",
@@ -278,7 +284,7 @@ impl StatsPanel {
                 lines.push(String::new());
                 lines.push(title("RETAINED HISTORY / SELECTED SCOPE"));
                 if snapshot.jev.records == 0 {
-                    lines.push(dim("No retained records; historical activity unavailable"));
+                    lines.push(dim("No retained records for this scope"));
                 } else {
                     lines.push(format!(
                         "Requests {}  Applied boundaries {}  Fallbacks {}",
@@ -290,7 +296,7 @@ impl StatsPanel {
                             .jev
                             .median_ms
                             .map(|n| format!("{n}ms"))
-                            .unwrap_or_else(|| "unavailable".into())
+                            .unwrap_or_else(|| "not recorded".into())
                     ));
                     let comparisons = snapshot.jev.agrees + snapshot.jev.disagrees;
                     lines.push(if comparisons > 0 {
@@ -300,7 +306,7 @@ impl StatsPanel {
                             snapshot.jev.agrees
                         )
                     } else {
-                        "Compare agreement: unavailable".into()
+                        "Compare agreement: no comparable decisions recorded".into()
                     });
                 }
                 lines.push(String::new());
@@ -314,13 +320,15 @@ impl StatsPanel {
                         c.samples
                     )
                 } else {
-                    "JEV compaction reduction: unavailable".into()
+                    "JEV compaction: no measured reduction yet".into()
                 });
+                lines.push(dim("Savings need applied changes with recorded token estimates."));
+                lines.push(dim("Enabled features still need eligible inputs and accepted decisions."));
                 lines.push(dim(
                     "Compaction reduction is separate from candidate reductions.",
                 ));
                 lines.push(dim(
-                    "Compare potential savings: unavailable without a measured projection.",
+                    "Compare potential savings: no measured projection recorded.",
                 ));
                 lines.push(dim(
                     "Records may have rotated; this is not lifetime JEV accounting.",
@@ -676,10 +684,22 @@ fn context_lines(snapshot: &Snapshot, width: usize) -> Vec<String> {
     });
     lines
 }
+fn jev_mode_label(snapshot: &Snapshot) -> String {
+    if snapshot.full_jev {
+        "FULL JEV (ACTIVE + COMPARISON LOGGING)".into()
+    } else {
+        match snapshot.jev_mode.as_str() {
+            "compare-active" => "ACTIVE + COMPARISON LOGGING".into(),
+            "compare" => "COMPARE ONLY".into(),
+            mode => clean(mode).to_uppercase(),
+        }
+    }
+}
+
 fn jev_activity(snapshot: &Snapshot) -> String {
     let usage = &snapshot.pipeline["usage"];
     if !usage.is_object() {
-        return "Live JEV activity: unavailable (no worker observations)".into();
+        return "Live JEV activity: no worker status available".into();
     }
     let n = |key: &str| {
         usage[key]
@@ -721,7 +741,7 @@ fn savings_lines(snapshot: &Snapshot, width: usize) -> Vec<String> {
                 savings.candidates
             ));
         } else {
-            lines.push(format!("{label:<10} unavailable"));
+            lines.push(format!("{label:<10} No measured savings yet"));
         }
     }
     lines

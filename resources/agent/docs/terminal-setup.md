@@ -68,14 +68,27 @@ support. This works with native PowerShell; WSL and external image converters
 are not required. Kitty and iTerm2 image protocols remain supported on compatible
 terminals. The approach follows [Oh My Pi's terminal image implementation](https://github.com/can1357/oh-my-pi).
 
+Image previews are enabled by default (`terminal.showImages: true`). This includes
+screenshots attached with `print(await attach_image(path))` and Matplotlib charts.
+In the Python workspace, new or changed open Matplotlib figures are attached when
+the cell finishes; `plt.show()` and `fig.show()` also display them inline. No GUI
+window or manual PNG/base64 conversion is needed. Matplotlib remains an optional
+Python dependency. An explicit `MPLBACKEND` or `matplotlib.use(...)` override is
+respected; use the default backend for automatic previews. A script run as an
+external process should save its chart and attach the resulting file in the
+Python workspace. Local Markdown image links display text links only.
+
 Image support is detected at startup without blocking input. SIXEL also requires
-a valid terminal cell-size report so images stay inside their reserved rows. Unsupported terminals,
-unanswered probes, invalid images, and images exceeding the safety limits show
-`Cannot display image` instead. Fullscreen images display only when their entire
+a valid terminal cell-size report so images stay inside their reserved rows. Unsupported terminals
+and unanswered probes use a lower-resolution ANSI colour preview on true-colour terminals,
+including GNOME Terminal and tmux. If neither graphics nor true colour is available,
+or an image is invalid or exceeds the safety limits, a `Cannot display image`
+message appears instead. Native fullscreen images display only when their entire
 rectangle fits the transcript; clipped images, selection, and overlays use a
 placeholder so graphics cannot cover the header or input area. At most eight
 images are displayed in a fullscreen viewport. Images retain their reserved rows
-while scrolling. tmux and screen use text fallbacks.
+while scrolling. ANSI previews scroll and clip as ordinary text. Explicitly
+disabling images also disables these previews.
 
 Optimus checks the standard device-attributes reply for SIXEL support, including
 Windows Terminal's reply. When available, XTerm graphics queries also supply the

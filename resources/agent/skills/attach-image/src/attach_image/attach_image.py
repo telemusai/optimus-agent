@@ -254,4 +254,8 @@ async def run(*paths: str) -> str:
     message = f"Loaded {len(validated)} image(s) into context: {', '.join(paths)}"
     if resize_notes:
         message += "\nResized for efficient inline rendering/replay:\n- " + "\n- ".join(resize_notes)
+    message += (
+        "\nInline preview attached to this tool result. A local Markdown image link does not "
+        "display the image; call attach_image again if the user asks to see it again."
+    )
     return message
