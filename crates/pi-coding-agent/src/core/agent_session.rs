@@ -548,6 +548,15 @@ pub const COMPACTION_REASON_REQUESTED: &str = "requested";
 const THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS: u64 = 5_000;
 const THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS: u64 = 120_000;
 const THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES: u32 = 6;
+/// A provider that refused or filtered one summary attempt may refuse a
+/// repeat of the same request, so repeated automatic attempts are paced back
+/// instead of re-attacking on a short cadence. The filtered ladder starts
+/// slower and climbs to a longer bounded ceiling. Still exponential and
+/// still capped: never a permanent lockout, and manual/requested compaction
+/// is never gated. This is retry pacing only; no claim is made about the
+/// provider's next outcome.
+const THRESHOLD_COMPACTION_FILTERED_BACKOFF_INITIAL_MS: u64 = 60_000;
+const THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS: u64 = 1_800_000;
 
 /// Consecutive automatic threshold-compaction failures and when the last one
 /// landed. Session-lifetime only; a restart starts without a cooldown.
@@ -555,15 +564,61 @@ const THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES: u32 = 6;
 struct ThresholdCompactionFailureState {
     consecutive_failures: u32,
     last_failure: std::time::Instant,
+    /// Classification of the most recent failure; the pending cooldown mirrors
+    /// the failure that must be recovered from.
+    kind: crate::core::compaction::compaction::SummaryFailureKind,
 }
 
-/// `initial * 2^(failures - 1)`, clamped to the ceiling.
-fn threshold_compaction_retry_backoff_delay(consecutive_failures: u32) -> std::time::Duration {
+/// Optional sanitized failure evidence attached to a persisted compaction
+/// outcome. Built from the classified summary error and the attempt's boundary
+/// record; entry IDs, counts and kind labels only.
+#[derive(Debug, Clone, Default)]
+struct CompactionFailureEvidence {
+    failure_kind: Option<crate::core::compaction::compaction::SummaryFailureKind>,
+    boundary_entry_id: Option<String>,
+    summary_shape: Option<String>,
+    consecutive_failures: Option<u32>,
+}
+
+/// Sanitized record of the compaction attempt in flight: entry IDs, counts and
+/// the selected model only. Never summary or conversation content.
+#[derive(Debug, Clone, PartialEq)]
+struct CompactionAttemptEvidence {
+    boundary_entry_id: String,
+    /// `splitTurnPrefix` when the turn-prefix slice is non-empty, else
+    /// `historyOnly` (an empty prefix at a CustomMessage boundary selects the
+    /// single history summary branch).
+    summary_shape: String,
+    model: String,
+}
+
+/// `initial * 2^(failures - 1)`, clamped to the ceiling selected by the failure
+/// kind: filtered/refused failures use the longer bounded ladder.
+fn threshold_compaction_retry_backoff_delay(
+    kind: crate::core::compaction::compaction::SummaryFailureKind,
+    consecutive_failures: u32,
+) -> std::time::Duration {
+    let (initial_ms, max_ms) = match kind {
+        crate::core::compaction::compaction::SummaryFailureKind::FilteredOrRefused => (
+            THRESHOLD_COMPACTION_FILTERED_BACKOFF_INITIAL_MS,
+            THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS,
+        ),
+        _ => (
+            THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS,
+            THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS,
+        ),
+    };
     let shift = consecutive_failures.saturating_sub(1).min(16);
-    let delay_ms = THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS
-        .saturating_mul(1u64 << shift)
-        .min(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS);
+    let delay_ms = initial_ms.saturating_mul(1u64 << shift).min(max_ms);
     std::time::Duration::from_millis(delay_ms)
+}
+
+/// Truthful short label for the cooldown an automatic threshold retry just
+/// armed, used in the user-facing recovery hint. Reports the actual delay for
+/// the current streak depth, never the ceiling alone.
+fn threshold_compaction_cooldown_hint(delay: std::time::Duration) -> String {
+    let minutes = (delay.as_millis() as f64 / 60_000.0).round().max(1.0) as u64;
+    format!("about {minutes} minute{}", if minutes == 1 { "" } else { "s" })
 }
 
 /// `AgentSessionEvent` - a tagged union mirroring the TypeScript union members.
@@ -837,6 +892,10 @@ pub enum SerializedBackgroundPlanResult {
         explicit: bool,
         options: RefineOptions,
         branch_version: i64,
+        /// Sanitized typed failure text of the planning attempt that failed
+        /// (fixed vocabulary; no prompts, completions, or auth material). It is
+        /// surfaced once instead of triggering a silent duplicate planning pass.
+        error: Option<String>,
     },
 }
 
@@ -2006,6 +2065,30 @@ pub fn is_refinement_skipped_error(error: &str) -> bool {
     error == REFINEMENT_SKIPPED_MESSAGE
 }
 
+/// Format a `session_before_refine` hook's typed failure for the
+/// `Result<_, String>` rail. The hook result is sanitized by construction
+/// (fixed vocabulary message, category name, attempt count, durations);
+/// the core adds no raw provider or auth material here.
+fn format_refine_hook_failure(
+    failure: &crate::core::extensions::types::SessionBeforeRefineFailure,
+) -> String {
+    let mut message = format!(
+        "Refinement planning failed in the session_before_refine hook: {}",
+        failure.message
+    );
+    if let Some(category) = failure.category.as_deref() {
+        message.push_str(&format!(" (category: {category}"));
+        if failure.attempts > 0 {
+            message.push_str(&format!(", attempts: {}", failure.attempts));
+        }
+        if let Some(attempt_ms) = failure.attempt_ms.as_ref().filter(|durations| !durations.is_empty()) {
+            message.push_str(&format!(", attemptMs: {attempt_ms:?}"));
+        }
+        message.push(')');
+    }
+    message
+}
+
 /// `text.slice(-80_000)`: JavaScript slices UTF-16 code units, so the port
 /// counts units rather than chars to keep the boundary identical.
 pub fn utf16_tail(text: &str, max_units: usize) -> String {
@@ -2029,13 +2112,17 @@ pub type SerializedPlanConsumer =
     Arc<dyn Fn(Option<SerializedBackgroundPlanResult>) -> BoxFuture<bool> + Send + Sync>;
 
 /// `_consumeSerializedBackgroundPlan`'s return value ("none" | "waited" |
-/// "continue" | "stop").
+/// "continue" | "stop"), plus `SlotChanged` for RF-001 identity binding: the
+/// pinned settled plan no longer occupies the slot (replaced by a newer
+/// plan, already consumed, or claimed by another consumer), so the caller
+/// returns without awaiting anything.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum SerializedPlanConsumption {
     None,
     Waited,
     Continue,
     Stop,
+    SlotChanged,
 }
 
 /// The TypeScript `_compactionOperation` (`Promise<void>`) together with its
@@ -2430,6 +2517,12 @@ pub struct AgentSession {
     overflow_recovery: Mutex<String>,
     continue_after_threshold_compaction: AtomicBool,
     threshold_compaction_failure_streak: Mutex<Option<ThresholdCompactionFailureState>>,
+    /// Sanitized boundary/request-shape evidence for the compaction attempt in
+    /// flight. Entry IDs, counts and model IDs only; never summary content.
+    /// Set by `perform_compaction_unmeasured_full` once preparation resolves and
+    /// cleared on every terminal (finish, cancel, model change), so a later
+    /// attempt cannot inherit stale metadata.
+    compaction_attempt_evidence: Mutex<Option<CompactionAttemptEvidence>>,
     pending_requested_compaction: Mutex<Option<PendingRequestedCompaction>>,
     pending_requested_refine: Mutex<Option<PendingRequestedRefine>>,
     branch_summary_abort_controller: Mutex<Option<CancellationToken>>,
@@ -2618,10 +2711,13 @@ pub struct PendingRequestedCompaction {
 }
 
 /// `pendingRequestedRefine`.
+///
+/// RF-001: the pending entry carries the FULL deliberate `RefineOptions`
+/// (instructions, rollback id, scope, retry policy, evidence, token limit)
+/// so queuing never silently drops a requested rollback to a planning pass.
 #[derive(Debug, Clone, Default)]
 pub struct PendingRequestedRefine {
-    pub instructions: Option<String>,
-    pub global: Option<bool>,
+    pub options: RefineOptions,
 }
 
 /// `SessionContext`/`SessionStats` re-exports used by callers of this module.
@@ -2810,6 +2906,7 @@ impl AgentSession {
             overflow_recovery: Mutex::new("idle".to_string()),
             continue_after_threshold_compaction: AtomicBool::new(false),
             threshold_compaction_failure_streak: Mutex::new(None),
+            compaction_attempt_evidence: Mutex::new(None),
             pending_requested_compaction: Mutex::new(None),
             pending_requested_refine: Mutex::new(None),
             branch_summary_abort_controller: Mutex::new(None),
@@ -5028,28 +5125,27 @@ impl AgentSession {
                 let previous = {
                     let pending = self.pending_requested_refine.lock().unwrap().clone();
                     match pending {
-                        Some(pending) => Some(pending),
+                        Some(pending) => Some(pending.options),
                         // `RefineOptions` carries the same two members the
-                        // pending request reads (`instructions`, `global`).
+                        // host payload sets (`instructions`, `global`).
                         None => self
                             .serialized_explicit_refine_options
                             .lock()
                             .unwrap()
-                            .clone()
-                            .map(|options| PendingRequestedRefine {
-                                instructions: options.instructions,
-                                global: options.global,
-                            }),
+                            .clone(),
                     }
                 };
                 *self.pending_requested_refine.lock().unwrap() = Some(PendingRequestedRefine {
-                    instructions: instructions.or_else(|| {
-                        previous
-                            .as_ref()
-                            .and_then(|previous| previous.instructions.clone())
-                    }),
-                    global: global_flag
-                        .or_else(|| previous.as_ref().and_then(|previous| previous.global)),
+                    options: RefineOptions {
+                        instructions: instructions.or_else(|| {
+                            previous
+                                .as_ref()
+                                .and_then(|previous| previous.instructions.clone())
+                        }),
+                        global: global_flag
+                            .or_else(|| previous.as_ref().and_then(|previous| previous.global)),
+                        ..Default::default()
+                    },
                 });
                 // In serialized mode, kick off background planning immediately
                 // (the primary response ended at message_end, tools are active).
@@ -5071,6 +5167,59 @@ impl AgentSession {
             }
             _ => Err(format!("unknown refine request type \"{request_type}\"")),
         }
+    }
+
+    /// Queue a deliberate manual `/refine` request for a serialized session
+    /// and kick background planning immediately. Never plans in the caller's
+    /// task (RF-001): the pump keeps executing queued primary input while the
+    /// plan runs; the settle watcher applies the outcome at the next safe
+    /// point. Returns whether the request was newly scheduled.
+    fn queue_serialized_manual_refine(self: &Arc<Self>, options: &RefineOptions) -> bool {
+        let previous = {
+            let pending = self.pending_requested_refine.lock().unwrap().clone();
+            match pending {
+                Some(pending) => Some(pending.options),
+                None => self.serialized_explicit_refine_options.lock().unwrap().clone(),
+            }
+        };
+        // Merge instead of overwrite: a new bare request keeps an explicit
+        // rollback id, scope or retry policy a previous request carried, so
+        // queuing never drops a requested rollback to a planning pass.
+        let previous = previous.as_ref();
+        let merged = RefineOptions {
+            instructions: options
+                .instructions
+                .clone()
+                .or_else(|| previous.and_then(|previous| previous.instructions.clone())),
+            rollback_id: options
+                .rollback_id
+                .clone()
+                .or_else(|| previous.and_then(|previous| previous.rollback_id.clone())),
+            global: options
+                .global
+                .or_else(|| previous.and_then(|previous| previous.global)),
+            retry: options
+                .retry
+                .clone()
+                .or_else(|| previous.and_then(|previous| previous.retry.clone())),
+            evidence: options
+                .evidence
+                .clone()
+                .or_else(|| previous.and_then(|previous| previous.evidence.clone())),
+            max_output_tokens: options
+                .max_output_tokens
+                .or_else(|| previous.and_then(|previous| previous.max_output_tokens)),
+        };
+        *self.pending_requested_refine.lock().unwrap() = Some(PendingRequestedRefine {
+            options: merged,
+        });
+        if self.serialized_plan_in_flight.lock().unwrap().is_some() {
+            // A plan is already running; the pending entry is serviced when
+            // that plan's consumer reaches the checkpoint tail.
+            return false;
+        }
+        self.maybe_start_serialized_background_plan();
+        true
     }
 
     /**
@@ -7799,26 +7948,18 @@ impl AgentSession {
                                     .store(0, Ordering::SeqCst);
                             }
                         }
-                        // Preserve a consumed explicit request when its background plan
-                        // failed, matching the turn-boundary recovery path.
+                        // No automatic requeue of a failed explicit plan (RF-001):
+                        // surface the sanitized typed failure once. A deliberate
+                        // newer pending request (if any) is still drained below,
+                        // which is the user's own retry, not an automatic one.
                         if let Some(SerializedBackgroundPlanResult::Failure {
                             explicit: true,
-                            options,
-                            branch_version,
+                            error,
+                            ..
                         }) = bg_result.as_ref()
                         {
-                            let current =
-                                session.auto_refine_branch_version.load(Ordering::SeqCst) as i64;
-                            let no_newer_pending =
-                                session.pending_requested_refine.lock().unwrap().is_none();
-                            if *branch_version == current && no_newer_pending {
-                                let mut pending = session.pending_requested_refine.lock().unwrap();
-                                if pending.is_none() {
-                                    *pending = Some(PendingRequestedRefine {
-                                        instructions: options.instructions.clone(),
-                                        global: options.global,
-                                    });
-                                }
+                            if let Some(error) = error.as_deref() {
+                                session.emit_refine_failed(error);
                             }
                         }
                         if let Some(SerializedBackgroundPlanResult::Skip {
@@ -7841,7 +7982,9 @@ impl AgentSession {
                         false
                     })
                 });
-                let _ = self.consume_serialized_background_plan(consumer).await;
+                let _ = self
+                    .consume_serialized_background_plan(None, true, consumer)
+                    .await;
             } else {
                 tokio::task::yield_now().await;
             }
@@ -7852,14 +7995,7 @@ impl AgentSession {
         // since the agent may still own activeRun at the final agent_end.
         let pending = self.pending_requested_refine.lock().unwrap().take();
         if let Some(pending) = pending {
-            let options = RefineOptions {
-                instructions: pending.instructions,
-                rollback_id: None,
-                global: pending.global,
-                retry: None,
-                evidence: None,
-                max_output_tokens: None,
-            };
+            let options = pending.options;
             // Best-effort drain; refinement errors must not block disposal.
             let _ = self
                 .run_serialized_refine(&options, REFINEMENT_SOURCE_SELF)
@@ -11716,11 +11852,31 @@ impl AgentSession {
                 self.compact_with_options(args.as_deref(), true).await?;
             }
             "refine" => {
-                let result = match parse_refine_command_options(&input.base.command.args) {
-                    Ok(options) => match self
-                        .refine_with_options_at_epoch(
-                            &refine_options_from_command(&options), true, None, Some(epoch),
-                        )
+                let options = match parse_refine_command_options(&input.base.command.args) {
+                    Ok(options) => refine_options_from_command(&options),
+                    Err(error) => return Err(error),
+                };
+                if self.serialized_refine {
+                    // RF-001: serialized sessions never run planner work inside
+                    // the pump. The deliberate request is queued, background
+                    // planning starts now, and queued primary input keeps
+                    // executing. The durable refinement notice reports the
+                    // outcome; progress stages report planning activity.
+                    if self.is_streaming() {
+                        return Err(
+                            "Cannot refine without aborting while the agent is running."
+                                .to_string(),
+                        );
+                    }
+                    let queued = self.queue_serialized_manual_refine(&options);
+                    result_text = Some(if queued {
+                        "Refinement queued: planning runs in the background while the chat continues; the saved outcome arrives as a refinement notice.".to_string()
+                    } else {
+                        "Refinement is already queued or running; the saved outcome arrives as a refinement notice.".to_string()
+                    });
+                } else {
+                    let result = match self
+                        .refine_with_options_at_epoch(&options, true, None, Some(epoch))
                         .await
                     {
                         Ok(result) => result,
@@ -11732,19 +11888,18 @@ impl AgentSession {
                             });
                             return Err(error);
                         }
-                    },
-                    Err(error) => return Err(error),
-                };
-                let applied = result
-                    .applied_edits
-                    .iter()
-                    .filter(|edit| edit.applied)
-                    .count();
-                result_text = Some(format!(
-                    "Refined continual harness state: {applied} edit{} applied.",
-                    if applied == 1 { "" } else { "s" }
-                ));
-                display_result = false;
+                    };
+                    let applied = result
+                        .applied_edits
+                        .iter()
+                        .filter(|edit| edit.applied)
+                        .count();
+                    result_text = Some(format!(
+                        "Refined continual harness state: {applied} edit{} applied.",
+                        if applied == 1 { "" } else { "s" }
+                    ));
+                    display_result = false;
+                }
             }
             "goal" => {
                 self.handle_goal_slash_command(&input.base.text).await?;
@@ -13121,6 +13276,14 @@ impl AgentSession {
             previous_model: previous.id.clone(),
             reason: "set".to_string(),
         });
+        // Only an effective, successful selection resets the compaction
+        // backoff: a different summarization model changes the summary
+        // request, so failures from the previous model do not carry over.
+        // A no-op re-selection of the same model leaves the streak intact.
+        if model.provider != previous.provider || model.id != previous.id {
+            self.clear_threshold_compaction_failure_streak();
+            *self.compaction_attempt_evidence.lock().unwrap() = None;
+        }
         Ok(())
     }
 
@@ -13612,6 +13775,7 @@ impl AgentSession {
 
     /// `abortCompaction()`.
     pub fn abort_compaction(&self) {
+        *self.compaction_attempt_evidence.lock().unwrap() = None;
         if let Some(controller) = self.compaction_abort_controller.lock().unwrap().clone() {
             controller.cancel();
         }
@@ -14841,6 +15005,12 @@ impl AgentSession {
             if parsed.skip.unwrap_or(false) {
                 return Err(REFINEMENT_SKIPPED_MESSAGE.to_string());
             }
+            // RF-001: a hook that owned planning and failed reports the typed
+            // failure. Surface it and STOP - never silently plan again with a
+            // second full planner pass that hides the first attempt's cause.
+            if let Some(failure) = parsed.error {
+                return Err(format_refine_hook_failure(&failure));
+            }
             if let Some(proposal) = emitted
                 .as_ref()
                 .and_then(|value| value.get("proposal"))
@@ -14884,7 +15054,10 @@ impl AgentSession {
         let plan = tokio::select! {
             biased;
             _ = signal.cancelled() => return Err("Refinement was aborted".to_string()),
-            result = planning => result.map_err(|error| error.message)?,
+            // The sanitized summary keeps the fixed planner message plus the
+            // typed category, attempt count and per-attempt durations, so a
+            // first-attempt cause is distinguishable without raw output.
+            result = planning => result.map_err(|error| error.sanitized_summary())?,
         };
         if self.disposed.load(Ordering::SeqCst) || signal.is_cancelled() {
             return Err("Refinement was aborted".to_string());
@@ -14904,9 +15077,9 @@ impl AgentSession {
         signal: Option<&CancellationToken>,
     ) -> Result<RefinementResult, String> {
         let progress = RefinementProgress::new(self);
-        let outcome = self.apply_refine_with_context(
-            plan, options, source, signal, None, false, &progress,
-        ).await;
+        let outcome = self
+            .apply_refine_with_context(plan, options, source, signal, None, false, false, &progress)
+            .await;
         progress.finish_result(&outcome);
         outcome
     }
@@ -14919,6 +15092,7 @@ impl AgentSession {
         signal: Option<&CancellationToken>,
         current: Option<&RefinementCurrentness>,
         reacquire_commit: bool,
+        spawn_complete_emit: bool,
         progress: &RefinementProgress,
     ) -> Result<RefinementResult, String> {
         if self.disposed.load(Ordering::SeqCst) {
@@ -14944,22 +15118,31 @@ impl AgentSession {
         }
         progress.finish_result(&outcome);
         let result = outcome?;
-        // The save has committed. Listener latency/failure must not hold admission or undo success.
+        // The save has committed. Listener latency/failure must not hold
+        // admission or undo success. RF-001: serialized background applies
+        // (`spawn_complete_emit`) detach the listener emit entirely so a slow
+        // post-save extension can never hold a turn boundary or the pump; the
+        // synchronous refine paths keep the awaited emit contract.
         if let Some(runner) = self.extension_runner() {
-            runner
-                .emit(ExtensionEvent::RefineComplete(
-                    crate::core::extensions::types::RefineCompletePayload {
-                        id: result.id.clone(),
-                        summary: result.summary.clone(),
-                        applied_edits: result.applied_edits.iter().filter(|edit| edit.applied).count()
-                            as f64,
-                        scope: match result.scope.unwrap_or(HarnessScope::Local) {
-                            HarnessScope::Global => "global".to_string(),
-                            HarnessScope::Local => "local".to_string(),
-                        },
+            let event = ExtensionEvent::RefineComplete(
+                crate::core::extensions::types::RefineCompletePayload {
+                    id: result.id.clone(),
+                    summary: result.summary.clone(),
+                    applied_edits: result.applied_edits.iter().filter(|edit| edit.applied).count()
+                        as f64,
+                    scope: match result.scope.unwrap_or(HarnessScope::Local) {
+                        HarnessScope::Global => "global".to_string(),
+                        HarnessScope::Local => "local".to_string(),
                     },
-                ))
-                .await;
+                },
+            );
+            if spawn_complete_emit {
+                tokio::spawn(async move {
+                    runner.emit(event).await;
+                });
+            } else {
+                runner.emit(event).await;
+            }
         }
         Ok(result)
     }
@@ -15176,7 +15359,8 @@ impl AgentSession {
             } else if background.is_some() {
                 // Wait for the consumer as well as the plan; never steal another apply's claim.
                 let consumer: SerializedPlanConsumer = Arc::new(|_| Box::pin(async { false }));
-                self.consume_serialized_background_plan(consumer).await;
+                self.consume_serialized_background_plan(None, true, consumer)
+                    .await;
                 tokio::select! {
                     biased;
                     _ = current.signal.cancelled() => return Err("Refinement was aborted".to_string()),
@@ -15199,8 +15383,10 @@ impl AgentSession {
             .await?;
         current.check(self)?;
         self.apply_refine_with_context(
-            &plan, options, source, Some(&current.signal), Some(&current), skip_abort, progress,
-        ).await
+            &plan, options, source, Some(&current.signal), Some(&current), skip_abort, false,
+            progress,
+        )
+        .await
     }
 
     /// The slot covers planning through apply. A dropped future must release its waiters too.
@@ -15258,7 +15444,9 @@ impl AgentSession {
                 // serializes.
                 let consumer: SerializedPlanConsumer =
                     Arc::new(move |_bg_result| Box::pin(async move { false }));
-                let _ = self.consume_serialized_background_plan(consumer).await;
+                let _ = self
+                    .consume_serialized_background_plan(None, true, consumer)
+                    .await;
             } else if self.refine_in_flight.lock().unwrap().is_some() {
                 self.wait_for_refine_idle().await;
             } else {
@@ -15295,9 +15483,18 @@ impl AgentSession {
         }
         current.check(self)?;
         let progress = RefinementProgress::new(self);
-        let outcome = self.apply_refine_with_context(
-            &plan, options, source, Some(&signal), Some(&current), false, &progress,
-        ).await;
+        let outcome = self
+            .apply_refine_with_context(
+                &plan,
+                options,
+                source,
+                Some(&signal),
+                Some(&current),
+                false,
+                false,
+                &progress,
+            )
+            .await;
         progress.finish_result(&outcome);
         drop(_flight);
         self.notify_session_input_checkpoint_change();
@@ -15305,28 +15502,147 @@ impl AgentSession {
         outcome.map(|_| ())
     }
 
-    /// `_runSerializedRefineCheckpoint()` (agent-session.ts:2481-2569).
+    /// `_runSerializedRefineCheckpoint()` (agent-session.ts:2481-2569), made
+    /// non-blocking (RF-001): a background plan that is still planning must
+    /// never hold the turn boundary (and with it queued primary input). The
+    /// checkpoint consumes and applies only an ALREADY-SETTLED plan; an
+    /// unsettled plan is left to its settle watcher, which applies it at the
+    /// next safe point with the same consume path.
     async fn run_serialized_refine_checkpoint(self: &Arc<Self>) {
         if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
             return;
         }
-        // 1. Await any background plan that was started at message_end.
         let branch_version = self.auto_refine_branch_version.load(Ordering::SeqCst);
+        // 1. Consume any background plan only if it has already settled.
+        // A single non-blocking peek: never await an unsettled plan here.
+        // The shared future is cloned out of the slot lock BEFORE the one-shot
+        // poll, so no poll happens under the std Mutex guard; the eager driver
+        // owns polling, and a joined poll of a `Shared` future is safe by
+        // design. The actual consume below re-locks and re-checks the slot.
+        let peeked: Option<SharedPlanFuture> = {
+            let plan = self.serialized_plan_in_flight.lock().unwrap().clone();
+            match plan {
+                Some(plan) => plan.clone().now_or_never().map(|_| plan),
+                None => None,
+            }
+        };
+        if let Some(plan) = peeked {
+            // The pinned settled plan is consumed by identity: a replacement
+            // plan that raced into the slot can never be awaited here.
+            let consumer = self.serialized_plan_boundary_consumer(branch_version);
+            let consumption = self
+                .consume_serialized_background_plan(Some(&plan), false, consumer)
+                .await;
+            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                return;
+            }
+            // `SlotChanged` (replaced or claimed elsewhere), `Stop`,
+            // `Continue` and `Waited` all end this boundary: the claim owner
+            // or the replacement plan's watcher services the pending work.
+            let _ = consumption;
+            return;
+        } else {
+            if self.serialized_plan_in_flight.lock().unwrap().is_some() {
+                // Still planning: do not block this boundary. The plan's
+                // settle watcher owns the deferred apply.
+                return;
+            }
+        }
+        self.run_serialized_refine_checkpoint_after_background(branch_version)
+            .await;
+    }
+
+    /// The turn-boundary consumer for a settled background plan
+    /// (agent-session.ts:2494-2567): applies the EXACT background plan
+    /// directly (no second plan call), stamps the review cooldown, surfaces
+    /// a typed failure exactly once, never requeues an automatic duplicate
+    /// planning pass, and services a pending deliberate request. Shared by
+    /// the turn-boundary checkpoint, the settle watcher and the discard
+    /// path - every caller pins the plan identity through the consume.
+    fn serialized_plan_boundary_consumer(
+        self: &Arc<Self>,
+        branch_version_snapshot: u64,
+    ) -> SerializedPlanConsumer {
         let session = self.clone();
-        let branch_version_snapshot = branch_version;
-        let consumer: SerializedPlanConsumer = Arc::new(move |bg_result| {
+        Arc::new(move |bg_result| {
             let session = session.clone();
             Box::pin(async move {
-                if session.disposed.load(Ordering::SeqCst)
-                    || session.disposing.load(Ordering::SeqCst)
-                {
-                    return true;
-                }
-                let current = session.auto_refine_branch_version.load(Ordering::SeqCst) as i64;
-                if let Some(SerializedBackgroundPlanResult::Plan { branch_version, .. }) =
-                    bg_result.as_ref()
-                {
-                    if *branch_version != current {
+                    if session.disposed.load(Ordering::SeqCst)
+                        || session.disposing.load(Ordering::SeqCst)
+                    {
+                        return true;
+                    }
+                    let current = session.auto_refine_branch_version.load(Ordering::SeqCst) as i64;
+                    if let Some(SerializedBackgroundPlanResult::Plan { branch_version, .. }) =
+                        bg_result.as_ref()
+                    {
+                        if *branch_version != current {
+                            if session.pending_requested_refine.lock().unwrap().is_none() {
+                                *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
+                                session
+                                    .assistant_turns_since_auto_refine
+                                    .store(0, Ordering::SeqCst);
+                                return true;
+                            }
+                        } else {
+                            // Apply the EXACT background plan directly: no second plan call.
+                            if let Some(bg_result) = bg_result.as_ref() {
+                                if let Err(error) = session.apply_serialized_plan(bg_result).await {
+                                    session.emit_refine_failed(&error);
+                                }
+                            }
+                            *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
+                            session
+                                .assistant_turns_since_auto_refine
+                                .store(0, Ordering::SeqCst);
+                            if session.pending_requested_refine.lock().unwrap().is_none() {
+                                return true;
+                            }
+                        }
+                    }
+                    if let Some(SerializedBackgroundPlanResult::Skip { explicit }) =
+                        bg_result.as_ref()
+                    {
+                        if explicit.unwrap_or(false) {
+                            session.emit_refine_failed(REFINEMENT_SKIPPED_MESSAGE);
+                        }
+                        *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
+                        session
+                            .assistant_turns_since_auto_refine
+                            .store(0, Ordering::SeqCst);
+                        if session.pending_requested_refine.lock().unwrap().is_none() {
+                            return true;
+                        }
+                    }
+                    if let Some(SerializedBackgroundPlanResult::Failure {
+                        explicit,
+                        error,
+                        branch_version,
+                        ..
+                    }) = bg_result.as_ref()
+                    {
+                        // TS 2536-2538: the failure stamps the cooldown when the
+                        // CAPTURED checkpoint branch version (2491) is still current -
+                        // not the result's carried version (2546 is the requeue check).
+                        let current = session.auto_refine_branch_version.load(Ordering::SeqCst) as i64;
+                        if branch_version_snapshot as i64 == current {
+                            *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
+                        }
+                        if *explicit {
+                            // Surface the sanitized typed first failure exactly
+                            // once. Never requeue an automatic duplicate planning
+                            // pass; a deliberate refine.run//refine request stays
+                            // a distinct pending entry the user can re-issue.
+                            if let Some(error) = error.as_deref() {
+                                session.emit_refine_failed(error);
+                            }
+                        }
+                        if session.pending_requested_refine.lock().unwrap().is_none() {
+                            return true;
+                        }
+                    }
+                    if let Some(SerializedBackgroundPlanResult::Invalidated { .. }) = bg_result.as_ref()
+                    {
                         if session.pending_requested_refine.lock().unwrap().is_none() {
                             *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
                             session
@@ -15334,92 +15650,35 @@ impl AgentSession {
                                 .store(0, Ordering::SeqCst);
                             return true;
                         }
-                    } else {
-                        // Apply the EXACT background plan directly: no second plan call.
-                        if let Some(bg_result) = bg_result.as_ref() {
-                            if let Err(error) = session.apply_serialized_plan(bg_result).await {
-                                session.emit_refine_failed(&error);
-                            }
-                        }
-                        *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                        session
-                            .assistant_turns_since_auto_refine
-                            .store(0, Ordering::SeqCst);
-                        if session.pending_requested_refine.lock().unwrap().is_none() {
-                            return true;
-                        }
                     }
-                }
-                if let Some(SerializedBackgroundPlanResult::Skip { explicit }) = bg_result.as_ref()
-                {
-                    if explicit.unwrap_or(false) {
-                        session.emit_refine_failed(REFINEMENT_SKIPPED_MESSAGE);
-                    }
-                    *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
                     session
-                        .assistant_turns_since_auto_refine
-                        .store(0, Ordering::SeqCst);
-                    if session.pending_requested_refine.lock().unwrap().is_none() {
-                        return true;
-                    }
-                }
-                if let Some(SerializedBackgroundPlanResult::Failure {
-                    explicit,
-                    options,
-                    branch_version,
-                }) = bg_result.as_ref()
-                {
-                    // TS 2536-2538: the failure stamps the cooldown when the
-                    // CAPTURED checkpoint branch version (2491) is still current -
-                    // not the result's carried version (2546 is the requeue check).
-                    let current = session.auto_refine_branch_version.load(Ordering::SeqCst) as i64;
-                    if branch_version_snapshot as i64 == current {
-                        *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                    }
-                    let mut pending = session.pending_requested_refine.lock().unwrap();
-                    if *explicit && *branch_version == current && pending.is_none() {
-                        *pending = Some(PendingRequestedRefine {
-                            instructions: options.instructions.clone(),
-                            global: options.global,
-                        });
-                    }
-                    if pending.is_none() {
-                        return true;
-                    }
-                }
-                if let Some(SerializedBackgroundPlanResult::Invalidated { .. }) = bg_result.as_ref()
-                {
-                    if session.pending_requested_refine.lock().unwrap().is_none() {
-                        *session.last_auto_refine_review_at.lock().unwrap() = now_ms();
-                        session
-                            .assistant_turns_since_auto_refine
-                            .store(0, Ordering::SeqCst);
-                        return true;
-                    }
-                }
-                session
-                    .run_serialized_refine_checkpoint_after_background(branch_version)
-                    .await;
-                true
+                        .run_serialized_refine_checkpoint_after_background(
+                            branch_version_snapshot,
+                        )
+                        .await;
+                    true
+                })
             })
-        });
-        let consumption = self.consume_serialized_background_plan(consumer).await;
-        if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
-            return;
-        }
-        if consumption != SerializedPlanConsumption::None {
-            return;
-        }
-        self.run_serialized_refine_checkpoint_after_background(branch_version)
-            .await;
     }
 
-    /// `_consumeSerializedBackgroundPlan(consume)` (agent-session.ts:2683-2713).
+    /// `_consumeSerializedBackgroundPlan(consume)` (agent-session.ts:2683-2713),
+    /// extended with RF-001 identity binding.
     ///
-    /// A concurrent caller waits for the claim holder's full processing callback
-    /// instead of resuming as soon as planning settles.
+    /// `expected` pins an exact settled plan future: the claim is taken only
+    /// while that exact future still occupies the slot, and only that future
+    /// is ever awaited - a replacement plan can never be awaited at a turn
+    /// boundary or by an obsolete watcher. `wait_claim` selects the
+    /// concurrent-claim policy: `false` (turn boundary) returns immediately
+    /// (`SlotChanged`) when another consumer owns the claim; `true` (detached
+    /// watcher/discard and the legacy serialization callers) waits for the
+    /// claim holder and re-verifies identity before taking the claim, which
+    /// preserves the reference's "wait for the claim holder's full processing
+    /// callback" semantics. Callers that pass no expected plan keep the
+    /// original generic current-slot consume.
     async fn consume_serialized_background_plan(
         self: &Arc<Self>,
+        expected: Option<&SharedPlanFuture>,
+        wait_claim: bool,
         consume: SerializedPlanConsumer,
     ) -> SerializedPlanConsumption {
         let release = create_agent_message_deferred();
@@ -15428,22 +15687,63 @@ impl AgentSession {
             let claim: BoxFuture<Result<(), String>> = Box::pin(async move { waiter.wait().await });
             claim.shared()
         };
-        let (existing_claim, plan_in_flight) = {
-            let mut claim = self.serialized_plan_claim.lock().unwrap();
-            if let Some(current) = claim.as_ref() {
-                (Some(current.clone()), None)
-            } else {
-                let plan = self.serialized_plan_in_flight.lock().unwrap().clone();
-                if plan.is_some() {
-                    *claim = Some(claim_shared.clone());
+        // Claim the plan slot. With a pinned `expected` plan the identity
+        // check and the claim take happen under the SAME claim guard, so a
+        // concurrent replacement can never make this consume await anything
+        // but the pinned settled future. Once the claim is owned the loop
+        // breaks with the captured plan; the claim is released in the tail
+        // below (also guarded by identity), so no early return may happen
+        // in between.
+        enum ClaimOutcome {
+            /// We own the claim (when the slot held a plan) with the captured
+            /// future; the slot may have been empty (legacy `None` result).
+            Owned(Option<SharedPlanFuture>),
+            /// Another consumer owns the claim and we chose not to wait.
+            Busy,
+        }
+        let plan_in_flight = loop {
+            let outcome = {
+                let mut claim = self.serialized_plan_claim.lock().unwrap();
+                if let Some(current) = claim.as_ref() {
+                    ClaimOutcome::Busy
+                } else {
+                    let mut slot = self.serialized_plan_in_flight.lock().unwrap();
+                    if let Some(expected) = expected {
+                        if !slot
+                            .as_ref()
+                            .is_some_and(|current| current.ptr_eq(expected))
+                        {
+                            return SerializedPlanConsumption::SlotChanged;
+                        }
+                    }
+                    let plan = slot.clone();
+                    if plan.is_some() {
+                        *claim = Some(claim_shared.clone());
+                    }
+                    ClaimOutcome::Owned(plan)
                 }
-                (None, plan)
+            };
+            match outcome {
+                ClaimOutcome::Owned(plan) => break plan,
+                ClaimOutcome::Busy => {
+                    if !wait_claim {
+                        return SerializedPlanConsumption::SlotChanged;
+                    }
+                    let existing_claim = self.serialized_plan_claim.lock().unwrap().clone();
+                    if let Some(existing_claim) = existing_claim {
+                        let _ = existing_claim.await;
+                    }
+                    if expected.is_none() {
+                        // Legacy generic callers keep the reference semantics:
+                        // wait for the claim holder's full processing callback
+                        // and report `Waited` without consuming again.
+                        return SerializedPlanConsumption::Waited;
+                    }
+                    // Identity-pinned watcher/discard: re-verify the slot
+                    // under a fresh claim attempt before consuming.
+                }
             }
         };
-        if let Some(existing_claim) = existing_claim {
-            let _ = existing_claim.await;
-            return SerializedPlanConsumption::Waited;
-        }
         let Some(plan_in_flight) = plan_in_flight else {
             return SerializedPlanConsumption::None;
         };
@@ -15482,6 +15782,15 @@ impl AgentSession {
     }
 
     /// `_applySerializedPlan(bgResult)`.
+    ///
+    /// RF-001: the apply is detached from the caller that planned it (settle
+    /// watcher or turn-boundary consumer), so it must serialize itself.
+    /// Currentness is captured first, the session action commit fence is
+    /// acquired before the refinement-execution lock (the same nesting order
+    /// as the pump: commit fence outside, refinement execution inside), and
+    /// branch/abort/currentness are rechecked immediately before the save.
+    /// The post-save `RefineComplete` listener emit is spawned, so a slow
+    /// extension can never hold a turn boundary or the pump.
     async fn apply_serialized_plan(
         self: &Arc<Self>,
         bg_result: &SerializedBackgroundPlanResult,
@@ -15491,20 +15800,99 @@ impl AgentSession {
         } = bg_result else {
             return Ok(());
         };
-        let _execution = tokio::select! {
+        if abort.is_cancelled() {
+            return Err("Refinement was aborted".to_string());
+        }
+        let current = RefinementCurrentness::capture(self, None)?;
+        let commit_fence = tokio::select! {
             biased;
             _ = abort.cancelled() => return Err("Refinement was aborted".to_string()),
-            guard = self.refinement_execution.lock() => guard,
+            _ = self.session_action_commit_dispose_abort.cancelled() => {
+                return Err("Refinement was aborted because the session changed.".to_string());
+            }
+            fence = self.acquire_session_action_commit_fence() => fence?,
+        };
+        // Never hold the primary commit fence while WAITING on the
+        // refinement-execution lock: another background plan or a sync refine
+        // can own that lock across a full provider planning pass, which would
+        // queue every input commit behind planning again (the RF-001 failure
+        // mode). Under the fence the lock is only try-locked; contention
+        // defers the apply: the settled plan is requeued with a fresh settle
+        // watcher (its safe-point loop waits the lock detached, fence-free)
+        // and this call returns without blocking the boundary.
+        let _execution = match self.refinement_execution.try_lock() {
+            Ok(guard) => guard,
+            Err(_) => {
+                drop(commit_fence);
+                self.requeue_settled_serialized_plan(bg_result.clone());
+                return Ok(());
+            }
         };
         if *branch_version != self.auto_refine_branch_version.load(Ordering::SeqCst) as i64 {
             return Err("Refinement was aborted because the session changed.".to_string());
         }
+        if let Err(error) = current.check(self) {
+            return Err(error);
+        }
         let _flight = self.create_refine_settlement();
-        let outcome = self.apply_refine(plan, options, source, Some(abort)).await;
+        let progress = RefinementProgress::new(self);
+        let outcome = self
+            .apply_refine_with_context(
+                plan,
+                options,
+                source,
+                Some(abort),
+                Some(&current),
+                false,
+                true,
+                &progress,
+            )
+            .await;
+        progress.finish_result(&outcome);
         drop(_flight);
         self.notify_session_input_checkpoint_change();
         self.schedule_session_input_pump();
         outcome.map(|_| ())
+    }
+
+    /// Requeue an already-settled background plan whose apply was deferred
+    /// because the refinement-execution lock was busy (another background
+    /// plan or a sync refine owns it across planning). The settled result
+    /// returns to the plan slot as an immediately-ready shared future with a
+    /// fresh settle watcher; that watcher's safe-point loop waits the lock
+    /// detached (no input fence), and the regular consume path re-applies
+    /// every fence and currentness check before saving. Never starts new
+    /// planning work. If a newer plan already owns the slot, the deferred
+    /// stale apply is dropped - the newer request supersedes it.
+    fn requeue_settled_serialized_plan(
+        self: &Arc<Self>,
+        bg_result: SerializedBackgroundPlanResult,
+    ) {
+        if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+            return;
+        }
+        let plan: SharedPlanFuture = {
+            let plan: BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>> =
+                Box::pin(async move { Ok(Some(bg_result)) });
+            plan.shared()
+        };
+        // Check and install under ONE slot guard: an accepted newer plan that
+        // enters the slot between the check and the install can never be
+        // overwritten by this deferred requeue.
+        {
+            let mut slot = self.serialized_plan_in_flight.lock().unwrap();
+            if slot.is_some() {
+                return;
+            }
+            *slot = Some(plan.clone());
+        }
+        let watcher_session = self.clone();
+        let watcher_abort = self.refinement_signal();
+        tokio::spawn(async move {
+            watcher_session
+                .apply_settled_serialized_plan_when_safe(plan, watcher_abort)
+                .await;
+        });
     }
 
     /// `_waitForRefineIdle()`.
@@ -15954,6 +16342,7 @@ impl AgentSession {
                         false,
                         None,
                         None,
+                        None,
                     );
                 }
                 return Some(false);
@@ -15970,7 +16359,9 @@ impl AgentSession {
     }
 
     /// `_endCompactionUnsuccessfully(reason, outcome, message, options)`
-    /// (agent-session.ts:9519-9541).
+    /// (agent-session.ts:9519-9541). `evidence` carries optional sanitized
+    /// attempt metadata for the persisted outcome; `None` on paths with no
+    /// classified summary failure.
     fn end_compaction_unsuccessfully(
         &self,
         reason: &str,
@@ -15979,8 +16370,9 @@ impl AgentSession {
         aborted: bool,
         error_severity: Option<&str>,
         custom_instructions: Option<&str>,
+        evidence: Option<&CompactionFailureEvidence>,
     ) {
-        self.persist_compaction_outcome(reason, outcome, message);
+        self.persist_compaction_outcome(reason, outcome, message, evidence);
         self.emit(AgentSessionEvent::CompactionEnd {
             reason: reason.to_string(),
             result: None,
@@ -15998,14 +16390,29 @@ impl AgentSession {
     }
 
     /// `_persistCompactionOutcome(reason, outcome, message)` (agent-session.ts:9543-9571).
-    fn persist_compaction_outcome(&self, reason: &str, outcome: &str, message: &str) {
+    fn persist_compaction_outcome(
+        &self,
+        reason: &str,
+        outcome: &str,
+        message: &str,
+        evidence: Option<&CompactionFailureEvidence>,
+    ) {
+        let details = || CompactionOutcomeDetails {
+            reason: reason.to_string(),
+            outcome: outcome.to_string(),
+            failure_kind: evidence
+                .and_then(|evidence| evidence.failure_kind)
+                .map(|kind| kind.as_str().to_string()),
+            boundary_entry_id: evidence
+                .and_then(|evidence| evidence.boundary_entry_id.clone()),
+            summary_shape: evidence.and_then(|evidence| evidence.summary_shape.clone()),
+            consecutive_failures: evidence.and_then(|evidence| evidence.consecutive_failures),
+            ..Default::default()
+        };
         let outcome_text = message.to_string();
         let mut message = create_compaction_outcome_message(
             outcome_text.clone(),
-            CompactionOutcomeDetails {
-                reason: reason.to_string(),
-                outcome: outcome.to_string(),
-            },
+            details(),
             false,
             now_ms_i64(),
         );
@@ -16026,10 +16433,7 @@ impl AgentSession {
                 format!(
                     "{outcome_text}\n\nThis compaction outcome could not be saved to session history: {persistence_error}"
                 ),
-                CompactionOutcomeDetails {
-                    reason: reason.to_string(),
-                    outcome: outcome.to_string(),
-                },
+                details(),
                 false,
                 now_ms_i64(),
             );
@@ -16100,6 +16504,10 @@ impl AgentSession {
             };
         self.continue_after_threshold_compaction
             .store(false, Ordering::SeqCst);
+        // Fresh-attempt fence: no outcome may inherit a previous attempt's
+        // boundary evidence. `perform_compaction_unmeasured_full` republishes it
+        // once this attempt's preparation resolves.
+        *self.compaction_attempt_evidence.lock().unwrap() = None;
 
         // Unlike the single-threaded TS microtask queue, Tokio can run a spawned
         // continuation immediately. Publish its fence before scheduling it or
@@ -16144,7 +16552,11 @@ impl AgentSession {
         match auth {
             Err(detail) => {
                 if reason == COMPACTION_REASON_THRESHOLD {
-                    self.record_threshold_compaction_failure();
+                    // The auth pre-check failed before any summary request; the
+                    // failure is not a classified summary outcome.
+                    self.record_threshold_compaction_failure(
+                        crate::core::compaction::compaction::SummaryFailureKind::Other,
+                    );
                 }
                 self.end_compaction_unsuccessfully(
                     reason,
@@ -16153,6 +16565,7 @@ impl AgentSession {
                     false,
                     None,
                     custom_instructions.as_deref(),
+                    None,
                 );
                 self.clear_queued_autonomous_continuations_after_skipped_threshold_compaction(
                     reason == COMPACTION_REASON_THRESHOLD && should_continue_after_compaction,
@@ -16172,9 +16585,12 @@ impl AgentSession {
                 match &result {
                     Ok(compaction_result) => {
                         compaction_succeeded = true;
-                        if reason == COMPACTION_REASON_THRESHOLD {
-                            self.clear_threshold_compaction_failure_streak();
-                        }
+                        // Any successful compaction (threshold, requested, manual
+                        // or overflow) proves the summary path currently works and
+                        // is the explicit recovery unblock: the automatic backoff
+                        // starts clean instead of inheriting the failed streak.
+                        self.clear_threshold_compaction_failure_streak();
+                        *self.compaction_attempt_evidence.lock().unwrap() = None;
                         // TS 9638-9645.
                         self.emit(AgentSessionEvent::CompactionEnd {
                             reason: reason.to_string(),
@@ -16236,6 +16652,9 @@ impl AgentSession {
             }
         }
         *self.auto_compaction_abort_controller.lock().unwrap() = None;
+        // Terminal fence: cancelled, skipped and consumed-failure paths all land
+        // here; a later attempt can never inherit this attempt's evidence.
+        *self.compaction_attempt_evidence.lock().unwrap() = None;
         // TS 9715-9720 `finally`.
         self.end_compaction_operation(&compaction_operation);
         // TS 9660/9669: only a successful willRetry compaction keeps the loop.
@@ -16299,6 +16718,7 @@ impl AgentSession {
             }
             // TS 9679-9689.
             self.clear_queued_goal_continuation_after_cancelled_threshold_compaction();
+            *self.compaction_attempt_evidence.lock().unwrap() = None;
             self.end_compaction_unsuccessfully(
                 reason,
                 "cancelled",
@@ -16313,6 +16733,7 @@ impl AgentSession {
                 true,
                 None,
                 custom_instructions,
+                None,
             );
             if !self.session_input_pump_suspended.load(Ordering::SeqCst) {
                 self.resume_auto_compaction_after_failure(reason, should_continue_after_compaction);
@@ -16341,30 +16762,69 @@ impl AgentSession {
                 false,
                 Some("warning"),
                 custom_instructions,
+                None,
             );
             self.resume_auto_compaction_after_failure(reason, should_continue_after_compaction);
             return;
         }
-        // TS 9703-9713.
+        // TS 9703-9713, with a typed cause. Only the validator's own structured
+        // handoff-failure formats are classified; transport, auth and provider
+        // text stays `Other` and keeps the existing short backoff.
+        let kind = crate::core::compaction::compaction::classify_summary_failure(error);
+        // Consume this attempt's boundary evidence; the terminal fences below
+        // guarantee it can never be inherited by a later attempt.
+        let attempt_evidence = self.compaction_attempt_evidence.lock().unwrap().take();
+        let mut evidence = CompactionFailureEvidence {
+            failure_kind: Some(kind),
+            boundary_entry_id: attempt_evidence
+                .as_ref()
+                .map(|attempt| attempt.boundary_entry_id.clone()),
+            summary_shape: attempt_evidence
+                .as_ref()
+                .map(|attempt| attempt.summary_shape.clone()),
+            consecutive_failures: None,
+        };
+        let mut message = format!(
+            "{}: {error}",
+            if reason == COMPACTION_REASON_OVERFLOW {
+                "Context overflow recovery failed"
+            } else if reason == COMPACTION_REASON_REQUESTED {
+                "Requested compaction failed"
+            } else {
+                "Auto-compaction failed"
+            }
+        );
         if reason == COMPACTION_REASON_THRESHOLD {
-            self.record_threshold_compaction_failure();
+            self.record_threshold_compaction_failure(kind);
+            let streak = self.threshold_compaction_failure_streak.lock().unwrap();
+            if let Some(state) = streak.as_ref() {
+                evidence.consecutive_failures = Some(state.consecutive_failures);
+                if kind
+                    == crate::core::compaction::compaction::SummaryFailureKind::FilteredOrRefused
+                {
+                    // Bounded, typed recovery guidance. The hint reports the
+                    // actual cooldown this failure armed (escalating with the
+                    // streak, capped), never the ceiling alone. Manual and
+                    // requested compaction stay ungated, and the conversation
+                    // history is preserved either way; a context-overflow
+                    // conversation is not promised to continue unchanged.
+                    let delay =
+                        threshold_compaction_retry_backoff_delay(state.kind, state.consecutive_failures);
+                    message.push_str(&format!(
+                        " Automatic compaction retries are paused for {}; a manual compaction request or selecting another summarization model retries immediately.",
+                        threshold_compaction_cooldown_hint(delay)
+                    ));
+                }
+            }
         }
         self.end_compaction_unsuccessfully(
             reason,
             "failed",
-            &format!(
-                "{}: {error}",
-                if reason == COMPACTION_REASON_OVERFLOW {
-                    "Context overflow recovery failed"
-                } else if reason == COMPACTION_REASON_REQUESTED {
-                    "Requested compaction failed"
-                } else {
-                    "Auto-compaction failed"
-                }
-            ),
+            &message,
             false,
             None,
             custom_instructions,
+            Some(&evidence),
         );
         self.resume_auto_compaction_after_failure(reason, should_continue_after_compaction);
     }
@@ -16391,7 +16851,7 @@ impl AgentSession {
     fn threshold_compaction_retry_cooldown_remaining(&self) -> Option<std::time::Duration> {
         let streak = self.threshold_compaction_failure_streak.lock().unwrap();
         let state = streak.as_ref()?;
-        let delay = threshold_compaction_retry_backoff_delay(state.consecutive_failures);
+        let delay = threshold_compaction_retry_backoff_delay(state.kind, state.consecutive_failures);
         let elapsed = state.last_failure.elapsed();
         if elapsed >= delay {
             None
@@ -16405,7 +16865,10 @@ impl AgentSession {
             .is_some()
     }
 
-    fn record_threshold_compaction_failure(&self) {
+    fn record_threshold_compaction_failure(
+        &self,
+        kind: crate::core::compaction::compaction::SummaryFailureKind,
+    ) {
         let mut streak = self.threshold_compaction_failure_streak.lock().unwrap();
         let consecutive_failures = streak
             .as_ref()
@@ -16415,6 +16878,7 @@ impl AgentSession {
         *streak = Some(ThresholdCompactionFailureState {
             consecutive_failures,
             last_failure: std::time::Instant::now(),
+            kind,
         });
     }
 
@@ -16958,12 +17422,19 @@ impl AgentSession {
         let outcome = self
             .perform_compaction_manual(custom_instructions, compaction_abort.clone())
             .await;
+        // The manual path persists no classified outcome evidence; drop the
+        // attempt record so nothing later inherits it.
+        *self.compaction_attempt_evidence.lock().unwrap() = None;
         *self.compaction_abort_controller.lock().unwrap() = None;
         self.reconnect_to_agent();
         // TS 8144-8147.
         self.end_compaction_operation(&compaction_operation);
         match outcome {
             Ok(result) => {
+                // A successful manual compaction is an explicit recovery
+                // unblock: the automatic threshold backoff starts clean
+                // instead of inheriting the failed streak.
+                self.clear_threshold_compaction_failure_streak();
                 self.emit(AgentSessionEvent::CompactionEnd {
                     reason: COMPACTION_REASON_MANUAL.to_string(),
                     result: Some(result.clone()),
@@ -17302,6 +17773,21 @@ impl AgentSession {
             );
             let (auth, preparation, extension_compaction, from_extension, headers, messages) =
                 prepared?;
+            // Sanitized attempt evidence for the outcome records: the boundary
+            // entry UUID and the request shape only. No summary or conversation
+            // content is stored here, and the terminal fences in
+            // `run_auto_compaction`/`compact` clear it on every exit.
+            *self.compaction_attempt_evidence.lock().unwrap() = Some(CompactionAttemptEvidence {
+                boundary_entry_id: preparation.first_kept_entry_id.clone(),
+                summary_shape: if preparation.is_split_turn
+                    && !preparation.turn_prefix_messages.is_empty()
+                {
+                    "splitTurnPrefix".to_string()
+                } else {
+                    "historyOnly".to_string()
+                },
+                model: model.id.clone(),
+            });
             // TS 8322/8323-8343: the summary call carries the provider retry policy, the
             // transformed provider context and the request options (20-minute timeout,
             // session id, service tier and reasoning). `onPayload`/`onResponse`
@@ -17723,30 +18209,20 @@ mod core001_entry_tests {
 
 impl AgentSession {
     /// `_runSerializedRefineCheckpointAfterBackground(branchVersion)`
-    /// (agent-session.ts:2571-2632).
+    /// (agent-session.ts:2571-2632), made non-blocking (RF-001): every rail
+    /// kicks a BACKGROUND plan instead of planning synchronously inside the
+    /// turn boundary, so queued primary input always executes first. The
+    /// plan's settle watcher applies the result at the next safe point, and
+    /// the in-flight guard prevents duplicate planning.
     async fn run_serialized_refine_checkpoint_after_background(
         self: &Arc<Self>,
-        branch_version: u64,
+        _branch_version: u64,
     ) {
         // 2. Agent-callable refine.run requests that were NOT consumed by background
-        //    planning. Service them synchronously.
-        let pending = self.pending_requested_refine.lock().unwrap().take();
-        if let Some(pending) = pending {
-            let options = RefineOptions {
-                instructions: pending.instructions,
-                rollback_id: None,
-                global: pending.global,
-                ..Default::default()
-            };
-            if let Err(error) = self
-                .run_serialized_refine(&options, REFINEMENT_SOURCE_SELF)
-                .await
-            {
-                self.emit_refine_failed(&error);
-            }
-            *self.last_auto_refine_review_at.lock().unwrap() = now_ms();
-            self.assistant_turns_since_auto_refine
-                .store(0, Ordering::SeqCst);
+        //    planning: hand the request to the background-plan kickoff. It takes
+        //    the pending entry and starts planning without blocking this boundary.
+        if self.pending_requested_refine.lock().unwrap().is_some() {
+            self.maybe_start_serialized_background_plan();
             return;
         }
 
@@ -17780,27 +18256,16 @@ impl AgentSession {
                 }
                 self.compact_auto_refine_pending
                     .store(false, Ordering::SeqCst);
-                self.run_serialized_auto_refine_review(&AutoRefineReason::Compact, branch_version)
-                    .await;
+                // Compact rail: the boundary already decided it is due; the
+                // review runs inside the background plan, not here.
+                self.maybe_start_serialized_background_plan_for_trigger(Some(AutoRefineReason::Compact));
                 return;
             }
         }
 
         // 4. Interval-triggered auto-refine (no background plan was started).
-        if (self
-            .assistant_turns_since_auto_refine
-            .load(Ordering::SeqCst) as f64)
-            < settings.turn_interval
-        {
-            return;
-        }
-        let now = now_ms();
-        let last = *self.last_auto_refine_review_at.lock().unwrap();
-        if last > 0.0 && now - last < settings.cooldown_ms {
-            return;
-        }
-        self.run_serialized_auto_refine_review(&AutoRefineReason::TurnInterval, branch_version)
-            .await;
+        // The kickoff applies the interval/cooldown checks itself.
+        self.maybe_start_serialized_background_plan();
     }
 
     /// `_runSerializedAutoRefineReview(reason, branchVersion)`
@@ -18021,8 +18486,19 @@ impl AgentSession {
         task_queue::enqueue(&self.agent_event_queue, task);
     }
 
-    /// `_maybeStartSerializedBackgroundPlan()`.
+    /// `_maybeStartSerializedBackgroundPlan()`: pending-request and interval rails.
     fn maybe_start_serialized_background_plan(self: &Arc<Self>) {
+        self.maybe_start_serialized_background_plan_for_trigger(None);
+    }
+
+    /// `_maybeStartSerializedBackgroundPlan()` with an explicit auto-refine
+    /// review trigger. `Some(reason)` starts the review rail for that reason
+    /// without the interval/cooldown checks (the caller already decided it is
+    /// due); `None` keeps the interval checks.
+    fn maybe_start_serialized_background_plan_for_trigger(
+        self: &Arc<Self>,
+        review_reason: Option<AutoRefineReason>,
+    ) {
         if !self.serialized_refine
             || self.disposed.load(Ordering::SeqCst)
             || self.disposing.load(Ordering::SeqCst)
@@ -18037,86 +18513,254 @@ impl AgentSession {
         }
         let pending = self.pending_requested_refine.lock().unwrap().take();
         if let Some(pending) = pending {
-            let options = RefineOptions {
-                instructions: pending.instructions,
-                rollback_id: None,
-                global: pending.global,
-                retry: None,
-                evidence: None,
-                max_output_tokens: None,
-            };
-            *self.serialized_explicit_refine_options.lock().unwrap() = Some(options);
+            *self.serialized_explicit_refine_options.lock().unwrap() = Some(pending.options);
             let branch_version = self.auto_refine_branch_version.load(Ordering::SeqCst);
             let refine_abort = self.refinement_signal();
-            let session = self.clone();
-            let plan: SharedPlanFuture = {
-                let plan: BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>> =
-                    Box::pin(async move {
-                        session
-                            .run_background_plan(branch_version, true, refine_abort)
-                            .await
-                    });
-                plan.shared()
-            };
-            // `this._serializedPlanInFlight = this._runBackgroundPlan(...)` starts the
-            // promise immediately, so the port drives the shared future eagerly; the
-            // boundary later awaits the SAME plan.
-            let driver = plan.clone();
-            tokio::spawn(async move {
-                let _ = driver.await;
-            });
-            *self.serialized_plan_in_flight.lock().unwrap() = Some(plan);
+            let reason = AutoRefineReason::TurnInterval;
+            self.start_serialized_background_plan(branch_version, true, reason, refine_abort);
             return;
         }
-        if !self.auto_refine_allowed_for_session() {
-            return;
-        }
-        let settings = self
-            .settings_manager
-            .lock()
-            .unwrap()
-            .get_auto_refine_settings();
-        if !settings.enabled {
-            return;
-        }
-        if (self
-            .assistant_turns_since_auto_refine
-            .load(Ordering::SeqCst) as f64)
-            < settings.turn_interval
-        {
-            return;
-        }
-        let now = now_ms();
-        let last = *self.last_auto_refine_review_at.lock().unwrap();
-        let under_cooldown = last > 0.0 && now - last < settings.cooldown_ms;
-        if under_cooldown {
-            return;
-        }
+        let reason = match review_reason {
+            Some(reason) => reason,
+            None => {
+                if !self.auto_refine_allowed_for_session() {
+                    return;
+                }
+                let settings = self
+                    .settings_manager
+                    .lock()
+                    .unwrap()
+                    .get_auto_refine_settings();
+                if !settings.enabled {
+                    return;
+                }
+                if (self
+                    .assistant_turns_since_auto_refine
+                    .load(Ordering::SeqCst) as f64)
+                    < settings.turn_interval
+                {
+                    return;
+                }
+                let now = now_ms();
+                let last = *self.last_auto_refine_review_at.lock().unwrap();
+                let under_cooldown = last > 0.0 && now - last < settings.cooldown_ms;
+                if under_cooldown {
+                    return;
+                }
+                AutoRefineReason::TurnInterval
+            }
+        };
         let branch_version = self.auto_refine_branch_version.load(Ordering::SeqCst);
         let refine_abort = self.refinement_signal();
+        self.start_serialized_background_plan(branch_version, false, reason, refine_abort);
+    }
+
+    /// Install the eagerly-started shared background-plan promise and its
+    /// settle watcher. `this._serializedPlanInFlight = this._runBackgroundPlan(...)`
+    /// starts the promise immediately, so the port drives the shared future
+    /// eagerly; unlike the reference, the turn boundary no longer blocks on an
+    /// unsettled plan (RF-001): the watcher applies the settled plan at the
+    /// next safe point instead.
+    fn start_serialized_background_plan(
+        self: &Arc<Self>,
+        branch_version: u64,
+        skip_review: bool,
+        review_reason: AutoRefineReason,
+        refine_abort: CancellationToken,
+    ) {
         let session = self.clone();
         let plan: SharedPlanFuture = {
             let plan: BoxFuture<Result<Option<SerializedBackgroundPlanResult>, String>> =
                 Box::pin(async move {
                     session
-                        .run_background_plan(branch_version, false, refine_abort)
+                        .run_background_plan(branch_version, skip_review, review_reason, refine_abort)
                         .await
                 });
             plan.shared()
         };
         *self.serialized_plan_in_flight.lock().unwrap() = Some(plan.clone());
-        // Eager start, exactly like the assigned `_runBackgroundPlan(...)` promise.
+        let watcher_plan = plan.clone();
         let driver = plan;
+        let watcher_session = self.clone();
+        let watcher_abort = self.refinement_signal();
         tokio::spawn(async move {
             let _ = driver.await;
+            watcher_session
+                .apply_settled_serialized_plan_when_safe(watcher_plan, watcher_abort)
+                .await;
         });
     }
 
+    /// After a background plan settles, apply it at the next safe point.
+    ///
+    /// This runs detached; it must never block the pump, a turn boundary, or
+    /// disposal. Every wait is cancellation-aware (disposal abort and the
+    /// refinement signal), and the plan slot is rechecked after each wait.
+    /// A cancelled refinement signal never parks in an empty select arm: a
+    /// cancelled token stays immediately ready, so the watcher consumes and
+    /// discards the invalidated plan once via the regular checkpoint path
+    /// (whose consumer reacquires the commit fence and rechecks branch/
+    /// cancel/stop/currentness immediately before mutation) and exits.
+    /// A single watcher exists per plan.
+    async fn apply_settled_serialized_plan_when_safe(
+        self: &Arc<Self>,
+        plan: SharedPlanFuture,
+        refine_abort: CancellationToken,
+    ) {
+        loop {
+            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                return;
+            }
+            if !self.owns_serialized_plan(&plan) {
+                // The slot is empty (consumed) or holds a NEWER plan this
+                // obsolete watcher must never touch or await.
+                return;
+            }
+            // Checked before every wait so a ready token can never starve
+            // behind a repeatedly-waking `wait_for_idle`/queue future.
+            if refine_abort.is_cancelled() {
+                self.discard_serialized_plan_after_abort(&plan).await;
+                return;
+            }
+            if self.is_streaming() {
+                tokio::select! {
+                    biased;
+                    _ = self.agent.wait_for_idle() => {},
+                    _ = self.session_action_commit_dispose_abort.cancelled() => return,
+                    _ = refine_abort.cancelled() => {
+                        self.discard_serialized_plan_after_abort(&plan).await;
+                        return;
+                    }
+                }
+                continue;
+            }
+            let compaction = self
+                .compaction_operation
+                .lock()
+                .unwrap()
+                .as_ref()
+                .map(|operation| operation.operation.clone());
+            match compaction {
+                None => {}
+                Some(operation) => {
+                    tokio::select! {
+                        biased;
+                        _ = operation => {},
+                        _ = self.session_action_commit_dispose_abort.cancelled() => return,
+                        _ = refine_abort.cancelled() => {
+                            self.discard_serialized_plan_after_abort(&plan).await;
+                            return;
+                        }
+                    }
+                    continue;
+                }
+            }
+            // Agent idle and no compaction running: drain queued event work
+            // once, then RECHECK serialization state. The drain can admit and
+            // start a new turn (or a compaction); the apply must not race it.
+            let queued = self.agent_event_queue.lock().unwrap().clone();
+            tokio::select! {
+                biased;
+                _ = queued => {},
+                _ = self.session_action_commit_dispose_abort.cancelled() => return,
+                _ = refine_abort.cancelled() => {
+                    self.discard_serialized_plan_after_abort(&plan).await;
+                    return;
+                }
+            }
+            if self.disposed.load(Ordering::SeqCst)
+                || self.disposing.load(Ordering::SeqCst)
+                || !self.owns_serialized_plan(&plan)
+            {
+                return;
+            }
+            if self.is_streaming() || self.compaction_operation.lock().unwrap().is_some() {
+                continue;
+            }
+            // Wait for any refinement-execution owner BEFORE the bounded
+            // apply: another background plan or a sync refine can own that
+            // lock across a full provider planning pass, and the apply's
+            // under-fence lock acquisition must never queue input commits
+            // behind planning. This detached wait holds no fence; the
+            // apply then only needs its short try-lock window.
+            tokio::select! {
+                biased;
+                _ = self.refinement_execution.lock() => {},
+                _ = self.session_action_commit_dispose_abort.cancelled() => return,
+                _ = refine_abort.cancelled() => {
+                    self.discard_serialized_plan_after_abort(&plan).await;
+                    return;
+                }
+            }
+            // The execution-lock wait can straddle a boundary consume or a
+            // replacement start; re-verify the plan identity before applying.
+            if self.disposed.load(Ordering::SeqCst)
+                || self.disposing.load(Ordering::SeqCst)
+                || !self.owns_serialized_plan(&plan)
+            {
+                return;
+            }
+            break;
+        }
+        // Consume THIS watcher's own plan by identity - never a replacement
+        // plan that may have entered the slot during the waits above. The
+        // boundary consumer applies the same fences and currentness checks.
+        let branch_version_snapshot = self.auto_refine_branch_version.load(Ordering::SeqCst);
+        let consumer = self.serialized_plan_boundary_consumer(branch_version_snapshot);
+        let _ = self
+            .consume_serialized_background_plan(Some(&plan), true, consumer)
+            .await;
+    }
+
+    /// Whether the plan slot still holds exactly this watcher's own plan
+    /// (identity, not mere occupancy): a boundary may have consumed it and a
+    /// newer plan may already occupy the slot.
+    fn owns_serialized_plan(&self, plan: &SharedPlanFuture) -> bool {
+        self.serialized_plan_in_flight
+            .lock()
+            .unwrap()
+            .as_ref()
+            .is_some_and(|current| current.ptr_eq(plan))
+    }
+
+    /// One-shot consume-and-discard after the plan's own refinement signal
+    /// aborted (replacement request, user abort, or invalidation). Bound to
+    /// THIS watcher's plan identity: a boundary may already have consumed it
+    /// and started a newer plan, which this watcher must never consume with
+    /// a stale cancellation assumption. The driver settles the plan on that
+    /// same token first, so joining the shared future is bounded; the
+    /// regular checkpoint consume path then applies the fences, discards the
+    /// invalidated result, and services any pending deliberate request.
+    /// Never retries planning here.
+    async fn discard_serialized_plan_after_abort(self: &Arc<Self>, plan: &SharedPlanFuture) {
+        if !self.owns_serialized_plan(plan) {
+            return;
+        }
+        // Bounded: the driver settles the plan on this same cancelled token.
+        let _ = plan.clone().await;
+        if !self.owns_serialized_plan(plan) {
+            return;
+        }
+        // Consume THIS watcher's own plan by identity through the regular
+        // boundary consumer: the fences are reacquired and the invalidated
+        // result is discarded without touching any replacement plan.
+        let branch_version_snapshot = self.auto_refine_branch_version.load(Ordering::SeqCst);
+        let consumer = self.serialized_plan_boundary_consumer(branch_version_snapshot);
+        let _ = self
+            .consume_serialized_background_plan(Some(plan), true, consumer)
+            .await;
+    }
+
     /// `_runBackgroundPlan(options, refineAbort, branchVersion, skipReview)`.
+    ///
+    /// `review_reason` selects the auto-refine review trigger when the plan is
+    /// not explicit (`skip_review == false`); the compact rail and the interval
+    /// rail otherwise share this one background path.
     async fn run_background_plan(
         self: &Arc<Self>,
         branch_version: u64,
         skip_review: bool,
+        review_reason: AutoRefineReason,
         refine_abort: CancellationToken,
     ) -> Result<Option<SerializedBackgroundPlanResult>, String> {
         let _execution = tokio::select! {
@@ -18136,7 +18780,7 @@ impl AgentSession {
         }
         if !skip_review {
             let context = AutoRefineReviewContext {
-                reason: AutoRefineReason::TurnInterval,
+                reason: review_reason,
                 turns_since_last_review: self
                     .assistant_turns_since_auto_refine
                     .load(Ordering::SeqCst) as i64,
@@ -18155,7 +18799,9 @@ impl AgentSession {
             }
             let review = match review {
                 Ok(review) => review,
-                Err(_) => {
+                Err(error) => {
+                    // Carry the sanitized first-attempt error; the consumer
+                    // surfaces it once and never requeues a duplicate plan.
                     return Ok(Some(SerializedBackgroundPlanResult::Failure {
                         explicit: false,
                         options: self
@@ -18165,6 +18811,7 @@ impl AgentSession {
                             .clone()
                             .unwrap_or_default(),
                         branch_version: branch_version_i64,
+                        error: Some(error),
                     }))
                 }
             };
@@ -18175,7 +18822,7 @@ impl AgentSession {
             }
             *self.serialized_explicit_refine_options.lock().unwrap() = Some(RefineOptions {
                 instructions: Some(auto_refine_instructions(
-                    &AutoRefineReason::TurnInterval,
+                    &review_reason,
                     &review,
                 )),
                 rollback_id: None,
@@ -18215,10 +18862,13 @@ impl AgentSession {
                     REFINEMENT_SOURCE_AUTO.to_string()
                 },
             })),
-            Err(_) => Ok(Some(SerializedBackgroundPlanResult::Failure {
+            Err(error) => Ok(Some(SerializedBackgroundPlanResult::Failure {
                 explicit: skip_review,
                 options,
                 branch_version: branch_version_i64,
+                // The planner error text is already the sanitized typed summary
+                // (fixed vocabulary, category, attempts, per-attempt durations).
+                error: Some(error),
             })),
         }
     }
@@ -21154,6 +21804,7 @@ mod post_compaction_continuation_tests {
     #[cfg(test)]
     mod compaction_retry_backoff_tests {
         use super::*;
+        use crate::core::compaction::compaction::SummaryFailureKind;
         use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
         use pi_ai::utils::event_stream::AssistantMessageEventStream;
         use std::sync::atomic::AtomicUsize;
@@ -21328,16 +21979,58 @@ mod post_compaction_continuation_tests {
 
         #[test]
         fn threshold_compaction_retry_backoff_doubles_and_caps() {
-            let delay = |count| threshold_compaction_retry_backoff_delay(count);
-            assert_eq!(delay(1), std::time::Duration::from_millis(5_000));
-            assert_eq!(delay(2), std::time::Duration::from_millis(10_000));
-            assert_eq!(delay(3), std::time::Duration::from_millis(20_000));
-            assert_eq!(delay(4), std::time::Duration::from_millis(40_000));
-            assert_eq!(delay(5), std::time::Duration::from_millis(80_000));
-            assert_eq!(delay(6), std::time::Duration::from_millis(120_000));
+            use crate::core::compaction::compaction::SummaryFailureKind;
+            let delay =
+                |kind, count| threshold_compaction_retry_backoff_delay(kind, count);
+            // Unclassified/transport failures keep the existing short ladder.
+            assert_eq!(delay(SummaryFailureKind::Other, 1), std::time::Duration::from_millis(5_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 2), std::time::Duration::from_millis(10_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(20_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 4), std::time::Duration::from_millis(40_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 5), std::time::Duration::from_millis(80_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 6), std::time::Duration::from_millis(120_000));
             assert_eq!(
-                delay(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
+                delay(SummaryFailureKind::Other, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
                 std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
+            );
+            // A provider filter/refusal starts at one minute - not at the
+            // ceiling - and escalates to the bounded 30-minute cap.
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 1), std::time::Duration::from_millis(60_000));
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 2), std::time::Duration::from_millis(120_000));
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 3), std::time::Duration::from_millis(240_000));
+            assert_eq!(
+                delay(SummaryFailureKind::FilteredOrRefused, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES),
+                std::time::Duration::from_millis(1_800_000)
+            );
+            assert_eq!(
+                delay(SummaryFailureKind::FilteredOrRefused, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
+                std::time::Duration::from_millis(THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS)
+            );
+        }
+
+        #[test]
+        fn cooldown_hints_report_the_actual_delay_not_the_ceiling() {
+            use crate::core::compaction::compaction::SummaryFailureKind;
+            assert_eq!(
+                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                    SummaryFailureKind::FilteredOrRefused,
+                    1
+                )),
+                "about 1 minute"
+            );
+            assert_eq!(
+                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                    SummaryFailureKind::FilteredOrRefused,
+                    3
+                )),
+                "about 4 minutes"
+            );
+            assert_eq!(
+                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                    SummaryFailureKind::FilteredOrRefused,
+                    THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES
+                )),
+                "about 30 minutes"
             );
         }
 
@@ -21347,7 +22040,7 @@ mod post_compaction_continuation_tests {
             let session = test_session(agent);
             assert!(!session.threshold_compaction_retry_in_cooldown());
             for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
-                session.record_threshold_compaction_failure();
+                session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             }
             assert_eq!(
                 session
@@ -21449,8 +22142,8 @@ mod post_compaction_continuation_tests {
             let (session, events) = gated_session().await;
             let settings = session.compaction_settings();
             // Two failed threshold attempts arm a 10s cooldown.
-            session.record_threshold_compaction_failure();
-            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             assert!(session.threshold_compaction_retry_in_cooldown());
             assert!(!session.check_compaction(&settings, false).await.unwrap());
             assert_eq!(
@@ -21483,8 +22176,8 @@ mod post_compaction_continuation_tests {
         #[tokio::test]
         async fn cooldown_gates_the_turn_end_stop_decision() {
             let (session, _events) = gated_session().await;
-            session.record_threshold_compaction_failure();
-            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             assert!(session.threshold_compaction_retry_in_cooldown());
             let message = match &session.agent.state().messages[1] {
                 AgentMessage::Message(Message::Assistant(assistant)) => assistant.clone(),
@@ -21523,8 +22216,8 @@ mod post_compaction_continuation_tests {
         #[tokio::test]
         async fn requested_and_overflow_compaction_ignore_the_threshold_cooldown() {
             let (session, events) = gated_session().await;
-            session.record_threshold_compaction_failure();
-            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             assert!(session.threshold_compaction_retry_in_cooldown());
 
             // Manual/requested compaction is never gated.
@@ -21698,8 +22391,8 @@ mod post_compaction_continuation_tests {
             session.agent.set_state(state);
 
             // Arm the cooldown, then succeed: the streak must be gone afterwards.
-            session.record_threshold_compaction_failure();
-            session.record_threshold_compaction_failure();
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
+            session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             assert!(session.threshold_compaction_retry_in_cooldown());
             let _ = session
                 .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
@@ -21707,6 +22400,226 @@ mod post_compaction_continuation_tests {
             assert!(
                 !session.threshold_compaction_retry_in_cooldown(),
                 "a successful threshold compaction clears the backoff"
+            );
+            // An explicit requested (manual) compaction is the other recovery
+            // unblock: a filtered failure streak must not survive it either.
+            // Seed one more oversized turn so the branch has work to compact
+            // again after the first compaction entry.
+            {
+                let mut manager = session.session_manager.lock().unwrap();
+                let text = "user turn 2 ".repeat(200);
+                manager
+                    .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                        UserContent::Text(text),
+                        0,
+                    ))))
+                    .unwrap();
+                manager
+                    .append_message(AgentMessage::Message(Message::Assistant(
+                        AssistantMessage {
+                            content: vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new("assistant reply 2"),
+                            )],
+                            stop_reason: STOP_REASON_STOP.to_string(),
+                            timestamp: 2,
+                            usage: Usage {
+                                input: 900.0,
+                                ..Default::default()
+                            },
+                            ..Default::default()
+                        },
+                    )))
+                    .unwrap();
+            }
+            session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            // Verify the actual manual-compaction path (the /compact command
+            // flow), not only the requested-reason arm of run_auto_compaction.
+            session
+                .compact(None, true)
+                .await
+                .expect("manual compaction succeeds on the seeded fixture");
+            assert!(
+                !session.threshold_compaction_retry_in_cooldown(),
+                "a successful manual compaction clears the filtered backoff"
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        #[test]
+        fn a_filtered_threshold_failure_arms_the_long_bounded_cooldown() {
+            let agent = ScriptedAgent::new(vec![]);
+            let session = test_session(agent);
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            // First filtered failure: the actual armed delay is 60s, not the
+            // ceiling. Just inside the window the gate holds...
+            session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(59_000))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(
+                session.threshold_compaction_retry_in_cooldown(),
+                "the first filtered cooldown is 60s and still holds"
+            );
+            // ...and 61s after the failure it expires.
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(61_000))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(
+                !session.threshold_compaction_retry_in_cooldown(),
+                "the first filtered cooldown expires after 60s"
+            );
+            // Escalation: a second filtered failure arms 120s. Repeated
+            // refused attempts are paced back past the entire unclassified
+            // cadence instead of re-attacking every couple of minutes.
+            session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(
+                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000,
+                    ))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(
+                session.threshold_compaction_retry_in_cooldown(),
+                "the escalated filtered cooldown outlasts the unclassified ceiling"
+            );
+            // The ladder stays bounded: at the cap the delay is 30 minutes,
+            // and the gate reopens after it - never a permanent lockout.
+            for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
+                session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            }
+            {
+                let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
+                let state = streak.as_mut().unwrap();
+                state.last_failure = std::time::Instant::now()
+                    .checked_sub(std::time::Duration::from_millis(
+                        THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS + 1,
+                    ))
+                    .expect("the backdated instant stays representable");
+            }
+            assert!(
+                !session.threshold_compaction_retry_in_cooldown(),
+                "the filtered cooldown is bounded, never a permanent lockout"
+            );
+        }
+
+        #[tokio::test]
+        async fn selecting_another_model_clears_the_failure_streak() {
+            let (session, _events) = gated_session().await;
+            session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            // A no-op re-selection of the same model is not a model change and
+            // must not reset the backoff.
+            let same = session.agent.state().model.clone();
+            session.set_model(same, ModelSelectOptions::default()).await.unwrap();
+            assert!(
+                session.threshold_compaction_retry_in_cooldown(),
+                "re-selecting the same model leaves the backoff armed"
+            );
+            let mut other = Model::new(
+                "unit-other-summarizer",
+                "unit-other-summarizer",
+                "faux",
+                "faux",
+                "https://fixture.invalid",
+            );
+            other.context_window = 1_000.0;
+            other.max_tokens = 500.0;
+            session.set_model(other, ModelSelectOptions::default()).await.unwrap();
+            assert!(
+                !session.threshold_compaction_retry_in_cooldown(),
+                "the outcome message's select-another-summarization-model advice clears the backoff"
+            );
+            session.dispose_async(Some(false)).await;
+        }
+
+        /// A filtered summary failure must persist a sanitized, typed outcome:
+        /// classification, boundary and request shape, plus the truthful
+        /// bounded-recovery hint. No conversation or summary content.
+        #[tokio::test]
+        async fn filtered_failure_persists_sanitized_evidence_and_truthful_hint() {
+            let agent = ScriptedAgent::new(vec![]);
+            let session = test_session(agent);
+            *session.compaction_attempt_evidence.lock().unwrap() = Some(CompactionAttemptEvidence {
+                boundary_entry_id: "boundary-a92a0a1b".to_string(),
+                summary_shape: "splitTurnPrefix".to_string(),
+                model: "gpt-6-astra".to_string(),
+            });
+            let error = "Summarization returned an unusable handoff (the provider refused or filtered the summary (provider_status=content_filter)); existing conversation preserved. Retry compaction or select another summarization model.";
+            session.handle_auto_compaction_failure(
+                COMPACTION_REASON_THRESHOLD,
+                error,
+                None,
+                false,
+                &[],
+                None,
+            );
+            assert!(session.threshold_compaction_retry_in_cooldown());
+            let entries = session.session_manager.lock().unwrap().get_entries();
+            let outcome = entries
+                .iter()
+                .find(|entry| entry.get("type").and_then(|value| value.as_str()) == Some("custom_message"))
+                .expect("a compaction outcome is persisted");
+            let details = outcome.get("details").expect("outcome details");
+            assert_eq!(details.get("failureKind").and_then(|value| value.as_str()), Some("filtered"));
+            assert_eq!(
+                details.get("boundaryEntryId").and_then(|value| value.as_str()),
+                Some("boundary-a92a0a1b")
+            );
+            assert_eq!(
+                details.get("summaryShape").and_then(|value| value.as_str()),
+                Some("splitTurnPrefix")
+            );
+            assert_eq!(
+                details.get("consecutiveFailures").and_then(|value| value.as_u64()),
+                Some(1)
+            );
+            let content = outcome
+                .get("content")
+                .and_then(|value| value.as_str())
+                .unwrap_or_default();
+            assert!(
+                content.contains("paused for about 1 minute"),
+                "the hint reports the actual first cooldown, not the ceiling: {content}"
+            );
+            assert!(content.contains("provider_status=content_filter"), "{content}");
+            // The evidence is sanitized: the details object carries exactly
+            // the typed fields and ids, never conversation or summary text.
+            let mut detail_keys = details
+                .as_object()
+                .expect("details is an object")
+                .keys()
+                .map(|key| key.to_string())
+                .collect::<Vec<_>>();
+            detail_keys.sort();
+            assert_eq!(
+                detail_keys,
+                vec![
+                    "boundaryEntryId",
+                    "consecutiveFailures",
+                    "failureKind",
+                    "outcome",
+                    "reason",
+                    "summaryShape",
+                ]
+            );
+            assert!(
+                !entries
+                    .iter()
+                    .any(|entry| entry.get("type").and_then(|value| value.as_str()) == Some("compaction")),
+                "a refused handoff never becomes the durable context head"
             );
             session.dispose_async(Some(false)).await;
         }
@@ -21836,6 +22749,12 @@ mod post_compaction_continuation_tests {
             manager: Arc<Mutex<SessionManager>>,
             provider: FauxProviderRegistration,
             agent: Arc<ScriptedAgent>,
+            /// The fixture scopes `getAgentDir()` through the PROCESS
+            /// environment, so parallel tests would swap each other's agent
+            /// dir mid-test (production code reads the env at plan/apply
+            /// time). One holder at a time serializes the fixture without
+            /// changing any test's logic.
+            _env_scope: tokio::sync::MutexGuard<'static, ()>,
         }
 
         impl T11Session {
@@ -21845,6 +22764,8 @@ mod post_compaction_continuation_tests {
                 auto_refine: Value,
                 extension_factories: Vec<crate::core::extensions::types::ExtensionFactory>,
             ) -> Self {
+                static T11_ENV_SCOPE: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+                let _env_scope = T11_ENV_SCOPE.lock().await;
                 let agent = ScriptedAgent::new(vec![]);
                 let provider = register_faux_provider(Some(RegisterFauxProviderOptions {
                     provider: Some(format!("t11-{}", uuid::Uuid::new_v4())),
@@ -21967,6 +22888,7 @@ mod post_compaction_continuation_tests {
                     manager,
                     provider,
                     agent,
+                    _env_scope,
                 }
             }
 
@@ -22365,11 +23287,13 @@ mod post_compaction_continuation_tests {
              `schedule_auto_refine` (`agent_session.rs:12219`) only set a pending flag it never consumed"
         );
             let _ = &events;
-            assert_eq!(
-                t.local_harness().refinements.len(),
-                1,
-                "H-02: the scheduled run must complete the full review -> plan -> apply cycle"
-            );
+            // RF-001: the apply is deferred to the next safe point, so the
+            // save completes asynchronously after the review/plan calls. Wait
+            // for it bounded instead of asserting mid-cycle.
+            rf_wait_until("scheduled auto-refine saves", || {
+                t.local_harness().refinements.len() == 1
+            })
+            .await;
             t.session.dispose_async(Some(false)).await;
         }
 
@@ -22447,6 +23371,10 @@ mod post_compaction_continuation_tests {
                 disabled.local_harness().refinements.is_empty(),
                 "H-02 negative control: a disabled session must not persist a refinement"
             );
+            // The fixture serializes the process-wide agent-dir environment;
+            // release the previous holder before the next phase constructs.
+            disabled.session.dispose_async(Some(false)).await;
+            drop(disabled);
 
             // (b) busy session: the trigger is deferred, not executed.
             let busy = T11Session::new(
@@ -22501,6 +23429,7 @@ mod post_compaction_continuation_tests {
                 "the deferred auto-refine must run once the busy session becomes idle"
             );
             busy.session.dispose_async(Some(false)).await;
+            drop(busy);
 
             // (c) a rejected review stamps the cooldown and never refines.
             let rejected = T11Session::new(
@@ -22543,7 +23472,6 @@ mod post_compaction_continuation_tests {
                 "H-02 negative control: a rejected review must not persist a refinement"
             );
 
-            disabled.session.dispose_async(Some(false)).await;
             rejected.session.dispose_async(Some(false)).await;
         }
 
@@ -22580,6 +23508,8 @@ mod post_compaction_continuation_tests {
                 before,
                 "H-02: a serialized session must not run the interactive path (TS 8521-8523)"
             );
+            serialized.session.dispose_async(Some(false)).await;
+            drop(serialized);
 
             // (b) non-serialized with a post-compaction continuation: deferred.
             let continued = T11Session::new(
@@ -22606,6 +23536,8 @@ mod post_compaction_continuation_tests {
                     .load(Ordering::SeqCst),
                 "H-02: the deferred compact trigger stays pending"
             );
+            continued.session.dispose_async(Some(false)).await;
+            drop(continued);
 
             // (c) no continuation: "compact" runs.
             let run = T11Session::new(
@@ -22632,8 +23564,6 @@ mod post_compaction_continuation_tests {
              (agent-session.ts:8531)"
             );
 
-            serialized.session.dispose_async(Some(false)).await;
-            continued.session.dispose_async(Some(false)).await;
             run.session.dispose_async(Some(false)).await;
         }
 
@@ -22728,7 +23658,9 @@ mod post_compaction_continuation_tests {
                                 false
                             })
                         });
-                        session.consume_serialized_background_plan(consumer).await
+                        session
+                            .consume_serialized_background_plan(None, true, consumer)
+                            .await
                     }));
                 }
                 barrier.wait().await;
@@ -22842,25 +23774,35 @@ mod post_compaction_continuation_tests {
             {
                 tokio::time::sleep(std::time::Duration::from_millis(10)).await;
             }
-            // The plan must still be UNCONSUMED: it is claimed at the boundary.
+            // RF-001: the boundary no longer awaits the plan. The settle watcher
+            // consumes the ready plan and applies it at the next safe point.
+            let applied = {
+                let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+                loop {
+                    if t.local_harness().refinements.len() == 1 {
+                        break true;
+                    }
+                    if tokio::time::Instant::now() > deadline {
+                        break false;
+                    }
+                    tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+                }
+            };
             assert!(
-                t.session
-                    .serialized_plan_in_flight
-                    .lock()
-                    .unwrap()
-                    .is_some(),
-                "H-03 precondition: a background plan is in flight and not yet claimed"
+                applied,
+                "H-03: the ready background plan must be applied exactly once by the \
+             deferred settle path (agent-session.ts:2505-2516 `_applySerializedPlan`)"
             );
 
+            // A boundary after the deferred apply must be inert: no second plan,
+            // no duplicate apply.
             t.session.run_serialized_refine_checkpoint().await;
 
             let state = t.local_harness();
             assert_eq!(
                 state.refinements.len(),
                 1,
-                "H-03: the ready plan must be applied exactly once at the boundary \
-             (agent-session.ts:2505-2516 `_applySerializedPlan`); the port awaited the plan and \
-             dropped the result (`let _ = in_flight.await`), so nothing was persisted"
+                "H-03: the ready plan must be applied exactly once"
             );
             assert!(
                 state
@@ -22912,17 +23854,25 @@ mod post_compaction_continuation_tests {
                 .assistant_turns_since_auto_refine
                 .store(1, Ordering::SeqCst);
             t.session.maybe_start_serialized_background_plan();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
-            while t
-                .session
-                .serialized_plan_in_flight
-                .lock()
-                .unwrap()
-                .is_none()
-                && tokio::time::Instant::now() < deadline
-            {
-                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
-            }
+            rf_wait_until("skip plan started", || {
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_some()
+            })
+            .await;
+            // RF-001: the boundary checkpoint is non-blocking; the settle
+            // watcher consumes the plan. Wait for that consume, then prove the
+            // boundary checkpoint is inert afterwards (no second planning).
+            rf_wait_until("skip plan consumed by the watcher", || {
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            })
+            .await;
             t.session.run_serialized_refine_checkpoint().await;
 
             assert_eq!(
@@ -22977,10 +23927,18 @@ mod post_compaction_continuation_tests {
             // plans while the turn is still running (agent-session.ts:2533 stamps the
             // cooldown when it settles as a failure).
             t.session.maybe_start_serialized_background_plan();
-            let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(10);
-            while t.provider.call_count() < 2 && tokio::time::Instant::now() < deadline {
-                tokio::time::sleep(std::time::Duration::from_millis(25)).await;
-            }
+            // RF-001: the boundary checkpoint is non-blocking; the settle
+            // watcher consumes the failed plan (stamping the cooldown, never
+            // requeueing a duplicate pass). Wait for that consume, capture the
+            // call count, then prove the boundary checkpoint is inert.
+            rf_wait_until("failed plan consumed by the watcher", || {
+                t.session
+                    .serialized_plan_in_flight
+                    .lock()
+                    .unwrap()
+                    .is_none()
+            })
+            .await;
             let planned_calls = t.provider.call_count();
             t.session.run_serialized_refine_checkpoint().await;
 
@@ -23140,6 +24098,8 @@ mod post_compaction_continuation_tests {
                     .is_some(),
                 "H-04: the preparation carries the trigger (agent-session.ts:9137)"
             );
+            t.session.dispose_async(Some(false)).await;
+            drop(t);
 
             // (b) proposal.
             let log2: EventLog = Arc::new(Mutex::new(Vec::new()));
@@ -23191,7 +24151,6 @@ mod post_compaction_continuation_tests {
                 Some("t11-extension-memory"),
                 "H-04: the extension edit id survives normalization"
             );
-            t.session.dispose_async(Some(false)).await;
             t2.session.dispose_async(Some(false)).await;
         }
 

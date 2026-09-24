@@ -9,7 +9,13 @@
 //!   NAME alone never counts; a single reasoning-only/empty turn is never
 //!   nonprogress);
 //! - host-authored FIXED feedback templates (Jev never authors conversation
-//!   text, tool arguments, or success claims);
+//!   text, tool arguments, or success claims). Each feedback KIND is
+//!   delivered at most once per real-user task epoch (approved 2026-09-24):
+//!   a repeated insistence on the same logical task refuses as
+//!   `duplicate_control_feedback`, never reopens the answer, and — while
+//!   results remain insufficient for non-terminal work — keeps the goal
+//!   deferred with a truthful paused state instead of finishing it, while
+//!   a repeated verification need keeps the truthful `Unverified` pause;
 //! - the gate resolvers the integrator's call sites use to turn accepted Jev
 //!   answers into typed effects at safe boundaries.
 //!
@@ -101,6 +107,17 @@ pub const MAX_DIGEST_INPUT_CHARS: usize = 400;
 /// move for internal steers, synthesized or extension inputs, resumes, or
 /// compaction).
 pub const REAL_USER_INPUT_SOURCES: [&str; 2] = ["interactive", "rpc"];
+
+/// Delivery state of one feedback KIND within the current task epoch.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FeedbackDeliveryState {
+    /// No notice of this kind delivered in this epoch yet.
+    New,
+    /// This exact decision already delivered its notice (replay guard).
+    SameDecision,
+    /// Another decision in this epoch already delivered this kind of notice.
+    DeliveredInEpoch,
+}
 
 /// One session's in-memory control bookkeeping. `budget` is `Some` only when
 /// a trusted durable record backs it; the ledger is always the authority and
@@ -242,15 +259,18 @@ impl ControlBook {
         expected_epoch_id: &str,
         kind: ControlBudgetKind,
     ) -> Option<ControlBudgetSnapshot> {
-        self.consume_with_notice(session_id, expected_epoch_id, kind, None)
+        self.consume_with_notices(session_id, expected_epoch_id, kind, &[])
     }
 
-    fn consume_with_notice(
+    /// Consume one budget unit, recording every delivered notice key
+    /// durably. A key already present refuses the whole consumption (race
+    /// safety), so a delivered notice can never be spent twice.
+    fn consume_with_notices(
         &self,
         session_id: &str,
         expected_epoch_id: &str,
         kind: ControlBudgetKind,
-        notice: Option<&str>,
+        notices: &[&str],
     ) -> Option<ControlBudgetSnapshot> {
         if !valid_session_id(session_id) {
             return None;
@@ -280,7 +300,9 @@ impl ControlBook {
             }
             let current = record.budget_snapshot();
             if !current.allows(kind)
-                || notice.is_some_and(|key| record.feedback_notices.iter().any(|seen| seen == key))
+                || notices
+                    .iter()
+                    .any(|key| record.feedback_notices.iter().any(|seen| seen == *key))
             {
                 return Ok((None, Vec::new(), false));
             }
@@ -291,7 +313,7 @@ impl ControlBook {
             updated.verification_remaining = next.verification_remaining;
             updated.nonprogress_remaining = next.nonprogress_remaining;
             updated.veto_remaining = next.veto_remaining;
-            if let Some(notice) = notice {
+            for notice in notices {
                 updated.feedback_notices.push(notice.to_string());
             }
             records[index] = updated.clone();
@@ -304,19 +326,40 @@ impl ControlBook {
         }
     }
 
-    fn feedback_already_delivered(&self, session_id: &str, facts: &HostControlFacts) -> bool {
-        let keys = [
-            feedback_notice_id(facts, FeedbackKind::ResultGap),
-            feedback_notice_id(facts, FeedbackKind::VerificationMissing),
-        ];
-        self.ledger_txn(session_id, false, |records| {
-            let duplicate = records.iter().any(|record| {
-                epoch_id(&record.session, record.epoch) == facts.epoch_id
-                    && record.session == session_id
-                    && record.feedback_notices.iter().any(|key| keys.contains(key))
-            });
-            Ok((duplicate, Vec::new(), false))
-        }).unwrap_or(false)
+    /// How this feedback KIND stands for the CURRENT logical task (epoch):
+    /// - [`FeedbackDeliveryState::New`]: nothing delivered yet in this epoch;
+    /// - [`FeedbackDeliveryState::SameDecision`]: THIS exact decision (same
+    ///   request and turn) already delivered its notice (replay guard);
+    /// - [`FeedbackDeliveryState::DeliveredInEpoch`]: another agent end in
+    ///   the same epoch already delivered this KIND of notice. One corrective
+    ///   notice per kind per real-user task: repeated insistence on the same
+    ///   logical task is refused, never re-queued.
+    fn feedback_delivery_state(
+        &self,
+        session_id: &str,
+        facts: &HostControlFacts,
+        kind: FeedbackKind,
+    ) -> FeedbackDeliveryState {
+        let exact_key = feedback_notice_key(facts, kind);
+        let epoch_key = feedback_epoch_notice_key(&facts.epoch_id, kind);
+        let outcome = self.ledger_txn(session_id, false, |records| {
+            let mut state = FeedbackDeliveryState::New;
+            for record in records.iter() {
+                if record.session == session_id
+                    && epoch_id(&record.session, record.epoch) == facts.epoch_id
+                {
+                    if record.feedback_notices.iter().any(|seen| *seen == exact_key) {
+                        state = FeedbackDeliveryState::SameDecision;
+                        break;
+                    }
+                    if record.feedback_notices.iter().any(|seen| *seen == epoch_key) {
+                        state = FeedbackDeliveryState::DeliveredInEpoch;
+                    }
+                }
+            }
+            Ok((state, Vec::new(), false))
+        });
+        outcome.unwrap_or(FeedbackDeliveryState::New)
     }
 
     /// Record one bounded turn signature for the nonprogress predicate. The
@@ -783,11 +826,14 @@ impl DurableRecord {
             veto_attempts.push(ordinal);
         }
         // Older v2 records have no notice ids. They retain their spent budgets.
+        // Each delivered notice stores two keys (exact-decision + epoch-kind),
+        // and at most `feedback` deliveries can happen in one epoch, so the
+        // validated bound is twice the feedback maximum.
         let feedback_notices: Vec<String> = match value.get("feedback_notices") {
             None => Vec::new(),
             Some(value) => serde_json::from_value(value.clone()).ok()?,
         };
-        if feedback_notices.len() > usize::from(maxima.feedback)
+        if feedback_notices.len() > usize::from(maxima.feedback) * 2
             || feedback_notices.iter().any(|key| key.len() != 64 || !key.bytes().all(|c| c.is_ascii_hexdigit()))
         {
             return None;
@@ -1248,10 +1294,20 @@ pub fn resolve_agent_end(
         result.terminal_annotation = Some("no_authorized_follow_up");
         return result;
     }
-    if book.feedback_already_delivered(session_id, facts) {
-        result.verdicts.push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
-            "duplicate_control_feedback",
-        )));
+    // Replayed-decision guard (both feedback kinds): when THIS exact
+    // decision already delivered its notice — including after a restart —
+    // nothing new may be said about it. Silent duplicate refusal, never a
+    // pause and never a success claim.
+    if book.feedback_delivery_state(session_id, facts, FeedbackKind::ResultGap)
+        == FeedbackDeliveryState::SameDecision
+        || book.feedback_delivery_state(session_id, facts, FeedbackKind::VerificationMissing)
+            == FeedbackDeliveryState::SameDecision
+    {
+        result
+            .verdicts
+            .push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+                "duplicate_control_feedback",
+            )));
         return result;
     }
     if sufficiency == SufficiencyVerdict::Insufficient {
@@ -1261,12 +1317,42 @@ pub fn resolve_agent_end(
             ));
             return result;
         }
-        let notice = feedback_notice_id(facts, FeedbackKind::ResultGap);
-        match book.consume_with_notice(
+        // One corrective result-gap notice per logical task. A repeated
+        // insistence on the same epoch must not reopen the task (no second
+        // message), but still-insufficient NON-TERMINAL work is never
+        // finished either: the goal stays deferred with a truthful paused
+        // state (attention required). This is a refusal to continue, never
+        // a success, sufficiency, or verification claim; NotRequired maps
+        // to NotApplicable only (verification not needed, not task
+        // sufficient).
+        if book.feedback_delivery_state(
+            session_id,
+            facts,
+            FeedbackKind::ResultGap,
+        ) != FeedbackDeliveryState::New
+        {
+            result.verdicts.push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+                "duplicate_control_feedback",
+            )));
+            if verification == VerificationNeed::NotRequired {
+                // Not-applicable mirrors the terminal-stop mapping: the
+                // evaluator's own recommendation, never a passed check and
+                // never a sufficiency claim.
+                result.verification_state = ControlVerificationState::NotApplicable;
+            }
+            result.pause = Some(PauseReason::BudgetExhausted);
+            result.defer_goal_finish = true;
+            result.terminal_annotation = Some("duplicate_control_feedback");
+            return result;
+        }
+        let exact_notice = feedback_notice_key(facts, FeedbackKind::ResultGap);
+        let epoch_notice = feedback_epoch_notice_key(&budget.epoch_id, FeedbackKind::ResultGap);
+        let notices = [exact_notice.as_str(), epoch_notice.as_str()];
+        match book.consume_with_notices(
             session_id,
             &budget.epoch_id,
             ControlBudgetKind::Feedback(FeedbackKind::ResultGap),
-            Some(&notice),
+            &notices,
         ) {
             Some(_) => {
                 result.feedback = Some(result_gap_feedback(
@@ -1297,12 +1383,48 @@ pub fn resolve_agent_end(
                     .push(ControlVerdict::Refused(ControlRefusal::ContinuationPending));
                 return result;
             }
-            let notice = feedback_notice_id(facts, FeedbackKind::VerificationMissing);
-            match book.consume_with_notice(
+            // One verification request per logical task. A replayed decision
+            // stays silent (its notice was delivered); a NEW agent end in the
+            // same epoch gets no second message, only the truthful pause.
+            match book.feedback_delivery_state(
+                session_id,
+                facts,
+                FeedbackKind::VerificationMissing,
+            ) {
+                FeedbackDeliveryState::SameDecision => {
+                    result
+                        .verdicts
+                        .push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+                            "duplicate_control_feedback",
+                        )));
+                    return result;
+                }
+                FeedbackDeliveryState::DeliveredInEpoch => {
+                    // Verification was already requested once in this epoch
+                    // and remains unconfirmed: no nag, no success claim; the
+                    // user decides. Unverified is preserved truthfully.
+                    result
+                        .verdicts
+                        .push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+                            "duplicate_control_feedback",
+                        )));
+                    result.pause = Some(PauseReason::VerificationUnconfirmed);
+                    result.defer_goal_finish = true;
+                    result.verification_state = ControlVerificationState::Unverified;
+                    result.terminal_annotation = Some("verification_unconfirmed");
+                    return result;
+                }
+                FeedbackDeliveryState::New => {}
+            }
+            let exact_notice = feedback_notice_key(facts, FeedbackKind::VerificationMissing);
+            let epoch_notice =
+                feedback_epoch_notice_key(&budget.epoch_id, FeedbackKind::VerificationMissing);
+            let notices = [exact_notice.as_str(), epoch_notice.as_str()];
+            match book.consume_with_notices(
                 session_id,
                 &budget.epoch_id,
                 ControlBudgetKind::Feedback(FeedbackKind::VerificationMissing),
-                Some(&notice),
+                &notices,
             ) {
                 Some(_) => {
                     result.feedback =
@@ -1342,13 +1464,22 @@ pub fn resolve_agent_end(
     result
 }
 
-fn feedback_notice_id(facts: &HostControlFacts, kind: FeedbackKind) -> String {
+/// Exact-decision notice key: epoch + request + turn + kind. A replayed
+/// decision (same facts) can never deliver its notice twice.
+fn feedback_notice_key(facts: &HostControlFacts, kind: FeedbackKind) -> String {
     digest_parts(&[
         facts.epoch_id.clone(),
         facts.request_id.clone(),
         facts.turn.to_string(),
         kind.as_str().to_string(),
     ])
+}
+
+/// Epoch-scoped notice key: epoch + kind. Once a KIND of corrective notice
+/// was delivered for one real-user task, no later agent end in that task
+/// delivers the same kind again (feedback finite per logical task).
+fn feedback_epoch_notice_key(epoch_id: &str, kind: FeedbackKind) -> String {
+    digest_parts(&[epoch_id.to_string(), kind.as_str().to_string()])
 }
 
 /// TurnEnd gate. The integrator calls this with the answers from ONE

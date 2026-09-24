@@ -485,7 +485,7 @@ impl Component for CustomEditor {
         }
 
         // Check app keybindings first
-        if self.editor.get_text().is_empty() && self.keybindings_match(data, "app.agents.back") {
+        if self.editor.get_text().is_empty() && self.keybindings_match(data, "app.sidebar.focus") {
             if let Some(on_agents_back) = self.on_agents_back.as_mut() {
                 if on_agents_back() {
                     return;

@@ -405,6 +405,7 @@ struct InlineState {
 struct FullscreenState {
     viewport: FullscreenViewport,
     header: Option<Rc<RefCell<dyn Component>>>,
+    sidebar: Option<Rc<RefCell<dyn Component>>>,
     scroll: Vec<Rc<RefCell<dyn Component>>>,
     dock: Rc<RefCell<dyn Component>>,
     mouse: bool,
@@ -1087,6 +1088,7 @@ impl TUI {
         self.fullscreen = Some(FullscreenState {
             viewport: FullscreenViewport::new(),
             header: None,
+            sidebar: None,
             scroll: options.scroll,
             dock: options.dock,
             mouse: options.mouse,
@@ -1146,6 +1148,26 @@ impl TUI {
             state.header = header;
             self.request_render();
         }
+    }
+
+    /// Fixed left session pane. Transcript coordinates include its reserved columns.
+    pub fn set_fullscreen_sidebar(&mut self, sidebar: Option<Rc<RefCell<dyn Component>>>) {
+        if let Some(state) = self.fullscreen.as_mut() {
+            state.sidebar = sidebar;
+            self.request_render();
+        }
+    }
+
+    pub fn fullscreen_sidebar_width(&self) -> usize {
+        if self.fullscreen.as_ref().is_some_and(|s| s.sidebar.is_some()) {
+            // Keep both panes visible, including on narrow terminals.
+            (self.terminal.columns() / 4).clamp(16, 34)
+                .min(self.terminal.columns().saturating_sub(12))
+        } else { 0 }
+    }
+
+    pub fn fullscreen_header_height(&self) -> usize {
+        self.fullscreen.as_ref().map(|s| s.viewport.header_height()).unwrap_or(0)
     }
 
     /// Scroll the fullscreen transcript window (negative = up).
@@ -2186,6 +2208,10 @@ impl TUI {
         self.sync_fullscreen_mouse_tracking();
         self.overlay_selection_regions = Vec::new();
 
+        let sidebar_width = self.fullscreen_sidebar_width();
+        let content_width = width.saturating_sub(sidebar_width).max(1);
+        let sidebar = self.fullscreen.as_ref().and_then(|s| s.sidebar.clone());
+        let prefix = " ".repeat(sidebar_width);
         let mut transcript: Vec<String> = Vec::new();
         let mut anchors = Vec::new();
         let mut bottom_aligned = false;
@@ -2200,7 +2226,10 @@ impl TUI {
             Some(fullscreen) => fullscreen.dock.clone(),
             None => return,
         };
-        let dock = with_fullscreen_image_fallback(|| dock_component.borrow_mut().render(width as f64));
+        let dock = with_fullscreen_image_fallback(|| {
+            dock_component.borrow_mut().render(content_width as f64)
+                .into_iter().map(|line| format!("{prefix}{line}")).collect::<Vec<_>>()
+        });
         let header_budget = (height / 4).min(height.saturating_sub(
             crate::fullscreen::clipped_fullscreen_dock_height(dock.len(), height)
                 + crate::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS));
@@ -2212,7 +2241,7 @@ impl TUI {
         with_image_height_limit(image_height, || {
             for component in scroll_components.iter() {
                 let line_offset = transcript.len();
-                let component_lines = component.borrow_mut().render(width as f64);
+                let component_lines = component.borrow_mut().render(content_width as f64);
                 let mut component_anchors = component.borrow().get_viewport_anchors();
                 component_anchors.resize(component_lines.len(), None);
                 anchors.extend(component_anchors);
@@ -2222,14 +2251,20 @@ impl TUI {
                         line: region.line + line_offset,
                         table_top: region.table_top + line_offset,
                         table_bottom: region.table_bottom + line_offset,
+                        col: region.col + sidebar_width,
+                        table_left: region.table_left + sidebar_width,
+                        table_right: region.table_right + sidebar_width,
                         ..region
                     });
                 }
                 let mut columns = component.borrow().get_selection_columns();
                 columns.resize(component_lines.len(), None);
-                selection_columns.extend(columns);
-                padding_line = component.borrow().get_fullscreen_padding();
-                transcript.extend(component_lines);
+                selection_columns.extend(columns.into_iter().map(|column| {
+                    column.map(|(start, end)| (start + sidebar_width, end + sidebar_width))
+                        .or_else(|| (sidebar_width > 0).then_some((sidebar_width, width)))
+                }));
+                padding_line = format!("{prefix}{}", component.borrow().get_fullscreen_padding());
+                transcript.extend(component_lines.into_iter().map(|line| format!("{prefix}{line}")));
             }
         });
 
@@ -2269,6 +2304,35 @@ impl TUI {
             }
         }
 
+        if let Some(sidebar) = sidebar {
+            let header_height = self.fullscreen.as_ref().map(|s| s.viewport.header_height()).unwrap_or(0);
+            let pane_height = height.saturating_sub(header_height);
+            let rows = sidebar.borrow_mut().render_with_height(sidebar_width as f64, pane_height);
+            for (row, line) in rows.iter().take(pane_height).enumerate() {
+                if let Some(base) = frame.get_mut(header_height + row) {
+                    if is_image_line(base)
+                        && base.len() >= sidebar_width
+                        && base[..sidebar_width].chars().all(|c| c == ' ')
+                    {
+                        // PR78 sidebar compatibility: a graphics row must never
+                        // pass through text slicing. Replace ONLY the leading
+                        // sidebar-width prefix (plain spaces) with the clipped/
+                        // padded sidebar row plus an SGR reset and append the
+                        // graphics suffix byte-for-byte.
+                        let suffix = &base[sidebar_width..];
+                        let mut sidebar_row = line.clone();
+                        let visible = visible_width(&sidebar_row);
+                        if visible < sidebar_width {
+                            sidebar_row.push_str(&" ".repeat(sidebar_width - visible));
+                        }
+                        *base = format!("{sidebar_row}\x1b[0m{suffix}");
+                    } else {
+                        *base = self.composite_line_at(base, line, 0, sidebar_width as i64, width as i64);
+                    }
+                }
+            }
+        }
+
         if viewport_controls && !scroll_info.following {
             // Follow hint composited over the bottom of the transcript window,
             // just above the dock. Overlays still paint on top of it.
@@ -2281,7 +2345,7 @@ impl TUI {
             let label_width = visible_width(&label);
             let row = window_height.saturating_sub(1);
             if row < frame.len() && label_width <= width {
-                let col = (width - label_width) / 2;
+                let col = sidebar_width + content_width.saturating_sub(label_width) / 2;
                 frame[row] = self.composite_line_at(
                     &frame[row],
                     &format!("\x1b[7m{label}\x1b[27m"),
@@ -3686,6 +3750,40 @@ mod tests {
         assert!(!tui.is_fullscreen());
         assert!(!terminal.borrow().alt_screen);
         assert!(!terminal.borrow().mouse_tracking);
+    }
+
+    #[test]
+    fn ui_repair_sidebar_preserves_cursor_copy_and_fixed_scroll_coordinates() {
+        let terminal = Rc::new(RefCell::new(FakeTerminal::new(80, 8)));
+        let mut tui = TUI::new(Box::new(SharedTerminal(terminal.clone())), Some(true));
+        let copied = Rc::new(RefCell::new(String::new()));
+        let sink = copied.clone();
+        tui.on_copy = Some(Box::new(move |text| *sink.borrow_mut() = text.into()));
+        tui.enter_fullscreen(FullscreenOptions {
+            scroll: vec![Rc::new(RefCell::new(Line("hello"))), Rc::new(RefCell::new(Line("world")))],
+            dock: Rc::new(RefCell::new(Line("prompt \x1b_pi:c\x07"))),
+            mouse: true, viewport_controls: true,
+        });
+        tui.set_fullscreen_header(Some(Rc::new(RefCell::new(Line("OPTIMUS version")))));
+        tui.set_fullscreen_sidebar(Some(Rc::new(RefCell::new(Line("Sessions")))));
+        tui.do_render();
+        assert_eq!(tui.fullscreen_sidebar_width(), 20);
+        assert!(terminal.borrow().written.contains("Sessions"));
+        assert!(terminal.borrow().written.contains("\x1b[8;28H"), "editor cursor includes sidebar columns");
+        tui.handle_fullscreen_input("\x1b[<0;21;2M");
+        tui.handle_fullscreen_input("\x1b[<32;26;3M");
+        tui.handle_fullscreen_input("\x1b[<0;26;3m");
+        assert_eq!(*copied.borrow(), "hello\nworld", "copy must exclude sidebar and header");
+        tui.scroll_to_top();
+        tui.do_render();
+        assert_eq!(tui.fullscreen_header_height(), 1);
+        let overlay = tui.show_overlay(Rc::new(RefCell::new(Line("Add folder"))), OverlayOptions::default());
+        tui.do_render();
+        assert!(terminal.borrow().written.contains("Add folder"));
+        overlay.hide();
+        tui.set_fullscreen_sidebar(None);
+        tui.do_render();
+        assert_eq!(tui.fullscreen_sidebar_width(), 0);
     }
 
     #[test]

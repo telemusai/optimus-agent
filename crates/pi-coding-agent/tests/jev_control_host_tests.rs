@@ -539,7 +539,11 @@ fn resolve_agent_end_defers_on_insufficient_results() {
     assert_eq!(result.verification_state, ControlVerificationState::Unknown);
     assert_eq!(book.snapshot("sess").feedback_remaining, 1);
 
-    // A different decision may use the second correction; replay cannot.
+    // A different decision in the SAME epoch is a repeated insistence on one
+    // logical task: at most one result-gap continuation per user task
+    // (approved 2026-09-24). The answer is respected; still-insufficient
+    // non-terminal work stays deferred and truthfully paused, never
+    // finished as complete.
     let mut next_facts = fact.clone();
     next_facts.request_id = "req-2".to_string();
     let mut next_insufficient = insufficient.clone();
@@ -555,12 +559,59 @@ fn resolve_agent_end_defers_on_insufficient_results() {
         false,
         "turns=3",
     );
-    assert!(second.feedback.is_some());
-    assert_eq!(book.snapshot("sess").feedback_remaining, 0);
+    assert!(second.feedback.is_none());
+    // Deduped feedback never finishes still-insufficient work: truthful
+    // paused state, goal stays deferred, no success or verification claim.
+    assert!(second.defer_goal_finish);
+    assert_eq!(second.pause, Some(PauseReason::BudgetExhausted));
+    assert_eq!(second.verification_state, ControlVerificationState::Unknown);
+    assert_eq!(second.terminal_annotation, Some("duplicate_control_feedback"));
+    assert!(second.verdicts.iter().any(|verdict| matches!(
+        verdict,
+        ControlVerdict::Refused(ControlRefusal::TriggerNotMet("duplicate_control_feedback"))
+    )));
+    // The refusal spends nothing: the shared budget keeps its remaining unit
+    // for the one verification request the epoch may still deliver.
+    assert_eq!(book.snapshot("sess").feedback_remaining, 1);
 
+    // The replay of the ORIGINAL decision also stays refused (same state).
+    let replay = resolve_agent_end(
+        &book,
+        "sess",
+        &ControlPolicy::default(),
+        &features(),
+        JevMode::Active,
+        &fact,
+        &[insufficient],
+        false,
+        "turns=2, tool_results=1",
+    );
+    assert!(replay.feedback.is_none());
+    assert!(!replay.defer_goal_finish);
+    assert!(replay.verdicts.iter().any(|verdict| matches!(
+        verdict,
+        ControlVerdict::Refused(ControlRefusal::TriggerNotMet("duplicate_control_feedback"))
+    )));
+    assert_eq!(book.snapshot("sess").feedback_remaining, 1);
+
+    // A genuinely exhausted budget (direct consumption) still refuses with
+    // the truthful budget annotation, never a silent success.
+    let spent = book.consume(
+        "sess",
+        &book.snapshot("sess").epoch_id,
+        ControlBudgetKind::Feedback(FeedbackKind::ResultGap),
+    );
+    assert!(spent.is_some());
+    assert_eq!(book.snapshot("sess").feedback_remaining, 0);
     let mut third_facts = fact.clone();
     third_facts.request_id = "req-3".to_string();
-    let mut third_insufficient = insufficient.clone();
+    let mut third_insufficient = candidate(
+        DecisionCategory::ResultSufficiency,
+        "result_sufficiency.0",
+        "insufficient",
+        0.9,
+        7,
+    );
     third_insufficient.request_id = third_facts.request_id.clone();
     let third = resolve_agent_end(
         &book,
@@ -666,6 +717,98 @@ fn resolve_agent_end_verification_request_and_pause_fallback() {
     assert!(second.defer_goal_finish);
     assert_eq!(second.verification_state, ControlVerificationState::Unverified);
     assert_eq!(second.terminal_annotation, Some("verification_unconfirmed"));
+}
+
+#[test]
+fn ctrl001_repeated_insufficiency_in_one_epoch_never_reopens_the_answer() {
+    // The observed recurrence pattern: an approval-required or read-only
+    // answer is restated on each automatic continuation. One result-gap
+    // correction per logical task epoch (approved 2026-09-24); the restated
+    // answer is respected, the duplicate refusal spends nothing, no success
+    // or verification is ever claimed, and still-insufficient non-terminal
+    // work never finishes merely because feedback was deduped: the goal
+    // stays deferred with a truthful paused state.
+    let (book, _dir) = temp_book("epoch-repeat-gap");
+    let budget = book.note_real_user_input("sess", "interactive", "Diagnose only; do not start the repair", true);
+    let mut fact = facts("sess", 7, &["result_sufficiency.0"]);
+    fact.epoch_id = budget.epoch_id.clone();
+    let insufficient = candidate(
+        DecisionCategory::ResultSufficiency,
+        "result_sufficiency.0",
+        "insufficient",
+        0.9,
+        7,
+    );
+
+    // First agent end: the single corrective continuation is delivered.
+    let first = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &[insufficient.clone()], false, "turns=7");
+    assert!(first.feedback.is_some());
+    assert!(first.defer_goal_finish);
+
+    // The queued continuation answers at a NEW turn: same epoch, new decision.
+    let mut continued = fact.clone();
+    continued.turn = 8;
+    continued.request_id = "req-continued".to_string();
+    let mut restated = insufficient.clone();
+    restated.request_id = continued.request_id.clone();
+    restated.turn = 8;
+    let second = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &continued, &[restated], false, "turns=8");
+    assert!(second.feedback.is_none(), "no second insistence on one logical task");
+    assert!(second.defer_goal_finish, "still-insufficient work is never finished by dedupe");
+    assert_eq!(second.pause, Some(PauseReason::BudgetExhausted));
+    assert_eq!(second.verification_state, ControlVerificationState::Unknown);
+    assert_eq!(second.terminal_annotation, Some("duplicate_control_feedback"));
+    assert_eq!(book.snapshot("sess").feedback_remaining, 1);
+
+    // A genuinely new real-user task re-arms the budget: fresh correction.
+    // Correlation requires candidate.turn == facts.turn AND
+    // candidate.request_id == facts.request_id: the third decision keeps them
+    // in sync (a mismatch refuses the candidate with Baseline(NoAnswer) before
+    // the epoch re-arm path is ever exercised — that was the C8s failure, a
+    // test defect, not a product defect in the epoch gate).
+    let reborn = book.note_real_user_input("sess", "interactive", "New task: implement it", true);
+    let mut fresh = facts("sess", 7, &["result_sufficiency.0"]);
+    fresh.epoch_id = reborn.epoch_id.clone();
+    fresh.request_id = "req-new-epoch".to_string();
+    let mut fresh_insufficient = insufficient.clone();
+    fresh_insufficient.request_id = fresh.request_id.clone();
+    let third = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fresh, &[fresh_insufficient], false, "turns=9");
+    assert!(third.feedback.is_some(), "a new logical task may be corrected again");
+}
+
+#[test]
+fn ctrl001_duplicate_result_gap_maps_not_required_without_success_claim() {
+    // When the epoch-duplicate refusal fires and the evaluator itself
+    // recommended no verification, verification maps to NotApplicable (no
+    // verification needed) — that speaks ONLY to verification, never to task
+    // sufficiency. Still-insufficient work stays deferred and paused; the
+    // state is never Verified and never a success claim.
+    let (book, _dir) = temp_book("epoch-repeat-not-applicable");
+    let budget = book.note_real_user_input("sess", "interactive", "Status only", true);
+    let mut fact = facts("sess", 7, &["result_sufficiency.0", "first_pass_verification.0"]);
+    fact.epoch_id = budget.epoch_id.clone();
+    let gap = candidate(DecisionCategory::ResultSufficiency, "result_sufficiency.0", "insufficient", 0.9, 7);
+    let no_verification = candidate(DecisionCategory::FirstPassVerification, "first_pass_verification.0", "none", 0.9, 7);
+
+    let first = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &[gap.clone(), no_verification.clone()], false, "turns=7");
+    assert!(first.feedback.is_some());
+
+    let mut continued = fact.clone();
+    continued.turn = 8;
+    continued.request_id = "req-continued".to_string();
+    let mut restated_gap = gap.clone();
+    restated_gap.request_id = continued.request_id.clone();
+    restated_gap.turn = 8;
+    let mut restated_none = no_verification.clone();
+    restated_none.request_id = continued.request_id.clone();
+    restated_none.turn = 8;
+    let second = resolve_agent_end(&book, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &continued, &[restated_gap, restated_none], false, "turns=8");
+    assert!(second.feedback.is_none());
+    assert!(second.defer_goal_finish);
+    assert_eq!(second.pause, Some(PauseReason::BudgetExhausted));
+    assert_eq!(second.verification_state, ControlVerificationState::NotApplicable);
+    assert_eq!(second.terminal_annotation, Some("duplicate_control_feedback"));
+    assert_eq!(book.snapshot("sess").feedback_remaining, 1);
 }
 
 #[test]
@@ -1556,7 +1699,14 @@ fn ctrl001_duplicate_feedback_never_suppresses_a_new_terminal_safety_decision() 
         assert!(first.feedback.is_some());
         let remaining = book.snapshot("sess");
         let reborn = ControlBook::new(dir);
-        let safety = candidate(DecisionCategory::ContinueStopEscalate, "continue_stop_escalate.0", terminal, 0.95, 9);
+        let mut safety = candidate(DecisionCategory::ContinueStopEscalate, "continue_stop_escalate.0", terminal, 0.95, 9);
+        // Deterministic freshness: stamp decided_at from the matching facts
+        // clock (minus 100ms) instead of the later wall clock, so a
+        // parallel-load stall between the facts construction and this
+        // candidate can never future-stamp decided_at past facts.now (the
+        // C8 parallel-only escalate failure was exactly that wall-clock
+        // skew; freshness itself is unchanged).
+        safety.decided_at = fact.now - std::time::Duration::from_millis(100);
         let result = resolve_agent_end(&reborn, "sess", &ControlPolicy::default(), &features(), JevMode::Active, &fact, &[gap, safety], false, "concrete blocker or stop");
         assert!(result.feedback.is_none());
         assert_eq!(result.escalate, escalate);

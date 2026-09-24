@@ -53,6 +53,10 @@ pub struct RefinementFailure {
     pub attempts: u8,
     #[serde(rename = "outputFingerprints")]
     pub output_fingerprints: Vec<RefinementOutputFingerprint>,
+    /// Sanitized per-attempt planner wall-clock durations, ascending by attempt
+    /// index. Durations only - never prompts, completions, or auth material.
+    #[serde(default, rename = "attemptDurationsMs")]
+    pub attempt_durations_ms: Vec<u64>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -84,8 +88,27 @@ impl RefinementFailureError {
                 category,
                 attempts,
                 output_fingerprints,
+                attempt_durations_ms: Vec::new(),
             },
         }
+    }
+
+    /// Attach sanitized per-attempt durations to an already-built failure.
+    pub fn with_attempt_durations(mut self, durations_ms: Vec<u64>) -> Self {
+        self.refinement_failure.attempt_durations_ms = durations_ms;
+        self
+    }
+
+    /// One-line sanitized summary: fixed message plus category, attempt count
+    /// and per-attempt durations. Safe for logs, UI, and extension boundaries.
+    pub fn sanitized_summary(&self) -> String {
+        format!(
+            "{} (category: {:?}, attempts: {}, attemptMs: {:?})",
+            self.message,
+            self.refinement_failure.category,
+            self.refinement_failure.attempts,
+            self.refinement_failure.attempt_durations_ms
+        )
     }
 }
 
@@ -2351,8 +2374,12 @@ pub async fn plan_refinement(
             .unwrap_or(REFINEMENT_MAX_OUTPUT_TOKENS),
     );
     let mut fingerprints: Vec<RefinementOutputFingerprint> = Vec::new();
+    // Sanitized per-attempt planner durations, surfaced with typed failures so a
+    // dropped first attempt is no longer invisible (RF-001). Durations only.
+    let mut attempt_durations_ms: Vec<u64> = Vec::new();
     let mut prompt = user_prompt.clone();
     for attempt in [1u8, 2u8] {
+        let attempt_started = std::time::Instant::now();
         let response = call_completion(
             &request.complete,
             REFINEMENT_SYSTEM_PROMPT,
@@ -2360,6 +2387,7 @@ pub async fn plan_refinement(
             max_tokens,
         )
         .await;
+        attempt_durations_ms.push(attempt_started.elapsed().as_millis() as u64);
         if response.stop_reason == StopReason::Aborted {
             // Port of the `DOMException("Refinement was aborted", "AbortError")` path.
             return Err(RefinementFailureError::new(
@@ -2367,7 +2395,8 @@ pub async fn plan_refinement(
                 RefinementFailureCategory::RequestError,
                 attempt,
                 fingerprints,
-            ));
+            )
+            .with_attempt_durations(attempt_durations_ms));
         }
         if response.stop_reason == StopReason::Error {
             return Err(RefinementFailureError::new(
@@ -2379,7 +2408,8 @@ pub async fn plan_refinement(
                 },
                 attempt,
                 fingerprints,
-            ));
+            )
+            .with_attempt_durations(attempt_durations_ms));
         }
         let text = refinement_response_text(&response);
         fingerprints.push(refinement_output_fingerprint(&text));
@@ -2393,7 +2423,8 @@ pub async fn plan_refinement(
                 },
                 attempt,
                 fingerprints,
-            ));
+            )
+            .with_attempt_durations(attempt_durations_ms));
         }
         match parse_proposal(&text) {
             Ok(mut proposal) => {
@@ -2468,7 +2499,8 @@ pub async fn plan_refinement(
                         },
                         attempt,
                         fingerprints,
-                    ));
+                    )
+                    .with_attempt_durations(attempt_durations_ms));
                 }
                 if attempt == 2 {
                     break;
@@ -2482,7 +2514,8 @@ pub async fn plan_refinement(
         RefinementFailureCategory::InvalidModelOutput,
         2,
         fingerprints,
-    ))
+    )
+    .with_attempt_durations(attempt_durations_ms))
 }
 
 pub struct ReviewAutoRefineRequest<'a> {

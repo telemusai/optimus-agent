@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 pub type AppKeybinding = &'static str;
 
 /// `keyof AppKeybindings` in declaration order.
-pub const APP_KEYBINDINGS: [AppKeybinding; 59] = [
+pub const APP_KEYBINDINGS: [AppKeybinding; 62] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -48,6 +48,9 @@ pub const APP_KEYBINDINGS: [AppKeybinding; 59] = [
     "app.modal.back",
     "app.agents.reply",
     "app.agents.new",
+    "app.sidebar.focus",
+    "app.sidebar.chat",
+    "app.sidebar.addFolder",
     "app.agents.delete",
     "app.agents.program",
     "app.agents.rename",
@@ -431,6 +434,18 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
             default_key_scope: None,
         },
     );
+    for (id, key, description) in [
+        ("app.sidebar.focus", "left", "Focus sessions when the prompt cursor is at the start"),
+        ("app.sidebar.chat", "right", "Return focus to the chat"),
+        ("app.sidebar.addFolder", "ctrl+a", "Add an existing folder to the session sidebar"),
+    ] {
+        map.insert(id.to_string(), KeybindingDefinition {
+            default_keys: vec![key.to_string()],
+            default_keys_is_single: true,
+            description: Some(description.to_string()),
+            default_key_scope: None,
+        });
+    }
     map.insert(
         "app.agents.delete".to_string(),
         KeybindingDefinition {

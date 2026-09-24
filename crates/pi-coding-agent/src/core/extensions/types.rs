@@ -896,6 +896,22 @@ pub struct SessionBeforeRefinePayload {
     pub preparation: RefinePreparation,
 }
 
+/// Typed, sanitized failure a `session_before_refine` hook reports when it
+/// owned planning and the planning attempt failed. `message` must be a fixed
+/// vocabulary string; `attempt_ms` carries per-attempt wall-clock durations.
+/// Raw provider output, keys, and headers never belong here.
+#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SessionBeforeRefineFailure {
+    pub message: String,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub category: Option<String>,
+    #[serde(default)]
+    pub attempts: u8,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub attempt_ms: Option<Vec<u64>>,
+}
+
 /// `SessionBeforeRefineResult`.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 pub struct SessionBeforeRefineResult {
@@ -903,6 +919,10 @@ pub struct SessionBeforeRefineResult {
     pub skip: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub proposal: Option<RefinementProposal>,
+    /// A hook that owned planning and failed reports the typed failure here so
+    /// the core surfaces it instead of silently planning again (RF-001).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub error: Option<SessionBeforeRefineFailure>,
 }
 
 /// Payload of `session_compact`.

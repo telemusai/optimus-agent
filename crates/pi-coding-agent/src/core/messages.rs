@@ -85,6 +85,33 @@ pub const COMPACTION_OUTCOME_FAILED: &str = "failed";
 pub struct CompactionOutcomeDetails {
     pub reason: CompactionOutcomeReason,
     pub outcome: CompactionOutcome,
+    /// Sanitized classification of a failed summary attempt. Absent on
+    /// cancelled/skipped outcomes and older history entries.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub failure_kind: Option<String>,
+    /// First-kept boundary entry UUID of the attempt, when preparation ran.
+    /// Entry IDs only; conversation content is never recorded here.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub boundary_entry_id: Option<String>,
+    /// Request shape of the attempt: "splitTurnPrefix" or "historyOnly".
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_shape: Option<String>,
+    /// Automatic-threshold failure streak depth after this failure.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub consecutive_failures: Option<u32>,
+}
+
+impl Default for CompactionOutcomeDetails {
+    fn default() -> Self {
+        Self {
+            reason: String::new(),
+            outcome: String::new(),
+            failure_kind: None,
+            boundary_entry_id: None,
+            summary_shape: None,
+            consecutive_failures: None,
+        }
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
