@@ -1,13 +1,16 @@
 //! Port of packages/tui/src/terminal-image.ts.
 
 use base64::Engine;
+use image::{DynamicImage, ImageDecoder, ImageFormat, ImageReader};
 use rand::Rng;
 use std::cell::RefCell;
+use std::io::Cursor;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ImageProtocol {
     Kitty,
     Iterm2,
+    Sixel,
 }
 
 /// `null` in the TypeScript protocol union.
@@ -50,19 +53,80 @@ pub struct RenderedImage {
     pub image_id: Option<u32>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) struct SixelLimits {
+    pub width: u32,
+    pub height: u32,
+    pub colors: u16,
+}
+
 thread_local! {
+    static CELL_DIMENSIONS_KNOWN: RefCell<bool> = const { RefCell::new(false) };
+    static SIXEL_LIMITS: RefCell<SixelLimits> = const {
+        RefCell::new(SixelLimits { width: 1024, height: 1024, colors: 16 })
+    };
     static CACHED_CAPABILITIES: RefCell<Option<TerminalCapabilities>> = const { RefCell::new(None) };
     static CELL_DIMENSIONS: RefCell<CellDimensions> = const {
         RefCell::new(CellDimensions { width_px: 9, height_px: 18 })
     };
 }
 
+pub(crate) fn set_sixel_limits(limits: (u32, u32)) {
+    SIXEL_LIMITS.with(|slot| {
+        let mut current = slot.borrow_mut();
+        current.width = limits.0;
+        current.height = limits.1;
+    });
+}
+
+pub(crate) fn get_sixel_limits() -> SixelLimits {
+    SIXEL_LIMITS.with(|slot| *slot.borrow())
+}
+
+pub(crate) fn get_sixel_palette_size() -> u16 {
+    get_sixel_limits().colors
+}
+
+pub(crate) fn set_sixel_palette_size(colors: u32) {
+    if colors >= 2 {
+        SIXEL_LIMITS.with(|slot| slot.borrow_mut().colors = colors.min(256) as u16);
+    }
+}
+
 pub fn get_cell_dimensions() -> CellDimensions {
     CELL_DIMENSIONS.with(|c| *c.borrow())
 }
 
+pub fn cell_dimensions_known() -> bool {
+    CELL_DIMENSIONS_KNOWN.with(|known| *known.borrow())
+}
+
+pub(crate) fn reset_cell_dimensions() {
+    CELL_DIMENSIONS_KNOWN.with(|known| *known.borrow_mut() = false);
+}
+
 pub fn set_cell_dimensions(dims: CellDimensions) {
-    CELL_DIMENSIONS.with(|c| *c.borrow_mut() = dims);
+    if (1..=256).contains(&dims.width_px) && (1..=256).contains(&dims.height_px) {
+        CELL_DIMENSIONS.with(|c| *c.borrow_mut() = dims);
+        CELL_DIMENSIONS_KNOWN.with(|known| *known.borrow_mut() = true);
+    }
+}
+
+pub const MAX_IMAGE_ROWS: usize = 24;
+const MAX_IMAGE_BYTES: usize = 20 * 1024 * 1024;
+const MAX_SOURCE_PIXELS: u64 = 16 * 1024 * 1024;
+const MAX_ENCODED_BYTES: usize = 2 * 1024 * 1024;
+const MAX_RENDER_EDGE: i64 = 1024;
+
+pub fn image_protocol_forced() -> bool {
+    let value = env_lower("PI_FORCE_IMAGE_PROTOCOL");
+    !value.is_empty() && value != "auto"
+}
+
+pub fn image_passthrough_blocked() -> bool {
+    let term = env_lower("TERM");
+    std::env::var_os("TMUX").is_some() || term.starts_with("tmux") || term.starts_with("screen")
+        || term == "dumb"
 }
 
 fn env_lower(name: &str) -> String {
@@ -70,6 +134,21 @@ fn env_lower(name: &str) -> String {
 }
 
 pub fn detect_capabilities() -> TerminalCapabilities {
+    let mut caps = detect_environment_capabilities();
+    if image_passthrough_blocked() {
+        caps.images = None;
+    } else if image_protocol_forced() {
+        caps.images = match env_lower("PI_FORCE_IMAGE_PROTOCOL").as_str() {
+            "kitty" => Some(ImageProtocol::Kitty),
+            "iterm2" => Some(ImageProtocol::Iterm2),
+            "sixel" => Some(ImageProtocol::Sixel),
+            _ => None,
+        };
+    }
+    caps
+}
+
+fn detect_environment_capabilities() -> TerminalCapabilities {
     let term_program = env_lower("TERM_PROGRAM");
     let term = env_lower("TERM");
     let color_term = env_lower("COLORTERM");
@@ -156,6 +235,8 @@ pub fn get_capabilities() -> TerminalCapabilities {
 
 pub fn reset_capabilities_cache() {
     CACHED_CAPABILITIES.with(|c| *c.borrow_mut() = None);
+    set_sixel_limits((1024, 1024));
+    set_sixel_palette_size(16);
 }
 
 /// Override the cached capabilities. Useful in tests to exercise both code paths.
@@ -172,7 +253,32 @@ pub fn is_image_line(line: &str) -> bool {
         return true;
     }
     // Slow path: sequence elsewhere (multi-row images have cursor-up prefix)
-    line.contains(KITTY_PREFIX) || line.contains(ITERM2_PREFIX)
+    line.contains(KITTY_PREFIX) || line.contains(ITERM2_PREFIX) || line.contains("\x1bP")
+}
+
+/// Managed images save the cursor at their last reserved row before moving up.
+/// Unknown/custom graphics have no trustworthy bounds and stay placeholders.
+pub fn image_row_count(line: &str) -> Option<usize> {
+    if !is_image_line(line) { return None; }
+    let (_, saved) = line.split_once("\x1b[s")?;
+    let (body, _) = saved.split_once("\x1b[u")?;
+    if let Some(up) = body.strip_prefix("\x1b[") {
+        let (count, _) = up.split_once('A')?;
+        let rows = count.parse::<usize>().ok()?.checked_add(1)?;
+        return (rows <= MAX_IMAGE_ROWS).then_some(rows);
+    }
+    Some(1)
+}
+
+pub fn position_image(sequence: &str, rows: usize) -> String {
+    let up = if rows > 1 { format!("\x1b[{}A", rows - 1) } else { String::new() };
+    format!("\x1b[s{up}{sequence}\x1b[u")
+}
+
+pub(crate) fn image_line_for_viewport(line: &str, available_rows: usize, width: usize) -> std::borrow::Cow<'_, str> {
+    if image_row_count(line).is_some_and(|rows| rows > available_rows) {
+        crate::utils::truncate_to_width("[Cannot display image in this viewport]", width as f64, "…", false).into()
+    } else { line.into() }
 }
 
 /// Generate a random image ID for Kitty graphics protocol.
@@ -293,7 +399,7 @@ pub fn calculate_image_rows_with_cells(
     target_width_cells: i64,
     cell_dimensions: &CellDimensions,
 ) -> usize {
-    let target_width_px = (target_width_cells * cell_dimensions.width_px) as f64;
+    let target_width_px = (target_width_cells.saturating_mul(cell_dimensions.width_px)) as f64;
     let scale = if image_dimensions.width_px == 0 {
         0.0
     } else {
@@ -309,6 +415,7 @@ pub fn calculate_image_rows_with_cells(
 }
 
 fn decode_base64(base64_data: &str) -> Option<Vec<u8>> {
+    if base64_data.len() > MAX_IMAGE_BYTES.div_ceil(3) * 4 { return None; }
     base64::engine::general_purpose::STANDARD
         .decode(base64_data)
         .ok()
@@ -443,21 +550,57 @@ pub fn get_image_dimensions(base64_data: &str, mime_type: &str) -> Option<ImageD
 
 pub fn render_image(
     base64_data: &str,
-    image_dimensions: &ImageDimensions,
+    _image_dimensions: &ImageDimensions,
     options: &ImageRenderOptions,
 ) -> Option<RenderedImage> {
     let caps = get_capabilities();
     let protocol = caps.images?;
+    // A guessed cell size can make SIXEL spill out of its reserved rows.
+    if protocol == ImageProtocol::Sixel && !cell_dimensions_known() { return None; }
 
-    let max_width = options.max_width_cells.unwrap_or(80);
-    let rows = calculate_image_rows(image_dimensions, max_width);
+    let source = decode_bounded_image(base64_data)?;
+    let cells = get_cell_dimensions();
+    let max_width = options.max_width_cells.unwrap_or(60).clamp(0, 256);
+    let max_height = options.max_height_cells.unwrap_or(MAX_IMAGE_ROWS as i64).clamp(0, MAX_IMAGE_ROWS as i64);
+    if max_width == 0 || max_height == 0 { return None; }
+    let (protocol_width, protocol_height) = if protocol == ImageProtocol::Sixel {
+        let limits = get_sixel_limits();
+        (limits.width, limits.height)
+    } else { (1024, 1024) };
+    let width_limit = (max_width * cells.width_px).min(MAX_RENDER_EDGE).min(i64::from(protocol_width)) as f64;
+    let height_limit = (max_height * cells.height_px).min(MAX_RENDER_EDGE).min(i64::from(protocol_height)) as f64;
+    let scale = (width_limit / f64::from(source.width()))
+        .min(height_limit / f64::from(source.height())).min(1.0);
+    let mut width_px = (f64::from(source.width()) * scale).floor().max(1.0) as u32;
+    let mut height_px = (f64::from(source.height()) * scale).floor().max(1.0) as u32;
+    if protocol == ImageProtocol::Sixel {
+        // SIXEL allocates six-pixel bands, including transparent padding.
+        // Keep that padding inside the row budget instead of overwriting text.
+        if height_limit < 6.0 { return None; }
+        if height_px >= 6 {
+            let aligned = height_px / 6 * 6;
+            width_px = (u64::from(width_px) * u64::from(aligned) / u64::from(height_px)).max(1) as u32;
+            height_px = aligned;
+        }
+    }
+    let raster = source.resize_exact(width_px, height_px, image::imageops::FilterType::Lanczos3);
+    let allocated_height = if protocol == ImageProtocol::Sixel { height_px.div_ceil(6) * 6 } else { height_px };
+    let rows = (i64::from(allocated_height) + cells.height_px - 1) / cells.height_px;
+    if rows > max_height { return None; }
+    let rows = rows as usize;
+    let columns = (i64::from(width_px) + cells.width_px - 1) / cells.width_px;
+    let png = if protocol != ImageProtocol::Sixel {
+        let mut output = Cursor::new(Vec::new());
+        raster.write_to(&mut output, ImageFormat::Png).ok()?;
+        Some(base64::engine::general_purpose::STANDARD.encode(output.into_inner()))
+    } else { None };
 
-    match protocol {
+    let result = match protocol {
         ImageProtocol::Kitty => {
             let sequence = encode_kitty(
-                base64_data,
+                png.as_deref()?,
                 &KittyEncodeOptions {
-                    columns: Some(max_width),
+                    columns: Some(columns),
                     rows: Some(rows),
                     image_id: options.image_id,
                     move_cursor: options.move_cursor,
@@ -471,9 +614,9 @@ pub fn render_image(
         }
         ImageProtocol::Iterm2 => {
             let sequence = encode_iterm2(
-                base64_data,
+                png.as_deref()?,
                 &Iterm2EncodeOptions {
-                    width: Some(max_width.to_string()),
+                    width: Some(columns.to_string()),
                     height: Some("auto".to_string()),
                     name: None,
                     preserve_aspect_ratio: Some(options.preserve_aspect_ratio.unwrap_or(true)),
@@ -486,7 +629,33 @@ pub fn render_image(
                 image_id: None,
             })
         }
+        ImageProtocol::Sixel => {
+            let rgba = raster.to_rgba8();
+            let sequence = icy_sixel::sixel_encode(rgba.as_raw(), width_px as usize, height_px as usize,
+                &icy_sixel::EncodeOptions {
+                    max_colors: get_sixel_palette_size(),
+                    ..Default::default()
+                }).ok()?;
+            Some(RenderedImage { sequence, rows, image_id: None })
+        }
+    }?;
+    (result.sequence.len() <= MAX_ENCODED_BYTES).then_some(result)
+}
+
+fn decode_bounded_image(base64_data: &str) -> Option<DynamicImage> {
+    let bytes = decode_base64(base64_data)?;
+    let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format().ok()?;
+    let mut limits = image::Limits::default();
+    limits.max_image_width = Some(8192);
+    limits.max_image_height = Some(8192);
+    limits.max_alloc = Some(128 * 1024 * 1024);
+    reader.limits(limits);
+    let decoder = reader.into_decoder().ok()?;
+    let (width, height) = decoder.dimensions();
+    if width == 0 || height == 0 || u64::from(width) * u64::from(height) > MAX_SOURCE_PIXELS {
+        return None;
     }
+    DynamicImage::from_decoder(decoder).ok()
 }
 
 /// Wrap text in an OSC 8 hyperlink sequence.
@@ -501,13 +670,36 @@ pub fn image_fallback(
 ) -> String {
     let mut parts: Vec<String> = Vec::new();
     if let Some(filename) = filename {
-        parts.push(filename.to_string());
+        parts.push(crate::terminal::sanitize_title_text(filename));
     }
-    parts.push(format!("[{mime_type}]"));
+    parts.push(format!("[{}]", crate::terminal::sanitize_title_text(mime_type)));
     if let Some(dimensions) = dimensions {
         parts.push(format!("{}x{}", dimensions.width_px, dimensions.height_px));
     }
-    format!("[Image: {}]", parts.join(" "))
+    format!("[Cannot display image: {}]", parts.join(" "))
+}
+
+#[cfg(test)]
+pub(crate) fn test_png(width: u32, height: u32) -> String {
+    let image = image::RgbaImage::from_pixel(width, height, image::Rgba([0, 244, 119, 255]));
+    let mut png = Cursor::new(Vec::new());
+    image.write_to(&mut png, ImageFormat::Png).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(png.into_inner())
+}
+
+#[cfg(test)]
+pub(crate) fn test_palette_png() -> String {
+    let image = image::RgbaImage::from_fn(96, 12, |x, _| {
+        image::Rgba(match x {
+            0..=15 => [0, 0, 0, 255],
+            16..=31 => [255, 255, 255, 255],
+            32..=47 => [255, 220, 0, 255],
+            _ => [(x * 2) as u8, (x * 3 % 256) as u8, (x * 5 % 256) as u8, 255],
+        })
+    });
+    let mut png = Cursor::new(Vec::new());
+    image.write_to(&mut png, ImageFormat::Png).unwrap();
+    base64::engine::general_purpose::STANDARD.encode(png.into_inner())
 }
 
 #[cfg(test)]
@@ -515,6 +707,110 @@ mod tests {
     use super::*;
 
     const PNG_1X1: &str = "iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAYAAAAfFcSJAAAADUlEQVR42mP8z8BQDwAEhQGAhKmMIQAAAABJRU5ErkJggg==";
+
+    #[test]
+    fn sixel_palette_stays_within_terminal_registers_and_preserves_primary_colors() {
+        reset_capabilities_cache();
+        set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        let registers = regex::Regex::new(r"#(\d+)").unwrap();
+        for colors in [2, 4, 16, 256] {
+            set_sixel_palette_size(colors);
+            let rendered = render_image(&test_palette_png(), &ImageDimensions { width_px: 96, height_px: 12 },
+                &ImageRenderOptions::default()).unwrap();
+            let highest = registers.captures_iter(&rendered.sequence)
+                .map(|capture| capture[1].parse::<u32>().unwrap()).max().unwrap();
+            assert!(highest < colors, "{highest} exceeds {colors} color registers");
+            if colors == 256 { assert!(highest >= 16); }
+            if colors >= 16 {
+                let decoded = icy_sixel::SixelImage::decode(rendered.sequence.as_bytes()).unwrap();
+                for (x, expected) in [(8, [0u8, 0, 0]), (24, [255, 255, 255]), (40, [255, 220, 0])] {
+                    let offset = (6 * decoded.width + x) * 4;
+                    for channel in 0..3 {
+                        assert!(decoded.pixels[offset + channel].abs_diff(expected[channel]) <= 6);
+                    }
+                }
+            }
+        }
+        reset_capabilities_cache();
+        assert_eq!(get_sixel_palette_size(), 16);
+    }
+
+    #[test]
+    fn sixel_round_trip_respects_height_band_and_cursor_bounds() {
+        set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 17 });
+        let result = render_image(&test_png(200, 400), &ImageDimensions { width_px: 1, height_px: 1 },
+            &ImageRenderOptions { max_width_cells: Some(60), max_height_cells: Some(5), ..Default::default() }).unwrap();
+        let decoded = icy_sixel::SixelImage::decode(result.sequence.as_bytes()).unwrap();
+        assert!(decoded.width <= 540 && decoded.height <= 85);
+        assert_eq!(decoded.height % 6, 0);
+        assert!((decoded.width as f64 / decoded.height as f64 - 0.5).abs() < 0.02);
+        assert!(result.rows <= 5);
+        assert_eq!(image_row_count(&position_image(&result.sequence, result.rows)), Some(result.rows));
+        assert!(is_image_line(&result.sequence));
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn corrupt_oversize_and_zero_room_images_fail_without_graphics() {
+        set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        let dims = ImageDimensions { width_px: i64::MAX, height_px: i64::MAX };
+        for data in ["not-base64".to_string(), base64::engine::general_purpose::STANDARD.encode(b"not an image"),
+            "A".repeat(MAX_IMAGE_BYTES.div_ceil(3) * 4 + 1)] {
+            assert!(render_image(&data, &dims, &ImageRenderOptions::default()).is_none());
+        }
+        let png = test_png(12, 12);
+        for options in [ImageRenderOptions { max_width_cells: Some(0), ..Default::default() },
+            ImageRenderOptions { max_height_cells: Some(0), ..Default::default() }] {
+            assert!(render_image(&png, &dims, &options).is_none());
+        }
+        // Reject the declared dimensions before allocating a decompressed raster.
+        let mut bytes = base64::engine::general_purpose::STANDARD.decode(&png).unwrap();
+        bytes[16..20].copy_from_slice(&100_000u32.to_be_bytes());
+        assert!(decode_bounded_image(&base64::engine::general_purpose::STANDARD.encode(bytes)).is_none());
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn sixel_waits_for_cell_geometry_and_honors_the_terminal_raster_limit() {
+        set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
+        reset_cell_dimensions();
+        let png = test_png(90, 90);
+        let dims = ImageDimensions { width_px: 90, height_px: 90 };
+        assert!(render_image(&png, &dims, &ImageRenderOptions::default()).is_none());
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        set_sixel_limits((30, 30));
+        let rendered = render_image(&png, &dims, &ImageRenderOptions::default()).unwrap();
+        let decoded = icy_sixel::SixelImage::decode(rendered.sequence.as_bytes()).unwrap();
+        assert!(decoded.width <= 30 && decoded.height <= 30);
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn inline_repaint_does_not_draw_above_the_visible_viewport() {
+        let line = position_image("\x1bP0;1;0q~\x1b\\", 3);
+        assert_eq!(image_line_for_viewport(&line, 3, 80), line);
+        assert!(image_line_for_viewport(&line, 2, 80).contains("Cannot display image"));
+        assert!(!is_image_line(&image_line_for_viewport(&line, 0, 80)));
+        assert!(crate::utils::visible_width(&image_line_for_viewport(&line, 0, 4)) <= 4);
+    }
+
+    #[test]
+    fn all_protocols_still_render_valid_images_and_respect_height_limits() {
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        let dims = ImageDimensions { width_px: 24, height_px: 48 };
+        for protocol in [ImageProtocol::Kitty, ImageProtocol::Iterm2, ImageProtocol::Sixel] {
+            set_capabilities(TerminalCapabilities { images: Some(protocol), true_color: true, hyperlinks: true });
+            let image = render_image(&test_png(24, 48), &dims, &ImageRenderOptions {
+                max_height_cells: Some(2), ..Default::default()
+            }).unwrap();
+            assert!(image.rows <= 2 && is_image_line(&image.sequence));
+        }
+        reset_capabilities_cache();
+    }
 
     #[test]
     fn detects_png_dimensions() {
@@ -577,7 +873,7 @@ mod tests {
         assert!(!is_image_line("plain"));
         assert_eq!(
             image_fallback("image/png", Some(&ImageDimensions { width_px: 2, height_px: 3 }), Some("a.png")),
-            "[Image: a.png [image/png] 2x3]"
+            "[Cannot display image: a.png [image/png] 2x3]"
         );
     }
 

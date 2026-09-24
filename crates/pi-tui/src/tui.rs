@@ -2,7 +2,7 @@
 //!
 //! Minimal TUI implementation with differential rendering.
 
-use crate::components::image::with_fullscreen_image_fallback;
+use crate::components::image::{with_fullscreen_image_fallback, with_image_height_limit};
 use crate::fullscreen::{FullscreenViewport, ScrollInfo, SelectionScrollDirection, ViewportAnchor};
 use crate::keybindings::get_keybindings;
 use crate::keys::{is_key_release, matches_key};
@@ -12,7 +12,7 @@ use crate::mouse::{
 use crate::selection_metadata::TableCellSelectionRegion;
 use crate::terminal::{Terminal, TerminalStopOptions};
 use crate::terminal_image::{
-    delete_kitty_image, get_capabilities, is_image_line, set_cell_dimensions,
+    delete_kitty_image, get_capabilities, image_line_for_viewport, is_image_line, set_cell_dimensions,
 };
 use crate::utils::{
     extract_segments, normalize_terminal_output, slice_by_column, slice_with_width, strip_ansi,
@@ -27,7 +27,7 @@ use std::rc::Rc;
 
 const KITTY_SEQUENCE_PREFIX: &str = "\x1b_G";
 
-fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
+pub(crate) fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
     let sequence_start = match line.find(KITTY_SEQUENCE_PREFIX) {
         Some(index) => index,
         None => return Vec::new(),
@@ -2200,7 +2200,16 @@ impl TUI {
             Some(fullscreen) => fullscreen.dock.clone(),
             None => return,
         };
-        let dock = with_fullscreen_image_fallback(|| {
+        let dock = with_fullscreen_image_fallback(|| dock_component.borrow_mut().render(width as f64));
+        let header_budget = (height / 4).min(height.saturating_sub(
+            crate::fullscreen::clipped_fullscreen_dock_height(dock.len(), height)
+                + crate::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS));
+        let header = self.fullscreen.as_ref().and_then(|state| state.header.clone())
+            .map(|component| with_fullscreen_image_fallback(|| component.borrow_mut().render_with_height(width as f64, header_budget)))
+            .unwrap_or_default();
+        let image_height = height.saturating_sub(header.len()
+            + crate::fullscreen::clipped_fullscreen_dock_height(dock.len(), height) + 1);
+        with_image_height_limit(image_height, || {
             for component in scroll_components.iter() {
                 let line_offset = transcript.len();
                 let component_lines = component.borrow_mut().render(width as f64);
@@ -2222,15 +2231,7 @@ impl TUI {
                 padding_line = component.borrow().get_fullscreen_padding();
                 transcript.extend(component_lines);
             }
-            dock_component.borrow_mut().render(width as f64)
         });
-
-        let header_budget = (height / 4).min(height.saturating_sub(
-            crate::fullscreen::clipped_fullscreen_dock_height(dock.len(), height)
-                + crate::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS));
-        let header = self.fullscreen.as_ref().and_then(|state| state.header.clone())
-            .map(|component| component.borrow_mut().render_with_height(width as f64, header_budget))
-            .unwrap_or_default();
 
         let (mut frame, window_height, scroll_info, viewport_controls) =
             match self.fullscreen.as_mut() {
@@ -2259,6 +2260,14 @@ impl TUI {
 
         let dock_regions = self.create_dock_selection_regions(&frame, window_height, width);
         self.overlay_selection_regions.extend(dock_regions);
+
+        // Graphics have no text-cell clipping. Keep overlays and the follow
+        // hint readable; preserve allocated rows so opening a menu never scrolls.
+        if self.has_overlay() || (viewport_controls && !scroll_info.following) {
+            for line in &mut frame {
+                if is_image_line(line) { *line = "[Cannot display image under overlay]".into(); }
+            }
+        }
 
         if viewport_controls && !scroll_info.following {
             // Follow hint composited over the bottom of the transcript window,
@@ -2365,11 +2374,14 @@ impl TUI {
         };
 
         // Render all components to get new lines
-        let mut new_lines = self.container.render(width as f64);
+        let mut new_lines = with_image_height_limit(height.saturating_sub(1), || self.container.render(width as f64));
 
         // Composite overlays into the rendered lines (before differential compare)
         if !self.overlay_stack.is_empty() {
-            new_lines = self.composite_overlays(&new_lines, width, height);
+            for line in &mut new_lines {
+                if is_image_line(line) { *line = crate::utils::truncate_to_width("[Cannot display image under overlay]", width as f64, "…", false); }
+            }
+            new_lines = with_fullscreen_image_fallback(|| self.composite_overlays(&new_lines, width, height));
         }
 
         // Extract cursor position before applying line resets (marker must be found first)
@@ -2440,7 +2452,7 @@ impl TUI {
                         buffer.push_str("\r\n");
                     }
                     buffer.push_str("\x1b[2K"); // Clear current line
-                    buffer.push_str(&new_lines[window_start + i]);
+                    buffer.push_str(&image_line_for_viewport(&new_lines[window_start + i], i + 1, width));
                 }
                 // Clear any rows the previous frame used below the new content.
                 if visible_count < prev_screen_rows {
@@ -2496,7 +2508,7 @@ impl TUI {
                 if i > render_start {
                     buffer.push_str("\r\n");
                 }
-                buffer.push_str(&new_lines[i]);
+                buffer.push_str(&image_line_for_viewport(&new_lines[i], i - render_start + 1, width));
             }
             buffer.push_str("\x1b[?2026l"); // End synchronized output
             terminal.write(&buffer);
@@ -2954,7 +2966,7 @@ impl TUI {
                 );
                 panic!("{error_msg}");
             }
-            buffer.push_str(&line);
+            buffer.push_str(&image_line_for_viewport(&line, i.saturating_sub(viewport_top) + 1, width));
         }
 
         // Track where cursor ended up after rendering
@@ -3860,7 +3872,7 @@ fn expand_last_changed_for_kitty_images_static(
 ) -> usize {
     let mut expanded_last_changed = last_changed;
     for i in first_changed..previous_lines.len() {
-        if !extract_kitty_image_ids(&previous_lines[i]).is_empty() {
+        if is_image_line(&previous_lines[i]) {
             expanded_last_changed = expanded_last_changed.max(i);
         }
     }

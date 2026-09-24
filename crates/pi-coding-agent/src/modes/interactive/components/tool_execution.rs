@@ -681,7 +681,7 @@ impl ToolExecutionComponent {
                         fallback_color: Box::new(|text: &str| theme().fg("toolOutput", text)),
                     },
                     ImageOptions {
-                        fallback_only: true,
+                        fallback_only: false,
                         fallback_prefix: Some("    \u{2570}\u{2500} ".to_string()),
                         ..Default::default()
                     },
@@ -845,6 +845,31 @@ pub fn select_latest_tool_expand_hint(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn tool_images_follow_terminal_support_and_show_images_setting() {
+        crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+        use base64::Engine;
+        use pi_tui::terminal_image::*;
+        let mut png = std::io::Cursor::new(Vec::new());
+        image::RgbaImage::from_pixel(24, 24, image::Rgba([0, 244, 119, 255]))
+            .write_to(&mut png, image::ImageFormat::Png).unwrap();
+        let mut component = ToolExecutionComponent::new("image-preview", "fixture", Value::Null, options(), None, "/tmp");
+        component.update_result(ToolExecutionResult {
+            content: vec![ResultContentBlock {
+                r#type: "image".into(), text: None, mime_type: Some("image/png".into()),
+                data: Some(base64::engine::general_purpose::STANDARD.encode(png.into_inner())),
+            }], ..Default::default()
+        }, false);
+        set_capabilities(TerminalCapabilities { images: Some(ImageProtocol::Sixel), true_color: true, hyperlinks: true });
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        assert!(component.render_lines(60.0).iter().any(|line| is_image_line(line)));
+        set_capabilities(TerminalCapabilities { images: None, true_color: true, hyperlinks: true });
+        assert!(component.render_lines(60.0).iter().any(|line| line.contains("Cannot display image")));
+        component.set_show_images(false);
+        assert!(component.render_lines(60.0).iter().all(|line| !is_image_line(line)));
+        reset_capabilities_cache();
+    }
 
     fn options() -> ToolExecutionOptions {
         ToolExecutionOptions::default()

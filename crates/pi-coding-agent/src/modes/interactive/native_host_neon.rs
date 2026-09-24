@@ -129,6 +129,11 @@ impl Timeline {
         self.width.saturating_sub(self.left + self.right).max(1)
     }
     pub fn line(self, text: &str, meta: Option<&RowMeta>, first: bool) -> String {
+        if pi_tui::terminal_image::is_image_line(text) {
+            // Paint the rail first, then graphics at the content column. Text
+            // padding after a SIXEL would erase the image's bottom cell row.
+            return format!("{}\x1b[{}G{}", self.line("", meta, first), self.left + 1, text);
+        }
         let palette = theme();
         if self.left == 0 {
             return surface_with(&palette, text, self.width);
@@ -443,3 +448,24 @@ pub(super) fn context_meter(
 #[cfg(test)]
 #[path = "native_host_neon_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+mod image_tests {
+    use super::*;
+
+    #[test]
+    fn neon_image_rows_preserve_graphics_and_reserve_the_content_column() {
+        crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+        use pi_tui::terminal_image::{image_row_count, position_image};
+        let graphic = position_image("\x1bP0;1;0q~\x1b\\", 3);
+        let mut wrap = super::super::TranscriptWrapCache::default();
+        for width in [24, 40, 120] {
+            let timeline = Timeline::new(width);
+            let wrapped = wrap.render(vec![String::new(), String::new(), graphic.clone()], timeline.content_width());
+            assert_eq!(wrapped.len(), 3);
+            let decorated = timeline.line(&wrapped[2], None, false);
+            assert!(decorated.ends_with(&format!("\x1b[{}G{}", timeline.left + 1, graphic)));
+            assert_eq!(image_row_count(&decorated), Some(3));
+        }
+    }
+}

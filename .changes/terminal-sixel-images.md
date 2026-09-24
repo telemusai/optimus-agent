@@ -1,0 +1,5 @@
+- Added native SIXEL image rendering with terminal capability detection, including Windows Terminal, alongside Kitty and iTerm2 graphics.
+- Fixed tool images in fullscreen transcripts with bounded decoding, viewport limits, cursor restoration, graphics cleanup, and readable fallbacks when an image cannot be displayed.
+- Fixed large terminal writes on Windows and WSL by splitting output into UTF-8-safe chunks.
+- Fixed incorrect SIXEL image colours by respecting the terminal's colour-register capacity and refreshing cached images when palette information arrives.
+- Fixed Windows Terminal image detection using its standard device-attributes reply and supported 256-colour palette, without requiring XTerm-specific capability replies.

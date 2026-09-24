@@ -14,6 +14,10 @@ use std::rc::Rc;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::Mutex;
 
+#[path = "terminal_image_probe.rs"]
+mod image_probe;
+use image_probe::{ImageProbe, CELL_QUERY, IMAGE_QUERY};
+
 const TERMINAL_PROGRESS_KEEPALIVE_MS: u64 = 1000;
 const TERMINAL_PROGRESS_ACTIVE_SEQUENCE: &str = "\x1b]9;4;3\x07";
 const TERMINAL_PROGRESS_CLEAR_SEQUENCE: &str = "\x1b]9;4;0;\x07";
@@ -88,10 +92,40 @@ fn drain_pending_handoff_input() -> bool {
 }
 
 pub(crate) fn stdout_write(data: &str) {
+    #[cfg(windows)]
+    ensure_windows_utf8();
     let stdout = std::io::stdout();
     let mut lock = stdout.lock();
-    let _ = lock.write_all(data.as_bytes());
+    let conpty = cfg!(windows) || std::env::var_os("WSL_INTEROP").is_some()
+        || std::env::var_os("WSL_DISTRO_NAME").is_some();
+    let _ = write_terminal_output(&mut lock, data, conpty);
     let _ = lock.flush();
+}
+
+fn write_terminal_output(writer: &mut impl Write, mut data: &str, conpty: bool) -> std::io::Result<()> {
+    // OMP uses 16 KiB writes to avoid ConPTY losing viewport tracking on
+    // large frames. UTF-8 boundaries matter when writing to a Win32 console.
+    while conpty && data.len() > 16 * 1024 {
+        let mut end = 16 * 1024;
+        while !data.is_char_boundary(end) { end -= 1; }
+        if let Some(newline) = data[..end].rfind('\n') { end = newline + 1; }
+        writer.write_all(data[..end].as_bytes())?;
+        data = &data[end..];
+    }
+    writer.write_all(data.as_bytes())
+}
+
+#[cfg(windows)]
+fn ensure_windows_utf8() {
+    use windows_sys::Win32::System::Console::{GetConsoleCP, GetConsoleOutputCP, SetConsoleCP, SetConsoleOutputCP};
+    // A console-sharing child can change these. Invalid/non-console handles
+    // return zero; leave redirected streams alone.
+    unsafe {
+        let input = GetConsoleCP();
+        let output = GetConsoleOutputCP();
+        if input != 0 && input != 65001 { let _ = SetConsoleCP(65001); }
+        if output != 0 && output != 65001 { let _ = SetConsoleOutputCP(65001); }
+    }
 }
 
 fn set_raw_mode(raw: bool) -> std::io::Result<()> {
@@ -339,6 +373,7 @@ struct DefaultColorProbe {
 
 /// State shared with the stdin dispatcher closure.
 struct Shared {
+    image_probe: ImageProbe,
     input_handler: Option<Box<dyn Fn(String)>>,
     resize_handler: Option<Box<dyn Fn()>>,
     kitty_protocol_active: bool,
@@ -435,6 +470,7 @@ impl ProcessTerminal {
     pub fn new() -> Self {
         Self {
             shared: Rc::new(RefCell::new(Shared {
+                image_probe: ImageProbe::default(),
                 input_handler: None,
                 resize_handler: None,
                 kitty_protocol_active: false,
@@ -474,6 +510,13 @@ impl ProcessTerminal {
 
         let shared = self.shared.clone();
         let dispatcher = Rc::new(move |sequence: String| {
+            let result = shared.borrow_mut().image_probe.filter(&sequence, std::time::Instant::now());
+            if result.query_cells { stdout_write(CELL_QUERY); }
+            if result.changed {
+                if let Some(handler) = &shared.borrow().resize_handler { handler(); }
+            }
+            let sequence = result.input;
+            if sequence.is_empty() { return; }
             // Check for Kitty protocol response (only if not already enabled).
             {
                 let mut s = shared.borrow_mut();
@@ -606,12 +649,20 @@ impl ProcessTerminal {
                 let handle = GetStdHandle(STD_INPUT_HANDLE);
                 let mut mode: u32 = 0;
                 if GetConsoleMode(handle, &mut mode) != 0 {
-                    self.windows_input_mode = Some(mode);
-                    let _ = SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT);
+                    if SetConsoleMode(handle, mode | ENABLE_VIRTUAL_TERMINAL_INPUT) != 0 {
+                        self.windows_input_mode = Some(mode);
+                    }
                 }
             }
             *WINDOWS_PENDING_SURROGATE.lock().unwrap() = None;
         }
+    }
+
+    fn windows_vt_input_ready(&self) -> bool {
+        #[cfg(windows)]
+        { self.windows_input_mode.is_some() }
+        #[cfg(not(windows))]
+        { true }
     }
 
     fn restore_windows_event_input(&mut self) {
@@ -882,11 +933,25 @@ impl Terminal for ProcessTerminal {
 
         // Query and enable Kitty keyboard protocol.
         self.query_and_enable_kitty_protocol();
+        use crate::terminal_image::{get_capabilities, image_passthrough_blocked, image_protocol_forced, reset_capabilities_cache};
+        reset_capabilities_cache();
+        crate::terminal_image::reset_cell_dimensions();
+        if get_capabilities().images.is_none() && !image_passthrough_blocked() && !image_protocol_forced()
+            && crossterm::tty::IsTty::is_tty(&std::io::stdin())
+            && crossterm::tty::IsTty::is_tty(&std::io::stdout())
+            && (!cfg!(windows) || self.windows_vt_input_ready())
+        {
+            self.shared.borrow_mut().image_probe.start(
+                std::time::Instant::now(), std::env::var_os("WT_SESSION").is_some(),
+            );
+            stdout_write(IMAGE_QUERY);
+        }
     }
 
     fn stop(&mut self, options: TerminalStopOptions) {
         let was_started = self.started;
         self.started = false;
+        self.shared.borrow_mut().image_probe = ImageProbe::default();
         self.finish_default_color_probe();
         self.clear_keyboard_protocol_fallback_timer();
 
@@ -1107,6 +1172,69 @@ impl Terminal for ProcessTerminal {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn conpty_image_writes_are_utf8_safe_bounded_and_stop_on_error() {
+        #[derive(Default)]
+        struct Writer { chunks: Vec<Vec<u8>>, fail_at: Option<usize> }
+        impl Write for Writer {
+            fn write(&mut self, bytes: &[u8]) -> std::io::Result<usize> {
+                if self.fail_at == Some(self.chunks.len()) { return Err(std::io::ErrorKind::BrokenPipe.into()); }
+                self.chunks.push(bytes.to_vec()); Ok(bytes.len())
+            }
+            fn flush(&mut self) -> std::io::Result<()> { Ok(()) }
+        }
+        let data = format!("{}\n\x1bP0;1;0q{}\x1b\\", "界😀".repeat(5000), "~".repeat(50000));
+        let mut writer = Writer::default();
+        write_terminal_output(&mut writer, &data, true).unwrap();
+        assert_eq!(writer.chunks.concat(), data.as_bytes());
+        assert!(writer.chunks.iter().all(|chunk| chunk.len() <= 16 * 1024 && std::str::from_utf8(chunk).is_ok()));
+        writer = Writer { fail_at: Some(1), ..Default::default() };
+        assert!(write_terminal_output(&mut writer, &data, true).is_err());
+        assert_eq!(writer.chunks.len(), 1);
+    }
+
+    #[test]
+    fn windows_vt_image_reply_survives_native_records_and_does_not_type_into_prompt() {
+        use crate::terminal_image::*;
+        set_capabilities(TerminalCapabilities { images: None, true_color: true, hyperlinks: true });
+        let (mut terminal, received) = native_input_fixture();
+        terminal.shared.borrow_mut().image_probe.start(std::time::Instant::now(), false);
+        let mut surrogate = None;
+        let mut records = vt_records("\x1b[?2;0;4096;4096S", &mut surrogate);
+        terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap();
+        assert!(received.borrow().is_empty());
+        assert_eq!(get_capabilities().images, Some(ImageProtocol::Sixel));
+        reset_capabilities_cache();
+    }
+
+    #[test]
+    fn windows_terminal_da1_and_cell_records_enable_full_color_without_xterm_replies() {
+        use crate::terminal_image::*;
+        reset_capabilities_cache();
+        reset_cell_dimensions();
+        set_capabilities(TerminalCapabilities { images: None, true_color: true, hyperlinks: true });
+        let (mut terminal, received) = native_input_fixture();
+        terminal.shared.borrow_mut().image_probe.start(std::time::Instant::now(), true);
+        let mut surrogate = None;
+        // Microsoft's DA1 response advertises feature 4; XTSMGRAPHICS is unsupported.
+        for reply in ["\x1b[?61;4;6;7;14;21;22;23;24;28;32;42c", "\x1b[6;20;10t"] {
+            let mut records = vt_records(reply, &mut surrogate);
+            terminal.poll_input_from(|| Ok(records.pop_front().unwrap_or(NativeInput::Pending)), true).unwrap();
+        }
+        assert!(received.borrow().is_empty());
+        assert_eq!(get_capabilities().images, Some(ImageProtocol::Sixel));
+        assert!(cell_dimensions_known());
+        assert_eq!(get_cell_dimensions(), CellDimensions { width_px: 10, height_px: 20 });
+        assert_eq!(get_sixel_palette_size(), 256);
+        let rendered = render_image(&test_palette_png(), &ImageDimensions { width_px: 96, height_px: 12 },
+            &ImageRenderOptions::default()).unwrap();
+        let highest = regex::Regex::new(r"#(\d+)").unwrap().captures_iter(&rendered.sequence)
+            .map(|capture| capture[1].parse::<u16>().unwrap()).max().unwrap();
+        assert!((16..256).contains(&highest));
+        set_cell_dimensions(CellDimensions { width_px: 9, height_px: 18 });
+        reset_capabilities_cache();
+    }
 
     fn native_input_fixture() -> (ProcessTerminal, Rc<RefCell<Vec<String>>>) {
         let mut terminal = ProcessTerminal::new();

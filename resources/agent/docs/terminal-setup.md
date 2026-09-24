@@ -63,6 +63,39 @@ Add to `keybindings.json` to enable `Shift+Enter` for multi-line input:
 
 ## Windows Terminal
 
+Optimus displays tool-result images using SIXEL when Windows Terminal 1.22 or later confirms
+support. This works with native PowerShell; WSL and external image converters
+are not required. Kitty and iTerm2 image protocols remain supported on compatible
+terminals. The approach follows [Oh My Pi's terminal image implementation](https://github.com/can1357/oh-my-pi).
+
+Image support is detected at startup without blocking input. SIXEL also requires
+a valid terminal cell-size report so images stay inside their reserved rows. Unsupported terminals,
+unanswered probes, invalid images, and images exceeding the safety limits show
+`Cannot display image` instead. Fullscreen images display only when their entire
+rectangle fits the transcript; clipped images, selection, and overlays use a
+placeholder so graphics cannot cover the header or input area. At most eight
+images are displayed in a fullscreen viewport. Images retain their reserved rows
+while scrolling. tmux and screen use text fallbacks.
+
+Optimus checks the standard device-attributes reply for SIXEL support, including
+Windows Terminal's reply. When available, XTerm graphics queries also supply the
+terminal's raster limits and number of colour registers. Images are quantized to
+that palette size so a 16-colour terminal cannot misinterpret a 256-colour image.
+Windows Terminal uses its supported 256-colour palette when no palette query is
+available; other terminals start with 16 colours until they report their capacity.
+
+To disable terminal graphics for a session in PowerShell:
+
+```powershell
+$env:PI_FORCE_IMAGE_PROTOCOL = 'off'
+optimus-agent
+```
+
+On Linux/macOS: `PI_FORCE_IMAGE_PROTOCOL=off optimus-agent`. Unset the variable
+to restore automatic detection. Advanced users can select `kitty`, `iterm2`, or
+`sixel` for a terminal they know supports it; automatic detection is recommended.
+VS Code's terminal also requires `terminal.integrated.enableImages` enabled.
+
 Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward the modified Enter keys Prime Agent uses:
 
 ```json
@@ -85,6 +118,19 @@ Add to `settings.json` (Ctrl+Shift+, or Settings → Open JSON file) to forward 
 - Remapping `Alt+Enter` to `sendInput` forwards the real key chord to Prime Agent instead.
 
 If you already have an `actions` array, add the objects to it. If the old fullscreen behavior persists, fully close and reopen Windows Terminal.
+
+## XTerm image previews
+
+For full-colour SIXEL images, enable 256 colour registers and size reports for the
+XTerm window:
+
+```bash
+xterm -xrm 'XTerm*decGraphicsID: 340' \
+  -xrm 'XTerm*numColorRegisters: 256' \
+  -xrm 'XTerm*allowWindowOps: true' -e optimus-agent
+```
+
+Optimus also respects XTerm's default 16-colour palette, with reduced shading.
 
 ## xfce4-terminal, terminator
 
