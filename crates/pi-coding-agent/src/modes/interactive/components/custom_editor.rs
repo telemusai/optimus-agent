@@ -485,7 +485,7 @@ impl Component for CustomEditor {
         }
 
         // Check app keybindings first
-        if self.editor.get_text().is_empty() && self.keybindings_match(data, "app.sidebar.focus") {
+        if self.editor.get_text().is_empty() && self.keybindings_match(data, "app.agents.back") {
             if let Some(on_agents_back) = self.on_agents_back.as_mut() {
                 if on_agents_back() {
                     return;
@@ -756,6 +756,25 @@ mod tests {
         assert_eq!(keys[0], "ctrl+d");
         editor.handle_input("\x04");
         assert!(exited.get());
+    }
+
+    #[test]
+    fn ui014_legacy_editing_bytes_do_not_trigger_removed_panel_shortcuts() {
+        init();
+        let mut editor = editor(CustomEditorOptions::default());
+        let submitted = Rc::new(RefCell::new(Vec::new()));
+        let sink = submitted.clone();
+        editor.editor_mut().on_submit = Some(Box::new(move |text| sink.borrow_mut().push(text.to_string())));
+        editor.editor_mut().set_text("draft!");
+        editor.handle_input("\x7f");
+        assert_eq!(editor.editor().get_text(), "draft");
+        editor.handle_input("\r");
+        assert_eq!(*submitted.borrow(), vec!["draft"]);
+        editor.editor_mut().set_text("keep");
+        for key in ["\x1b[104;5u", "\x1b[109;5u", "\x1b[108;6u"] {
+            editor.handle_input(key);
+        }
+        assert_eq!(editor.editor().get_text(), "keep", "old distinct panel keys must not steal or change the draft");
     }
 
     #[test]

@@ -1,0 +1,1 @@
+- Restore the full-screen session list and Down-arrow sub-agent navigation without a session sidebar.

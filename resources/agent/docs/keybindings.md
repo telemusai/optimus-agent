@@ -109,16 +109,6 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.session.fork` | *(none)* | Fork current session (`/fork`) |
 | `app.session.resume` | *(none)* | Open session resume picker (`/resume`) |
 
-### Session Sidebar
-
-| Keybinding id | Default | Description |
-|--------|---------|-------------|
-| `app.sidebar.toggleVisibility` | `ctrl+h` | Hide or show Sessions |
-| `app.sidebar.toggleSide` | `ctrl+m` | Alternate Sessions between the left and right edges |
-| `app.sidebar.location` | `ctrl+shift+l` | View and copy the selected full location |
-
-The hide/side defaults require distinct CSI-u, modifyOtherKeys, or native Windows virtual-key events. Legacy VT/ConPTY input cannot distinguish Ctrl+H from Backspace or Ctrl+M from Enter. Raw editing bytes keep their original function. Safe custom bindings remain supported. The clickable location line and `Location / copy` footer also open full locations. See [Session sidebar](session-sidebar.md).
-
 ### Statistics Panel
 
 These bindings apply while `/stats` is open. Opening or navigating the panel does not interrupt the agent.

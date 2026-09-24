@@ -44,12 +44,7 @@ impl Bar {
     pub(super) fn new(mode: Rc<RefCell<InteractiveMode>>) -> Self {
         let mut line = SubagentSummaryLine::default();
         line.set_always_visible(true);
-        // The bar exists only in the workspace-attached terminal, where the
-        // sessions sidebar always serves the roster the old agents view did.
-        // `options.return_to_agents_view` describes that retired hand-off and is
-        // forced false by the workspace loop, so keying `openable` on it
-        // disabled the editor's Down-arrow path (UI006).
-        line.set_openable(true);
+        line.set_openable(mode.borrow().options.return_to_agents_view);
         Self {
             mode,
             editor: None,
@@ -287,6 +282,41 @@ pub(super) fn project_child(
 #[cfg(test)]
 mod jev_bar_tests {
     use super::*;
+
+
+    #[test]
+    fn ui014_down_confirm_returns_to_scoped_list_and_back_restores_draft() {
+        let harness = super::super::ui_tests::FrameHarness::new("ui014-parent");
+        harness.mode.borrow_mut().replace_subagent_summary(Some(&[
+            local::AgentConnectionRlmChildAgentSnapshot {
+                id: "direct-child".into(), active_session_id: Some("active-child".into()),
+                status: "running".into(), ..Default::default()
+            },
+        ]));
+        harness.editor.borrow_mut().editor_mut().set_text("keep my draft");
+        let mut bar = Bar::new(harness.mode.clone());
+        let actions = Rc::new(RefCell::new(Vec::new()));
+        assert!(bar.input("\x1b[B", &harness.editor, &actions));
+        assert!(bar.line.focused());
+        assert!(!harness.editor.borrow().editor().focused());
+        assert!(bar.input("\x1b[A", &harness.editor, &actions));
+        assert!(harness.editor.borrow().editor().focused());
+        assert!(actions.borrow().is_empty());
+        assert!(bar.input("\x1b[B", &harness.editor, &actions));
+        assert!(bar.input("\r", &harness.editor, &actions));
+        assert!(matches!(actions.borrow_mut().pop(), Some(InputAction::Subagents)));
+        stash_editor_draft_for_agents_view(&harness.mode, &harness.editor, "ui014-parent");
+        harness.mode.borrow_mut().return_to_agents_view(InteractiveModeRunResultType::ScopedAgentsView);
+        assert!(matches!(harness.mode.borrow().agents_view_request,
+            Some(InteractiveModeRunResultType::ScopedAgentsView)));
+        let reopened = super::super::tests::stash_mode("ui014-parent");
+        let outcome = stash_session(&reopened, "ui014-parent")
+            .restore_prompt_stash_if_editor_empty(None, "", true).expect("stashed draft on reopen");
+        assert!(matches!(outcome.editor, PromptStashEditorEffect::SetText { text, .. } if text == "keep my draft"));
+        harness.mode.borrow_mut().options.return_to_agents_view = false;
+        let mut standalone = Bar::new(harness.mode.clone());
+        assert!(!standalone.input("\x1b[B", &harness.editor, &actions), "standalone chat must not enter a missing owner");
+    }
 
     #[test]
     fn neon_header_uses_only_the_current_sessions_cached_status() {
