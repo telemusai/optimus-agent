@@ -2080,15 +2080,8 @@ impl AgentSession {
         self: &Arc<Self>,
         target: &str,
     ) -> Result<RlmDeleteSubagentResult, String> {
-        // Running and retained children can be reserved synchronously. This keeps
-        // them hidden immediately while the async daemon listing checks for a
-        // conflicting passive selector.
-        // REPAIR CURSOR: `this._deletingRlmChildren` in the TypeScript maps
-        // selector -> `{ subagent, promise }`, so the `inFlight` ambiguity guard
-        // below cannot be evaluated here: `AgentSession::deleting_rlm_children`
-        // (core/agent_session.rs:2120) stores `Arc<AgentMessageDeferred>` only.
-        // Store `{ subagent, promise }` there (or add a sibling map) and filter it
-        // by `rlm_subagent_matches_target` before `local_matches`.
+        let in_flight: Vec<_> = self.deleting_rlm_children.lock().unwrap().values()
+            .filter(|entry| self.rlm_subagent_matches_target(&entry.subagent, target)).cloned().collect();
         let mut local_matches = self.build_rlm_subagent_list(None).subagents;
         local_matches.extend(
             self.rlm_child_cleanup_failures
@@ -2104,11 +2097,16 @@ impl AgentSession {
         let matching_child_ids: HashSet<String> = local_matches
             .iter()
             .map(|subagent| subagent.rlm_child_id.clone())
+            .chain(in_flight.iter().map(|entry| entry.subagent.rlm_child_id.clone()))
             .collect();
         if matching_child_ids.len() > 1 || local_matches.len() > 1 {
             return Err(format!(
                 "RLM subagent selector \"{target}\" is ambiguous in the current parent session"
             ));
+        }
+        if let Some(deletion) = in_flight.into_iter().next() {
+            deletion.wait().await?;
+            return Ok(RlmDeleteSubagentResult { subagent: deletion.subagent.clone(), outcome: None });
         }
         if let Some(subagent) = local_matches.into_iter().next() {
             let target = target.to_string();
@@ -2195,7 +2193,7 @@ impl AgentSession {
             match pending.get(&child_id) {
                 Some(deletion) => (deletion.clone(), true),
                 None => {
-                    let deletion = Arc::new(create_agent_message_deferred());
+                    let deletion = Arc::new(RlmChildDeletion::new(subagent));
                     pending.insert(child_id.clone(), deletion.clone());
                     (deletion, false)
                 }
@@ -2592,6 +2590,7 @@ impl AgentSession {
             } else {
                 self.emit_rlm_subagent_removal(subagent);
             }
+            self.remember_deleted_rlm_child(subagent, Some(&run.lock().unwrap()));
             let live_session = run.lock().unwrap().session.clone();
             let (status, settled) = {
                 let entry = run.lock().unwrap();
@@ -2669,6 +2668,9 @@ impl AgentSession {
             .lock()
             .unwrap()
             .insert(child_id.clone());
+        let retained_run = self.rlm_child_sessions.lock().unwrap().get(&child_id)
+            .and_then(|child| child.run.as_ref()).map(|run| run.lock().unwrap().clone());
+        self.remember_deleted_rlm_child(subagent, retained_run.as_ref());
         self.remove_rlm_subagent_tracking(&child_id, None);
         Ok(RlmDeleteSubagentResult {
             subagent: subagent.clone(),
@@ -2787,6 +2789,7 @@ impl AgentSession {
             !deleting.contains(id) && run.lock().unwrap().detached_deletion.is_none()
         });
         let mut runs = std::collections::BTreeMap::new();
+        let mut deleted_results = std::collections::BTreeMap::new();
         if targets.is_empty() {
             runs = candidates;
         } else {
@@ -2808,6 +2811,12 @@ impl AgentSession {
                     }
                 }
                 if matches.len() != 1 {
+                    if matches.is_empty() {
+                        if let Some(result) = self.deleted_rlm_collect_match(target)? {
+                            deleted_results.insert(result.rlm_child_id.clone(), result);
+                            continue;
+                        }
+                    }
                     return Err(format!(
                         "RLM child selector {target:?} {} in the current parent session",
                         if matches.is_empty() {
@@ -2836,7 +2845,7 @@ impl AgentSession {
                 _ = self.session_action_commit_dispose_abort.cancelled() => {}
             }
         }
-        let results = runs
+        let mut results: Vec<_> = runs
             .into_values()
             .map(|run| {
                 let run = run.lock().unwrap().clone();
@@ -2861,6 +2870,7 @@ impl AgentSession {
                 }
             })
             .collect();
+        results.extend(deleted_results.into_values());
         Ok(RlmCollectResult { results })
     }
 
@@ -3038,7 +3048,13 @@ impl AgentSession {
                 .unwrap()
                 .contains(name)
         };
+        let local_conflict = self.active_rlm_child_runs.lock().unwrap().values().any(|run| {
+            let run = run.lock().unwrap();
+            (run.detached_deletion.is_none() || run.session.is_none())
+                && (run.session_name == name || run.session.as_ref().and_then(|child| child.session_name()).as_deref() == Some(name))
+        }) || self.rlm_child_cleanup_failures.lock().unwrap().values().any(|entry| entry.session_name == name);
         if pending
+            || local_conflict
             || self
                 .list_rlm_subagents()
                 .await?

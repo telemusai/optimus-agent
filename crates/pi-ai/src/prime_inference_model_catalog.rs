@@ -1,6 +1,7 @@
 //! Port of packages/ai/src/prime-inference-model-catalog.ts
 
 use serde_json::Value;
+use crate::types::ThinkingLevelMap;
 
 #[derive(Debug, Clone, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct PrimeInferenceCatalogEntry {
@@ -21,6 +22,67 @@ pub struct PrimeInferenceCatalogEntry {
     pub vision: Option<bool>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub reasoning: Option<bool>,
+    #[serde(rename = "supportedParameters", skip_serializing_if = "Option::is_none")]
+    pub supported_parameters: Option<Vec<String>>,
+    #[serde(rename = "reasoningEfforts", skip_serializing_if = "Option::is_none")]
+    pub reasoning_efforts: Option<Vec<String>>,
+    #[serde(rename = "reasoningMandatory", skip_serializing_if = "Option::is_none")]
+    pub reasoning_mandatory: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+pub struct PrimeInferenceReasoningControls {
+    pub supports_reasoning_effort: bool,
+    pub thinking_format: Option<String>,
+    pub thinking_level_map: Option<ThinkingLevelMap>,
+}
+
+pub fn parse_string_array(value: Option<&Value>) -> Option<Vec<String>> {
+    let mut result = Vec::new();
+    for value in value?.as_array()? {
+        if let Some(text) = value.as_str().filter(|text| !text.is_empty()) {
+            if !result.iter().any(|entry| entry == text) {
+                result.push(text.to_string());
+            }
+        }
+    }
+    (!result.is_empty()).then_some(result)
+}
+
+/// Unknown parameter metadata leaves the bundled controls intact.
+pub fn get_prime_inference_reasoning_controls(
+    supported_parameters: Option<&[String]>,
+    reasoning_efforts: Option<&[String]>,
+    mandatory: bool,
+) -> Option<PrimeInferenceReasoningControls> {
+    let supported = supported_parameters?;
+    let includes = |name: &str| supported.iter().any(|value| value == name);
+    let effort = includes("reasoning_effort");
+    let mut map = None;
+    if effort && reasoning_efforts.is_some() {
+        let efforts = reasoning_efforts.unwrap();
+        let mut levels = ThinkingLevelMap::new();
+        levels.insert("off".to_string(), (!mandatory).then(|| "none".to_string()));
+        for level in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+            levels.insert(level.to_string(), efforts.iter().any(|value| value == level).then(|| level.to_string()));
+        }
+        map = Some(levels);
+    } else if includes("reasoning") && !effort && !includes("enable_thinking") {
+        let mut levels = ThinkingLevelMap::new();
+        if mandatory { levels.insert("off".to_string(), None); }
+        for level in ["minimal", "low", "medium", "high", "xhigh", "max"] {
+            levels.insert(level.to_string(), (level == "high").then(|| level.to_string()));
+        }
+        map = Some(levels);
+    } else if includes("enable_thinking") && !effort && mandatory {
+        map = Some(ThinkingLevelMap::from([("off".to_string(), None)]));
+    }
+    Some(PrimeInferenceReasoningControls {
+        supports_reasoning_effort: effort,
+        thinking_format: if effort { None } else if includes("enable_thinking") { Some("zai".to_string()) }
+            else if includes("reasoning") { Some("openrouter".to_string()) } else { None },
+        thinking_level_map: map,
+    })
 }
 
 #[derive(Debug, Clone, Default, PartialEq)]
@@ -156,6 +218,9 @@ pub fn parse_prime_inference_model_catalog(
             max_tokens: None,
             vision: None,
             reasoning: None,
+            supported_parameters: parse_string_array(item.get("supported_parameters")),
+            reasoning_efforts: parse_string_array(item.get("reasoning").and_then(|spec| spec.get("supported_efforts"))),
+            reasoning_mandatory: item.get("reasoning").and_then(|spec| spec.get("mandatory")).and_then(Value::as_bool),
         };
         if has_specs {
             let context_window = context_window.expect("checked by has_specs");
@@ -267,5 +332,38 @@ mod tests {
         assert!(is_private_prime_inference_model_id("DEV/foo"));
         assert!(is_private_prime_inference_model_id("vendor:model"));
         assert!(!is_private_prime_inference_model_id("openai/gpt-5"));
+    }
+
+    #[test]
+    fn live_reasoning_controls_limit_efforts_and_respect_mandatory_routes() {
+        let mut value = catalog();
+        value["data"][0]["supported_parameters"] = json!(["reasoning_effort", "reasoning_effort", null, ""]);
+        value["data"][0]["reasoning"] = json!({"supported_efforts":["low","high","high"], "mandatory":true});
+        let entries = parse_prime_inference_model_catalog(&value, None).unwrap();
+        let entry = &entries[0];
+        assert_eq!(entry.supported_parameters.as_deref(), Some(["reasoning_effort".to_string()].as_slice()));
+        let controls = get_prime_inference_reasoning_controls(entry.supported_parameters.as_deref(), entry.reasoning_efforts.as_deref(), entry.reasoning_mandatory == Some(true)).unwrap();
+        assert!(controls.supports_reasoning_effort);
+        assert_eq!(controls.thinking_format, None);
+        let mut model = crate::types::Model::default();
+        model.reasoning = true;
+        model.thinking_level_map = controls.thinking_level_map;
+        assert_eq!(crate::models::get_supported_thinking_levels(&model), ["low", "high"]);
+    }
+
+    #[test]
+    fn reasoning_toggles_do_not_invent_effort_support() {
+        for (parameters, format) in [(["reasoning"], "openrouter"), (["enable_thinking"], "zai")] {
+            let parameters = parameters.map(String::from);
+            let controls = get_prime_inference_reasoning_controls(Some(&parameters), Some(&["high".into()]), true).unwrap();
+            assert!(!controls.supports_reasoning_effort);
+            assert_eq!(controls.thinking_format.as_deref(), Some(format));
+            assert_eq!(controls.thinking_level_map.unwrap().get("off"), Some(&None));
+        }
+        assert!(get_prime_inference_reasoning_controls(None, None, false).is_none());
+        let controls = get_prime_inference_reasoning_controls(Some(&["temperature".into()]), None, false).unwrap();
+        assert!(!controls.supports_reasoning_effort);
+        assert_eq!(controls.thinking_format, None);
+        assert_eq!(controls.thinking_level_map, None);
     }
 }

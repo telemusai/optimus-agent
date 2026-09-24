@@ -42,6 +42,17 @@ fn local_provider(child: &Arc<AgentSession>, entered: CancellationToken, hold: b
     }));
 }
 
+fn assert_native_settlement(receipt: &Value) {
+    // Kernel Job Object ownership is currently proved only on Windows.
+    assert_eq!(receipt["settled"], cfg!(windows), "{receipt}");
+    if !cfg!(windows) {
+        assert_eq!(receipt["status"], "failed_settlement");
+        assert_eq!(receipt["error_code"], "execution_ownership_or_settlement_unproved");
+        assert_eq!(receipt["acknowledged"]["kernel"], false);
+        assert_eq!(receipt["acknowledged"]["owned_processes"], false);
+    }
+}
+
 #[cfg(windows)]
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn retained_stop_native_admission_settlement_history_restore_and_audit() {
@@ -262,7 +273,7 @@ async fn retained_stop_wins_late_release_and_keeps_the_child_addressable() {
     parent.unsettled_rlm_child_runs.lock().unwrap().push(run.clone());
     // The finalizer has a stale pre-stop snapshot, like the original race.
     let receipt = parent.stop_retained_child("child", 5_000).await.unwrap();
-    assert_eq!(receipt["settled"], true, "{receipt}");
+    assert_native_settlement(&receipt);
     assert!(!parent.try_claim_rlm_runtime_release("child", &child));
     assert!(parent.finish_retained_rlm_run(&run, &current));
     assert!(!parent.active_rlm_child_runs.lock().unwrap().contains_key("child"));
@@ -299,7 +310,7 @@ async fn retained_stop_rejects_an_atomically_reserved_explicit_deletion() {
     assert!(tokio::time::timeout(std::time::Duration::from_secs(2), deleting).await.unwrap().unwrap().is_err());
     // A vetoed preflight did not admit destructive cleanup or poison later stop.
     let stopped = parent.stop_retained_child("child", 5_000).await.unwrap();
-    assert_eq!(stopped["settled"], true, "{stopped}");
+    assert_native_settlement(&stopped);
     assert!(Path::new(&child.session_file().unwrap()).is_file());
     parent.rlm_child_sessions.lock().unwrap().clear();
     child.dispose_async(Some(false)).await;

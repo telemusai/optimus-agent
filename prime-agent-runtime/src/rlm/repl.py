@@ -43,6 +43,7 @@ from .snapshot import (
     snapshot_cas_v2,
 )
 from .snapshot_serializer import SnapshotSerializationMetrics, dump_snapshot_value
+from .snapshot_restore import ALWAYS_SKIP as _ALWAYS_SKIP, RESTORE_SKIP as _RESTORE_SKIP, prepare_restored_values
 
 PROTOCOL_VERSION = 3
 
@@ -62,11 +63,6 @@ def _cap_text(text: str) -> str:
     if len(text) > _RESULT_TEXT_CAP:
         return text[:_RESULT_TEXT_CAP] + _RESULT_TRUNCATION_MARKER
     return text
-
-# Names the session bootstrap re-creates on every start; never snapshotted.
-_ALWAYS_SKIP = {"rlm", "mcp", "bash", "asyncio", "In", "Out", "get_ipython", "exit", "quit", "open"}
-# IPython-injected names that may appear in a snapshot payload; never restored.
-_RESTORE_SKIP = {"In", "Out", "get_ipython"}
 
 _protocol_fd: int = -1
 _write_lock = threading.Lock()
@@ -958,14 +954,18 @@ def _restore_state(
             staged[name] = dill.loads(blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
-    result: dict[str, Any] = {"restored": sorted(staged), "failed": failed, "format": "legacy"}
+    prepared, backfill, revive_failed = prepare_restored_values(staged, ns, _RESTORE_SKIP)
+    result: dict[str, Any] = {"restored": sorted(prepared), "failed": failed + revive_failed, "format": "legacy"}
     if source == "legacy" and has_cas:
         result.update({"legacy_recovery": True, "unsaved_work_possible": True})
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)
     try:
-        for name, value in staged.items():
+        for name, value in prepared.items():
             ns[name] = value
+        for name, value in backfill:
+            if name not in ns:
+                ns[name] = value
         # Publish while still parked: a later KeyboardInterrupt into this task finds the committed result (see _handle_state).
         if committed is not None:
             committed.append(result)

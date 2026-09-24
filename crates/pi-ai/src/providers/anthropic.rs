@@ -97,7 +97,7 @@ fn get_cache_control(model: &Model, cache_retention: Option<&CacheRetention>) ->
 }
 
 // Stealth mode: Mimic Claude Code's tool naming exactly
-const CLAUDE_CODE_VERSION: &str = "2.1.261";
+const CLAUDE_CODE_VERSION: &str = "2.1.281";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -3241,7 +3241,7 @@ mod tests {
 			headers.get("anthropic-beta").map(String::as_str),
 			Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
 		);
-		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.261"));
+		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.281"));
 		assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
 
 		let mut opencode = test_model("opencode", "claude-sonnet-4-5");

@@ -24,6 +24,7 @@ from collections.abc import Iterator
 from typing import Any
 
 from .snapshot_serializer import SnapshotSerializationMetrics, dump_snapshot_value
+from .snapshot_restore import prepare_restored_values
 
 CAS_FORMAT = "prime-agent-kernel-snapshot-cas"
 CAS_VERSION = 2
@@ -908,9 +909,10 @@ def restore_cas_v2(
                 except Exception as error:
                     failed.append({"name": name, "reason": f"{type(error).__name__}: {_safe_str(error)[:200]}"})
 
+            prepared, backfill, revive_failed = prepare_restored_values(staged, ns, restore_skip)
             result: dict[str, Any] = {
-                "restored": sorted(staged),
-                "failed": failed,
+                "restored": sorted(prepared),
+                "failed": failed + revive_failed,
                 "format": "cas-v2",
                 "generation": generation["generation"],
             }
@@ -920,8 +922,11 @@ def restore_cas_v2(
 
             previous_handler = signal.signal(signal.SIGINT, lambda signum, frame: None)
             try:
-                for name, value in staged.items():
+                for name, value in prepared.items():
                     ns[name] = value
+                for name, value in backfill:
+                    if name not in ns:
+                        ns[name] = value
                 if committed is not None:
                     committed.append(result)
             finally:

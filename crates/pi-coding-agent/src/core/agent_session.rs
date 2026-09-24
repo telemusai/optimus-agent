@@ -28,6 +28,9 @@ mod agent_handle;
 mod rlm_result_delivery_tests;
 #[path = "agent_session/runtime_members.rs"]
 mod runtime_members;
+#[path = "agent_session/deleted_children.rs"]
+mod deleted_children;
+use deleted_children::{DeletedRlmChild, RlmChildDeletion};
 #[path = "agent_session/task_queue.rs"]
 mod task_queue;
 #[path = "agent_session/refinement_progress.rs"]
@@ -2495,8 +2498,9 @@ pub struct AgentSession {
     pending_rlm_subagent_session_names: Mutex<HashSet<String>>,
     rlm_child_sessions: Mutex<HashMap<String, RetainedRlmChild>>,
     deleted_rlm_child_ids: Mutex<HashSet<String>>,
+    deleted_rlm_children: Mutex<HashMap<String, DeletedRlmChild>>,
     rlm_child_cleanup_failures: Mutex<HashMap<String, RlmSubagentRegistryEntry>>,
-    deleting_rlm_children: Mutex<HashMap<String, Arc<AgentMessageDeferred>>>,
+    deleting_rlm_children: Mutex<HashMap<String, Arc<RlmChildDeletion>>>,
     rlm_child_unsubscribes: Mutex<HashMap<String, Arc<dyn Fn() + Send + Sync>>>,
     model_registry: Arc<Mutex<crate::core::model_registry::ModelRegistry>>,
     tool_registry: Mutex<BTreeMap<String, AgentTool>>,
@@ -2867,6 +2871,7 @@ impl AgentSession {
             pending_rlm_subagent_session_names: Mutex::new(HashSet::new()),
             rlm_child_sessions: Mutex::new(HashMap::new()),
             deleted_rlm_child_ids: Mutex::new(HashSet::new()),
+            deleted_rlm_children: Mutex::new(HashMap::new()),
             rlm_child_cleanup_failures: Mutex::new(HashMap::new()),
             deleting_rlm_children: Mutex::new(HashMap::new()),
             rlm_child_unsubscribes: Mutex::new(HashMap::new()),
@@ -8000,6 +8005,7 @@ impl AgentSession {
         self.rlm_child_sessions.lock().unwrap().clear();
         self.rlm_child_cleanup_failures.lock().unwrap().clear();
         self.deleted_rlm_child_ids.lock().unwrap().clear();
+        self.deleted_rlm_children.lock().unwrap().clear();
         let provisioner = self.ipython_kernel_provisioner.lock().unwrap().clone();
         if let Some(provisioner) = provisioner {
             // a failed kernel startup already cleaned up after itself
@@ -8068,6 +8074,7 @@ impl AgentSession {
         self.rlm_child_sessions.lock().unwrap().clear();
         self.rlm_child_cleanup_failures.lock().unwrap().clear();
         self.deleted_rlm_child_ids.lock().unwrap().clear();
+        self.deleted_rlm_children.lock().unwrap().clear();
         self.pending_next_turn_messages.lock().unwrap().clear();
         let delivery_error = "Session disposed before prompt delivery.";
         let completion_error = "Session disposed before prompt completion.";
@@ -24239,6 +24246,107 @@ mod rlm_session_t10_tests {
             .is_err());
         assert_eq!(session.unfinished_action_count(), queue_before);
         assert!(session.messages().is_empty());
+    }
+
+    fn deleted_child_entry(id: &str, name: &str) -> RlmSubagentRegistryEntry {
+        RlmSubagentRegistryEntry {
+            rlm_child_id: id.into(), session_name: name.into(), session_id: Some(format!("session-{id}")),
+            session_dir: format!("/synthetic/{id}"), status: "running".into(), ..Default::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn deleted_collect_receipt_settles_before_cleanup_and_survives_removal() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        let mut run = empty_rlm_child_run("old");
+        run.session_name = "builder".into();
+        run.status = "running".into();
+        run.settled = false;
+        run.answer_preview = Some("x".repeat(1000));
+        let run = Arc::new(Mutex::new(run));
+        session.active_rlm_child_runs.lock().unwrap().insert("old".into(), run.clone());
+        session.delete_resolved_rlm_subagent(&deleted_child_entry("old", "builder")).await.unwrap();
+        let receipt = tokio::time::timeout(std::time::Duration::from_secs(1),
+            session.collect_rlm_children(&["old".into()], 30_000)).await.unwrap().unwrap();
+        assert_eq!(receipt.results[0].status, "cancelled");
+        assert!(receipt.results[0].settled);
+        assert!(receipt.results[0].answer_preview.as_ref().unwrap().chars().count() <= 160);
+        assert!(!run.lock().unwrap().settled, "physical cleanup is independent of the receipt");
+        assert!(session.collect_rlm_children(&[], 0).await.unwrap().results.is_empty());
+        let run_snapshot = run.lock().unwrap().clone();
+        session.remove_rlm_subagent_tracking("old", Some(&run_snapshot));
+        let receipt = session.collect_rlm_children(&["old".into(), "builder".into(), "session-old".into()], 0).await.unwrap();
+        assert_eq!(receipt.results.len(), 1);
+        assert_eq!(receipt.results[0].rlm_child_id, "old");
+    }
+
+    #[tokio::test]
+    async fn deleted_collect_does_not_answer_for_live_or_preflight_replacements() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        session.remember_deleted_rlm_child(&deleted_child_entry("old", "builder"), None);
+        let mut live = empty_rlm_child_run("new");
+        live.session_name = "builder".into();
+        live.status = "running".into();
+        session.active_rlm_child_runs.lock().unwrap().insert("new".into(), Arc::new(Mutex::new(live)));
+        assert_eq!(session.collect_rlm_children(&["builder".into()], 0).await.unwrap().results[0].rlm_child_id, "new");
+        session.deleting_rlm_children.lock().unwrap().insert("new".into(), Arc::new(RlmChildDeletion::new(&deleted_child_entry("new", "builder"))));
+        assert!(session.collect_rlm_children(&["builder".into()], 0).await.is_err());
+        assert_eq!(session.collect_rlm_children(&["old".into()], 0).await.unwrap().results[0].status, "cancelled");
+        session.active_rlm_child_runs.lock().unwrap().clear();
+        assert!(session.collect_rlm_children(&["builder".into()], 0).await.is_err(), "runless preflight must also block old receipts");
+        session.deleting_rlm_children.lock().unwrap().clear();
+        let retained = t10_session(ScriptedAgent::new(), 0);
+        retained.set_session_name("builder").unwrap();
+        session.rlm_child_sessions.lock().unwrap().insert("new".into(), RetainedRlmChild { session: retained, run: None });
+        assert!(session.collect_rlm_children(&["builder".into()], 0).await.is_err(), "live runless replacement owns the name");
+        session.rlm_child_sessions.lock().unwrap().clear();
+        session.remember_deleted_rlm_child(&deleted_child_entry("new", "builder"), None);
+        assert!(session.collect_rlm_children(&["builder".into()], 0).await.unwrap_err().contains("ambiguous"));
+    }
+
+    #[tokio::test]
+    async fn retained_runless_delete_keeps_collectable_identity() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        let retained = t10_session(ScriptedAgent::new(), 0);
+        retained.set_session_name("builder").unwrap();
+        session.rlm_child_sessions.lock().unwrap().insert("old".into(), RetainedRlmChild { session: retained, run: None });
+        session.delete_resolved_rlm_subagent(&deleted_child_entry("old", "builder")).await.unwrap();
+        assert!(!session.rlm_child_sessions.lock().unwrap().contains_key("old"));
+        let result = session.collect_rlm_children(&["session-old".into()], 0).await.unwrap();
+        assert_eq!(result.results[0].status, "cancelled");
+        assert!(result.results[0].settled);
+    }
+
+    #[tokio::test]
+    async fn deleted_name_can_be_reused_after_binding_but_not_during_startup() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        let mut run = empty_rlm_child_run("old");
+        run.session_name = "builder".into();
+        run.status = "cancelled".into();
+        run.detached_deletion = Some(deleted_child_entry("old", "builder"));
+        let run = Arc::new(Mutex::new(run));
+        session.active_rlm_child_runs.lock().unwrap().insert("old".into(), run.clone());
+        assert!(session.assert_rlm_subagent_session_name_available("builder", true).await.is_err());
+        run.lock().unwrap().session = Some(t10_session(ScriptedAgent::new(), 0));
+        session.assert_rlm_subagent_session_name_available("builder", true).await.unwrap();
+        session.rlm_child_cleanup_failures.lock().unwrap().insert("old".into(), deleted_child_entry("old", "builder"));
+        assert!(session.assert_rlm_subagent_session_name_available("builder", true).await.is_err());
+    }
+
+    #[tokio::test]
+    async fn delete_selector_cannot_cancel_a_replacement_during_old_cleanup() {
+        let session = t10_session(ScriptedAgent::new(), 0);
+        let previous = Arc::new(RlmChildDeletion::new(&deleted_child_entry("old", "builder")));
+        previous.resolve();
+        session.deleting_rlm_children.lock().unwrap().insert("old".into(), previous);
+        let mut replacement = empty_rlm_child_run("new");
+        replacement.session_name = "builder".into();
+        replacement.status = "running".into();
+        let replacement = Arc::new(Mutex::new(replacement));
+        session.active_rlm_child_runs.lock().unwrap().insert("new".into(), replacement.clone());
+        assert!(session.delete_rlm_subagent("builder").await.unwrap_err().contains("ambiguous"));
+        session.delete_rlm_subagent("old").await.unwrap();
+        assert_eq!(replacement.lock().unwrap().status, "running");
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

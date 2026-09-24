@@ -6,8 +6,8 @@
 //! feature keeps the declaration order.
 //!
 //! The original generator was removed with the TypeScript implementation. Keep
-//! the imported base64 snapshot unchanged; reviewed subscription additions live
-//! in models.subscription.json. See resources/agent/docs/subscription-models.md.
+//! the imported base64 snapshot unchanged; reviewed additions live in
+//! models.subscription.json and models.compatibility.json. See resources/agent/docs/providers.md.
 
 use std::sync::OnceLock;
 
@@ -175,13 +175,14 @@ pub fn models() -> &'static IndexMap<String, IndexMap<String, Model>> {
     MODELS.get_or_init(|| {
         let mut catalog: IndexMap<String, IndexMap<String, Model>> =
             serde_json::from_str(decode_catalog_json()).expect("embedded catalog parses");
-        let additions: IndexMap<String, IndexMap<String, Model>> =
-            serde_json::from_str(include_str!("models.subscription.json"))
-                .expect("subscription catalog parses");
-        for (provider, models) in additions {
-            let target = catalog.get_mut(&provider).expect("existing subscription provider");
-            for (id, model) in models {
-                assert!(target.insert(id, model).is_none(), "duplicate subscription model");
+        for json in [include_str!("models.subscription.json"), include_str!("models.compatibility.json")] {
+            let additions: IndexMap<String, IndexMap<String, Model>> =
+                serde_json::from_str(json).expect("reviewed catalog additions parse");
+            for (provider, models) in additions {
+                let target = catalog.get_mut(&provider).expect("existing provider for catalog additions");
+                for (id, model) in models {
+                    assert!(target.insert(id, model).is_none(), "duplicate catalog addition");
+                }
             }
         }
         catalog
@@ -213,7 +214,7 @@ mod tests {
         assert_eq!(catalog.len(), 32);
         assert_eq!(catalog.keys().next().map(String::as_str), Some("amazon-bedrock"));
         assert_eq!(catalog.keys().last().map(String::as_str), Some("zai"));
-        assert_eq!(all_models().len(), 1287);
+        assert_eq!(all_models().len(), 1297);
     }
 
     #[test]
@@ -231,6 +232,29 @@ mod tests {
                 assert_eq!(&model.id, model_id);
                 assert_eq!(&model.provider, provider);
             }
+        }
+    }
+
+    #[test]
+    fn opus_55_routes_are_selectable_with_supported_thinking_levels() {
+        let routes = [
+            ("anthropic", "claude-opus-5-5", "anthropic-messages"),
+            ("amazon-bedrock", "anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("amazon-bedrock", "au.anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("amazon-bedrock", "eu.anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("amazon-bedrock", "global.anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("amazon-bedrock", "jp.anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("amazon-bedrock", "us.anthropic.claude-opus-5-5", "bedrock-converse-stream"),
+            ("openrouter", "anthropic/claude-opus-5.5", "openai-completions"),
+            ("vercel-ai-gateway", "anthropic/claude-opus-5.5", "anthropic-messages"),
+            ("vercel-ai-gateway", "anthropic/claude-opus-5.5-fast", "anthropic-messages"),
+        ];
+        for (provider, id, api) in routes {
+            let model = find_model(provider, id).unwrap_or_else(|| panic!("missing {provider}/{id}"));
+            assert_eq!(model.api, api);
+            assert_eq!(crate::models::get_supported_thinking_levels(model), ["low", "medium", "high", "xhigh", "max"]);
+            assert_eq!(crate::models::clamp_thinking_level(model, "off"), "low");
+            assert!(model.max_tokens > 0.0 && model.context_window >= model.max_tokens);
         }
     }
 }

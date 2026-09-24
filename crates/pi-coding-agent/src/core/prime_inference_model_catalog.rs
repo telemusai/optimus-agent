@@ -11,6 +11,7 @@ use pi_ai::types::{
     Compat, InputModality, Model, ModelCost, OpenAICompletionsCompat, ThinkingLevelMap,
 };
 use serde_json::Value;
+use pi_ai::prime_inference_model_catalog::{get_prime_inference_reasoning_controls, parse_string_array};
 
 use crate::core::prime_inference_auth::FetchFn;
 use crate::utils::atomic_file::{write_file_atomic_sync, WriteFileAtomicOptions};
@@ -32,8 +33,7 @@ pub fn default_compat() -> OpenAICompletionsCompat {
     OpenAICompletionsCompat {
         supports_store: Some(false),
         supports_developer_role: Some(false),
-        // The endpoint does not yet describe reasoning controls. Do not send an
-        // unconfirmed reasoning_effort parameter for models without a bundled template.
+        // Live supported parameters override this conservative fallback.
         supports_reasoning_effort: Some(false),
         max_tokens_field: Some("max_tokens".to_string()),
         supports_strict_mode: Some(false),
@@ -54,6 +54,9 @@ pub struct PrimeInferenceCatalogEntry {
     pub max_tokens: Option<f64>,
     pub vision: Option<bool>,
     pub reasoning: Option<bool>,
+    pub supported_parameters: Option<Vec<String>>,
+    pub reasoning_efforts: Option<Vec<String>>,
+    pub reasoning_mandatory: Option<bool>,
 }
 
 fn is_record(value: &Value) -> Option<&serde_json::Map<String, Value>> {
@@ -181,6 +184,9 @@ pub fn parse_prime_inference_model_catalog(
             max_tokens: None,
             vision: None,
             reasoning: None,
+            supported_parameters: parse_string_array(item.get("supported_parameters")),
+            reasoning_efforts: parse_string_array(item.get("reasoning").and_then(|spec| spec.get("supported_efforts"))),
+            reasoning_mandatory: item.get("reasoning").and_then(|spec| spec.get("mandatory")).and_then(Value::as_bool),
         };
         if has_specs {
             let context_window = context_window.expect("checked above");
@@ -257,12 +263,30 @@ pub fn build_prime_inference_models(
         } else {
             vec![InputModality::Text]
         };
-        let thinking_level_map: Option<ThinkingLevelMap> = template.and_then(|model| {
+        let mut thinking_level_map: Option<ThinkingLevelMap> = template.and_then(|model| {
             model
                 .thinking_level_map
                 .as_ref()
                 .map(|map| map.clone())
         });
+        let mut compat = template
+            .and_then(|model| model.compat.as_ref())
+            .and_then(Compat::as_completions)
+            .cloned()
+            .unwrap_or_else(default_compat);
+        if let Some(controls) = get_prime_inference_reasoning_controls(
+            entry.supported_parameters.as_deref(), entry.reasoning_efforts.as_deref(),
+            entry.reasoning_mandatory == Some(true),
+        ) {
+            compat.supports_reasoning_effort = Some(controls.supports_reasoning_effort);
+            compat.thinking_format = controls.thinking_format;
+            thinking_level_map = controls.thinking_level_map.or_else(|| {
+                controls.supports_reasoning_effort.then_some(thinking_level_map).flatten()
+            });
+            if controls.supports_reasoning_effort && entry.reasoning_mandatory == Some(true) {
+                thinking_level_map.get_or_insert_with(ThinkingLevelMap::new).insert("off".to_string(), None);
+            }
+        }
         models.push(Model {
             id: entry.id.clone(),
             name: entry
@@ -295,13 +319,7 @@ pub fn build_prime_inference_models(
             },
             native_compaction: None,
             headers: None,
-            compat: Some(Compat::Completions(
-                template
-                    .and_then(|model| model.compat.as_ref())
-                    .and_then(Compat::as_completions)
-                    .cloned()
-                    .unwrap_or_else(default_compat),
-            )),
+            compat: Some(Compat::Completions(compat)),
         });
     }
     let minimum_models = minimum_models
@@ -694,6 +712,53 @@ mod tests {
         assert_eq!(sonnet.max_tokens, 64000.0);
         assert!(!sonnet.reasoning);
         assert_eq!(sonnet.input, vec![InputModality::Text]);
+    }
+
+    #[test]
+    fn live_route_reasoning_metadata_overrides_stale_template_controls() {
+        let mut bundled = template();
+        bundled.thinking_level_map = Some(ThinkingLevelMap::from([("xhigh".into(), Some("xhigh".into()))]));
+        bundled.compat = Some(Compat::Completions(OpenAICompletionsCompat {
+            supports_reasoning_effort: Some(false), thinking_format: Some("zai".into()), ..Default::default()
+        }));
+        let mut value = catalog_value();
+        value["data"][0]["supported_parameters"] = json!(["reasoning_effort"]);
+        value["data"][0]["reasoning"] = json!({"supported_efforts":["low","high"],"mandatory":true});
+        let entries = parse_prime_inference_model_catalog(&value, false).unwrap();
+        let models = build_prime_inference_models(&[bundled.clone()], &entries, false, None).unwrap();
+        let model = models.iter().find(|model| model.id == bundled.id).unwrap();
+        let compat = model.compat.as_ref().unwrap().as_completions().unwrap();
+        assert_eq!(compat.supports_reasoning_effort, Some(true));
+        assert_eq!(compat.thinking_format, None);
+        assert_eq!(pi_ai::models::get_supported_thinking_levels(model), ["low", "high"]);
+
+        value["data"][0]["supported_parameters"] = json!(["temperature"]);
+        let entries = parse_prime_inference_model_catalog(&value, false).unwrap();
+        let models = build_prime_inference_models(&[bundled], &entries, false, None).unwrap();
+        let model = &models[0];
+        let compat = model.compat.as_ref().unwrap().as_completions().unwrap();
+        assert_eq!(compat.supports_reasoning_effort, Some(false));
+        assert_eq!(compat.thinking_format, None);
+        assert!(model.thinking_level_map.is_none());
+    }
+
+    #[test]
+    fn missing_live_efforts_preserve_template_bounds_and_mandatory_reasoning() {
+        let mut bundled = template();
+        bundled.thinking_level_map = Some(ThinkingLevelMap::from([
+            ("minimal".into(), None), ("low".into(), None), ("medium".into(), None),
+            ("high".into(), Some("high".into())), ("xhigh".into(), None), ("max".into(), None),
+        ]));
+        let original = bundled.thinking_level_map.clone();
+        let entries = parse_prime_inference_model_catalog(&catalog_value(), false).unwrap();
+        let models = build_prime_inference_models(&[bundled.clone()], &entries, false, None).unwrap();
+        assert_eq!(models[0].thinking_level_map, original);
+        let mut value = catalog_value();
+        value["data"][0]["supported_parameters"] = json!(["reasoning_effort"]);
+        value["data"][0]["reasoning"] = json!({"mandatory":true});
+        let entries = parse_prime_inference_model_catalog(&value, false).unwrap();
+        let models = build_prime_inference_models(&[bundled], &entries, false, None).unwrap();
+        assert_eq!(pi_ai::models::get_supported_thinking_levels(&models[0]), ["high"]);
     }
 
     #[test]

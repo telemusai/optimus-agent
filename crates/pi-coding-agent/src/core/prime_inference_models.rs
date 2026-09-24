@@ -144,6 +144,9 @@ pub async fn fetch_authorized_private_prime_inference_models(
                 max_tokens: None,
                 vision: None,
                 reasoning: None,
+                supported_parameters: None,
+                reasoning_efforts: None,
+                reasoning_mandatory: None,
             });
         }
     }

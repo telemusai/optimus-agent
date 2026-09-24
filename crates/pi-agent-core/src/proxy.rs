@@ -165,6 +165,13 @@ pub struct ProxySerializableStreamOptions {
     pub transport: Option<String>,
     #[serde(rename = "thinkingBudgets", default, skip_serializing_if = "Option::is_none")]
     pub thinking_budgets: Option<pi_ai::types::ThinkingBudgets>,
+    #[serde(rename = "serviceTier", default, skip_serializing_if = "Option::is_none")]
+    #[serde(deserialize_with = "deserialize_service_tier")]
+    pub service_tier: pi_ai::types::ServiceTier,
+}
+
+fn deserialize_service_tier<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<pi_ai::types::ServiceTier, D::Error> {
+    Option::<String>::deserialize(deserializer).map(Some)
 }
 
 /// `interface ProxyStreamOptions extends ProxySerializableStreamOptions`.
@@ -189,6 +196,7 @@ fn build_proxy_request_options(options: &ProxyStreamOptions) -> ProxySerializabl
         metadata: options.serializable.metadata.clone(),
         transport: options.serializable.transport.clone(),
         thinking_budgets: options.serializable.thinking_budgets.clone(),
+        service_tier: options.serializable.service_tier.clone(),
     }
 }
 
@@ -215,6 +223,7 @@ impl ProxyStreamOptions {
                 metadata: options.stream.metadata.clone(),
                 transport: options.stream.transport.clone(),
                 thinking_budgets: options.thinking_budgets.clone(),
+                service_tier: options.stream.service_tier.clone(),
             },
             signal: options.stream.signal.clone(),
             auth_token: auth_token.into(),
@@ -633,7 +642,12 @@ pub fn stream_proxy(model: Model, context: Context, options: ProxyStreamOptions)
                         }
                     };
                     match process_proxy_event(proxy_event, &mut state) {
-                        Ok(Some(event)) => stream_for_task.push(event),
+                        Ok(Some(event)) => {
+                            stream_for_task.push(event);
+                            if stream_for_task.is_done() {
+                                return;
+                            }
+                        }
                         Ok(None) => {}
                         Err(error) => {
                             let error_message = error.to_string();
@@ -663,8 +677,129 @@ pub fn stream_proxy(model: Model, context: Context, options: ProxyStreamOptions)
             return;
         }
 
+        if !stream_for_task.is_done() {
+            state.partial.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+            state.partial.error_message = Some("Proxy stream truncated before completion".to_string());
+            stream_for_task.push(AssistantMessageEvent::Error {
+                reason: pi_ai::types::STOP_REASON_ERROR.to_string(),
+                error: state.partial.clone(),
+            });
+        }
         stream_for_task.end(None);
     });
 
     stream
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::time::Duration;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    async fn fixture(body: String, hold_open: bool) -> (String, tokio::sync::oneshot::Receiver<Value>, tokio::task::JoinHandle<()>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let (sender, receiver) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            let request = loop {
+                let mut chunk = [0u8; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|window| window == b"\r\n\r\n") {
+                    let headers = String::from_utf8_lossy(&bytes[..end]);
+                    let length: usize = headers.lines().find_map(|line| {
+                        let (name, value) = line.split_once(':')?;
+                        name.eq_ignore_ascii_case("content-length").then(|| value.trim().parse().unwrap())
+                    }).unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break serde_json::from_slice(&bytes[end + 4..end + 4 + length]).unwrap();
+                    }
+                }
+            };
+            let response = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len() + if hold_open { 1000 } else { 0 },
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+            let _ = sender.send(request);
+            if hold_open {
+                std::future::pending::<()>().await;
+            }
+        });
+        (format!("http://{address}"), receiver, task)
+    }
+
+    fn start(url: String, options: Option<SimpleStreamOptions>) -> ProxyMessageEventStream {
+        stream_proxy(Model::default(), Context::default(), ProxyStreamOptions::from_simple(options, "synthetic-proxy-token", url))
+    }
+
+    async fn finish(stream: &ProxyMessageEventStream) -> (Vec<AssistantMessageEvent>, AssistantMessage) {
+        tokio::time::timeout(Duration::from_secs(3), async {
+            let mut events = Vec::new();
+            while let Some(event) = stream.next().await { events.push(event); }
+            (events, stream.result().await)
+        }).await.expect("proxy final result must settle")
+    }
+
+    #[tokio::test]
+    async fn truncated_stream_returns_error_and_preserves_partial_text() {
+        for body in ["", "data: {\"type\":\"text_start\",\"contentIndex\":0}\n\ndata: {\"type\":\"text_delta\",\"contentIndex\":0,\"delta\":\"partial\"}\n\n"] {
+            let (url, _, task) = fixture(body.to_string(), false).await;
+            let (events, result) = finish(&start(url, None)).await;
+            assert_eq!(result.stop_reason, "error");
+            assert_eq!(result.error_message.as_deref(), Some("Proxy stream truncated before completion"));
+            assert_eq!(events.iter().filter(|event| matches!(event, AssistantMessageEvent::Error { .. })).count(), 1);
+            if !body.is_empty() {
+                assert!(matches!(&result.content[0], ContentBlock::Text(text) if text.text == "partial"));
+            }
+            task.await.unwrap();
+        }
+    }
+
+    #[tokio::test]
+    async fn terminal_events_finish_without_waiting_for_server_eof() {
+        for event in [
+            serde_json::json!({"type":"done", "reason":"stop", "usage":Usage::zero()}),
+            serde_json::json!({"type":"error", "reason":"error", "errorMessage":"provider failure", "usage":Usage::zero()}),
+        ] {
+            let (url, _, task) = fixture(format!("data: {event}\n\n"), true).await;
+            let (events, result) = finish(&start(url, None)).await;
+            task.abort();
+            assert_eq!(events.len(), 1);
+            assert_eq!(result.stop_reason, event["reason"].as_str().unwrap());
+            assert_eq!(result.error_message.as_deref(), event["errorMessage"].as_str());
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_stays_aborted_and_service_tier_reaches_proxy() {
+        let (url, request, task) = fixture("data: {\"type\":\"start\"}\n\n".to_string(), true).await;
+        let signal = CancellationToken::new();
+        let mut options = SimpleStreamOptions::default();
+        options.stream.signal = Some(signal.clone());
+        options.stream.service_tier = Some(Some("priority".to_string()));
+        options.stream.api_key = Some("client-local-key".to_string());
+        let stream = start(url, Some(options));
+        let request = tokio::time::timeout(Duration::from_secs(3), request).await.unwrap().unwrap();
+        assert_eq!(request["options"]["serviceTier"], "priority");
+        assert!(request["options"].get("apiKey").is_none());
+        assert!(request["options"].get("signal").is_none());
+        signal.cancel();
+        let (_, result) = finish(&stream).await;
+        task.abort();
+        assert_eq!(result.stop_reason, "aborted");
+    }
+
+    #[test]
+    fn unspecified_service_tier_is_omitted() {
+        let options = build_proxy_request_options(&ProxyStreamOptions::default());
+        assert!(serde_json::to_value(options).unwrap().get("serviceTier").is_none());
+        let explicit_null: ProxySerializableStreamOptions = serde_json::from_value(serde_json::json!({"serviceTier":null})).unwrap();
+        assert_eq!(explicit_null.service_tier, Some(None));
+        assert_eq!(serde_json::to_value(explicit_null).unwrap()["serviceTier"], Value::Null);
+    }
 }

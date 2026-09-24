@@ -2,6 +2,8 @@
 
 Prime Agent supports subscription-based providers via OAuth and API key providers via environment variables or the auth file. Models for external providers are bundled with each release. Prime Inference models refresh from its `/models` endpoint, with the bundled list and a validated disk cache as fallbacks. Set `PI_OFFLINE=1` to skip network refreshes.
 
+Reviewed Opus 5.5 entries for Anthropic, Bedrock, OpenRouter and Vercel live in `crates/pi-ai/src/models.compatibility.json`, alongside the existing subscription overlay. Their metadata comes from `PrimeIntellect-ai/prime-agent-catalog` at commit `d3f43ad14d87caa99662d7a62f0d658ab12afa86`. These routes use adaptive thinking and expose low through max effort. Availability depends on the selected provider and account. The imported base catalog and custom model settings remain intact.
+
 ## Table of Contents
 
 - [Subscriptions](#subscriptions)
@@ -28,7 +30,7 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 ### Claude Pro/Max
 
-Anthropic subscription auth is active for Claude Pro/Max accounts. Third-party harness usage draws from [extra usage](https://claude.ai/settings/usage) and is billed per token, not against Claude plan limits.
+Subscription requests identify as Claude Code. Using this identity in Optimus may violate Anthropic's terms and lead to account restrictions. An Anthropic API key avoids this subscription-auth risk. Review your account's [usage settings](https://claude.ai/settings/usage).
 
 ### GitHub Copilot
 

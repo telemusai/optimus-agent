@@ -1905,6 +1905,9 @@ impl AuthStorage {
     }
 
     pub fn get_prime_inference_team_selection(&self) -> Option<Option<PrimeTeamCredential>> {
+        if std::env::var("PRIME_TEAM_ID").ok().is_some_and(|value| !value.trim().is_empty()) {
+            return None;
+        }
         let mut config: Option<PrimeCliConfig> = None;
         if self.is_prime_cli_config_enabled() {
             config = self.get_prime_cli_config(PRIME_INFERENCE_PROVIDER_ID);
@@ -1919,11 +1922,7 @@ impl AuthStorage {
 
         let credential = self.data.get(PRIME_INFERENCE_PROVIDER_ID).cloned();
         let auth_source = self.get_auth_status(PRIME_INFERENCE_PROVIDER_ID).source;
-        if auth_source.as_deref() == Some(AUTH_SOURCE_RUNTIME)
-            || auth_source.as_deref() == Some(AUTH_SOURCE_ENVIRONMENT)
-        {
-            return None;
-        }
+        // Runtime and environment keys do not override the user's selected team.
         // A stale CLI key must not erase the selected team used to validate cached model access.
         let config_api_key = config.as_ref().and_then(|config| config.api_key.clone());
         if auth_source.as_deref() == Some(AUTH_SOURCE_PRIME_CLI)
@@ -1986,6 +1985,10 @@ impl AuthStorage {
     pub fn get_provider_headers(&self, provider_id: &str) -> Option<IndexMap<String, String>> {
         if provider_id != PRIME_INFERENCE_PROVIDER_ID {
             return None;
+        }
+
+        if let Some(team_id) = std::env::var("PRIME_TEAM_ID").ok().map(|value| value.trim().to_string()).filter(|value| !value.is_empty()) {
+            return Some(IndexMap::from([("X-Prime-Team-ID".to_string(), team_id)]));
         }
 
         let prime_cli_config = self.get_prime_cli_config(provider_id);
@@ -2138,6 +2141,37 @@ mod tests {
         assert!(value.get("primeTeam").is_none());
         let value = serde_json::to_value(storage.get("withNull").unwrap()).unwrap();
         assert_eq!(value.get("primeTeam"), Some(&Value::Null));
+    }
+
+    #[test]
+    fn prime_team_survives_key_overrides_in_isolated_process() {
+        let status = std::process::Command::new(std::env::current_exe().unwrap())
+            .args(["--exact", "core::auth_storage::tests::prime_team_override_fixture", "--ignored"])
+            .env("PRIME_API_KEY", "synthetic-environment-key")
+            .env_remove("PRIME_TEAM_ID")
+            .status().unwrap();
+        assert!(status.success());
+    }
+
+    #[test]
+    #[ignore = "invoked in an isolated process with synthetic credentials"]
+    fn prime_team_override_fixture() {
+        let mut storage = memory(json!({"prime-inference": {
+            "type":"api_key", "key":"stored-key", "primeTeam":{"teamId":"team-1","name":"One"}
+        }}));
+        storage.set_runtime_api_key("prime-inference", "synthetic-runtime-key");
+        assert_eq!(storage.get_prime_inference_team_selection().flatten().unwrap().team_id, "team-1");
+        assert_eq!(storage.get_provider_headers("prime-inference").unwrap()["X-Prime-Team-ID"], "team-1");
+        storage.remove_runtime_api_key("prime-inference");
+        assert_eq!(storage.get_auth_status("prime-inference").source.as_deref(), Some(AUTH_SOURCE_ENVIRONMENT));
+        assert_eq!(storage.get_provider_headers("prime-inference").unwrap()["X-Prime-Team-ID"], "team-1");
+        let mut personal = memory(json!({"prime-inference":{"type":"api_key","key":"stored-key","primeTeam":null}}));
+        personal.set_runtime_api_key("prime-inference", "synthetic-runtime-key");
+        assert_eq!(personal.get_prime_inference_team_selection(), Some(None));
+        assert!(personal.get_provider_headers("prime-inference").is_none());
+        std::env::set_var("PRIME_TEAM_ID", "explicit-team");
+        assert_eq!(storage.get_prime_inference_team_selection(), None);
+        assert_eq!(storage.get_provider_headers("prime-inference").unwrap()["X-Prime-Team-ID"], "explicit-team");
     }
 
     #[test]
