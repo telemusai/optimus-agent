@@ -32,6 +32,9 @@ pub const DAEMON_REFINE_REQUEST_TIMEOUT_MS: u64 = 10 * 60 * 1000;
 const DAEMON_LONG_RUNNING_REQUEST_TIMEOUT_MS: u64 = 24 * 60 * 60 * 1000;
 pub const DAEMON_RECONNECT_TIMEOUT_MS: u64 = 60_000;
 pub const DAEMON_SNAPSHOT_TIMEOUT_MS: u64 = 30_000;
+#[path = "replacement_snapshot.rs"]
+mod replacement_snapshot;
+use replacement_snapshot::{ReplacementSnapshot, ReplacementSnapshotGuard};
 const MAX_IGNORED_SNAPSHOT_IDS: usize = 128;
 const UPDATE_RECONNECT_TIMEOUT_MS: u64 = 120000;
 const UPDATE_RECONNECT_RETRY_MS: u64 = 100;
@@ -897,6 +900,7 @@ pub struct DaemonAgentConnection {
     pending_reattach_active_session_ids: Arc<Mutex<HashSet<String>>>,
     ignored_snapshot_ids: Arc<Mutex<VecDeque<String>>>,
     snapshot_in_progress: Arc<Mutex<Option<String>>>,
+    pending_replacement_snapshot: Arc<Mutex<Option<Arc<ReplacementSnapshot>>>>,
     deferred_session_events: Arc<Mutex<DeferredSessionEvents>>,
     defer_session_events: Arc<Mutex<bool>>,
     attach_snapshot_pending: Arc<Mutex<bool>>,
@@ -961,6 +965,7 @@ impl DaemonAgentConnection {
             pending_reattach_active_session_ids: Arc::new(Mutex::new(HashSet::new())),
             ignored_snapshot_ids: Arc::new(Mutex::new(VecDeque::new())),
             snapshot_in_progress: Arc::new(Mutex::new(None)),
+            pending_replacement_snapshot: Arc::new(Mutex::new(None)),
             deferred_session_events: Arc::new(Mutex::new(DeferredSessionEvents::default())),
             defer_session_events: Arc::new(Mutex::new(defer_session_events)),
             attach_snapshot_pending: Arc::new(Mutex::new(false)),
@@ -1266,6 +1271,7 @@ impl DaemonAgentConnection {
     }
 
     fn emit(&self, event: AgentConnectionEvent) -> BoxFuture<()> {
+        self.observe_replacement_snapshot(&event);
         let listeners = self.listeners.lock().unwrap().clone();
         Box::pin(async move {
             let mut deliveries = Vec::with_capacity(listeners.len());
@@ -1968,6 +1974,13 @@ impl DaemonAgentConnection {
 
     async fn get_initial_snapshot_inner(&self, recoverable: bool) -> Result<AgentConnectionSnapshot, String> {
         if let Some(error) = self.deferred_session_events.lock().unwrap().failure.clone() { return Err(error); }
+        // Recovery fetches must remain able to complete an interrupted replacement.
+        if recoverable {
+            let pending = self.pending_replacement_snapshot.lock().unwrap().clone();
+            if let Some(pending) = pending {
+                self.wait_for_replacement_snapshot(&pending).await?;
+            }
+        }
         if *self.latest_snapshot_is_fresh.lock().unwrap() {
             if let Some(snapshot) = self.latest_snapshot.lock().unwrap().clone() {
                 return Ok(snapshot);
@@ -2577,6 +2590,7 @@ impl DaemonAgentConnection {
             return;
         }
         *self.disposing.lock().unwrap() = true;
+        self.fail_replacement_snapshot("Daemon connection disposed during session switch".to_string());
         if let Some(attempt) = self.reconnect_in_flight.lock().unwrap().as_ref() {
             attempt.cancel.cancel();
         }
@@ -4239,6 +4253,7 @@ impl AgentConnection for DaemonAgentConnection {
         options: Option<AgentConnectionSwitchSessionOptions>,
     ) -> BoxFuture<Result<bool, String>> {
         let this = self.clone();
+        let session_path = session_path.to_string();
         let source_active_session_id = this.active_session_id();
         let cwd_override = options.and_then(|options| options.cwd_override);
         let request = command_body(
@@ -4250,14 +4265,21 @@ impl AgentConnection for DaemonAgentConnection {
             ],
         );
         Box::pin(async move {
-            match this.request_data(request, None).await {
-                Ok(data) => Ok(data.get("cancelled").and_then(Value::as_bool).unwrap_or(false)),
+            let pending = this.begin_replacement_snapshot(&session_path);
+            let _guard = ReplacementSnapshotGuard::new(&this, pending.clone());
+            let result = match this.request_data(request, None).await {
+                Ok(data) if data.get("cancelled").and_then(Value::as_bool) == Some(true) => {
+                    pending.finish(Ok(()));
+                    Ok(true)
+                }
+                Ok(_) => this.wait_for_replacement_snapshot(&pending).await.map(|_| false),
                 Err(error) => {
-                    // `SessionAlreadyActiveError` (core/session-lease.ts) carries the
-                    // active session id; without that slice the port surfaces the error.
+                    pending.finish(Err(error.clone()));
                     Err(error)
                 }
-            }
+            };
+            this.clear_replacement_snapshot(&pending);
+            result
         })
     }
 

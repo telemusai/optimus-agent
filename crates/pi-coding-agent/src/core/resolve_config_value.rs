@@ -9,11 +9,8 @@ use std::sync::Mutex;
 use crate::utils::child_process::{wait_with_timeout, SpawnOptions};
 use crate::utils::shell::get_shell_config;
 
-/// `const commandResultCache = new Map<string, string | undefined>()`.
-///
-/// `undefined` is a cached value in the TypeScript (a `has()` hit), so the Rust
-/// map stores `Option<String>` and membership is the cache hit.
-static COMMAND_RESULT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, Option<String>>>> =
+/// Only successful credentials are cached; temporary helper failures must be retried.
+static COMMAND_RESULT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, String>>> =
     std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
 
 /// The Node default timeout used by both shell executions.
@@ -334,14 +331,16 @@ fn execute_command(command_config: &str) -> Option<String> {
     {
         let cache = COMMAND_RESULT_CACHE.lock().expect("command cache poisoned");
         if let Some(cached) = cache.get(command_config) {
-            return cached.clone();
+            return Some(cached.clone());
         }
     }
     let result = execute_command_uncached(command_config);
-    COMMAND_RESULT_CACHE
-        .lock()
-        .expect("command cache poisoned")
-        .insert(command_config.to_string(), result.clone());
+    if let Some(value) = &result {
+        COMMAND_RESULT_CACHE
+            .lock()
+            .expect("command cache poisoned")
+            .insert(command_config.to_string(), value.clone());
+    }
     result
 }
 
@@ -408,6 +407,30 @@ pub fn resolve_headers_or_throw(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn credential_helper_retries_failure_and_empty_output_then_caches_success() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("credential.txt");
+        let command = if cfg!(windows) {
+            let script = directory.path().join("credential.ps1");
+            std::fs::write(&script, format!(
+                "$ErrorActionPreference = 'Stop'\nGet-Content -Raw -LiteralPath '{}'\n",
+                path.display().to_string().replace('\'', "''"),
+            )).unwrap();
+            format!("!powershell.exe -NoProfile -ExecutionPolicy Bypass -File \"{}\"", script.display())
+        } else {
+            format!("!cat '{}'", path.display().to_string().replace('\'', "'\\''"))
+        };
+        assert_eq!(resolve_config_value(&command), None);
+        std::fs::write(&path, " \n").unwrap();
+        assert_eq!(resolve_config_value(&command), None);
+        std::fs::write(&path, "synthetic-test-key\n").unwrap();
+        assert_eq!(resolve_config_value(&command).as_deref(), Some("synthetic-test-key"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(resolve_config_value(&command).as_deref(), Some("synthetic-test-key"));
+        COMMAND_RESULT_CACHE.lock().unwrap().remove(&command);
+    }
 
     #[cfg(windows)]
     #[test]

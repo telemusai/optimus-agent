@@ -264,7 +264,7 @@ pub const BEDROCK_PROVIDER_ID: &str = "amazon-bedrock";
 
 /// `ANTHROPIC_SUBSCRIPTION_AUTH_WARNING`
 pub const ANTHROPIC_SUBSCRIPTION_AUTH_WARNING: &str =
-    "Anthropic subscription auth is active. Third-party harness usage draws from extra usage and is billed per token, not your Claude plan limits. Manage extra usage at https://claude.ai/settings/usage.";
+    "Anthropic subscription auth is active. Optimus identifies these requests as Claude Code, which may violate Anthropic's terms and lead to account restrictions. An Anthropic API key avoids this subscription-auth risk. Review usage at https://claude.ai/settings/usage.";
 
 /// Port of `isAnthropicSubscriptionAuthKey`.
 fn is_anthropic_subscription_auth_key(api_key: Option<&str>) -> bool {
@@ -1107,6 +1107,8 @@ mod tests {
     fn bedrock_provider_and_warning_constants_match() {
         assert_eq!(BEDROCK_PROVIDER_ID, "amazon-bedrock");
         assert!(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING.starts_with("Anthropic subscription auth is active."));
+        assert!(ANTHROPIC_SUBSCRIPTION_AUTH_WARNING.contains("identifies these requests as Claude Code"));
+        assert!(!ANTHROPIC_SUBSCRIPTION_AUTH_WARNING.contains("billed per token"));
         assert_eq!(PRIME_INFERENCE_PROVIDER_NAME, "Prime Inference");
         assert_eq!(PRIME_AGENT_TRACES_PROVIDER_NAME, "Prime Agent Traces");
     }

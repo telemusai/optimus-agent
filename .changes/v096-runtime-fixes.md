@@ -1,0 +1,8 @@
+- Fixed restored Python functions, closures, and partials retaining detached globals in legacy and CAS-v2 snapshots.
+- Fixed credential command failures remaining cached after the helper recovered.
+- Fixed proxy streams hanging after truncated responses and dropping service-tier options.
+- Fixed deleted child collection and name reuse while protecting replacement children from old deletion requests.
+- Fixed session switching returning stale history before the replacement snapshot completed.
+- Fixed Prime Inference reasoning capability mapping and saved team selection with overridden API keys.
+- Changed bundled Opus 5.5 routes and Anthropic subscription client identity to match reviewed upstream compatibility metadata.
+- Changed the Optimus Agent version to 0.1.4.
