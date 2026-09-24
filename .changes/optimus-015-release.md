@@ -1,0 +1,2 @@
+- Changed the Optimus application and Python runtime version to 0.1.5 for the stable release.
+- Added a live Pursuing Goal elapsed-time label beside heartbeat status, immediately before the bottom-right context meter.

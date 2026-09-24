@@ -24,7 +24,8 @@ def fixture_provenance(source=ROOT):
                "sourceTreeSha256": release.raw_aggregate(source, release.source_files(source)),
                "payloadSourceSha256": release.raw_aggregate(source, release.payload_files(source)),
                "runtimeSourceSha256": release.runtime_source_sha256(source),
-               "version": "0.1.4", "target": target, "profile": "release",
+               "version": json.loads((source / "resources/agent/package.json").read_text())["version"],
+               "target": target, "profile": "release",
                "rustc": "rustc offline-fixture", "buildOptionsSha256": "1" * 64}
     receipt["buildFingerprint"] = release.build_fingerprint(receipt)
     return receipt
