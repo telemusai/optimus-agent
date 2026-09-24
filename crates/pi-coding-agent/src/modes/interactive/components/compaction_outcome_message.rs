@@ -118,6 +118,7 @@ mod tests {
         let details = CompactionOutcomeDetails {
             reason: crate::core::messages::COMPACTION_OUTCOME_REASON_THRESHOLD.to_string(),
             outcome: COMPACTION_OUTCOME_SKIPPED.to_string(),
+            ..Default::default()
         };
         let mut component = CompactionOutcomeMessageComponent::new("Compaction skipped", &details);
         let lines = component.render(40.0);

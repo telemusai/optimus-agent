@@ -448,7 +448,7 @@ async fn rf_newer_harness_entry_survives_a_blocked_stale_plan() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn rf_post_save_extension_does_not_hold_prompt_admission() {
+async fn rf_post_save_extension_does_not_hold_serialized_apply_or_prompt_admission() {
     let started = Arc::new(tokio::sync::Notify::new());
     let release = CancellationToken::new();
     let gate = RfPlannerGate {
@@ -474,41 +474,377 @@ async fn rf_post_save_extension_does_not_hold_prompt_admission() {
     });
     let t = T11Session::new(
         "rf-completion-hook",
-        false,
+        true,
         serde_json::json!({"enabled": false}),
         vec![extension],
     )
     .await;
     append_user_turn(&t);
-    let progress = rf_progress(&t.session);
     t.queue_json(proposal_json("rf-hook-saved"));
     let session = t.session.clone();
-    let pending =
+    let command =
         tokio::spawn(async move { session.prompt_and_wait("/refine fixture", None).await });
+    // The serialized command queues and returns immediately; the settled
+    // plan applies in the background.
+    rf_bounded(command).await.unwrap().unwrap();
     rf_bounded(gate.started.notified()).await;
     assert_eq!(
         t.local_harness().refinements.len(),
         1,
         "save completes before the extension hook"
     );
-    assert_eq!(
-        progress.lock().unwrap().last(),
-        Some(&(false, "Refinement saved".into()))
-    );
+    // The detached listener emit cannot hold the pump: queued primary input
+    // EXECUTES while the post-save hook is still blocked (pump path; the
+    // direct start's durable-delivery receipt cannot settle in this fixture).
+    let pause = t.session.acquire_queued_work_pause();
     rf_bounded(
         t.session
             .prompt_until_accepted("RF queued after save", Some(rf_queued_prompt_options())),
     )
     .await
     .unwrap();
-    assert!(
-        t.agent.prompt_batches.lock().unwrap().is_empty(),
-        "execution still waits for the selected command"
-    );
+    pause.release();
+    rf_wait_until("primary input executed while the hook blocks", || {
+        rf_executed_prompts(&t) == vec!["RF queued after save".to_string()]
+    })
+    .await;
     gate.release.cancel();
-    rf_bounded(pending).await.unwrap().unwrap();
-    rf_bounded(t.session.wait_for_session_input_idle())
+    t.session.dispose_async(Some(false)).await;
+}
+
+/// Bounded wait until `condition` holds. Polling is test-only; every step is a
+/// real settle/notify await elsewhere in the fixture.
+async fn rf_wait_until<F: Fn() -> bool>(label: &str, condition: F) {
+    let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(15);
+    while !condition() {
+        if tokio::time::Instant::now() > deadline {
+            panic!("RF fixture timed out waiting for {label}");
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+    }
+}
+
+/// The texts of user turns the scripted agent actually EXECUTED, in order.
+fn rf_executed_prompts(t: &T11Session) -> Vec<String> {
+    t.agent
+        .prompt_batches
+        .lock()
+        .unwrap()
+        .iter()
+        .flatten()
+        .filter_map(|message| {
+            if let AgentMessage::Message(Message::User(user)) = message {
+                return Some(user.content.text());
+            }
+            None
+        })
+        .collect()
+}
+
+/// RF-001: a serialized turn boundary must NOT wait for an in-flight background
+/// plan. A pending refine request is kicked into the background, the boundary
+/// returns while the (delayed fake) planner is still blocked, queued primary
+/// input actually EXECUTES before the refinement completes, and the deferred
+/// settle apply saves the plan exactly once with no duplicate planning pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rf_serialized_boundary_defers_blocked_plan_and_executes_primary_input() {
+    let t = T11Session::new(
+        "rf-boundary-defers",
+        true,
+        serde_json::json!({"enabled": false}),
+        vec![],
+    )
+    .await;
+    append_user_turn(&t);
+    let gate = rf_block_planner(&t, proposal_json("rf-boundary-memory"));
+    // A deliberate refine request, serviced by the boundary's background kick.
+    *t.session.pending_requested_refine.lock().unwrap() = Some(PendingRequestedRefine {
+        options: RefineOptions {
+            instructions: Some("keep the fixture preference".to_string()),
+            ..Default::default()
+        },
+    });
+    // The boundary must return promptly instead of planning synchronously.
+    rf_bounded(t.session.run_serialized_refine_checkpoint()).await;
+    rf_bounded(gate.started.notified()).await;
+    assert!(
+        t.session.serialized_plan_in_flight.lock().unwrap().is_some(),
+        "the boundary kicked a background plan"
+    );
+    // A second boundary while the plan is still planning stays non-blocking.
+    rf_bounded(t.session.run_serialized_refine_checkpoint()).await;
+
+    // Queued primary input EXECUTES while the planner is still blocked. The
+    // admission is shaped through the pump path (fixture agents emit no
+    // MessageEnd, so the direct start's durable-delivery receipt cannot
+    // settle): a short queued-work pause forces the queued disposition, and
+    // releasing it lets the pump dispatch while planning is still gated.
+    let pause = t.session.acquire_queued_work_pause();
+    rf_bounded(
+        t.session
+            .prompt_until_accepted("RF primary input", Some(rf_queued_prompt_options())),
+    )
+    .await
+    .unwrap();
+    pause.release();
+    rf_wait_until("primary input executed while planning", || {
+        rf_executed_prompts(&t) == vec!["RF primary input".to_string()]
+    })
+    .await;
+    assert!(
+        t.local_harness().refinements.is_empty(),
+        "no refinement was saved while planning was still running"
+    );
+    // The deferred apply saves exactly once; the planner ran exactly once.
+    gate.release.cancel();
+    rf_wait_until("deferred apply", || t.local_harness().refinements.len() == 1).await;
+    assert_eq!(
+        t.provider.call_count(),
+        1,
+        "one planning pass only: no silent duplicate planner"
+    );
+    assert!(
+        t.session.serialized_plan_in_flight.lock().unwrap().is_none(),
+        "the settle watcher cleared the in-flight slot"
+    );
+    assert!(
+        t.local_harness()
+            .entries
+            .get("memory")
+            .map(|bucket| bucket.contains_key("rf-boundary-memory"))
+            .unwrap_or(false),
+        "the deferred plan's edit reached the harness"
+    );
+    t.session.dispose_async(Some(false)).await;
+}
+
+/// RF-001: the manual `/refine` command in a serialized session queues a
+/// deliberate request and returns immediately; the pump keeps executing primary
+/// input while planning runs, and the outcome arrives via the deferred apply.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rf_serialized_manual_refine_command_returns_and_primary_executes() {
+    let t = T11Session::new(
+        "rf-manual-queued",
+        true,
+        serde_json::json!({"enabled": false}),
+        vec![],
+    )
+    .await;
+    append_user_turn(&t);
+    let gate = rf_block_planner(&t, proposal_json("rf-manual-memory"));
+    let session = t.session.clone();
+    let command = tokio::spawn(async move {
+        session
+            .prompt_and_wait("/refine remember the fixture preference", None)
+            .await
+    });
+    rf_bounded(gate.started.notified()).await;
+    // The command settles while the planner is still blocked: it queued the
+    // request instead of planning inside the pump.
+    rf_bounded(command).await.unwrap().unwrap();
+    assert!(
+        t.session.serialized_plan_in_flight.lock().unwrap().is_some(),
+        "the queued command started the background plan"
+    );
+
+    // Primary input executes while the refinement is still planning, via the
+    // pump path (the direct start's durable-delivery receipt cannot settle in
+    // this fixture, so the admission is shaped with a short queued-work
+    // pause).
+    let pause = t.session.acquire_queued_work_pause();
+    rf_bounded(
+        t.session
+            .prompt_until_accepted("RF primary after refine", Some(rf_queued_prompt_options())),
+    )
+    .await
+    .unwrap();
+    pause.release();
+    rf_wait_until("primary input executed while planning", || {
+        rf_executed_prompts(&t) == vec!["RF primary after refine".to_string()]
+    })
+    .await;
+    assert!(t.local_harness().refinements.is_empty());
+
+    gate.release.cancel();
+    rf_wait_until("deferred apply", || t.local_harness().refinements.len() == 1).await;
+    assert_eq!(
+        t.provider.call_count(),
+        1,
+        "one planning pass only: the queued request planned once"
+    );
+    assert!(
+        t.session.pending_requested_refine.lock().unwrap().is_none(),
+        "the deliberate request was consumed"
+    );
+
+    // Manual options survive queuing: a rollback request is routed through
+    // the short non-provider rollback path (no planner call), and its typed
+    // first failure surfaces without any duplicate planning pass.
+    let session = t.session.clone();
+    let rollback = tokio::spawn(async move {
+        session
+            .prompt_and_wait("/refine rollback rf-rollback-missing", None)
+            .await
+    });
+    rf_bounded(rollback).await.unwrap().unwrap();
+    rf_wait_until("rollback plan settles", || {
+        t.session.serialized_plan_in_flight.lock().unwrap().is_none()
+    })
+    .await;
+    assert_eq!(
+        t.provider.call_count(),
+        1,
+        "a queued rollback never runs a planner pass"
+    );
+    assert_eq!(
+        t.local_harness().refinements.len(),
+        1,
+        "a failed rollback saves nothing"
+    );
+    assert!(
+        t.session.pending_requested_refine.lock().unwrap().is_none(),
+        "the rollback request was consumed"
+    );
+    t.session.dispose_async(Some(false)).await;
+}
+
+/// RF-001: a background plan that settles stale (branch change) or cancelled
+/// (refinement abort) is discarded by the deferred apply: nothing is saved and
+/// no second planning pass starts. The busy variant cancels while the agent
+/// is still streaming: the watcher must discard once and exit without
+/// waiting for idle and without spinning on the ready cancellation token.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rf_serialized_stale_or_cancelled_plan_discards_without_save() {
+    for mode in ["cancel", "branch", "cancel-busy"] {
+        let t = T11Session::new(
+            &format!("rf-discard-{mode}"),
+            true,
+            serde_json::json!({"enabled": false}),
+            vec![],
+        )
+        .await;
+        append_user_turn(&t);
+        let gate = rf_block_planner(&t, proposal_json("rf-discard-memory"));
+        *t.session.pending_requested_refine.lock().unwrap() = Some(PendingRequestedRefine {
+            options: RefineOptions {
+                instructions: Some("must not save".to_string()),
+                ..Default::default()
+            },
+        });
+        rf_bounded(t.session.run_serialized_refine_checkpoint()).await;
+        rf_bounded(gate.started.notified()).await;
+        let busy = mode == "cancel-busy";
+        if busy {
+            // The plan settles while a turn is mid-flight.
+            t.agent.state.lock().unwrap().is_streaming = true;
+        }
+        if mode == "cancel" || mode == "cancel-busy" {
+            t.session.abort_refinement();
+        } else {
+            t.session
+                .auto_refine_branch_version
+                .fetch_add(1, Ordering::SeqCst);
+        }
+        gate.release.cancel();
+        if busy {
+            // The watcher must discard while the agent is STILL streaming.
+            rf_wait_until("busy cancelled plan discarded", || {
+                t.session.serialized_plan_in_flight.lock().unwrap().is_none()
+            })
+            .await;
+            assert!(
+                t.agent.state.lock().unwrap().is_streaming,
+                "{mode}: discard did not wait for idle"
+            );
+            t.agent.state.lock().unwrap().is_streaming = false;
+        }
+        // The settle watcher consumes and discards; the slot must clear without
+        // any save or any duplicate planning.
+        rf_wait_until("invalidated plan consumed", || {
+            t.session.serialized_plan_in_flight.lock().unwrap().is_none()
+        })
+        .await;
+        assert!(
+            t.local_harness().refinements.is_empty(),
+            "{mode}: stale/cancelled plan never saved"
+        );
+        assert_eq!(
+            t.provider.call_count(),
+            1,
+            "{mode}: no second planning pass after discard"
+        );
+        // A later boundary must not resurrect the discarded plan.
+        rf_bounded(t.session.run_serialized_refine_checkpoint()).await;
+        assert_eq!(
+            t.provider.call_count(),
+            1,
+            "{mode}: the boundary does not re-plan a discarded request"
+        );
+        t.session.dispose_async(Some(false)).await;
+    }
+}
+
+/// RF-001: the builtin memory `session_before_refine` hook is the single
+/// planning owner. When its planning attempt fails, the typed failure
+/// (category, attempts, per-attempt durations) is surfaced and the core never
+/// starts a silent duplicate planner pass.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn rf_memory_hook_failure_is_typed_and_prevents_duplicate_planning() {
+    let agent_dir = t11_case_agent_dir("rf-hook-typed-failure");
+    let settings = Arc::new(Mutex::new(
+        crate::core::settings_manager::SettingsManager::in_memory(
+            serde_json::json!({
+                "autoRefine": {"enabled": false},
+                "retry": {"enabled": false},
+                "compaction": {"enabled": false},
+                "telemetryEnabled": false,
+                "agentTracesEnabled": false,
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        ),
+    ));
+    let memory_extension =
+        crate::core::extensions::builtin::memory::create_memory_extension(
+            agent_dir,
+            settings,
+        );
+    let t = T11Session::new(
+        "rf-hook-typed-failure",
+        false,
+        serde_json::json!({"enabled": false}),
+        vec![memory_extension],
+    )
+    .await;
+    append_user_turn(&t);
+    // The hook plans; both attempts return unparseable output so its single
+    // planning operation fails after its one corrective retry.
+    t.queue_json(serde_json::json!({"not": "a proposal"}));
+    t.queue_json(serde_json::json!({"still": "not a proposal"}));
+    let error = rf_bounded(t.session.refine_with_options(&RefineOptions::default(), false, None))
         .await
-        .unwrap();
+        .unwrap_err();
+    assert!(
+        error.contains("session_before_refine hook"),
+        "the typed hook failure is surfaced: {error}"
+    );
+    assert!(
+        error.contains("category: InvalidModelOutput"),
+        "the failure carries its typed category: {error}"
+    );
+    assert!(
+        error.contains("attemptMs: ["),
+        "the failure carries sanitized per-attempt durations: {error}"
+    );
+    assert_eq!(
+        t.provider.call_count(),
+        2,
+        "hook planning + its one corrective retry only; the core never replanned"
+    );
+    assert!(
+        t.local_harness().refinements.is_empty(),
+        "a failed hook plan saves nothing"
+    );
     t.session.dispose_async(Some(false)).await;
 }

@@ -132,7 +132,18 @@ impl Timeline {
         if pi_tui::terminal_image::is_image_line(text) {
             // Paint the rail first, then graphics at the content column. Text
             // padding after a SIXEL would erase the image's bottom cell row.
-            return format!("{}\x1b[{}G{}", self.line("", meta, first), self.left + 1, text);
+            // Sidebar-safe placement: save the cursor BEFORE the blank rail
+            // row, paint it, restore, then move RIGHT by `left` cells
+            // relative to the CURRENT chat origin. An absolute CSI G would
+            // land inside the sidebar once the transcript origin shifts;
+            // the relative CSI C keeps the payload anchored to whatever
+            // column the row started at. The outer save/restore finishes
+            // before the payload's own save/restore begins.
+            let mut placement = String::new();
+            if self.left > 0 {
+                placement.push_str(&format!("\x1b[{}C", self.left));
+            }
+            return format!("\x1b7{}\x1b8{}{}", self.line("", meta, first), placement, text);
         }
         let palette = theme();
         if self.left == 0 {
@@ -210,9 +221,6 @@ impl TuiComponent for Header {
         self.render_with_height(width, 7)
     }
     fn render_with_height(&mut self, width: f64, height: usize) -> Vec<String> {
-        if !active() {
-            return Vec::new();
-        }
         let mode = self.0.borrow();
         let transport = self
             .1
@@ -261,13 +269,13 @@ impl TuiComponent for Header {
     fn invalidate(&mut self) {}
 }
 
-struct HeaderData<'a> {
-    cwd: &'a str,
-    session: &'a str,
-    model: &'a str,
-    phase: &'a str,
-    jev: Option<&'a str>,
-    clock: &'a str,
+pub(super) struct HeaderData<'a> {
+    pub cwd: &'a str,
+    pub session: &'a str,
+    pub model: &'a str,
+    pub phase: &'a str,
+    pub jev: Option<&'a str>,
+    pub clock: &'a str,
 }
 
 fn paired(left: &str, right: &str, width: usize) -> String {
@@ -278,7 +286,7 @@ fn paired(left: &str, right: &str, width: usize) -> String {
     format!("{}  {}", fit(left, width - right_width - 2), right)
 }
 
-fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<String> {
+pub(super) fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<String> {
     if budget == 0 || width == 0 {
         return Vec::new();
     }
@@ -334,7 +342,7 @@ fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<Stri
                 caption,
             );
             let right = match i {
-                0 => palette.bold(&palette.fg("accent", "telemus.ai")),
+                0 => format!("{}  {}", palette.bold(&palette.fg("accent", "telemus.ai")), palette.fg("dim", &format!("v{}", crate::config::VERSION))),
                 1 => String::new(),
                 _ => format!("SYSTEM // {status}"),
             };
@@ -349,12 +357,16 @@ fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<Stri
         }
     } else if budget >= 3 {
         rows.push(paired(
-            &palette.fg("accent", " OPTIMUS  //  BUILT FOR WHAT'S NEXT"),
+            &format!("{} {}", palette.fg("accent", " OPTIMUS  //  BUILT FOR WHAT'S NEXT"), palette.fg("dim", &format!("v{}", crate::config::VERSION))),
             &format!("{status} "),
             width,
         ));
     }
-    let session = format!("{} · {}", clean_label(data.cwd), clean_label(data.session));
+    let session = if budget == 2 {
+        format!("OPTIMUS v{} · {}", crate::config::VERSION, clean_label(data.session))
+    } else {
+        format!("{} · {}", clean_label(data.cwd), clean_label(data.session))
+    };
     let right = if width >= 100 {
         format!(
             "{model}  │  {}  │  {}",
@@ -367,7 +379,7 @@ fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) -> Vec<Stri
         model
     };
     if budget == 1 {
-        rows.push(paired(&palette.fg("accent", "OPTIMUS"), &right, width));
+        rows.push(paired(&palette.fg("accent", &format!("OPTIMUS v{}", crate::config::VERSION)), &right, width));
     } else {
         let inside = paired(
             &palette.fg("muted", &session),
@@ -464,7 +476,13 @@ mod image_tests {
             let wrapped = wrap.render(vec![String::new(), String::new(), graphic.clone()], timeline.content_width());
             assert_eq!(wrapped.len(), 3);
             let decorated = timeline.line(&wrapped[2], None, false);
-            assert!(decorated.ends_with(&format!("\x1b[{}G{}", timeline.left + 1, graphic)));
+            // Sidebar-safe relative placement: restore to the pre-rail
+            // cursor, then CSI n C (omitted when the rail is empty).
+            if timeline.left > 0 {
+                assert!(decorated.ends_with(&format!("\x1b8\x1b[{}C{}", timeline.left, graphic)));
+            } else {
+                assert!(decorated.ends_with(&format!("\x1b8{}", graphic)));
+            }
             assert_eq!(image_row_count(&decorated), Some(3));
         }
     }

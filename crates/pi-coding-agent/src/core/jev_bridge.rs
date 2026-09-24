@@ -16,7 +16,9 @@ use serde_json::{json, Value};
 
 use crate::config::get_agent_dir;
 use crate::core::extensions::types::SharedExtension;
-use crate::core::extensions::types::{Extension, ExtensionContext, ExtensionEvent, ExtensionHandler};
+use crate::core::extensions::types::{
+    Extension, ExtensionContext, ExtensionEvent, ExtensionHandler, ToolExecutionEndPayload,
+};
 use crate::core::memory::search::MemoryHit;
 use crate::core::skills::Skill;
 
@@ -301,6 +303,19 @@ pub fn session_status_snapshot(session_id: &str) -> Option<Value> {
     {
         let status = result.get_or_insert_with(|| json!({}));
         status["controlTerminal"] = control;
+    }
+    // TOOL-001: truthful offered-tool/availability diagnostics. Historical
+    // observations (names, staleness, counts) only; they appear only when
+    // the session already has status content, so the absent-session
+    // semantics stay exactly as before. No commands, results, or secrets.
+    if result.is_some() {
+        if let Some(core) = bridge_for_session(session_id) {
+            let diagnostics = core.tool_diagnostics(session_id);
+            if !diagnostics.is_null() {
+                let status = result.get_or_insert_with(|| json!({}));
+                status["toolDiagnostics"] = diagnostics;
+            }
+        }
     }
     // Full-jev overlay status truth: presence plus its persisted stamp and
     // how many saved session values are currently masked. Read from the same
@@ -610,6 +625,23 @@ struct SessionBook {
     request_turn: Option<u64>,
     trace: pi_jev::observation::TraceObserver,
     control_epoch_id: Option<String>,
+    /// TOOL-001 diagnostics: tool names advertised by the MOST RECENTLY
+    /// OBSERVED provider request, plus the turn that request belonged to.
+    /// This is a historical observation, not a guarantee of current
+    /// availability; consumers must read `advertised_turn` for staleness.
+    last_advertised_tools: Vec<String>,
+    advertised_turn: Option<u64>,
+    /// Bounded retention window of recent observed provider requests: 1 when
+    /// the request advertised at least one tool, 0 otherwise.
+    recent_tool_requests: std::collections::VecDeque<bool>,
+    /// Last observed tool RESULT state and the turn it arrived in.
+    last_tool_result_ok: Option<bool>,
+    last_tool_result_turn: Option<u64>,
+    /// CTRL-001: a designated task check FAILED in the current task epoch.
+    /// Sticky within the epoch: a later unrelated passed check can never
+    /// flip the epoch's verification evidence back to Passed. Reset when
+    /// the host commits a new real-user task epoch (with the trace).
+    verification_failed_in_epoch: bool,
     /// ROOT-CONTRACT v7 (Agent-guidance lane): latest advisory skill hint.
     /// Assessment only — it never loads or executes a skill.
     skill_hint: Option<pi_jev::agent_guidance::SkillHint>,
@@ -632,12 +664,33 @@ impl SessionBook {
     fn note_control_epoch(&mut self, epoch_id: &str) {
         if !epoch_id.is_empty() && self.control_epoch_id.as_deref() != Some(epoch_id) {
             self.trace.reset();
+            self.verification_failed_in_epoch = false;
             self.control_epoch_id = Some(epoch_id.to_string());
         }
     }
 
     fn current_turn(&self) -> u64 {
         self.request_turn.unwrap_or(self.turn)
+    }
+
+    /// TOOL-001 diagnostics: record the tool names one observed provider
+    /// request actually advertised. Names only, bounded; a tool schema is
+    /// public by definition (it is already on its way to the provider).
+    fn note_advertised_tools(&mut self, turn: u64, names: &[String]) {
+        const MAX_ADVERTISED_HISTORY: usize = 16;
+        self.last_advertised_tools = names.to_vec();
+        self.last_advertised_tools.truncate(MAX_ADVERTISED_HISTORY);
+        self.advertised_turn = Some(turn);
+        self.recent_tool_requests.push_back(!names.is_empty());
+        while self.recent_tool_requests.len() > MAX_ADVERTISED_HISTORY {
+            self.recent_tool_requests.pop_front();
+        }
+    }
+
+    /// Record the last observed tool result state for diagnostics.
+    fn note_tool_result_state(&mut self, turn: u64, is_error: bool) {
+        self.last_tool_result_ok = Some(!is_error);
+        self.last_tool_result_turn = Some(turn);
     }
 }
 
@@ -777,6 +830,69 @@ impl JevBridgeCore {
             book.observed_tools.push(tool_name.to_string());
             book.observed_tools.truncate(MAX_OBSERVED_TOOLS);
         }
+    }
+
+    /// CTRL-001: reset epoch-scoped verification bookkeeping (and the
+    /// observation trace) when the host commits a new real-user task epoch.
+    /// Evidence from a previous task never bleeds into the new one.
+    fn note_control_epoch(&self, session_id: &str, epoch_id: &str) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        if let Some(book) = sessions.get_mut(session_id) {
+            book.note_control_epoch(epoch_id);
+        }
+    }
+
+    /// TOOL-001: remember which tool names one observed provider request
+    /// actually advertised, with the request turn for staleness reporting.
+    fn note_advertised_tools(&self, session_id: &str, turn: u64, names: &[String]) {
+        let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        sessions
+            .entry(session_id.to_string())
+            .or_default()
+            .note_advertised_tools(turn, names);
+    }
+
+    /// TOOL-001: bounded names from the last OBSERVED provider request.
+    fn last_advertised_tools(&self, session_id: &str) -> Vec<String> {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .map(|book| book.last_advertised_tools.clone())
+            .unwrap_or_default()
+    }
+
+    /// TOOL-001: whether the recorded advertisement belongs to the current
+    /// turn. False means stale (from an earlier request), never "missing".
+    fn advertised_tools_is_current(&self, session_id: &str) -> bool {
+        self.sessions
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .get(session_id)
+            .is_some_and(|book| {
+                book.advertised_turn.is_some_and(|turn| turn == book.current_turn())
+            })
+    }
+
+    /// TOOL-001: the offered-tools fact for CONTROL evidence text. Bounded
+    /// names of the last OBSERVED advertisement plus explicit staleness;
+    /// never a guarantee of current availability, and never derived from a
+    /// blanket model claim.
+    fn advertised_tools_fact(&self, session_id: &str) -> Option<String> {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let book = sessions.get(session_id)?;
+        if book.last_advertised_tools.is_empty() {
+            return None;
+        }
+        let names = book.last_advertised_tools.join(",");
+        let current = book
+            .advertised_turn
+            .is_some_and(|turn| turn == book.current_turn());
+        Some(if current {
+            format!("advertised_tools_last_request={names}")
+        } else {
+            format!("advertised_tools_last_request={names} (stale, from an earlier request)")
+        })
     }
 
     fn observed_tools(&self, session_id: &str) -> Vec<String> {
@@ -933,12 +1049,39 @@ impl JevBridgeCore {
     }
 
     fn note_observation(&self, session_id: &str, event: &ExtensionEvent) {
-        use pi_jev::observation::{ObservedStopReason, TraceEvent};
+        use pi_jev::observation::{ObservedStopReason, TraceEvent, VerificationEvidence};
         let mut sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
         let book = sessions.entry(session_id.to_string()).or_default();
         match event {
             ExtensionEvent::TurnStart(_) => book.trace.record(TraceEvent::TurnStarted),
-            ExtensionEvent::ToolExecutionEnd(payload) => book.trace.record(TraceEvent::ToolEnded { is_error: payload.is_error }),
+            ExtensionEvent::ToolExecutionEnd(payload) => {
+                book.trace.record(TraceEvent::ToolEnded { is_error: payload.is_error });
+                book.note_tool_result_state(book.current_turn(), payload.is_error);
+                // CTRL-001 evidence adapter: only the native ipython tool —
+                // the sole supported producer of the typed script-report
+                // pipe — can record verification evidence, and only from
+                // strictly-shaped, explicitly designated task checks. The
+                // outcome is the host-measured, validated script report:
+                // never transport success, printed text, activity counts, or
+                // an executionReports-shaped payload echoed by another tool.
+                if payload.tool_name == SCRIPT_REPORT_TOOL_NAME {
+                    if let Some(reports) = designated_verification_reports(payload) {
+                        if reports.iter().any(|report| report.failed()) {
+                            book.verification_failed_in_epoch = true;
+                            book.trace.record(TraceEvent::VerificationObserved {
+                                outcome: VerificationEvidence::Failed,
+                            });
+                        } else if !book.verification_failed_in_epoch {
+                            // A failed designated check is sticky within the
+                            // task epoch: a later unrelated passed check can
+                            // never flip the epoch's evidence to Passed.
+                            book.trace.record(TraceEvent::VerificationObserved {
+                                outcome: VerificationEvidence::Passed,
+                            });
+                        }
+                    }
+                }
+            }
             ExtensionEvent::MessageEnd(payload) if payload.message.get("role").and_then(Value::as_str) == Some("assistant") => {
                 let stop = payload.message.get("stopReason").and_then(Value::as_str).unwrap_or("");
                 let kind = observed_failure_kind(&payload.message);
@@ -946,6 +1089,45 @@ impl JevBridgeCore {
             }
             _ => {}
         }
+    }
+
+    /// TOOL-001: bounded, truthful offered-tool/availability diagnostics for
+    /// one session. Historical observations with explicit staleness data;
+    /// `None` bookkeeping stays absent (never a fabricated healthy state).
+    /// Tool NAMES only — no commands, no results, no secrets.
+    fn tool_diagnostics(&self, session_id: &str) -> Value {
+        let sessions = self.sessions.lock().unwrap_or_else(|p| p.into_inner());
+        let Some(book) = sessions.get(session_id) else {
+            return Value::Null;
+        };
+        let advertised_turn = book.advertised_turn;
+        let current_turn = book.current_turn();
+        let with_tools = book.recent_tool_requests.iter().filter(|flag| **flag).count();
+        let observed_requests = book.recent_tool_requests.len();
+        let verification = match book.trace.summary().verification {
+            pi_jev::observation::VerificationEvidence::Passed => "passed",
+            pi_jev::observation::VerificationEvidence::Failed => "failed",
+            pi_jev::observation::VerificationEvidence::NotRun => "not_run",
+            pi_jev::observation::VerificationEvidence::NotNeeded => "not_needed",
+            pi_jev::observation::VerificationEvidence::Unknown => "unknown",
+        };
+        json!({
+            // Last OBSERVED advertisement, never a guaranteed current list.
+            "lastAdvertisedTools": book.last_advertised_tools.clone(),
+            "advertisedAtTurn": advertised_turn,
+            "currentTurn": current_turn,
+            "isCurrentTurn": advertised_turn.is_some_and(|turn| turn == current_turn),
+            "recentRequestsRetainingTools": format!("{with_tools}/{observed_requests}"),
+            "lastToolResult": match book.last_tool_result_ok {
+                Some(false) => "error",
+                Some(true) => "ok",
+                None => "none",
+            },
+            "turnsSinceLastToolResult": book
+                .last_tool_result_turn
+                .map(|turn| current_turn.saturating_sub(turn)),
+            "verificationEvidence": verification,
+        })
     }
 
     fn observation(&self, session_id: &str) -> pi_jev::observation::TraceSummary {
@@ -1982,6 +2164,15 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                 if !core.effective_mode(Some(&session_id)).allows_active() {
                     return None::<Value>;
                 }
+                // TOOL-001 diagnostics: remember the tool names THIS request
+                // actually advertises (public schema names only), so a later
+                // "no tools attached" claim can be compared with facts.
+                // Observation only — it never changes the request.
+                core.note_advertised_tools(
+                    &session_id,
+                    core.turn(&session_id),
+                    &advertised_tool_names(&payload.payload),
+                );
                 let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else {
                     return None::<Value>;
                 };
@@ -2133,10 +2324,7 @@ pub fn current_skill_hint(session_id: &str) -> Option<pi_jev::agent_guidance::Sk
 /// Automatic follow-ups keep the same observation scope and verification state.
 pub fn note_control_task_epoch(session_id: &str, epoch_id: &str) {
     if let Some(core) = bridge_for_session(session_id) {
-        let mut sessions = core.sessions.lock().unwrap_or_else(|p| p.into_inner());
-        if let Some(book) = sessions.get_mut(session_id) {
-            book.note_control_epoch(epoch_id);
-        }
+        core.note_control_epoch(session_id, epoch_id);
     }
 }
 
@@ -2962,7 +3150,14 @@ pub async fn decide_control(
             decided_at: now,
         }
     }).collect();
-    let evidence_description = core.observation(session_id).evidence_description();
+    let mut evidence_description = core.observation(session_id).evidence_description();
+    // TOOL-001: append the truthful offered-tool fact so a corrective
+    // feedback message answers a "no tools attached" claim with the actual
+    // last observed advertisement instead of login/reconnect advice.
+    if let Some(fact) = core.advertised_tools_fact(session_id) {
+        evidence_description.push_str("; ");
+        evidence_description.push_str(&fact);
+    }
     Some(ControlDecision {
         answers,
         question_ids,
@@ -2975,6 +3170,35 @@ pub async fn decide_control(
         policy_generation: outcome.policy_generation.clone(),
         full_jev_stamp: settings.full_jev_stamp(),
     })
+}
+
+/// CTRL-001 trusted-producer gate: verification-designated reports are
+/// accepted ONLY from the native ipython tool, the sole supported producer
+/// of the typed script-report pipe (`create_ipython_tool_definition`,
+/// `core::tools::ipython`). An `executionReports`-shaped details payload
+/// echoed by any other tool is ignored: schema shape alone never
+/// establishes host-measured execution.
+const SCRIPT_REPORT_TOOL_NAME: &str = "ipython";
+
+/// CTRL-001: verification-designated reports from one observed ipython tool
+/// result, parsed through the SUPPORTED structured report path only (callers
+/// must first pass the `SCRIPT_REPORT_TOOL_NAME` provenance gate). Strictly
+/// validated (a malformed designation invalidates its whole report), and a
+/// designation is required: a bare exit code is never verification.
+fn designated_verification_reports(
+    payload: &ToolExecutionEndPayload,
+) -> Option<Vec<crate::core::kernel::shared::ScriptExecutionReport>> {
+    let reports_value = payload
+        .result
+        .get("details")?
+        .get(crate::core::kernel::shared::EXECUTION_REPORTS_DETAILS_KEY)?;
+    let reports = crate::core::kernel::shared::parse_execution_reports(Some(reports_value))
+        .ok()??;
+    let designated: Vec<_> = reports
+        .into_iter()
+        .filter(|report| report.verification_label().is_some())
+        .collect();
+    (!designated.is_empty()).then_some(designated)
 }
 
 fn observed_failure_kind(message: &Value) -> Option<pi_jev::observation::RetryFailureKind> {
@@ -3082,6 +3306,7 @@ fn active_request_state(
 /// definition: it is already on its way to the model provider.
 fn advertised_tool_names(params: &Value) -> Vec<String> {
     const MAX_ADVERTISED_TOOLS: usize = 16;
+    const MAX_ADVERTISED_NAME_CHARS: usize = 128;
     let Some(tools) = params.get(crate::core::jev_active::TOOLS_KEY).and_then(Value::as_array) else {
         return Vec::new();
     };
@@ -3093,7 +3318,10 @@ fn advertised_tool_names(params: &Value) -> Vec<String> {
             .and_then(Value::as_str)
             .or_else(|| tool.get("name").and_then(Value::as_str));
         if let Some(name) = name {
-            if !name.is_empty() && !names.iter().any(|seen| seen == name) {
+            if !name.is_empty()
+                && name.chars().count() <= MAX_ADVERTISED_NAME_CHARS
+                && !names.iter().any(|seen| seen == name)
+            {
                 names.push(name.to_string());
             }
         }
@@ -3238,6 +3466,11 @@ fn bridge_event(
                         "stop_reason": summary.stop_reason,
                         "message_count": message_count,
                         "model_allowlist": allowlist,
+                        // TOOL-001: observed advertisement facts for the
+                        // records; the last OBSERVED request only, with
+                        // explicit staleness (never a current guarantee).
+                        "offered_tools": core.last_advertised_tools(session_id),
+                        "offered_tools_current": core.advertised_tools_is_current(session_id),
                     },
                 }),
             ))
@@ -3919,6 +4152,139 @@ mod provider_action_tests {
         assert_eq!(before[&changes[0].key],"low");
         assert_eq!(after[&changes[0].key],"medium");
         assert!(!after.contains_key("reasoning_effort"));
+    }
+
+    fn tool_end_with_reports(tool_name: &str, reports: Value, is_error: bool) -> ExtensionEvent {
+        ExtensionEvent::ToolExecutionEnd(ToolExecutionEndPayload {
+            tool_call_id: "call-1".to_string(),
+            tool_name: tool_name.to_string(),
+            result: json!({
+                "content": [{ "type": "text", "text": "done" }],
+                "details": { "executionReports": reports },
+                "isError": is_error,
+            }),
+            is_error,
+        })
+    }
+
+    fn designated_report(label: &str, exit_code: i64, expected: Value, is_error: bool) -> Value {
+        json!([{
+            "schema": "optimus.script-result.v1",
+            "stage": "process",
+            "scriptId": "s1",
+            "exitCode": exit_code,
+            "durationSeconds": 0.1,
+            "expectedExitCodes": expected,
+            "isError": is_error,
+            "receipt": { "verification": { "kind": "task_check", "label": label } },
+        }])
+    }
+
+    #[test]
+    fn ctrl001_designated_task_check_records_real_verification_evidence() {
+        use pi_jev::observation::VerificationEvidence;
+        let core = Arc::new(JevBridgeCore::new(JevSettings::default()));
+        // A designated, non-failed report records Passed evidence.
+        core.note_observation("sess-verify", &tool_end_with_reports("ipython",
+            designated_report("focused scope: status check", 0, json!([0]), false), false));
+        assert_eq!(core.observation("sess-verify").verification, VerificationEvidence::Passed);
+        // A designated failed report records Failed evidence.
+        core.note_observation("sess-verify", &tool_end_with_reports("ipython",
+            designated_report("focused scope: status check", 1, json!([0]), true), true));
+        assert_eq!(core.observation("sess-verify").verification, VerificationEvidence::Failed);
+        // A failed designated check is sticky for the task epoch: a later
+        // unrelated passed check can never flip the evidence to Passed.
+        core.note_observation("sess-verify", &tool_end_with_reports("ipython",
+            designated_report("unrelated later check", 0, json!([0]), false), false));
+        assert_eq!(core.observation("sess-verify").verification, VerificationEvidence::Failed,
+            "a later passed check must not un-fail the epoch");
+        // A new real-user task epoch resets the scope: the sticky failure and
+        // the trace evidence do not bleed into the new task, and a fresh
+        // designated passed check is recorded truthfully.
+        core.note_control_epoch("sess-verify", "sess-verify:2");
+        assert_eq!(core.observation("sess-verify").verification, VerificationEvidence::Unknown);
+        core.note_observation("sess-verify", &tool_end_with_reports("ipython",
+            designated_report("new task check", 0, json!([0]), false), false));
+        assert_eq!(core.observation("sess-verify").verification, VerificationEvidence::Passed);
+    }
+
+    #[test]
+    fn ctrl001_undesignated_reports_and_transport_success_never_become_verification() {
+        use pi_jev::observation::VerificationEvidence;
+        let core = Arc::new(JevBridgeCore::new(JevSettings::default()));
+        // Plain successful reports (no designation) stay Unknown.
+        core.note_observation("sess-plain", &tool_end_with_reports("ipython", json!([{
+            "schema": "optimus.script-result.v1", "stage": "process", "scriptId": "s1",
+            "exitCode": 0, "durationSeconds": 0.1, "expectedExitCodes": [0],
+            "isError": false, "receipt": null,
+        }]), false));
+        assert_eq!(core.observation("sess-plain").verification, VerificationEvidence::Unknown);
+        // Tool transport success without reports is not verification either.
+        core.note_observation("sess-plain", &tool_end_with_reports("ipython", Value::Null, false));
+        assert_eq!(core.observation("sess-plain").verification, VerificationEvidence::Unknown);
+        // A malformed designation invalidates the whole report: no evidence.
+        core.note_observation("sess-plain", &tool_end_with_reports("ipython", json!([{
+            "schema": "optimus.script-result.v1", "stage": "process", "scriptId": "s1",
+            "exitCode": 0, "durationSeconds": 0.1, "expectedExitCodes": [0],
+            "isError": false, "receipt": { "verification": { "kind": "assert", "label": "fake" } },
+        }]), false));
+        assert_eq!(core.observation("sess-plain").verification, VerificationEvidence::Unknown);
+        // Provenance gate: executionReports-shaped details from any tool
+        // other than the native ipython producer never become verification
+        // evidence, designated or not.
+        core.note_observation("sess-plain", &tool_end_with_reports("bash",
+            designated_report("echoed by another tool", 0, json!([0]), false), false));
+        assert_eq!(core.observation("sess-plain").verification, VerificationEvidence::Unknown,
+            "schema shape alone is not host-measured provenance");
+    }
+
+    #[test]
+    fn tool001_diagnostics_report_last_advertisement_with_staleness() {
+        let core = Arc::new(JevBridgeCore::new(JevSettings::default()));
+        // No observation yet: absent, never a fabricated healthy state.
+        assert!(core.tool_diagnostics("sess-diag").is_null());
+        core.note_turn("sess-diag", 5);
+        core.note_advertised_tools("sess-diag", 5, &["ipython".to_string(), "bash".to_string()]);
+        core.note_observation("sess-diag", &tool_end_with_reports("ipython", Value::Null, false));
+        let fresh = core.tool_diagnostics("sess-diag");
+        assert_eq!(fresh["lastAdvertisedTools"], json!(["ipython", "bash"]));
+        assert_eq!(fresh["advertisedAtTurn"], json!(5));
+        assert_eq!(fresh["isCurrentTurn"], json!(true));
+        assert_eq!(fresh["recentRequestsRetainingTools"], json!("1/1"));
+        assert_eq!(fresh["lastToolResult"], json!("ok"));
+        assert_eq!(fresh["turnsSinceLastToolResult"], json!(0));
+        assert_eq!(fresh["verificationEvidence"], json!("unknown"));
+        // A later turn makes the SAME observation explicitly stale; the
+        // list is never relabelled as current availability.
+        core.note_turn("sess-diag", 9);
+        let stale = core.tool_diagnostics("sess-diag");
+        assert_eq!(stale["isCurrentTurn"], json!(false));
+        assert_eq!(stale["currentTurn"], json!(9));
+        assert_eq!(stale["turnsSinceLastToolResult"], json!(4));
+        assert_eq!(core.advertised_tools_fact("sess-diag").unwrap(),
+            "advertised_tools_last_request=ipython,bash (stale, from an earlier request)");
+        // Only bounded names ever leave bookkeeping: no command bodies.
+        assert!(!format!("{stale:?}").contains("secret"));
+    }
+
+    #[test]
+    fn tool001_fact_and_event_state_carry_only_public_tool_names() {
+        let core = Arc::new(JevBridgeCore::new(JevSettings::default()));
+        core.note_turn("sess-fact", 3);
+        core.note_advertised_tools("sess-fact", 3, &["ipython".to_string()]);
+        assert_eq!(core.advertised_tools_fact("sess-fact").unwrap(),
+            "advertised_tools_last_request=ipython");
+        assert_eq!(core.last_advertised_tools("sess-fact"), vec!["ipython".to_string()]);
+        assert!(core.advertised_tools_is_current("sess-fact"));
+        assert!(core.advertised_tools_fact("sess-fact-none").is_none());
+        // Oversized or duplicate names are dropped/bounded, never a flood.
+        let long_name = "x".repeat(129);
+        let names = advertised_tool_names(&json!({"tools": [
+            {"type":"function","name":"ipython"},
+            {"type":"function","name":"ipython"},
+            {"type":"function","name": long_name},
+        ]}));
+        assert_eq!(names, vec!["ipython".to_string()]);
     }
 }
 

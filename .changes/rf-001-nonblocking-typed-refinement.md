@@ -1,0 +1,4 @@
+- Fixed serialized turn boundaries blocking queued chat input for the whole refinement planning pass: planning runs in the background, primary input executes first, and the settled plan applies at the next safe point with unchanged currentness, branch-version and cancellation checks.
+- Changed the manual `/refine` command in serialized sessions to queue a deliberate request with truthful queued feedback instead of blocking the session during planning; non-serialized sessions keep the synchronous command contract.
+- Fixed silent duplicate refinement planning: the builtin memory `session_before_refine` hook is the single planning owner and its failures now surface as one typed, sanitized error with category, attempt count and per-attempt durations instead of being discarded before a second full planner pass.
+- Removed automatic re-queueing of a failed explicit refinement request; re-issuing the request deliberately is the only retry.

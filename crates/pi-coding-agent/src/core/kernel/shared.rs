@@ -5,7 +5,10 @@
 //! slice status file under `blocked_on`.
 #[path = "execution_report.rs"]
 mod execution_report;
-pub use execution_report::{parse_execution_reports, ScriptExecutionReport};
+pub use execution_report::{
+    parse_execution_reports, ScriptExecutionReport, EXECUTION_REPORTS_DETAILS_KEY,
+    MAX_VERIFICATION_LABEL_CHARS, VERIFICATION_DESIGNATION_KEY, VERIFICATION_KIND_TASK_CHECK,
+};
 
 use std::collections::HashMap;
 use std::future::Future;

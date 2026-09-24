@@ -1531,6 +1531,92 @@ enum SummaryFormat {
     TurnPrefix,
 }
 
+/// Provider raw finish signals that mean the provider refused or filtered the
+/// content instead of running out of output budget. Matched case-insensitively
+/// by substring; this is the same rule `validate_summary` rejects with.
+pub fn is_filtered_provider_status(raw: &str) -> bool {
+    let raw = raw.to_ascii_lowercase();
+    ["refusal", "content_filter", "safety", "blocked"]
+        .iter()
+        .any(|marker| raw.contains(marker))
+}
+
+/// Classified cause of a failed compaction summary attempt. Drives bounded
+/// recovery pacing and sanitized outcome evidence; it never changes what
+/// counts as a usable handoff.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SummaryFailureKind {
+    /// The provider refused or filtered the summary. A repeat of the same
+    /// request may be refused again, so automatic attempts back off far
+    /// longer; the classification paces retries and does not predict the
+    /// provider's next outcome.
+    FilteredOrRefused,
+    /// Confirmed output-token exhaustion (provider reported max_output_tokens).
+    LengthExhausted,
+    /// Transport, cancellation, malformed or unclassified failures.
+    Other,
+}
+
+impl SummaryFailureKind {
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            SummaryFailureKind::FilteredOrRefused => "filtered",
+            SummaryFailureKind::LengthExhausted => "length",
+            SummaryFailureKind::Other => "other",
+        }
+    }
+}
+
+/// The `({reason});` body of a `validate_summary` handoff failure. Only the
+/// validator's own stable wrapper is recognized, so transport, auth and
+/// provider error text can never be misread as a classified cause.
+fn summary_handoff_failure_reason(error: &str) -> Option<&str> {
+    let rest = error
+        .strip_prefix("Summarization returned an unusable handoff (")?;
+    let (reason, _) = rest.split_once(");")?;
+    Some(reason)
+}
+
+/// Classify a compaction summary failure from its error message. Only the
+/// structured reasons `validate_summary` itself composes are inspected: a
+/// provider filter/refusal stays distinct from confirmed length exhaustion,
+/// and everything else - including `Summarization failed:` transport text,
+/// auth failures and empty-summary shape errors - is `Other`.
+pub fn classify_summary_failure(error: &str) -> SummaryFailureKind {
+    let Some(reason) = summary_handoff_failure_reason(error) else {
+        return SummaryFailureKind::Other;
+    };
+    // Filtered terminal: "the provider refused or filtered the summary
+    // (provider_status={raw})", or the completed-but-refused shape.
+    if let Some(status) = reason
+        .strip_prefix("the provider refused or filtered the summary (provider_status=")
+        .and_then(|rest| rest.strip_suffix(')'))
+    {
+        if is_filtered_provider_status(status) {
+            return SummaryFailureKind::FilteredOrRefused;
+        }
+    }
+    if reason == "provider refused or filtered the summary" {
+        return SummaryFailureKind::FilteredOrRefused;
+    }
+    // Incomplete terminal: "response did not complete (stop_reason={label},
+    // provider_status={raw})" or the no-status form. Only a confirmed
+    // max_output_tokens verdict is length exhaustion; a bare length label is
+    // unproven and stays `Other`.
+    if let Some(rest) = reason.strip_prefix("response did not complete (stop_reason=") {
+        if let Some((_, status)) = rest.split_once(", provider_status=") {
+            let status = status.strip_suffix(')').unwrap_or(status);
+            if is_filtered_provider_status(status) {
+                return SummaryFailureKind::FilteredOrRefused;
+            }
+            if status == "max_output_tokens" {
+                return SummaryFailureKind::LengthExhausted;
+            }
+        }
+    }
+    SummaryFailureKind::Other
+}
+
 // Enforce the handoff structure already requested by the summarization prompts.
 // There is deliberately no minimum length: "none" is a legitimate section body.
 fn validate_summary(response: &AssistantMessage, text: &str, format: SummaryFormat) -> Result<(), String> {
@@ -1552,6 +1638,12 @@ fn validate_summary(response: &AssistantMessage, text: &str, format: SummaryForm
             .map(str::trim)
             .filter(|raw| !raw.is_empty());
         let detail = match raw {
+            // A filter or refusal is its own terminal, not a token-budget stop:
+            // leading with the generic enum (for example stop_reason=length)
+            // misrepresents a provider block as truncation.
+            Some(raw) if is_filtered_provider_status(raw) => format!(
+                "the provider refused or filtered the summary (provider_status={raw})"
+            ),
             Some(raw) => format!(
                 "response did not complete (stop_reason={stop_label}, provider_status={raw})"
             ),
@@ -1562,10 +1654,11 @@ fn validate_summary(response: &AssistantMessage, text: &str, format: SummaryForm
     if response.error_message.as_deref().is_some_and(|message| !message.trim().is_empty()) {
         return Err(fail("provider reported an error"));
     }
-    if response.stop_reason_raw.as_deref().is_some_and(|reason| {
-        let reason = reason.to_ascii_lowercase();
-        ["refusal", "content_filter", "safety", "blocked"].iter().any(|marker| reason.contains(marker))
-    }) {
+    if response
+        .stop_reason_raw
+        .as_deref()
+        .is_some_and(is_filtered_provider_status)
+    {
         return Err(fail("provider refused or filtered the summary"));
     }
     if text.trim().is_empty() {
@@ -2075,5 +2168,232 @@ mod summary_retry_safety_tests {
         let result = complete_with_provider_retry(&call, Some(&policy), None).await.unwrap();
         assert_eq!(result.stop_reason, "error");
         assert_eq!(attempts.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn a_filtered_terminal_is_distinct_from_length_in_the_handoff_error() {
+        // Incident 2026-09-24 shape: Azure returned response.incomplete with
+        // incomplete_details.reason=content_filter. The handoff error must name
+        // the filter, not lead with the generic length enum.
+        let mut filtered = AssistantMessage::default();
+        filtered.stop_reason = "length".into();
+        filtered.stop_reason_raw = Some("content_filter".into());
+        let error = validate_summary(&filtered, "text", SummaryFormat::TurnPrefix).unwrap_err();
+        assert!(
+            error.contains(
+                "the provider refused or filtered the summary (provider_status=content_filter)"
+            ),
+            "{error}"
+        );
+        assert!(
+            !error.contains("stop_reason=length"),
+            "a provider filter must not be reported as a length stop: {error}"
+        );
+        assert!(error.contains("existing conversation preserved"), "{error}");
+        // The same terminal without a filter marker keeps the existing
+        // stop_reason/provider_status detail.
+        let mut incomplete = AssistantMessage::default();
+        incomplete.stop_reason = "length".into();
+        incomplete.stop_reason_raw = Some("other".into());
+        let error = validate_summary(&incomplete, "text", SummaryFormat::TurnPrefix).unwrap_err();
+        assert!(
+            error.contains("response did not complete (stop_reason=length, provider_status=other)"),
+            "{error}"
+        );
+    }
+
+    #[test]
+    fn classification_reads_only_validator_owned_formats() {
+        let kind = |error: &str| classify_summary_failure(error);
+        // Validator-owned formats.
+        assert_eq!(kind("Summarization returned an unusable handoff (the provider refused or filtered the summary (provider_status=content_filter)); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::FilteredOrRefused);
+        assert_eq!(kind("Summarization returned an unusable handoff (provider refused or filtered the summary); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::FilteredOrRefused);
+        assert_eq!(kind("Summarization returned an unusable handoff (response did not complete (stop_reason=length, provider_status=max_output_tokens)); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::LengthExhausted);
+        // Unproven length, other terminals and shape failures stay Other.
+        assert_eq!(kind("Summarization returned an unusable handoff (response did not complete (stop_reason=length, provider_status=other)); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::Other);
+        assert_eq!(kind("Summarization returned an unusable handoff (response did not complete (stop_reason=length)); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::Other);
+        assert_eq!(kind("Summarization returned an unusable handoff (missing, empty or incomplete handoff sections); existing conversation preserved. Retry compaction or select another summarization model."), SummaryFailureKind::Other);
+        // Transport, auth, empty-summary and provider text are never scanned
+        // for markers, so they can never be misread as a filter verdict.
+        assert_eq!(kind("Summarization failed: Error Code connection_closed: Azure WebSocket connection closed"), SummaryFailureKind::Other);
+        assert_eq!(kind("Error Code content_filter: arbitrary provider text"), SummaryFailureKind::Other);
+        assert_eq!(kind("provider refused or filtered the summary appears inside a transport error"), SummaryFailureKind::Other);
+        assert_eq!(kind("Summarization returned an empty summary"), SummaryFailureKind::Other);
+        assert_eq!(kind(""), SummaryFailureKind::Other);
+    }
+
+    fn fixture_preparation(split_with_prefix: bool) -> CompactionPreparation {
+        let message = |text: &str| {
+            AgentMessage::Message(pi_ai::types::Message::User(pi_ai::types::UserMessage::new(
+                pi_ai::types::UserContent::Text(text.into()),
+                0,
+            )))
+        };
+        CompactionPreparation {
+            first_kept_entry_id: "retained-boundary".into(),
+            messages_to_summarize: vec![message("history turn")],
+            turn_prefix_messages: if split_with_prefix {
+                vec![message("turn prefix")]
+            } else {
+                Vec::new()
+            },
+            is_split_turn: split_with_prefix,
+            tokens_before: 250_905.0,
+            retained_state_anchor: None,
+            previous_summary: None,
+            file_ops: crate::core::compaction::utils::create_file_ops(),
+            settings: default_compaction_settings(),
+        }
+    }
+
+    fn register_summary_fixture(name: &'static str, respond: Arc<dyn Fn(bool) -> AssistantMessage + Send + Sync>) -> (Model, Arc<AtomicUsize>) {
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_stream = calls.clone();
+        pi_ai::api_registry::register_api_provider_simple(
+            pi_ai::api_registry::ApiProviderSimple {
+                api: name.into(),
+                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                stream_simple: Arc::new(move |_, context, _| {
+                    let is_prefix = serde_json::to_string(context)
+                        .unwrap()
+                        .contains("turn prefix");
+                    calls_for_stream.fetch_add(1, Ordering::SeqCst);
+                    let message = respond(is_prefix);
+                    let stream = pi_ai::utils::event_stream::AssistantMessageEventStream::new();
+                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                        reason: message.stop_reason.clone(),
+                        message,
+                    });
+                    stream
+                }),
+                compact: None,
+                supports_compaction: None,
+            },
+            None,
+        );
+        let mut model = Model::new(name, name, name, "faux", "https://fixture.invalid");
+        model.context_window = 1_000_000.0;
+        model.max_tokens = 32_000.0;
+        (model, calls)
+    }
+
+    const FIXTURE_HISTORY: &str = "## Goal\nComplete.\n## Constraints & Preferences\nNone.\n## Progress\nDone.\n## Key Decisions\nWait.\n## Next Steps\nReview.\n## Critical Context\nSaved.";
+    const FIXTURE_PREFIX: &str =
+        "## Original Request\nComplete.\n## Early Progress\nSaved.\n## Context for Suffix\nReady.";
+
+    #[tokio::test]
+    async fn split_turn_with_a_non_empty_prefix_summarizes_both_slices() {
+        let (model, calls) = register_summary_fixture(
+            "summary-split-prefix-success",
+            Arc::new(|is_prefix| {
+                let text = if is_prefix { FIXTURE_PREFIX } else { FIXTURE_HISTORY };
+                AssistantMessage {
+                    content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(text))],
+                    stop_reason: "stop".into(),
+                    ..Default::default()
+                }
+            }),
+        );
+        let metrics = crate::core::compaction::metrics::CompactionMetrics::new(None, &model);
+        let result = compact_with_metrics(
+            &fixture_preparation(true),
+            &model,
+            "unused",
+            None,
+            None,
+            None,
+            default_summary_call_runner(None),
+            None,
+            None,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 2, "history and prefix each make one request");
+        assert!(result.summary.contains("Turn Context (split turn)"), "{}", result.summary);
+        assert!(result.summary.contains("Original Request"), "{}", result.summary);
+        assert!(result.summary.contains("Critical Context"), "{}", result.summary);
+    }
+
+    #[tokio::test]
+    async fn a_custom_message_boundary_with_an_empty_prefix_uses_the_history_only_request() {
+        // Live 2026-09-24 success shape: the first-kept entry is a CustomMessage
+        // boundary, so the turn-prefix slice is empty and the single
+        // history-only summary branch runs - no prefix request is made.
+        let (model, calls) = register_summary_fixture(
+            "summary-empty-prefix-success",
+            Arc::new(|_| AssistantMessage {
+                content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(FIXTURE_HISTORY))],
+                stop_reason: "stop".into(),
+                ..Default::default()
+            }),
+        );
+        let metrics = crate::core::compaction::metrics::CompactionMetrics::new(None, &model);
+        let result = compact_with_metrics(
+            &fixture_preparation(false),
+            &model,
+            "unused",
+            None,
+            None,
+            None,
+            default_summary_call_runner(None),
+            None,
+            None,
+            &metrics,
+        )
+        .await
+        .unwrap();
+        assert_eq!(calls.load(Ordering::SeqCst), 1, "an empty prefix makes no separate request");
+        assert!(result.summary.contains("Critical Context"), "{}", result.summary);
+        assert!(!result.summary.contains("Turn Context (split turn)"), "{}", result.summary);
+    }
+
+    #[tokio::test]
+    async fn a_filtered_prefix_failure_refuses_the_handoff_and_classifies_as_filtered() {
+        // Live 2026-09-24 failure shape: the prefix summary returns
+        // response.incomplete/content_filter. The compaction must refuse the
+        // partial handoff and the error must classify as a provider filter.
+        let (model, _calls) = register_summary_fixture(
+            "summary-filtered-prefix-failure",
+            Arc::new(|is_prefix| {
+                if is_prefix {
+                    AssistantMessage {
+                        stop_reason: "length".into(),
+                        stop_reason_raw: Some("content_filter".into()),
+                        ..Default::default()
+                    }
+                } else {
+                    AssistantMessage {
+                        content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(FIXTURE_HISTORY))],
+                        stop_reason: "stop".into(),
+                        ..Default::default()
+                    }
+                }
+            }),
+        );
+        let metrics = crate::core::compaction::metrics::CompactionMetrics::new(None, &model);
+        let error = compact_with_metrics(
+            &fixture_preparation(true),
+            &model,
+            "unused",
+            None,
+            None,
+            None,
+            default_summary_call_runner(None),
+            None,
+            None,
+            &metrics,
+        )
+        .await
+        .unwrap_err();
+        assert!(
+            error.contains("the provider refused or filtered the summary (provider_status=content_filter)"),
+            "{error}"
+        );
+        assert!(error.contains("existing conversation preserved"), "{error}");
+        assert_eq!(
+            classify_summary_failure(&error),
+            SummaryFailureKind::FilteredOrRefused
+        );
     }
 }

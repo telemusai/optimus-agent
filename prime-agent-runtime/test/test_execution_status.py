@@ -39,6 +39,31 @@ class ScriptReportTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(stored["receipt"]["status"],"error")
         self.assertNotIn("private output",json.dumps(stored))
 
+    async def test_verification_designation_is_strict_and_optional(self):
+        # CTRL-001: an explicit task_check designation marks the report as
+        # the task's verification. It is optional; without it a plain exit 0
+        # is never verification evidence. The outcome stays host-measured.
+        plain = report_script_result(BashResult(0, "ok", 0.1))
+        self.assertIsNone(plain["receipt"])
+        designated = report_script_result(BashResult(0, "ok", 0.1),
+            receipt={"verification": {"kind": "task_check", "label": "focused scope: status check"}})
+        self.assertEqual(designated["receipt"]["verification"]["kind"], "task_check")
+        self.assertEqual(designated["receipt"]["verification"]["label"], "focused scope: status check")
+        failed = report_script_result(BashResult(1, "boom", 0.1),
+            receipt={"verification": {"kind": "task_check", "label": "focused scope"}})
+        self.assertTrue(failed["isError"])
+        for receipt in (
+            {"verification": {"kind": "assert", "label": "x"}},
+            {"verification": {"kind": "task_check"}},
+            {"verification": {"kind": "task_check", "label": "x", "note": "y"}},
+            {"verification": {"kind": "task_check", "label": ""}},
+            {"verification": {"kind": "task_check", "label": "x" * 129}},
+            {"verification": "task_check"},
+            {"verification": None},
+        ):
+            with self.assertRaises(TypeError):
+                report_script_result(BashResult(0, "", 0), receipt=receipt)
+
     async def test_reject_invalid_result_and_receipt(self):
         for result in (None, object(), "Traceback", BashResult(True,"",0), BashResult(0,"",float("nan"))):
             with self.assertRaises(TypeError): report_script_result(result)

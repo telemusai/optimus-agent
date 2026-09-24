@@ -73,6 +73,25 @@ pub fn create_memory_extension(
     })
 }
 
+/// Typed sanitized `session_before_refine` planning failure result. The
+/// message must be fixed vocabulary; `category` is a stable name; `attempt_ms`
+/// are per-attempt wall-clock durations. Nothing raw crosses the boundary.
+fn hook_planning_error(
+    message: &str,
+    category: &str,
+    attempts: u8,
+    attempt_ms: Option<Vec<u64>>,
+) -> serde_json::Value {
+    serde_json::json!({
+        "error": {
+            "message": message,
+            "category": category,
+            "attempts": attempts,
+            "attemptMs": attempt_ms,
+        }
+    })
+}
+
 /// `diagnostic(data)` - `pi.appendEntry("prime-agent.memory-diagnostic", data)`.
 ///
 /// Diagnostics cannot block a turn.
@@ -515,13 +534,48 @@ fn create_memory_extension_impl(
                 let ExtensionEvent::SessionBeforeRefine(payload) = event else {
                     return None;
                 };
-                let memory = service(&ctx, &agent_dir, &services).ok()?;
+                // RF-001: this hook IS the planning owner. Every failure below
+                // returns a typed, sanitized error result so the core surfaces
+                // it and never silently starts a second full planner pass.
+                // Fixed vocabulary only: no keys, headers, prompts, completions,
+                // or raw provider error bodies cross this boundary.
+                let memory = match service(&ctx, &agent_dir, &services) {
+                    Ok(memory) => memory,
+                    Err(_) => {
+                        return Some(hook_planning_error(
+                            "memory service unavailable for refinement planning",
+                            "internal",
+                            0,
+                            None,
+                        ))
+                    }
+                };
                 let preparation = payload.preparation;
                 if preparation.trigger == "auto" && !memory.store.settings().learning {
                     return Some(serde_json::json!({ "skip": true }));
                 }
-                let model = ctx.model()?;
-                let (api_key, headers) = api_key_and_headers(&ctx, &model).await.ok()?;
+                let model = match ctx.model() {
+                    Some(model) => model,
+                    None => {
+                        return Some(hook_planning_error(
+                            "no model selected",
+                            "model",
+                            0,
+                            None,
+                        ))
+                    }
+                };
+                let (api_key, headers) = match api_key_and_headers(&ctx, &model).await {
+                    Ok(auth) => auth,
+                    Err(_) => {
+                        return Some(hook_planning_error(
+                            "refinement auth could not be resolved",
+                            "auth",
+                            0,
+                            None,
+                        ))
+                    }
+                };
                 let state = preparation.planning_state.clone();
                 let plan = plan_refinement(PlanRefinementRequest {
                     messages: &[],
@@ -543,8 +597,22 @@ fn create_memory_extension_impl(
                     thinking_level: None,
                     complete: completion_fn_for(model, api_key, headers, Some(refinement_retry_policy(&settings_manager))),
                 })
-                .await
-                .ok()?;
+                .await;
+                let plan = match plan {
+                    Ok(plan) => plan,
+                    Err(error) => {
+                        // Typed first failure: fixed message, category, attempt
+                        // count and per-attempt durations. The fingerprints stay
+                        // internal; they are sha256 digests and byte counts, but
+                        // the visible failure needs only the summary above.
+                        return Some(hook_planning_error(
+                            &error.message,
+                            &format!("{:?}", error.refinement_failure.category),
+                            error.refinement_failure.attempts,
+                            Some(error.refinement_failure.attempt_durations_ms.clone()),
+                        ))
+                    }
+                };
                 if preparation.trigger == "auto" && !memory.store.settings().learning {
                     return Some(serde_json::json!({ "skip": true }));
                 }

@@ -23,6 +23,15 @@ use crate::modes::interactive::components::keybinding_hints::expand_collapse_hin
 use crate::modes::interactive::components::mermaid::MermaidMarkdownTransform;
 use crate::modes::interactive::theme::theme::{theme, MarkdownTheme};
 
+/// Normal AI prose only; markdown code, semantic styles and activity keep their palette.
+fn assistant_prose(text: &str) -> String {
+    let ansi = match theme().color_mode() {
+        pi_tui::terminal_colors::TerminalColorMode::Truecolor => "\x1b[38;2;19;161;14m",
+        _ => "\x1b[38;5;34m",
+    };
+    format!("{ansi}{text}\x1b[39m")
+}
+
 const OSC133_ZONE_START: &str = "\u{1b}]133;A\u{7}";
 const OSC133_ZONE_END: &str = "\u{1b}]133;B\u{7}";
 const OSC133_ZONE_FINAL: &str = "\u{1b}]133;C\u{7}";
@@ -522,7 +531,10 @@ impl AssistantMessageComponent {
                         1,
                         0,
                         clone_tui_markdown_theme(&self.markdown_theme),
-                        None,
+                        Some(DefaultTextStyle {
+                            color: Some(Rc::new(assistant_prose)),
+                            ..Default::default()
+                        }),
                         options,
                     )));
                     self.block_markdowns.insert(index, Rc::clone(&markdown));

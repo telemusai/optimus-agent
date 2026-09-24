@@ -13,6 +13,19 @@ use crate::modes::interactive::theme::theme::{get_markdown_theme, theme, Markdow
 
 use super::prompt_highlight::PromptTokenMask;
 
+/// A submitted prompt surface, independent of the editor and global accents.
+fn submitted_prompt_background(content: &str) -> String {
+    let palette = theme();
+    if palette.name.as_deref() == Some("light") {
+        return palette.get_user_message_background_color()(content);
+    }
+    let ansi = match palette.color_mode() {
+        pi_tui::terminal_colors::TerminalColorMode::Truecolor => "\x1b[48;2;28;28;28m",
+        _ => "\x1b[48;5;234m",
+    };
+    format!("{ansi}{content}\x1b[49m")
+}
+
 /// `OSC133_ZONE_START`
 pub const OSC133_ZONE_START: &str = "\u{1b}]133;A\u{7}";
 /// `OSC133_ZONE_END`
@@ -134,7 +147,7 @@ impl UserMessageComponent {
             2,
             1,
             Some(Box::new(|content: &str| {
-                theme().get_user_message_background_color()(content)
+                submitted_prompt_background(content)
             })),
         );
         content_box.add_child(Box::new(HighlightedMarkdown::new(
@@ -165,6 +178,10 @@ impl Component for UserMessageComponent {
         lines[0] = format!("{OSC133_ZONE_START}{}", lines[0]);
         lines[last] = format!("{OSC133_ZONE_END}{OSC133_ZONE_FINAL}{}", lines[last]);
         lines
+    }
+
+    fn get_selection_regions(&self) -> Vec<TableCellSelectionRegion> {
+        self.content_box.get_selection_regions()
     }
 
     fn invalidate(&mut self) {

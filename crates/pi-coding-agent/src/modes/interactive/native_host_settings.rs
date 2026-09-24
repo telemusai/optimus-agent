@@ -145,6 +145,7 @@ pub(super) fn fullscreen(
     ui: &Rc<RefCell<TUI>>,
     transcript: &Rc<RefCell<Transcript>>,
 ) {
+    let enabled = enabled || transcript.borrow().sidebar.is_some();
     mode.borrow_mut().fullscreen_enabled = enabled;
     if enabled {
         let dock = Rc::new(RefCell::new(pi_tui::tui::Container::new()));
@@ -184,6 +185,10 @@ pub(super) fn fullscreen(
                 viewport_controls: true,
             });
         ui.borrow_mut().set_fullscreen_header(Some(Rc::new(RefCell::new(native_neon::Header(mode.clone(), Rc::downgrade(transcript))))));
+        if let Some(sidebar) = &transcript.borrow().sidebar {
+            ui.borrow_mut().set_fullscreen_sidebar(Some(Rc::new(RefCell::new(
+                crate::modes::interactive::session_sidebar::Pane(sidebar.clone())))));
+        }
     } else {
         ui.borrow_mut()
             .exit_fullscreen(pi_tui::tui::ExitFullscreenOptions {
