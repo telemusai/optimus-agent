@@ -6,7 +6,7 @@
 //! scroll position is application state, not terminal scrollback.
 
 use crate::selection_metadata::TableCellSelectionRegion;
-use crate::terminal_image::is_image_line;
+use crate::terminal_image::{delete_kitty_image, image_row_count, is_image_line};
 use crate::utils::{slice_by_column, strip_ansi, url_at_column, visible_width};
 use std::rc::Rc;
 
@@ -17,8 +17,7 @@ pub fn clipped_fullscreen_dock_height(dock_length: usize, height: usize) -> usiz
     dock_length.min(max_dock)
 }
 
-/// Kitty images span multiple physical rows and cannot be clipped to a window.
-const IMAGE_PLACEHOLDER: &str = "\x1b[2m[image \u{2014} view in inline mode]\x1b[0m";
+const IMAGE_PLACEHOLDER: &str = "\x1b[2m[Cannot display image in this viewport]\x1b[0m";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct ScrollInfo {
@@ -260,9 +259,19 @@ impl FullscreenViewport {
 
         let end = (self.scroll_top + window_height).min(transcript.len());
         let mut window: Vec<String> = transcript[self.scroll_top..end].to_vec();
-        for line in window.iter_mut() {
-            if is_image_line(line) {
-                *line = IMAGE_PLACEHOLDER.to_string();
+        let mut visible_images = 0;
+        for (last, line) in transcript.iter().enumerate().filter(|(_, line)| is_image_line(line)) {
+            let rows = image_row_count(line);
+            let first = last.saturating_sub(rows.unwrap_or(1).saturating_sub(1));
+            if last < self.scroll_top || first >= end { continue; }
+            if rows.is_some() && first >= self.scroll_top && last < end
+                && !self.has_selection() && visible_images < 8
+            {
+                visible_images += 1;
+            } else {
+                // A cursor-positioned image cannot be sliced like text. Keep
+                // its row allocation stable while it crosses either boundary.
+                window[last.min(end - 1) - self.scroll_top] = IMAGE_PLACEHOLDER.into();
             }
         }
         self.highlight_selection(&mut window);
@@ -567,6 +576,7 @@ impl FullscreenViewport {
     }
 
     fn highlight_line(line: &str, span: ColumnSpan) -> String {
+        if is_image_line(line) { return line.to_string(); }
         let width = visible_width(line);
         let from = span.from.min(width);
         let to = span.to.min(width);
@@ -1056,7 +1066,18 @@ impl FullscreenViewport {
         };
 
         let mut buffer = String::from("\x1b[?2026h");
-        if width != self.prev_width || height != self.prev_height || self.prev_frame.is_empty() {
+        let previous_images: Vec<_> = self.prev_frame.iter().enumerate().filter(|(_, line)| is_image_line(line)).collect();
+        let current_images: Vec<_> = frame.iter().enumerate().filter(|(_, line)| is_image_line(line)).collect();
+        let images_changed = previous_images != current_images || current_images.iter().any(|(last, line)| {
+            let first = last.saturating_sub(image_row_count(line).unwrap_or(1) - 1);
+            (first..=*last).any(|row| frame.get(row) != self.prev_frame.get(row))
+        });
+        if width != self.prev_width || height != self.prev_height || self.prev_frame.is_empty() || images_changed {
+            for line in &self.prev_frame {
+                for id in crate::tui::extract_kitty_image_ids(line) {
+                    buffer.push_str(&delete_kitty_image(id));
+                }
+            }
             buffer.push_str("\x1b[2J\x1b[H");
             self.prev_frame = Vec::new();
         }
@@ -1067,7 +1088,7 @@ impl FullscreenViewport {
             }
             buffer.push_str(&format!("\x1b[{};1H\x1b[2K", row + 1));
             // an overwide line would wrap and shear the grid; clamp instead of crash
-            buffer.push_str(&if visible_width(&line) > width {
+            buffer.push_str(&if !is_image_line(&line) && visible_width(&line) > width {
                 slice_by_column(&line, 0, width, true)
             } else {
                 line
@@ -1147,6 +1168,42 @@ fn trim_end(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn managed_images_render_only_when_the_whole_rectangle_is_visible() {
+        let image = crate::terminal_image::position_image("\x1bP0;1;0q~\x1b\\", 3);
+        let transcript = vec!["before".into(), String::new(), String::new(), image.clone(), "after".into()];
+        let mut viewport = FullscreenViewport::new();
+        let frame = viewport.compose_frame_with_header(&transcript, &lines(&["dock"]), 7, &[], &[], false, &lines(&["header"]));
+        assert!(frame.contains(&image));
+        assert_eq!(frame[0], "header");
+        assert_eq!(frame[6], "dock");
+        let clipped_top = viewport.compose_frame(&transcript, &lines(&["dock"]), 4, &[]);
+        assert!(clipped_top.iter().all(|line| !is_image_line(line)));
+        assert!(clipped_top.iter().any(|line| line.contains("Cannot display image")));
+        viewport.scroll_to_top();
+        let clipped_bottom = viewport.compose_frame(&transcript, &lines(&["dock"]), 4, &[]);
+        assert!(clipped_bottom.iter().all(|line| !is_image_line(line)));
+        assert!(clipped_bottom.iter().any(|line| line.contains("Cannot display image")));
+    }
+
+    #[test]
+    fn moving_or_removing_graphics_clears_them_but_editor_changes_do_not_repaint_them() {
+        let image = crate::terminal_image::position_image("\x1bP0;1;0q~\x1b\\", 2);
+        let mut frame = vec![String::new(), image.clone(), "editor".into()];
+        let mut viewport = FullscreenViewport::new();
+        let mut output = String::new();
+        viewport.paint(&mut |s| output.push_str(s), &frame, 40, 3, Some((2, 3)));
+        assert!(output.contains(&image) && output.contains("\x1b[3;4H"));
+        output.clear();
+        frame[2] = "editor text".into();
+        viewport.paint(&mut |s| output.push_str(s), &frame, 40, 3, None);
+        assert!(!output.contains("\x1bP") && !output.contains("\x1b[2J"));
+        output.clear();
+        frame = lines(&["one", "two", "editor"]);
+        viewport.paint(&mut |s| output.push_str(s), &frame, 40, 3, None);
+        assert!(output.contains("\x1b[2J") && !output.contains("\x1bP"));
+    }
 
     fn lines(items: &[&str]) -> Vec<String> {
         items.iter().map(|s| s.to_string()).collect()
