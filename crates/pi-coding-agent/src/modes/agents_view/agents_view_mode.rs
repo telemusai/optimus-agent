@@ -6471,6 +6471,61 @@ mod tests {
         assert!(crate::modes::agents_view::roster_store::RosterUpdate::from_outbound(&DaemonOutbound::Other).is_none());
     }
 
+
+    #[tokio::test]
+    async fn ui014_scoped_list_opens_only_its_child_and_back_returns_to_parent() {
+        let parent = roster_entry("parent", "Current chat");
+        let unrelated = roster_entry("other", "Unrelated chat");
+        let mut child = roster_entry("child", "Running direct child");
+        child.summary.runtime_kind = Some(RuntimeKind::Subagent);
+        child.summary.rlm_child_id = Some("child-id".into());
+        child.summary.parent_active_session_id = Some("parent".into());
+        child.status = AgentRosterStatus::Running;
+        child.summary.is_streaming = true;
+        let entries = vec![unrelated, parent.clone(), child];
+        let scope = AgentsViewScopeKey { session_id: "parent".into(), active_session_id: Some("parent".into()) };
+        let mut mode = build_mode(entries.clone()).await;
+        super::super::native_host::capture_for_test("ui014-session-list-80x30.ansi", &mut mode, 80, 30);
+        mode.enter_scope_for_test(scope.clone(), parent.summary.clone());
+        super::super::native_host::capture_for_test("ui014-scoped-child-list-80x30.ansi", &mut mode, 80, 30);
+        let selectable: Vec<_> = mode.rows().iter().filter(|row| row.selectable).collect();
+        assert_eq!(selectable.len(), 1);
+        assert_eq!(selectable[0].summary.active_session_id.as_deref(), Some("child"));
+        let (send, receive) = tokio::sync::oneshot::channel();
+        mode.resolve_run = Some(send);
+        mode.handle_input("\x1b[C");
+        let opened = receive.await.unwrap();
+        let AgentsViewRunResult::Open { summary: selected, .. } = opened else { panic!("child open expected") };
+        assert_eq!(selected.active_session_id.as_deref(), Some("child"));
+        struct RecordingFactory(StdMutex<Vec<String>>);
+        impl DaemonAgentConnectionFactory for RecordingFactory {
+            fn attach(&self, _client: DaemonTransportClient, active: &str, _options: AttachOptions)
+                -> TransportFuture<Result<Arc<dyn DaemonAgentConnectionHandle>, String>> {
+                self.0.lock().unwrap().push(active.into());
+                Box::pin(async { Ok(Arc::new(FakeAgentConnection) as Arc<dyn DaemonAgentConnectionHandle>) })
+            }
+        }
+        let factory = RecordingFactory(StdMutex::new(Vec::new()));
+        let transport = FakeTransport::new(&["agent_roster"]);
+        open_agents_view_session(&mode.options, &selected, transport.clone(), &factory).await.unwrap();
+        assert_eq!(*factory.0.lock().unwrap(), vec!["child"]);
+        assert!(transport.requests().is_empty(), "active child attaches without creating or mutating a session");
+        let mut returned = build_mode(entries).await;
+        returned.enter_scope_for_test(scope, parent.summary);
+        let (send, receive) = tokio::sync::oneshot::channel();
+        returned.resolve_run = Some(send);
+        returned.handle_input("\x1b[D");
+        let back = receive.await.unwrap();
+        assert!(matches!(back, AgentsViewRunResult::ScopeBack { .. }));
+        // The owner loop converts ScopeBack to the stashed parent Open before
+        // using the same attach path; exercise that exact conversion here.
+        let opened = create_scope_back_return_chat_open_result(&back).expect("return chat");
+        let AgentsViewRunResult::Open { summary, .. } = opened else { panic!("parent open expected") };
+        assert_eq!(summary.active_session_id.as_deref(), Some("parent"));
+        open_agents_view_session(&returned.options, &summary, transport, &factory).await.unwrap();
+        assert_eq!(*factory.0.lock().unwrap(), vec!["child", "parent"]);
+    }
+
     #[test]
     fn subagent_rows_carry_the_root_linkage() {
         let mut child = summary("c-1", "Child");

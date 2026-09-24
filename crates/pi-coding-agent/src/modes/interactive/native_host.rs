@@ -32,7 +32,7 @@ use crate::modes::interactive::prompt_stash_state::{
     PromptStashCapture, PromptStashEditorEffect, PromptStashOutcome, PromptStashSession,
 };
 use pi_tui::components::text::Text as TuiText;
-use pi_tui::tui::{Component as TuiComponent, Focusable, InputListenerResult, TuiStopOptions, TUI};
+use pi_tui::tui::{Component as TuiComponent, InputListenerResult, TuiStopOptions, TUI};
 use std::cell::{Cell, RefCell};
 use std::hash::{Hash, Hasher};
 use std::io::IsTerminal;
@@ -100,9 +100,6 @@ mod native_subagents;
 mod native_recovery_notice;
 #[path = "native_host_metrics.rs"]
 mod native_metrics;
-#[path = "native_host_workspace.rs"]
-mod native_workspace;
-pub(crate) use native_workspace::startup as run_workspace;
 #[cfg(test)]
 #[path = "native_host_ui_tests.rs"]
 mod ui_tests;
@@ -130,11 +127,7 @@ async fn launch(
     benchmark: bool,
 ) -> Result<Option<InteractiveModeRunResult>, String> {
     let handle = tokio::runtime::Handle::current();
-    tokio::task::spawn_blocking(move || handle.block_on(async move {
-        let mut workspace = native_workspace::Runtime::new(
-            options.daemon_socket_path.clone(), Default::default(), &crate::config::get_agent_dir());
-        native_workspace::attached_loop(options, benchmark, &mut workspace).await
-    }))
+    tokio::task::spawn_blocking(move || handle.block_on(run_terminal(options, benchmark)))
         .await
         .map_err(|error| format!("Interactive terminal failed: {error}"))?
 }
@@ -159,7 +152,6 @@ struct Transcript {
     agent_messages: Vec<Rc<RefCell<crate::modes::interactive::components::agent_message::AgentMessageComponent>>>,
     extension_surfaces: Option<Rc<RefCell<native_extensions::Surfaces>>>,
     side_pane: Option<Rc<RefCell<native_extensions::SidePane>>>,
-    sidebar: Option<Rc<RefCell<crate::modes::interactive::session_sidebar::State>>>,
     stats_panel: native_commands::StatsDock,
     history: Option<Box<Transcript>>,
     mode: Rc<RefCell<InteractiveMode>>,
@@ -272,7 +264,6 @@ impl Transcript {
             agent_messages: Vec::new(),
             extension_surfaces: None,
             side_pane: None,
-            sidebar: None,
             stats_panel: native_commands::StatsDock::default(),
             history: None,
             mode,
@@ -1394,7 +1385,6 @@ fn select_theme() -> pi_tui::components::select_list::SelectListTheme {
 async fn run_terminal(
     options: InteractiveModeSeamOptions,
     benchmark: bool,
-    workspace: &mut native_workspace::Runtime,
 ) -> Result<Option<InteractiveModeRunResult>, String> {
     let opened_at = Instant::now();
     let mut in_process_connection = None;
@@ -1413,7 +1403,6 @@ async fn run_terminal(
         }
     };
     let snapshot = connection.get_initial_snapshot().await?;
-    workspace.set_current(&snapshot.state);
     let mut current_session_id = snapshot.state.session_id.clone();
     let mut ui_metrics = native_metrics::UiMetrics::new(&current_session_id);
     let mut state_refresh = native_state::StateRefresh::new();
@@ -1484,7 +1473,6 @@ async fn run_terminal(
     let subagents = Rc::new(RefCell::new(native_subagents::Bar::new(mode.clone())));
     let transcript = Rc::new(RefCell::new(Transcript::new(mode.clone())));
     transcript.borrow_mut().subagents = Some(subagents.clone());
-    transcript.borrow_mut().sidebar = Some(workspace.state.clone());
     let initial_history = snapshot.history.clone();
     let initial_history_messages = snapshot.messages.clone();
     let initial_streaming_message = snapshot.streaming_message.clone();
@@ -1578,34 +1566,17 @@ async fn run_terminal(
     let input_received = Rc::new(Cell::new(None::<Instant>));
     let viewport_input = Rc::new(Cell::new(false));
     let history_requested = Rc::new(Cell::new(false));
-    let sidebar_bounds = Rc::new(Cell::new((None::<pi_tui::tui::FullscreenSidebarBounds>, 0usize, false)));
     {
         let input = input.clone();
         let mode = mode.clone();
         let viewport_input = viewport_input.clone();
         let history_requested = history_requested.clone();
         let input_received = input_received.clone();
-        let sidebar_bounds = sidebar_bounds.clone();
         // Dispatch component input after releasing the TUI borrow: Editor owns
         // the same TUI handle and requests rendering from its input handlers.
         ui.borrow_mut().add_input_listener(Box::new(move |data| {
             if !pi_tui::keys::is_key_release(data) && input_received.get().is_none() {
                 input_received.set(Some(Instant::now()));
-            }
-            let (bounds, header_height, overlay_focused) = sidebar_bounds.get();
-            // The cached bounds mirror `fullscreen_sidebar_hit` for both edges
-            // (hidden/unmounted is `None`, so the pane never claims mouse input).
-            if !overlay_focused {
-                if let Some(mouse) = pi_tui::mouse::parse_sgr_mouse_event(data) {
-                    if bounds.is_some_and(|bounds| {
-                        mouse.y > header_height as i64
-                            && mouse.x > bounds.col as i64
-                            && mouse.x <= (bounds.col + bounds.width) as i64
-                    }) {
-                        input.borrow_mut().push(data.to_string());
-                        return InputListenerResult { consume: true, data: None };
-                    }
-                }
             }
             let keys = pi_tui::keybindings::get_keybindings();
             if keys.matches(data, "tui.viewport.pageUp")
@@ -1832,14 +1803,12 @@ async fn run_terminal(
         // (tui.ts:439) and must not steal the viewport keys.
         viewport_input
             .set(ui.borrow().is_fullscreen() && !ui.borrow().is_fullscreen_overlay_focused() && command_dialog.is_none());
-        sidebar_bounds.set((ui.borrow().fullscreen_sidebar_bounds(), ui.borrow().fullscreen_header_height(), ui.borrow().is_fullscreen_overlay_focused()));
         ui.borrow_mut().drain_input();
         if let Some(received) = input_received.take() { ui_metrics.input(received); }
         if history_requested.replace(false) {
             history_runtime.request(&mode.borrow());
         }
         for data in std::mem::take(&mut *input.borrow_mut()) {
-            let editor_at_start = editor.borrow().editor().get_cursor() == (0, 0);
             let data = if let Some(bridge) = &local_extension_bridge {
                 let Some(data) = bridge.filter_input(data) else { continue; }; data
             } else { data };
@@ -1873,8 +1842,6 @@ async fn run_terminal(
                 picker.borrow_mut().handle_input(&data);
             } else if let Some(selector) = &selector {
                 selector.borrow_mut().handle_input(&data);
-            } else if workspace.input(&data, editor_at_start, &ui) {
-                editor.borrow_mut().editor_mut().set_focused(!workspace.state.borrow().focused);
             } else if !side_pane.borrow().is_open() && subagents.borrow_mut().input(&data, &editor, &actions) {
             } else if !side_pane.borrow().is_open() && queue_runtime.handle_input(&data) {
             } else if pi_tui::keybindings::get_keybindings().matches(&data, "app.message.followUp")
@@ -2128,14 +2095,16 @@ async fn run_terminal(
                         tool.borrow_mut().set_agent_messages_expanded(mode.borrow().agent_messages_expanded);
                     }
                 }
-                // UI-006: confirming the sub-agent summary aims the sidebar at a
-                // running child of the current chat; the retired agents-view
-                // hand-off stays gone. `AgentsBack` keeps plain sidebar focus.
                 InputAction::Subagents => {
-                    workspace.focus_subagents(&editor, &ui);
+                    stash_editor_draft_for_agents_view(&mode, &editor, &current_session_id);
+                    mode.borrow_mut().return_to_agents_view(InteractiveModeRunResultType::ScopedAgentsView);
                 }
                 InputAction::AgentsBack => {
-                    workspace.focus(&editor);
+                    // `returnToAgentsView` stashes the live draft first
+                    // (interactive-mode.ts:7122) so the handoff does not lose it.
+                    stash_editor_draft_for_agents_view(&mode, &editor, &current_session_id);
+                    mode.borrow_mut()
+                        .return_to_agents_view(InteractiveModeRunResultType::AgentsView);
                 }
                 // Ctrl+S: `handlePromptStash` (interactive-mode.ts:4379-4394).
                 InputAction::PromptStash => {
@@ -2163,7 +2132,11 @@ async fn run_terminal(
                 InputAction::SessionNew => submit(&connection, &send, "/new".into(), false, None),
                 InputAction::SessionTree => submit(&connection, &send, "/tree".into(), false, None),
                 InputAction::SessionFork => submit(&connection, &send, "/fork".into(), false, None),
-                InputAction::SessionResume => workspace.focus(&editor),
+                InputAction::SessionResume => {
+                    stash_editor_draft_for_agents_view(&mode, &editor, &current_session_id);
+                    mode.borrow_mut()
+                        .return_to_agents_view(InteractiveModeRunResultType::AgentsView);
+                }
                 // `applyThinkingLevel` (interactive-mode.ts:8309-8321): the picker
                 // already closed itself, so only the level is applied.
                 InputAction::ThinkingLevel(level) => {
@@ -2474,7 +2447,6 @@ async fn run_terminal(
                         );
                     }
                     mode.borrow_mut().reset_subagent_summary();
-                    workspace.set_current(&state);
                     current_session_id = state.session_id.clone();
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
@@ -2510,7 +2482,6 @@ async fn run_terminal(
                             );
                         }
                     }
-                    workspace.set_current(&snapshot.state);
                     current_session_id = snapshot.state.session_id.clone();
                     queue_runtime.reset_session(current_session_id.clone());
                     mode.borrow_mut()
@@ -3011,7 +2982,12 @@ async fn run_terminal(
                         }
                     }
                 }
-                HostEvent::AgentsView => workspace.focus(&editor),
+                HostEvent::AgentsView => {
+                    // `requestAgentsView` (interactive-mode.ts:3509-3519): resident
+                    // sessions return to the agents view, ephemeral ones report why
+                    // they cannot.
+                    mode.borrow_mut().request_agents_view();
+                }
                 HostEvent::Error(error) => mode.borrow_mut().show_error(&error),
                 HostEvent::Fullscreen(requested) => {
                     apply_fullscreen_request(requested, &mode, &editor, &ui, &transcript)
@@ -3102,11 +3078,6 @@ async fn run_terminal(
                 }
             });
         }
-        workspace.poll(&ui);
-        if workspace.next.is_some() {
-            stash_editor_draft_for_agents_view(&mode, &editor, &current_session_id);
-            break;
-        }
         if mode.borrow().shutdown_requested {
             break;
         }
@@ -3154,9 +3125,6 @@ async fn run_terminal(
         editor.borrow_mut().editor_mut().set_terminal_rows(rows);
         editor.borrow_mut().editor_mut().poll_autocomplete();
         ui_metrics.session(&current_session_id);
-        if workspace.state.borrow().focused {
-            editor.borrow_mut().editor_mut().set_focused(false);
-        }
         let render_requested = ui.borrow().render_requested();
         let render_started = Instant::now();
         ui.borrow_mut().run_pending_render(now_ms());
@@ -3185,7 +3153,7 @@ async fn run_terminal(
     logins.cancel_current();
     mode.borrow_mut().shutdown().await;
     drop(guard);
-    let returning_to_browser = workspace.next.is_some() || mode.borrow().agents_view_request.is_some();
+    let returning_to_browser = mode.borrow().agents_view_request.is_some();
     let cleanup = close_session_view(connection.clone(), cancelled_dialogs);
     if returning_to_browser {
         // Detach acknowledges are not a prerequisite for drawing the browser.

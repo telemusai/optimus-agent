@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 pub type AppKeybinding = &'static str;
 
 /// `keyof AppKeybindings` in declaration order.
-pub const APP_KEYBINDINGS: [AppKeybinding; 65] = [
+pub const APP_KEYBINDINGS: [AppKeybinding; 59] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -48,20 +48,6 @@ pub const APP_KEYBINDINGS: [AppKeybinding; 65] = [
     "app.modal.back",
     "app.agents.reply",
     "app.agents.new",
-    "app.sidebar.focus",
-    "app.sidebar.chat",
-    "app.sidebar.addFolder",
-    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
-    // repair25-layout lane, root-approved): UI-010 sidebar shortcuts. Defaults
-    // are the user-requested Ctrl+H / Ctrl+M; host dispatch gates them on
-    // pi_tui::tui::is_unambiguous_ctrl_combo so the raw Enter/Backspace-class
-    // bytes they share on legacy terminals never trigger the actions.
-    "app.sidebar.toggleVisibility",
-    "app.sidebar.toggleSide",
-    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
-    // repair25-layout lane, root-approved): registered for the integrator's
-    // UI-009 full-location view; host wiring lives in the integrator's files.
-    "app.sidebar.location",
     "app.agents.delete",
     "app.agents.program",
     "app.agents.rename",
@@ -445,35 +431,6 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
             default_key_scope: None,
         },
     );
-    for (id, key, description) in [
-        ("app.sidebar.focus", "left", "Focus sessions when the prompt cursor is at the start"),
-        ("app.sidebar.chat", "right", "Return focus to the chat"),
-        ("app.sidebar.addFolder", "ctrl+a", "Add an existing folder to the session sidebar"),
-    ] {
-        map.insert(id.to_string(), KeybindingDefinition {
-            default_keys: vec![key.to_string()],
-            default_keys_is_single: true,
-            description: Some(description.to_string()),
-            default_key_scope: None,
-        });
-    }
-    // SHARED FILE EDIT (core/keybindings.rs, DEFAULT-only addition by
-    // repair25-layout lane, root-approved): see `APP_KEYBINDINGS`. Hosts pair
-    // these with pi_tui::tui::is_unambiguous_ctrl_combo so raw CR/BS/DEL keep
-    // their editing meaning on terminals that cannot distinguish the combos.
-    for (id, key, description) in [
-        ("app.sidebar.toggleVisibility", "ctrl+h", "Hide or show the session sidebar"),
-        ("app.sidebar.toggleSide", "ctrl+m", "Move the session sidebar to the other edge"),
-        // Registered on behalf of the integrator's UI-009 full-location view.
-        ("app.sidebar.location", "ctrl+shift+l", "Show the full location of the selected project or chat"),
-    ] {
-        map.insert(id.to_string(), KeybindingDefinition {
-            default_keys: vec![key.to_string()],
-            default_keys_is_single: true,
-            description: Some(description.to_string()),
-            default_key_scope: None,
-        });
-    }
     map.insert(
         "app.agents.delete".to_string(),
         KeybindingDefinition {
@@ -1007,6 +964,15 @@ mod tests {
 
     fn list(values: &[&str]) -> KeybindingSetting {
         KeybindingSetting::List(values.iter().map(|value| value.to_string()).collect())
+    }
+
+    #[test]
+    fn ui014_session_list_keys_remain_without_sidebar_actions() {
+        let definitions = keybindings();
+        assert!(definitions.keys().all(|key| !key.starts_with("app.sidebar.")));
+        assert_eq!(definitions["app.agents.back"].default_keys, vec!["left"]);
+        assert_eq!(definitions["app.agents.open"].default_keys, vec!["right"]);
+        assert!(definitions.contains_key("app.session.resume"));
     }
 
     #[test]

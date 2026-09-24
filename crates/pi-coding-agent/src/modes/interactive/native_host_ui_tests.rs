@@ -2,11 +2,13 @@
 use super::*;
 use pi_ai::types::{AssistantMessage, ContentBlock, Message, TextContent, ToolCall, UserContent, UserMessage};
 use pi_tui::terminal::{Terminal, TerminalStopOptions};
+use pi_tui::tui::Focusable;
 
 type InputHandler = Rc<RefCell<Option<Box<dyn Fn(String)>>>>;
 
 struct FrameTerminal {
     frame: Rc<RefCell<Vec<String>>>,
+    raw: Rc<RefCell<String>>,
     width: Rc<Cell<usize>>,
     height: Rc<Cell<usize>>,
     input: InputHandler,
@@ -18,6 +20,7 @@ impl Terminal for FrameTerminal {
     fn stop(&mut self, _: TerminalStopOptions) {}
     fn drain_input(&mut self, _: u64, _: u64) {}
     fn write(&mut self, data: &str) {
+        self.raw.borrow_mut().push_str(data);
         let mut frame = self.frame.borrow_mut();
         frame.resize(self.height.get(), String::new());
         if data.contains("\x1b[2J") { frame.fill(String::new()); }
@@ -56,6 +59,7 @@ pub(super) struct FrameHarness {
     pub(super) width: Rc<Cell<usize>>,
     pub(super) height: Rc<Cell<usize>>,
     frame: Rc<RefCell<Vec<String>>>,
+    raw: Rc<RefCell<String>>,
     input: InputHandler,
 }
 
@@ -70,23 +74,35 @@ impl FrameHarness {
 
     fn with_mode(mode: Rc<RefCell<InteractiveMode>>, editor: Option<Rc<RefCell<CustomEditor>>>) -> Self {
         let frame = Rc::new(RefCell::new(Vec::new()));
+        let raw = Rc::new(RefCell::new(String::new()));
         let width = Rc::new(Cell::new(80));
         let height = Rc::new(Cell::new(24));
         let input = Rc::new(RefCell::new(None));
         let ui = Rc::new(RefCell::new(TUI::new(Box::new(FrameTerminal {
-            frame: frame.clone(), width: width.clone(), height: height.clone(), input: input.clone(), mouse_tracking: false,
+            frame: frame.clone(), raw: raw.clone(), width: width.clone(), height: height.clone(), input: input.clone(), mouse_tracking: false,
         }), None)));
         let editor = editor.unwrap_or_else(|| Rc::new(RefCell::new(CustomEditor::new(ui.clone(), editor_theme(), CustomEditorOptions::default()))));
         let transcript = Rc::new(RefCell::new(Transcript::new(mode.clone())));
         ui.borrow_mut().set_focus(Some(editor.clone()));
         ui.borrow_mut().start();
         native_settings::fullscreen(true, &mode, &editor, &ui, &transcript);
-        Self { mode, transcript, editor, ui, width, height, frame, input }
+        Self { mode, transcript, editor, ui, width, height, frame, raw, input }
     }
 
     pub(super) fn paint(&self) -> Vec<String> {
         self.ui.borrow_mut().do_render();
         self.frame.borrow().clone()
+    }
+
+    fn capture(&self, name: &str) -> Vec<String> {
+        self.raw.borrow_mut().clear();
+        self.ui.borrow_mut().request_render_forced();
+        let frame = self.paint();
+        if let Ok(directory) = std::env::var("OPTIMUS_UI_PROOF_DIR") {
+            std::fs::create_dir_all(&directory).unwrap();
+            std::fs::write(std::path::Path::new(&directory).join(name), self.raw.borrow().as_bytes()).unwrap();
+        }
+        frame
     }
 
     pub(super) fn key(&self, data: &str) {
@@ -134,6 +150,51 @@ fn unused_connection() -> Arc<dyn wire::AgentConnection> {
     Arc::new(crate::modes::agent_connection::daemon_agent_connection::DaemonAgentConnection::new(
         Arc::new(crate::main_entry::MainEntryDaemonTransport::new(client)), "active".into(), Default::default(),
     ))
+}
+
+
+#[test]
+fn ui014_full_width_chat_and_summary_render_without_a_session_side_panel() {
+    let h = FrameHarness::new("ui014-full-width");
+    h.width.set(120);
+    h.height.set(32);
+    h.mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
+        session_id: "ui014-full-width".into(), active_session_id: Some("parent".into()),
+        session_name: Some("Full-width parent chat".into()), cwd: "C:/synthetic/project".into(),
+        ..Default::default()
+    });
+    h.mode.borrow_mut().replace_subagent_summary(Some(&[
+        local::AgentConnectionRlmChildAgentSnapshot { id: "direct-child".into(),
+            active_session_id: Some("child".into()), status: "running".into(), ..Default::default() }
+    ]));
+    let bar = Rc::new(RefCell::new(native_subagents::Bar::new(h.mode.clone())));
+    h.transcript.borrow_mut().subagents = Some(bar.clone());
+    // Production installs the bar before entering fullscreen. This harness
+    // starts with a dock, so leave it before composing the production dock.
+    h.ui.borrow_mut().exit_fullscreen(pi_tui::tui::ExitFullscreenOptions {
+        flush: false, leave_alt_screen: false,
+    });
+    native_settings::fullscreen(true, &h.mode, &h.editor, &h.ui, &h.transcript);
+    h.transcript.borrow_mut().message(user("Restore the session list and keep the chat full width."), false);
+    let line = format!("FULL_LEFT {} FULL_RIGHT", "content ".repeat(11));
+    h.transcript.borrow_mut().message(assistant(&line), false);
+    h.editor.borrow_mut().editor_mut().set_text("keep this parent draft");
+    let frame = h.capture("ui014-chat-120x32.ansi");
+    assert!(frame.iter().any(|row| row.contains("FULL_LEFT") && row.contains("FULL_RIGHT")), "{frame:?}");
+    assert!(frame.iter().all(|row| !row.contains("Location / copy")));
+    let actions = Rc::new(RefCell::new(Vec::new()));
+    assert!(bar.borrow_mut().input("\x1b[B", &h.editor, &actions));
+    let focused = h.capture("ui014-child-summary-focus-120x32.ansi");
+    assert!(focused.iter().any(|row| row.contains("1 agent")), "{focused:?}");
+    assert!(focused.iter().any(|row| row.contains("1 running") && row.contains("open")), "focused count and open hint: {focused:?}");
+    assert!(bar.borrow_mut().input("\x1b[A", &h.editor, &actions));
+    assert!(h.editor.borrow().editor().focused());
+    h.width.set(40);
+    h.height.set(18);
+    let narrow = h.capture("ui014-chat-narrow-40x18.ansi");
+    assert_eq!(narrow.len(), 18);
+    assert!(narrow.iter().all(|row| pi_tui::utils::visible_width(row) <= 40));
+    assert_eq!(h.editor.borrow().editor().get_text(), "keep this parent draft");
 }
 
 #[test]
