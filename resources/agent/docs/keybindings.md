@@ -109,6 +109,18 @@ Modifier combinations: `ctrl+shift+x`, `alt+ctrl+x`, `ctrl+shift+alt+x`, `ctrl+1
 | `app.session.fork` | *(none)* | Fork current session (`/fork`) |
 | `app.session.resume` | *(none)* | Open session resume picker (`/resume`) |
 
+### Statistics Panel
+
+These bindings apply while `/stats` is open. Opening or navigating the panel does not interrupt the agent.
+
+| Keybinding id | Default | Description |
+|--------|---------|-------------|
+| `app.stats.toggleSubagents` | `s` | Include or exclude subagents |
+| `app.stats.nextSection` | `tab` | Cycle Overview, Models, JEV, and Trends |
+| `tui.select.cancel` | `escape`, `ctrl+c` | Close the panel |
+| `tui.select.up`, `tui.select.down` | `up`, `down` | Scroll the panel |
+| `tui.editor.pageUp`, `tui.editor.pageDown` | `pageUp`, `pageDown` | Scroll by a page |
+
 ### Models and Thinking
 
 | Keybinding id | Default | Description |

@@ -26,12 +26,26 @@ For the JSONL file format and SessionManager API, see [Session Format](session-f
 | `/name <name>` | Set the current session display name |
 | `/session` | Show session info |
 | `/usage` | Show token, cost, and context usage |
+| `/stats` | Open live model usage, context, and JEV statistics with ASCII charts |
 | `/tree` | Navigate the current session tree |
 | `/fork` | Create a new session from a previous user message |
 | `/clone` | Duplicate the current active branch into a new session |
 | `/compact [prompt]` | Summarize older context; see [Compaction](compaction.md) |
 | `/export [file]` | Export session to HTML |
 | `/share` | Upload as private GitHub gist with shareable HTML link |
+
+## Live Statistics
+
+`/stats` opens a read-only dashboard directly above the chat input without sending a model request or interrupting ongoing work. It refreshes every two seconds while open and closes with Escape. The default scope is the current chat; press `s` to include its subagents. Press Tab to cycle through Overview, Models, JEV, and Trends, and use Up/Down or PageUp/PageDown to scroll.
+
+The dashboard uses themed ASCII bars and a tokens-per-user-turn histogram. It requires no image protocol, plotting library, or special font, and remains readable without colour.
+
+- Model usage includes reported input, output, cache reads, cache writes, and estimated cost. The current branch's saved history keeps usage from before compaction. Child usage attributed to parent responses is subtracted before the optional subagent totals are added.
+- Context usage and the trend chart describe the current chat. The cache-read percentage uses the selected scope. Calls count recorded model responses, not physical transport retries. Missing usage and unrecorded prices are labelled rather than treated as measured zero.
+- JEV history comes from retained local records for the selected sessions. Batched questions and Compare + Active rows share request-level usage, which is counted once. Live JEV activity describes the current chat's worker.
+- Savings show recorded, applied candidate-token estimates. Compare projections never count as applied savings. JEV overhead and immediate compaction reduction are separate; none of these figures claims a measured reduction in billing or future requests. Missing projections show `unavailable`. Rotated JEV logs and unavailable child files can make historical coverage incomplete.
+
+The stats panel reuses the existing read-only session APIs and makes no daemon protocol changes. On older workers or where session files cannot be read, unavailable metrics degrade locally.
 
 ## Resuming and Deleting Sessions
 

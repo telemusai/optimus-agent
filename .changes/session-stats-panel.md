@@ -1,0 +1,1 @@
+- Added `/stats`, a live ASCII dashboard for per-model tokens and estimated cost, context and caching, JEV activity, and recorded savings estimates. Escape closes the panel without interrupting work; subagent usage is an optional toggle.

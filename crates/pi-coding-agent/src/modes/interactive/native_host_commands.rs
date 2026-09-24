@@ -1,6 +1,12 @@
 //! Native owner-thread dialogs for the remaining interactive slash commands.
 use super::*;
 
+#[path = "session_stats_data.rs"]
+mod stats_data;
+#[path = "session_stats_panel.rs"]
+mod stats_panel;
+pub(super) use stats_panel::StatsDock;
+
 // Jev surfaces. Registered here (inside the lane-C-owned file) with `#[path]`
 // sibling declarations, so the new files need no edit to `native_host.rs`.
 #[path = "jev_menu.rs"]
@@ -22,6 +28,7 @@ use crate::modes::interactive::components::{
 use tokio::sync::{mpsc as async_mpsc, oneshot};
 
 pub(super) enum Dialog {
+    Stats,
     Logout(
         Vec<crate::modes::interactive::components::oauth_selector::AuthSelectorProvider>,
         oneshot::Sender<Option<String>>,
@@ -89,6 +96,9 @@ pub(super) fn mount(
     connection: Arc<dyn wire::AgentConnection>,
     send: mpsc::Sender<HostEvent>,
 ) -> Rc<RefCell<dyn TuiComponent>> {
+    if let Dialog::Stats = dialog {
+        return Rc::new(RefCell::new(stats_panel::StatsPanel::new(connection, send, ui)));
+    }
     // SHARED FILE EDIT (native_host_commands.rs, jev-ui lane): the two `/jev`
     // overlay mounts. Additive branches ahead of the existing ones.
     if let Dialog::Jev(active_mode, events) = dialog {
@@ -141,7 +151,7 @@ pub(super) fn mount(
     }
     let (reply, content) = match dialog {
         // Handled above; listed so a future `Dialog` variant forces an update here.
-        Dialog::Jev(..) | Dialog::JevKey(..) => unreachable!(),
+        Dialog::Stats | Dialog::Jev(..) | Dialog::JevKey(..) => unreachable!(),
         Dialog::Select(title, values, reply) => (reply, (Some(title), values, None, None, false)),
         Dialog::Input(title, multiline, reply) => {
             (reply, (Some(title), Vec::new(), None, None, multiline))
@@ -282,6 +292,12 @@ pub(super) async fn run(
     args: &str,
 ) -> Result<CommandOutput, String> {
     match name {
+        "stats" => {
+            if !args.trim().is_empty() {
+                return Err("Usage: /stats (S toggles subagents; Tab changes section; Esc closes)".into());
+            }
+            send.send(HostEvent::CommandDialog(Dialog::Stats)).map_err(|error| error.to_string())?;
+        }
         "fork" => {
             let messages = connection.get_user_messages_for_forking().await?;
             if messages.is_empty() {
