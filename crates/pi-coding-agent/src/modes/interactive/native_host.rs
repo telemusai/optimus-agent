@@ -78,6 +78,8 @@ mod native_settings;
 mod native_state;
 #[path = "native_host_status.rs"]
 mod native_status;
+#[path = "native_host_clipboard.rs"]
+mod native_clipboard;
 #[path = "native_host_commands.rs"]
 mod native_commands;
 // Child-session mode inheritance (integration hunk C-4) uses the /jev mode
@@ -146,6 +148,7 @@ impl<T: TuiComponent> TuiComponent for SharedComponent<T> {
 }
 
 struct Transcript {
+    clipboard_notice: native_clipboard::Notice,
     recovery_notices: Vec<Rc<RefCell<native_recovery_notice::RecoveryNotice>>>,
     refinement_outcomes: Vec<Rc<RefCell<RefinementOutcomeMessageComponent>>>,
     subagents: Option<Rc<RefCell<native_subagents::Bar>>>,
@@ -258,6 +261,7 @@ impl Transcript {
 
     fn new(mode: Rc<RefCell<InteractiveMode>>) -> Self {
         Self {
+            clipboard_notice: native_clipboard::Notice::default(),
             recovery_notices: Vec::new(),
             refinement_outcomes: Vec::new(),
             subagents: None,
@@ -284,6 +288,7 @@ impl Transcript {
     }
     fn replace(&mut self, messages: Vec<AgentMessage>) {
         self.history = None;
+        self.clipboard_notice = native_clipboard::Notice::default();
         self.rows.clear();
         self.row_keys.clear();
         self.row_metadata.clear();
@@ -584,6 +589,9 @@ impl TuiComponent for Transcript {
         for container in mode.get_prompt_context_containers() {
             lines.extend(local::Component::render(container, width.max(1.0) as usize));
         }
+        if let Some(message) = self.clipboard_notice.text() {
+            lines.push(theme().fg("dim", message));
+        }
         if mode.restored_draft_notice.borrow().is_some() {
             lines.push(theme().fg("dim", "Draft restored"));
         }
@@ -779,6 +787,7 @@ enum HostEvent {
     Connection(wire::AgentConnectionEvent),
     Completed(Result<(), String>),
     Status(String),
+    ClipboardNotice(String),
     /// A local command's reply that lands in the chat as a message
     /// (`chatContainer.addChild(new Text(info, 1, 0))`, e.g. `/session`
     /// interactive-mode.ts:9499-9501).
@@ -1660,7 +1669,7 @@ async fn run_terminal(
             let (text, send) = (text.to_owned(), send.clone());
             tokio::spawn(async move {
                 let event = match crate::utils::clipboard::copy_to_clipboard(&text).await {
-                    Ok(outcome) => HostEvent::Status(outcome.status().to_string()),
+                    Ok(outcome) => HostEvent::ClipboardNotice(outcome.status().to_string()),
                     Err(error) => HostEvent::Error(error.to_string()),
                 };
                 let _ = send.send(event);
@@ -2763,6 +2772,9 @@ async fn run_terminal(
                     );
                 }
                 HostEvent::Status(status) => mode.borrow_mut().show_status(&status, "dim"),
+                HostEvent::ClipboardNotice(message) => {
+                    transcript.borrow_mut().clipboard_notice.show(message, Instant::now());
+                }
                 HostEvent::Warning(warning) => mode.borrow_mut().show_warning(&warning),
                 HostEvent::Panel(panel) => {
                     transcript.borrow_mut().panel(&panel);
@@ -3121,6 +3133,9 @@ async fn run_terminal(
         // `showCtrlCExitHint`'s 2 s timer has no Rust counterpart, so the host
         // expires the hint on its own 16 ms cadence (interactive-mode.ts:7018-7025).
         mode.borrow_mut().expire_ctrl_c_exit_hint();
+        if transcript.borrow_mut().clipboard_notice.expire(Instant::now()) {
+            ui.borrow_mut().request_render();
+        }
         history_runtime.poll(&mode, &transcript, &ui);
         if let Some(bridge) = &local_extension_bridge {
             *bridge.editor_text.lock().unwrap_or_else(|e| e.into_inner()) = editor.borrow().editor().get_text();
@@ -3548,6 +3563,7 @@ fn should_record_prompt_history(text: &str) -> bool {
 enum CommandOutput {
     Nothing,
     Status(String),
+    ClipboardNotice(String),
     Warning(String),
     EchoLocal(String),
     /// `echoLocalCommand(text)` followed by the command's own panel.
@@ -3595,6 +3611,9 @@ impl CommandOutput {
             CommandOutput::Status(status) => {
                 mode.borrow_mut().show_status(&status, "dim");
             }
+            CommandOutput::ClipboardNotice(message) => {
+                let _ = send.send(HostEvent::ClipboardNotice(message));
+            }
             CommandOutput::Warning(warning) => {
                 mode.borrow_mut().show_warning(&warning);
             }
@@ -3631,6 +3650,7 @@ impl CommandOutput {
         match self {
             CommandOutput::Nothing => Vec::new(),
             CommandOutput::Status(status) => vec![HostEvent::Status(status)],
+            CommandOutput::ClipboardNotice(message) => vec![HostEvent::ClipboardNotice(message)],
             CommandOutput::Warning(warning) => vec![HostEvent::Warning(warning)],
             CommandOutput::EchoLocal(text) => vec![HostEvent::EchoLocal(text)],
             CommandOutput::EchoPanel { command, panel } => {
@@ -4084,14 +4104,14 @@ async fn run_builtin_command(
         // `commandName === "copy"` (interactive-mode.ts:4868-4872, 9395-9408).
         "copy" => {
             let Some(last) = connection.get_last_assistant_text().await? else {
-                return Ok(CommandOutput::Status(
+                return Ok(CommandOutput::ClipboardNotice(
                     "No agent messages to copy yet.".to_string(),
                 ));
             };
             let outcome = crate::utils::clipboard::copy_to_clipboard(&last)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(CommandOutput::Status(outcome.status().to_string()))
+            Ok(CommandOutput::ClipboardNotice(outcome.status().to_string()))
         }
         // `commandName === "clone"` (interactive-mode.ts:4942-4945, 8582-8602).
         "clone" => {
@@ -6152,6 +6172,7 @@ mod tests {
                 HostEvent::Connection(_) => "Connection",
                 HostEvent::Completed(_) => "Completed",
                 HostEvent::Status(_) => "Status",
+                HostEvent::ClipboardNotice(_) => "ClipboardNotice",
                 HostEvent::Panel(_) => "Panel",
                 HostEvent::EchoLocal(_) => "EchoLocal",
                 HostEvent::ContextTree(_) => "ContextTree",

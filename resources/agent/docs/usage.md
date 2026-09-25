@@ -62,6 +62,14 @@ Type `/` in the editor to open command completion. Extensions can register custo
 | `/changelog` | Display version history |
 | `/quit` | Quit Prime Agent |
 
+### Clipboard feedback
+
+Mouse-selection copy and `/copy` show feedback for three seconds, then remove only
+that notice. Other status messages remain unchanged. Repeated copies restart the
+notice timer. “Copied to local clipboard” means a local backend accepted the text;
+terminal forwarding remains explicitly unconfirmed and requires OSC 52 support.
+Copy failures remain visible as errors.
+
 ## Message Queue
 
 You can submit messages while the agent is still working:
