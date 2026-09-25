@@ -1,0 +1,1 @@
+- Fixed mouse-selection and `/copy` feedback remaining on screen indefinitely; notices now expire after three seconds without removing unrelated status messages or changing clipboard delivery guarantees.
