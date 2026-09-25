@@ -66,8 +66,9 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // The existing jev_control capability gates reads; missing usage degrades locally.
 // Revision 32 adds optional typed tool isError / executionReports metadata.
 // Native lifecycle host requests are separately capability-gated and never required at startup.
-pub const DAEMON_SCHEMA_REVISION: u32 = 32;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-32-c16da0e12d5a";
+// Revision 33 advertises optional jev_dynamic tool support; existing commands/events are unchanged.
+pub const DAEMON_SCHEMA_REVISION: u32 = 33;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-c16da0e12d5a";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -150,6 +151,8 @@ pub enum DaemonServerCapability {
     // Combined Compare + Active mode and optional feature/compaction settings metadata.
     // Clients must negotiate this before sending the combined mode or relying on its metadata.
     JevFeatures,
+    /// Explicit agent-authored questions via the optional jev_decide tool.
+    JevDynamic,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -200,7 +203,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 24] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 25] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -225,6 +228,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 24] = [
     DaemonServerCapability::AcpMcpServers,
     DaemonServerCapability::JevControl,
     DaemonServerCapability::JevFeatures,
+    DaemonServerCapability::JevDynamic,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.

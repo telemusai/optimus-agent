@@ -1441,6 +1441,8 @@ pub enum DecisionCategory {
     FirstPassVerification,
     RetryClassification,
     TraceAssessment,
+    /// Explicit agent-authored questions; never an automatic control recommendation.
+    Dynamic,
 }
 
 impl DecisionCategory {
@@ -1468,11 +1470,12 @@ impl DecisionCategory {
             DecisionCategory::FirstPassVerification => "first_pass_verification",
             DecisionCategory::RetryClassification => "retry_classification",
             DecisionCategory::TraceAssessment => "trace_assessment",
+            DecisionCategory::Dynamic => "dynamic",
         }
     }
 
     /// All categories in canonical order.
-    pub fn all() -> [DecisionCategory; 21] {
+    pub fn all() -> [DecisionCategory; 22] {
         [
             DecisionCategory::TaskClassification,
             DecisionCategory::Complexity,
@@ -1495,6 +1498,7 @@ impl DecisionCategory {
             DecisionCategory::FirstPassVerification,
             DecisionCategory::RetryClassification,
             DecisionCategory::TraceAssessment,
+            DecisionCategory::Dynamic,
         ]
     }
 
@@ -1517,11 +1521,12 @@ impl fmt::Display for DecisionCategory {
     }
 }
 
-/// Category switches enabled; optional observers also require their feature flag.
+/// Automatic category switches; optional observers also require their feature flag.
+/// Explicit Dynamic questions never enter the comparison lane.
 pub fn compare_default_categories() -> BTreeMap<DecisionCategory, bool> {
     DecisionCategory::all()
         .into_iter()
-        .map(|category| (category, true))
+        .map(|category| (category, category != DecisionCategory::Dynamic))
         .collect()
 }
 

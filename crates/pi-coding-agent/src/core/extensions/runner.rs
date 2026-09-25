@@ -1875,6 +1875,7 @@ pub fn create_extension_runner(
     // file; integration may relocate the call to the session assembly site.
     let mut extensions = extensions;
     crate::core::jev_bridge::maybe_register_jev_observer(&mut extensions);
+    crate::core::jev_bridge::dynamic::register(&mut extensions, runtime.clone());
     Arc::new(ExtensionRunner::new(
         extensions,
         runtime,

@@ -73,7 +73,7 @@ fn jev_new_client_old_daemon_keeps_legacy_commands_without_enabling_combined_mod
 fn jev_expansion_requires_both_capabilities_and_schema_revision() {
     let command = mode_command("compare-active");
     assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-    assert_eq!(DAEMON_SCHEMA_REVISION, 32);
+    assert_eq!(DAEMON_SCHEMA_REVISION, 33);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevControl));
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevFeatures));
     assert!(!supported(
@@ -260,4 +260,22 @@ fn jev_usage_metadata_is_optional_for_both_peer_generations() {
     let legacy: LegacyPipeline = serde_json::from_value(response.data.unwrap()["pipeline"].clone()).unwrap();
     assert_eq!(legacy.success_count, 2);
     assert_eq!(daemon_outbound_compatibility("response"), DaemonCommandCompatibility::legacy());
+}
+
+#[test]
+fn jev_dynamic_is_additive_without_new_commands_or_startup_requirements() {
+    assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevDynamic));
+    for capabilities in [vec!["jev_control", "jev_features"], vec!["jev_control", "jev_features", "jev_dynamic"]] {
+        let current = hello(DAEMON_SCHEMA_REVISION, &capabilities);
+        for mode in ["off", "compare", "active", "compare-active"] {
+            assert!(supported(&current, &mode_command(mode)));
+        }
+        let body = json!({"type":"jev_get_status", "activeSessionId":"session-a"}).as_object().unwrap().clone();
+        assert!(supported(&current, &body));
+    }
+    // Older settings readers ignore the new feature member.
+    #[derive(Deserialize)]
+    struct LegacyFeatures { tool_requirement: bool }
+    let legacy: LegacyFeatures = serde_json::from_value(json!({"tool_requirement":true,"dynamic":true})).unwrap();
+    assert!(legacy.tool_requirement);
 }

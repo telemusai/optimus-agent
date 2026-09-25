@@ -1423,7 +1423,7 @@ fn negative_regression_baseline_delegation_is_unchanged() {
         let calls = calls_on_a_connection(&source);
         for call in &calls {
             assert!(
-                matches!(call.as_str(), "get_state" | "get_jev_status" | "supports_jev_features"),
+                matches!(call.as_str(), "get_state" | "get_jev_status" | "supports_jev_features" | "supports_jev_dynamic"),
                 "{file} may only READ the session (found {call})"
             );
         }
@@ -1623,7 +1623,7 @@ fn the_jev_surface_cannot_express_a_model_or_subagent_control_action() {
     let connection_calls = calls_on_a_connection(&host);
     assert_eq!(
         connection_calls,
-        vec!["get_jev_status".to_string(), "get_state".to_string(), "supports_jev_features".to_string()],
+        vec!["get_jev_status".to_string(), "get_state".to_string(), "supports_jev_dynamic".to_string(), "supports_jev_features".to_string()],
         "only identity and worker telemetry reads are allowed"
     );
     assert!(host.contains("connection.get_state().await?"));
@@ -1890,7 +1890,7 @@ fn an_operative_footer_is_green_names_its_mode_and_off_is_red() {
 #[test]
 fn the_keybinding_addition_has_no_default_key_and_keeps_the_app_order() {
     let keybindings = crate_file("src/core/keybindings.rs");
-    assert!(keybindings.contains("pub const APP_KEYBINDINGS: [AppKeybinding; 57] = ["));
+    assert!(keybindings.contains("pub const APP_KEYBINDINGS: [AppKeybinding;"));
     assert!(keybindings.contains("\"app.jev.cancel\","));
     let definition = keybindings
         .split("\"app.jev.cancel\".to_string(),")
@@ -1899,15 +1899,16 @@ fn the_keybinding_addition_has_no_default_key_and_keeps_the_app_order() {
     assert!(definition.contains("default_keys: vec![]"), "{definition}");
     assert!(definition.contains("default_keys_is_single: false"), "{definition}");
     assert!(definition.contains("Cancel the /jev dialog"), "{definition}");
-    // The declaration order test is driven by the constant, so the entry must be
-    // last in both places or `keybindings_spread_tui_entries_first_then_app_entries`
-    // fails. Guard that ordering here as well.
+    // Preserve Jev's declaration order without assuming later features cannot
+    // append their own bindings (Stats already does).
     let list = keybindings
         .split("pub const APP_KEYBINDINGS")
         .nth(1)
         .expect("the constant");
     let list = list.split("];").next().unwrap();
-    assert!(list.trim_end().ends_with("\"app.jev.cancel\","), "{list}");
+    assert_eq!(list.matches("\"app.jev.cancel\"").count(), 1);
+    assert!(list.find("\"app.tree.filter.cycleBackward\"").unwrap()
+        < list.find("\"app.jev.cancel\"").unwrap());
 }
 
 #[test]
@@ -2406,9 +2407,10 @@ fn the_row_ladder_keeps_the_counter_visible_and_the_baseline_shared() {
     );
     assert_eq!(
         render_row.matches("lines.push").count(),
-        1,
-        "exactly one extra line: goal/heartbeat only"
+        2,
+        "one conditional goal/heartbeat line plus the composed baseline"
     );
+    assert_eq!(render_row.matches("lines.push(composed)").count(), 1);
 }
 
 #[test]
@@ -2857,4 +2859,14 @@ fn full_jev_concurrent_bridge_instances_see_each_others_writes() {
         FullJevChange::Removed { was_active: true }
     ));
     assert!(!bridge_a.settings().full_jev_active());
+}
+
+#[test]
+fn dynamic_command_shorthand_and_explicit_toggles_parse() {
+    for command in ["feature dynamic", "feature dynamic on"] {
+        assert_eq!(parse_jev_request(command), JevRequest::SetFeature(JevFeature::Dynamic, true));
+    }
+    assert_eq!(parse_jev_request("feature dynamic off"), JevRequest::SetFeature(JevFeature::Dynamic, false));
+    assert!(render_help().contains("/jev feature dynamic"));
+    assert!(JEV_FULL_JEV_ON_NOTICE.contains("Dynamic questions"));
 }

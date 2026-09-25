@@ -124,6 +124,8 @@ pub struct JevFeatures {
     /// actual supplied source span. Defaults to `false`; the full-jev
     /// overlay forces it on.
     pub citation_check: bool,
+    /// Agent-authored typed questions through the jev_decide tool.
+    pub dynamic: bool,
 }
 
 impl Default for JevFeatures {
@@ -148,6 +150,7 @@ impl Default for JevFeatures {
             guardrails_output: false,
             retrieval_safety: false,
             citation_check: false,
+            dynamic: false,
         }
     }
 }
@@ -178,10 +181,11 @@ pub enum JevFeature {
     RetrievalSafety,
     /// ROOT-CONTRACT v6 (Evidence lane): citation check.
     CitationCheck,
+    Dynamic,
 }
 
 impl JevFeature {
-    pub const ALL: [Self; 19] = [
+    pub const ALL: [Self; 20] = [
         Self::ToolRequirement,
         Self::Complexity,
         Self::ToolCandidates,
@@ -201,6 +205,7 @@ impl JevFeature {
         Self::GuardrailsOutput,
         Self::RetrievalSafety,
         Self::CitationCheck,
+        Self::Dynamic,
     ];
 
     pub fn as_str(self) -> &'static str {
@@ -224,6 +229,7 @@ impl JevFeature {
             Self::GuardrailsOutput => "guardrails_output",
             Self::RetrievalSafety => "retrieval_safety",
             Self::CitationCheck => "citation_check",
+            Self::Dynamic => "dynamic",
         }
     }
 
@@ -255,6 +261,7 @@ impl JevFeatures {
             JevFeature::GuardrailsOutput => self.guardrails_output,
             JevFeature::RetrievalSafety => self.retrieval_safety,
             JevFeature::CitationCheck => self.citation_check,
+            JevFeature::Dynamic => self.dynamic,
         }
     }
 
@@ -279,6 +286,7 @@ impl JevFeatures {
             JevFeature::GuardrailsOutput => self.guardrails_output = enabled,
             JevFeature::RetrievalSafety => self.retrieval_safety = enabled,
             JevFeature::CitationCheck => self.citation_check = enabled,
+            JevFeature::Dynamic => self.dynamic = enabled,
         }
     }
 }
@@ -422,6 +430,7 @@ pub const FULL_JEV_FEATURES: JevFeatures = JevFeatures {
     guardrails_output: true,
     retrieval_safety: true,
     citation_check: true,
+    dynamic: true,
 };
 
 /// Compaction under the full-jev overlay: on, still request-local and

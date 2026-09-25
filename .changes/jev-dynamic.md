@@ -1,0 +1,2 @@
+- Added `/jev feature dynamic` and the native `jev_decide` tool for agent-authored Choice, Noul and Score questions, with batched requests and optional local sampling of Choice probabilities.
+- Added Dynamic to Full Jev, with session usage accounting, cancellation, validated results and a capability gate for attached daemons.

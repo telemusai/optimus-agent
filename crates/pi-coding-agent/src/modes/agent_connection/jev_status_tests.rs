@@ -5,6 +5,7 @@ use super::*;
 struct StatusTransport {
     supported: bool,
     features_supported: bool,
+    dynamic_supported: bool,
     response: Result<DaemonResponse, String>,
     requests: Mutex<Vec<(Value, Option<u64>, bool)>>,
     entered: Arc<tokio::sync::Semaphore>,
@@ -16,6 +17,7 @@ impl StatusTransport {
         Arc::new(Self {
             supported,
             features_supported: false,
+            dynamic_supported: false,
             response: Ok(DaemonResponse::ok(data)),
             requests: Mutex::new(Vec::new()),
             entered: Arc::new(tokio::sync::Semaphore::new(0)),
@@ -45,6 +47,7 @@ impl DaemonTransportClient for StatusTransport {
         match capability {
             "jev_control" => self.supported,
             "jev_features" => self.features_supported,
+            "jev_dynamic" => self.dynamic_supported,
             _ => false,
         }
     }
@@ -123,6 +126,19 @@ fn jev_feature_settings_gate_uses_the_execution_host_capability_without_requests
         Arc::get_mut(&mut transport).unwrap().features_supported = features_supported;
         let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
         assert_eq!(connection.supports_jev_features(), features_supported);
+        assert!(transport.requests.lock().unwrap().is_empty());
+    }
+}
+
+#[test]
+fn jev_dynamic_requires_its_own_execution_host_capability_without_requests() {
+    for dynamic_supported in [false, true] {
+        let mut transport = StatusTransport::new(true, Value::Null);
+        let fixture = Arc::get_mut(&mut transport).unwrap();
+        fixture.features_supported = true;
+        fixture.dynamic_supported = dynamic_supported;
+        let connection = DaemonAgentConnection::new(transport.clone(), "active-a".into(), Default::default());
+        assert_eq!(connection.supports_jev_dynamic(), dynamic_supported);
         assert!(transport.requests.lock().unwrap().is_empty());
     }
 }

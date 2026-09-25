@@ -80,7 +80,7 @@ pub const JEV_BOUNDARY_NOTICE: &str = "Jev never controls the primary model, pro
 
 /// What `/jev full-jev` (and its explicit `on` spelling) print on install.
 /// Bare full-jev is explicit consent (ROOT-CONTRACT v1): no extra modal.
-pub const JEV_FULL_JEV_ON_NOTICE: &str = "Full-jev is now active globally for this agent dir: mode Compare + Active, every feature gate on (including candidate reranking and line-level semantic find), and independent request-local compaction on. The overlay resolves ABOVE every saved per-session, global and inherited override; those saved values stay on disk unchanged and resolve again the moment you run /jev full-jev off.";
+pub const JEV_FULL_JEV_ON_NOTICE: &str = "Full-jev is now active globally for this agent dir: mode Compare + Active, every feature gate on (including candidate reranking, line-level semantic find and Dynamic questions), and independent request-local compaction on. The overlay resolves ABOVE every saved per-session, global and inherited override; those saved values stay on disk unchanged and resolve again the moment you run /jev full-jev off.";
 
 /// What `/jev full-jev off` prints when the overlay was removed.
 pub const JEV_FULL_JEV_OFF_NOTICE: &str = "Full-jev is now off. The overlay was removed without touching any saved setting, so every chat resolves from its own saved values again.";
@@ -188,6 +188,7 @@ pub fn parse_jev_request(args: &str) -> JevRequest {
         ["compact" | "compaction", value] if toggle(value).is_some() => JevRequest::SetCompaction(toggle(value).unwrap()),
         ["default", "compact" | "compaction", value] if toggle(value).is_some() => JevRequest::SetDefaultCompaction(toggle(value).unwrap()),
         ["default", mode] if JevMode::parse(mode).is_some() => JevRequest::SetDefaultMode(JevMode::parse(mode).unwrap()),
+        ["feature", "dynamic"] => JevRequest::SetFeature(JevFeature::Dynamic, true),
         ["feature", feature, value] if JevFeature::parse(feature).is_some() && toggle(value).is_some() => JevRequest::SetFeature(JevFeature::parse(feature).unwrap(), toggle(value).unwrap()),
         // Bare `full-jev` means ON, exactly like `on` means Compare: no silent
         // shorthand arms a request-changing state (ROOT-CONTRACT v1).
@@ -872,6 +873,7 @@ Compare + Active    Comparison and application from one boundary request.\n\
 Commands: /jev off|compare|active|compare-active|on|status|key|help\n\
 /jev compact on|off|status    Independent request-local compaction control.\n\
 /jev feature <name> on|off   Set one feature gate for this chat.\n\
+/jev feature dynamic [on|off]  Agent-authored Choice, Noul and Score questions (Active modes).\n\
 /jev default <mode>          Default for sessions without a mode override.\n\
 /jev default compact on|off  Default independent compaction toggle.\n\
 /jev key clear              Remove the saved credential.\n\

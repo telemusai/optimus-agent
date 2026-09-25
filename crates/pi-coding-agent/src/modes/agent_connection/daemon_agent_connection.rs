@@ -2828,6 +2828,10 @@ impl AgentConnection for DaemonAgentConnection {
         })
     }
 
+    fn supports_jev_dynamic(&self) -> bool {
+        self.client.supports_server_capability("jev_dynamic")
+    }
+
     fn supports_jev_features(&self) -> bool {
         self.client.supports_server_capability("jev_features")
     }

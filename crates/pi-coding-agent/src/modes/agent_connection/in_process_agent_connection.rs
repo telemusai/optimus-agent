@@ -377,6 +377,8 @@ impl AgentConnection for InProcessAgentConnection {
         Box::pin(async move { Ok(state) })
     }
 
+    fn supports_jev_dynamic(&self) -> bool { true }
+
     fn supports_jev_features(&self) -> bool {
         true
     }
