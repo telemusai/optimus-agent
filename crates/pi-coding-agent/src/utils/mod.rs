@@ -20,6 +20,7 @@ pub mod pi_user_agent;
 pub mod semaphore;
 pub mod shell;
 pub mod sleep;
+pub(crate) mod store_lock;
 pub mod tools_manager;
 pub mod update_source;
 pub mod version_check;

@@ -58,8 +58,14 @@ fn stringify_pretty(value: &serde_json::Value) -> String {
 ///
 /// @returns Provider names that were migrated.
 pub fn migrate_auth_to_auth_json() -> Vec<String> {
-    let agent_dir = get_agent_dir();
-    let auth_path = join_path(&agent_dir, "auth.json");
+    migrate_auth_in_dir(&get_agent_dir(), write_file_atomic_sync)
+}
+
+fn migrate_auth_in_dir(
+    agent_dir: &str,
+    write_auth: impl FnOnce(&str, &str, WriteFileAtomicOptions) -> std::io::Result<()>,
+) -> Vec<String> {
+    let auth_path = join_path(agent_dir, "auth.json");
     let oauth_path = join_path(&agent_dir, "oauth.json");
     let settings_path = join_path(&agent_dir, "settings.json");
 
@@ -118,10 +124,15 @@ pub fn migrate_auth_to_auth_json() -> Vec<String> {
     }
 
     // The destination must be durable before any source is destroyed.
-    if !migrated.is_empty() {
-        let _ = std::fs::create_dir_all(parent_dir(&auth_path));
+    if migrated.is_empty() {
+        return Vec::new();
+    }
+    {
+        if std::fs::create_dir_all(parent_dir(&auth_path)).is_err() {
+            return Vec::new();
+        }
         let real_path = realpath_if_present_sync(&auth_path).unwrap_or_else(|_| auth_path.clone());
-        let _ = write_file_atomic_sync(
+        if write_auth(
             &real_path,
             &stringify_pretty(&serde_json::Value::Object(migrated)),
             WriteFileAtomicOptions {
@@ -130,7 +141,11 @@ pub fn migrate_auth_to_auth_json() -> Vec<String> {
                 fsync_dir: true,
                 before_rename: None,
             },
-        );
+        ).is_err() {
+            // Includes directory-sync failure after rename: keep both sources
+            // and do not report success when durability is uncertain.
+            return Vec::new();
+        }
     }
     // Source cleanup is best-effort: with auth.json durable, leftovers are inert.
     if oauth_readable {
@@ -779,6 +794,27 @@ mod tests {
         raw.insert("tui.editor.cursorUp".to_string(), serde_json::json!("up"));
         let (_config, migrated) = migrate_keybindings_config(&raw);
         assert!(!migrated);
+    }
+
+    #[test]
+    fn auth_migration_preserves_sources_on_destination_failure() {
+        for after_commit in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let oauth = r#"{"synthetic":{"access":"test-only"}}"#;
+            let settings = r#"{"apiKeys":{"other":"test-only"},"theme":"dark"}"#;
+            std::fs::write(dir.path().join("oauth.json"), oauth).unwrap();
+            std::fs::write(dir.path().join("settings.json"), settings).unwrap();
+            let result = migrate_auth_in_dir(dir.path().to_str().unwrap(), |path, data, options| {
+                assert!(options.fsync && options.fsync_dir);
+                assert_eq!(options.mode, Some(0o600));
+                if after_commit { std::fs::write(path, data)?; }
+                Err(std::io::Error::other("injected destination failure"))
+            });
+            assert!(result.is_empty());
+            assert_eq!(std::fs::read_to_string(dir.path().join("oauth.json")).unwrap(), oauth);
+            assert_eq!(std::fs::read_to_string(dir.path().join("settings.json")).unwrap(), settings);
+            assert!(!dir.path().join("oauth.json.migrated").exists());
+        }
     }
 
     #[test]

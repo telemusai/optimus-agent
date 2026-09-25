@@ -74,6 +74,10 @@ mod supervisor_maintenance_tests;
 #[path = "supervisor_core_backlog_tests.rs"]
 mod supervisor_core_backlog_tests;
 
+#[cfg(test)]
+#[path = "supervisor_adoption_retry_tests.rs"]
+mod supervisor_adoption_retry_tests;
+
 #[cfg(all(test, windows))]
 #[path = "worker_stop_safety_tests.rs"]
 mod worker_stop_safety_tests;
@@ -725,10 +729,26 @@ impl Supervisor {
         let result = self.authenticate(&client, &descriptor).await;
         *worker.pending_client.lock().unwrap() = None;
         if let Err(error) = result { client.close_now(); return Err(error); }
+        if self.is_worker_recovery_cancelled(worker) {
+            client.close_now();
+            return Err("Worker recovery cancelled".into());
+        }
         *worker.client.lock().unwrap() = Some(Arc::clone(&client));
-        self.subscribe(worker, &descriptor.root_active_session_id).await?;
-        self.refresh(worker).await?;
-        Ok(())
+        let result = async {
+            self.subscribe(worker, &descriptor.root_active_session_id).await?;
+            if self.is_worker_recovery_cancelled(worker) { return Err("Worker recovery cancelled".into()); }
+            self.refresh(worker).await?;
+            if self.is_worker_recovery_cancelled(worker) { return Err("Worker recovery cancelled".into()); }
+            Ok(())
+        }.await;
+        if result.is_err() { Self::discard_failed_worker_client(worker, &client); }
+        result
+    }
+    fn discard_failed_worker_client(worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>) {
+        let mut current = worker.client.lock().unwrap();
+        if current.as_ref().is_some_and(|current| Arc::ptr_eq(current, client)) { *current = None; }
+        drop(current);
+        client.close_now();
     }
     fn forward_frame(&self, worker: &Worker, frame: &PrivateFrame) {
         let kind = frame.header.get("outboundType").and_then(Value::as_str).unwrap_or("");
@@ -1352,6 +1372,12 @@ impl Supervisor {
                 self.schedule_worker_stop_finalization(&worker);
                 continue;
             }
+            if process_identity_verdict(&identity) == ProcessIdentityVerdict::Unknown {
+                let client = Arc::new(DaemonWorkerClient::new(&descriptor.socket_path));
+                let worker = self.install_worker(descriptor, client.clone());
+                self.defer_worker_adoption(&worker, &client, "Live worker identity is temporarily unverifiable");
+                continue;
+            }
             if !matches_exact_process_identity(&identity) { continue; }
             let client = Arc::new(DaemonWorkerClient::new(&descriptor.socket_path));
             let root = descriptor.root_active_session_id.clone();
@@ -1365,9 +1391,36 @@ impl Supervisor {
                 self.refresh(&worker).await?;
                 self.subscribe(&worker, &root).await
             }.await;
-            if let Err(error) = adopted { self.park_worker_recovery_failure(&worker, &error); }
+            if let Err(error) = adopted { self.defer_worker_adoption(&worker, &client, &error); }
         }
         Ok(())
+    }
+    // A slow startup probe is not evidence of lost work. Retain the registration
+    // and let the existing identity-fenced, bounded recovery ladder recheck it.
+    fn defer_worker_adoption(self: &Arc<Self>, worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>, error: &str) {
+        let id = worker.descriptor.lock().unwrap().worker_id.clone();
+        self.defer_worker_adoption_if_current(worker, client, &id, error);
+    }
+    fn defer_worker_adoption_if_current(self: &Arc<Self>, worker: &Arc<Worker>, client: &Arc<DaemonWorkerClient>, id: &str, error: &str) {
+        {
+            // Match require_worker's lock order: registry -> descriptor -> client.
+            // Keep the client identity check and lifecycle transition atomic against
+            // a close-triggered reconnect publishing its replacement client/READY.
+            let workers = self.workers.lock().unwrap();
+            if !workers.get(id).is_some_and(|current| Arc::ptr_eq(current, worker)) { return; }
+            let mut descriptor = worker.descriptor.lock().unwrap();
+            if self.stopped.is_cancelled() || descriptor.stop_requested_at.is_some()
+                || descriptor.lifecycle == DAEMON_WORKER_LIFECYCLE_STOPPING { return; }
+            let mut current = worker.client.lock().unwrap();
+            if current.as_ref().is_some_and(|current| !Arc::ptr_eq(current, client)) { return; }
+            descriptor.lifecycle = DAEMON_WORKER_LIFECYCLE_RECOVERING.into();
+            descriptor.last_error = Some(error.into());
+            if let Err(error) = self.persist_worker(&descriptor) { eprintln!("Could not persist worker adoption retry {id}: {error}"); }
+            *current = None;
+        }
+        client.close_now();
+        self.mark_worker_roster_entries(worker, Some(DAEMON_WORKER_LIFECYCLE_RECOVERING));
+        self.schedule_deferred_worker_recovery(worker);
     }
     async fn create(self: &Arc<Self>, public: &PublicClient, body: &Map<String, Value>) -> Result<Value, String> {
         self.create_for_owner(public.identity(), body).await
@@ -3464,9 +3517,19 @@ const MAX_DEFERRED_RECOVERY_ROUNDS: u64 = 10;
 enum ProcessIdentityVerdict { Current, Unknown, Gone }
 
 fn process_identity_verdict(identity: &ProcessIdentity) -> ProcessIdentityVerdict {
-    if !is_process_alive(identity.pid as i32) { return ProcessIdentityVerdict::Gone; }
-    if identity.process_start_id.is_none() { return ProcessIdentityVerdict::Unknown; }
-    if get_process_start_id(identity.pid).as_deref() == identity.process_start_id.as_deref() { ProcessIdentityVerdict::Current } else { ProcessIdentityVerdict::Gone }
+    process_identity_observation(
+        is_process_alive(identity.pid as i32), identity.process_start_id.as_deref(),
+        get_process_start_id(identity.pid).as_deref(),
+    )
+}
+
+fn process_identity_observation(alive: bool, expected: Option<&str>, observed: Option<&str>) -> ProcessIdentityVerdict {
+    if !alive { return ProcessIdentityVerdict::Gone; }
+    match (expected, observed) {
+        (Some(expected), Some(observed)) if expected == observed => ProcessIdentityVerdict::Current,
+        (Some(_), Some(_)) => ProcessIdentityVerdict::Gone,
+        _ => ProcessIdentityVerdict::Unknown,
+    }
 }
 
 /// `Date.parse(value)`, `undefined` when unparseable (the TS guards with `Number.isFinite`).

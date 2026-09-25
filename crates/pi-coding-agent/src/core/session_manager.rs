@@ -1001,7 +1001,10 @@ pub fn build_session_context_with_entry_ids(
     // push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
     let mut path: Vec<SessionEntry> = Vec::new();
     let mut current = Some(leaf);
+    let mut visited = HashSet::new();
     while let Some(entry) = current {
+        // Damaged ancestry must not repeat entries or grow context without bound.
+        if !visited.insert(entry_id(&entry)) { break; }
         current = entry_parent_id(&entry).and_then(|parent| by_id.get(&parent).cloned());
         path.push(entry);
     }
@@ -1402,17 +1405,17 @@ fn parses_as_json(line: &[u8]) -> bool {
 }
 
 /// A bounded tail read gates the full repair scan: clean opens stay O(window).
-fn tail_looks_damaged(target_path: &str) -> bool {
+fn tail_looks_damaged(target_path: &str) -> Result<bool, String> {
     let mut file = match std::fs::File::open(target_path) {
         Ok(file) => file,
-        Err(_) => return false,
+        Err(error) => return Err(error.to_string()),
     };
     let size = match file.metadata() {
         Ok(metadata) => metadata.len(),
-        Err(_) => return false,
+        Err(error) => return Err(error.to_string()),
     };
     if size == 0 {
-        return false;
+        return Ok(false);
     }
     use std::io::{Read, Seek, SeekFrom};
     let window_bytes = size.min(REPAIR_SUSPICION_WINDOW_BYTES) as usize;
@@ -1421,22 +1424,22 @@ fn tail_looks_damaged(target_path: &str) -> bool {
         .seek(SeekFrom::Start(size - window_bytes as u64))
         .is_err()
     {
-        return true;
+        return Ok(true);
     }
     let mut read = 0usize;
     while read < window_bytes {
         match file.read(&mut window[read..]) {
             Ok(0) => break,
             Ok(bytes) => read += bytes,
-            Err(_) => return true,
+            Err(error) => return Err(error.to_string()),
         }
     }
     window.truncate(read);
     if window.contains(&0) {
-        return true;
+        return Ok(true);
     }
     if window.last() != Some(&0x0a) {
-        return true;
+        return Ok(true);
     }
     let previous_newline = window[..window.len().saturating_sub(1)]
         .iter()
@@ -1445,7 +1448,7 @@ fn tail_looks_damaged(target_path: &str) -> bool {
         // No boundary inside the window: the final line exceeds it; scan to be sure.
         None => {
             if (window_bytes as u64) < size {
-                return true;
+                return Ok(true);
             }
             None
         }
@@ -1453,26 +1456,31 @@ fn tail_looks_damaged(target_path: &str) -> bool {
     };
     let last_line = &window[previous_newline.map(|i| i + 1).unwrap_or(0)..window.len() - 1];
     // A blank final line is benign (the loader skips it) and appends stay safe.
-    !last_line.is_empty() && !parses_as_json(last_line)
+    Ok(!last_line.is_empty() && !parses_as_json(last_line))
 }
 
-struct RepairSupersededError;
+/// A required repair must commit before a writable manager can adopt this path.
+/// `true` invalidates any entries preloaded before the repair.
+fn repair_jsonl_damage(file_path: &str) -> Result<bool, String> {
+    repair_jsonl_damage_checked(file_path)
+        .map_err(|error| format!("Session repair failed for {file_path}: {error}"))
+}
 
-fn repair_jsonl_damage(file_path: &str) {
+fn repair_jsonl_damage_checked(file_path: &str) -> Result<bool, String> {
     let target_path = realpath_if_present_sync(file_path);
-    if !tail_looks_damaged(&target_path) {
-        return;
+    if !tail_looks_damaged(&target_path)? {
+        return Ok(false);
     }
     let buffer = match std::fs::read(&target_path) {
         Ok(buffer) => buffer,
-        Err(_) => return,
+        Err(error) => return Err(error.to_string()),
     };
     let snapshot = match std::fs::metadata(&target_path) {
         Ok(metadata) => (metadata.len(), metadata.modified().ok()),
-        Err(_) => return,
+        Err(error) => return Err(error.to_string()),
     };
     if buffer.is_empty() || snapshot.0 != buffer.len() as u64 {
-        return;
+        return Err("session changed during required repair; retry opening".to_string());
     }
     let mut kept_lines: Vec<Vec<u8>> = Vec::new();
     let mut recovered_nul_lines = 0usize;
@@ -1518,7 +1526,7 @@ fn repair_jsonl_damage(file_path: &str) {
         start = end + 1;
     }
     if !dirty {
-        return;
+        return Ok(false);
     }
     let metadata = stat_metadata_if_present(&target_path);
     let content = if kept_lines.is_empty() {
@@ -1533,35 +1541,28 @@ fn repair_jsonl_damage(file_path: &str) {
     };
     let mode = metadata.as_ref().map(|metadata| metadata.mode);
     let before_rename = |_temp_path: &str| -> Result<(), String> {
-        // A concurrent appender wins; skipping the repair is safe (next open retries).
+        // A concurrent appender wins; this opener must fail rather than append to an unrepaired tail.
         match std::fs::metadata(&target_path) {
             Ok(current) => {
                 if current.len() != snapshot.0 || current.modified().ok() != snapshot.1 {
-                    return Err("repair_superseded".to_string());
+                    return Err("session changed during required repair; retry opening".to_string());
                 }
                 Ok(())
             }
-            Err(_) => Ok(()),
+            Err(error) => Err(error.to_string()),
         }
     };
-    match write_file_atomic_sync(
+    write_file_atomic_sync(
         &target_path,
         &content,
         WriteFileAtomicOptions { mode, fsync: false },
         Some(&before_rename),
-    ) {
-        Ok(()) => {}
-        Err(error) if error == "repair_superseded" => return,
-        Err(error) => {
-            let _ = RepairSupersededError;
-            eprintln!("session repair failed for {target_path}: {error}");
-            return;
-        }
-    }
+    )?;
     eprintln!(
         "Repaired crash damage in {target_path}: recovered {recovered_nul_lines} zero-filled line(s), dropped {dropped_lines} unrecoverable line(s){}",
         if repaired_tail { ", restored the trailing newline" } else { "" }
     );
+    Ok(true)
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -3356,14 +3357,16 @@ impl SessionManager {
         preloaded_entries: Option<Vec<FileEntry>>,
         preloaded_observation: Option<SessionLoadObservation>,
     ) -> Result<(), String> {
+        let session_file = resolve_path(session_file);
+        // Failure must leave the previous manager writable only at its old path.
+        // Public preloaded callers cannot bypass the required repair gate.
+        let repaired = self.persist && Path::new(&session_file).exists()
+            && repair_jsonl_damage(&session_file)?;
+        let preloaded_entries = if repaired { None } else { preloaded_entries };
         // A switch/reload must never report the prior transcript's bytes.
         self.load_observation = None;
-        self.session_file = Some(resolve_path(session_file));
-        let session_file = self.session_file.clone().unwrap_or_default();
+        self.session_file = Some(session_file.clone());
         if Path::new(&session_file).exists() {
-            if self.persist && preloaded_entries.is_none() {
-                repair_jsonl_damage(&session_file);
-            }
             match preloaded_entries {
                 None => {
                     let loaded = load_entries_from_file_observed(&session_file);
@@ -4238,7 +4241,9 @@ impl SessionManager {
             .as_ref()
             .and_then(|leaf| self.by_id.get(leaf))
             .cloned();
+        let mut visited = HashSet::new();
         while let Some(entry) = current {
+            if !visited.insert(entry_id(&entry)) { break; }
             if entry_type(&entry) == "git_state" {
                 return entry
                     .get("git")
@@ -4263,7 +4268,9 @@ impl SessionManager {
             .as_ref()
             .and_then(|leaf| self.by_id.get(leaf))
             .cloned();
+        let mut visited = HashSet::new();
         while let Some(entry) = current {
+            if !visited.insert(entry_id(&entry)) { break; }
             if entry_type(&entry) == "agent_status" {
                 return entry
                     .get("status")
@@ -4393,15 +4400,8 @@ impl SessionManager {
     }
 
     pub fn get_branch(&self, from_id: Option<&str>) -> Vec<SessionEntry> {
-        // push+reverse, not unshift-per-entry: unshift is O(n), which makes this O(n^2) on long sessions.
-        let mut path: Vec<SessionEntry> = Vec::new();
-        let start_id = from_id.map(str::to_string).or_else(|| self.leaf_id.clone());
-        let mut current = start_id.and_then(|id| self.by_id.get(&id)).cloned();
-        while let Some(entry) = current {
-            current = entry_parent_id(&entry).and_then(|parent| self.by_id.get(&parent).cloned());
-            path.push(entry);
-        }
-        path.reverse();
+        let mut path = Vec::new();
+        self.visit_branch(from_id, |entry| path.push(entry.clone()));
         path
     }
 
@@ -4411,7 +4411,9 @@ impl SessionManager {
     pub fn visit_branch(&self, from_id: Option<&str>, mut visit: impl FnMut(&SessionEntry)) {
         let mut path = Vec::new();
         let mut current = from_id.or(self.leaf_id.as_deref()).and_then(|id| self.by_id.get(id));
+        let mut visited = HashSet::new();
         while let Some(entry) = current {
+            if !visited.insert(entry.get("id").and_then(Value::as_str).unwrap_or_default()) { break; }
             path.push(entry);
             current = entry.get("parentId").and_then(Value::as_str).and_then(|id| self.by_id.get(id));
         }
@@ -4885,7 +4887,7 @@ impl SessionManager {
         if !Path::new(path).exists() {
             return SessionManager::open(path, session_dir, cwd_override);
         }
-        repair_jsonl_damage(path);
+        repair_jsonl_damage(path)?;
         let loaded = load_entries_from_file_async_observed(path, None).await;
         if loaded.entries.is_empty() {
             return SessionManager::open(path, session_dir, cwd_override);
@@ -5023,7 +5025,9 @@ impl SessionManager {
         }
         let live_parent = |parent_id: Option<String>| -> Option<String> {
             let mut pid = parent_id;
+            let mut visited = HashSet::new();
             while let Some(current) = pid.clone() {
+                if !visited.insert(current.clone()) { return None; }
                 if !dropped_parent.contains_key(&current) {
                     return Some(current);
                 }
@@ -5125,6 +5129,10 @@ impl SessionManager {
         sessions
     }
 }
+
+#[cfg(test)]
+#[path = "session_manager_safety_tests.rs"]
+mod safety_tests;
 
 #[cfg(test)]
 mod tests {

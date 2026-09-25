@@ -11,13 +11,14 @@
 //! `pi_coding_agent::config` lands.
 
 use std::collections::{BTreeMap, BTreeSet};
-use std::path::{Path, PathBuf};
+use std::path::Path;
 use std::sync::{Arc, Mutex};
 
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 
-use crate::utils::atomic_file::{write_file_atomic_sync, WriteFileAtomicOptions};
+use crate::utils::atomic_file::{realpath_if_present_sync, write_file_atomic_sync, WriteFileAtomicOptions};
+use crate::utils::store_lock::{lock_store_sync, read_store};
 
 const RECENT_MODELS_LIMIT: usize = 20;
 pub const DEFAULT_IDLE_EVICTION_MINUTES: f64 = 90.0;
@@ -471,17 +472,6 @@ fn lock_error(path: &str, error: &std::io::Error) -> SettingsErrorValue {
     SettingsErrorValue::new(format!("Failed to acquire settings lock for {path}: {error}"))
 }
 
-/// Release guard for the local `proper-lockfile` emulation.
-struct LockRelease {
-    path: PathBuf,
-}
-
-impl Drop for LockRelease {
-    fn drop(&mut self) {
-        let _ = std::fs::remove_dir(&self.path);
-    }
-}
-
 /// `FileSettingsStorage` - global settings at `<agentDir>/settings.json`,
 /// project settings at `<cwd>/<CONFIG_DIR_NAME>/settings.json`.
 pub struct FileSettingsStorage {
@@ -538,45 +528,13 @@ impl FileSettingsStorage {
         }
     }
 
-    /// `acquireLockSyncWithRetry`: `proper-lockfile` creates `<file>.lock` and
-    /// throws ELOCKED while it exists; this retries ELOCKED 10 times, 20ms apart.
-    ///
-    /// The reference rethrows any non-ELOCKED error and the last ELOCKED error
-    /// (settings-manager.ts:261-278: `if (code !== "ELOCKED" || attempt ===
-    /// maxAttempts) { throw error; }`), so this returns the error instead of
-    /// panicking: the load path turns it into a recorded `SettingsError` and the
-    /// write path turns it into a recorded failure (settings-manager.ts:419-423
-    /// `catch (error) { return { settings: {}, error: error as Error }; }`).
-    ///
-    /// `onCompromised` has no equivalent here (the lock directory is only ever
-    /// removed by its owner), so a compromised lock can never be observed.
-    fn acquire_lock_sync_with_retry(path: &str) -> Result<LockRelease, SettingsErrorValue> {
-        const MAX_ATTEMPTS: u32 = 10;
-        const DELAY_MS: u64 = 20;
-        let lock_path = PathBuf::from(format!("{path}.lock"));
-        let mut last_error: Option<std::io::Error> = None;
+    fn acquire_lock_sync_with_retry(path: &str) -> Result<std::fs::File, SettingsErrorValue> {
+        lock_store_sync(path).map_err(|error| lock_error(path, &error))
+    }
 
-        for attempt in 1..=MAX_ATTEMPTS {
-            match std::fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(LockRelease { path: lock_path }),
-                Err(error) => {
-                    let locked = error.kind() == std::io::ErrorKind::AlreadyExists;
-                    if !locked || attempt == MAX_ATTEMPTS {
-                        return Err(lock_error(path, &error));
-                    }
-                    last_error = Some(error);
-                    let start = std::time::Instant::now();
-                    while start.elapsed() < std::time::Duration::from_millis(DELAY_MS) {
-                        // Sleep synchronously to avoid changing callers to async.
-                        std::thread::yield_now();
-                    }
-                }
-            }
-        }
-
-        Err(match last_error {
-            Some(error) => lock_error(path, &error),
-            None => SettingsErrorValue::new("Failed to acquire settings lock"),
+    fn read_current(&self, scope: &str, path: &str) -> Result<Option<String>, ()> {
+        read_store(path).map_err(|error| {
+            self.record_failure(scope, SettingsErrorValue::new(format!("Failed to read settings: {error}")));
         })
     }
 }
@@ -591,10 +549,11 @@ impl SettingsStorage for FileSettingsStorage {
     }
 
     fn with_lock(&self, scope: &str, update: &mut dyn FnMut(Option<&str>) -> Option<String>) -> bool {
-        let path = self.path_for(scope).to_string();
+        let path = realpath_if_present_sync(self.path_for(scope))
+            .unwrap_or_else(|_| self.path_for(scope).to_string());
         let dir = parent_dir(&path);
 
-        let mut release: Option<LockRelease> = None;
+        let mut release: Option<std::fs::File> = None;
         let file_exists = Path::new(&path).exists();
         if file_exists {
             match FileSettingsStorage::acquire_lock_sync_with_retry(&path) {
@@ -609,10 +568,8 @@ impl SettingsStorage for FileSettingsStorage {
                 }
             }
         }
-        let current = if file_exists {
-            std::fs::read_to_string(&path).ok()
-        } else {
-            None
+        let Ok(current) = self.read_current(scope, &path) else {
+            return false;
         };
         let mut next = update(current.as_deref());
         if next.is_some() {
@@ -628,8 +585,11 @@ impl SettingsStorage for FileSettingsStorage {
                     }
                 }
                 // The first-write read ran unlocked; a racing first writer may have landed since.
-                if Path::new(&path).exists() {
-                    next = update(std::fs::read_to_string(&path).ok().as_deref());
+                let Ok(current) = self.read_current(scope, &path) else {
+                    return false;
+                };
+                if current.is_some() {
+                    next = update(current.as_deref());
                 }
             }
             if let Some(next_value) = next {
@@ -2408,6 +2368,7 @@ impl SettingsManager {
 #[cfg(test)]
 mod tests_support {
     use super::*;
+    use std::path::PathBuf;
 
     pub struct TempDir {
         path: PathBuf,
@@ -2486,6 +2447,57 @@ mod tests {
         ));
         assert_eq!(migrated["telemetry"]["enabled"], Value::Bool(true));
         assert!(!migrated.contains_key("markdown"));
+    }
+
+    #[test]
+    fn unreadable_settings_bytes_are_not_replaced() {
+        let temp = TempDir::new();
+        let agent_dir = temp.child("agent");
+        let project_dir = temp.child("project");
+        let path = join_path(&agent_dir, "settings.json");
+        std::fs::write(&path, r#"{"theme":"dark"}"#).unwrap();
+        let mut manager = SettingsManager::create(&project_dir, Some(&agent_dir));
+        let invalid_utf8 = [0xff, 0xfe, 0x80];
+        std::fs::write(&path, invalid_utf8).unwrap();
+        manager.set_theme("light");
+        assert_eq!(std::fs::read(&path).unwrap(), invalid_utf8);
+        assert!(!manager.drain_errors(Some(SETTINGS_SCOPE_GLOBAL)).is_empty());
+        let mut reloaded = SettingsManager::create(&project_dir, Some(&agent_dir));
+        assert!(!reloaded.drain_errors(Some(SETTINGS_SCOPE_GLOBAL)).is_empty());
+        reloaded.set_theme("other");
+        assert_eq!(std::fs::read(&path).unwrap(), invalid_utf8);
+    }
+
+    #[test]
+    fn first_write_recheck_read_failure_preserves_bytes() {
+        let temp = TempDir::new();
+        let agent_dir = temp.child("agent");
+        let project_dir = temp.child("project");
+        let path = join_path(&agent_dir, "settings.json");
+        let storage = FileSettingsStorage::new(&project_dir, &agent_dir);
+        let mut calls = 0;
+        assert!(!storage.with_lock(SETTINGS_SCOPE_GLOBAL, &mut |_| {
+            calls += 1;
+            std::fs::write(&path, [0xff]).unwrap();
+            Some("{}".to_string())
+        }));
+        assert_eq!(calls, 1);
+        assert_eq!(std::fs::read(&path).unwrap(), [0xff]);
+        assert_eq!(storage.take_failures(SETTINGS_SCOPE_GLOBAL).len(), 1);
+    }
+
+    #[test]
+    fn settings_lock_file_remains_reusable_after_release() {
+        let temp = TempDir::new();
+        let agent_dir = temp.child("agent");
+        let project_dir = temp.child("project");
+        let mut manager = SettingsManager::create(&project_dir, Some(&agent_dir));
+        manager.set_theme("dark");
+        assert!(Path::new(&format!("{agent_dir}/settings.json.lock")).is_file());
+        let mut reloaded = SettingsManager::create(&project_dir, Some(&agent_dir));
+        assert_eq!(reloaded.get_theme().as_deref(), Some("dark"));
+        reloaded.set_theme("light");
+        assert!(reloaded.drain_errors(None).is_empty());
     }
 
     #[test]

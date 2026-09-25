@@ -767,6 +767,7 @@ impl LoginDialogComponent {
         };
         let status_text = match status {
             Some("copied") => Some(theme().fg("success", "Copied sign-in link")),
+            Some("forwarded") => Some(theme().fg("muted", "Sign-in link sent to terminal (clipboard unconfirmed)")),
             Some("failed") => Some(theme().fg("error", "Failed to copy sign-in link")),
             _ => None,
         };
@@ -796,7 +797,8 @@ impl LoginDialogComponent {
         }
 
         let status = match copy_to_clipboard(&url).await {
-            Ok(()) => Some("copied"),
+            Ok(crate::utils::clipboard::ClipboardOutcome::LocalBackendAccepted) => Some("copied"),
+            Ok(crate::utils::clipboard::ClipboardOutcome::TerminalForwarded) => Some("forwarded"),
             Err(_) => Some("failed"),
         };
         if self.auth_url.as_deref() == Some(url.as_str()) {
@@ -941,6 +943,7 @@ mod tests {
     use pi_tui::terminal::ProcessTerminal;
 
     fn tui() -> Rc<RefCell<TUI>> {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         crate::core::keybindings::KeybindingsManager::new(Default::default(), None).install();
         Rc::new(RefCell::new(TUI::new(
             Box::new(ProcessTerminal::new()),
@@ -1036,6 +1039,9 @@ mod tests {
         assert!(component
             .get_auth_actions_text(Some("failed"))
             .contains("Failed to copy sign-in link"));
+        let forwarded = component.get_auth_actions_text(Some("forwarded"));
+        assert!(forwarded.contains("clipboard unconfirmed"));
+        assert!(!forwarded.contains("Copied sign-in link"));
     }
 
     #[test]

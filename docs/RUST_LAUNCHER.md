@@ -73,7 +73,7 @@ The launcher respects `PRIME_AGENT_CODING_AGENT_DIR` and `PRIME_AGENT_KERNEL_VEN
 
 Closing the TUI disconnects that client; the supervisor and resident sessions can continue in the background. Client-owned temporary sessions have their own disconnect cleanup. Changing the launcher does not restart existing processes.
 
-To reuse an existing Prime OAuth login, share its `auth.json` through a symlink after backing up the Rust credential file. Independent copies of a rotating refresh token can become stale. Rust resolves the credential path before locking, so it coordinates refreshes with Prime's `proper-lockfile` lock on the original file. Settings, sessions, and daemon state can remain in the separate Rust profile. Only share credentials between trusted local profiles.
+Do not concurrently share a rotating OAuth credential file with Prime or an older Optimus build that uses directory-based locks. Optimus now resolves the credential path and holds an OS-owned regular-file lock; this does not coordinate with `proper-lockfile` directory locks. Stop all writers before changing builds or moving an existing login. Independent credential copies can also become stale when refresh tokens rotate. Keep settings, sessions, and daemon state in the separate Rust profile. See [store-lock compatibility and recovery](persistence-store-lock-review.md) before sharing or rolling back credential storage.
 
 To use an existing Codex CLI login instead, configure `providers.openai-codex.apiKey` in the Rust profile's `models.json` with a command that reads the current access token:
 

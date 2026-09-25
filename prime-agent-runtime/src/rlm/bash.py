@@ -24,6 +24,7 @@ from datetime import datetime, timezone
 from typing import Any, cast
 
 from . import _winjob
+from .bash_guard import guard_command
 
 _IS_POSIX = os.name == "posix"
 
@@ -881,7 +882,8 @@ class BashHandle:
         return f"<BashHandle pid={self._pid} {state} command={self.command!r}>"
 
 
-def bash(command: str) -> BashHandle:
+def bash(command: str, *, allow_destructive_git: bool = False,
+         allow_destructive_rm: bool = False) -> BashHandle:
     """Start a shell command immediately; await the handle for the result.
 
     `await bash(cmd)` is a one-shot: cancelling the await (e.g. an interrupt)
@@ -894,12 +896,19 @@ def bash(command: str) -> BashHandle:
     Windows entered while the child is still suspended, so no descendant can
     escape it and kill()/crash cleanup are unconditional -- bash() raises if
     containment cannot be established.
+    Literal destructive git and recursive-force rm commands have bounded accident
+    checks, not a sandbox. After intentional review, a keyword-only
+    allow_destructive_git=True or allow_destructive_rm=True bypasses that check
+    for this call. No environment variable bypass is supported.
     Output written after the completion fence (e.g. by an EXIT trap or a
     background job) is not in BashResult.output but stays visible via
     handle.output()/tail().
     """
     if not isinstance(command, str) or not command:
         raise TypeError("command must be a non-empty str")
+    guard_command(_with_prefix(command), cwd=os.getcwd(), env=_child_env(),
+                  allow_destructive_git=allow_destructive_git,
+                  allow_destructive_rm=allow_destructive_rm)
     _install_shutdown_hook()
     return BashHandle(command)
 

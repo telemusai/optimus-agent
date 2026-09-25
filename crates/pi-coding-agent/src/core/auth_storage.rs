@@ -33,6 +33,7 @@ pub(crate) use crate::core::resolve_config_value::{
     resolve_config_value, resolve_config_value_or_throw, resolve_config_value_uncached,
 };
 use crate::utils::atomic_file::{realpath_if_present_sync, write_file_atomic_sync, WriteFileAtomicOptions};
+use crate::utils::store_lock::{lock_store_sync, open_store_lock, read_store};
 
 // ---------------------------------------------------------------------------
 // Environment-key lookup helpers.
@@ -411,64 +412,7 @@ impl FileAuthStorageBackend {
         }
     }
 
-    /// Steal a lock whose holder died: `proper-lockfile` marks a lock stale once
-    /// its mtime is older than `stale` and removes it before retrying, which is
-    /// what un-BRICKS auth writes after a crashed instance. The TS relies on that
-    /// takeover in both paths - `lockfile.lockSync` (auth-storage.ts:152-157,
-    /// proper-lockfile default `stale` 10000 ms) and `lockfile.lock` with
-    /// `stale: 30000` (auth-storage.ts:217-230). Returns true when a stale lock
-    /// was removed and the caller may retry immediately.
-    fn steal_stale_lock(lock_path: &str, stale_ms: u128) -> bool {
-        let Ok(metadata) = std::fs::metadata(lock_path) else {
-            return false;
-        };
-        let Ok(modified) = metadata.modified() else {
-            return false;
-        };
-        let Ok(age) = modified.elapsed() else {
-            return false;
-        };
-        if age.as_millis() < stale_ms {
-            return false;
-        }
-        std::fs::remove_dir(lock_path).is_ok()
-    }
 
-    /// `proper-lockfile` parity: a `<path>.lock` directory holds the lock.
-    ///
-    /// `stale` is the sync default `proper-lockfile` applies when the TS passes no
-    /// `stale` option (auth-storage.ts:152-157). The TS `onCompromised` callback
-    /// (auth-storage.ts:154-156) has no Rust equivalent here: it only reports that
-    /// the lock was lost mid-write, and this port holds the lock for the whole
-    /// callback, so the callback cannot fire.
-    fn acquire_lock_sync_with_retry(&self) -> Result<(), String> {
-        const STALE_MS: u128 = 10_000;
-        let max_attempts = 10;
-        let delay_ms = 20u64;
-        let lock_path = format!("{}.lock", self.auth_path);
-        let mut last_error: Option<String> = None;
-        for attempt in 1..=max_attempts {
-            match std::fs::create_dir(&lock_path) {
-                Ok(()) => return Ok(()),
-                Err(error) => {
-                    let locked = error.kind() == std::io::ErrorKind::AlreadyExists;
-                    if !locked || attempt == max_attempts {
-                        return Err(error.to_string());
-                    }
-                    last_error = Some(error.to_string());
-                    if Self::steal_stale_lock(&lock_path, STALE_MS) {
-                        continue;
-                    }
-                    std::thread::sleep(Duration::from_millis(delay_ms));
-                }
-            }
-        }
-        Err(last_error.unwrap_or_else(|| "Failed to acquire auth storage lock".to_string()))
-    }
-
-    fn release_lock_sync(&self) {
-        let _ = std::fs::remove_dir(format!("{}.lock", self.auth_path));
-    }
 }
 
 fn create_dir_mode(path: &Path, mode: u32) -> std::io::Result<()> {
@@ -507,92 +451,44 @@ impl AuthStorageBackend for FileAuthStorageBackend {
         f: &mut dyn FnMut(Option<String>) -> Result<Option<String>, String>,
     ) -> Result<(), String> {
         self.ensure_parent_dir().map_err(|error| error.to_string())?;
+        let _lock = lock_store_sync(&self.auth_path).map_err(|error| error.to_string())?;
         self.ensure_file_exists().map_err(|error| error.to_string())?;
-
-        self.acquire_lock_sync_with_retry()?;
-        let outcome = (|| -> Result<(), String> {
-            let current = if Path::new(&self.auth_path).exists() {
-                Some(std::fs::read_to_string(&self.auth_path).map_err(|error| error.to_string())?)
-            } else {
-                None
-            };
-            let next = f(current)?;
-            if let Some(next) = next {
-                write_auth_file(&self.auth_path, &next)?;
-            }
-            Ok(())
-        })();
-        self.release_lock_sync();
-        outcome
+        let current = read_store(&self.auth_path).map_err(|error| error.to_string())?;
+        if let Some(next) = f(current)? {
+            write_auth_file(&self.auth_path, &next)?;
+        }
+        Ok(())
     }
 
     fn with_lock_async(&self, f: LockFn) -> BoxFuture<Result<(), String>> {
         let auth_path = self.auth_path.clone();
         Box::pin(async move {
-            if let Some(parent) = Path::new(&auth_path).parent() {
-                if !parent.exists() {
-                    create_dir_mode(parent, 0o700).map_err(|error| error.to_string())?;
-                }
-            }
-            let mut open = std::fs::OpenOptions::new();
-            open.write(true).create_new(true);
-            #[cfg(unix)]
-            {
-                use std::os::unix::fs::OpenOptionsExt;
-                open.mode(0o600);
-            }
-            if let Ok(mut file) = open.open(&auth_path) {
-                use std::io::Write;
-                let _ = file.write_all(b"{}");
-            }
-
-            // proper-lockfile options from the TS: retries 10, factor 2,
-            // minTimeout 100ms, maxTimeout 10000ms, `stale: 30000`
-            // (auth-storage.ts:217-230). A crashed holder leaves the lock
-            // directory behind, so a stale lock must be stolen or auth writes stay
-            // bricked until someone deletes it by hand.
-            const STALE_MS: u128 = 30_000;
-            let lock_path = format!("{}.lock", auth_path);
+            let backend = FileAuthStorageBackend { auth_path };
+            backend.ensure_parent_dir().map_err(|error| error.to_string())?;
+            let lock = open_store_lock(&backend.auth_path).map_err(|error| error.to_string())?;
             let mut delay = Duration::from_millis(100);
-            let mut acquired = false;
             for attempt in 0..=10 {
-                match std::fs::create_dir(&lock_path) {
-                    Ok(()) => {
-                        acquired = true;
-                        break;
-                    }
-                    Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
-                        if attempt == 10 {
-                            return Err(error.to_string());
-                        }
-                        if FileAuthStorageBackend::steal_stale_lock(&lock_path, STALE_MS) {
-                            continue;
-                        }
+                match lock.try_lock() {
+                    Ok(()) => break,
+                    Err(std::fs::TryLockError::WouldBlock) if attempt < 10 => {
                         tokio::time::sleep(delay).await;
                         delay = (delay * 2).min(Duration::from_millis(10_000));
                     }
-                    Err(error) => return Err(error.to_string()),
+                    Err(std::fs::TryLockError::WouldBlock) => {
+                        return Err("Auth storage is locked by another writer; retry".to_string());
+                    }
+                    Err(std::fs::TryLockError::Error(error)) => return Err(error.to_string()),
                 }
             }
-            if !acquired {
-                return Err("Failed to acquire auth storage lock".to_string());
+            // Keep the OS lock across refresh and commit. Drop also releases it
+            // on cancellation or panic, without deleting another owner's lock.
+            backend.ensure_file_exists().map_err(|error| error.to_string())?;
+            let current = read_store(&backend.auth_path).map_err(|error| error.to_string())?;
+            if let Some(next) = f(current).await? {
+                write_auth_file(&backend.auth_path, &next)?;
             }
-
-            let outcome = (|| async {
-                let current = if Path::new(&auth_path).exists() {
-                    Some(std::fs::read_to_string(&auth_path).map_err(|error| error.to_string())?)
-                } else {
-                    None
-                };
-                let next = f(current).await?;
-                if let Some(next) = next {
-                    write_auth_file(&auth_path, &next)?;
-                }
-                Ok(())
-            })()
-            .await;
-            let _ = std::fs::remove_dir(&lock_path);
-            outcome
+            drop(lock);
+            Ok(())
         })
     }
 }
@@ -2079,7 +1975,7 @@ mod tests {
     use serde_json::json;
     use pi_ai::utils::oauth::{get_oauth_provider_info_list, unregister_oauth_provider};
 
-    /// Age a lock *directory* so the stale-lock takeover can be exercised.
+    /// Legacy directory age must not be accepted as proof that its owner died.
     fn set_directory_mtime_to_now_minus(path: &str, seconds: u64) {
         let mut options = std::fs::OpenOptions::new();
         #[cfg(unix)]
@@ -2670,41 +2566,55 @@ Write-Output ('isolated-test-key-' + $count)"#,
         assert_eq!(std::fs::read_to_string(&path).unwrap(), original);
     }
 
-    /// C3-02: a crashed instance leaves `<auth>.lock` behind; `proper-lockfile`
-    /// steals it once it is older than `stale` (auth-storage.ts:217-230), and the
-    /// sync path uses the same takeover (auth-storage.ts:152-157), so auth writes
-    /// must not stay bricked until someone deletes the lock by hand.
     #[test]
-    fn a_stale_lock_from_a_crashed_instance_is_stolen() {
+    fn legacy_auth_lock_is_preserved_even_when_old() {
         let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("auth.json");
-        let path_string = path.to_string_lossy().to_string();
-        let mut storage = AuthStorage::create(Some(path_string.clone()), None);
-        storage.set(
-            "openai",
-            AuthCredential::ApiKey {
-                key: "first".to_string(),
-                prime_team: None,
-            },
-        );
-
-        // Simulate the corpse of a crashed writer: the lock is 60s old.
-        let lock_path = format!("{}.lock", path_string);
+        let path = dir.path().join("auth.json").to_string_lossy().to_string();
+        std::fs::write(&path, "{}").unwrap();
+        let lock_path = format!("{path}.lock");
         std::fs::create_dir(&lock_path).unwrap();
         set_directory_mtime_to_now_minus(&lock_path, 60);
-
-        storage.set(
-            "github-copilot",
-            AuthCredential::ApiKey {
-                key: "second".to_string(),
-                prime_team: None,
-            },
-        );
-
-        let written: Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
-        assert_eq!(written["openai"]["key"], Value::from("first"));
-        assert_eq!(written["github-copilot"]["key"], Value::from("second"));
-        assert!(!Path::new(&lock_path).exists());
+        let backend = FileAuthStorageBackend::new(Some(path.clone()));
+        assert!(backend.with_lock(&mut |_| panic!("legacy owner must not be bypassed")).is_err());
+        assert!(Path::new(&lock_path).is_dir());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "{}");
     }
+
+    #[tokio::test]
+    async fn live_auth_refresh_is_not_stolen_and_cancellation_releases_lock() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json").to_string_lossy().to_string();
+        let backend = FileAuthStorageBackend::new(Some(path.clone()));
+        let (entered, ready) = tokio::sync::oneshot::channel();
+        let task = tokio::spawn(backend.with_lock_async(Box::new(move |_| Box::pin(async move {
+            entered.send(()).unwrap();
+            std::future::pending::<()>().await;
+            Ok(Some("unreachable".to_string()))
+        }))));
+        ready.await.unwrap();
+        let lock_path = format!("{path}.lock");
+        std::fs::OpenOptions::new().write(true).open(&lock_path).unwrap()
+            .set_modified(std::time::SystemTime::now() - Duration::from_secs(60)).unwrap();
+        let rival = FileAuthStorageBackend::new(Some(path.clone()));
+        assert!(rival.with_lock(&mut |_| panic!("live refresh must retain ownership")).is_err());
+        task.abort();
+        assert!(task.await.unwrap_err().is_cancelled());
+        rival.with_lock(&mut |current| {
+            assert_eq!(current.as_deref(), Some("{}"));
+            Ok(Some(r#"{"synthetic":"new"}"#.to_string()))
+        }).unwrap();
+        assert!(Path::new(&lock_path).is_file());
+        assert_eq!(std::fs::read_to_string(path).unwrap(), r#"{"synthetic":"new"}"#);
+    }
+
+    #[test]
+    fn auth_callback_failure_releases_lock_without_changing_credentials() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json").to_string_lossy().to_string();
+        std::fs::write(&path, "{}").unwrap();
+        let backend = FileAuthStorageBackend::new(Some(path.clone()));
+        assert!(backend.with_lock(&mut |_| Err("injected".into())).is_err());
+        backend.with_lock(&mut |current| { assert_eq!(current.as_deref(), Some("{}")); Ok(None) }).unwrap();
+    }
+
 }
