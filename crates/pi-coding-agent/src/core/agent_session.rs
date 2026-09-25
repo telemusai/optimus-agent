@@ -5601,7 +5601,10 @@ impl AgentSession {
         objective: &str,
         token_budget: Option<f64>,
     ) -> Result<GoalState, String> {
-        match self.goal_state.lock().unwrap().status {
+        // A match scrutinee keeps its temporary guard alive through the arm.
+        // Release it before start_goal updates and publishes the goal state.
+        let status = self.goal_state.lock().unwrap().status;
+        match status {
             GoalStatus::Active => Err(
                 "cannot create a new goal because this thread already has an active goal; run `await goal.complete()` when it is achieved, or ask the user to clear it with /goal clear"
                     .to_string(),

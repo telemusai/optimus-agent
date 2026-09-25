@@ -1,0 +1,1 @@
+- Fixed Python goal creation deadlocking the session worker and blocking goal status and abort requests.
