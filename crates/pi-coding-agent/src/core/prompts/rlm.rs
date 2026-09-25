@@ -213,7 +213,7 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
     if has_ipython {
         parts.push(String::new());
         parts.push(REPL_CONTROL_PROMPT.to_string());
-        parts.push("For code search, retrieve candidates with ripgrep (`rg --json` through bash()), AST or symbol tools first. Keep results in a named variable. Use `from rlm.code_search import from_ripgrep, present`; `candidates = from_ripgrep(result.output)` parses ripgrep matches. `present(candidates)` in a cell with no other output exposes optional file/symbol/grep/reference/test candidates to host-side Jev relevance scoring when enabled. Each candidate has `kind`, `path`, optional `line`, `snippet`, and `mandatory=True` for required evidence. Jev never performs the search or edits code; inspect retained candidates with normal tools. Unscored and uncertain candidates remain available; the original variable stays complete.".to_string());
+        parts.push("For code search, retrieve candidates with ripgrep (`rg --json` through bash()), `fd` for file discovery, AST or symbol tools first. Keep results in a named variable. Use `from rlm.code_search import from_ripgrep, present`; `candidates = from_ripgrep(result.output)` parses ripgrep matches. `present(candidates)` in a cell with no other output exposes optional file/symbol/grep/reference/test candidates to host-side Jev relevance scoring when enabled. Each candidate has `kind`, `path`, optional `line`, `snippet`, and `mandatory=True` for required evidence. Jev never performs the search or edits code; inspect retained candidates with normal tools. Unscored and uncertain candidates remain available; the original variable stays complete.".to_string());
         if installed_skills.iter().any(|skill| skill == "refine") {
             parts.push(String::new());
             parts.push(
@@ -292,6 +292,8 @@ mod tests {
         assert!(prompt.contains("Pre-installed Python packages: requests, httpx, yaml (PyYAML), tomli, dotenv (python-dotenv), pandas, numpy, scipy, bs4 (Beautiful Soup), lxml, pydantic, tyro."));
         assert!(prompt.contains("A callable `rlm` is already in your global namespace."));
         assert!(prompt.contains(REPL_CONTROL_PROMPT));
+        assert!(prompt.contains("`fd` for file discovery"));
+        assert!(prompt.contains("from rlm.code_search import from_ripgrep, present"));
         assert!(!prompt.contains("You are a child agent spawned by"));
     }
 

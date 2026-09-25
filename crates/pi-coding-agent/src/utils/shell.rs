@@ -203,36 +203,26 @@ pub fn resolve_kernel_bash_shell(custom_shell_path: Option<&str>) -> Option<Stri
 
 pub fn get_shell_env() -> Vec<(String, String)> {
     let bin_dir = super::tools_manager::get_bin_dir().to_string_lossy().to_string();
-    let mut env: Vec<(String, String)> = std::env::vars().collect();
-    let path_key = env
-        .iter()
-        .map(|(key, _)| key.clone())
-        .find(|key| key.to_lowercase() == "path")
-        .unwrap_or_else(|| "PATH".to_string());
-    let current_path = env
-        .iter()
-        .find(|(key, _)| key == &path_key)
-        .map(|(_, value)| value.clone())
-        .unwrap_or_default();
-    let separator = if cfg!(windows) { ';' } else { ':' };
-    let path_entries: Vec<&str> = current_path.split(separator).filter(|entry| !entry.is_empty()).collect();
-    let has_bin_dir = path_entries.contains(&bin_dir.as_str());
-    let updated_path = if has_bin_dir {
-        current_path
+    shell_env_with_bin_dir(std::env::vars().collect(), &bin_dir, cfg!(windows))
+}
+
+fn shell_env_with_bin_dir(mut env: Vec<(String, String)>, bin_dir: &str, windows: bool) -> Vec<(String, String)> {
+    let is_path = |key: &str| if windows { key.eq_ignore_ascii_case("PATH") } else { key == "PATH" };
+    let path_index = env.iter().position(|(key, _)| is_path(key));
+    let current_path = path_index.map(|index| env[index].1.as_str()).unwrap_or_default();
+    let separator = if windows { ';' } else { ':' };
+    let updated_path = if current_path.split(separator).any(|entry| entry == bin_dir) {
+        current_path.to_string()
     } else {
-        let mut entries: Vec<String> = vec![bin_dir];
-        entries.extend(path_entries.iter().map(|entry| entry.to_string()));
-        entries
-            .into_iter()
-            .filter(|entry| !entry.is_empty())
-            .collect::<Vec<String>>()
+        std::iter::once(bin_dir)
+            .chain(current_path.split(separator).filter(|entry| !entry.is_empty()))
+            .collect::<Vec<_>>()
             .join(&separator.to_string())
     };
-
-    if let Some(entry) = env.iter_mut().find(|(key, _)| key == &path_key) {
-        entry.1 = updated_path;
+    if let Some(index) = path_index {
+        env[index].1 = updated_path;
     } else {
-        env.push((path_key, updated_path));
+        env.push(("PATH".to_string(), updated_path));
     }
     env
 }
@@ -424,6 +414,21 @@ mod tests {
             }
         } else {
             assert!(resolve_kernel_bash_shell(None).is_some());
+        }
+    }
+
+    #[test]
+    fn managed_path_uses_platform_keys_and_preserves_existing_entries() {
+        let env = vec![("Path".into(), "unrelated".into()), ("PATH".into(), ":/usr/bin:".into())];
+        let posix = shell_env_with_bin_dir(env, "/managed", false);
+        assert_eq!(posix[0].1, "unrelated");
+        assert_eq!(posix[1].1, "/managed:/usr/bin");
+        assert_eq!(shell_env_with_bin_dir(posix.clone(), "/managed", false), posix);
+        let windows = shell_env_with_bin_dir(vec![("Path".into(), r"C:\System;D:\Tools".into())], r"C:\Managed", true);
+        assert_eq!(windows, vec![("Path".into(), r"C:\Managed;C:\System;D:\Tools".into())]);
+        assert_eq!(shell_env_with_bin_dir(windows.clone(), r"C:\Managed", true), windows);
+        for env in [vec![], vec![("PATH".into(), String::new())]] {
+            assert_eq!(shell_env_with_bin_dir(env, "/managed", false), vec![("PATH".into(), "/managed".into())]);
         }
     }
 

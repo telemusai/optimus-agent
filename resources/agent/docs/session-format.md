@@ -338,6 +338,21 @@ Entries form a tree:
                                                             └─ [branch_summary] ─── [user msg] ← alternate branch
 ```
 
+## Damaged-file recovery
+
+Writable resume repairs an incomplete final JSONL row before admitting new writes.
+A complete row missing its newline is kept and terminated. An incomplete tail is
+dropped. If a required repair cannot commit, or detects a concurrent change,
+resume returns an error instead of appending to the damaged file. A failed file
+switch leaves the current session selected. Retry after resolving the filesystem
+error. This does not provide a transaction lock against other writers or a
+power-loss durability guarantee.
+
+Parent-chain reads stop before visiting an entry ID twice. This bounds context,
+branch, and active-metadata reads of cyclic ancestry without rewriting the source
+entries. Normal branch order, unknown entry fields, and compaction checkpoints are
+unchanged. This is not full entry-schema validation.
+
 ## Context Building
 
 `buildSessionContext()` walks from the current leaf to the root, producing the message list for the LLM:

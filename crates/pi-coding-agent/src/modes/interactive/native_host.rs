@@ -1654,6 +1654,19 @@ async fn run_terminal(
         return Ok(None);
     }
     let (send, receive) = mpsc::channel();
+    {
+        let send = send.clone();
+        ui.borrow_mut().on_copy = Some(Box::new(move |text| {
+            let (text, send) = (text.to_owned(), send.clone());
+            tokio::spawn(async move {
+                let event = match crate::utils::clipboard::copy_to_clipboard(&text).await {
+                    Ok(outcome) => HostEvent::Status(outcome.status().to_string()),
+                    Err(error) => HostEvent::Error(error.to_string()),
+                };
+                let _ = send.send(event);
+            });
+        }));
+    }
     subagents.borrow().subscribe(connection.clone(), send.clone());
     let local_extension_bridge = in_process_connection.as_ref().map(|local| {
         let bridge = native_extension_bridge::Bridge::new(send.clone(), &mode.borrow().get_current_cwd());
@@ -4075,12 +4088,10 @@ async fn run_builtin_command(
                     "No agent messages to copy yet.".to_string(),
                 ));
             };
-            crate::utils::clipboard::copy_to_clipboard(&last)
+            let outcome = crate::utils::clipboard::copy_to_clipboard(&last)
                 .await
                 .map_err(|error| error.to_string())?;
-            Ok(CommandOutput::Status(
-                "Copied last agent message to clipboard".to_string(),
-            ))
+            Ok(CommandOutput::Status(outcome.status().to_string()))
         }
         // `commandName === "clone"` (interactive-mode.ts:4942-4945, 8582-8602).
         "clone" => {

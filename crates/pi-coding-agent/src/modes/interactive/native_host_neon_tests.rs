@@ -102,7 +102,10 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
         "{}● Jev Full · fallback",
         theme().get_fg_ansi("warning")
     )));
-    assert!(strip_ansi(&header[1]).trim_end().ends_with("telemus.ai"));
+    // 95c61aeb82 made the runtime version part of the persistent brand caption.
+    assert!(strip_ansi(&header[1]).trim_end().ends_with(&format!(
+        "telemus.ai  v{}", crate::config::VERSION
+    )));
     let disabled = HeaderData {
         jev: Some("Jev Off"),
         ..data
@@ -348,9 +351,15 @@ fn neon_frame_fixture_keeps_editor_jev_history_and_theme_switching() {
             std::fs::write(format!("{dir}/{width}x{height}.txt"), plain).unwrap();
         }
     }
-    // Rendering a different theme immediately removes the fixed chrome/margins.
+    // 95c61aeb82 retained the branded/versioned header across themes; only
+    // Neon transcript margins and dock decoration disappear in the prime theme.
     crate::modes::interactive::theme::theme::set_theme("prime", false);
-    assert!(header.render(120.0).is_empty());
+    let prime_header = header.render(120.0);
+    assert!(prime_header.iter().all(|row| visible_width(row) == 120));
+    assert!(strip_ansi(&prime_header[1]).trim_end().ends_with(&format!(
+        "telemus.ai  v{}", crate::config::VERSION
+    )));
+    assert!(prime_header.iter().any(|row| strip_ansi(row).contains("Add tests for @filepath")));
     transcript.borrow_mut().render(120.0);
     assert!(transcript.borrow().get_selection_columns().is_empty());
     assert!(!dock
@@ -359,6 +368,12 @@ fn neon_frame_fixture_keeps_editor_jev_history_and_theme_switching() {
         .any(|r| strip_ansi(r).starts_with('└')));
     // Switching back, and toggling inline mode, keep the original text available.
     crate::modes::interactive::theme::theme::set_theme("neon", false);
+    let neon_header = header.render(120.0);
+    assert!(neon_header.iter().all(|row| visible_width(row) == 120));
+    assert!(strip_ansi(&neon_header[1]).trim_end().ends_with(&format!(
+        "telemus.ai  v{}", crate::config::VERSION
+    )));
+    assert!(neon_header.iter().any(|row| strip_ansi(row).contains("Add tests for @filepath")));
     mode.borrow_mut().fullscreen_enabled = false;
     assert!(transcript
         .borrow_mut()

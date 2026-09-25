@@ -899,12 +899,11 @@ impl IpythonKernelProvisioner {
                 .unwrap_or(&[]),
         );
 
-        let mut env: std::collections::HashMap<String, String> = std::collections::HashMap::new();
-        if let Some(options_env) = self.options.as_ref().and_then(|options| options.env.clone()) {
-            for (key, value) in options_env {
-                env.insert(key, value);
-            }
-        }
+        let mut env = kernel_shell_env(
+            crate::utils::shell::get_shell_env(),
+            self.options.as_ref().and_then(|options| options.env.as_deref()).unwrap_or(&[]),
+            cfg!(windows),
+        );
         if let Some(shell_path) = shell_path.as_ref() {
             env.insert("PRIME_AGENT_BASH_SHELL".to_string(), shell_path.clone());
         }
@@ -1055,6 +1054,23 @@ impl IpythonKernelProvisioner {
         }
         Ok(manager)
     }
+}
+
+/// Pass only the local shell PATH default; explicit kernel overrides remain authoritative.
+fn kernel_shell_env(
+    shell_env: Vec<(String, String)>,
+    overrides: &[(String, String)],
+    windows: bool,
+) -> std::collections::HashMap<String, String> {
+    let is_path = |key: &str| if windows { key.eq_ignore_ascii_case("PATH") } else { key == "PATH" };
+    let mut env = std::collections::HashMap::new();
+    for (key, value) in shell_env.into_iter().filter(|(key, _)| is_path(key)) {
+        env.insert(if windows { "PATH".to_string() } else { key }, value);
+    }
+    for (key, value) in overrides {
+        env.insert(if is_path(key) { "PATH".to_string() } else { key.clone() }, value.clone());
+    }
+    env
 }
 
 /// Port of `utils/shell.ts resolveKernelBashShell`.
@@ -1633,6 +1649,73 @@ mod tests {
             &format!("{}", "subprocess"),
             "win32"
         ));
+    }
+
+    #[test]
+    fn managed_kernel_path_honors_explicit_overrides_and_platform_keys() {
+        for windows in [false, true] {
+            let base = vec![("PATH".into(), "/managed:/system".into()), ("SECRET".into(), "not-forwarded".into())];
+            let defaults = kernel_shell_env(base.clone(), &[], windows);
+            assert_eq!(defaults.len(), 1);
+            assert_eq!(defaults["PATH"], "/managed:/system");
+            for path in ["", "/explicit"] {
+                let env = kernel_shell_env(base.clone(), &[("PATH".into(), path.into()), ("OTHER".into(), "value".into())], windows);
+                assert_eq!(env["PATH"], path);
+                assert_eq!(env["OTHER"], "value");
+                assert!(!env.contains_key("SECRET"));
+            }
+            let env = kernel_shell_env(base, &[("Path".into(), "override".into())], windows);
+            assert_eq!(env["PATH"], if windows { "override" } else { "/managed:/system" });
+            assert_eq!(env.contains_key("Path"), !windows);
+        }
+    }
+
+    // Re-exec isolates PATH/profile changes from parallel tests and never provisions tools.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn managed_kernel_path_resolves_both_tools_from_clean_environment() {
+        const CHILD: &str = "OPTIMUS_MANAGED_PATH_TEST_CHILD";
+        if std::env::var_os(CHILD).is_none() {
+            use std::os::unix::fs::PermissionsExt;
+            let root = tempfile::tempdir().unwrap();
+            let bin = root.path().join("managed tools");
+            std::fs::create_dir(&bin).unwrap();
+            for name in ["rg", "fd"] {
+                let tool = bin.join(name);
+                std::fs::write(&tool, format!("#!/bin/sh\nprintf '{name}-fixture\\n'\n")).unwrap();
+                std::fs::set_permissions(tool, std::fs::Permissions::from_mode(0o755)).unwrap();
+            }
+            let output = std::process::Command::new(std::env::current_exe().unwrap())
+                .args(["--exact", "core::tools::ipython::tests::managed_kernel_path_resolves_both_tools_from_clean_environment", "--nocapture"])
+                .env_clear()
+                .env(CHILD, "1")
+                .env("HOME", root.path())
+                .env("PI_BIN_DIR", &bin)
+                .env("PI_OFFLINE", "1")
+                .env("PATH", "")
+                .output().unwrap();
+            assert!(output.status.success(), "{}\n{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+            assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+            return;
+        }
+        assert_eq!(std::env::var("PATH").unwrap(), "");
+        let captured = Arc::new(Mutex::new(None));
+        let target = captured.clone();
+        let cwd = std::env::var("HOME").unwrap();
+        let provisioner = IpythonKernelProvisioner::new(&cwd, None, Arc::new(move |options| {
+            *target.lock().unwrap() = options.env;
+            Arc::new(StubKernelClient)
+        }));
+        provisioner.ensure(None, None).await.unwrap();
+        let env = captured.lock().unwrap().clone().unwrap();
+        assert_eq!(env["PATH"], std::env::var("PI_BIN_DIR").unwrap());
+        let output = std::process::Command::new(&env["PRIME_AGENT_BASH_SHELL"])
+            .args(["-c", "rg --version && fd --version"])
+            .env_clear().envs(&env).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout), "rg-fixture\nfd-fixture\n");
+        assert_eq!(std::env::var("PATH").unwrap(), "", "host PATH is not mutated");
+        provisioner.dispose(Some(false)).await;
     }
 
     #[test]
