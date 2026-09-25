@@ -4491,6 +4491,7 @@ impl AgentSession {
     }
 
     /// `_accountGoalUsageForAssistantMessage`.
+    /// Returns true only when this message reaches the goal's token budget.
     fn account_goal_usage_for_assistant_message(&self, message: &AssistantMessage) -> bool {
         let goal = self.goal_state.lock().unwrap().clone();
         if goal.status != GoalStatus::Active {
@@ -4518,7 +4519,7 @@ impl AgentSession {
             }
         }
         self.set_goal_state(&next, None);
-        true
+        next.status == GoalStatus::BudgetLimited
     }
 
     /// `get _steeringStopPending()`.
