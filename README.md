@@ -46,7 +46,7 @@ See the [installer source](installers/) and [launcher guide](docs/RUST_LAUNCHER.
 | Rust implementation | Available on `main`, installed as `optimus-agent`; remaining parity gaps are documented |
 | Platforms | macOS, Linux, and native Windows; Windows currently requires a Bash shell such as Git Bash |
 | Memory | Session, project, and global harness memory, with optional selected sharing; authoritative project storage is JSON |
-| Jev integration | Optional TypeSafe System One decisions, code-search filtering/reranking, semantic line finding, and request-local compaction; full-Jev enables all native feature gates |
+| Jev integration | Optional TypeSafe System One decisions, code-search filtering/reranking, semantic line finding, request-local compaction, and Dynamic questions through `jev_decide`; full-Jev enables all native feature gates |
 | TencentDB-backed memory | An intended integration direction, not an implemented backend in the current `main` branch |
 
 The feature descriptions below refer to `main` unless explicitly marked as development work. Some hardened Windows installations also use deployment-specific launchers and compatibility layers that are not included in a plain source checkout.
@@ -151,7 +151,7 @@ Experimental model-facing output reduction, iterative-summary consolidation, and
 
 ## Jev integration
 
-[Jev by TypeSafe AI](https://typesafe.ai/) is a System One model that returns typed judgments and probabilities. Optimus uses those judgments for bounded decisions around tools, code search, context, and ongoing work. Your selected coding model still handles the conversation and implementation.
+[Jev by TypeSafe AI](https://typesafe.ai/) is a System One model that returns typed judgments and probabilities. Optimus uses those judgments for bounded decisions around tools, code search, context, and ongoing work. With **Jev Dynamic**, the agent can also ask Jev task-specific questions through `jev_decide`, including choosing an option, assessing a yes/no condition, rating candidates, or sampling a coin-flip result. Your selected coding model handles the conversation and implementation.
 
 **Official links:** [Jev website](https://typesafe.ai/) · [Get an API key](https://console.typesafe.ai/keys) · [Quick start](https://docs.typesafe.ai/introduction/quickstart) · [HTTP API](https://docs.typesafe.ai/api) · [Models and pricing](https://docs.typesafe.ai/models).
 
@@ -190,7 +190,7 @@ After configuring the API key, enter these commands in the Optimus TUI:
 /jev status
 ```
 
-**Full-Jev is a persisted, global overlay for the active agent directory.** It enables Compare + Active, every registered feature gate, and independent request-local compaction across sessions using that directory. Bare `/jev full-jev` also enables it. The overlay takes precedence over saved session, global, and inherited controls without overwriting them. A running older binary must be upgraded and restarted to gain the new features.
+**Full-Jev is a persisted, global overlay for the active agent directory.** It enables Compare + Active, every registered feature gate, and independent request-local compaction across sessions using that directory. **Dynamic is included automatically, including for existing full-Jev profiles.** Bare `/jev full-jev` also enables it. The overlay takes precedence over saved session, global, and inherited controls without overwriting them. A running older binary must be upgraded and restarted to gain the new features.
 
 To leave full-Jev, use `/jev full-jev off`. This restores the saved settings, which may themselves enable Jev. While the overlay is active, individual mode, feature, compaction, and default edits are refused; turn the overlay off before customizing them.
 
@@ -235,15 +235,23 @@ With the full-Jev overlay off, enter these commands individually in the Optimus 
 /jev feature context_relevance on
 /jev feature code_search_relevance on
 /jev feature code_search_filtering on
+/jev feature code_search_reranking on
+/jev feature line_find on
 /jev feature memory_relevance on
 /jev feature result_sufficiency on
 /jev feature loop_control on
 /jev feature retry_classification on
 /jev feature verification on
 /jev feature trace_observer on
+/jev feature skill_suggestion on
+/jev feature guardrails_input on
+/jev feature guardrails_output on
+/jev feature retrieval_safety on
+/jev feature citation_check on
+/jev feature dynamic on
 ```
 
-Replace `on` with `off` to disable an individual gate, and use `/jev status` to inspect the effective settings. These commands do not enable the full-Jev overlay or independent compaction.
+Replace `on` with `off` to disable an individual gate, and use `/jev status` to inspect the effective settings. These commands do not enable the full-Jev overlay or independent compaction. Dynamic requires Active or Compare + Active; Compare alone does not expose `jev_decide`.
 
 ### What full-Jev enables
 
@@ -255,11 +263,35 @@ Replace `on` with `off` to disable an individual gate, and use `/jev status` to 
 | Retrieved evidence | `retrieval_safety` assesses candidate usefulness, possible prompt injection, and contradictions. `citation_check` assesses a claim against its supplied source span with a native quote check. These assessments do not establish facts outside the supplied evidence. |
 | Skills and guardrails | `skill_suggestion` assesses the already-loaded skill catalog without loading or executing a skill. `guardrails_input` and `guardrails_output` add advisory input and post-output assessments; they do not grant permissions or create a security sandbox. |
 | Progress and control | `result_sufficiency`, `loop_control`, `retry_classification`, `verification`, and `trace_observer` assess outcomes and progress. With full-Jev and an Active-capable mode, accepted control decisions can produce bounded host-owned feedback, queued follow-up, pause/escalation, retry suppression, or verification status. |
+| Dynamic questions | `dynamic` exposes `jev_decide` so the agent can ask ad hoc Choice, Noul and Score questions, batch independent questions, and optionally sample Choice probabilities locally. |
 | Compaction | The separate `compaction_enabled` control projects eligible old tool-call/result pairs into smaller outgoing context. Recent/protected messages, durable transcripts, and provider-native `/compact` behavior remain intact. It can also run with decision mode Off. |
 
 Code search starts with deterministic retrieval such as `rg --json`, AST queries, or symbol tools. The Python runtime's `rlm.code_search.from_ripgrep(...)` and `rlm.code_search.present(candidates)` expose an explicit candidate set to the native host; keep the complete results in a variable and make `present(...)` the cell's only output. Jev judges bounded supplied candidates and source reads; enabling it does not create an index or scan every file automatically. Filtering requires both relevance and filtering gates plus an Active-capable mode; full-Jev supplies those settings. See the [code-search workflow](docs/JEV_SYSTEM_ONE.md#experimental-code-search-relevance).
 
-The native host owns thresholds, freshness checks, deadlines, protected entries, and per-session control budgets. It rejects invalid, stale, unavailable, or insufficient-confidence decisions and retains baseline behavior. Jev cannot change the primary model/provider, grant permissions, execute tools itself, refill budgets, or declare a goal complete. Verification needs explicit correlated evidence; a successful tool call alone is insufficient. Active boundaries add API work and may add latency; quality and savings depend on the task.
+For automatic decisions, the native host owns thresholds, freshness checks, deadlines, protected entries, and per-session control budgets. It rejects invalid, stale, unavailable, or insufficient-confidence decisions and retains baseline behavior. Jev cannot change the primary model/provider, grant permissions, execute tools itself, refill budgets, or declare a goal complete. Verification needs explicit correlated evidence; a successful tool call alone is insufficient. Active boundaries add API work and may add latency; quality and savings depend on the task.
+
+### Ask Jev directly from chat
+
+With full-Jev on, Dynamic is ready to use. To enable it individually while full-Jev is off:
+
+```text
+/jev active
+/jev feature dynamic
+```
+
+`/jev feature dynamic` is shorthand for `/jev feature dynamic on`. `/jev feature dynamic off` disables it. Dynamic also works in Compare + Active. These explicit tool calls do not run a separate LLM comparison.
+
+Then ask in ordinary chat:
+
+```text
+Get Jev to flip a coin.
+Ask Jev whether this patch addresses the error in the supplied log.
+Have Jev rate these three candidate solutions from poor to excellent.
+```
+
+The agent selects **Choice** for named options, **Noul** for a yes/no probability, or **Score** for an ordered rating. It supplies the relevant context and criteria and can batch up to 64 independent questions. Results include typed answers, probabilities, confidence where available, and the reported model, token usage, latency and attempt count. Dynamic usage contributes to the chat's Jev statistics without claiming estimated token savings.
+
+For random choices, the tool draws fresh local randomness from Jev's returned Choice probabilities. A coin-flip request is therefore not a guaranteed fair 50/50 toss. The raw distribution is retained alongside the sampled result. See the [Jev Dynamic guide](resources/agent/docs/jev-dynamic.md) for the tool format, sampling, cancellation and daemon compatibility.
 
 ### System One API and model selection
 
@@ -303,6 +335,8 @@ For your own integrations, the official [Python SDK](https://docs.typesafe.ai/sd
 ### Data sent, settings, and records
 
 Enabled features and independent compaction send bounded task, code, context, or result excerpts to TypeSafe. The observation bridge omits raw tool arguments and redacts credential-shaped material while constructing bounded excerpts. Redaction is pattern-based: selected private text can still leave the machine. Choose modes and full-Jev's profile-wide scope with that disclosure in mind.
+
+Dynamic sends the state, questions and criteria supplied to `jev_decide` to the configured Jev service. The observation bridge's excerpt redaction does not apply to that explicit payload.
 
 Local Jev settings and records live under `<agent-dir>/jev/`. `jev-settings.json` holds saved controls and the full-Jev overlay; `records.jsonl` includes comparison and active-outcome records. `/jev status` reports credential source, configured gates, and observed or unknown telemetry without printing the key. Enabled, accepted, and applied are different states; an enabled gate or available credential does not prove a feature ran.
 
@@ -404,7 +438,7 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 | `/heartbeat` | Configure recurring session prompts |
 | `/tree`, `/fork`, `/clone` | Navigate or branch session history |
 | `/telegram` | Manage the Telegram connection |
-| `/jev` | Configure Jev credentials, models, full-Jev, individual feature gates, and compaction |
+| `/jev` | Configure Jev credentials, models, full-Jev, Dynamic questions, individual feature gates, and compaction |
 | `/settings`, `/mcp`, `/reload` | Configure and reload integrations and resources |
 
 ## Safety and compatibility
@@ -421,7 +455,7 @@ Preserve sessions, memory, configuration, and credentials when upgrading. New tr
 - [Background agents](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/long-running-agents.md)
 - [Project memory](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/project-memory.md)
 - [MCP integrations](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/mcp-integrations.md)
-- [Jev setup and API](#jev-integration), [native integration](docs/JEV_SYSTEM_ONE.md), and [official Jev website](https://typesafe.ai/)
+- [Jev setup and API](#jev-integration), [Dynamic questions](resources/agent/docs/jev-dynamic.md), [native integration](docs/JEV_SYSTEM_ONE.md), and [official Jev website](https://typesafe.ai/)
 - [Providers and authentication](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/providers.md)
 - [Settings](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/settings.md)
 - [Performance metrics](https://github.com/telemusai/optimus-agent/blob/main/docs/performance-metrics.md)

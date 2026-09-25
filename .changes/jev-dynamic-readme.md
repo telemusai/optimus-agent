@@ -1,0 +1,1 @@
+- Changed the README Jev guide to cover Dynamic questions, automatic Full Jev enablement, and all current feature controls.
