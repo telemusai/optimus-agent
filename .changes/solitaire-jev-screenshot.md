@@ -1,0 +1,1 @@
+- Added a Solitaire screenshot showing full JEV integration to the README.
