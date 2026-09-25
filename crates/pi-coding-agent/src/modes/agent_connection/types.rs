@@ -1343,6 +1343,7 @@ pub trait AgentConnection: Send + Sync {
     fn get_state(&self) -> pi_ai::types::BoxFuture<Result<AgentConnectionState, String>>;
     /// Whether the current execution host understands expanded Jev settings.
     /// Local settings writes must check this too, not only daemon RPCs.
+    fn supports_jev_dynamic(&self) -> bool { false }
     fn supports_jev_features(&self) -> bool {
         false
     }

@@ -25,6 +25,8 @@ use crate::core::skills::Skill;
 /// Path of the internal observer extension (stable, easy to spot in logs).
 pub const JEV_OBSERVER_PATH: &str = "<jev-observer-internal>";
 
+pub(crate) mod dynamic;
+
 /// Ownership-only stop fence, independent of credentials or observer replacement.
 /// The host persists retention and combines this with its other owned domains.
 pub fn request_session_retain_stop(session_id: &str) -> pi_jev::scheduler::SessionSettlementStatus {

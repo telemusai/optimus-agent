@@ -276,6 +276,9 @@ pub(super) async fn status_panel(
     if !connection.supports_jev_features() {
         text.push_str("\nAttached worker lacks Jev System One capability; new feature settings are local configuration only.\n");
     }
+    if settings.effective_features(session_id).dynamic && !connection.supports_jev_dynamic() {
+        text.push_str("\nDynamic is configured but unavailable in the attached worker. Update the daemon to use it.\n");
+    }
     text
 }
 
@@ -373,9 +376,19 @@ pub(super) async fn run(
         }
         JevRequest::SetFeature(feature, enabled) => {
             require_feature_support(connection.supports_jev_features())?;
+            if feature == pi_jev::config::JevFeature::Dynamic && !connection.supports_jev_dynamic() {
+                return Err("The attached worker does not support Jev Dynamic. Update the daemon; no settings were changed.".into());
+            }
             bridge.set_feature(&session_id, feature, enabled)?;
             crate::core::jev_bridge::invalidate_settings_cache();
-            Ok(CommandOutput::Status(format!("Jev feature {}: {} (this chat). Mode and compaction are unchanged.",
+            let guidance = if feature == pi_jev::config::JevFeature::Dynamic && enabled {
+                if bridge.effective_mode(&session_id).allows_active() {
+                    " Ask the agent, for example: Get Jev to flip a coin."
+                } else {
+                    " Run /jev active to make the tool available."
+                }
+            } else { "" };
+            Ok(CommandOutput::Status(format!("Jev feature {}: {} (this chat). Mode and compaction are unchanged.{guidance}",
                 feature.as_str(), if enabled { "on" } else { "off" })))
         }
         JevRequest::SetCompaction(enabled) => {

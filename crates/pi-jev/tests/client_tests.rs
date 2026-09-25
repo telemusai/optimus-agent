@@ -1931,7 +1931,7 @@ fn wire_json_uses_the_documented_shapes() {
 }
 
 #[test]
-fn bundle_helpers_map_question_ids_to_categories_and_keep_every_category_enabled() {
+fn bundle_helpers_map_question_ids_to_categories_and_exclude_explicit_dynamic_comparisons() {
     let bundle = default_bundle();
     assert_eq!(bundle.question_categories["complexity.0"], DecisionCategory::Complexity);
     assert_eq!(
@@ -1941,14 +1941,16 @@ fn bundle_helpers_map_question_ids_to_categories_and_keep_every_category_enabled
     let enabled = pi_jev::compare_default_categories();
     // Live count: baseline 14 + search lane (rerank, line-find) + evidence lane
     // (retrieval-safety, citation-check) + agent-guidance lane (skill suggestion,
-    // guardrails input/output).
-    assert_eq!(enabled.len(), 21, "category switches include the opt-in observers and the search/evidence/agent-guidance lane categories");
-    assert!(enabled.values().all(|value| *value));
+    // guardrails input/output), plus explicit Dynamic questions.
+    assert_eq!(enabled.len(), 22, "category switches include all registered categories");
+    for (category, value) in &enabled {
+        assert_eq!(*value, *category != DecisionCategory::Dynamic);
+    }
     let request = bundle.to_request();
     let ids = bundle.enabled_question_ids(&enabled);
     assert_eq!(ids.len(), 3);
     assert!(ids.iter().all(|id| request.questions.contains_key(id)));
-    assert_eq!(DecisionCategory::all().len(), 21);
+    assert_eq!(DecisionCategory::all().len(), 22);
     assert_eq!(DecisionCategory::Complexity.question_id(2), "complexity.2");
     assert_eq!(DecisionCategory::parse("task_classification"), Some(DecisionCategory::TaskClassification));
 }

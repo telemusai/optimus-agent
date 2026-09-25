@@ -60,6 +60,7 @@ fn activity(stage: &str) -> &'static str {
         }
         "code_search" | "code_search_rerank" | "code_line_find" => "searching",
         "skill_suggestion" => "selecting skills",
+        "dynamic" => "answering dynamic questions",
         "context_relevance" | "memory_relevance" | "retrieval" => "checking context",
         "agent_end" | "turn_end" | "verification" | "citation_check" | "retrieval_safety" => {
             "verifying"

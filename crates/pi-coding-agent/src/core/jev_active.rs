@@ -140,12 +140,25 @@ fn apply_tool_requirement(
 
     let mut changes = Vec::new();
     if let Some(removed) = object.remove(TOOLS_KEY) {
+        // Keep explicit Dynamic requests reachable without disabling normal pruning.
+        let pinned: Vec<_> = removed.as_array().into_iter().flatten()
+            .filter(|tool| tool_name_for_pruning(tool) == Some("jev_decide")).cloned().collect();
+        let retained = (!pinned.is_empty()).then(|| Value::Array(pinned));
+        if let Some(retained) = &retained {
+            object.insert(TOOLS_KEY.into(), retained.clone());
+            if retained == &removed { return changes; }
+        }
         changes.push(AppliedChange {
             key: TOOLS_KEY.to_string(),
             from: Some(render(&removed)),
-            to: None,
+            to: retained.as_ref().map(render),
             category: category.to_string(),
         });
+    }
+    // Retaining Dynamic must not override an explicit provider-side tool ban.
+    if object.contains_key(TOOLS_KEY)
+        && object.get(TOOL_CHOICE_KEY).and_then(Value::as_str) == Some("none") {
+        return changes;
     }
     if let Some(removed) = object.remove(TOOL_CHOICE_KEY) {
         changes.push(AppliedChange {
@@ -301,7 +314,7 @@ pub fn prepare_tool_pruning(
             return plan;
         };
         if !seen.insert(name) { return plan; }
-        let mandatory = name == "ipython" || name.starts_with("__") || name.starts_with("rlm")
+        let mandatory = name == "ipython" || name == "jev_decide" || name.starts_with("__") || name.starts_with("rlm")
             || name.starts_with("agent_") || options.mandatory_tool_names.iter().any(|item| item == name);
         if mandatory || !options.optional_tool_names.iter().any(|item| item == name)
             || candidates.len() >= options.max_candidates { continue; }
@@ -328,6 +341,29 @@ mod tests {
             "tool_choice": "auto",
             "stream": true
         })
+    }
+
+    #[test]
+    fn dynamic_tool_survives_automatic_requirement_and_candidate_pruning() {
+        for tool in [json!({"type":"function","function":{"name":"jev_decide","parameters":{}}}),
+            json!({"type":"function","name":"jev_decide","parameters":{}}),
+            json!({"name":"jev_decide","input_schema":{}})] {
+            let mut body=json!({"tools":[tool],"tool_choice":"auto"});
+            let original=body.clone();
+            assert!(apply_decision(&mut body,"tool_requirement","none").is_empty());
+            assert_eq!(body,original);
+            let options=pruning_options(&["jev_decide"]);
+            assert!(prepare_tool_pruning(&body,"Get Jev to flip a coin",&options).questions().is_empty());
+            body["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"lookup"}));
+            assert!(!apply_decision(&mut body,"tool_requirement","none").is_empty());
+            assert_eq!(body["tools"],original["tools"]);
+            assert!(body.get("tool_choice").is_none());
+            body["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"lookup"}));
+            body["tool_choice"] = json!("none");
+            apply_decision(&mut body,"tool_requirement","none");
+            assert_eq!(body["tool_choice"],"none");
+            assert_eq!(body["tools"],original["tools"]);
+        }
     }
 
     #[test]
