@@ -1,0 +1,1 @@
+- Changed the Optimus application and Python runtime version to 0.1.6 for the stable release.
