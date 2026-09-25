@@ -1,0 +1,1 @@
+- Fixed goals reporting budget exhaustion before reaching their token limit, including goals without a token budget.
