@@ -40,6 +40,26 @@ async fn persistent_javascript_await_files_modules_errors_and_reset() {
         .await
         .unwrap();
     assert!(text(&import).contains("test"));
+    let package = dir.path().join("node_modules/optimus-esm-fixture");
+    std::fs::create_dir_all(&package).unwrap();
+    std::fs::write(
+        package.join("package.json"),
+        r#"{"type":"module","exports":{"import":"./index.mjs"}}"#,
+    )
+    .unwrap();
+    std::fs::write(package.join("index.mjs"), "export default 42;").unwrap();
+    let esm = runtime
+        .execute(
+            cwd,
+            "(await nodeImport('optimus-esm-fixture')).default",
+            10.,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+    assert_eq!(esm.is_error, Some(false));
+    assert!(text(&esm).contains("42"));
     let error = runtime
         .execute(cwd, "throw new Error('deliberate')", 10., None, None)
         .await

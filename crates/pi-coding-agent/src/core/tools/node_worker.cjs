@@ -4,7 +4,7 @@
   const { Session } = require('node:inspector');
   const { createInterface } = require('node:readline');
   const { createRequire } = require('node:module');
-  const { resolve } = require('node:path');
+  const { resolve, isAbsolute } = require('node:path');
   const { pathToFileURL } = require('node:url');
   const { inspect } = require('node:util');
   const { AsyncLocalStorage } = require('node:async_hooks');
@@ -34,9 +34,8 @@
   globalThis.require = createRequire(resolve(process.cwd(), '__optimus_node__.cjs'));
   // Dynamic import inside inspector expressions has no module loader callback.
   // This helper imports through the real Node module loader instead.
-  globalThis.nodeImport = (specifier) => import(specifier.startsWith('.') || specifier.startsWith('/')
-    ? pathToFileURL(resolve(process.cwd(), specifier)).href
-    : specifier.startsWith('node:') ? specifier : pathToFileURL(globalThis.require.resolve(specifier)).href);
+  globalThis.nodeImport = (specifier) => import(isAbsolute(specifier) || specifier.startsWith('./') || specifier.startsWith('../')
+    ? pathToFileURL(resolve(process.cwd(), specifier)).href : specifier);
   globalThis.__optimusInspect = (value) => inspect(value, {
     colors: false, depth: 4, maxArrayLength: 100, maxStringLength: 8192, customInspect: false, getters: false,
   });
