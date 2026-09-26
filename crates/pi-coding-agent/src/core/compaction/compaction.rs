@@ -575,6 +575,7 @@ pub const COMPACT_SKILL_NAME: &str = "compact";
 
 /// Automatic compaction policy; this does not change the model's advertised window.
 pub const MAX_COMPACTION_CONTEXT_TOKENS: f64 = 250_000.0;
+const AZURE_GPT_MAX_COMPACTION_CONTEXT_TOKENS: f64 = 400_000.0;
 
 pub const SUMMARY_UPDATE_POLICY_ENV: &str = "PRIME_AGENT_SUMMARY_UPDATE_POLICY";
 pub const CONSOLIDATE_REPEATED_SUMMARY_POLICY: &str = "consolidate-repeated-v1";
@@ -734,17 +735,27 @@ pub fn should_compact(
     context_window: f64,
     settings: &CompactionSettings,
 ) -> bool {
+    should_compact_with_cap(
+        context_tokens,
+        context_window,
+        settings,
+        MAX_COMPACTION_CONTEXT_TOKENS,
+    )
+}
+
+fn should_compact_with_cap(
+    context_tokens: f64,
+    context_window: f64,
+    settings: &CompactionSettings,
+    cap: f64,
+) -> bool {
     if !settings.enabled {
         return false;
     }
     if context_window <= 0.0 {
         return false;
     }
-    context_tokens
-        >= f64::min(
-            MAX_COMPACTION_CONTEXT_TOKENS,
-            context_window - settings.reserve_tokens,
-        )
+    context_tokens >= f64::min(cap, context_window - settings.reserve_tokens)
 }
 
 pub fn should_compact_for_model(
@@ -752,8 +763,16 @@ pub fn should_compact_for_model(
     model: &Model,
     settings: &CompactionSettings,
 ) -> bool {
-    let input_limit = get_model_input_limit(model);
-    should_compact(context_tokens, input_limit, settings)
+    let cap = if matches!(
+        model.provider.as_str(),
+        "azure-openai-managed" | "azure-foundry-managed" | "azure-openai-responses"
+    ) && model.id.to_ascii_lowercase().starts_with("gpt-")
+    {
+        AZURE_GPT_MAX_COMPACTION_CONTEXT_TOKENS
+    } else {
+        MAX_COMPACTION_CONTEXT_TOKENS
+    };
+    should_compact_with_cap(context_tokens, get_model_input_limit(model), settings, cap)
 }
 
 /// `Math.ceil(chars / 4)` with JavaScript's number semantics.
