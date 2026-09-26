@@ -26,11 +26,15 @@ Both use the same structured summary format and track file operations cumulative
 
 ### When It Triggers
 
-Auto-compaction triggers when:
+When enabled, auto-compaction triggers at this inclusive boundary:
 
 ```
-contextTokens > contextWindow - reserveTokens
+contextTokens >= min(policyCap, modelInputLimit - reserveTokens)
 ```
+
+The policy cap is 400,000 tokens only for models whose resolved ID starts with `gpt-` (ASCII-case-insensitive) on `azure-openai-managed`, `azure-foundry-managed`, or `azure-openai-responses`. All other models retain the 250,000-token cap. This includes Azure Foundry Kimi/GLM models, Azure o-series models, non-Azure GPT models, and opaque deployment aliases.
+
+The model input limit still respects its context window and any smaller configured input limit. A smaller input limit minus reserve takes priority over the policy cap. The policy does not change the advertised context window and is checked against the currently selected model.
 
 By default, `reserveTokens` is 16384 tokens (configurable in `~/.prime/agent/settings.json` or `<project-dir>/.prime/agent/settings.json`). This leaves room for the LLM's response.
 

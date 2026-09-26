@@ -1,0 +1,1 @@
+- Changed automatic compaction to use a 400,000-token cap for Azure GPT models and keep the 250,000-token cap for all other models, with both caps still bounded by the model input limit minus the configured reserve.
