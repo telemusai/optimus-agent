@@ -18,7 +18,7 @@ Edit directly or use `/settings` for common options.
 | `defaultProvider` | string | - | Default provider (e.g., `"anthropic"`, `"openai"`) |
 | `defaultModel` | string | - | Default model ID |
 | `defaultThinkingLevel` | string | `"xhigh"` | `"off"`, `"minimal"`, `"low"`, `"medium"`, `"high"`, `"xhigh"`, `"max"` |
-| `hideThinkingBlock` | boolean | `false` | Hide thinking blocks in output |
+| `hideThinkingBlock` | boolean | `false` | Legacy thinking preference; startup visibility follows `chatDetail` |
 | `thinkingBudgets` | object | - | Custom token budgets per thinking level |
 
 #### thinkingBudgets
@@ -36,12 +36,17 @@ Edit directly or use `/settings` for common options.
 
 ### UI & Display
 
+Chats open at the saved `chatDetail` level, defaulting to `details`. Ctrl+O cycles overview → details → all output and saves the choice for new, resumed, and attached chats. Overview hides thinking and collapses tools and diffs; details shows thinking and file diffs; all output also expands tools and agent-to-agent message bodies. Messages and session files are unchanged. Extension calls to `ctx.ui.setToolsExpanded()` affect the current view without changing the saved preference.
+
+The Neon header includes a small striped sunset behind a continuous mountain range when the terminal has room (at least 160 columns and 48 rows with a normal input area). Smaller windows keep the compact header.
+
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `theme` | string | `"neon"` | Theme name (`"neon"`, `"prime"`, `"dark"`, `"light"`, or custom); explicit selections are preserved |
 | `quietStartup` | boolean | `false` | Hide startup header |
 | `collapseChangelog` | boolean | `false` | Show condensed changelog after updates |
 | `treeFilterMode` | string | `"user-only"` | Default filter for `/tree`: `"default"`, `"no-tools"`, `"user-only"`, `"labeled-only"`, `"all"` |
+| `chatDetail` | string | `"details"` | Conversation detail: `"overview"`, `"details"`, or `"all"`; Ctrl+O saves the choice |
 | `editorPaddingX` | number | `0` | Horizontal padding for input editor (0-3) |
 | `autocompleteMaxVisible` | number | `5` | Max visible items in autocomplete dropdown (3-20) |
 | `showHardwareCursor` | boolean | `false` | Show terminal cursor |

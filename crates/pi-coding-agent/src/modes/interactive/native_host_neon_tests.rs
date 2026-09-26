@@ -66,7 +66,7 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
     for width in [
         1, 8, 24, 35, 36, 79, 80, 89, 90, 100, 109, 110, 120, 159, 160, 240,
     ] {
-        for budget in 0..12 {
+        for budget in 0..14 {
             let rows = render_header(width, budget, &data);
             assert!(rows.len() <= budget);
             assert!(
@@ -113,6 +113,47 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
     assert!(render_header(120, 7, &disabled)
         .join("\n")
         .contains("○ Jev Off"));
+}
+
+#[test]
+fn neon_landscape_fits_between_brand_and_status_and_yields_to_small_windows() {
+    let _mode = mode();
+    let data = HeaderData {
+        cwd: "~/agents/optimus-agent",
+        session: "Synthwave header",
+        model: "offline-fixture",
+        phase: "WORKING",
+        jev: Some("Jev Full"),
+        clock: "12:34:56",
+    };
+    for width in [160, 180, 240] {
+        let rows = render_header(width, 12, &data);
+        assert_eq!(rows.len(), 12);
+        assert!(rows.iter().all(|row| visible_width(row) == width));
+        let text = strip_ansi(&rows.join("\n"));
+        for label in [
+            "telemus.ai", "SYSTEM // WORKING", "offline-fixture", "Jev Full",
+            "12:34:56", "Synthwave header",
+        ] {
+            assert!(text.contains(label), "missing {label} at width {width}");
+        }
+        let line = strip_ansi(&rows[5]);
+        assert!(line.contains("--------------"));
+        assert!(line.find("///").unwrap() < line.find("--------------").unwrap());
+        assert!(rows[5].contains(&theme().get_fg_ansi("thinkingText")));
+    }
+    for (width, budget) in [(159, 12), (160, 11), (80, 6), (240, 7)] {
+        assert!(!render_header(width, budget, &data)
+            .join("\n").contains("--------------"));
+    }
+    let long_status = "CONNECTION STATUS ".repeat(5);
+    let crowded = HeaderData {
+        phase: &long_status,
+        ..data
+    };
+    assert!(!render_header(160, 12, &crowded).join("\n").contains("--------------"));
+    crate::modes::interactive::theme::theme::set_theme("prime", false);
+    assert!(!render_header(160, 12, &data).join("\n").contains("--------------"));
 }
 
 #[test]

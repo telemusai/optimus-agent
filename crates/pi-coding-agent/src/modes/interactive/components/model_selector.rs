@@ -6,7 +6,7 @@
 use pi_ai::types::Model;
 use pi_tui::components::{spacer::Spacer, text::Text};
 use pi_tui::fuzzy::fuzzy_match;
-use pi_tui::keybindings::get_keybindings;
+use pi_tui::keybindings::{get_keybindings, KeyMatchOptions};
 use pi_tui::tui::{Component, Focusable};
 use serde_json::Value;
 use std::cell::RefCell;
@@ -701,7 +701,7 @@ impl ModelSelectorComponent {
     /// Port of `handleInput`.
     pub fn handle_input(&mut self, key_data: &str) {
         let kb = get_keybindings();
-        if kb.matches(key_data, "app.model.toggleScope") {
+        if kb.matches_with_options(key_data, "app.model.toggleScope", KeyMatchOptions { option_composed: true }) {
             if !self.scoped_model_items.is_empty() {
                 let next_scope = if self.scope == ModelScope::All {
                     ModelScope::Scoped
@@ -1323,6 +1323,40 @@ mod tests {
         assert_eq!(selector.filtered_models[0].id, "beta");
         selector.handle_input("\x1bs");
         assert!(selector.filtered_models.is_empty());
+    }
+
+    #[test]
+    fn composed_option_s_toggles_scope_without_changing_search() {
+        let models = vec![
+            item("signed", "alpha", "Alpha").model,
+            item("signed", "beta", "Beta").model,
+        ];
+        let mut selector = picker(models.clone());
+        selector.scoped_models = vec![ScopedModelItem {
+            model: models[0].clone(),
+            thinking_level: None,
+        }];
+        selector.load_models();
+        selector.set_scope(ModelScope::Scoped);
+        selector.set_search_value("beta");
+        selector.handle_input("ß");
+        assert_eq!(selector.scope, ModelScope::All);
+        assert_eq!(selector.get_search_value(), "beta");
+        assert_eq!(selector.filtered_models[0].id, "beta");
+        selector.handle_input("ß");
+        assert_eq!(selector.scope, ModelScope::Scoped);
+        assert_eq!(selector.get_search_value(), "beta");
+
+        let mut kb = get_keybindings();
+        kb.set_user_bindings(indexmap::IndexMap::from([
+            ("app.model.toggleScope".into(), vec!["alt+a".into()]),
+        ]));
+        pi_tui::keybindings::set_keybindings(kb);
+        selector.set_search_value("");
+        selector.handle_input("ß");
+        assert_eq!(selector.scope, ModelScope::Scoped);
+        assert_eq!(selector.get_search_value(), "ß");
+        crate::core::keybindings::KeybindingsManager::new(Default::default(), None).install();
     }
 
     #[test]

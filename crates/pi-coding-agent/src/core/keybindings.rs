@@ -210,7 +210,7 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
         KeybindingDefinition {
             default_keys: vec![String::from("ctrl+o")],
             default_keys_is_single: true,
-            description: Some("Toggle tool output".to_string()),
+            description: Some("Cycle and save conversation detail".to_string()),
             default_key_scope: Some("editor".to_string()),
         },
     );

@@ -30,6 +30,24 @@ const CONFIG_DIR_NAME: &str = ".prime/agent";
 /// `interface Settings` - keys are written verbatim, so this is a JSON object.
 pub type Settings = Map<String, Value>;
 
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub enum ChatDetail {
+    Overview,
+    #[default]
+    Details,
+    All,
+}
+
+impl ChatDetail {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Self::Overview => "overview",
+            Self::Details => "details",
+            Self::All => "all",
+        }
+    }
+}
+
 pub type SummaryUpdatePolicySetting = String;
 const SUMMARY_UPDATE_POLICY_OFF: &str = "off";
 const SUMMARY_UPDATE_POLICY_CONSOLIDATE_REPEATED_V1: &str = "consolidate-repeated-v1";
@@ -2271,6 +2289,20 @@ impl SettingsManager {
 
     // -- tree filter / cursor / padding ------------------------------------
 
+    pub fn get_chat_detail(&self) -> ChatDetail {
+        match self.settings.get("chatDetail").and_then(Value::as_str) {
+            Some("overview") => ChatDetail::Overview,
+            Some("all") => ChatDetail::All,
+            _ => ChatDetail::Details,
+        }
+    }
+
+    pub fn set_chat_detail(&mut self, detail: ChatDetail) {
+        self.global_settings.insert("chatDetail".into(), Value::String(detail.as_str().into()));
+        self.mark_modified("chatDetail", None);
+        self.save();
+    }
+
     pub fn get_tree_filter_mode(&self) -> TreeFilterMode {
         let mode = top_string(&self.settings, keys::TREE_FILTER_MODE);
         match mode {
@@ -2407,6 +2439,22 @@ mod tests_support {
 mod tests {
     use super::tests_support::*;
     use super::*;
+
+    #[test]
+    fn chat_detail_defaults_and_invalid_values_use_details() {
+        for value in [Value::Null, Value::Bool(true), serde_json::json!(42), serde_json::json!("invalid")] {
+            let mut settings = Settings::new();
+            settings.insert("chatDetail".into(), value);
+            assert_eq!(SettingsManager::in_memory(settings).get_chat_detail(), ChatDetail::Details);
+        }
+        assert_eq!(SettingsManager::in_memory(Settings::new()).get_chat_detail(), ChatDetail::Details);
+        for detail in [ChatDetail::Overview, ChatDetail::Details, ChatDetail::All] {
+            let mut manager = SettingsManager::in_memory(Settings::new());
+            manager.set_chat_detail(detail);
+            assert_eq!(manager.get_chat_detail(), detail);
+            assert_eq!(manager.get_global_settings()["chatDetail"], detail.as_str());
+        }
+    }
 
     #[test]
     fn deep_merge_merges_nested_objects_and_overrides_scalars() {
