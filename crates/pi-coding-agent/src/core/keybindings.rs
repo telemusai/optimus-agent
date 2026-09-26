@@ -646,7 +646,7 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
     for (action, key, description) in [
         ("app.stats.toggleSubagents", "s", "Include or exclude subagents in statistics"),
         ("app.stats.nextSection", "tab", "Show the next statistics section"),
-        ("app.executionMode.toggle", "f6", "Toggle IPython / Direct tools execution mode"),
+        ("app.executionMode.toggle", "f6", "Cycle IPython / Node / Direct tools execution mode"),
     ] {
         map.insert(action.into(), KeybindingDefinition {
             default_keys: vec![key.into()],

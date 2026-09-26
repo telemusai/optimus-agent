@@ -379,6 +379,7 @@ impl AgentConnection for InProcessAgentConnection {
 
     fn supports_jev_dynamic(&self) -> bool { true }
     fn supports_execution_mode(&self) -> bool { true }
+    fn supports_node_execution_mode(&self) -> bool { true }
 
     fn supports_jev_features(&self) -> bool {
         true

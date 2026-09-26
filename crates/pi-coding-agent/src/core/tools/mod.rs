@@ -10,6 +10,7 @@ pub mod edit;
 pub mod edit_diff;
 pub mod file_mutation_queue;
 pub mod ipython;
+pub mod node;
 pub mod ipython_cell_code;
 pub mod output_accumulator;
 pub mod path_utils;

@@ -1,0 +1,3 @@
+- Added Node execution mode with a persistent JavaScript workspace, top-level await, a JavaScript system prompt, and `/mode node`; F6 cycles IPython, Node, and Direct tools.
+- Fixed pending execution mode changes waiting for an entire tool-driven run: switches now apply after the current tool batch and preserve unfinished work through the session queue.
+- Fixed Direct tools Bash hanging after shell exit when a background process keeps stdout or stderr open; output draining and child reaping are bounded.

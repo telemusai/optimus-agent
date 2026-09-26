@@ -457,7 +457,7 @@ fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests()
             "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
         }})).await;
         let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
-        for message in ["HTTP_MODE_HISTORY", "/mode direct", "HTTP_DIRECT_REQUEST", "/mode ipython", "HTTP_IPYTHON_REQUEST", "/mode direct"] {
+        for message in ["HTTP_MODE_HISTORY", "/mode direct", "HTTP_DIRECT_REQUEST", "/mode ipython", "HTTP_IPYTHON_REQUEST", "/mode node", "HTTP_NODE_REQUEST", "/mode direct"] {
             request(&client, json!({"type":"prompt_and_wait", "activeSessionId":active, "message":message})).await;
         }
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
@@ -470,8 +470,13 @@ fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests()
         assert!(status.success(), "{status}; {stdout}; {stderr}");
     });
     let requests = model.requests.lock().unwrap();
-    assert_eq!(requests.len(), 4, "mode switches must not call a model");
-    for (index, direct) in [(0, false), (1, true), (2, false), (3, true)] {
+    assert_eq!(requests.len(), 5, "mode switches must not call a model");
+    let node = &requests[3];
+    assert_eq!(node["tools"][0]["function"]["name"], "node");
+    let node_prompt = node["messages"][0]["content"].to_string();
+    assert!(node_prompt.contains("JavaScript is the orchestration language"));
+    assert!(!node_prompt.contains("Python is the orchestration language"));
+    for (index, direct) in [(0, false), (1, true), (2, false), (4, true)] {
         let request = &requests[index];
         let names: Vec<_> = request["tools"].as_array().unwrap().iter()
             .filter_map(|tool| tool["function"]["name"].as_str()).collect();
@@ -525,7 +530,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         let saved = state["sessionFile"].as_str().unwrap().to_string();
         let stop = entries(&saved, "prime-agent.explicit-stop");
         assert!(stop.last().unwrap()["data"]["generation"].is_string());
-        for expected in [json!(["bash", "edit"]), json!(["ipython"])] {
+        for expected in [json!(["node"]), json!(["bash", "edit"]), json!(["ipython"])] {
             // F6 uses prompt admission with a steer schedule, not prompt_and_wait.
             request(&client, json!({"type":"prompt", "activeSessionId":active,
                 "message":"/mode toggle", "streamingBehavior":"steer"})).await;
@@ -557,7 +562,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         }})).await;
         let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
         request(&client, json!({"type":"prompt", "activeSessionId":active,
-            "message":"/mode toggle", "streamingBehavior":"steer"})).await;
+            "message":"/mode direct", "streamingBehavior":"steer"})).await;
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
         assert_eq!(state["activeToolNames"], json!(["bash", "edit"]));
         client.close().await;

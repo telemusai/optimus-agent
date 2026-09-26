@@ -4,6 +4,30 @@ use crate::core::execution_mode::ExecutionMode;
 const ENTRY: &str = "execution_mode";
 
 impl AgentSession {
+    /// F6 yields after the current tool batch instead of waiting for the model's
+    /// entire investigation to end. Keep a continuation in the ordinary queue,
+    /// so stop/cancel, persistence and newer user input retain their ownership.
+    pub(super) fn preserve_work_after_mode_switch(self: &Arc<Self>, context: &ShouldStopAfterTurnContext) {
+        if context.tool_results.is_empty() || self.explicitly_stopped() { return; }
+        let queued = self.action_store.lock().unwrap().queued_actions(None);
+        let switching = queued.iter().any(|action| matches!(&action.payload,
+            QueuedActionPayload::SessionCommand(input) if input.base.command.name == "mode" && !input.base.command.args.is_empty()));
+        if !switching || queued.iter().any(|action| matches!(action.payload, QueuedActionPayload::Turn(_))) { return; }
+        let text = "Continue the user's unfinished task after the queued execution mode change. Use the current system prompt and available tools; the previous tool batch has completed.";
+        let message = CustomMessage {
+            role: "custom".into(), timestamp: now_ms_i64(),
+            custom_type: "executionModeContinuation".into(),
+            content: CustomMessageContent::Text(text.into()),
+            display: false,
+            details: None,
+        };
+        let action = self.create_prepared_turn_action("followUp", text, None, Some(PreparedTurnActionOptions {
+            custom_message: Some(message), source: Some("internal".into()), queue_visible: Some(false),
+            queue_key: Some("execution-mode-continuation".into()), ..Default::default()
+        }));
+        let _ = self.admit_session_input(action, false);
+    }
+
     /// A stopped chat can change settings without admitting or waking queued work.
     pub(super) async fn try_stopped_execution_mode(
         self: &Arc<Self>,
@@ -89,7 +113,7 @@ impl AgentSession {
                 ))
             }
             "toggle" => current
-                .ok_or("Cannot toggle a custom tool set; use /mode ipython or /mode direct")?
+                .ok_or("Cannot toggle a custom tool set; use /mode ipython, /mode node or /mode direct")?
                 .toggled(),
             value => ExecutionMode::parse(value)?,
         };

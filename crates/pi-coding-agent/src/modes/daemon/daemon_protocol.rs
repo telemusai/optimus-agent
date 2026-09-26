@@ -68,8 +68,9 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Native lifecycle host requests are separately capability-gated and never required at startup.
 // Revision 33 advertises optional jev_dynamic tool support; existing commands/events are unchanged.
 // Revision 34 gates /mode session commands; existing response/event shapes are unchanged.
-pub const DAEMON_SCHEMA_REVISION: u32 = 34;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-34-c16da0e12d5a";
+// Revision 35 gates Node selection and the three-mode toggle; legacy explicit modes remain compatible.
+pub const DAEMON_SCHEMA_REVISION: u32 = 35;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-35-node-modes";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -155,6 +156,7 @@ pub enum DaemonServerCapability {
     /// Explicit agent-authored questions via the optional jev_decide tool.
     JevDynamic,
     ExecutionMode,
+    NodeExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -205,7 +207,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 26] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 27] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -232,6 +234,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 26] = [
     DaemonServerCapability::JevFeatures,
     DaemonServerCapability::JevDynamic,
     DaemonServerCapability::ExecutionMode,
+    DaemonServerCapability::NodeExecutionMode,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2239,6 +2242,11 @@ pub fn get_daemon_command_compatibilities(command: &DaemonCommand) -> Vec<Daemon
             .is_some_and(|command| command.name == "mode")
     {
         requirements.push(DaemonCommandCompatibility::gated(34, DaemonServerCapability::ExecutionMode));
+        if command.get("message").as_ref().and_then(Value::as_str)
+            .and_then(crate::core::slash_commands::parse_session_slash_command)
+            .is_some_and(|c| matches!(c.args.trim(), "node" | "toggle")) {
+            requirements.push(DaemonCommandCompatibility::gated(35, DaemonServerCapability::NodeExecutionMode));
+        }
     }
     if (command_type == "attach" || command_type == "reattach") && command.has_field("recoveryConfig") {
         requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);

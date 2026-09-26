@@ -57,22 +57,25 @@ The feature descriptions below refer to `main` unless explicitly marked as devel
 
 ## What makes Optimus different
 
-### Choose IPython or Direct tools
+### Choose IPython, Node, or Direct tools
 
-Optimus starts new chats in **IPython** mode. Press **F6** to switch between IPython and **Direct tools**. The header shows the current mode immediately after the model name, for example `gpt-6-astra · IPython [F6]`.
+Optimus starts new chats in **IPython** mode. Press **F6** to cycle through **IPython → Node → Direct tools**. The header shows the current mode immediately after the model name, for example `gpt-6-astra · IPython [F6]`.
 
 | Mode | How the agent works |
 | --- | --- |
 | **IPython** (default) | Uses a persistent Python workspace to coordinate commands, retain variables, invoke Python skills, and delegate through RLM. |
+| **Node** | Uses a persistent JavaScript workspace with top-level `await`, Node modules, file access, and command execution. Requires Node.js 22 or newer on the daemon’s PATH. |
 | **Direct tools** | Calls the `bash` and `edit` tools directly and inspects their results. Project Python scripts can still run through the shell. |
 
-Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current run finishes. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Switching to Direct tools keeps the Python workspace alive, so switching back can reuse its variables.
+Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current tool batch finishes, then continues with the new mode. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Live mode switches keep both workspaces alive, so switching back can reuse their variables. Node variables are not saved across daemon restarts or session reopening. Cancelling or timing out a Node cell resets its workspace; ordinary JavaScript errors preserve it.
 
 F6 and `/mode` also work in stopped chats, including after reopening them. Switching modes leaves the chat stopped: queued messages and goals do not resume, and no model request is made. If work is still settling after a stop, wait until the chat is idle before switching.
 
-Use `/mode` to inspect the current mode, `/mode ipython` or `/mode direct` to select one, and `/mode toggle` to switch. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
+Use `/mode` to inspect the current mode, `/mode ipython`, `/mode node`, or `/mode direct` to select one, and `/mode toggle` to switch. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
 
-Python-only skills, RLM delegation, kernel MCP connections, and Python image previews require IPython mode. Other exposed tools, including Dynamic Jev, remain available in either mode. Changing mode does not change the selected model, Jev settings, or autonomy settings.
+Python-only skills, RLM delegation, kernel MCP connections, and Python image previews require IPython mode. Other exposed tools, including Dynamic Jev, remain available in all three modes. Changing mode does not change the selected model, Jev settings, or autonomy settings.
+
+In Node mode, the agent sends JavaScript to the `node` tool. It can use `require("node:fs/promises")`, async commands through `node:child_process`, and `await nodeImport("module-or-path")` for ESM. The cell timeout defaults to 60 seconds and can be set up to one hour. Python skills and RLM are available by switching back to IPython.
 
 ### A programmable workspace, not just a chat loop
 

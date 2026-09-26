@@ -98,6 +98,30 @@ pub struct LocalBashOperations {
     pub shell_path: Option<String>,
 }
 
+// Tool futures can be dropped by the agent's cancellation race before their
+// own select observes the token. Keep process/reader cleanup owned by RAII too.
+struct BashChild(tokio::process::Child);
+impl std::ops::Deref for BashChild {
+    type Target = tokio::process::Child;
+    fn deref(&self) -> &Self::Target { &self.0 }
+}
+impl std::ops::DerefMut for BashChild {
+    fn deref_mut(&mut self) -> &mut Self::Target { &mut self.0 }
+}
+impl Drop for BashChild {
+    fn drop(&mut self) {
+        if let Some(pid) = self.0.id() {
+            kill_process_tree(pid as i32);
+            let _ = self.0.start_kill();
+            untrack_detached_child_pid(pid as i32);
+        }
+    }
+}
+struct BashReaders(Vec<tokio::task::AbortHandle>);
+impl Drop for BashReaders {
+    fn drop(&mut self) { for reader in &self.0 { reader.abort(); } }
+}
+
 impl BashOperations for LocalBashOperations {
     fn exec(
         &self,
@@ -141,7 +165,7 @@ impl BashOperations for LocalBashOperations {
             command_builder.process_group(0);
 
             let mut child = match command_builder.spawn() {
-                Ok(child) => child,
+                Ok(child) => BashChild(child),
                 Err(error) => return Err(error.to_string()),
             };
 
@@ -164,46 +188,50 @@ impl BashOperations for LocalBashOperations {
                 tokio::spawn(async move { pump(stderr, on_data).await })
             });
 
+            let _readers = BashReaders([&stdout_task, &stderr_task].into_iter()
+                .filter_map(|task| task.as_ref().map(tokio::task::JoinHandle::abort_handle)).collect());
             let mut timed_out = false;
             let mut aborted = false;
             // `wait` holds a mutable borrow of `child` for as long as it lives, so
             // the pid is captured before the wait starts.
             let child_pid = child.id();
-            let wait = child.wait();
-            tokio::pin!(wait);
+            let result = {
+                let wait = child.wait();
+                tokio::pin!(wait);
 
-            let signal = options.signal.clone();
-            let timeout = options.timeout;
-            let result = loop {
-                let deadline = async {
-                    match timeout {
-                        Some(seconds) if seconds > 0.0 => {
-                            tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
-                            "timeout"
+                let signal = options.signal.clone();
+                let timeout = options.timeout;
+                loop {
+                    let deadline = async {
+                        match timeout {
+                            Some(seconds) if seconds > 0.0 => {
+                                tokio::time::sleep(std::time::Duration::from_secs_f64(seconds)).await;
+                                "timeout"
+                            }
+                            _ => {
+                                futures::future::pending::<&'static str>().await
+                            }
                         }
-                        _ => {
-                            futures::future::pending::<&'static str>().await
+                    };
+                    let abort = async {
+                        match signal.as_ref() {
+                            Some(token) => {
+                                token.cancelled().await;
+                                "abort"
+                            }
+                            None => futures::future::pending::<&'static str>().await,
                         }
-                    }
-                };
-                let abort = async {
-                    match signal.as_ref() {
-                        Some(token) => {
-                            token.cancelled().await;
-                            "abort"
+                    };
+                    tokio::select! {
+                        status = &mut wait => break Some(status),
+                        reason = deadline => {
+                            if reason == "timeout" { timed_out = true; }
+                            break None;
                         }
-                        None => futures::future::pending::<&'static str>().await,
-                    }
-                };
-                tokio::select! {
-                    status = &mut wait => break Some(status),
-                    reason = deadline => {
-                        if reason == "timeout" { timed_out = true; }
-                        break None;
-                    }
-                    reason = abort => {
-                        if reason == "abort" { aborted = true; }
-                        break None;
+                        reason = abort => {
+                            if reason == "abort" { aborted = true; }
+                            break None;
+                        }
                     }
                 }
             };
@@ -215,11 +243,24 @@ impl BashOperations for LocalBashOperations {
                 }
             }
 
-            if let Some(task) = stdout_task {
-                let _ = task.await;
+            // Shell exit does not imply EOF: a background descendant may still
+            // hold either pipe. Never wait without a bound after exit or kill.
+            if result.is_none() {
+                let _ = child.start_kill();
+                let _ = tokio::time::timeout(std::time::Duration::from_secs(3), child.wait()).await;
             }
-            if let Some(task) = stderr_task {
-                let _ = task.await;
+            let drain_deadline = tokio::time::Instant::now()
+                + std::time::Duration::from_millis(crate::utils::child_process::EXIT_STDIO_GRACE_MS);
+            let mut detached_output = false;
+            for mut task in [stdout_task, stderr_task].into_iter().flatten() {
+                if tokio::time::timeout_at(drain_deadline, &mut task).await.is_err() {
+                    task.abort();
+                    let _ = task.await;
+                    detached_output = true;
+                }
+            }
+            if detached_output && result.is_some() {
+                (options.on_data)(b"\n[Shell exited; closed output pipes held by a background process. Redirect background output to a file to retain it.]\n");
             }
 
             // TS bash.ts:102/:116: the child settled (exit or kill), so the

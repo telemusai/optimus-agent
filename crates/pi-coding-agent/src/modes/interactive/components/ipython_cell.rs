@@ -516,12 +516,19 @@ impl IPythonCellComponent {
         self.state_version += 1;
     }
 
+    fn language(&self) -> &str {
+        if self.state.details.as_ref().and_then(|v| v.get("language")).and_then(Value::as_str) == Some("javascript") { "javascript" } else { "python" }
+    }
+
     /// Port of `collapsedLine`.
     fn collapsed_line(&self, details: &IpythonDetails) -> String {
         let code = self.state.code.trim_end().to_string();
-        let is_bash_cell = parse_ipython_bash_cell(&code).is_some();
-        let preview = preview_ipython_code(&code);
-        let preview_language = preview.language.as_str();
+        let is_bash_cell = self.language() == "python" && parse_ipython_bash_cell(&code).is_some();
+        let mut preview = preview_ipython_code(&code);
+        if self.language() == "javascript" {
+            preview.text = code.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim().chars().take(100).collect();
+        }
+        let preview_language = if self.language() == "javascript" { "javascript" } else { preview.language.as_str() };
         let language_label = if is_bash_cell && preview_language != "bash" {
             format!("bash \u{b7} {preview_language}")
         } else {
@@ -712,13 +719,13 @@ impl IPythonCellComponent {
         }
 
         self.add_blank(lines, width);
-        let is_bash_cell = parse_ipython_bash_cell(&code).is_some();
+        let is_bash_cell = self.language() == "python" && parse_ipython_bash_cell(&code).is_some();
         let raw_lines: Vec<String> = code.split('\n').map(|line| line.to_string()).collect();
         // Highlight the whole cell at once so multi-line strings keep their color.
         let highlighted_lines = if is_bash_cell {
             Vec::new()
         } else {
-            highlight_code(&code, Some("python"))
+            highlight_code(&code, Some(self.language()))
         };
         for (index, raw_line) in raw_lines.iter().enumerate() {
             let prefix = if index == 0 {
@@ -754,13 +761,13 @@ impl IPythonCellComponent {
 
     /// Port of `highlightInputLine`.
     fn highlight_input_line(&self, line: &str, is_bash_cell: bool) -> String {
-        if is_bash_cell
+        if self.language() == "python" && (is_bash_cell
             || magic_line_pattern().is_match(line)
-            || parse_ipython_bash_cell(line).is_some()
+            || parse_ipython_bash_cell(line).is_some())
         {
             return theme().fg("bashMode", line);
         }
-        let highlighted = highlight_code(line, Some("python"));
+        let highlighted = highlight_code(line, Some(self.language()));
         highlighted
             .first()
             .cloned()
