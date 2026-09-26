@@ -3,9 +3,6 @@ use super::*;
 use crate::modes::interactive::theme::theme::Theme;
 use pi_tui::utils::{strip_ansi, visible_width};
 
-#[path = "native_host_neon_landscape.rs"]
-mod landscape;
-
 pub(super) fn active() -> bool {
     theme().name.as_deref() == Some("neon")
 }
@@ -326,28 +323,8 @@ pub(super) fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) 
         ];
         let brand_width = 37;
         let caption_width = if width >= 160 { 36 } else { 0 };
-        let right = [
-            format!(
-                "{}  {}",
-                palette.bold(&palette.fg("accent", "telemus.ai")),
-                palette.fg("dim", &format!("v{}", crate::config::VERSION)),
-            ),
-            String::new(),
-            format!("SYSTEM // {status}"),
-        ];
-        let right_width = right.iter().map(|r| visible_width(r)).max().unwrap_or(0) + 1;
-        let scenery_space = width.saturating_sub(brand_width + caption_width + right_width + 4);
-        // Keep the disk at its authored size; short/narrow windows retain the compact header.
-        let scenery = (active()
-            && width >= 160
-            && budget >= landscape::HEIGHT + 3
-            && scenery_space >= landscape::WIDTH)
-            .then(landscape::render);
-        let row_count = scenery.as_ref().map_or(3, |_| landscape::HEIGHT);
-        let logo_top = (row_count - LOGO.len()) / 2;
-        for row in 0..row_count {
-            let logo_row = row.checked_sub(logo_top).filter(|&i| i < LOGO.len());
-            let caption = if let Some(i) = logo_row.filter(|_| caption_width > 0) {
+        for i in 0..3 {
+            let caption = if caption_width > 0 {
                 fit(
                     &match i {
                         0 => palette.fg("muted", "BUILT FOR WHAT'S NEXT"),
@@ -361,23 +338,14 @@ pub(super) fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) 
             };
             let brand = format!(
                 "{}{}",
-                fit(
-                    &format!(" {}", palette.fg("accent", logo_row.map_or("", |i| LOGO[i]))),
-                    brand_width,
-                ),
+                fit(&format!(" {}", palette.fg("accent", LOGO[i])), brand_width),
                 caption,
             );
-            let brand = if let Some(scenery) = &scenery {
-                let column = brand_width + caption_width + 2 + (scenery_space - landscape::WIDTH) / 2;
-                format!(
-                    "{}{}",
-                    fit(&brand, column),
-                    palette.fg("thinkingText", &scenery[row]),
-                )
-            } else {
-                brand
+            let right = match i {
+                0 => format!("{}  {}", palette.bold(&palette.fg("accent", "telemus.ai")), palette.fg("dim", &format!("v{}", crate::config::VERSION))),
+                1 => String::new(),
+                _ => format!("SYSTEM // {status}"),
             };
-            let right = logo_row.map_or("", |i| right[i].as_str());
             rows.push(paired(&brand, &format!("{right} "), width));
         }
         if caption_width == 0 {

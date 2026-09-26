@@ -38,8 +38,6 @@ Edit directly or use `/settings` for common options.
 
 Chats open at the saved `chatDetail` level, defaulting to `details`. Ctrl+O cycles overview → details → all output and saves the choice for new, resumed, and attached chats. Overview hides thinking and collapses tools and diffs; details shows thinking and file diffs; all output also expands tools and agent-to-agent message bodies. Messages and session files are unchanged. Extension calls to `ctx.ui.setToolsExpanded()` affect the current view without changing the saved preference.
 
-The Neon header includes a small striped sunset behind a continuous mountain range when the terminal has room (at least 160 columns and 48 rows with a normal input area). Smaller windows keep the compact header.
-
 | Setting | Type | Default | Description |
 |---------|------|---------|-------------|
 | `theme` | string | `"neon"` | Theme name (`"neon"`, `"prime"`, `"dark"`, `"light"`, or custom); explicit selections are preserved |
