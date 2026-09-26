@@ -27,7 +27,7 @@ pub struct SlashCommandInfo {
     pub source_info: SourceInfo,
 }
 
-pub const SESSION_SLASH_COMMAND_NAMES: [&str; 4] = ["compact", "refine", "goal", "autonomous"];
+pub const SESSION_SLASH_COMMAND_NAMES: [&str; 5] = ["compact", "refine", "goal", "autonomous", "mode"];
 
 pub type SessionSlashCommandName = String;
 
@@ -216,6 +216,7 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
         None,
     );
     push("fast", "Toggle OpenAI Fast mode".to_string(), None, None);
+    push("mode", "Switch between IPython and Direct tools for this chat".into(), Some("[ipython|direct|toggle]"), Some(true));
     push(
         "scoped-models",
         "Enable/disable models for Ctrl+P cycling".to_string(),
@@ -757,7 +758,7 @@ mod tests {
 
     #[test]
     fn session_slash_command_names_are_fixed() {
-        assert_eq!(SESSION_SLASH_COMMAND_NAMES, ["compact", "refine", "goal", "autonomous"]);
+        assert_eq!(SESSION_SLASH_COMMAND_NAMES, ["compact", "refine", "goal", "autonomous", "mode"]);
         assert!(is_session_slash_command_name("goal"));
         assert!(!is_session_slash_command_name("model"));
     }

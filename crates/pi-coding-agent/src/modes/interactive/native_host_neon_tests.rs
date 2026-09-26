@@ -59,6 +59,7 @@ fn neon_header_and_timeline_fit_unicode_and_tiny_windows() {
         cwd: "~/projects/界界界",
         session: "Long title 👩‍💻 ",
         model: "fixture-model",
+        execution: None,
         phase: "READY",
         jev: Some("Jev Full · fallback"),
         clock: "12:34:56",
@@ -424,4 +425,32 @@ fn neon_canvas_preserves_cursor_and_hyperlink_control_sequences() {
     assert!(painted.contains(cursor));
     assert!(painted.contains(link));
     assert_eq!(visible_width(&painted), 80);
+}
+
+#[test]
+fn execution_mode_header_tracks_confirmed_pending_and_remapped_states() {
+    use crate::core::execution_mode::ExecutionMode;
+    let mode = mode();
+    let mut bindings = crate::core::keybindings::KeybindingsConfig::new();
+    bindings.insert("app.executionMode.toggle".into(), crate::core::keybindings::KeybindingSetting::Single("f8".into()));
+    crate::core::keybindings::KeybindingsManager::new(bindings, None).install();
+    mode.borrow_mut().patch_connection_state(|state| {
+        state.execution_mode = Some(ExecutionMode::Ipython);
+        state.session_actions.follow_ups = vec!["/mode direct".into()];
+    });
+    assert_eq!(execution_label(&mode.borrow()).as_deref(), Some("IPython → Direct tools pending [F8]"));
+    let transcript = Rc::new(RefCell::new(Transcript::new(mode.clone())));
+    let mut header = Header(mode.clone(), Rc::downgrade(&transcript));
+    let rendered = strip_ansi(&header.render(180.0).join("\n"));
+    assert!(rendered.contains("offline-fixture · IPython → Direct tools pending [F8]"), "{rendered}");
+    mode.borrow_mut().patch_connection_state(|state| {
+        state.execution_mode = Some(ExecutionMode::Direct);
+        state.session_actions.follow_ups.clear();
+    });
+    assert_eq!(execution_label(&mode.borrow()).as_deref(), Some("Direct tools [F8]"));
+    for width in [40.0, 80.0, 120.0, 180.0] {
+        assert!(header.render(width).iter().all(|line| visible_width(line) == width as usize));
+        assert!(strip_ansi(&header.render(width).join("\n")).contains("Direct tools [F8]"));
+    }
+    crate::core::keybindings::KeybindingsManager::new(Default::default(), None).install();
 }

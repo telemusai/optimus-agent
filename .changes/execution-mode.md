@@ -1,0 +1,2 @@
+- Added per-chat IPython and Direct tools modes, with configurable F6 switching, /mode commands, and a mode indicator after the model in the header.
+- Added safe mid-conversation switching of system instructions and tool definitions between agent runs, persisted across resume while retaining the Python workspace during live switches.

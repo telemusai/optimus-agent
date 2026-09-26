@@ -502,6 +502,7 @@ pub struct AgentConnectionState {
     pub heartbeat: Option<AgentCronJob>,
     pub scoped_models: Vec<AgentConnectionScopedModel>,
     pub active_tool_names: Vec<String>,
+    pub execution_mode: Option<crate::core::execution_mode::ExecutionMode>,
     pub context_usage: ContextUsage,
     pub recap: Option<String>,
 }

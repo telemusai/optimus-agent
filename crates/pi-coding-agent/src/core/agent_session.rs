@@ -23,6 +23,7 @@
 
 #[path = "agent_session/agent_handle.rs"]
 mod agent_handle;
+mod execution_mode;
 #[cfg(test)]
 #[path = "agent_session/rlm_result_delivery_tests.rs"]
 mod rlm_result_delivery_tests;
@@ -8608,7 +8609,7 @@ impl AgentSession {
         // Root blocker-3: the consumption stamp derives from the ACTUAL
         // loaded skills (the same list the roster block renders), noted into
         // the bridge cache right here at the consumer seam.
-        let loaded_skills = self.model_visible_skills();
+        let loaded_skills = self.prompt_visible_skills(&self.get_active_tool_names());
         crate::core::jev_bridge::note_session_skill_roster(&jev_session_id, &loaded_skills);
         let hint = crate::core::jev_bridge::current_skill_hint(&jev_session_id).and_then(|hint| {
             let current =
@@ -8714,7 +8715,7 @@ impl AgentSession {
         let loader_append_system_prompt = self.resource_loader.get_append_system_prompt();
         let append_system_prompt = (!loader_append_system_prompt.is_empty())
             .then(|| loader_append_system_prompt.join("\n\n"));
-        let loaded_skills = self.model_visible_skills();
+        let loaded_skills = self.prompt_visible_skills(&valid_tool_names);
         // ROOT-CONTRACT v7 (Agent-guidance lane): the suggestion pool equals
         // the prompt roster; the bridge caches this already-loaded metadata.
         let jev_session_id = self.session_manager.lock().unwrap().get_session_id();
@@ -10644,8 +10645,8 @@ impl AgentSession {
         QueuedSessionAction {
             id: uuid::Uuid::new_v4().to_string(),
             source: action_source(source.as_deref()),
-            priority: None,
-            delivery: self.delivery_policy(schedule),
+            priority: (command.name == "mode").then_some(crate::core::session_action_store::SessionActionPriority::Pinned),
+            delivery: if command.name == "mode" { DeliveryPolicy::WhenRunIdle } else { self.delivery_policy(schedule) },
             wake: WakePolicy::Immediate,
             payload: QueuedActionPayload::SessionCommand(PreparedCommandPayload {
                 base: SessionCommandPayload {
@@ -11847,6 +11848,9 @@ impl AgentSession {
         let mut result_text: Option<String> = None;
         let mut display_result = true;
         match input.base.command.name.as_str() {
+            "mode" => {
+                result_text = Some(self.change_execution_mode(&input.base.command.args)?);
+            }
             "compact" => {
                 let args = if input.base.command.args.is_empty() {
                     None
@@ -16114,6 +16118,13 @@ impl AgentSession {
             Some(Value::Number(number)) => number.as_f64(),
             _ => None,
         }
+    }
+
+    fn prompt_visible_skills(&self, tools: &[String]) -> Vec<Skill> {
+        let has_ipython = tools.iter().any(|tool| tool == "ipython");
+        self.model_visible_skills().into_iter()
+            .filter(|skill| has_ipython || !matches!(skill, Skill::Python(_)))
+            .collect()
     }
 
     /// `_modelVisibleSkills()` - loader skills minus the ones this session cannot use.

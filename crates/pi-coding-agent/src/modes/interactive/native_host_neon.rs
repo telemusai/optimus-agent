@@ -247,6 +247,7 @@ impl TuiComponent for Header {
             .upgrade()
             .and_then(|t| t.borrow().subagents.clone())
             .and_then(|bar| bar.borrow().compact_jev_status());
+        let execution = execution_label(&mode);
         render_header(
             width as usize,
             height,
@@ -261,6 +262,7 @@ impl TuiComponent for Header {
                     .as_deref()
                     .unwrap_or("No model selected"),
                 phase,
+                execution: execution.as_deref(),
                 jev: jev.as_deref(),
                 clock: &chrono::Local::now().format("%H:%M:%S").to_string(),
             },
@@ -273,9 +275,34 @@ pub(super) struct HeaderData<'a> {
     pub cwd: &'a str,
     pub session: &'a str,
     pub model: &'a str,
+    pub execution: Option<&'a str>,
     pub phase: &'a str,
     pub jev: Option<&'a str>,
     pub clock: &'a str,
+}
+
+fn execution_label(mode: &InteractiveMode) -> Option<String> {
+    use crate::core::execution_mode::ExecutionMode;
+    use crate::modes::interactive::components::keybinding_hints::{key_text, KeyTextOptions};
+    let state = mode.connection_state.as_ref()?;
+    let current = state.execution_mode?;
+    let mut pending = None;
+    for text in state.session_actions.follow_ups.iter().chain(&state.session_actions.steering) {
+        if let Some(command) = crate::core::slash_commands::parse_session_slash_command(text) {
+            if command.name == "mode" && !command.args.is_empty() {
+                pending = match command.args.as_str() {
+                    "toggle" => Some(pending.unwrap_or(current).toggled()),
+                    value => ExecutionMode::parse(value).ok().or(pending),
+                };
+            }
+        }
+    }
+    let label = match pending {
+        Some(next) => format!("{} → {} pending", current.label(), next.label()),
+        None => current.label().to_string(),
+    };
+    let key = key_text("app.executionMode.toggle", &KeyTextOptions::default());
+    Some(if key.is_empty() { label } else { format!("{label} [{key}]") })
 }
 
 fn paired(left: &str, right: &str, width: usize) -> String {
@@ -299,7 +326,14 @@ pub(super) fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) 
         },
         &clean_label(data.phase).to_uppercase(),
     );
-    let model = palette.fg("accent", &format!("● {}", clean_label(data.model)));
+    let model_width = data.execution.map(|label| width.saturating_sub(visible_width(label) + 15));
+    let model_name = clean_label(data.model);
+    let model_name = model_width.map(|width| truncate_to_width(&model_name, width.max(1) as f64, "…", false)).unwrap_or(model_name);
+    let model = palette.fg("accent", &format!("● {model_name}"));
+    let model = match data.execution {
+        Some(execution) => format!("{model} · {}", palette.fg("thinkingText", &clean_label(execution))),
+        None => model,
+    };
     let jev = data.jev.map(|label| {
         let lower = label.to_ascii_lowercase();
         let (color, dot) = if lower.contains("fallback") || lower.contains("error") {
@@ -376,8 +410,12 @@ pub(super) fn render_header(width: usize, budget: usize, data: &HeaderData<'_>) 
     } else if width >= 60 {
         format!("{model} · {status}")
     } else {
-        model
+        model.clone()
     };
+    // Drop secondary metadata before hiding the model and execution mode.
+    let right = if data.execution.is_some() && visible_width(&right) + 8 >= width {
+        model
+    } else { right };
     if budget == 1 {
         rows.push(paired(&palette.fg("accent", &format!("OPTIMUS v{}", crate::config::VERSION)), &right, width));
     } else {

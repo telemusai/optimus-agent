@@ -918,8 +918,18 @@ impl AgentSession {
                     provisioner: Some(provisioner),
                     ..Default::default()
                 }) };
-                crate::core::tools::create_all_tool_definitions(&self.cwd, Some(&options))
-                    .into_iter().map(|(name, definition)| (name.to_string(), definition.into())).collect()
+                let mut definitions: BTreeMap<String, crate::core::extensions::types::ToolDefinition> =
+                    crate::core::tools::create_all_tool_definitions(&self.cwd, Some(&options))
+                        .into_iter().map(|(name, definition)| (name.to_string(), definition.into())).collect();
+                let settings = self.settings_manager.lock().unwrap();
+                let bash_options = crate::core::tools::BashToolOptions {
+                    command_prefix: settings.get_shell_command_prefix(),
+                    shell_path: settings.get_shell_path(),
+                    ..Default::default()
+                };
+                definitions.insert("bash".into(), crate::core::tools::create_bash_tool_definition(&self.cwd, Some(&bash_options)).into());
+                definitions.insert("edit".into(), crate::core::tools::create_edit_tool_definition(&self.cwd, None).into());
+                definitions
             }
         };
         *self.base_tool_definitions.lock().unwrap() = definitions;
@@ -1000,6 +1010,9 @@ impl AgentSession {
                 .map(|tools| tools.iter().map(|(name, _)| name.clone()).collect())
                 .unwrap_or_else(|| vec!["ipython".to_string()])
         });
+        let active = if self.base_tools_override.is_none() {
+            self.saved_execution_mode().map(|mode| mode.tools(&active)).unwrap_or(active)
+        } else { active };
         self.refresh_tool_registry(include_all, Some(active.clone()));
         // TS agent-session.ts:10159-10167: prewarm when configured, or whenever
         // we're resuming a session that already has a kernel snapshot - so its

@@ -1,6 +1,6 @@
 [project]
 name = "prime-agent-runtime"
-version = "0.1.7"
+version = "0.1.8"
 description = "Kernel-side runtime shim for Prime Agent recursion"
 requires-python = ">=3.11"
 dependencies = [

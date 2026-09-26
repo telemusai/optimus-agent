@@ -24,6 +24,8 @@ const SIMPLIFIED_TECHNICAL_ENGLISH_PROMPT: &str = "Use simplified technical Engl
 
 const REPL_CONTROL_PROMPT: &str = "The `ipython` tool is a persistent Python REPL — the agent's long-lived control environment for reasoning, context management, state, tool orchestration, and recursive subcalls. Top-level `await` works directly. Use it to keep intermediate variables, inspect and transform outputs, and write small helper functions. Compaction removes individual variables whose serialized form exceeds 16 MiB; keep large source data on disk and reload it when needed.\n\nPython is the orchestration language: use Python for loops, conditionals, parsing, and state. Use `bash()` to invoke programs, not to write shell programs — no shell loops or heredocs; do those in Python.\n\nDo not assume the REPL is the native runtime of the external thing being investigated. A repository, package, service, dataset, paper, website, benchmark, or API may have its own environment and normal interface. Evaluate external systems through their own interface, then use the REPL to coordinate the process and analyze what comes back.\n\n`bash(command)` starts a shell command in the background and returns a handle immediately: `h = bash('npm test')`. Use `h.pid` / `h.running` for liveness, `h.tail(n)` / `h.output()` for combined stdout+stderr so far, `h.poll()` for a non-blocking result, `h.kill()` to terminate (SIGTERM, escalating to SIGKILL; on Windows kill() uses taskkill /T and detached or reparented descendants may survive), and `await h` (or `await bash('cmd')`) for the completed result with exit_code, output, and duration. Prefer bash() for long-running commands so the turn keeps working. Run shell commands with `bash()`, not `subprocess`/`os.system`: subprocess calls block the kernel, show the user nothing while they run, and spawn processes the harness cannot see or stop.\n\nImportant: do not install dependencies into the kernel just to make an external project import or run there. If a project import, test, script, CLI, or dependency check is needed, run it through that project's own environment and normal command interface. For example, in a Python repo use its documented commands, `uv run ...`, `.venv/bin/python ...`, or the active project interpreter from the repo root. Treat failures from that native environment as the relevant result.\n\nUse Python for reading, searching, and editing files — it gives you reusable variables you can slice, filter, and act on without re-reading. Always assign read/search results to named variables so you can revisit them later.\n\nEach `bash()` call is its own process, so shell state does not persist between calls; use `os.chdir(...)` for the working directory and `os.environ[...]` for environment variables — both persist in the REPL and apply to later `bash()` calls.\n\nPython state in the kernel persists across cells: named variables, helper functions, classes, imports, notes, parsed outputs, and helper data structures all remain available in every later turn. Tool calls are themselves Python `await` expressions, so their return values can be bound to variables and composed into program logic just like any other call.\n\nContinual harness state is available as `rlm.harness` and `rlm.get_harness_state()`. CRUD calls are local to this Prime Agent session by default: `rlm.harness.create_memory(...)`, `rlm.harness.update_memory(...)`, `rlm.harness.delete_memory(...)`, `rlm.harness.create_skill(...)`, `rlm.harness.update_skill(...)`, `rlm.harness.delete_skill(...)`, `rlm.harness.create_subagent(...)`, `rlm.harness.update_subagent(...)`, `rlm.harness.delete_subagent(...)`, `rlm.harness.create_prompt_note(...)`, `rlm.harness.update_prompt_note(...)`, `rlm.harness.delete_prompt_note(...)`, plus `rlm.harness.record_refinement(...)` and `rlm.harness.overview()`. Use `global_=True` only for stable cross-session lessons; Python reserves `global`, so literal `global=True` is invalid syntax.\n\nTerminology: continual harness names the persisted prompt, memory, skill, and subagent layer; RLM names the runtime, Python REPL kernel, and native call interface exposed to the model.\n\nRLM-native call contract: installed Python skills are pre-imported modules. Read the matching SKILL.md and call its documented function, such as `await <skill_import>.<function>(...)`; when a CLI exists, use `<skill_import> ...` from shell. Continual harness skill entries are Python REPL skills with an explicit Python `reference` and `arguments` contract. Spawn a reusable delegation spec with `await rlm('sub-task')`; admission returns a child handle immediately. Results arrive only through an available messaging capability or files, never as an `rlm()` return value. Do not invent non-native wrappers such as `call_skill(...)` or `run_subagent(...)`.";
 
+pub const DIRECT_TOOL_PROMPT: &str = "Execution mode: Direct tools. Call the available tools directly using their schemas, inspect their results, and continue until the task is complete. Use the bash tool for commands, reading files, and code search (prefer rg); use the edit tool for targeted file changes. Python scripts may run through the project's own interpreter via bash, but there is no persistent model-facing Python workspace in this mode. Do not send actions as Python cells or assume variables, pre-imported skills, rlm, or the kernel MCP object are available. Python-only skills, recursive Python delegation, kernel image previews, and kernel MCP integrations require switching back to IPython. Other explicitly exposed tools, including Jev decisions, remain available. Prior Python tool calls in conversation history belong to the previous mode; follow the current tool schemas and these instructions for new actions. Normal progress updates and final answers remain prose.";
+
 #[derive(Debug, Clone, Default)]
 pub struct ChildAgentDoctrineOptions {
     pub depth: Option<i64>,
@@ -82,7 +84,9 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
         "You solve tasks by breaking down problems into sub-tasks, writing and executing code, observing results, and iterating one step at a time.".to_string(),
         "When you are done, stop calling tools and state your final answer.".to_string(),
         String::new(),
-        LONG_RUNNING_WORK_PROMPT.to_string(),
+        if has_ipython { LONG_RUNNING_WORK_PROMPT.to_string() } else {
+            "Use the available tools to perform work and inspect each result before deciding the next action. Keep commands bounded and use the tool's timeout and cancellation support for long-running work.".to_string()
+        },
         String::new(),
     ];
     if depth == 0 {
@@ -94,14 +98,18 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
     parts.push(format!("Working directory: {}", options.cwd));
     parts.push(format!("Conversation log: {}", options.messages_path));
     parts.push(format!("Recursive agent depth: {depth}"));
-    parts.push(format!(
-        "Pre-installed Python packages: {}.",
-        default_rlm_extra_import_labels().join(", ")
-    ));
-    parts.push(
-        "Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module)."
-            .to_string(),
-    );
+    if has_ipython {
+        parts.push(format!(
+            "Pre-installed Python packages: {}.",
+            default_rlm_extra_import_labels().join(", ")
+        ));
+        parts.push(
+            "Install additional packages with `uv pip install <pkg>` (this is a uv-managed venv with no pip module)."
+                .to_string(),
+        );
+    } else if active_tools.iter().any(|tool| tool == "bash") {
+        parts.push(DIRECT_TOOL_PROMPT.to_string());
+    }
 
     let child_doctrine = build_child_agent_doctrine(ChildAgentDoctrineOptions {
         depth: options.depth,
@@ -154,12 +162,12 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
         parts.push(String::new());
         parts.extend(skill_lines);
     }
-    if has_agent_message {
+    if has_agent_message && has_ipython {
         parts.push(
             "Agent messaging is restricted to your parent, siblings, and direct children; roots are siblings, and deeper communication relays through the intermediate child.".to_string(),
         );
     }
-    if has_agent_observe {
+    if has_agent_observe && has_ipython {
         parts.push(
             "Agent observation is restricted to your parent, siblings, and direct children; roots are siblings, and deeper inspection relays through the intermediate child.".to_string(),
         );

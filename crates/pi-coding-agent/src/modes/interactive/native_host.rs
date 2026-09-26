@@ -779,6 +779,7 @@ enum InputAction {
     Exit,
     Heartbeats,
     ToggleTools,
+    ToggleExecutionMode,
     ToggleThinking,
     ToggleMessages,
     Model,
@@ -1189,6 +1190,7 @@ fn bind_editor_actions(
         ),
         ("app.heartbeats.open", || InputAction::Heartbeats),
         ("app.tools.expand", || InputAction::ToggleTools),
+        ("app.executionMode.toggle", || InputAction::ToggleExecutionMode),
         ("app.thinking.toggle", || InputAction::ToggleThinking),
         ("app.messages.expand", || InputAction::ToggleMessages),
         ("app.model.select", || InputAction::Model),
@@ -2120,6 +2122,9 @@ async fn run_terminal(
                     mode.borrow_mut().toggle_tool_output_expansion();
                     transcript.borrow_mut().apply_chat_detail();
                 }
+                InputAction::ToggleExecutionMode => {
+                    submit(&connection, &send, "/mode toggle".into(), true, None);
+                }
                 InputAction::ToggleThinking => {
                     let mut mode = mode.borrow_mut();
                     mode.hide_thinking_block = !mode.hide_thinking_block;
@@ -2443,7 +2448,7 @@ async fn run_terminal(
                     if event.type_name() == "session_action_update" {
                         queue_runtime.observe_queue_change();
                     }
-                    let finished = event.type_name() == "agent_end";
+                    let finished = matches!(event.type_name(), "agent_end" | "session_action_update");
                     let renamed = matches!(
                         &event,
                         wire::AgentConnectionSessionEvent::SessionInfoChanged { .. }
@@ -3393,6 +3398,10 @@ async fn dispatch_submission(
             // into a session command action (`agent-session.ts:5065-5068`,
             // `_executeQueuedSessionCommand` :6760-6824).
             SlashDispatch::SessionCommand(line) => {
+                if crate::core::slash_commands::parse_session_slash_command(&line)
+                    .is_some_and(|command| command.name == "mode") && !connection.supports_execution_mode() {
+                    return Err("This session host does not support execution mode switching. Update and restart the daemon.".into());
+                }
                 prompt_model(&connection, &line, follow_up, images).await
             }
             // `!command` runs shell (interactive-mode.ts:5043-5070).
@@ -4465,6 +4474,7 @@ fn project_state(state: wire::AgentConnectionState) -> local::AgentConnectionSta
             .into_iter()
             .map(|model| local::AgentConnectionScopedModel { model: model.model })
             .collect(),
+        execution_mode: crate::core::execution_mode::ExecutionMode::from_tools(&state.active_tool_names),
         active_tool_names: state.active_tool_names,
         context_usage: local::ContextUsage {
             tokens: number(&state.context_usage, "tokens"),
@@ -4765,6 +4775,7 @@ mod tests {
     #[derive(Default)]
     pub(super) struct RecordingConnection {
         pub(super) heartbeat_catalog_support: std::sync::Mutex<Option<bool>>,
+        execution_mode_support: bool,
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
         state: std::sync::Mutex<wire::AgentConnectionState>,
         user_messages: std::sync::Mutex<Vec<wire::AgentConnectionUserMessage>>,
@@ -4817,6 +4828,7 @@ mod tests {
     }
 
     impl wire::AgentConnection for RecordingConnection {
+        fn supports_execution_mode(&self) -> bool { self.execution_mode_support }
         fn get_state(&self) -> pi_ai::types::BoxFuture<Result<wire::AgentConnectionState, String>> {
             self.record("get_state");
             let state = self.state.lock().unwrap().clone();
@@ -6380,6 +6392,74 @@ mod tests {
             persisted(&mode),
             "the bare toggle must invert the LIVE state, not the persisted setting"
         );
+    }
+
+    #[tokio::test]
+    async fn execution_mode_refresh_retries_after_later_idle_events() {
+        use crate::core::execution_mode::ExecutionMode;
+        let mode = Rc::new(RefCell::new(stash_mode("mode-refresh-fixture")));
+        mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState {
+            session_id: "mode-refresh-fixture".into(), execution_mode: Some(ExecutionMode::Ipython), ..Default::default()
+        });
+        let recorder = Arc::new(RecordingConnection::new());
+        *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+            session_id: "mode-refresh-fixture".into(), active_tool_names: vec!["bash".into(), "edit".into()], ..Default::default()
+        };
+        let connection: Arc<dyn wire::AgentConnection> = recorder;
+        let mut refresh = native_state::StateRefresh::new();
+        refresh.request(connection.clone(), "mode-refresh-fixture".into());
+        refresh.invalidate(); // A later command-result event invalidates the first read.
+        tokio::time::sleep(Duration::from_millis(120)).await;
+        assert!(!refresh.poll(&mode, "mode-refresh-fixture"));
+        assert_eq!(mode.borrow().connection_state.as_ref().unwrap().execution_mode, Some(ExecutionMode::Ipython));
+        refresh.reconcile_if_due(connection, "mode-refresh-fixture".into(), &mode.borrow());
+        tokio::time::timeout(Duration::from_secs(1), async {
+            while !refresh.poll(&mode, "mode-refresh-fixture") { tokio::task::yield_now().await; }
+        }).await.unwrap();
+        assert_eq!(mode.borrow().connection_state.as_ref().unwrap().execution_mode, Some(ExecutionMode::Direct));
+    }
+
+    #[test]
+    fn execution_mode_function_key_is_configurable_and_keeps_editor_draft() {
+        use crate::core::keybindings::{KeybindingsConfig, KeybindingsManager, KeybindingSetting};
+        let _mode = stash_mode("mode-key-fixture");
+        let tui = Rc::new(RefCell::new(TUI::new(Box::new(pi_tui::terminal::ProcessTerminal::new()), None)));
+        for (setting, key, fires) in [
+            (None, "\x1b[17~", true),
+            (Some(KeybindingSetting::Single("f8".into())), "\x1b[17~", false),
+            (Some(KeybindingSetting::Single("f8".into())), "\x1b[19~", true),
+            (Some(KeybindingSetting::List(vec![])), "\x1b[17~", false),
+        ] {
+            let mut bindings = KeybindingsConfig::new();
+            if let Some(setting) = setting { bindings.insert("app.executionMode.toggle".into(), setting); }
+            KeybindingsManager::new(bindings, None).install();
+            let editor = Rc::new(RefCell::new(CustomEditor::new(tui.clone(), editor_theme(), CustomEditorOptions::default())));
+            let actions = Rc::new(RefCell::new(Vec::<InputAction>::new()));
+            bind_editor_actions(&editor, &actions);
+            editor.borrow_mut().editor_mut().set_text("unfinished draft");
+            editor.borrow_mut().handle_input(key);
+            assert_eq!(matches!(actions.borrow().as_slice(), [InputAction::ToggleExecutionMode]), fires);
+            assert_eq!(editor.borrow().editor().get_text(), "unfinished draft");
+        }
+        KeybindingsManager::new(Default::default(), None).install();
+    }
+
+    #[tokio::test]
+    async fn execution_mode_dispatch_requires_host_support() {
+        for supported in [false, true] {
+            let recorder = Arc::new(RecordingConnection { execution_mode_support: supported, ..Default::default() });
+            let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+            let (send, _receive) = mpsc::channel();
+            let result = dispatch_submission(&connection, &send, "/mode toggle", true, None).await;
+            assert_eq!(result.is_ok(), supported);
+            let calls = recorder.calls();
+            if supported {
+                assert!(calls.iter().any(|(name, args)| name == "prompt" && args[0] == "/mode toggle" && args[1] == "followUp"));
+            } else {
+                assert!(calls.is_empty());
+                assert!(result.unwrap_err().contains("restart the daemon"));
+            }
+        }
     }
 
     /// The Ctrl+S byte reaches a real handler: the editor is cleared and a stash is

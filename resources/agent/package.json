@@ -1,6 +1,6 @@
 {
   "name": "@earendil-works/pi-coding-agent",
-  "version": "0.1.7",
+  "version": "0.1.8",
   "description": "Coding agent CLI with a persistent Python REPL kernel and session management",
   "piConfig": {
     "name": "prime-agent",

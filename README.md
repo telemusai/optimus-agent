@@ -57,6 +57,23 @@ The feature descriptions below refer to `main` unless explicitly marked as devel
 
 ## What makes Optimus different
 
+### Choose IPython or Direct tools
+
+Optimus starts new chats in **IPython** mode. Press **F6** to switch between IPython and **Direct tools**. The header shows the current mode immediately after the model name, for example `gpt-6-astra · IPython [F6]`.
+
+| Mode | How the agent works |
+| --- | --- |
+| **IPython** (default) | Uses a persistent Python workspace to coordinate commands, retain variables, invoke Python skills, and delegate through RLM. |
+| **Direct tools** | Calls the `bash` and `edit` tools directly and inspects their results. Project Python scripts can still run through the shell. |
+
+Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current run finishes. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Switching to Direct tools keeps the Python workspace alive, so switching back can reuse its variables.
+
+A stopped chat must first be resumed with a new message; changing modes does not override an explicit stop.
+
+Use `/mode` to inspect the current mode, `/mode ipython` or `/mode direct` to select one, and `/mode toggle` to switch. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
+
+Python-only skills, RLM delegation, kernel MCP connections, and Python image previews require IPython mode. Other exposed tools, including Dynamic Jev, remain available in either mode. Changing mode does not change the selected model, Jev settings, or autonomy settings.
+
 ### A programmable workspace, not just a chat loop
 
 The persistent Python REPL gives the agent a working environment that survives individual tool calls. It can inspect a repository, transform data, retain intermediate results, execute commands, and invoke skills through code.
@@ -396,7 +413,7 @@ Automatic continuation skips empty drafts. To choose a particular saved session,
 
 ### Build and run from source
 
-Install Rust/Cargo (validated with 1.95.0), Python 3.11 or newer, `uv`, and a Bash shell. Windows uses native Rust with Git Bash and the MSVC build tools. Then:
+Install Rust/Cargo 1.98.0 or newer, Python 3.11 or newer, `uv`, and a Bash shell. Windows uses native Rust with Git Bash and the MSVC build tools. Then:
 
 ```bash
 git clone https://github.com/telemusai/optimus-agent.git
