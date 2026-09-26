@@ -73,7 +73,7 @@ fn jev_new_client_old_daemon_keeps_legacy_commands_without_enabling_combined_mod
 fn jev_expansion_requires_both_capabilities_and_schema_revision() {
     let command = mode_command("compare-active");
     assert_eq!(DAEMON_PROTOCOL_VERSION, 7);
-    assert_eq!(DAEMON_SCHEMA_REVISION, 33);
+    assert!(DAEMON_SCHEMA_REVISION >= 33);
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevControl));
     assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevFeatures));
     assert!(!supported(
@@ -278,4 +278,47 @@ fn jev_dynamic_is_additive_without_new_commands_or_startup_requirements() {
     struct LegacyFeatures { tool_requirement: bool }
     let legacy: LegacyFeatures = serde_json::from_value(json!({"tool_requirement":true,"dynamic":true})).unwrap();
     assert!(legacy.tool_requirement);
+}
+
+#[test]
+fn execution_mode_raw_and_typed_gates_agree_and_keep_ordinary_chat_compatible() {
+    use super::super::daemon_protocol::{DaemonCommand, get_daemon_command_compatibilities};
+    for kind in ["prompt", "prompt_and_wait", "steer", "follow_up"] {
+        for message in ["/mode", "/mode direct", "/mode toggle", "ordinary chat"] {
+            let value = json!({"type":kind,"activeSessionId":"session-a","message":message});
+            let raw = value.as_object().unwrap().clone();
+            let typed: DaemonCommand = serde_json::from_value(value).unwrap();
+            assert_eq!(command_compatibilities(&raw), get_daemon_command_compatibilities(&typed));
+            let ordinary = message == "ordinary chat";
+            assert_eq!(supported(&hello(33, &["session_input_admission"]), &raw), ordinary);
+            assert_eq!(supported(&hello(34, &["session_input_admission"]), &raw), ordinary);
+            assert!(supported(&hello(34, &["session_input_admission", "execution_mode"]), &raw));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn execution_mode_rejects_old_daemons_before_writing_and_sends_to_capable_daemons() {
+    let command = json!({"type":"prompt","activeSessionId":"session-a","message":"/mode direct"})
+        .as_object().unwrap().clone();
+    let (client, peer) = connected_client(hello(33, &["session_input_admission"])).await;
+    let error = client.request(command.clone(), Some(100), Default::default()).await.unwrap_err();
+    assert!(matches!(error, DaemonClientError::CapabilityUnavailable(ref e)
+        if e.capability.as_deref() == Some("execution_mode")));
+    assert_no_wire_bytes(&peer);
+    assert!(client.state.lock().await.pending.is_empty());
+    client.close().await;
+
+    let (client, peer) = connected_client(hello(34, &["session_input_admission", "execution_mode"])).await;
+    let mut peer = Framed::new(peer, LinesCodec::new());
+    let receive = async {
+        let line = tokio::time::timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
+        let envelope: Value = serde_json::from_str(&line).unwrap();
+        assert_eq!(envelope["command"]["message"], "/mode direct");
+        client.handle_line(&json!({"type":"response","id":envelope["id"],"command":"prompt","success":true}).to_string()).await;
+    };
+    let (response, ()) = tokio::join!(client.request(command, Some(1000), Default::default()), receive);
+    assert!(response.unwrap().success);
+    client.close().await;
 }

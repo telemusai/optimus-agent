@@ -20,14 +20,14 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.95.0 --profile minimal
-      - run: cargo +1.95.0 build --locked --release -p pi-coding-agent --bin optimus-rust
+      - run: rustup toolchain install 1.98.0 --profile minimal
+      - run: cargo +1.98.0 build --locked --release -p pi-coding-agent --bin optimus-rust
       - name: Stage executable and matching runtime resources
         shell: bash
         run: |
           binary=target/release/optimus-rust
           if [ -f "$binary.exe" ]; then binary="$binary.exe"; fi
-          target=$(rustc +1.95.0 -vV | sed -n 's/^host: //p')
+          target=$(rustc +1.98.0 -vV | sed -n 's/^host: //p')
           python3 scripts/rust_release.py stage --binary "$binary" --output dist --name "optimus-agent-$target"
       - uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7
         with:

@@ -49,9 +49,9 @@ jobs:
         with:
           persist-credentials: false
       - name: Install Rust
-        run: rustup toolchain install 1.95.0 --profile minimal
+        run: rustup toolchain install 1.98.0 --profile minimal
       - name: Check all native targets
-        run: cargo +1.95.0 check --locked --workspace --all-targets
+        run: cargo +1.98.0 check --locked --workspace --all-targets
       - name: Check resources and packaging
         shell: bash
         run: |
@@ -73,23 +73,27 @@ jobs:
       - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
         with:
           persist-credentials: false
-      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: rustup toolchain install 1.98.0 --profile minimal
       - run: python3 -m pip install uv
       - name: Shared crate unit tests
-        run: cargo +1.95.0 test --locked -p pi-ai -p pi-agent-core -p pi-tui -p pi-jev --lib -- --test-threads=1
+        run: cargo +1.98.0 test --locked -p pi-ai -p pi-agent-core -p pi-tui -p pi-jev --lib -- --test-threads=1
       - name: Native configuration regressions
-        run: cargo +1.95.0 test --locked -p pi-coding-agent --lib config::tests:: -- --test-threads=1
+        run: cargo +1.98.0 test --locked -p pi-coding-agent --lib config::tests:: -- --test-threads=1
       - name: Jev status and disclosure regressions
         shell: bash
         run: |
-          cargo +1.95.0 test --locked -p pi-jev --test usage_tests -- --test-threads=1
+          cargo +1.98.0 test --locked -p pi-jev --test usage_tests -- --test-threads=1
           for filter in disclosure_tests jev_activity jev_bar_tests subagent_summary_line jev_status_tests jev_compatibility_tests daemon_protocol::tests; do
-            cargo +1.95.0 test --locked -p pi-coding-agent --lib "$filter" -- --test-threads=1
+            cargo +1.98.0 test --locked -p pi-coding-agent --lib "$filter" -- --test-threads=1
           done
       - name: Native resource and command regressions
-        run: cargo +1.95.0 test --locked -p pi-coding-agent --test rust_only_resources --test slash_command_matrix --test native_cli --test transcript_t06 -- --test-threads=1
+        run: cargo +1.98.0 test --locked -p pi-coding-agent --test rust_only_resources --test slash_command_matrix --test native_cli --test transcript_t06 -- --test-threads=1
+      - name: Execution mode regressions
+        run: |
+          cargo +1.98.0 test --locked -p pi-coding-agent --test execution_mode -- --test-threads=1
+          cargo +1.98.0 test --locked -p pi-coding-agent --lib execution_mode -- --test-threads=1
       - name: Compaction recovery regressions
-        run: cargo +1.95.0 test --locked -p pi-coding-agent --test compaction_chat_length_recovery --test compaction_length_recovery --test compaction_summary_guard --test compaction_observability -- --test-threads=1
+        run: cargo +1.98.0 test --locked -p pi-coding-agent --test compaction_chat_length_recovery --test compaction_length_recovery --test compaction_summary_guard --test compaction_observability -- --test-threads=1
       - name: Relocated Python skill regressions
         run: uv run --locked --project prime-agent-runtime python -m unittest discover -s prime-agent-runtime/test -p '*_skill.py'
       - name: Python observation aliases

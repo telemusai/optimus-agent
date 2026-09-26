@@ -13,7 +13,7 @@ use serde_json::{Map, Value};
 pub type AppKeybinding = &'static str;
 
 /// `keyof AppKeybindings` in declaration order.
-pub const APP_KEYBINDINGS: [AppKeybinding; 59] = [
+pub const APP_KEYBINDINGS: [AppKeybinding; 60] = [
     "app.interrupt",
     "app.clear",
     "app.input.clear",
@@ -79,6 +79,7 @@ pub const APP_KEYBINDINGS: [AppKeybinding; 59] = [
     "app.jev.cancel",
     "app.stats.toggleSubagents",
     "app.stats.nextSection",
+    "app.executionMode.toggle",
 ];
 
 /// `Keybinding` (the merged id type) and `KeyId`; the TUI crate models both as
@@ -645,6 +646,7 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
     for (action, key, description) in [
         ("app.stats.toggleSubagents", "s", "Include or exclude subagents in statistics"),
         ("app.stats.nextSection", "tab", "Show the next statistics section"),
+        ("app.executionMode.toggle", "f6", "Toggle IPython / Direct tools execution mode"),
     ] {
         map.insert(action.into(), KeybindingDefinition {
             default_keys: vec![key.into()],

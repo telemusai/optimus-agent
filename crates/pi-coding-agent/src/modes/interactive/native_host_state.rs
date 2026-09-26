@@ -17,6 +17,7 @@ pub(super) struct StateRefresh {
     receive: mpsc::Receiver<RefreshResult>,
     task: Option<tokio::task::JoinHandle<()>>,
     last_requested_at: std::time::Instant,
+    retry_needed: bool,
 }
 
 impl StateRefresh {
@@ -29,6 +30,7 @@ impl StateRefresh {
             receive,
             task: None,
             last_requested_at: std::time::Instant::now(),
+            retry_needed: false,
         }
     }
 
@@ -50,10 +52,9 @@ impl StateRefresh {
         session_id: String,
         mode: &InteractiveMode,
     ) {
-        if !(mode.is_agent_streaming() || mode.is_agent_compacting() || mode.is_bash_running())
-            || self.task.is_some()
-            || self.last_requested_at.elapsed() < Duration::from_secs(5)
-        {
+        let active = mode.is_agent_streaming() || mode.is_agent_compacting() || mode.is_bash_running();
+        let delay = if self.retry_needed && !active { Duration::from_millis(100) } else { Duration::from_secs(5) };
+        if self.task.is_some() || (!active && !self.retry_needed) || self.last_requested_at.elapsed() < delay {
             return;
         }
         self.start(connection, session_id, true);
@@ -69,6 +70,7 @@ impl StateRefresh {
             task.abort();
         }
         self.last_requested_at = std::time::Instant::now();
+        self.retry_needed = false;
         self.generation = self.generation.wrapping_add(1);
         let generation = self.generation;
         let revision = self.revision;
@@ -94,7 +96,14 @@ impl StateRefresh {
                 continue;
             }
             self.task = None;
-            if reply.revision != self.revision || reply.session_id != session_id {
+            if reply.session_id != session_id {
+                self.retry_needed = false;
+                continue;
+            }
+            if reply.revision != self.revision {
+                // A final queue/message event can invalidate an idle control
+                // refresh. Retry after settling instead of leaving stale metadata.
+                self.retry_needed = true;
                 continue;
             }
             match reply.result {

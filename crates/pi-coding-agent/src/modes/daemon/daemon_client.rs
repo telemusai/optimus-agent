@@ -425,6 +425,13 @@ fn command_envelope_value(command: &Value, id: &str, client_id: Option<&str>, pr
 pub(crate) fn command_compatibilities(body: &DaemonCommandBody) -> Vec<DaemonCommandCompatibility> {
     let command_type = command_body_type(body);
     let mut requirements: Vec<DaemonCommandCompatibility> = Vec::new();
+    if matches!(command_type, "prompt" | "prompt_and_wait" | "steer" | "follow_up")
+        && body.get("message").and_then(Value::as_str)
+            .and_then(crate::core::slash_commands::parse_session_slash_command)
+            .is_some_and(|command| command.name == "mode")
+    {
+        requirements.push(DaemonCommandCompatibility::gated(34, DaemonServerCapability::ExecutionMode));
+    }
     let has_field = |key: &str| body.get(key).is_some_and(|value| !value.is_null());
     if (command_type == "attach" || command_type == "reattach") && has_field("recoveryConfig") {
         requirements.push(DaemonCommandCompatibility::gated(17, DaemonServerCapability::OwnedSessionRecoveryContext));

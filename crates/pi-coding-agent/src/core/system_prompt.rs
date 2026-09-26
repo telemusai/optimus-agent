@@ -110,6 +110,11 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let tools = selected_tools.clone().unwrap_or_else(|| vec!["ipython".to_string()]);
     let has_ipython = tools.iter().any(|tool| tool == "ipython");
     let has_bash = tools.iter().any(|tool| tool == "bash");
+    // Python-backed skills depend on the persistent workspace. Do not advertise
+    // them as shell executables when the session exposes only direct tools.
+    let skills: Vec<Skill> = skills.into_iter()
+        .filter(|skill| has_ipython || !matches!(skill, Skill::Python(_)))
+        .collect();
     let visible_skills: Vec<Skill> = skills
         .iter()
         .filter(|skill| !skill_is_disabled(skill))
@@ -133,6 +138,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
     if let Some(custom_prompt) = custom_prompt {
         let mut prompt = custom_prompt;
+        if !has_ipython && has_bash {
+            prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::DIRECT_TOOL_PROMPT));
+        }
 
         // Append project context files.
         if !context_files.is_empty() {

@@ -23,10 +23,10 @@ jobs:
         with:
           persist-credentials: false
 
-      - run: rustup toolchain install 1.95.0 --profile minimal
+      - run: rustup toolchain install 1.98.0 --profile minimal
       - name: Run native daemon and session process regressions
         env:
           CARGO_INCREMENTAL: '0'
           CARGO_PROFILE_TEST_DEBUG: '0'
           PRIME_AGENT_CODING_AGENT_DIR: ${{ runner.temp }}/optimus-nightly-profile
-        run: cargo +1.95.0 test --locked -p pi-coding-agent --test native_cli -- --test-threads=1
+        run: cargo +1.98.0 test --locked -p pi-coding-agent --test native_cli -- --test-threads=1

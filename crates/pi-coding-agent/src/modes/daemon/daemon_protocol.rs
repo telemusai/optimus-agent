@@ -67,8 +67,9 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 32 adds optional typed tool isError / executionReports metadata.
 // Native lifecycle host requests are separately capability-gated and never required at startup.
 // Revision 33 advertises optional jev_dynamic tool support; existing commands/events are unchanged.
-pub const DAEMON_SCHEMA_REVISION: u32 = 33;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-33-c16da0e12d5a";
+// Revision 34 gates /mode session commands; existing response/event shapes are unchanged.
+pub const DAEMON_SCHEMA_REVISION: u32 = 34;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-34-c16da0e12d5a";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -153,6 +154,7 @@ pub enum DaemonServerCapability {
     JevFeatures,
     /// Explicit agent-authored questions via the optional jev_decide tool.
     JevDynamic,
+    ExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -203,7 +205,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 25] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 26] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -229,6 +231,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 25] = [
     DaemonServerCapability::JevControl,
     DaemonServerCapability::JevFeatures,
     DaemonServerCapability::JevDynamic,
+    DaemonServerCapability::ExecutionMode,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2230,6 +2233,13 @@ pub fn is_session_plane_daemon_command(command_type: &str) -> bool {
 pub fn get_daemon_command_compatibilities(command: &DaemonCommand) -> Vec<DaemonCommandCompatibility> {
     let mut requirements: Vec<DaemonCommandCompatibility> = Vec::new();
     let command_type = command.command_type();
+    if matches!(command_type, "prompt" | "prompt_and_wait" | "steer" | "follow_up")
+        && command.get("message").and_then(|message| message.as_str().map(str::to_owned))
+            .and_then(|message| crate::core::slash_commands::parse_session_slash_command(&message))
+            .is_some_and(|command| command.name == "mode")
+    {
+        requirements.push(DaemonCommandCompatibility::gated(34, DaemonServerCapability::ExecutionMode));
+    }
     if (command_type == "attach" || command_type == "reattach") && command.has_field("recoveryConfig") {
         requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
     }
@@ -3004,6 +3014,30 @@ pub fn failure(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn execution_mode_commands_are_gated_without_changing_legacy_events() {
+        for command_type in ["prompt", "prompt_and_wait", "steer", "follow_up"] {
+            let command: DaemonCommand = serde_json::from_value(serde_json::json!({
+                "type": command_type, "activeSessionId": "test", "message": "/mode direct"
+            })).unwrap();
+            let requirements = get_daemon_command_compatibilities(&command);
+            let mut old = DaemonCompatibilityHello {
+                protocol: daemon_protocol_info(), schema_revision: Some(33),
+                server_capabilities: Some(vec![DaemonServerCapability::SessionInputAdmission]),
+            };
+            assert!(!requirements.iter().all(|r| meets_daemon_command_compatibility(&old, r)));
+            old.schema_revision = Some(34);
+            assert!(!requirements.iter().all(|r| meets_daemon_command_compatibility(&old, r)));
+            old.server_capabilities.as_mut().unwrap().push(DaemonServerCapability::ExecutionMode);
+            assert!(requirements.iter().all(|r| meets_daemon_command_compatibility(&old, r)));
+        }
+        // Old clients continue to consume the existing snapshots and queue events.
+        let old = DaemonCompatibilityHello { protocol: daemon_protocol_info(), schema_revision: Some(33), server_capabilities: None };
+        for event in ["session_event", "session_attached", "session_resynced", "response"] {
+            assert!(meets_daemon_command_compatibility(&old, &daemon_outbound_compatibility(event)));
+        }
+    }
 
     #[test]
     fn keeps_provider_compaction_metadata_optional_for_older_clients_and_workers() {

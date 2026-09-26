@@ -4,7 +4,7 @@
 use std::fs::{self, File};
 use std::io::{Read, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::process::{Child, Command, ExitStatus, Stdio};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -429,6 +429,63 @@ fn actual_print_cli_streams_local_http_through_the_daemon_worker() {
             "CLI prompt never reached the HTTP adapter: {prompt}"
         );
     }
+    drop(daemon);
+    model.finish();
+}
+
+#[test]
+fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests() {
+    let mut model = LocalModel::start();
+    let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("mode-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    async fn request(client: &Arc<DaemonClient>, body: Value) -> Value {
+        let response = client.request(body.as_object().unwrap().clone(), Some(30_000), Default::default()).await.unwrap();
+        assert!(response.success, "{:?}", response.error);
+        response.data.unwrap_or(Value::Null)
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    runtime.block_on(async {
+        let client = DaemonClient::create(&fixture.socket);
+        client.connect(1000).await.unwrap();
+        assert!(client.wait_for_hello(1000).await.unwrap().supports("execution_mode"));
+        let created = request(&client, json!({"type":"create", "config":{
+            "cwd":fixture.workspace, "agentDir":fixture.agent_dir, "sessionDir":fixture.root.path().join("sessions"),
+            "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
+        }})).await;
+        let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
+        for message in ["HTTP_MODE_HISTORY", "/mode direct", "HTTP_DIRECT_REQUEST", "/mode ipython", "HTTP_IPYTHON_REQUEST", "/mode direct"] {
+            request(&client, json!({"type":"prompt_and_wait", "activeSessionId":active, "message":message})).await;
+        }
+        let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit"]));
+        let saved = state["sessionFile"].as_str().unwrap().to_string();
+        client.close().await;
+        // A new CLI client resumes the durable chat, through the real supervisor.
+        let mut resumed = fixture.spawn("mode-resumed", &["--print", "--offline", "--resume", &saved, "HTTP_RESUMED_DIRECT"]);
+        let (status, stdout, stderr) = resumed.wait(Duration::from_secs(45));
+        assert!(status.success(), "{status}; {stdout}; {stderr}");
+    });
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 4, "mode switches must not call a model");
+    for (index, direct) in [(0, false), (1, true), (2, false), (3, true)] {
+        let request = &requests[index];
+        let names: Vec<_> = request["tools"].as_array().unwrap().iter()
+            .filter_map(|tool| tool["function"]["name"].as_str()).collect();
+        assert_eq!(names.contains(&"ipython"), !direct, "{names:?}");
+        assert_eq!(names.contains(&"bash"), direct, "{names:?}");
+        assert_eq!(names.contains(&"edit"), direct, "{names:?}");
+        let messages = request["messages"].as_array().unwrap();
+        let system = messages.iter().filter(|m| m["role"] == "system" || m["role"] == "developer")
+            .map(|m| m["content"].to_string()).collect::<String>();
+        assert_eq!(system.contains("Execution mode: Direct tools"), direct);
+        assert_eq!(system.contains("Python is the orchestration language"), !direct);
+        assert!(request["messages"].to_string().contains("HTTP_MODE_HISTORY"));
+    }
+    drop(requests);
     drop(daemon);
     model.finish();
 }
