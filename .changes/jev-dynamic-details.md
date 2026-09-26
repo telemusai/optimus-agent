@@ -1,0 +1,1 @@
+- Fixed Dynamic Jev calls flooding chat with JSON: requests and results now follow Ctrl+O's saved detail level, with a compact status row and visible error summaries when collapsed.

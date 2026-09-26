@@ -30,6 +30,7 @@ use crate::modes::interactive::theme::theme::theme;
 use crate::modes::interactive::theme::working_icon::{get_working_pulse_frame, working_icon_frame};
 
 use super::tool_panel::ToolPanel;
+use super::keybinding_hints::{expand_collapse_hint, key_text, KeyTextOptions};
 
 /// `getIpythonCodeFromArgs` / `IPythonCellState` live in
 /// components/ipython-cell.ts -> `super::ipython_cell`.
@@ -323,6 +324,11 @@ impl ToolExecutionComponent {
                 .unwrap_or(false)
     }
 
+    fn uses_jev_decision_summary(&self) -> bool {
+        self.tool_name == crate::core::jev_bridge::dynamic::TOOL_NAME
+            && !has_tool_renderer(self.tool_definition.as_ref())
+    }
+
     fn is_built_in_edit_tool(&self) -> bool {
         self.tool_name == "edit"
             && (self.tool_definition.is_none()
@@ -524,13 +530,31 @@ impl ToolExecutionComponent {
                     .as_ref()
                     .map(|definition| definition.label().to_string())
             })
-            .unwrap_or_else(|| self.tool_name.clone());
-        format!(
+            .unwrap_or_else(|| {
+                if self.uses_jev_decision_summary() { "Jev decision".into() }
+                else { self.tool_name.clone() }
+            });
+        let mut header = format!(
             "{}{}{}",
             theme().fg("muted", &label),
             theme().fg("dim", " \u{b7} "),
             self.panel_status()
-        )
+        );
+        if self.uses_jev_decision_summary() {
+            if let Some(questions) = self.args.get("questions").and_then(Value::as_object) {
+                let count = questions.len();
+                header.push_str(&theme().fg("dim", &format!(
+                    " · {count} question{}", if count == 1 { "" } else { "s" },
+                )));
+            }
+            if self.show_expand_hint
+                && !key_text("app.tools.expand", &KeyTextOptions::default()).is_empty()
+            {
+                header.push(' ');
+                header.push_str(&expand_collapse_hint("app.tools.expand", self.expanded));
+            }
+        }
+        header
     }
 
     /// Port of `panelStatus`.
@@ -645,7 +669,22 @@ impl ToolExecutionComponent {
             // is self-identifying. The header replaces the bold-tool-name fallback.
             self.content_panel.set_header(self.panel_header());
             self.content_panel.clear();
-            if self.has_renderer_definition() {
+            if self.uses_jev_decision_summary() {
+                // Preserve the complete request/result; only their presentation is folded.
+                if self.expanded {
+                    self.content_panel.add_child(Box::new(Text::new(
+                        self.format_tool_execution(), 0, 0, None,
+                    )));
+                } else if self.result.as_ref().is_some_and(|result| result.is_error) {
+                    let summary = super::collapsible_error::summarize_error_details(
+                        &self.get_text_output_value(),
+                    );
+                    let summary = pi_tui::utils::truncate_to_width(&summary, 120.0, "…", false);
+                    self.content_panel.add_child(Box::new(Text::new(
+                        theme().fg("error", &summary), 0, 0, None,
+                    )));
+                }
+            } else if self.has_renderer_definition() {
                 self.mount_renderers(0, false);
             } else {
                 let fallback_text = self.format_tool_execution();
@@ -841,6 +880,10 @@ pub fn select_latest_tool_expand_hint(
     }
     latest.set_show_expand_hint(true);
 }
+
+#[cfg(test)]
+#[path = "tool_execution_jev_tests.rs"]
+mod jev_tests;
 
 #[cfg(test)]
 mod tests {
