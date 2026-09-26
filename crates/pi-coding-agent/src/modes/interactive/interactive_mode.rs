@@ -19,6 +19,7 @@ use pi_agent_core::types::{AgentMessage, ThinkingLevel};
 use pi_ai::types::{ImageContent, Model, ServiceTier};
 
 use crate::config::VERSION;
+use crate::core::settings_manager::ChatDetail;
 use crate::utils::paths::get_cwd_relative_path;
 
 use super::agent_activity::format_token_count;
@@ -1571,7 +1572,8 @@ impl InteractiveMode {
             escape_repeat_window_ms: Self::ESCAPE_REPEAT_WINDOW_MS,
         };
         mode.hydrate_prompt_stash();
-        mode.hide_thinking_block = mode.with_settings(|settings| settings.get_hide_thinking_block());
+        let detail = mode.with_settings(|settings| settings.get_chat_detail());
+        mode.assign_chat_detail(detail);
         Ok(mode)
     }
 
@@ -2520,7 +2522,7 @@ impl InteractiveMode {
 `{clear_input}` interrupt \u{b7} press twice to rewind or clear the prompt
 
 **Controls**
-`{select_model}` select model \u{b7} `/effort` set reasoning \u{b7} `{expand_tools}` tool output
+`{select_model}` select model \u{b7} `/effort` set reasoning \u{b7} `{expand_tools}` chat detail
 `{expand_messages}` agent messages \u{b7} `{expand_edits}` edit diffs \u{b7} `{toggle_thinking}` thinking blocks \u{b7} `{prompt_stash}` stash prompt \u{b7} `{external_editor}` edit in `$EDITOR`
 `{paste_image}` paste image
 
@@ -2635,7 +2637,7 @@ impl InteractiveMode {
 | `{clear}` | Interrupt current operation (first) / exit (second) |
 {interrupt_row}{shortcuts_row}| `{exit}` | Exit (when editor is empty) |
 | `{select_model}` | Open model selector |
-| `{expand_tools}` | Toggle tool output expansion |
+| `{expand_tools}` | Cycle and save conversation detail |
 | `{expand_messages}` | Toggle agent message expansion |
 | `{expand_edits}` | Toggle edit diff expansion |
 | `{toggle_thinking}` | Toggle thinking block visibility |
@@ -3415,13 +3417,33 @@ impl InteractiveMode {
 
     /// Port of `setToolsExpanded`.
     pub fn set_tools_expanded(&mut self, expanded: bool) {
-        self.tool_output_expanded = expanded;
-        self.apply_chat_expansion();
+        // Extension overrides affect this view, never the user's saved choice.
+        self.set_chat_detail(if expanded { ChatDetail::All } else { ChatDetail::Overview });
     }
 
     /// Port of `toggleToolOutputExpansion`.
     pub fn toggle_tool_output_expansion(&mut self) {
-        self.set_tools_expanded(!self.tool_output_expanded);
+        let detail = if self.tool_output_expanded {
+            ChatDetail::Overview
+        } else if self.edit_diffs_expanded {
+            ChatDetail::All
+        } else {
+            ChatDetail::Details
+        };
+        self.with_settings_mut(|settings| settings.set_chat_detail(detail));
+        self.set_chat_detail(detail);
+    }
+
+    fn assign_chat_detail(&mut self, detail: ChatDetail) {
+        self.tool_output_expanded = detail == ChatDetail::All;
+        self.agent_messages_expanded = detail == ChatDetail::All;
+        self.edit_diffs_expanded = detail != ChatDetail::Overview;
+        self.hide_thinking_block = detail == ChatDetail::Overview;
+    }
+
+    fn set_chat_detail(&mut self, detail: ChatDetail) {
+        self.assign_chat_detail(detail);
+        self.apply_chat_expansion();
     }
 
     /// Port of `toggleAgentMessageExpansion`.

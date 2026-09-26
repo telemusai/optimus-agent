@@ -1,0 +1,2 @@
+- Fixed Option+S in the model picker when macOS sends `ß`, while respecting custom bindings and preserving normal text entry elsewhere.
+- Fixed conversation detail resetting across new, resumed, and attached chats; Ctrl+O now saves the overview, details, or all-output choice, while extension overrides remain temporary.

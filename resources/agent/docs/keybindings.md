@@ -129,6 +129,8 @@ These bindings apply while `/stats` is open. Opening or navigating the panel doe
 | `app.model.toggleScope` | `alt+s` | Toggle between all and scoped models |
 | `app.thinking.toggle` | `ctrl+t` | Collapse or expand thinking blocks |
 
+In the model picker, Option+S also accepts `ß` from macOS terminals that do not send Option as Meta. This applies only while the scope action is bound to `alt+s`; remapping or disabling the binding is respected, and normal text editors still accept `ß`.
+
 ### Configuration Menu
 
 Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, Models, and MCP Connections. Use `escape` to close the menu. Left and right move the cursor in the active search field.
@@ -141,7 +143,7 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 
 | Keybinding id | Default | Description |
 |--------|---------|-------------|
-| `app.tools.expand` | `ctrl+o` | Collapse or expand tool output |
+| `app.tools.expand` | `ctrl+o` | Cycle and save conversation detail |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
 | `app.message.followUp` | `alt+enter` | Queue follow-up message |
@@ -149,6 +151,8 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.message.navigateNewer` | `alt+down` | Select the next newer pending message or restore the draft |
 | `app.message.moveEarlier` | `ctrl+alt+up` | Move the selected pending message one place earlier in its queue |
 | `app.message.moveLater` | `ctrl+alt+down` | Move the selected pending message one place later in its queue |
+
+Ctrl+O cycles overview → details → all output. Details is the default; new, resumed, and attached chats use the last saved `chatDetail` choice. Overview hides thinking and collapses tools and diffs; details shows thinking and diffs; all output also expands tools and agent-to-agent message bodies. Individual thinking, diff, and message toggles remain available for adjustments to the current view; Ctrl+O saves a complete level. These controls never rewrite the conversation or session file.
 
 ### Tree Navigation
 

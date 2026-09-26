@@ -106,6 +106,10 @@ mod native_metrics;
 #[path = "native_host_ui_tests.rs"]
 mod ui_tests;
 
+#[cfg(test)]
+#[path = "native_host_chat_detail_tests.rs"]
+mod chat_detail_tests;
+
 pub(crate) async fn run_interactive_mode(
     options: InteractiveModeSeamOptions,
 ) -> Result<(), String> {
@@ -340,6 +344,30 @@ impl Transcript {
         for outcome in &self.refinement_outcomes { outcome.borrow_mut().set_expanded(expanded); }
         if let Some(history) = &mut self.history { history.set_recovery_notices_expanded(expanded); }
     }
+    /// Refresh both restored and live components from the view's detail settings.
+    fn apply_chat_detail(&mut self) {
+        let (tools, messages, diffs, hide_thinking) = {
+            let mode = self.mode.borrow();
+            (mode.tool_output_expanded, mode.agent_messages_expanded,
+                mode.edit_diffs_expanded, mode.hide_thinking_block)
+        };
+        self.set_recovery_notices_expanded(tools);
+        if let Some(pane) = &self.side_pane { pane.borrow_mut().set_expanded(tools); }
+        for component in self.all_tools() {
+            let mut component = component.borrow_mut();
+            component.set_expanded(tools);
+            component.set_agent_messages_expanded(messages);
+            component.set_edit_diffs_expanded(diffs);
+        }
+        for component in self.all_assistants() {
+            let mut component = component.borrow_mut();
+            component.set_hide_thinking_block(hide_thinking);
+            component.set_expanded(messages);
+        }
+        for component in self.all_agent_messages() {
+            component.borrow_mut().set_expanded(messages);
+        }
+    }
     fn sent_agent_message(&mut self, tool_call_id: &str, message: wire::KernelSentAgentMessage) {
         if let Some(tool) = self.tools.get(tool_call_id) {
             tool.borrow_mut().append_sent_agent_message(message);
@@ -506,6 +534,8 @@ impl Transcript {
         );
         component.mark_execution_started();
         component.set_expanded(mode.tool_output_expanded);
+        component.set_agent_messages_expanded(mode.agent_messages_expanded);
+        component.set_edit_diffs_expanded(mode.edit_diffs_expanded);
         let component = Rc::new(RefCell::new(component));
         let key: Rc<str> = Rc::from(format!("tool:{id}"));
         self.row_metadata.insert(key.clone(), native_neon::RowMeta::new(native_neon::Kind::Tool, None));
@@ -2088,12 +2118,7 @@ async fn run_terminal(
                 }
                 InputAction::ToggleTools => {
                     mode.borrow_mut().toggle_tool_output_expansion();
-                    transcript.borrow_mut().set_recovery_notices_expanded(mode.borrow().tool_output_expanded);
-                    side_pane.borrow_mut().set_expanded(mode.borrow().tool_output_expanded);
-                    for tool in transcript.borrow().all_tools() {
-                        tool.borrow_mut()
-                            .set_expanded(mode.borrow().tool_output_expanded);
-                    }
+                    transcript.borrow_mut().apply_chat_detail();
                 }
                 InputAction::ToggleThinking => {
                     let mut mode = mode.borrow_mut();
@@ -2263,8 +2288,7 @@ async fn run_terminal(
                         Event::Paste(text) => editor.borrow_mut().handle_input(&format!("\x1b[200~{text}\x1b[201~")),
                         Event::ToolsExpanded(expanded) => {
                             mode.borrow_mut().set_tools_expanded(expanded);
-                            transcript.borrow_mut().set_recovery_notices_expanded(expanded);
-                            for tool in transcript.borrow().all_tools() { tool.borrow_mut().set_expanded(expanded); }
+                            transcript.borrow_mut().apply_chat_detail();
                         }
                         Event::Widget(key, factory, options) => {
                             if let Some(bridge) = &local_extension_bridge {

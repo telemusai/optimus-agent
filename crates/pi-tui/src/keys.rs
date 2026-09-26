@@ -703,6 +703,16 @@ fn parse_key_id(key_id: &str) -> Option<ParsedKeyId> {
     })
 }
 
+/// Opt-in decoding for macOS terminals that type a character instead of Option-as-Meta.
+/// Keep this separate from normal matching so text editors can still accept `ß`.
+pub fn matches_option_composed_key(data: &str, key_id: &str) -> bool {
+    let Some(parsed) = parse_key_id(key_id) else {
+        return false;
+    };
+    parsed.alt && !parsed.ctrl && !parsed.shift && !parsed.super_modifier
+        && parsed.key == "s" && data == "ß"
+}
+
 /// Match input data against a key identifier string.
 pub fn matches_key(data: &str, key_id: &str) -> bool {
     // Legacy macOS terminals encode Option as an extra ESC prefix around the
@@ -1389,6 +1399,21 @@ mod tests {
         assert!(matches_key("\x1bx", "alt+x"));
         assert!(matches_key("\x1b\x03", "ctrl+alt+c"));
         assert!(!matches_key("\x03", "ctrl+d"));
+    }
+
+    #[test]
+    fn option_composed_matching_is_explicit_and_modifier_specific() {
+        for active in [false, true] {
+            let _guard = KittyGuard::new(active);
+            assert!(matches_option_composed_key("ß", "alt+s"));
+            assert!(!matches_key("ß", "alt+s"));
+            for key in ["s", "alt+a", "ctrl+alt+s", "shift+alt+s", "super+alt+s", "alt+"] {
+                assert!(!matches_option_composed_key("ß", key), "{key}");
+            }
+            for data in ["s", "ẞ", "ßs", "\x1b[200~ß\x1b[201~"] {
+                assert!(!matches_option_composed_key(data, "alt+s"), "{data:?}");
+            }
+        }
     }
 
     #[test]

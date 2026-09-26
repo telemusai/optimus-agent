@@ -1,6 +1,6 @@
 //! Port of packages/tui/src/keybindings.ts.
 
-use crate::keys::matches_key;
+use crate::keys::{matches_key, matches_option_composed_key};
 use indexmap::IndexMap;
 use std::cell::RefCell;
 
@@ -13,6 +13,11 @@ pub type Keybinding = String;
 
 /// Port of the `KeybindingsConfig` record: user overrides by action id.
 pub type KeybindingsConfig = IndexMap<String, Vec<String>>;
+
+#[derive(Clone, Copy, Debug, Default)]
+pub struct KeyMatchOptions {
+    pub option_composed: bool,
+}
 
 /// Port of the `KeybindingDefinitions` record.
 pub type KeybindingDefinitions = IndexMap<String, KeybindingDefinition>;
@@ -323,8 +328,15 @@ impl KeybindingsManager {
     }
 
     pub fn matches(&self, data: &str, keybinding: &str) -> bool {
+        self.matches_with_options(data, keybinding, KeyMatchOptions::default())
+    }
+
+    pub fn matches_with_options(&self, data: &str, keybinding: &str, options: KeyMatchOptions) -> bool {
         match self.keys_by_id.get(keybinding) {
-            Some(keys) => keys.iter().any(|key| matches_key(data, key)),
+            Some(keys) => keys.iter().any(|key| {
+                matches_key(data, key)
+                    || (options.option_composed && matches_option_composed_key(data, key))
+            }),
             None => false,
         }
     }
@@ -409,6 +421,19 @@ mod tests {
         assert_eq!(manager.get_keys("tui.input.submit"), vec!["ctrl+s".to_string()]);
         assert!(manager.matches("\x13", "tui.input.submit"));
         assert!(!manager.matches("\r", "tui.input.submit"));
+    }
+
+    #[test]
+    fn option_composed_matching_respects_remapped_and_disabled_bindings() {
+        let options = KeyMatchOptions { option_composed: true };
+        for keys in [vec!["alt+s".into()], vec!["alt+a".into()], vec![]] {
+            let accepts_option_s = keys == ["alt+s"];
+            let manager = KeybindingsManager::new(tui_keybindings(), IndexMap::from([
+                ("tui.input.submit".into(), keys),
+            ]));
+            assert!(!manager.matches("ß", "tui.input.submit"));
+            assert_eq!(manager.matches_with_options("ß", "tui.input.submit", options), accepts_option_s);
+        }
     }
 
     #[test]
