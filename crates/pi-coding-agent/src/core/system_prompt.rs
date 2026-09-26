@@ -109,6 +109,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let skills = provided_skills.unwrap_or_default();
     let tools = selected_tools.clone().unwrap_or_else(|| vec!["ipython".to_string()]);
     let has_ipython = tools.iter().any(|tool| tool == "ipython");
+    let has_node = tools.iter().any(|tool| tool == "node");
     let has_bash = tools.iter().any(|tool| tool == "bash");
     // Python-backed skills depend on the persistent workspace. Do not advertise
     // them as shell executables when the session exposes only direct tools.
@@ -138,7 +139,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
 
     if let Some(custom_prompt) = custom_prompt {
         let mut prompt = custom_prompt;
-        if !has_ipython && has_bash {
+        if has_node {
+            prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::NODE_TOOL_PROMPT));
+        } else if !has_ipython && has_bash {
             prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::DIRECT_TOOL_PROMPT));
         }
 
@@ -154,7 +157,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         // Append skills section only when the model has a way to inspect skill files.
         let custom_prompt_has_file_access = match &selected_tools {
             None => true,
-            Some(tools) => tools.iter().any(|tool| tool == "ipython" || tool == "bash"),
+            Some(tools) => tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "bash"),
         };
         if custom_prompt_has_file_access && !skills.is_empty() {
             prompt.push_str(&format_skills_for_prompt(&skills));
@@ -221,7 +224,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         active_tools: Some(
             tools
                 .iter()
-                .filter(|name| name.as_str() == "ipython" || name.as_str() == "bash" || name.as_str() == "edit")
+                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "bash" || name.as_str() == "edit")
                 .cloned()
                 .collect(),
         ),
@@ -288,7 +291,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     }
 
     // Append skills section only when the model has a way to inspect skill files.
-    let has_file_access = tools.iter().any(|tool| tool == "ipython" || tool == "bash");
+    let has_file_access = tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "bash");
     if has_file_access && !skills.is_empty() {
         prompt.push_str(&format_skills_for_prompt(&skills));
         if let Some(hint) = &options.skill_hint { prompt.push_str(hint); }

@@ -284,7 +284,7 @@ fn jev_dynamic_is_additive_without_new_commands_or_startup_requirements() {
 fn execution_mode_raw_and_typed_gates_agree_and_keep_ordinary_chat_compatible() {
     use super::super::daemon_protocol::{DaemonCommand, get_daemon_command_compatibilities};
     for kind in ["prompt", "prompt_and_wait", "steer", "follow_up"] {
-        for message in ["/mode", "/mode direct", "/mode toggle", "ordinary chat"] {
+        for message in ["/mode", "/mode direct", "/mode node", "/mode toggle", "ordinary chat"] {
             let value = json!({"type":kind,"activeSessionId":"session-a","message":message});
             let raw = value.as_object().unwrap().clone();
             let typed: DaemonCommand = serde_json::from_value(value).unwrap();
@@ -292,7 +292,8 @@ fn execution_mode_raw_and_typed_gates_agree_and_keep_ordinary_chat_compatible() 
             let ordinary = message == "ordinary chat";
             assert_eq!(supported(&hello(33, &["session_input_admission"]), &raw), ordinary);
             assert_eq!(supported(&hello(34, &["session_input_admission"]), &raw), ordinary);
-            assert!(supported(&hello(34, &["session_input_admission", "execution_mode"]), &raw));
+            assert_eq!(supported(&hello(34, &["session_input_admission", "execution_mode"]), &raw), !matches!(message, "/mode node" | "/mode toggle"));
+            assert!(supported(&hello(35, &["session_input_admission", "execution_mode", "node_execution_mode"]), &raw));
         }
     }
 }
@@ -321,4 +322,20 @@ async fn execution_mode_rejects_old_daemons_before_writing_and_sends_to_capable_
     let (response, ()) = tokio::join!(client.request(command, Some(1000), Default::default()), receive);
     assert!(response.unwrap().success);
     client.close().await;
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn node_mode_is_rejected_before_writing_to_an_older_execution_mode_daemon() {
+    for message in ["/mode node", "/mode toggle"] {
+        let command = json!({"type":"prompt","activeSessionId":"session-a","message":message})
+            .as_object().unwrap().clone();
+        let (client, peer) = connected_client(hello(34, &["session_input_admission", "execution_mode"])).await;
+        let error = client.request(command, Some(100), Default::default()).await.unwrap_err();
+        assert!(matches!(error, DaemonClientError::CapabilityUnavailable(ref e)
+            if e.capability.as_deref() == Some("node_execution_mode")));
+        assert_no_wire_bytes(&peer);
+        assert!(client.state.lock().await.pending.is_empty());
+        client.close().await;
+    }
 }

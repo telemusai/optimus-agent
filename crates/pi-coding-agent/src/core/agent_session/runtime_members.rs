@@ -927,6 +927,7 @@ impl AgentSession {
                     shell_path: settings.get_shell_path(),
                     ..Default::default()
                 };
+                definitions.insert("node".into(), crate::core::tools::node::create_node_tool_definition(&self.cwd, self.node_runtime.clone()).into());
                 definitions.insert("bash".into(), crate::core::tools::create_bash_tool_definition(&self.cwd, Some(&bash_options)).into());
                 definitions.insert("edit".into(), crate::core::tools::create_edit_tool_definition(&self.cwd, None).into());
                 definitions

@@ -216,7 +216,7 @@ fn canonical_builtin_slash_commands() -> Vec<BuiltinSlashCommand> {
         None,
     );
     push("fast", "Toggle OpenAI Fast mode".to_string(), None, None);
-    push("mode", "Switch between IPython and Direct tools for this chat".into(), Some("[ipython|direct|toggle]"), Some(true));
+    push("mode", "Switch between IPython, Node and Direct tools for this chat".into(), Some("[ipython|node|direct|toggle]"), Some(true));
     push(
         "scoped-models",
         "Enable/disable models for Ctrl+P cycling".to_string(),

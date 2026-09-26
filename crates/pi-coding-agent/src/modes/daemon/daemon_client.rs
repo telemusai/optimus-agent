@@ -431,6 +431,11 @@ pub(crate) fn command_compatibilities(body: &DaemonCommandBody) -> Vec<DaemonCom
             .is_some_and(|command| command.name == "mode")
     {
         requirements.push(DaemonCommandCompatibility::gated(34, DaemonServerCapability::ExecutionMode));
+        if body.get("message").and_then(Value::as_str)
+            .and_then(crate::core::slash_commands::parse_session_slash_command)
+            .is_some_and(|c| matches!(c.args.trim(), "node" | "toggle")) {
+            requirements.push(DaemonCommandCompatibility::gated(35, DaemonServerCapability::NodeExecutionMode));
+        }
     }
     let has_field = |key: &str| body.get(key).is_some_and(|value| !value.is_null());
     if (command_type == "attach" || command_type == "reattach") && has_field("recoveryConfig") {

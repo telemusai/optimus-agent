@@ -283,7 +283,7 @@ impl ToolExecutionComponent {
     }
 
     fn has_renderer_definition(&self) -> bool {
-        self.built_in_tool_definition.is_some() || self.tool_definition.is_some()
+        self.should_use_ipython_renderer() || self.built_in_tool_definition.is_some() || self.tool_definition.is_some()
     }
 
     fn get_render_shell(&self) -> String {
@@ -316,7 +316,7 @@ impl ToolExecutionComponent {
     }
 
     fn should_use_ipython_renderer(&self) -> bool {
-        self.tool_name == "ipython"
+        matches!(self.tool_name.as_str(), "ipython" | "node")
             && !self
                 .tool_definition
                 .as_ref()
@@ -629,10 +629,11 @@ impl ToolExecutionComponent {
                         .result
                         .as_ref()
                         .map(|result| result.content.iter().map(to_ipython_cell_block).collect()),
-                    details: self
-                        .result
-                        .as_ref()
-                        .and_then(|result| result.details.clone()),
+                    details: if self.tool_name == "node" {
+                        let mut details = self.result.as_ref().and_then(|result| result.details.clone()).unwrap_or_else(|| serde_json::json!({}));
+                        details["language"] = serde_json::json!("javascript");
+                        Some(details)
+                    } else { self.result.as_ref().and_then(|result| result.details.clone()) },
                     is_partial: Some(self.is_partial),
                     is_error: Some(
                         self.result
@@ -1033,6 +1034,18 @@ mod tests {
         );
         assert_eq!(component.get_render_shell(), "self");
         assert!(component.ipython_cell_component.is_some());
+    }
+
+    #[test]
+    fn node_cells_share_collapsible_rendering_with_javascript_label() {
+        let mut component = ToolExecutionComponent::new(
+            "node", "node-cell", serde_json::json!({"code":"const answer = 42;\nconsole.log(answer)"}),
+            options(), None, "/cwd",
+        );
+        assert_eq!(component.get_render_shell(), "self");
+        let rendered = pi_tui::utils::strip_ansi(&component.render_lines(100.0).join("\n"));
+        assert!(rendered.contains("javascript"), "{rendered}");
+        assert!(!rendered.contains("\"code\""), "{rendered}");
     }
 
     #[test]

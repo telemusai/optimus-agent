@@ -321,7 +321,7 @@ async fn busy_switch_waits_for_current_run_then_precedes_queued_prompts() {
     assert_eq!(session.get_active_tool_names(), ["ipython"]);
     assert!(session
         .get_session_action_snapshot()
-        .follow_ups
+        .steering
         .contains(&"/mode direct".into()));
     release.add_permits(1);
     running.await.unwrap().unwrap();
@@ -395,11 +395,11 @@ async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
     assert!(session.is_queued_work_suspended());
     assert_eq!(session.get_session_action_snapshot().follow_ups, queued);
     assert_eq!(stop_entries(&file), stopped);
-    // Two concurrent F6 presses are serialized, so neither toggle is lost.
-    let (a, b) = tokio::join!(
-        session.prompt("/mode toggle", None), session.prompt("/mode toggle", None)
+    // Three concurrent F6 presses are serialized, so none is lost.
+    let (a, b, c) = tokio::join!(
+        session.prompt("/mode toggle", None), session.prompt("/mode toggle", None), session.prompt("/mode toggle", None)
     );
-    a.unwrap(); b.unwrap();
+    a.unwrap(); b.unwrap(); c.unwrap();
     assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
     assert!(session.prompt("/compact", None).await.is_err());
     session.dispose_async(Some(false)).await;
@@ -489,5 +489,106 @@ async fn real_python_state_survives_a_round_trip_through_direct_tools() {
     f.assert_request(0, false);
     f.assert_request(2, true);
     f.assert_request(4, false);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires PRIME_AGENT_KERNEL_PYTHON pointing to a prepared runtime"]
+async fn f6_during_real_python_cell_does_not_block_admission_or_follow_up() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    let started = f.root.path().join("workspace/cell-started");
+    let release = f.root.path().join("workspace/cell-release");
+    f.reply(Some(("ipython", json!({"code":
+        "from pathlib import Path\nimport asyncio\nPath('cell-started').touch()\nwhile not Path('cell-release').exists():\n    await asyncio.sleep(0.02)\nprint('PYTHON_COMPLETED')"}))), None);
+    f.reply(None, None);
+    f.reply(None, None);
+    let running = { let session = session.clone(); tokio::spawn(async move {
+        session.prompt("Run the Python cell", None::<PromptOptions>).await
+    }) };
+    tokio::time::timeout(Duration::from_secs(40), async {
+        while !started.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("Python cell started");
+    tokio::time::timeout(Duration::from_secs(3), session.prompt("/mode toggle", Some(PromptOptions {
+        streaming_behavior: Some("followUp".into()), ..Default::default()
+    }))).await.expect("F6 acknowledged during running Python").unwrap();
+    assert_eq!(session.get_active_tool_names(), ["ipython"]);
+    session.prompt("Queued after F6", Some(PromptOptions {
+        streaming_behavior: Some("followUp".into()), ..Default::default()
+    })).await.unwrap();
+    std::fs::write(release, "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), running).await.expect("active turn finished").unwrap().unwrap();
+    idle(&session).await;
+    assert_eq!(session.get_active_tool_names(), ["node"]);
+    assert_eq!(f.captured.lock().unwrap()[1].tools.as_ref().unwrap()[0].name, "node",
+        "the next provider request must use Node immediately after the completed tool batch");
+    assert!(serde_json::to_string(&session.messages()).unwrap().contains("PYTHON_COMPLETED"));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    turn(&session, "/mode toggle").await;
+    assert_eq!(session.get_active_tool_names(), ["node"]);
+    f.reply(Some(("node", json!({"code":"const modeValue = 41; modeValue"}))), None);
+    f.reply(None, None);
+    turn(&session, "Use Node").await;
+    let captured = f.captured.lock().unwrap()[0].clone();
+    assert!(captured.system_prompt.unwrap().contains("JavaScript is the orchestration language"));
+    assert_eq!(captured.tools.unwrap()[0].name, "node");
+    turn(&session, "/mode toggle").await;
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    turn(&session, "/mode toggle").await;
+    assert_eq!(session.get_active_tool_names(), ["ipython"]);
+    turn(&session, "/mode node").await;
+    f.reply(Some(("node", json!({"code":"await Promise.resolve(modeValue + 1)"}))), None);
+    f.reply(None, None);
+    turn(&session, "Read retained JavaScript").await;
+    let messages = serde_json::to_value(session.messages()).unwrap();
+    let result = messages.as_array().unwrap().iter().rev().find(|m| m["role"] == "toolResult").unwrap();
+    assert_eq!(result["isError"], false, "{result}");
+    assert!(result.to_string().contains("42"));
+    let file = session.session_file().unwrap();
+    session.dispose_async(Some(false)).await;
+    let reopened = f.session(Some(&file), false).await;
+    assert_eq!(reopened.get_active_tool_names(), ["node"]);
+    assert!(reopened.system_prompt().contains("JavaScript is the orchestration language"));
+    reopened.dispose_async(Some(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn f6_after_node_tool_batch_continues_unfinished_work_in_direct_mode() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    turn(&session, "/mode node").await;
+    let started = f.root.path().join("workspace/node-started");
+    let release = f.root.path().join("workspace/node-release");
+    f.reply(Some(("node", json!({"code":"var fs = require('node:fs'); fs.writeFileSync('node-started', 'ready'); while (!fs.existsSync('node-release')) { await new Promise(r => setTimeout(r, 20)); } console.log('NODE_COMPLETED');"}))), None);
+    f.reply(Some(("bash", json!({"command":"printf 'port 8080'", "timeout":2}))), None);
+    f.reply(None, None);
+    let running = { let session = session.clone(); tokio::spawn(async move {
+        session.prompt("Run long Node work", None::<PromptOptions>).await
+    }) };
+    tokio::time::timeout(Duration::from_secs(10), async {
+        while !started.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("Node started");
+    tokio::time::timeout(Duration::from_secs(2), session.prompt("/mode toggle", Some(PromptOptions {
+        streaming_behavior: Some("followUp".into()), ..Default::default()
+    }))).await.expect("F6 acknowledged while Node is busy").unwrap();
+    assert_eq!(session.get_active_tool_names(), ["node"]);
+    std::fs::write(release, "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
+    idle(&session).await;
+    f.assert_request(1, true);
+    let history = serde_json::to_value(session.messages()).unwrap();
+    let results: Vec<_> = history.as_array().unwrap().iter().filter(|m| m["role"] == "toolResult").collect();
+    assert_eq!(results.len(), 2);
+    assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
+    assert!(results[1].to_string().contains("8080"));
     session.dispose_async(Some(false)).await;
 }

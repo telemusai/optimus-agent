@@ -2658,6 +2658,7 @@ pub struct AgentSession {
     rlm_session_dir: Option<String>,
     rlm_parent_node_id: Option<String>,
     rlm_parent_agent: Option<String>,
+    node_runtime: Arc<crate::core::tools::node::NodeRuntime>,
     ipython_kernel_provisioner:
         Mutex<Option<Arc<crate::core::tools::ipython::IpythonKernelProvisioner>>>,
     exec_env_provider: Mutex<Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>>,
@@ -3028,6 +3029,7 @@ impl AgentSession {
             rlm_session_dir: config.rlm_session_dir.clone(),
             rlm_parent_node_id: config.rlm_parent_node_id.clone(),
             rlm_parent_agent: config.rlm_parent_agent.clone(),
+            node_runtime: Arc::new(crate::core::tools::node::NodeRuntime::default()),
             ipython_kernel_provisioner: Mutex::new(None),
             exec_env_provider: Mutex::new(None),
             auto_compaction_enabled: AtomicBool::new(true),
@@ -4587,6 +4589,7 @@ impl AgentSession {
         if self.jev_control_pause_pending.swap(false, Ordering::SeqCst) {
             return true;
         }
+        self.preserve_work_after_mode_switch(&context);
         // Steering stops continuation only after mandatory serialized checkpoints.
         // Returning true here still prevents the agent loop from starting another turn.
         self.steering_stop_pending()
@@ -7885,6 +7888,7 @@ impl AgentSession {
             return;
         }
         self.disposing.store(true, Ordering::SeqCst);
+        self.node_runtime.cancel();
         self.session_action_commit_dispose_abort.cancel();
         self.dispose_async_once(kernel_snapshot).await;
     }
@@ -8152,6 +8156,7 @@ impl AgentSession {
             // a failed kernel startup already cleaned up after itself
             let _ = provisioner.dispose(Some(kernel_snapshot)).await;
         }
+        self.node_runtime.dispose().await;
         self.dispose();
         self.start_dispose_callbacks().await;
     }
@@ -8179,6 +8184,7 @@ impl AgentSession {
         for controller in self.rlm_quiescence_wait_aborts.lock().unwrap().iter() {
             controller.cancel();
         }
+        self.node_runtime.cancel();
         self.session_action_commit_dispose_abort.cancel();
         // Invalidate scheduled timers and abort any in-flight review so a late
         // resolution cannot write harness state or re-subscribe handlers.
@@ -10651,7 +10657,7 @@ impl AgentSession {
             id: uuid::Uuid::new_v4().to_string(),
             source: action_source(source.as_deref()),
             priority: (command.name == "mode").then_some(crate::core::session_action_store::SessionActionPriority::Pinned),
-            delivery: if command.name == "mode" { DeliveryPolicy::WhenRunIdle } else { self.delivery_policy(schedule) },
+            delivery: if command.name == "mode" && !command.args.is_empty() { DeliveryPolicy::NextTurnBoundary } else { self.delivery_policy(schedule) },
             wake: WakePolicy::Immediate,
             payload: QueuedActionPayload::SessionCommand(PreparedCommandPayload {
                 base: SessionCommandPayload {
