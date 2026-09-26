@@ -68,7 +68,7 @@ Optimus starts new chats in **IPython** mode. Press **F6** to switch between IPy
 
 Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current run finishes. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Switching to Direct tools keeps the Python workspace alive, so switching back can reuse its variables.
 
-A stopped chat must first be resumed with a new message; changing modes does not override an explicit stop.
+F6 and `/mode` also work in stopped chats, including after reopening them. Switching modes leaves the chat stopped: queued messages and goals do not resume, and no model request is made. If work is still settling after a stop, wait until the chat is idle before switching.
 
 Use `/mode` to inspect the current mode, `/mode ipython` or `/mode direct` to select one, and `/mode toggle` to switch. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
 

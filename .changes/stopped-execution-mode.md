@@ -1,0 +1,1 @@
+- Fixed F6 and /mode failing in explicitly stopped or reopened chats; mode changes preserve the stop state, queued work, goals, and Python workspace without making a model request.

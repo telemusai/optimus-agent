@@ -348,6 +348,99 @@ async fn invalid_or_restricted_mode_does_not_change_prompt_or_tools() {
 }
 
 #[tokio::test]
+async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    f.reply(None, None);
+    turn(&session, "HISTORY_BEFORE_STOP").await;
+    session.handle_goal_host_request("goal.create", Some(&json!({
+        "objective":"Never resume this goal just to change modes"
+    }))).unwrap();
+    let pause = session.acquire_queued_work_pause();
+    assert!(session.follow_up("pending setup", None, None, None, Some(false)).await.unwrap());
+    tokio::time::timeout(Duration::from_secs(5), session.prompt(
+        "QUEUED_WORK_MUST_STAY_STOPPED", Some(PromptOptions {
+            streaming_behavior: Some("followUp".into()), queue_if_busy: Some(true),
+            ..Default::default()
+        }),
+    )).await.unwrap().unwrap();
+    session.abort().await.unwrap();
+    pause.release();
+    let queued = session.get_session_action_snapshot().follow_ups;
+    assert!(queued.contains(&"QUEUED_WORK_MUST_STAY_STOPPED".into()));
+    let goal = session.goal_state();
+    let file = session.session_file().unwrap();
+    let stop_entries = |path: &str| -> Vec<serde_json::Value> {
+        std::fs::read_to_string(path).unwrap().lines()
+            .map(|line| serde_json::from_str::<serde_json::Value>(line).unwrap())
+            .filter(|entry| entry["customType"] == "prime-agent.explicit-stop")
+            .collect()
+    };
+    let stopped = stop_entries(&file);
+    assert!(stopped.last().unwrap()["data"]["generation"].is_string());
+    for command in ["/mode", "/mode toggle", "/mode toggle", "/mode direct"] {
+        turn(&session, command).await;
+        assert!(session.is_queued_work_suspended());
+        assert_eq!(session.get_session_action_snapshot().follow_ups, queued);
+        assert_eq!(session.goal_state().status, goal.status);
+        assert_eq!(session.goal_state().objective, goal.objective);
+        assert_eq!(f.captured.lock().unwrap().len(), 1, "a setting must not wake the model");
+        assert_eq!(stop_entries(&file), stopped, "a setting must not clear the durable stop");
+    }
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    assert!(session.system_prompt().contains("Execution mode: Direct tools"));
+    tokio::time::timeout(Duration::from_secs(5), session.prompt_and_wait("/mode direct", None))
+        .await.expect("stopped mode commands acknowledge completion").unwrap();
+    assert!(session.is_queued_work_suspended());
+    assert_eq!(session.get_session_action_snapshot().follow_ups, queued);
+    assert_eq!(stop_entries(&file), stopped);
+    // Two concurrent F6 presses are serialized, so neither toggle is lost.
+    let (a, b) = tokio::join!(
+        session.prompt("/mode toggle", None), session.prompt("/mode toggle", None)
+    );
+    a.unwrap(); b.unwrap();
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    assert!(session.prompt("/compact", None).await.is_err());
+    session.dispose_async(Some(false)).await;
+    let reopened = f.session(Some(&file), false).await;
+    assert!(reopened.is_queued_work_suspended());
+    assert_eq!(reopened.get_active_tool_names(), ["bash", "edit"]);
+    turn(&reopened, "/mode toggle").await;
+    assert_eq!(reopened.get_active_tool_names(), ["ipython"]);
+    assert!(reopened.is_queued_work_suspended());
+    assert_eq!(f.captured.lock().unwrap().len(), 1);
+    assert_eq!(stop_entries(&file), stopped);
+    reopened.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn stopped_mode_switch_rejects_invalid_restricted_and_paused_changes() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    for restricted in [false, true] {
+        let session = f.session(None, restricted).await;
+        session.abort().await.unwrap();
+        let before = session.system_prompt();
+        assert!(session.prompt("/mode unknown", None).await.is_err());
+        if restricted {
+            assert!(session.prompt("/mode direct", None).await.is_err());
+        }
+        let pause = session.acquire_session_input_pause();
+        assert!(session.prompt("/mode direct", None).await.unwrap_err().contains("paused"));
+        pause.release();
+        assert!(session.prompt("/mode direct", Some(PromptOptions {
+            internal_prompt: Some(true), ..Default::default()
+        })).await.is_err());
+        assert_eq!(session.system_prompt(), before);
+        assert_eq!(session.get_active_tool_names(), ["ipython"]);
+        assert!(session.is_queued_work_suspended());
+        assert!(f.captured.lock().unwrap().is_empty());
+        session.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
 #[ignore = "requires PRIME_AGENT_KERNEL_PYTHON pointing to a prepared runtime"]
 async fn real_python_state_survives_a_round_trip_through_direct_tools() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());

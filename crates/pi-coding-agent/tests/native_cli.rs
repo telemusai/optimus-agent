@@ -489,3 +489,105 @@ fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests()
     drop(daemon);
     model.finish();
 }
+
+#[test]
+fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
+    let mut model = LocalModel::start();
+    let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("stopped-mode-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    async fn request(client: &Arc<DaemonClient>, body: Value) -> Value {
+        let response = client.request(body.as_object().unwrap().clone(), Some(30_000), Default::default()).await.unwrap();
+        assert!(response.success, "{:?}", response.error);
+        response.data.unwrap_or(Value::Null)
+    }
+    fn entries(path: &str, kind: &str) -> Vec<Value> {
+        fs::read_to_string(path).unwrap().lines()
+            .map(|line| serde_json::from_str::<Value>(line).unwrap())
+            .filter(|entry| entry["customType"] == kind).collect()
+    }
+    let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+    let saved = runtime.block_on(async {
+        let client = DaemonClient::create(&fixture.socket);
+        client.connect(1000).await.unwrap();
+        client.wait_for_hello(1000).await.unwrap();
+        let created = request(&client, json!({"type":"create", "config":{
+            "cwd":fixture.workspace, "agentDir":fixture.agent_dir, "sessionDir":fixture.root.path().join("sessions"),
+            "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
+        }})).await;
+        let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
+        request(&client, json!({"type":"prompt_and_wait", "activeSessionId":active, "message":"BEFORE_EXPLICIT_STOP"})).await;
+        request(&client, json!({"type":"abort", "activeSessionId":active})).await;
+        let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
+        let saved = state["sessionFile"].as_str().unwrap().to_string();
+        let stop = entries(&saved, "prime-agent.explicit-stop");
+        assert!(stop.last().unwrap()["data"]["generation"].is_string());
+        for expected in [json!(["bash", "edit"]), json!(["ipython"])] {
+            // F6 uses prompt admission with a steer schedule, not prompt_and_wait.
+            request(&client, json!({"type":"prompt", "activeSessionId":active,
+                "message":"/mode toggle", "streamingBehavior":"steer"})).await;
+            let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
+            assert_eq!(state["activeToolNames"], expected);
+            assert_eq!(state["isStreaming"], false);
+            assert_eq!(entries(&saved, "prime-agent.explicit-stop"), stop);
+            assert_eq!(model.requests.lock().unwrap().len(), 1);
+        }
+        client.close().await;
+        saved
+    });
+    drop(daemon);
+    // Reload the saved stop in a fresh supervisor and worker, then toggle before
+    // submitting any human message that could clear the stop.
+    let mut restarted = OwnedDaemon {
+        process: fixture.spawn("restarted-mode-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut restarted);
+    let before = entries(&saved, "prime-agent.explicit-stop");
+    let resumed_active = runtime.block_on(async {
+        let client = DaemonClient::create(&fixture.socket);
+        client.connect(1000).await.unwrap();
+        client.wait_for_hello(1000).await.unwrap();
+        let created = request(&client, json!({"type":"create", "sessionPath":saved, "config":{
+            "cwd":fixture.workspace, "agentDir":fixture.agent_dir, "sessionDir":fixture.root.path().join("sessions"),
+            "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
+        }})).await;
+        let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
+        request(&client, json!({"type":"prompt", "activeSessionId":active,
+            "message":"/mode toggle", "streamingBehavior":"steer"})).await;
+        let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit"]));
+        client.close().await;
+        active.to_string()
+    });
+    assert_eq!(entries(&saved, "prime-agent.explicit-stop"), before);
+    assert_eq!(entries(&saved, "execution_mode").last().unwrap()["data"]["mode"], "direct");
+    assert_eq!(model.requests.lock().unwrap().len(), 1, "a stopped mode change must never reach HTTP");
+    let mut resumed = fixture.spawn("stopped-mode-print", &[
+        "--print", "--offline", "--resume", &saved, "/mode direct"
+    ]);
+    let (status, stdout, stderr) = resumed.wait(Duration::from_secs(45));
+    assert!(status.success(), "{status}; {stdout}; {stderr}");
+    assert!(stdout.contains("Direct tools"), "{stdout}");
+    assert_eq!(entries(&saved, "prime-agent.explicit-stop"), before);
+    assert_eq!(model.requests.lock().unwrap().len(), 1);
+    runtime.block_on(async {
+        let client = DaemonClient::create(&fixture.socket);
+        client.connect(1000).await.unwrap();
+        client.wait_for_hello(1000).await.unwrap();
+        request(&client, json!({"type":"prompt_and_wait", "activeSessionId":resumed_active,
+            "message":"HUMAN_RESUMES_IN_DIRECT_MODE", "streamingBehavior":"steer"})).await;
+        client.close().await;
+    });
+    let requests = model.requests.lock().unwrap();
+    assert_eq!(requests.len(), 2);
+    let tools = requests[1]["tools"].to_string();
+    assert!(tools.contains("bash") && tools.contains("edit") && !tools.contains("ipython"));
+    assert!(requests[1]["messages"].to_string().contains("Execution mode: Direct tools"));
+    drop(requests);
+    drop(restarted);
+    model.finish();
+}

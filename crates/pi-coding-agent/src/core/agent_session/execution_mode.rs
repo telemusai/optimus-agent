@@ -4,6 +4,60 @@ use crate::core::execution_mode::ExecutionMode;
 const ENTRY: &str = "execution_mode";
 
 impl AgentSession {
+    /// A stopped chat can change settings without admitting or waking queued work.
+    pub(super) async fn try_stopped_execution_mode(
+        self: &Arc<Self>,
+        text: &str,
+        options: &PromptOptions,
+    ) -> Result<bool, String> {
+        if !self.explicitly_stopped()
+            || options.internal_prompt == Some(true)
+            || options.custom_message.is_some()
+            || !matches!(options.source, None
+                | Some(crate::core::session_action_store::InputSource::Interactive)
+                | Some(crate::core::session_action_store::InputSource::Rpc))
+        {
+            return Ok(false);
+        }
+        let Some(command) = parse_session_slash_command(text).filter(|c| c.name == "mode") else {
+            return Ok(false);
+        };
+        let _commit = self.acquire_session_action_commit_fence().await?;
+        let result = {
+            // Serialize with stop/resume too; never clear the stop or suspend flags.
+            let _stop = self.explicit_stop_admission.lock().unwrap();
+            if !self.explicitly_stopped() {
+                return Ok(false);
+            }
+            if self.disposed.load(Ordering::SeqCst) || self.disposing.load(Ordering::SeqCst) {
+                return Err("Cannot change execution mode while the session is closing.".into());
+            }
+            if !self.session_input_admission_pauses.lock().unwrap().is_empty() {
+                return Err("Cannot change execution mode while session input admission is paused.".into());
+            }
+            if options.signal.as_ref().is_some_and(|signal| signal.is_cancelled()) {
+                return Err("Mode change was cancelled.".into());
+            }
+            let activity = self.runtime_activity();
+            if activity.lower_agent_run || activity.compaction || activity.retry || activity.bash
+                || activity.refinement_apply || activity.branch_mutation
+            {
+                return Err("The session is still stopping. Try changing modes once it is idle.".into());
+            }
+            self.change_execution_mode(&command.args)?
+        };
+        self.append_durable_session_command_message(
+            &result, &command, true, false, true,
+        );
+        if let Some(committed) = &options.admission_committed {
+            committed();
+        }
+        once_preflight(options.preflight_result.clone())(true, false);
+        self.settle_agent_message(options.agent_message_id.as_deref(), "delivery", None);
+        self.settle_agent_message(options.agent_message_id.as_deref(), "completion", None);
+        Ok(true)
+    }
+
     pub(super) fn saved_execution_mode(&self) -> Option<ExecutionMode> {
         self.session_manager
             .lock()
@@ -24,7 +78,7 @@ impl AgentSession {
             })
     }
 
-    /// Runs only inside the session command's commit fence, between agent runs.
+    /// Runs only inside the session commit fence, between agent runs.
     pub(super) fn change_execution_mode(&self, args: &str) -> Result<String, String> {
         let current = ExecutionMode::from_tools(&self.get_active_tool_names());
         let mode = match args.trim() {

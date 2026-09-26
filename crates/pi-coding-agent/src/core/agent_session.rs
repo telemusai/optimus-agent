@@ -9703,6 +9703,11 @@ impl AgentSession {
         skip_pre_prompt_work: Option<bool>,
         return_after_accepted: Option<bool>,
     ) -> Result<(), String> {
+        if skip_pre_prompt_work != Some(true)
+            && self.try_stopped_execution_mode(text, &options).await?
+        {
+            return Ok(());
+        }
         // Only fresh human admission resumes a persistent explicit stop. Injected
         // traffic and automatic checkpoint resumption cannot revoke cancellation.
         if options.internal_prompt != Some(true)
