@@ -38,6 +38,13 @@ also return confidence. The tool includes the reported model, latency, attempt
 count and actual token usage when supplied by the service. Usage contributes to
 the current session's Jev statistics; Dynamic does not claim estimated savings.
 
+In chat, Jev calls appear as a compact status row in overview and details mode.
+Use **Ctrl+O** to reach all output and reveal the full request and result JSON;
+the next press collapses them again. This follows the saved chat detail setting
+for new, resumed, and attached chats. Errors keep a short visible summary when
+collapsed. The complete data remains available to the coding model and in the
+saved conversation.
+
 For a random choice, the agent requests local sampling of a Choice distribution:
 
 ```json
