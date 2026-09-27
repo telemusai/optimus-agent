@@ -1,0 +1,1 @@
+- Fixed delayed typing and high idle CPU in long Neon chats by reusing unchanged transcript decoration and selection measurements across editor and status repaints.
