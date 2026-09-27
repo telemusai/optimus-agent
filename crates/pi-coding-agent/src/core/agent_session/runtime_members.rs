@@ -4,6 +4,8 @@ use super::*;
 
 #[path = "subagent_runs.rs"]
 mod subagent_runs;
+#[path = "native_subagents.rs"]
+mod native_subagents;
 
 use crate::core::agent_messages::{AgentSessionMessageAgentSummary, RUNTIME_KIND_SUBAGENT};
 use crate::core::extensions::types::{
@@ -927,6 +929,7 @@ impl AgentSession {
                     shell_path: settings.get_shell_path(),
                     ..Default::default()
                 };
+                definitions.insert("subagent".into(), self.native_subagent_tool());
                 definitions.insert("node".into(), crate::core::tools::node::create_node_tool_definition(&self.cwd, self.node_runtime.clone()).into());
                 definitions.insert("bash".into(), crate::core::tools::create_bash_tool_definition(&self.cwd, Some(&bash_options)).into());
                 definitions.insert("edit".into(), crate::core::tools::create_edit_tool_definition(&self.cwd, None).into());
@@ -1012,7 +1015,14 @@ impl AgentSession {
                 .unwrap_or_else(|| vec!["ipython".to_string()])
         });
         let active = if self.base_tools_override.is_none() {
-            self.saved_execution_mode().map(|mode| mode.tools(&active)).unwrap_or(active)
+            let mut active = self.saved_execution_mode().map(|mode| mode.tools(&active)).unwrap_or(active);
+            if matches!(crate::core::execution_mode::ExecutionMode::from_tools(&active),
+                Some(crate::core::execution_mode::ExecutionMode::Node | crate::core::execution_mode::ExecutionMode::Direct))
+                && !active.iter().any(|name| name == "subagent")
+            {
+                active.push("subagent".into());
+            }
+            active
         } else { active };
         self.refresh_tool_registry(include_all, Some(active.clone()));
         // TS agent-session.ts:10159-10167: prewarm when configured, or whenever

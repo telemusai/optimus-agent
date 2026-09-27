@@ -990,27 +990,14 @@ fn normalize_socket_path(socket_path: &str, base_dir: Option<&str>) -> String {
 }
 
 fn default_daemon_socket_dir() -> String {
-    // Node's `process.getuid()` is undefined on Windows, which the TypeScript
-    // renders as the literal "user" suffix.
-    let suffix = if process_platform() == "win32" {
-        "user".to_string()
-    } else {
-        std::env::var("UID").unwrap_or_else(|_| "user".to_string())
-    };
-    Path::new(&std::env::temp_dir())
-        .join(format!("prime-agent-{}", suffix))
-        .to_string_lossy()
-        .to_string()
+    crate::modes::daemon::daemon_socket::default_daemon_socket_dir()
 }
 
 fn default_daemon_socket_path() -> String {
-    if process_platform() == "win32" {
-        return "\\\\.\\pipe\\prime-agent-daemon".to_string();
-    }
-    Path::new(&default_daemon_socket_dir())
-        .join("daemon.sock")
-        .to_string_lossy()
-        .to_string()
+    std::env::var(DAEMON_WORKER_SUPERVISOR_SOCKET_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(crate::modes::daemon::daemon_socket::default_daemon_socket_path)
 }
 
 fn resolve_path(path: &Path) -> String {

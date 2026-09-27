@@ -26,6 +26,10 @@ struct LocalModel {
 
 impl LocalModel {
     fn start() -> Self {
+        Self::with_response(|_| (json!({"role":"assistant", "content":REPLY}), "stop"))
+    }
+
+    fn with_response(respond: fn(&Value) -> (Value, &'static str)) -> Self {
         let listener = TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).unwrap();
         listener.set_nonblocking(true).unwrap();
         let address = listener.local_addr().unwrap();
@@ -46,7 +50,7 @@ impl LocalModel {
                         // request bytes have not landed yet, which kills this accept loop and
                         // fails the test intermittently. The fixture is a blocking HTTP server.
                         stream.set_nonblocking(false).unwrap();
-                        let body = serve_completion(stream)?;
+                        let body = serve_completion(stream, respond)?;
                         received.lock().unwrap().push(body);
                     }
                     Err(error) if error.kind() == std::io::ErrorKind::WouldBlock => {
@@ -81,7 +85,7 @@ impl Drop for LocalModel {
     }
 }
 
-fn serve_completion(mut stream: TcpStream) -> Result<Value, String> {
+fn serve_completion(mut stream: TcpStream, respond: fn(&Value) -> (Value, &'static str)) -> Result<Value, String> {
     stream
         .set_read_timeout(Some(Duration::from_secs(3)))
         .map_err(|error| error.to_string())?;
@@ -122,8 +126,9 @@ fn serve_completion(mut stream: TcpStream) -> Result<Value, String> {
     if body["model"] != "fixture-model" || body["stream"] != true {
         return Err(format!("Unexpected completion body: {body}"));
     }
-    let text = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":{"role":"assistant","content":REPLY},"finish_reason":null}]});
-    let end = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":"stop"}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}});
+    let (delta, finish) = respond(&body);
+    let text = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
+    let end = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}});
     let response = format!("data: {text}\n\ndata: {end}\n\ndata: [DONE]\n\n");
     write!(stream, "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len()).map_err(|error| error.to_string())?;
     Ok(body)
@@ -194,7 +199,9 @@ impl PrivateCli {
         }
     }
     fn command(&self) -> Command {
-        let mut command = Command::new(env!("CARGO_BIN_EXE_optimus-rust"));
+        let binary = std::env::var_os("OPTIMUS_TEST_BINARY")
+            .unwrap_or_else(|| env!("CARGO_BIN_EXE_optimus-rust").into());
+        let mut command = Command::new(binary);
         command
             .env_clear()
             .current_dir(&self.workspace)
@@ -461,7 +468,7 @@ fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests()
             request(&client, json!({"type":"prompt_and_wait", "activeSessionId":active, "message":message})).await;
         }
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
-        assert_eq!(state["activeToolNames"], json!(["bash", "edit"]));
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent"]));
         let saved = state["sessionFile"].as_str().unwrap().to_string();
         client.close().await;
         // A new CLI client resumes the durable chat, through the real supervisor.
@@ -530,7 +537,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         let saved = state["sessionFile"].as_str().unwrap().to_string();
         let stop = entries(&saved, "prime-agent.explicit-stop");
         assert!(stop.last().unwrap()["data"]["generation"].is_string());
-        for expected in [json!(["node"]), json!(["bash", "edit"]), json!(["ipython"])] {
+        for expected in [json!(["node", "subagent"]), json!(["bash", "edit", "subagent"]), json!(["ipython"])] {
             // F6 uses prompt admission with a steer schedule, not prompt_and_wait.
             request(&client, json!({"type":"prompt", "activeSessionId":active,
                 "message":"/mode toggle", "streamingBehavior":"steer"})).await;
@@ -564,7 +571,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         request(&client, json!({"type":"prompt", "activeSessionId":active,
             "message":"/mode direct", "streamingBehavior":"steer"})).await;
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
-        assert_eq!(state["activeToolNames"], json!(["bash", "edit"]));
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent"]));
         client.close().await;
         active.to_string()
     });
@@ -595,4 +602,140 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
     drop(requests);
     drop(restarted);
     model.finish();
+}
+
+fn delegation_response(body: &Value) -> (Value, &'static str) {
+    let messages = body["messages"].as_array().unwrap();
+    let system = messages[0]["content"].to_string();
+    let node = system.contains("Execution mode: Node");
+    let child = system.contains("Recursive agent depth: 1");
+    let results = messages.iter().filter(|m| m["role"] == "tool").count();
+    let tool = |name: &str, args: Value| (json!({"role":"assistant", "tool_calls":[{
+        "index":0,"id":format!("fixture-{child}-{results}"),"type":"function",
+        "function":{"name":name,"arguments":args.to_string()}
+    }]}), "tool_calls");
+    if child {
+        let name = if messages.iter().any(|m| m["role"] == "user" && m["content"].to_string().contains("CHILD_ALPHA")) { "alpha" } else { "beta" };
+        if results == 0 {
+            return if node {
+                tool("node", json!({"code":format!("var fs = require('node:fs'); fs.writeFileSync('{name}-started', 'ready'); while (!fs.existsSync('release-children')) {{ await new Promise(r => setTimeout(r, 10)); }} fs.writeFileSync('{name}-done', '42'); console.log('CHILD_TOOL_OK');"),"timeout":15}))
+            } else {
+                tool("bash", json!({"command":format!("printf ready > {name}-started; while [ ! -f release-children ]; do sleep 0.01; done; printf 42 > {name}-done; printf CHILD_TOOL_OK"),"timeout":15}))
+            };
+        }
+        return (json!({"role":"assistant","content":format!("CHILD_RESULT_{name}_42\nRLM_CHILD_STATUS: complete")}), "stop");
+    }
+    match results {
+        0 => tool("subagent", json!({"action":"spawn","name":"alpha","prompt":"CHILD_ALPHA: execute the requested fixture tool and report the result."})),
+        1 => tool("subagent", json!({"action":"spawn","name":"beta","prompt":"CHILD_BETA: execute the requested fixture tool and report the result."})),
+        2 if node => tool("node", json!({"code":"var fs = require('node:fs'); var deadline = Date.now() + 10000; while (!fs.existsSync('alpha-started') || !fs.existsSync('beta-started')) { if (Date.now() > deadline) throw Error('children did not overlap'); await new Promise(r => setTimeout(r, 10)); } fs.writeFileSync('release-children', 'go'); console.log('BOTH_CHILDREN_RUNNING');", "timeout":12})),
+        2 => tool("bash", json!({"command":"while [ ! -f alpha-started ] || [ ! -f beta-started ]; do sleep 0.01; done; printf go > release-children; printf BOTH_CHILDREN_RUNNING", "timeout":12})),
+        3 => tool("subagent", json!({"action":"list"})),
+        4 => tool("subagent", json!({"action":"collect","targets":["alpha","beta"],"timeout_ms":20000})),
+        _ => (json!({"role":"assistant","content":"PARENT_DELEGATION_COMPLETE"}), "stop"),
+    }
+}
+
+#[test]
+fn node_and_direct_tools_spawn_concurrent_native_children_and_receive_results() {
+    for mode in ["node", "direct"] {
+        let mut model = LocalModel::with_response(delegation_response);
+        let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+        let mut daemon = OwnedDaemon {
+            process: fixture.spawn("delegation-daemon", &["--mode", "daemon", "--offline"]),
+            socket: fixture.socket.clone(),
+        };
+        wait_for_daemon(&mut daemon);
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap();
+        runtime.block_on(async {
+            let client = DaemonClient::create(&fixture.socket);
+            client.connect(1000).await.unwrap();
+            client.wait_for_hello(1000).await.unwrap();
+            async fn request(client: &Arc<DaemonClient>, body: Value) -> Value {
+                let response = client.request(body.as_object().unwrap().clone(), Some(45_000), Default::default()).await.unwrap();
+                assert!(response.success, "{:?}", response.error);
+                response.data.unwrap_or(Value::Null)
+            }
+            let created = request(&client, json!({"type":"create", "config":{
+                "cwd":fixture.workspace, "agentDir":fixture.agent_dir, "sessionDir":fixture.root.path().join("sessions"),
+                "provider":"local-cli-fixture", "model":"fixture-model", "noSkills":true, "noExtensions":true
+            }})).await;
+            let active = created.get("activeSessionId").or_else(|| created.get("id")).unwrap().as_str().unwrap();
+            request(&client, json!({"type":"prompt_and_wait","activeSessionId":active,"message":format!("/mode {mode}")})).await;
+            request(&client, json!({"type":"prompt_and_wait","activeSessionId":active,"message":"Delegate the two independent fixture tasks."})).await;
+            let state = request(&client, json!({"type":"get_connection_state","activeSessionId":active})).await;
+            let saved = fs::read_to_string(state["sessionFile"].as_str().unwrap()).unwrap();
+            for marker in ["BOTH_CHILDREN_RUNNING", "CHILD_RESULT_alpha_42", "CHILD_RESULT_beta_42"] {
+                assert!(saved.contains(marker), "{mode}: missing {marker} in {saved}");
+            }
+            let rows: Vec<Value> = saved.lines().map(|s| serde_json::from_str(s).unwrap()).collect();
+            let results: Vec<_> = rows.iter().filter(|r| r["message"]["role"] == "toolResult").collect();
+            assert!(results.iter().all(|r| r["message"]["isError"] == false), "{mode}: {results:?}");
+            let collect = results.iter().find(|r| r["message"]["toolName"] == "subagent" && r["message"]["details"]["results"].is_array()).unwrap();
+            let collected = collect["message"]["details"]["results"].as_array().unwrap();
+            assert_eq!(collected.len(), 2);
+            assert!(collected.iter().all(|r| r["settled"] == true && r["status"] == "done"), "{collected:?}");
+            client.close().await;
+        });
+        for name in ["alpha", "beta"] {
+            assert_eq!(fs::read_to_string(fixture.workspace.join(format!("{name}-done"))).unwrap(), "42");
+        }
+        let requests = model.requests.lock().unwrap();
+        let children: Vec<_> = requests.iter().filter(|r| r["messages"][0]["content"].to_string().contains("Recursive agent depth: 1")).collect();
+        assert!(children.len() >= 4, "both children must execute and report through HTTP");
+        for request in requests.iter() {
+            let system = request["messages"][0]["content"].to_string();
+            assert!(system.contains("Native delegation: call the `subagent` tool"));
+            assert!(system.contains(if mode == "node" {"JavaScript is the orchestration language"} else {"Execution mode: Direct tools"}));
+            assert!(!system.contains("Python is the orchestration language"));
+            assert!(request["tools"].as_array().unwrap().iter().any(|t| t["function"]["name"] == "subagent"));
+        }
+        drop(requests);
+        drop(daemon);
+        model.finish();
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn daemon_cli_finds_default_socket_without_uid_and_honours_worker_socket() {
+    let model = LocalModel::start();
+    let mut fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+    fixture.socket = fixture.root.path().join("tmp")
+        .join(format!("prime-agent-{}", unsafe { libc::getuid() }))
+        .join("daemon.sock").to_string_lossy().into_owned();
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("socket-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    for uid in [None, Some("not-the-os-uid")] {
+        let mut command = fixture.command();
+        if let Some(uid) = uid { command.env("UID", uid); }
+        let output = command.args(["list", "--json"]).output().unwrap();
+        assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+        assert!(serde_json::from_slice::<Value>(&output.stdout).unwrap()["sessions"].is_array());
+    }
+    let status = fixture.command().args(["status", "--json"]).output().unwrap();
+    assert!(status.status.success());
+    let rows: Value = serde_json::from_slice(&status.stdout).unwrap();
+    assert!(rows.as_array().unwrap().iter().any(|row| row["socketPath"] == fixture.socket && row["isDefault"] == true));
+    drop(daemon);
+    fixture.socket = fixture.root.path().join("custom.sock").to_string_lossy().into_owned();
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("custom-socket-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    let output = fixture.command()
+        .env("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET", &fixture.socket)
+        .args(["list", "--json"]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    // An explicit caller-selected socket takes precedence over inherited context.
+    let output = fixture.command()
+        .env("PRIME_AGENT_INTERNAL_DAEMON_SUPERVISOR_SOCKET", "/nonexistent-fixture.sock")
+        .args(["list", "--json", "--socket", &fixture.socket]).output().unwrap();
+    assert!(output.status.success(), "{}", String::from_utf8_lossy(&output.stderr));
+    assert!(model.requests.lock().unwrap().is_empty(), "socket discovery must not call the model");
+    drop(daemon);
 }

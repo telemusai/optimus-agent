@@ -145,6 +145,10 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
             prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::DIRECT_TOOL_PROMPT));
         }
 
+        if tools.iter().any(|tool| tool == "subagent") {
+            prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::NATIVE_SUBAGENT_PROMPT));
+        }
+
         // Append project context files.
         if !context_files.is_empty() {
             prompt.push_str("\n\n# Project Context\n\n");
@@ -224,7 +228,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         active_tools: Some(
             tools
                 .iter()
-                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "bash" || name.as_str() == "edit")
+                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "bash" || name.as_str() == "edit" || name.as_str() == "subagent")
                 .cloned()
                 .collect(),
         ),

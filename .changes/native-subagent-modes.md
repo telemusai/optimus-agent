@@ -1,0 +1,2 @@
+- Added native subagent spawning, listing and collection in Node and Direct tools, using the existing tracked child lifecycle and inherited execution mode.
+- Fixed CLI daemon discovery without an exported UID and when invoked from a worker attached to a custom supervisor socket.

@@ -2521,21 +2521,12 @@ fn normalize_socket_path(socket_path: &str, base_dir: Option<&str>) -> String {
     crate::utils::daemon_socket_path::normalize_socket_path(socket_path, base_dir)
 }
 
-fn process_platform() -> &'static str {
-    crate::utils::pi_user_agent::process_platform()
-}
-
-/// Local stand-in for `defaultDaemonSocketPath` from ../modes/daemon/daemon-socket.js.
+/// CLI clients and the supervisor must resolve the same per-user socket.
 fn default_daemon_socket_path() -> String {
-    if process_platform() == "win32" {
-        return "\\\\.\\pipe\\prime-agent-daemon".to_string();
-    }
-    let suffix = std::env::var("UID").unwrap_or_else(|_| "user".to_string());
-    Path::new(&std::env::temp_dir())
-        .join(format!("prime-agent-{}", suffix))
-        .join("daemon.sock")
-        .to_string_lossy()
-        .to_string()
+    std::env::var(super::daemon_launch::DAEMON_WORKER_SUPERVISOR_SOCKET_ENV)
+        .ok()
+        .filter(|path| !path.trim().is_empty())
+        .unwrap_or_else(crate::modes::daemon::daemon_socket::default_daemon_socket_path)
 }
 
 fn current_entrypoint() -> String {

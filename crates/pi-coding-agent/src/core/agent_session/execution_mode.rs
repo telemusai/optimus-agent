@@ -120,7 +120,10 @@ impl AgentSession {
         if self.base_tools_override.is_some() {
             return Err("Execution mode switching is unavailable with an SDK tool override".into());
         }
-        let names = mode.tools(&self.get_active_tool_names());
+        let mut names = mode.tools(&self.get_active_tool_names());
+        if let Some(allowed) = self.allowed_tool_names.lock().unwrap().as_ref() {
+            names.retain(|name| name != "subagent" || allowed.contains(name));
+        }
         let tools: Vec<_> = {
             let registry = self.tool_registry.lock().unwrap();
             names

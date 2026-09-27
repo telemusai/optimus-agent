@@ -59,13 +59,13 @@ impl ExecutionMode {
     pub fn tools(self, current: &[String]) -> Vec<String> {
         let mut tools: Vec<_> = current
             .iter()
-            .filter(|name| !matches!(name.as_str(), "ipython" | "node" | "bash" | "edit"))
+            .filter(|name| !matches!(name.as_str(), "ipython" | "node" | "bash" | "edit" | "subagent"))
             .cloned()
             .collect();
         tools.extend(match self {
             Self::Ipython => vec!["ipython".into()],
-            Self::Node => vec!["node".into()],
-            Self::Direct => vec!["bash".into(), "edit".into()],
+            Self::Node => vec!["node".into(), "subagent".into()],
+            Self::Direct => vec!["bash".into(), "edit".into(), "subagent".into()],
         });
         tools
     }
