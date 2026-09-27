@@ -466,12 +466,15 @@ impl Component for CustomEditor {
             let border = |text: &str| background(&palette.fg("border", text));
             // Use the same single-line outline as the other panels and retain
             // the editor's grey padding rows and scroll indicators.
-            let mut framed_lines = Vec::with_capacity(lines.len() + 2);
+            let gap = palette.bg("toolPanelBg", &" ".repeat(width as usize + 2));
+            let mut framed_lines = Vec::with_capacity(lines.len() + 4);
+            framed_lines.push(gap.clone());
             let horizontal = "─".repeat(width as usize);
             framed_lines.push(border(&format!("┌{horizontal}┐")));
             let side = border("│");
             framed_lines.extend(lines.into_iter().map(|line| format!("{side}{line}{side}")));
             framed_lines.push(border(&format!("└{horizontal}┘")));
+            framed_lines.push(gap);
             framed_lines
         } else {
             lines
@@ -692,30 +695,34 @@ mod tests {
                 editor.editor_mut().set_text(text);
                 let rows = editor.render(width as f64);
                 assert!(rows.iter().all(|row| visible_width(row) == width));
-                let top = pi_tui::utils::strip_ansi(&rows[0]);
-                let bottom = pi_tui::utils::strip_ansi(rows.last().unwrap());
+                assert_eq!(pi_tui::utils::strip_ansi(&rows[0]), " ".repeat(width));
+                assert_eq!(pi_tui::utils::strip_ansi(rows.last().unwrap()), " ".repeat(width));
+                assert!(!rows[0].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(!rows.last().unwrap().contains(&theme().get_bg_ansi("editorBg")));
+                let top = pi_tui::utils::strip_ansi(&rows[1]);
+                let bottom = pi_tui::utils::strip_ansi(&rows[rows.len() - 2]);
                 assert_eq!(top, format!("┌{}┐", "─".repeat(width - 2)));
                 assert_eq!(bottom, format!("└{}┘", "─".repeat(width - 2)));
-                assert!(rows.len() >= 5, "keep padding above and below the draft");
-                assert!(rows.iter().all(|row| row.contains(&theme().get_bg_ansi("editorBg"))));
-                for row in &rows[1..rows.len() - 1] {
+                assert!(rows.len() >= 7, "keep internal padding and external panel gaps");
+                assert!(rows[1..rows.len() - 1].iter().all(|row| row.contains(&theme().get_bg_ansi("editorBg"))));
+                for row in &rows[2..rows.len() - 2] {
                     let plain = pi_tui::utils::strip_ansi(row);
                     assert!(plain.starts_with('│') && plain.ends_with('│'));
                     assert!(row.contains(&theme().fg("border", "│")));
                     assert!(!row.contains(&theme().get_bg_ansi("toolPanelBg")));
                 }
                 if text.is_empty() {
-                    assert_eq!(rows.len(), 5);
-                    assert_eq!(pi_tui::utils::strip_ansi(&rows[1]), format!("│{}│", " ".repeat(width - 2)));
-                    assert_eq!(pi_tui::utils::strip_ansi(&rows[3]), format!("│{}│", " ".repeat(width - 2)));
-                    assert!(rows[2].contains(pi_tui::tui::CURSOR_MARKER));
+                    assert_eq!(rows.len(), 7);
+                    assert_eq!(pi_tui::utils::strip_ansi(&rows[2]), format!("│{}│", " ".repeat(width - 2)));
+                    assert_eq!(pi_tui::utils::strip_ansi(&rows[4]), format!("│{}│", " ".repeat(width - 2)));
+                    assert!(rows[3].contains(pi_tui::tui::CURSOR_MARKER));
                 }
                 assert_eq!(rows.join("\n").matches(pi_tui::tui::CURSOR_MARKER).count(), 1);
                 assert_eq!(editor.editor().get_text(), text);
             }
         }
         editor.editor_mut().set_text(&(0..40).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"));
-        assert!(pi_tui::utils::strip_ansi(&editor.render(40.0)[1]).contains("↑"));
+        assert!(pi_tui::utils::strip_ansi(&editor.render(40.0)[2]).contains("↑"));
         init_theme(Some("prime"), false);
         assert!(!pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).starts_with('┌'));
     }
