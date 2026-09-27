@@ -1,3 +1,3 @@
 - Added native subagent spawning, listing and collection in Node and Direct tools, using the existing tracked child lifecycle and inherited execution mode.
 - Fixed CLI daemon discovery without an exported UID and when invoked from a worker attached to a custom supervisor socket.
-- Changed the input area to use a visible background, with a subtle charcoal-grey surface and matching green panel outline in Neon that do not depend on terminal colour detection.
+- Changed the input area to use a taller charcoal-grey surface with padding above and below the text, filled to the matching green outline in Neon without depending on terminal colour detection.

@@ -49,9 +49,10 @@ The selection is saved in your existing settings; other themes remain available.
 Neon provides a dark canvas with green (`#00f477`) borders, magenta (`#e201ea`)
 thinking text and grey (`#b3bcc7`) body text,
 a fixed Optimus banner and session/model strip, and a framed conversation timeline.
-The input area has a subtle charcoal-grey background (`#1c2022`) and the same
-green outline as the other panels, so it is easy to find even when the terminal
-does not report its background colour. The outline grows with wrapped input.
+The input area has a subtle charcoal-grey background (`#1c2022`) and an outline
+in the same green as the other panels. Grey padding above and below the text
+makes the box easier to find, and the fill reaches the border. It grows with
+wrapped input and does not depend on terminal background colour detection.
 The existing agent counts and live Jev activity stay in the bordered bottom bar,
 with Jev requests, token usage and latency aligned on the right. The context meter
 uses the session’s current token usage, including in-flight output.
