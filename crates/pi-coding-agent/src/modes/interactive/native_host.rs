@@ -167,6 +167,7 @@ struct Transcript {
     row_metadata: HashMap<Rc<str>, native_neon::RowMeta>,
     assistant_row: Option<usize>,
     timeline: Option<native_neon::Timeline>,
+    timeline_cache: native_neon::TimelineCache,
     selection_columns: Vec<Option<(usize, usize)>>,
     connection_status: String,
     refinement_progress: Option<String>,
@@ -280,6 +281,7 @@ impl Transcript {
             row_metadata: HashMap::new(),
             assistant_row: None,
             timeline: None,
+            timeline_cache: native_neon::TimelineCache::default(),
             selection_columns: Vec::new(),
             connection_status: String::new(),
             refinement_progress: None,
@@ -291,6 +293,7 @@ impl Transcript {
         }
     }
     fn replace(&mut self, messages: Vec<AgentMessage>) {
+        self.timeline_cache.clear();
         self.history = None;
         self.clipboard_notice = native_clipboard::Notice::default();
         self.rows.clear();
@@ -661,16 +664,22 @@ impl TuiComponent for Transcript {
         keys.resize(lines.len(), None);
         let rendered = self.wrapped_lines.render(lines, width.max(1.0) as usize);
         self.viewport_anchors = self.wrapped_lines.anchors(&keys);
-        self.selection_columns = if let Some(t) = self.timeline {
-            rendered.iter().map(|line| Some((t.left, t.left + pi_tui::utils::visible_width(pi_tui::utils::strip_ansi(line).trim_end()).min(t.content_width())))).collect()
-        } else { Vec::new() };
         if let Some(timeline) = self.timeline {
-            rendered.iter().zip(&self.viewport_anchors).map(|(line, anchor)| {
-                let meta = anchor.as_ref().and_then(|anchor| self.row_metadata.get(&anchor.key)
-                    .or_else(|| self.history.as_ref().and_then(|h| h.row_metadata.get(&anchor.key))));
-                timeline.line(line, meta, anchor.as_ref().is_some_and(|a| a.offset == 0))
-            }).collect()
-        } else { rendered }
+            let metadata = &self.row_metadata;
+            let history = &self.history;
+            let rows = rendered.iter().zip(&self.viewport_anchors).map(|(line, anchor)| {
+                let meta = anchor.as_ref().and_then(|anchor| metadata.get(&anchor.key)
+                    .or_else(|| history.as_ref().and_then(|h| h.row_metadata.get(&anchor.key))));
+                (line.as_str(), meta, anchor.as_ref().is_some_and(|a| a.offset == 0))
+            });
+            let (decorated, columns) = self.timeline_cache.render(timeline, rows);
+            self.selection_columns = columns;
+            decorated
+        } else {
+            self.timeline_cache.clear();
+            self.selection_columns.clear();
+            rendered
+        }
     }
     fn get_selection_columns(&self) -> Vec<Option<(usize, usize)>> {
         self.selection_columns.clone()
@@ -685,6 +694,7 @@ impl TuiComponent for Transcript {
         !self.rows.is_empty() || self.history.as_ref().is_some_and(|history| !history.rows.is_empty())
     }
     fn invalidate(&mut self) {
+        self.timeline_cache.clear();
         if let Some(side_pane) = &self.side_pane {
             side_pane.borrow_mut().invalidate();
         }

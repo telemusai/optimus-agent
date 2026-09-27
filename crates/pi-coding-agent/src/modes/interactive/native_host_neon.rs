@@ -3,6 +3,11 @@ use super::*;
 use crate::modes::interactive::theme::theme::Theme;
 use pi_tui::utils::{strip_ansi, visible_width};
 
+#[cfg(test)]
+thread_local! {
+    static LINE_FORMATS: Cell<usize> = const { Cell::new(0) };
+}
+
 pub(super) fn active() -> bool {
     theme().name.as_deref() == Some("neon")
 }
@@ -107,7 +112,7 @@ pub(super) fn surface(text: &str, width: usize) -> String {
     surface_with(&theme(), text, width)
 }
 
-#[derive(Clone, Copy, Debug)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub(super) struct Timeline {
     pub width: usize,
     pub left: usize,
@@ -129,6 +134,11 @@ impl Timeline {
         self.width.saturating_sub(self.left + self.right).max(1)
     }
     pub fn line(self, text: &str, meta: Option<&RowMeta>, first: bool) -> String {
+        self.line_with_palette(&theme(), text, meta, first)
+    }
+    fn line_with_palette(self, palette: &Theme, text: &str, meta: Option<&RowMeta>, first: bool) -> String {
+        #[cfg(test)]
+        LINE_FORMATS.with(|count| count.set(count.get() + 1));
         if pi_tui::terminal_image::is_image_line(text) {
             // Paint the rail first, then graphics at the content column. Text
             // padding after a SIXEL would erase the image's bottom cell row.
@@ -143,11 +153,10 @@ impl Timeline {
             if self.left > 0 {
                 placement.push_str(&format!("\x1b[{}C", self.left));
             }
-            return format!("\x1b7{}\x1b8{}{}", self.line("", meta, first), placement, text);
+            return format!("\x1b7{}\x1b8{}{}", self.line_with_palette(palette, "", meta, first), placement, text);
         }
-        let palette = theme();
         if self.left == 0 {
-            return surface_with(&palette, text, self.width);
+            return surface_with(palette, text, self.width);
         }
         let (color, marker) = match meta.map(|m| m.kind) {
             Some(Kind::User) => ("mdLink", "○"),
@@ -204,10 +213,76 @@ impl Timeline {
             fit(&content, self.content_width()),
             palette.fg("border", "│")
         );
-        surface_with(&palette, &row, self.width)
+        surface_with(palette, &row, self.width)
     }
     pub fn padding(self) -> String {
         self.line("", None, false)
+    }
+}
+
+struct CachedTimelineLine {
+    text: String,
+    metadata: Option<(Kind, Option<i64>, Option<Duration>)>,
+    first: bool,
+    rendered: String,
+    selection: (usize, usize),
+}
+
+/// Keep ANSI decoration and Unicode measurement off the editor repaint path.
+/// Entries are positional and retained only for the current transcript lines.
+#[derive(Default)]
+pub(super) struct TimelineCache {
+    timeline: Option<Timeline>,
+    palette: Option<Arc<Theme>>,
+    lines: Vec<CachedTimelineLine>,
+}
+
+impl TimelineCache {
+    pub fn clear(&mut self) {
+        *self = Self::default();
+    }
+
+    pub fn render<'a>(
+        &mut self,
+        timeline: Timeline,
+        rows: impl IntoIterator<Item = (&'a str, Option<&'a RowMeta>, bool)>,
+    ) -> (Vec<String>, Vec<Option<(usize, usize)>>) {
+        let palette = theme();
+        if self.timeline != Some(timeline)
+            || self.palette.as_ref().is_none_or(|previous| !Arc::ptr_eq(previous, &palette))
+        {
+            self.lines.clear();
+            self.timeline = Some(timeline);
+            self.palette = Some(palette.clone());
+        }
+        let mut output = Vec::new();
+        let mut columns = Vec::new();
+        for (index, (text, meta, first)) in rows.into_iter().enumerate() {
+            let metadata = meta.map(|m| (m.kind, m.timestamp, m.elapsed));
+            let unchanged = self.lines.get(index).is_some_and(|previous| {
+                previous.text == text && previous.metadata == metadata && previous.first == first
+            });
+            if !unchanged {
+                let entry = CachedTimelineLine {
+                    text: text.to_string(),
+                    metadata,
+                    first,
+                    rendered: timeline.line_with_palette(&palette, text, meta, first),
+                    selection: (timeline.left, timeline.left
+                        + visible_width(strip_ansi(text).trim_end()).min(timeline.content_width())),
+                };
+                if let Some(previous) = self.lines.get_mut(index) {
+                    *previous = entry;
+                } else {
+                    self.lines.push(entry);
+                }
+            }
+            let entry = &self.lines[index];
+            output.push(entry.rendered.clone());
+            columns.push(Some(entry.selection));
+        }
+        self.lines.truncate(output.len());
+        (output, columns)
     }
 }
 
@@ -498,6 +573,10 @@ pub(super) fn context_meter(
 #[cfg(test)]
 #[path = "native_host_neon_tests.rs"]
 mod tests;
+
+#[cfg(test)]
+#[path = "native_host_neon_cache_tests.rs"]
+mod cache_tests;
 
 #[cfg(test)]
 mod image_tests {
