@@ -50,7 +50,7 @@ Neon provides a dark canvas with green (`#00f477`) borders, magenta (`#e201ea`)
 thinking text and grey (`#b3bcc7`) body text,
 a fixed Optimus banner and session/model strip, and a framed conversation timeline.
 The input area has a subtle charcoal-grey background (`#1c2022`) and an outline
-in the same green as the other panels. Grey padding above and below the text
+with the same thin lines and green colour as the other panels. Grey padding above and below the text
 makes the box easier to find, and the fill reaches the border. It grows with
 wrapped input and does not depend on terminal background colour detection.
 The existing agent counts and live Jev activity stay in the bordered bottom bar,
