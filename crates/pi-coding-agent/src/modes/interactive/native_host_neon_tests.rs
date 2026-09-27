@@ -315,6 +315,11 @@ fn neon_frame_fixture_keeps_editor_jev_history_and_theme_switching() {
             );
         }
         let dock_rows = dock.render(width as f64);
+        let editor_background = theme().get_bg_ansi("editorBg");
+        let input_rows: Vec<_> = dock_rows.iter()
+            .filter(|row| row.contains(&editor_background)).collect();
+        assert_eq!(input_rows.len(), 3, "input and vertical padding must stay painted");
+        assert!(input_rows.iter().all(|row| visible_width(row) == width));
         let budget = (height / 4).min(height.saturating_sub(
             pi_tui::fullscreen::clipped_fullscreen_dock_height(dock_rows.len(), height)
                 + pi_tui::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS,
