@@ -303,6 +303,7 @@ pub type ThemeBg = &'static str;
 /// The background keys of the `colors` object (`bgColorKeys` in `createTheme`).
 pub const BG_COLOR_KEYS: &[&str] = &[
     "selectedBg",
+    "editorBg",
     "userMessageBg",
     "customMessageBg",
     "toolPendingBg",
@@ -597,7 +598,16 @@ impl Theme {
 
     /// Port of `getEditorBackgroundColor`.
     pub fn get_editor_background_color(&self) -> Option<Box<dyn Fn(&str) -> String + Send + Sync>> {
-        self.surface_background_color("userMessageBg")
+        if let Some(ansi) = self.bg_colors.get("editorBg") {
+            let ansi = ansi.clone();
+            return Some(Box::new(move |text| {
+                let text = text.replace("\x1b[0m", &format!("\x1b[0m{ansi}"))
+                    .replace("\x1b[49m", &ansi);
+                format!("{ansi}{text}\x1b[49m")
+            }));
+        }
+        Some(self.surface_background_color("userMessageBg")
+            .unwrap_or_else(|| self.simple_bg("userMessageBg")))
     }
 
     /// Port of `getUserMessageBackgroundColor`.
@@ -1872,6 +1882,26 @@ mod tests {
     }
 
     #[test]
+    fn editor_background_is_visible_without_a_terminal_probe() {
+        clear_default_terminal_colors();
+        for mode in [TerminalColorMode::Truecolor, TerminalColorMode::Color256] {
+            let palette = load_theme("neon", Some(mode)).unwrap();
+            let background = palette.get_editor_background_color().unwrap();
+            let ansi = palette.get_bg_ansi("editorBg");
+            assert_ne!(ansi, palette.get_bg_ansi("toolPanelBg"));
+            assert_ne!(ansi, palette.get_bg_ansi("userMessageBg"));
+            assert_eq!(background("draft"), format!("{ansi}draft\x1b[49m"));
+            assert_eq!(background("a\x1b[0mb\x1b[49mc"),
+                format!("{ansi}a\x1b[0m{ansi}b{ansi}c\x1b[49m"));
+            for name in ["prime", "dark", "light"] {
+                let palette = load_theme(name, Some(mode)).unwrap();
+                assert_eq!(palette.get_editor_background_color().unwrap()("draft"),
+                    palette.bg("userMessageBg", "draft"));
+            }
+        }
+    }
+
+    #[test]
     fn hex_to_rgb_and_errors() {
         assert_eq!(hex_to_rgb("#ff0000").expect("hex"), Rgb { r: 255.0, g: 0.0, b: 0.0 });
         assert_eq!(hex_to_rgb("00ff00").expect("hex"), Rgb { r: 0.0, g: 255.0, b: 0.0 });
@@ -2005,7 +2035,7 @@ mod tests {
     #[test]
     fn create_theme_splits_background_keys() {
         let theme = create_theme(&minimal_theme_json(), Some(TerminalColorMode::Truecolor), None).expect("theme");
-        assert_eq!(theme.bg_color_values.len(), BG_COLOR_KEYS.len());
+        assert_eq!(theme.bg_color_values.len(), BG_COLOR_KEYS.len() - 1);
         assert_eq!(theme.color_mode(), TerminalColorMode::Truecolor);
     }
 

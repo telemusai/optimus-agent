@@ -10,6 +10,7 @@ use pi_tui::utils::{truncate_to_width, visible_width};
 use regex::Regex;
 
 use crate::modes::interactive::components::prompt_highlight::ArgTokenHighlighter;
+use crate::modes::interactive::theme::theme::theme;
 
 const COMMAND_TOKEN_PATTERN: &str = r"^(\s*)\/(\S+)";
 
@@ -421,6 +422,10 @@ impl CommandTokenPattern {
 impl Component for CustomEditor {
     /// Port of the `render` override.
     fn render(&mut self, width: f64) -> Vec<String> {
+        let palette = theme();
+        let framed = palette.name.as_deref() == Some("neon")
+            && self.background_color.is_some() && width >= 10.0;
+        let width = if framed { width.floor() - 2.0 } else { width };
         let lines_source = self.editor.get_lines();
         let first_line = lines_source.first().cloned().unwrap_or_default();
         let is_argument_command_line = match CommandTokenPattern::get().captures(&first_line) {
@@ -456,7 +461,23 @@ impl Component for CustomEditor {
                 }
             }
         }
-        lines
+        if framed {
+            let border = |text: &str| palette.bg("toolPanelBg", &palette.fg("border", text));
+            // Use the same single-line outline as the other panels and retain
+            // the editor's grey padding rows and scroll indicators.
+            let gap = palette.bg("toolPanelBg", &" ".repeat(width as usize + 2));
+            let mut framed_lines = Vec::with_capacity(lines.len() + 4);
+            framed_lines.push(gap.clone());
+            let horizontal = "─".repeat(width as usize);
+            framed_lines.push(border(&format!("┌{horizontal}┐")));
+            let side = border("│");
+            framed_lines.extend(lines.into_iter().map(|line| format!("{side}{line}{side}")));
+            framed_lines.push(border(&format!("└{horizontal}┘")));
+            framed_lines.push(gap);
+            framed_lines
+        } else {
+            lines
+        }
     }
 
     /// Port of the `handleInput` override.
@@ -660,6 +681,51 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn neon_frame_preserves_wrapping_cursor_and_scroll_indicators() {
+        init();
+        init_theme(Some("neon"), false);
+        let mut editor = editor(CustomEditorOptions::default());
+        editor.editor_mut().set_focused(true);
+        for width in [10usize, 12, 40, 80] {
+            for text in ["", "hello", "Unicode 世界 with a longer line that wraps inside the frame"] {
+                editor.editor_mut().set_text(text);
+                let rows = editor.render(width as f64);
+                assert!(rows.iter().all(|row| visible_width(row) == width));
+                assert_eq!(pi_tui::utils::strip_ansi(&rows[0]), " ".repeat(width));
+                assert_eq!(pi_tui::utils::strip_ansi(rows.last().unwrap()), " ".repeat(width));
+                assert!(!rows[0].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(!rows.last().unwrap().contains(&theme().get_bg_ansi("editorBg")));
+                let top = pi_tui::utils::strip_ansi(&rows[1]);
+                let bottom = pi_tui::utils::strip_ansi(&rows[rows.len() - 2]);
+                assert_eq!(top, format!("┌{}┐", "─".repeat(width - 2)));
+                assert_eq!(bottom, format!("└{}┘", "─".repeat(width - 2)));
+                assert!(!rows[1].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(!rows[rows.len() - 2].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(rows.len() >= 7, "keep internal padding and external panel gaps");
+                let side = theme().bg("toolPanelBg", &theme().fg("border", "│"));
+                for row in &rows[2..rows.len() - 2] {
+                    let plain = pi_tui::utils::strip_ansi(row);
+                    assert!(plain.starts_with('│') && plain.ends_with('│'));
+                    assert!(row.starts_with(&side) && row.ends_with(&side));
+                    assert!(row.contains(&theme().get_bg_ansi("editorBg")));
+                }
+                if text.is_empty() {
+                    assert_eq!(rows.len(), 7);
+                    assert_eq!(pi_tui::utils::strip_ansi(&rows[2]), format!("│{}│", " ".repeat(width - 2)));
+                    assert_eq!(pi_tui::utils::strip_ansi(&rows[4]), format!("│{}│", " ".repeat(width - 2)));
+                    assert!(rows[3].contains(pi_tui::tui::CURSOR_MARKER));
+                }
+                assert_eq!(rows.join("\n").matches(pi_tui::tui::CURSOR_MARKER).count(), 1);
+                assert_eq!(editor.editor().get_text(), text);
+            }
+        }
+        editor.editor_mut().set_text(&(0..40).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"));
+        assert!(pi_tui::utils::strip_ansi(&editor.render(40.0)[2]).contains("↑"));
+        init_theme(Some("prime"), false);
+        assert!(!pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).starts_with('┌'));
     }
 
     #[test]

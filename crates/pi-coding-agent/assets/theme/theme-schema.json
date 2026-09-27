@@ -33,7 +33,7 @@
 		},
 		"colors": {
 			"type": "object",
-			"description": "Theme color definitions (all required)",
+			"description": "Theme color definitions (editorBg is optional)",
 			"required": [
 				"accent",
 				"border",
@@ -139,6 +139,10 @@
 				"selectedBg": {
 					"$ref": "#/$defs/colorValue",
 					"description": "Selected item background"
+				},
+				"editorBg": {
+					"$ref": "#/$defs/colorValue",
+					"description": "Optional input background; defaults to userMessageBg with adaptive contrast"
 				},
 				"userMessageBg": {
 					"$ref": "#/$defs/colorValue",

@@ -1403,36 +1403,12 @@ fn normalize_lexically(path: &Path) -> String {
     }
 }
 
-/// Local stand-in for `defaultDaemonSocketDir` from daemon-socket.js.
 fn default_daemon_socket_dir() -> String {
-    let suffix = match std::env::var("USERNAME").ok().or_else(|| std::env::var("UID").ok()) {
-        Some(_) => current_user_id(),
-        None => "user".to_string(),
-    };
-    Path::new(&std::env::temp_dir())
-        .join(format!("prime-agent-{}", suffix))
-        .to_string_lossy()
-        .to_string()
+    crate::modes::daemon::daemon_socket::default_daemon_socket_dir()
 }
 
-fn current_user_id() -> String {
-    // Node's `process.getuid()` is undefined on Windows, which the TypeScript
-    // renders as the literal "user" suffix.
-    if process_platform() == "win32" {
-        return "user".to_string();
-    }
-    std::env::var("UID").unwrap_or_else(|_| "user".to_string())
-}
-
-/// Local stand-in for `defaultDaemonSocketPath` from daemon-socket.js.
 fn default_daemon_socket_path() -> String {
-    if process_platform() == "win32" {
-        return "\\\\.\\pipe\\prime-agent-daemon".to_string();
-    }
-    Path::new(&default_daemon_socket_dir())
-        .join("daemon.sock")
-        .to_string_lossy()
-        .to_string()
+    crate::modes::daemon::daemon_socket::default_daemon_socket_path()
 }
 
 /// Local stand-in for `getAgentDir` from ../config.js.

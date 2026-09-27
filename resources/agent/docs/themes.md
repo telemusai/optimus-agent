@@ -49,6 +49,12 @@ The selection is saved in your existing settings; other themes remain available.
 Neon provides a dark canvas with green (`#00f477`) borders, magenta (`#e201ea`)
 thinking text and grey (`#b3bcc7`) body text,
 a fixed Optimus banner and session/model strip, and a framed conversation timeline.
+The input area has a subtle charcoal-grey background (`#1c2022`) and an outline
+with the same thin lines and green colour as the other panels. Grey padding above
+and below the text makes the box easier to find. A small inset keeps the grey
+inside the outline using ordinary terminal text rendering.
+A blank row above and below separates it from neighbouring panels. It grows with
+wrapped input and does not depend on terminal background colour detection.
 The existing agent counts and live Jev activity stay in the bordered bottom bar,
 with Jev requests, token usage and latency aligned on the right. The context meter
 uses the session’s current token usage, including in-flight output.
@@ -171,13 +177,13 @@ vim ~/.prime/agent/themes/my-theme.json
 
 - `name` is required and must be unique.
 - `vars` is optional. Define reusable colors here, then reference them in `colors`.
-- `colors` must define all 51 required tokens.
+- `colors` must define all required tokens listed in the schema; `editorBg` is optional.
 
 The `$schema` field enables editor auto-completion and validation.
 
 ## Color Tokens
 
-Every theme must define all 51 color tokens. There are no optional colors.
+Every theme must define the required color tokens. `editorBg` is optional.
 
 ### Core UI (11 colors)
 
@@ -200,6 +206,7 @@ Every theme must define all 51 color tokens. There are no optional colors.
 | Token | Purpose |
 |-------|---------|
 | `selectedBg` | Selected line background |
+| `editorBg` | Optional input background; defaults to `userMessageBg` with adaptive contrast |
 | `userMessageBg` | User message background |
 | `userMessageText` | User message text |
 | `customMessageBg` | Extension message background |

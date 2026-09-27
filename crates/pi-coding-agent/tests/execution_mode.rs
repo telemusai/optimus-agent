@@ -47,6 +47,10 @@ impl Fixture {
     }
 
     async fn session(&self, saved: Option<&str>, restricted: bool) -> Arc<AgentSession> {
+        self.session_allowed(saved, restricted.then(|| vec!["ipython".into()])).await
+    }
+
+    async fn session_allowed(&self, saved: Option<&str>, allowed: Option<Vec<String>>) -> Arc<AgentSession> {
         let cwd = self
             .root
             .path()
@@ -113,7 +117,7 @@ impl Fixture {
                 model: Some(model),
                 prewarm_ipython_kernel: Some(false),
                 telemetry_disabled: Some(true),
-                allowed_tool_names: restricted.then(|| vec!["ipython".into()]),
+                allowed_tool_names: allowed,
                 ..Default::default()
             },
         })
@@ -256,7 +260,7 @@ async fn mid_conversation_switch_changes_outgoing_requests_runs_direct_tools_and
     let file = session.session_file().unwrap();
     session.dispose_async(Some(false)).await;
     let resumed = f.session(Some(&file), false).await;
-    assert_eq!(resumed.get_active_tool_names(), ["bash", "edit"]);
+    assert_eq!(resumed.get_active_tool_names(), ["bash", "edit", "subagent"]);
     f.reply(None, None);
     turn(&resumed, "Continue after resume").await;
     f.assert_request(3, true);
@@ -388,7 +392,7 @@ async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
         assert_eq!(f.captured.lock().unwrap().len(), 1, "a setting must not wake the model");
         assert_eq!(stop_entries(&file), stopped, "a setting must not clear the durable stop");
     }
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
     assert!(session.system_prompt().contains("Execution mode: Direct tools"));
     tokio::time::timeout(Duration::from_secs(5), session.prompt_and_wait("/mode direct", None))
         .await.expect("stopped mode commands acknowledge completion").unwrap();
@@ -400,12 +404,12 @@ async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
         session.prompt("/mode toggle", None), session.prompt("/mode toggle", None), session.prompt("/mode toggle", None)
     );
     a.unwrap(); b.unwrap(); c.unwrap();
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
     assert!(session.prompt("/compact", None).await.is_err());
     session.dispose_async(Some(false)).await;
     let reopened = f.session(Some(&file), false).await;
     assert!(reopened.is_queued_work_suspended());
-    assert_eq!(reopened.get_active_tool_names(), ["bash", "edit"]);
+    assert_eq!(reopened.get_active_tool_names(), ["bash", "edit", "subagent"]);
     turn(&reopened, "/mode toggle").await;
     assert_eq!(reopened.get_active_tool_names(), ["ipython"]);
     assert!(reopened.is_queued_work_suspended());
@@ -520,7 +524,7 @@ async fn f6_during_real_python_cell_does_not_block_admission_or_follow_up() {
     std::fs::write(release, "go").unwrap();
     tokio::time::timeout(Duration::from_secs(15), running).await.expect("active turn finished").unwrap().unwrap();
     idle(&session).await;
-    assert_eq!(session.get_active_tool_names(), ["node"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
     assert_eq!(f.captured.lock().unwrap()[1].tools.as_ref().unwrap()[0].name, "node",
         "the next provider request must use Node immediately after the completed tool batch");
     assert!(serde_json::to_string(&session.messages()).unwrap().contains("PYTHON_COMPLETED"));
@@ -533,7 +537,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     let f = Fixture::new();
     let session = f.session(None, false).await;
     turn(&session, "/mode toggle").await;
-    assert_eq!(session.get_active_tool_names(), ["node"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
     f.reply(Some(("node", json!({"code":"const modeValue = 41; modeValue"}))), None);
     f.reply(None, None);
     turn(&session, "Use Node").await;
@@ -541,7 +545,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     assert!(captured.system_prompt.unwrap().contains("JavaScript is the orchestration language"));
     assert_eq!(captured.tools.unwrap()[0].name, "node");
     turn(&session, "/mode toggle").await;
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
     turn(&session, "/mode toggle").await;
     assert_eq!(session.get_active_tool_names(), ["ipython"]);
     turn(&session, "/mode node").await;
@@ -555,7 +559,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     let file = session.session_file().unwrap();
     session.dispose_async(Some(false)).await;
     let reopened = f.session(Some(&file), false).await;
-    assert_eq!(reopened.get_active_tool_names(), ["node"]);
+    assert_eq!(reopened.get_active_tool_names(), ["node", "subagent"]);
     assert!(reopened.system_prompt().contains("JavaScript is the orchestration language"));
     reopened.dispose_async(Some(false)).await;
 }
@@ -580,7 +584,7 @@ async fn f6_after_node_tool_batch_continues_unfinished_work_in_direct_mode() {
     tokio::time::timeout(Duration::from_secs(2), session.prompt("/mode toggle", Some(PromptOptions {
         streaming_behavior: Some("followUp".into()), ..Default::default()
     }))).await.expect("F6 acknowledged while Node is busy").unwrap();
-    assert_eq!(session.get_active_tool_names(), ["node"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
     std::fs::write(release, "go").unwrap();
     tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
     idle(&session).await;
@@ -590,5 +594,38 @@ async fn f6_after_node_tool_batch_continues_unfinished_work_in_direct_mode() {
     assert_eq!(results.len(), 2);
     assert!(results.iter().all(|r| r["isError"] == false), "{results:?}");
     assert!(results[1].to_string().contains("8080"));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn native_subagents_respect_tool_restrictions_and_depth_limits() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let restricted = f.session_allowed(None, Some(vec!["node".into(), "bash".into(), "edit".into()])).await;
+    for mode in ["node", "direct"] {
+        turn(&restricted, &format!("/mode {mode}")).await;
+        assert!(!restricted.get_active_tool_names().contains(&"subagent".into()));
+        assert!(restricted.get_tool_definition("subagent").is_none());
+        assert!(!restricted.system_prompt().contains("Native delegation:"));
+    }
+    restricted.dispose_async(Some(false)).await;
+    let session = f.session(None, false).await;
+    turn(&session, "/mode node").await;
+    session.set_rlm_max_depth(0, false).await.unwrap();
+    for args in [
+        json!({"action":"spawn","prompt":"Cannot bypass the recursion limit"}),
+        json!({"action":"spawn","prompt":"  "}),
+        json!({"action":"collect","targets":["unrelated-session"]}),
+        json!({"action":"collect","timeout_ms":60001}),
+        json!({"action":"list","prompt":"Do not silently ignore wrong fields"}),
+    ] {
+        f.reply(Some(("subagent", args)), None);
+        f.reply(None, None);
+        turn(&session, "Exercise invalid delegation").await;
+        let history = serde_json::to_value(session.messages()).unwrap();
+        let result = history.as_array().unwrap().iter().rev().find(|m| m["role"] == "toolResult").unwrap();
+        assert_eq!(result["isError"], true, "{result}");
+    }
+    assert!(session.get_rlm_child_snapshots().is_empty());
     session.dispose_async(Some(false)).await;
 }
