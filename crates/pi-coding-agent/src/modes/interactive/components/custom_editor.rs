@@ -462,7 +462,6 @@ impl Component for CustomEditor {
             }
         }
         if framed {
-            let background = self.background_color.as_ref().expect("framed editor background");
             let inner_width = width as usize;
             let last = lines.len().saturating_sub(1);
             lines.into_iter().enumerate().map(|(index, line)| {
@@ -470,17 +469,24 @@ impl Component for CustomEditor {
                     // Retain scroll indicators in the existing padding rows.
                     let plain = pi_tui::utils::strip_ansi(&line);
                     let label = plain.trim();
+                    // Edge strokes meet the fill without painting outside the frame.
+                    // Ordinary box-drawing strokes sit halfway through their cells.
+                    let (left, horizontal, right) = if index == 0 {
+                        ("▗", "▁", "▖")
+                    } else {
+                        ("▝", "▔", "▘")
+                    };
                     let middle = if label.is_empty() {
-                        "─".repeat(inner_width)
+                        horizontal.repeat(inner_width)
                     } else {
                         let label = truncate_to_width(&format!(" {label} "), width, "", false);
-                        format!("{label}{}", "─".repeat(inner_width.saturating_sub(visible_width(&label))))
+                        format!("{label}{}", horizontal.repeat(inner_width.saturating_sub(visible_width(&label))))
                     };
-                    let (left, right) = if index == 0 { ("┌", "┐") } else { ("└", "┘") };
-                    background(&palette.fg("border", &format!("{left}{middle}{right}")))
+                    palette.bg("toolPanelBg", &palette.fg("border", &format!("{left}{middle}{right}")))
                 } else {
-                    let side = background(&palette.fg("border", "│"));
-                    format!("{side}{line}{side}")
+                    let left = palette.bg("toolPanelBg", &palette.fg("border", "▕"));
+                    let right = palette.bg("toolPanelBg", &palette.fg("border", "▏"));
+                    format!("{left}{line}{right}")
                 }
             }).collect()
         } else {
@@ -704,12 +710,14 @@ mod tests {
                 assert!(rows.iter().all(|row| visible_width(row) == width));
                 let top = pi_tui::utils::strip_ansi(&rows[0]);
                 let bottom = pi_tui::utils::strip_ansi(rows.last().unwrap());
-                assert!(top.starts_with('┌') && top.ends_with('┐'));
-                assert!(bottom.starts_with('└') && bottom.ends_with('┘'));
+                assert!(top.starts_with('▗') && top.ends_with('▖'));
+                assert!(bottom.starts_with('▝') && bottom.ends_with('▘'));
+                assert!(!rows[0].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(!rows.last().unwrap().contains(&theme().get_bg_ansi("editorBg")));
                 for row in &rows[1..rows.len() - 1] {
                     let plain = pi_tui::utils::strip_ansi(row);
-                    assert!(plain.starts_with('│') && plain.ends_with('│'));
-                    assert!(row.contains(&theme().fg("border", "│")));
+                    assert!(plain.starts_with('▕') && plain.ends_with('▏'));
+                    assert!(row.contains(&theme().fg("border", "▕")));
                 }
                 assert_eq!(rows.join("\n").matches(pi_tui::tui::CURSOR_MARKER).count(), 1);
                 assert_eq!(editor.editor().get_text(), text);
@@ -718,7 +726,7 @@ mod tests {
         editor.editor_mut().set_text(&(0..40).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"));
         assert!(pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).contains("↑"));
         init_theme(Some("prime"), false);
-        assert!(!pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).starts_with('┌'));
+        assert!(!pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).starts_with('▗'));
     }
 
     #[test]
