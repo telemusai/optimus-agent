@@ -462,6 +462,7 @@ impl Component for CustomEditor {
             }
         }
         if framed {
+            let background = self.background_color.as_ref().expect("framed editor background");
             let inner_width = width as usize;
             let last = lines.len().saturating_sub(1);
             lines.into_iter().enumerate().map(|(index, line)| {
@@ -476,9 +477,9 @@ impl Component for CustomEditor {
                         format!("{label}{}", "─".repeat(inner_width.saturating_sub(visible_width(&label))))
                     };
                     let (left, right) = if index == 0 { ("┌", "┐") } else { ("└", "┘") };
-                    palette.bg("toolPanelBg", &palette.fg("border", &format!("{left}{middle}{right}")))
+                    background(&palette.fg("border", &format!("{left}{middle}{right}")))
                 } else {
-                    let side = palette.bg("toolPanelBg", &palette.fg("border", "│"));
+                    let side = background(&palette.fg("border", "│"));
                     format!("{side}{line}{side}")
                 }
             }).collect()
