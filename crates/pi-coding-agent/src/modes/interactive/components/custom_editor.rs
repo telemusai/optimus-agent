@@ -10,6 +10,7 @@ use pi_tui::utils::{truncate_to_width, visible_width};
 use regex::Regex;
 
 use crate::modes::interactive::components::prompt_highlight::ArgTokenHighlighter;
+use crate::modes::interactive::theme::theme::theme;
 
 const COMMAND_TOKEN_PATTERN: &str = r"^(\s*)\/(\S+)";
 
@@ -421,6 +422,10 @@ impl CommandTokenPattern {
 impl Component for CustomEditor {
     /// Port of the `render` override.
     fn render(&mut self, width: f64) -> Vec<String> {
+        let palette = theme();
+        let framed = palette.name.as_deref() == Some("neon")
+            && self.background_color.is_some() && width >= 10.0;
+        let width = if framed { width.floor() - 2.0 } else { width };
         let lines_source = self.editor.get_lines();
         let first_line = lines_source.first().cloned().unwrap_or_default();
         let is_argument_command_line = match CommandTokenPattern::get().captures(&first_line) {
@@ -456,7 +461,30 @@ impl Component for CustomEditor {
                 }
             }
         }
-        lines
+        if framed {
+            let inner_width = width as usize;
+            let last = lines.len().saturating_sub(1);
+            lines.into_iter().enumerate().map(|(index, line)| {
+                if index == 0 || index == last {
+                    // Retain scroll indicators in the existing padding rows.
+                    let plain = pi_tui::utils::strip_ansi(&line);
+                    let label = plain.trim();
+                    let middle = if label.is_empty() {
+                        "─".repeat(inner_width)
+                    } else {
+                        let label = truncate_to_width(&format!(" {label} "), width, "", false);
+                        format!("{label}{}", "─".repeat(inner_width.saturating_sub(visible_width(&label))))
+                    };
+                    let (left, right) = if index == 0 { ("┌", "┐") } else { ("└", "┘") };
+                    palette.bg("toolPanelBg", &palette.fg("border", &format!("{left}{middle}{right}")))
+                } else {
+                    let side = palette.bg("toolPanelBg", &palette.fg("border", "│"));
+                    format!("{side}{line}{side}")
+                }
+            }).collect()
+        } else {
+            lines
+        }
     }
 
     /// Port of the `handleInput` override.
@@ -660,6 +688,36 @@ mod tests {
             }
         }
         result
+    }
+
+    #[test]
+    fn neon_frame_preserves_wrapping_cursor_and_scroll_indicators() {
+        init();
+        init_theme(Some("neon"), false);
+        let mut editor = editor(CustomEditorOptions::default());
+        editor.editor_mut().set_focused(true);
+        for width in [10usize, 12, 40, 80] {
+            for text in ["", "hello", "Unicode 世界 with a longer line that wraps inside the frame"] {
+                editor.editor_mut().set_text(text);
+                let rows = editor.render(width as f64);
+                assert!(rows.iter().all(|row| visible_width(row) == width));
+                let top = pi_tui::utils::strip_ansi(&rows[0]);
+                let bottom = pi_tui::utils::strip_ansi(rows.last().unwrap());
+                assert!(top.starts_with('┌') && top.ends_with('┐'));
+                assert!(bottom.starts_with('└') && bottom.ends_with('┘'));
+                for row in &rows[1..rows.len() - 1] {
+                    let plain = pi_tui::utils::strip_ansi(row);
+                    assert!(plain.starts_with('│') && plain.ends_with('│'));
+                    assert!(row.contains(&theme().fg("border", "│")));
+                }
+                assert_eq!(rows.join("\n").matches(pi_tui::tui::CURSOR_MARKER).count(), 1);
+                assert_eq!(editor.editor().get_text(), text);
+            }
+        }
+        editor.editor_mut().set_text(&(0..40).map(|n| format!("line {n}")).collect::<Vec<_>>().join("\n"));
+        assert!(pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).contains("↑"));
+        init_theme(Some("prime"), false);
+        assert!(!pi_tui::utils::strip_ansi(&editor.render(40.0)[0]).starts_with('┌'));
     }
 
     #[test]
