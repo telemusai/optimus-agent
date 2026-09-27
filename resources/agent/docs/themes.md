@@ -51,7 +51,8 @@ thinking text and grey (`#b3bcc7`) body text,
 a fixed Optimus banner and session/model strip, and a framed conversation timeline.
 The input area has a subtle charcoal-grey background (`#1c2022`) and an outline
 with the same thin lines and green colour as the other panels. Grey padding above
-and below the text makes the box easier to find, and the fill reaches the border.
+and below the text makes the box easier to find. A small inset keeps the grey
+inside the outline using ordinary terminal text rendering.
 A blank row above and below separates it from neighbouring panels. It grows with
 wrapped input and does not depend on terminal background colour detection.
 The existing agent counts and live Jev activity stay in the bordered bottom bar,

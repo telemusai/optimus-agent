@@ -462,8 +462,7 @@ impl Component for CustomEditor {
             }
         }
         if framed {
-            let background = self.background_color.as_ref().expect("framed editor background");
-            let border = |text: &str| background(&palette.fg("border", text));
+            let border = |text: &str| palette.bg("toolPanelBg", &palette.fg("border", text));
             // Use the same single-line outline as the other panels and retain
             // the editor's grey padding rows and scroll indicators.
             let gap = palette.bg("toolPanelBg", &" ".repeat(width as usize + 2));
@@ -703,13 +702,15 @@ mod tests {
                 let bottom = pi_tui::utils::strip_ansi(&rows[rows.len() - 2]);
                 assert_eq!(top, format!("┌{}┐", "─".repeat(width - 2)));
                 assert_eq!(bottom, format!("└{}┘", "─".repeat(width - 2)));
+                assert!(!rows[1].contains(&theme().get_bg_ansi("editorBg")));
+                assert!(!rows[rows.len() - 2].contains(&theme().get_bg_ansi("editorBg")));
                 assert!(rows.len() >= 7, "keep internal padding and external panel gaps");
-                assert!(rows[1..rows.len() - 1].iter().all(|row| row.contains(&theme().get_bg_ansi("editorBg"))));
+                let side = theme().bg("toolPanelBg", &theme().fg("border", "│"));
                 for row in &rows[2..rows.len() - 2] {
                     let plain = pi_tui::utils::strip_ansi(row);
                     assert!(plain.starts_with('│') && plain.ends_with('│'));
-                    assert!(row.contains(&theme().fg("border", "│")));
-                    assert!(!row.contains(&theme().get_bg_ansi("toolPanelBg")));
+                    assert!(row.starts_with(&side) && row.ends_with(&side));
+                    assert!(row.contains(&theme().get_bg_ansi("editorBg")));
                 }
                 if text.is_empty() {
                     assert_eq!(rows.len(), 7);

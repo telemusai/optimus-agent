@@ -318,15 +318,14 @@ fn neon_frame_fixture_keeps_editor_jev_history_and_theme_switching() {
         let editor_background = theme().get_bg_ansi("editorBg");
         let input_rows: Vec<_> = dock_rows.iter()
             .filter(|row| row.contains(&editor_background)).collect();
-        assert_eq!(input_rows.len(), 5, "input padding and edges stay painted");
+        assert_eq!(input_rows.len(), 3, "grey fills the interior and its padding only");
         assert!(input_rows.iter().all(|row| visible_width(row) == width));
-        assert_eq!(strip_ansi(input_rows[0]), format!("┌{}┐", "─".repeat(width - 2)));
-        assert_eq!(strip_ansi(input_rows[4]), format!("└{}┘", "─".repeat(width - 2)));
-        assert!(strip_ansi(input_rows[2]).starts_with('│'));
-        assert!(strip_ansi(input_rows[2]).ends_with('│'));
+        assert!(input_rows.iter().all(|row| strip_ansi(row).starts_with('│') && strip_ansi(row).ends_with('│')));
         let input_start = dock_rows.iter().position(|row| row.contains(&editor_background)).unwrap();
-        assert_eq!(strip_ansi(&dock_rows[input_start - 1]), " ".repeat(width));
-        assert_eq!(strip_ansi(&dock_rows[input_start + input_rows.len()]), " ".repeat(width));
+        assert_eq!(strip_ansi(&dock_rows[input_start - 1]), format!("┌{}┐", "─".repeat(width - 2)));
+        assert_eq!(strip_ansi(&dock_rows[input_start + input_rows.len()]), format!("└{}┘", "─".repeat(width - 2)));
+        assert_eq!(strip_ansi(&dock_rows[input_start - 2]), " ".repeat(width));
+        assert_eq!(strip_ansi(&dock_rows[input_start + input_rows.len() + 1]), " ".repeat(width));
         let budget = (height / 4).min(height.saturating_sub(
             pi_tui::fullscreen::clipped_fullscreen_dock_height(dock_rows.len(), height)
                 + pi_tui::fullscreen::FULLSCREEN_MIN_TRANSCRIPT_ROWS,
