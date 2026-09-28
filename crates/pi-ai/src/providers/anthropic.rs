@@ -1602,6 +1602,15 @@ fn nullable_to_record(headers: &IndexMap<String, Option<String>>) -> IndexMap<St
 		.collect()
 }
 
+fn token_count_json(value: f64, field: &str) -> Result<Value, AnthropicStreamError> {
+	if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_991.0 {
+		return Err(AnthropicStreamError::Message(format!(
+			"Anthropic {field} must be a nonnegative integer within JSON's exact integer range"
+		)));
+	}
+	Ok(Value::from(value as u64))
+}
+
 /// TS: `buildParams(model, context, isOAuthToken, options?, cacheControl?)`.
 fn build_params(
 	model: &Model,
@@ -1618,24 +1627,10 @@ fn build_params(
 	);
 	params.insert(
 		"max_tokens".to_string(),
-		serde_json::Number::from_f64(
-			options
-				.stream
-				.max_tokens
-				// JS `options?.maxTokens || ...`: 0 and NaN are falsy.
-				.filter(|max_tokens| *max_tokens != 0.0 && !max_tokens.is_nan())
-				.unwrap_or_else(|| {
-					// JS `(model.maxTokens / 3) | 0` wraps only the fallback.
-					let fallback = (model.max_tokens / 3.0).trunc();
-					if fallback.is_finite() {
-						(fallback.rem_euclid(4_294_967_296.0) as u32 as i32) as f64
-					} else {
-						0.0
-					}
-				}),
-		)
-		.map(Value::Number)
-		.unwrap_or(Value::Null),
+		token_count_json(
+			options.stream.max_tokens.unwrap_or_else(|| (model.max_tokens / 3.0).floor()),
+			"max_tokens",
+		)?,
 	);
 	params.insert("stream".to_string(), Value::Bool(true));
 
@@ -1733,16 +1728,7 @@ fn build_params(
 				thinking.insert("type".to_string(), Value::String("enabled".to_string()));
 				thinking.insert(
 					"budget_tokens".to_string(),
-					Value::Number(
-						serde_json::Number::from_f64(
-							options
-								.thinking_budget_tokens
-								// JS `options.thinkingBudgetTokens || 1024`.
-								.filter(|budget| *budget != 0.0 && !budget.is_nan())
-								.unwrap_or(1024.0),
-						)
-						.unwrap_or_else(|| serde_json::Number::from(0)),
-					),
+					token_count_json(options.thinking_budget_tokens.unwrap_or(1024.0), "thinking.budget_tokens")?,
 				);
 				thinking.insert("display".to_string(), Value::String(display));
 				params.insert("thinking".to_string(), Value::Object(thinking));
@@ -2794,6 +2780,31 @@ mod tests {
 	}
 
 	#[test]
+	fn catalog_token_limits_serialize_as_json_integers() {
+		for (id, reasoning) in [("claude-opus-5-5", "low"), ("claude-sonnet-4-5", "high")] {
+			let mut model = test_model("anthropic", id);
+			model.max_tokens = 128_000.0;
+			let base = build_base_options(&model, None, Some("synthetic-key"));
+			let mut options = AnthropicOptions::from_base(&base);
+			if reasoning == "high" {
+				let adjusted = adjust_max_tokens_for_thinking(base.max_tokens.unwrap(), model.max_tokens, &reasoning.to_string(), None);
+				options.stream.max_tokens = Some(adjusted.max_tokens);
+				options.thinking_enabled = Some(true);
+				options.thinking_budget_tokens = Some(adjusted.thinking_budget);
+			}
+			let params = build_params(&model, &context_with_user("hello"), false, &options, None).unwrap();
+			let wire: Value = serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+			assert!(wire["max_tokens"].is_u64(), "{id}: {}", wire["max_tokens"]);
+			if reasoning == "high" {
+				assert_eq!(wire["max_tokens"].as_u64(), Some(48_384));
+				assert_eq!(wire["thinking"]["budget_tokens"].as_u64(), Some(16_384));
+			} else {
+				assert_eq!(wire["max_tokens"].as_u64(), Some(32_000));
+			}
+		}
+	}
+
+	#[test]
 	fn build_params_sets_defaults_and_stream_flag() {
 		let model = test_model("anthropic", "claude-sonnet-4-5");
 		let context = context_with_user("Say hello.");
@@ -2810,28 +2821,31 @@ mod tests {
 	}
 
 	#[test]
-	fn build_params_preserves_explicit_limits_and_wraps_the_default_like_javascript() {
+	fn build_params_uses_integer_limits_without_wrapping_or_nulls() {
 		let context = context_with_user("hi");
 		for (limit, model_limit, expected) in [
-			(Some(3.9), 8192.0, Some(3.9)),
-			(None, 8.7, Some(2.0)),
-			(None, 6_442_450_950.0, Some(-2_147_483_646.0)),
-			(None, -6_442_450_950.0, Some(2_147_483_646.0)),
-			(Some(0.0), 6_442_450_950.0, Some(-2_147_483_646.0)),
-			(Some(f64::NAN), 8.7, Some(2.0)),
-			(None, f64::INFINITY, Some(0.0)),
-			(None, f64::NAN, Some(0.0)),
-			(Some(f64::INFINITY), 8192.0, None),
+			(Some(128_000.0), 128_000.0, 128_000),
+			(None, 128_000.0, 42_666),
+			(None, 8.7, 2),
+			(None, 6_442_450_950.0, 2_147_483_650),
+			(Some(0.0), 8192.0, 0),
 		] {
 			let mut model = test_model("anthropic", "claude-sonnet-4-5");
 			model.max_tokens = model_limit;
 			let mut options = AnthropicOptions::default();
 			options.stream.max_tokens = limit;
 			let params = build_params(&model, &context, false, &options, None).unwrap();
-			assert_eq!(params["max_tokens"].as_f64(), expected, "limit={limit:?}, model_limit={model_limit}");
-			if expected.is_none() {
-				assert!(params["max_tokens"].is_null());
-			}
+			assert_eq!(params["max_tokens"].as_u64(), Some(expected), "limit={limit:?}, model_limit={model_limit}");
+		}
+		for invalid in [3.9, -1.0, f64::NAN, f64::INFINITY, 9_007_199_254_740_992.0] {
+			let model = test_model("anthropic", "claude-sonnet-4-5");
+			let mut options = AnthropicOptions::default();
+			options.stream.max_tokens = Some(invalid);
+			assert!(build_params(&model, &context, false, &options, None).unwrap_err().message().contains("max_tokens"));
+			options.stream.max_tokens = Some(8192.0);
+			options.thinking_enabled = Some(true);
+			options.thinking_budget_tokens = Some(invalid);
+			assert!(build_params(&model, &context, false, &options, None).unwrap_err().message().contains("thinking.budget_tokens"));
 		}
 	}
 

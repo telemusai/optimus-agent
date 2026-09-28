@@ -493,6 +493,7 @@ async fn native_provider_sends_resolved_oauth_and_version_to_local_fixture() {
         assert!(headers.contains("oauth-2025-04-20"));
         assert!(!headers.contains("x-api-key:"));
         assert_eq!(request["model"], "claude-opus-5-5");
+        assert_eq!(request["max_tokens"].as_u64(), Some(128_000));
         assert!(request["system"][0]["text"].as_str().unwrap().contains("Claude Code"));
         assert_eq!(request["messages"].as_array().unwrap().len(), 1);
         assert!(!request.to_string().contains("local-only authentication diagnostic"));
@@ -526,6 +527,7 @@ async fn native_provider_sends_resolved_oauth_and_version_to_local_fixture() {
             &pi_ai::types::StreamOptions {
                 api_key: auth.api_key,
                 headers: auth.headers,
+                max_tokens: Some(128_000.0),
                 ..Default::default()
             },
         )),
