@@ -403,6 +403,9 @@ impl OAuthSelectorComponent {
 
     fn is_provider_configured(&self, provider: &AuthSelectorProvider) -> bool {
         let status = self.status(&provider.id);
+        if status.source.as_deref() == Some("claude_code") {
+            return status.configured && provider.auth_type == "oauth";
+        }
         let credential = self.credential(provider);
         if self.is_provider_stale(provider) {
             return false;
@@ -521,6 +524,10 @@ impl OAuthSelectorComponent {
     /// Port of `formatStatusIndicator`.
     pub fn format_status_indicator(&self, provider: &AuthSelectorProvider) -> String {
         let status = self.status(&provider.id);
+        if status.source.as_deref() == Some("claude_code") {
+            return theme().fg(if status.configured { "success" } else { "warning" },
+                status.label.as_deref().unwrap_or("Claude Code OAuth"));
+        }
         if self.is_provider_stale(provider) {
             return theme().fg("warning", status.label.as_deref().unwrap_or("expired"));
         }
@@ -824,5 +831,21 @@ mod tests {
         assert!(format_api_key_status_indicator(&status).contains("env: MY_KEY"));
         let unconfigured = AuthStatus::default();
         assert!(format_api_key_status_indicator(&unconfigured).contains("unconfigured"));
+    }
+
+    #[test]
+    fn claude_code_is_shown_as_the_active_subscription() {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let mut storage = storage();
+        storage.statuses.insert("anthropic".into(), AuthStatus {
+            configured: true, source: Some("claude_code".into()), label: Some("Claude Code 2.1.283 OAuth".into()),
+        });
+        let oauth = provider("anthropic", "Claude", "oauth");
+        let api_key = provider("anthropic", "Anthropic API", "api_key");
+        let component = OAuthSelectorComponent::new("login", Box::new(storage),
+            vec![api_key.clone(), oauth.clone()], None, OAuthSelectorOptions::default());
+        assert!(component.is_provider_configured(&oauth));
+        assert!(!component.is_provider_configured(&api_key));
+        assert!(component.format_status_indicator(&oauth).contains("Claude Code 2.1.283 OAuth"));
     }
 }

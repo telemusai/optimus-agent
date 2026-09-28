@@ -96,8 +96,8 @@ fn get_cache_control(model: &Model, cache_retention: Option<&CacheRetention>) ->
 	}
 }
 
-// Stealth mode: Mimic Claude Code's tool naming exactly
-const CLAUDE_CODE_VERSION: &str = "2.1.281";
+// Fallback when no installed version is supplied; verified against Anthropic's release on 2026-09-29.
+const CLAUDE_CODE_VERSION: &str = "2.1.283";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -1540,11 +1540,18 @@ fn create_client(
 		);
 		base.insert("x-app".to_string(), Some("cli".to_string()));
 
-		let headers = merge_headers(vec![
+		let mut headers = IndexMap::new();
+		for source in [
 			Some(base),
 			record_to_nullable(model.headers.as_ref()),
 			record_to_nullable(options_headers),
-		]);
+		].into_iter().flatten() {
+			for (name, value) in source {
+				headers.insert(name.to_ascii_lowercase(), value);
+			}
+		}
+		// The resolved OAuth credential remains authoritative over custom headers.
+		headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization") && !name.eq_ignore_ascii_case("x-api-key"));
 
 		return Ok(CreatedClient {
 			client: AnthropicClientOverride {
@@ -3241,7 +3248,7 @@ mod tests {
 			headers.get("anthropic-beta").map(String::as_str),
 			Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
 		);
-		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.281"));
+		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.283"));
 		assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
 
 		let mut opencode = test_model("opencode", "claude-sonnet-4-5");
@@ -3268,6 +3275,29 @@ mod tests {
 		assert_eq!(headers.get("anthropic-dangerous-direct-browser-access").map(String::as_str), Some("true"));
 		assert!(!headers.contains_key("x-api-key"));
 		assert!(!headers.contains_key("Authorization"));
+	}
+
+	#[test]
+	fn oauth_credentials_cannot_be_overridden_by_custom_headers() {
+		let mut model = test_model("anthropic", "claude-opus-5-5");
+		model.headers = Some(IndexMap::from([
+			("Authorization".into(), "Bearer stale-model-token".into()),
+			("X-API-Key".into(), "paid-model-key".into()),
+			("User-Agent".into(), "stale-model-version".into()),
+			("X-App".into(), "stale-app".into()),
+		]));
+		let options = IndexMap::from([
+			("AUTHORIZATION".into(), "Bearer stale-option-token".into()),
+			("x-api-key".into(), "paid-option-key".into()),
+			("user-agent".into(), "claude-cli/2.1.999".into()),
+			("x-app".into(), "cli".into()),
+		]);
+		let created = create_client(&model, "sk-ant-oat01-selected", false, false, Some(&options), None, None).unwrap();
+		let headers = build_request_headers(&created.client, 1000.0, true);
+		assert_eq!(headers.get("Authorization"), Some("Bearer sk-ant-oat01-selected"));
+		assert_eq!(headers.get("x-api-key"), None);
+		assert_eq!(headers.get("user-agent"), Some("claude-cli/2.1.999"));
+		assert_eq!(headers.get("x-app"), Some("cli"));
 	}
 
 	#[test]

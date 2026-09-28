@@ -35,6 +35,10 @@ pub(crate) use crate::core::resolve_config_value::{
 use crate::utils::atomic_file::{realpath_if_present_sync, write_file_atomic_sync, WriteFileAtomicOptions};
 use crate::utils::store_lock::{lock_store_sync, open_store_lock, read_store};
 
+#[path = "claude_code_auth.rs"]
+mod claude_code;
+pub(crate) const AUTH_SOURCE_CLAUDE_CODE: &str = "claude_code";
+
 // ---------------------------------------------------------------------------
 // Environment-key lookup helpers.
 // ---------------------------------------------------------------------------
@@ -554,6 +558,7 @@ pub struct AuthStorage {
     fallback_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     load_error: Option<String>,
     errors: Vec<String>,
+    claude_code: Option<Arc<claude_code::ClaudeCodeAuth>>,
 }
 
 impl std::fmt::Debug for AuthSourceCandidate {
@@ -580,20 +585,28 @@ impl AuthStorage {
             fallback_resolver: None,
             load_error: None,
             errors: Vec::new(),
+            claude_code: None,
         };
         storage.reload();
         storage
     }
 
     pub fn create(auth_path: Option<String>, options: Option<AuthStorageOptions>) -> Self {
+        // Explicit, isolated auth files must not unexpectedly borrow host credentials.
+        let use_claude_code = auth_path.as_deref().is_none_or(|path| path == auth_path_default())
+            || options.as_ref().is_some_and(|options| options.use_prime_cli_config);
         let auth_options = options.unwrap_or_else(|| AuthStorageOptions {
             prime_cli_config_path: None,
             use_prime_cli_config: auth_path.is_none(),
         });
-        Self::new(
+        let mut storage = Self::new(
             Box::new(FileAuthStorageBackend::new(auth_path)),
             auth_options,
-        )
+        );
+        if use_claude_code {
+            storage.claude_code = claude_code::ClaudeCodeAuth::from_environment().map(Arc::new);
+        }
+        storage
     }
 
     pub fn from_storage(storage: Box<dyn AuthStorageBackend>, options: Option<AuthStorageOptions>) -> Self {
@@ -859,6 +872,9 @@ impl AuthStorage {
         provider: &str,
         include_fallback: bool,
     ) -> Vec<AuthSourceCandidate> {
+        if let Some(candidate) = self.get_claude_code_candidate(provider) {
+            return vec![candidate];
+        }
         let fallback_candidate = if include_fallback {
             self.get_fallback_auth_candidate(provider)
         } else {
@@ -1309,6 +1325,13 @@ impl AuthStorage {
         provider_id: &str,
         callbacks: pi_ai::utils::oauth::types::OAuthLoginCallbacks,
     ) -> Result<(), String> {
+        if self.has_claude_code_auth(provider_id) {
+            self.resolve_claude_code_auth(provider_id).await?;
+            if let Some(progress) = callbacks.on_progress {
+                progress("Using the installed Claude Code OAuth login".into());
+            }
+            return Ok(());
+        }
         let provider = get_oauth_provider(provider_id)
             .ok_or_else(|| format!("Unknown OAuth provider: {}", provider_id))?;
         let credentials = (provider.login)(callbacks).await?;
@@ -1321,6 +1344,9 @@ impl AuthStorage {
 
     /// Logout from a provider.
     pub fn logout(&mut self, provider: &str) -> Result<(), String> {
+        if self.has_claude_code_auth(provider) {
+            return Err("This login is managed by Claude Code. Run `claude auth logout`, or set OPTIMUS_CLAUDE_CODE_AUTH=0 to use Optimus credentials independently.".into());
+        }
         if provider == PRIME_INFERENCE_PROVIDER_ID && self.is_prime_cli_config_enabled() {
             let config_path = self.get_enabled_prime_cli_config_path()?;
             clear_prime_cli_credentials(Some(&config_path)).map_err(|error| {
@@ -1545,7 +1571,7 @@ impl AuthStorage {
     /// Get API key for a provider with its auth source token.
     ///
     /// Priority:
-    /// 1. Runtime override (CLI --api-key)
+    /// 1. Installed Claude Code OAuth for Anthropic, then runtime override (CLI --api-key)
     /// 2. Prime Inference: environment variable, Prime CLI config, auth.json
     /// 3. Other providers: auth.json, environment variable
     /// 4. Fallback resolver (models.json custom providers)
@@ -1554,6 +1580,9 @@ impl AuthStorage {
         provider_id: &str,
         include_fallback: bool,
     ) -> Result<AuthApiKeyResult, String> {
+        if let Some(result) = self.resolve_claude_code_auth(provider_id).await? {
+            return Ok(result);
+        }
         // Runtime overrides take precedence over stored credentials and environment keys.
         let runtime_candidate = self.get_runtime_auth_candidate(provider_id);
         let runtime_key = self.runtime_overrides.get(provider_id).cloned();

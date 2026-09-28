@@ -1,0 +1,3 @@
+- Added automatic Claude Code OAuth discovery and installed-version pinning for the native Anthropic provider, with source labels, original-store refresh/write-back, bounded helpers, and no paid-key fallback on authentication failure.
+- Changed the OAuth fallback version to Claude Code 2.1.283 when no installed version is supplied; custom headers cannot replace the selected OAuth credential.
+- Added coverage and configuration examples for Claude Opus 5.5's 1,000,000-token context window and optional input/output limits.
