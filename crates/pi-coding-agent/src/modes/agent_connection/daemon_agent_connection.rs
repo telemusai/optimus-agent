@@ -351,7 +351,7 @@ pub trait DaemonTransportClient: Send + Sync {
 /// TS returns the reason from a *typed* carrier: `error instanceof DaemonSocketClosedError ?
 /// error.daemonClosingReason : undefined`. The one wire-visible form of that field is
 /// `DaemonSocketClosedError`'s message template (`daemon-client.ts:73-86`):
-/// `Connection to the Prime Agent daemon closed.{ Reason: <reason>.}{ Cause: <cause>.} Socket: ...`,
+/// `Connection to the Optimus Agent daemon closed.{ Reason: <reason>.}{ Cause: <cause>.} Socket: ...`,
 /// which is what `getDaemonSocketCloseReason`'s consumers actually receive, because
 /// `daemon-agent-connection.ts` and `daemon-routed-client.ts:27` hand it the close *listener's*
 /// `Error`. The only producer of this string on the Rust side is `DaemonSocketClosedError::message`
@@ -921,7 +921,7 @@ pub trait AgentConnectionRosterStore: Send + Sync {
 
 /// `STALE_ROSTER_DAEMON_MESSAGE`.
 pub const STALE_ROSTER_DAEMON_MESSAGE: &str =
-    "The running Prime Agent daemon is older than this client. Restart Prime Agent to use Agents View.";
+    "The running Optimus Agent daemon is older than this client. Restart Optimus Agent to use Agents View.";
 
 impl DaemonAgentConnection {
     pub fn new(
@@ -1047,10 +1047,10 @@ impl DaemonAgentConnection {
     fn format_daemon_session_closed_error(&self, reason: &str) -> String {
         let explanation = match reason {
             "killed" => "The daemon stopped this agent session. Its transcript remains saved and can be reopened from Agents View.",
-            "shutdown" => "The Prime Agent daemon shut down while this window was attached. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+            "shutdown" => "The Optimus Agent daemon shut down while this window was attached. The session transcript remains saved; restart Optimus Agent and reopen it from Agents View.",
             "completed" => "The daemon closed this agent session after it completed. Its transcript remains available from Agents View.",
             "replaced" => "The daemon replaced this agent session with another session. Reopen the current session from Agents View.",
-            "update" => "The Prime Agent daemon restarted for an update, but this window did not restore automatically. The session transcript remains saved; restart Prime Agent and reopen it from Agents View.",
+            "update" => "The Optimus Agent daemon restarted for an update, but this window did not restore automatically. The session transcript remains saved; restart Optimus Agent and reopen it from Agents View.",
             _ => "The daemon closed this agent session.",
         };
         format!("{explanation} {}", self.format_daemon_diagnostic_context())
@@ -1058,7 +1058,7 @@ impl DaemonAgentConnection {
 
     fn format_daemon_connection_closed_error(&self, error: &str) -> String {
         format!(
-            "Lost connection to the Prime Agent daemon. Cause: {} The session transcript remains saved; restart Prime Agent or reopen the session from Agents View. {}",
+            "Lost connection to the Optimus Agent daemon. Cause: {} The session transcript remains saved; restart Optimus Agent or reopen the session from Agents View. {}",
             format_error_sentence(error),
             self.format_daemon_diagnostic_context()
         )
@@ -1066,7 +1066,7 @@ impl DaemonAgentConnection {
 
     fn format_update_reconnect_error(&self, error: &str) -> String {
         format!(
-            "The Prime Agent daemon restarted for an update, but this window could not reconnect to its restored session before the recovery timeout expired. Last error: {} The session transcript remains saved; restart Prime Agent and reopen it from Agents View. {}",
+            "The Optimus Agent daemon restarted for an update, but this window could not reconnect to its restored session before the recovery timeout expired. Last error: {} The session transcript remains saved; restart Optimus Agent and reopen it from Agents View. {}",
             format_error_sentence(error),
             self.format_daemon_diagnostic_context()
         )
@@ -1526,7 +1526,7 @@ impl DaemonAgentConnection {
             return;
         };
         tokio::spawn(async move {
-            let _ = connection.reconnect("The Prime Agent daemon is restarting for an update.".to_string()).await;
+            let _ = connection.reconnect("The Optimus Agent daemon is restarting for an update.".to_string()).await;
         });
     }
 
@@ -2831,6 +2831,9 @@ impl AgentConnection for DaemonAgentConnection {
     fn supports_jev_dynamic(&self) -> bool {
         self.client.supports_server_capability("jev_dynamic")
     }
+    fn supports_clang_execution_mode(&self) -> bool {
+        self.client.supports_server_capability("clang_execution_mode")
+    }
     fn supports_node_execution_mode(&self) -> bool {
         self.client.supports_server_capability("node_execution_mode")
     }
@@ -3457,7 +3460,7 @@ impl AgentConnection for DaemonAgentConnection {
         let this = self.clone();
         if !this.client.supports_server_capability("heartbeat_management") {
             return Box::pin(async {
-                Err("Heartbeat management requires a newer Prime Agent daemon.".to_string())
+                Err("Heartbeat management requires a newer Optimus Agent daemon.".to_string())
             });
         }
         let command = command_body(
@@ -3476,7 +3479,7 @@ impl AgentConnection for DaemonAgentConnection {
                     .ok_or_else(|| "Daemon returned an invalid heartbeat".to_string()),
                 Err(error) => {
                     if is_unknown_daemon_command_error(&error, "heartbeat_manage") {
-                        Err("Heartbeat management requires a newer Prime Agent daemon.".to_string())
+                        Err("Heartbeat management requires a newer Optimus Agent daemon.".to_string())
                     } else {
                         Err(error)
                     }

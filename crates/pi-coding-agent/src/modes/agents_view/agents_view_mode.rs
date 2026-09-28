@@ -2557,7 +2557,7 @@ impl<'a> AgentsViewMode<'a> {
         self.reconnect_timed_out = false;
         self.set_status_message(
             Some(&format!(
-                "Prime Agent daemon shut down. Restart Prime Agent to reconnect. {message}"
+                "Optimus Agent daemon shut down. Restart Optimus Agent to reconnect. {message}"
             )),
             false,
             Some(StatusTone::Error),
@@ -6424,7 +6424,7 @@ mod tests {
             assert!(mode
                 .status_message()
                 .unwrap()
-                .starts_with("Prime Agent daemon shut down. Restart Prime Agent to reconnect."));
+                .starts_with("Optimus Agent daemon shut down. Restart Optimus Agent to reconnect."));
             assert!(mode.status_message_is_sticky());
         });
     }

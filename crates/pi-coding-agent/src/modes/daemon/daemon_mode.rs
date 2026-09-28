@@ -996,7 +996,7 @@ const UPDATE_RESTART_ABORT_BASH_TIMEOUT_MS: u64 = 5000;
 /// cap matches the worker stop's non-forced graceful deadline.
 const CLOSE_SETTLE_WAIT_TIMEOUT: Duration = Duration::from_millis(10_000);
 const SUPERVISOR_FENCE_POLL_MS: u64 = 250;
-const UPDATE_RESTART_MARKER: &str = "<prime_agent_update_interrupted>\nPrime Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been stopped.\n</prime_agent_update_interrupted>";
+const UPDATE_RESTART_MARKER: &str = "<prime_agent_update_interrupted>\nOptimus Agent was updated and intentionally interrupted this session. Continue from the saved transcript and restored tool/kernel state. Any running model, tool, bash, or child-agent work may have been stopped.\n</prime_agent_update_interrupted>";
 
 const RECOVERY_CHECKPOINT_EVENTS: [&str; 16] = [
     "agent_start",
@@ -2612,7 +2612,7 @@ impl AgentDaemon {
         self.register_signal_handlers();
         self.summarizer.start();
         self.log(&format!(
-            "Prime Agent daemon listening on {}",
+            "Optimus Agent daemon listening on {}",
             self.socket_path
         ));
         if !self.shutting_down.load(Ordering::SeqCst) {

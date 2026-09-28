@@ -480,14 +480,14 @@ fn startup_session_loss_copy() -> DaemonSessionLossCopy<'static> {
         busy_detail: &|count| {
             let pluralized = pluralize_sessions(count);
             format!(
-                "A background service from a different Prime Agent version is running with {count} busy {}. Stopping it will terminate {}.",
+                "A background service from a different Optimus Agent version is running with {count} busy {}. Stopping it will terminate {}.",
                 pluralized.noun, pluralized.pronoun
             )
         },
         unlistable_detail:
-            "A background service from a different Prime Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
+            "A background service from a different Optimus Agent version is running and its sessions could not be listed. Stopping it may terminate active sessions.",
         question: "Stop it and continue?",
-        non_tty_hint: "Run \"prime-agent shutdown\" to stop it, then retry.",
+        non_tty_hint: "Run \"optimus-agent shutdown\" to stop it, then retry.",
     }
 }
 
@@ -522,7 +522,7 @@ async fn take_over_stale_daemon_or_exit(socket_path: &str) -> Arc<DaemonReadyHan
         eprintln!(
             "{}",
             red(&format!(
-                "Could not stop the background service on {socket_path}. Run \"prime-agent shutdown\" and retry."
+                "Could not stop the background service on {socket_path}. Run \"optimus-agent shutdown\" and retry."
             ))
         );
         std::process::exit(1);
@@ -565,7 +565,7 @@ pub async fn await_daemon_ready(daemon_ready: Option<Arc<DaemonReadyHandle>>) ->
 }
 
 /// The first line of `StaleDaemonError`'s message.
-pub const STALE_DAEMON_ERROR_PREFIX: &str = "An incompatible Prime Agent daemon is running.";
+pub const STALE_DAEMON_ERROR_PREFIX: &str = "An incompatible Optimus Agent daemon is running.";
 
 /// The shared `ensureInteractiveDaemonRunning` promise, kept as a handle so
 /// callers can await it more than once and keep the same promise on success.
@@ -2701,7 +2701,7 @@ pub async fn main(args: Vec<String>, options: MainOptions, host: &dyn MainHost) 
     install_file_log_sink(None);
     if is_daemon_catalog_process_from_env() {
         if let Err(message) = host.run_daemon_catalog_process().await {
-            eprintln!("Prime Agent daemon catalog failed: {message}");
+            eprintln!("Optimus Agent daemon catalog failed: {message}");
             host.exit(1);
         }
         return;

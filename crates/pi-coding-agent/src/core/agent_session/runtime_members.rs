@@ -930,6 +930,10 @@ impl AgentSession {
                     ..Default::default()
                 };
                 definitions.insert("subagent".into(), self.native_subagent_tool());
+                definitions.insert("clang".into(), crate::core::tools::clang::create_clang_tool(&self.cwd, self.clang_runtime.clone()).into());
+                let weak = Arc::downgrade(self);
+                definitions.insert("attach_image".into(), crate::core::tools::attach_image::create_attach_image_tool(&self.cwd,
+                    Arc::new(move || weak.upgrade().and_then(|session| session.model()))).into());
                 definitions.insert("node".into(), crate::core::tools::node::create_node_tool_definition(&self.cwd, self.node_runtime.clone()).into());
                 definitions.insert("bash".into(), crate::core::tools::create_bash_tool_definition(&self.cwd, Some(&bash_options)).into());
                 definitions.insert("edit".into(), crate::core::tools::create_edit_tool_definition(&self.cwd, None).into());
@@ -1017,10 +1021,11 @@ impl AgentSession {
         let active = if self.base_tools_override.is_none() {
             let mut active = self.saved_execution_mode().map(|mode| mode.tools(&active)).unwrap_or(active);
             if matches!(crate::core::execution_mode::ExecutionMode::from_tools(&active),
-                Some(crate::core::execution_mode::ExecutionMode::Node | crate::core::execution_mode::ExecutionMode::Direct))
-                && !active.iter().any(|name| name == "subagent")
-            {
-                active.push("subagent".into());
+                Some(crate::core::execution_mode::ExecutionMode::Node | crate::core::execution_mode::ExecutionMode::Clang | crate::core::execution_mode::ExecutionMode::Direct))
+                {
+                for name in ["subagent", "attach_image"] {
+                    if !active.iter().any(|tool| tool == name) { active.push(name.into()); }
+                }
             }
             active
         } else { active };

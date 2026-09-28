@@ -11,6 +11,8 @@ pub const JEV_SKILL_HINT_BLOCK_END: &str = "</jev_skill_hint>";
 
 const IMAGE_DISPLAY_GUIDANCE: &str = "# Showing Images\n\nWhen the user asks to see an image, screenshot, or chart in this chat, use the attach-image skill and emit it with `print(await attach_image(path))` in the Python workspace. Wait for capture or generation to finish before attaching the file. The attachment provides the inline preview when terminal image display is enabled. Local Markdown image links such as `![Screenshot](/tmp/shot.png)` only render as text links; they do not display images. If the user asks to show it again, emit a fresh attachment in that turn. If attachment fails, report the error instead of claiming the image is shown.";
 
+const NATIVE_IMAGE_DISPLAY_GUIDANCE: &str = "# Showing Images\n\nUse the native `attach_image` tool with a paths array to attach screenshots, charts and other saved images to this chat and the model's context. It works in Node, Clang-Repl and Direct tools without a Python kernel. Wait for file generation to finish, then call attach_image as a separate native tool. Do not execute the Python attach_image shell CLI, import rlm, or switch to IPython just to attach an image. Local Markdown image links do not display inline previews. Reattach when asked to show an image again, and report any attachment error honestly. Matplotlib scripts run outside IPython should savefig to a file, then attach that file.";
+
 const MATPLOTLIB_DISPLAY_GUIDANCE: &str = "Matplotlib figures in the Python workspace use an inline backend by default: new or changed open figures are attached when the cell finishes. Use `plt.show()` or `fig.show()` to display them explicitly or show them again. Keep the default backend for chat previews; an explicit `matplotlib.use('Agg')` or MPLBACKEND override disables automatic previews. Saved image files can be displayed with the attach-image skill when available.";
 
 use serde::{Deserialize, Serialize};
@@ -110,6 +112,8 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     let tools = selected_tools.clone().unwrap_or_else(|| vec!["ipython".to_string()]);
     let has_ipython = tools.iter().any(|tool| tool == "ipython");
     let has_node = tools.iter().any(|tool| tool == "node");
+    let has_clang = tools.iter().any(|tool| tool == "clang");
+    let has_native_image = tools.iter().any(|tool| tool == "attach_image");
     let has_bash = tools.iter().any(|tool| tool == "bash");
     // Python-backed skills depend on the persistent workspace. Do not advertise
     // them as shell executables when the session exposes only direct tools.
@@ -141,6 +145,8 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         let mut prompt = custom_prompt;
         if has_node {
             prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::NODE_TOOL_PROMPT));
+        } else if has_clang {
+            prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::CLANG_TOOL_PROMPT));
         } else if !has_ipython && has_bash {
             prompt.push_str(&format!("\n\n{}", crate::core::prompts::rlm::DIRECT_TOOL_PROMPT));
         }
@@ -161,7 +167,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         // Append skills section only when the model has a way to inspect skill files.
         let custom_prompt_has_file_access = match &selected_tools {
             None => true,
-            Some(tools) => tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "bash"),
+            Some(tools) => tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "clang" || tool == "bash"),
         };
         if custom_prompt_has_file_access && !skills.is_empty() {
             prompt.push_str(&format_skills_for_prompt(&skills));
@@ -203,7 +209,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
             prompt.push_str(&format!("\n\n{generic_mcp_section}"));
         }
 
-        if has_attach_image {
+        if has_native_image {
+            prompt.push_str(&format!("\n\n{NATIVE_IMAGE_DISPLAY_GUIDANCE}"));
+        } else if has_attach_image {
             prompt.push_str(&format!("\n\n{IMAGE_DISPLAY_GUIDANCE}"));
         }
         if has_ipython {
@@ -228,7 +236,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         active_tools: Some(
             tools
                 .iter()
-                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "bash" || name.as_str() == "edit" || name.as_str() == "subagent")
+                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "clang" || name.as_str() == "bash" || name.as_str() == "edit" || name.as_str() == "subagent")
                 .cloned()
                 .collect(),
         ),
@@ -273,7 +281,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         prompt.push_str(&format!("\n\n{generic_mcp_section}"));
     }
 
-    if has_attach_image {
+    if has_native_image {
+        prompt.push_str(&format!("\n\n{NATIVE_IMAGE_DISPLAY_GUIDANCE}"));
+    } else if has_attach_image {
         prompt.push_str(&format!("\n\n{IMAGE_DISPLAY_GUIDANCE}"));
     }
     if has_ipython {
@@ -295,7 +305,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     }
 
     // Append skills section only when the model has a way to inspect skill files.
-    let has_file_access = tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "bash");
+    let has_file_access = tools.iter().any(|tool| tool == "ipython" || tool == "node" || tool == "clang" || tool == "bash");
     if has_file_access && !skills.is_empty() {
         prompt.push_str(&format_skills_for_prompt(&skills));
         if let Some(hint) = &options.skill_hint { prompt.push_str(hint); }

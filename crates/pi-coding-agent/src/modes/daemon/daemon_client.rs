@@ -244,7 +244,7 @@ impl DaemonSocketClosedError {
             .map(|cause| format!(" Cause: {cause}."))
             .unwrap_or_default();
         format!(
-            "Connection to the Prime Agent daemon closed.{reason_details}{cause_details} {}",
+            "Connection to the Optimus Agent daemon closed.{reason_details}{cause_details} {}",
             daemon_endpoint_details(&self.socket_path)
         )
     }
@@ -276,8 +276,8 @@ impl DaemonCapabilityUnavailableError {
 
     pub fn message(&self) -> String {
         match &self.capability {
-            Some(capability) => format!("The running Prime Agent daemon does not support {capability}."),
-            None => format!("The running Prime Agent daemon does not support {}.", self.command),
+            Some(capability) => format!("The running Optimus Agent daemon does not support {capability}."),
+            None => format!("The running Optimus Agent daemon does not support {}.", self.command),
         }
     }
 }
@@ -435,6 +435,11 @@ pub(crate) fn command_compatibilities(body: &DaemonCommandBody) -> Vec<DaemonCom
             .and_then(crate::core::slash_commands::parse_session_slash_command)
             .is_some_and(|c| matches!(c.args.trim(), "node" | "toggle")) {
             requirements.push(DaemonCommandCompatibility::gated(35, DaemonServerCapability::NodeExecutionMode));
+        }
+        if body.get("message").and_then(Value::as_str)
+            .and_then(crate::core::slash_commands::parse_session_slash_command)
+            .is_some_and(|c| matches!(c.args.trim(), "clang" | "clang-repl" | "cycle")) {
+            requirements.push(DaemonCommandCompatibility::gated(36, DaemonServerCapability::ClangExecutionMode));
         }
     }
     let has_field = |key: &str| body.get(key).is_some_and(|value| !value.is_null());
@@ -739,7 +744,7 @@ impl DaemonClient {
             .and_then(std::sync::Weak::upgrade)
             .ok_or_else(|| {
                 DaemonClientError::Message(
-                    "Prime Agent daemon client requires an Arc handle for this operation".to_string(),
+                    "Optimus Agent daemon client requires an Arc handle for this operation".to_string(),
                 )
             })
     }
@@ -772,7 +777,7 @@ impl DaemonClient {
             }
             if state.socket.is_none() {
                 return Err(DaemonClientError::Message(format!(
-                    "Cannot wait for the Prime Agent daemon handshake because the daemon is not connected. {}",
+                    "Cannot wait for the Optimus Agent daemon handshake because the daemon is not connected. {}",
                     daemon_endpoint_details(&self.socket_path)
                 )));
             }
@@ -782,13 +787,13 @@ impl DaemonClient {
         match tokio::time::timeout(Duration::from_millis(timeout_ms), receiver).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(DaemonClientError::Message(format!(
-                "Cannot wait for the Prime Agent daemon handshake because the daemon is not connected. {details}"
+                "Cannot wait for the Optimus Agent daemon handshake because the daemon is not connected. {details}"
             ))),
             Err(_) => {
                 let mut state = self.state.lock().await;
                 state.hello_waiters.retain(|waiter| !waiter.sender.is_closed());
                 Err(DaemonClientError::Message(format!(
-                    "Timed out after {timeout_ms}ms waiting for the Prime Agent daemon handshake. {details}"
+                    "Timed out after {timeout_ms}ms waiting for the Optimus Agent daemon handshake. {details}"
                 )))
             }
         }
@@ -797,14 +802,14 @@ impl DaemonClient {
     pub async fn connect(self: &Arc<Self>, timeout_ms: u64) -> DaemonClientResult<()> {
         if self.closed.load(Ordering::SeqCst) {
             return Err(DaemonClientError::Message(
-                "Prime Agent daemon client is closed".to_string(),
+                "Optimus Agent daemon client is closed".to_string(),
             ));
         }
         {
             let mut state = self.state.lock().await;
             if state.socket.is_some() {
                 return Err(DaemonClientError::Message(format!(
-                    "Prime Agent daemon client is already connected. {}",
+                    "Optimus Agent daemon client is already connected. {}",
                     daemon_endpoint_details(&self.socket_path)
                 )));
             }
@@ -823,13 +828,13 @@ impl DaemonClient {
             Ok(Ok(stream)) => stream,
             Ok(Err(error)) => {
                 return Err(DaemonClientError::Message(format!(
-                    "Failed to connect to the Prime Agent daemon: {error}. {}",
+                    "Failed to connect to the Optimus Agent daemon: {error}. {}",
                     daemon_endpoint_details(&self.socket_path)
                 )));
             }
             Err(_) => {
                 return Err(DaemonClientError::Message(format!(
-                    "Timed out after {timeout_ms}ms connecting to the Prime Agent daemon. {}",
+                    "Timed out after {timeout_ms}ms connecting to the Optimus Agent daemon. {}",
                     daemon_endpoint_details(&self.socket_path)
                 )));
             }
@@ -940,7 +945,7 @@ impl DaemonClient {
             let state = self.state.lock().await;
             if state.socket.is_none() {
                 return Err(DaemonClientError::Message(format!(
-                    "Cannot send daemon command \"{}\" because the Prime Agent daemon is not connected. {}",
+                    "Cannot send daemon command \"{}\" because the Optimus Agent daemon is not connected. {}",
                     command_body_type(&command),
                     daemon_endpoint_details(&self.socket_path)
                 )));
@@ -1019,7 +1024,7 @@ impl DaemonClient {
                 Some(socket) => socket,
                 None => {
                     return Err(DaemonClientError::Message(format!(
-                        "Cannot send daemon command \"{}\" because the Prime Agent daemon is not connected. {}",
+                        "Cannot send daemon command \"{}\" because the Optimus Agent daemon is not connected. {}",
                         command_body_type(&command),
                         daemon_endpoint_details(&self.socket_path)
                     )));
@@ -1085,7 +1090,7 @@ impl DaemonClient {
                 let pending = self.state.lock().await.pending.remove(&id);
                 if let Some(pending) = pending {
                     pending.settle(Err(DaemonClientError::Message(format!(
-                        "Timed out after {}ms waiting for the Prime Agent daemon response to \"{}\". {details}",
+                        "Timed out after {}ms waiting for the Optimus Agent daemon response to \"{}\". {details}",
                         pending.timeout_ms, pending.command_type
                     ))));
                 }
@@ -1105,7 +1110,7 @@ impl DaemonClient {
         let settled = result.lock().expect("pending request slot poisoned").take();
         settled.unwrap_or_else(|| {
             Err(DaemonClientError::Message(format!(
-                "Prime Agent daemon client closed before the operation completed. {details} (command \"{command_type}\")"
+                "Optimus Agent daemon client closed before the operation completed. {details} (command \"{command_type}\")"
             )))
         })
     }
@@ -1120,7 +1125,7 @@ impl DaemonClient {
         self.quick_connected.store(false, Ordering::SeqCst);
         self.reject_all(
             DaemonClientError::Message(format!(
-                "Prime Agent daemon client closed before the operation completed. {}",
+                "Optimus Agent daemon client closed before the operation completed. {}",
                 daemon_endpoint_details(&self.socket_path)
             )),
             false,
@@ -1668,10 +1673,10 @@ mod tests {
             DaemonCapabilityUnavailableError::new("get_history_range", Some("history_ranges"), false);
         assert_eq!(
             with_capability.message(),
-            "The running Prime Agent daemon does not support history_ranges."
+            "The running Optimus Agent daemon does not support history_ranges."
         );
         let without = DaemonCapabilityUnavailableError::new("bogus", None, false);
-        assert_eq!(without.message(), "The running Prime Agent daemon does not support bogus.");
+        assert_eq!(without.message(), "The running Optimus Agent daemon does not support bogus.");
     }
 
     #[test]
@@ -1684,7 +1689,7 @@ mod tests {
     #[test]
     fn socket_closed_error_carries_reason_and_cause() {
         let error = DaemonSocketClosedError::new("/tmp/sock", Some("update"), Some("reset"));
-        assert!(error.message().starts_with("Connection to the Prime Agent daemon closed."));
+        assert!(error.message().starts_with("Connection to the Optimus Agent daemon closed."));
         assert!(error.message().contains(" Reason: update."));
         assert!(error.message().contains(" Cause: reset."));
         assert_eq!(

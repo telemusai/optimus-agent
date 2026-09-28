@@ -67,7 +67,8 @@ impl Fixture {
             "autoRefine":{"enabled":false}, "retry":{"enabled":false}, "compaction":{"enabled":false},
             "telemetryEnabled":false, "agentTracesEnabled":false
         }).as_object().unwrap().clone())));
-        let model: Model = self.provider.get_model();
+        let mut model: Model = self.provider.get_model();
+        model.input.push(pi_ai::types::InputModality::Image);
         let auth = Arc::new(tokio::sync::Mutex::new(AuthStorage::in_memory(
             Default::default(),
             None,
@@ -260,7 +261,7 @@ async fn mid_conversation_switch_changes_outgoing_requests_runs_direct_tools_and
     let file = session.session_file().unwrap();
     session.dispose_async(Some(false)).await;
     let resumed = f.session(Some(&file), false).await;
-    assert_eq!(resumed.get_active_tool_names(), ["bash", "edit", "subagent"]);
+    assert_eq!(resumed.get_active_tool_names(), ["bash", "edit", "subagent", "attach_image"]);
     f.reply(None, None);
     turn(&resumed, "Continue after resume").await;
     f.assert_request(3, true);
@@ -392,7 +393,7 @@ async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
         assert_eq!(f.captured.lock().unwrap().len(), 1, "a setting must not wake the model");
         assert_eq!(stop_entries(&file), stopped, "a setting must not clear the durable stop");
     }
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent", "attach_image"]);
     assert!(session.system_prompt().contains("Execution mode: Direct tools"));
     tokio::time::timeout(Duration::from_secs(5), session.prompt_and_wait("/mode direct", None))
         .await.expect("stopped mode commands acknowledge completion").unwrap();
@@ -404,12 +405,12 @@ async fn stopped_mode_switch_preserves_queue_goal_and_stop_across_reopen() {
         session.prompt("/mode toggle", None), session.prompt("/mode toggle", None), session.prompt("/mode toggle", None)
     );
     a.unwrap(); b.unwrap(); c.unwrap();
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent", "attach_image"]);
     assert!(session.prompt("/compact", None).await.is_err());
     session.dispose_async(Some(false)).await;
     let reopened = f.session(Some(&file), false).await;
     assert!(reopened.is_queued_work_suspended());
-    assert_eq!(reopened.get_active_tool_names(), ["bash", "edit", "subagent"]);
+    assert_eq!(reopened.get_active_tool_names(), ["bash", "edit", "subagent", "attach_image"]);
     turn(&reopened, "/mode toggle").await;
     assert_eq!(reopened.get_active_tool_names(), ["ipython"]);
     assert!(reopened.is_queued_work_suspended());
@@ -524,7 +525,7 @@ async fn f6_during_real_python_cell_does_not_block_admission_or_follow_up() {
     std::fs::write(release, "go").unwrap();
     tokio::time::timeout(Duration::from_secs(15), running).await.expect("active turn finished").unwrap().unwrap();
     idle(&session).await;
-    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent", "attach_image"]);
     assert_eq!(f.captured.lock().unwrap()[1].tools.as_ref().unwrap()[0].name, "node",
         "the next provider request must use Node immediately after the completed tool batch");
     assert!(serde_json::to_string(&session.messages()).unwrap().contains("PYTHON_COMPLETED"));
@@ -537,7 +538,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     let f = Fixture::new();
     let session = f.session(None, false).await;
     turn(&session, "/mode toggle").await;
-    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent", "attach_image"]);
     f.reply(Some(("node", json!({"code":"const modeValue = 41; modeValue"}))), None);
     f.reply(None, None);
     turn(&session, "Use Node").await;
@@ -545,7 +546,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     assert!(captured.system_prompt.unwrap().contains("JavaScript is the orchestration language"));
     assert_eq!(captured.tools.unwrap()[0].name, "node");
     turn(&session, "/mode toggle").await;
-    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["bash", "edit", "subagent", "attach_image"]);
     turn(&session, "/mode toggle").await;
     assert_eq!(session.get_active_tool_names(), ["ipython"]);
     turn(&session, "/mode node").await;
@@ -559,7 +560,7 @@ async fn node_mode_retains_state_across_live_switches_and_restores_its_prompt() 
     let file = session.session_file().unwrap();
     session.dispose_async(Some(false)).await;
     let reopened = f.session(Some(&file), false).await;
-    assert_eq!(reopened.get_active_tool_names(), ["node", "subagent"]);
+    assert_eq!(reopened.get_active_tool_names(), ["node", "subagent", "attach_image"]);
     assert!(reopened.system_prompt().contains("JavaScript is the orchestration language"));
     reopened.dispose_async(Some(false)).await;
 }
@@ -584,7 +585,7 @@ async fn f6_after_node_tool_batch_continues_unfinished_work_in_direct_mode() {
     tokio::time::timeout(Duration::from_secs(2), session.prompt("/mode toggle", Some(PromptOptions {
         streaming_behavior: Some("followUp".into()), ..Default::default()
     }))).await.expect("F6 acknowledged while Node is busy").unwrap();
-    assert_eq!(session.get_active_tool_names(), ["node", "subagent"]);
+    assert_eq!(session.get_active_tool_names(), ["node", "subagent", "attach_image"]);
     std::fs::write(release, "go").unwrap();
     tokio::time::timeout(Duration::from_secs(10), running).await.unwrap().unwrap().unwrap();
     idle(&session).await;
@@ -627,5 +628,123 @@ async fn native_subagents_respect_tool_restrictions_and_depth_limits() {
         assert_eq!(result["isError"], true, "{result}");
     }
     assert!(session.get_rlm_child_snapshots().is_empty());
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn native_images_reach_the_next_model_request_in_node_direct_and_clang() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let path = f.root.path().join("workspace/chart.png");
+    image::RgbaImage::from_pixel(32, 24, image::Rgba([255, 0, 180, 255])).save(&path).unwrap();
+    let session = f.session(None, false).await;
+    for mode in ["node", "direct", "clang"] {
+        turn(&session, &format!("/mode {mode}")).await;
+        assert!(session.system_prompt().contains("native `attach_image` tool"));
+        f.reply(Some(("attach_image", json!({"paths":["chart.png"]}))), None);
+        f.reply(None, None);
+        turn(&session, "Show the saved chart inline").await;
+        let context = f.captured.lock().unwrap().last().unwrap().clone();
+        let messages = serde_json::to_value(&context.messages).unwrap();
+        let result = messages.as_array().unwrap().iter().rev().find(|m| m["role"] == "toolResult").unwrap();
+        assert_eq!(result["isError"], false, "{result}");
+        assert!(result["content"].as_array().unwrap().iter().any(|c| c["type"] == "image" && c["mimeType"] == "image/png"));
+        assert!(!result.to_string().contains("repl runtime is not serving"));
+    }
+    let file = session.session_file().unwrap();
+    session.dispose_async(Some(false)).await;
+    let reopened = f.session(Some(&file), false).await;
+    assert_eq!(reopened.get_active_tool_names(), ["clang", "subagent", "attach_image"]);
+    assert!(reopened.system_prompt().contains("C++ is the orchestration language"));
+    let messages = serde_json::to_value(reopened.messages()).unwrap();
+    assert_eq!(messages.as_array().unwrap().iter().filter(|m| m["role"] == "toolResult" && m["toolName"] == "attach_image").count(), 3);
+    reopened.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn four_mode_cycle_is_durable_and_replaces_language_instructions() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    for (tool, language) in [("node", "JavaScript"), ("clang", "C++"), ("bash", "Direct tools"), ("ipython", "Python")] {
+        turn(&session, "/mode cycle").await;
+        assert_eq!(session.get_active_tool_names()[0], tool);
+        f.reply(None, None);
+        turn(&session, "Continue with the current execution language").await;
+        let context = f.captured.lock().unwrap().last().unwrap().clone();
+        assert!(context.system_prompt.unwrap().contains(language));
+        assert_eq!(context.tools.unwrap()[0].name, tool);
+    }
+    session.abort().await.unwrap();
+    for _ in 0..4 { turn(&session, "/mode cycle").await; }
+    assert!(session.is_queued_work_suspended());
+    assert_eq!(session.get_active_tool_names(), ["ipython"]);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+#[ignore = "requires OPTIMUS_CLANG_REPL pointing to LLVM clang-repl"]
+async fn real_clang_state_survives_mode_switches_and_recovers_from_compiler_errors() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    assert!(std::env::var_os("OPTIMUS_CLANG_REPL").is_some());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    turn(&session, "/mode clang").await;
+    for code in ["int answer = 40;\nint add(int n) { return answer + n; }", "not_valid_cpp !!"] {
+        f.reply(Some(("clang", json!({"code":code}))), None);
+        f.reply(None, None);
+        turn(&session, "Run C++").await;
+    }
+    turn(&session, "/mode node").await;
+    f.reply(Some(("node", json!({"code":"const independent = 7; independent"}))), None);
+    f.reply(None, None);
+    turn(&session, "Run JavaScript").await;
+    turn(&session, "/mode clang").await;
+    f.reply(Some(("clang", json!({"code":"auto show = [] { std::printf(\"CLANG_RETAINED_%d\\n\", add(2)); return 0; }();"}))), None);
+    f.reply(None, None);
+    turn(&session, "Read retained C++ state").await;
+    let history = serde_json::to_value(session.messages()).unwrap();
+    let results: Vec<_> = history.as_array().unwrap().iter().filter(|m| m["role"] == "toolResult").collect();
+    assert_eq!(results.len(), 4);
+    assert_eq!(results[0]["isError"], false, "{results:?}");
+    assert_eq!(results[1]["isError"], true, "{results:?}");
+    assert_eq!(results[3]["isError"], false, "{results:?}");
+    assert!(results[3].to_string().contains("CLANG_RETAINED_42"));
+    let last = f.captured.lock().unwrap().last().unwrap().clone();
+    let prompt = last.system_prompt.unwrap();
+    assert!(prompt.contains("C++ is the orchestration language"));
+    assert!(!prompt.contains("JavaScript is the orchestration language"));
+    assert!(!prompt.contains("Python is the orchestration language"));
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+#[ignore = "requires OPTIMUS_CLANG_REPL pointing to LLVM clang-repl"]
+async fn real_busy_clang_switch_yields_to_direct_without_jamming() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    let f = Fixture::new();
+    let session = f.session(None, false).await;
+    turn(&session, "/mode clang").await;
+    let started = f.root.path().join("workspace/clang-started");
+    let release = f.root.path().join("workspace/clang-release");
+    f.reply(Some(("clang", json!({"code":"#include <fstream>\n#include <thread>\n#include <chrono>\nauto busy = [] { std::ofstream(\"clang-started\") << \"ready\"; while (!std::ifstream(\"clang-release\").good()) std::this_thread::sleep_for(std::chrono::milliseconds(20)); std::printf(\"CLANG_FINISHED\\n\"); return 0; }();"}))), None);
+    f.reply(Some(("bash", json!({"command":"printf DIRECT_AFTER_CLANG"}))), None);
+    f.reply(None, None);
+    let running = { let session = session.clone(); tokio::spawn(async move { session.prompt("Run C++", None).await }) };
+    tokio::time::timeout(Duration::from_secs(20), async {
+        while !started.exists() { tokio::time::sleep(Duration::from_millis(20)).await; }
+    }).await.expect("Clang cell started");
+    tokio::time::timeout(Duration::from_secs(2), session.prompt("/mode cycle", Some(PromptOptions {
+        streaming_behavior: Some("followUp".into()), ..Default::default()
+    }))).await.expect("F6 acknowledged while C++ was busy").unwrap();
+    assert_eq!(session.get_active_tool_names()[0], "clang");
+    std::fs::write(release, "go").unwrap();
+    tokio::time::timeout(Duration::from_secs(15), running).await.unwrap().unwrap().unwrap();
+    idle(&session).await;
+    f.assert_request(1, true);
+    let history = serde_json::to_value(session.messages()).unwrap();
+    let results: Vec<_> = history.as_array().unwrap().iter().filter(|m| m["role"] == "toolResult").collect();
+    assert!(results.iter().all(|m| m["isError"] == false), "{results:?}");
+    assert!(results.last().unwrap().to_string().contains("DIRECT_AFTER_CLANG"));
     session.dispose_async(Some(false)).await;
 }

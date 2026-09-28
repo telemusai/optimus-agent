@@ -298,6 +298,36 @@ fn execution_mode_raw_and_typed_gates_agree_and_keep_ordinary_chat_compatible() 
     }
 }
 
+#[test]
+fn clang_mode_is_optional_and_legacy_mode_commands_stay_compatible() {
+    use super::super::daemon_protocol::{DaemonCommand, get_daemon_command_compatibilities};
+    let old = hello(35, &["session_input_admission", "execution_mode", "node_execution_mode"]);
+    let new = hello(36, &["session_input_admission", "execution_mode", "node_execution_mode", "clang_execution_mode"]);
+    for kind in ["prompt", "prompt_and_wait", "steer", "follow_up"] {
+        for message in ["/mode clang", "/mode clang-repl", "/mode cycle", "/mode toggle", "/mode node", "/mode direct", "ordinary chat"] {
+            let value = json!({"type":kind,"activeSessionId":"session-a","message":message});
+            let raw = value.as_object().unwrap().clone();
+            let typed: DaemonCommand = serde_json::from_value(value).unwrap();
+            assert_eq!(command_compatibilities(&raw), get_daemon_command_compatibilities(&typed));
+            assert_eq!(supported(&old, &raw), !matches!(message, "/mode clang" | "/mode clang-repl" | "/mode cycle"));
+            assert!(supported(&new, &raw));
+        }
+    }
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn clang_mode_is_rejected_before_writing_to_an_older_node_daemon() {
+    for message in ["/mode clang", "/mode cycle"] {
+        let command = json!({"type":"prompt","activeSessionId":"session-a","message":message}).as_object().unwrap().clone();
+        let (client, peer) = connected_client(hello(35, &["session_input_admission", "execution_mode", "node_execution_mode"])).await;
+        let error = client.request(command, Some(100), Default::default()).await.unwrap_err();
+        assert!(matches!(error, DaemonClientError::CapabilityUnavailable(ref e) if e.capability.as_deref() == Some("clang_execution_mode")));
+        assert_no_wire_bytes(&peer);
+        client.close().await;
+    }
+}
+
 #[cfg(unix)]
 #[tokio::test]
 async fn execution_mode_rejects_old_daemons_before_writing_and_sends_to_capable_daemons() {

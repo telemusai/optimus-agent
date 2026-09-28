@@ -366,7 +366,8 @@ fn execution_label(mode: &InteractiveMode) -> Option<String> {
         if let Some(command) = crate::core::slash_commands::parse_session_slash_command(text) {
             if command.name == "mode" && !command.args.is_empty() {
                 pending = match command.args.as_str() {
-                    "toggle" => Some(pending.unwrap_or(current).toggled()),
+                    "cycle" => Some(pending.unwrap_or(current).toggled()),
+                    "toggle" => Some(pending.unwrap_or(current).legacy_toggled()),
                     value => ExecutionMode::parse(value).ok().or(pending),
                 };
             }
