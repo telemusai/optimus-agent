@@ -316,7 +316,7 @@ impl ToolExecutionComponent {
     }
 
     fn should_use_ipython_renderer(&self) -> bool {
-        matches!(self.tool_name.as_str(), "ipython" | "node")
+        matches!(self.tool_name.as_str(), "ipython" | "node" | "clang")
             && !self
                 .tool_definition
                 .as_ref()
@@ -629,10 +629,13 @@ impl ToolExecutionComponent {
                         .result
                         .as_ref()
                         .map(|result| result.content.iter().map(to_ipython_cell_block).collect()),
-                    details: if self.tool_name == "node" {
-                        let mut details = self.result.as_ref().and_then(|result| result.details.clone()).unwrap_or_else(|| serde_json::json!({}));
-                        details["language"] = serde_json::json!("javascript");
-                        Some(details)
+                    details: if matches!(self.tool_name.as_str(), "node" | "clang") {
+                        let mut details = self.result.as_ref()
+                            .and_then(|result| result.details.as_ref())
+                            .and_then(Value::as_object).cloned().unwrap_or_default();
+                        let language = if self.tool_name == "clang" { "cpp" } else { "javascript" };
+                        details.insert("language".into(), Value::String(language.into()));
+                        Some(Value::Object(details))
                     } else { self.result.as_ref().and_then(|result| result.details.clone()) },
                     is_partial: Some(self.is_partial),
                     is_error: Some(
@@ -885,6 +888,10 @@ pub fn select_latest_tool_expand_hint(
 #[cfg(test)]
 #[path = "tool_execution_jev_tests.rs"]
 mod jev_tests;
+
+#[cfg(test)]
+#[path = "tool_execution_clang_tests.rs"]
+mod clang_tests;
 
 #[cfg(test)]
 mod tests {

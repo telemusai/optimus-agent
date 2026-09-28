@@ -74,6 +74,8 @@ F6 and `/mode` also work in stopped chats, including after reopening them. Switc
 
 Use `/mode` to inspect the current mode, `/mode ipython`, `/mode node`, `/mode clang`, or `/mode direct` to select one, and `/mode cycle` to advance through all four. The older `/mode toggle` command retains its three-mode cycle for older clients. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
 
+Python, Node, and Clang-Repl cells share the **Ctrl+O** detail cycle. Collapsed cells show a short code summary, status, and line counts; expanding shows the full source, output, and diagnostics. This also applies to resumed chats, and the last selected detail level is remembered.
+
 Python-only skills, the Python `rlm` API, kernel MCP connections, and automatic Matplotlib previews require IPython mode. Saved images can be attached in every mode: Node, Clang-Repl and Direct tools expose a native `attach_image` tool with a `paths` array. Save a chart or screenshot, then call that tool; no Python kernel or shell attachment command is needed. Image attachments render inline when terminal image display is enabled and are available to vision-capable models. Native subagent delegation works in Node, Clang-Repl and Direct tools as well. Other exposed tools, including Dynamic Jev, remain available in all four modes. Changing mode does not change the selected model, Jev settings, or autonomy settings.
 
 In Node mode, the agent sends JavaScript to the `node` tool. It can use `require("node:fs/promises")`, async commands through `node:child_process`, and `await nodeImport("module-or-path")` for ESM. The cell timeout defaults to 60 seconds and can be set up to one hour. Python skills and the Python `rlm` API are available by switching back to IPython.

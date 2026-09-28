@@ -367,7 +367,7 @@ wheels = [
 
 [[package]]
 name = "prime-agent-runtime"
-version = "0.1.13"
+version = "0.1.14"
 source = { editable = "." }
 dependencies = [
     { name = "mcp" },
