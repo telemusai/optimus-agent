@@ -34,32 +34,6 @@ pub const RESPONSES_EFFORT_KEY: &str = "reasoning.effort";
 /// Supported reasoning-effort values in increasing order.
 pub const REASONING_LADDER: [&str; 6] = ["minimal", "low", "medium", "high", "xhigh", "max"];
 
-/// Maximum byte length of a rendered `from`/`to` value before truncation.
-const MAX_RENDER_BYTES: usize = 120;
-
-const TRUNCATION_MARKER: &str = "...";
-
-fn render(value: &Value) -> String {
-    let text = serde_json::to_string(value).unwrap_or_else(|_| String::from("<unrenderable>"));
-    truncate_bytes(text, MAX_RENDER_BYTES)
-}
-
-/// Truncate to at most `max` bytes on a UTF-8 boundary, appending the marker
-/// when anything was dropped.
-fn truncate_bytes(text: String, max: usize) -> String {
-    if text.len() <= max {
-        return text;
-    }
-    let mut end = max;
-    while end > 0 && !text.is_char_boundary(end) {
-        end -= 1;
-    }
-    let mut out = String::with_capacity(end + TRUNCATION_MARKER.len());
-    out.push_str(&text[..end]);
-    out.push_str(TRUNCATION_MARKER);
-    out
-}
-
 /// Index of a reasoning-effort value, if it is on the supported ladder.
 fn ladder_index(effort: &str) -> Option<usize> {
     REASONING_LADDER.iter().position(|step| *step == effort)
@@ -92,8 +66,10 @@ pub fn apply_decision(params: &mut Value, category: &str, value: &str) -> Vec<Ap
         return Vec::new();
     };
 
+    // Task classification is advisory, not authority to withdraw execution tools.
+    // Deliberate catalog reductions use the guarded optional-candidate path.
     if category == "tool_requirement" {
-        return apply_tool_requirement(object, category, value);
+        return Vec::new();
     }
     if category == "complexity" {
         return apply_complexity(object, category, value);
@@ -119,56 +95,6 @@ pub fn apply_model_decision(params: &mut Value, category: &str, value: &str, mod
     if key == RESPONSES_EFFORT_KEY { params["reasoning"]["effort"] = Value::String(previous); }
     else { params[key] = Value::String(previous); }
     Vec::new()
-}
-
-/// Drop the tool surface when the decision says no tool is required.
-///
-/// A missing or empty `tools` array means there is nothing to disable, so the
-/// body is left byte-identical.
-fn apply_tool_requirement(
-    object: &mut serde_json::Map<String, Value>,
-    category: &str,
-    value: &str,
-) -> Vec<AppliedChange> {
-    if !value.trim().eq_ignore_ascii_case("none") {
-        return Vec::new();
-    }
-    let has_tools = matches!(object.get(TOOLS_KEY), Some(Value::Array(tools)) if !tools.is_empty());
-    if !has_tools {
-        return Vec::new();
-    }
-
-    let mut changes = Vec::new();
-    if let Some(removed) = object.remove(TOOLS_KEY) {
-        // Keep explicit Dynamic requests reachable without disabling normal pruning.
-        let pinned: Vec<_> = removed.as_array().into_iter().flatten()
-            .filter(|tool| tool_name_for_pruning(tool) == Some("jev_decide")).cloned().collect();
-        let retained = (!pinned.is_empty()).then(|| Value::Array(pinned));
-        if let Some(retained) = &retained {
-            object.insert(TOOLS_KEY.into(), retained.clone());
-            if retained == &removed { return changes; }
-        }
-        changes.push(AppliedChange {
-            key: TOOLS_KEY.to_string(),
-            from: Some(render(&removed)),
-            to: retained.as_ref().map(render),
-            category: category.to_string(),
-        });
-    }
-    // Retaining Dynamic must not override an explicit provider-side tool ban.
-    if object.contains_key(TOOLS_KEY)
-        && object.get(TOOL_CHOICE_KEY).and_then(Value::as_str) == Some("none") {
-        return changes;
-    }
-    if let Some(removed) = object.remove(TOOL_CHOICE_KEY) {
-        changes.push(AppliedChange {
-            key: TOOL_CHOICE_KEY.to_string(),
-            from: Some(render(&removed)),
-            to: None,
-            category: category.to_string(),
-        });
-    }
-    changes
 }
 
 /// Nudge `reasoning_effort` by exactly one ladder step.
@@ -223,7 +149,7 @@ fn apply_complexity(
 }
 
 
-/// Optional catalog pruning is independent of the legacy whole-catalog switch.
+/// Optional catalog pruning is independent of advisory tool-requirement classification.
 /// An empty optional allowlist intentionally preserves every tool.
 pub struct PreparedToolPruning {
     pub state: Value,
@@ -314,7 +240,8 @@ pub fn prepare_tool_pruning(
             return plan;
         };
         if !seen.insert(name) { return plan; }
-        let mandatory = name == "ipython" || name == "jev_decide" || name.starts_with("__") || name.starts_with("rlm")
+        let mandatory = matches!(name, "ipython" | "node" | "clang" | "bash" | "edit" | "subagent" | "attach_image" | "jev_decide")
+            || name.starts_with("__") || name.starts_with("rlm")
             || name.starts_with("agent_") || options.mandatory_tool_names.iter().any(|item| item == name);
         if mandatory || !options.optional_tool_names.iter().any(|item| item == name)
             || candidates.len() >= options.max_candidates { continue; }
@@ -344,60 +271,45 @@ mod tests {
     }
 
     #[test]
-    fn dynamic_tool_survives_automatic_requirement_and_candidate_pruning() {
-        for tool in [json!({"type":"function","function":{"name":"jev_decide","parameters":{}}}),
-            json!({"type":"function","name":"jev_decide","parameters":{}}),
-            json!({"name":"jev_decide","input_schema":{}})] {
-            let mut body=json!({"tools":[tool],"tool_choice":"auto"});
-            let original=body.clone();
-            assert!(apply_decision(&mut body,"tool_requirement","none").is_empty());
-            assert_eq!(body,original);
-            let options=pruning_options(&["jev_decide"]);
-            assert!(prepare_tool_pruning(&body,"Get Jev to flip a coin",&options).questions().is_empty());
-            body["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"lookup"}));
-            assert!(!apply_decision(&mut body,"tool_requirement","none").is_empty());
-            assert_eq!(body["tools"],original["tools"]);
-            assert!(body.get("tool_choice").is_none());
-            body["tools"].as_array_mut().unwrap().push(json!({"type":"function","name":"lookup"}));
-            body["tool_choice"] = json!("none");
-            apply_decision(&mut body,"tool_requirement","none");
-            assert_eq!(body["tool_choice"],"none");
-            assert_eq!(body["tools"],original["tools"]);
+    fn tool_requirement_is_advisory_for_every_execution_mode_and_provider_schema() {
+        use crate::core::execution_mode::ExecutionMode;
+        for mode in [ExecutionMode::Ipython, ExecutionMode::Direct, ExecutionMode::Node, ExecutionMode::Clang] {
+            for dynamic in [false, true] {
+                for schema in ["chat", "responses", "anthropic"] {
+                    let mut names = mode.tools(&[]);
+                    if dynamic { names.push("jev_decide".into()); }
+                    let tools: Vec<_> = names.iter().map(|name| match schema {
+                        "chat" => json!({"type":"function","function":{"name":name,"description":"keep","parameters":{"type":"object"}}}),
+                        "responses" => json!({"type":"function","name":name,"description":"keep","parameters":{"type":"object"}}),
+                        _ => json!({"name":name,"description":"keep","input_schema":{"type":"object"}}),
+                    }).collect();
+                    for value in ["none", "  NoNe ", "python", "multiple"] {
+                        let mut body = json!({"tools":tools,"tool_choice":"auto","messages":[{"role":"user","content":"status"}],"stream":true});
+                        let before = serde_json::to_vec(&body).unwrap();
+                        assert!(apply_model_decision(&mut body,"tool_requirement",value,None).is_empty());
+                        assert_eq!(serde_json::to_vec(&body).unwrap(),before,"{mode:?}/{schema}/{dynamic}");
+                    }
+                    // Even an explicit optional allowlist cannot remove native execution/control tools.
+                    let options = pruning_options(&names.iter().map(String::as_str).collect::<Vec<_>>());
+                    assert!(prepare_tool_pruning(&json!({"tools":tools}),"status",&options).questions().is_empty());
+                }
+            }
         }
     }
 
     #[test]
-    fn tool_requirement_none_removes_tools_and_tool_choice() {
-        let mut body = chat_body();
-        let changes = apply_decision(&mut body, "tool_requirement", "none");
-
-        assert!(body.get(TOOLS_KEY).is_none());
-        assert!(body.get(TOOL_CHOICE_KEY).is_none());
-        assert_eq!(body["model"], json!("gpt-5"));
-        assert_eq!(body["stream"], json!(true));
-        assert_eq!(body["messages"].as_array().map(Vec::len), Some(1));
-
-        assert_eq!(changes.len(), 2);
-        assert_eq!(changes[0].key, TOOLS_KEY);
-        assert_eq!(changes[0].category, "tool_requirement");
-        assert_eq!(changes[0].to, None);
-        assert!(changes[0]
-            .from
-            .as_deref()
-            .unwrap_or_default()
-            .contains("shell_exec"));
-        assert_eq!(changes[1].key, TOOL_CHOICE_KEY);
-        assert_eq!(changes[1].from.as_deref(), Some("\"auto\""));
-        assert_eq!(changes[1].to, None);
-    }
-
-    #[test]
-    fn tool_requirement_none_is_case_insensitive_and_trimmed() {
-        let mut body = chat_body();
-        let changes = apply_decision(&mut body, "tool_requirement", "  NoNe ");
-        assert_eq!(changes.len(), 2);
-        assert!(body.get(TOOLS_KEY).is_none());
-        assert!(body.get(TOOL_CHOICE_KEY).is_none());
+    fn advisory_requirement_preserves_forced_banned_unknown_and_custom_catalogs() {
+        for choice in [json!("auto"),json!("required"),json!("none"),json!({"type":"none"}),
+            json!({"type":"function","function":{"name":"custom"}}),json!({"type":"tool","name":"custom"}),
+            json!({"type":"allowed_tools","mode":"required","tools":[{"type":"function","name":"custom"}]}),Value::Null] {
+            for tools in [json!([{"type":"web_search"}]),json!([{"type":"function","name":"custom"}]),
+                json!([{"name":"unknown"}]),json!([{"type":"function","name":"jev_decide"}]),json!([]),Value::Null] {
+                let mut body = json!({"tools":tools,"tool_choice":choice,"input":"continue"});
+                let before = serde_json::to_vec(&body).unwrap();
+                assert!(apply_decision(&mut body,"tool_requirement","none").is_empty());
+                assert_eq!(serde_json::to_vec(&body).unwrap(),before);
+            }
+        }
     }
 
     #[test]
@@ -531,35 +443,6 @@ mod tests {
         assert_eq!(serde_json::to_string(&body).expect("serialize"), before);
     }
 
-    #[test]
-    fn from_render_is_truncated_to_120_bytes() {
-        let long_name = "a".repeat(400);
-        let mut body = json!({
-            "tools": [{"type": "function", "function": {"name": long_name}}],
-            "tool_choice": "auto"
-        });
-        let changes = apply_decision(&mut body, "tool_requirement", "none");
-        assert_eq!(changes.len(), 2);
-
-        let rendered = changes[0].from.as_deref().expect("from rendered");
-        assert_eq!(rendered.len(), MAX_RENDER_BYTES + TRUNCATION_MARKER.len());
-        assert!(rendered.ends_with(TRUNCATION_MARKER));
-        assert!(rendered.starts_with('['));
-        assert!(body.get(TOOLS_KEY).is_none());
-    }
-
-    #[test]
-    fn truncation_respects_utf8_boundaries() {
-        // 3-byte characters straddle the 120-byte cut point.
-        let text: String = std::iter::repeat('\u{20ac}').take(80).collect();
-        let truncated = truncate_bytes(text.clone(), MAX_RENDER_BYTES);
-        assert!(truncated.ends_with(TRUNCATION_MARKER));
-        assert!(truncated.len() <= MAX_RENDER_BYTES + TRUNCATION_MARKER.len());
-        assert!(truncated.is_char_boundary(0));
-        assert_eq!(truncate_bytes(String::from("short"), MAX_RENDER_BYTES), "short");
-    }
-
-
     fn pruning_options(names: &[&str]) -> pi_jev::filtering::FilteringOptions {
         pi_jev::filtering::FilteringOptions {
             optional_tool_names: names.iter().map(|name| name.to_string()).collect(),
@@ -639,12 +522,7 @@ mod tests {
         assert_eq!(body,original);
     }
 
-    #[test]
-    fn short_from_render_is_not_truncated() {
-        let mut body = json!({"tools": [{"type": "function"}], "tool_choice": "auto"});
-        let changes = apply_decision(&mut body, "tool_requirement", "none");
-        assert_eq!(changes[0].from.as_deref(), Some("[{\"type\":\"function\"}]"));
-    }
+
 }
 
 #[cfg(test)]

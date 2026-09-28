@@ -1216,6 +1216,9 @@ impl ExtensionRunner {
             }
         }
 
+        crate::core::jev_bridge::note_final_provider_request(
+            &ctx.session_manager().get_session_id(), &current_payload,
+        );
         current_payload
     }
 

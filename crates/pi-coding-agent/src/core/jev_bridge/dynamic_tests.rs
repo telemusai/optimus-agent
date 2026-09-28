@@ -162,6 +162,9 @@ fn dynamic_tool_registration_can_enable_and_remove_without_duplicate_tools() {
     assert!(tool
         .description
         .contains("not a guaranteed fair distribution"));
+    assert!(tool.description.contains("cannot execute tools, message agents, or inspect runtime tool availability"));
+    assert!(tool.description.contains("not evidence that a tool is available or missing"));
+    assert!(tool.prompt_guidelines.unwrap().join(" ").contains("try the smallest relevant call"));
     assert!(sync_tools(extension, false));
     assert!(extension.lock().unwrap().tools.is_empty());
 }

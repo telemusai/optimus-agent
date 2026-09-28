@@ -627,8 +627,8 @@ struct SessionBook {
     request_turn: Option<u64>,
     trace: pi_jev::observation::TraceObserver,
     control_epoch_id: Option<String>,
-    /// TOOL-001 diagnostics: tool names advertised by the MOST RECENTLY
-    /// OBSERVED provider request, plus the turn that request belonged to.
+    /// Tool names in the most recent local post-hook catalog, plus its turn.
+    /// This is not a remote provider receipt.
     /// This is a historical observation, not a guarantee of current
     /// availability; consumers must read `advertised_turn` for staleness.
     last_advertised_tools: Vec<String>,
@@ -891,9 +891,9 @@ impl JevBridgeCore {
             .advertised_turn
             .is_some_and(|turn| turn == book.current_turn());
         Some(if current {
-            format!("advertised_tools_last_request={names}")
+            format!("advertised_tools_last_request={names} (local post-hook catalog, not provider receipt)")
         } else {
-            format!("advertised_tools_last_request={names} (stale, from an earlier request)")
+            format!("advertised_tools_last_request={names} (local post-hook catalog, not provider receipt; stale, from an earlier request)")
         })
     }
 
@@ -1116,6 +1116,7 @@ impl JevBridgeCore {
         json!({
             // Last OBSERVED advertisement, never a guaranteed current list.
             "lastAdvertisedTools": book.last_advertised_tools.clone(),
+            "toolStateScope": "local_post_hook_catalog_not_provider_receipt",
             "advertisedAtTurn": advertised_turn,
             "currentTurn": current_turn,
             "isCurrentTurn": advertised_turn.is_some_and(|turn| turn == current_turn),
@@ -2166,15 +2167,6 @@ fn make_active_handler(core: Arc<JevBridgeCore>) -> ExtensionHandler {
                 if !core.effective_mode(Some(&session_id)).allows_active() {
                     return None::<Value>;
                 }
-                // TOOL-001 diagnostics: remember the tool names THIS request
-                // actually advertises (public schema names only), so a later
-                // "no tools attached" claim can be compared with facts.
-                // Observation only — it never changes the request.
-                core.note_advertised_tools(
-                    &session_id,
-                    core.turn(&session_id),
-                    &advertised_tool_names(&payload.payload),
-                );
                 let Some(observer) = core.observer(&session_id, Some(ctx.ui())) else {
                     return None::<Value>;
                 };
@@ -3235,7 +3227,14 @@ fn request_action(params: &Value) -> BTreeMap<String, String> {
     let tools = params.get("tools").and_then(Value::as_array);
     result.insert("tools".to_string(), tools.map(|tools| format!("count:{}", tools.len())).unwrap_or_else(|| "absent".to_string()));
     result.insert("execution_tool".to_string(), if tools.is_some_and(|tools| tools.iter().any(|tool| tool.get("name").or_else(|| tool.get("function").and_then(|function| function.get("name"))).and_then(Value::as_str) == Some("ipython"))) { "ipython_advertised" } else { "ipython_not_advertised" }.to_string());
-    result.insert("tool_state_scope".to_string(), "local_request_not_provider_receipt".to_string());
+    for name in ["bash", "edit", "node", "clang"] {
+        let advertised = tools.is_some_and(|tools| tools.iter().any(|tool|
+            tool.get("function").and_then(|function| function.get("name")).or_else(|| tool.get("name"))
+                .and_then(Value::as_str) == Some(name)));
+        result.insert(format!("{name}_advertised"), advertised.to_string());
+    }
+    // These action snapshots bracket Jev, not later extension hooks.
+    result.insert("tool_state_scope".to_string(), "local_jev_hook_not_provider_receipt".to_string());
     if let Some((key, effort)) = crate::core::jev_active::reasoning_effort(params) {
         result.insert(key.to_string(), effort.to_string());
     }
@@ -3259,6 +3258,14 @@ fn request_action(params: &Value) -> BTreeMap<String, String> {
     result
 }
 
+/// Observe the final local catalog after every provider-request extension hook.
+/// This is not a provider receipt and never changes the request or tool registry.
+pub(crate) fn note_final_provider_request(session_id: &str, params: &Value) {
+    if let Some(core) = bridge_for_session(session_id) {
+        core.note_advertised_tools(session_id, core.turn(session_id), &advertised_tool_names(params));
+    }
+}
+
 fn bridge_for_session(session_id: &str) -> Option<Arc<JevBridgeCore>> {
     let cores: Vec<_> = live_bridges().lock().unwrap_or_else(|p| p.into_inner()).iter().filter_map(Weak::upgrade).collect();
     cores.iter().find(|core| core.sessions.lock().unwrap_or_else(|p| p.into_inner()).contains_key(session_id)).cloned()
@@ -3268,8 +3275,8 @@ fn bridge_for_session(session_id: &str) -> Option<Arc<JevBridgeCore>> {
 ///
 /// Reuses the same field names the Compare path sends at `turn_start`, so both
 /// modes ask the same questions of the same snapshot. The tool catalog is the
-/// one this request actually advertises, which is what the tool-candidate and
-/// tool-requirement evaluators need; the observed-tool history is the fallback.
+/// local pre-Jev baseline; final advertisement is observed after all hooks.
+/// Missing tool names never fall back to historical observations.
 fn active_request_state(
     core: &Arc<JevBridgeCore>,
     ctx: &Arc<dyn crate::core::extensions::types::ExtensionContext>,
@@ -3787,6 +3794,8 @@ mod full_jev_overlay_wiring_tests {
             .unwrap_or(0)
     }
 
+    include!("jev_bridge/tool_availability_tests.rs");
+
     fn test_settings(agent_dir: &Path) -> JevSettings {
         JevSettingsStore::new(agent_dir).load()
     }
@@ -4134,7 +4143,7 @@ mod provider_action_tests {
             assert_eq!(action["tools"], "count:1");
             assert_eq!(action["execution_tool"], "ipython_advertised");
             assert_eq!(action["tool_choice"], choice);
-            assert_eq!(action["tool_state_scope"], "local_request_not_provider_receipt");
+            assert_eq!(action["tool_state_scope"], "local_jev_hook_not_provider_receipt");
             assert!(!format!("{action:?}").contains("DO_NOT_LOG"));
         }
         let absent = request_action(&json!({}));
@@ -4264,7 +4273,7 @@ mod provider_action_tests {
         assert_eq!(stale["currentTurn"], json!(9));
         assert_eq!(stale["turnsSinceLastToolResult"], json!(4));
         assert_eq!(core.advertised_tools_fact("sess-diag").unwrap(),
-            "advertised_tools_last_request=ipython,bash (stale, from an earlier request)");
+            "advertised_tools_last_request=ipython,bash (local post-hook catalog, not provider receipt; stale, from an earlier request)");
         // Only bounded names ever leave bookkeeping: no command bodies.
         assert!(!format!("{stale:?}").contains("secret"));
     }
@@ -4275,7 +4284,7 @@ mod provider_action_tests {
         core.note_turn("sess-fact", 3);
         core.note_advertised_tools("sess-fact", 3, &["ipython".to_string()]);
         assert_eq!(core.advertised_tools_fact("sess-fact").unwrap(),
-            "advertised_tools_last_request=ipython");
+            "advertised_tools_last_request=ipython (local post-hook catalog, not provider receipt)");
         assert_eq!(core.last_advertised_tools("sess-fact"), vec!["ipython".to_string()]);
         assert!(core.advertised_tools_is_current("sess-fact"));
         assert!(core.advertised_tools_fact("sess-fact-none").is_none());

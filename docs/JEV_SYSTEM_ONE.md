@@ -20,7 +20,8 @@ in [JEV_QUESTIONS_AND_THRESHOLDS.md](JEV_QUESTIONS_AND_THRESHOLDS.md).
 `/jev compact on`, `/jev compact off`, and `/jev compact status` control a
 separate per-session setting. Compaction can run with decisions Off. Changing
 one axis does not change the other. New feature gates and compaction are off by
-default. Existing tool-requirement and complexity effects retain their defaults.
+default. Tool-requirement classification and complexity retain their default gates;
+tool-requirement answers are advisory and never withdraw the tool catalog.
 
 `/jev feature <name> on|off` changes a feature policy. An enabled Active feature
 still needs Active mode and an accepted, current answer. Compare never changes
@@ -57,10 +58,16 @@ not repeated.
 - `jev_active.rs` changes only the advertised provider request. The original
   tool registry and tool execution path remain authoritative. Optional pruning
   only considers configured optional tools; required, unknown, and forced tools
-  remain available. The native `ipython` tool is never an optional pruning
-  candidate; extension tools need an explicit optional-tool allowlist.
-  The existing `tool_requirement == none` effect is separate
-  and retains PR #56's full catalog withdrawal behavior.
+  remain unchanged. Advertised native execution and control tools (`ipython`,
+  `node`, `clang`, `bash`, `edit`, `subagent`, `attach_image`, `jev_decide`) are
+  never optional pruning candidates. Extension tools need an explicit optional
+  allowlist. `tool_requirement`, including `none`, is advisory: it preserves
+  `tools` and `tool_choice`, including explicit bans and forced choices.
+  It never recreates a tool absent from the request.
+  Action records bracket the local Jev hook, not later extension hooks.
+  `lastAdvertisedTools` observes the final local catalog after all provider-request
+  extension hooks. Neither diagnostic is a remote provider receipt or proof that
+  an advertised tool is allowed by `tool_choice`.
   Complexity supports both Chat `reasoning_effort` and Responses
   `reasoning.effort`, preserving summary fields and the model registry's limits.
 - Retrieval filtering works on temporary, identified candidates. Memory filtering
