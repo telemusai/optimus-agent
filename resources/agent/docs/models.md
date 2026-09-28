@@ -196,6 +196,7 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `thinkingLevelMap` | No | omitted | Maps Prime Agent thinking levels to provider values and marks unsupported levels (see below) |
 | `input` | No | `["text"]` | Input types: `["text"]` or `["text", "image"]` |
 | `contextWindow` | No | `128000` | Context window size in tokens |
+| `maxInputTokens` | No | `contextWindow` | Optional positive integer cap on input tokens, no larger in effect than `contextWindow` |
 | `maxTokens` | No | `16384` | Maximum output tokens |
 | `cost` | No | all zeros | `{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}` (per million tokens) |
 | `compat` | No | provider `compat` | Provider compatibility overrides. Merged with provider-level `compat` when both are set. |
@@ -313,7 +314,7 @@ Use `modelOverrides` to customize specific built-in models without replacing the
 }
 ```
 
-`modelOverrides` supports these fields per model: `name`, `reasoning`, `input`, `cost` (partial), `contextWindow`, `maxTokens`, `headers`, `compat`.
+`modelOverrides` supports these fields per model: `name`, `reasoning`, `thinkingLevelMap`, `input`, `cost` (partial), `contextWindow`, `maxInputTokens`, `maxTokens`, `headers`, `compat`.
 
 Behavior notes:
 - `modelOverrides` are applied to built-in provider models.
@@ -322,6 +323,28 @@ Behavior notes:
 - If `models` is also defined for a provider, custom models are merged after built-in overrides. A custom model with the same `id` replaces the overridden built-in model entry.
 
 ## Anthropic Messages Compatibility
+
+### Claude Opus 5.5 with a 1M context window
+
+The bundled Anthropic `claude-opus-5-5` model already advertises a 1,000,000-token context window and 128,000 maximum output tokens. To make these limits explicit and reserve the full output allowance, merge this into `<agent-dir>/models.json` (normally `~/.config/optimus-rust/models.json` with the installed launcher):
+
+```json
+{
+  "providers": {
+    "anthropic": {
+      "modelOverrides": {
+        "claude-opus-5-5": {
+          "contextWindow": 1000000,
+          "maxInputTokens": 872000,
+          "maxTokens": 128000
+        }
+      }
+    }
+  }
+}
+```
+
+Open `/model` to reload the configuration. `contextWindow` is the total window; `maxTokens` is output, and optional `maxInputTokens` limits input separately. These fields also work on full entries in the `models` array. This example preserves the bundled model's reasoning, image, and provider metadata. Actual access depends on your Anthropic account; increasing a local limit does not grant additional provider capacity. The existing 250,000-token automatic-compaction ceiling still applies independently of this advertised window.
 
 For providers or proxies using `api: "anthropic-messages"`, use `compat.supportsEagerToolInputStreaming` to control Anthropic fine-grained tool streaming compatibility.
 

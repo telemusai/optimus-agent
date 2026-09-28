@@ -166,6 +166,16 @@ Use the model appropriate to each task: a planner or reviewer, an implementation
 
 See [Providers](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/providers.md) and [Custom models](https://github.com/telemusai/optimus-agent/blob/main/resources/agent/docs/models.md).
 
+#### Claude Code login
+
+When Claude Code is installed and signed in, Optimus automatically uses its saved OAuth login for the **Anthropic** provider and pins request headers to the installed `claude --version`. Optimus retains its native agent loop, tools, and execution modes. The provider picker identifies the source as `Claude Code <version> OAuth`.
+
+Claude Code is optional. Without it, Optimus uses its own configured credentials; OAuth requests default to the bundled Claude Code version `2.1.283`.
+
+Credentials stay in Claude Code's Keychain entry on macOS or `.credentials.json` on Linux/Windows. Optimus re-reads them before requests, refreshes expiring tokens, and writes rotated tokens back to the same store. A failed refresh reports an error instead of switching to a paid API key. Set `OPTIMUS_CLAUDE_CODE_AUTH=0` before starting the daemon to use Optimus's own credentials instead. See [Claude authentication and compatibility](resources/agent/docs/providers.md#claude-promax) for profile selection and limitations.
+
+Claude Opus 5.5 is bundled with a **1,000,000-token context window**. You can override `contextWindow`, `maxInputTokens`, and `maxTokens` in `models.json`; see the [1M-context example](resources/agent/docs/models.md#claude-opus-55-with-a-1m-context-window). Model limits and the automatic-compaction ceiling are separate settings.
+
 ### Efficiency you can measure
 
 The performance work targets both the host runtime and the conversation it manages:

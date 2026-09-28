@@ -96,8 +96,8 @@ fn get_cache_control(model: &Model, cache_retention: Option<&CacheRetention>) ->
 	}
 }
 
-// Stealth mode: Mimic Claude Code's tool naming exactly
-const CLAUDE_CODE_VERSION: &str = "2.1.281";
+// Fallback when no installed version is supplied; verified against Anthropic's release on 2026-09-29.
+const CLAUDE_CODE_VERSION: &str = "2.1.283";
 
 // Claude Code 2.x tool names (canonical casing)
 // Source: https://cchistory.mariozechner.at/data/prompts-2.1.11.md
@@ -1540,11 +1540,18 @@ fn create_client(
 		);
 		base.insert("x-app".to_string(), Some("cli".to_string()));
 
-		let headers = merge_headers(vec![
+		let mut headers = IndexMap::new();
+		for source in [
 			Some(base),
 			record_to_nullable(model.headers.as_ref()),
 			record_to_nullable(options_headers),
-		]);
+		].into_iter().flatten() {
+			for (name, value) in source {
+				headers.insert(name.to_ascii_lowercase(), value);
+			}
+		}
+		// The resolved OAuth credential remains authoritative over custom headers.
+		headers.retain(|name, _| !name.eq_ignore_ascii_case("authorization") && !name.eq_ignore_ascii_case("x-api-key"));
 
 		return Ok(CreatedClient {
 			client: AnthropicClientOverride {
@@ -1595,6 +1602,15 @@ fn nullable_to_record(headers: &IndexMap<String, Option<String>>) -> IndexMap<St
 		.collect()
 }
 
+fn token_count_json(value: f64, field: &str) -> Result<Value, AnthropicStreamError> {
+	if !value.is_finite() || value < 0.0 || value.fract() != 0.0 || value > 9_007_199_254_740_991.0 {
+		return Err(AnthropicStreamError::Message(format!(
+			"Anthropic {field} must be a nonnegative integer within JSON's exact integer range"
+		)));
+	}
+	Ok(Value::from(value as u64))
+}
+
 /// TS: `buildParams(model, context, isOAuthToken, options?, cacheControl?)`.
 fn build_params(
 	model: &Model,
@@ -1611,24 +1627,10 @@ fn build_params(
 	);
 	params.insert(
 		"max_tokens".to_string(),
-		serde_json::Number::from_f64(
-			options
-				.stream
-				.max_tokens
-				// JS `options?.maxTokens || ...`: 0 and NaN are falsy.
-				.filter(|max_tokens| *max_tokens != 0.0 && !max_tokens.is_nan())
-				.unwrap_or_else(|| {
-					// JS `(model.maxTokens / 3) | 0` wraps only the fallback.
-					let fallback = (model.max_tokens / 3.0).trunc();
-					if fallback.is_finite() {
-						(fallback.rem_euclid(4_294_967_296.0) as u32 as i32) as f64
-					} else {
-						0.0
-					}
-				}),
-		)
-		.map(Value::Number)
-		.unwrap_or(Value::Null),
+		token_count_json(
+			options.stream.max_tokens.unwrap_or_else(|| (model.max_tokens / 3.0).floor()),
+			"max_tokens",
+		)?,
 	);
 	params.insert("stream".to_string(), Value::Bool(true));
 
@@ -1726,16 +1728,7 @@ fn build_params(
 				thinking.insert("type".to_string(), Value::String("enabled".to_string()));
 				thinking.insert(
 					"budget_tokens".to_string(),
-					Value::Number(
-						serde_json::Number::from_f64(
-							options
-								.thinking_budget_tokens
-								// JS `options.thinkingBudgetTokens || 1024`.
-								.filter(|budget| *budget != 0.0 && !budget.is_nan())
-								.unwrap_or(1024.0),
-						)
-						.unwrap_or_else(|| serde_json::Number::from(0)),
-					),
+					token_count_json(options.thinking_budget_tokens.unwrap_or(1024.0), "thinking.budget_tokens")?,
 				);
 				thinking.insert("display".to_string(), Value::String(display));
 				params.insert("thinking".to_string(), Value::Object(thinking));
@@ -2787,6 +2780,31 @@ mod tests {
 	}
 
 	#[test]
+	fn catalog_token_limits_serialize_as_json_integers() {
+		for (id, reasoning) in [("claude-opus-5-5", "low"), ("claude-sonnet-4-5", "high")] {
+			let mut model = test_model("anthropic", id);
+			model.max_tokens = 128_000.0;
+			let base = build_base_options(&model, None, Some("synthetic-key"));
+			let mut options = AnthropicOptions::from_base(&base);
+			if reasoning == "high" {
+				let adjusted = adjust_max_tokens_for_thinking(base.max_tokens.unwrap(), model.max_tokens, &reasoning.to_string(), None);
+				options.stream.max_tokens = Some(adjusted.max_tokens);
+				options.thinking_enabled = Some(true);
+				options.thinking_budget_tokens = Some(adjusted.thinking_budget);
+			}
+			let params = build_params(&model, &context_with_user("hello"), false, &options, None).unwrap();
+			let wire: Value = serde_json::from_str(&serde_json::to_string(&params).unwrap()).unwrap();
+			assert!(wire["max_tokens"].is_u64(), "{id}: {}", wire["max_tokens"]);
+			if reasoning == "high" {
+				assert_eq!(wire["max_tokens"].as_u64(), Some(48_384));
+				assert_eq!(wire["thinking"]["budget_tokens"].as_u64(), Some(16_384));
+			} else {
+				assert_eq!(wire["max_tokens"].as_u64(), Some(32_000));
+			}
+		}
+	}
+
+	#[test]
 	fn build_params_sets_defaults_and_stream_flag() {
 		let model = test_model("anthropic", "claude-sonnet-4-5");
 		let context = context_with_user("Say hello.");
@@ -2803,28 +2821,31 @@ mod tests {
 	}
 
 	#[test]
-	fn build_params_preserves_explicit_limits_and_wraps_the_default_like_javascript() {
+	fn build_params_uses_integer_limits_without_wrapping_or_nulls() {
 		let context = context_with_user("hi");
 		for (limit, model_limit, expected) in [
-			(Some(3.9), 8192.0, Some(3.9)),
-			(None, 8.7, Some(2.0)),
-			(None, 6_442_450_950.0, Some(-2_147_483_646.0)),
-			(None, -6_442_450_950.0, Some(2_147_483_646.0)),
-			(Some(0.0), 6_442_450_950.0, Some(-2_147_483_646.0)),
-			(Some(f64::NAN), 8.7, Some(2.0)),
-			(None, f64::INFINITY, Some(0.0)),
-			(None, f64::NAN, Some(0.0)),
-			(Some(f64::INFINITY), 8192.0, None),
+			(Some(128_000.0), 128_000.0, 128_000),
+			(None, 128_000.0, 42_666),
+			(None, 8.7, 2),
+			(None, 6_442_450_950.0, 2_147_483_650),
+			(Some(0.0), 8192.0, 0),
 		] {
 			let mut model = test_model("anthropic", "claude-sonnet-4-5");
 			model.max_tokens = model_limit;
 			let mut options = AnthropicOptions::default();
 			options.stream.max_tokens = limit;
 			let params = build_params(&model, &context, false, &options, None).unwrap();
-			assert_eq!(params["max_tokens"].as_f64(), expected, "limit={limit:?}, model_limit={model_limit}");
-			if expected.is_none() {
-				assert!(params["max_tokens"].is_null());
-			}
+			assert_eq!(params["max_tokens"].as_u64(), Some(expected), "limit={limit:?}, model_limit={model_limit}");
+		}
+		for invalid in [3.9, -1.0, f64::NAN, f64::INFINITY, 9_007_199_254_740_992.0] {
+			let model = test_model("anthropic", "claude-sonnet-4-5");
+			let mut options = AnthropicOptions::default();
+			options.stream.max_tokens = Some(invalid);
+			assert!(build_params(&model, &context, false, &options, None).unwrap_err().message().contains("max_tokens"));
+			options.stream.max_tokens = Some(8192.0);
+			options.thinking_enabled = Some(true);
+			options.thinking_budget_tokens = Some(invalid);
+			assert!(build_params(&model, &context, false, &options, None).unwrap_err().message().contains("thinking.budget_tokens"));
 		}
 	}
 
@@ -3241,7 +3262,7 @@ mod tests {
 			headers.get("anthropic-beta").map(String::as_str),
 			Some("claude-code-20250219,oauth-2025-04-20,interleaved-thinking-2025-05-14")
 		);
-		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.281"));
+		assert_eq!(headers.get("user-agent").map(String::as_str), Some("claude-cli/2.1.283"));
 		assert_eq!(headers.get("x-app").map(String::as_str), Some("cli"));
 
 		let mut opencode = test_model("opencode", "claude-sonnet-4-5");
@@ -3268,6 +3289,29 @@ mod tests {
 		assert_eq!(headers.get("anthropic-dangerous-direct-browser-access").map(String::as_str), Some("true"));
 		assert!(!headers.contains_key("x-api-key"));
 		assert!(!headers.contains_key("Authorization"));
+	}
+
+	#[test]
+	fn oauth_credentials_cannot_be_overridden_by_custom_headers() {
+		let mut model = test_model("anthropic", "claude-opus-5-5");
+		model.headers = Some(IndexMap::from([
+			("Authorization".into(), "Bearer stale-model-token".into()),
+			("X-API-Key".into(), "paid-model-key".into()),
+			("User-Agent".into(), "stale-model-version".into()),
+			("X-App".into(), "stale-app".into()),
+		]));
+		let options = IndexMap::from([
+			("AUTHORIZATION".into(), "Bearer stale-option-token".into()),
+			("x-api-key".into(), "paid-option-key".into()),
+			("user-agent".into(), "claude-cli/2.1.999".into()),
+			("x-app".into(), "cli".into()),
+		]);
+		let created = create_client(&model, "sk-ant-oat01-selected", false, false, Some(&options), None, None).unwrap();
+		let headers = build_request_headers(&created.client, 1000.0, true);
+		assert_eq!(headers.get("Authorization"), Some("Bearer sk-ant-oat01-selected"));
+		assert_eq!(headers.get("x-api-key"), None);
+		assert_eq!(headers.get("user-agent"), Some("claude-cli/2.1.999"));
+		assert_eq!(headers.get("x-app"), Some("cli"));
 	}
 
 	#[test]

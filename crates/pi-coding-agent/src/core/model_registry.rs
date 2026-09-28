@@ -2313,6 +2313,10 @@ impl ModelRegistry {
 
     /// Get API key for a model.
     pub fn has_configured_auth(&self, model: &Model) -> bool {
+        if self.auth_storage.has_claude_code_auth(&model.provider) {
+            return self.auth_storage.has_auth(&model.provider)
+                && self.auth_storage.validate_claude_code_endpoint(model).is_ok();
+        }
         self.auth_storage.has_auth(&model.provider) || self.has_configured_provider_request_auth(&model.provider)
     }
 
@@ -2639,6 +2643,10 @@ impl ModelRegistry {
     pub async fn get_api_key_and_headers(&mut self, model: &Model) -> ResolvedRequestAuth {
         let provider_config = self.provider_request_configs.get(&model.provider).cloned();
 
+        if let Err(error) = self.auth_storage.validate_claude_code_endpoint(model) {
+            return ResolvedRequestAuth { error: Some(error), ..Default::default() };
+        }
+
         let auth_storage_auth = match self
             .auth_storage
             .get_api_key_with_source_token(&model.provider, false)
@@ -2656,6 +2664,11 @@ impl ModelRegistry {
         };
         let mut api_key = auth_storage_auth.api_key;
         let mut auth_source_token = auth_storage_auth.source_token;
+        if auth_source_token.as_ref().is_some_and(|token| token.source == crate::core::auth_storage::AUTH_SOURCE_CLAUDE_CODE) {
+            if let Err(error) = self.auth_storage.validate_claude_code_endpoint(model) {
+                return ResolvedRequestAuth { error: Some(error), ..Default::default() };
+            }
+        }
 
         if api_key.is_none() {
             if let Some(provider_api_key) = provider_config.as_ref().and_then(|config| config.api_key.clone()) {
@@ -2686,7 +2699,7 @@ impl ModelRegistry {
         }
         self.set_last_provider_auth_source_token(
             &model.provider,
-            if api_key.is_none() { None } else { auth_source_token },
+            if api_key.is_none() { None } else { auth_source_token.clone() },
         );
 
         let provider_headers = match resolve_headers_or_throw(
@@ -2769,6 +2782,8 @@ impl ModelRegistry {
             headers = Some(merged);
         }
 
+        self.auth_storage.pin_claude_code_headers(auth_source_token.as_ref(), &mut headers);
+
         ResolvedRequestAuth {
             ok: true,
             api_key,
@@ -2782,6 +2797,7 @@ impl ModelRegistry {
     /// values.
     pub fn get_provider_auth_status(&self, provider: &str) -> AuthStatus {
         let auth_status = self.auth_storage.get_auth_status(provider);
+        if self.auth_storage.has_claude_code_auth(provider) { return auth_status; }
         if auth_status.source.is_some() && auth_status.source.as_deref() != Some("stale") {
             return auth_status;
         }
@@ -2857,6 +2873,9 @@ impl ModelRegistry {
 
     /// Check if a model is using OAuth credentials (subscription).
     pub fn is_using_oauth(&self, model: &Model) -> bool {
+        if self.auth_storage.has_claude_code_auth(&model.provider) {
+            return self.auth_storage.validate_claude_code_endpoint(model).is_ok();
+        }
         matches!(self.auth_storage.get(&model.provider), Some(AuthCredential::OAuth { .. }))
     }
 
@@ -3311,6 +3330,29 @@ mod tests {
         let compat = serde_json::to_value(updated.compat.unwrap()).unwrap();
         assert_eq!(compat.get("supportsStore"), Some(&json!(false)));
         assert_eq!(compat.get("maxTokensField"), Some(&json!("max_tokens")));
+    }
+
+    #[test]
+    fn opus_55_million_token_override_survives_reload_and_sets_input_limit() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = json!({"providers": {"anthropic": {"modelOverrides": {
+            "claude-opus-5-5": {"contextWindow": 1_000_000, "maxInputTokens": 872_000, "maxTokens": 128_000}
+        }}}});
+        assert!(validate_models_config_schema(&config).is_empty());
+        let mut registry = registry_with_config(dir.path(), &config.to_string());
+        for _ in 0..2 {
+            let model = registry.find("anthropic", "claude-opus-5-5").unwrap();
+            assert_eq!(model.context_window, 1_000_000.0);
+            assert_eq!(model.max_tokens, 128_000.0);
+            assert_eq!(model.max_input_tokens, Some(872_000.0));
+            assert_eq!(pi_ai::models::get_model_input_limit(&model), 872_000.0);
+            assert!(model.reasoning);
+            assert_eq!(model.api, "anthropic-messages");
+            registry.refresh();
+        }
+        let mut invalid = config;
+        invalid["providers"]["anthropic"]["modelOverrides"]["claude-opus-5-5"]["maxInputTokens"] = json!(-1);
+        assert!(!validate_models_config_schema(&invalid).is_empty());
     }
 
     /// TS: `parseModels` (model-registry.ts:829) `compat: mergeCompat(providerConfig.compat, modelDef.compat)`

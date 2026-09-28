@@ -30,6 +30,24 @@ Use `/logout` to clear credentials. Tokens are stored in `~/.prime/agent/auth.js
 
 ### Claude Pro/Max
 
+Optimus checks for an installed `claude` executable and a saved Claude Code subscription login. If both are present, the native `anthropic` provider uses that OAuth login ahead of `--api-key`, `auth.json`, environment keys, and `models.json`. This applies to every model on that provider. Claude models accessed through Bedrock, Vertex, OpenRouter, Copilot, or other providers retain their own authentication.
+
+Run `claude auth login` first if needed, then select an Anthropic model in Optimus. The provider picker displays `Claude Code <version> OAuth`. The version comes from `claude --version`, is validated before use in a header, and is checked again after five minutes. Optimus keeps its native agent loop; this does not install or use the Claude Agent SDK.
+
+If Claude Code is not installed, normal Optimus authentication remains available. OAuth requests use the bundled fallback version `2.1.283`, verified against [Anthropic's release](https://github.com/anthropics/claude-code/releases/tag/v2.1.283) on 2026-09-29. No installation diagnostic is added to model messages.
+
+Credential storage follows Claude Code's selected profile:
+
+- macOS: the `Claude Code-credentials` Keychain item, with the directory-specific suffix when a custom profile is selected; the corresponding file is a fallback when it contains a usable login.
+- Linux/Windows: `~/.claude/.credentials.json` (`%USERPROFILE%\.claude\.credentials.json` on Windows).
+- `CLAUDE_CONFIG_DIR` selects another directory. `CLAUDE_SECURESTORAGE_CONFIG_DIR`, when set, selects the credential directory independently; an empty value selects the default store. Use an absolute path for a custom directory. Optimus follows this selected account instead of scanning unrelated Keychain accounts.
+
+Discovery results are cached for up to 30 seconds for the picker. Requests re-read the original store and refresh within 60 seconds of expiry. Refreshed tokens are written back atomically to the file (mode `0600` on Unix) or to the same Keychain account, preserving other credential metadata. Optimus processes serialize refreshes and check for changes made by Claude Code before write-back. Claude Code does not share Optimus's lock, so simultaneous refreshes by the two applications can still require a retry or login. No token copy is seeded into Optimus's `auth.json`, no CLI model request is used as a refresh fallback, and refresh errors do not include response bodies or tokens.
+
+While this login is selected, a stale token or refresh failure stops the request instead of falling back to a paid API key. `/login` reuses the Claude Code login; `/logout` directs you to `claude auth logout`. Set `OPTIMUS_CLAUDE_CODE_AUTH=0` before starting the daemon to use independent Optimus credentials and the normal precedence below. Explicit isolated auth files also retain independent credentials. Changing daemon environment settings requires a restart.
+
+Automatically discovered Claude Code credentials are restricted to the direct HTTPS Anthropic Messages endpoint. To use an Anthropic proxy, opt out of automatic discovery and configure the proxy's credentials explicitly. Version matching preserves Optimus's existing OAuth identity, beta flags, and tool-name handling; it cannot guarantee compatibility with future Claude Code changes or subscription billing rules. This is a community compatibility route, inspired by [pi-claude-auth](https://github.com/pankajudhas81/pi-claude-auth), rather than an official subscription API integration.
+
 Subscription requests identify as Claude Code. Using this identity in Optimus may violate Anthropic's terms and lead to account restrictions. An Anthropic API key avoids this subscription-auth risk. Review your account's [usage settings](https://claude.ai/settings/usage).
 
 ### GitHub Copilot
@@ -273,6 +291,8 @@ Or set `GOOGLE_APPLICATION_CREDENTIALS` to a service account key file.
 ## Resolution Order
 
 When resolving credentials for a provider:
+
+For Anthropic, an installed and authenticated Claude Code login takes precedence unless `OPTIMUS_CLAUDE_CODE_AUTH=0`. Otherwise:
 
 1. CLI `--api-key` flag
 2. `auth.json` entry (API key or OAuth token)
