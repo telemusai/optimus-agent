@@ -1,0 +1,2 @@
+- Fixed advisory Jev tool-requirement decisions withdrawing execution tools; preserve native execution modes, forced choices, and bans.
+- Fixed advertised-tool diagnostics to observe the final local extension-hook catalog and clarified Jev Dynamic decision-only boundaries.

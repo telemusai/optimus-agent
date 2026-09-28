@@ -4,6 +4,14 @@ Dynamic lets the coding agent ask Jev ad hoc, typed questions through the native
 `jev_decide` tool. The agent selects the primitive and supplies the relevant state,
 instructions and answer criteria.
 
+Jev returns decisions only. It cannot execute tools, launch work, message agents,
+or inspect runtime tool availability. Supplied assumptions and Jev answers are
+not evidence that an execution tool is available or missing. Use advertised
+execution tools for authorized work. Try the smallest relevant call before
+claiming an advertised tool is unavailable. If absent, describe that request's
+catalog only; do not infer a global outage. Automatic `tool_requirement`
+classification, including `none`, does not remove tools or change `tool_choice`.
+
 Enable it for the current chat:
 
 ```text
