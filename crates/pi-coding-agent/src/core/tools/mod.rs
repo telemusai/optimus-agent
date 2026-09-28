@@ -11,6 +11,8 @@ pub mod edit_diff;
 pub mod file_mutation_queue;
 pub mod ipython;
 pub mod node;
+pub mod clang;
+pub mod attach_image;
 pub mod ipython_cell_code;
 pub mod output_accumulator;
 pub mod path_utils;

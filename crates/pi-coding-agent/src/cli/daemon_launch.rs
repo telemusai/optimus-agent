@@ -293,7 +293,7 @@ impl StaleDaemonError {
         Self {
             socket_path: socket_path.to_string(),
             message: format!(
-                "An incompatible Prime Agent daemon is running.\n\n{}\nClient: v{}, protocol {}, schema {}, build {}, executable {}\n\nRun:\n{}\n\nThen retry the original command.",
+                "An incompatible Optimus Agent daemon is running.\n\n{}\nClient: v{}, protocol {}, schema {}, build {}, executable {}\n\nRun:\n{}\n\nThen retry the original command.",
                 daemon_identity,
                 VERSION,
                 DAEMON_PROTOCOL_VERSION,
@@ -531,7 +531,7 @@ async fn ensure_daemon_running(socket_path: &str, spawn_cwd: Option<&str>) -> Re
         DaemonVersionProbe::Current(_) => return Ok(()),
         DaemonVersionProbe::Unresponsive => {
             return Err(format!(
-                "Prime Agent daemon on {} accepted connections but did not finish startup within {} seconds. It was left running to avoid interrupting active work.\n\nRun:\n{}\n\nThen retry the original command.",
+                "Optimus Agent daemon on {} accepted connections but did not finish startup within {} seconds. It was left running to avoid interrupting active work.\n\nRun:\n{}\n\nThen retry the original command.",
                 socket_path,
                 DAEMON_STARTUP_TIMEOUT_MS / 1000.0,
                 format_current_cli_command(
@@ -635,7 +635,7 @@ async fn ensure_daemon_running(socket_path: &str, spawn_cwd: Option<&str>) -> Re
         return Err(match failure {
             ChildFailure::Error(message) => {
                 format!(
-                    "Failed to spawn Prime Agent daemon: {}.{}",
+                    "Failed to spawn Optimus Agent daemon: {}.{}",
                     message, log_tail
                 )
             }
@@ -644,7 +644,7 @@ async fn ensure_daemon_running(socket_path: &str, spawn_cwd: Option<&str>) -> Re
                     .map(|signal| format!(", signal {}", signal))
                     .unwrap_or_default();
                 format!(
-                    "Prime Agent daemon exited during startup (code {}{}).{}",
+                    "Optimus Agent daemon exited during startup (code {}{}).{}",
                     code.map(|code| code.to_string())
                         .unwrap_or_else(|| "unknown".to_string()),
                     signal,
@@ -1212,7 +1212,7 @@ async fn daemon_connect(
         Ok(Ok(stream)) => Ok(stream),
         Ok(Err(error)) => Err(error.to_string()),
         Err(_) => Err(format!(
-            "Timed out after {}ms connecting to the Prime Agent daemon. {}",
+            "Timed out after {}ms connecting to the Optimus Agent daemon. {}",
             timeout_ms,
             daemon_endpoint_details(socket_path)
         )),
@@ -1305,7 +1305,7 @@ async fn daemon_wait_for_hello(socket_path: &str, timeout_ms: f64) -> Result<Dae
         }
     }
     Err(format!(
-        "Timed out after {}ms waiting for the Prime Agent daemon handshake. {}",
+        "Timed out after {}ms waiting for the Optimus Agent daemon handshake. {}",
         timeout_ms,
         daemon_endpoint_details(socket_path)
     ))
@@ -1614,7 +1614,7 @@ mod tests {
         let error = StaleDaemonError::new("/tmp/daemon.sock", Some(&hello));
         assert!(error
             .message
-            .starts_with("An incompatible Prime Agent daemon is running.\n\n"));
+            .starts_with("An incompatible Optimus Agent daemon is running.\n\n"));
         assert!(error.message.contains("Daemon: v0.1.0, protocol 6, schema legacy, build unknown, PID 4242, executable /usr/local/bin/prime-agent"));
         assert!(error.message.contains(&format!("Client: v{}", VERSION)));
         assert!(error.message.ends_with("Then retry the original command."));

@@ -2133,7 +2133,9 @@ async fn run_terminal(
                     transcript.borrow_mut().apply_chat_detail();
                 }
                 InputAction::ToggleExecutionMode => {
-                    let command = if connection.supports_node_execution_mode() {
+                    let command = if connection.supports_clang_execution_mode() {
+                        "/mode cycle"
+                    } else if connection.supports_node_execution_mode() {
                         "/mode toggle"
                     } else if mode.borrow().connection_state.as_ref().and_then(|s| s.execution_mode)
                         == Some(crate::core::execution_mode::ExecutionMode::Direct) {
@@ -3422,6 +3424,11 @@ async fn dispatch_submission(
                     .is_some_and(|command| command.name == "mode" && matches!(command.args.trim(), "node" | "toggle"))
                     && !connection.supports_node_execution_mode() {
                     return Err("This session host does not support Node mode. Update and restart the daemon, or use /mode ipython or /mode direct.".into());
+                }
+                if crate::core::slash_commands::parse_session_slash_command(&line)
+                    .is_some_and(|command| command.name == "mode" && matches!(command.args.trim(), "clang" | "clang-repl" | "cycle"))
+                    && !connection.supports_clang_execution_mode() {
+                    return Err("This session host does not support Clang-Repl mode. Update and restart the daemon.".into());
                 }
                 prompt_model(&connection, &line, follow_up, images).await
             }
@@ -4851,6 +4858,7 @@ mod tests {
     impl wire::AgentConnection for RecordingConnection {
         fn supports_execution_mode(&self) -> bool { self.execution_mode_support }
         fn supports_node_execution_mode(&self) -> bool { self.execution_mode_support }
+        fn supports_clang_execution_mode(&self) -> bool { self.execution_mode_support }
         fn get_state(&self) -> pi_ai::types::BoxFuture<Result<wire::AgentConnectionState, String>> {
             self.record("get_state");
             let state = self.state.lock().unwrap().clone();

@@ -455,6 +455,16 @@ fn execution_mode_header_tracks_confirmed_pending_and_remapped_states() {
     let rendered = strip_ansi(&header.render(180.0).join("\n"));
     assert!(rendered.contains("offline-fixture · IPython → Direct tools pending [F8]"), "{rendered}");
     mode.borrow_mut().patch_connection_state(|state| {
+        state.execution_mode = Some(ExecutionMode::Node);
+        state.session_actions.follow_ups = vec!["/mode cycle".into()];
+    });
+    assert_eq!(execution_label(&mode.borrow()).as_deref(), Some("Node → Clang-Repl pending [F8]"));
+    mode.borrow_mut().patch_connection_state(|state| {
+        state.execution_mode = Some(ExecutionMode::Clang);
+        state.session_actions.follow_ups.clear();
+    });
+    assert_eq!(execution_label(&mode.borrow()).as_deref(), Some("Clang-Repl [F8]"));
+    mode.borrow_mut().patch_connection_state(|state| {
         state.execution_mode = Some(ExecutionMode::Direct);
         state.session_actions.follow_ups.clear();
     });

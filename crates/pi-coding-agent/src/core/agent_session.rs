@@ -2659,6 +2659,7 @@ pub struct AgentSession {
     rlm_parent_node_id: Option<String>,
     rlm_parent_agent: Option<String>,
     node_runtime: Arc<crate::core::tools::node::NodeRuntime>,
+    clang_runtime: Arc<crate::core::tools::clang::ClangRuntime>,
     ipython_kernel_provisioner:
         Mutex<Option<Arc<crate::core::tools::ipython::IpythonKernelProvisioner>>>,
     exec_env_provider: Mutex<Option<Arc<dyn Fn() -> HashMap<String, String> + Send + Sync>>>,
@@ -3030,6 +3031,7 @@ impl AgentSession {
             rlm_parent_node_id: config.rlm_parent_node_id.clone(),
             rlm_parent_agent: config.rlm_parent_agent.clone(),
             node_runtime: Arc::new(crate::core::tools::node::NodeRuntime::default()),
+            clang_runtime: Arc::new(crate::core::tools::clang::ClangRuntime::default()),
             ipython_kernel_provisioner: Mutex::new(None),
             exec_env_provider: Mutex::new(None),
             auto_compaction_enabled: AtomicBool::new(true),
@@ -7889,6 +7891,7 @@ impl AgentSession {
         }
         self.disposing.store(true, Ordering::SeqCst);
         self.node_runtime.cancel();
+        self.clang_runtime.cancel();
         self.session_action_commit_dispose_abort.cancel();
         self.dispose_async_once(kernel_snapshot).await;
     }
@@ -8157,6 +8160,7 @@ impl AgentSession {
             let _ = provisioner.dispose(Some(kernel_snapshot)).await;
         }
         self.node_runtime.dispose().await;
+        self.clang_runtime.dispose().await;
         self.dispose();
         self.start_dispose_callbacks().await;
     }
@@ -8185,6 +8189,7 @@ impl AgentSession {
             controller.cancel();
         }
         self.node_runtime.cancel();
+        self.clang_runtime.cancel();
         self.session_action_commit_dispose_abort.cancel();
         // Invalidate scheduled timers and abort any in-flight review so a late
         // resolution cannot write harness state or re-subscribe handlers.

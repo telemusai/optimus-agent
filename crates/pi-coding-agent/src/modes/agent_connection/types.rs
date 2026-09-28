@@ -1346,6 +1346,7 @@ pub trait AgentConnection: Send + Sync {
     fn supports_jev_dynamic(&self) -> bool { false }
     fn supports_execution_mode(&self) -> bool { false }
     fn supports_node_execution_mode(&self) -> bool { false }
+    fn supports_clang_execution_mode(&self) -> bool { false }
     fn supports_jev_features(&self) -> bool {
         false
     }

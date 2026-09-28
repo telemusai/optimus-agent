@@ -16,7 +16,7 @@ use crate::core::session_manager::{
 
 use super::daemon_catalog_process::{run_daemon_catalog_process, CatalogSessionBackend};
 
-pub const DAEMON_CATALOG_FAILURE_PREFIX: &str = "Prime Agent daemon catalog failed: ";
+pub const DAEMON_CATALOG_FAILURE_PREFIX: &str = "Optimus Agent daemon catalog failed: ";
 
 /// Run the catalog process as the entry point does, reporting the failure text.
 ///
@@ -129,7 +129,7 @@ mod tests {
     fn failure_prefix_matches_the_typescript() {
         assert_eq!(
             DAEMON_CATALOG_FAILURE_PREFIX,
-            "Prime Agent daemon catalog failed: "
+            "Optimus Agent daemon catalog failed: "
         );
     }
 }

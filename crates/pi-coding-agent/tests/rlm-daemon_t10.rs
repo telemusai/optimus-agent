@@ -256,7 +256,7 @@ async fn list_heartbeats_degrades_only_on_unknown_command() {
     let transport_failure = FakeTransport::new(
         &["heartbeat_catalog"],
         true,
-        Reply::Transport("Connection to the Prime Agent daemon closed.".to_string()),
+        Reply::Transport("Connection to the Optimus Agent daemon closed.".to_string()),
     );
     let connection = connect(Arc::clone(&transport_failure), true);
     assert!(

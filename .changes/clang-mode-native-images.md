@@ -1,0 +1,3 @@
+- Added a persistent Clang-Repl C++ mode, configurable F6 cycling, mode-specific prompts, and saved mode restoration.
+- Fixed inline image attachments in Node and Direct tools with a native attachment tool, also available in Clang-Repl.
+- Changed daemon startup, shutdown, and recovery messages to use Optimus Agent branding.

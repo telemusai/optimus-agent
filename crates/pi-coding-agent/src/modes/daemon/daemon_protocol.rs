@@ -69,8 +69,9 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 33 advertises optional jev_dynamic tool support; existing commands/events are unchanged.
 // Revision 34 gates /mode session commands; existing response/event shapes are unchanged.
 // Revision 35 gates Node selection and the three-mode toggle; legacy explicit modes remain compatible.
-pub const DAEMON_SCHEMA_REVISION: u32 = 35;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-35-node-modes";
+// Revision 36 gates Clang selection and four-mode cycling; legacy toggle retains three modes.
+pub const DAEMON_SCHEMA_REVISION: u32 = 36;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-36-clang-modes";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -157,6 +158,7 @@ pub enum DaemonServerCapability {
     JevDynamic,
     ExecutionMode,
     NodeExecutionMode,
+    ClangExecutionMode,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -207,7 +209,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 27] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 28] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -235,6 +237,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 27] = [
     DaemonServerCapability::JevDynamic,
     DaemonServerCapability::ExecutionMode,
     DaemonServerCapability::NodeExecutionMode,
+    DaemonServerCapability::ClangExecutionMode,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2247,6 +2250,11 @@ pub fn get_daemon_command_compatibilities(command: &DaemonCommand) -> Vec<Daemon
             .is_some_and(|c| matches!(c.args.trim(), "node" | "toggle")) {
             requirements.push(DaemonCommandCompatibility::gated(35, DaemonServerCapability::NodeExecutionMode));
         }
+        if command.get("message").as_ref().and_then(Value::as_str)
+            .and_then(crate::core::slash_commands::parse_session_slash_command)
+            .is_some_and(|c| matches!(c.args.trim(), "clang" | "clang-repl" | "cycle")) {
+            requirements.push(DaemonCommandCompatibility::gated(36, DaemonServerCapability::ClangExecutionMode));
+        }
     }
     if (command_type == "attach" || command_type == "reattach") && command.has_field("recoveryConfig") {
         requirements.push(OWNED_SESSION_RECOVERY_CONTEXT);
@@ -3070,7 +3078,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-c16da0e12d5a"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-clang-modes"));
     }
 
     #[test]

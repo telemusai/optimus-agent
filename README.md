@@ -57,27 +57,38 @@ The feature descriptions below refer to `main` unless explicitly marked as devel
 
 ## What makes Optimus different
 
-### Choose IPython, Node, or Direct tools
+### Choose IPython, Node, Clang-Repl, or Direct tools
 
-Optimus starts new chats in **IPython** mode. Press **F6** to cycle through **IPython → Node → Direct tools**. The header shows the current mode immediately after the model name, for example `gpt-6-astra · IPython [F6]`.
+Optimus starts new chats in **IPython** mode. Press **F6** to cycle through **IPython → Node → Clang-Repl → Direct tools**. The header shows the current mode immediately after the model name, for example `gpt-6-astra · IPython [F6]`.
 
 | Mode | How the agent works |
 | --- | --- |
 | **IPython** (default) | Uses a persistent Python workspace to coordinate commands, retain variables, invoke Python skills, and delegate through RLM. |
 | **Node** | Uses a persistent JavaScript workspace with top-level `await`, Node modules, file access, command execution, and native subagents. Requires Node.js 22 or newer on the daemon’s PATH. |
+| **Clang-Repl** | Uses a persistent C++17 workspace through LLVM Clang-Repl, with native image attachments and subagents. Requires `clang-repl` and C++ development headers. |
 | **Direct tools** | Calls `bash`, `edit`, and the native `subagent` tool directly and inspects their results. Project Python scripts can still run through the shell. |
 
-Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current tool batch finishes, then continues with the new mode. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Live mode switches keep both workspaces alive, so switching back can reuse their variables. Node variables are not saved across daemon restarts or session reopening. Cancelling or timing out a Node cell resets its workspace; ordinary JavaScript errors preserve it.
+Switch during an existing conversation without clearing its history. An idle chat switches before its next model request; a busy chat shows the change as pending until the current tool batch finishes, then continues with the new mode. The switch updates the system prompt and available tools together. The selected mode is saved with the chat and restored on resume or attachment. Live mode switches keep the workspaces alive, so switching back can reuse their variables. Node and Clang-Repl variables are not saved across daemon restarts or session reopening. Cancelling or timing out a Node or Clang-Repl cell resets that workspace. JavaScript errors preserve Node state; C++ compiler errors can leave earlier declarations from that cell intact.
 
 F6 and `/mode` also work in stopped chats, including after reopening them. Switching modes leaves the chat stopped: queued messages and goals do not resume, and no model request is made. If work is still settling after a stop, wait until the chat is idle before switching.
 
-Use `/mode` to inspect the current mode, `/mode ipython`, `/mode node`, or `/mode direct` to select one, and `/mode toggle` to switch. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
+Use `/mode` to inspect the current mode, `/mode ipython`, `/mode node`, `/mode clang`, or `/mode direct` to select one, and `/mode cycle` to advance through all four. The older `/mode toggle` command retains its three-mode cycle for older clients. F6 is configurable as `app.executionMode.toggle` in `keybindings.json`.
 
-Python-only skills, the Python `rlm` API, kernel MCP connections, and Python image previews require IPython mode. Native subagent delegation works in Node and Direct tools as well. Other exposed tools, including Dynamic Jev, remain available in all three modes. Changing mode does not change the selected model, Jev settings, or autonomy settings.
+Python-only skills, the Python `rlm` API, kernel MCP connections, and automatic Matplotlib previews require IPython mode. Saved images can be attached in every mode: Node, Clang-Repl and Direct tools expose a native `attach_image` tool with a `paths` array. Save a chart or screenshot, then call that tool; no Python kernel or shell attachment command is needed. Image attachments render inline when terminal image display is enabled and are available to vision-capable models. Native subagent delegation works in Node, Clang-Repl and Direct tools as well. Other exposed tools, including Dynamic Jev, remain available in all four modes. Changing mode does not change the selected model, Jev settings, or autonomy settings.
 
 In Node mode, the agent sends JavaScript to the `node` tool. It can use `require("node:fs/promises")`, async commands through `node:child_process`, and `await nodeImport("module-or-path")` for ESM. The cell timeout defaults to 60 seconds and can be set up to one hour. Python skills and the Python `rlm` API are available by switching back to IPython.
 
-Node and Direct tools expose a native `subagent` tool with `spawn`, `list`, and `collect` actions. Ask the agent to delegate independent tasks; it can start multiple children without waiting for each one. Children inherit the execution mode, project directory, and tool restrictions, and appear in the normal agent roster. Spawn returns a child handle immediately; completion notices deliver results back to the parent chat. `collect` can wait up to 60 seconds for status and answer previews without cancelling unfinished children. Existing recursion limits and parent stop/cleanup behaviour apply. No Python cell or nested `optimus-agent -p` process is needed.
+Node, Clang-Repl and Direct tools expose a native `subagent` tool with `spawn`, `list`, and `collect` actions. Ask the agent to delegate independent tasks; it can start multiple children without waiting for each one. Children inherit the execution mode, project directory, and tool restrictions, and appear in the normal agent roster. Spawn returns a child handle immediately; completion notices deliver results back to the parent chat. `collect` can wait up to 60 seconds for status and answer previews without cancelling unfinished children. Existing recursion limits and parent stop/cleanup behaviour apply. No Python cell or nested `optimus-agent -p` process is needed.
+
+In Clang-Repl mode, the system prompt tells the agent to send C++17 source to the `clang` tool. Includes, global variables, functions, and classes persist. Each cell is a complete source fragment; imperative work runs inside an immediately invoked lambda and prints its results explicitly. For example:
+
+```cpp
+#include <cstdio>
+int answer = 40;
+auto first = [] { std::printf("%d\n", answer + 2); return 0; }();
+```
+
+Use unique global names in later cells, or update existing variables from a lambda. The workspace does not replay past cells after a restart. The default timeout is 60 seconds, with a maximum of one hour. Install an LLVM distribution that includes [Clang-Repl](https://clang.llvm.org/docs/ClangRepl.html) and the platform's C++ headers; a regular `clang` compiler alone is insufficient. Optimus searches for `clang-repl` and versioned executables on PATH. Set `OPTIMUS_CLANG_REPL` to an executable path when needed. Clang-Repl runs as a contained child process using the same platform cleanup support as Node; availability of LLVM's interpreter varies by platform/distribution.
 
 ### A programmable workspace, not just a chat loop
 

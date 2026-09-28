@@ -355,7 +355,7 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         supervisor.ownership.update_phase("owner").await?;
         supervisor.register_signals();
         eprintln!(
-            "[{}] Prime Agent daemon supervisor {} listening on {}",
+            "[{}] Optimus Agent daemon supervisor {} listening on {}",
             iso_from_ms(supervisor_now_ms() as f64),
             supervisor.ownership.snapshot().generation,
             socket_path

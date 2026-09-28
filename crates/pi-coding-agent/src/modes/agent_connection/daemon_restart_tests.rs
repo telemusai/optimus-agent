@@ -123,7 +123,7 @@ async fn announced_shutdown_reattaches_the_saved_session_and_resyncs_once() {
             .await
             .unwrap();
         if close == "socket" {
-            connection.handle_transport_close("Connection to the Prime Agent daemon closed. Reason: shutdown. Socket: same-fixture-socket".into()).await;
+            connection.handle_transport_close("Connection to the Optimus Agent daemon closed. Reason: shutdown. Socket: same-fixture-socket".into()).await;
         } else {
             connection
                 .handle_daemon_message(DaemonOutbound::SessionClosed {

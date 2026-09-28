@@ -112,8 +112,9 @@ impl AgentSession {
                     current.map(ExecutionMode::label).unwrap_or("Custom tools")
                 ))
             }
-            "toggle" => current
-                .ok_or("Cannot toggle a custom tool set; use /mode ipython, /mode node or /mode direct")?
+            "toggle" => current.ok_or("Cannot toggle a custom tool set; choose an explicit /mode")?.legacy_toggled(),
+            "cycle" => current
+                .ok_or("Cannot toggle a custom tool set; use /mode ipython, /mode node, /mode clang or /mode direct")?
                 .toggled(),
             value => ExecutionMode::parse(value)?,
         };
@@ -122,7 +123,7 @@ impl AgentSession {
         }
         let mut names = mode.tools(&self.get_active_tool_names());
         if let Some(allowed) = self.allowed_tool_names.lock().unwrap().as_ref() {
-            names.retain(|name| name != "subagent" || allowed.contains(name));
+            names.retain(|name| !matches!(name.as_str(), "subagent" | "attach_image") || allowed.contains(name));
         }
         let tools: Vec<_> = {
             let registry = self.tool_registry.lock().unwrap();
