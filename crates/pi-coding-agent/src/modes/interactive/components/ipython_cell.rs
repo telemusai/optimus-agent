@@ -517,18 +517,23 @@ impl IPythonCellComponent {
     }
 
     fn language(&self) -> &str {
-        if self.state.details.as_ref().and_then(|v| v.get("language")).and_then(Value::as_str) == Some("javascript") { "javascript" } else { "python" }
+        match self.state.details.as_ref().and_then(|v| v.get("language")).and_then(Value::as_str) {
+            Some("javascript") => "javascript",
+            Some("cpp") => "cpp",
+            _ => "python",
+        }
     }
 
     /// Port of `collapsedLine`.
     fn collapsed_line(&self, details: &IpythonDetails) -> String {
         let code = self.state.code.trim_end().to_string();
         let is_bash_cell = self.language() == "python" && parse_ipython_bash_cell(&code).is_some();
-        let mut preview = preview_ipython_code(&code);
-        if self.language() == "javascript" {
-            preview.text = code.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim().chars().take(100).collect();
-        }
-        let preview_language = if self.language() == "javascript" { "javascript" } else { preview.language.as_str() };
+        let (preview_language, preview_text) = if self.language() == "python" {
+            let preview = preview_ipython_code(&code);
+            (preview.language.as_str(), preview.text)
+        } else {
+            (self.language(), code.lines().find(|line| !line.trim().is_empty()).unwrap_or("").trim().chars().take(100).collect())
+        };
         let language_label = if is_bash_cell && preview_language != "bash" {
             format!("bash \u{b7} {preview_language}")
         } else {
@@ -540,8 +545,8 @@ impl IPythonCellComponent {
             theme().fg("muted", &language_label)
         )];
 
-        if !preview.text.is_empty() {
-            parts.push(self.highlight_input_line(&preview.text, preview_language == "bash"));
+        if !preview_text.is_empty() {
+            parts.push(self.highlight_input_line(&preview_text, preview_language == "bash"));
         } else if self.state.execution_started != Some(true) {
             parts.push(theme().fg("muted", "waiting for code"));
         }
@@ -592,7 +597,7 @@ impl IPythonCellComponent {
     /// `↑in ↓out lines` - the "lines" unit disambiguates from the token counts on
     /// the activity line. Output is omitted for edits (the diff shows on expand).
     fn line_counts(&self, details: &IpythonDetails) -> Option<String> {
-        let bash_cell = parse_ipython_bash_cell(&self.state.code);
+        let bash_cell = if self.language() == "python" { parse_ipython_bash_cell(&self.state.code) } else { None };
         let body = bash_cell
             .map(|parsed| parsed.body)
             .unwrap_or_else(|| self.state.code.clone());
@@ -733,9 +738,9 @@ impl IPythonCellComponent {
             } else {
                 theme().fg("dim", "  ")
             };
-            let highlighted = if is_bash_cell
+            let highlighted = if self.language() == "python" && (is_bash_cell
                 || magic_line_pattern().is_match(raw_line)
-                || parse_ipython_bash_cell(raw_line).is_some()
+                || parse_ipython_bash_cell(raw_line).is_some())
             {
                 theme().fg("bashMode", raw_line)
             } else {

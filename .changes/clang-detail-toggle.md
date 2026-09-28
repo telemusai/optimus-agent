@@ -1,0 +1,1 @@
+- Fixed Clang-Repl cells showing raw JSON instead of compact C++ summaries. Ctrl+O now expands source, output, and compiler diagnostics in live and restored chats, matching Python and Node cells.
