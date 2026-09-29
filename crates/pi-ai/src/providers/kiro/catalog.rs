@@ -3,7 +3,7 @@ use crate::types::{InputModality, Model, ModelCost};
 use serde_json::{json, Value};
 use std::{collections::HashSet, time::Duration};
 
-/// Baseline reported by Kiro CLI 2.25.0 on 2026-09-29. Availability depends on the account.
+/// Baseline reported by Kiro management API on 2026-09-29. Availability depends on the account.
 pub fn built_in_models() -> Vec<Model> {
     serde_json::from_str(include_str!("models.json")).expect("embedded Kiro catalog must be valid")
 }
@@ -63,7 +63,9 @@ pub fn parse_models(value: &Value, base_url: &str) -> Result<Vec<Model>, String>
 pub async fn discover(key: &str, base_url: Option<&str>) -> Result<Vec<Model>, String> {
     let access = Access::parse(key)?;
     let client = client()?;
-    let root = access.root(base_url.unwrap_or(DEFAULT_ENDPOINT))?;
+    let base_url = base_url.unwrap_or(DEFAULT_ENDPOINT);
+    let root = access.root(base_url)?;
+    let management = access.management_root(base_url)?;
     let mut models = vec![];
     let mut ids = HashSet::new();
     let mut pages = HashSet::new();
@@ -76,14 +78,25 @@ pub async fn discover(key: &str, base_url: Option<&str>) -> Result<Vec<Model>, S
         if let Some(next) = &next {
             body["nextToken"] = json!(next);
         }
-        let response = access
-            .request(
-                &client,
-                root.clone(),
-                "AmazonCodeWhispererService.ListAvailableModels",
-            )
+        let request = if access.api_key {
+            access
+                .request(
+                    &client,
+                    management.clone(),
+                    "AmazonCodeWhispererService.ListAvailableModels",
+                )
+                .json(&body)
+        } else {
+            let url = management
+                .join("List-Available-Models")
+                .map_err(|_| "Invalid Kiro model discovery endpoint")?;
+            access
+                .authorize(client.get(url))
+                .header("Accept", "application/json")
+                .query(&body)
+        };
+        let response = request
             .timeout(Duration::from_secs(15))
-            .json(&body)
             .send()
             .await
             .map_err(|_| "Kiro model discovery network error")?;

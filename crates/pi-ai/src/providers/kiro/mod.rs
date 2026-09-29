@@ -16,7 +16,7 @@ use futures_util::StreamExt;
 use serde_json::Value;
 use std::time::Duration;
 
-pub const DEFAULT_ENDPOINT: &str = "https://q.us-east-1.amazonaws.com/";
+pub const DEFAULT_ENDPOINT: &str = "https://runtime.us-east-1.kiro.dev/";
 
 pub(crate) struct Access {
     credential: Credential,
@@ -54,7 +54,11 @@ impl Access {
         })
     }
     pub(crate) fn root(&self, base: &str) -> Result<url::Url, String> {
-        let default = format!("https://q.{}.amazonaws.com/", self.credential.region);
+        let default = if self.api_key {
+            format!("https://q.{}.amazonaws.com/", self.credential.region)
+        } else {
+            format!("https://runtime.{}.kiro.dev/", self.credential.region)
+        };
         let base = if base.is_empty() || base == DEFAULT_ENDPOINT {
             &default
         } else {
@@ -79,7 +83,7 @@ impl Access {
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
         if !self.api_key
             && url.host_str()
-                != Some(format!("q.{}.amazonaws.com", self.credential.region).as_str())
+                != Some(format!("runtime.{}.kiro.dev", self.credential.region).as_str())
             && !(cfg!(test) && loopback)
         {
             return Err(
@@ -94,6 +98,30 @@ impl Access {
         url.set_path(&format!("{path}/"));
         Ok(url)
     }
+    pub(crate) fn management_root(&self, base: &str) -> Result<url::Url, String> {
+        let mut root = self.root(base)?;
+        if !self.api_key
+            && root.host_str()
+                == Some(format!("runtime.{}.kiro.dev", self.credential.region).as_str())
+        {
+            root.set_host(Some(&format!(
+                "management.{}.kiro.dev",
+                self.credential.region
+            )))
+            .map_err(|_| "Invalid Kiro management endpoint")?;
+        }
+        Ok(root)
+    }
+    pub(crate) fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
+        let mut request = request.bearer_auth(&self.credential.access).header(
+            "User-Agent",
+            concat!("Optimus-Agent/", env!("CARGO_PKG_VERSION")),
+        );
+        if self.api_key {
+            request = request.header("tokentype", "API_KEY");
+        }
+        request
+    }
     pub(crate) fn origin(&self) -> &'static str {
         if self.api_key {
             "AI_EDITOR"
@@ -107,19 +135,16 @@ impl Access {
         url: url::Url,
         target: &str,
     ) -> reqwest::RequestBuilder {
-        let mut request = client
-            .post(url)
-            .bearer_auth(&self.credential.access)
-            .header("Content-Type", "application/x-amz-json-1.0")
-            .header("X-Amz-Target", target)
+        let mut request = self
+            .authorize(client.post(url))
             .header("x-amzn-codewhisperer-optout", "true")
-            .header(
-                "User-Agent",
-                concat!("Optimus-Agent/", env!("CARGO_PKG_VERSION")),
-            )
             .header("amz-sdk-invocation-id", uuid::Uuid::new_v4().to_string());
         if self.api_key {
-            request = request.header("tokentype", "API_KEY");
+            request = request
+                .header("Content-Type", "application/x-amz-json-1.0")
+                .header("X-Amz-Target", target);
+        } else {
+            request = request.header("Content-Type", "application/json");
         }
         request
     }

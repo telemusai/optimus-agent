@@ -79,9 +79,11 @@ The default path is the platform's local data directory under `kiro-cli/data.sql
 
 Alternatively, configure an authorized `KIRO_API_KEY` in the daemon environment or store it under the `kiro` provider in `auth.json`. `KIRO_API_REGION` defaults to `us-east-1`; use the region that issued the key. The API-key route sends the API-key token type and uses the service-root endpoint.
 
-The baseline catalog contains the 20 model IDs reported by Kiro CLI 2.25.0 on 2026-09-29, including `auto`, `claude-opus-5.5`, `claude-opus-5`, `claude-sonnet-5`, the GPT-5.6 variants, Haiku, DeepSeek, MiniMax, GLM and Qwen. Native IDs keep their dots. Reported 1M context windows remain 1M; Optimus's compaction ceiling is separate. Model availability depends on the account. This bundled list is not an entitlement check and does not refresh automatically.
+The baseline catalog contains the 20 model IDs reported by the authenticated Kiro management API on 2026-09-29, including `auto`, `claude-opus-5.5`, `claude-opus-5`, `claude-sonnet-5`, the GPT-5.6 variants, Haiku, DeepSeek, MiniMax, GLM and Qwen. Native IDs keep their dots. Reported 1M context windows remain 1M; Optimus's compaction ceiling is separate. Model availability depends on the account. This bundled list is not an entitlement check and does not refresh automatically.
 
-Custom `models.json` entries use `"api": "kiro-api"` under provider `kiro`; `contextWindow` and `maxTokens` remain configurable. Default output metadata is a conservative 8,192 tokens when the CLI does not report an output limit. Kiro controls response limits; this transport does not claim to enforce a requested `maxTokens` or temperature. Costs are subscription credits, not a known USD/token tariff, so catalog USD costs are zero rather than a billing estimate. When the stream omits exact usage, token counters are approximate; raw usage observations are emitted only for API-reported counts.
+Custom `models.json` entries use `"api": "kiro-api"` under provider `kiro`; `contextWindow` and `maxTokens` remain configurable. The bundled context, output and image limits come from that API response. Unknown models fall back to 8,192 output tokens when discovery omits the limit. Kiro controls response limits; this transport does not claim to enforce a requested `maxTokens` or temperature. Costs are subscription credits, not a known USD/token tariff, so catalog USD costs are zero rather than a billing estimate. When the stream omits exact usage, token counters are approximate; raw usage observations are emitted only for API-reported counts.
+
+CLI OAuth discovery uses `GET https://management.<region>.kiro.dev/List-Available-Models`; inference uses `POST https://runtime.<region>.kiro.dev/generateAssistantResponse`. Both use the profile region. These are distinct services; discovery success does not imply permission to generate a response.
 
 For explicit direct discovery from a source checkout, run:
 
@@ -95,7 +97,7 @@ This reads `KIRO_API_KEY` or the existing CLI login and prints a credential-free
 cargo run --locked -p pi-ai --example kiro_probe -- --model claude-haiku-4.5
 ```
 
-These are explicit live diagnostics and can consume subscription credits. They are not run by regression tests. Successful CLI login or model listing does not prove direct API entitlement. An HTTP 403 such as “Your subscription does not support this application” remains an access-denied error, without changing identity or retrying another endpoint. The integration does not claim official third-party subscription support.
+These are explicit live diagnostics and can consume subscription credits. They are not run by regression tests. Successful CLI login or model listing does not prove direct API entitlement. An HTTP 403 remains an access-denied error, without changing identity or retrying another endpoint. On the validation host, current-service model discovery returned HTTP 200 and 20 models, while native `auto` and Haiku inference returned HTTP 403 (“User is not authorized to make this call.”). A separate test through the installed CLI’s supported ACP interface returned a live response; that exercises Kiro’s own agent loop and does not validate this direct provider. The integration does not claim official third-party subscription support.
 
 ## API Keys
 

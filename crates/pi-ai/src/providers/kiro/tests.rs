@@ -77,7 +77,7 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
                 .strip_prefix("content-length: ")
                 .map(str::to_owned)
         })
-        .unwrap()
+        .unwrap_or_else(|| "0".into())
         .parse()
         .unwrap();
     while request.len() < split + length {
@@ -85,7 +85,11 @@ async fn read_request(socket: &mut tokio::net::TcpStream) -> (String, Value) {
         assert!(n > 0);
         request.extend_from_slice(&temp[..n]);
     }
-    let payload: Value = serde_json::from_slice(&request[split..split + length]).unwrap();
+    let payload: Value = if length == 0 {
+        Value::Null
+    } else {
+        serde_json::from_slice(&request[split..split + length]).unwrap()
+    };
     (headers, payload)
 }
 
@@ -176,6 +180,9 @@ async fn oauth_uses_own_profile_without_api_key_identity() {
     let (headers, body) = server.await.unwrap();
     assert!(headers.starts_with("POST /generateAssistantResponse HTTP/1.1"));
     assert!(!headers.contains("tokentype"));
+    assert!(!headers.contains("x-amz-target"));
+    assert!(headers.contains("content-type: application/json"));
+    assert!(headers.contains("user-agent: Optimus-Agent/"));
     assert!(headers.contains("authorization: Bearer synthetic-oauth"));
     assert_eq!(body["profileArn"], "synthetic-profile");
 }
@@ -560,4 +567,66 @@ async fn discovery_paginates_deduplicates_and_rejects_repeated_page_tokens() {
             );
         }
     }
+}
+
+#[test]
+fn oauth_uses_current_services_in_the_profile_region() {
+    let access = Access::parse(
+        &Credential {
+            access: "fixture".into(),
+            region: "eu-central-1".into(),
+            profile_arn: None,
+        }
+        .encode(),
+    )
+    .unwrap();
+    assert_eq!(
+        access.root(DEFAULT_ENDPOINT).unwrap().as_str(),
+        "https://runtime.eu-central-1.kiro.dev/"
+    );
+    assert_eq!(
+        access.management_root(DEFAULT_ENDPOINT).unwrap().as_str(),
+        "https://management.eu-central-1.kiro.dev/"
+    );
+    assert!(access
+        .root("https://runtime.us-east-1.kiro.dev/custom")
+        .is_err());
+    assert!(access
+        .root("https://q.eu-central-1.amazonaws.com/")
+        .is_err());
+}
+
+#[tokio::test]
+async fn oauth_catalog_uses_management_get_and_preserves_runtime_model_urls() {
+    let (url, server) = fixture(json!({"models":[{"modelId":"claude-opus-5.5","tokenLimits":{"maxInputTokens":1000000,"maxOutputTokens":128000},"supportedInputTypes":["TEXT","IMAGE"]}]}).to_string().into_bytes(),200,false).await;
+    let key = Credential {
+        access: "synthetic-oauth".into(),
+        region: "us-east-1".into(),
+        profile_arn: Some("arn:aws:kiro:us-east-1:test:profile/example".into()),
+    }
+    .encode();
+    let models = catalog::discover(&key, Some(&url)).await.unwrap();
+    let (headers, body) = server.await.unwrap();
+    assert!(headers.starts_with("GET /List-Available-Models?"));
+    assert!(headers.contains("authorization: Bearer synthetic-oauth"));
+    assert!(!headers.contains("x-amz-target"));
+    assert!(body.is_null());
+    let path = headers
+        .lines()
+        .next()
+        .unwrap()
+        .split_whitespace()
+        .nth(1)
+        .unwrap();
+    let request = url::Url::parse(&format!("http://fixture{path}")).unwrap();
+    let query = request
+        .query_pairs()
+        .collect::<std::collections::HashMap<_, _>>();
+    assert_eq!(query.get("origin").map(|v| v.as_ref()), Some("KIRO_CLI"));
+    assert_eq!(
+        query.get("profileArn").map(|v| v.as_ref()),
+        Some("arn:aws:kiro:us-east-1:test:profile/example")
+    );
+    assert_eq!(models[0].base_url, url);
+    assert_eq!(models[0].max_tokens, 128000.0);
 }
