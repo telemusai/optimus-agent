@@ -5,3 +5,4 @@
 - Fixed JSON print mode returning a successful exit code after provider errors; text and JSON runs now check the same terminal outcome.
 - Fixed Kiro CLI OAuth generation returning HTTP 403 by supplying the required CLI application metadata while retaining Optimus's client identity.
 - Added Kiro provider `region` configuration in `models.json`, defaulting to `us-east-1` independently of the sign-in region.
+- Changed the Optimus application and Python runtime version to 0.1.17.
