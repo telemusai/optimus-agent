@@ -446,26 +446,42 @@ fn create_memory_extension_impl(
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .get(&session_key(&ctx))
                         .cloned();
-                    let baseline = match cached {
-                        Some((cached_key, recall)) if cached_key == key => recall,
-                        _ => {
-                            let mut hits = if query.is_empty() { Vec::new() } else { memory.search(&query, false) };
-                            let recalled = memory.render_recall(&hits);
-                            hits.retain(|hit| recalled.ids.contains(&hit.id));
-                            Arc::new(CachedRecall { hits, recalled: Arc::new(recalled) })
+                    let supplemental_enabled = crate::core::jev_bridge::memory::enabled(
+                        &ctx.session_manager().get_session_id());
+                    let normal_memory = memory.clone();
+                    let normal_query = query.clone();
+                    let normal_key = key.clone();
+                    let normal = tokio::task::spawn_blocking(move || {
+                        match cached {
+                            Some((cached_key, recall)) if cached_key == normal_key && !supplemental_enabled => recall,
+                            _ => {
+                                let mut hits = if normal_query.is_empty() { Vec::new() } else { normal_memory.search(&normal_query, false) };
+                                let recalled = normal_memory.render_recall(&hits);
+                                hits.retain(|hit| recalled.ids.contains(&hit.id));
+                                Arc::new(CachedRecall { hits, recalled: Arc::new(recalled) })
+                            }
                         }
-                    };
+                    });
+                    let (baseline, supplemental) = tokio::join!(normal,
+                        crate::core::jev_bridge::memory::retrieve(ctx.clone(), memory.clone(), &query));
+                    let baseline = baseline.map_err(|_| "Memory recall worker failed".to_string())?;
                     recalled_turns
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
                         .insert(session_key(&ctx), (key, baseline.clone()));
-                    let filtered = crate::core::jev_bridge::filter_memory_candidates(
-                        ctx.clone(), &query, baseline.hits.clone(),
-                    ).await;
-                    let recalled = if filtered.len() == baseline.hits.len() {
-                        baseline.recalled.clone()
+                    let recalled = if supplemental_enabled {
+                        // Supplemental recall never filters or spends the normal lane's budget.
+                        let normal = memory.render_recall(&baseline.hits);
+                        Arc::new(match supplemental {
+                            Some(retrieval) => retrieval.append(&memory, normal),
+                            None => normal,
+                        })
                     } else {
-                        Arc::new(memory.render_recall(&filtered))
+                        let filtered = crate::core::jev_bridge::filter_memory_candidates(
+                            ctx.clone(), &query, baseline.hits.clone(),
+                        ).await;
+                        if filtered.len() == baseline.hits.len() { baseline.recalled.clone() }
+                        else { Arc::new(memory.render_recall(&filtered)) }
                     };
                     if !recalled.text.is_empty() {
                         let note: AgentMessage =

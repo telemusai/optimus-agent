@@ -77,7 +77,10 @@ fn realpath_sync(path: &Path) -> String {
 
 /// Windows paths are case-insensitive; lock identity must match the OS view.
 fn lock_key(path: &Path) -> String {
-    realpath_sync(path).to_lowercase()
+    let key = realpath_sync(path);
+    #[cfg(windows)]
+    let key = key.to_lowercase();
+    key
 }
 
 fn projects_registry_path(agent_dir: &str) -> PathBuf {

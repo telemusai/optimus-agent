@@ -1,0 +1,3 @@
+- Fixed Claude summary truncation recovery: preserve native max_tokens diagnostics, reserve adaptive-thinking headroom, and retry confirmed exhaustion once without replacing history with an incomplete handoff.
+- Added `/jev feature memory on`, included in full-Jev, to supplement normal recall with bounded parallel Jev retrieval while preserving normal results, memory scopes, source checks, cancellation, and fallback behavior.
+- Fixed project memory initialization in mixed-case profile paths on case-sensitive filesystems.

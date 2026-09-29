@@ -1285,11 +1285,15 @@ fn summary_output_budgets(
     if !ceiling.is_finite() || ceiling < 1.0 {
         return Err("Compaction model has no usable output budget".to_string());
     }
-    // Responses counts hidden reasoning inside max_output_tokens. Other APIs
-    // keep their adapter-owned reasoning budget behavior (no double addition).
-    let reasoning_budgeted = model.reasoning
+    // Adaptive Claude and Responses count reasoning inside the output limit.
+    // Legacy Claude adds its explicit thinking budget in the adapter already.
+    let adaptive_claude = model.api == "anthropic-messages" && model.reasoning
+        && pi_ai::providers::anthropic::supports_adaptive_thinking(&model.id)
+        && (thinking_level.is_some_and(|level| *level != ThinkingLevel::Off)
+            || pi_ai::providers::anthropic::is_always_on_adaptive_thinking_model(&model.id));
+    let reasoning_budgeted = adaptive_claude || (model.reasoning
         && matches!(model.api.as_str(), "openai-responses" | "azure-openai-responses")
-        && thinking_level != Some(&ThinkingLevel::Off);
+        && thinking_level != Some(&ThinkingLevel::Off));
     if reasoning_budgeted {
         // Local ceiling for the added reasoning headroom. Preserve other APIs'
         // preexisting initial output allocation, including Ollama.
@@ -1299,7 +1303,8 @@ fn summary_output_budgets(
         pi_ai::providers::simple_options::adjust_max_tokens_for_thinking(
             requested,
             ceiling,
-            &thinking_level.map(|level| level.as_str()).unwrap_or("medium").to_string(),
+            &thinking_level.filter(|level| **level != ThinkingLevel::Off)
+                .map(|level| level.as_str()).unwrap_or("medium").to_string(),
             request_options.and_then(|options| options.simple.thinking_budgets.as_ref()),
         ).max_tokens
     } else {
@@ -1488,6 +1493,8 @@ async fn generate_bounded_summary(
         // does not retain the raw reason. Responses also maps generic incomplete
         // to length, so it still requires explicit max_output_tokens evidence.
         let exhausted_output = response.stop_reason_raw.as_deref() == Some("max_output_tokens")
+            || (model.api == "anthropic-messages"
+                && response.stop_reason_raw.as_deref() == Some("max_tokens"))
             || (model.api == "openai-completions"
                 && matches!(response.stop_reason_raw.as_deref(), None | Some("length")));
         if !length_retry_used && retry_max_tokens > max_tokens
@@ -1628,7 +1635,7 @@ pub fn classify_summary_failure(error: &str) -> SummaryFailureKind {
             if is_filtered_provider_status(status) {
                 return SummaryFailureKind::FilteredOrRefused;
             }
-            if status == "max_output_tokens" {
+            if matches!(status, "max_output_tokens" | "max_tokens") {
                 return SummaryFailureKind::LengthExhausted;
             }
         }
@@ -2129,6 +2136,20 @@ mod summary_retry_safety_tests {
             ),
             "{error}"
         );
+    }
+
+    #[test]
+    fn adaptive_summary_budget_covers_split_prefix_and_always_on_thinking() {
+        let mut model = Model::new("claude-opus-5-5", "Opus", "anthropic-messages", "fixture", "http://localhost");
+        model.context_window = 1_000_000.0;
+        model.max_tokens = 128_000.0;
+        model.reasoning = true;
+        assert_eq!(summary_output_budgets(&model, 8192.0, Some(&ThinkingLevel::Max), None).unwrap(), (24576.0,49152.0));
+        assert_eq!(summary_output_budgets(&model, 8192.0, Some(&ThinkingLevel::Off), None).unwrap(), (16384.0,32768.0));
+        model.id = "claude-sonnet-5".into();
+        assert_eq!(summary_output_budgets(&model, 8192.0, Some(&ThinkingLevel::Off), None).unwrap(), (8192.0,16384.0));
+        model.max_tokens = 10_000.0;
+        assert_eq!(summary_output_budgets(&model, 8192.0, Some(&ThinkingLevel::Max), None).unwrap(), (10000.0,10000.0));
     }
 
     #[test]
