@@ -141,6 +141,7 @@ async fn streams_fragmented_unicode_repeated_text_and_exact_usage() {
     let (headers, body) = server.await.unwrap();
     assert!(headers.starts_with("POST / HTTP/1.1"));
     assert!(headers.contains("tokentype: API_KEY"));
+    assert!(!headers.contains("app/AmazonQ-For-CLI"));
     assert_eq!(
         body["conversationState"]["currentMessage"]["userInputMessage"]["origin"],
         "AI_EDITOR"
@@ -183,6 +184,23 @@ async fn oauth_uses_own_profile_without_api_key_identity() {
     assert!(!headers.contains("x-amz-target"));
     assert!(headers.contains("content-type: application/json"));
     assert!(headers.contains("user-agent: Optimus-Agent/"));
+    let expected_agent = concat!(
+        "Optimus-Agent/",
+        env!("CARGO_PKG_VERSION"),
+        " app/AmazonQ-For-CLI"
+    );
+    for name in ["user-agent", "x-amz-user-agent"] {
+        assert_eq!(
+            headers
+                .lines()
+                .filter(|line| line.starts_with(&format!("{name}:")))
+                .count(),
+            1
+        );
+        assert!(headers
+            .lines()
+            .any(|line| line == format!("{name}: {expected_agent}")));
+    }
     assert!(headers.contains("authorization: Bearer synthetic-oauth"));
     assert_eq!(body["profileArn"], "synthetic-profile");
 }
@@ -316,6 +334,7 @@ async fn access_denied_is_not_retried_or_reported_as_success_and_redacts_token()
     assert!(error.contains("HTTP 403"));
     assert!(error.contains("subscription"));
     assert!(!error.contains("ksk_synthetic"));
+    assert!(!error.contains("Check this account's API entitlement"));
 }
 
 #[tokio::test]
@@ -570,7 +589,7 @@ async fn discovery_paginates_deduplicates_and_rejects_repeated_page_tokens() {
 }
 
 #[test]
-fn oauth_uses_current_services_in_the_profile_region() {
+fn oauth_defaults_to_us_east_1_and_uses_the_configured_service_region() {
     let access = Access::parse(
         &Credential {
             access: "fixture".into(),
@@ -582,18 +601,51 @@ fn oauth_uses_current_services_in_the_profile_region() {
     .unwrap();
     assert_eq!(
         access.root(DEFAULT_ENDPOINT).unwrap().as_str(),
-        "https://runtime.eu-central-1.kiro.dev/"
+        "https://runtime.us-east-1.kiro.dev/"
     );
     assert_eq!(
         access.management_root(DEFAULT_ENDPOINT).unwrap().as_str(),
+        "https://management.us-east-1.kiro.dev/"
+    );
+    let configured = endpoint_for_region("eu-central-1").unwrap();
+    assert_eq!(
+        access.root(&configured).unwrap().as_str(),
+        "https://runtime.eu-central-1.kiro.dev/"
+    );
+    assert_eq!(
+        access.management_root(&configured).unwrap().as_str(),
         "https://management.eu-central-1.kiro.dev/"
     );
     assert!(access
-        .root("https://runtime.us-east-1.kiro.dev/custom")
+        .root("https://runtime.us-east-1.kiro.dev.evil.test/")
         .is_err());
     assert!(access
         .root("https://q.eu-central-1.amazonaws.com/")
         .is_err());
+}
+
+#[test]
+fn configured_api_key_region_overrides_credential_default_for_both_services() {
+    let access = Access {
+        credential: Credential {
+            access: "ksk_fixture".into(),
+            region: "eu-central-1".into(),
+            profile_arn: None,
+        },
+        api_key: true,
+    };
+    let endpoint = endpoint_for_region("us-east-1").unwrap();
+    assert_eq!(
+        access.root(&endpoint).unwrap().as_str(),
+        "https://q.us-east-1.amazonaws.com/"
+    );
+    assert_eq!(
+        access.management_root(&endpoint).unwrap().as_str(),
+        "https://q.us-east-1.amazonaws.com/"
+    );
+    for invalid in ["", "US-EAST-1", "us-east-1.evil.test", "us-east-1/path"] {
+        assert!(endpoint_for_region(invalid).is_err());
+    }
 }
 
 #[tokio::test]

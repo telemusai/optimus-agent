@@ -18,6 +18,21 @@ use std::time::Duration;
 
 pub const DEFAULT_ENDPOINT: &str = "https://runtime.us-east-1.kiro.dev/";
 
+/// Explicit regions use a URL distinct from the bundled default sentinel.
+pub fn endpoint_for_region(region: &str) -> Result<String, String> {
+    if !auth::valid_region(region) {
+        return Err("Invalid Kiro region (expected an AWS region such as us-east-1)".into());
+    }
+    Ok(format!("https://runtime.{region}.kiro.dev"))
+}
+
+fn runtime_region(url: &url::Url) -> Option<&str> {
+    url.host_str()?
+        .strip_prefix("runtime.")?
+        .strip_suffix(".kiro.dev")
+        .filter(|region| auth::valid_region(region))
+}
+
 pub(crate) struct Access {
     credential: Credential,
     api_key: bool,
@@ -57,7 +72,7 @@ impl Access {
         let default = if self.api_key {
             format!("https://q.{}.amazonaws.com/", self.credential.region)
         } else {
-            format!("https://runtime.{}.kiro.dev/", self.credential.region)
+            DEFAULT_ENDPOINT.to_string()
         };
         let base = if base.is_empty() || base == DEFAULT_ENDPOINT {
             &default
@@ -81,14 +96,16 @@ impl Access {
             );
         }
         let loopback = matches!(url.host_str(), Some("127.0.0.1" | "localhost" | "[::1]"));
-        if !self.api_key
-            && url.host_str()
-                != Some(format!("runtime.{}.kiro.dev", self.credential.region).as_str())
-            && !(cfg!(test) && loopback)
-        {
+        if !self.api_key && runtime_region(&url).is_none() && !(cfg!(test) && loopback) {
             return Err(
-                "Kiro CLI OAuth credentials are restricted to their regional Kiro endpoint".into(),
+                "Kiro CLI OAuth credentials are restricted to regional Kiro endpoints".into(),
             );
+        }
+        if self.api_key {
+            if let Some(region) = runtime_region(&url).map(str::to_owned) {
+                url.set_host(Some(&format!("q.{region}.amazonaws.com")))
+                    .map_err(|_| "Invalid Kiro API-key endpoint")?;
+            }
         }
         let path = url
             .path()
@@ -100,25 +117,32 @@ impl Access {
     }
     pub(crate) fn management_root(&self, base: &str) -> Result<url::Url, String> {
         let mut root = self.root(base)?;
-        if !self.api_key
-            && root.host_str()
-                == Some(format!("runtime.{}.kiro.dev", self.credential.region).as_str())
-        {
-            root.set_host(Some(&format!(
-                "management.{}.kiro.dev",
-                self.credential.region
-            )))
-            .map_err(|_| "Invalid Kiro management endpoint")?;
+        if !self.api_key {
+            if let Some(region) = runtime_region(&root).map(str::to_owned) {
+                root.set_host(Some(&format!("management.{region}.kiro.dev")))
+                    .map_err(|_| "Invalid Kiro management endpoint")?;
+            }
         }
         Ok(root)
     }
     pub(crate) fn authorize(&self, request: reqwest::RequestBuilder) -> reqwest::RequestBuilder {
-        let mut request = request.bearer_auth(&self.credential.access).header(
-            "User-Agent",
-            concat!("Optimus-Agent/", env!("CARGO_PKG_VERSION")),
-        );
+        let mut request = request.bearer_auth(&self.credential.access);
         if self.api_key {
-            request = request.header("tokentype", "API_KEY");
+            request = request.header("tokentype", "API_KEY").header(
+                "User-Agent",
+                concat!("Optimus-Agent/", env!("CARGO_PKG_VERSION")),
+            );
+        } else {
+            // Kiro routes CLI OAuth subscriptions using this legacy application marker.
+            // Retain Optimus's identity; no borrowed SDK version or device ID is needed.
+            let user_agent = concat!(
+                "Optimus-Agent/",
+                env!("CARGO_PKG_VERSION"),
+                " app/AmazonQ-For-CLI"
+            );
+            request = request
+                .header("User-Agent", user_agent)
+                .header("x-amz-user-agent", user_agent);
         }
         request
     }
@@ -184,7 +208,7 @@ pub(crate) async fn response_error(response: reqwest::Response, access: &Access)
         .unwrap_or("Request rejected by Kiro");
     let detail = access.error(message);
     if status.as_u16() == 403 {
-        format!("Kiro access denied (HTTP 403): {detail}. Check this account's API entitlement; CLI login alone does not verify direct API access.")
+        format!("Kiro access denied (HTTP 403): {detail}")
     } else if status.as_u16() == 413 || message.contains("CONTENT_LENGTH_EXCEEDS_THRESHOLD") {
         "Kiro context_length_exceeded; conversation preserved".into()
     } else {

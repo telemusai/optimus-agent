@@ -182,7 +182,7 @@ Claude Opus 5.5 is bundled with a **1,000,000-token context window**. You can ov
 
 Optimus includes a native **Kiro** provider with 20 catalog entries, including Opus 5.5, Sonnet 5 and the GPT-5.6 models, preserving reported 1M context windows. It can reuse an existing Kiro CLI OIDC login or use `KIRO_API_KEY`. Optimus keeps control of its agent loop, tools and execution modes.
 
-Select `kiro/claude-sonnet-5` in `/model`, or use `optimus-agent --provider kiro --model claude-sonnet-5`. CLI login and catalog presence do not establish direct API entitlement. This integration is awaiting successful live direct-inference validation; see [Kiro setup, model discovery and limitations](resources/agent/docs/providers.md#kiro).
+Select `kiro/claude-sonnet-5` in `/model`, or use `optimus-agent --provider kiro --model claude-sonnet-5`. Native tool round trips with Opus 5.5, Sonnet 5 and Haiku 4.5 have been validated using an existing CLI login. The service region defaults to `us-east-1`; configure `providers.kiro.region` in `models.json` to change it. See [Kiro setup, model discovery and limitations](resources/agent/docs/providers.md#kiro).
 
 ### Efficiency you can measure
 

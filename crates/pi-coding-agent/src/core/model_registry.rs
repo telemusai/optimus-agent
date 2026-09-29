@@ -136,6 +136,9 @@ pub struct ProviderConfig {
     pub name: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub base_url: Option<String>,
+    /// Kiro service region; defaults to us-east-1 when no endpoint is configured.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub region: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub api_key: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -520,7 +523,7 @@ pub fn validate_models_config_schema(value: &Value) -> Vec<String> {
             errors.push(format!("  - {}: Expected object", path));
             continue;
         };
-        for key in ["name", "baseUrl", "apiKey", "api"] {
+        for key in ["name", "baseUrl", "apiKey", "api", "region"] {
             if let Some(entry) = provider.get(key) {
                 expect_string(entry, &validation_path(&path, key), &mut errors, 1);
             }
@@ -1522,7 +1525,7 @@ impl ModelRegistry {
             )));
         }
 
-        let config: ModelsConfig = match serde_json::from_value(parsed) {
+        let mut config: ModelsConfig = match serde_json::from_value(parsed) {
             Ok(config) => config,
             Err(error) => {
                 return empty_custom_models_result(Some(format!(
@@ -1531,6 +1534,12 @@ impl ModelRegistry {
                 )))
             }
         };
+
+        if let Err(error) = resolve_kiro_regions(&mut config) {
+            return empty_custom_models_result(Some(format!(
+                "Failed to load models.json: {}\n\nFile: {}", error, models_json_path
+            )));
+        }
 
         // `validateConfig` throws inside the TypeScript try block, so its message
         // is reported through the generic "Failed to load models.json" path.
@@ -3125,6 +3134,24 @@ fn fingerprint_provider_request_auth_source(source: &str, material: &str) -> Str
     format!("{}:{:x}", source, hasher.finalize())
 }
 
+fn resolve_kiro_regions(config: &mut ModelsConfig) -> Result<(), String> {
+    for (name, provider) in &mut config.providers {
+        let kiro = name == "kiro" || provider.api.as_deref() == Some("kiro-api");
+        if let Some(region) = &provider.region {
+            if !kiro {
+                return Err(format!("Provider {name}: region is supported only for kiro-api."));
+            }
+            if provider.base_url.is_some() {
+                return Err(format!("Provider {name}: specify region or baseUrl, not both."));
+            }
+            provider.base_url = Some(pi_ai::providers::kiro::endpoint_for_region(region)?);
+        } else if kiro && provider.base_url.is_none() {
+            provider.base_url = Some(pi_ai::providers::kiro::DEFAULT_ENDPOINT.to_string());
+        }
+    }
+    Ok(())
+}
+
 
 #[cfg(test)]
 mod tests {
@@ -3155,6 +3182,42 @@ mod tests {
         assert_eq!(strip_json_comments("{\"a\": \"// not a comment\"}"), "{\"a\": \"// not a comment\"}");
         assert_eq!(strip_json_comments("{\"a\": [1, 2,]}"), "{\"a\": [1, 2]}");
         assert_eq!(strip_json_comments("{\"a\": \"x,\"}"), "{\"a\": \"x,\"}");
+    }
+
+    #[test]
+    fn kiro_region_config_applies_to_built_in_and_custom_models_after_reload() {
+        let dir = tempfile::tempdir().unwrap();
+        let defaults = registry_with_config(dir.path(), r#"{"providers":{"kiro":{}}}"#);
+        assert!(defaults.get_error().is_none(), "{:?}", defaults.get_error());
+        assert_eq!(defaults.find("kiro", "claude-opus-5.5").unwrap().base_url,
+            pi_ai::providers::kiro::DEFAULT_ENDPOINT);
+        for region in ["us-east-1", "eu-central-1"] {
+            let config = json!({"providers":{"kiro":{"region":region,"models":[{"id":"custom-kiro-model"}]}}});
+            let mut registry = registry_with_config(dir.path(), &config.to_string());
+            for _ in 0..2 {
+                assert!(registry.get_error().is_none(), "{:?}", registry.get_error());
+                for id in ["claude-opus-5.5", "custom-kiro-model"] {
+                    let model = registry.find("kiro", id).unwrap();
+                    assert_eq!(model.api, "kiro-api");
+                    assert_eq!(model.base_url, format!("https://runtime.{region}.kiro.dev"));
+                }
+                registry.refresh();
+            }
+        }
+    }
+
+    #[test]
+    fn kiro_region_config_rejects_invalid_and_ambiguous_values() {
+        let dir = tempfile::tempdir().unwrap();
+        for config in [
+            json!({"providers":{"kiro":{"region":7}}}),
+            json!({"providers":{"kiro":{"region":"us-east-1.evil.test"}}}),
+            json!({"providers":{"kiro":{"region":"us-east-1","baseUrl":"https://runtime.eu-central-1.kiro.dev"}}}),
+            json!({"providers":{"anthropic":{"region":"us-east-1"}}}),
+        ] {
+            let registry = registry_with_config(dir.path(), &config.to_string());
+            assert!(registry.get_error().is_some(), "{config}");
+        }
     }
 
     #[test]

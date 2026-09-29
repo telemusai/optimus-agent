@@ -58,7 +58,7 @@ Subscription requests identify as Claude Code. Using this identity in Optimus ma
 
 ## Kiro
 
-The experimental native `kiro` provider uses Kiro's streaming API while Optimus owns the conversation, execution mode and tools. It is a community compatibility integration, informed by [pi-kiro](https://github.com/hongyilyu/pi-kiro) and [pi-kiro-api](https://github.com/satiyap/pi-kiro-api), not an ACP or CLI agent bridge. Live direct inference must be verified with an authorized account before release. See the bundled [third-party notices](kiro-notices.txt).
+The experimental native `kiro` provider uses Kiro's streaming API while Optimus owns the conversation, execution mode and tools. It is a community compatibility integration, informed by [pi-kiro](https://github.com/hongyilyu/pi-kiro), [pi-kiro-api](https://github.com/satiyap/pi-kiro-api) and [pi-provider-kiro](https://github.com/mikeyobrien/pi-provider-kiro). It does not use an ACP or CLI agent bridge. See the bundled [third-party notices](kiro-notices.txt).
 
 ### Existing Kiro CLI login
 
@@ -71,9 +71,11 @@ optimus-agent model list kiro
 
 Explicit runtime, stored, environment and custom-provider keys take priority over the ambient CLI login. `/login kiro` can reuse the CLI login; it does not register a new OAuth client. The picker labels ambient authentication **Kiro CLI**. `OPTIMUS_KIRO_CLI_AUTH=0` disables automatic reuse; `KIRO_CLI_DB_FILE` selects an existing database. These settings must be present in the daemon environment. Explicit isolated auth files and in-memory stores do not borrow the host's login automatically.
 
-Optimus reads the database with SQLite in read-only mode. It does not copy or rotate the CLI's refresh token. Before a request it re-reads the access token and profile; the profile region, which may differ from the Identity Center login region, selects the Kiro endpoint. When expiry is near, it asks the installed CLI to refresh through its metadata-only `chat --list-models --format json` command, bounded to 20 seconds, then re-reads the database. Custom databases are refreshed manually in their owning CLI profile to avoid refreshing the wrong account. No CLI agent turn is used. A failed refresh stops the request and asks you to refresh the CLI login. `/logout` for an active ambient login directs you to `kiro-cli logout`.
+Optimus reads the database with SQLite in read-only mode. It does not copy or rotate the CLI's refresh token. Before a request it re-reads the access token and profile. The service region defaults to `us-east-1`, independently of the Identity Center sign-in region; use the [models.json region setting](models.md#kiro-region) for a profile in another region. When expiry is near, it asks the installed CLI to refresh through its metadata-only `chat --list-models --format json` command, bounded to 20 seconds, then re-reads the database. Custom databases are refreshed manually in their owning CLI profile to avoid refreshing the wrong account. No CLI agent turn is used. A failed refresh stops the request and asks you to refresh the CLI login. `/logout` for an active ambient login directs you to `kiro-cli logout`.
 
-The default path is the platform's local data directory under `kiro-cli/data.sqlite3`, with `~/.local/share/kiro-cli/data.sqlite3` and macOS `~/Library/Application Support/kiro-cli/data.sqlite3` fallbacks. Use `KIRO_CLI_DB_FILE` when an installation uses another path. The initial reader supports the CLI's OIDC credential record (Builder ID / Identity Center); other credential-store formats require a separate adapter. OAuth credentials are restricted to their regional HTTPS Kiro service endpoint.
+The default path is the platform's local data directory under `kiro-cli/data.sqlite3`, with `~/.local/share/kiro-cli/data.sqlite3` and macOS `~/Library/Application Support/kiro-cli/data.sqlite3` fallbacks. Use `KIRO_CLI_DB_FILE` when an installation uses another path. The initial reader supports the CLI's OIDC credential record (Builder ID / Identity Center); other credential-store formats require a separate adapter. OAuth credentials are restricted to regional HTTPS Kiro service endpoints.
+
+OAuth requests send `Optimus-Agent/<version> app/AmazonQ-For-CLI` in both `User-Agent` and `x-amz-user-agent`. The legacy application marker selects CLI subscription compatibility while preserving Optimus's own identity. No copied SDK version or device identifier is needed. On the validation host, adding this metadata changed an otherwise identical generation request from HTTP 403 to HTTP 200.
 
 ### API keys and models
 
@@ -83,7 +85,7 @@ The baseline catalog contains the 20 model IDs reported by the authenticated Kir
 
 Custom `models.json` entries use `"api": "kiro-api"` under provider `kiro`; `contextWindow` and `maxTokens` remain configurable. The bundled context, output and image limits come from that API response. Unknown models fall back to 8,192 output tokens when discovery omits the limit. Kiro controls response limits; this transport does not claim to enforce a requested `maxTokens` or temperature. Costs are subscription credits, not a known USD/token tariff, so catalog USD costs are zero rather than a billing estimate. When the stream omits exact usage, token counters are approximate; raw usage observations are emitted only for API-reported counts.
 
-CLI OAuth discovery uses `GET https://management.<region>.kiro.dev/List-Available-Models`; inference uses `POST https://runtime.<region>.kiro.dev/generateAssistantResponse`. Both use the profile region. These are distinct services; discovery success does not imply permission to generate a response.
+CLI OAuth discovery uses `GET https://management.<region>.kiro.dev/List-Available-Models`; inference uses `POST https://runtime.<region>.kiro.dev/generateAssistantResponse`. Both use the selected service region. These are distinct services; discovery success alone does not validate inference.
 
 For explicit direct discovery from a source checkout, run:
 
@@ -97,7 +99,7 @@ This reads `KIRO_API_KEY` or the existing CLI login and prints a credential-free
 cargo run --locked -p pi-ai --example kiro_probe -- --model claude-haiku-4.5
 ```
 
-These are explicit live diagnostics and can consume subscription credits. They are not run by regression tests. Successful CLI login or model listing does not prove direct API entitlement. An HTTP 403 remains an access-denied error, without changing identity or retrying another endpoint. On the validation host, current-service model discovery returned HTTP 200 and 20 models, while native `auto` and Haiku inference returned HTTP 403 (“User is not authorized to make this call.”). A separate test through the installed CLI’s supported ACP interface returned a live response; that exercises Kiro’s own agent loop and does not validate this direct provider. The integration does not claim official third-party subscription support.
+Add `--region eu-central-1` to either diagnostic to select another service region; the standalone diagnostic does not read the application's `models.json`. These are explicit live diagnostics and can consume subscription credits. They are not run by regression tests. Native two-request tool round trips with `claude-opus-5.5`, `claude-sonnet-5` and `claude-haiku-4.5` passed on the Linux validation host using its existing CLI OIDC login. The API-key route and macOS/Windows credential paths have offline coverage but were not live-validated there. An HTTP 403 is reported without guessing an entitlement cause or retrying another identity or endpoint. The integration does not claim official third-party subscription support.
 
 ## API Keys
 

@@ -12,10 +12,20 @@ async fn main() {
 }
 
 async fn run() -> Result<(), String> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut args: Vec<String> = std::env::args().skip(1).collect();
+    let endpoint = if let Some(index) = args.iter().position(|arg| arg == "--region") {
+        args.remove(index);
+        if index >= args.len() {
+            return Err("--region requires an AWS region such as us-east-1".into());
+        }
+        Some(kiro::endpoint_for_region(&args.remove(index))?)
+    } else {
+        None
+    };
     if args != ["--catalog"] && !(args.len() == 2 && args[0] == "--model") {
         return Err(
-            "Use --catalog for direct discovery, or --model <id> for a live tool round trip".into(),
+            "Use --catalog or --model <id>, optionally with --region <region> (default us-east-1)"
+                .into(),
         );
     }
     let key = if let Ok(key) = std::env::var("KIRO_API_KEY") {
@@ -24,12 +34,12 @@ async fn run() -> Result<(), String> {
         let path = kiro::auth::default_cli_path().ok_or("No Kiro CLI login or KIRO_API_KEY")?;
         kiro::auth::resolve_cli(&path).await?.credential.encode()
     };
-    let catalog = kiro::catalog::discover(&key, None).await?;
+    let catalog = kiro::catalog::discover(&key, endpoint.as_deref()).await?;
     if args == ["--catalog"] {
         println!(
             "{}",
             serde_json::to_string_pretty(&serde_json::json!({"providers":{"kiro":{
-                "api":"kiro-api","baseUrl":kiro::DEFAULT_ENDPOINT,"models":catalog
+                "api":"kiro-api","baseUrl":catalog.first().map(|model| model.base_url.as_str()).unwrap_or(kiro::DEFAULT_ENDPOINT),"models":catalog
             }}}))
             .map_err(|_| "Cannot serialize Kiro catalog")?
         );
