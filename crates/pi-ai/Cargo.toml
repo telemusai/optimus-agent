@@ -18,6 +18,7 @@ indexmap = { workspace = true }
 once_cell = { workspace = true }
 parking_lot = { workspace = true }
 reqwest = { workspace = true }
+rusqlite = { version = "=0.40.2", features = ["bundled"] }
 tokio-tungstenite = { version = "=0.28.0", features = ["native-tls"] }
 uuid = { workspace = true }
 chrono = { workspace = true }

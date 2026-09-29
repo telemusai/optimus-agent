@@ -37,6 +37,8 @@ use crate::utils::store_lock::{lock_store_sync, open_store_lock, read_store};
 
 #[path = "claude_code_auth.rs"]
 mod claude_code;
+#[path = "kiro_cli_auth.rs"]
+mod kiro_cli;
 pub(crate) const AUTH_SOURCE_CLAUDE_CODE: &str = "claude_code";
 
 // ---------------------------------------------------------------------------
@@ -52,6 +54,7 @@ fn api_key_env_vars(provider: &str) -> Option<Vec<&'static str>> {
         return Some(vec!["ANTHROPIC_OAUTH_TOKEN", "ANTHROPIC_API_KEY"]);
     }
     let env_var = match provider {
+        "kiro" => "KIRO_API_KEY",
         "openai" => "OPENAI_API_KEY",
         "azure-openai-responses" => "AZURE_OPENAI_API_KEY",
         "prime-inference" => "PRIME_API_KEY",
@@ -559,6 +562,7 @@ pub struct AuthStorage {
     load_error: Option<String>,
     errors: Vec<String>,
     claude_code: Option<Arc<claude_code::ClaudeCodeAuth>>,
+    kiro_cli_path: Option<std::path::PathBuf>,
 }
 
 impl std::fmt::Debug for AuthSourceCandidate {
@@ -586,6 +590,7 @@ impl AuthStorage {
             load_error: None,
             errors: Vec::new(),
             claude_code: None,
+            kiro_cli_path: None,
         };
         storage.reload();
         storage
@@ -604,6 +609,7 @@ impl AuthStorage {
             auth_options,
         );
         if use_claude_code {
+            storage.kiro_cli_path = pi_ai::providers::kiro::auth::default_cli_path();
             storage.claude_code = claude_code::ClaudeCodeAuth::from_environment().map(Arc::new);
         }
         storage
@@ -894,6 +900,7 @@ impl AuthStorage {
                 self.get_stored_auth_candidate(provider, false, None),
                 self.get_environment_auth_candidate(provider),
                 fallback_candidate,
+                self.get_kiro_cli_candidate(provider),
             ]
         };
         candidates.into_iter().flatten().collect()
@@ -1325,6 +1332,15 @@ impl AuthStorage {
         provider_id: &str,
         callbacks: pi_ai::utils::oauth::types::OAuthLoginCallbacks,
     ) -> Result<(), String> {
+        if provider_id == "kiro" && self.kiro_cli_path.is_some() {
+            self.clear_auth_stale(provider_id);
+            self.resolve_kiro_cli_auth(provider_id).await?
+                .ok_or("Run `kiro-cli login` first, or configure KIRO_API_KEY")?;
+            if let Some(progress) = callbacks.on_progress {
+                progress("Using the existing Kiro CLI login".into());
+            }
+            return Ok(());
+        }
         if self.has_claude_code_auth(provider_id) {
             self.resolve_claude_code_auth(provider_id).await?;
             if let Some(progress) = callbacks.on_progress {
@@ -1344,6 +1360,9 @@ impl AuthStorage {
 
     /// Logout from a provider.
     pub fn logout(&mut self, provider: &str) -> Result<(), String> {
+        if provider == "kiro" && self.get_auth_status(provider).source.as_deref() == Some("kiro_cli") {
+            return Err("This login is managed by Kiro CLI. Run `kiro-cli logout`, or set OPTIMUS_KIRO_CLI_AUTH=0 to disable reuse.".into());
+        }
         if self.has_claude_code_auth(provider) {
             return Err("This login is managed by Claude Code. Run `claude auth logout`, or set OPTIMUS_CLAUDE_CODE_AUTH=0 to use Optimus credentials independently.".into());
         }
@@ -1737,6 +1756,9 @@ impl AuthStorage {
             }
         }
 
+        if let Some(result) = self.resolve_kiro_cli_auth(provider_id).await? {
+            return Ok(result);
+        }
         Ok(AuthApiKeyResult::default())
     }
 

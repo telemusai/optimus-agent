@@ -130,6 +130,7 @@ fn get_api_key_env_vars(provider: &str) -> Vec<&'static str> {
     }
 
     let env_var: Option<&'static str> = match provider {
+        "kiro" => Some("KIRO_API_KEY"),
         "openai" => Some("OPENAI_API_KEY"),
         "azure-openai-responses" => Some("AZURE_OPENAI_API_KEY"),
         "prime-inference" => Some("PRIME_API_KEY"),

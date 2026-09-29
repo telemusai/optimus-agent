@@ -46,6 +46,7 @@ fn lock_registry() -> std::sync::MutexGuard<'static, HashMap<String, OAuthProvid
 
 pub fn built_in_oauth_providers() -> Vec<OAuthProviderInterface> {
     vec![
+        crate::providers::kiro::auth::oauth_provider(),
         anthropic::anthropic_oauth_provider(),
         github_copilot::github_copilot_oauth_provider(),
         openai_codex::openai_codex_oauth_provider(),

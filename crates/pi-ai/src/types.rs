@@ -47,10 +47,11 @@ pub const API_ANTHROPIC_MESSAGES: &str = "anthropic-messages";
 pub const API_BEDROCK_CONVERSE_STREAM: &str = "bedrock-converse-stream";
 pub const API_BEDROCK_RESPONSES: &str = "bedrock-responses";
 pub const API_GOOGLE_GENERATIVE_AI: &str = "google-generative-ai";
+pub const API_KIRO: &str = "kiro-api";
 pub const API_GOOGLE_VERTEX: &str = "google-vertex";
 
 /// The `KnownApi` union in declaration order.
-pub const KNOWN_APIS: [&str; 10] = [
+pub const KNOWN_APIS: [&str; 11] = [
     API_OPENAI_COMPLETIONS,
     API_MISTRAL_CONVERSATIONS,
     API_OPENAI_RESPONSES,
@@ -61,6 +62,7 @@ pub const KNOWN_APIS: [&str; 10] = [
     API_BEDROCK_RESPONSES,
     API_GOOGLE_GENERATIVE_AI,
     API_GOOGLE_VERTEX,
+    API_KIRO,
 ];
 
 pub type KnownProvider = String;
@@ -68,6 +70,7 @@ pub type Provider = String;
 
 pub const PROVIDER_AMAZON_BEDROCK: &str = "amazon-bedrock";
 pub const PROVIDER_ANTHROPIC: &str = "anthropic";
+pub const PROVIDER_KIRO: &str = "kiro";
 pub const PROVIDER_GOOGLE: &str = "google";
 pub const PROVIDER_GOOGLE_VERTEX: &str = "google-vertex";
 pub const PROVIDER_OPENAI: &str = "openai";
@@ -100,9 +103,10 @@ pub const PROVIDER_XIAOMI_TOKEN_PLAN_AMS: &str = "xiaomi-token-plan-ams";
 pub const PROVIDER_XIAOMI_TOKEN_PLAN_SGP: &str = "xiaomi-token-plan-sgp";
 
 /// The `KnownProvider` union in declaration order.
-pub const KNOWN_PROVIDERS: [&str; 32] = [
+pub const KNOWN_PROVIDERS: [&str; 33] = [
     PROVIDER_AMAZON_BEDROCK,
     PROVIDER_ANTHROPIC,
+    PROVIDER_KIRO,
     PROVIDER_GOOGLE,
     PROVIDER_GOOGLE_VERTEX,
     PROVIDER_OPENAI,

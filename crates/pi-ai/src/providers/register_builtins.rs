@@ -507,6 +507,13 @@ fn stream_simple_bedrock_lazy() -> SimpleStreamFunction {
 /// TS: `registerBuiltInApiProviders()`
 pub fn register_built_in_api_providers() {
 	register_api_provider_simple(ApiProviderSimple {
+		api: "kiro-api".into(),
+		stream: Arc::new(super::kiro::stream_kiro),
+		stream_simple: Arc::new(super::kiro::stream_simple_kiro),
+		compact: None,
+		supports_compaction: None,
+	}, None);
+	register_api_provider_simple(ApiProviderSimple {
 		api: "bedrock-responses".to_string(),
 		stream: stream_bedrock_responses(),
 		stream_simple: stream_simple_bedrock_responses_lazy(),
@@ -641,6 +648,7 @@ mod tests {
 		assert_eq!(
 			registered_api_ids(),
 			vec![
+				"kiro-api",
 				"bedrock-responses",
 				"anthropic-messages",
 				"openai-completions",
@@ -809,7 +817,7 @@ mod tests {
 		clear_api_providers();
 		assert_eq!(get_api_providers().len(), 0);
 		reset_api_providers();
-		assert_eq!(get_api_providers().len(), 10);
+		assert_eq!(get_api_providers().len(), 11);
 		clear_api_providers();
 	}
 }

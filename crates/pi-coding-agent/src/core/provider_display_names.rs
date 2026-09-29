@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 pub fn built_in_provider_display_names() -> &'static IndexMap<String, String> {
     static NAMES: OnceLock<IndexMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let pairs: [(&str, &str); 31] = [
+        let pairs: [(&str, &str); 32] = [
             ("anthropic", "Anthropic"),
             ("amazon-bedrock", "Amazon Bedrock"),
             ("azure-openai-responses", "Azure OpenAI Responses"),
@@ -21,6 +21,7 @@ pub fn built_in_provider_display_names() -> &'static IndexMap<String, String> {
             ("groq", "Groq"),
             ("huggingface", "Hugging Face"),
             ("kimi-coding", "Kimi For Coding"),
+            ("kiro", "Kiro"),
             ("mistral", "Mistral"),
             ("minimax", "MiniMax"),
             ("minimax-cn", "MiniMax (China)"),

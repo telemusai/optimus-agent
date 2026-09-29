@@ -127,6 +127,7 @@ The `baseUrl` is required when adding custom models to the `google-generative-ai
 | `openai-responses` | OpenAI Responses API |
 | `anthropic-messages` | Anthropic Messages API |
 | `google-generative-ai` | Google Generative AI |
+| `kiro-api` | Native Kiro streaming API |
 
 Set `api` at provider level (default for all models) or model level (override per model).
 
@@ -135,12 +136,29 @@ Set `api` at provider level (default for all models) or model level (override pe
 | Field | Description |
 |-------|-------------|
 | `baseUrl` | API endpoint URL |
+| `region` | Kiro service region, default `us-east-1`; use instead of provider `baseUrl` |
 | `api` | API type (see above) |
 | `apiKey` | API key (see value resolution below) |
 | `headers` | Custom headers (see value resolution below) |
 | `authHeader` | Set `true` to add `Authorization: Bearer <apiKey>` automatically |
 | `models` | Array of model configurations |
 | `modelOverrides` | Per-model overrides for built-in models on this provider |
+
+### Kiro region
+
+Merge this into `<agent-dir>/models.json` (normally `~/.config/optimus-rust/models.json` with the installed launcher):
+
+```json
+{
+  "providers": {
+    "kiro": {
+      "region": "us-east-1"
+    }
+  }
+}
+```
+
+The default is `us-east-1`. Set another Kiro service region, such as `eu-central-1`, when your account's profile uses it. The Identity Center sign-in region is separate and does not change this default. The setting applies to bundled models and custom models inheriting the provider endpoint, survives reload, and takes precedence over `KIRO_API_REGION` for API keys. Specify either provider `region` or `baseUrl`; conflicting settings are rejected. A model-specific `baseUrl` overrides the inherited endpoint. Changing region does not move your Kiro profile or grant model access.
 
 ### Value Resolution
 

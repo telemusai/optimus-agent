@@ -1,0 +1,8 @@
+- Added an experimental native Kiro streaming provider with API-key authentication and optional reuse of an existing Kiro CLI OIDC login.
+- Added 20 Kiro model definitions with API-reported context/output/image limits, native model IDs, and explicit paginated API catalog discovery.
+- Added offline coverage for text, reasoning, tools, images, cancellation, malformed streams, and access-denied handling, plus live native tool-round-trip validation with Opus 5.5, Sonnet 5 and Haiku 4.5.
+- Fixed CLI OAuth routing to the current Kiro management and runtime services; successful discovery is kept separate from inference authorization.
+- Fixed JSON print mode returning a successful exit code after provider errors; text and JSON runs now check the same terminal outcome.
+- Fixed Kiro CLI OAuth generation returning HTTP 403 by supplying the required CLI application metadata while retaining Optimus's client identity.
+- Added Kiro provider `region` configuration in `models.json`, defaulting to `us-east-1` independently of the sign-in region.
+- Changed the Optimus application and Python runtime version to 0.1.17.
