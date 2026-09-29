@@ -1,0 +1,2 @@
+- Fixed Kiro `/btw` requests failing with HTTP 400 when the parent conversation contains a tool call whose result has not arrived; outgoing snapshots now include an explicit result-unavailable marker without changing the parent session.
+- Fixed duplicate and late Kiro tool results being emitted as unmatched result blocks; their output remains available as conversation text.

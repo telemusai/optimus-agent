@@ -39,6 +39,54 @@ fn add_images(message: &mut Value, content: &[ImageOrTextContent]) -> Result<(),
     Ok(())
 }
 
+fn push_message(history: &mut Vec<Value>, key: &str, mut wire: Value) {
+    if let Some(previous) = history.last_mut().and_then(|entry| entry.get_mut(key)) {
+        previous["content"] = json!(format!(
+            "{}\n\n{}",
+            previous["content"].as_str().unwrap_or(""),
+            wire["content"].as_str().unwrap_or("")
+        ));
+        append_array(previous, "images", &wire);
+        append_array(previous, "toolUses", &wire);
+        if wire["userInputMessageContext"]["toolResults"].is_array() {
+            if !previous["userInputMessageContext"].is_object() {
+                previous["userInputMessageContext"] = json!({});
+            }
+            append_array(
+                &mut previous["userInputMessageContext"],
+                "toolResults",
+                &wire["userInputMessageContext"],
+            );
+        }
+    } else {
+        let mut entry = json!({});
+        entry[key] = wire.take();
+        history.push(entry);
+    }
+}
+
+fn close_pending_calls(
+    history: &mut Vec<Value>,
+    calls: &mut Vec<String>,
+    model: &Model,
+    origin: &str,
+) {
+    if calls.is_empty() {
+        return;
+    }
+    // /btw can snapshot a running tool. Repair only this request, never the session.
+    let mut wire = user(
+        "Tool results unavailable in this conversation snapshot.",
+        model,
+        origin,
+    );
+    wire["userInputMessageContext"] = json!({"toolResults":std::mem::take(calls)
+        .into_iter().map(|id| json!({"toolUseId":id,"status":"error","content":[{
+            "text":"Tool result unavailable in this conversation snapshot. The tool may still be running in the main conversation."
+        }]})).collect::<Vec<_>>()});
+    push_message(history, "userInputMessage", wire);
+}
+
 pub fn build(
     model: &Model,
     context: &Context,
@@ -47,10 +95,11 @@ pub fn build(
     profile: Option<&str>,
 ) -> Result<Value, String> {
     let mut history: Vec<Value> = vec![];
-    let mut calls = std::collections::HashSet::new();
+    let mut calls = Vec::new();
     for message in &context.messages {
-        let (key, mut wire) = match message {
+        let (key, wire) = match message {
             Message::User(message) => {
+                close_pending_calls(&mut history, &mut calls, model, origin);
                 let mut wire = user(&message.content.text(), model, origin);
                 if let UserContent::Blocks(blocks) = &message.content {
                     add_images(&mut wire, blocks)?;
@@ -61,13 +110,14 @@ pub fn build(
                 if matches!(message.stop_reason.as_str(), "error" | "aborted") {
                     continue;
                 }
+                close_pending_calls(&mut history, &mut calls, model, origin);
                 let mut text = String::new();
                 let mut tools = vec![];
                 for block in &message.content {
                     match block {
                         ContentBlock::Text(block) => text.push_str(&block.text),
                         ContentBlock::ToolCall(call) => {
-                            calls.insert(call.id.clone());
+                            calls.push(call.id.clone());
                             tools.push(json!({"name":call.name,"toolUseId":call.id,"input":call.arguments}));
                         }
                         // Reasoning signatures belong to their original provider, not Kiro's history.
@@ -95,13 +145,14 @@ pub fn build(
                     .join("\n");
                 let mut wire = user("Tool results provided.", model, origin);
                 add_images(&mut wire, &message.content)?;
-                if calls.contains(&message.tool_call_id) {
+                if let Some(index) = calls.iter().position(|id| id == &message.tool_call_id) {
+                    calls.remove(index);
                     wire["userInputMessageContext"] = json!({"toolResults":[{
                         "toolUseId":message.tool_call_id,"status":if message.is_error {"error"} else {"success"},
                         "content":[{"text":text}]
                     }]});
                 } else {
-                    // An interrupted/cross-provider history may omit the matching tool call.
+                    // Preserve orphan, duplicate and late output without an unmatched result block.
                     wire["content"] = json!(format!(
                         "Previous tool output ({}):\n{text}",
                         message.tool_name
@@ -110,30 +161,9 @@ pub fn build(
                 ("userInputMessage", wire)
             }
         };
-        if let Some(previous) = history.last_mut().and_then(|entry| entry.get_mut(key)) {
-            previous["content"] = json!(format!(
-                "{}\n\n{}",
-                previous["content"].as_str().unwrap_or(""),
-                wire["content"].as_str().unwrap_or("")
-            ));
-            append_array(previous, "images", &wire);
-            append_array(previous, "toolUses", &wire);
-            if wire["userInputMessageContext"]["toolResults"].is_array() {
-                if !previous["userInputMessageContext"].is_object() {
-                    previous["userInputMessageContext"] = json!({});
-                }
-                append_array(
-                    &mut previous["userInputMessageContext"],
-                    "toolResults",
-                    &wire["userInputMessageContext"],
-                );
-            }
-        } else {
-            let mut entry = json!({});
-            entry[key] = wire.take();
-            history.push(entry);
-        }
+        push_message(&mut history, key, wire);
     }
+    close_pending_calls(&mut history, &mut calls, model, origin);
     if history
         .first()
         .is_some_and(|entry| entry["assistantResponseMessage"].is_object())

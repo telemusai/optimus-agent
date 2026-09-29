@@ -6,6 +6,8 @@ use tokio::{
 };
 use tokio_util::sync::CancellationToken;
 
+mod request_history;
+
 fn model() -> Model {
     catalog::built_in_models()
         .into_iter()
