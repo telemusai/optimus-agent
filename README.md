@@ -158,6 +158,8 @@ See [Windows setup](https://github.com/telemusai/optimus-agent/blob/main/resourc
 
 Goals, autonomous continuation, heartbeats, and schedules support work that spans multiple turns or sessions. Background agents can be detached and revisited, with saved history and execution state available for recovery.
 
+Ask the agent to set a heartbeat, for example: “Check the subagents every five minutes and review completed results.” The native `heartbeat` tool creates, lists, updates and cancels agent-owned timers in IPython, Node, Clang-Repl and Direct tools. It returns a job ID and the next scheduled time; subagent completion notifications alone do not schedule a timer. Agent-owned heartbeats are separate from your `/heartbeat` setting. Intervals default to five minutes, with a ten-second minimum; `follow_up` delivery waits until the current turn finishes.
+
 Use explicit budgets and stop controls. An idle worker is not proof of a completed task, and a successful tool call is not proof that the overall objective is finished. The fork adds bounded incomplete-child recovery and runtime-owned result delivery so parent agents are less dependent on a child remembering to send its final report.
 
 ### Multiple models, one harness

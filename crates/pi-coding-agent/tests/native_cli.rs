@@ -15,6 +15,9 @@ use pi_coding_agent::modes::daemon::daemon_client::{DaemonClient, DaemonClientRe
 use pi_coding_agent::modes::daemon::daemon_protocol::daemon_protocol_info;
 use serde_json::{json, Value};
 
+#[path = "native_cli/heartbeat.rs"]
+mod heartbeat;
+
 const REPLY: &str = "LOCAL_HTTP_FIXTURE_RESPONSE";
 
 struct LocalModel {
@@ -508,7 +511,7 @@ fn execution_mode_survives_real_daemon_worker_resume_and_changes_http_requests()
             request(&client, json!({"type":"prompt_and_wait", "activeSessionId":active, "message":message})).await;
         }
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
-        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent", "attach_image"]));
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent", "attach_image", "heartbeat"]));
         let saved = state["sessionFile"].as_str().unwrap().to_string();
         client.close().await;
         // A new CLI client resumes the durable chat, through the real supervisor.
@@ -577,7 +580,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         let saved = state["sessionFile"].as_str().unwrap().to_string();
         let stop = entries(&saved, "prime-agent.explicit-stop");
         assert!(stop.last().unwrap()["data"]["generation"].is_string());
-        for expected in [json!(["node", "subagent", "attach_image"]), json!(["clang", "subagent", "attach_image"]), json!(["bash", "edit", "subagent", "attach_image"]), json!(["ipython"])] {
+        for expected in [json!(["node", "subagent", "attach_image", "heartbeat"]), json!(["clang", "subagent", "attach_image", "heartbeat"]), json!(["bash", "edit", "subagent", "attach_image", "heartbeat"]), json!(["ipython", "heartbeat"])] {
             // F6 uses prompt admission with a steer schedule, not prompt_and_wait.
             request(&client, json!({"type":"prompt", "activeSessionId":active,
                 "message":"/mode cycle", "streamingBehavior":"steer"})).await;
@@ -611,7 +614,7 @@ fn stopped_execution_mode_switches_through_real_daemon_and_after_restart() {
         request(&client, json!({"type":"prompt", "activeSessionId":active,
             "message":"/mode direct", "streamingBehavior":"steer"})).await;
         let state = request(&client, json!({"type":"get_connection_state", "activeSessionId":active})).await;
-        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent", "attach_image"]));
+        assert_eq!(state["activeToolNames"], json!(["bash", "edit", "subagent", "attach_image", "heartbeat"]));
         client.close().await;
         active.to_string()
     });

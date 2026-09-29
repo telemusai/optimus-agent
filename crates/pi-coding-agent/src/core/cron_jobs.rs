@@ -1817,6 +1817,7 @@ struct AgentCronSchedulerState {
     stopped: bool,
     has_started: bool,
     timer: Option<tokio::task::JoinHandle<()>>,
+    timer_generation: u64,
     dispatch_lanes: HashMap<String, Arc<tokio::sync::Mutex<()>>>,
 }
 
@@ -2031,6 +2032,8 @@ impl AgentCronScheduler {
             timer.abort();
         }
         let now = self.now();
+        state.timer_generation = state.timer_generation.wrapping_add(1);
+        let generation = state.timer_generation;
         let next_delay = match delay_ms {
             Some(delay) => Some(delay),
             None => self.store.next_active_run_at().map(|next| (next - now).max(0.0)),
@@ -2045,6 +2048,15 @@ impl AgentCronScheduler {
         let state_handle = self.state_handle();
         let timer = tokio::spawn(async move {
             tokio::time::sleep(Duration::from_millis(delay.max(0.0) as u64)).await;
+            {
+                let mut state = state_handle.lock().expect("scheduler poisoned");
+                if state.stopped || state.timer_generation != generation {
+                    return;
+                }
+                // The fired task now owns dispatch work. Rearming, waking or
+                // stopping the next timer must not abort it at an admission await.
+                state.timer.take();
+            }
             let scheduler = AgentCronScheduler {
                 store,
                 hooks,
