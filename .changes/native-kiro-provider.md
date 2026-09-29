@@ -2,3 +2,4 @@
 - Added 20 Kiro model definitions with API-reported context/output/image limits, native model IDs, and explicit paginated API catalog discovery.
 - Added offline coverage for text, reasoning, tools, images, cancellation, malformed streams, and access-denied handling. Live direct inference remains a release gate.
 - Fixed CLI OAuth routing to the current Kiro management and runtime services; successful discovery is kept separate from inference authorization.
+- Fixed JSON print mode returning a successful exit code after provider errors; text and JSON runs now check the same terminal outcome.

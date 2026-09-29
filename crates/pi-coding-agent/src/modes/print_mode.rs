@@ -232,7 +232,8 @@ async fn run_print_mode_with_connection_internal(
         }
 
         let autonomous_status = connection.wait_for_headless_completion(None).await?;
-        if mode == PRINT_MODE_TEXT {
+        {
+            // Output format must not change whether a completed request failed.
             let terminal = select_headless_terminal_result(&connection.get_messages().await?);
             match &terminal.primary {
                 Some(HeadlessTerminalResultMessage::Assistant(primary)) => {
@@ -244,7 +245,7 @@ async fn run_print_mode_with_connection_internal(
                             eprintln!("{error_message}");
                         }
                         exit_code = 1;
-                    } else {
+                    } else if mode == PRINT_MODE_TEXT {
                         for content in &primary.content {
                             if let pi_ai::types::ContentBlock::Text(text) = content {
                                 write_raw_stdout(&format!("{}\n", text.text));
@@ -253,8 +254,10 @@ async fn run_print_mode_with_connection_internal(
                     }
                 }
                 Some(HeadlessTerminalResultMessage::SessionSlashCommandResult(primary)) => {
-                    let content = terminal_value_text(primary);
-                    write_raw_stdout(&format!("{content}\n"));
+                    if mode == PRINT_MODE_TEXT {
+                        let content = terminal_value_text(primary);
+                        write_raw_stdout(&format!("{content}\n"));
+                    }
                     let details = primary.get("details").cloned().unwrap_or(Value::Null);
                     let success = details.get("success").and_then(Value::as_bool).unwrap_or(false);
                     let severity = details.get("severity").and_then(Value::as_str).unwrap_or_default();
@@ -265,7 +268,9 @@ async fn run_print_mode_with_connection_internal(
                 None => {}
             }
             for outcome in &terminal.compaction_outcomes {
-                eprintln!("{}", terminal_value_text(outcome));
+                if mode == PRINT_MODE_TEXT {
+                    eprintln!("{}", terminal_value_text(outcome));
+                }
                 let is_failed = outcome
                     .get("details")
                     .and_then(|details| details.get("outcome"))

@@ -127,6 +127,12 @@ fn serve_completion(mut stream: TcpStream, respond: fn(&Value) -> (Value, &'stat
         return Err(format!("Unexpected completion body: {body}"));
     }
     let (delta, finish) = respond(&body);
+    if delta.get("error").is_some() {
+        let response = delta.to_string();
+        write!(stream, "HTTP/1.1 403 Forbidden\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{response}", response.len())
+            .map_err(|error| error.to_string())?;
+        return Ok(body);
+    }
     let text = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":delta,"finish_reason":null}]});
     let end = json!({"id":"fixture-1","object":"chat.completion.chunk","created":1,"model":"fixture-model","choices":[{"index":0,"delta":{},"finish_reason":finish}],"usage":{"prompt_tokens":10,"completion_tokens":4,"total_tokens":14}});
     let response = format!("data: {text}\n\ndata: {end}\n\ndata: [DONE]\n\n");
@@ -435,6 +441,40 @@ fn actual_print_cli_streams_local_http_through_the_daemon_worker() {
                 .any(|request| request["messages"].to_string().contains(prompt)),
             "CLI prompt never reached the HTTP adapter: {prompt}"
         );
+    }
+    drop(daemon);
+    model.finish();
+}
+
+#[test]
+fn print_cli_reports_provider_rejection_in_text_and_json_modes() {
+    let mut model = LocalModel::with_response(|_| {
+        (json!({"error":{"message":"fixture access denied","type":"permission_error"}}), "stop")
+    });
+    let fixture = PrivateCli::new(&format!("http://{}/v1", model.address));
+    let mut daemon = OwnedDaemon {
+        process: fixture.spawn("rejection-daemon", &["--mode", "daemon", "--offline"]),
+        socket: fixture.socket.clone(),
+    };
+    wait_for_daemon(&mut daemon);
+    for mode in ["text", "json"] {
+        let mut client = fixture.spawn(mode, &[
+            "--print", "--mode", mode, "--offline", "--no-tools",
+            "--provider", "local-cli-fixture", "--model", "fixture-model", "rejection-prompt",
+        ]);
+        let (status, stdout, stderr) = client.wait(Duration::from_secs(45));
+        assert_eq!(status.code(), Some(1), "{mode} must fail: {status}; stdout: {stdout}; stderr: {stderr}");
+        assert!(stderr.contains("fixture access denied"), "{mode}: {stderr}");
+        if mode == "json" {
+            let frames: Vec<Value> = stdout.lines().filter(|line| !line.trim().is_empty())
+                .map(|line| serde_json::from_str(line).expect("JSON output must remain an event stream")).collect();
+            assert!(frames.iter().any(|frame| frame["type"] == "message_end"
+                && frame["message"]["stopReason"] == "error"
+                && frame["message"]["errorMessage"].as_str().is_some_and(|error| error.contains("fixture access denied"))),
+                "missing provider failure event: {stdout}");
+        } else {
+            assert!(stdout.trim().is_empty(), "failed text requests must not print a successful answer: {stdout}");
+        }
     }
     drop(daemon);
     model.finish();
