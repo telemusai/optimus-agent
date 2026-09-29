@@ -1191,7 +1191,7 @@ async fn run_stream_anthropic(
 		} else if event_type == "message_delta" {
 			if let Some(stop_reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
 				output.stop_reason = map_stop_reason(stop_reason)?;
-				if output.stop_reason == "error" {
+				if matches!(output.stop_reason.as_str(), "error" | "length") {
 					output.stop_reason_raw = Some(stop_reason.to_string());
 				}
 			}
@@ -1287,13 +1287,13 @@ fn parse_cache_creation(value: Option<&Value>) -> Option<AnthropicCacheCreationU
 ///
 /// Opus 5.5 and Fable/Mythos models think every turn and reject an explicit
 /// `thinking: {type: "disabled"}` (and any sampling params) with a 400.
-fn is_always_on_adaptive_thinking_model(model_id: &str) -> bool {
+pub fn is_always_on_adaptive_thinking_model(model_id: &str) -> bool {
 	model_id.contains("opus-5-5") || model_id.contains("opus-5.5")
 		|| model_id.contains("fable-5") || model_id.contains("mythos-5") || model_id.contains("mythos-preview")
 }
 
 /// Check if a model supports adaptive thinking (Opus 4.6+, Sonnet 4.6).
-fn supports_adaptive_thinking(model_id: &str) -> bool {
+pub fn supports_adaptive_thinking(model_id: &str) -> bool {
 	// Adaptive-thinking model IDs (with or without date suffix).
 	model_id.contains("opus-4-6")
 		|| model_id.contains("opus-4.6")

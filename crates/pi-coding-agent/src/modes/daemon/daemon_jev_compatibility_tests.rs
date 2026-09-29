@@ -369,3 +369,22 @@ async fn node_mode_is_rejected_before_writing_to_an_older_execution_mode_daemon(
         client.close().await;
     }
 }
+
+#[test]
+fn jev_memory_metadata_is_optional_for_old_and_new_peers() {
+    assert!(DAEMON_SCHEMA_REVISION >= 37);
+    assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::JevMemory));
+    for revision in [36, 37] {
+        let frame = hello(revision, &["jev_control", "jev_features"]);
+        for command in ["jev_get_settings", "jev_get_status"] {
+            assert!(supported(&frame, json!({"type":command,"activeSessionId":"a"}).as_object().unwrap()));
+        }
+    }
+    #[derive(Deserialize)]
+    struct OldFeatures { memory_relevance: bool }
+    let old: OldFeatures = serde_json::from_value(json!({"memory_relevance":true,"memory":true})).unwrap();
+    assert!(old.memory_relevance);
+    let new: pi_jev::config::JevFeatures = serde_json::from_value(json!({"memory_relevance":true})).unwrap();
+    assert!(!new.memory);
+    assert_eq!(daemon_outbound_compatibility("response"), DaemonCommandCompatibility::legacy());
+}

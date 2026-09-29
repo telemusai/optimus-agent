@@ -70,8 +70,9 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 34 gates /mode session commands; existing response/event shapes are unchanged.
 // Revision 35 gates Node selection and the three-mode toggle; legacy explicit modes remain compatible.
 // Revision 36 gates Clang selection and four-mode cycling; legacy toggle retains three modes.
-pub const DAEMON_SCHEMA_REVISION: u32 = 36;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-36-clang-modes";
+// Revision 37 adds optional Jev memory-retrieval capability and feature metadata; no new commands.
+pub const DAEMON_SCHEMA_REVISION: u32 = 37;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-37-jev-memory";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -156,6 +157,8 @@ pub enum DaemonServerCapability {
     JevFeatures,
     /// Explicit agent-authored questions via the optional jev_decide tool.
     JevDynamic,
+    /// Optional additive memory retrieval; no startup or command requirement.
+    JevMemory,
     ExecutionMode,
     NodeExecutionMode,
     ClangExecutionMode,
@@ -209,7 +212,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 28] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 29] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -235,6 +238,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 28] = [
     DaemonServerCapability::JevControl,
     DaemonServerCapability::JevFeatures,
     DaemonServerCapability::JevDynamic,
+    DaemonServerCapability::JevMemory,
     DaemonServerCapability::ExecutionMode,
     DaemonServerCapability::NodeExecutionMode,
     DaemonServerCapability::ClangExecutionMode,
@@ -2170,7 +2174,7 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "jev_get_settings" | "jev_set_session_mode" => {
             DaemonCommandCompatibility::capability(Capability::JevControl)
         }
-        // Revision 31 usage is optional; older workers still provide valid status.
+        // Revisions 31/37 usage and memory feature metadata are optional; older workers still provide valid status.
         "jev_get_status" => {
             DaemonCommandCompatibility::capability(Capability::JevControl)
         }
@@ -2769,7 +2773,7 @@ pub fn daemon_outbound_compatibility(outbound: &'static str) -> DaemonCommandCom
     match outbound {
         "heartbeats_changed" => DaemonCommandCompatibility::capability(Capability::HeartbeatCatalog),
         "roster_update" => DaemonCommandCompatibility::capability(Capability::AgentRoster),
-        // Jev feature/usage metadata is additive; no new startup or event requirement.
+        // Jev feature/usage metadata, including revision 37 memory, is additive; no new startup or event requirement.
         "response" | "extension_ui_request" => DaemonCommandCompatibility::legacy(),
         _ => DaemonCommandCompatibility::legacy(),
     }
@@ -3078,7 +3082,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-clang-modes"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-jev-memory"));
     }
 
     #[test]

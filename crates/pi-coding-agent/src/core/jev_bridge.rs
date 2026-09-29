@@ -26,6 +26,7 @@ use crate::core::skills::Skill;
 pub const JEV_OBSERVER_PATH: &str = "<jev-observer-internal>";
 
 pub(crate) mod dynamic;
+pub(crate) mod memory;
 
 /// Ownership-only stop fence, independent of credentials or observer replacement.
 /// The host persists retention and combines this with its other owned domains.

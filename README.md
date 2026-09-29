@@ -115,6 +115,8 @@ The fork includes provider-native compaction and checkpoint replay for supported
 
 Compaction work includes saved-checkpoint restoration, continuation of incomplete subagent work, and preservation of queued input. WebSocket handling retains connection reuse and incremental requests where supported, with bounded recovery that avoids transparently replaying a partially delivered response.
 
+Claude summarization reserves extra output headroom for adaptive thinking and retries a confirmed output-token-limit stop once with a larger budget. The selected effort and original transcript remain unchanged; incomplete handoffs never replace the conversation.
+
 Fast/service-tier selection remains separate from reasoning effort and context management, and depends on the provider. It is not a prerequisite for using Astra.
 
 ### Memory that you can inspect and correct
@@ -239,7 +241,7 @@ After configuring the API key, enter these commands in the Optimus TUI:
 /jev status
 ```
 
-**Full-Jev is a persisted, global overlay for the active agent directory.** It enables Compare + Active, every registered feature gate, and independent request-local compaction across sessions using that directory. **Dynamic is included automatically, including for existing full-Jev profiles.** Bare `/jev full-jev` also enables it. The overlay takes precedence over saved session, global, and inherited controls without overwriting them. A running older binary must be upgraded and restarted to gain the new features.
+**Full-Jev is a persisted, global overlay for the active agent directory.** It enables Compare + Active, every registered feature gate, and independent request-local compaction across sessions using that directory. **Dynamic and additive memory retrieval are included automatically, including for existing full-Jev profiles.** Bare `/jev full-jev` also enables it. The overlay takes precedence over saved session, global, and inherited controls without overwriting them. A running older binary must be upgraded and restarted to gain the new features.
 
 To leave full-Jev, use `/jev full-jev off`. This restores the saved settings, which may themselves enable Jev. While the overlay is active, individual mode, feature, compaction, and default edits are refused; turn the overlay off before customizing them.
 
@@ -287,6 +289,7 @@ With the full-Jev overlay off, enter these commands individually in the Optimus 
 /jev feature code_search_reranking on
 /jev feature line_find on
 /jev feature memory_relevance on
+/jev feature memory on
 /jev feature result_sufficiency on
 /jev feature loop_control on
 /jev feature retry_classification on
@@ -307,7 +310,7 @@ Replace `on` with `off` to disable an individual gate, and use `/jev status` to 
 | Area | Feature gates and bounded behavior |
 | --- | --- |
 | Tools and effort | `tool_requirement` can withdraw the outgoing request's tool catalog. `complexity` can move an already-set request reasoning effort one step. `tool_candidates` filters explicitly optional tools while protecting mandatory/internal tools and forced choices. |
-| Context and memory | `context_relevance` and `memory_relevance` filter eligible historical read/search context and automatically retrieved memory for one request. They preserve durable history and stored memory. |
+| Context and memory | `context_relevance` filters eligible historical read/search context. The separate `memory` gate adds Jev-assisted memory retrieval in parallel with ordinary recall; normal results are preserved. `memory_relevance` remains the existing optional filter when additive recall is off. Stored memory and durable history are unchanged. |
 | Code scanning and search | `code_search_relevance` scores supplied candidates; `code_search_filtering` permits eligible candidates to be removed; `code_search_reranking` orders eligible candidates by query relevance. `line_find` identifies relevant lines in supplied source reads, or reports that the answer is absent. |
 | Retrieved evidence | `retrieval_safety` assesses candidate usefulness, possible prompt injection, and contradictions. `citation_check` assesses a claim against its supplied source span with a native quote check. These assessments do not establish facts outside the supplied evidence. |
 | Skills and guardrails | `skill_suggestion` assesses the already-loaded skill catalog without loading or executing a skill. `guardrails_input` and `guardrails_output` add advisory input and post-output assessments; they do not grant permissions or create a security sandbox. |
@@ -318,6 +321,12 @@ Replace `on` with `off` to disable an individual gate, and use `/jev status` to 
 Code search starts with deterministic retrieval such as `rg --json`, AST queries, or symbol tools. The Python runtime's `rlm.code_search.from_ripgrep(...)` and `rlm.code_search.present(candidates)` expose an explicit candidate set to the native host; keep the complete results in a variable and make `present(...)` the cell's only output. Jev judges bounded supplied candidates and source reads; enabling it does not create an index or scan every file automatically. Filtering requires both relevance and filtering gates plus an Active-capable mode; full-Jev supplies those settings. See the [code-search workflow](docs/JEV_SYSTEM_ONE.md#experimental-code-search-relevance).
 
 For automatic decisions, the native host owns thresholds, freshness checks, deadlines, protected entries, and per-session control budgets. It rejects invalid, stale, unavailable, or insufficient-confidence decisions and retains baseline behavior. Jev cannot change the primary model/provider, grant permissions, execute tools itself, refill budgets, or declare a goal complete. Verification needs explicit correlated evidence; a successful tool call alone is insufficient. Active boundaries add API work and may add latency; quality and savings depend on the task.
+
+### Retrieve memories with Jev
+
+`/jev feature memory on` enables an additional retrieval lane; full-Jev includes it automatically. Normal keyword recall and Jev-assisted retrieval run concurrently. Jev judges a bounded shortlist drawn from the same permitted session, project, host, global, and shared memory sources, including entries with no query-word overlap. It adds at most two nonduplicate memories in a separate 2,000-character budget without displacing normal results. Smaller configured recall limits also constrain the supplement. Missing or changed source files and inactive entries remain excluded.
+
+This is separate from `memory_relevance`, the existing filter over normal recall candidates. With `memory` enabled, normal recall is protected from that filter. In Compare, Jev records recommendations only; Active and Compare + Active can add accepted memories. `/memory recall off` disables both lanes. Unavailable, malformed, timed-out, cancelled, or stale Jev results leave normal recall intact. Each context request can assess up to 16 bounded, credential-redacted memory excerpts with a 1.5-second decision deadline. This is a shortlist search, not an exhaustive semantic index, and added context can increase tokens rather than save them.
 
 ### Ask Jev directly from chat
 

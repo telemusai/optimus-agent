@@ -91,6 +91,8 @@ pub struct JevFeatures {
     pub context_relevance: bool,
     pub code_search_relevance: bool,
     pub code_search_filtering: bool,
+    /// Additive semantic recall; normal memory retrieval always runs alongside it.
+    pub memory: bool,
     pub memory_relevance: bool,
     pub result_sufficiency: bool,
     pub loop_control: bool,
@@ -137,6 +139,7 @@ impl Default for JevFeatures {
             context_relevance: false,
             code_search_relevance: false,
             code_search_filtering: false,
+            memory: false,
             memory_relevance: false,
             result_sufficiency: false,
             loop_control: false,
@@ -163,6 +166,7 @@ pub enum JevFeature {
     ContextRelevance,
     CodeSearchRelevance,
     CodeSearchFiltering,
+    Memory,
     MemoryRelevance,
     ResultSufficiency,
     LoopControl,
@@ -185,13 +189,14 @@ pub enum JevFeature {
 }
 
 impl JevFeature {
-    pub const ALL: [Self; 20] = [
+    pub const ALL: [Self; 21] = [
         Self::ToolRequirement,
         Self::Complexity,
         Self::ToolCandidates,
         Self::ContextRelevance,
         Self::CodeSearchRelevance,
         Self::CodeSearchFiltering,
+        Self::Memory,
         Self::MemoryRelevance,
         Self::ResultSufficiency,
         Self::LoopControl,
@@ -216,6 +221,7 @@ impl JevFeature {
             Self::ContextRelevance => "context_relevance",
             Self::CodeSearchRelevance => "code_search_relevance",
             Self::CodeSearchFiltering => "code_search_filtering",
+            Self::Memory => "memory",
             Self::MemoryRelevance => "memory_relevance",
             Self::ResultSufficiency => "result_sufficiency",
             Self::LoopControl => "loop_control",
@@ -248,6 +254,7 @@ impl JevFeatures {
             JevFeature::ContextRelevance => self.context_relevance,
             JevFeature::CodeSearchRelevance => self.code_search_relevance,
             JevFeature::CodeSearchFiltering => self.code_search_filtering,
+            JevFeature::Memory => self.memory,
             JevFeature::MemoryRelevance => self.memory_relevance,
             JevFeature::ResultSufficiency => self.result_sufficiency,
             JevFeature::LoopControl => self.loop_control,
@@ -273,6 +280,7 @@ impl JevFeatures {
             JevFeature::ContextRelevance => self.context_relevance = enabled,
             JevFeature::CodeSearchRelevance => self.code_search_relevance = enabled,
             JevFeature::CodeSearchFiltering => self.code_search_filtering = enabled,
+            JevFeature::Memory => self.memory = enabled,
             JevFeature::MemoryRelevance => self.memory_relevance = enabled,
             JevFeature::ResultSufficiency => self.result_sufficiency = enabled,
             JevFeature::LoopControl => self.loop_control = enabled,
@@ -417,6 +425,7 @@ pub const FULL_JEV_FEATURES: JevFeatures = JevFeatures {
     context_relevance: true,
     code_search_relevance: true,
     code_search_filtering: true,
+    memory: true,
     memory_relevance: true,
     result_sufficiency: true,
     loop_control: true,
