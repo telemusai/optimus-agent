@@ -1,0 +1,3 @@
+- Fixed agents reporting that heartbeat scheduling is unavailable in Direct tools, Node and Clang-Repl modes by exposing the existing session scheduler through a native heartbeat tool in every execution mode.
+- Added explicit guidance to create and verify real recurring heartbeats instead of relying on subagent completion notifications or promised check-ins.
+- Fixed fired scheduler timers aborting their own asynchronous dispatch when rearming, which left due heartbeats claimed without delivering a prompt.

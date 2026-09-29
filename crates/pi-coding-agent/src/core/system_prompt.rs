@@ -15,6 +15,8 @@ const NATIVE_IMAGE_DISPLAY_GUIDANCE: &str = "# Showing Images\n\nUse the native 
 
 const MATPLOTLIB_DISPLAY_GUIDANCE: &str = "Matplotlib figures in the Python workspace use an inline backend by default: new or changed open figures are attached when the cell finishes. Use `plt.show()` or `fig.show()` to display them explicitly or show them again. Keep the default backend for chat previews; an explicit `matplotlib.use('Agg')` or MPLBACKEND override disables automatic previews. Saved image files can be displayed with the attach-image skill when available.";
 
+const HEARTBEAT_GUIDANCE: &str = "# Recurring Agent Heartbeats\n\nWhen asked to set a heartbeat or periodically check progress, call the native `heartbeat` tool with action=create, a specific instruction and the requested interval (default 5m). This schedules real recurring prompts through Optimus in every execution mode. Subagent completion notifications and promises to check later do not create a timer. Use action=list to inspect existing heartbeats and action=update/delete to manage them. Confirm scheduling only after a successful tool result with an id, active status and next_run_at. For checks that should wait until current work finishes, use delivery_mode=follow_up. The user's /heartbeat is separate and cannot be changed through this tool. Never substitute a background shell loop or switch execution modes to set a heartbeat.";
+
 use serde::{Deserialize, Serialize};
 
 use crate::core::prompts::rlm::{build_child_agent_doctrine, build_rlm_prompt, build_subagent_guidance, ChildAgentDoctrineOptions, RlmPromptOptions, SubagentGuidanceOptions};
@@ -217,6 +219,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         if has_ipython {
             prompt.push_str(&format!("\n\n{MATPLOTLIB_DISPLAY_GUIDANCE}"));
         }
+        if tools.iter().any(|tool| tool == "heartbeat") {
+            prompt.push_str(&format!("\n\n{HEARTBEAT_GUIDANCE}"));
+        }
 
         if !append_section.is_empty() {
             prompt.push_str(&append_section);
@@ -288,6 +293,9 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
     }
     if has_ipython {
         prompt.push_str(&format!("\n\n{MATPLOTLIB_DISPLAY_GUIDANCE}"));
+    }
+    if tools.iter().any(|tool| tool == "heartbeat") {
+        prompt.push_str(&format!("\n\n{HEARTBEAT_GUIDANCE}"));
     }
 
     let guidelines = format_prompt_guidelines(prompt_guidelines.as_deref());
@@ -423,6 +431,25 @@ mod tests {
             ])),
             "- keep me\n- second"
         );
+    }
+
+    #[test]
+    fn heartbeat_guidance_tracks_available_tools_in_all_modes_and_custom_prompts() {
+        for custom_prompt in [None, Some("Custom prompt".to_string())] {
+            for runtime in ["ipython", "node", "clang", "bash"] {
+                let mut options = BuildSystemPromptOptions {
+                    custom_prompt: custom_prompt.clone(),
+                    selected_tools: Some(vec![runtime.to_string()]),
+                    ..Default::default()
+                };
+                assert!(!build_system_prompt(&options).contains("# Recurring Agent Heartbeats"));
+                options.selected_tools.as_mut().unwrap().push("heartbeat".into());
+                let prompt = build_system_prompt(&options);
+                assert!(prompt.contains("# Recurring Agent Heartbeats"));
+                assert!(prompt.contains("next_run_at"));
+                assert!(prompt.contains("do not create a timer"));
+            }
+        }
     }
 
     #[test]

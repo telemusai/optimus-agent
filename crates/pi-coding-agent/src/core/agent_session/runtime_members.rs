@@ -6,6 +6,8 @@ use super::*;
 mod subagent_runs;
 #[path = "native_subagents.rs"]
 mod native_subagents;
+#[path = "native_heartbeat.rs"]
+mod native_heartbeat;
 
 use crate::core::agent_messages::{AgentSessionMessageAgentSummary, RUNTIME_KIND_SUBAGENT};
 use crate::core::extensions::types::{
@@ -930,6 +932,9 @@ impl AgentSession {
                     ..Default::default()
                 };
                 definitions.insert("subagent".into(), self.native_subagent_tool());
+                if self.rlm_heartbeat_controller.lock().unwrap().is_some() {
+                    definitions.insert("heartbeat".into(), self.native_heartbeat_tool());
+                }
                 definitions.insert("clang".into(), crate::core::tools::clang::create_clang_tool(&self.cwd, self.clang_runtime.clone()).into());
                 let weak = Arc::downgrade(self);
                 definitions.insert("attach_image".into(), crate::core::tools::attach_image::create_attach_image_tool(&self.cwd,
@@ -1026,6 +1031,12 @@ impl AgentSession {
                 for name in ["subagent", "attach_image"] {
                     if !active.iter().any(|tool| tool == name) { active.push(name.into()); }
                 }
+            }
+            if crate::core::execution_mode::ExecutionMode::from_tools(&active).is_some()
+                && self.rlm_heartbeat_controller.lock().unwrap().is_some()
+                && !active.iter().any(|name| name == "heartbeat")
+            {
+                active.push("heartbeat".into());
             }
             active
         } else { active };

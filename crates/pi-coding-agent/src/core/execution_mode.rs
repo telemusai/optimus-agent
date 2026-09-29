@@ -71,7 +71,7 @@ impl ExecutionMode {
     pub fn tools(self, current: &[String]) -> Vec<String> {
         let mut tools: Vec<_> = current
             .iter()
-            .filter(|name| !matches!(name.as_str(), "ipython" | "node" | "clang" | "bash" | "edit" | "subagent" | "attach_image"))
+            .filter(|name| !matches!(name.as_str(), "ipython" | "node" | "clang" | "bash" | "edit" | "subagent" | "attach_image" | "heartbeat"))
             .cloned()
             .collect();
         tools.extend(match self {
@@ -80,6 +80,9 @@ impl ExecutionMode {
             Self::Clang => vec!["clang".into(), "subagent".into(), "attach_image".into()],
             Self::Direct => vec!["bash".into(), "edit".into(), "subagent".into(), "attach_image".into()],
         });
+        if current.iter().any(|name| name == "heartbeat") {
+            tools.push("heartbeat".into());
+        }
         tools
     }
 }
