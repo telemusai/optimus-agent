@@ -185,6 +185,13 @@ pub fn models() -> &'static IndexMap<String, IndexMap<String, Model>> {
                 }
             }
         }
+        catalog.insert(
+            "kiro".into(),
+            crate::providers::kiro::catalog::built_in_models()
+                .into_iter()
+                .map(|model| (model.id.clone(), model))
+                .collect(),
+        );
         catalog
     })
 }
@@ -211,10 +218,10 @@ mod tests {
     #[test]
     fn catalog_parses_with_declaration_order() {
         let catalog = models();
-        assert_eq!(catalog.len(), 32);
+        assert_eq!(catalog.len(), 33);
         assert_eq!(catalog.keys().next().map(String::as_str), Some("amazon-bedrock"));
-        assert_eq!(catalog.keys().last().map(String::as_str), Some("zai"));
-        assert_eq!(all_models().len(), 1297);
+        assert_eq!(catalog.keys().last().map(String::as_str), Some("kiro"));
+        assert_eq!(all_models().len(), 1317);
     }
 
     #[test]

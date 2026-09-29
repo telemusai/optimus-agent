@@ -1,0 +1,3 @@
+- Added an experimental native Kiro streaming provider with API-key authentication and optional reuse of an existing Kiro CLI OIDC login.
+- Added 20 Kiro model definitions, native model IDs, 1M context metadata, and explicit paginated API catalog discovery.
+- Added offline coverage for text, reasoning, tools, images, cancellation, malformed streams, and access-denied handling. Live direct inference remains a release gate.

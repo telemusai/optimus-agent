@@ -52,3 +52,6 @@ windows-sys = { version = "0.61", features = ["Win32_Foundation", "Win32_System_
 [[bin]]
 name = "optimus-rust"
 path = "src/bin/optimus_rust.rs"
+
+[dev-dependencies]
+rusqlite = { version = "=0.40.2", features = ["bundled"] }

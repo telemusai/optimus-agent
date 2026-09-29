@@ -7,6 +7,7 @@ Reviewed Opus 5.5 entries for Anthropic, Bedrock, OpenRouter and Vercel live in 
 ## Table of Contents
 
 - [Subscriptions](#subscriptions)
+- [Kiro](#kiro)
 - [API Keys](#api-keys)
 - [Auth File](#auth-file)
 - [Cloud Providers](#cloud-providers)
@@ -55,6 +56,47 @@ Subscription requests identify as Claude Code. Using this identity in Optimus ma
 - Press Enter for github.com, or enter your GitHub Enterprise Server domain
 - If you get "model not supported", enable it in VS Code: Copilot Chat → model selector → select model → "Enable"
 
+## Kiro
+
+The experimental native `kiro` provider uses Kiro's streaming API while Optimus owns the conversation, execution mode and tools. It is a community compatibility integration, informed by [pi-kiro](https://github.com/hongyilyu/pi-kiro) and [pi-kiro-api](https://github.com/satiyap/pi-kiro-api), not an ACP or CLI agent bridge. Live direct inference must be verified with an authorized account before release. See the bundled [third-party notices](kiro-notices.txt).
+
+### Existing Kiro CLI login
+
+Run `kiro-cli login` if needed. With the default Optimus profile, the provider discovers the existing Kiro CLI credential database. Select **Kiro** in `/model`, or run:
+
+```bash
+optimus-agent --provider kiro --model claude-sonnet-5
+optimus-agent model list kiro
+```
+
+Explicit runtime, stored, environment and custom-provider keys take priority over the ambient CLI login. `/login kiro` can reuse the CLI login; it does not register a new OAuth client. The picker labels ambient authentication **Kiro CLI**. `OPTIMUS_KIRO_CLI_AUTH=0` disables automatic reuse; `KIRO_CLI_DB_FILE` selects an existing database. These settings must be present in the daemon environment. Explicit isolated auth files and in-memory stores do not borrow the host's login automatically.
+
+Optimus reads the database with SQLite in read-only mode. It does not copy or rotate the CLI's refresh token. Before a request it re-reads the access token and profile; the profile region, which may differ from the Identity Center login region, selects the Kiro endpoint. When expiry is near, it asks the installed CLI to refresh through its metadata-only `chat --list-models --format json` command, bounded to 20 seconds, then re-reads the database. Custom databases are refreshed manually in their owning CLI profile to avoid refreshing the wrong account. No CLI agent turn is used. A failed refresh stops the request and asks you to refresh the CLI login. `/logout` for an active ambient login directs you to `kiro-cli logout`.
+
+The default path is the platform's local data directory under `kiro-cli/data.sqlite3`, with `~/.local/share/kiro-cli/data.sqlite3` and macOS `~/Library/Application Support/kiro-cli/data.sqlite3` fallbacks. Use `KIRO_CLI_DB_FILE` when an installation uses another path. The initial reader supports the CLI's OIDC credential record (Builder ID / Identity Center); other credential-store formats require a separate adapter. OAuth credentials are restricted to their regional HTTPS Kiro service endpoint.
+
+### API keys and models
+
+Alternatively, configure an authorized `KIRO_API_KEY` in the daemon environment or store it under the `kiro` provider in `auth.json`. `KIRO_API_REGION` defaults to `us-east-1`; use the region that issued the key. The API-key route sends the API-key token type and uses the service-root endpoint.
+
+The baseline catalog contains the 20 model IDs reported by Kiro CLI 2.25.0 on 2026-09-29, including `auto`, `claude-opus-5.5`, `claude-opus-5`, `claude-sonnet-5`, the GPT-5.6 variants, Haiku, DeepSeek, MiniMax, GLM and Qwen. Native IDs keep their dots. Reported 1M context windows remain 1M; Optimus's compaction ceiling is separate. Model availability depends on the account. This bundled list is not an entitlement check and does not refresh automatically.
+
+Custom `models.json` entries use `"api": "kiro-api"` under provider `kiro`; `contextWindow` and `maxTokens` remain configurable. Default output metadata is a conservative 8,192 tokens when the CLI does not report an output limit. Kiro controls response limits; this transport does not claim to enforce a requested `maxTokens` or temperature. Costs are subscription credits, not a known USD/token tariff, so catalog USD costs are zero rather than a billing estimate. When the stream omits exact usage, token counters are approximate; raw usage observations are emitted only for API-reported counts.
+
+For explicit direct discovery from a source checkout, run:
+
+```bash
+cargo run --locked -p pi-ai --example kiro_probe -- --catalog
+```
+
+This reads `KIRO_API_KEY` or the existing CLI login and prints a credential-free `models.json` provider section. Merge that section with your other providers; do not replace an existing configuration wholesale. Discovery follows pagination and returns only models reported by the API. Errors do not fall back to an unverified list. To validate a native, side-effect-free tool round trip with an authorized account:
+
+```bash
+cargo run --locked -p pi-ai --example kiro_probe -- --model claude-haiku-4.5
+```
+
+These are explicit live diagnostics and can consume subscription credits. They are not run by regression tests. Successful CLI login or model listing does not prove direct API entitlement. An HTTP 403 such as “Your subscription does not support this application” remains an access-denied error, without changing identity or retrying another endpoint. The integration does not claim official third-party subscription support.
+
 ## API Keys
 
 ### Environment Variables or Auth File
@@ -69,6 +111,7 @@ prime-agent
 | Provider | Environment Variable | `auth.json` key |
 |----------|----------------------|------------------|
 | Anthropic | `ANTHROPIC_API_KEY` | `anthropic` |
+| Kiro | `KIRO_API_KEY` | `kiro` |
 | Azure OpenAI Responses | `AZURE_OPENAI_API_KEY` | `azure-openai-responses` |
 | OpenAI | `OPENAI_API_KEY` | `openai` |
 | Prime Inference | `PRIME_API_KEY` | `prime-inference` |
@@ -298,3 +341,5 @@ For Anthropic, an installed and authenticated Claude Code login takes precedence
 2. `auth.json` entry (API key or OAuth token)
 3. Environment variable
 4. Custom provider keys from `models.json`
+
+For Kiro, the existing CLI login is an additional fallback after explicit credentials.

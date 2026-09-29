@@ -172,11 +172,20 @@ pub const TOP_LEVEL_OPTION_GROUPS: &[TopLevelOptionGroup] = &[
     TopLevelOptionGroup {
         heading: "Model options",
         options: &[
-            ("--provider <name>", "Select a model provider"),
+            ("--provider <name>", "Select a model provider (including kiro)"),
             ("--model <id>", "Select a model"),
             ("--api-key <key>", "Use an API key for this run"),
             ("--models <patterns>", "Set comma-separated models for cycling"),
             ("--thinking <level>", "Set reasoning: off, minimal, low, medium, high, xhigh, max"),
+        ],
+    },
+    TopLevelOptionGroup {
+        heading: "Kiro environment",
+        options: &[
+            ("KIRO_API_KEY", "Use an authorized Kiro API key"),
+            ("KIRO_API_REGION", "API key region (default: us-east-1)"),
+            ("OPTIMUS_KIRO_CLI_AUTH=0", "Disable automatic reuse of the Kiro CLI login"),
+            ("KIRO_CLI_DB_FILE", "Select the existing Kiro CLI credential database"),
         ],
     },
     TopLevelOptionGroup {
