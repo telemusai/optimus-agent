@@ -9,6 +9,7 @@ use serde_json::json;
 #[test]
 fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
     for (id, input_cost, output_cost) in [
+        ("gpt-6.1-sol", 2.0, 10.0),
         ("gpt-6-sol", 2.0, 10.0),
         ("gpt-6-luna", 0.1, 0.5),
     ] {
@@ -30,7 +31,7 @@ fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
 
 #[test]
 fn codex_sol_luna_requests_keep_ids_reasoning_and_existing_auth_shape() {
-    for id in ["gpt-6-sol", "gpt-6-luna"] {
+    for id in ["gpt-6.1-sol", "gpt-6-sol", "gpt-6-luna"] {
         let model = get_model("openai-codex", id).unwrap();
         for effort in ["low", "medium", "high", "xhigh", "max"] {
             let options = OpenAICodexResponsesOptions {
@@ -127,4 +128,28 @@ fn copilot_sol_luna_requests_keep_subscription_auth_routing_and_exact_ids() {
             assert!(!serde_json::to_string(&body).unwrap().contains("synthetic"));
         }
     }
+}
+
+#[test]
+fn gpt_61_api_limits_are_separate_from_codex_subscription_limits() {
+    let api = get_model("openai", "gpt-6.1-sol").unwrap();
+    let codex = get_model("openai-codex", "gpt-6.1-sol").unwrap();
+    assert_eq!(api.api, "openai-responses");
+    assert_eq!(api.base_url, "https://api.openai.com/v1");
+    assert_eq!(api.context_window, 1_050_000.0);
+    assert_eq!(api.max_input_tokens, Some(922_000.0));
+    assert_eq!(api.max_tokens, 128_000.0);
+    assert_eq!(codex.context_window, 272_000.0);
+    let options = pi_ai::providers::openai_responses::OpenAIResponsesOptions {
+        reasoning_effort: Some("max".into()),
+        stream: pi_ai::types::StreamOptions { max_tokens: Some(128_000.0), ..Default::default() },
+        ..Default::default()
+    };
+    let body = pi_ai::providers::openai_responses::build_params(api, &Context::default(), Some(&options)).unwrap();
+    assert_eq!(body["model"], "gpt-6.1-sol");
+    assert_eq!(body["max_output_tokens"].as_u64(), Some(128_000));
+    assert_eq!(body["reasoning"]["effort"], "max");
+    assert_eq!(api.cost.cache_read, 0.1);
+    assert_eq!(codex.cost.cache_read, 0.1);
+    assert_eq!(get_supported_thinking_levels(api), vec!["low", "medium", "high", "xhigh", "max"]);
 }

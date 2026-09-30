@@ -74,8 +74,27 @@ fn cap_cell_source(code: &str) -> String {
     }
 }
 
-fn first_protocol_frame_too_large(buffer: &str) -> bool {
-    buffer.find('\n').unwrap_or(buffer.len()) > MAX_PROTOCOL_FRAME_BYTES
+#[derive(Default)]
+struct ProtocolLineBuffer {
+    partial: String,
+}
+
+impl ProtocolLineBuffer {
+    fn push(&mut self, chunk: &str) -> (Vec<String>, bool) {
+        let mut lines = Vec::new();
+        for segment in chunk.split_inclusive('\n') {
+            let complete = segment.ends_with('\n');
+            let content = if complete { &segment[..segment.len() - 1] } else { segment };
+            if content.len() > MAX_PROTOCOL_FRAME_BYTES.saturating_sub(self.partial.len()) {
+                return (lines, true);
+            }
+            self.partial.push_str(content);
+            if complete {
+                lines.push(std::mem::take(&mut self.partial));
+            }
+        }
+        (lines, false)
+    }
 }
 
 #[cfg(unix)]
@@ -1532,7 +1551,7 @@ impl KernelState {
             let child_state = child.clone();
             self.owned_tasks.spawn(async move {
                 let mut reader = stdout;
-                let mut buffered = String::new();
+                let mut buffered = ProtocolLineBuffer::default();
                 let mut pending: Vec<u8> = Vec::new();
                 let mut chunk = vec![0u8; STREAM_CHUNK_BYTES];
                 loop {
@@ -1550,19 +1569,12 @@ impl KernelState {
                     if !this.is_current_child(&child_state) {
                         return;
                     }
-                    buffered.push_str(&decode_utf8_chunk(&mut pending, &chunk[..read]));
-                    loop {
-                        if first_protocol_frame_too_large(&buffered) {
-                            this.fail_protocol_frame(&child_state,
-                                "kernel protocol frame exceeds 32 MiB; output was rejected");
-                            return;
-                        }
-                        let Some(newline) = buffered.find('\n') else { break; };
+                    let decoded = decode_utf8_chunk(&mut pending, &chunk[..read]);
+                    let (lines, oversized) = buffered.push(&decoded);
+                    for line in lines {
                         if !this.is_current_child(&child_state) {
                             return;
                         }
-                        let line = buffered[..newline].to_string();
-                        buffered = buffered[newline + 1..].to_string();
                         if line.trim().is_empty() {
                             continue;
                         }
@@ -1599,6 +1611,11 @@ impl KernelState {
                         if this.handle_event(object).is_err() {
                             return;
                         }
+                    }
+                    if oversized {
+                        this.fail_protocol_frame(&child_state,
+                            "kernel protocol frame exceeds 32 MiB; output was rejected");
+                        return;
                     }
                 }
             });
@@ -4432,16 +4449,50 @@ mod tests {
     #[test]
     fn protocol_frame_limit_handles_delimiters_and_unicode() {
         let maximum = "x".repeat(MAX_PROTOCOL_FRAME_BYTES);
-        assert!(!first_protocol_frame_too_large(&maximum));
-        assert!(!first_protocol_frame_too_large(&format!("{maximum}\nnext")));
-        assert!(first_protocol_frame_too_large(&format!("{maximum}x")));
-        assert!(first_protocol_frame_too_large(&format!("{maximum}x\n")));
-        assert!(first_protocol_frame_too_large(&"😀".repeat(MAX_PROTOCOL_FRAME_BYTES / 4 + 1)));
-        assert!(!first_protocol_frame_too_large(&format!("ok\n{maximum}")));
+        for (input, expected) in [
+            (maximum.clone(), false), (format!("{maximum}\nnext"), false),
+            (format!("{maximum}x"), true), (format!("{maximum}x\n"), true),
+            ("😀".repeat(MAX_PROTOCOL_FRAME_BYTES / 4 + 1), true),
+            (format!("ok\n{maximum}"), false),
+        ] {
+            let mut buffer = ProtocolLineBuffer::default();
+            assert_eq!(buffer.push(&input).1, expected);
+        }
+        let mut buffer = ProtocolLineBuffer::default();
+        assert!(!buffer.push(&maximum).1);
+        assert_eq!(buffer.push("\nx"), (vec![maximum], false));
+        let (lines, oversized) = buffer.push(&format!("\nok\n{}", "x".repeat(MAX_PROTOCOL_FRAME_BYTES + 1)));
+        assert_eq!(lines, vec!["x", "ok"]);
+        assert!(oversized);
         assert_eq!(cap_cell_source("small"), "small");
         let source = "😀".repeat(MAX_CELL_SOURCE_CHARS + 1);
         assert!(cap_cell_source(&source).starts_with(&"😀".repeat(MAX_CELL_SOURCE_CHARS)));
         assert!(cap_cell_source(&source).ends_with("[... cell source truncated ...]"));
+    }
+
+    #[test]
+    fn fragmented_protocol_lines_preserve_large_images_unicode_and_order() {
+        let image = "a".repeat(2 * 1024 * 1024);
+        let events = [
+            json!({"event":"stdout", "id":"fixture", "text":"世😀\ntext"}),
+            json!({"event":"display", "id":"fixture", "data":{"image/png":image}}),
+            json!({"event":"done", "id":"fixture", "status":"ok"}),
+        ];
+        let wire = events.iter().map(|event| format!("{event}\n")).collect::<String>();
+        for chunk_size in [1, 127, STREAM_CHUNK_BYTES] {
+            let mut buffer = ProtocolLineBuffer::default();
+            let mut pending = Vec::new();
+            let mut received = Vec::new();
+            for chunk in wire.as_bytes().chunks(chunk_size) {
+                let decoded = decode_utf8_chunk(&mut pending, chunk);
+                let (lines, oversized) = buffer.push(&decoded);
+                assert!(!oversized);
+                received.extend(lines.into_iter().map(|line| serde_json::from_str::<Value>(&line).unwrap()));
+            }
+            assert_eq!(received, events);
+            assert!(buffer.partial.is_empty());
+            assert!(pending.is_empty());
+        }
     }
 
     #[cfg(unix)]

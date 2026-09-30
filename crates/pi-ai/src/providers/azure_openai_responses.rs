@@ -535,8 +535,11 @@ fn build_params(
 	params.insert("model".to_string(), Value::String(deployment_name.to_string()));
 	params.insert("input".to_string(), Value::Array(messages));
 	params.insert("stream".to_string(), Value::Bool(true));
-	if let Some(session_id) = options.and_then(|options| options.stream.session_id.clone()) {
-		params.insert("prompt_cache_key".to_string(), Value::String(session_id));
+	params.insert("store".to_string(), Value::Bool(false));
+	if options.and_then(|options| options.stream.cache_retention.as_deref()) != Some("none") {
+		if let Some(session_id) = options.and_then(|options| options.stream.session_id.clone()) {
+			params.insert("prompt_cache_key".to_string(), Value::String(session_id));
+		}
 	}
 
 	if let Some(max_tokens) = options.and_then(|options| options.stream.max_tokens) {
@@ -917,6 +920,7 @@ mod tests {
 		let params = build_params(&model, &context(), None, "deployment-x");
 		assert_eq!(params.get("model").and_then(Value::as_str), Some("deployment-x"));
 		assert_eq!(params.get("stream").and_then(Value::as_bool), Some(true));
+		assert_eq!(params.get("store").and_then(Value::as_bool), Some(false));
 		assert!(params.get("input").and_then(Value::as_array).is_some());
 		// `prompt_cache_key`, `max_output_tokens` and `temperature` are omitted when unset.
 		assert!(!params.contains_key("prompt_cache_key"));
@@ -953,6 +957,24 @@ mod tests {
 		assert_eq!(tools[0].get("type").and_then(Value::as_str), Some("function"));
 		assert_eq!(tools[0].get("name").and_then(Value::as_str), Some("read"));
 		assert_eq!(tools[0].get("strict").and_then(Value::as_bool), Some(false));
+	}
+
+	#[test]
+	fn disabled_cache_omits_the_session_cache_key() {
+		let model = model("azure-openai-responses", "m", "https://res.openai.azure.com");
+		for retention in [None, Some("short"), Some("long"), Some("none")] {
+			let options = AzureOpenAIResponsesOptions {
+				stream: StreamOptions {
+					session_id: Some("session-1".to_string()),
+					cache_retention: retention.map(str::to_string),
+					..Default::default()
+				},
+				..Default::default()
+			};
+			let params = build_params(&model, &context(), Some(&options), "m");
+			assert_eq!(params["store"], false);
+			assert_eq!(params.contains_key("prompt_cache_key"), retention != Some("none"));
+		}
 	}
 
 	#[test]

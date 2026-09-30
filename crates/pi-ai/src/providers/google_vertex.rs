@@ -1384,6 +1384,11 @@ pub fn build_params(
 /// TS: `type ClampedThinkingLevel = Exclude<PiThinkingLevel, "xhigh" | "max">`.
 pub type ClampedThinkingLevel = String;
 
+fn is_gemma4_model(model: &Model) -> bool {
+	let id = model.id.to_lowercase();
+	id.contains("gemma-4") || id.contains("gemma4")
+}
+
 /// TS: `isGemini3ProModel(model)` - `/gemini-3(?:\.\d+)?-pro/`.
 fn is_gemini3_pro_model(model: &Model) -> bool {
 	matches_gemini3(&model.id.to_lowercase(), "pro")
@@ -1422,7 +1427,7 @@ fn get_disabled_thinking_config(model: &Model) -> Value {
 		config.insert("thinkingLevel".to_string(), Value::String("LOW".to_string()));
 		return Value::Object(config);
 	}
-	if is_gemini3_flash_model(model) {
+	if is_gemini3_flash_model(model) || is_gemma4_model(model) {
 		config.insert("thinkingLevel".to_string(), Value::String("MINIMAL".to_string()));
 		return Value::Object(config);
 	}
@@ -1432,14 +1437,21 @@ fn get_disabled_thinking_config(model: &Model) -> Value {
 	Value::Object(config)
 }
 
-/// TS: `getGemini3ThinkingLevel(effort, model)`.
-fn get_gemini3_thinking_level(effort: &ClampedThinkingLevel, model: &Model) -> GoogleThinkingLevel {
+/// Provider thinking levels for Gemini 3 and Gemma 4.
+fn get_thinking_level(effort: &ClampedThinkingLevel, model: &Model) -> GoogleThinkingLevel {
 	if is_gemini3_pro_model(model) {
 		match effort.as_str() {
 			"minimal" | "low" => return "LOW".to_string(),
 			"medium" | "high" => return "HIGH".to_string(),
 			_ => {}
 		}
+	}
+	if is_gemma4_model(model) {
+		return match effort.as_str() {
+			"minimal" | "low" => "MINIMAL".to_string(),
+			"medium" | "high" => "HIGH".to_string(),
+			_ => "THINKING_LEVEL_UNSPECIFIED".to_string(),
+		};
 	}
 	match effort.as_str() {
 		"minimal" => "MINIMAL".to_string(),
@@ -1474,12 +1486,12 @@ pub fn stream_simple_google_vertex(
 		clamped_reasoning
 	};
 
-	if is_gemini3_pro_model(model) || is_gemini3_flash_model(model) {
+	if is_gemini3_pro_model(model) || is_gemini3_flash_model(model) || is_gemma4_model(model) {
 		let mut typed = GoogleVertexOptions::from_base(&base);
 		typed.thinking = Some(GoogleVertexThinkingOptions {
 			enabled: true,
 			budget_tokens: None,
-			level: Some(get_gemini3_thinking_level(&effort, model)),
+			level: Some(get_thinking_level(&effort, model)),
 		});
 		return stream_google_vertex(model, context, Some(typed));
 	}
@@ -1787,13 +1799,13 @@ mod tests {
 
 	#[test]
 	fn gemini3_thinking_levels_follow_the_typescript_switch() {
-		assert_eq!(get_gemini3_thinking_level(&"minimal".to_string(), &model("gemini-3-pro")), "LOW");
-		assert_eq!(get_gemini3_thinking_level(&"low".to_string(), &model("gemini-3.2-pro")), "LOW");
-		assert_eq!(get_gemini3_thinking_level(&"medium".to_string(), &model("gemini-3-pro")), "HIGH");
-		assert_eq!(get_gemini3_thinking_level(&"high".to_string(), &model("gemini-3-pro")), "HIGH");
-		assert_eq!(get_gemini3_thinking_level(&"minimal".to_string(), &model("gemini-3-flash")), "MINIMAL");
-		assert_eq!(get_gemini3_thinking_level(&"medium".to_string(), &model("gemini-3-flash")), "MEDIUM");
-		assert_eq!(get_gemini3_thinking_level(&"high".to_string(), &model("gemini-3-flash")), "HIGH");
+		assert_eq!(get_thinking_level(&"minimal".to_string(), &model("gemini-3-pro")), "LOW");
+		assert_eq!(get_thinking_level(&"low".to_string(), &model("gemini-3.2-pro")), "LOW");
+		assert_eq!(get_thinking_level(&"medium".to_string(), &model("gemini-3-pro")), "HIGH");
+		assert_eq!(get_thinking_level(&"high".to_string(), &model("gemini-3-pro")), "HIGH");
+		assert_eq!(get_thinking_level(&"minimal".to_string(), &model("gemini-3-flash")), "MINIMAL");
+		assert_eq!(get_thinking_level(&"medium".to_string(), &model("gemini-3-flash")), "MEDIUM");
+		assert_eq!(get_thinking_level(&"high".to_string(), &model("gemini-3-flash")), "HIGH");
 	}
 
 	#[test]

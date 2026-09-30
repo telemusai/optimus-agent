@@ -221,7 +221,7 @@ mod tests {
         assert_eq!(catalog.len(), 33);
         assert_eq!(catalog.keys().next().map(String::as_str), Some("amazon-bedrock"));
         assert_eq!(catalog.keys().last().map(String::as_str), Some("kiro"));
-        assert_eq!(all_models().len(), 1317);
+        assert_eq!(all_models().len(), 1319);
     }
 
     #[test]

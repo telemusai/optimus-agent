@@ -1,0 +1,6 @@
+- Added GPT-6.1 Sol to the Codex and OpenAI Responses catalogs, retaining provider-specific context limits and the existing Codex sign-in.
+- Fixed Codex account discovery hiding newer models by updating the reported client version to 0.159.1.
+- Fixed large kernel output and inline-image frames slowing down due to repeated scans, while preserving UTF-8 decoding, frame limits, and protocol error handling.
+- Fixed large bracketed pastes repeatedly scanning accumulated text, including split delimiters and Unicode input.
+- Fixed the dedicated Azure Responses provider to disable response storage and omit session cache keys when caching is disabled.
+- Fixed Vertex Gemma 4 requests to use supported MINIMAL/HIGH thinking levels instead of unsupported thinking budgets.
