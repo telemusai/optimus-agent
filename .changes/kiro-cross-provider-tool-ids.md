@@ -1,0 +1,1 @@
+- Fixed Kiro rejecting conversations resumed or switched from Codex/OpenAI Responses with "Invalid tool use format" by consistently remapping incompatible tool-call and result IDs in requests while preserving saved conversations and native Kiro IDs.
