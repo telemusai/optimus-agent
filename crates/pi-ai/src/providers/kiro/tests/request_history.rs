@@ -188,6 +188,123 @@ fn a_later_main_snapshot_uses_the_real_result_instead_of_a_placeholder() {
     assert_eq!(result["content"][0]["text"], "finished");
 }
 
+#[test]
+fn foreign_tool_ids_are_valid_stable_distinct_and_paired_for_real_or_pending_results() {
+    let long_a = format!("{}a", "x".repeat(64));
+    let long_b = format!("{}b", "x".repeat(64));
+    let ids = [
+        "call_example|fc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        "call/a",
+        "call?a",
+        "",
+        "🦀",
+        long_a.as_str(),
+        long_b.as_str(),
+    ];
+    let history = wire(vec![
+        assistant(&ids),
+        result(ids[0], "real output"),
+        result(ids[1], "second real output"),
+        question(),
+    ]);
+    assert_pairs(&history);
+    let calls = history
+        .iter()
+        .find_map(|entry| entry["assistantResponseMessage"]["toolUses"].as_array())
+        .unwrap();
+    let mapped = calls
+        .iter()
+        .map(|call| call["toolUseId"].as_str().unwrap())
+        .collect::<Vec<_>>();
+    for id in &mapped {
+        assert!((1..=64).contains(&id.len()));
+        assert!(id
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b"_.:-".contains(&b)));
+    }
+    assert_eq!(
+        mapped
+            .iter()
+            .collect::<std::collections::HashSet<_>>()
+            .len(),
+        ids.len()
+    );
+    let repeated = wire(vec![assistant(&ids), question()]);
+    assert_eq!(
+        repeated[1]["assistantResponseMessage"]["toolUses"],
+        json!(calls)
+    );
+    let results =
+        &history.last().unwrap()["userInputMessage"]["userInputMessageContext"]["toolResults"];
+    assert_eq!(results[0]["status"], "success");
+    assert_eq!(results[0]["content"][0]["text"], "real output");
+    assert_eq!(results[2]["status"], "error");
+}
+
+#[test]
+fn native_tool_ids_keep_their_exact_spelling() {
+    let max = "a".repeat(64);
+    let ids = [
+        "toolu_bdrk_01Example",
+        "call.with:valid-characters_123",
+        max.as_str(),
+    ];
+    let history = wire(vec![assistant(&ids), question()]);
+    assert_pairs(&history);
+    for (call, id) in history[1]["assistantResponseMessage"]["toolUses"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .zip(ids)
+    {
+        assert_eq!(call["toolUseId"], id);
+    }
+}
+
+#[tokio::test]
+async fn codex_history_is_remapped_in_the_actual_http_request() {
+    let (url, server) = fixture(
+        [
+            frame(json!({"content":"History accepted."})),
+            frame(json!({"contextUsagePercentage":1})),
+        ]
+        .concat(),
+        200,
+        false,
+    )
+    .await;
+    let id = "call_example|fc_0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef";
+    let mut model = model();
+    model.base_url = url;
+    let mut ctx = context();
+    ctx.messages
+        .extend([assistant(&[id]), result(id, "real output"), question()]);
+    let before = serde_json::to_value(&ctx.messages).unwrap();
+    let response = stream_simple_kiro(&model, &ctx, Some(&options()))
+        .result()
+        .await;
+    assert_eq!(response.stop_reason, "stop");
+    assert_eq!(serde_json::to_value(&ctx.messages).unwrap(), before);
+    let (_, body) = server.await.unwrap();
+    let mut history = body["conversationState"]["history"]
+        .as_array()
+        .unwrap()
+        .clone();
+    history.push(body["conversationState"]["currentMessage"].clone());
+    assert_pairs(&history);
+    let mapped = history[1]["assistantResponseMessage"]["toolUses"][0]["toolUseId"]
+        .as_str()
+        .unwrap();
+    assert!(mapped.starts_with("optimus_"));
+    assert!(mapped.len() <= 64);
+    assert!(!body.to_string().contains(id));
+    assert_eq!(
+        history.last().unwrap()["userInputMessage"]["userInputMessageContext"]["toolResults"][0]
+            ["content"][0]["text"],
+        "real output"
+    );
+}
+
 #[tokio::test]
 async fn pending_side_question_snapshot_is_repaired_in_the_actual_http_request() {
     let (url, server) = fixture(
