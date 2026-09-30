@@ -299,23 +299,8 @@ impl StdinBuffer {
         self.buffer.push_str(str_data);
 
         if self.paste_mode {
-            self.paste_buffer.push_str(&self.buffer);
-            self.buffer.clear();
-
-            if let Some(end_index) = self.paste_buffer.find(BRACKETED_PASTE_END) {
-                let pasted_content = self.paste_buffer[..end_index].to_string();
-                let remaining = self.paste_buffer[end_index + BRACKETED_PASTE_END.len()..].to_string();
-
-                self.paste_mode = false;
-                self.paste_buffer.clear();
-                self.pending_kitty_printable_codepoint = None;
-
-                self.pending_events.push(StdinBufferEvent::Paste(pasted_content));
-
-                if !remaining.is_empty() {
-                    self.process_str(&remaining);
-                }
-            }
+            let chunk = std::mem::take(&mut self.buffer);
+            self.append_paste(&chunk);
             return;
         }
 
@@ -329,24 +314,10 @@ impl StdinBuffer {
             }
 
             self.pending_kitty_printable_codepoint = None;
-            self.buffer = self.buffer[start_index + BRACKETED_PASTE_START.len()..].to_string();
+            let after_start = self.buffer[start_index + BRACKETED_PASTE_START.len()..].to_string();
+            self.buffer.clear();
             self.paste_mode = true;
-            self.paste_buffer = std::mem::take(&mut self.buffer);
-
-            if let Some(end_index) = self.paste_buffer.find(BRACKETED_PASTE_END) {
-                let pasted_content = self.paste_buffer[..end_index].to_string();
-                let remaining = self.paste_buffer[end_index + BRACKETED_PASTE_END.len()..].to_string();
-
-                self.paste_mode = false;
-                self.paste_buffer.clear();
-                self.pending_kitty_printable_codepoint = None;
-
-                self.pending_events.push(StdinBufferEvent::Paste(pasted_content));
-
-                if !remaining.is_empty() {
-                    self.process_str(&remaining);
-                }
-            }
+            self.append_paste(&after_start);
             return;
         }
 
@@ -362,6 +333,28 @@ impl StdinBuffer {
 
         for sequence in sequences {
             self.emit_data_sequence(&sequence);
+        }
+    }
+
+    fn append_paste(&mut self, chunk: &str) {
+        // Only the marker-length tail can complete a delimiter spanning two reads.
+        let mut search_start = self.paste_buffer.len().saturating_sub(BRACKETED_PASTE_END.len() - 1);
+        while !self.paste_buffer.is_char_boundary(search_start) {
+            search_start -= 1;
+        }
+        self.paste_buffer.push_str(chunk);
+        let Some(index) = self.paste_buffer[search_start..].find(BRACKETED_PASTE_END) else {
+            return;
+        };
+        let end_index = search_start + index;
+        let pasted_content = self.paste_buffer[..end_index].to_string();
+        let remaining = self.paste_buffer[end_index + BRACKETED_PASTE_END.len()..].to_string();
+        self.paste_mode = false;
+        self.paste_buffer.clear();
+        self.pending_kitty_printable_codepoint = None;
+        self.pending_events.push(StdinBufferEvent::Paste(pasted_content));
+        if !remaining.is_empty() {
+            self.process_str(&remaining);
         }
     }
 
@@ -521,6 +514,44 @@ mod tests {
             events,
             vec![StdinBufferEvent::Paste("line1\nline2".to_string())]
         );
+    }
+
+    #[test]
+    fn bracketed_paste_markers_and_unicode_survive_every_chunk_boundary() {
+        let input = "a\x1b[200~hello 世😀\x1b[201~b".as_bytes();
+        for first in 1..input.len() {
+            for second in first + 1..input.len() {
+                let mut buffer = StdinBuffer::new(StdinBufferOptions::default());
+                for chunk in [&input[..first], &input[first..second], &input[second..]] {
+                    buffer.process(chunk);
+                }
+                assert_eq!(buffer.take_events(), vec![
+                    StdinBufferEvent::Data("a".into()),
+                    StdinBufferEvent::Paste("hello 世😀".into()),
+                    StdinBufferEvent::Data("b".into()),
+                ], "splits {first}, {second}");
+            }
+        }
+    }
+
+    #[test]
+    fn large_fragmented_paste_preserves_payload_and_following_input() {
+        let mut buffer = StdinBuffer::new(StdinBufferOptions::default());
+        let payload = "世😀 text ".repeat(100_000);
+        buffer.process(BRACKETED_PASTE_START.as_bytes());
+        for chunk in payload.as_bytes().chunks(127) {
+            buffer.process(chunk);
+        }
+        assert!(buffer.take_events().is_empty());
+        buffer.process(b"\x1b[20");
+        buffer.process(b"1~\x1b[A");
+        assert_eq!(buffer.take_events(), vec![
+            StdinBufferEvent::Paste(payload), StdinBufferEvent::Data("\x1b[A".into()),
+        ]);
+        buffer.process(b"\x1b[200~discarded\x1b[20");
+        buffer.clear();
+        assert_eq!(feed(&mut buffer, "\x1b[200~fresh\x1b[201~"),
+            vec![StdinBufferEvent::Paste("fresh".into())]);
     }
 
     #[test]

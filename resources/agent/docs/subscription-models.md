@@ -4,6 +4,24 @@
 catalog. It does not change sign-in, select a model automatically, or grant an
 account access. Explicit user model definitions still override built-in entries.
 
+## GPT-6.1 Sol
+
+Selectors: `openai-codex/gpt-6.1-sol` with your existing Codex sign-in, or
+`openai/gpt-6.1-sol` with an OpenAI API key. Both support text/image input and
+reasoning levels `low`, `medium`, `high`, `xhigh`, and `max`.
+
+A live Codex account catalog read with client version 0.159.1 on 2026-09-30
+returned the exact ID and a 272,000-token context window. Version 0.156.1 did
+not return it. The subscription entry retains that reported limit; it does not
+inherit the larger API window. A live Optimus shell tool round trip also passed
+using the existing Codex sign-in. Availability remains account-scoped.
+
+[Official API model details](https://developers.openai.com/api/docs/models/gpt-6.1-sol)
+specify 1,050,000 total context tokens, a 922,000-token input ceiling, and
+128,000 maximum output tokens. Standard catalog cost estimates are $2 input,
+$10 output, $0.10 cache read, and $2.50 cache write per million tokens. They do
+not measure Codex subscription credits. The existing fast-mode policy is unchanged.
+
 ## GPT-6 Sol and Luna on Codex
 
 Selectors: `openai-codex/gpt-6-sol` and `openai-codex/gpt-6-luna`.
@@ -26,8 +44,8 @@ Reviewed sources:
   cache read $0.01/cache write $0.125. These estimates do not measure subscription
   credits, account charges, or long-context pricing tiers.
 
-The discovery client version is 0.156.1, the published CLI release that bundled
-these models. Its source declares minimum client version 0.155.0. The existing
+The discovery client version is 0.159.1, verified against the account catalog
+on 2026-09-30 to include GPT-6.1 Sol as well as Sol and Luna. The existing
 account-scoped Codex catalog filter is retained. Missing IDs or failed catalog
 reads do not trigger a substitute model. Static registration and offline fixtures
 are not proof of an account's current rollout, policy, quota, or entitlement.
