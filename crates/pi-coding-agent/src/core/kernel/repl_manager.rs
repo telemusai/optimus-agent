@@ -266,6 +266,27 @@ fn as_snapshot_performance_metadata(value: Option<&Value>) -> Option<SnapshotPer
         serialization_slow_variables: as_metric_number_field(value.get("serialization_slow_variables")),
         serialization_saved_ms: as_metric_number_field(value.get("serialization_saved_ms")),
         serialization_skipped_ms: as_metric_number_field(value.get("serialization_skipped_ms")),
+        serialization_native_values: as_metric_number_field(value.get("serialization_native_values")),
+        serialization_dill_values: as_metric_number_field(value.get("serialization_dill_values")),
+        serialization_native_ms: as_metric_number_field(value.get("serialization_native_ms")),
+        serialization_dill_ms: as_metric_number_field(value.get("serialization_dill_ms")),
+        serialization_native_probe_ms: as_metric_number_field(value.get("serialization_native_probe_ms")),
+        serialization_native_probe_bytes: as_metric_number_field(value.get("serialization_native_probe_bytes")),
+        serialization_native_probe_attempts: as_metric_number_field(value.get("serialization_native_probe_attempts")),
+        serialization_native_probe_rejected: as_metric_number_field(value.get("serialization_native_probe_rejected")),
+        serialization_fragment_prepare_ms: as_metric_number_field(value.get("serialization_fragment_prepare_ms")),
+        serialization_fragment_write_ms: as_metric_number_field(value.get("serialization_fragment_write_ms")),
+        serialization_fragment_bytes: as_metric_number_field(value.get("serialization_fragment_bytes")),
+        serialization_fragment_segments: as_metric_number_field(value.get("serialization_fragment_segments")),
+        serialization_buffer_reset_ms: as_metric_number_field(value.get("serialization_buffer_reset_ms")),
+        serialization_blob_extract_ms: as_metric_number_field(value.get("serialization_blob_extract_ms")),
+        serialization_native_probe_saved_ms: as_metric_number_field(value.get("serialization_native_probe_saved_ms")),
+        serialization_native_probe_skipped_ms: as_metric_number_field(value.get("serialization_native_probe_skipped_ms")),
+        serialization_envelope_count_ms: as_metric_number_field(value.get("serialization_envelope_count_ms")),
+        serialization_envelope_count_calls: as_metric_number_field(value.get("serialization_envelope_count_calls")),
+        serialization_envelope_write_ms: as_metric_number_field(value.get("serialization_envelope_write_ms")),
+        snapshot_cas_captures: as_metric_number_field(value.get("snapshot_cas_captures")),
+        snapshot_legacy_captures: as_metric_number_field(value.get("snapshot_legacy_captures")),
         serialized_bytes: as_metric_number_field(value.get("serialized_bytes")),
         write_ms: as_metric_number_field(value.get("write_ms")),
         written_bytes: as_metric_number_field(value.get("written_bytes")),
@@ -3480,6 +3501,90 @@ impl KernelState {
                     "serialization_skipped_ms",
                     metadata.and_then(|metadata| metadata.serialization_skipped_ms),
                 ),
+                (
+                    "serialization_native_values",
+                    metadata.and_then(|metadata| metadata.serialization_native_values),
+                ),
+                (
+                    "serialization_dill_values",
+                    metadata.and_then(|metadata| metadata.serialization_dill_values),
+                ),
+                (
+                    "serialization_native_ms",
+                    metadata.and_then(|metadata| metadata.serialization_native_ms),
+                ),
+                (
+                    "serialization_dill_ms",
+                    metadata.and_then(|metadata| metadata.serialization_dill_ms),
+                ),
+                (
+                    "serialization_native_probe_ms",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_ms),
+                ),
+                (
+                    "serialization_native_probe_bytes",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_bytes),
+                ),
+                (
+                    "serialization_native_probe_attempts",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_attempts),
+                ),
+                (
+                    "serialization_native_probe_rejected",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_rejected),
+                ),
+                (
+                    "serialization_fragment_prepare_ms",
+                    metadata.and_then(|metadata| metadata.serialization_fragment_prepare_ms),
+                ),
+                (
+                    "serialization_fragment_write_ms",
+                    metadata.and_then(|metadata| metadata.serialization_fragment_write_ms),
+                ),
+                (
+                    "serialization_fragment_bytes",
+                    metadata.and_then(|metadata| metadata.serialization_fragment_bytes),
+                ),
+                (
+                    "serialization_fragment_segments",
+                    metadata.and_then(|metadata| metadata.serialization_fragment_segments),
+                ),
+                (
+                    "serialization_buffer_reset_ms",
+                    metadata.and_then(|metadata| metadata.serialization_buffer_reset_ms),
+                ),
+                (
+                    "serialization_blob_extract_ms",
+                    metadata.and_then(|metadata| metadata.serialization_blob_extract_ms),
+                ),
+                (
+                    "serialization_native_probe_saved_ms",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_saved_ms),
+                ),
+                (
+                    "serialization_native_probe_skipped_ms",
+                    metadata.and_then(|metadata| metadata.serialization_native_probe_skipped_ms),
+                ),
+                (
+                    "serialization_envelope_count_ms",
+                    metadata.and_then(|metadata| metadata.serialization_envelope_count_ms),
+                ),
+                (
+                    "serialization_envelope_count_calls",
+                    metadata.and_then(|metadata| metadata.serialization_envelope_count_calls),
+                ),
+                (
+                    "serialization_envelope_write_ms",
+                    metadata.and_then(|metadata| metadata.serialization_envelope_write_ms),
+                ),
+                (
+                    "snapshot_cas_captures",
+                    metadata.and_then(|metadata| metadata.snapshot_cas_captures),
+                ),
+                (
+                    "snapshot_legacy_captures",
+                    metadata.and_then(|metadata| metadata.snapshot_legacy_captures),
+                ),
                 ("write_ms", metadata.and_then(|metadata| metadata.write_ms)),
                 (
                     "serialized_bytes",
@@ -4373,6 +4478,116 @@ mod tests {
         let old_metadata = as_snapshot_performance_metadata(Some(&json!({}))).expect("old metadata");
         assert_eq!(old_metadata.serialization_max_variable_ms, None);
         assert!(as_snapshot_performance_metadata(Some(&json!([1]))).is_none());
+    }
+
+    const SNAPSHOT_DETAIL_KEYS: [&str; 21] = [
+        "serialization_native_values",
+        "serialization_dill_values",
+        "serialization_native_ms",
+        "serialization_dill_ms",
+        "serialization_native_probe_ms",
+        "serialization_native_probe_bytes",
+        "serialization_native_probe_attempts",
+        "serialization_native_probe_rejected",
+        "serialization_fragment_prepare_ms",
+        "serialization_fragment_write_ms",
+        "serialization_fragment_bytes",
+        "serialization_fragment_segments",
+        "serialization_buffer_reset_ms",
+        "serialization_blob_extract_ms",
+        "serialization_native_probe_saved_ms",
+        "serialization_native_probe_skipped_ms",
+        "serialization_envelope_count_ms",
+        "serialization_envelope_count_calls",
+        "serialization_envelope_write_ms",
+        "snapshot_cas_captures",
+        "snapshot_legacy_captures",
+    ];
+
+    fn snapshot_detail_values(metadata: &SnapshotPerformanceMetadata) -> [Option<f64>; 21] {
+        [
+            metadata.serialization_native_values,
+            metadata.serialization_dill_values,
+            metadata.serialization_native_ms,
+            metadata.serialization_dill_ms,
+            metadata.serialization_native_probe_ms,
+            metadata.serialization_native_probe_bytes,
+            metadata.serialization_native_probe_attempts,
+            metadata.serialization_native_probe_rejected,
+            metadata.serialization_fragment_prepare_ms,
+            metadata.serialization_fragment_write_ms,
+            metadata.serialization_fragment_bytes,
+            metadata.serialization_fragment_segments,
+            metadata.serialization_buffer_reset_ms,
+            metadata.serialization_blob_extract_ms,
+            metadata.serialization_native_probe_saved_ms,
+            metadata.serialization_native_probe_skipped_ms,
+            metadata.serialization_envelope_count_ms,
+            metadata.serialization_envelope_count_calls,
+            metadata.serialization_envelope_write_ms,
+            metadata.snapshot_cas_captures,
+            metadata.snapshot_legacy_captures,
+        ]
+    }
+
+    #[test]
+    fn snapshot_detail_metadata_sanitizes_all_fields_and_keeps_wire_unchanged() {
+        let old = as_snapshot_performance_metadata(Some(&json!({}))).unwrap();
+        assert_eq!(snapshot_detail_values(&old), [None; 21]);
+        let mut input = Map::new();
+        for (index, key) in SNAPSHOT_DETAIL_KEYS.iter().enumerate() {
+            input.insert((*key).into(), json!(index as f64 + 0.5));
+        }
+        input.insert("private_variable_name".into(), json!("synthetic-payload"));
+        let metadata = as_snapshot_performance_metadata(Some(&Value::Object(input.clone()))).unwrap();
+        for (index, value) in snapshot_detail_values(&metadata).into_iter().enumerate() {
+            assert_eq!(value, Some(index as f64 + 0.5));
+        }
+        assert_eq!(serde_json::to_value(&metadata).unwrap(), serde_json::to_value(&old).unwrap());
+        for invalid in [Value::Null, json!(true), json!(-1), json!("private"), json!([]), json!({})] {
+            for key in SNAPSHOT_DETAIL_KEYS {
+                input.insert(key.into(), invalid.clone());
+            }
+            let metadata = as_snapshot_performance_metadata(Some(&Value::Object(input.clone()))).unwrap();
+            assert_eq!(snapshot_detail_values(&metadata), [None; 21]);
+        }
+    }
+
+    #[test]
+    fn snapshot_detail_metrics_reach_capture_recorder_without_content_or_invented_values() {
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<PerformanceMetricEvent>>);
+        impl PerformanceMetricRecorder for Recorder {
+            fn session_id(&self) -> &str { "snapshot-offline" }
+            fn monotonic_now(&self) -> f64 { 100.0 }
+            fn record(&self, event: PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
+        }
+        let recorder = Arc::new(Recorder::default());
+        let metric = SnapshotMetricState {
+            recorder: recorder.clone(), started_at: Some(1.0),
+            timing: Arc::new(Mutex::new(SnapshotQueueTiming::default())),
+        };
+        let manager = new_repl_kernel_manager(KernelManagerOptions::default());
+        let mut input = Map::new();
+        for (index, key) in SNAPSHOT_DETAIL_KEYS.iter().enumerate() {
+            input.insert((*key).into(), json!(index as f64 + 0.5));
+        }
+        input.insert("private_variable_name".into(), json!("synthetic-payload"));
+        let metadata = as_snapshot_performance_metadata(Some(&Value::Object(input))).unwrap();
+        manager.state.record_snapshot_metric(Some(&metric), PerformanceMetricOutcome::Success, Some(&metadata));
+        manager.state.record_snapshot_metric(Some(&metric), PerformanceMetricOutcome::Failure, None);
+        let events = recorder.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        for (index, key) in SNAPSHOT_DETAIL_KEYS.iter().enumerate() {
+            assert_eq!(events[0].measurements.iter().find(|(name, _)| name == key).unwrap().1,
+                Some(index as f64 + 0.5));
+            assert_eq!(events[1].measurements.iter().find(|(name, _)| name == key).unwrap().1, None);
+        }
+        for event in events.iter() {
+            assert_eq!(event.operation, "snapshot");
+            assert!(!event.measurements.iter().any(|(key, _)| *key == "private_variable_name"));
+            assert_eq!(event.measurements.len(), 33);
+        }
     }
 
     #[test]

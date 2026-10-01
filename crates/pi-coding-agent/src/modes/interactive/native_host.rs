@@ -171,6 +171,7 @@ struct Transcript {
     selection_columns: Vec<Option<(usize, usize)>>,
     connection_status: String,
     refinement_progress: Option<String>,
+    local_sending_count: usize,
     viewport_anchors: Vec<Option<pi_tui::fullscreen::ViewportAnchor>>,
     assistant: Option<Rc<RefCell<AssistantMessageComponent>>>,
     assistants: Vec<Rc<RefCell<AssistantMessageComponent>>>,
@@ -285,6 +286,7 @@ impl Transcript {
             selection_columns: Vec::new(),
             connection_status: String::new(),
             refinement_progress: None,
+            local_sending_count: 0,
             viewport_anchors: Vec::new(),
             assistant: None,
             assistants: Vec::new(),
@@ -658,6 +660,9 @@ impl TuiComponent for Transcript {
         if let Some(side_pane) = &self.side_pane {
             lines.extend(side_pane.borrow_mut().render(width));
         }
+        if self.local_sending_count > 0 {
+            lines.push(theme().fg("dim", "Sending — not yet confirmed by host"));
+        }
         // Editor and overlay repaints must not reparse unchanged history's ANSI
         // and Unicode on every key. Compare rendered bytes so external component
         // updates, theme changes and expansion still invalidate precisely.
@@ -826,6 +831,8 @@ enum HostEvent {
     SideBashFailed(String, String),
     Debug,
     Connection(wire::AgentConnectionEvent),
+    TimedConnection(wire::AgentConnectionEvent, Instant),
+    SubmissionReply(native_metrics::SubmissionTicket, Result<(), String>),
     Completed(Result<(), String>),
     Status(String),
     ClipboardNotice(String),
@@ -1751,7 +1758,7 @@ async fn run_terminal(
     let mut pending_relaunch = None;
     let event_send = send.clone();
     let unsubscribe = connection.subscribe(Arc::new(move |event| {
-        let _ = event_send.send(HostEvent::Connection(event));
+        let _ = event_send.send(HostEvent::TimedConnection(event, Instant::now()));
         Box::pin(async {})
     }));
     if let Some(message) = initial_message {
@@ -2074,7 +2081,7 @@ async fn run_terminal(
                     } else if text.trim() == "/help" {
                         mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Alt+Enter queues follow-up; Ctrl+O expands tools.", "dim");
                     } else {
-                        submit_with_metrics(&connection, &send, text, follow_up, None, Some(ui_metrics.recorder.clone()));
+                        submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
                     }
                 }
                 InputAction::Interrupt | InputAction::Escape => {
@@ -2248,6 +2255,13 @@ async fn run_terminal(
         // Preserve event order, but yield back to input/rendering under a continuous stream.
         let mut event_budget = HostEventBudget::new();
         while let Some(event) = event_budget.next(&receive) {
+            let (event, received_at) = match event {
+                HostEvent::TimedConnection(event, received_at) => (HostEvent::Connection(event), Some(received_at)),
+                event => (event, None),
+            };
+            if submission_attachment_invalidated(&event) {
+                ui_metrics.reset_attachment();
+            }
             if matches!(&event,
                 HostEvent::Connection(
                     wire::AgentConnectionEvent::SessionEvent { .. }
@@ -2471,7 +2485,10 @@ async fn run_terminal(
                         &event,
                         wire::AgentConnectionSessionEvent::SessionInfoChanged { .. }
                     );
+                    let queue_age = received_at.map(|at| at.elapsed());
+                    let apply_started = Instant::now();
                     apply_event(&mode, &transcript, event);
+                    ui_metrics.applied(apply_started.elapsed(), queue_age);
                     if renamed {
                         refresh_terminal_title(&mode, &ui);
                     }
@@ -2681,6 +2698,13 @@ async fn run_terminal(
                     Ok(_) => {}
                     Err(error) => mode.borrow_mut().show_error(&error),
                 },
+                HostEvent::SubmissionReply(ticket, result) => {
+                    if apply_submission_reply(&mode, &mut ui_metrics, &ticket, result) {
+                        state_refresh.request(connection.clone(), current_session_id.clone());
+                    }
+                }
+                // TimedConnection is normalized before reducers run.
+                HostEvent::TimedConnection(..) => unreachable!("normalized connection event"),
                 HostEvent::Completed(result) => {
                     if let Err(error) = result {
                         mode.borrow_mut().show_error(&error);
@@ -3166,6 +3190,8 @@ async fn run_terminal(
                 terminal_progress = progress;
             }
             mode.borrow_mut().tick_working_pulse();
+            // Custom components have no complete dirty/revision contract.
+            ui_metrics.fallback_tick();
             ui.borrow_mut().request_render();
             last_tick = Instant::now();
         }
@@ -3200,13 +3226,27 @@ async fn run_terminal(
         editor.borrow_mut().editor_mut().set_terminal_rows(rows);
         editor.borrow_mut().editor_mut().poll_autocomplete();
         ui_metrics.session(&current_session_id);
+        let pending_count = ui_metrics.pending_count();
+        if transcript.borrow().local_sending_count != pending_count {
+            transcript.borrow_mut().local_sending_count = pending_count;
+            ui.borrow_mut().request_render();
+        }
+        // Service autoscroll before sampling the render flag so timer paints count.
+        ui.borrow_mut().poll_selection_auto_scroll();
         let render_requested = ui.borrow().render_requested();
         let render_started = Instant::now();
         ui.borrow_mut().run_pending_render(now_ms());
-        if render_requested { ui_metrics.rendered(render_started.elapsed()); }
+        if render_requested {
+            ui_metrics.rendered(render_started.elapsed());
+            // A scrolled/covered receipt is not proof of a receipt on screen.
+            let receipt_visible = !ui.borrow().has_overlay()
+                && (!ui.borrow().is_fullscreen() || ui.borrow().get_scroll_info().is_some_and(|info| info.following));
+            if receipt_visible { ui_metrics.receipt_rendered(); }
+        }
         tokio::time::sleep(Duration::from_millis(16)).await;
     }
     unsubscribe();
+    ui_metrics.reset_attachment();
     ui_metrics.flush_render();
     if let Some(bridge) = &local_extension_bridge { bridge.close(); }
     if let Some((_, _, handle, reply)) = custom_extension { handle.hide(); let _ = reply.send(None); }
@@ -3332,27 +3372,69 @@ fn submit(
     submit_with_metrics(connection, send, text, follow_up, images, None);
 }
 
+fn submission_is_prompt(text: &str) -> bool {
+    if matches!(text.trim(), "/help" | "/hotkeys" | "/quit" | "/exit") { return false; }
+    match classify_submission(text) {
+        SlashDispatch::Model(line) => !line.starts_with('!'),
+        SlashDispatch::SessionCommand(_) => true,
+        SlashDispatch::Builtin { .. } => false,
+    }
+}
+
+fn submission_attachment_invalidated(event: &HostEvent) -> bool {
+    matches!(event, HostEvent::RefreshSnapshot(_)
+        | HostEvent::Extension(native_extension_bridge::Event::RuntimeRebound)
+        | HostEvent::Connection(wire::AgentConnectionEvent::SessionResynced { .. }
+            | wire::AgentConnectionEvent::SessionReplaced { .. }
+            | wire::AgentConnectionEvent::Closed { .. }
+            | wire::AgentConnectionEvent::ConnectionStatus { .. }))
+}
+
+fn apply_submission_reply(
+    mode: &Rc<RefCell<InteractiveMode>>,
+    metrics: &mut native_metrics::UiMetrics,
+    ticket: &native_metrics::SubmissionTicket,
+    result: Result<(), String>,
+) -> bool {
+    if !metrics.reply(ticket) { return false; }
+    if let Err(error) = result { mode.borrow_mut().show_error(&error); }
+    true
+}
+
+fn submit_from_editor(
+    connection: &Arc<dyn wire::AgentConnection>,
+    send: &mpsc::Sender<HostEvent>,
+    text: String,
+    follow_up: bool,
+    metrics: &mut native_metrics::UiMetrics,
+    transcript: &Rc<RefCell<Transcript>>,
+) {
+    let ticket = submission_is_prompt(&text).then(|| metrics.begin_submission());
+    transcript.borrow_mut().local_sending_count = metrics.pending_count();
+    submit_with_metrics(connection, send, text, follow_up, None, ticket);
+}
+
 fn submit_with_metrics(
     connection: &Arc<dyn wire::AgentConnection>,
     send: &mpsc::Sender<HostEvent>,
     text: String,
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
-    recorder: Option<Arc<dyn pi_agent_core::performance_metrics::PerformanceMetricRecorder>>,
+    ticket: Option<native_metrics::SubmissionTicket>,
 ) {
     let (connection, send) = (connection.clone(), send.clone());
     tokio::spawn(async move {
-        let is_prompt = match classify_submission(&text) {
-            SlashDispatch::Model(line) => !line.starts_with('!'),
-            SlashDispatch::SessionCommand(_) => true,
-            SlashDispatch::Builtin { .. } => false,
-        };
+        let task_started = Instant::now();
         let submission = dispatch_submission(&connection, &send, &text, follow_up, images);
-        let result = match recorder.filter(|_| is_prompt) {
-            Some(recorder) => native_metrics::acknowledged(recorder, submission).await,
-            None => submission.await,
-        };
-        let _ = send.send(HostEvent::Completed(result));
+        match ticket {
+            Some(ticket) => {
+                let result = native_metrics::acknowledged(ticket.clone(), task_started, submission).await;
+                let _ = send.send(HostEvent::SubmissionReply(ticket, result));
+            }
+            None => {
+                let _ = send.send(HostEvent::Completed(submission.await));
+            }
+        }
     });
 }
 
@@ -4525,12 +4607,86 @@ fn refresh_terminal_title(mode: &Rc<RefCell<InteractiveMode>>, ui: &Rc<RefCell<T
     ui.borrow_mut().terminal.set_title(&title);
 }
 
+/// Only bypass Serde for messages whose typed fields survive its round trip.
+/// Non-canonical local fields keep the old normalization/fail-closed path.
+fn message_projection_is_identity(message: &AgentMessage) -> bool {
+    use pi_ai::types::{ContentBlock, ImageOrTextContent, Message, UserContent};
+    use pi_agent_core::types::CustomAgentMessage;
+    let image_or_text = |blocks: &[ImageOrTextContent]| blocks.iter().all(|block| match block {
+        ImageOrTextContent::Text(text) => text.type_ == "text",
+        ImageOrTextContent::Image(image) => image.type_ == "image",
+    });
+    let checkpoint = |value: &Option<pi_ai::compaction::ProviderCompactionCheckpoint>| {
+        value.as_ref().is_none_or(|value| value.estimated_tokens.is_finite())
+    };
+    match message {
+        AgentMessage::Message(Message::User(user)) => user.role == "user"
+            && checkpoint(&user.provider_context)
+            && match &user.content { UserContent::Text(_) => true, UserContent::Blocks(blocks) => image_or_text(blocks) },
+        AgentMessage::Message(Message::Assistant(assistant)) => {
+            let usage = &assistant.usage;
+            assistant.role == "assistant"
+                && [usage.input, usage.output, usage.cache_read, usage.cache_write, usage.total_tokens,
+                    usage.cost.input, usage.cost.output, usage.cost.cache_read, usage.cost.cache_write, usage.cost.total]
+                    .into_iter().all(f64::is_finite)
+                && assistant.content.iter().all(|block| match block {
+                    ContentBlock::Text(text) => text.type_ == "text",
+                    ContentBlock::Thinking(thinking) => thinking.type_ == "thinking",
+                    ContentBlock::ToolCall(call) => call.type_ == "toolCall",
+                })
+        }
+        AgentMessage::Message(Message::ToolResult(result)) => result.role == "toolResult" && image_or_text(&result.content),
+        AgentMessage::Custom(CustomAgentMessage::CompactionSummary { provider_context, tokens_before, retained_message_count, .. }) => {
+            checkpoint(provider_context) && tokens_before.is_finite() && retained_message_count.is_none_or(f64::is_finite)
+        }
+        AgentMessage::Custom(_) => true,
+    }
+}
+
+fn project_message_event(event: wire::AgentConnectionSessionEvent) -> Option<AgentMessage> {
+    use pi_agent_core::types::AgentEvent;
+    use wire::AgentConnectionSessionEvent as Event;
+    let message = match event {
+        Event::MessageStart { message } | Event::MessageUpdate { message, .. } | Event::MessageEnd { message }
+        | Event::Agent(AgentEvent::MessageStart { message } | AgentEvent::MessageUpdate { message, .. } | AgentEvent::MessageEnd { message }) => message,
+        _ => return None,
+    };
+    if message_projection_is_identity(&message) { Some(message) }
+    else { serde_json::to_value(message).ok().and_then(|value| serde_json::from_value(value).ok()) }
+}
+
+fn apply_message_projection(
+    mode: &Rc<RefCell<InteractiveMode>>,
+    transcript: &Rc<RefCell<Transcript>>,
+    kind: &str,
+    message: AgentMessage,
+) {
+    // Durable refinement outcomes emit MessageStart only.
+    let refinement_outcome = matches!(&message, AgentMessage::Custom(pi_agent_core::types::CustomAgentMessage::Custom { custom_type, .. }) if custom_type == crate::core::messages::REFINEMENT_OUTCOME_CUSTOM_TYPE);
+    if message.role() == "assistant"
+        || (kind == "message_start" && refinement_outcome)
+        || (kind == "message_end" && !refinement_outcome && message.role() != "assistant")
+    {
+        transcript.borrow_mut().message(message, kind != "message_end");
+    }
+    if (kind == "message_end" && !refinement_outcome) || (kind == "message_start" && refinement_outcome) {
+        mode.borrow_mut().patch_connection_state(|s| s.message_count += 1.0);
+    }
+}
+
 fn apply_event(
     mode: &Rc<RefCell<InteractiveMode>>,
     transcript: &Rc<RefCell<Transcript>>,
     event: wire::AgentConnectionSessionEvent,
 ) {
     native_state::track_activity(&mut mode.borrow_mut(), &event);
+    let kind = event.type_name();
+    if matches!(kind, "message_start" | "message_update" | "message_end") {
+        if let Some(message) = project_message_event(event) {
+            apply_message_projection(mode, transcript, kind, message);
+        }
+        return;
+    }
     let value = match &event {
         wire::AgentConnectionSessionEvent::Agent(event) => serde_json::to_value(event),
         event => serde_json::to_value(event),
@@ -4599,29 +4755,6 @@ fn apply_event(
                 s.active_tool_names.clear();
             });
             mode.stop_working_loader();
-        }
-        "message_start" | "message_update" | "message_end" => {
-            if let Some(message) = value
-                .get("message")
-                .and_then(|value| serde_json::from_value::<AgentMessage>(value.clone()).ok())
-            {
-                let kind = event.type_name();
-                // Durable refinement outcomes emit MessageStart only; the old
-                // end-only custom path hid successful automatic learning live.
-                let refinement_outcome = matches!(&message, AgentMessage::Custom(pi_agent_core::types::CustomAgentMessage::Custom { custom_type, .. }) if custom_type == crate::core::messages::REFINEMENT_OUTCOME_CUSTOM_TYPE);
-                if message.role() == "assistant"
-                    || (kind == "message_start" && refinement_outcome)
-                    || (kind == "message_end" && !refinement_outcome && message.role() != "assistant")
-                {
-                    transcript
-                        .borrow_mut()
-                        .message(message, kind != "message_end");
-                }
-                if (kind == "message_end" && !refinement_outcome) || (kind == "message_start" && refinement_outcome) {
-                    mode.borrow_mut()
-                        .patch_connection_state(|s| s.message_count += 1.0);
-                }
-            }
         }
         "tool_execution_start" => {
             let id = string(&value, "toolCallId");
@@ -4811,6 +4944,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
         state: std::sync::Mutex<wire::AgentConnectionState>,
         user_messages: std::sync::Mutex<Vec<wire::AgentConnectionUserMessage>>,
+        prompt_replies: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<Result<(), String>>>>,
         last_assistant_text: std::sync::Mutex<Option<String>>,
         session_tree: std::sync::Mutex<wire::AgentConnectionWatchSessionTree>,
         export_path: std::sync::Mutex<Option<String>>,
@@ -5146,7 +5280,10 @@ mod tests {
                 "prompt",
                 &[message.to_string(), behavior, format!("{images:?}")],
             );
-            Box::pin(async { Ok(()) })
+            let reply = self.prompt_replies.lock().unwrap().pop_front();
+            Box::pin(async move {
+                match reply { Some(reply) => reply.await.unwrap_or_else(|_| Err("Synthetic reply dropped".into())), None => Ok(()) }
+            })
         }
         fn prompt_and_wait(
             &self,
@@ -5479,6 +5616,527 @@ mod tests {
             _listener: wire::AgentConnectionBeforeSessionInvalidateListener,
         ) -> Box<dyn Fn() + Send + Sync> {
             Box::new(|| {})
+        }
+    }
+
+fn apply_event_legacy_for_speed(
+    mode: &Rc<RefCell<InteractiveMode>>,
+    transcript: &Rc<RefCell<Transcript>>,
+    event: wire::AgentConnectionSessionEvent,
+) {
+    native_state::track_activity(&mut mode.borrow_mut(), &event);
+    let value = match &event {
+        wire::AgentConnectionSessionEvent::Agent(event) => serde_json::to_value(event),
+        event => serde_json::to_value(event),
+    }
+    .unwrap_or_default();
+    match event.type_name() {
+        "refinement_update" => {
+            if let wire::AgentConnectionSessionEvent::RefinementUpdate { active, reason } = &event {
+                transcript.borrow_mut().refinement_progress = active.then(|| {
+                    reason.as_deref().filter(|text| !text.trim().is_empty())
+                        .unwrap_or("Refining saved knowledge")
+                        .chars().map(|ch| if ch.is_control() { ' ' } else { ch }).collect()
+                });
+            }
+        }
+        "refine_complete" | "refine_failed" => {
+            transcript.borrow_mut().refinement_progress = None;
+            if let wire::AgentConnectionSessionEvent::RefineFailed { error } = &event {
+                mode.borrow_mut().show_error(error);
+            }
+        }
+        "rlm_child_update" => {
+            if let wire::AgentConnectionSessionEvent::RlmChildUpdate { child } = &event {
+                mode.borrow_mut().update_subagent_summary(native_subagents::project_child(child));
+            }
+        }
+        "ipython_sent_agent_message" => {
+            if let wire::AgentConnectionSessionEvent::IpythonSentAgentMessage { tool_call_id, message } = &event {
+                transcript.borrow_mut().sent_agent_message(tool_call_id, message.clone());
+            }
+        }
+        "session_action_update" => {
+            if let Some(actions) = value.get("actions") {
+                let strings = |key| {
+                    actions
+                        .get(key)
+                        .and_then(serde_json::Value::as_array)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|value| {
+                            value
+                                .as_str()
+                                .map(str::to_string)
+                                .or_else(|| optional_string(value, "text"))
+                        })
+                        .collect::<Vec<_>>()
+                };
+                mode.borrow_mut().patch_connection_queue(|state| {
+                    state.session_actions.steering = strings("steering");
+                    state.session_actions.follow_ups = strings("followUps");
+                    state.session_actions.queued_count =
+                        number(actions, "queuedCount").unwrap_or(0.0) as usize;
+                    state.session_actions.active = optional_string(actions, "active");
+                });
+            }
+        }
+        "agent_start" => {
+            let mut mode = mode.borrow_mut();
+            mode.patch_connection_state(|s| s.is_streaming = true);
+            mode.working_started_at = Some(now_ms());
+        }
+        "agent_end" => {
+            let mut mode = mode.borrow_mut();
+            mode.patch_connection_state(|s| {
+                s.is_streaming = false;
+                s.active_tool_names.clear();
+            });
+            mode.stop_working_loader();
+        }
+        "message_start" | "message_update" | "message_end" => {
+            if let Some(message) = value
+                .get("message")
+                .and_then(|value| serde_json::from_value::<AgentMessage>(value.clone()).ok())
+            {
+                let kind = event.type_name();
+                // Durable refinement outcomes emit MessageStart only; the old
+                // end-only custom path hid successful automatic learning live.
+                let refinement_outcome = matches!(&message, AgentMessage::Custom(pi_agent_core::types::CustomAgentMessage::Custom { custom_type, .. }) if custom_type == crate::core::messages::REFINEMENT_OUTCOME_CUSTOM_TYPE);
+                if message.role() == "assistant"
+                    || (kind == "message_start" && refinement_outcome)
+                    || (kind == "message_end" && !refinement_outcome && message.role() != "assistant")
+                {
+                    transcript
+                        .borrow_mut()
+                        .message(message, kind != "message_end");
+                }
+                if (kind == "message_end" && !refinement_outcome) || (kind == "message_start" && refinement_outcome) {
+                    mode.borrow_mut()
+                        .patch_connection_state(|s| s.message_count += 1.0);
+                }
+            }
+        }
+        "tool_execution_start" => {
+            let id = string(&value, "toolCallId");
+            let mut transcript = transcript.borrow_mut();
+            transcript.tool_start(&id, &string(&value, "toolName"), value.get("args").cloned().unwrap_or_default());
+            if let Some(meta) = transcript.row_metadata.get_mut(format!("tool:{id}").as_str()) {
+                meta.started.get_or_insert_with(Instant::now);
+                meta.timestamp = Some(now_ms() as i64);
+            }
+        },
+        "tool_execution_end" | "tool_execution_update" => transcript.borrow_mut().tool_result(
+            &string(&value, "toolCallId"),
+            value
+                .get("result")
+                .or_else(|| value.get("partialResult"))
+                .unwrap_or(&serde_json::Value::Null),
+            value
+                .get("isError")
+                .and_then(|v| v.as_bool())
+                .unwrap_or(false),
+            event.type_name() == "tool_execution_update",
+        ),
+        "bash_start" => {
+            mode.borrow_mut()
+                .patch_connection_state(|s| s.is_bash_running = true);
+            mode.borrow_mut()
+                .show_status(&format!("$ {}", string(&value, "command")), "dim");
+        }
+        "bash_output" => mode
+            .borrow_mut()
+            .show_status(&string(&value, "chunk"), "text"),
+        "bash_end" => {
+            mode.borrow_mut()
+                .patch_connection_state(|s| s.is_bash_running = false);
+            if let Some(error) = optional_string(&value, "errorMessage") {
+                mode.borrow_mut().show_error(&error);
+            }
+        }
+        "goal_update" => {
+            if let wire::AgentConnectionSessionEvent::GoalUpdate { goal } = event {
+                mode.borrow_mut().handle_goal_update(&goal, 120.0);
+                mode.borrow_mut().patch_connection_state(|s| s.goal = goal);
+            }
+        }
+        "compaction_start" => {
+            if let wire::AgentConnectionSessionEvent::CompactionStart {
+                reason,
+                custom_instructions,
+            } = event
+            {
+                let mut mode = mode.borrow_mut();
+                mode.patch_connection_state(|s| s.is_compacting = true);
+                mode.start_compaction_loader(&reason, custom_instructions.as_deref());
+            }
+        }
+        "compaction_end" => {
+            let mut mode = mode.borrow_mut();
+            mode.patch_connection_state(|s| s.is_compacting = false);
+            mode.stop_compaction_loader();
+            if let wire::AgentConnectionSessionEvent::CompactionEnd { result, aborted, error_message, .. } = event {
+                if let Some(error) = error_message {
+                    mode.show_compaction_error(&error);
+                } else if !aborted && result.is_some() {
+                    // An idle snapshot or cancelled/skipped attempt is not recovery.
+                    mode.clear_compaction_notices();
+                }
+            }
+        }
+        "recap_update" => {
+            mode.borrow_mut().session_recap = optional_string(&value, "recap");
+            mode.borrow_mut().render_recap();
+        }
+        "auto_retry_start" => {
+            let mut mode = mode.borrow_mut();
+            mode.patch_connection_state(|s| s.retry_attempt = number(&value, "attempt").unwrap_or(0.0));
+            mode.show_warning(&string(&value, "errorMessage"));
+        }
+        "auto_retry_end" => mode.borrow_mut().patch_connection_state(|s| s.retry_attempt = 0.0),
+        "session_info_changed" => {
+            if let wire::AgentConnectionSessionEvent::SessionInfoChanged { name } = event {
+                mode.borrow_mut().patch_connection_state(|s| s.session_name = name.clone());
+            }
+        }
+        _ => {}
+    }
+}
+
+
+    #[derive(Default)]
+    struct SpeedRecorder(std::sync::Mutex<Vec<pi_agent_core::performance_metrics::PerformanceMetricEvent>>);
+    impl pi_agent_core::performance_metrics::PerformanceMetricRecorder for SpeedRecorder {
+        fn session_id(&self) -> &str { "ui-speed" }
+        fn monotonic_now(&self) -> f64 { 0.0 }
+        fn next_id(&self, _: pi_agent_core::performance_metrics::PerformanceMetricIdScope) -> String { "ui-speed".into() }
+        fn record(&self, event: pi_agent_core::performance_metrics::PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
+        fn flush(&self) {}
+        fn close(&self) {}
+    }
+
+    #[tokio::test]
+    async fn ui_speed_local_sending_precedes_spawn_and_matching_error_preserves_new_draft() {
+        let h = ui_tests::FrameHarness::new("ui-speed");
+        let recorder = Arc::new(SpeedRecorder::default());
+        let mut metrics = native_metrics::UiMetrics::with_recorder("ui-speed", recorder.clone());
+        let fake = Arc::new(RecordingConnection::new());
+        let connection: Arc<dyn wire::AgentConnection> = fake.clone();
+        let (reply, wait) = tokio::sync::oneshot::channel();
+        fake.prompt_replies.lock().unwrap().push_back(wait);
+        let (send, receive) = mpsc::channel();
+        submit_from_editor(&connection, &send, "private submitted prompt".into(), true, &mut metrics, &h.transcript);
+        assert_eq!(metrics.pending_count(), 1);
+        assert!(fake.calls().is_empty(), "the receipt/ID must exist before the task runs");
+        let initial = h.paint().join("\n");
+        assert!(initial.contains("Sending — not yet confirmed by host"), "{initial}");
+        assert!(!initial.contains("private submitted prompt"));
+        metrics.receipt_rendered();
+        h.editor.borrow_mut().editor_mut().set_text("new draft stays here");
+        h.editor.borrow_mut().handle_input("\x1b[D");
+        let cursor = h.editor.borrow().editor().get_cursor();
+        tokio::task::yield_now().await;
+        assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "followUp", "None"]);
+        assert!(receive.try_recv().is_err(), "held reply must not claim completion");
+        reply.send(Err("synthetic host rejection".into())).unwrap();
+        tokio::task::yield_now().await;
+        let HostEvent::SubmissionReply(ticket, result) = receive.try_recv().expect("one matching reply") else { panic!("expected identified reply") };
+        assert!(apply_submission_reply(&h.mode, &mut metrics, &ticket, result));
+        assert!(!apply_submission_reply(&h.mode, &mut metrics, &ticket, Err("duplicate rejection".into())));
+        h.transcript.borrow_mut().local_sending_count = metrics.pending_count();
+        let settled = h.paint().join("\n");
+        assert!(!settled.contains("Sending"));
+        assert!(settled.contains("synthetic host rejection"), "{settled}");
+        assert!(!settled.contains("duplicate rejection"));
+        assert_eq!(h.editor.borrow().editor().get_text(), "new draft stays here");
+        assert_eq!(h.editor.borrow().editor().get_cursor(), cursor);
+        assert!(!serde_json::to_string(&*recorder.0.lock().unwrap()).unwrap().contains("private"));
+    }
+
+    #[test]
+    fn ui_speed_every_attachment_boundary_discards_late_reply_without_draft_or_state_changes() {
+        let _agent_dir = ScopedAgentDir::in_temp("ui-speed-session-metrics");
+        let h = ui_tests::FrameHarness::new("ui-speed");
+        h.editor.borrow_mut().editor_mut().set_text("replacement draft");
+        let cursor = h.editor.borrow().editor().get_cursor();
+        let boundaries = [
+            HostEvent::RefreshSnapshot(Default::default()),
+            HostEvent::Extension(native_extension_bridge::Event::RuntimeRebound),
+            HostEvent::Connection(wire::AgentConnectionEvent::SessionResynced { snapshot: Default::default() }),
+            HostEvent::Connection(wire::AgentConnectionEvent::SessionReplaced { state: Default::default(), messages: vec![] }),
+            HostEvent::Connection(wire::AgentConnectionEvent::ConnectionStatus { status: "reconnecting".into(), error: None }),
+            HostEvent::Connection(wire::AgentConnectionEvent::ConnectionStatus { status: "connected".into(), error: None }),
+            HostEvent::Connection(wire::AgentConnectionEvent::Closed { error: None }),
+        ];
+        let mut metrics = native_metrics::UiMetrics::with_recorder("ui-speed", Arc::new(SpeedRecorder::default()));
+        for event in boundaries {
+            let old = metrics.begin_submission();
+            assert!(submission_attachment_invalidated(&event));
+            metrics.reset_attachment();
+            let current = metrics.begin_submission();
+            let state = format!("{:?}", h.mode.borrow().connection_state);
+            assert!(!apply_submission_reply(&h.mode, &mut metrics, &old, Err("late private error".into())));
+            assert_eq!(format!("{:?}", h.mode.borrow().connection_state), state);
+            assert_eq!(metrics.pending_count(), 1);
+            assert!(!h.paint().join("\n").contains("late private error"));
+            assert!(apply_submission_reply(&h.mode, &mut metrics, &current, Ok(())));
+        }
+        assert!(!submission_attachment_invalidated(&HostEvent::Connection(wire::AgentConnectionEvent::SessionEvent {
+            event: wire::AgentConnectionSessionEvent::MessageEnd { message: pi_ai::types::UserMessage::new(pi_ai::types::UserContent::Text("x".into()), 1).into() }
+        })));
+        let old = metrics.begin_submission();
+        metrics.session("other-session");
+        assert!(!apply_submission_reply(&h.mode, &mut metrics, &old, Ok(())));
+        assert_eq!(h.editor.borrow().editor().get_text(), "replacement draft");
+        assert_eq!(h.editor.borrow().editor().get_cursor(), cursor);
+    }
+
+    #[test]
+    fn ui_speed_receipt_classification_preserves_local_commands_shell_and_session_routes() {
+        for text in ["task", "/unknown_extension argument", "/compact instructions", "/refine", "/goal objective"] {
+            assert!(submission_is_prompt(text), "{text}");
+        }
+        for text in ["/help", "/hotkeys", "/new", "/model", "!echo synthetic", "!!echo synthetic"] {
+            assert!(!submission_is_prompt(text), "{text}");
+        }
+    }
+
+    fn speed_message(kind: &str, message: AgentMessage, wrapped: bool) -> wire::AgentConnectionSessionEvent {
+        use pi_agent_core::types::AgentEvent;
+        if wrapped {
+            wire::AgentConnectionSessionEvent::Agent(match kind {
+                "start" => AgentEvent::MessageStart { message },
+                "end" => AgentEvent::MessageEnd { message },
+                _ => {
+                    let AgentMessage::Message(pi_ai::types::Message::Assistant(partial)) = &message else { panic!("assistant required") };
+                    AgentEvent::MessageUpdate { assistant_message_event: pi_ai::types::AssistantMessageEvent::TextDelta { content_index: 0, delta: " delta ".into(), partial: partial.clone() }, message }
+                }
+            })
+        } else {
+            match kind {
+                "start" => wire::AgentConnectionSessionEvent::MessageStart { message },
+                "end" => wire::AgentConnectionSessionEvent::MessageEnd { message },
+                _ => {
+                    let AgentMessage::Message(pi_ai::types::Message::Assistant(partial)) = &message else { panic!("assistant required") };
+                    wire::AgentConnectionSessionEvent::MessageUpdate { assistant_message_event: pi_ai::types::AssistantMessageEvent::TextDelta { content_index: 0, delta: " delta ".into(), partial: partial.clone() }, message }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn ui_speed_typed_direct_and_wrapped_replay_match_frozen_json_adapter_at_every_event() {
+        use pi_agent_core::types::{AgentEvent, CustomAgentMessage, CustomMessageContent};
+        use pi_ai::types::{AssistantMessage, ContentBlock, TextContent, ToolCall, ToolResultMessage, UserContent, UserMessage};
+        for wrapped in [false, true] {
+            let fast = ui_tests::FrameHarness::new("ui-speed-golden");
+            let old = ui_tests::FrameHarness::new("ui-speed-golden");
+            for h in [&fast, &old] { h.editor.borrow_mut().editor_mut().set_text("golden draft"); h.mode.borrow_mut().set_working_visible(false); }
+            let user: AgentMessage = UserMessage::new(UserContent::Text("USER_ROW".into()), 1).into();
+            let assistant = |text: &str| -> AgentMessage { AssistantMessage { content: vec![ContentBlock::Text(TextContent::new(text))], ..Default::default() }.into() };
+            let tool: AgentMessage = AssistantMessage { content: vec![ContentBlock::Text(TextContent::new("LATEST_TEXT")), ContentBlock::ToolCall(ToolCall::new("tool-1", "ipython", serde_json::json!({"code":"synthetic"}).as_object().unwrap().clone()))], ..Default::default() }.into();
+            let custom: AgentMessage = AgentMessage::Custom(CustomAgentMessage::Custom { custom_type: "extension_notice".into(), content: CustomMessageContent::Text("CUSTOM_ROW".into()), display: true, details: None, timestamp: 1 });
+            let hidden: AgentMessage = AgentMessage::Custom(CustomAgentMessage::Custom { custom_type: "hidden_context".into(), content: CustomMessageContent::Text("HIDDEN_ROW".into()), display: false, details: None, timestamp: 1 });
+            let refinement: AgentMessage = AgentMessage::Custom(CustomAgentMessage::Custom { custom_type: crate::core::messages::REFINEMENT_OUTCOME_CUSTOM_TYPE.into(), content: CustomMessageContent::Text("Refinement complete: GOLDEN_LESSON".into()), display: true, details: Some(serde_json::json!({"refinementId":"golden", "summary":"GOLDEN_LESSON", "scope":"local", "edits":[]})), timestamp: 1 });
+            let result = serde_json::json!({"content":[{"type":"text","text":"TOOL_RESULT"}],"details":{}});
+            let events = vec![
+                wire::AgentConnectionSessionEvent::Agent(AgentEvent::AgentStart),
+                speed_message("start", user.clone(), wrapped), speed_message("end", user, wrapped),
+                wire::AgentConnectionSessionEvent::SessionActionUpdate { actions: serde_json::json!({"steering":["steer"],"followUps":[{"text":"later"}],"queuedCount":2,"active":"running"}) },
+                speed_message("start", assistant("FIRST_TEXT"), wrapped),
+                speed_message("update", assistant("SECOND_TEXT"), wrapped),
+                speed_message("update", tool.clone(), wrapped),
+                wire::AgentConnectionSessionEvent::ToolExecutionStart { tool_call_id: "tool-1".into(), tool_name: "ipython".into(), args: serde_json::json!({"code":"synthetic"}) },
+                wire::AgentConnectionSessionEvent::Agent(AgentEvent::ToolExecutionUpdate { tool_call_id: "tool-1".into(), tool_name: "ipython".into(), args: serde_json::json!({}), partial_result: pi_agent_core::types::AgentToolResult::new(vec![pi_agent_core::types::ContentBlock::text("PARTIAL_RESULT")], serde_json::json!({})) }),
+                wire::AgentConnectionSessionEvent::ToolExecutionEnd { tool_call_id: "tool-1".into(), tool_name: "ipython".into(), result, is_error: false },
+                speed_message("end", tool, wrapped),
+                speed_message("end", ToolResultMessage::new("tool-1", "ipython", vec![pi_ai::types::ImageOrTextContent::Text(TextContent::new("TOOL_RESULT"))], false, 1).into(), wrapped),
+                speed_message("start", custom.clone(), wrapped), speed_message("end", custom, wrapped),
+                wire::AgentConnectionSessionEvent::RefinementUpdate { active: true, reason: Some("Refining".into()) },
+                speed_message("start", refinement.clone(), wrapped), speed_message("end", refinement, wrapped),
+                wire::AgentConnectionSessionEvent::RefineComplete { result: Default::default() },
+                speed_message("end", hidden, wrapped),
+                // Duplicate and reordered snapshots are not dropped or coalesced.
+                speed_message("update", assistant("LATE_SNAPSHOT"), wrapped),
+                speed_message("update", assistant("LATE_SNAPSHOT"), wrapped),
+                speed_message("update", assistant("REORDERED_SNAPSHOT"), wrapped),
+                speed_message("end", AssistantMessage { stop_reason: "aborted".into(), error_message: Some("CANCELLED_REPLY".into()), ..Default::default() }.into(), wrapped),
+                wire::AgentConnectionSessionEvent::Agent(AgentEvent::AgentEnd { messages: vec![] }),
+            ];
+            let mut end_count = 0.0;
+            for (index, event) in events.into_iter().enumerate() {
+                let kind = event.type_name();
+                if kind == "message_end" { end_count += 1.0; }
+                apply_event_legacy_for_speed(&old.mode, &old.transcript, event.clone());
+                apply_event(&fast.mode, &fast.transcript, event);
+                assert_eq!(format!("{:?}", fast.mode.borrow().connection_state), format!("{:?}", old.mode.borrow().connection_state), "state at {index}:{kind}");
+                assert_eq!(fast.mode.borrow().activity_tracker.get_status(), old.mode.borrow().activity_tracker.get_status(), "activity at {index}:{kind}");
+                assert_eq!(fast.transcript.borrow().rows.len(), old.transcript.borrow().rows.len(), "rows at {index}:{kind}");
+                assert_eq!(fast.transcript.borrow().tools.len(), old.transcript.borrow().tools.len(), "tools at {index}:{kind}");
+                assert_eq!(fast.transcript.borrow().refinement_outcomes.len(), old.transcript.borrow().refinement_outcomes.len());
+                // Compare transcript projection and the full terminal frame/cursor.
+                assert_eq!(fast.transcript.borrow_mut().render(80.0), old.transcript.borrow_mut().render(80.0), "projection at {index}:{kind}");
+                assert_eq!(fast.paint(), old.paint(), "frame at {index}:{kind}");
+                assert_eq!(fast.editor.borrow().editor().get_cursor(), old.editor.borrow().editor().get_cursor());
+            }
+            assert_eq!(end_count, 7.0, "audit pins all message-end events, including refinement");
+            assert_eq!(fast.mode.borrow().connection_state.as_ref().unwrap().message_count, 7.0);
+            assert_eq!(fast.transcript.borrow().refinement_outcomes.len(), 1);
+            assert_eq!(fast.transcript.borrow().tools.len(), 1);
+            assert_eq!(fast.editor.borrow().editor().get_text(), "golden draft");
+            assert!(!fast.paint().join("\n").contains("HIDDEN_ROW"));
+        }
+    }
+
+    struct SpeedSurface { revision: Rc<Cell<usize>>, renders: Rc<Cell<usize>> }
+    impl TuiComponent for SpeedSurface {
+        fn render(&mut self, _: f64) -> Vec<String> {
+            self.renders.set(self.renders.get() + 1);
+            vec![format!("CUSTOM_REV_{}", self.revision.get())]
+        }
+        fn invalidate(&mut self) {}
+    }
+
+    #[test]
+    fn ui_speed_retained_tick_keeps_custom_resize_theme_overlay_hint_and_selection_surfaces_live() {
+        let h = ui_tests::FrameHarness::new("ui-speed-timers");
+        h.mode.borrow_mut().set_working_visible(false);
+        let revision = Rc::new(Cell::new(0));
+        let renders = Rc::new(Cell::new(0));
+        let surfaces = Rc::new(RefCell::new(native_extensions::Surfaces::default()));
+        surfaces.borrow_mut().header = Some(Box::new(SpeedSurface { revision: revision.clone(), renders: renders.clone() }));
+        h.transcript.borrow_mut().extension_surfaces = Some(surfaces);
+        h.editor.borrow_mut().editor_mut().set_text("timer draft");
+        let cursor = h.editor.borrow().editor().get_cursor();
+        assert!(h.paint().join("\n").contains("CUSTOM_REV_0"));
+        let mut metrics = native_metrics::UiMetrics::with_recorder("ui-speed-timers", Arc::new(SpeedRecorder::default()));
+        let before = renders.get();
+        revision.set(1); // No input/event/revision contract: the old tick must paint.
+        h.mode.borrow_mut().tick_working_pulse(); metrics.fallback_tick();
+        h.ui.borrow_mut().request_render();
+        h.ui.borrow_mut().run_pending_render(now_ms());
+        assert!(renders.get() > before);
+        assert!(h.paint().join("\n").contains("CUSTOM_REV_1"));
+        h.width.set(40); h.height.set(18);
+        h.ui.borrow_mut().request_render_forced();
+        let resized = h.paint();
+        assert_eq!(resized.len(), 18);
+        assert!(resized.iter().all(|line| pi_tui::utils::visible_width(line) <= 40));
+        crate::modes::interactive::theme::theme::init_theme(Some("neon"), false);
+        h.transcript.borrow_mut().invalidate(); h.ui.borrow_mut().request_render_forced();
+        assert!(h.paint().join("\n").contains("CUSTOM_REV_1"));
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
+        let handle = h.ui.borrow_mut().show_overlay(Rc::new(RefCell::new(TuiText::new("ASYNC_OVERLAY".into(), 0, 0, None))), pi_tui::tui::OverlayOptions { non_capturing: true, ..Default::default() });
+        assert!(h.paint().join("\n").contains("ASYNC_OVERLAY"));
+        handle.hide(); // No key follows async dismissal.
+        h.ui.borrow_mut().request_render(); h.ui.borrow_mut().run_pending_render(now_ms());
+        assert!(!h.ui.borrow().has_overlay());
+        assert!(!h.paint().join("\n").contains("ASYNC_OVERLAY"));
+        h.mode.borrow_mut().show_ctrl_c_exit_hint();
+        assert!(h.mode.borrow().is_ctrl_c_exit_hint_visible());
+        h.mode.borrow_mut().ctrl_c_exit_hint_expires_at = now_ms() - 1.0;
+        h.mode.borrow_mut().expire_ctrl_c_exit_hint();
+        assert!(!h.mode.borrow().is_ctrl_c_exit_hint_visible());
+        let now = Instant::now();
+        h.transcript.borrow_mut().clipboard_notice.show("COPY_HINT".into(), now);
+        assert!(h.paint().join("\n").contains("COPY_HINT"));
+        assert!(h.transcript.borrow_mut().clipboard_notice.expire(now + Duration::from_secs(3)));
+        assert!(!h.paint().join("\n").contains("COPY_HINT"));
+        h.mode.borrow_mut().set_working_visible(true);
+        h.mode.borrow_mut().working_message = Some("WORKING_TIMER".into());
+        assert!(h.mode.borrow().should_show_working_loader());
+        h.ui.borrow_mut().request_render(); h.ui.borrow_mut().run_pending_render(now_ms());
+        assert!(h.paint().join("\n").contains("WORKING_TIMER"));
+        h.mode.borrow_mut().set_working_visible(false);
+        h.height.set(10);
+        for _ in 0..40 { h.transcript.borrow_mut().message(pi_ai::types::UserMessage::new(pi_ai::types::UserContent::Text("SCROLL_ROW".into()), 1).into(), false); }
+        h.paint();
+        let above = h.ui.borrow().get_scroll_info().unwrap().lines_above;
+        assert!(above > 0);
+        h.key("\x1b[<0;3;5M"); h.key("\x1b[<32;3;1M");
+        h.ui.borrow_mut().run_pending_render(now_ms());
+        assert_eq!(h.ui.borrow().get_scroll_info().unwrap().lines_above, above, "drag timer does not fire early");
+        // Exercise timer body without sleeping. Existing TUI test pins 150/50ms due times.
+        assert_eq!(h.ui.borrow_mut().run_selection_auto_scroll(), Some(50));
+        h.ui.borrow_mut().run_pending_render(now_ms());
+        assert_eq!(h.ui.borrow().get_scroll_info().unwrap().lines_above, above - 1);
+        assert_eq!(h.editor.borrow().editor().get_text(), "timer draft");
+        assert_eq!(h.editor.borrow().editor().get_cursor(), cursor);
+    }
+
+    #[test]
+    fn ui_speed_fullscreen_frame_and_hardware_cursor_bytes_match_the_frozen_adapter() {
+        fn capture(legacy: bool) -> String {
+            let mode = Rc::new(RefCell::new(stash_mode("ui-speed-raw")));
+            mode.borrow_mut().apply_connection_state_snapshot(local::AgentConnectionState { session_id: "ui-speed-raw".into(), ..Default::default() });
+            mode.borrow_mut().set_working_visible(false);
+            let transcript = Rc::new(RefCell::new(Transcript::new(mode.clone())));
+            let (terminal, _) = RecordingTerminal::new();
+            let written = terminal.written.clone();
+            let ui = Rc::new(RefCell::new(TUI::new(Box::new(terminal), Some(true))));
+            let editor = Rc::new(RefCell::new(CustomEditor::new(ui.clone(), editor_theme(), CustomEditorOptions::default())));
+            ui.borrow_mut().set_focus(Some(editor.clone()));
+            ui.borrow_mut().start();
+            native_settings::fullscreen(true, &mode, &editor, &ui, &transcript);
+            editor.borrow_mut().editor_mut().set_text("cursor 界 draft");
+            editor.borrow_mut().handle_input("\x1b[D");
+            let message: AgentMessage = pi_ai::types::AssistantMessage { content: vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new("RAW_FRAME"))], ..Default::default() }.into();
+            let event = speed_message("end", message, true);
+            if legacy { apply_event_legacy_for_speed(&mode, &transcript, event); }
+            else { apply_event(&mode, &transcript, event); }
+            written.borrow_mut().clear();
+            ui.borrow_mut().request_render_forced();
+            ui.borrow_mut().run_pending_render(now_ms());
+            let result = written.borrow().clone();
+            assert!(result.contains("RAW_FRAME"));
+            assert!(result.contains("\x1b[?25h"), "hardware cursor must be visible");
+            assert!(!result.contains(pi_tui::tui::CURSOR_MARKER));
+            result
+        }
+        assert_eq!(capture(false), capture(true));
+    }
+
+    #[test]
+    fn ui_speed_canonical_projection_moves_the_typed_payload_without_json_copy() {
+        let text = String::from("stable typed allocation");
+        let pointer = text.as_ptr();
+        let message: AgentMessage = pi_ai::types::UserMessage::new(pi_ai::types::UserContent::Text(text), 1).into();
+        assert!(message_projection_is_identity(&message));
+        let expected = serde_json::to_value(&message).unwrap();
+        let moved = project_message_event(speed_message("end", message, false)).unwrap();
+        let AgentMessage::Message(pi_ai::types::Message::User(user)) = &moved else { panic!("user projection") };
+        let pi_ai::types::UserContent::Text(text) = &user.content else { panic!("text projection") };
+        assert_eq!(text.as_ptr(), pointer, "projection must retain the owned string allocation");
+        assert_eq!(serde_json::to_value(&moved).unwrap(), expected);
+    }
+
+    #[test]
+    fn ui_speed_projection_matches_serde_for_nonfinite_and_noncanonical_local_messages() {
+        use pi_ai::types::{AssistantMessage, ContentBlock, Message, TextContent, UserMessage};
+        use pi_agent_core::types::CustomAgentMessage;
+        let mut invalid = AssistantMessage::default(); invalid.usage.output = f64::NAN;
+        let mut cost = AssistantMessage::default(); cost.usage.cost.total = f64::INFINITY;
+        let mut bad_role = AssistantMessage::default(); bad_role.role = "wrong_role".into();
+        let mut bad_type = TextContent::new("bad type"); bad_type.type_ = "unknown".into();
+        let blocks = AssistantMessage { content: vec![ContentBlock::Text(bad_type)], ..Default::default() };
+        let mut bad_user = UserMessage::new(Default::default(), 1); bad_user.role = "assistant".into();
+        let custom = CustomAgentMessage::CompactionSummary { summary: "summary".into(), provider_context: None, tokens_before: 1.0, retained_message_count: Some(f64::NAN), custom_instructions: None, harness_digest: None, timestamp: 1 };
+        for message in [invalid.into(), cost.into(), bad_role.into(), blocks.into(), AgentMessage::Message(Message::User(bad_user)), AgentMessage::Custom(custom)] {
+            assert!(!message_projection_is_identity(&message));
+            let expected = serde_json::to_value(&message).ok().and_then(|value| serde_json::from_value::<AgentMessage>(value).ok());
+            for wrapped in [false, true] {
+                let projected = project_message_event(speed_message("end", message.clone(), wrapped));
+                assert_eq!(projected, expected);
+                let fast = ui_tests::FrameHarness::new("ui-speed-invalid");
+                let old = ui_tests::FrameHarness::new("ui-speed-invalid");
+                apply_event_legacy_for_speed(&old.mode, &old.transcript, speed_message("end", message.clone(), wrapped));
+                apply_event(&fast.mode, &fast.transcript, speed_message("end", message.clone(), wrapped));
+                assert_eq!(fast.transcript.borrow().rows.len(), old.transcript.borrow().rows.len());
+                assert_eq!(fast.mode.borrow().connection_state.as_ref().unwrap().message_count, old.mode.borrow().connection_state.as_ref().unwrap().message_count);
+            }
+        }
+        for malformed in [serde_json::json!({"type":"message_end","message":{"role":"assistant","usage":null}}), serde_json::json!({"type":"message_end","message":{"role":"unknown"}})] {
+            assert!(wire::parse_agent_connection_session_event(malformed).is_err());
         }
     }
 
@@ -7112,12 +7770,13 @@ mod tests {
     /// real console. The shared event list survives the `Box` move into the TUI.
     struct RecordingTerminal {
         events: Rc<RefCell<Vec<&'static str>>>,
+        written: Rc<RefCell<String>>,
     }
 
     impl RecordingTerminal {
         fn new() -> (Self, Rc<RefCell<Vec<&'static str>>>) {
             let events = Rc::new(RefCell::new(Vec::<&'static str>::new()));
-            (Self { events: events.clone() }, events)
+            (Self { events: events.clone(), written: Rc::new(RefCell::new(String::new())) }, events)
         }
     }
 
@@ -7131,13 +7790,13 @@ mod tests {
         fn drain_input(&mut self, _max_ms: u64, _idle_ms: u64) {
             self.events.borrow_mut().push("drain");
         }
-        fn write(&mut self, _data: &str) {}
+        fn write(&mut self, data: &str) { self.written.borrow_mut().push_str(data); }
         fn columns(&self) -> usize { 80 }
         fn rows(&self) -> usize { 24 }
         fn kitty_protocol_active(&self) -> bool { false }
         fn move_by(&mut self, _lines: i64) {}
-        fn hide_cursor(&mut self) {}
-        fn show_cursor(&mut self) {}
+        fn hide_cursor(&mut self) { self.written.borrow_mut().push_str("\x1b[?25l"); }
+        fn show_cursor(&mut self) { self.written.borrow_mut().push_str("\x1b[?25h"); }
         fn clear_line(&mut self) {}
         fn clear_from_cursor(&mut self) {}
         fn clear_screen(&mut self) {}

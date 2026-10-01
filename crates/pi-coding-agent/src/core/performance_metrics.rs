@@ -23,7 +23,7 @@ const DEFAULT_FLUSH_INTERVAL_MS: usize = 1_000;
 const DEFAULT_CLOSE_TIMEOUT_MS: usize = 1_000;
 
 /// `OPERATIONS`.
-const OPERATIONS: [PerformanceMetricOperation; 20] = [
+const OPERATIONS: [PerformanceMetricOperation; 22] = [
     PerformanceMetricOperation::LogicalRequest,
     PerformanceMetricOperation::ProviderAttempt,
     PerformanceMetricOperation::Tool,
@@ -40,6 +40,8 @@ const OPERATIONS: [PerformanceMetricOperation; 20] = [
     PerformanceMetricOperation::SessionInput,
     PerformanceMetricOperation::UiInput,
     PerformanceMetricOperation::UiInputAck,
+    PerformanceMetricOperation::UiEventApply,
+    PerformanceMetricOperation::UiTick,
     PerformanceMetricOperation::UiRender,
     PerformanceMetricOperation::UiMenuOpen,
     PerformanceMetricOperation::UiSessionOpen,
@@ -68,7 +70,7 @@ const COMPONENTS: [PerformanceMetricComponent; 8] = [
 ];
 
 /// `MEASUREMENTS`.
-const MEASUREMENTS: [PerformanceMetricMeasurement; 35] = [
+const MEASUREMENTS: [PerformanceMetricMeasurement; 64] = [
     PerformanceMetricMeasurement::TotalMs,
     PerformanceMetricMeasurement::WaitMs,
     PerformanceMetricMeasurement::DispatchToResponseHeadersMs,
@@ -90,6 +92,27 @@ const MEASUREMENTS: [PerformanceMetricMeasurement; 35] = [
     PerformanceMetricMeasurement::SerializationSlowVariables,
     PerformanceMetricMeasurement::SerializationSavedMs,
     PerformanceMetricMeasurement::SerializationSkippedMs,
+    PerformanceMetricMeasurement::SerializationNativeValues,
+    PerformanceMetricMeasurement::SerializationDillValues,
+    PerformanceMetricMeasurement::SerializationNativeMs,
+    PerformanceMetricMeasurement::SerializationDillMs,
+    PerformanceMetricMeasurement::SerializationNativeProbeMs,
+    PerformanceMetricMeasurement::SerializationNativeProbeBytes,
+    PerformanceMetricMeasurement::SerializationNativeProbeAttempts,
+    PerformanceMetricMeasurement::SerializationNativeProbeRejected,
+    PerformanceMetricMeasurement::SerializationFragmentPrepareMs,
+    PerformanceMetricMeasurement::SerializationFragmentWriteMs,
+    PerformanceMetricMeasurement::SerializationFragmentBytes,
+    PerformanceMetricMeasurement::SerializationFragmentSegments,
+    PerformanceMetricMeasurement::SerializationBufferResetMs,
+    PerformanceMetricMeasurement::SerializationBlobExtractMs,
+    PerformanceMetricMeasurement::SerializationNativeProbeSavedMs,
+    PerformanceMetricMeasurement::SerializationNativeProbeSkippedMs,
+    PerformanceMetricMeasurement::SerializationEnvelopeCountMs,
+    PerformanceMetricMeasurement::SerializationEnvelopeCountCalls,
+    PerformanceMetricMeasurement::SerializationEnvelopeWriteMs,
+    PerformanceMetricMeasurement::SnapshotCasCaptures,
+    PerformanceMetricMeasurement::SnapshotLegacyCaptures,
     PerformanceMetricMeasurement::WriteMs,
     PerformanceMetricMeasurement::QueueMs,
     PerformanceMetricMeasurement::InputAgentMessage,
@@ -103,6 +126,14 @@ const MEASUREMENTS: [PerformanceMetricMeasurement; 35] = [
     PerformanceMetricMeasurement::AttemptOrdinal,
     PerformanceMetricMeasurement::DroppedCount,
     PerformanceMetricMeasurement::FrameCount,
+    PerformanceMetricMeasurement::UiSubmitToTaskMs,
+    PerformanceMetricMeasurement::UiSubmitToAwaitMs,
+    PerformanceMetricMeasurement::UiSubmitToReplyMs,
+    PerformanceMetricMeasurement::UiSubmitToReceiptRenderMs,
+    PerformanceMetricMeasurement::UiAttachmentGeneration,
+    PerformanceMetricMeasurement::UiPendingCount,
+    PerformanceMetricMeasurement::UiEventCount,
+    PerformanceMetricMeasurement::UiTickFallbackCount,
     PerformanceMetricMeasurement::MaxMs,
 ];
 
@@ -1235,6 +1266,30 @@ mod tests {
             }
         }
         records
+    }
+
+    #[test]
+    fn speed_local_metric_allowlists_match_typed_names_and_keep_nulls() {
+        let mut operation_names = std::collections::HashSet::new();
+        for operation in OPERATIONS {
+            assert!(operation_names.insert(operation.as_str()));
+            assert_eq!(serde_json::to_value(operation).unwrap(), operation.as_str());
+        }
+        let mut measurement_names = std::collections::HashSet::new();
+        for measurement in MEASUREMENTS {
+            assert!(measurement_names.insert(measurement.as_str()));
+            assert_eq!(serde_json::to_value(measurement).unwrap(), measurement.as_str());
+            let value = serde_json::json!({(measurement.as_str()): 12.0});
+            let sanitized = sanitize_measurements(Some(&value)).unwrap();
+            assert_eq!(sanitized.get(&measurement), Some(&Some(12.0)));
+            let unknown = serde_json::json!({(measurement.as_str()): null, "private_payload": "secret"});
+            let sanitized = sanitize_measurements(Some(&unknown)).unwrap();
+            assert_eq!(sanitized.len(), 1);
+            assert_eq!(sanitized.get(&measurement), Some(&None));
+        }
+        assert!(OPERATIONS.contains(&PerformanceMetricOperation::UiEventApply));
+        assert!(OPERATIONS.contains(&PerformanceMetricOperation::UiTick));
+        assert!(MEASUREMENTS.contains(&PerformanceMetricMeasurement::UiSubmitToReceiptRenderMs));
     }
 
     #[tokio::test]

@@ -42,7 +42,7 @@ from .snapshot import (
     restore_cas_v2,
     snapshot_cas_v2,
 )
-from .snapshot_serializer import SnapshotSerializationMetrics, dump_snapshot_value
+from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
 from .snapshot_restore import ALWAYS_SKIP as _ALWAYS_SKIP, RESTORE_SKIP as _RESTORE_SKIP, prepare_restored_values
 
 PROTOCOL_VERSION = 3
@@ -653,6 +653,14 @@ class _CappedWriter:
         self.written += size
         return size
 
+    def write_segments(self, segments: tuple[memoryview | bytes, ...]) -> int:
+        size = sum(len(segment) for segment in segments)
+        if self.written + size > self._limit:
+            raise _SnapshotSizeLimitExceeded()
+        for segment in segments:
+            self.write(segment)
+        return size
+
 
 def _snapshot_state(
     ns: dict[str, Any],
@@ -697,6 +705,11 @@ def _snapshot_state(
     serialization_cpu_ns = 0
     variable_metrics = SnapshotSerializationMetrics()
     outer_serialization_wall_ns = 0
+    envelope_metrics: dict[str, float | int] = {
+        "serialization_envelope_count_ms": 0.0,
+        "serialization_envelope_count_calls": 0,
+        "serialization_envelope_write_ms": 0.0,
+    }
     thread_clock = getattr(time, "thread_time_ns", None)
 
     payload: dict[str, bytes] = {}
@@ -723,11 +736,14 @@ def _snapshot_state(
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
         buffer = io.BytesIO()
+        path_metrics = SnapshotPathMetrics()
         serialization_started = time.monotonic_ns()
         serialization_cpu_started = thread_clock() if thread_clock is not None else None
         try:
-            dump_snapshot_value(dill, value, buffer, _CappedWriter(buffer, limit))
+            dump_snapshot_value(dill, value, buffer, _CappedWriter(buffer, limit), path_metrics)
+            extract_started = time.monotonic_ns()
             blob = buffer.getvalue()
+            path_metrics.elapsed("serialization_blob_extract_ms", extract_started)
         except _SnapshotSizeLimitExceeded:
             if not prune_oversized and remaining < max_variable_bytes:
                 skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
@@ -741,7 +757,7 @@ def _snapshot_state(
         finally:
             elapsed_ns = time.monotonic_ns() - serialization_started
             serialization_wall_ns += elapsed_ns
-            variable_metrics.record(name, elapsed_ns)
+            variable_metrics.record(name, elapsed_ns, path_metrics)
             if serialization_cpu_started is not None and thread_clock is not None:
                 serialization_cpu_ns += thread_clock() - serialization_cpu_started
         if total + len(blob) > max_bytes:
@@ -787,15 +803,15 @@ def _snapshot_state(
             # to disk. Values are already serialized immutable bytes here.
             count_started = time.monotonic_ns()
             count_cpu_started = thread_clock() if thread_clock is not None else None
-            envelope_bytes = _count_envelope(dill, payload, max_bytes)
+            envelope_bytes = _count_envelope(dill, payload, max_bytes, envelope_metrics)
             if envelope_bytes is None:
                 items = list(payload.items())
-                if _count_envelope(dill, {}, max_bytes) is None:
+                if _count_envelope(dill, {}, max_bytes, envelope_metrics) is None:
                     return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
                 low, high = 0, len(items) - 1
                 while low < high:
                     mid = (low + high + 1) // 2
-                    if _count_envelope(dill, dict(items[:mid]), max_bytes) is None:
+                    if _count_envelope(dill, dict(items[:mid]), max_bytes, envelope_metrics) is None:
                         high = mid - 1
                     else:
                         low = mid
@@ -820,6 +836,7 @@ def _snapshot_state(
                         elapsed = time.monotonic_ns() - started
                         non_io = max(0, elapsed - writer.io_ns)
                         outer_serialization_wall_ns += non_io
+                        envelope_metrics["serialization_envelope_write_ms"] += non_io / 1_000_000
                         disk_bytes_written += writer.written
                         if cpu_started is not None and thread_clock is not None:
                             serialization_cpu_ns += thread_clock() - cpu_started
@@ -882,6 +899,9 @@ def _snapshot_state(
                 "write_ms": max(0, persistence_elapsed_ns - outer_serialization_wall_ns) / 1_000_000,
                 "written_bytes": disk_bytes_written,
                 "total_wall_ms": (time.monotonic_ns() - total_started) / 1_000_000,
+                "snapshot_legacy_captures": 1,
+                "snapshot_cas_captures": 0,
+                **envelope_metrics,
                 **variable_metrics.summarize(payload),
             },
         }

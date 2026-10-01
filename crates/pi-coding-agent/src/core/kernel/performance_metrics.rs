@@ -105,6 +105,60 @@ mod tests {
     }
 
     #[test]
+    fn kernel_metrics_preserve_snapshot_detail_numbers_and_sanitize_unavailable() {
+        let keys = [
+            "serialization_native_values",
+            "serialization_dill_values",
+            "serialization_native_ms",
+            "serialization_dill_ms",
+            "serialization_native_probe_ms",
+            "serialization_native_probe_bytes",
+            "serialization_native_probe_attempts",
+            "serialization_native_probe_rejected",
+            "serialization_fragment_prepare_ms",
+            "serialization_fragment_write_ms",
+            "serialization_fragment_bytes",
+            "serialization_fragment_segments",
+            "serialization_buffer_reset_ms",
+            "serialization_blob_extract_ms",
+            "serialization_native_probe_saved_ms",
+            "serialization_native_probe_skipped_ms",
+            "serialization_envelope_count_ms",
+            "serialization_envelope_count_calls",
+            "serialization_envelope_write_ms",
+            "snapshot_cas_captures",
+            "snapshot_legacy_captures",
+        ];
+        let capture = Arc::new(Capture::default());
+        let adapter = KernelPerformanceMetricAdapter::new(capture.clone());
+        let mut event = snapshot();
+        event.measurements = keys.iter().enumerate().map(|(index, name)|
+            (*name, Some(index as f64 + 0.5))).collect();
+        event.measurements.push(("private_variable_name", Some(1.0)));
+        adapter.record(event);
+        let mut event = snapshot();
+        event.measurements = keys.iter().enumerate().map(|(index, name)| {
+            let value = match index % 4 {
+                0 => None, 1 => Some(-1.0), 2 => Some(f64::NAN), _ => Some(f64::INFINITY),
+            };
+            (*name, value)
+        }).collect();
+        adapter.record(event);
+        let events = capture.0.lock().unwrap();
+        assert_eq!(events.len(), 2);
+        let wire = serde_json::to_value(&events[0]).unwrap();
+        assert_eq!(wire["measurements"].as_object().unwrap().len(), keys.len());
+        for (index, key) in keys.iter().enumerate() {
+            assert_eq!(wire["measurements"][*key], index as f64 + 0.5);
+        }
+        assert!(events[1].measurements.as_ref().unwrap().values().all(Option::is_none));
+        assert_eq!(events[1].measurements.as_ref().unwrap().len(), keys.len());
+        let wire = wire.to_string();
+        assert!(!wire.contains("private_variable_name"));
+        assert!(!wire.contains("synthetic-payload"));
+    }
+
+    #[test]
     fn kernel_metrics_reject_unknown_fields_and_invalid_numbers() {
         let capture = Arc::new(Capture::default());
         let adapter = KernelPerformanceMetricAdapter::new(capture.clone());

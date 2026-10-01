@@ -105,12 +105,25 @@ pub fn settings_revision() -> String {
             // never installs from compare-only observations.
             return;
         }
+        let assessment_started = Instant::now();
         let roster_at_capture = core.cached_skill_roster();
-        if roster_at_capture.is_empty() { return; }
+        if roster_at_capture.is_empty() {
+            let stamp = core.current_hint_stamp_with(session_id, &settings_at_capture, true, request_turn, &roster_at_capture);
+            record_unasked_skill_assessment(skill_assessment_record(&core, session_id, request_turn, &settings_at_capture, &stamp), "catalog_absent", assessment_started.elapsed());
+            return;
+        }
         let Some(prepared) = crate::core::jev_agent_guidance::prepare_skill_suggestion(
             core.task_excerpt(session_id).as_deref().unwrap_or(""), &roster_at_capture,
-        ) else { return; };
-        let Some(observer) = core.observer(session_id, None) else { return };
+        ) else {
+            let stamp = core.current_hint_stamp_with(session_id, &settings_at_capture, true, request_turn, &roster_at_capture);
+            record_unasked_skill_assessment(skill_assessment_record(&core, session_id, request_turn, &settings_at_capture, &stamp), "no_eligible_questions", assessment_started.elapsed());
+            return;
+        };
+        let Some(observer) = core.observer(session_id, None) else {
+            let stamp = core.current_hint_stamp_with(session_id, &settings_at_capture, true, request_turn, &roster_at_capture);
+            record_unasked_skill_assessment(skill_assessment_record(&core, session_id, request_turn, &settings_at_capture, &stamp), "observer_unavailable", assessment_started.elapsed());
+            return;
+        };
         let dispatch_payload = serde_json::json!({
             "session_id": session_id,
             "turn": request_turn,
@@ -133,27 +146,29 @@ pub fn settings_revision() -> String {
             request_turn,
             &roster_at_capture,
         );
-        let decide = observer.decide_prepared(&dispatch_payload, "skill_suggestion", prepared.questions, &policy);
-        let outcome = if let Some(signal) = signal {
-            tokio::select! { biased;
-                _ = signal.cancelled() => {
-                    observer.cancel_decisions(session_id);
-                    // Best-effort bounded state event. The outer loop may win
-                    // the same abort race and drop this hook before it writes.
-                    observer.correlator().record_skipped_category(
-                        session_id,
-                        request_turn,
-                        "skill_suggestion",
-                        pi_jev::types::DecisionCategory::SkillSuggestion,
-                        "assessment_cancelled",
-                        pi_jev::hooks::PROMPT_VERSION,
-                        mode_at_capture.as_str(),
-                    );
-                    return;
+        let mut audit = observer.begin_prepared_assessment(skill_assessment_record(
+            &core, session_id, request_turn, &settings_at_capture, &request_stamp,
+        ));
+        let outcome = {
+            let decide = observer.decide_prepared_assessed(&dispatch_payload, "skill_suggestion", prepared.questions, &policy, &mut audit);
+            if let Some(signal) = signal {
+                tokio::select! { biased;
+                    _ = signal.cancelled() => { observer.cancel_decisions(session_id); None },
+                    outcome = decide => Some(outcome),
                 }
-                outcome = decide => outcome,
-            }
-        } else { decide.await };
+            } else { Some(decide.await) }
+        };
+        let Some(outcome) = outcome else {
+            audit.record.terminal_reason = "assessment_cancelled".to_string();
+            audit.record.unavailable = Some(true);
+            // The decision future is dropped, not awaited after cancellation.
+            observer.correlator().record_skipped_category(
+                session_id, request_turn, "skill_suggestion",
+                pi_jev::types::DecisionCategory::SkillSuggestion, "assessment_cancelled",
+                pi_jev::hooks::PROMPT_VERSION, mode_at_capture.as_str(),
+            );
+            return;
+        };
         let fresh = observer.can_apply(&outcome) && outcome.turn == request_turn;
         let budget_ok = outcome.unavailable.is_none();
         // At store time the CURRENT facts are FRESHLY resolved (durable
@@ -173,6 +188,7 @@ pub fn settings_revision() -> String {
             request_turn,
             &fresh_roster,
         ) == request_stamp;
+        audit.record.host_fresh = Some(fresh && facts_stable && core.turn(session_id) == request_turn);
         let records: &[pi_jev::types::DecisionRecord] = outcome.raw.as_ref()
             .map(|raw| raw.records.as_slice()).unwrap_or(&[]);
         match crate::core::jev_agent_guidance::skill_hint_from_raw(
@@ -185,6 +201,7 @@ pub fn settings_revision() -> String {
             pi_jev::agent_guidance::SkillHintOutcome::Hint(hint) => {
                 core.store_skill_hint(session_id, request_turn, Some(hint));
                 core.notify_hint_listener(session_id);
+                audit.record.hint_state = Some("hint_state_updated".to_string());
                 // This row records only the bounded host-state update. It is
                 // not evidence of prompt rendering, provider receipt, or tool
                 // execution; those boundaries have separate native captures.
@@ -201,6 +218,7 @@ pub fn settings_revision() -> String {
             pi_jev::agent_guidance::SkillHintOutcome::NoHint(_) => {
                 core.store_skill_hint(session_id, request_turn, None);
                 core.notify_hint_listener(session_id);
+                audit.record.hint_state = Some("no_hint_state_updated".to_string());
                 observer.correlator().record_skipped_category(
                     session_id,
                     request_turn,
@@ -213,6 +231,46 @@ pub fn settings_revision() -> String {
             }
         }
     }
+
+fn skill_assessment_record(
+    core: &JevBridgeCore,
+    session_id: &str,
+    request_turn: u64,
+    settings: &JevSettings,
+    stamp: &pi_jev::agent_guidance::SkillHintStamp,
+) -> pi_jev::correlate::AssessmentRecord {
+    let identity = core.sessions.lock().unwrap_or_else(|p| p.into_inner()).get(session_id)
+        .map(|book| (book.control_epoch_id.clone(), book.delivery_id.clone())).unwrap_or_default();
+    let stamp_fingerprint = pi_jev::snapshot::fingerprint_of(&json!([
+        stamp.settings_revision, stamp.mode, stamp.feature_enabled, stamp.turn,
+        stamp.delivery_id, stamp.task_hash, stamp.catalog_hash,
+    ]));
+    pi_jev::correlate::AssessmentRecord {
+        schema_version: "jev.assessment/1".to_string(),
+        assessment_id: format!("assessment-{}", uuid::Uuid::new_v4()),
+        request_id: None, session_id: session_id.to_string(), turn: request_turn,
+        task_epoch_id: identity.0,
+        delivery_id: identity.1,
+        stamp_fingerprint,
+        policy_fingerprint: pi_jev::snapshot::fingerprint_of(&json!(decision_policy_generation(settings, session_id))),
+        requested_model: settings.requested_model_or_default().to_string(),
+        response_model: None, mode: settings.effective_mode(session_id).as_str().to_string(),
+        request_start_ts: None, terminal_ts: None, decision_dispatched: false,
+        transport_dispatched: Some(false), attempts: Some(0), attempt_count_known: true,
+        elapsed_ms: 0, decision_duration_ms: None, input_tokens: None, output_tokens: None,
+        terminal_reason: "assessment_cancelled".to_string(), unavailable: None, policy_refusal_count: None, host_fresh: None, hint_state: None,
+    }
+}
+
+fn record_unasked_skill_assessment(mut record: pi_jev::correlate::AssessmentRecord, reason: &str, elapsed: Duration) {
+    record.elapsed_ms = elapsed.as_millis() as u64;
+    record.terminal_reason = reason.to_string();
+    record.unavailable = Some(true);
+    record.policy_refusal_count = Some(0);
+    record.terminal_ts = Some(pi_jev::client::utc_now_rfc3339());
+    let records = std::path::PathBuf::from(get_agent_dir()).join("jev").join("records.jsonl");
+    pi_jev::hooks::record_unasked_assessment(&pi_jev::correlate::Correlator::new(records, 0.7), &record);
+}
 
 fn live_bridges() -> &'static Mutex<Vec<Weak<JevBridgeCore>>> {
     static BRIDGES: OnceLock<Mutex<Vec<Weak<JevBridgeCore>>>> = OnceLock::new();
@@ -3796,6 +3854,202 @@ mod full_jev_overlay_wiring_tests {
     }
 
     include!("jev_bridge/tool_availability_tests.rs");
+
+    struct AssessmentFixture {
+        core: Arc<JevBridgeCore>,
+        session: String,
+        dir: tempfile::TempDir,
+        previous: Option<std::ffi::OsString>,
+        _lock: std::sync::MutexGuard<'static, ()>,
+    }
+
+    impl Drop for AssessmentFixture {
+        fn drop(&mut self) {
+            debug_hint_fixture_reset();
+            self.core.drop_session_work(&self.session);
+            match self.previous.take() {
+                Some(previous) => std::env::set_var(crate::config::env_agent_dir(), previous),
+                None => std::env::remove_var(crate::config::env_agent_dir()),
+            }
+            *settings_cache().lock().unwrap_or_else(|p| p.into_inner()) = None;
+        }
+    }
+
+    fn assessment_fixture() -> AssessmentFixture {
+        let lock = env_lock().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let dir = tempfile::tempdir().unwrap();
+        let previous = std::env::var_os(crate::config::env_agent_dir());
+        std::env::set_var(crate::config::env_agent_dir(), dir.path());
+        debug_hint_fixture_reset();
+        let mut settings = JevSettings::default();
+        settings.global_default = Some(JevMode::Active);
+        settings.transport = Some("mock-hint".into());
+        settings.features.skill_suggestion = true;
+        JevSettingsStore::new(dir.path()).save(&settings).unwrap();
+        invalidate_settings_cache();
+        let core = Arc::new(JevBridgeCore::new(settings));
+        let session = format!("assessment-host-{}", uuid::Uuid::new_v4());
+        core.own_session(&session);
+        core.note_delivery(&session, "opaque-delivery");
+        core.note_control_epoch(&session, "opaque-epoch-id");
+        core.remember_task_text(&session, "alpha retry policy DO_NOT_RECORD_TASK_TEXT");
+        core.set_skill_roster(&[assessment_skill()]);
+        live_bridges().lock().unwrap().push(Arc::downgrade(&core));
+        AssessmentFixture { core, session, dir, previous, _lock: lock }
+    }
+
+    fn assessment_skill() -> Skill {
+        Skill::Markdown(crate::core::skills::MarkdownSkill {
+            base: crate::core::skills::BaseSkill {
+                name: "alpha-skill".into(), description: "DO_NOT_RECORD_ROSTER_DESCRIPTION".into(),
+                file_path: "synthetic/SKILL.md".into(), base_dir: "synthetic".into(),
+                source_info: crate::core::source_info::create_synthetic_source_info("fixture", &Default::default()),
+                disable_model_invocation: false,
+            },
+            kind: crate::core::skills::SkillKind::Markdown,
+        })
+    }
+
+    fn assessment_rows(fixture: &AssessmentFixture) -> Vec<pi_jev::correlate::AssessmentRecord> {
+        let text = std::fs::read_to_string(fixture.dir.path().join("jev").join("records.jsonl")).unwrap();
+        assert!(!text.contains("DO_NOT_RECORD_TASK_TEXT"));
+        assert!(!text.contains("DO_NOT_RECORD_ROSTER_DESCRIPTION"));
+        assert!(!text.contains("jev-mock-credential-not-a-real-key"));
+        text.lines().filter_map(|line| {
+            let value: Value = serde_json::from_str(line).unwrap();
+            (value["schema_version"] == "jev.assessment/1").then(|| serde_json::from_value(value).unwrap())
+        }).collect()
+    }
+
+    #[tokio::test]
+    async fn assessment_metrics_actual_dispatch_hint_install_and_nohint_clear_are_separate_from_state_rows() {
+        let fixture = assessment_fixture();
+        let notified = Arc::new(AtomicU64::new(0));
+        let captured = notified.clone();
+        fixture.core.set_hint_listener(&fixture.session, Arc::new(move || { captured.fetch_add(1, Ordering::SeqCst); }));
+        before_request_assessment(&fixture.session, 7, None).await;
+        let hint = fixture.core.skill_hint_for(&fixture.session).expect("actual pre-context hook installed hint");
+        let captured_stamp = hint.stamp.clone();
+        assert_eq!(notified.load(Ordering::SeqCst), 1);
+        let first = assessment_rows(&fixture);
+        assert_eq!(first.len(), 1);
+        assert!(first[0].decision_dispatched);
+        assert_eq!(first[0].transport_dispatched, Some(true));
+        assert_eq!(first[0].attempts, Some(1));
+        assert_eq!(first[0].input_tokens, Some(5));
+        assert_eq!(first[0].output_tokens, Some(5));
+        assert_eq!(first[0].task_epoch_id.as_deref(), Some("opaque-epoch-id"));
+        assert_eq!(first[0].delivery_id.as_deref(), Some("opaque-delivery"));
+        assert_eq!(first[0].hint_state.as_deref(), Some("hint_state_updated"));
+        assert_eq!(first[0].stamp_fingerprint, pi_jev::snapshot::fingerprint_of(&json!([
+            captured_stamp.settings_revision, captured_stamp.mode, captured_stamp.feature_enabled,
+            captured_stamp.turn, captured_stamp.delivery_id, captured_stamp.task_hash, captured_stamp.catalog_hash,
+        ])));
+        fixture.core.remember_task_text(&fixture.session, "beta cleanup flow");
+        before_request_assessment(&fixture.session, 8, None).await;
+        assert!(fixture.core.skill_hint_for(&fixture.session).is_none());
+        assert_eq!(notified.load(Ordering::SeqCst), 2);
+        let rows = assessment_rows(&fixture);
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[1].hint_state.as_deref(), Some("no_hint_state_updated"));
+        assert_ne!(rows[0].request_id, rows[1].request_id);
+        assert_ne!(rows[0].stamp_fingerprint, rows[1].stamp_fingerprint);
+        let state = pi_jev::correlate::read_records(&fixture.dir.path().join("jev").join("records.jsonl"), 1 << 20);
+        assert_eq!(state.len(), 2, "retain the existing two host-state rows only");
+        for row in state {
+            assert_eq!(row.attempt, 0);
+            assert!(row.duration_ms.is_none() && row.response_model.is_none());
+            assert!(row.observed_metrics.is_empty());
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_metrics_stale_task_roster_model_policy_and_turn_never_render_old_hint() {
+        for drift in ["task", "roster", "model", "policy", "turn"] {
+            let fixture = assessment_fixture();
+            let core = fixture.core.clone();
+            let session = fixture.session.clone();
+            let path = fixture.dir.path().to_path_buf();
+            debug_hint_fixture_on_suggestion(Some(Arc::new(move || {
+                match drift {
+                    "task" => core.remember_task_text(&session, "new task with different identity"),
+                    "roster" => {
+                        let mut skill = assessment_skill();
+                        if let Skill::Markdown(skill) = &mut skill { skill.base.description = "changed catalog meaning".into(); }
+                        core.set_skill_roster(&[skill]);
+                    }
+                    "turn" => core.note_request_turn(&session, 9),
+                    _ => {
+                        let mut settings = JevSettingsStore::new(&path).load();
+                        if drift == "model" { settings.requested_model = Some("new-synthetic-model".into()); }
+                        else { settings.features.skill_suggestion = false; }
+                        JevSettingsStore::new(&path).save(&settings).unwrap();
+                    }
+                }
+            })));
+            before_request_assessment(&fixture.session, 7, None).await;
+            let rows = assessment_rows(&fixture);
+            assert_eq!(rows.len(), 1);
+            assert!(rows[0].decision_dispatched);
+            assert_eq!(rows[0].attempts, Some(1), "returned transport metadata remains known on stale answers");
+            assert_eq!(rows[0].input_tokens, Some(5));
+            assert!(fixture.core.skill_hint_for(&fixture.session).is_none(), "old hint served after {drift}");
+            assert_eq!(rows[0].host_fresh, Some(false));
+            if drift != "turn" {
+                assert_eq!(rows[0].hint_state.as_deref(), Some("no_hint_state_updated"));
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_metrics_empty_ineligible_and_cancelled_before_poll_do_not_claim_calls() {
+        for case in ["empty", "ineligible", "cancelled"] {
+            let fixture = assessment_fixture();
+            let token = CancellationToken::new();
+            match case {
+                "empty" => fixture.core.set_skill_roster(&[]),
+                "ineligible" => {
+                    let mut skill = assessment_skill();
+                    if let Skill::Markdown(skill) = &mut skill { skill.base.disable_model_invocation = true; }
+                    fixture.core.set_skill_roster(&[skill]);
+                }
+                _ => token.cancel(),
+            }
+            before_request_assessment(&fixture.session, 7, Some(token)).await;
+            assert_eq!(debug_hint_fixture_suggestion_calls(), 0);
+            let rows = assessment_rows(&fixture);
+            assert_eq!(rows.len(), 1);
+            assert!(!rows[0].decision_dispatched);
+            assert_eq!(rows[0].transport_dispatched, Some(false));
+            assert_eq!(rows[0].attempts, Some(0));
+            assert!(rows[0].input_tokens.is_none() && rows[0].output_tokens.is_none());
+            assert!(rows[0].decision_duration_ms.is_none());
+            assert!(fixture.core.skill_hint_for(&fixture.session).is_none());
+        }
+    }
+
+    #[tokio::test]
+    async fn assessment_metrics_cancel_drops_actual_call_and_preserves_unknown_attempts() {
+        let fixture = assessment_fixture();
+        let token = CancellationToken::new();
+        let captured = token.clone();
+        debug_hint_fixture_set_hold_ms(2_000);
+        debug_hint_fixture_on_suggestion(Some(Arc::new(move || { captured.cancel(); })));
+        tokio::time::timeout(Duration::from_secs(1), before_request_assessment(&fixture.session, 7, Some(token))).await.unwrap();
+        let rows = assessment_rows(&fixture);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].decision_dispatched);
+        assert_eq!(rows[0].attempts, None);
+        assert!(!rows[0].attempt_count_known);
+        assert_eq!(rows[0].transport_dispatched, None);
+        assert_eq!(rows[0].input_tokens, None);
+        assert_eq!(rows[0].output_tokens, None);
+        assert_eq!(rows[0].terminal_reason, "assessment_cancelled");
+        assert!(rows[0].decision_duration_ms.is_some());
+        assert!(fixture.core.skill_hint_for(&fixture.session).is_none());
+        assert_eq!(session_retain_status(&fixture.session).pending_work, 0);
+    }
+
 
     fn test_settings(agent_dir: &Path) -> JevSettings {
         JevSettingsStore::new(agent_dir).load()

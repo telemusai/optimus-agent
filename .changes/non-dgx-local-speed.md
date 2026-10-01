@@ -1,0 +1,7 @@
+- Changed native snapshot fragment writes to use immutable byte-backed segments with existing caps and dill fallback.
+- Added content-free snapshot substage and Jev pre-context assessment timing and usage-knownness records.
+- Changed Jev diagnostic writes to batch within each result phase without changing durable control transactions.
+- Changed canonical interactive message display to use typed payloads with the existing validation fallback.
+- Added local Sending receipts and submission-phase timing without treating local display as host admission.
+- Changed OpenAI completion request construction to move prepared messages without an extra clone.
+- Added content-free local completion serialization, send, and response-header phase observations.

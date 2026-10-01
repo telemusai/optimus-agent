@@ -73,6 +73,48 @@ pub struct SnapshotPerformanceMetadata {
     pub serialization_slow_variables: Option<f64>,
     pub serialization_saved_ms: Option<f64>,
     pub serialization_skipped_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_values: Option<f64>,
+    #[serde(skip)]
+    pub serialization_dill_values: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_dill_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_bytes: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_attempts: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_rejected: Option<f64>,
+    #[serde(skip)]
+    pub serialization_fragment_prepare_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_fragment_write_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_fragment_bytes: Option<f64>,
+    #[serde(skip)]
+    pub serialization_fragment_segments: Option<f64>,
+    #[serde(skip)]
+    pub serialization_buffer_reset_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_blob_extract_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_saved_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_native_probe_skipped_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_envelope_count_ms: Option<f64>,
+    #[serde(skip)]
+    pub serialization_envelope_count_calls: Option<f64>,
+    #[serde(skip)]
+    pub serialization_envelope_write_ms: Option<f64>,
+    #[serde(skip)]
+    pub snapshot_cas_captures: Option<f64>,
+    #[serde(skip)]
+    pub snapshot_legacy_captures: Option<f64>,
     pub serialized_bytes: Option<f64>,
     pub write_ms: Option<f64>,
     pub written_bytes: Option<f64>,
@@ -211,6 +253,53 @@ pub fn cas_snapshot_state_exists(root: &str) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn speed_snapshot_stage_metrics_remain_local_and_preserve_result_json() {
+        let mut legacy: SnapshotPerformanceMetadata = serde_json::from_value(serde_json::json!({
+            "serialization_wall_ms": 12.0,
+            "serialized_bytes": 1024.0
+        })).unwrap();
+        assert_eq!(legacy.serialization_wall_ms, Some(12.0));
+        let original = serde_json::to_value(&legacy).unwrap();
+        legacy.serialization_native_ms = Some(5.0);
+        legacy.snapshot_cas_captures = Some(1.0);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), original);
+        let keys = [
+            "serialization_native_values",
+            "serialization_dill_values",
+            "serialization_native_ms",
+            "serialization_dill_ms",
+            "serialization_native_probe_ms",
+            "serialization_native_probe_bytes",
+            "serialization_native_probe_attempts",
+            "serialization_native_probe_rejected",
+            "serialization_fragment_prepare_ms",
+            "serialization_fragment_write_ms",
+            "serialization_fragment_bytes",
+            "serialization_fragment_segments",
+            "serialization_buffer_reset_ms",
+            "serialization_blob_extract_ms",
+            "serialization_native_probe_saved_ms",
+            "serialization_native_probe_skipped_ms",
+            "serialization_envelope_count_ms",
+            "serialization_envelope_count_calls",
+            "serialization_envelope_write_ms",
+            "snapshot_cas_captures",
+            "snapshot_legacy_captures",
+        ];
+        let mut input = original.clone();
+        for key in keys {
+            input.as_object_mut().unwrap().insert(key.into(), serde_json::json!(5.0));
+        }
+        let decoded: SnapshotPerformanceMetadata = serde_json::from_value(input).unwrap();
+        assert_eq!(decoded.serialization_native_ms, None);
+        assert_eq!(decoded.snapshot_cas_captures, None);
+        assert_eq!(serde_json::to_value(decoded).unwrap(), original);
+        for key in keys {
+            assert!(original.get(key).is_none());
+        }
+    }
 
     #[test]
     fn snapshot_paths_are_derived_from_the_artifact_dir() {
