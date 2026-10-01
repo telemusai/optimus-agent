@@ -161,6 +161,8 @@ impl BashOperations for LocalBashOperations {
             for (key, value) in options.env.clone().unwrap_or_else(get_shell_env) {
                 command_builder.env(key, value);
             }
+            #[cfg(windows)]
+            command_builder.creation_flags(0x0800_0000); // CREATE_NO_WINDOW
             #[cfg(unix)]
             command_builder.process_group(0);
 
@@ -1226,6 +1228,50 @@ mod tests {
         assert_eq!(result.exit_code, Some(0));
         let stdout = String::from_utf8_lossy(&received.lock().expect("sink lock")).to_string();
         assert!(stdout.contains("pi-bash-shell-ok"), "stdout: {stdout}");
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn local_operations_hide_windows_console_and_preserve_stdio() {
+        let shell = get_shell_config(None).expect("Git Bash is required for the Windows regression");
+        let temp = tempfile::tempdir().expect("temporary working directory");
+        let script = temp.path().join("console-probe.ps1");
+        std::fs::write(&script, r#"
+Add-Type -Namespace DirectBashConsoleProbe -Name Native -MemberDefinition '[DllImport("kernel32.dll")] public static extern IntPtr GetConsoleWindow();'
+if ([DirectBashConsoleProbe.Native]::GetConsoleWindow() -ne [IntPtr]::Zero) { exit 91 }
+if ($env:PI_DIRECT_BASH_TEST -ne 'env-preserved') { exit 92 }
+[Console]::Out.WriteLine('direct-bash-no-console')
+[Console]::Error.WriteLine('direct-bash-stderr')
+exit 7
+"#).expect("console probe");
+        let powershell = std::path::PathBuf::from(std::env::var_os("SystemRoot").expect("SystemRoot"))
+            .join("System32/WindowsPowerShell/v1.0/powershell.exe");
+        let command = format!(
+            "\"{}\" -NoLogo -NoProfile -NonInteractive -ExecutionPolicy Bypass -File \"{}\"",
+            powershell.to_string_lossy().replace('\\', "/"),
+            script.to_string_lossy().replace('\\', "/"),
+        );
+        let received = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let sink = received.clone();
+        let mut env = get_shell_env();
+        env.push(("PI_DIRECT_BASH_TEST".into(), "env-preserved".into()));
+        let operations = create_local_bash_operations(Some(LocalBashOperationsOptions {
+            shell_path: Some(shell.shell),
+        }));
+        let result = operations.exec(
+            &command,
+            &temp.path().to_string_lossy(),
+            BashExecOptions {
+                on_data: Arc::new(move |data: &[u8]| sink.lock().expect("sink lock").extend_from_slice(data)),
+                signal: None,
+                timeout: Some(30.0),
+                env: Some(env),
+            },
+        ).await.expect("hidden shell executed");
+        let output = String::from_utf8_lossy(&received.lock().expect("sink lock")).to_string();
+        assert_eq!(result.exit_code, Some(7), "console/env probe failed: {output}");
+        assert!(output.contains("direct-bash-no-console"), "stdout: {output}");
+        assert!(output.contains("direct-bash-stderr"), "stderr: {output}");
     }
 
     // `core/tools/bash.ts:135` (`resolveSpawnContext`) and
