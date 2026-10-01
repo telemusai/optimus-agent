@@ -1,0 +1,1 @@
+- Fixed terminal windows flashing during direct Bash tool calls on Windows.
