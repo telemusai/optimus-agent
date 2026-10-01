@@ -4,6 +4,19 @@ use crate::core::execution_mode::ExecutionMode;
 const ENTRY: &str = "execution_mode";
 
 impl AgentSession {
+    /// Child creation supplies the parent's tool snapshot. Record its mode before
+    /// the first task so disk recovery uses the same prompt and execution tools.
+    pub(super) fn persist_inherited_execution_mode(&self) -> Result<(), String> {
+        if self.base_tools_override.is_none() && self.saved_execution_mode().is_none() {
+            if let Some(mode) = ExecutionMode::from_tools(&self.get_active_tool_names()) {
+                self.session_manager.lock().unwrap().append_custom_entry_with_rollback(
+                    ENTRY, Some(serde_json::json!({"mode":mode.as_str()})),
+                )?;
+            }
+        }
+        Ok(())
+    }
+
     /// F6 yields after the current tool batch instead of waiting for the model's
     /// entire investigation to end. Keep a continuation in the ordinary queue,
     /// so stop/cancel, persistence and newer user input retain their ownership.

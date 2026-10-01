@@ -82,6 +82,8 @@ In Node mode, the agent sends JavaScript to the `node` tool. It can use `require
 
 Node, Clang-Repl and Direct tools expose a native `subagent` tool with `spawn`, `list`, and `collect` actions. Ask the agent to delegate independent tasks; it can start multiple children without waiting for each one. Children inherit the execution mode, project directory, and tool restrictions, and appear in the normal agent roster. Spawn returns a child handle immediately; completion notices deliver results back to the parent chat. `collect` can wait up to 60 seconds for status and answer previews without cancelling unfinished children. Existing recursion limits and parent stop/cleanup behaviour apply. No Python cell or nested `optimus-agent -p` process is needed.
 
+Each child snapshots its parent's mode at spawn, including the system prompt's execution language and available tools. Switching the parent later leaves existing children in their own mode. The inherited choice is saved in the child's transcript and restored when that chat is reopened.
+
 In Clang-Repl mode, the system prompt tells the agent to send C++17 source to the `clang` tool. Includes, global variables, functions, and classes persist. Each cell is a complete source fragment; imperative work runs inside an immediately invoked lambda and prints its results explicitly. For example:
 
 ```cpp

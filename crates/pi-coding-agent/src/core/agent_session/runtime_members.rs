@@ -1645,6 +1645,11 @@ impl AgentSession {
         state.messages.clear();
         state.tools = Some(Vec::new());
         state.system_prompt.clear();
+        // Copy configuration, never the parent's in-flight turn ownership.
+        state.is_streaming = false;
+        state.streaming_message = None;
+        state.pending_tool_calls.clear();
+        state.error_message = None;
         state.model = options.model;
         state.thinking_level = options.thinking_level;
         state.service_tier = options.service_tier;
@@ -1701,6 +1706,19 @@ impl AgentSession {
             serialized_refine: None,
             initial_goal: None,
         })?;
+        let weak = Arc::downgrade(&child);
+        child.agent.set_convert_to_llm(Arc::new(move |messages| {
+            let weak = weak.clone();
+            Box::pin(async move {
+                let Some(child) = weak.upgrade() else { return Vec::new(); };
+                let converted = crate::core::sdk::convert_session_messages(
+                    &messages,
+                    &child.session_manager.lock().unwrap(),
+                    &child.settings_manager.lock().unwrap(),
+                );
+                converted
+            })
+        }));
         child.set_session_name(&options.session_name)?;
         if let Some(published) = options.on_session_published {
             published(&child);

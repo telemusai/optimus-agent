@@ -281,18 +281,7 @@ async fn run_stream_google_vertex(
 		}
 
 		if let Some(usage_metadata) = chunk.get("usageMetadata") {
-			let prompt_token_count = number_field(usage_metadata, "promptTokenCount");
-			let cached_content_token_count = number_field(usage_metadata, "cachedContentTokenCount");
-			let candidates_token_count = number_field(usage_metadata, "candidatesTokenCount");
-			let thoughts_token_count = number_field(usage_metadata, "thoughtsTokenCount");
-			output.usage = Usage {
-				input: prompt_token_count - cached_content_token_count,
-				output: candidates_token_count + thoughts_token_count,
-				cache_read: cached_content_token_count,
-				cache_write: 0.0,
-				total_tokens: number_field(usage_metadata, "totalTokenCount"),
-				cost: crate::types::UsageCost::zero(),
-			};
+			output.usage = super::google_usage::normalize(usage_metadata);
 			calculate_cost(model, &mut output.usage, None);
 		}
 	}
@@ -324,11 +313,6 @@ async fn run_stream_google_vertex(
 	});
 	stream.end(None);
 	Ok(())
-}
-
-/// TS: `chunk.usageMetadata?.promptTokenCount || 0`.
-fn number_field(value: &Value, key: &str) -> f64 {
-	value.get(key).and_then(Value::as_f64).unwrap_or(0.0)
 }
 
 /// The block the streaming loop is currently filling.
@@ -1974,13 +1958,7 @@ mod tests {
 		assert!(stream.next().await.unwrap().is_none());
 	}
 
-	#[test]
-	fn number_field_defaults_to_zero() {
-		let usage = json!({"promptTokenCount": 3, "totalTokenCount": 9});
-		assert_eq!(number_field(&usage, "promptTokenCount"), 3.0);
-		assert_eq!(number_field(&usage, "totalTokenCount"), 9.0);
-		assert_eq!(number_field(&usage, "thoughtsTokenCount"), 0.0);
-	}
+
 }
 
 

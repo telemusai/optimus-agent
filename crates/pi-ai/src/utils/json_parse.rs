@@ -133,6 +133,45 @@ pub fn parse_streaming_json(partial_json: Option<&str>) -> Value {
     Value::Object(serde_json::Map::new())
 }
 
+/// Accumulate streamed arguments without reparsing a large buffer on every
+/// tiny delta. Previews stay eager through 8 KiB, then refresh after 1/16 growth.
+/// Always flush before publishing a terminal tool call, including error paths.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct StreamingJsonAccumulator {
+    text: String,
+    len_utf16: usize,
+    parsed_length: usize,
+}
+
+impl StreamingJsonAccumulator {
+    pub fn new(text: impl Into<String>) -> Self {
+        let text = text.into();
+        let len_utf16 = text.chars().map(char::len_utf16).sum();
+        Self { text, len_utf16, parsed_length: 0 }
+    }
+
+    pub fn text(&self) -> &str { &self.text }
+
+    pub fn append(&mut self, delta: &str) -> Option<Value> {
+        self.text.push_str(delta);
+        self.len_utf16 += delta.chars().map(char::len_utf16).sum::<usize>();
+        // Use a rounded-up integer threshold; avoid multiplying lengths.
+        if self.len_utf16 > 8 * 1024
+            && self.len_utf16 - self.parsed_length < self.parsed_length.div_ceil(16)
+        { return None; }
+        Some(self.parse())
+    }
+
+    pub fn flush(&mut self) -> Option<Value> {
+        (self.parsed_length != self.len_utf16).then(|| self.parse())
+    }
+
+    fn parse(&mut self) -> Value {
+        self.parsed_length = self.len_utf16;
+        parse_streaming_json(Some(&self.text))
+    }
+}
+
 /// Port of the third-party `partial-json` parser (default `Allow.ALL`).
 mod partial_json_crate {
     use serde_json::{Map, Number, Value};
@@ -565,6 +604,41 @@ mod tests {
             parse_streaming_json(Some("{\"cmd\":\"ls\",\"args\":[\"-l\"")),
             json!({"cmd": "ls", "args": ["-l"]})
         );
+    }
+
+    #[test]
+    fn accumulator_previews_small_repaired_and_unicode_arguments_exactly() {
+        let mut acc = StreamingJsonAccumulator::default();
+        assert_eq!(acc.flush(), None);
+        for ch in "{\"text\":\"😀 bad \\q and\nnewline\",\"n\":42}".chars() {
+            let mut bytes = [0; 4];
+            assert_eq!(acc.append(ch.encode_utf8(&mut bytes)), Some(parse_streaming_json(Some(acc.text()))));
+        }
+    }
+
+    #[test]
+    fn accumulator_limits_large_parse_work_and_flushes_the_unparsed_tail() {
+        let payload = serde_json::json!({"content":"x".repeat(256 * 1024), "last":42}).to_string();
+        let mut acc = StreamingJsonAccumulator::default();
+        let mut parses = 0;
+        let mut parsed_bytes = 0;
+        for chunk in payload.as_bytes().chunks(16) {
+            if acc.append(std::str::from_utf8(chunk).unwrap()).is_some() {
+                parses += 1;
+                parsed_bytes += acc.text().len();
+            }
+        }
+        assert!(parses < 700, "{parses} full parses");
+        assert!(parsed_bytes < payload.len() * 32, "parse work should grow linearly");
+        assert_eq!(acc.flush().unwrap(), serde_json::from_str::<Value>(&payload).unwrap());
+        assert_eq!(acc.flush(), None);
+    }
+
+    #[test]
+    fn accumulator_flushes_seeded_and_incomplete_arguments() {
+        let mut acc = StreamingJsonAccumulator::new("{\"n\":42,\"pending\":");
+        assert_eq!(acc.flush(), Some(serde_json::json!({"n":42})));
+        assert_eq!(acc.flush(), None);
     }
 
     #[test]

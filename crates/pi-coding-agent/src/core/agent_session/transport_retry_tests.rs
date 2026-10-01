@@ -195,6 +195,25 @@ async fn clean_pre_output_rate_limit_still_retries_once_then_succeeds() {
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_stream_before_output_retries_once_then_succeeds() {
+    assert_attempts("malformed_response", vec![], 2).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn incomplete_stream_after_tool_proposal_never_replays() {
+    assert_attempts(
+        "malformed_response",
+        vec![ContentBlock::ToolCall(ToolCall::new(
+            "partial",
+            "never_execute",
+            Default::default(),
+        ))],
+        1,
+    )
+    .await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn disabled_retry_settles_the_initial_error_metric() {
     assert_attempt_metrics("server_error", vec![], 1, false, false).await;
 }

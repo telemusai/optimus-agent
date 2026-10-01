@@ -24,7 +24,7 @@ use crate::types::{
 	Message, Model, SimpleStreamOptions, StreamOptions, TextContent, ThinkingContent, Tool, ToolCall, UserContent,
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
-use crate::utils::json_parse::parse_streaming_json;
+use crate::utils::json_parse::StreamingJsonAccumulator;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::stream_failure::{record_stream_failure, ThrownStreamError};
 
@@ -1284,7 +1284,7 @@ fn map_stop_reason(reason: Option<&Value>) -> StopReasonResult {
 #[derive(Debug, Clone, Default)]
 struct StreamingToolCallBlock {
 	tool_call: ToolCall,
-	partial_args: Option<String>,
+	partial_args: Option<StreamingJsonAccumulator>,
 	stream_index: Option<i64>,
 }
 
@@ -1371,6 +1371,14 @@ impl From<String> for StreamError {
 }
 
 impl StreamError {
+	fn dropped() -> Self {
+		let message = "Completions stream ended before finish_reason or [DONE]".to_string();
+		Self {
+			value: json!({"name":"Error", "message":message, "error":{"type":"malformed_response", "message":message}}),
+			message,
+		}
+	}
+
 	fn new(message: impl Into<String>) -> Self {
 		let message = message.into();
 		let value = json!({ "name": "Error", "message": message });
@@ -1582,16 +1590,20 @@ fn observe_chunk_usage(raw: &Value, model: &Model, options: Option<&OpenAIComple
 	}
 }
 
+enum SsePayload {
+	Data(String),
+	Done,
+}
+
 async fn read_sse_data(
 	response: reqwest::Response,
 	signal: Option<tokio_util::sync::CancellationToken>,
-	sender: tokio::sync::mpsc::UnboundedSender<Result<String, StreamError>>,
+	sender: tokio::sync::mpsc::UnboundedSender<Result<SsePayload, StreamError>>,
 	observer: Option<crate::types::OnStreamObservation>,
 ) {
 	let mut response = response;
 	let mut decoder = SseDecoder::new();
 	let mut line_buffer: Vec<u8> = Vec::new();
-	let mut done = false;
 
 	loop {
 		if is_cancelled(signal.as_ref()) {
@@ -1631,16 +1643,13 @@ async fn read_sse_data(
 			let block: Vec<u8> = buffer.drain(..index).collect();
 			let text = String::from_utf8_lossy(&block).to_string();
 			for line in text.split('\n') {
-				if done {
-					continue;
-				}
 				if let Some((_, payload)) = decoder.decode(line) {
 					observe_sse_payload(observer.as_ref(), &payload);
 					if payload.starts_with("[DONE]") {
-						done = true;
-						continue;
+						let _ = sender.send(Ok(SsePayload::Done));
+						return;
 					}
-					if sender.send(Ok(payload)).is_err() {
+					if sender.send(Ok(SsePayload::Data(payload))).is_err() {
 						return;
 					}
 				}
@@ -1651,16 +1660,13 @@ async fn read_sse_data(
 
 	let tail = String::from_utf8_lossy(&line_buffer).to_string();
 	for line in tail.split('\n') {
-		if done {
-			continue;
-		}
 		if let Some((_, payload)) = decoder.decode(line) {
 			observe_sse_payload(observer.as_ref(), &payload);
 			if payload.starts_with("[DONE]") {
-				done = true;
-				continue;
+				let _ = sender.send(Ok(SsePayload::Done));
+				return;
 			}
-			if sender.send(Ok(payload)).is_err() {
+			if sender.send(Ok(SsePayload::Data(payload))).is_err() {
 				return;
 			}
 		}
@@ -1772,6 +1778,11 @@ async fn run_stream(
 	let mut state = StreamState::new();
 	let result = run_stream_body(model, context, options, output, &mut state, stream).await;
 	if result.is_err() {
+		for block in &mut state.blocks {
+			if let StreamingBlock::ToolCall(block) = block {
+				flush_tool_arguments(block);
+			}
+		}
 		// TS: the catch iterates `output.content`, which aliases the live `blocks`
 		// array, and strips the streaming scratch buffers (which never reach
 		// `StreamState::content`).
@@ -1846,11 +1857,16 @@ async fn run_stream_body(
 	// headers must be captured while the response is still owned here.
 	let response_headers = crate::utils::headers::header_map_to_record(response.headers());
 
-	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<String, StreamError>>();
+	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<SsePayload, StreamError>>();
 	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.clone());
 	stream.spawn(read_sse_data(response, signal.clone(), sender, observer));
+	let mut finished = false;
+	let mut done = false;
 	while let Some(payload) = receiver.recv().await {
-		let payload = payload?;
+		let payload = match payload? {
+			SsePayload::Data(payload) => payload,
+			SsePayload::Done => { done = true; break; }
+		};
 		let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
 			continue;
 		};
@@ -1904,6 +1920,7 @@ async fn run_stream_body(
 		}
 
 		if let Some(finish_reason) = choice.get("finish_reason").filter(|value| js_truthy(value)) {
+			finished = true;
 			let finish_reason_result = map_stop_reason(Some(finish_reason));
 			output.stop_reason = finish_reason_result.stop_reason;
 			if let Some(error_message) = finish_reason_result.error_message {
@@ -1994,10 +2011,10 @@ async fn run_stream_body(
 					{
 						delta_text = arguments.to_string();
 						if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
-							let partial_args = block.partial_args.get_or_insert_with(String::new);
-							partial_args.push_str(arguments);
-							let parsed = parse_streaming_json(Some(partial_args.as_str()));
-							block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+							let partial_args = block.partial_args.get_or_insert_with(StreamingJsonAccumulator::default);
+							if let Some(parsed) = partial_args.append(arguments) {
+								block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+							}
 						}
 					}
 					let partial = partial_message(output, state);
@@ -2083,11 +2100,14 @@ async fn run_stream_body(
 		}
 	}
 
+	if is_cancelled(signal.as_ref()) {
+		return Err(abort_error());
+	}
+	if !finished && !done {
+		return Err(StreamError::dropped());
+	}
 	for index in 0..state.blocks.len() {
 		finish_block(state, index, output, stream);
-	}
-	if is_cancelled(signal.as_ref()) {
-		return Err(StreamError::new("Request was aborted"));
 	}
 
 	if output.stop_reason == "aborted" {
@@ -2122,6 +2142,15 @@ fn partial_message(output: &AssistantMessage, state: &StreamState) -> AssistantM
 	partial
 }
 
+fn flush_tool_arguments(block: &mut StreamingToolCallBlock) {
+	if let Some(mut arguments) = block.partial_args.take() {
+		if let Some(parsed) = arguments.flush() {
+			block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+		}
+	}
+	block.stream_index = None;
+}
+
 /// TS: `getContentIndex(block)`
 fn finish_block(
 	state: &mut StreamState,
@@ -2129,6 +2158,9 @@ fn finish_block(
 	output: &AssistantMessage,
 	stream: &AssistantMessageEventStream,
 ) {
+	if let StreamingBlock::ToolCall(block) = &mut state.blocks[content_index] {
+		flush_tool_arguments(block);
+	}
 	let partial = partial_message(output, state);
 	match &mut state.blocks[content_index] {
 		StreamingBlock::Text(block) => {
@@ -2148,14 +2180,6 @@ fn finish_block(
 			});
 		}
 		StreamingBlock::ToolCall(block) => {
-			block.tool_call.arguments = parse_streaming_json(block.partial_args.as_deref())
-				.as_object()
-				.cloned()
-				.unwrap_or_default();
-			// Finalize in-place and strip the scratch buffers so replay only
-			// carries parsed arguments.
-			block.partial_args = None;
-			block.stream_index = None;
 			let tool_call = block.tool_call.clone();
 			stream.push(AssistantMessageEvent::ToolCallEnd {
 				content_index,
@@ -2232,7 +2256,7 @@ fn ensure_tool_call_block(
 		None => {
 			let block = StreamingToolCallBlock {
 				tool_call: ToolCall::new(tool_call_id.clone(), tool_call_name, Map::new()),
-				partial_args: Some(String::new()),
+				partial_args: Some(StreamingJsonAccumulator::default()),
 				stream_index,
 			};
 			state.blocks.push(StreamingBlock::ToolCall(block));
@@ -2452,6 +2476,18 @@ mod provider_settlement_tests {
 
     async fn join_server(server: tokio::task::JoinHandle<()>) {
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn done_marker_finishes_without_waiting_for_the_server_to_close() {
+        let (model, server) = local_sse("data: {\"choices\":[{\"delta\":{\"content\":\"complete\"}}]}\n\ndata: [DONE]\n\n", true).await;
+        let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(keyed_options()));
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.stop_reason, "stop");
+        let settled = stream.task_receipt().settle(Duration::from_secs(5)).await;
+        assert_eq!(settled.pending_tasks, 0);
+        assert_eq!(settled.completed_tasks, 2);
+        join_server(server).await;
     }
 
     #[tokio::test]
@@ -2685,7 +2721,8 @@ mod tests {
 
 	/// A minimal one-response fixture server: reads the request, writes one HTTP
 	/// response, then closes.
-	async fn serve_http(status: &'static str, body: &'static str) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+	async fn serve_http(status: &'static str, body: impl Into<String>) -> (std::net::SocketAddr, tokio::task::JoinHandle<()>) {
+		let body = body.into();
 		use tokio::io::{AsyncReadExt, AsyncWriteExt};
 		let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
 		let address = listener.local_addr().unwrap();
@@ -2720,6 +2757,59 @@ mod tests {
 			socket.flush().await.unwrap();
 		});
 		(address, server)
+	}
+
+	#[tokio::test]
+	async fn incomplete_completions_fail_without_executing_partial_tool_calls() {
+		for body in ["", "data: {\"choices\":[{\"delta\":{\"role\":\"assistant\"}}]}\n\n", "data: {\"choices\":[{\"delta\":{\"content\":\"unfinished\"}}]}\n\n"] {
+			let (address, server) = serve_http("200 OK", body).await;
+			let mut model = base_model();
+			model.base_url = format!("http://{address}");
+			let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(keyed_options()));
+			let output = stream.result().await;
+			assert_eq!(output.stop_reason, "error");
+			assert!(output.error_message.unwrap().contains("before finish_reason or [DONE]"));
+			assert_eq!(output.diagnostics.unwrap()[0].details.as_ref().unwrap()["kind"], "malformed_response");
+			if body.contains("unfinished") { assert!(serde_json::to_string(&output.content).unwrap().contains("unfinished")); }
+			server.await.unwrap();
+		}
+	}
+
+	#[tokio::test]
+	async fn large_completions_arguments_flush_on_success_and_failure() {
+		let args = json!({"code":"x".repeat(20_001), "tail":"received"}).to_string();
+		for ending in ["finish", "done", "drop", "error"] {
+			let mut body = String::new();
+			for (index, fragment) in args.as_bytes().chunks(41).enumerate() {
+				let mut call = json!({"index":0,"function":{"arguments":std::str::from_utf8(fragment).unwrap()}});
+				if index == 0 { call["id"] = json!("fixture-call"); call["function"]["name"] = json!("write"); }
+				body.push_str(&format!("data: {}\n\n", json!({"choices":[{"delta":{"tool_calls":[call]}}]})));
+			}
+			body.push_str(match ending {
+				"finish" => "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\n\n",
+				"done" => "data: [DONE]\n\n",
+				"error" => "data: {\"error\":{\"type\":\"overloaded_error\",\"message\":\"fixture error\"}}\n\n",
+				_ => "",
+			});
+			let (address, server) = serve_http("200 OK", body).await;
+			let mut model = base_model(); model.base_url = format!("http://{address}");
+			let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(keyed_options()));
+			let mut ends = 0;
+			while let Some(event) = stream.next().await {
+				if let AssistantMessageEvent::ToolCallEnd {tool_call, partial, ..} = event {
+					ends += 1;
+					assert_eq!(tool_call.arguments, serde_json::from_str::<Value>(&args).unwrap().as_object().unwrap().clone());
+					assert_eq!(partial.content[0], ContentBlock::ToolCall(tool_call));
+				}
+			}
+			let output = stream.result().await;
+			let ContentBlock::ToolCall(call) = &output.content[0] else { panic!("missing tool call"); };
+			assert_eq!(call.arguments["tail"], "received", "{ending}");
+			assert_eq!(call.arguments["code"].as_str().unwrap().len(), 20_001);
+			assert_eq!(output.stop_reason == "error", matches!(ending, "drop" | "error"));
+			assert_eq!(ends, usize::from(matches!(ending, "finish" | "done")));
+			server.await.unwrap();
+		}
 	}
 
 	#[tokio::test]
