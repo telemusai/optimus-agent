@@ -23,7 +23,7 @@ import uuid
 from collections.abc import Iterator
 from typing import Any
 
-from .snapshot_serializer import SnapshotSerializationMetrics, dump_snapshot_value
+from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
 from .snapshot_restore import prepare_restored_values
 
 CAS_FORMAT = "prime-agent-kernel-snapshot-cas"
@@ -66,6 +66,14 @@ class CappedWriter:
             raise SnapshotSizeLimitExceeded()
         self._sink.write(chunk)
         self.written += size
+        return size
+
+    def write_segments(self, segments: tuple[memoryview | bytes, ...]) -> int:
+        size = sum(len(segment) for segment in segments)
+        if self.written + size > self._limit:
+            raise SnapshotSizeLimitExceeded()
+        for segment in segments:
+            self.write(segment)
         return size
 
 
@@ -527,12 +535,22 @@ def open_cas_generation(
         _unregister_active(root, digests)
 
 
-def _count_envelope(dill: Any, payload: dict[str, bytes], limit: int) -> int | None:
+def _count_envelope(
+    dill: Any, payload: dict[str, bytes], limit: int,
+    metrics: dict[str, float | int] | None = None,
+) -> int | None:
     writer = CappedWriter(_NullWriter(), limit)
+    started = time.monotonic_ns()
     try:
+        # Keep exact dill framing and custom dispatch: native envelope byte
+        # parity is not implied by native per-variable restore parity.
         dill.dump(payload, writer)
     except SnapshotSizeLimitExceeded:
         return None
+    finally:
+        if metrics is not None:
+            metrics["serialization_envelope_count_calls"] += 1
+            metrics["serialization_envelope_count_ms"] += (time.monotonic_ns() - started) / 1_000_000
     return writer.written
 
 
@@ -579,10 +597,13 @@ def _serialize_namespace(
         import io
 
         buffer = io.BytesIO()
+        path_metrics = SnapshotPathMetrics()
         serialization_started = time.monotonic_ns()
         try:
-            dump_snapshot_value(dill, value, buffer, CappedWriter(buffer, limit))
+            dump_snapshot_value(dill, value, buffer, CappedWriter(buffer, limit), path_metrics)
+            extract_started = time.monotonic_ns()
             blob = buffer.getvalue()
+            path_metrics.elapsed("serialization_blob_extract_ms", extract_started)
         except SnapshotSizeLimitExceeded:
             if not prune_oversized and remaining < max_variable_bytes:
                 skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
@@ -594,30 +615,35 @@ def _serialize_namespace(
             skipped.append({"name": name, "reason": f"{type(error).__name__}: {_safe_str(error)[:200]}"})
             continue
         finally:
-            variable_metrics.record(name, time.monotonic_ns() - serialization_started)
+            variable_metrics.record(name, time.monotonic_ns() - serialization_started, path_metrics)
         if total + len(blob) > max_bytes:
             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
             continue
         payload[name] = blob
         total += len(blob)
 
-    envelope_bytes = _count_envelope(dill, payload, max_bytes)
+    envelope_metrics: dict[str, float | int] = {
+        "serialization_envelope_count_ms": 0.0,
+        "serialization_envelope_count_calls": 0,
+        "serialization_envelope_write_ms": 0.0,
+    }
+    envelope_bytes = _count_envelope(dill, payload, max_bytes, envelope_metrics)
     if envelope_bytes is None:
         items = list(payload.items())
-        empty_bytes = _count_envelope(dill, {}, max_bytes)
+        empty_bytes = _count_envelope(dill, {}, max_bytes, envelope_metrics)
         if empty_bytes is None:
             raise SnapshotStoreError("snapshot exceeds aggregate snapshot size cap")
         low, high = 0, len(items) - 1
         while low < high:
             mid = (low + high + 1) // 2
-            if _count_envelope(dill, dict(items[:mid]), max_bytes) is None:
+            if _count_envelope(dill, dict(items[:mid]), max_bytes, envelope_metrics) is None:
                 high = mid - 1
             else:
                 low = mid
         for name, _ in items[low:]:
             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
         payload = dict(items[:low])
-        envelope_bytes = _count_envelope(dill, payload, max_bytes)
+        envelope_bytes = _count_envelope(dill, payload, max_bytes, envelope_metrics)
         if envelope_bytes is None:
             raise SnapshotStoreError("snapshot exceeds aggregate snapshot size cap")
 
@@ -628,6 +654,7 @@ def _serialize_namespace(
         "serialization_wall_ms": _elapsed_ms(wall_start, wall_end),
         "serialization_cpu_ms": _elapsed_ms(cpu_start, cpu_end),
         "serialized_bytes": logical_bytes,
+        **envelope_metrics,
         **variable_metrics.summarize(payload),
     }
     return payload, skipped, oversized, envelope_bytes, logical_bytes, metrics
@@ -765,6 +792,8 @@ def snapshot_cas_v2(
         "write_ms": None,
         "written_bytes": 0,
         "total_wall_ms": None,
+        "snapshot_cas_captures": 1,
+        "snapshot_legacy_captures": 0,
     }
     written = [0]
     try:

@@ -7,7 +7,36 @@ import datetime
 import decimal
 import io
 import pickle
+import time
 from typing import Any
+
+
+class SnapshotPathMetrics:
+    """Content-free counters for one freshly serialized variable."""
+
+    def __init__(self) -> None:
+        self.values: dict[str, float | int] = {
+            "serialization_native_values": 0,
+            "serialization_dill_values": 0,
+            "serialization_native_ms": 0.0,
+            "serialization_dill_ms": 0.0,
+            "serialization_native_probe_ms": 0.0,
+            "serialization_native_probe_bytes": 0,
+            "serialization_native_probe_attempts": 0,
+            "serialization_native_probe_rejected": 0,
+            "serialization_fragment_prepare_ms": 0.0,
+            "serialization_fragment_write_ms": 0.0,
+            "serialization_fragment_bytes": 0,
+            "serialization_fragment_segments": 0,
+            "serialization_buffer_reset_ms": 0.0,
+            "serialization_blob_extract_ms": 0.0,
+        }
+
+    def add(self, key: str, value: float | int) -> None:
+        self.values[key] += max(0, value)
+
+    def elapsed(self, key: str, started: int) -> None:
+        self.add(key, (time.monotonic_ns() - started) / 1_000_000)
 
 
 class SnapshotSerializationMetrics:
@@ -15,20 +44,39 @@ class SnapshotSerializationMetrics:
 
     def __init__(self) -> None:
         self._durations_ns: dict[str, int] = {}
+        self._path_totals: dict[str, float | int] | None = None
+        self._probe_ms: dict[str, float] = {}
 
-    def record(self, name: str, elapsed_ns: int) -> None:
+    def record(self, name: str, elapsed_ns: int, paths: SnapshotPathMetrics | None = None) -> None:
         self._durations_ns[name] = max(0, elapsed_ns)
+        if paths is not None:
+            if self._path_totals is None:
+                self._path_totals = {key: 0 for key in paths.values}
+            for key, value in paths.values.items():
+                self._path_totals[key] += value
+            probe_ms = paths.values["serialization_native_probe_ms"]
+            if probe_ms:
+                self._probe_ms[name] = self._probe_ms.get(name, 0.0) + probe_ms
 
     def summarize(self, saved: Any) -> dict[str, float | int]:
         saved_names = set(saved)
         saved_ns = sum(elapsed for name, elapsed in self._durations_ns.items() if name in saved_names)
         total_ns = sum(self._durations_ns.values())
-        return {
+        result = {
             "serialization_max_variable_ms": max(self._durations_ns.values(), default=0) / 1_000_000,
             "serialization_slow_variables": sum(elapsed >= 100_000_000 for elapsed in self._durations_ns.values()),
             "serialization_saved_ms": saved_ns / 1_000_000,
             "serialization_skipped_ms": (total_ns - saved_ns) / 1_000_000,
         }
+        if self._path_totals is not None:
+            result.update(self._path_totals)
+            result["serialization_native_probe_saved_ms"] = sum(
+                elapsed for name, elapsed in self._probe_ms.items() if name in saved_names
+            )
+            result["serialization_native_probe_skipped_ms"] = sum(
+                elapsed for name, elapsed in self._probe_ms.items() if name not in saved_names
+            )
+        return result
 
 
 class _RequiresDill(Exception):
@@ -110,27 +158,44 @@ class _ProbeWriter:
         return self.buffer.write(data)
 
 
-def _value_fragment(buffer: io.BytesIO, writer: _ProbeWriter, protocol: int) -> bytes | None:
-    """Remove the native stream envelope without interpreting value opcodes."""
+def _value_fragment(
+    buffer: io.BytesIO, writer: _ProbeWriter, protocol: int
+) -> tuple[memoryview | bytes, ...] | None:
+    """Keep immutable backing bytes; only replace the final frame's size."""
     data = buffer.getvalue()
     if data[:2] != bytes((pickle.PROTO[0], protocol)) or not data.endswith(pickle.STOP):
         return None
+    view = memoryview(data)
     if protocol >= 4:
-        # CPython emits the final frame as one write (possibly after PROTO).
-        # Validate its boundary rather than searching arbitrary user bytes for
-        # FRAME/STOP. Unexpected writer layouts simply keep the dill path.
+        # Validate the final write boundary, never search user payload opcodes.
         start = max(2, writer.last_write_start)
         if data[start:start + 1] == pickle.FRAME:
-            size = int.from_bytes(data[start + 1:start + 9], "little")
+            size = int.from_bytes(view[start + 1:start + 9], "little")
             if size != len(data) - start - 9 or size < 1:
                 return None
-            data = data[:start + 1] + (size - 1).to_bytes(8, "little") + data[start + 9:]
-        elif len(data) - start >= 4:
+            return (view[2:start + 1], (size - 1).to_bytes(8, "little"), view[start + 9:-1])
+        if len(data) - start >= 4:
             return None
-    return data[2:-1]
+    return (view[2:-1],)
 
 
-def _dump_with_dill(dill: Any, value: Any, writer: Any) -> None:
+def _write_fragment(pickler: Any, writer: Any, fragment: tuple[memoryview | bytes, ...]) -> None:
+    write_segments = getattr(writer, "write_segments", None)
+    file_write = pickler._file_write
+    if (
+        write_segments is None
+        or getattr(file_write, "__self__", None) is not writer
+        or getattr(file_write, "__func__", None) is not getattr(type(writer), "write", None)
+    ):
+        # Unknown sinks or wrapped dill writes keep the original behavior.
+        file_write(b"".join(fragment))
+    else:
+        write_segments(fragment)
+
+
+def _dump_with_dill(
+    dill: Any, value: Any, writer: Any, metrics: SnapshotPathMetrics | None = None
+) -> None:
     """Keep dill's graph/reducer semantics, accelerating only builtin subgraphs."""
     pickler = dill.Pickler(writer, protocol=dill.settings["protocol"])
     original_save = pickler.save
@@ -160,27 +225,53 @@ def _dump_with_dill(dill: Any, value: Any, writer: Any) -> None:
                 probe_writer, dill, protocol=pickler.proto
             )
             native.memo = pickler.memo
+            probe_started = time.monotonic_ns()
+            probe_ended = None
+            if metrics is not None:
+                metrics.add("serialization_native_probe_attempts", 1)
             try:
                 native.dump(obj)
             except (_RequiresDill, pickle.PicklingError, _ProbeLimitExceeded):
+                if metrics is not None:
+                    metrics.add("serialization_native_probe_rejected", 1)
                 # Do not repeatedly probe a mixed graph at every nested level.
                 # Revert this value's remaining traversal to unwrapped dill.
                 can_accelerate = False
                 pickler.save = original_save
             else:
+                probe_ended = time.monotonic_ns()
+                prepare_started = probe_ended
                 fragment = _value_fragment(buffer, probe_writer, pickler.proto)
+                if metrics is not None:
+                    metrics.elapsed("serialization_fragment_prepare_ms", prepare_started)
                 if fragment is not None:
-                    # Never nest FRAME opcodes. Both serializers share one memo,
-                    # including aliases/cycles crossing into the custom graph.
+                    # Never nest FRAME opcodes. Publish the native memo only
+                    # after all segments succeed, including cap preflight.
                     if pickler.proto >= 4:
                         pickler.framer.end_framing()
-                    pickler._file_write(fragment)
+                    write_started = time.monotonic_ns()
+                    try:
+                        _write_fragment(pickler, writer, fragment)
+                    finally:
+                        if metrics is not None:
+                            metrics.elapsed("serialization_fragment_write_ms", write_started)
                     if pickler.proto >= 4:
                         pickler.framer.start_framing()
                     pickler.memo = native.memo.copy()
+                    if metrics is not None:
+                        metrics.add("serialization_fragment_bytes", sum(len(part) for part in fragment))
+                        metrics.add("serialization_fragment_segments", len(fragment))
                     return
+                if metrics is not None:
+                    metrics.add("serialization_native_probe_rejected", 1)
                 can_accelerate = False
                 pickler.save = original_save
+            finally:
+                if metrics is not None:
+                    metrics.add("serialization_native_probe_ms", (
+                        (probe_ended if probe_ended is not None else time.monotonic_ns()) - probe_started
+                    ) / 1_000_000)
+                    metrics.add("serialization_native_probe_bytes", buffer.tell())
         original_save(obj, save_persistent_id=save_persistent_id)
 
     pickler.save = save
@@ -192,14 +283,37 @@ def _dump_with_dill(dill: Any, value: Any, writer: Any) -> None:
         del pickler.save
 
 
-def dump_snapshot_value(dill: Any, value: Any, buffer: Any, writer: Any) -> None:
+def dump_snapshot_value(
+    dill: Any, value: Any, buffer: Any, writer: Any, metrics: SnapshotPathMetrics | None = None
+) -> None:
     """Serialize afresh on every save, including in-place mutations and cycles."""
+    started = time.monotonic_ns()
     try:
         if not _native_dispatch_compatible(dill):
             raise _RequiresDill()
         _PrimitivePickler(writer, dill).dump(value)
     except (_RequiresDill, pickle.PicklingError):
+        if metrics is not None:
+            metrics.elapsed("serialization_native_ms", started)
+            metrics.add("serialization_dill_values", 1)
+        reset_started = time.monotonic_ns()
         buffer.seek(0)
         buffer.truncate()
         writer.written = 0
-        _dump_with_dill(dill, value, writer)
+        if metrics is not None:
+            metrics.elapsed("serialization_buffer_reset_ms", reset_started)
+        dill_started = time.monotonic_ns()
+        try:
+            _dump_with_dill(dill, value, writer, metrics)
+        finally:
+            if metrics is not None:
+                metrics.elapsed("serialization_dill_ms", dill_started)
+    except BaseException:
+        if metrics is not None:
+            metrics.elapsed("serialization_native_ms", started)
+            metrics.add("serialization_native_values", 1)
+        raise
+    else:
+        if metrics is not None:
+            metrics.elapsed("serialization_native_ms", started)
+            metrics.add("serialization_native_values", 1)

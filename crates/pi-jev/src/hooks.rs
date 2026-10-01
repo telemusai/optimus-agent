@@ -82,6 +82,42 @@ pub struct ActiveDecideOutcome {
     pub policy_generation: String,
 }
 
+/// Opt-in content-free audit for the pre-context assessment. The caller owns
+/// this through hint-store settlement; dropping a cancelled future still
+/// writes exactly one outcome before releasing retain ownership.
+pub struct PreparedAssessmentAudit<'a> {
+    observer: &'a JevObserver,
+    pub record: crate::correlate::AssessmentRecord,
+    started: std::time::Instant,
+    decision_started: Option<std::time::Instant>,
+    work: Option<crate::scheduler::SessionWorkGuard>,
+}
+
+impl Drop for PreparedAssessmentAudit<'_> {
+    fn drop(&mut self) {
+        self.record.elapsed_ms = self.started.elapsed().as_millis() as u64;
+        if self.record.decision_duration_ms.is_none() {
+            self.record.decision_duration_ms = self.decision_started.map(|started| started.elapsed().as_millis() as u64);
+        }
+        self.record.terminal_ts = Some(crate::client::utc_now_rfc3339());
+        // A refused retain admission cannot create late writes/callbacks.
+        if self.work.is_some() {
+            self.observer.correlator.record_assessment(&self.record);
+            if let Some(notify) = &self.observer.config.on_terminal { notify(&self.record.session_id); }
+            if let Some(work) = self.work.take() { work.finish(); }
+        }
+    }
+}
+
+/// Early assessment telemetry without constructing a decision client. A retained
+/// session refuses this new audit work; admitted writes settle synchronously.
+pub fn record_unasked_assessment(correlator: &Correlator, record: &crate::correlate::AssessmentRecord) -> bool {
+    let Some(work) = crate::scheduler::register_session_work(&record.session_id, None) else { return false; };
+    let written = correlator.record_assessment(record);
+    work.finish();
+    written
+}
+
 /// One refused answer.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActiveRefusal {
@@ -814,6 +850,30 @@ impl JevObserver {
         self.decide_bundle(payload, stage, bundle, policy, gate, false, work).await
     }
 
+    pub fn begin_prepared_assessment(&self, mut record: crate::correlate::AssessmentRecord) -> PreparedAssessmentAudit<'_> {
+        record.terminal_reason = "assessment_dropped".to_string();
+        let work = crate::scheduler::register_session_work(&record.session_id, None);
+        PreparedAssessmentAudit {
+            observer: self, record, started: std::time::Instant::now(),
+            decision_started: None, work,
+        }
+    }
+
+    /// Same decision gates, payload, policy and cancellation as decide_prepared.
+    /// Only the opted-in audit retains metadata that an obsolete answer cannot apply.
+    pub async fn decide_prepared_assessed(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>, policy: &crate::active::ActivationPolicy, audit: &mut PreparedAssessmentAudit<'_>) -> ActiveDecideOutcome {
+        let gate = resolve_request_gate(&self.config, payload.get("session_id").and_then(Value::as_str), false);
+        let bundle = if audit.work.is_some() && gate.allowed && gate.mode.allows_active() && payload_matches_gate(&self.config, payload, &gate) {
+            self.prepare_explicit(payload, stage, questions, gate.mode, &gate.requested_model, &gate.policy_generation)
+        } else { None };
+        let outcome = self.decide_bundle_owned(payload, stage, bundle, policy, gate, false, &mut audit.work,
+            Some((&mut audit.record, &mut audit.decision_started))).await;
+        audit.record.terminal_reason = outcome.terminal_reason.clone().unwrap_or_else(|| "answered".to_string());
+        audit.record.unavailable = Some(outcome.unavailable.is_some());
+        audit.record.policy_refusal_count = Some(outcome.refusals.len() as u64);
+        outcome
+    }
+
     pub async fn decide_independent(&self, payload: &Value, stage: &str, questions: Vec<PreparedQuestion>) -> ActiveDecideOutcome {
         let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("");
         let work = crate::scheduler::register_session_work(session_id, None);
@@ -836,12 +896,12 @@ impl JevObserver {
     }
 
     async fn decide_bundle(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool, mut work: Option<crate::scheduler::SessionWorkGuard>) -> ActiveDecideOutcome {
-        let outcome = self.decide_bundle_owned(payload, stage, bundle, policy, gate, independent, &mut work).await;
+        let outcome = self.decide_bundle_owned(payload, stage, bundle, policy, gate, independent, &mut work, None).await;
         if let Some(work) = work { work.finish(); }
         outcome
     }
 
-    async fn decide_bundle_owned(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool, work: &mut Option<crate::scheduler::SessionWorkGuard>) -> ActiveDecideOutcome {
+    async fn decide_bundle_owned(&self, payload: &Value, stage: &str, bundle: Option<PreparedBundle>, policy: &crate::active::ActivationPolicy, gate: JevRequestGate, independent: bool, work: &mut Option<crate::scheduler::SessionWorkGuard>, mut audit: Option<(&mut crate::correlate::AssessmentRecord, &mut Option<std::time::Instant>)>) -> ActiveDecideOutcome {
         use crate::active::FallbackReason;
         let session_id = payload.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
         let token = {
@@ -890,6 +950,10 @@ impl JevObserver {
         outcome.request_id = Some(bundle.ctx.request_id.clone());
         outcome.state_fingerprint = bundle.ctx.state_fingerprint.clone();
         outcome.context = Some(bundle.ctx.clone());
+        if let Some((record, _)) = audit.as_mut() {
+            record.request_id = Some(bundle.ctx.request_id.clone());
+            record.request_start_ts = Some(bundle.ctx.request_start_ts.clone());
+        }
         if !self.active_breaker_allows() {
             outcome.unavailable = Some(FallbackReason::Unavailable);
             outcome.terminal_reason = Some("circuit_open".to_string());
@@ -910,6 +974,13 @@ impl JevObserver {
         }
         let started = std::time::Instant::now();
         outcome.dispatched = true;
+        if let Some((record, decision_started)) = audit.as_mut() {
+            record.decision_dispatched = true;
+            record.transport_dispatched = None;
+            record.attempts = None;
+            record.attempt_count_known = false;
+            **decision_started = Some(started);
+        }
         // Clone the moved request fields: the typed acceptance borrows below
         // still need the prepared bundle intact (same request identity).
         let call = self.system_one.decide(crate::client::bundle_with_questions(
@@ -926,6 +997,19 @@ impl JevObserver {
             },
         };
         outcome.duration_ms = Some(started.elapsed().as_millis() as u64);
+        if let Some((record, _)) = audit.as_mut() {
+            record.decision_duration_ms = outcome.duration_ms;
+            // Preserve measured metadata even when the returned answer is stale.
+            // Do not expose the obsolete answer to any application/control path.
+            if let Some(raw) = decision.as_ref() {
+                record.attempts = Some(raw.attempts);
+                record.attempt_count_known = true;
+                record.transport_dispatched = Some(raw.attempts > 0);
+                record.input_tokens = raw.usage.input_tokens;
+                record.output_tokens = raw.usage.output_tokens;
+                record.response_model = raw.response_model.clone();
+            }
+        }
         if !self.can_apply(&outcome) || decision.is_none() {
             outcome.unavailable = Some(FallbackReason::Unavailable);
             if outcome.terminal_reason.is_none() { outcome.terminal_reason = Some("cancelled_or_generation_changed".to_string()); }
@@ -1462,4 +1546,305 @@ fn assess_line_find_pair(
             decided_at: now,
         },
     ])
+}
+
+#[cfg(test)]
+mod assessment_audit_tests {
+    use super::*;
+    use crate::correlate::AssessmentRecord;
+    use crate::types::{Answer, DecisionOutcome, DecisionRecord, Usage};
+    use std::time::Duration;
+    use std::future::Future;
+
+    fn input() -> Value {
+        serde_json::json!({"session_id": format!("assessment-{}", Uuid::new_v4()), "turn": 4,
+            "state": {"raw_prompt": "DO_NOT_RECORD_PROMPT", "secret": "DO_NOT_RECORD_CREDENTIAL"}})
+    }
+
+    fn questions() -> Vec<PreparedQuestion> {
+        vec![PreparedQuestion { question_id: "skill_suggestion.0".into(),
+            spec: crate::mock::choice_question("DO_NOT_RECORD_INSTRUCTIONS", &[("none", None), ("skill", None)]) }]
+    }
+
+    fn record(input: &Value) -> AssessmentRecord {
+        AssessmentRecord {
+            schema_version: "jev.assessment/1".into(), assessment_id: format!("span-{}", Uuid::new_v4()),
+            request_id: None, session_id: input["session_id"].as_str().unwrap().into(), turn: 4,
+            task_epoch_id: Some("opaque-epoch".into()), delivery_id: Some("opaque-delivery".into()),
+            stamp_fingerprint: "immutable-task-catalog-stamp".into(), policy_fingerprint: "immutable-policy".into(),
+            requested_model: "jev-latest".into(), response_model: None, mode: "active".into(),
+            request_start_ts: None, terminal_ts: None, decision_dispatched: false,
+            transport_dispatched: Some(false), attempts: Some(0), attempt_count_known: true,
+            elapsed_ms: 0, decision_duration_ms: None, input_tokens: None, output_tokens: None,
+            terminal_reason: "initial".into(), unavailable: None, policy_refusal_count: None, host_fresh: None, hint_state: None,
+        }
+    }
+
+    fn read(path: &std::path::Path) -> AssessmentRecord {
+        let text = std::fs::read_to_string(path).unwrap();
+        assert_eq!(text.lines().count(), 1, "one actual assessment outcome, not one service call per question");
+        for forbidden in ["DO_NOT_RECORD_PROMPT", "DO_NOT_RECORD_CREDENTIAL", "DO_NOT_RECORD_INSTRUCTIONS", "selected_value", "\"state\":"] {
+            assert!(!text.contains(forbidden), "private content/answers leaked: {text}");
+        }
+        serde_json::from_str(text.trim()).unwrap()
+    }
+
+    struct Probe {
+        calls: std::sync::atomic::AtomicU64,
+        started: tokio::sync::Notify,
+        pending: bool,
+        raw: DecisionOutcome,
+        on_call: Option<Arc<dyn Fn() + Send + Sync>>,
+        dropped: Arc<AtomicBool>,
+    }
+    impl crate::types::SystemOne for Probe {
+        fn mode(&self) -> JevMode { JevMode::Active }
+        fn decide(&self, _: crate::types::DecisionBundle) -> crate::types::BoxFuture<DecisionOutcome> {
+            self.calls.fetch_add(1, Ordering::SeqCst);
+            self.started.notify_one();
+            if let Some(on_call) = &self.on_call { on_call(); }
+            struct Mark(Arc<AtomicBool>);
+            impl Drop for Mark { fn drop(&mut self) { self.0.store(true, Ordering::SeqCst); } }
+            let mark = Mark(self.dropped.clone());
+            let raw = self.raw.clone();
+            let pending = self.pending;
+            Box::pin(async move {
+                let _mark = mark;
+                if pending { std::future::pending::<()>().await; }
+                raw
+            })
+        }
+    }
+
+    fn probe(pending: bool) -> Arc<Probe> {
+        Arc::new(Probe {
+            calls: std::sync::atomic::AtomicU64::new(0), started: tokio::sync::Notify::new(),
+            pending, on_call: None, dropped: Arc::new(AtomicBool::new(false)),
+            raw: DecisionOutcome {
+                records: vec![DecisionRecord { question_id: "skill_suggestion.0".into(), category: DecisionCategory::SkillSuggestion,
+                    answer: Answer::Choice { choice: "skill".into(), probabilities: BTreeMap::from([("skill".into(), 0.9), ("none".into(), 0.1)]), confidence: 0.9 },
+                    response_model: Some("synthetic-response".into()), requested_model: "jev-latest".into(), applied: false }],
+                skips: Vec::new(), response_model: Some("synthetic-response".into()),
+                usage: Usage { input_tokens: Some(0), output_tokens: None }, applied: false,
+                attempts: 2, server_request_id: None,
+            },
+        })
+    }
+
+    fn config() -> JevObserverConfig {
+        JevObserverConfig { mode_gate: Arc::new(|_| (JevMode::Active, SYSTEM_ONE_MODEL.into())),
+            scheduler: SchedulerConfig { min_interval: Duration::ZERO, ..Default::default() }, ..Default::default() }
+    }
+
+    #[tokio::test]
+    async fn dispatched_refused_assessment_records_real_attempts_usage_and_local_spans() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.jsonl");
+        let client = probe(false);
+        let observer = JevObserver::new(config(), client.clone(), path.clone());
+        let input = input();
+        let captured = record(&input);
+        let mut audit = observer.begin_prepared_assessment(captured.clone());
+        let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &crate::active::ActivationPolicy::default(), &mut audit).await;
+        assert!(outcome.dispatched);
+        assert!(outcome.decisions.is_empty(), "assessment cannot apply provider/control effects");
+        assert_eq!(outcome.refusals[0].reason, crate::active::FallbackReason::CategoryNotAppliable);
+        assert_eq!(crate::scheduler::session_retain_status(&outcome.session_id).pending_work, 1);
+        audit.record.host_fresh = Some(true);
+        audit.record.hint_state = Some("hint_state_updated".into());
+        drop(audit);
+        let written = read(&path);
+        assert_eq!(written.request_id, outcome.request_id);
+        assert_eq!(written.stamp_fingerprint, captured.stamp_fingerprint);
+        assert_eq!(written.task_epoch_id, captured.task_epoch_id);
+        assert!(written.decision_dispatched);
+        assert_eq!(written.transport_dispatched, Some(true));
+        assert_eq!(written.attempts, Some(2));
+        assert!(written.attempt_count_known);
+        assert_eq!(written.input_tokens, Some(0));
+        assert_eq!(written.output_tokens, None);
+        assert_eq!(written.unavailable, Some(false));
+        assert_eq!(written.policy_refusal_count, Some(1));
+        assert!(written.decision_duration_ms.is_some());
+        assert!(written.elapsed_ms >= written.decision_duration_ms.unwrap());
+        assert_eq!(client.calls.load(Ordering::SeqCst), 1);
+        assert_eq!(crate::scheduler::session_retain_status(&outcome.session_id).pending_work, 0);
+    }
+
+    #[tokio::test]
+    async fn no_eligible_wrong_mode_and_zero_deadline_never_fabricate_dispatch() {
+        for case in ["empty", "off", "zero_deadline", "no_credential"] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("records.jsonl");
+            let mut cfg = config();
+            if case == "off" { cfg.mode_gate = Arc::new(|_| (JevMode::Off, SYSTEM_ONE_MODEL.into())); }
+            let mut client = probe(false);
+            if case == "no_credential" { Arc::get_mut(&mut client).unwrap().raw = DecisionOutcome::skipped_questions("missing_credential", ["skill_suggestion.0".into()]); }
+            let observer = JevObserver::new(cfg, client.clone(), path.clone());
+            let mut input = input();
+            if case == "zero_deadline" { input["decision_timeout_ms"] = serde_json::json!(0); }
+            let mut audit = observer.begin_prepared_assessment(record(&input));
+            let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion",
+                if case == "empty" { Vec::new() } else { questions() }, &crate::active::ActivationPolicy::default(), &mut audit).await;
+            assert!(outcome.unavailable.is_some());
+            drop(audit);
+            let written = read(&path);
+            assert_eq!(written.decision_dispatched, case == "no_credential");
+            assert_eq!(written.transport_dispatched, Some(false));
+            assert_eq!(written.attempts, Some(0));
+            assert!(written.attempt_count_known);
+            assert!(written.input_tokens.is_none() && written.output_tokens.is_none());
+            assert_eq!(written.decision_duration_ms.is_some(), case == "no_credential");
+            assert_eq!(client.calls.load(Ordering::SeqCst), u64::from(case == "no_credential"));
+        }
+    }
+
+    #[tokio::test]
+    async fn stale_model_and_policy_metadata_does_not_expose_obsolete_answers() {
+        for model_change in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("records.jsonl");
+            let changed = Arc::new(AtomicBool::new(false));
+            let current = changed.clone();
+            let mut cfg = config();
+            cfg.authoritative_gate = Some(Arc::new(move |_, _| JevRequestGate {
+                mode: JevMode::Active, requested_model: if model_change && current.load(Ordering::SeqCst) { "new-model" } else { SYSTEM_ONE_MODEL }.into(),
+                policy_generation: if !model_change && current.load(Ordering::SeqCst) { "policy-2" } else { "policy-1" }.into(), allowed: true,
+            }));
+            let mut client = probe(false);
+            Arc::get_mut(&mut client).unwrap().on_call = Some(Arc::new(move || { changed.store(true, Ordering::SeqCst); }));
+            let observer = JevObserver::new(cfg, client, path.clone());
+            let mut input = input();
+            input["policy_generation"] = serde_json::json!("policy-1");
+            let mut audit = observer.begin_prepared_assessment(record(&input));
+            let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &crate::active::ActivationPolicy::default(), &mut audit).await;
+            assert!(!observer.can_apply(&outcome));
+            assert!(outcome.raw.is_none(), "keep original stale-answer application behavior");
+            assert!(outcome.decisions.is_empty());
+            drop(audit);
+            let written = read(&path);
+            assert_eq!(written.attempts, Some(2));
+            assert_eq!(written.input_tokens, Some(0));
+            assert_eq!(written.response_model.as_deref(), Some("synthetic-response"));
+            assert_eq!(written.requested_model, SYSTEM_ONE_MODEL);
+            assert_eq!(written.terminal_reason, "cancelled_or_generation_changed");
+        }
+    }
+
+    #[tokio::test]
+    async fn timeout_and_dropped_cancel_keep_attempts_unknown_and_drop_actual_future() {
+        for cancel in [false, true] {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().join("records.jsonl");
+            let client = probe(true);
+            let mut cfg = config();
+            cfg.active.deadline = Duration::from_millis(10);
+            let observer = JevObserver::new(cfg, client.clone(), path.clone());
+            let input = input();
+            let mut audit = observer.begin_prepared_assessment(record(&input));
+            let policy = crate::active::ActivationPolicy::default();
+            if cancel {
+                let mut future = Box::pin(observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &policy, &mut audit));
+                std::future::poll_fn(|cx| { assert!(future.as_mut().poll(cx).is_pending()); std::task::Poll::Ready(()) }).await;
+                observer.cancel_decisions(input["session_id"].as_str().unwrap());
+                drop(future);
+                audit.record.terminal_reason = "assessment_cancelled".into();
+            } else {
+                let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &crate::active::ActivationPolicy::default(), &mut audit).await;
+                assert_eq!(outcome.terminal_reason.as_deref(), Some("timeout"));
+            }
+            assert!(client.dropped.load(Ordering::SeqCst));
+            drop(audit);
+            let written = read(&path);
+            assert!(written.decision_dispatched);
+            assert_eq!(written.attempts, None);
+            assert!(!written.attempt_count_known);
+            assert_eq!(written.transport_dispatched, None);
+            assert!(written.input_tokens.is_none() && written.output_tokens.is_none());
+            assert!(written.decision_duration_ms.is_some());
+            assert_eq!(written.terminal_reason, if cancel { "assessment_cancelled" } else { "timeout" });
+        }
+    }
+
+    #[tokio::test]
+    async fn concurrency_refusal_does_not_count_a_transport_call() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.jsonl");
+        let client = probe(true);
+        let observer = JevObserver::new(config(), client.clone(), path.clone());
+        let policy = crate::active::ActivationPolicy::default();
+        let first = input();
+        let second = input();
+        let mut first_future = Box::pin(observer.decide_prepared(&first, "fixture", questions(), &policy));
+        let mut second_future = Box::pin(observer.decide_prepared(&second, "fixture", questions(), &policy));
+        use std::future::Future;
+        std::future::poll_fn(|cx| {
+            assert!(first_future.as_mut().poll(cx).is_pending());
+            assert!(second_future.as_mut().poll(cx).is_pending());
+            std::task::Poll::Ready(())
+        }).await;
+        let input = input();
+        let mut audit = observer.begin_prepared_assessment(record(&input));
+        let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &policy, &mut audit).await;
+        assert_eq!(outcome.terminal_reason.as_deref(), Some("concurrency_limit"));
+        drop(audit);
+        let written = read(&path);
+        assert!(written.request_id.is_some());
+        assert!(!written.decision_dispatched);
+        assert_eq!(written.attempts, Some(0));
+        assert_eq!(written.transport_dispatched, Some(false));
+        assert_eq!(client.calls.load(Ordering::SeqCst), 2);
+        drop(first_future);
+        drop(second_future);
+    }
+
+
+    #[tokio::test]
+    async fn refused_retain_admission_never_writes_a_late_assessment() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.jsonl");
+        let client = probe(false);
+        let observer = JevObserver::new(config(), client.clone(), path.clone());
+        let input = input();
+        let id = input["session_id"].as_str().unwrap();
+        assert!(crate::scheduler::request_session_retain_stop(id).settled);
+        assert!(!record_unasked_assessment(&observer.correlator, &record(&input)));
+        let mut audit = observer.begin_prepared_assessment(record(&input));
+        let outcome = observer.decide_prepared_assessed(&input, "skill_suggestion", questions(), &crate::active::ActivationPolicy::default(), &mut audit).await;
+        assert!(!outcome.dispatched);
+        drop(audit);
+        assert_eq!(client.calls.load(Ordering::SeqCst), 0);
+        assert!(!path.exists());
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 3)]
+    async fn assessment_append_and_blocked_callback_retain_ownership_after_stop() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("records.jsonl");
+        let (started, ready) = tokio::sync::oneshot::channel();
+        let started = Arc::new(Mutex::new(Some(started)));
+        let (release, wait) = std::sync::mpsc::channel();
+        let wait = Arc::new(Mutex::new(wait));
+        let mut cfg = config();
+        cfg.on_terminal = Some(Arc::new(move |_| {
+            if let Some(started) = started.lock().unwrap().take() { let _ = started.send(()); }
+            wait.lock().unwrap().recv_timeout(Duration::from_secs(5)).unwrap();
+        }));
+        let observer = JevObserver::new(cfg, probe(false), path.clone());
+        let input = input();
+        let id = input["session_id"].as_str().unwrap().to_string();
+        let captured = observer.clone();
+        let task = tokio::spawn(async move {
+            let mut audit = captured.begin_prepared_assessment(record(&input));
+            captured.decide_prepared_assessed(&input, "skill_suggestion", questions(), &crate::active::ActivationPolicy::default(), &mut audit).await;
+            drop(audit);
+        });
+        ready.await.unwrap();
+        assert!(read(&path).decision_dispatched, "append has really completed before callback");
+        assert_eq!(crate::scheduler::request_session_retain_stop(&id).pending_work, 1);
+        assert!(!crate::scheduler::settle_session_retain_stop(&id, Duration::ZERO).await.settled);
+        release.send(()).unwrap();
+        task.await.unwrap();
+        assert!(crate::scheduler::settle_session_retain_stop(&id, Duration::from_secs(1)).await.settled);
+    }
 }

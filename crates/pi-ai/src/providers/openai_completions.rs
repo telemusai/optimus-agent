@@ -971,7 +971,7 @@ fn build_params(
 
 	let mut params = Map::new();
 	params.insert("model".to_string(), Value::String(model.id.clone()));
-	params.insert("messages".to_string(), Value::Array(messages.clone()));
+	params.insert("messages".to_string(), Value::Array(messages));
 	params.insert("stream".to_string(), Value::Bool(true));
 	let session_id = options.and_then(|options| options.stream.session_id.clone());
 	let prompt_cache_key = if (model.base_url.contains("api.openai.com") && cache_retention != "none")
@@ -1538,6 +1538,12 @@ fn find_double_newline_index(data: &[u8]) -> Option<usize> {
 	None
 }
 
+fn observe_local_phase(observer: Option<&crate::types::OnStreamObservation>, phase: &'static str) {
+	if let Some(observer) = observer {
+		let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| observer(phase)));
+	}
+}
+
 /// Reads the response body and forwards each `data:` payload as it arrives, so
 /// the caller emits events incrementally like the SDK's async iterator.
 fn observe_sse_payload(observer: Option<&crate::types::OnStreamObservation>, payload: &str) {
@@ -1679,6 +1685,7 @@ async fn post_chat_completions(
 	body: &Value,
 	signal: Option<&tokio_util::sync::CancellationToken>,
 	timeout_ms: Option<f64>,
+	observer: Option<&crate::types::OnStreamObservation>,
 ) -> Result<reqwest::Response, StreamError> {
 	let url = format!("{}/chat/completions", client.base_url.trim_end_matches('/'));
 	let mut headers: IndexMap<String, Option<String>> = IndexMap::new();
@@ -1699,7 +1706,10 @@ async fn post_chat_completions(
 			None => {}
 		}
 	}
+	observe_local_phase(observer, "generation_serialize_start");
 	builder = builder.json(body);
+	// RequestBuilder may retain an error; this phase does not prove success.
+	observe_local_phase(observer, "generation_serialize_returned");
 
 	// TS: `...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {})`
 	// -> the openai@6.47.0 SDK falls back to `OpenAI.DEFAULT_TIMEOUT = 600000` (10 minutes),
@@ -1708,6 +1718,7 @@ async fn post_chat_completions(
 	// `RequestBuilder::timeout` (a TOTAL deadline) because that aborts a long-lived stream.
 	let header_timeout = resolve_header_timeout(timeout_ms);
 
+	observe_local_phase(observer, "generation_send_start");
 	let request = builder.send();
 	let response = match signal {
 		Some(signal) => {
@@ -1738,6 +1749,7 @@ async fn post_chat_completions(
 		}
 	};
 
+	observe_local_phase(observer, "generation_headers_complete");
 	let status = response.status().as_u16();
 	if status >= 400 {
 		let headers_record = crate::utils::headers::header_map_to_record(response.headers());
@@ -1838,7 +1850,8 @@ async fn run_stream_body(
 	let signal = options_ref.and_then(|options| options.stream.signal.clone());
 	let timeout_ms = options_ref.and_then(|options| options.stream.timeout_ms);
 
-	let response = post_chat_completions(&client, &params, signal.as_ref(), timeout_ms).await?;
+	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.as_ref());
+	let response = post_chat_completions(&client, &params, signal.as_ref(), timeout_ms, observer).await?;
 	let status = response.status().as_u16();
 	if let Some(on_response) = options_ref.and_then(|options| options.stream.on_response.clone()) {
 		let mut response_record = crate::types::ProviderResponse {
@@ -2439,7 +2452,8 @@ mod provider_settlement_tests {
         }
     }
 
-    async fn local_sse(body: &'static str, stalled: bool) -> (Model, tokio::task::JoinHandle<()>) {
+    async fn local_sse(body: impl Into<String>, stalled: bool) -> (Model, tokio::task::JoinHandle<()>) {
+        let body = body.into();
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
         let address = listener.local_addr().unwrap();
         let server = tokio::spawn(async move {
@@ -2519,6 +2533,155 @@ mod provider_settlement_tests {
             join_server(server).await;
         }
     }
+
+    #[tokio::test]
+    async fn phase_observation_does_not_turn_deferred_builder_errors_into_success() {
+        let client = OpenAIClient {
+            api_key: "local-fixture-key".into(),
+            base_url: "not-a-url".into(),
+            default_headers: IndexMap::new(),
+        };
+        let body = json!({"model": "fixture", "messages": []});
+        let baseline = post_chat_completions(&client, &body, None, None, None).await.unwrap_err();
+        for panic_in_observer in [false, true] {
+            let phases = Arc::new(Mutex::new(Vec::<String>::new()));
+            let capture = phases.clone();
+            let observer: crate::types::OnStreamObservation = Arc::new(move |phase| {
+                capture.lock().unwrap().push(phase.to_string());
+                if panic_in_observer { panic!("synthetic observer failure"); }
+            });
+            let failure = post_chat_completions(&client, &body, None, None, Some(&observer)).await.unwrap_err();
+            assert_eq!(failure.message, baseline.message);
+            assert_eq!(failure.value, baseline.value);
+            assert_eq!(*phases.lock().unwrap(), vec![
+                "generation_serialize_start", "generation_serialize_returned", "generation_send_start"
+            ]);
+        }
+    }
+
+    #[tokio::test]
+    async fn done_settles_held_open_body_after_usage_and_drains_each_event_once() {
+        let body = concat!(
+            "data: {\"choices\":[{\"delta\":{\"reasoning_content\":\"thought\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"content\":\"answer é\"}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{\"tool_calls\":[{\"id\":\"call-1\",\"index\":0,\"function\":{\"name\":\"read\",\"arguments\":\"{\\\"path\\\":\\\"fixture\\\"}\"}}]}}]}\r\n\r\n",
+            "data: {\"choices\":[{\"delta\":{},\"finish_reason\":\"tool_calls\"}]}\r\n\r\n",
+            "data: {\"choices\":[],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\r\n\r\n",
+            "data: [DONE]\r\n\r\n",
+            "data: {\"error\":{\"message\":\"ignored after sentinel\"}}\r\n\r\n"
+        );
+        for simple in [false, true] {
+            let (model, server) = local_sse(body, true).await;
+            let mut options = keyed_options();
+            let usages = Arc::new(Mutex::new(Vec::new()));
+            let capture = usages.clone();
+            options.stream.on_usage_observation = Some(Arc::new(move |usage, _| {
+                capture.lock().unwrap().push(usage);
+                Box::pin(async {})
+            }));
+            let stream = if simple {
+                stream_simple_openai_completions(&model, &context(vec![]), Some(SimpleStreamOptions { stream: options.stream, ..Default::default() }))
+            } else { stream_openai_completions(&model, &context(vec![]), Some(options)) };
+            let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.expect("DONE must not await EOF");
+            assert_eq!(output.stop_reason, "toolUse");
+            assert_eq!(output.usage.input, 10.0);
+            assert_eq!(output.usage.output, 2.0);
+            assert_eq!(output.content[0].as_thinking().unwrap().thinking, "thought");
+            assert_eq!(output.content[1].as_text().unwrap().text, "answer é");
+            assert_eq!(output.content[2].as_tool_call().unwrap().arguments["path"], "fixture");
+            assert_eq!(usages.lock().unwrap().len(), 1);
+            let mut kinds = Vec::new();
+            while let Some(event) = stream.next().await { kinds.push(event.event_type()); }
+            assert_eq!(kinds, vec!["start", "thinking_start", "thinking_delta", "text_start", "text_delta", "toolcall_start", "toolcall_delta", "thinking_end", "text_end", "toolcall_end", "done"]);
+            assert_eq!(stream.result().await, output);
+            let joined = stream.task_receipt().settle(Duration::from_secs(5)).await;
+            assert_eq!(joined.pending_tasks, 0);
+            assert_eq!(joined.completed_tasks, 3);
+            assert_eq!(joined.failed_tasks + joined.cancelled_tasks, 0);
+            assert!(!joined.cancel_requested);
+            join_server(server).await;
+        }
+    }
+
+
+    #[tokio::test]
+    async fn split_utf8_crlf_done_finishes_without_eof_and_body_errors_still_fail() {
+        for done in [true, false] {
+            let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+            let address = listener.local_addr().unwrap();
+            let server = tokio::spawn(async move {
+                let (mut socket, _) = listener.accept().await.unwrap();
+                let mut request = Vec::new();
+                loop {
+                    let mut bytes = [0; 4096];
+                    let n = socket.read(&mut bytes).await.unwrap();
+                    assert_ne!(n, 0); request.extend_from_slice(&bytes[..n]);
+                    if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = std::str::from_utf8(&request[..end]).unwrap();
+                        let size: usize = head.lines().filter_map(|l| l.split_once(':'))
+                            .find(|(k,_)| k.eq_ignore_ascii_case("content-length")).unwrap().1.trim().parse().unwrap();
+                        if request.len() >= end + 4 + size { break; }
+                    }
+                }
+                socket.write_all(b"HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n").await.unwrap();
+                let mut body = "data: {\"choices\":[{\"delta\":{\"content\":\"é🦀\"},\"finish_reason\":\"stop\"}]}\r\n\r\ndata: {\"choices\":[],\"usage\":{\"prompt_tokens\":7,\"completion_tokens\":2}}\r\n\r\n".to_string();
+                if done { body.push_str("data: [DONE]\r\n\r\n"); }
+                // Individual HTTP chunks split every UTF-8 byte, CRLF and sentinel.
+                for byte in body.as_bytes() {
+                    socket.write_all(&[b'1', b'\r', b'\n', *byte, b'\r', b'\n']).await.unwrap();
+                }
+                if done {
+                    let mut byte = [0];
+                    assert_eq!(socket.read(&mut byte).await.unwrap(), 0);
+                } else {
+                    // EOF before chunked terminator is still a transport failure.
+                    socket.shutdown().await.unwrap();
+                }
+            });
+            let mut model = base_model(); model.base_url = format!("http://{address}");
+            let stream = stream_openai_completions(&model, &context(vec![]), Some(keyed_options()));
+            let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+            assert_eq!(output.stop_reason, if done { "stop" } else { "error" });
+            assert_eq!(output.content[0].as_text().unwrap().text, "é🦀");
+            assert_eq!(output.usage.input, 7.0); assert_eq!(output.usage.output, 2.0);
+            assert_eq!(stream.task_receipt().settle(Duration::from_secs(5)).await.completed_tasks, 2);
+            join_server(server).await;
+        }
+    }
+
+    #[tokio::test]
+    async fn cancellation_at_recognized_done_preserves_prior_usage_and_is_aborted() {
+        let (model, server) = local_sse("data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}],\"usage\":{\"prompt_tokens\":10,\"completion_tokens\":2}}\n\ndata: [DONE]\n\n", true).await;
+        let mut options = keyed_options();
+        let signal = tokio_util::sync::CancellationToken::new();
+        options.stream.signal = Some(signal.clone());
+        options.stream.on_stream_observation = Some(Arc::new(move |phase| { if phase == "terminal" { signal.cancel(); } }));
+        let stream = stream_openai_completions(&model, &context(vec![]), Some(options));
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.stop_reason, "aborted");
+        assert_eq!(output.content[0].as_text().unwrap().text, "partial");
+        assert_eq!(output.usage.output, 2.0);
+        let joined = stream.task_receipt().settle(Duration::from_secs(5)).await;
+        assert_eq!(joined.completed_tasks, 2);
+        assert_eq!(joined.pending_tasks + joined.failed_tasks, 0);
+        join_server(server).await;
+    }
+
+    #[tokio::test]
+    async fn missing_or_malformed_done_keeps_existing_eof_policy() {
+        for suffix in ["", "data: [DON]\n\n", "data: malformed-json\n\n"] {
+            let body = format!("data: {{\"choices\":[{{\"delta\":{{\"content\":\"prior\"}},\"finish_reason\":\"stop\"}}]}}\n\n{suffix}");
+            // Finite local fixture; EOF-without-DONE remains accepted, as before.
+            let (model, server) = local_sse(body, false).await;
+            let stream = stream_openai_completions(&model, &context(vec![]), Some(keyed_options()));
+            let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+            assert_eq!(output.stop_reason, "stop");
+            assert_eq!(output.content[0].as_text().unwrap().text, "prior");
+            assert_eq!(stream.task_receipt().settle(Duration::from_secs(5)).await.completed_tasks, 2);
+            join_server(server).await;
+        }
+    }
+
 
     #[tokio::test]
     async fn pending_usage_observer_is_owned_after_terminal_result() {
@@ -2856,7 +3019,7 @@ mod tests {
 			let done = done.unwrap();
 			outputs.push((done.content, done.usage));
 			if enabled {
-				assert_eq!(*phases.lock().unwrap(), vec!["raw_event", "thinking", "raw_event", "text", "raw_event", "raw_event", "terminal"]);
+				assert_eq!(*phases.lock().unwrap(), vec!["generation_serialize_start", "generation_serialize_returned", "generation_send_start", "generation_headers_complete", "raw_event", "thinking", "raw_event", "text", "raw_event", "raw_event", "terminal"]);
 				let usage = usages.lock().unwrap();
 				assert_eq!(usage.len(), 1);
 				assert_eq!(usage[0].input_tokens, Some(Some(100.0)));
@@ -3167,6 +3330,41 @@ mod tests {
 		let cache_control = get_compat_cache_control(&compat, &cache_retention);
 		build_params(model, context, options, &compat, &cache_retention, cache_control.as_ref()).expect("params")
 	}
+
+    #[test]
+    fn moved_messages_preserve_exact_serialized_rich_payload() {
+        let mut model = base_model();
+        model.id = "anthropic/fixture".into(); model.provider = "openrouter".into();
+        model.input = vec![InputModality::Text, InputModality::Image];
+        let compat = get_compat(&model);
+        let mut thinking = ThinkingContent::new("fixture thought");
+        thinking.thinking_signature = Some("reasoning_content".into());
+        let mut call = ToolCall::new("call-1", "read", json!({"path":"fixture"}).as_object().unwrap().clone());
+        call.thought_signature = Some(json!({"type":"reasoning.encrypted","id":"call-1","data":"opaque"}).to_string());
+        let mut assistant = assistant_message(vec![ContentBlock::Thinking(thinking), ContentBlock::ToolCall(call)], "toolUse");
+        if let Message::Assistant(message) = &mut assistant {
+            message.provider = model.provider.clone(); message.model = model.id.clone();
+        }
+        let mut ctx = context(vec![user_text("fixture question"), assistant, tool_result_with_image("call-1")]);
+        ctx.system_prompt = Some("fixture system".into());
+        ctx.tools = Some(vec![Tool { name:"read".into(),description:"fixture".into(),parameters:json!({"type":"object"}) }]);
+        let mut options = keyed_options(); options.reasoning_effort = Some("max".into()); options.stream.max_tokens = Some(131072.0);
+        let cache = get_compat_cache_control(&compat, &"short".into()).unwrap();
+        let prepared = build_params(&model, &ctx, Some(&options), &compat, &"short".into(), Some(&cache)).unwrap();
+        // Explicit legacy cloned-vector recipe, independent of build_params' move.
+        let converted = convert_messages(&model, &ctx, &compat).unwrap();
+        let mut legacy_messages = converted.clone();
+        let mut legacy_tools = convert_tools(ctx.tools.as_ref().unwrap(), &compat);
+        apply_anthropic_cache_control(&mut legacy_messages, Some(&mut legacy_tools), &cache);
+        let expected = json!({"model":"anthropic/fixture","messages":legacy_messages,"stream":true,"stream_options":{"include_usage":true},"store":false,"max_completion_tokens":131072,"tools":legacy_tools,"reasoning":{"effort":"max"}});
+        assert_eq!(serde_json::to_vec(&prepared).unwrap(), serde_json::to_vec(&expected).unwrap());
+        assert_eq!(prepared["messages"][1]["content"], "fixture question");
+        assert_eq!(prepared["messages"][2]["reasoning_content"], "fixture thought");
+        assert_eq!(prepared["messages"][3]["tool_call_id"], "call-1");
+        assert_eq!(prepared["messages"][4]["content"][1]["image_url"]["url"], "data:image/png;base64,ZmFrZQ==");
+        assert_eq!(prepared["messages"][2]["reasoning_details"][0]["data"], "opaque");
+    }
+
 
 	#[test]
 	fn params_include_usage_in_streaming_and_store_defaults() {
