@@ -3,7 +3,7 @@ use pi_ai::models::{get_model, get_supported_thinking_levels, supports_fast_mode
 use pi_ai::providers::openai_codex_responses::{
     build_request_body, build_sse_headers, OpenAICodexResponsesOptions,
 };
-use pi_ai::types::{Context, InputModality};
+use pi_ai::types::{Context, InputModality, StreamOptions};
 use serde_json::json;
 
 #[test]
@@ -24,8 +24,12 @@ fn codex_sol_luna_catalog_preserves_reviewed_metadata() {
         assert_eq!(model.cost.input, input_cost);
         assert_eq!(model.cost.output, output_cost);
         assert_eq!(get_supported_thinking_levels(model), vec!["low", "medium", "high", "xhigh", "max"]);
-        // Model admission does not opt into a new tier/pricing policy.
-        assert!(!supports_fast_mode(model));
+        // Fast-mode eligibility does not change the reviewed catalog prices.
+        if id == "gpt-6-luna" {
+            assert!(!supports_fast_mode(model));
+        } else {
+            assert!(supports_fast_mode(model));
+        }
     }
 }
 
@@ -50,6 +54,47 @@ fn codex_sol_luna_requests_keep_ids_reasoning_and_existing_auth_shape() {
         let headers = build_sse_headers(None, None, "fixture-account", "synthetic-token", None);
         assert_eq!(headers["Authorization"], "Bearer synthetic-token");
         assert_eq!(headers["chatgpt-account-id"], "fixture-account");
+    }
+}
+
+#[test]
+fn codex_gpt6_fast_requests_preserve_nullable_service_tier() {
+    for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+        let model = get_model("openai-codex", id).expect("requested Codex model");
+        assert!(supports_fast_mode(model), "openai-codex/{id}");
+        for service_tier in [
+            None,
+            Some(Some("priority".to_string())),
+            Some(Some("default".to_string())),
+            Some(None),
+        ] {
+            let base = StreamOptions {
+                service_tier: service_tier.clone(),
+                api_key: Some("synthetic-token".to_string()),
+                session_id: Some("fixture-fast-session".to_string()),
+                ..Default::default()
+            };
+            let mut options = OpenAICodexResponsesOptions::from_base(&base);
+            options.reasoning_effort = Some("high".to_string());
+            assert_eq!(options.service_tier, service_tier);
+            let body = build_request_body(model, &Context::default(), Some(&options)).unwrap();
+            let expected = service_tier.map(|tier| tier.map(serde_json::Value::String)
+                .unwrap_or(serde_json::Value::Null));
+            assert_eq!(body.get("service_tier"), expected.as_ref(), "{id}");
+            let serialized = serde_json::to_string(&body).unwrap();
+            let wire: serde_json::Value = serde_json::from_str(&serialized).unwrap();
+            assert_eq!(wire.get("service_tier"), expected.as_ref(), "{id}");
+            assert_eq!(wire["model"], id);
+            assert_eq!(wire["reasoning"]["effort"], "high");
+            assert_eq!(wire["store"], false);
+            assert_eq!(wire["stream"], true);
+            assert_eq!(wire["prompt_cache_key"], "fixture-fast-session");
+            assert!(!body.contains_key("authorization"));
+            assert!(!body.contains_key("chatgpt-account-id"));
+            assert!(!serialized.contains("synthetic-token"));
+        }
+        assert!(!build_request_body(model, &Context::default(), None).unwrap()
+            .contains_key("service_tier"));
     }
 }
 

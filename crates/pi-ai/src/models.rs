@@ -41,6 +41,8 @@ pub const GPT_5_5: &str = "gpt-5.5";
 pub const GPT_5_6: &str = "gpt-5.6";
 pub const GPT_5_6_PREFIX: &str = "gpt-5.6-";
 pub const GPT_6_ASTRA: &str = "gpt-6-astra";
+pub const GPT_6_SOL: &str = "gpt-6-sol";
+pub const GPT_6_1_SOL: &str = "gpt-6.1-sol";
 
 /// `supportsFastMode(model)`.
 pub fn supports_fast_mode(model: &Model) -> bool {
@@ -49,9 +51,10 @@ pub fn supports_fast_mode(model: &Model) -> bool {
         || model.id == GPT_5_6
         || model.id.starts_with(GPT_5_6_PREFIX)
         || model.id == GPT_6_ASTRA;
-    eligible_id
-        && ((model.provider == "openai-codex" && model.api == "openai-codex-responses")
-            || (model.provider == "openai" && model.api == "openai-responses"))
+    let codex_sol_id = model.id == GPT_6_SOL || model.id == GPT_6_1_SOL;
+    let codex_route = model.provider == "openai-codex" && model.api == "openai-codex-responses";
+    let openai_route = model.provider == "openai" && model.api == "openai-responses";
+    (codex_route && (eligible_id || codex_sol_id)) || (openai_route && eligible_id)
 }
 
 /// Astra reserves part of its context window for output.
@@ -290,23 +293,45 @@ mod tests {
 
     #[test]
     fn fast_mode_requires_eligible_id_and_route() {
-        let mut model = Model::default();
-        model.id = "gpt-5.6-astra".to_string();
-        model.provider = "openai".to_string();
-        model.api = "openai-responses".to_string();
-        assert!(supports_fast_mode(&model));
+        for id in [
+            GPT_5_4, GPT_5_5, GPT_5_6, "gpt-5.6-astra", "gpt-5.6-anything",
+            GPT_6_ASTRA, GPT_6_SOL, GPT_6_1_SOL,
+        ] {
+            for provider in [
+                "openai", "openai-codex", "github-copilot", "openrouter", "custom",
+                "OpenAI-Codex", "openai-codex/", "",
+            ] {
+                for api in [
+                    "openai-responses", "openai-codex-responses", "openai-completions",
+                    "anthropic-messages", "openai-codex-responses-v2", "OpenAI-Codex-Responses", "",
+                ] {
+                    let model = Model::new(id, id, api, provider, "https://fixture.invalid");
+                    let codex = provider == "openai-codex" && api == "openai-codex-responses";
+                    let openai = provider == "openai" && api == "openai-responses"
+                        && id != GPT_6_SOL && id != GPT_6_1_SOL;
+                    assert_eq!(supports_fast_mode(&model), codex || openai, "{provider}/{id} via {api}");
+                }
+            }
+        }
+    }
 
-        model.api = "openai-completions".to_string();
-        assert!(!supports_fast_mode(&model));
-
-        model.api = "openai-responses".to_string();
-        model.id = "gpt-4o".to_string();
-        assert!(!supports_fast_mode(&model));
-
-        model.id = "gpt-5.6-anything".to_string();
-        model.provider = "openai-codex".to_string();
-        model.api = "openai-codex-responses".to_string();
-        assert!(supports_fast_mode(&model));
+    #[test]
+    fn fast_mode_rejects_unreviewed_model_ids() {
+        for id in [
+            "gpt-4o", "gpt-5.60", "gpt-6", "gpt-6.1", "gpt-6-luna", "gpt-6.1-luna",
+            "gpt-6-terra", "gpt-6.2-sol", "gpt-6.1-astra", "gpt-6-astra-preview",
+            "gpt-6-sol-preview", "gpt-6.1-sol-preview", "gpt-6-sol-2026-09-30",
+            "gpt-6.1-sol-2026-09-30", "gpt-6-solx", "gpt-6.1-solx", "GPT-6-SOL",
+            " gpt-6-sol", "gpt-6-sol ", "openai-codex/gpt-6-sol", "",
+        ] {
+            for (provider, api) in [
+                ("openai", "openai-responses"),
+                ("openai-codex", "openai-codex-responses"),
+            ] {
+                let model = Model::new(id, id, api, provider, "https://fixture.invalid");
+                assert!(!supports_fast_mode(&model), "{provider}/{id} via {api}");
+            }
+        }
     }
 
     #[test]

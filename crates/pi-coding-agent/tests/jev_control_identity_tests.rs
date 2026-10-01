@@ -644,6 +644,91 @@ async fn ctrl001_informational_answer_is_not_reopened() {
     assert_eq!(status["controlTerminal"]["terminal_annotation"], "no_authorized_follow_up");
 }
 
+/// Both observed weak-stop confidence profiles leave explanation/status replies
+/// stopped even when the quality assessments disagree. The Choice distribution
+/// remains a valid stop argmax; confidence is a separate low authorization score.
+/// These are normal provider completions, not explicit user stops or aborts.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn ctrl001_weak_stop_explanation_or_status_does_not_queue_a_provider_follow_up() {
+    for (task, reply, gap_confidence, coverage_confidence, stop_confidence, verification, expected_state) in [
+        (
+            "Explain why the broader change is incomplete. Do not implement it.",
+            "The broader change still needs implementation. This reply explains why.",
+            0.76, 0.84, 0.27, "none", "not_applicable",
+        ),
+        (
+            "Only report status and pending work. Do not implement or test anything.",
+            "Status: not deployed. Pending: implementation and tests.",
+            0.70, 0.85, 0.28, "none", "not_applicable",
+        ),
+        (
+            "Explain why the implementation is incomplete, without repairing it.",
+            "The requested explanation is complete; the broader implementation has no check outcome.",
+            0.76, 0.84, 0.27, "verify", "unknown",
+        ),
+        (
+            "Only report which checks remain pending; do not rerun them.",
+            "The requested status reply lists the checks still pending.",
+            0.70, 0.85, 0.28, "rerun", "unknown",
+        ),
+    ] {
+        let scope = begin_test_scope();
+        save_control_settings(
+            shared_agent_dir(), JevMode::CompareAndActive, true, false, "mock-control", None,
+        );
+        pi_coding_agent::core::jev_bridge::debug_control_fixture_set_respond(Some(Box::new(
+            move |request: &SystemOneRequest| -> Option<SystemOneResponse> {
+                if !is_control_request(request) {
+                    return None;
+                }
+                let mut response = control_round_response(request, 0);
+                for (id, spec) in &request.questions {
+                    let answer = if id.starts_with("result_sufficiency.0") {
+                        choice_answer(spec, "insufficient", gap_confidence)
+                    } else if id.starts_with("result_sufficiency.") {
+                        choice_answer(spec, "partial", coverage_confidence)
+                    } else if id.starts_with("first_pass_verification.") {
+                        choice_answer(spec, verification, 0.95)
+                    } else if id.starts_with("continue_stop_escalate.") {
+                        let mut answer = choice_answer(spec, "stop", 0.95).expect("valid stop distribution");
+                        if let Answer::Choice { confidence, .. } = &mut answer {
+                            *confidence = stop_confidence;
+                        }
+                        Some(answer)
+                    } else {
+                        None
+                    };
+                    if let Some(answer) = answer {
+                        response.answers.insert(id.clone(), answer);
+                    }
+                }
+                Some(response)
+            },
+        )));
+        let fixture = build_fixture(vec![terminal_step(reply)], scope).await;
+        turn(&fixture.session, task).await;
+        assert_eq!(control_calls().len(), 1, "the control boundary was assessed: {task}");
+        assert_eq!(fixture.captured.lock().unwrap().len(), 1, "no extra provider request: {task}");
+        assert!(!captured_texts_contain(&fixture, 0, "not yet complete (assessment: insufficient)"));
+        assert!(!captured_texts_contain(&fixture, 0, "Verification is unreported, not failed"));
+        let budget = ControlBook::new(shared_agent_dir()).snapshot(&fixture.session_id);
+        assert!(budget.available);
+        assert_eq!(budget.feedback_remaining, 2);
+        assert_eq!(budget.verification_remaining, 1);
+        let records = ledger_records_for(&fixture.session_id);
+        assert_eq!(records.len(), 1);
+        assert_eq!(records[0]["feedback"], json!(2));
+        assert_eq!(records[0]["verification"], json!(1));
+        assert_eq!(records[0]["feedback_notices"], json!([]));
+        let status = pi_coding_agent::core::jev_bridge::session_status_snapshot(&fixture.session_id)
+            .expect("terminal control outcome");
+        assert_eq!(status["controlTerminal"]["verification_state"], expected_state);
+        assert_eq!(status["controlTerminal"]["terminal_annotation"], "no_authorized_follow_up");
+        assert_eq!(status["controlTerminal"]["attention_required"], json!(false));
+        assert!(status["controlTerminal"]["pause"].is_null(), "ordinary answers must not be forced into a pause");
+    }
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn ctrl001_explicit_stop_during_control_decision_cannot_restart_work() {
     let scope = begin_test_scope();
@@ -694,21 +779,15 @@ async fn control_decision_applies_when_nothing_changes() {
     )
     .await;
 
-    turn(&fixture.session, "make retries configurable").await;
+    // Text-only provider steps have no prior tool results. Explicitly requested
+    // implementation stays eligible; zero tools is not an authorization rule.
+    turn(&fixture.session, "Explain why retries need configuration, and implement configurable retries.").await;
 
     let calls = control_calls();
-    assert!(
-        calls.len() >= 2,
-        "both agent-end rounds decided (got {})",
-        calls.len()
-    );
+    assert_eq!(calls.len(), 2, "both agent-end rounds decided exactly once");
 
     let captured = fixture.captured.lock().unwrap().clone();
-    assert!(
-        captured.len() >= 2,
-        "the corrective feedback continuation ran (captured {} provider requests)",
-        captured.len()
-    );
+    assert_eq!(captured.len(), 2, "exactly one corrective provider continuation ran");
     assert!(
         captured_texts_contain(
             &fixture,
