@@ -1,0 +1,4 @@
+- Fixed `/fast` support for Codex GPT-6 Sol and GPT-6.1 Sol on the `openai-codex-responses` route. The model requirement message now includes GPT-6 Astra and Sol.
+- Fixed Jev agent-end result-gap and verification feedback to require a current, accepted `continue_stop_escalate=continue` decision before queuing a follow-up or spending its task budget. Missing, weak, stale, or uncorrelated authorization leaves the ordinary answer stopped; accepted stop and escalation retain precedence.
+- Changed Jev agent-end loop-control instructions to assess the current requested reply. Explaining why broader work is incomplete does not authorize implementing it; explicit requests to explain and implement remain eligible. In-turn instructions and exact-decision replay reporting stay unchanged.
+- Fixed unauthorized follow-up reporting to retain unknown verification or accepted not-applicable assessments without claiming checks passed or forcing conversational answers into a pause.

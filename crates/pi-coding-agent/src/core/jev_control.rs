@@ -1193,6 +1193,7 @@ pub fn resolve_agent_end(
     let mut insufficient_budget_refused = false;
     let mut verification_budget_refused = false;
     let mut terminal_stop = false;
+    let mut continuation_authorized = false;
     for candidate in candidates {
         let verdict = evaluate_control_answer(
             policy,
@@ -1245,10 +1246,14 @@ pub fn resolve_agent_end(
                 _ => verification_budget_refused |= budget_refused,
             },
             DecisionCategory::ContinueStopEscalate => {
-                // At AgentEnd the loop has already stopped. An accepted stop
-                // must not be overridden by another category reopening it.
-                terminal_stop |= matches!(applied_effect, Some(ControlEffectKind::Continue))
-                    && candidate.value.as_deref().is_some_and(|value| value.eq_ignore_ascii_case("stop"));
+                // Continue also represents record-only sufficient/none/stop
+                // effects. Only this category's accepted selected value can
+                // authorize reopening the already-stopped loop.
+                if let Some(acceptance) = verdict.applied() {
+                    let value = acceptance.value.trim();
+                    terminal_stop |= value.eq_ignore_ascii_case("stop");
+                    continuation_authorized |= value.eq_ignore_ascii_case("continue");
+                }
                 if matches!(applied_effect, Some(ControlEffectKind::Escalate)) {
                     result.escalate = true;
                 }
@@ -1308,6 +1313,21 @@ pub fn resolve_agent_end(
             .push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
                 "duplicate_control_feedback",
             )));
+        return result;
+    }
+    if !continuation_authorized {
+        // Absence of an accepted stop is not permission to continue. Quality
+        // recommendations alone cannot spend a budget, reopen the answer, or
+        // force it into a pause. Verification remains an assessment, not proof.
+        if verification == VerificationNeed::NotRequired {
+            result.verification_state = ControlVerificationState::NotApplicable;
+        }
+        result
+            .verdicts
+            .push(ControlVerdict::Refused(ControlRefusal::TriggerNotMet(
+                "continuation_not_authorized",
+            )));
+        result.terminal_annotation = Some("no_authorized_follow_up");
         return result;
     }
     if sufficiency == SufficiencyVerdict::Insufficient {

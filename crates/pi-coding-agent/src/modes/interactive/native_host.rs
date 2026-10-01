@@ -4043,7 +4043,11 @@ async fn run_builtin_command(
             if !args.is_empty() {
                 return Ok(CommandOutput::Error("Usage: /fast".to_string()));
             }
-            let unavailable = "Fast mode requires GPT-5.4, GPT-5.5, or GPT-5.6 with ChatGPT or OpenAI API key authentication";
+            let unavailable = concat!(
+                "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra ",
+                "with ChatGPT or OpenAI API key authentication; ",
+                "GPT-6 Sol and GPT-6.1 Sol require ChatGPT authentication (openai-codex)",
+            );
             let state = connection.get_state().await?;
             let supports = state
                 .model
@@ -5280,7 +5284,8 @@ mod tests {
             &self,
             service_tier: ServiceTier,
         ) -> pi_ai::types::BoxFuture<Result<(), String>> {
-            self.record("set_service_tier");
+            self.record_with("set_service_tier", &[serde_json::to_string(&service_tier).unwrap()]);
+            self.state.lock().unwrap().service_tier = service_tier;
             Box::pin(async move { Ok(()) })
         }
         fn cycle_thinking_level(
@@ -5791,6 +5796,141 @@ mod tests {
 
         state.available_thinking_levels = Vec::new();
         assert!(available_thinking_levels(&state).is_empty());
+    }
+
+    #[tokio::test]
+    async fn fast_command_toggles_requested_codex_models_without_prompting() {
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+            let model = pi_ai::models::get_model("openai-codex", id).unwrap().clone();
+            for initial_tier in [
+                None,
+                Some(None),
+                Some(Some("default".to_string())),
+                Some(Some("priority".to_string())),
+                Some(Some("flex".to_string())),
+                Some(Some("auto".to_string())),
+                Some(Some("scale".to_string())),
+            ] {
+                let initially_on = initial_tier.as_ref().and_then(|tier| tier.as_deref())
+                    == Some("priority");
+                let recorder = Arc::new(RecordingConnection::new());
+                *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+                    model: Some(model.clone()),
+                    service_tier: initial_tier,
+                    ..Default::default()
+                };
+                let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+                let (send, receive) = mpsc::channel();
+                let expected_tiers = if initially_on {
+                    ["default", "priority"]
+                } else {
+                    ["priority", "default"]
+                };
+                let mut expected_calls = Vec::new();
+                for tier in expected_tiers {
+                    dispatch_submission(&connection, &send, "/fast", false, None).await.unwrap();
+                    let events: Vec<_> = receive.try_iter().collect();
+                    let expected_status = format!("Fast mode: {}", if tier == "priority" { "on" } else { "off" });
+                    assert!(
+                        matches!(events.as_slice(), [HostEvent::Status(status)] if status == &expected_status),
+                        "{id}: expected {expected_status}, got {:?}", event_names(&events)
+                    );
+                    let state = recorder.state.lock().unwrap();
+                    assert_eq!(state.service_tier, Some(Some(tier.to_string())), "{id}");
+                    assert_eq!(state.model.as_ref(), Some(&model), "{id}");
+                    drop(state);
+                    expected_calls.extend([
+                        ("get_state".to_string(), Vec::new()),
+                        ("set_service_tier".to_string(), vec![serde_json::json!(tier).to_string()]),
+                        ("get_state".to_string(), Vec::new()),
+                    ]);
+                    assert_eq!(recorder.calls(), expected_calls, "{id}");
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_command_reports_updated_requirements_for_unsupported_models_and_routes() {
+        let mut models = vec![None];
+        for id in ["gpt-6-astra", "gpt-6-sol", "gpt-6.1-sol"] {
+            let codex = pi_ai::models::get_model("openai-codex", id).unwrap();
+            for (provider, api) in [
+                ("openai-codex", "openai-responses"),
+                ("openai-codex", "openai-completions"),
+                ("openai", "openai-codex-responses"),
+                ("github-copilot", "openai-responses"),
+                ("github-copilot", "openai-codex-responses"),
+                ("custom", "openai-codex-responses"),
+            ] {
+                let mut model = codex.clone();
+                model.provider = provider.to_string();
+                model.api = api.to_string();
+                models.push(Some(model));
+            }
+            if id != "gpt-6-astra" {
+                let mut model = codex.clone();
+                model.provider = "openai".to_string();
+                model.api = "openai-responses".to_string();
+                models.push(Some(model));
+            }
+        }
+        for id in [
+            "gpt-6-luna", "gpt-6.1-luna", "gpt-6-astra-preview", "gpt-6-sol-preview",
+            "gpt-6.1-sol-preview", "gpt-6.2-sol", "gpt-6-terra",
+        ] {
+            let mut model = pi_ai::models::get_model("openai-codex", "gpt-6-sol").unwrap().clone();
+            model.id = id.to_string();
+            models.push(Some(model));
+        }
+        let expected = concat!(
+            "Fast mode requires GPT-5.4, GPT-5.5, GPT-5.6, or GPT-6 Astra ",
+            "with ChatGPT or OpenAI API key authentication; ",
+            "GPT-6 Sol and GPT-6.1 Sol require ChatGPT authentication (openai-codex)",
+        );
+        for model in models {
+            let label = model.as_ref().map(|model| format!("{}/{} via {}", model.provider, model.id, model.api))
+                .unwrap_or_else(|| "no model".to_string());
+            let recorder = Arc::new(RecordingConnection::new());
+            *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+                model,
+                service_tier: Some(Some("priority".to_string())),
+                ..Default::default()
+            };
+            let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+            let (send, receive) = mpsc::channel();
+            dispatch_submission(&connection, &send, "/fast", false, None).await.unwrap();
+            let events: Vec<_> = receive.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [HostEvent::Status(status)] if status == expected),
+                "{label}: expected updated requirements, got {:?}", event_names(&events)
+            );
+            assert_eq!(recorder.calls(), vec![("get_state".to_string(), Vec::<String>::new())], "{label}");
+            assert_eq!(recorder.state.lock().unwrap().service_tier, Some(Some("priority".to_string())), "{label}");
+        }
+    }
+
+    #[tokio::test]
+    async fn fast_command_arguments_remain_usage_errors_without_connection_calls() {
+        for args in ["on", "off", "priority", "default", "null", "bogus", "on off"] {
+            let recorder = Arc::new(RecordingConnection::new());
+            *recorder.state.lock().unwrap() = wire::AgentConnectionState {
+                model: Some(pi_ai::models::get_model("openai-codex", "gpt-6-sol").unwrap().clone()),
+                service_tier: Some(Some("priority".to_string())),
+                ..Default::default()
+            };
+            let connection: Arc<dyn wire::AgentConnection> = recorder.clone();
+            let (send, receive) = mpsc::channel();
+            let text = format!("/fast {args}");
+            dispatch_submission(&connection, &send, &text, false, None).await.unwrap();
+            let events: Vec<_> = receive.try_iter().collect();
+            assert!(
+                matches!(events.as_slice(), [HostEvent::Error(error)] if error == "Usage: /fast"),
+                "{text}: expected usage error, got {:?}", event_names(&events)
+            );
+            assert!(recorder.calls().is_empty(), "{text}");
+            assert_eq!(recorder.state.lock().unwrap().service_tier, Some(Some("priority".to_string())), "{text}");
+        }
     }
 
     #[test]
