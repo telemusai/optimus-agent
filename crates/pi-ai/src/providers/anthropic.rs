@@ -23,7 +23,7 @@ use crate::types::{
 };
 use crate::utils::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
 use crate::utils::headers::header_map_to_record;
-use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json};
+use crate::utils::json_parse::{parse_json_with_repair, parse_streaming_json, StreamingJsonAccumulator};
 use crate::utils::now_ms;
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::stream_failure::{
@@ -713,7 +713,7 @@ enum AnthropicBlock {
 	},
 	ToolCall {
 		tool_call: ToolCall,
-		partial_json: String,
+		partial_json: StreamingJsonAccumulator,
 		index: i64,
 	},
 }
@@ -925,6 +925,7 @@ async fn run_stream_anthropic(
 	let reader = SseMessageReader::new(chunks, options.stream.signal.clone());
 	let mut events = AnthropicEventIterator::new(reader, request_id.clone());
 
+	let result = async {
 	while let Some(event) = events.next().await? {
 		let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
 		if event_type == "message_start" {
@@ -1021,7 +1022,7 @@ async fn run_stream_anthropic(
 							name,
 							arguments,
 						),
-						partial_json: String::new(),
+						partial_json: StreamingJsonAccumulator::default(),
 						index: index as i64,
 					});
 					sync_output_content(output, &blocks);
@@ -1096,11 +1097,9 @@ async fn run_stream_anthropic(
 								partial_json,
 								..
 							} => {
-								partial_json.push_str(&delta);
-								tool_call.arguments = match parse_streaming_json(Some(partial_json.as_str())) {
-									Value::Object(object) => object,
-									_ => Map::new(),
-								};
+								if let Some(parsed) = partial_json.append(&delta) {
+									tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+								}
 								true
 							}
 							_ => false,
@@ -1164,7 +1163,7 @@ async fn run_stream_anthropic(
 							AnthropicBlock::ToolCall { tool_call, .. } => tool_call.clone(),
 							_ => unreachable!(),
 						};
-						tool_call.arguments = match parse_streaming_json(Some(partial_json.as_str())) {
+						tool_call.arguments = match parse_streaming_json(Some(partial_json.text())) {
 							Value::Object(object) => object,
 							_ => Map::new(),
 						};
@@ -1177,7 +1176,7 @@ async fn run_stream_anthropic(
 						} = &mut blocks[index]
 						{
 							*stored = tool_call.clone();
-							scratch.clear();
+							*scratch = StreamingJsonAccumulator::default();
 						}
 						sync_output_content(output, &blocks);
 						out.push(AssistantMessageEvent::ToolCallEnd {
@@ -1236,6 +1235,19 @@ async fn run_stream_anthropic(
 			calculate_cost(model, &mut output.usage, overrides.as_ref());
 		}
 	}
+
+	Ok(())
+	}.await;
+	// Settle even when the SSE reader fails before content_block_stop.
+	for block in &mut blocks {
+		if let AnthropicBlock::ToolCall { tool_call, partial_json, .. } = block {
+			if let Some(parsed) = partial_json.flush() {
+				tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+			}
+		}
+	}
+	sync_output_content(output, &blocks);
+	result?;
 
 	if options
 		.stream
@@ -2515,6 +2527,51 @@ mod tests {
 		assert_eq!(resolve_cache_retention(None), "long");
 		env.remove("PI_CACHE_RETENTION");
 		assert_eq!(resolve_cache_retention(None), "short");
+	}
+
+	#[tokio::test]
+	async fn large_anthropic_arguments_flush_on_stop_and_stream_error() {
+		use serde_json::json;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let args = json!({"code":"x".repeat(20_001),"tail":"received"}).to_string();
+		for error in [false, true] {
+			let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+			let mut body = event(json!({"type":"message_start", "message":{"id":"fixture-message","usage":{"input_tokens":1,"output_tokens":0}}}));
+			body.push_str(&event(json!({"type":"content_block_start","index":0,"content_block":{"type":"tool_use","id":"fixture-call","name":"write","input":{}}})));
+			for fragment in args.as_bytes().chunks(41) {
+				body.push_str(&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"input_json_delta","partial_json":std::str::from_utf8(fragment).unwrap()}})));
+			}
+			if error {
+				body.push_str(&event(json!({"type":"error","error":{"type":"overloaded_error","message":"fixture disconnect"}})));
+			} else {
+				body.push_str(&event(json!({"type":"content_block_stop","index":0})));
+				body.push_str(&event(json!({"type":"message_delta","delta":{"stop_reason":"tool_use"},"usage":{"output_tokens":2}})));
+				body.push_str(&event(json!({"type":"message_stop"})));
+			}
+			let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+			let address = listener.local_addr().unwrap();
+			let server = tokio::spawn(async move {
+				let (mut socket,_) = listener.accept().await.unwrap(); let mut request = Vec::new();
+				loop {
+					let mut buffer = [0;4096]; let count = socket.read(&mut buffer).await.unwrap(); assert_ne!(count,0);
+					request.extend_from_slice(&buffer[..count]);
+					if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+						let headers = std::str::from_utf8(&request[..end]).unwrap();
+						let length: usize = headers.lines().filter_map(|line| line.split_once(':')).find(|(key,_)| key.eq_ignore_ascii_case("content-length")).unwrap().1.trim().parse().unwrap();
+						if request.len() >= end + 4 + length {break;}
+					}
+				}
+				let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+				socket.write_all(response.as_bytes()).await.unwrap();
+			});
+			let mut model = test_model("anthropic", "fixture"); model.base_url = format!("http://{address}");
+			let mut options = AnthropicOptions::default(); options.stream.api_key = Some("synthetic-fixture-key".into());
+			let stream = stream_anthropic(&model, &context_with_user("fixture"), Some(options));
+			let message = tokio::time::timeout(std::time::Duration::from_secs(5), stream.result()).await.unwrap();
+			assert_eq!(message.stop_reason, if error {"error"} else {"toolUse"}, "{:?}",message.error_message);
+			assert_eq!(message.content[0].as_tool_call().unwrap().arguments, serde_json::from_str::<Value>(&args).unwrap().as_object().unwrap().clone());
+			server.await.unwrap();
+		}
 	}
 
 	#[test]

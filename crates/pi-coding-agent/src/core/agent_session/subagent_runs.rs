@@ -413,6 +413,7 @@ impl AgentSession {
         let publish = options.on_session_published.clone();
         let runtime = self.create_rlm_subagent_runtime(options).await?;
         let child = runtime.session;
+        child.persist_inherited_execution_mode()?;
         if let Some(publish) = publish {
             publish(&child);
         }

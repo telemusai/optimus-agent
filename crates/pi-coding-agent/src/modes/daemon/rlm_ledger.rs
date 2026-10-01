@@ -1116,7 +1116,16 @@ impl RlmSpawnLedger {
             .event_log
             .replay_sync(
                 |line, index| {
-                    let record = parse_ledger_line(line, index)?;
+                    // One damaged record must not hide every other child (or
+                    // its deletion tombstone). Keep the shared event log strict;
+                    // only this reconstructible topology ledger skips bad rows.
+                    let record = match parse_ledger_line(line, index) {
+                        Ok(record) => record,
+                        Err(error) => {
+                            (self.log)(&format!("RLM ledger: skipped corrupt record: {error}"));
+                            return Ok(None);
+                        }
+                    };
                     if record.is_none() {
                         (self.log)(&format!(
                             "RLM ledger: skipped record with unknown op on line {}",
@@ -1127,7 +1136,10 @@ impl RlmSpawnLedger {
                 },
                 ReplayOptions::default(),
             )
-            .unwrap_or_default();
+            .unwrap_or_else(|error| {
+                (self.log)(&format!("RLM ledger: replay failed: {error}"));
+                Vec::new()
+            });
         for record in records {
             match record {
                 RlmLedgerRecord::Meta(_) => continue,
@@ -1426,6 +1438,41 @@ mod tests {
             .await
             .expect("rename by path");
         let _ = std::fs::remove_dir_all(&root);
+    }
+
+    #[tokio::test]
+    async fn corrupt_records_preserve_children_tombstones_and_duplicate_guards() {
+        use std::io::Write;
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let parent = write_session_file(&sessions, "parent.jsonl");
+        let child = write_session_file(&sessions, "child.jsonl");
+        let other = write_session_file(&sessions, "other.jsonl");
+        let logs = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let captured = logs.clone();
+        let ledger = RlmSpawnLedger::new(
+            &root.path().to_string_lossy(), &sessions.to_string_lossy(), None,
+            Some(Arc::new(move |message| captured.lock().unwrap().push(message.into()))),
+        );
+        ledger.append_spawn(spawn("c1", &parent, &child, 1, "first")).await.unwrap();
+        let mut file = std::fs::OpenOptions::new().append(true).open(ledger.ledger_path()).unwrap();
+        file.write_all(b"not json\n\xff\xfe\n{\"v\":1,\"op\":\"spawn\",\"at\":\"x\"}\n").unwrap();
+        ledger.append_rename("c1", &child, "renamed").await.unwrap();
+        ledger.append_delete("c1", &child, RlmLedgerDeleteReason::User).await.unwrap();
+        ledger.append_spawn(spawn("c2", &parent, &other, 1, "second")).await.unwrap();
+        assert_eq!(ledger.edges(false).await.len(), 1);
+        let edges = ledger.edges(true).await;
+        assert_eq!(edges.len(), 2);
+        assert_eq!(edges[0].name, "renamed");
+        assert_eq!(edges[0].deleted, Some(RlmLedgerDeleteReason::User));
+        assert!(ledger.append_spawn(spawn("duplicate", &parent, &other, 1, "bad")).await
+            .unwrap_err().contains("duplicate child session path"));
+        // The existing torn-tail repair still protects the next append.
+        file.write_all(b"{\"v\":1,\"op\":\"spawn\"").unwrap();
+        ledger.append_rename("c2", &other, "after torn tail").await.unwrap();
+        assert_eq!(ledger.edges(false).await[0].name, "after torn tail");
+        assert!(logs.lock().unwrap().iter().any(|line| line.contains("skipped corrupt record")));
     }
 
     #[tokio::test]

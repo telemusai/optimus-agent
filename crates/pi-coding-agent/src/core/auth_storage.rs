@@ -349,6 +349,9 @@ pub struct AuthApiKeyResult {
 /// The lock callback returns the `next` content to persist (the TypeScript
 /// `LockResult.next`); a callback that only reads returns `Ok(None)`.
 pub trait AuthStorageBackend: Send + Sync {
+    /// Cheap change detection for shared persistent stores. Custom/in-memory
+    /// backends retain their existing explicit reload behavior by default.
+    fn revision(&self) -> Option<String> { None }
     fn with_lock(
         &self,
         f: &mut dyn FnMut(Option<String>) -> Result<Option<String>, String>,
@@ -453,6 +456,22 @@ fn write_auth_file(path: &str, content: &str) -> Result<(), String> {
 }
 
 impl AuthStorageBackend for FileAuthStorageBackend {
+    fn revision(&self) -> Option<String> {
+        Some(match std::fs::metadata(&self.auth_path) {
+            Ok(metadata) => {
+                let stamp = format!("{}:{:?}:{:?}", metadata.len(), metadata.modified(), metadata.created());
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::MetadataExt;
+                    format!("{stamp}:{}:{}:{}:{}", metadata.dev(), metadata.ino(), metadata.ctime(), metadata.ctime_nsec())
+                }
+                #[cfg(not(unix))]
+                { stamp }
+            }
+            Err(error) => format!("missing-or-unreadable:{:?}", error.kind()),
+        })
+    }
+
     fn with_lock(
         &self,
         f: &mut dyn FnMut(Option<String>) -> Result<Option<String>, String>,
@@ -560,6 +579,7 @@ pub struct AuthStorage {
     stale_auth_sources: HashMap<String, Vec<AuthSourceToken>>,
     fallback_resolver: Option<Arc<dyn Fn(&str) -> Option<String> + Send + Sync>>,
     load_error: Option<String>,
+    last_backend_revision: Option<String>,
     errors: Vec<String>,
     claude_code: Option<Arc<claude_code::ClaudeCodeAuth>>,
     kiro_cli_path: Option<std::path::PathBuf>,
@@ -588,6 +608,7 @@ impl AuthStorage {
             stale_auth_sources: HashMap::new(),
             fallback_resolver: None,
             load_error: None,
+            last_backend_revision: None,
             errors: Vec::new(),
             claude_code: None,
             kiro_cli_path: None,
@@ -1201,6 +1222,9 @@ impl AuthStorage {
 
     /// Reload credentials from storage.
     pub fn reload(&mut self) {
+        // Sample before reading: a replacement racing the read is detected by
+        // the next lookup rather than blessing an older snapshot as current.
+        self.last_backend_revision = self.storage.revision();
         let mut captured: Option<String> = None;
         let mut outcome: Result<(), String> = Ok(());
         {
@@ -1218,10 +1242,22 @@ impl AuthStorage {
             // load that could not read every entry.
             Ok(()) => self.adopt_loaded_data(captured.as_deref()),
             Err(error) => {
+                self.data.clear();
                 self.load_error = Some(error.clone());
                 self.record_error(error);
             }
         }
+    }
+
+    /// Observe a login, rotation, removal or atomic replacement by another
+    /// process without refreshing OAuth tokens or changing source precedence.
+    pub fn reload_if_changed(&mut self) -> bool {
+        let Some(revision) = self.storage.revision() else { return false; };
+        if self.last_backend_revision.as_ref() == Some(&revision) && self.load_error.is_none() {
+            return false;
+        }
+        self.reload();
+        true
     }
 
     fn persist_provider_change(&mut self, provider: &str, credential: Option<&AuthCredential>) {
@@ -1599,6 +1635,7 @@ impl AuthStorage {
         provider_id: &str,
         include_fallback: bool,
     ) -> Result<AuthApiKeyResult, String> {
+        self.reload_if_changed();
         if let Some(result) = self.resolve_claude_code_auth(provider_id).await? {
             return Ok(result);
         }
@@ -2398,6 +2435,45 @@ Write-Output ('isolated-test-key-' + $count)"#,
             .block_on(storage.get_api_key_with_source_token("custom", false))
             .unwrap();
         assert!(result.api_key.is_none());
+    }
+
+    #[test]
+    fn shared_auth_changes_are_used_without_restarting_the_reader() {
+        let runtime = tokio::runtime::Runtime::new().unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("auth.json");
+        let mut reader = AuthStorage::create(Some(path.to_string_lossy().into()), None);
+        let mut writer = AuthStorage::create(Some(path.to_string_lossy().into()), None);
+        let key = |value: &str| AuthCredential::ApiKey { key: value.into(), prime_team: None };
+        writer.set("shared-fixture", key("old-synthetic"));
+        let old = runtime.block_on(reader.get_api_key_with_source_token("shared-fixture", false)).unwrap();
+        assert_eq!(old.api_key.as_deref(), Some("old-synthetic"));
+        reader.mark_auth_source_stale(old.source_token.as_ref().unwrap());
+        writer.set("shared-fixture", key("new-synthetic"));
+        assert_eq!(runtime.block_on(reader.get_api_key("shared-fixture", false)).unwrap().as_deref(), Some("new-synthetic"));
+        assert!(!reader.reload_if_changed(), "unchanged lookups must not reread/lock the file");
+        // Another account login commonly replaces auth.json atomically.
+        write_auth_file(path.to_str().unwrap(), r#"{"shared-fixture":{"type":"api_key","key":"replacement"},"added-fixture":{"type":"api_key","key":"new-provider"}}"#).unwrap();
+        assert_eq!(runtime.block_on(reader.get_api_key("added-fixture", false)).unwrap().as_deref(), Some("new-provider"));
+        reader.set_runtime_api_key("shared-fixture", "runtime-fixture");
+        let rejected = runtime.block_on(reader.get_api_key_with_source_token("shared-fixture", false)).unwrap();
+        reader.mark_auth_source_stale(rejected.source_token.as_ref().unwrap());
+        writer.reload();
+        writer.set("shared-fixture", key("after-runtime-rejection"));
+        assert_eq!(runtime.block_on(reader.get_api_key("shared-fixture", false)).unwrap().as_deref(), Some("after-runtime-rejection"));
+        assert!(reader.is_auth_source_stale("shared-fixture", &reader.get_runtime_auth_candidate("shared-fixture").unwrap()),
+            "external updates must not revive an unchanged rejected runtime credential");
+        reader.remove_runtime_api_key("shared-fixture");
+        writer.remove("shared-fixture");
+        assert_eq!(runtime.block_on(reader.get_api_key("shared-fixture", false)).unwrap(), None);
+        std::fs::write(&path, "not valid json").unwrap();
+        assert_eq!(runtime.block_on(reader.get_api_key("added-fixture", false)).unwrap(), None);
+        assert!(reader.load_error.is_some());
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "not valid json", "never overwrite a failed load");
+        write_auth_file(path.to_str().unwrap(), r#"{"shared-fixture":{"type":"api_key","key":"repaired"}}"#).unwrap();
+        assert_eq!(runtime.block_on(reader.get_api_key("shared-fixture", false)).unwrap().as_deref(), Some("repaired"));
+        std::fs::remove_file(&path).unwrap();
+        assert_eq!(runtime.block_on(reader.get_api_key("shared-fixture", false)).unwrap(), None);
     }
 
     #[test]

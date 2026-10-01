@@ -1,0 +1,7 @@
+- Fixed subagents inheriting a busy parent state or losing their assigned task in inline SDK sessions.
+- Fixed inherited IPython, Node, Clang-Repl and Direct tools modes reverting after a child session is reopened.
+- Fixed a corrupt child-ledger record hiding otherwise valid child agents and deletion records during recovery.
+- Changed large streamed tool arguments to use bounded JSON preview parsing, preserving the received arguments on completion and errors.
+- Fixed interrupted OpenAI-compatible Completions streams being accepted as successful; incomplete responses now fail without executing unfinished tools.
+- Fixed OpenAI Responses, Gemini and Vertex usage totals when providers omit totals or report cached input larger than prompt input.
+- Fixed running sessions retaining stale shared auth.json credentials after another process logs in, rotates credentials or removes them.

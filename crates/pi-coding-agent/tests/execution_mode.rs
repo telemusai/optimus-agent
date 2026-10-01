@@ -599,6 +599,64 @@ async fn f6_after_node_tool_batch_continues_unfinished_work_in_direct_mode() {
 }
 
 #[tokio::test]
+async fn subagents_inherit_the_current_prompt_and_keep_the_mode_when_reopened() {
+    let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
+    fn transcript(dir: &std::path::Path) -> Option<std::path::PathBuf> {
+        for entry in std::fs::read_dir(dir).unwrap() {
+            let path = entry.unwrap().path();
+            if path.is_dir() {
+                if let Some(path) = transcript(&path) { return Some(path); }
+            } else if path.extension().is_some_and(|ext| ext == "jsonl")
+                && std::fs::read_to_string(&path).unwrap().contains("\"type\":\"session\"") {
+                return Some(path);
+            }
+        }
+        None
+    }
+    for (mode, language) in [("ipython", "Python"), ("node", "JavaScript"), ("clang", "C++"), ("direct", "Direct tools")] {
+        let f = Fixture::new();
+        let parent = f.session(None, false).await;
+        turn(&parent, &format!("/mode {mode}")).await;
+        // The Python bridge and native tool share the same child lifecycle.
+        // Expose that native entry point here to keep the regression offline.
+        if mode == "ipython" { parent.set_active_tools_by_name(&["ipython".into(), "subagent".into()]); }
+        let expected = parent.get_active_tool_names();
+        f.reply(Some(("subagent", json!({"action":"spawn", "name":"mode-child", "prompt":"CHILD_MODE_PROBE: reply briefly"}))), None);
+        for _ in 0..8 {
+            let captured = f.captured.clone();
+            f.provider.append_responses(vec![FauxResponseStep::Factory(Arc::new(move |context,_,_,_| {
+                captured.lock().unwrap().push(context.clone());
+                Box::pin(async { faux_assistant_message("MODE_FIXTURE_DONE\nRLM_CHILD_STATUS: complete".into(), None) })
+            }))]);
+        }
+        turn(&parent, "Spawn the child").await;
+        let collected = tokio::time::timeout(Duration::from_secs(30), parent.collect_rlm_children(&[], 30_000))
+            .await.unwrap().unwrap();
+        assert_eq!(collected.results.len(), 1);
+        assert_eq!(collected.results[0].status, "done", "{collected:?}");
+        let child_request = f.captured.lock().unwrap().iter()
+            .find(|context| {
+                let messages = serde_json::to_string(&context.messages).unwrap();
+                messages.contains("CHILD_MODE_PROBE") && !messages.contains("Spawn the child")
+            })
+            .expect("child made a real provider request with its assigned task").clone();
+        assert_eq!(child_request.tools.unwrap().iter().map(|tool| tool.name.clone()).collect::<Vec<_>>(), expected);
+        let prompt = child_request.system_prompt.unwrap();
+        assert!(prompt.contains(language), "{mode} child received wrong prompt");
+        assert!(prompt.contains("PROJECT_MODE_FIXTURE"));
+        let listed = parent.list_rlm_subagents().await.unwrap();
+        assert_eq!(listed.subagents.len(), 1);
+        let file = transcript(std::path::Path::new(&listed.subagents[0].session_dir)).unwrap();
+        turn(&parent, "/mode cycle").await;
+        parent.dispose_async(Some(false)).await;
+        let reopened = f.session(Some(file.to_str().unwrap()), false).await;
+        assert_eq!(reopened.get_active_tool_names()[0], expected[0], "{mode} child lost its mode after resume");
+        assert!(reopened.system_prompt().contains(language));
+        reopened.dispose_async(Some(false)).await;
+    }
+}
+
+#[tokio::test]
 async fn native_subagents_respect_tool_restrictions_and_depth_limits() {
     let _env = ENV.lock().unwrap_or_else(|p| p.into_inner());
     let f = Fixture::new();

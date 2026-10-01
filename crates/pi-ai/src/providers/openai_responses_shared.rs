@@ -22,7 +22,7 @@ use crate::utils::diagnostics::{
 };
 use crate::utils::event_stream::AssistantMessageEventStream;
 use crate::utils::hash::short_hash;
-use crate::utils::json_parse::parse_streaming_json;
+use crate::utils::json_parse::{parse_streaming_json, StreamingJsonAccumulator};
 use crate::utils::sanitize_unicode::sanitize_surrogates;
 use crate::utils::stream_failure::{
     classify_stream_failure, StreamFailureError, StreamFailureInfo, ThrownStreamError,
@@ -517,7 +517,7 @@ fn block_index(output: &AssistantMessage) -> usize {
 enum CurrentBlock {
     Thinking { index: usize },
     Text { index: usize },
-    ToolCall { index: usize, partial_json: String },
+    ToolCall { index: usize, partial_json: StreamingJsonAccumulator },
 }
 
 impl CurrentBlock {
@@ -727,6 +727,7 @@ pub async fn process_responses_stream(
     let mut current_item: Option<Value> = None;
     let mut current_block: Option<CurrentBlock> = None;
 
+    let result = async {
     while let Some(event) = openai_stream.next().await {
         let event_type = get_str(&event, "type").unwrap_or_default().to_string();
 
@@ -761,7 +762,7 @@ pub async fn process_responses_stream(
                     let call_id = get_str(&item, "call_id").unwrap_or_default();
                     let id = get_str(&item, "id").unwrap_or_default();
                     let name = get_str(&item, "name").unwrap_or_default();
-                    let partial_json = string_or_empty(get(&item, "arguments"));
+                    let partial_json = StreamingJsonAccumulator::new(string_or_empty(get(&item, "arguments")));
                     let tool_call = ToolCall::new(format!("{}|{}", call_id, id), name, Map::new());
                     let index = output.content.len();
                     output.content.push(ContentBlock::ToolCall(tool_call));
@@ -946,15 +947,12 @@ pub async fn process_responses_stream(
             if is_function_call && matches!(current_block, Some(CurrentBlock::ToolCall { .. })) {
                 let delta = string_or_empty(get(&event, "delta"));
                 let index = current_block.as_ref().expect("checked").index();
-                let partial_json = match current_block.as_mut().expect("checked") {
-                    CurrentBlock::ToolCall { partial_json, .. } => {
-                        partial_json.push_str(&delta);
-                        partial_json.clone()
-                    }
-                    _ => String::new(),
+                let parsed = match current_block.as_mut().expect("checked") {
+                    CurrentBlock::ToolCall { partial_json, .. } => partial_json.append(&delta),
+                    _ => None,
                 };
-                if let ContentBlock::ToolCall(tool_call) = &mut output.content[index] {
-                    tool_call.arguments = as_arguments(parse_streaming_json(Some(&partial_json)));
+                if let (Some(parsed), ContentBlock::ToolCall(tool_call)) = (parsed, &mut output.content[index]) {
+                    tool_call.arguments = as_arguments(parsed);
                 }
                 stream.push(AssistantMessageEvent::ToolCallDelta {
                     content_index: block_index(output),
@@ -971,8 +969,8 @@ pub async fn process_responses_stream(
                 let arguments = string_or_empty(get(&event, "arguments"));
                 let previous_partial_json = match current_block.as_mut().expect("checked") {
                     CurrentBlock::ToolCall { partial_json, .. } => {
-                        let previous = partial_json.clone();
-                        *partial_json = arguments.clone();
+                        let previous = partial_json.text().to_string();
+                        *partial_json = StreamingJsonAccumulator::new(arguments.clone());
                         previous
                     }
                     _ => String::new(),
@@ -1068,8 +1066,8 @@ pub async fn process_responses_stream(
                 current_block = None;
             } else if item_type(&item) == Some("function_call") {
                 let args = match current_block.as_ref() {
-                    Some(CurrentBlock::ToolCall { partial_json, .. }) if !partial_json.is_empty() => {
-                        parse_streaming_json(Some(partial_json))
+                    Some(CurrentBlock::ToolCall { partial_json, .. }) if !partial_json.text().is_empty() => {
+                        parse_streaming_json(Some(partial_json.text()))
                     }
                     _ => {
                         let raw = string_or_empty(get(&item, "arguments"));
@@ -1157,13 +1155,15 @@ pub async fn process_responses_stream(
                     output.usage = Usage {
                         // OpenAI includes cached tokens in input_tokens, so subtract to get
                         // non-cached input
-                        input: number_or_zero(get(usage, "input_tokens")) - cached_tokens,
+                        input: (number_or_zero(get(usage, "input_tokens")) - cached_tokens).max(0.0),
                         output: number_or_zero(get(usage, "output_tokens")),
                         cache_read: cached_tokens,
                         cache_write: 0.0,
-                        total_tokens: number_or_zero(get(usage, "total_tokens")),
+                        total_tokens: 0.0,
                         cost: Default::default(),
                     };
+                    output.usage.total_tokens = output.usage.input + output.usage.output
+                        + output.usage.cache_read + output.usage.cache_write;
                 }
             }
             calculate_cost(model, &mut output.usage, None);
@@ -1268,6 +1268,16 @@ pub async fn process_responses_stream(
     }
 
     Ok(())
+    }.await;
+    // A failure or early EOF can leave a throttled preview behind the actual
+    // bytes received. Preserve all received arguments in the terminal message.
+    if let Some(CurrentBlock::ToolCall { index, partial_json }) = current_block.as_mut() {
+        if let (Some(parsed), Some(ContentBlock::ToolCall(tool_call))) =
+            (partial_json.flush(), output.content.get_mut(*index)) {
+            tool_call.arguments = as_arguments(parsed);
+        }
+    }
+    result
 }
 
 #[cfg(test)]
@@ -2064,6 +2074,46 @@ mod tests {
             types.push(event.event_type().to_string());
         }
         types
+    }
+
+    #[tokio::test]
+    async fn normalized_usage_cannot_have_negative_input_or_a_missing_total() {
+        let mut model = text_model();
+        model.cost = ModelCost { input: 10.0, output: 20.0, cache_read: 1.0, cache_write: 0.0 };
+        for (input, cached, total) in [(3, 8, 10.0), (10, 4, 12.0)] {
+            let mut output = empty_output(&model);
+            process_responses_stream(event_stream(vec![json!({"type":"response.completed", "response":{
+                "status":"completed", "usage":{"input_tokens":input, "input_tokens_details":{"cached_tokens":cached}, "output_tokens":2}
+            }})]), &mut output, &AssistantMessageEventStream::new(), &model, None).await.unwrap();
+            assert!(output.usage.input >= 0.0);
+            assert_eq!(output.usage.total_tokens, total);
+            assert!((output.usage.cost.input - output.usage.input * 10.0 / 1_000_000.0).abs() < 1e-12);
+            assert!(output.usage.cost.total >= 0.0);
+        }
+    }
+
+    #[tokio::test]
+    async fn large_tool_arguments_are_complete_on_end_error_and_early_eof() {
+        let model = text_model();
+        let arguments = json!({"content":"x".repeat(20 * 1024),"last":42});
+        let encoded = arguments.to_string();
+        for ending in ["end", "error", "eof"] {
+            let mut output = empty_output(&model);
+            let mut events = vec![json!({"type":"response.output_item.added", "item":{
+                "type":"function_call", "id":"fc_large", "call_id":"call_large", "name":"edit", "arguments":""
+            }})];
+            for chunk in encoded.as_bytes().chunks(16) {
+                events.push(json!({"type":"response.function_call_arguments.delta","delta":std::str::from_utf8(chunk).unwrap()}));
+            }
+            if ending == "end" {
+                events.push(json!({"type":"response.output_item.done","item":{"type":"function_call","arguments":encoded}}));
+            } else if ending == "error" {
+                events.push(json!({"type":"error","code":"server_error","message":"fixture disconnect"}));
+            }
+            let result = process_responses_stream(event_stream(events), &mut output, &AssistantMessageEventStream::new(), &model, None).await;
+            assert_eq!(result.is_err(), ending == "error");
+            assert_eq!(output.content[0].as_tool_call().unwrap().arguments, arguments.as_object().unwrap().clone(), "{ending}");
+        }
     }
 
     #[tokio::test]

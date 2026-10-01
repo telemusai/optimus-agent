@@ -459,30 +459,12 @@ pub async fn create_agent_session_with_factories(
                 .lock()
                 .expect("active session manager poisoned")
                 .clone();
-            let (model_tool_output_artifact_dir, session_id, policy, block_images) = {
-                let manager = session_manager.lock().expect("session manager poisoned");
-                let settings = settings_manager.lock().expect("settings manager poisoned");
-                (
-                    manager.get_session_artifact_dir(),
-                    manager.get_session_id(),
-                    resolve_model_tool_output_policy(Some(&settings.get_model_tool_output_policy())),
-                    settings.get_block_images(),
-                )
-            };
-            let converted = convert_to_llm(
+            let converted = convert_session_messages(
                 &messages,
-                &ModelToolOutputPolicyOptions {
-                    policy: Some(policy),
-                    scope: model_tool_output_artifact_dir.map(|dir| ModelToolOutputScope {
-                        session_id,
-                        session_artifact_dir: dir,
-                    }),
-                },
+                &session_manager.lock().expect("session manager poisoned"),
+                &settings_manager.lock().expect("settings manager poisoned"),
             );
-            if !block_images {
-                return converted;
-            }
-            converted.into_iter().map(block_images_in_message).collect()
+            converted
         })
     };
 
@@ -777,6 +759,24 @@ pub async fn create_agent_session_with_factories(
         extensions_result,
         model_fallback_message,
     })
+}
+
+pub(crate) fn convert_session_messages(
+    messages: &[AgentMessage],
+    manager: &SessionManager,
+    settings: &crate::core::settings_manager::SettingsManager,
+) -> Vec<Message> {
+    let converted = convert_to_llm(messages, &ModelToolOutputPolicyOptions {
+        policy: Some(resolve_model_tool_output_policy(Some(&settings.get_model_tool_output_policy()))),
+        scope: manager.get_session_artifact_dir().map(|dir| ModelToolOutputScope {
+            session_id: manager.get_session_id(), session_artifact_dir: dir,
+        }),
+    });
+    if settings.get_block_images() {
+        converted.into_iter().map(block_images_in_message).collect()
+    } else {
+        converted
+    }
 }
 
 /// `convertToLlmWithBlockImages`: replaces image blocks with the disabled-image
