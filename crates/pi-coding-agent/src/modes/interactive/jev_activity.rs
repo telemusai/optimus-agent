@@ -17,11 +17,22 @@ fn number(value: u64) -> String {
     }
 }
 
+#[cfg(test)]
 pub(super) fn status(
     mode: JevMode,
     full: bool,
     compaction: bool,
     response: Option<&Value>,
+) -> Option<RightStatus> {
+    status_with_freshness(mode, full, compaction, response, false)
+}
+
+pub(super) fn status_with_freshness(
+    mode: JevMode,
+    full: bool,
+    compaction: bool,
+    response: Option<&Value>,
+    delayed: bool,
 ) -> Option<RightStatus> {
     if !mode.is_enabled() && !compaction {
         return None;
@@ -51,7 +62,9 @@ pub(super) fn status(
         .flatten()
         .any(|reason| reason.as_str().is_some_and(|reason| !reason.is_empty()))
     });
-    let phase = if let Some(usage) = &usage {
+    let phase = if delayed {
+        "stats delayed"
+    } else if let Some(usage) = &usage {
         if usage.in_flight > 0 {
             match usage.activity.as_str() {
                 "compacting" => "compacting",
@@ -76,7 +89,7 @@ pub(super) fn status(
     } else {
         "idle"
     };
-    let color = if usage.as_ref().is_some_and(|usage| usage.in_flight > 0)
+    let color = if delayed || usage.as_ref().is_some_and(|usage| usage.in_flight > 0)
         || fallback
         || response.is_none()
     {
@@ -119,6 +132,7 @@ pub(super) fn status(
         "checking safety" => "safety",
         "checking effort" => "effort",
         "stats unavailable" => "unavailable",
+        "stats delayed" => "delayed",
         "evaluating" => "busy",
         "compacting" => "compact",
         "searching" => "search",

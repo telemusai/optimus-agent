@@ -102,6 +102,11 @@ mod native_subagents;
 mod native_recovery_notice;
 #[path = "native_host_metrics.rs"]
 mod native_metrics;
+#[path = "native_host_receipts.rs"]
+mod native_receipts;
+#[cfg(test)]
+#[path = "native_host_receipt_tests.rs"]
+mod receipt_tests;
 #[cfg(test)]
 #[path = "native_host_ui_tests.rs"]
 mod ui_tests;
@@ -172,6 +177,7 @@ struct Transcript {
     connection_status: String,
     refinement_progress: Option<String>,
     local_sending_count: usize,
+    local_receipts: native_receipts::Receipts,
     viewport_anchors: Vec<Option<pi_tui::fullscreen::ViewportAnchor>>,
     assistant: Option<Rc<RefCell<AssistantMessageComponent>>>,
     assistants: Vec<Rc<RefCell<AssistantMessageComponent>>>,
@@ -287,6 +293,7 @@ impl Transcript {
             connection_status: String::new(),
             refinement_progress: None,
             local_sending_count: 0,
+            local_receipts: native_receipts::Receipts::default(),
             viewport_anchors: Vec::new(),
             assistant: None,
             assistants: Vec::new(),
@@ -295,6 +302,7 @@ impl Transcript {
         }
     }
     fn replace(&mut self, messages: Vec<AgentMessage>) {
+        self.local_receipts.clear();
         self.timeline_cache.clear();
         self.history = None;
         self.clipboard_notice = native_clipboard::Notice::default();
@@ -413,6 +421,7 @@ impl Transcript {
         match message {
             AgentMessage::Message(pi_ai::types::Message::User(user)) => {
                 let mode = self.mode.borrow();
+                self.local_receipts.message(&mode.get_user_message_text(&user));
                 self.rows.push(Box::new(UserMessageComponent::new(
                     &mode.get_user_message_text(&user),
                     mode.get_markdown_theme_with_settings(),
@@ -660,9 +669,11 @@ impl TuiComponent for Transcript {
         if let Some(side_pane) = &self.side_pane {
             lines.extend(side_pane.borrow_mut().render(width));
         }
-        if self.local_sending_count > 0 {
+        let receipts = self.local_receipts.render(width);
+        if self.local_sending_count > 0 && receipts.is_empty() {
             lines.push(theme().fg("dim", "Sending — not yet confirmed by host"));
         }
+        lines.extend(receipts);
         // Editor and overlay repaints must not reparse unchanged history's ANSI
         // and Unicode on every key. Compare rendered bytes so external component
         // updates, theme changes and expansion still invalidate precisely.
@@ -700,6 +711,7 @@ impl TuiComponent for Transcript {
     }
     fn invalidate(&mut self) {
         self.timeline_cache.clear();
+        self.local_receipts.invalidate();
         if let Some(side_pane) = &self.side_pane {
             side_pane.borrow_mut().invalidate();
         }
@@ -2081,6 +2093,7 @@ async fn run_terminal(
                     } else if text.trim() == "/help" {
                         mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Alt+Enter queues follow-up; Ctrl+O expands tools.", "dim");
                     } else {
+                        if submission_is_prompt(&text) { ui.borrow_mut().scroll_to_bottom(); }
                         submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
                     }
                 }
@@ -2261,6 +2274,7 @@ async fn run_terminal(
             };
             if submission_attachment_invalidated(&event) {
                 ui_metrics.reset_attachment();
+                transcript.borrow_mut().local_receipts.clear();
             }
             if matches!(&event,
                 HostEvent::Connection(
@@ -2699,7 +2713,7 @@ async fn run_terminal(
                     Err(error) => mode.borrow_mut().show_error(&error),
                 },
                 HostEvent::SubmissionReply(ticket, result) => {
-                    if apply_submission_reply(&mode, &mut ui_metrics, &ticket, result) {
+                    if apply_submission_reply(&mode, &transcript, &mut ui_metrics, &ticket, result) {
                         state_refresh.request(connection.clone(), current_session_id.clone());
                     }
                 }
@@ -3226,6 +3240,11 @@ async fn run_terminal(
         editor.borrow_mut().editor_mut().set_terminal_rows(rows);
         editor.borrow_mut().editor_mut().poll_autocomplete();
         ui_metrics.session(&current_session_id);
+        if let Some(state) = &mode.borrow().connection_state {
+            if transcript.borrow_mut().local_receipts.queue(
+                state.session_actions.steering.iter().chain(&state.session_actions.follow_ups).cloned(),
+            ) { ui.borrow_mut().request_render(); }
+        }
         let pending_count = ui_metrics.pending_count();
         if transcript.borrow().local_sending_count != pending_count {
             transcript.borrow_mut().local_sending_count = pending_count;
@@ -3392,11 +3411,13 @@ fn submission_attachment_invalidated(event: &HostEvent) -> bool {
 
 fn apply_submission_reply(
     mode: &Rc<RefCell<InteractiveMode>>,
+    transcript: &Rc<RefCell<Transcript>>,
     metrics: &mut native_metrics::UiMetrics,
     ticket: &native_metrics::SubmissionTicket,
     result: Result<(), String>,
 ) -> bool {
     if !metrics.reply(ticket) { return false; }
+    transcript.borrow_mut().local_receipts.reply(ticket.id(), result.is_ok());
     if let Err(error) = result { mode.borrow_mut().show_error(&error); }
     true
 }
@@ -3410,6 +3431,15 @@ fn submit_from_editor(
     transcript: &Rc<RefCell<Transcript>>,
 ) {
     let ticket = submission_is_prompt(&text).then(|| metrics.begin_submission());
+    // Commands can complete without a user-message event. Preview only ordinary
+    // prompts; their text is painted before any daemon work or network await.
+    if let Some(ticket) = &ticket {
+        if !text.trim_start().starts_with('/') {
+            let mut transcript = transcript.borrow_mut();
+            let mode = transcript.mode.clone();
+            transcript.local_receipts.begin(ticket.id(), &text, &mode.borrow());
+        }
+    }
     transcript.borrow_mut().local_sending_count = metrics.pending_count();
     submit_with_metrics(connection, send, text, follow_up, None, ticket);
 }
@@ -4944,7 +4974,7 @@ mod tests {
         calls: std::sync::Mutex<Vec<(String, Vec<String>)>>,
         state: std::sync::Mutex<wire::AgentConnectionState>,
         user_messages: std::sync::Mutex<Vec<wire::AgentConnectionUserMessage>>,
-        prompt_replies: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<Result<(), String>>>>,
+        pub(super) prompt_replies: std::sync::Mutex<std::collections::VecDeque<tokio::sync::oneshot::Receiver<Result<(), String>>>>,
         last_assistant_text: std::sync::Mutex<Option<String>>,
         session_tree: std::sync::Mutex<wire::AgentConnectionWatchSessionTree>,
         export_path: std::sync::Mutex<Option<String>>,
@@ -5805,7 +5835,7 @@ fn apply_event_legacy_for_speed(
 
 
     #[derive(Default)]
-    struct SpeedRecorder(std::sync::Mutex<Vec<pi_agent_core::performance_metrics::PerformanceMetricEvent>>);
+    pub(super) struct SpeedRecorder(pub(super) std::sync::Mutex<Vec<pi_agent_core::performance_metrics::PerformanceMetricEvent>>);
     impl pi_agent_core::performance_metrics::PerformanceMetricRecorder for SpeedRecorder {
         fn session_id(&self) -> &str { "ui-speed" }
         fn monotonic_now(&self) -> f64 { 0.0 }
@@ -5830,7 +5860,7 @@ fn apply_event_legacy_for_speed(
         assert!(fake.calls().is_empty(), "the receipt/ID must exist before the task runs");
         let initial = h.paint().join("\n");
         assert!(initial.contains("Sending — not yet confirmed by host"), "{initial}");
-        assert!(!initial.contains("private submitted prompt"));
+        assert!(initial.contains("private submitted prompt"));
         metrics.receipt_rendered();
         h.editor.borrow_mut().editor_mut().set_text("new draft stays here");
         h.editor.borrow_mut().handle_input("\x1b[D");
@@ -5841,8 +5871,8 @@ fn apply_event_legacy_for_speed(
         reply.send(Err("synthetic host rejection".into())).unwrap();
         tokio::task::yield_now().await;
         let HostEvent::SubmissionReply(ticket, result) = receive.try_recv().expect("one matching reply") else { panic!("expected identified reply") };
-        assert!(apply_submission_reply(&h.mode, &mut metrics, &ticket, result));
-        assert!(!apply_submission_reply(&h.mode, &mut metrics, &ticket, Err("duplicate rejection".into())));
+        assert!(apply_submission_reply(&h.mode, &h.transcript, &mut metrics, &ticket, result));
+        assert!(!apply_submission_reply(&h.mode, &h.transcript, &mut metrics, &ticket, Err("duplicate rejection".into())));
         h.transcript.borrow_mut().local_sending_count = metrics.pending_count();
         let settled = h.paint().join("\n");
         assert!(!settled.contains("Sending"));
@@ -5875,18 +5905,18 @@ fn apply_event_legacy_for_speed(
             metrics.reset_attachment();
             let current = metrics.begin_submission();
             let state = format!("{:?}", h.mode.borrow().connection_state);
-            assert!(!apply_submission_reply(&h.mode, &mut metrics, &old, Err("late private error".into())));
+            assert!(!apply_submission_reply(&h.mode, &h.transcript, &mut metrics, &old, Err("late private error".into())));
             assert_eq!(format!("{:?}", h.mode.borrow().connection_state), state);
             assert_eq!(metrics.pending_count(), 1);
             assert!(!h.paint().join("\n").contains("late private error"));
-            assert!(apply_submission_reply(&h.mode, &mut metrics, &current, Ok(())));
+            assert!(apply_submission_reply(&h.mode, &h.transcript, &mut metrics, &current, Ok(())));
         }
         assert!(!submission_attachment_invalidated(&HostEvent::Connection(wire::AgentConnectionEvent::SessionEvent {
             event: wire::AgentConnectionSessionEvent::MessageEnd { message: pi_ai::types::UserMessage::new(pi_ai::types::UserContent::Text("x".into()), 1).into() }
         })));
         let old = metrics.begin_submission();
         metrics.session("other-session");
-        assert!(!apply_submission_reply(&h.mode, &mut metrics, &old, Ok(())));
+        assert!(!apply_submission_reply(&h.mode, &h.transcript, &mut metrics, &old, Ok(())));
         assert_eq!(h.editor.borrow().editor().get_text(), "replacement draft");
         assert_eq!(h.editor.borrow().editor().get_cursor(), cursor);
     }

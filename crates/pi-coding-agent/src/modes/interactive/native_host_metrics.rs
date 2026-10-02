@@ -170,6 +170,8 @@ pub(super) struct SubmissionTicket {
 struct PendingSubmission { ticket: SubmissionTicket, rendered: bool }
 
 impl SubmissionTicket {
+    pub fn id(&self) -> &str { &self.key.submission_id }
+
     fn event(&self, op: Op, elapsed: Duration, outcome: Outcome) -> PerformanceMetricEvent {
         let mut event = duration_event(op, elapsed, outcome);
         event.correlation = Some(PerformanceMetricCorrelation { action_id: Some(self.key.submission_id.clone()), ..Default::default() });
