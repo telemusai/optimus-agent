@@ -14,6 +14,7 @@ mod jev_activity;
 struct JevBarState {
     session_id: String,
     status: Option<crate::modes::interactive::components::subagent_summary_line::RightStatus>,
+    response: Option<serde_json::Value>,
 }
 
 impl JevBarState {
@@ -21,6 +22,7 @@ impl JevBarState {
         if self.session_id != session_id {
             self.session_id = session_id;
             self.status = None;
+            self.response = None;
         }
     }
 
@@ -28,6 +30,17 @@ impl JevBarState {
         if self.session_id != session_id || self.status == status { return false; }
         self.status = status;
         true
+    }
+
+    fn poll_result(&mut self, session_id: &str, mode: pi_jev::config::JevMode, full: bool,
+        compaction: bool, result: Result<Option<serde_json::Value>, ()>) -> bool {
+        if self.session_id != session_id { return false; }
+        let delayed = match result {
+            Ok(response) => { self.response = response; false }
+            Err(()) => self.response.is_some(),
+        };
+        let status = jev_activity::status_with_freshness(mode, full, compaction, self.response.as_ref(), delayed);
+        self.update(session_id, status)
     }
 }
 
@@ -81,12 +94,11 @@ impl Bar {
                     let compaction = settings.effective_compaction_enabled(&session_id);
                     let response = if mode.is_enabled() || compaction {
                         tokio::time::timeout(Duration::from_secs(2), status_connection.get_jev_status())
-                            .await.ok().and_then(Result::ok).flatten()
-                    } else { None };
-                    let status = jev_activity::status(mode, settings.full_jev_active(), compaction, response.as_ref());
+                            .await.map_err(|_| ()).and_then(|result| result.map_err(|_| ()))
+                    } else { Ok(None) };
                     let changed = {
                         let mut state = jev.lock().unwrap_or_else(|e| e.into_inner());
-                        state.update(&session_id, status)
+                        state.poll_result(&session_id, mode, settings.full_jev_active(), compaction, response)
                     };
                     if changed && status_send.send(HostEvent::Render).is_err() { break; }
                 }
@@ -282,6 +294,37 @@ pub(super) fn project_child(
 #[cfg(test)]
 mod jev_bar_tests {
     use super::*;
+
+    #[test]
+    fn failed_stats_refresh_retains_counters_until_recovery_and_never_crosses_sessions() {
+        use pi_jev::config::JevMode;
+        let mut state = JevBarState::default();
+        state.select("a".into());
+        let reply = |requests| serde_json::json!({"pipeline": {"usage": pi_jev::telemetry::SessionUsage {
+            requests, input_tokens: Some(1200), output_tokens: Some(45), in_flight: 1,
+            activity: "searching".into(), ..Default::default()
+        }}});
+        assert!(state.poll_result("a", JevMode::Active, false, false, Ok(Some(reply(12)))));
+        assert!(state.status.as_ref().unwrap().full.contains("searching · 12 req"));
+        assert!(state.poll_result("a", JevMode::Active, false, false, Err(())));
+        let stale = state.status.as_ref().unwrap();
+        assert!(stale.full.contains("stats delayed · 12 req · 1.2k in/45 out"));
+        assert!(!stale.full.contains("searching"));
+        assert!(!state.poll_result("a", JevMode::Active, false, false, Err(())));
+        assert!(state.poll_result("a", JevMode::Active, false, false, Ok(Some(reply(13)))));
+        assert!(state.status.as_ref().unwrap().full.contains("searching · 13 req"));
+        state.select("b".into());
+        assert!(!state.poll_result("a", JevMode::Active, false, false, Ok(Some(reply(99)))));
+        assert!(state.poll_result("b", JevMode::Active, false, false, Err(())));
+        assert!(state.status.as_ref().unwrap().full.contains("stats unavailable"));
+        assert!(!state.status.as_ref().unwrap().full.contains("13 req"));
+        state.poll_result("b", JevMode::Active, false, false, Ok(Some(reply(1))));
+        state.poll_result("b", JevMode::Off, false, false, Ok(None));
+        assert!(state.response.is_none());
+        assert!(state.status.is_none());
+        state.poll_result("b", JevMode::Active, false, false, Err(()));
+        assert!(state.status.as_ref().unwrap().full.contains("stats unavailable"));
+    }
 
 
     #[test]

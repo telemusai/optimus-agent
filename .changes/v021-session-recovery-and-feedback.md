@@ -1,0 +1,5 @@
+- Fixed submitted prompts waiting for the daemon before appearing in chat; pending text now paints immediately and reconciles with confirmed messages and queue previews.
+- Fixed transient Jev status failures discarding known token and request counters; cached values now remain visible with a stats delayed indicator until polling recovers.
+- Fixed Python snapshots reopening captured file handles during recovery, which could truncate files; unsafe handles are skipped during capture and blocked before opening during restore.
+- Fixed malformed Bedrock event-stream frames panicking or consuming payload bytes as headers.
+- Fixed session header IDs and explicit new-session IDs accepting path components; invalid sessions are rejected without rewriting the file or switching the current session.

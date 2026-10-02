@@ -6,6 +6,51 @@ fn fixture_header() -> Value {
         "timestamp":"2026-01-01T00:00:00Z","cwd":"/fixture","rlmDepth":0})
 }
 
+#[tokio::test]
+async fn session_safety_rejects_path_ids_without_rewriting_or_switching() {
+    let dir = tempfile::tempdir().unwrap();
+    let safe = dir.path().join("safe.jsonl");
+    write_fixture(&safe, &[fixture_header(), fixture_message("safe", None)]);
+    let mut manager = SessionManager::open(&safe.to_string_lossy(), None, None).unwrap();
+    let old_id = manager.get_session_id();
+    let old_path = manager.get_session_file();
+    let old_entries = manager.get_entries();
+    for id in ["", ".", "..", "../escape", "/absolute", "nested/file", "nested\\file", "C:drive", "x\0y"] {
+        let file = dir.path().join("invalid.jsonl");
+        let mut header = fixture_header();
+        header["id"] = id.into();
+        let original = write_fixture(&file, &[header.clone(), fixture_message("keep", None)]);
+        assert!(serde_json::from_value::<SessionHeader>(header.clone()).is_err(), "{id:?}");
+        assert!(load_entries_from_file(&file.to_string_lossy()).is_empty());
+        for threshold in [None, Some(1)] {
+            assert!(load_entries_from_file_async(&file.to_string_lossy(), threshold).await.is_empty());
+        }
+        assert!(read_session_info(&file.to_string_lossy()).await.is_none());
+        assert!(SessionManager::open(&file.to_string_lossy(), None, None).is_err());
+        assert!(SessionManager::open_async(&file.to_string_lossy(), None, None).await.is_err());
+        for preloaded in [None, Some(vec![header.as_object().unwrap().clone()])] {
+            assert!(manager.set_session_file(&file.to_string_lossy(), preloaded, None).is_err());
+            assert_eq!(manager.get_session_id(), old_id);
+            assert_eq!(manager.get_session_file(), old_path);
+            assert_eq!(manager.get_entries(), old_entries);
+        }
+        assert!(manager.new_session(Some(&NewSessionOptions { id: Some(id.into()), ..Default::default() })).is_err());
+        assert_eq!(manager.get_session_id(), old_id);
+        assert_eq!(std::fs::read(&file).unwrap(), original);
+        // Leading malformed rows must not turn an invalid header into a destructive reset.
+        std::fs::write(&file, format!("\ninvalid row\n{}", String::from_utf8(original).unwrap())).unwrap();
+        let prefixed = std::fs::read(&file).unwrap();
+        assert!(SessionManager::open(&file.to_string_lossy(), None, None).is_err());
+        assert_eq!(std::fs::read(&file).unwrap(), prefixed);
+    }
+    for id in ["legacy-short", "01a0ea27-d4fd-72d3-b06c-f335feca382c", "sessión"] {
+        assert!(valid_session_id(id));
+        let mut header = fixture_header();
+        header["id"] = id.into();
+        assert!(serde_json::from_value::<SessionHeader>(header).is_ok());
+    }
+}
+
 fn fixture_message(id: &str, parent: Option<&str>) -> Value {
     serde_json::json!({"type":"message","id":id,"parentId":parent,
         "timestamp":"2026-01-01T00:00:01Z",

@@ -10,6 +10,8 @@ import pickle
 import time
 from typing import Any
 
+from .snapshot_safety import reject_file_handle
+
 
 class SnapshotPathMetrics:
     """Content-free counters for one freshly serialized variable."""
@@ -120,6 +122,7 @@ class _PrimitivePickler(pickle.Pickler):
         self._dill = dill
 
     def reducer_override(self, value: Any) -> Any:
+        reject_file_handle(value)
         # The C pickler bypasses this hook only for exact builtin primitives and
         # containers. Exact immutable standard-library values have the same
         # importable reducers under dill. Subclasses, custom tzinfo, closures and
@@ -198,11 +201,21 @@ def _dump_with_dill(
 ) -> None:
     """Keep dill's graph/reducer semantics, accelerating only builtin subgraphs."""
     pickler = dill.Pickler(writer, protocol=dill.settings["protocol"])
+    original_persistent_id = pickler.persistent_id
+
+    def persistent_id(obj: Any) -> Any:
+        reject_file_handle(obj)
+        return original_persistent_id(obj)
+
+    pickler.persistent_id = persistent_id
     original_save = pickler.save
     # A custom dispatch table may change even primitive values inside a graph.
     can_accelerate = _native_dispatch_compatible(dill) and pickler.proto >= 3
     if not can_accelerate:
-        pickler.dump(value)
+        try:
+            pickler.dump(value)
+        finally:
+            del pickler.persistent_id
         return
 
     def save(obj: Any, save_persistent_id: bool = True) -> None:
@@ -281,6 +294,7 @@ def _dump_with_dill(
         # The wrapper closes over this pickler and its memo. Do not retain the
         # entire snapshot graph until cyclic GC happens to run.
         del pickler.save
+        del pickler.persistent_id
 
 
 def dump_snapshot_value(

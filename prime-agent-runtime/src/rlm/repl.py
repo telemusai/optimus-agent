@@ -44,6 +44,7 @@ from .snapshot import (
 )
 from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
 from .snapshot_restore import ALWAYS_SKIP as _ALWAYS_SKIP, RESTORE_SKIP as _RESTORE_SKIP, prepare_restored_values
+from .snapshot_safety import load_snapshot_value
 
 PROTOCOL_VERSION = 3
 
@@ -962,7 +963,7 @@ def _restore_state(
         return {"error": f"dill unavailable: {err}"}
     try:
         with open(path, "rb") as fh:
-            payload = dill.load(fh)
+            payload = load_snapshot_value(dill, fh)
     except Exception as err:  # noqa: BLE001 - a corrupt snapshot yields an empty restore
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
@@ -974,7 +975,7 @@ def _restore_state(
         if name in _RESTORE_SKIP:
             continue
         try:
-            staged[name] = dill.loads(blob)
+            staged[name] = load_snapshot_value(dill, blob)
         except Exception as err:  # noqa: BLE001 - revive every other name regardless
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     prepared, backfill, revive_failed = prepare_restored_values(staged, ns, _RESTORE_SKIP)

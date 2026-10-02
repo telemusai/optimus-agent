@@ -1625,6 +1625,9 @@ pub fn decode_event_stream_frames(buffer: &mut Vec<u8>) -> Result<Vec<EventStrea
 			break;
 		}
 		let total_length = u32::from_be_bytes([buffer[0], buffer[1], buffer[2], buffer[3]]) as usize;
+		if !(16..=16 * 1024 * 1024).contains(&total_length) {
+			return Err(ProviderError::message("Invalid event stream frame length"));
+		}
 		if buffer.len() < total_length {
 			break;
 		}
@@ -1639,17 +1642,18 @@ fn decode_event_stream_frame(frame: &[u8]) -> Result<EventStreamFrame, ProviderE
 		return Err(ProviderError::message("Truncated event stream frame"));
 	}
 	let headers_length = u32::from_be_bytes([frame[4], frame[5], frame[6], frame[7]]) as usize;
-	let headers_end = 12 + headers_length;
-	if frame.len() < headers_end + 4 {
+	if headers_length > frame.len() - 16 {
 		return Err(ProviderError::message("Truncated event stream frame"));
 	}
+	let headers_end = 12 + headers_length;
+	let header_bytes = &frame[..headers_end];
 
 	let mut headers: IndexMap<String, String> = IndexMap::new();
 	let mut cursor = 12usize;
 	while cursor < headers_end {
 		let name_length = frame[cursor] as usize;
 		cursor += 1;
-		if cursor + name_length > headers_end {
+		if cursor + name_length >= headers_end {
 			return Err(ProviderError::message("Malformed event stream headers"));
 		}
 		let name = String::from_utf8_lossy(&frame[cursor..cursor + name_length]).to_string();
@@ -1659,9 +1663,15 @@ fn decode_event_stream_frame(frame: &[u8]) -> Result<EventStreamFrame, ProviderE
 		match header_type {
 			// 7 = string
 			7 => {
+				if cursor + 2 > headers_end {
+					return Err(ProviderError::message("Malformed event stream headers"));
+				}
 				let value_length =
-					u16::from_be_bytes([frame[cursor], frame[cursor + 1]]) as usize;
+					u16::from_be_bytes([header_bytes[cursor], header_bytes[cursor + 1]]) as usize;
 				cursor += 2;
+				if cursor + value_length > headers_end {
+					return Err(ProviderError::message("Malformed event stream headers"));
+				}
 				let value = String::from_utf8_lossy(&frame[cursor..cursor + value_length]).to_string();
 				cursor += value_length;
 				headers.insert(name, value);
@@ -1677,12 +1687,18 @@ fn decode_event_stream_frame(frame: &[u8]) -> Result<EventStreamFrame, ProviderE
 			// 5 = long, 8 = timestamp (8 bytes), 6 = byte array, 9 = uuid (16 bytes)
 			5 | 8 => cursor += 8,
 			6 => {
+				if cursor + 2 > headers_end {
+					return Err(ProviderError::message("Malformed event stream headers"));
+				}
 				let value_length =
-					u16::from_be_bytes([frame[cursor], frame[cursor + 1]]) as usize;
+					u16::from_be_bytes([header_bytes[cursor], header_bytes[cursor + 1]]) as usize;
 				cursor += 2 + value_length;
 			}
 			9 => cursor += 16,
 			_ => return Err(ProviderError::message("Unknown event stream header type")),
+		}
+		if cursor > headers_end {
+			return Err(ProviderError::message("Malformed event stream headers"));
 		}
 	}
 
@@ -3206,6 +3222,50 @@ mod tests {
 			}
 		);
 		assert!(buffer.is_empty());
+	}
+
+	#[test]
+	fn event_stream_rejects_invalid_lengths_and_truncated_headers() {
+		for total in [0u32, 1, 4, 15, 16 * 1024 * 1024 + 1, u32::MAX] {
+			assert!(decode_event_stream_frames(&mut total.to_be_bytes().to_vec()).is_err());
+		}
+		let mut oversized_headers = frame(&[], b"{}");
+		oversized_headers[4..8].copy_from_slice(&u32::MAX.to_be_bytes());
+		assert!(decode_event_stream_frames(&mut oversized_headers).is_err());
+
+		let malformed: &[&[u8]] = &[
+			&[1, b'x'], // missing type
+			&[2, b'x'], // incomplete name
+			&[1, b'x', 7], // missing string length
+			&[1, b'x', 7, 0],
+			&[1, b'x', 7, 0, 4, b'y'], // value extends into payload/CRC
+			&[1, b'x', 6], // missing byte-array length
+			&[1, b'x', 6, 0, 4, b'y'],
+			&[1, b'x', 2], &[1, b'x', 3, 0],
+			&[1, b'x', 4, 0], &[1, b'x', 5, 0],
+			&[1, b'x', 8, 0], &[1, b'x', 9, 0],
+		];
+		for headers in malformed {
+			let mut bytes = frame(&[], b"payload large enough to hide header overflow");
+			bytes.splice(12..12, headers.iter().copied());
+			let total = bytes.len() as u32;
+			bytes[..4].copy_from_slice(&total.to_be_bytes());
+			bytes[4..8].copy_from_slice(&(headers.len() as u32).to_be_bytes());
+			assert!(decode_event_stream_frames(&mut bytes).is_err(), "headers: {headers:?}");
+		}
+	}
+
+	#[test]
+	fn event_stream_preserves_frames_split_at_every_byte_boundary() {
+		let bytes = frame(&[(":event-type", "messageStart")], br#"{"role":"assistant"}"#);
+		for split in 0..bytes.len() {
+			let mut buffer = bytes[..split].to_vec();
+			assert!(decode_event_stream_frames(&mut buffer).unwrap().is_empty());
+			assert_eq!(buffer, bytes[..split]);
+			buffer.extend_from_slice(&bytes[split..]);
+			assert_eq!(decode_event_stream_frames(&mut buffer).unwrap().len(), 1);
+			assert!(buffer.is_empty());
+		}
 	}
 
 	#[test]

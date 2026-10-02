@@ -485,6 +485,30 @@ fn is_session_header(entry: &SessionEntry) -> bool {
     entry_type(entry) == "session"
 }
 
+fn valid_session_id(id: &str) -> bool {
+    !id.is_empty() && id != "." && id != ".."
+        && !id.chars().any(|ch| matches!(ch, '/' | '\\' | ':') || ch.is_control())
+}
+
+fn valid_session_header(header: &SessionEntry) -> bool {
+    is_session_header(header) && header.get("id").and_then(Value::as_str).is_some_and(valid_session_id)
+}
+
+fn validate_session_file_id(path: &str) -> Result<(), String> {
+    use std::io::BufRead;
+    let Ok(file) = std::fs::File::open(path) else { return Ok(()); };
+    // Like the loader, ignore blank/malformed rows before the first parsed entry.
+    for line in std::io::BufReader::new(file).lines() {
+        let line = line.map_err(|error| error.to_string())?;
+        let Ok(Value::Object(header)) = serde_json::from_str::<Value>(&line) else { continue; };
+        if is_session_header(&header) && !valid_session_header(&header) {
+            return Err("Invalid session id: expected a single nonempty file name component".into());
+        }
+        break;
+    }
+    Ok(())
+}
+
 fn json_stringify(value: &Value) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "null".to_string())
 }
@@ -1610,7 +1634,7 @@ fn finalize_loaded_entries(mut entries: Vec<FileEntry>) -> Vec<FileEntry> {
         return entries;
     }
     let header = &entries[0];
-    if entry_type(header) != "session" || header.get("id").and_then(Value::as_str).is_none() {
+    if !valid_session_header(header) {
         return Vec::new();
     }
     apply_child_usage_attributions(&mut entries);
@@ -1794,7 +1818,7 @@ pub async fn load_entries_from_file_async(
 fn read_session_header(file_path: &str) -> Option<Map<String, Value>> {
     let first_line = read_first_line_sync(file_path, 0)?;
     let parsed = serde_json::from_str::<Value>(&first_line).ok()?;
-    parsed.as_object().cloned()
+    parsed.as_object().filter(|header| valid_session_header(header)).cloned()
 }
 
 fn header_rlm_depth(header: &Map<String, Value>) -> Option<i64> {
@@ -2626,7 +2650,7 @@ fn fold_session_scan_line(acc: &mut SessionScanAccumulator, line_buffer: &[u8]) 
         }
     }
     if acc.header.is_none() {
-        if entry_type(&entry) != "session" {
+        if !valid_session_header(&entry) {
             acc.invalid = true;
             return;
         }
@@ -3038,6 +3062,7 @@ pub struct SessionHeader {
     /// v1 sessions don't have this.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub version: Option<i64>,
+    #[serde(deserialize_with = "deserialize_session_id")]
     pub id: String,
     pub timestamp: String,
     pub cwd: String,
@@ -3047,6 +3072,12 @@ pub struct SessionHeader {
     pub rlm_depth: Option<i64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub git: Option<GitContext>,
+}
+
+fn deserialize_session_id<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<String, D::Error> {
+    let id = <String as serde::Deserialize>::deserialize(deserializer)?;
+    if valid_session_id(&id) { Ok(id) }
+    else { Err(serde::de::Error::custom("Invalid session id: expected a single nonempty file name component")) }
 }
 
 #[derive(Debug, Clone, Default)]
@@ -3358,6 +3389,11 @@ impl SessionManager {
         preloaded_observation: Option<SessionLoadObservation>,
     ) -> Result<(), String> {
         let session_file = resolve_path(session_file);
+        validate_session_file_id(&session_file)?;
+        if preloaded_entries.as_ref().and_then(|entries| entries.first())
+            .is_some_and(|header| is_session_header(header) && !valid_session_header(header)) {
+            return Err("Invalid preloaded session id".into());
+        }
         // Failure must leave the previous manager writable only at its old path.
         // Public preloaded callers cannot bypass the required repair gate.
         let repaired = self.persist && Path::new(&session_file).exists()
@@ -3441,10 +3477,13 @@ impl SessionManager {
         &mut self,
         options: Option<&NewSessionOptions>,
     ) -> Result<Option<String>, String> {
-        self.load_observation = None;
         let mut session_id = options
             .and_then(|options| options.id.clone())
             .unwrap_or_else(create_session_id);
+        if !valid_session_id(&session_id) {
+            return Err("Invalid session id: expected a single nonempty file name component".into());
+        }
+        self.load_observation = None;
         let mut session_file: Option<String> = None;
         let has_explicit_rlm_depth = options
             .map(NewSessionOptions::has_explicit_rlm_depth)
@@ -4887,6 +4926,7 @@ impl SessionManager {
         if !Path::new(path).exists() {
             return SessionManager::open(path, session_dir, cwd_override);
         }
+        validate_session_file_id(path)?;
         repair_jsonl_damage(path)?;
         let loaded = load_entries_from_file_async_observed(path, None).await;
         if loaded.entries.is_empty() {

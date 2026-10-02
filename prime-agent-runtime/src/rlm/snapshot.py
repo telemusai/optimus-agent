@@ -25,6 +25,7 @@ from typing import Any
 
 from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
 from .snapshot_restore import prepare_restored_values
+from .snapshot_safety import load_snapshot_value
 
 CAS_FORMAT = "prime-agent-kernel-snapshot-cas"
 CAS_VERSION = 2
@@ -934,7 +935,7 @@ def restore_cas_v2(
                 if name in restore_skip:
                     continue
                 try:
-                    staged[name] = dill.loads(blobs[name])
+                    staged[name] = load_snapshot_value(dill, blobs[name])
                 except Exception as error:
                     failed.append({"name": name, "reason": f"{type(error).__name__}: {_safe_str(error)[:200]}"})
 
