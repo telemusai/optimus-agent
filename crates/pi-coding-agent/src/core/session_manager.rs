@@ -4265,13 +4265,18 @@ impl SessionManager {
             Some(git) => git,
             None => return Ok(None),
         };
+        self.record_captured_git_state(&git)
+    }
+
+    pub(crate) fn record_captured_git_state(&mut self, git: &GitContext) -> Result<Option<String>, String> {
+        if !self.persist { return Ok(None); }
         let last = self.get_active_git_context();
         if let Some(last) = last {
-            if git_contexts_equal(&last, &git) {
+            if git_contexts_equal(&last, git) {
                 return Ok(None);
             }
         }
-        self.append_git_state(&git).map(Some)
+        self.append_git_state(git).map(Some)
     }
 
     fn get_active_git_context(&self) -> Option<GitContext> {

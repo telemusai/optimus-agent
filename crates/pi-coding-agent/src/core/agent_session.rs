@@ -24,6 +24,8 @@
 #[path = "agent_session/agent_handle.rs"]
 mod agent_handle;
 mod execution_mode;
+#[path = "agent_session/git_state.rs"]
+mod git_state;
 #[cfg(test)]
 #[path = "agent_session/rlm_result_delivery_tests.rs"]
 mod rlm_result_delivery_tests;
@@ -7653,20 +7655,12 @@ impl AgentSession {
         match event {
             AgentEvent::AgentStart => {
                 self.turn_index.store(0, Ordering::SeqCst);
-                let _ = self
-                    .session_manager
-                    .lock()
-                    .unwrap()
-                    .record_git_state_if_changed();
+                git_state::record(self.session_manager.clone()).await;
                 let _ = runner.emit(ExtensionEvent::AgentStart).await;
             }
             AgentEvent::AgentEnd { messages } => {
                 // Also capture at end of turn so commits made during the run (e.g. via a bash tool) land.
-                let _ = self
-                    .session_manager
-                    .lock()
-                    .unwrap()
-                    .record_git_state_if_changed();
+                git_state::record(self.session_manager.clone()).await;
                 let values = messages
                     .iter()
                     .map(|message| serde_json::to_value(message).unwrap_or(Value::Null))

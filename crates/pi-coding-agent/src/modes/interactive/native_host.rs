@@ -72,6 +72,10 @@ mod native_history;
 mod native_queue;
 #[path = "native_host_neon.rs"]
 mod native_neon;
+#[path = "native_host_live_preview.rs"]
+mod native_live_preview;
+#[path = "native_host_stash_restore.rs"]
+mod native_stash_restore;
 #[path = "native_host_settings.rs"]
 mod native_settings;
 #[path = "native_host_state.rs"]
@@ -157,6 +161,8 @@ impl<T: TuiComponent> TuiComponent for SharedComponent<T> {
 }
 
 struct Transcript {
+    live_preview: native_live_preview::LivePreview,
+    pending_stash_restore: Option<native_stash_restore::PendingRestore>,
     clipboard_notice: native_clipboard::Notice,
     recovery_notices: Vec<Rc<RefCell<native_recovery_notice::RecoveryNotice>>>,
     refinement_outcomes: Vec<Rc<RefCell<RefinementOutcomeMessageComponent>>>,
@@ -273,6 +279,8 @@ impl Transcript {
 
     fn new(mode: Rc<RefCell<InteractiveMode>>) -> Self {
         Self {
+            live_preview: native_live_preview::LivePreview::default(),
+            pending_stash_restore: None,
             clipboard_notice: native_clipboard::Notice::default(),
             recovery_notices: Vec::new(),
             refinement_outcomes: Vec::new(),
@@ -302,6 +310,8 @@ impl Transcript {
         }
     }
     fn replace(&mut self, messages: Vec<AgentMessage>) {
+        self.live_preview = native_live_preview::LivePreview::default();
+        self.pending_stash_restore = None;
         self.local_receipts.clear();
         self.timeline_cache.clear();
         self.history = None;
@@ -1435,6 +1445,9 @@ fn apply_history_snapshot(
 ) -> Option<String> {
     let error = history_runtime.reset(history, messages, transcript, editor, viewport);
     if let Some(message) = streaming_message {
+        if let AgentMessage::Message(pi_ai::types::Message::Assistant(assistant)) = &message {
+            transcript.borrow_mut().live_preview.update(assistant, true);
+        }
         transcript.borrow_mut().message(message, true);
     }
     error
@@ -2713,7 +2726,11 @@ async fn run_terminal(
                     Err(error) => mode.borrow_mut().show_error(&error),
                 },
                 HostEvent::SubmissionReply(ticket, result) => {
-                    if apply_submission_reply(&mode, &transcript, &mut ui_metrics, &ticket, result) {
+                    let success = result.is_ok();
+                    let current = apply_submission_reply(&mode, &transcript, &mut ui_metrics, &ticket, result);
+                    native_stash_restore::finish(&mut transcript.borrow_mut().pending_stash_restore,
+                        ticket.id(), current && success, &mode, &editor);
+                    if current {
                         state_refresh.request(connection.clone(), current_session_id.clone());
                     }
                 }
@@ -3431,12 +3448,14 @@ fn submit_from_editor(
     transcript: &Rc<RefCell<Transcript>>,
 ) {
     let ticket = submission_is_prompt(&text).then(|| metrics.begin_submission());
+    transcript.borrow_mut().pending_stash_restore = None;
     // Commands can complete without a user-message event. Preview only ordinary
     // prompts; their text is painted before any daemon work or network await.
     if let Some(ticket) = &ticket {
         if !text.trim_start().starts_with('/') {
             let mut transcript = transcript.borrow_mut();
             let mode = transcript.mode.clone();
+            transcript.pending_stash_restore = native_stash_restore::capture(&mode.borrow(), ticket.id());
             transcript.local_receipts.begin(ticket.id(), &text, &mode.borrow());
         }
     }
@@ -4710,6 +4729,7 @@ fn apply_event(
     event: wire::AgentConnectionSessionEvent,
 ) {
     native_state::track_activity(&mut mode.borrow_mut(), &event);
+    transcript.borrow_mut().live_preview.observe(&event);
     let kind = event.type_name();
     if matches!(kind, "message_start" | "message_update" | "message_end") {
         if let Some(message) = project_message_event(event) {

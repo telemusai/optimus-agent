@@ -17,6 +17,8 @@ mod native_server;
 
 #[path = "daemon_subagents.rs"]
 mod daemon_subagents;
+#[path = "daemon_passivation_fence.rs"]
+mod daemon_passivation_fence;
 
 #[path = "agent_message_transport.rs"]
 mod agent_message_transport;
@@ -13099,17 +13101,8 @@ impl AgentDaemon {
                 .map(|entry| Arc::ptr_eq(&entry.state, state))
                 .unwrap_or(false)
         };
-        if self.shutting_down.load(Ordering::SeqCst)
-            || self
-                .update_restart
-                .lock()
-                .expect("update restart poisoned")
-                .is_some()
-            || !residency(self)
-        {
-            return false;
-        }
-        let fresh = self.session_passivation_snapshot(state, None).await;
+        let Some(fresh) = self.fenced_passivation_snapshot(state, active_session_id,
+            self.session_passivation_snapshot(state, None)).await else { return false; };
         if !can_passivate_session(&fresh, idle_eviction_minutes, now) {
             return false;
         }

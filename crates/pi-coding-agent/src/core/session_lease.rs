@@ -390,8 +390,42 @@ pub fn get_process_start_id(pid: i64) -> Option<String> {
             }
         }
     }
+    // A missing /proc entry is common when sweeping dead workers. Do not spawn
+    // ps for each one; retain the fallback for live but inaccessible processes.
+    #[cfg(target_os = "linux")]
+    if !is_process_alive(pid) {
+        return None;
+    }
     // Fall through to the portable process listing used on macOS and BSD.
     get_ps_process_start_id(pid, None)
+}
+
+#[cfg(all(test, target_os = "linux"))]
+#[test]
+fn dead_process_identity_never_launches_ps() {
+    const CHILD: &str = "OPTIMUS_DEAD_PID_PROBE_TEST";
+    if let Ok(pid) = std::env::var(CHILD) {
+        assert!(get_process_start_id(pid.parse().unwrap()).is_none());
+        assert!(get_process_start_id(i64::MAX).is_none());
+        assert!(get_process_start_id(std::process::id() as i64).unwrap().starts_with("proc:"));
+        return;
+    }
+    use std::os::unix::fs::PermissionsExt;
+    let root = tempfile::tempdir().unwrap();
+    let fake_ps = root.path().join("ps");
+    std::fs::write(&fake_ps, "#!/bin/sh\nprintf called > \"$OPTIMUS_PS_SENTINEL\"\n").unwrap();
+    std::fs::set_permissions(&fake_ps, std::fs::Permissions::from_mode(0o755)).unwrap();
+    let mut exited = std::process::Command::new("/bin/sh").args(["-c", "exit 0"]).spawn().unwrap();
+    let pid = exited.id();
+    exited.wait().unwrap();
+    let marker = root.path().join("called");
+    let output = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "core::session_lease::dead_process_identity_never_launches_ps", "--nocapture"])
+        .env(CHILD, pid.to_string()).env("PATH", root.path()).env("OPTIMUS_PS_SENTINEL", &marker)
+        .output().unwrap();
+    assert!(output.status.success(), "{}{}", String::from_utf8_lossy(&output.stdout), String::from_utf8_lossy(&output.stderr));
+    assert!(String::from_utf8_lossy(&output.stdout).contains("1 passed"));
+    assert!(!marker.exists(), "dead PID check must avoid invoking ps");
 }
 
 fn get_current_process_start_id() -> Option<String> {
@@ -408,7 +442,8 @@ fn is_process_alive(pid: i64) -> bool {
     }
     #[cfg(unix)]
     {
-        if unsafe { libc::kill(pid as libc::pid_t, 0) } == 0 {
+        let Ok(pid) = libc::pid_t::try_from(pid) else { return false; };
+        if unsafe { libc::kill(pid, 0) } == 0 {
             return true;
         }
         return io::Error::last_os_error().raw_os_error() == Some(libc::EPERM);
