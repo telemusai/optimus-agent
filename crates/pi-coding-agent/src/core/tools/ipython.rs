@@ -26,6 +26,10 @@ use crate::utils::mime::is_image_mime_type;
 use super::tool_definition_wrapper::wrap_tool_definition;
 use super::{ExtensionContext, ToolDefinition, ToolExecuteFn};
 
+#[path = "ipython_lifecycle.rs"]
+mod lifecycle;
+use lifecycle::{SharedStop, StartupAdmission};
+
 const UNSAFE_WINDOWS_CAPTURED_LAUNCHER_MESSAGE: &str =
     "A persistent PowerShell launcher must not use subprocess.run(..., capture_output=True) on Windows: \
 a long-lived child can inherit the captured pipes and prevent the Python call from returning. \
@@ -462,6 +466,8 @@ pub struct IpythonKernelProvisioner {
     cwd: String,
     options: Option<IpythonToolOptions>,
     factory: KernelClientFactory,
+    /// Serializes generation changes and retains the single in-flight teardown.
+    lifecycle: Mutex<Option<SharedStop>>,
     manager_promise: Mutex<Option<Arc<StartupHandle>>>,
     started_manager: Mutex<Option<Arc<dyn KernelClient>>>,
     startup_listeners: Mutex<Vec<KernelBootstrapProgressHandler>>,
@@ -523,6 +529,7 @@ impl IpythonKernelProvisioner {
             cwd: cwd.to_string(),
             options,
             factory,
+            lifecycle: Mutex::new(None),
             manager_promise: Mutex::new(None),
             started_manager: Mutex::new(None),
             startup_listeners: Mutex::new(Vec::new()),
@@ -605,7 +612,10 @@ impl IpythonKernelProvisioner {
         }
         let handle = self.manager_promise.lock().expect("manager promise lock").clone();
         match handle {
-            Some(handle) => handle.wait().await.ok(),
+            Some(handle) => {
+                let manager = handle.wait().await.ok()?;
+                self.is_current_startup(&handle).then_some(manager)
+            }
             None => None,
         }
     }
@@ -622,8 +632,12 @@ impl IpythonKernelProvisioner {
         }
         let deadline = tokio::time::Instant::now() + std::time::Duration::from_millis(timeout_ms.min(10000));
         let (startups, clients) = {
+            let _lifecycle = self.lifecycle.lock().unwrap();
             let mut ownership = self.ownership.lock().unwrap();
             ownership.fenced = true;
+            *self.manager_promise.lock().unwrap() = None;
+            *self.started_manager.lock().unwrap() = None;
+            self.settle_startup();
             (ownership.startups.clone(), ownership.clients.clone())
         };
         *self.dispose_snapshot.lock().unwrap() = false;
@@ -696,25 +710,7 @@ impl IpythonKernelProvisioner {
 
     /// Dispose the kernel owned by this provisioner, including one still starting up.
     pub async fn dispose(&self, snapshot: Option<bool>) {
-        *self.dispose_snapshot.lock().expect("dispose snapshot lock") = snapshot.unwrap_or(true);
-        // Drops a still-queued boot out of the semaphore and short-circuits an
-        // in-flight startKernel before it spawns, so a disposed session's boot
-        // doesn't waste a slot during a fan-out.
-        self.dispose_controller.abort(None);
-        // A replacement may never start, but still owns the old kernel's shutdown.
-        if let Some(ready_gate) = self.options.as_ref().and_then(|options| options.ready_gate.clone()) {
-            ready_gate().await;
-        }
-        let pending = self.manager_promise.lock().expect("manager promise lock").take();
-        *self.started_manager.lock().expect("started manager lock") = None;
-        let Some(pending) = pending else {
-            return;
-        };
-        // a failed startup already cleaned up after itself
-        if let Ok(manager) = pending.wait().await {
-            let snapshot = *self.dispose_snapshot.lock().expect("dispose snapshot lock");
-            let _ = manager.shutdown(snapshot, true).await;
-        }
+        let _ = self.begin_stop(Some(snapshot.unwrap_or(true))).await;
     }
 
     /// Begin disposal immediately, while allowing every replacement to await the same flush.
@@ -728,15 +724,7 @@ impl IpythonKernelProvisioner {
     }
 
     pub async fn kill(&self) {
-        let pending = self.manager_promise.lock().expect("manager promise lock").take();
-        *self.started_manager.lock().expect("started manager lock") = None;
-        let Some(pending) = pending else {
-            return;
-        };
-        // a failed startup already cleaned up after itself
-        if let Ok(manager) = pending.wait().await {
-            let _ = manager.kill().await;
-        }
+        let _ = self.begin_stop(None).await;
     }
 
     pub async fn ensure(
@@ -747,25 +735,11 @@ impl IpythonKernelProvisioner {
         if signal.as_ref().map(|signal| signal.is_aborted()).unwrap_or(false) {
             return Err(create_abort_error());
         }
-        let (handle, launch_startup) = {
-            let mut ownership = self.ownership.lock().unwrap();
-            if ownership.fenced {
-                return Err(KernelError::new("Kernel provisioner retained-stop fence"));
-            }
-            // Only terminally dead kernels drop the memo; repair still reuses it.
-            let started_defunct = self.manager().map(|manager| manager.is_defunct()).unwrap_or(false);
-            let mut memo = self.manager_promise.lock().expect("manager promise lock");
-            if started_defunct {
-                *memo = None;
-                *self.started_manager.lock().expect("started manager lock") = None;
-            }
-            match memo.as_ref() {
-                Some(handle) => (handle.clone(), false),
-                None => {
-                    let handle = Arc::new(StartupHandle::new());
-                    *memo = Some(handle.clone());
-                    ownership.startups.push(handle.clone());
-                    (handle, true)
+        let (handle, launch_startup) = loop {
+            match self.admit_startup()? {
+                StartupAdmission::Ready(handle, launch) => break (handle, launch),
+                StartupAdmission::Stopping(stop) => {
+                    race_with_abort(stop, signal.clone(), None).await?;
                 }
             }
         };
@@ -798,41 +772,13 @@ impl IpythonKernelProvisioner {
             let startup_signal = signal.clone();
             let startup_task = self.owned_tasks.spawn(async move {
                 let outcome = provisioner.start_kernel(startup_signal).await;
-                let failed = outcome.is_err();
-                if !failed {
-                    if let Ok(manager) = outcome.as_ref() {
-                        let is_current = provisioner
-                            .manager_promise
-                            .lock()
-                            .expect("manager promise lock")
-                            .as_ref()
-                            .map(|current| Arc::ptr_eq(current, &startup_handle))
-                            .unwrap_or(false);
-                        if is_current {
-                            *provisioner.started_manager.lock().expect("started manager lock") =
-                                Some(manager.clone());
-                        }
-                    }
-                } else {
-                    // Clear the memo so the next ensure() retries instead of
-                    // rethrowing a cached rejection forever.
-                    let is_current = provisioner
-                        .manager_promise
-                        .lock()
-                        .expect("manager promise lock")
-                        .as_ref()
-                        .map(|current| Arc::ptr_eq(current, &startup_handle))
-                        .unwrap_or(false);
-                    if is_current {
-                        *provisioner.manager_promise.lock().expect("manager promise lock") = None;
-                    }
-                }
-                provisioner.settle_startup();
+                provisioner.complete_startup(&startup_handle, &outcome);
                 startup_handle.settle(outcome).await;
             }, false, true);
             if let Err(error) = startup_task {
-                handle.settle(Err(KernelError::new(error))).await;
-                self.settle_startup();
+                let outcome = Err(KernelError::new(error));
+                self.complete_startup(&handle, &outcome);
+                handle.settle(outcome).await;
                 if let Some(listener) = cleanup_progress_listener { listener.remove(); }
                 return Err(KernelError::new(error));
             }
@@ -849,6 +795,9 @@ impl IpythonKernelProvisioner {
         }
         if self.ownership.lock().unwrap().fenced {
             return Err(KernelError::new("Kernel provisioner retained-stop fence"));
+        }
+        if result.is_ok() && !self.is_current_startup(&handle) {
+            return Err(KernelError::new("Kernel startup was superseded by shutdown"));
         }
         result
     }

@@ -1,0 +1,5 @@
+- Fixed overlapping Python kernel startup and teardown, late publication of retired kernels, and concurrent disposal returning before the snapshot flush.
+- Fixed idle-child passivation continuing after shutdown, update restart, or session replacement began during snapshot collection.
+- Fixed Git probes blocking the session lock at turn boundaries; delayed results are discarded after session or branch changes.
+- Fixed stashed prompts not returning after accepted submissions while preserving newer drafts, images, and pasted content.
+- Fixed Linux dead-process checks spawning unnecessary ps subprocesses and rejected process IDs outside the platform PID range.

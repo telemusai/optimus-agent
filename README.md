@@ -493,6 +493,8 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 
 ## Everyday commands
 
+Use **Ctrl+S** to stash an unfinished prompt. After an ordinary prompt is accepted, the saved draft returns to an empty input box, including pasted content and image markers. Rejected submissions, session changes and newly typed text leave the stash intact.
+
 | Command | Purpose |
 | --- | --- |
 | `/login` | Configure provider authentication |
