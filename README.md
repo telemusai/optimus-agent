@@ -493,8 +493,6 @@ On first launch, use `/login` to configure a provider, `/model` to select a mode
 
 ## Everyday commands
 
-The fullscreen session header includes a compact **live output panel** in its upper right. It follows the latest text or generated code, including Python, JavaScript, C++ and direct tool arguments, without expanding tool JSON. The count is the provider-reported output tokens for the current response; **tokens pending** means the provider has not reported usage yet. Completed responses are labelled **LAST OUTPUT** until the next turn. The preview uses terminal text, follows the selected theme, and shrinks or hides on small terminals to preserve space for the chat and input. It makes no additional model requests.
-
 Use **Ctrl+S** to stash an unfinished prompt. After an ordinary prompt is accepted, the saved draft returns to an empty input box, including pasted content and image markers. Rejected submissions, session changes and newly typed text leave the stash intact.
 
 | Command | Purpose |

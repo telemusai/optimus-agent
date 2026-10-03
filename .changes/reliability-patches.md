@@ -1,4 +1,3 @@
-- Added a bounded live text/code preview in the session header with provider-reported output tokens, responsive sizing, and theme colours.
 - Fixed overlapping Python kernel startup and teardown, late publication of retired kernels, and concurrent disposal returning before the snapshot flush.
 - Fixed idle-child passivation continuing after shutdown, update restart, or session replacement began during snapshot collection.
 - Fixed Git probes blocking the session lock at turn boundaries; delayed results are discarded after session or branch changes.

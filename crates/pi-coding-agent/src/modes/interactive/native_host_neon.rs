@@ -323,12 +323,9 @@ impl TuiComponent for Header {
             .and_then(|t| t.borrow().subagents.clone())
             .and_then(|bar| bar.borrow().compact_jev_status());
         let execution = execution_label(&mode);
-        let transcript = self.1.upgrade();
-        let preview_height = transcript.as_ref()
-            .map(|t| t.borrow().live_preview.height(width as usize, height)).unwrap_or(0);
-        let mut rows = render_header(
+        render_header(
             width as usize,
-            height - preview_height,
+            height,
             &HeaderData {
                 cwd: &mode.get_current_cwd(),
                 session: mode
@@ -344,13 +341,7 @@ impl TuiComponent for Header {
                 jev: jev.as_deref(),
                 clock: &chrono::Local::now().format("%H:%M:%S").to_string(),
             },
-        );
-        if preview_height > 0 {
-            let separator = rows.pop();
-            rows.extend(transcript.unwrap().borrow().live_preview.render(width as usize, preview_height));
-            rows.extend(separator);
-        }
-        rows
+        )
     }
     fn invalidate(&mut self) {}
 }
