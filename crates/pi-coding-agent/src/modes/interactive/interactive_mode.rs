@@ -1317,6 +1317,9 @@ struct CompactionNotice {
     text: Text,
 }
 
+#[path = "interactive_mode_transient_errors.rs"]
+mod transient_errors;
+
 impl super::interactive_mode_services::Component for CompactionNotice {
     fn render(&self, width: usize) -> Vec<String> {
         let mut lines = vec![String::new()];
@@ -1406,6 +1409,7 @@ pub struct InteractiveMode {
 
     last_status_spacer_index: Option<usize>,
     last_status_text_index: Option<usize>,
+    next_error_expiry: Option<std::time::Instant>,
     restored_draft_notice: std::rc::Rc<std::cell::RefCell<Option<String>>>,
     last_goal_announcement: Option<GoalAnnouncementSnapshot>,
 
@@ -1548,6 +1552,7 @@ impl InteractiveMode {
             anthropic_subscription_warning_shown: false,
             last_status_spacer_index: None,
             last_status_text_index: None,
+            next_error_expiry: None,
             restored_draft_notice: std::rc::Rc::new(std::cell::RefCell::new(None)),
             last_goal_announcement: None,
             feature_hint_deck: FeatureHintDeck::default(),
@@ -4240,21 +4245,9 @@ impl InteractiveMode {
         }
     }
 
-    /// Port of `showError` (interactive-mode.ts:7672-7676).
-    ///
-    /// Errors always append a fresh spacer + line and never coalesce, so the
-    /// `Error: ` prefix is never overwritten by a later status.
+    /// Show a temporary error without coalescing it into a status message.
     pub fn show_error(&mut self, message: &str) {
-        self.chat_container
-            .add_child(Box::new(super::interactive_mode_services::Spacer::new(1)));
-        self.chat_container.add_child(Box::new(Text::new(
-            theme().fg("error", &format!("Error: {message}")),
-            1,
-            0,
-        )));
-        self.last_status_spacer_index = None;
-        self.last_status_text_index = None;
-        self.ui.request_render();
+        self.show_error_at(message, std::time::Instant::now());
     }
 
     /// Port of `showWarning` (interactive-mode.ts:7678-7682).
@@ -4858,7 +4851,7 @@ mod tests {
 
     /// Reads back the rendered text of the chat container, matching the TS test
     /// helper `renderLastLine` (interactive-mode-status.test.ts:167-205).
-    fn chat_lines(mode: &InteractiveMode) -> Vec<String> {
+    pub(super) fn chat_lines(mode: &InteractiveMode) -> Vec<String> {
         mode.chat_container.children.iter().flat_map(|child| child.render(80)).collect()
     }
 
@@ -4915,7 +4908,7 @@ mod tests {
         mode.show_status("first", "dim");
         mode.show_error("boom");
         mode.show_status("second", "dim");
-        assert_eq!(mode.chat_container.len(), 6);
+        assert_eq!(mode.chat_container.len(), 5);
         let joined = chat_lines(&mode).join("\n");
         assert!(joined.contains("first"));
         assert!(joined.contains("Error: boom"));
@@ -5390,7 +5383,7 @@ mod tests {
     }
 
     /// A minimal mode with no connection: enough for the pure helpers above.
-    fn test_mode() -> InteractiveMode {
+    pub(super) fn test_mode() -> InteractiveMode {
         let services = InteractiveModeUiServices {
             settings_manager: Arc::new(Mutex::new(
                 super::super::interactive_mode_services::SettingsManager::in_memory(serde_json::Map::new()),

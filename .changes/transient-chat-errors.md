@@ -1,0 +1,1 @@
+- Request errors such as “Kiro network request failed” and temporary command errors now disappear from chat after five seconds, including while idle. Partial replies and saved diagnostic data are preserved; old request-error decorations do not reappear when resuming a chat.

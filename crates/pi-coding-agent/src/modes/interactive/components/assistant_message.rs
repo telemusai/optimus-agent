@@ -334,6 +334,7 @@ pub struct AssistantMessageComponent {
     mermaid_transform: Option<Rc<MermaidMarkdownTransform>>,
     base_url: Option<String>,
     is_streaming: bool,
+    error_dismissed: bool,
     container: Container,
 }
 
@@ -372,6 +373,7 @@ impl AssistantMessageComponent {
             mermaid_transform: options.mermaid_transform,
             base_url,
             is_streaming: false,
+            error_dismissed: false,
             container,
         };
 
@@ -406,6 +408,19 @@ impl AssistantMessageComponent {
         self.last_message = Some(message);
         self.is_streaming = is_streaming;
         self.dirty = true;
+    }
+
+    /// Hide only the request-error decoration, preserving the message and any
+    /// partial text, thinking, or tool output for history and diagnostics.
+    pub(crate) fn dismiss_request_error(&mut self) -> bool {
+        if self.error_dismissed || self.last_message.as_ref()
+            .is_none_or(|message| message.stop_reason != pi_ai::types::STOP_REASON_ERROR)
+        {
+            return false;
+        }
+        self.error_dismissed = true;
+        self.dirty = true;
+        true
     }
 
     /// Port of `computeSignature`.
@@ -448,6 +463,7 @@ impl AssistantMessageComponent {
         parts.push(format!("hide:{}", self.hide_thinking_block));
         parts.push(format!("label:{}", self.hidden_thinking_label));
         parts.push(format!("expanded:{}", self.expanded));
+        parts.push(format!("error_dismissed:{}", self.error_dismissed));
         // In the signature so the streaming->final transition rebuilds (mermaid
         // renders differently).
         parts.push(format!("streaming:{}", self.is_streaming));
@@ -641,7 +657,7 @@ impl AssistantMessageComponent {
                 .add_child(Rc::new(RefCell::new(Spacer::new(1))) as Rc<RefCell<dyn Component>>);
             let component = self.create_error_component(&abort_message, None);
             self.content_container.borrow_mut().add_child(component);
-        } else if !has_tool_calls && message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
+        } else if !self.error_dismissed && !has_tool_calls && message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
             let error_msg = match &message.error_message {
                 Some(error_message) if !error_message.is_empty() => error_message.clone(),
                 _ => "Unknown error".to_string(),
@@ -989,6 +1005,32 @@ mod tests {
         component.update_content(message, false);
         let text = plain(&component.render(80.0));
         assert!(text.contains("Error: boom"));
+    }
+
+    #[test]
+    fn dismissing_request_error_only_changes_presentation() {
+        init();
+        let mut component = component();
+        let mut message = assistant(vec![text("Partial answer")], "error");
+        message.error_message = Some("Kiro network request failed".into());
+        let stored = serde_json::to_value(&message).unwrap();
+        component.update_content(message, false);
+        assert!(plain(&component.render(80.0)).contains("Kiro network request failed"));
+        assert!(component.dismiss_request_error());
+        for expanded in [true, false] {
+            component.set_expanded(expanded);
+            component.invalidate();
+            let visible = plain(&component.render(80.0));
+            assert!(visible.contains("Partial answer"));
+            assert!(!visible.contains("Kiro network request failed"));
+            assert_eq!(serde_json::to_value(component.last_message.as_ref().unwrap()).unwrap(), stored);
+        }
+        assert!(!component.dismiss_request_error());
+        let mut cancelled = assistant(Vec::new(), "aborted");
+        cancelled.error_message = Some("Request was aborted".into());
+        component.update_content(cancelled, false);
+        assert!(!component.dismiss_request_error());
+        assert!(plain(&component.render(80.0)).contains("Operation aborted"));
     }
 
     #[test]
