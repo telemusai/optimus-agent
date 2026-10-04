@@ -33,6 +33,7 @@ use pi_ai::types::{
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use serde_json::Value;
 
+use crate::core::compaction::charcount::{count_chars, scan_chars_forward};
 use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::metrics::CompactionMetrics;
 use crate::core::compaction::utils::{
@@ -142,8 +143,10 @@ impl CompactionSessionEntry {
     }
 }
 
-/// `buildSessionContext(entries).messages`.
-pub type SessionContextBuilder<'a> = &'a dyn Fn(&[CompactionSessionEntry]) -> Vec<AgentMessage>;
+/// `buildSessionContext(entries).messages`, reduced to the token estimate the
+/// preparation needs. Returning the estimate lets callers that already hold
+/// the active context measure it without cloning the message list.
+pub type SessionContextBuilder<'a> = &'a dyn Fn(&[CompactionSessionEntry]) -> f64;
 
 // ---------------------------------------------------------------------------
 // Retry policy surface used by the summary call sites
@@ -782,11 +785,11 @@ fn ceil_div4(chars: usize) -> f64 {
 
 fn content_chars(content: &CustomMessageContent) -> usize {
     match content {
-        CustomMessageContent::Text(text) => text.chars().count(),
+        CustomMessageContent::Text(text) => count_chars(text),
         CustomMessageContent::Blocks(blocks) => blocks
             .iter()
             .map(|block| match block {
-                pi_agent_core::types::ContentBlock::Text(text) => text.text.chars().count(),
+                pi_agent_core::types::ContentBlock::Text(text) => count_chars(&text.text),
                 pi_agent_core::types::ContentBlock::Image(_) => 4800,
             })
             .sum(),
@@ -802,12 +805,12 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
                 return provider_context.estimated_tokens;
             }
             let chars = match &user.content {
-                pi_ai::types::UserContent::Text(text) => text.chars().count(),
+                pi_ai::types::UserContent::Text(text) => count_chars(text),
                 pi_ai::types::UserContent::Blocks(blocks) => blocks
                     .iter()
                     .filter_map(|block| match block {
                         pi_ai::types::ImageOrTextContent::Text(text) => {
-                            Some(text.text.chars().count())
+                            Some(count_chars(&text.text))
                         }
                         pi_ai::types::ImageOrTextContent::Image(_) => None,
                     })
@@ -819,14 +822,14 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             let mut chars = 0usize;
             for block in &assistant.content {
                 match block {
-                    pi_ai::types::ContentBlock::Text(text) => chars += text.text.chars().count(),
+                    pi_ai::types::ContentBlock::Text(text) => chars += count_chars(&text.text),
                     pi_ai::types::ContentBlock::Thinking(thinking) => {
-                        chars += thinking.thinking.chars().count()
+                        chars += count_chars(&thinking.thinking)
                     }
                     pi_ai::types::ContentBlock::ToolCall(tool_call) => {
-                        chars += tool_call.name.chars().count();
+                        chars += count_chars(&tool_call.name);
                         chars += serde_json::to_string(&tool_call.arguments)
-                            .map(|json| json.chars().count())
+                            .map(|json| count_chars(&json))
                             .unwrap_or(0);
                     }
                 }
@@ -838,7 +841,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             for block in &tool_result.content {
                 match block {
                     pi_ai::types::ImageOrTextContent::Text(text) => {
-                        chars += text.text.chars().count()
+                        chars += count_chars(&text.text)
                     }
                     pi_ai::types::ImageOrTextContent::Image(_) => chars += 4800,
                 }
@@ -847,12 +850,12 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
         }
         AgentMessage::Custom(CustomAgentMessage::BashExecution {
             command, output, ..
-        }) => ceil_div4(command.chars().count() + output.chars().count()),
+        }) => ceil_div4(count_chars(command) + count_chars(output)),
         AgentMessage::Custom(CustomAgentMessage::Custom { content, .. }) => {
             ceil_div4(content_chars(content))
         }
         AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => {
-            ceil_div4(summary.chars().count())
+            ceil_div4(count_chars(summary))
         }
         AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
             summary,
@@ -863,13 +866,13 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             if let Some(provider_context) = provider_context {
                 let digest_tokens = harness_digest
                     .as_ref()
-                    .map(|digest| ceil_div4(digest.chars().count()))
+                    .map(|digest| ceil_div4(count_chars(digest)))
                     .unwrap_or(0.0);
                 return provider_context.estimated_tokens + digest_tokens;
             }
-            let mut chars = summary.chars().count();
+            let mut chars = count_chars(summary);
             if let Some(digest) = harness_digest {
-                chars += digest.chars().count();
+                chars += count_chars(digest);
             }
             ceil_div4(chars)
         }
@@ -1090,7 +1093,7 @@ pub fn prepare_compaction(
     }
     let boundary_end = path_entries.len();
 
-    let tokens_before = estimate_context_tokens(&build_session_context(path_entries)).tokens;
+    let tokens_before = build_session_context(path_entries);
 
     let cut_point = find_cut_point(
         path_entries,
@@ -1319,6 +1322,11 @@ fn summary_output_budgets(
     Ok((initial, (initial * 2.0).min(ceiling).min(65_536.0).floor().max(initial)))
 }
 
+/// `SUMMARIZATION_SYSTEM_PROMPT` length in Unicode scalars. The chunk budget
+/// subtracts it on every iteration, so it is computed once.
+static SUMMARIZATION_SYSTEM_PROMPT_CHARS: std::sync::LazyLock<usize> =
+    std::sync::LazyLock::new(|| SUMMARIZATION_SYSTEM_PROMPT.chars().count());
+
 #[allow(clippy::too_many_arguments)]
 async fn generate_bounded_summary(
     messages: &[AgentMessage],
@@ -1347,8 +1355,12 @@ async fn generate_bounded_summary(
     let mut length_retry_used = false;
     let conversation = serialize_conversation(&convert_to_llm(messages, &Default::default()));
     phase.measurement(PerformanceMetricMeasurement::SerializedBytes, Some(conversation.len() as f64));
-    let conversation_chars = conversation.chars().count();
+    let conversation_chars = count_chars(&conversation);
     let mut offset = 0usize;
+    // Byte offset of `offset` inside `conversation`. Consecutive chunks are
+    // adjacent, so each chunk's byte range is found by walking only that
+    // chunk instead of re-decoding the whole prefix per chunk.
+    let mut chunk_start_byte = 0usize;
     let mut summary: Option<String> = previous_summary.map(strip_file_operations).filter(|text| !text.is_empty());
     let mut usage = empty_usage();
     loop {
@@ -1368,8 +1380,8 @@ async fn generate_bounded_summary(
         // so retrying never drops or changes the transcript being summarized.
         let budget = (((f64::min(input_limit, model.context_window - retry_max_tokens) - 1024.0) * 3.0)
             .floor())
-            - suffix.chars().count() as f64
-            - SUMMARIZATION_SYSTEM_PROMPT.chars().count() as f64
+            - count_chars(&suffix) as f64
+            - *SUMMARIZATION_SYSTEM_PROMPT_CHARS as f64
             - 64.0;
         if budget <= 0.0 {
             return Err(
@@ -1377,8 +1389,30 @@ async fn generate_bounded_summary(
                     .to_string(),
             );
         }
-        let chunk: String = slice_chars(&conversation, offset, offset + budget as usize);
-        offset += chunk.chars().count();
+        let chunk_char_len = (budget as usize).min(conversation_chars - offset);
+        let chunk_end_byte = if chunk_char_len == 0 {
+            chunk_start_byte
+        } else {
+            // The end of the `chunk_char_len`-th char from `chunk_start_byte`.
+            // Invariant: `chunk_start_byte` is the byte offset of `offset`, and
+            // `offset + chunk_char_len <= conversation_chars`.
+            debug_assert!(
+                chunk_start_byte <= conversation.len()
+                    && offset + chunk_char_len <= conversation_chars,
+                "chunk stays inside the conversation"
+            );
+            let (end, seen) =
+                scan_chars_forward(conversation.as_bytes(), chunk_start_byte, chunk_char_len);
+            if seen < chunk_char_len {
+                // Unreachable by the loop invariant above; degrade to a terminal
+                // error instead of panicking if it ever regresses.
+                return Err(abort_error());
+            }
+            end
+        };
+        let chunk: String = conversation[chunk_start_byte..chunk_end_byte].to_string();
+        offset += chunk_char_len;
+        chunk_start_byte = chunk_end_byte;
         let mut attempt_max_tokens = max_tokens;
         let response = loop {
         let max_tokens = attempt_max_tokens;
@@ -1737,15 +1771,6 @@ fn validate_summary(response: &AssistantMessage, text: &str, format: SummaryForm
         return Err(fail("missing, empty or incomplete handoff sections"));
     }
     Ok(())
-}
-
-/// JavaScript `String.prototype.slice(start, end)` by UTF-16 code units; the
-/// port uses character offsets, which match for the text this function slices.
-fn slice_chars(text: &str, start: usize, end: usize) -> String {
-    text.chars()
-        .skip(start)
-        .take(end.saturating_sub(start))
-        .collect()
 }
 
 // ---------------------------------------------------------------------------
@@ -2386,6 +2411,142 @@ mod summary_retry_safety_tests {
         assert_eq!(calls.load(Ordering::SeqCst), 1, "an empty prefix makes no separate request");
         assert!(result.summary.contains("Critical Context"), "{}", result.summary);
         assert!(!result.summary.contains("Turn Context (split turn)"), "{}", result.summary);
+    }
+
+    #[tokio::test]
+    async fn multi_chunk_summaries_partition_the_conversation_exactly() {
+        // A small context window forces the chunk loop through several slices.
+        // Every chunk must satisfy the documented budget formula in Unicode
+        // scalars, and the chunks must reproduce the exact char-offset slices
+        // of the serialized conversation (the pre-optimization skip/take
+        // behavior), with nothing lost or duplicated.
+        let recorded = Arc::new(std::sync::Mutex::new(Vec::<String>::new()));
+        let recorded_for_stream = recorded.clone();
+        pi_ai::api_registry::register_api_provider_simple(
+            pi_ai::api_registry::ApiProviderSimple {
+                api: "summary-multichunk-partition".into(),
+                stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                stream_simple: Arc::new(move |_, context, _| {
+                    let body = match context.messages.first() {
+                        Some(pi_ai::types::Message::User(user)) => match &user.content {
+                            pi_ai::types::UserContent::Blocks(blocks) => match blocks.first() {
+                                Some(pi_ai::types::ImageOrTextContent::Text(text)) => {
+                                    text.text.clone()
+                                }
+                                _ => String::new(),
+                            },
+                            _ => String::new(),
+                        },
+                        _ => String::new(),
+                    };
+                    recorded_for_stream.lock().unwrap().push(body);
+                    let stream = AssistantMessageEventStream::new();
+                    stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                        reason: "stop".into(),
+                        message: AssistantMessage {
+                            content: vec![ContentBlock::Text(pi_ai::types::TextContent::new(
+                                FIXTURE_HISTORY,
+                            ))],
+                            stop_reason: "stop".into(),
+                            ..Default::default()
+                        },
+                    });
+                    stream
+                }),
+                compact: None,
+                supports_compaction: None,
+            },
+            None,
+        );
+        let mut model = Model::new(
+            "summary-multichunk-partition",
+            "summary-multichunk-partition",
+            "summary-multichunk-partition",
+            "faux",
+            "https://fixture.invalid",
+        );
+        model.context_window = 16_000.0;
+        model.max_tokens = 4_000.0;
+        let mut messages: Vec<AgentMessage> = Vec::new();
+        for turn in 0..60 {
+            // Multibyte content keeps the scalar/byte distinction live.
+            let body = format!("turn {turn}: {} {}\n", "x".repeat(1400), "界".repeat(300));
+            messages.push(AgentMessage::Message(pi_ai::types::Message::User(
+                pi_ai::types::UserMessage::new(
+                    pi_ai::types::UserContent::Text(body),
+                    turn as i64,
+                ),
+            )));
+        }
+        let metrics = CompactionMetrics::new(None, &model);
+        let policy = SUMMARY_UPDATE_POLICY_OFF.to_string();
+        let instructions =
+            move |previous: Option<&str>| build_summarization_prompt(None, previous, &policy);
+        let result = generate_bounded_summary(
+            &messages,
+            &model,
+            2_000.0,
+            "unused",
+            None,
+            None,
+            None,
+            default_summary_call_runner(None),
+            &instructions,
+            None,
+            SummaryFormat::Conversation,
+            None,
+            &metrics,
+        )
+        .await
+        .unwrap();
+
+        let requests = recorded.lock().unwrap().clone();
+        assert!(
+            requests.len() >= 3,
+            "expected several chunks, got {}",
+            requests.len()
+        );
+        // The request body is "<conversation>\n{chunk}\n</conversation>\n\n{suffix}".
+        let mut chunks = Vec::new();
+        let mut suffixes = Vec::new();
+        for body in &requests {
+            let rest = body.strip_prefix("<conversation>\n").unwrap();
+            let split = rest.find("\n</conversation>\n\n").unwrap();
+            chunks.push(rest[..split].to_string());
+            suffixes.push(rest[split + "\n</conversation>\n\n".len()..].to_string());
+        }
+        let conversation = serialize_conversation(&crate::core::messages::convert_to_llm(
+            &messages,
+            &Default::default(),
+        ));
+        let conversation_chars = conversation.chars().count();
+        let (_, retry_max_tokens) = summary_output_budgets(&model, 2_000.0, None, None).unwrap();
+        let input_limit = get_model_input_limit(&model);
+        let system_prompt_chars = SUMMARIZATION_SYSTEM_PROMPT.chars().count();
+        let mut offset = 0usize;
+        for (index, (chunk, suffix)) in chunks.iter().zip(&suffixes).enumerate() {
+            let budget =
+                (((f64::min(input_limit, model.context_window - retry_max_tokens) - 1024.0) * 3.0)
+                    .floor())
+                    - suffix.chars().count() as f64
+                    - system_prompt_chars as f64
+                    - 64.0;
+            let expected = (budget as usize).min(conversation_chars - offset);
+            let actual = chunk.chars().count();
+            assert_eq!(actual, expected, "chunk {index} length");
+            let scalar_slice: String = conversation
+                .chars()
+                .skip(offset)
+                .take(actual)
+                .collect();
+            assert_eq!(&scalar_slice, chunk, "chunk {index} content");
+            offset += actual;
+        }
+        assert!(
+            offset >= conversation_chars,
+            "chunks must cover the whole conversation"
+        );
+        assert!(result.summary.contains("Critical Context"));
     }
 
     #[tokio::test]

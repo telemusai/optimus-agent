@@ -981,14 +981,33 @@ pub fn get_latest_compaction_entry(entries: &[SessionEntry]) -> Option<SessionEn
     None
 }
 
+/// Id lookup over session entries for the context builder. Implemented for
+/// the manager's insertion-ordered index and for the sorted map callers build
+/// from a plain entry slice, so both share one borrowed walk.
+pub trait SessionEntryIndex {
+    fn get_entry(&self, id: &str) -> Option<&SessionEntry>;
+}
+
+impl SessionEntryIndex for BTreeMap<String, SessionEntry> {
+    fn get_entry(&self, id: &str) -> Option<&SessionEntry> {
+        self.get(id)
+    }
+}
+
+impl SessionEntryIndex for indexmap::IndexMap<String, SessionEntry> {
+    fn get_entry(&self, id: &str) -> Option<&SessionEntry> {
+        self.get(id)
+    }
+}
+
 pub fn build_session_context_with_entry_ids(
     entries: &[SessionEntry],
     leaf_id: Option<Option<&str>>,
-    by_id: Option<&BTreeMap<String, SessionEntry>>,
+    by_id: Option<&dyn SessionEntryIndex>,
     target_model: Option<&pi_ai::types::Model>,
 ) -> SessionContextWithEntryIds {
     let owned_index;
-    let by_id = match by_id {
+    let by_id: &dyn SessionEntryIndex = match by_id {
         Some(by_id) => by_id,
         None => {
             let mut map: BTreeMap<String, SessionEntry> = BTreeMap::new();
@@ -1008,14 +1027,11 @@ pub fn build_session_context_with_entry_ids(
         model: None,
     };
 
-    let resolved_leaf: Option<SessionEntry> = match leaf_id {
+    let resolved_leaf: Option<&SessionEntry> = match leaf_id {
         // `leafId === null` resolves no context at all.
         Some(None) => return empty,
-        Some(Some(id)) => match by_id.get(id) {
-            Some(entry) => Some(entry.clone()),
-            None => entries.last().cloned(),
-        },
-        None => entries.last().cloned(),
+        Some(Some(id)) => by_id.get_entry(id).or_else(|| entries.last()),
+        None => entries.last(),
     };
     let leaf = match resolved_leaf {
         Some(leaf) => leaf,
@@ -1023,13 +1039,14 @@ pub fn build_session_context_with_entry_ids(
     };
 
     // push+reverse, not unshift-per-entry: unshift is O(n), making this O(n^2) on long sessions.
-    let mut path: Vec<SessionEntry> = Vec::new();
+    // The path holds references; cloning each hop would copy the branch again.
+    let mut path: Vec<&SessionEntry> = Vec::new();
     let mut current = Some(leaf);
     let mut visited = HashSet::new();
     while let Some(entry) = current {
         // Damaged ancestry must not repeat entries or grow context without bound.
-        if !visited.insert(entry_id(&entry)) { break; }
-        current = entry_parent_id(&entry).and_then(|parent| by_id.get(&parent).cloned());
+        if !visited.insert(entry_id(entry)) { break; }
+        current = entry_parent_id(entry).and_then(|parent| by_id.get_entry(&parent));
         path.push(entry);
     }
     path.reverse();
@@ -1037,7 +1054,7 @@ pub fn build_session_context_with_entry_ids(
     let mut thinking_level = "off".to_string();
     let mut service_tier: ServiceTier = Some(Some("default".to_string()));
     let mut model: Option<SessionContextModel> = None;
-    let mut compaction: Option<SessionEntry> = None;
+    let mut compaction: Option<&SessionEntry> = None;
 
     for entry in &path {
         match entry_type(entry) {
@@ -1107,7 +1124,7 @@ pub fn build_session_context_with_entry_ids(
             native_endpoint: None,
         }),
     };
-    for entry in &path {
+    for &entry in &path {
         if entry_type(entry) != "compaction" {
             continue;
         }
@@ -1124,7 +1141,7 @@ pub fn build_session_context_with_entry_ids(
                 continue;
             }
         }
-        compaction = Some(entry.clone());
+        compaction = Some(entry);
     }
 
     // Build messages and collect corresponding entries
@@ -1193,7 +1210,7 @@ pub fn build_session_context_with_entry_ids(
 
     match compaction {
         Some(compaction) => {
-            let compaction_id = entry_id(&compaction);
+            let compaction_id = entry_id(compaction);
             let compaction_idx = path
                 .iter()
                 .position(|entry| {
@@ -1284,7 +1301,7 @@ pub fn build_session_context_with_entry_ids(
 pub fn build_session_context(
     entries: &[SessionEntry],
     leaf_id: Option<Option<&str>>,
-    by_id: Option<&BTreeMap<String, SessionEntry>>,
+    by_id: Option<&dyn SessionEntryIndex>,
     target_model: Option<&pi_ai::types::Model>,
 ) -> SessionContext {
     let context = build_session_context_with_entry_ids(entries, leaf_id, by_id, target_model);
@@ -4473,11 +4490,11 @@ impl SessionManager {
         // the header), so the entries argument is only a fallback for an undefined
         // leaf - never hit here since leafId is always set or null. Avoids an O(n)
         // array copy on every call (attach, get_session_context, agent init, ...).
-        let entries: Vec<SessionEntry> = self.file_entries.clone();
+        // The walk borrows both the entries and the index instead of cloning them.
         build_session_context(
-            &entries,
+            &self.file_entries,
             Some(self.leaf_id.as_deref()),
-            Some(&self.indexed_by_id()),
+            Some(&self.by_id),
             target_model,
         )
     }
@@ -4486,11 +4503,10 @@ impl SessionManager {
         &self,
         target_model: Option<&pi_ai::types::Model>,
     ) -> SessionContextWithEntryIds {
-        let entries: Vec<SessionEntry> = self.file_entries.clone();
         build_session_context_with_entry_ids(
-            &entries,
+            &self.file_entries,
             Some(self.leaf_id.as_deref()),
-            Some(&self.indexed_by_id()),
+            Some(&self.by_id),
             target_model,
         )
     }
@@ -4513,24 +4529,15 @@ impl SessionManager {
         // the daemon body still maps to None here, which selects the leaf like
         // an omitted call.)
         let effective_tip = tip_entry_id.or(self.leaf_id.as_deref());
-        let entries: Vec<SessionEntry> = self.file_entries.clone();
         let context = build_session_context_with_entry_ids(
-            &entries,
+            &self.file_entries,
             Some(effective_tip),
-            Some(&self.indexed_by_id()),
+            Some(&self.by_id),
             target_model,
         );
         let mut snapshot = order_session_context_for_transcript(&context);
         snapshot.tip_entry_id = effective_tip.map(str::to_string);
         Ok(snapshot)
-    }
-
-    /// The TypeScript passes `this.byId` (a `Map<string, SessionEntry>`).
-    fn indexed_by_id(&self) -> BTreeMap<String, SessionEntry> {
-        self.by_id
-            .iter()
-            .map(|(key, value)| (key.clone(), value.clone()))
-            .collect()
     }
 
     pub fn get_header(&self) -> Option<SessionEntry> {

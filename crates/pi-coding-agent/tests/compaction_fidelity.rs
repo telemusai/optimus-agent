@@ -64,7 +64,7 @@ async fn prepared_summary_uses_retained_state_and_reattaches_file_inventory_once
     ];
     let mut settings = default_compaction_settings();
     settings.keep_recent_tokens = 1.0;
-    let prep = prepare_compaction(&entries, &settings, &|_| vec![]).unwrap();
+    let prep = prepare_compaction(&entries, &settings, &|_| 0.0).unwrap();
     assert_eq!(prep.previous_summary.as_deref(), Some(SUMMARY));
     let anchor = prep.retained_state_anchor.as_ref().unwrap();
     assert_eq!(anchor.chars().count(), 2000);
