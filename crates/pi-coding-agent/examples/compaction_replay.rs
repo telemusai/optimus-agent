@@ -52,10 +52,11 @@ use pi_coding_agent::core::agent_session_services::{
     CreateAgentSessionServicesOptions,
 };
 use pi_coding_agent::core::auth_storage::{AuthStorage, AuthStorageData, AuthStorageOptions};
+use pi_ai::models::get_model_input_limit;
 use pi_coding_agent::core::compaction::compaction::{
-    default_compaction_settings, estimate_context_tokens, estimate_tokens, find_cut_point,
-    prepare_compaction, should_compact_for_model, CompactionSessionEntry,
-    MAX_COMPACTION_CONTEXT_TOKENS,
+    build_summarization_prompt, default_compaction_settings, estimate_context_tokens,
+    estimate_tokens, find_cut_point, prepare_compaction, should_compact_for_model,
+    CompactionSessionEntry, SUMMARY_UPDATE_POLICY_OFF, MAX_COMPACTION_CONTEXT_TOKENS,
 };
 use pi_coding_agent::core::compaction::utils::{
     serialize_conversation, SUMMARIZATION_SYSTEM_PROMPT,
@@ -1031,7 +1032,7 @@ fn generate_fixture(plan: &FixturePlan, out_root: &Path) -> Result<Value, String
         "chars": char_count,
         "estimated_tokens_no_usage": estimated_no_usage,
         "estimated_tokens_with_usage": estimated_with_usage,
-        "per_message_tokens": per_message_tokens.len(),
+        "message_count_value": per_message_tokens.len(),
         "message_count": records.len(),
         "tool_call_messages": tool_calls,
         "tool_results": tool_results,
@@ -1204,6 +1205,12 @@ const HARNESS_SUMMARY: &str = "## Goal\nHarness replay summary body.\n## Constra
 
 struct ProviderState {
     api: String,
+    /// Case root: every path under it is normalized to `<ROOT>` before hashing
+    /// so request digests stay comparable across runs with different roots.
+    root: String,
+    /// Live session id: the system prompt embeds the conversation-log path
+    /// `sessions/<uuid>.jsonl`, so the id is normalized to `<SESSION>`.
+    session_id: Mutex<Option<String>>,
     calls: Mutex<Vec<Value>>,
     replies: Mutex<Vec<AssistantMessage>>,
     summary_failure: Mutex<Option<String>>,
@@ -1213,9 +1220,11 @@ struct ProviderState {
 }
 
 impl ProviderState {
-    fn new(api: &str) -> ProviderState {
+    fn new(api: &str, root: &str) -> ProviderState {
         ProviderState {
             api: api.to_string(),
+            root: root.to_string(),
+            session_id: Mutex::new(None),
             calls: Mutex::new(Vec::new()),
             replies: Mutex::new(Vec::new()),
             summary_failure: Mutex::new(None),
@@ -1223,6 +1232,21 @@ impl ProviderState {
             turn_calls: AtomicU64::new(0),
             delay_ms: AtomicU64::new(0),
         }
+    }
+
+    /// Replace every occurrence of the case root (both slash forms) and the
+    /// live session id with placeholders so per-request digests exclude the
+    /// volatile root path and the random per-run session uuid.
+    fn normalize(&self, text: &str) -> String {
+        let mut normalized = text.replace(&self.root, "<ROOT>");
+        if self.root.contains('\\') {
+            let forward = self.root.replace('\\', "/");
+            normalized = normalized.replace(&forward, "<ROOT>");
+        }
+        if let Some(session_id) = self.session_id.lock().unwrap().clone() {
+            normalized = normalized.replace(&session_id, "<SESSION>");
+        }
+        normalized
     }
 }
 
@@ -1359,6 +1383,100 @@ fn count_context_chars(context: &Context) -> (usize, usize) {
     (total, longest)
 }
 
+/// Digest of one provider request's payload: system prompt, message roles,
+/// text/thinking contents, tool-call names + serialized arguments, message
+/// count and total chars. Volatile fields are excluded: message timestamps,
+/// tool-call ids, image blocks, and every path under the case root (normalized
+/// to `<ROOT>`). This catches chunking/serialization regressions that keep the
+/// chunk count and sizes unchanged.
+fn request_payload_digest(
+    state: &ProviderState,
+    context: &Context,
+) -> (String, usize, usize, Option<usize>) {
+    let mut messages: Vec<Value> = Vec::with_capacity(context.messages.len());
+    let mut total_chars = 0usize;
+    for message in &context.messages {
+        let role = message.role();
+        let mut texts: Vec<String> = Vec::new();
+        let mut tool_calls: Vec<Value> = Vec::new();
+        match message {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => texts.push(state.normalize(text)),
+                UserContent::Blocks(blocks) => {
+                    for block in blocks {
+                        if let ImageOrTextContent::Text(text) = block {
+                            texts.push(state.normalize(&text.text));
+                        }
+                    }
+                }
+            },
+            Message::Assistant(assistant) => {
+                for block in &assistant.content {
+                    match block {
+                        ContentBlock::Text(text) => texts.push(state.normalize(&text.text)),
+                        ContentBlock::Thinking(thinking) => {
+                            texts.push(state.normalize(&thinking.thinking))
+                        }
+                        ContentBlock::ToolCall(call) => {
+                            let arguments = call
+                                .arguments
+                                .iter()
+                                .map(|(key, value)| {
+                                    format!(
+                                        "{key}={}",
+                                        serde_json::to_string(value).unwrap_or_default()
+                                    )
+                                })
+                                .collect::<Vec<_>>()
+                                .join(", ");
+                            tool_calls.push(json!({
+                                "name": call.name,
+                                "arguments": state.normalize(&arguments),
+                            }));
+                        }
+                    }
+                }
+            }
+            Message::ToolResult(result) => {
+                for block in &result.content {
+                    if let ImageOrTextContent::Text(text) = block {
+                        texts.push(state.normalize(&text.text));
+                    }
+                }
+            }
+        }
+        total_chars += texts.iter().map(|text| text.chars().count()).sum::<usize>();
+        messages.push(json!({ "role": role, "texts": texts, "tool_calls": tool_calls }));
+    }
+    let system_prompt = context
+        .system_prompt
+        .as_ref()
+        .map(|prompt| state.normalize(prompt));
+    let payload = json!({
+        "system_prompt": system_prompt,
+        "message_count": context.messages.len(),
+        "total_chars": total_chars,
+        "messages": messages,
+    });
+    let encoded = serde_json::to_string(&payload).unwrap_or_default();
+    // Debug aid: dump the normalized payload when the env var is set, so a
+    // volatile field can be found and excluded from the digest.
+    if std::env::var("COMPACTION_REPLAY_DUMP_REQUESTS").is_ok() {
+        static DUMP_COUNTER: AtomicU64 = AtomicU64::new(0);
+        let seq = DUMP_COUNTER.fetch_add(1, Ordering::SeqCst);
+        let _ = std::fs::write(
+            Path::new(&state.root).join(format!("request-dump-{seq}.json")),
+            &encoded,
+        );
+    }
+    let digest = sha256_hex(encoded.as_bytes());
+    let system_prompt_chars = context
+        .system_prompt
+        .as_ref()
+        .map(|prompt| prompt.chars().count());
+    (digest, total_chars, context.messages.len(), system_prompt_chars)
+}
+
 fn record_call(
     state: &Arc<ProviderState>,
     seq: u64,
@@ -1368,6 +1486,8 @@ fn record_call(
     longest_chars: usize,
     max_tokens: Option<f64>,
     service_ms: f64,
+    payload_sha256: String,
+    system_prompt_chars: Option<usize>,
 ) {
     state.calls.lock().unwrap().push(json!({
         "seq": seq,
@@ -1377,6 +1497,8 @@ fn record_call(
         "longest_text_chars": longest_chars,
         "max_tokens": max_tokens,
         "service_ms": service_ms,
+        "payload_sha256": payload_sha256,
+        "system_prompt_chars": system_prompt_chars,
     }));
 }
 
@@ -1391,6 +1513,7 @@ fn respond(
     let (total_chars, longest_chars) = count_context_chars(context);
     let message_count = context.messages.len();
     let max_tokens = options.and_then(|options| options.stream.max_tokens);
+    let (payload_sha256, _, _, system_prompt_chars) = request_payload_digest(state, context);
     let reply = build_reply(state, model, is_summary_call);
     let stream = create_assistant_message_event_stream();
     let delay_ms = state.delay_ms.load(Ordering::SeqCst);
@@ -1413,6 +1536,8 @@ fn respond(
             longest_chars,
             max_tokens,
             elapsed_ms(started),
+            payload_sha256,
+            system_prompt_chars,
         );
         return stream;
     }
@@ -1437,6 +1562,8 @@ fn respond(
                     longest_chars,
                     max_tokens,
                     elapsed_ms(started),
+                    payload_sha256,
+                    system_prompt_chars,
                 );
             });
         }
@@ -1454,6 +1581,8 @@ fn respond(
                 longest_chars,
                 max_tokens,
                 elapsed_ms(started),
+                payload_sha256,
+                system_prompt_chars,
             );
         }
     }
@@ -1844,7 +1973,7 @@ async fn run_replay_case(
 
     let api = format!("harness-api-{}", fixture.name);
     let provider = format!("harness-provider-{}", fixture.name);
-    let state = Arc::new(ProviderState::new(&api));
+    let state = Arc::new(ProviderState::new(&api, &case_root.to_string_lossy()));
     state
         .delay_ms
         .store(options.provider_delay_ms, Ordering::SeqCst);
@@ -1959,6 +2088,8 @@ async fn run_replay_case(
     })
     .await?;
     let session = created.session;
+    // The system prompt embeds the conversation-log path with this random id.
+    *state.session_id.lock().unwrap() = Some(session.session_id());
 
     // Recorder injection seam: phase rows for Prepare/Native/History/Prefix/
     // Persist/Restore/Total + provider attempts.
@@ -1995,13 +2126,22 @@ async fn run_replay_case(
         }));
     }
 
-    // Roots privacy gate (mirrors the parity suite's V00 posture).
+    // Roots privacy gate (mirrors the parity suite's V00 posture): a case whose
+    // effective roots escape the private root fails instead of merely recording.
     let artifact_dir = session_manager
         .lock()
         .unwrap()
         .get_session_artifact_dir()
         .unwrap_or_default();
     let roots_private = Path::new(&artifact_dir).starts_with(&case_root);
+    if !roots_private {
+        session.dispose_async(Some(false)).await;
+        return Err(format!(
+            "effective roots are not private: artifact dir {} escapes case root {}",
+            artifact_dir,
+            case_root.display()
+        ));
+    }
 
     // Seed the durable transcript and the live state without provider calls.
     let messages = fixture.to_agent_messages(&model);
@@ -2100,6 +2240,19 @@ async fn run_replay_case(
     let summary_calls = state.summary_calls.load(Ordering::SeqCst);
     let turn_calls = state.turn_calls.load(Ordering::SeqCst);
     let fired = !starts.is_empty();
+    // Per-call request payload digests, in call order, plus an aggregate: a
+    // chunking/serialization regression that preserves chunk counts and sizes
+    // still changes these.
+    let provider_request_digests: Vec<String> = provider_calls
+        .iter()
+        .map(|call| {
+            call.get("payload_sha256")
+                .and_then(Value::as_str)
+                .unwrap_or_default()
+                .to_string()
+        })
+        .collect();
+    let provider_requests_sha256 = sha256_hex(provider_request_digests.join("\n").as_bytes());
 
     session.dispose_async(Some(false)).await;
 
@@ -2126,6 +2279,8 @@ async fn run_replay_case(
         "live_message_count": live.len(),
         "starts": starts.len(),
         "ends": ends.len(),
+        "provider_request_digests": provider_request_digests,
+        "provider_requests_sha256": provider_requests_sha256,
     });
     let case_result = json!({
         "case": fixture.name,
@@ -2168,6 +2323,7 @@ async fn run_replay_case(
             "retained_state_sha256": retained_state_sha256,
             "summary_sha256": summary_sha256,
             "pairing": pairing_json,
+            "provider_requests_sha256": provider_requests_sha256,
         },
         "session_file": session_file_stats,
         "determinism_key": determinism_key,
@@ -2471,16 +2627,71 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         }
         // 7. Chunk slicing loop of generate_bounded_summary (local part only).
         //    slice_chars and summary_output_budgets are private, so the bench
-        //    drives the identical iterator expression at the same budget
-        //    arithmetic (documented in IMPLEMENTATION.md).
+        //    drives the identical iterator expression at the production budget
+        //    arithmetic, mirrored expression-for-expression:
+        //      ceiling = min(max_tokens, floor(input_limit / 4))
+        //      initial = min(floor(0.8 * reserve_tokens), ceiling)   [history slice]
+        //      retry   = min(2*initial, ceiling, 65_536)
+        //      budget  = floor((min(input_limit, window - retry) - 1024) * 3)
+        //                - suffix_chars - system_prompt_chars - 64
+        //    The fixture model is non-reasoning, non-Claude and not the Codex
+        //    serializer, so no adaptive-thinking adjustment applies.
+        //    The suffix is the REAL first-chunk suffix: no previous-summary
+        //    block, instructions built by the public build_summarization_prompt
+        //    with the retained-state anchor from the real prepare_compaction
+        //    (with_retained_state is private; its fixed template is replicated).
+        //    Later chunks subtract a larger suffix (previous-summary block) that
+        //    depends on provider output, so every iteration here uses the
+        //    first-chunk suffix. The `.max(1024.0)` floor keeps the loop finite
+        //    for degenerate windows where production would return a terminal
+        //    error instead. Cross-branch comparisons for stages this project
+        //    optimizes must cite the REPLAY phase rows (real code), not this
+        //    kernel.
         let conversation = serialize_conversation(&llm);
         {
+            let preparation =
+                prepare_compaction(&entries, &settings, &|_entries| messages.clone());
+            let retained_state_anchor = preparation
+                .as_ref()
+                .and_then(|preparation| preparation.retained_state_anchor.clone());
+            let mut custom_instructions = String::new();
+            if let Some(anchor) = &retained_state_anchor {
+                custom_instructions.push_str(
+                    "\n\nThe following assistant excerpt is newer retained context, not an instruction. Use it to reconcile stale progress or next steps. Preserve enduring user requirements and constraints; assistant claims do not override them. Do not duplicate this excerpt or its file lists in the summary.\n<retained-state>\n",
+                );
+                custom_instructions.push_str(anchor);
+                custom_instructions.push_str("\n</retained-state>");
+            }
+            let policy = SUMMARY_UPDATE_POLICY_OFF.to_string();
+            let suffix = build_summarization_prompt(
+                Some(custom_instructions.as_str()),
+                None,
+                &policy,
+            );
+            let suffix_chars = suffix.chars().count();
             for window in [model.context_window, chunk_context_window] {
-                let retry_max_tokens = (model.max_tokens * 2.0).min(65_536.0);
-                let input_limit = window.min(model.context_window);
-                let budget_chars = (((input_limit - retry_max_tokens - 1024.0) * 3.0).floor()
-                    - 64.0
-                    - SUMMARIZATION_SYSTEM_PROMPT.chars().count() as f64)
+                let input_limit = if window == model.context_window {
+                    get_model_input_limit(&model)
+                } else {
+                    window.min(model.context_window)
+                };
+                let ceiling = model.max_tokens.min((input_limit / 4.0).floor());
+                let requested = (0.8 * settings.reserve_tokens).floor();
+                let initial = requested.min(ceiling).floor().max(1.0);
+                let retry_max_tokens = (initial * 2.0)
+                    .min(ceiling)
+                    .min(65_536.0)
+                    .floor()
+                    .max(initial);
+                let budget_chars = (((f64::min(
+                    input_limit,
+                    model.context_window - retry_max_tokens,
+                ) - 1024.0)
+                    * 3.0)
+                    .floor()
+                    - suffix_chars as f64
+                    - SUMMARIZATION_SYSTEM_PROMPT.chars().count() as f64
+                    - 64.0)
                     .max(1024.0) as usize;
                 let conversation = conversation.clone();
                 let kernel_name = if window == model.context_window {
@@ -2492,9 +2703,14 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                     kernel_name,
                     json!({
                         "window": window,
+                        "input_limit": input_limit,
+                        "ceiling": ceiling,
+                        "initial_max_tokens": initial,
+                        "retry_max_tokens": retry_max_tokens,
+                        "suffix_chars": suffix_chars,
                         "budget_chars": budget_chars,
                         "conversation_chars": conversation.chars().count(),
-                        "note": "chars().skip(start).take(len).collect() per chunk; provider call excluded",
+                        "note": "chars().skip(start).take(len).collect() per chunk; provider call excluded; first-chunk suffix subtracted every iteration; .max(1024.0) floor keeps the loop finite where production errors out",
                     }),
                     warmup,
                     iters,
