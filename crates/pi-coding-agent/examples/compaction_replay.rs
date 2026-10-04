@@ -2650,7 +2650,9 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         let conversation = serialize_conversation(&llm);
         {
             let preparation =
-                prepare_compaction(&entries, &settings, &|_entries| messages.clone());
+                prepare_compaction(&entries, &settings, &|_entries| {
+                    messages.iter().map(estimate_tokens).sum()
+                });
             let retained_state_anchor = preparation
                 .as_ref()
                 .and_then(|preparation| preparation.retained_state_anchor.clone());
