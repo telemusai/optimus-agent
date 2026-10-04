@@ -241,6 +241,85 @@ pub type BeforeRequestHook = Arc<
     dyn Fn(u64, Option<CancellationToken>) -> BoxFuture<Result<(), anyhow::Error>> + Send + Sync,
 >;
 
+fn find_last_assistant_message_from_state(
+    state: &AgentState,
+) -> Option<pi_ai::types::AssistantMessage> {
+    state
+        .messages
+        .iter()
+        .rev()
+        .find_map(|message| match message {
+            AgentMessage::Message(Message::Assistant(assistant)) => Some(assistant.clone()),
+            _ => None,
+        })
+}
+
+fn latest_compaction_summary_timestamp_from_state(state: &AgentState) -> Option<i64> {
+    state.messages.iter().find_map(|message| match message {
+        AgentMessage::Custom(CustomAgentMessage::CompactionSummary { timestamp, .. }) => {
+            Some(*timestamp)
+        }
+        _ => None,
+    })
+}
+
+/// `_getThresholdContextTokens` over a state snapshot. Shared by the trait
+/// default and the real Agent's borrowed projection so both read identical
+/// logic.
+fn threshold_context_tokens_from_state(
+    state: &AgentState,
+    assistant_message: &pi_ai::types::AssistantMessage,
+    compaction_timestamp: Option<f64>,
+    model: Option<&Model>,
+    rebuilt_at: Option<f64>,
+) -> Option<f64> {
+    let messages = &state.messages;
+    let estimate = estimate_context_tokens(messages);
+    let Some(last_usage_index) = estimate.last_usage_index else {
+        if assistant_message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
+            return None;
+        }
+        return Some(calculate_context_tokens(&assistant_message.usage));
+    };
+    // Verify the usage source is post-compaction. Kept pre-compaction messages
+    // have stale usage reflecting the old (larger) context and would falsely
+    // trigger compaction right after one just finished.
+    let usage_message = messages.get(last_usage_index);
+    if let Some(AgentMessage::Message(Message::Assistant(usage_message))) = usage_message {
+        if (rebuilt_at.is_some()
+            && (usage_message.timestamp as f64) <= rebuilt_at.unwrap_or_default())
+            || Some(usage_message.model.clone()) != model.map(|model| model.id.clone())
+            || Some(usage_message.provider.clone()) != model.map(|model| model.provider.clone())
+        {
+            return Some(messages.iter().map(estimate_tokens).sum());
+        }
+        if let Some(compaction_timestamp) = compaction_timestamp {
+            if (usage_message.timestamp as f64) <= compaction_timestamp {
+                return None;
+            }
+        }
+    }
+    Some(estimate.tokens)
+}
+
+fn system_prompt_and_tools_from_state(
+    state: &AgentState,
+) -> (String, Option<Vec<pi_ai::types::Tool>>) {
+    (
+        state.system_prompt.clone(),
+        state.tools.as_deref().map(|tools| {
+            tools
+                .iter()
+                .map(|tool| pi_ai::types::Tool {
+                    name: tool.name.clone(),
+                    description: tool.description.clone(),
+                    parameters: tool.parameters.clone(),
+                })
+                .collect::<Vec<_>>()
+        }),
+    )
+}
+
 pub trait AgentHandle: Send + Sync {
     /// Snapshot the live callbacks copied by TypeScript's standalone side agent.
     fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> {
@@ -267,6 +346,40 @@ pub trait AgentHandle: Send + Sync {
     }
     fn streaming_message(&self) -> Option<AgentMessage> {
         self.state().streaming_message
+    }
+    /// State projections that read the live conversation without cloning it.
+    /// Defaults snapshot through `state()` for sequential test doubles; the
+    /// real Agent overrides them with its state lock.
+    fn find_last_assistant_message(&self) -> Option<pi_ai::types::AssistantMessage> {
+        find_last_assistant_message_from_state(&self.state())
+    }
+    fn latest_compaction_summary_timestamp(&self) -> Option<i64> {
+        latest_compaction_summary_timestamp_from_state(&self.state())
+    }
+    fn threshold_context_tokens(
+        &self,
+        assistant_message: &pi_ai::types::AssistantMessage,
+        compaction_timestamp: Option<f64>,
+        model: Option<&Model>,
+        rebuilt_at: Option<f64>,
+    ) -> Option<f64> {
+        threshold_context_tokens_from_state(
+            &self.state(),
+            assistant_message,
+            compaction_timestamp,
+            model,
+            rebuilt_at,
+        )
+    }
+    fn model_and_context_tokens(&self) -> (Model, f64) {
+        let state = self.state();
+        (state.model, estimate_context_tokens(&state.messages).tokens)
+    }
+    fn messages_without_harness_digests(&self) -> Vec<AgentMessage> {
+        without_harness_digests_for_compaction(&self.state().messages)
+    }
+    fn system_prompt_and_tools(&self) -> (String, Option<Vec<pi_ai::types::Tool>>) {
+        system_prompt_and_tools_from_state(&self.state())
     }
     fn active_tool_names(&self) -> Vec<String> {
         self.state()
@@ -5058,7 +5171,7 @@ impl AgentSession {
                         .collect();
                     prepare_compaction(&path_entries, &settings, &move |path_entries| {
                         let _ = (&session_manager, path_entries);
-                        Vec::new()
+                        0.0
                     })
                 };
                 if preparation.is_none() {
@@ -7591,13 +7704,7 @@ impl AgentSession {
 
     /// `_findLastAssistantMessage`.
     fn find_last_assistant_message(&self) -> Option<AssistantMessage> {
-        let messages = self.agent.state().messages;
-        for message in messages.iter().rev() {
-            if let AgentMessage::Message(Message::Assistant(assistant)) = message {
-                return Some(assistant.clone());
-            }
-        }
-        None
+        self.agent.find_last_assistant_message()
     }
 
     /// `_replaceMessageInPlace`.
@@ -8407,7 +8514,7 @@ impl AgentSession {
 
     /// `buildSessionContext`.
     pub fn build_session_context(&self) -> SessionContext {
-        let model = self.agent.state().model;
+        let model = self.agent.model();
         let mut context = self
             .session_manager
             .lock()
@@ -8880,8 +8987,7 @@ impl AgentSession {
                 let _ = self.check_compaction(&settings, false).await;
             }
         } else {
-            let model = self.agent.state().model;
-            let tokens = estimate_context_tokens(&self.agent.state().messages).tokens;
+            let (model, tokens) = self.agent.model_and_context_tokens();
             let settings = self.compaction_settings();
             if should_compact_for_model(tokens, &model, &settings)
                 && !self.threshold_compaction_retry_in_cooldown()
@@ -16090,9 +16196,9 @@ impl AgentSession {
         }
         // TS 9358: `this.agent.state.messages = this.buildSessionContext().messages`.
         let context = self.build_session_context();
-        let mut state = self.agent.state();
-        state.messages = context.messages;
-        self.agent.set_state(state);
+        self.agent.update_state(Box::new(move |state| {
+            state.messages = context.messages;
+        }));
         // TS 9360-9361.
         *self.provider_context_rebuilt_at.lock().unwrap() = Some(now_ms());
         self.ensure_harness_digest_context();
@@ -16101,13 +16207,8 @@ impl AgentSession {
     /// `_activeCompactionTimestamp()` (agent-session.ts:9364-9371).
     fn active_compaction_timestamp(&self) -> Option<f64> {
         // TS 9365-9366: an in-conversation compaction marker wins over the branch.
-        for message in self.messages() {
-            if let AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
-                timestamp, ..
-            }) = &message
-            {
-                return Some(*timestamp as f64);
-            }
+        if let Some(timestamp) = self.agent.latest_compaction_summary_timestamp() {
+            return Some(timestamp as f64);
         }
         let branch = self.session_manager.lock().unwrap().get_branch(None);
         // TS 9368: a provider checkpoint makes the timestamp unknowable, so the
@@ -16169,37 +16270,16 @@ impl AgentSession {
         assistant_message: &pi_ai::types::AssistantMessage,
         compaction_timestamp: Option<f64>,
     ) -> Option<f64> {
-        let messages = &self.agent.state().messages;
-        let estimate = estimate_context_tokens(messages);
-        if let Some(last_usage_index) = estimate.last_usage_index {
-            // Verify the usage source is post-compaction. Kept pre-compaction messages
-            // have stale usage reflecting the old (larger) context and would falsely
-            // trigger compaction right after one just finished.
-            let usage_message = messages.get(last_usage_index);
-            let model = self.model();
-            if let Some(AgentMessage::Message(Message::Assistant(usage_message))) = usage_message {
-                let rebuilt_at = *self.provider_context_rebuilt_at.lock().unwrap();
-                if (rebuilt_at.is_some()
-                    && (usage_message.timestamp as f64) <= rebuilt_at.unwrap_or_default())
-                    || Some(usage_message.model.clone())
-                        != model.as_ref().map(|model| model.id.clone())
-                    || Some(usage_message.provider.clone())
-                        != model.as_ref().map(|model| model.provider.clone())
-                {
-                    return Some(messages.iter().map(estimate_tokens).sum());
-                }
-                if let Some(compaction_timestamp) = compaction_timestamp {
-                    if (usage_message.timestamp as f64) <= compaction_timestamp {
-                        return None;
-                    }
-                }
-            }
-            return Some(estimate.tokens);
-        }
-        if assistant_message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
-            return None;
-        }
-        Some(calculate_context_tokens(&assistant_message.usage))
+        // The model and the rebuild marker are read before the state projection
+        // so the projection never re-enters the agent while holding its lock.
+        let model = self.model();
+        let rebuilt_at = *self.provider_context_rebuilt_at.lock().unwrap();
+        self.agent.threshold_context_tokens(
+            assistant_message,
+            compaction_timestamp,
+            model.as_ref(),
+            rebuilt_at,
+        )
     }
 
     /// `_checkCompaction(assistantMessage, skipAbortedCheck, queueAutonomousContinuation)`.
@@ -16475,9 +16555,10 @@ impl AgentSession {
             details: message.details.clone(),
             timestamp: message.timestamp,
         });
-        let mut state = self.agent.state();
-        state.messages.push(agent_message.clone());
-        self.agent.set_state(state);
+        let message_for_state = agent_message.clone();
+        self.agent.update_state(Box::new(move |state| {
+            state.messages.push(message_for_state)
+        }));
         self.emit(AgentSessionEvent::MessageStart {
             message: agent_message.clone(),
         });
@@ -17590,7 +17671,9 @@ impl AgentSession {
         messages: &[AgentMessage],
         signal: &CancellationToken,
     ) -> pi_ai::types::Context {
-        let state = self.agent.state();
+        // Only the system prompt and the tool list are needed from the agent
+        // state; reading them as a projection avoids cloning the conversation.
+        let (system_prompt, tools) = self.agent.system_prompt_and_tools();
         // `this.agent.transformContext` (agent-session.ts:8328) is the session's own
         // extension-context transform, wired in `core/sdk.rs:596-617`; re-running the
         // same `emitContext` pass here reproduces it without a getter.
@@ -17638,18 +17721,9 @@ impl AgentSession {
             },
         );
         pi_ai::types::Context {
-            system_prompt: Some(state.system_prompt.clone()),
+            system_prompt: Some(system_prompt),
             messages: converted,
-            tools: state.tools.as_ref().map(|tools| {
-                tools
-                    .iter()
-                    .map(|tool| pi_ai::types::Tool {
-                        name: tool.name.clone(),
-                        description: tool.description.clone(),
-                        parameters: tool.parameters.clone(),
-                    })
-                    .collect()
-            }),
+            tools,
         }
     }
 
@@ -17710,11 +17784,13 @@ impl AgentSession {
                 // tokensBefore measures the active context, including unpersisted outcomes,
                 // not transcript size. Native compaction receives this same context.
                 // Harness digests are regenerated and excluded from both.
-                let messages = without_harness_digests_for_compaction(&self.messages());
+                let messages = self.agent.messages_without_harness_digests();
                 let preparation = prepare_compaction(
                     &path_entries,
                     &settings,
-                    &|_entries: &[CompactionSessionEntry]| messages.clone(),
+                    &|_entries: &[CompactionSessionEntry]| {
+                        estimate_context_tokens(&messages).tokens
+                    },
                 );
                 let preparation = match preparation {
                     Some(preparation) => preparation,
@@ -17906,9 +17982,11 @@ impl AgentSession {
                 // merged with the outcomes that have not been persisted yet.
                 {
                     let context = self.build_session_context();
-                    let mut state = self.agent.state();
-                    state.messages = context.messages;
-                    self.agent.set_state(state);
+                    // `agent.state.messages = ...`: assign in place instead of
+                    // snapshotting and re-cloning the whole state.
+                    self.agent.update_state(Box::new(move |state| {
+                        state.messages = context.messages;
+                    }));
                     self.restore_late_ipython_sent_agent_messages();
                 }
                 // TS 8388-8397: the newest compaction entry is announced to extensions.

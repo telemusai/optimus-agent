@@ -97,6 +97,46 @@ impl AgentHandle for Arc<Agent> {
     fn messages(&self) -> Vec<AgentMessage> {
         self.read_state(|state| state.messages.clone())
     }
+    fn find_last_assistant_message(&self) -> Option<pi_ai::types::AssistantMessage> {
+        Agent::read_state(self, super::find_last_assistant_message_from_state)
+    }
+    fn latest_compaction_summary_timestamp(&self) -> Option<i64> {
+        Agent::read_state(self, super::latest_compaction_summary_timestamp_from_state)
+    }
+    fn threshold_context_tokens(
+        &self,
+        assistant_message: &pi_ai::types::AssistantMessage,
+        compaction_timestamp: Option<f64>,
+        model: Option<&pi_ai::types::Model>,
+        rebuilt_at: Option<f64>,
+    ) -> Option<f64> {
+        Agent::read_state(self, |state| {
+            super::threshold_context_tokens_from_state(
+                state,
+                assistant_message,
+                compaction_timestamp,
+                model,
+                rebuilt_at,
+            )
+        })
+    }
+    fn model_and_context_tokens(&self) -> (pi_ai::types::Model, f64) {
+        Agent::read_state(self, |state| {
+            (
+                state.model.clone(),
+                crate::core::compaction::compaction::estimate_context_tokens(&state.messages)
+                    .tokens,
+            )
+        })
+    }
+    fn messages_without_harness_digests(&self) -> Vec<AgentMessage> {
+        Agent::read_state(self, |state| {
+            crate::core::messages::without_harness_digests_for_compaction(&state.messages)
+        })
+    }
+    fn system_prompt_and_tools(&self) -> (String, Option<Vec<pi_ai::types::Tool>>) {
+        Agent::read_state(self, super::system_prompt_and_tools_from_state)
+    }
     fn streaming_message(&self) -> Option<AgentMessage> {
         self.read_state(|state| state.streaming_message.clone())
     }
