@@ -2653,10 +2653,13 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
         //    kernel.
         let conversation = serialize_conversation(&llm);
         {
-            let preparation =
-                prepare_compaction(&entries, &settings, &|_entries| {
-                    messages.iter().map(estimate_tokens).sum()
-                });
+            let preparation = prepare_compaction(
+                &entries,
+                &settings,
+                // Mirrors the production context builder: the threshold
+                // estimate over the live message list.
+                &|_entries| estimate_context_tokens(&messages).tokens,
+            );
             let retained_state_anchor = preparation
                 .as_ref()
                 .and_then(|preparation| preparation.retained_state_anchor.clone());
