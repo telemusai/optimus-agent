@@ -422,10 +422,7 @@ pub async fn send_signed_responses_request(
 
 	let signed = build_signed_request_headers(client, &url, "POST", &headers, &body, options)?;
 
-	let mut request = reqwest::Client::builder()
-		.redirect(reqwest::redirect::Policy::none())
-		.build()
-		.map_err(|error| error.to_string())?
+	let mut request = crate::providers::shared_http::try_shared_client(crate::providers::shared_http::ClientPolicy::RedirectNone)?
 		.post(&url)
 		.body(body);
 	for (key, value) in signed {
