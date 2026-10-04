@@ -33,6 +33,7 @@ use pi_ai::types::{
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use serde_json::Value;
 
+use crate::core::compaction::charcount::{count_chars, scan_chars_forward};
 use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::metrics::CompactionMetrics;
 use crate::core::compaction::utils::{
@@ -784,11 +785,11 @@ fn ceil_div4(chars: usize) -> f64 {
 
 fn content_chars(content: &CustomMessageContent) -> usize {
     match content {
-        CustomMessageContent::Text(text) => text.chars().count(),
+        CustomMessageContent::Text(text) => count_chars(text),
         CustomMessageContent::Blocks(blocks) => blocks
             .iter()
             .map(|block| match block {
-                pi_agent_core::types::ContentBlock::Text(text) => text.text.chars().count(),
+                pi_agent_core::types::ContentBlock::Text(text) => count_chars(&text.text),
                 pi_agent_core::types::ContentBlock::Image(_) => 4800,
             })
             .sum(),
@@ -804,12 +805,12 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
                 return provider_context.estimated_tokens;
             }
             let chars = match &user.content {
-                pi_ai::types::UserContent::Text(text) => text.chars().count(),
+                pi_ai::types::UserContent::Text(text) => count_chars(text),
                 pi_ai::types::UserContent::Blocks(blocks) => blocks
                     .iter()
                     .filter_map(|block| match block {
                         pi_ai::types::ImageOrTextContent::Text(text) => {
-                            Some(text.text.chars().count())
+                            Some(count_chars(&text.text))
                         }
                         pi_ai::types::ImageOrTextContent::Image(_) => None,
                     })
@@ -821,14 +822,14 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             let mut chars = 0usize;
             for block in &assistant.content {
                 match block {
-                    pi_ai::types::ContentBlock::Text(text) => chars += text.text.chars().count(),
+                    pi_ai::types::ContentBlock::Text(text) => chars += count_chars(&text.text),
                     pi_ai::types::ContentBlock::Thinking(thinking) => {
-                        chars += thinking.thinking.chars().count()
+                        chars += count_chars(&thinking.thinking)
                     }
                     pi_ai::types::ContentBlock::ToolCall(tool_call) => {
-                        chars += tool_call.name.chars().count();
+                        chars += count_chars(&tool_call.name);
                         chars += serde_json::to_string(&tool_call.arguments)
-                            .map(|json| json.chars().count())
+                            .map(|json| count_chars(&json))
                             .unwrap_or(0);
                     }
                 }
@@ -840,7 +841,7 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             for block in &tool_result.content {
                 match block {
                     pi_ai::types::ImageOrTextContent::Text(text) => {
-                        chars += text.text.chars().count()
+                        chars += count_chars(&text.text)
                     }
                     pi_ai::types::ImageOrTextContent::Image(_) => chars += 4800,
                 }
@@ -849,12 +850,12 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
         }
         AgentMessage::Custom(CustomAgentMessage::BashExecution {
             command, output, ..
-        }) => ceil_div4(command.chars().count() + output.chars().count()),
+        }) => ceil_div4(count_chars(command) + count_chars(output)),
         AgentMessage::Custom(CustomAgentMessage::Custom { content, .. }) => {
             ceil_div4(content_chars(content))
         }
         AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => {
-            ceil_div4(summary.chars().count())
+            ceil_div4(count_chars(summary))
         }
         AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
             summary,
@@ -865,13 +866,13 @@ pub fn estimate_tokens(message: &AgentMessage) -> f64 {
             if let Some(provider_context) = provider_context {
                 let digest_tokens = harness_digest
                     .as_ref()
-                    .map(|digest| ceil_div4(digest.chars().count()))
+                    .map(|digest| ceil_div4(count_chars(digest)))
                     .unwrap_or(0.0);
                 return provider_context.estimated_tokens + digest_tokens;
             }
-            let mut chars = summary.chars().count();
+            let mut chars = count_chars(summary);
             if let Some(digest) = harness_digest {
-                chars += digest.chars().count();
+                chars += count_chars(digest);
             }
             ceil_div4(chars)
         }
@@ -1354,7 +1355,7 @@ async fn generate_bounded_summary(
     let mut length_retry_used = false;
     let conversation = serialize_conversation(&convert_to_llm(messages, &Default::default()));
     phase.measurement(PerformanceMetricMeasurement::SerializedBytes, Some(conversation.len() as f64));
-    let conversation_chars = conversation.chars().count();
+    let conversation_chars = count_chars(&conversation);
     let mut offset = 0usize;
     // Byte offset of `offset` inside `conversation`. Consecutive chunks are
     // adjacent, so each chunk's byte range is found by walking only that
@@ -1379,7 +1380,7 @@ async fn generate_bounded_summary(
         // so retrying never drops or changes the transcript being summarized.
         let budget = (((f64::min(input_limit, model.context_window - retry_max_tokens) - 1024.0) * 3.0)
             .floor())
-            - suffix.chars().count() as f64
+            - count_chars(&suffix) as f64
             - *SUMMARIZATION_SYSTEM_PROMPT_CHARS as f64
             - 64.0;
         if budget <= 0.0 {
@@ -1400,15 +1401,14 @@ async fn generate_bounded_summary(
                     && offset + chunk_char_len <= conversation_chars,
                 "chunk stays inside the conversation"
             );
-            let Some((byte, ch)) = conversation[chunk_start_byte..]
-                .char_indices()
-                .nth(chunk_char_len - 1)
-            else {
+            let (end, seen) =
+                scan_chars_forward(conversation.as_bytes(), chunk_start_byte, chunk_char_len);
+            if seen < chunk_char_len {
                 // Unreachable by the loop invariant above; degrade to a terminal
                 // error instead of panicking if it ever regresses.
                 return Err(abort_error());
-            };
-            chunk_start_byte + byte + ch.len_utf8()
+            }
+            end
         };
         let chunk: String = conversation[chunk_start_byte..chunk_end_byte].to_string();
         offset += chunk_char_len;
