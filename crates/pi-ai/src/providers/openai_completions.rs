@@ -17,6 +17,7 @@ use crate::models::{calculate_cost, clamp_thinking_level, CostOverrides};
 use crate::providers::cloudflare::{is_cloudflare_provider, resolve_cloudflare_base_url};
 use crate::providers::github_copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input, CopilotDynamicHeaderParams};
 use crate::providers::opencode_headers::with_opencode_headers;
+use crate::providers::shared_http::{shared_client, ClientPolicy};
 use crate::providers::simple_options::build_base_options;
 use crate::providers::transform_messages::try_transform_messages;
 use crate::types::{
@@ -1699,7 +1700,7 @@ async fn post_chat_completions(
 		headers.insert(name.clone(), value.clone());
 	}
 
-	let mut builder = reqwest::Client::new().post(&url);
+	let mut builder = shared_client(ClientPolicy::Default).post(&url);
 	for (name, value) in &headers {
 		match value {
 			Some(value) => builder = builder.header(name.as_str(), value.as_str()),
