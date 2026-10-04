@@ -72,6 +72,152 @@ async fn nine_supervisor_stale_reclaim_preserves_transcript_and_rejects_live_ide
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_reclaims_dead_registration_with_fresh_owner_context() {
+    let fixture = SupervisorFixture::new("stale-owned-adoption").await;
+    let worker = dead_worker(&fixture, "old-worker");
+    let (file, _) = session(&fixture, &worker, "saved-owned-chat");
+    let before = std::fs::read(&file).unwrap();
+    worker.descriptor.lock().unwrap().owner_client_id = Some(fixture.client.identity());
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+
+    // Stop at replacement launch validation: no worker, credentials or model needed.
+    let body = json!({"sessionPath":file,"config":"deliberately invalid fixture config"});
+    let error = fixture.supervisor.create_for_owner_inner(
+        fixture.client.identity(), body.as_object().unwrap(),
+    ).await.unwrap_err();
+    assert!(error.contains("invalid type"), "resume did not reach fresh launch: {error}");
+    assert!(!fixture.supervisor.workers.lock().unwrap().contains_key("old-worker"),
+        "a dead worker still blocks its owner resuming with fresh context");
+    assert!(!fixture.supervisor.descriptor_dir.join("old-worker.json").exists());
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_retains_connected_owner_until_transport_is_gone() {
+    let fixture = SupervisorFixture::new("stale-owned-connected").await;
+    let worker = dead_worker(&fixture, "owned");
+    let (file, _) = session(&fixture, &worker, "owned-chat");
+    worker.descriptor.lock().unwrap().owner_client_id = Some(fixture.client.identity());
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+    assert!(!fixture.supervisor.reclaim_stale_worker_registration(&worker).await.unwrap());
+    assert!(fixture.supervisor.descriptor_dir.join("owned.json").exists());
+    let body = json!({"sessionPath":file,"config":"deliberately invalid fixture config"});
+    let error = fixture.supervisor.create_for_owner_inner("different-client".into(), body.as_object().unwrap()).await.unwrap_err();
+    assert!(!error.contains("invalid type"), "must not launch over a connected owner");
+    assert!(fixture.supervisor.descriptor_dir.join("owned.json").exists());
+    fixture.client.stopped.cancel();
+    let error = fixture.supervisor.create_for_owner_inner("different-client".into(), body.as_object().unwrap()).await.unwrap_err();
+    assert!(error.contains("invalid type"), "{error}");
+    assert!(!fixture.supervisor.descriptor_dir.join("owned.json").exists());
+    assert!(Path::new(&file).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_retains_live_or_unknown_worker_generation() {
+    let fixture = SupervisorFixture::new("stale-owned-live").await;
+    let worker = add_descriptor_only_worker(&fixture, "live-owned", "live-owned", "token", DAEMON_WORKER_LIFECYCLE_FAILED);
+    worker.descriptor.lock().unwrap().owner_client_id = Some("disconnected-client".into());
+    for start in [get_process_start_id(std::process::id() as i64), None] {
+        worker.descriptor.lock().unwrap().process_start_id = start;
+        fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+        assert!(!fixture.supervisor.reclaim_worker_for_resume(&worker, "disconnected-client").await.unwrap());
+        assert!(fixture.supervisor.descriptor_dir.join("live-owned.json").exists());
+    }
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_preserves_unresolved_recovery_evidence() {
+    let fixture = SupervisorFixture::new("stale-owned-uncertain").await;
+    let worker = dead_worker(&fixture, "owned");
+    let (file, _) = session(&fixture, &worker, "owned-chat");
+    worker.descriptor.lock().unwrap().owner_client_id = Some(fixture.client.identity());
+    let journal = fixture.root.join("broken-orphans.jsonl");
+    worker.descriptor.lock().unwrap().orphan_process_journal_path = Some(journal.to_string_lossy().into_owned());
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+    std::fs::write(&journal, b"crash-truncated-orphan-record").unwrap();
+    let body = json!({"sessionPath":file,"config":"deliberately invalid fixture config"});
+    let error = fixture.supervisor.create_for_owner_inner(fixture.client.identity(), body.as_object().unwrap()).await.unwrap_err();
+    assert!(error.contains("Malformed orphan record"), "{error}");
+    assert!(fixture.supervisor.descriptor_dir.join("owned.json").exists());
+    assert_eq!(std::fs::read(&journal).unwrap(), b"crash-truncated-orphan-record");
+    assert_eq!(worker.descriptor.lock().unwrap().owner_client_id.as_deref(), Some(fixture.client.identity().as_str()));
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_startup_already_cleans_dead_disconnected_owner() {
+    let fixture = SupervisorFixture::new("stale-owned-startup").await;
+    let worker = dead_worker(&fixture, "old-worker");
+    let (file, _) = session(&fixture, &worker, "saved-chat");
+    let before = std::fs::read(&file).unwrap();
+    worker.descriptor.lock().unwrap().owner_client_id = Some("disconnected-client".into());
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+    fixture.supervisor.workers.lock().unwrap().clear();
+    fixture.supervisor.adopt_workers().await.unwrap();
+    assert!(!fixture.supervisor.workers.lock().unwrap().contains_key("old-worker"));
+    assert!(!fixture.supervisor.descriptor_dir.join("old-worker.json").exists());
+    assert_eq!(std::fs::read(&file).unwrap(), before);
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_rechecks_owner_after_catalog_recovery() {
+    let fixture = SupervisorFixture::new("stale-owned-reconnect").await;
+    let worker = dead_worker(&fixture, "owned");
+    let (file, _) = session(&fixture, &worker, "owned-chat");
+    worker.descriptor.lock().unwrap().owner_client_id = Some("reconnecting-owner".into());
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+    let journal = worker.descriptor.lock().unwrap().recovery_journal_path.clone();
+    WorkerRecoveryJournal::new(&journal).record(WorkerRecoveryRecordInput {
+        active_session_id: "owned".into(), session_id: "owned-chat".into(),
+        session_file: Some(file), busy: true, operation: "tool_call".into(),
+    });
+    let script = fixture.root.join("held-catalog.py");
+    let entered = fixture.root.join("entered");
+    let release = fixture.root.join("release");
+    std::fs::write(&script, format!(r#"import json,pathlib,sys,time
+print(json.dumps({{'type':'ready'}}),flush=True)
+for line in sys.stdin:
+    request=json.loads(line)
+    pathlib.Path({entered}).touch()
+    deadline=time.monotonic()+10
+    while not pathlib.Path({release}).exists() and time.monotonic()<deadline:
+        time.sleep(0.01)
+    print(json.dumps({{'type':'response','id':request['id'],'success':True,'data':{{}}}}),flush=True)
+"#, entered=serde_json::to_string(&entered.to_string_lossy()).unwrap(), release=serde_json::to_string(&release.to_string_lossy()).unwrap())).unwrap();
+    fixture.supervisor.catalog.start(if cfg!(windows) { "python" } else { "python3" }, vec![script.to_string_lossy().into_owned()], Vec::new()).await.unwrap();
+    let supervisor = fixture.supervisor.clone();
+    let candidate = worker.clone();
+    let pending = tokio::spawn(async move {
+        supervisor.reclaim_worker_for_resume(&candidate, "new-client").await
+    });
+    tokio::time::timeout(Duration::from_secs(5), async {
+        while !entered.exists() { tokio::time::sleep(Duration::from_millis(10)).await; }
+    }).await.unwrap();
+    *fixture.client.id.lock().unwrap() = "reconnecting-owner".into();
+    std::fs::write(&release, "").unwrap();
+    let reclaimed = pending.await.unwrap().unwrap();
+    fixture.supervisor.catalog.stop().await;
+    assert!(!reclaimed, "resume retired a reconnected client's worker");
+    assert!(fixture.supervisor.descriptor_dir.join("owned.json").exists());
+    assert!(Path::new(&journal).exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn stale_owned_resume_never_signals_recycled_pid() {
+    let fixture = SupervisorFixture::new("stale-owned-recycled-pid").await;
+    let worker = dead_worker(&fixture, "old-generation");
+    {
+        let mut descriptor = worker.descriptor.lock().unwrap();
+        descriptor.pid = std::process::id() as i32;
+        descriptor.process_start_id = Some("a-different-process-generation".into());
+        descriptor.owner_client_id = Some("gone-client".into());
+    }
+    fixture.supervisor.persist_worker(&worker.descriptor.lock().unwrap()).unwrap();
+    assert!(fixture.supervisor.reclaim_worker_for_resume(&worker, "new-client").await.unwrap());
+    assert!(is_process_alive(std::process::id() as i32));
+    assert!(!fixture.supervisor.descriptor_dir.join("old-generation.json").exists());
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn nine_supervisor_uncertain_work_is_marked_interrupted_not_replayed() {
     let fixture = SupervisorFixture::new("nine-uncertain").await;
     let worker = dead_worker(&fixture, "dead");
