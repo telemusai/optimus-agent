@@ -1349,14 +1349,8 @@ fn spawn_hidden_detached(
     log_options.create(true).append(true);
     #[cfg(unix)]
     {
-        use std::os::unix::{fs::OpenOptionsExt, process::CommandExt};
+        use std::os::unix::fs::OpenOptionsExt;
         log_options.mode(0o600);
-        process.process_group(0);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::process::CommandExt;
-        process.creation_flags(0x0800_0000 | 0x0000_0200);
     }
     if let Ok(log) = log_options.open(&log_path) {
         process.stderr(std::process::Stdio::from(log));
@@ -1367,6 +1361,7 @@ fn spawn_hidden_detached(
     let failure: std::sync::Arc<Mutex<Option<ChildFailure>>> =
         std::sync::Arc::new(Mutex::new(None));
     let failure_slot = failure.clone();
+    crate::utils::daemon_process::detach_daemon(&mut process);
     match process.spawn() {
         Ok(mut child) => {
             let pid = child.id();
@@ -1813,4 +1808,12 @@ mod tests {
             assert_eq!(normalize_lexically(relative), "C:registry");
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn detached_daemon_survives_launcher_exit() {
+    crate::utils::daemon_process::tests::assert_detached_spawn(|command, args, cwd, env| {
+        assert!(spawn_hidden_detached(command, args, cwd, env, &format!("{cwd}/daemon.sock")).is_some());
+    });
 }

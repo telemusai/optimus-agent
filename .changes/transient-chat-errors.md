@@ -1,1 +1,4 @@
-- Request errors such as “Kiro network request failed” and temporary command errors now disappear from chat after five seconds, including while idle. Partial replies and saved diagnostic data are preserved; old request-error decorations do not reappear when resuming a chat.
+- Changed request errors such as “Kiro network request failed” and temporary command errors to disappear from chat after five seconds, including while idle. Partial replies and saved diagnostic data are preserved; old request-error decorations do not reappear when resuming a chat.
+- Fixed background daemon startup and update coordination retaining the launching terminal session on Unix; all daemon launch paths now detach consistently.
+- Fixed Python startup hanging indefinitely after the kernel ready handshake by bounding runtime initialization, preserving snapshots on timeout, and stopping the failed kernel before a fresh retry.
+- Fixed silently lost Python protocol frames by logging write failures directly to the host stderr log without capturing the failed frame contents.

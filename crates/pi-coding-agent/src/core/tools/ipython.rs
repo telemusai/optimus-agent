@@ -466,6 +466,7 @@ pub struct IpythonKernelProvisioner {
     cwd: String,
     options: Option<IpythonToolOptions>,
     factory: KernelClientFactory,
+    bootstrap_timeout: std::time::Duration,
     /// Serializes generation changes and retains the single in-flight teardown.
     lifecycle: Mutex<Option<SharedStop>>,
     manager_promise: Mutex<Option<Arc<StartupHandle>>>,
@@ -529,6 +530,7 @@ impl IpythonKernelProvisioner {
             cwd: cwd.to_string(),
             options,
             factory,
+            bootstrap_timeout: std::time::Duration::from_secs(30),
             lifecycle: Mutex::new(None),
             manager_promise: Mutex::new(None),
             started_manager: Mutex::new(None),
@@ -914,6 +916,7 @@ impl IpythonKernelProvisioner {
             manager
         };
         let mut pending_restore: Option<RestoreResult> = None;
+        let mut bootstrap_timed_out = false;
         let startup_result: Result<(), KernelError> = async {
             // Emitted synchronously (before the permit await) so a listener
             // attaching mid-flight can replay the current stage.
@@ -964,9 +967,19 @@ impl IpythonKernelProvisioner {
                 }
             }
             self.emit_startup_progress("Preparing Python runtime...");
-            let bootstrap = manager
-                .execute(&bootstrap_code, Some(startup_signal.clone()), None)
-                .await?;
+            let bootstrap = match tokio::time::timeout(
+                self.bootstrap_timeout,
+                manager.execute(&bootstrap_code, Some(startup_signal.clone()), None),
+            ).await {
+                Ok(result) => result?,
+                Err(_) => {
+                    bootstrap_timed_out = true;
+                    return Err(KernelError::new(format!(
+                        "Python runtime bootstrap did not finish within {} seconds. The kernel was stopped; retry to start a fresh kernel.",
+                        self.bootstrap_timeout.as_secs_f64(),
+                    )));
+                }
+            };
             if bootstrap.status != ExecuteStatus::Ok {
                 let details = [bootstrap.stderr, bootstrap
                     .error
@@ -989,7 +1002,10 @@ impl IpythonKernelProvisioner {
             // Never leak the kernel process if startup fails after spawn - and never
             // surface the failure before the teardown (final snapshot flush included)
             // finished.
-            let snapshot = *self.dispose_snapshot.lock().expect("dispose snapshot lock");
+            // Never overwrite a recovered snapshot with a partially initialized runtime.
+            // Skipping the flush also avoids queueing snapshot work behind a stuck bootstrap.
+            let snapshot = !bootstrap_timed_out
+                && *self.dispose_snapshot.lock().expect("dispose snapshot lock");
             let _ = manager.shutdown(snapshot, true).await;
             return Err(error);
         }
@@ -2613,3 +2629,7 @@ mod tests {
         assert!(receipt.settle(std::time::Duration::from_secs(1)).await.settled);
     }
 }
+
+#[cfg(test)]
+#[path = "ipython_bootstrap_tests.rs"]
+mod bootstrap_tests;
