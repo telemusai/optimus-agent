@@ -1321,12 +1321,12 @@ fn summary_output_budgets(
     Ok((initial, (initial * 2.0).min(ceiling).min(65_536.0).floor().max(initial)))
 }
 
-#[allow(clippy::too_many_arguments)]
 /// `SUMMARIZATION_SYSTEM_PROMPT` length in Unicode scalars. The chunk budget
 /// subtracts it on every iteration, so it is computed once.
 static SUMMARIZATION_SYSTEM_PROMPT_CHARS: std::sync::LazyLock<usize> =
     std::sync::LazyLock::new(|| SUMMARIZATION_SYSTEM_PROMPT.chars().count());
 
+#[allow(clippy::too_many_arguments)]
 async fn generate_bounded_summary(
     messages: &[AgentMessage],
     model: &Model,
@@ -1393,10 +1393,21 @@ async fn generate_bounded_summary(
             chunk_start_byte
         } else {
             // The end of the `chunk_char_len`-th char from `chunk_start_byte`.
-            let (byte, ch) = conversation[chunk_start_byte..]
+            // Invariant: `chunk_start_byte` is the byte offset of `offset`, and
+            // `offset + chunk_char_len <= conversation_chars`.
+            debug_assert!(
+                chunk_start_byte <= conversation.len()
+                    && offset + chunk_char_len <= conversation_chars,
+                "chunk stays inside the conversation"
+            );
+            let Some((byte, ch)) = conversation[chunk_start_byte..]
                 .char_indices()
                 .nth(chunk_char_len - 1)
-                .expect("chunk stays inside the conversation");
+            else {
+                // Unreachable by the loop invariant above; degrade to a terminal
+                // error instead of panicking if it ever regresses.
+                return Err(abort_error());
+            };
             chunk_start_byte + byte + ch.len_utf8()
         };
         let chunk: String = conversation[chunk_start_byte..chunk_end_byte].to_string();
