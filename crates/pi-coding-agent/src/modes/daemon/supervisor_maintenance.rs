@@ -271,9 +271,26 @@ impl Supervisor {
     }
 
     pub(super) async fn reclaim_stale_worker_registration(self: &Arc<Self>, worker: &Arc<Worker>) -> Result<bool, String> {
+        self.reclaim_worker_registration(worker, None).await
+    }
+
+    pub(super) async fn reclaim_worker_for_resume(self: &Arc<Self>, worker: &Arc<Worker>, owner: &str) -> Result<bool, String> {
+        self.reclaim_worker_registration(worker, Some(owner)).await
+    }
+
+    fn can_reclaim_worker_owner(&self, descriptor: &DaemonWorkerDescriptor, requester: Option<&str>) -> bool {
+        let Some(owner) = descriptor.owner_client_id.as_deref() else { return true; };
+        // An explicit resume brings fresh launch context. Background cleanup and
+        // unrelated clients must not take a connected client's private worker.
+        let Some(requester) = requester else { return false; };
+        requester == owner || !self.clients.lock().unwrap().values().any(|client|
+            !client.stopped.is_cancelled() && client.identity() == owner)
+    }
+
+    async fn reclaim_worker_registration(self: &Arc<Self>, worker: &Arc<Worker>, requester: Option<&str>) -> Result<bool, String> {
         let descriptor = worker.descriptor.lock().unwrap().clone();
         if worker.client.lock().unwrap().as_ref().is_some_and(|client| client.is_connected()) || worker.recovery.load(Ordering::SeqCst) { return Ok(false); }
-        if descriptor.stop_requested_at.is_none() && (descriptor.lifecycle != DAEMON_WORKER_LIFECYCLE_FAILED || descriptor.owner_client_id.is_some()) { return Ok(false); }
+        if descriptor.stop_requested_at.is_none() && (descriptor.lifecycle != DAEMON_WORKER_LIFECYCLE_FAILED || !self.can_reclaim_worker_owner(&descriptor, requester)) { return Ok(false); }
         if stop_cleanup_is_parked(&descriptor) { return Err("Session worker stop cleanup is parked; retained recovery journals require attention".into()); }
         if is_stopping_process_alive(&ProcessIdentity { pid: descriptor.pid as i64, process_start_id: descriptor.process_start_id.clone() }) { return Ok(false); }
         if descriptor.stop_requested_at.is_some() {
@@ -282,6 +299,8 @@ impl Supervisor {
         }
         self.recover_uncertain_worker_operations(worker).await?;
         self.assert_dead_registration(worker, &descriptor).await?;
+        // Recovery can await catalog I/O; the previous owner may have reconnected.
+        if !self.can_reclaim_worker_owner(&descriptor, requester) { return Ok(false); }
         self.invalidate_worker_input_pauses(worker);
         self.flip_worker_roster_entries_inactive(worker);
         remove_file_durably(&self.descriptor_dir.join(format!("{}.json", descriptor.worker_id)).to_string_lossy(), RemoveFileDurablyOptions { fsync_dir: true, platform: None }).await.map_err(|error| error.to_string())?;

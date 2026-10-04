@@ -384,6 +384,7 @@ fn measure_slice_lines(
     for message in messages {
         scratch.message_anchored(message.clone(), false, "initial-fill-measure");
     }
+    scratch.request_errors.dismiss_all();
     scratch
         .rows
         .iter_mut()

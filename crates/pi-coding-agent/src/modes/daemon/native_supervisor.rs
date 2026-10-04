@@ -1540,14 +1540,16 @@ impl Supervisor {
             let workers: Vec<_> = self.workers.lock().unwrap().values().cloned().collect();
             let mut matches: Vec<(Arc<Worker>, SessionSummary)> = Vec::new();
             for worker in workers {
-                if !visible(&worker, &owner) { continue; }
                 let descriptor = worker.descriptor.lock().unwrap().clone();
                 let target = canonical_session_path(path);
                 let matches_path = descriptor.session_file.as_ref().or(descriptor.create_command.session_path.as_ref())
                     .is_some_and(|file| canonical_session_path(file) == target)
                     || self.find_summary_in_worker(&worker, path).is_some();
                 if !matches_path { continue; }
-                if self.reclaim_stale_worker_registration(&worker).await? { continue; }
+                if self.reclaim_worker_for_resume(&worker, &owner).await? { continue; }
+                if !visible(&worker, &owner) {
+                    return Err(format!("Session \"{path}\" still belongs to another client or an unverified worker; retry after it stops"));
+                }
                 // The refresh republishes the worker's rows, so the summary that
                 // answers a reuse is the roster's, matched on the canonical path.
                 self.refresh(&worker).await?;

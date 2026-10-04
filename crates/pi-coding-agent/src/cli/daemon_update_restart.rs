@@ -1167,6 +1167,7 @@ fn spawn_hidden_detached(
     let failure: std::sync::Arc<std::sync::Mutex<Option<ChildFailure>>> =
         std::sync::Arc::new(std::sync::Mutex::new(None));
     let failure_slot = failure.clone();
+    crate::utils::daemon_process::detach_daemon(&mut process);
     match process.spawn() {
         Ok(mut child) => {
             std::thread::spawn(move || {
@@ -1470,4 +1471,12 @@ mod tests {
         assert!(!environment.contains_key(DAEMON_WORKER_ROLE_ENV));
         assert!(!environment.contains_key(SESSION_LEASES_ENABLED_ENV));
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn detached_daemon_survives_launcher_exit() {
+    crate::utils::daemon_process::tests::assert_detached_spawn(|command, args, cwd, env| {
+        assert!(spawn_hidden_detached(command, args, cwd, env).is_some());
+    });
 }

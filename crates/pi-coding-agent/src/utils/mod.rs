@@ -4,6 +4,7 @@ pub mod child_process;
 pub mod clipboard;
 pub mod clipboard_image;
 pub mod clipboard_native;
+pub(crate) mod daemon_process;
 pub mod daemon_socket_path;
 pub mod dir_lock;
 pub mod exif_orientation;

@@ -2567,6 +2567,7 @@ fn spawn_hidden_detached(
     for (key, value) in env {
         process.env(key, value);
     }
+    crate::utils::daemon_process::detach_daemon(&mut process);
     match process.spawn() {
         Ok(child) => Some(SpawnedChild { pid: child.id() as i64 }),
         Err(_) => None,
@@ -3156,4 +3157,12 @@ mod tests {
             assert_eq!(normalize_lexically(relative), "C:registry");
         }
     }
+}
+
+#[cfg(all(test, unix))]
+#[test]
+fn detached_daemon_survives_launcher_exit() {
+    crate::utils::daemon_process::tests::assert_detached_spawn(|command, args, cwd, env| {
+        assert!(spawn_hidden_detached(command, args, cwd, env).is_some());
+    });
 }

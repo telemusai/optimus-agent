@@ -82,6 +82,8 @@ mod native_state;
 mod native_status;
 #[path = "native_host_clipboard.rs"]
 mod native_clipboard;
+#[path = "native_host_errors.rs"]
+mod native_errors;
 #[path = "native_host_commands.rs"]
 mod native_commands;
 // Child-session mode inheritance (integration hunk C-4) uses the /jev mode
@@ -161,6 +163,7 @@ impl<T: TuiComponent> TuiComponent for SharedComponent<T> {
 struct Transcript {
     pending_stash_restore: Option<native_stash_restore::PendingRestore>,
     clipboard_notice: native_clipboard::Notice,
+    request_errors: native_errors::PendingErrors,
     recovery_notices: Vec<Rc<RefCell<native_recovery_notice::RecoveryNotice>>>,
     refinement_outcomes: Vec<Rc<RefCell<RefinementOutcomeMessageComponent>>>,
     subagents: Option<Rc<RefCell<native_subagents::Bar>>>,
@@ -278,6 +281,7 @@ impl Transcript {
         Self {
             pending_stash_restore: None,
             clipboard_notice: native_clipboard::Notice::default(),
+            request_errors: native_errors::PendingErrors::default(),
             recovery_notices: Vec::new(),
             refinement_outcomes: Vec::new(),
             subagents: None,
@@ -311,6 +315,7 @@ impl Transcript {
         self.timeline_cache.clear();
         self.history = None;
         self.clipboard_notice = native_clipboard::Notice::default();
+        self.request_errors = native_errors::PendingErrors::default();
         self.rows.clear();
         self.row_keys.clear();
         self.row_metadata.clear();
@@ -326,6 +331,7 @@ impl Transcript {
         for message in initial_render_messages(messages) {
             self.message(message, false);
         }
+        self.request_errors.dismiss_all();
     }
     fn replace_history(&mut self, messages: Vec<AgentMessage>, total: f64) {
         self.replace_history_with_ids(messages, total, &[]);
@@ -348,6 +354,7 @@ impl Transcript {
                 });
             history.message_anchored(message, false, &key);
         }
+        history.request_errors.dismiss_all();
         self.history = Some(Box::new(history));
     }
     fn all_tools(&self) -> Vec<Rc<RefCell<ToolExecutionComponent>>> {
@@ -464,6 +471,9 @@ impl Transcript {
                 component
                     .borrow_mut()
                     .update_content(message.clone(), streaming);
+                if !streaming && message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
+                    self.request_errors.push(&component, Instant::now());
+                }
                 for block in &message.content {
                     if let pi_ai::types::ContentBlock::ToolCall(call) = block {
                         self.tool_start(
@@ -3232,6 +3242,7 @@ async fn run_terminal(
         if transcript.borrow_mut().clipboard_notice.expire(Instant::now()) {
             ui.borrow_mut().request_render();
         }
+        native_errors::expire_notices(&mode, &transcript, &ui, Instant::now());
         history_runtime.poll(&mode, &transcript, &ui);
         if let Some(bridge) = &local_extension_bridge {
             *bridge.editor_text.lock().unwrap_or_else(|e| e.into_inner()) = editor.borrow().editor().get_text();
@@ -4871,7 +4882,7 @@ fn apply_event(
         "auto_retry_start" => {
             let mut mode = mode.borrow_mut();
             mode.patch_connection_state(|s| s.retry_attempt = number(&value, "attempt").unwrap_or(0.0));
-            mode.show_warning(&string(&value, "errorMessage"));
+            mode.show_error(&string(&value, "errorMessage"));
         }
         "auto_retry_end" => mode.borrow_mut().patch_connection_state(|s| s.retry_attempt = 0.0),
         "session_info_changed" => {
@@ -5832,7 +5843,7 @@ fn apply_event_legacy_for_speed(
         "auto_retry_start" => {
             let mut mode = mode.borrow_mut();
             mode.patch_connection_state(|s| s.retry_attempt = number(&value, "attempt").unwrap_or(0.0));
-            mode.show_warning(&string(&value, "errorMessage"));
+            mode.show_error(&string(&value, "errorMessage"));
         }
         "auto_retry_end" => mode.borrow_mut().patch_connection_state(|s| s.retry_attempt = 0.0),
         "session_info_changed" => {

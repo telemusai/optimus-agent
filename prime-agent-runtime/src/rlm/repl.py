@@ -66,6 +66,7 @@ def _cap_text(text: str) -> str:
     return text
 
 _protocol_fd: int = -1
+_host_stderr_fd: int = -1
 _write_lock = threading.Lock()
 _loop: asyncio.AbstractEventLoop | None = None
 _serve_task: asyncio.Task[Any] | None = None
@@ -107,9 +108,17 @@ def _send(event: dict[str, Any]) -> None:
         view = memoryview(data)
         try:
             while view:
-                view = view[os.write(_protocol_fd, view) :]
-        except OSError:
-            pass
+                written = os.write(_protocol_fd, view)
+                if written == 0:
+                    raise OSError("protocol write made no progress")
+                view = view[written:]
+        except OSError as error:
+            # sys.stderr is captured and would recurse through _send under this lock.
+            # Only log the failure, never the frame contents (which can contain secrets).
+            try:
+                os.write(_host_stderr_fd, f"rlm.repl: dropped protocol frame: {error}\n".encode())
+            except OSError:
+                pass
 
 
 def emit(data: dict[str, Any]) -> None:
@@ -1458,7 +1467,9 @@ _pump_err: _Pump
 
 def _setup_fds() -> int:
     """Reserve stdout for the protocol; route fds 1/2 through captured pipes."""
-    global _protocol_fd, _pump_out, _pump_err
+    global _protocol_fd, _host_stderr_fd, _pump_out, _pump_err
+    _host_stderr_fd = os.dup(2)
+    os.set_inheritable(_host_stderr_fd, False)
     _protocol_fd = os.dup(1)
     os.set_inheritable(_protocol_fd, False)
     out_r, out_w = os.pipe()
