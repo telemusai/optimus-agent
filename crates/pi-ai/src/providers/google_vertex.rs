@@ -843,7 +843,10 @@ async fn send_request(
 		}
 	}
 
-	let mut request = reqwest::Client::new().post(&url).headers(headers).json(&body);
+	let mut request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
+		.post(&url)
+		.headers(headers)
+		.json(&body);
 	if let Some(timeout_ms) = options.stream.timeout_ms {
 		request = request.timeout(std::time::Duration::from_millis(timeout_ms.max(0.0) as u64));
 	}
