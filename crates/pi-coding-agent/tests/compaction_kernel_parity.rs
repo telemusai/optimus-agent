@@ -1580,7 +1580,7 @@ async fn compact_with_a_precancelled_token_aborts_without_a_wire_call() {
     let mut settings = default_compaction_settings();
     settings.keep_recent_tokens = 1.0;
     let entries = cancel_entries();
-    let preparation = prepare_compaction(&entries, &settings, &|_| vec![]).expect("preparation");
+    let preparation = prepare_compaction(&entries, &settings, &|_| 0.0).expect("preparation");
 
     let model = chunk_fixture_model();
     let token = tokio_util::sync::CancellationToken::new();
