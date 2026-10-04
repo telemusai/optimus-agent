@@ -1,0 +1,2 @@
+- Accelerated the local stages of auto-compaction with behavior-identical output: session context rebuild, summarizer serialization, truncation, and chunk slicing no longer clone or re-decode the full conversation, and the every-turn context threshold check borrows agent state instead of cloning it.
+- Added a runtime-dispatched SIMD char counter (AVX2 when available, SSE2/NEON/reference fallback) for compaction token estimation and chunk boundaries, with a one-time differential self-check and PRIME_AGENT_COMPACT_RUST_COUNT=1 to pin the portable implementation.
