@@ -18,7 +18,8 @@
 //! Selection happens behind a `OnceLock` that first runs a differential
 //! self-check of each candidate backend against `chars().count()` on fixed
 //! edge-case fixtures (empty input, every byte length 1..=64, load alignments
-//! 0..=31, NUL, every UTF-8 scalar width). A backend that disagrees on any
+//! 0..=31, NUL, every UTF-8 scalar width, and a > 128 KiB mixed buffer so the
+//! aarch64 fold path is exercised). A backend that disagrees on any
 //! fixture is disabled and the next candidate is tried; the compact
 //! diagnostic (no transcript content) is retrievable via [`diagnostic`].
 //! `PRIME_AGENT_COMPACT_RUST_COUNT=1` (or `true`) pins the reference
@@ -387,8 +388,9 @@ fn run_backend(backend: Backend, bytes: &[u8]) -> Option<usize> {
 /// Fixed edge-case fixtures for the self-check (and the unit tests): empty,
 /// NUL, every byte length 1..=64 over a mixed alphabet (all tails and block
 /// boundaries), load alignments 0..=31 in front of a multibyte payload, every
-/// UTF-8 scalar width and its boundary scalars, and a 4 KiB deterministic
-/// mixed buffer.
+/// UTF-8 scalar width and its boundary scalars, a 4 KiB deterministic mixed
+/// buffer, and a >= 128 KiB repeat of it (beyond the NEON fold interval) so
+/// the self-check covers the fold path on aarch64.
 fn self_check_fixtures() -> Vec<String> {
     let mut fixtures: Vec<String> = vec![
         String::new(),
@@ -435,7 +437,12 @@ fn self_check_fixtures() -> Vec<String> {
         state ^= state << 17;
         big.push(pool[(state % pool.len() as u64) as usize]);
     }
-    fixtures.push(big);
+    fixtures.push(big.clone());
+    // A buffer beyond the NEON fold interval (4096 blocks x 16 B = 65 536 B)
+    // so the per-process self-check executes the aarch64 kernel's u16-lane
+    // fold path (and the unrolled loops at >64 KiB sizes on x86-64). Built by
+    // repeating the 4 KiB buffer: deterministic, and generation is a memcpy.
+    fixtures.push(big.repeat(32));
     fixtures
 }
 
@@ -945,6 +952,23 @@ mod tests {
         assert!(!parse(""));
         assert!(!parse("2"));
         assert!(!parse(" 1"));
+    }
+
+    #[test]
+    fn self_check_corpus_exceeds_the_neon_fold_interval() {
+        // The aarch64 kernel folds its u16 lanes every 4096 blocks x 16 B =
+        // 65 536 B. The per-process self-check must see a fixture at least
+        // that large so the fold path is differentially validated on every
+        // process start (the corpus carries a >= 128 KiB buffer).
+        let max_len = self_check_fixtures()
+            .iter()
+            .map(|fixture| fixture.len())
+            .max()
+            .unwrap();
+        assert!(
+            max_len >= 65_536,
+            "largest self-check fixture is {max_len} bytes; the NEON fold path would never run"
+        );
     }
 
     #[test]
