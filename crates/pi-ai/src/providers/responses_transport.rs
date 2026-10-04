@@ -118,7 +118,7 @@ pub(crate) fn http_client(provider: &str) -> reqwest::Client {
             })
             .clone()
     } else {
-        reqwest::Client::new()
+        crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
     }
 }
 
