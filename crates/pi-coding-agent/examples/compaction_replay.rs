@@ -2240,10 +2240,13 @@ async fn run_replay_case(
     let summary_calls = state.summary_calls.load(Ordering::SeqCst);
     let turn_calls = state.turn_calls.load(Ordering::SeqCst);
     let fired = !starts.is_empty();
-    // Per-call request payload digests, in call order, plus an aggregate: a
+    // Per-call request payload digests, sorted, plus an aggregate: a
     // chunking/serialization regression that preserves chunk counts and sizes
-    // still changes these.
-    let provider_request_digests: Vec<String> = provider_calls
+    // still changes these. The list is SORTED because the split-turn history
+    // and turn-prefix summary calls run concurrently (tokio::try_join!), so
+    // their completion order — and with it the record order — is not
+    // deterministic; the ordered per-call log stays in `provider_calls`.
+    let mut provider_request_digests: Vec<String> = provider_calls
         .iter()
         .map(|call| {
             call.get("payload_sha256")
@@ -2252,6 +2255,7 @@ async fn run_replay_case(
                 .to_string()
         })
         .collect();
+    provider_request_digests.sort();
     let provider_requests_sha256 = sha256_hex(provider_request_digests.join("\n").as_bytes());
 
     session.dispose_async(Some(false)).await;
@@ -2685,10 +2689,10 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                     .min(65_536.0)
                     .floor()
                     .max(initial);
-                let budget_chars = (((f64::min(
-                    input_limit,
-                    model.context_window - retry_max_tokens,
-                ) - 1024.0)
+                // `window` is the effective context window for this variant
+                // (the fixture model's own window, or the emulated small one).
+                let budget_chars = (((f64::min(input_limit, window - retry_max_tokens)
+                    - 1024.0)
                     * 3.0)
                     .floor()
                     - suffix_chars as f64
