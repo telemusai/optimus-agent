@@ -2416,7 +2416,7 @@ async fn send_messages_request(
 	let headers = build_request_headers(client, timeout_ms, true);
 	let body = serde_json::to_string(params).map_err(|error| AnthropicStreamError::Message(error.to_string()))?;
 
-	let request = reqwest::Client::new()
+	let request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
 		.post(&url)
 		.body(body)
 		.timeout(std::time::Duration::from_millis(timeout_ms as u64));
