@@ -129,20 +129,45 @@ const TOOL_RESULT_MAX_CHARS: usize = 2000;
 fn truncate_for_summary(text: &str, max_chars: usize) -> String {
     // `String::chars` counts UTF-16-independent scalar values; the TypeScript
     // `slice` counts UTF-16 code units. Plain ASCII/Unicode text matches.
-    let chars: Vec<char> = text.chars().collect();
-    if chars.len() <= max_chars {
+    // Byte counts never exceed char counts, so short ASCII text skips the scan.
+    if text.len() <= max_chars {
+        return text.to_string();
+    }
+    let total_chars = text.chars().count();
+    if total_chars <= max_chars {
         return text.to_string();
     }
     let tail_chars = 500.min(max_chars / 4);
-    let marker_max = format!("[... {} characters truncated; first {max_chars} and last {tail_chars} kept ...]", chars.len()).len() + 4;
+    let marker_max = format!("[... {total_chars} characters truncated; first {max_chars} and last {tail_chars} kept ...]").len() + 4;
     if max_chars <= marker_max + tail_chars {
-        return chars[chars.len() - max_chars..].iter().collect();
+        return text[char_boundary_before(text, max_chars)..].to_string();
     }
     let head_chars = max_chars - tail_chars - marker_max;
-    let elided = chars.len() - head_chars - tail_chars;
-    let head: String = chars[..head_chars].iter().collect();
-    let tail: String = chars[chars.len() - tail_chars..].iter().collect();
+    let elided = total_chars - head_chars - tail_chars;
+    let head = &text[..char_boundary_after(text, head_chars)];
+    let tail = &text[char_boundary_before(text, tail_chars)..];
     format!("{head}\n\n[... {elided} characters truncated; first {head_chars} and last {tail_chars} kept ...]\n\n{tail}")
+}
+
+/// Byte offset where the first `count` chars end.
+fn char_boundary_after(text: &str, count: usize) -> usize {
+    if count == 0 {
+        return 0;
+    }
+    text.char_indices()
+        .nth(count - 1)
+        .map_or(text.len(), |(byte, ch)| byte + ch.len_utf8())
+}
+
+/// Byte offset where the last `count` chars start.
+fn char_boundary_before(text: &str, count: usize) -> usize {
+    if count == 0 {
+        return text.len();
+    }
+    text.char_indices()
+        .rev()
+        .nth(count - 1)
+        .map_or(0, |(byte, _)| byte)
 }
 
 /// Serialize LLM messages to text for summarization.
@@ -152,30 +177,33 @@ fn truncate_for_summary(text: &str, max_chars: usize) -> String {
 /// Tool results are truncated to keep the summarization request within
 /// reasonable token budgets. Full content is not needed for summarization.
 pub fn serialize_conversation(messages: &[Message]) -> String {
-    let mut parts: Vec<String> = Vec::new();
     let mut calls: HashMap<String, usize> = HashMap::new();
     let mut next_call = 1usize;
+    // The parts are appended directly: collecting them first and joining
+    // would copy the whole conversation once more into the final string.
+    // Every appended part is non-empty, so separators land exactly where
+    // `parts.join("\n\n")` placed them.
+    let mut out = String::new();
 
     for message in messages {
         match message {
             Message::User(user) => {
                 let content = user.content.text();
                 if !content.is_empty() {
-                    parts.push(format!("[User]: {content}"));
+                    push_part(&mut out, "[User]: ");
+                    out.push_str(&content);
                 }
             }
             Message::Assistant(assistant) => {
-                let mut text_parts: Vec<String> = Vec::new();
-                let mut thinking_parts: Vec<String> = Vec::new();
+                let mut text_parts: Vec<&str> = Vec::new();
+                let mut thinking_parts: Vec<&str> = Vec::new();
                 let mut tool_calls: Vec<String> = Vec::new();
 
                 for block in &assistant.content {
                     match block {
-                        pi_ai::types::ContentBlock::Text(text) => {
-                            text_parts.push(text.text.clone())
-                        }
+                        pi_ai::types::ContentBlock::Text(text) => text_parts.push(&text.text),
                         pi_ai::types::ContentBlock::Thinking(thinking) => {
-                            thinking_parts.push(thinking.thinking.clone())
+                            thinking_parts.push(&thinking.thinking)
                         }
                         pi_ai::types::ContentBlock::ToolCall(tool_call) => {
                             let args_str = tool_call
@@ -198,16 +226,16 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                 }
 
                 if !thinking_parts.is_empty() {
-                    parts.push(format!(
-                        "[Assistant thinking]: {}",
-                        thinking_parts.join("\n")
-                    ));
+                    push_part(&mut out, "[Assistant thinking]: ");
+                    out.push_str(&thinking_parts.join("\n"));
                 }
                 if !text_parts.is_empty() {
-                    parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
+                    push_part(&mut out, "[Assistant]: ");
+                    out.push_str(&text_parts.join("\n"));
                 }
                 if !tool_calls.is_empty() {
-                    parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
+                    push_part(&mut out, "[Assistant tool calls]: ");
+                    out.push_str(&tool_calls.join("; "));
                 }
             }
             Message::ToolResult(tool_result) => {
@@ -225,17 +253,25 @@ pub fn serialize_conversation(messages: &[Message]) -> String {
                         Some(index) => format!("#{index} {}", tool_result.tool_name),
                         None => format!("{} (call outside excerpt)", tool_result.tool_name),
                     };
-                    parts.push(format!(
-                        "[Tool result {identity}{}]: {}",
-                        if tool_result.is_error { " ERROR" } else { "" },
-                        truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS)
-                    ));
+                    push_part(&mut out, "[Tool result ");
+                    out.push_str(&identity);
+                    out.push_str(if tool_result.is_error { " ERROR" } else { "" });
+                    out.push_str("]: ");
+                    out.push_str(&truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS));
                 }
             }
         }
     }
 
-    parts.join("\n\n")
+    out
+}
+
+/// Start a new `\n\n`-separated part of the serialized conversation.
+fn push_part(out: &mut String, prefix: &str) {
+    if !out.is_empty() {
+        out.push_str("\n\n");
+    }
+    out.push_str(prefix);
 }
 
 pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
@@ -382,6 +418,195 @@ mod tests {
         assert_eq!(strip_file_operations("Narrative <read-files> inline </read-files>"),
             "Narrative <read-files> inline </read-files>");
         assert_eq!(modified.len(), 200);
+    }
+
+    #[test]
+    fn truncate_for_summary_matches_the_char_vector_reference() {
+        // The pre-optimization implementation, kept as the oracle: it
+        // materialized the whole text as Vec<char> before slicing.
+        fn reference(text: &str, max_chars: usize) -> String {
+            let chars: Vec<char> = text.chars().collect();
+            if chars.len() <= max_chars {
+                return text.to_string();
+            }
+            let tail_chars = 500.min(max_chars / 4);
+            let marker_max = format!("[... {} characters truncated; first {max_chars} and last {tail_chars} kept ...]", chars.len()).len() + 4;
+            if max_chars <= marker_max + tail_chars {
+                return chars[chars.len() - max_chars..].iter().collect();
+            }
+            let head_chars = max_chars - tail_chars - marker_max;
+            let elided = chars.len() - head_chars - tail_chars;
+            let head: String = chars[..head_chars].iter().collect();
+            let tail: String = chars[chars.len() - tail_chars..].iter().collect();
+            format!("{head}\n\n[... {elided} characters truncated; first {head_chars} and last {tail_chars} kept ...]\n\n{tail}")
+        }
+        let unicode_tail = format!("BEGIN{}\nERROR: failed at final step", "界".repeat(4000));
+        let ascii = "y".repeat(9000);
+        let mixed = format!("{}{}{}", "a".repeat(2000), "é界𝔘".repeat(500), "z".repeat(3000));
+        let samples: [&str; 6] = ["", "abc", "界", "ab界", "界界界界", "hello world"];
+        for text in samples {
+            for max in [0usize, 1, 2, 3, 4, 5, 10, 100] {
+                assert_eq!(
+                    truncate_for_summary(text, max),
+                    reference(text, max),
+                    "text {text:?} max {max}"
+                );
+            }
+        }
+        for text in [&unicode_tail, &ascii, &mixed] {
+            for max in [0usize, 1, 2, 3, 10, 100, 999, 1500, 2000, 2001, 5000, 9000] {
+                assert_eq!(
+                    truncate_for_summary(text, max),
+                    reference(text, max),
+                    "len {} max {max}",
+                    text.len()
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn serialize_conversation_matches_the_parts_join_reference() {
+        // The pre-optimization implementation, kept as the oracle: it collected
+        // every part into a Vec<String> and joined at the end.
+        fn reference(messages: &[Message]) -> String {
+            let mut parts: Vec<String> = Vec::new();
+            let mut calls: HashMap<String, usize> = HashMap::new();
+            let mut next_call = 1usize;
+            for message in messages {
+                match message {
+                    Message::User(user) => {
+                        let content = user.content.text();
+                        if !content.is_empty() {
+                            parts.push(format!("[User]: {content}"));
+                        }
+                    }
+                    Message::Assistant(assistant) => {
+                        let mut text_parts: Vec<String> = Vec::new();
+                        let mut thinking_parts: Vec<String> = Vec::new();
+                        let mut tool_calls: Vec<String> = Vec::new();
+                        for block in &assistant.content {
+                            match block {
+                                ContentBlock::Text(text) => text_parts.push(text.text.clone()),
+                                ContentBlock::Thinking(thinking) => {
+                                    thinking_parts.push(thinking.thinking.clone())
+                                }
+                                ContentBlock::ToolCall(tool_call) => {
+                                    let args_str = tool_call
+                                        .arguments
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            format!(
+                                                "{key}={}",
+                                                serde_json::to_string(value).unwrap_or_default()
+                                            )
+                                        })
+                                        .collect::<Vec<_>>()
+                                        .join(", ");
+                                    let index = next_call;
+                                    next_call += 1;
+                                    calls.insert(tool_call.id.clone(), index);
+                                    tool_calls.push(format!("#{index} {}({args_str})", tool_call.name));
+                                }
+                            }
+                        }
+                        if !thinking_parts.is_empty() {
+                            parts.push(format!(
+                                "[Assistant thinking]: {}",
+                                thinking_parts.join("\n")
+                            ));
+                        }
+                        if !text_parts.is_empty() {
+                            parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
+                        }
+                        if !tool_calls.is_empty() {
+                            parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
+                        }
+                    }
+                    Message::ToolResult(tool_result) => {
+                        let content: String = tool_result
+                            .content
+                            .iter()
+                            .filter_map(|block| match block {
+                                ImageOrTextContent::Text(text) => Some(text.text.clone()),
+                                ImageOrTextContent::Image(_) => None,
+                            })
+                            .collect::<Vec<_>>()
+                            .join("");
+                        if !content.is_empty() {
+                            let identity = match calls.get(&tool_result.tool_call_id) {
+                                Some(index) => format!("#{index} {}", tool_result.tool_name),
+                                None => format!("{} (call outside excerpt)", tool_result.tool_name),
+                            };
+                            parts.push(format!(
+                                "[Tool result {identity}{}]: {}",
+                                if tool_result.is_error { " ERROR" } else { "" },
+                                truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS)
+                            ));
+                        }
+                    }
+                }
+            }
+            parts.join("\n\n")
+        }
+        let mut arguments = serde_json::Map::new();
+        arguments.insert("path".to_string(), json!("src/界.rs"));
+        arguments.insert(
+            "nested".to_string(),
+            json!({"rows": [1, 2, 3], "note": "细节"}),
+        );
+        let messages = vec![
+            Message::User(UserMessage::new(
+                UserContent::Blocks(vec![
+                    ImageOrTextContent::Text(TextContent::new("hello 界")),
+                    ImageOrTextContent::Text(TextContent::new("second block")),
+                ]),
+                1,
+            )),
+            Message::User(UserMessage::new(UserContent::Text(String::new()), 2)),
+            Message::Assistant(AssistantMessage {
+                content: vec![
+                    ContentBlock::Thinking(pi_ai::types::ThinkingContent::new("why")),
+                    ContentBlock::Text(TextContent::new("answer")),
+                    ContentBlock::ToolCall(ToolCall::new("a", "ipython", arguments)),
+                    ContentBlock::Text(TextContent::new("after")),
+                    ContentBlock::ToolCall(ToolCall::new("b", "bash", Default::default())),
+                ],
+                ..Default::default()
+            }),
+            Message::ToolResult(pi_ai::types::ToolResultMessage::new(
+                "b",
+                "bash",
+                vec![ImageOrTextContent::Text(TextContent::new("x".repeat(5000)))],
+                false,
+                3,
+            )),
+            Message::ToolResult(pi_ai::types::ToolResultMessage::new(
+                "a",
+                "ipython",
+                vec![ImageOrTextContent::Text(TextContent::new(format!(
+                    "BEGIN{}\nERROR: failed at final step",
+                    "界".repeat(4000)
+                )))],
+                true,
+                4,
+            )),
+            Message::ToolResult(pi_ai::types::ToolResultMessage::new(
+                "missing",
+                "read",
+                vec![ImageOrTextContent::Text(TextContent::new("orphan"))],
+                false,
+                5,
+            )),
+            Message::ToolResult(pi_ai::types::ToolResultMessage::new(
+                "img",
+                "view",
+                vec![ImageOrTextContent::Image(Default::default())],
+                false,
+                6,
+            )),
+        ];
+        assert_eq!(serialize_conversation(&messages), reference(&messages));
     }
 
     #[test]
