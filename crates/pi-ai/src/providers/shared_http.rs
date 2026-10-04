@@ -60,23 +60,31 @@ pub(crate) fn shared_client(policy: ClientPolicy) -> reqwest::Client {
 	try_shared_client(policy).expect("Shared HTTP client")
 }
 
-fn build(policy: ClientPolicy) -> reqwest::Result<reqwest::Client> {
-	// reqwest's default `pool_idle_timeout` is already 90s; set it explicitly so the pooling
-	// policy of every shared client is stated, not inherited.
-	let builder = reqwest::Client::builder().pool_idle_timeout(POOL_IDLE_TIMEOUT);
-	let builder = match policy {
-		ClientPolicy::Default => builder,
-		ClientPolicy::RedirectNone => builder.redirect(reqwest::redirect::Policy::none()),
-		ClientPolicy::Bedrock { force_http1, no_proxy } => {
-			let builder = builder.redirect(reqwest::redirect::Policy::none());
-			let builder = if force_http1 { builder.http1_only() } else { builder };
-			if no_proxy { builder.no_proxy() } else { builder }
+impl ClientPolicy {
+	/// The builder options this policy represents, in pre-build form. Bedrock's
+	/// client-builder tests assert on this Debug output, and the cached client is built
+	/// from the same expression, so the options cannot drift between the two.
+	pub(crate) fn builder(self) -> reqwest::ClientBuilder {
+		// reqwest's default `pool_idle_timeout` is already 90s; set it explicitly so the
+		// pooling policy of every shared client is stated, not inherited.
+		let builder = reqwest::Client::builder().pool_idle_timeout(POOL_IDLE_TIMEOUT);
+		match self {
+			ClientPolicy::Default => builder,
+			ClientPolicy::RedirectNone => builder.redirect(reqwest::redirect::Policy::none()),
+			ClientPolicy::Bedrock { force_http1, no_proxy } => {
+				let builder = builder.redirect(reqwest::redirect::Policy::none());
+				let builder = if force_http1 { builder.http1_only() } else { builder };
+				if no_proxy { builder.no_proxy() } else { builder }
+			}
+			ClientPolicy::Kiro => builder
+				.redirect(reqwest::redirect::Policy::none())
+				.connect_timeout(Duration::from_secs(15)),
 		}
-		ClientPolicy::Kiro => builder
-			.redirect(reqwest::redirect::Policy::none())
-			.connect_timeout(Duration::from_secs(15)),
-	};
-	builder.build()
+	}
+}
+
+fn build(policy: ClientPolicy) -> reqwest::Result<reqwest::Client> {
+	policy.builder().build()
 }
 
 #[cfg(test)]

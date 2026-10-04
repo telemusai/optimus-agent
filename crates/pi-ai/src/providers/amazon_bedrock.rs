@@ -2145,12 +2145,8 @@ pub fn handle_content_block_stop(
 /// object, so the same intent is expressed on the client with `http1_only()` (ALPN restricted to
 /// `http/1.1`; `reqwest-0.12.28/src/async_impl/client.rs`, `http1_only`, and the ALPN list at its
 /// line 825). Without the flag the client keeps reqwest's default negotiation, like the SDK.
-fn bedrock_http_client_builder(config: &BedrockClientConfig) -> reqwest::ClientBuilder {
-	let mut builder = reqwest::Client::builder().redirect(reqwest::redirect::Policy::none());
-	if config.force_http1 {
-		builder = builder.http1_only();
-	}
-	let has_proxy_env = [
+fn bedrock_proxy_env_present() -> bool {
+	[
 		"HTTP_PROXY",
 		"HTTPS_PROXY",
 		"NO_PROXY",
@@ -2159,18 +2155,23 @@ fn bedrock_http_client_builder(config: &BedrockClientConfig) -> reqwest::ClientB
 		"no_proxy",
 	]
 	.iter()
-	.any(|name| std::env::var(name).map(|value| !value.is_empty()).unwrap_or(false));
-	if !has_proxy_env {
-		// The SDK does not read proxy env vars unless the proxy request handler is installed.
-		builder = builder.no_proxy();
+	.any(|name| std::env::var(name).map(|value| !value.is_empty()).unwrap_or(false))
+}
+
+fn bedrock_client_policy(config: &BedrockClientConfig) -> crate::providers::shared_http::ClientPolicy {
+	crate::providers::shared_http::ClientPolicy::Bedrock {
+		force_http1: config.force_http1,
+		no_proxy: !bedrock_proxy_env_present(),
 	}
-	builder
+}
+
+fn bedrock_http_client_builder(config: &BedrockClientConfig) -> reqwest::ClientBuilder {
+	bedrock_client_policy(config).builder()
 }
 
 fn build_http_client(config: &BedrockClientConfig) -> Result<reqwest::Client, ProviderError> {
-	bedrock_http_client_builder(config)
-		.build()
-		.map_err(|error| ProviderError::message(error.to_string()))
+	crate::providers::shared_http::try_shared_client(bedrock_client_policy(config))
+		.map_err(ProviderError::message)
 }
 
 /// The `$metadata.requestId` the SDK reads from `x-amzn-requestid`.
