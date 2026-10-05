@@ -55,6 +55,18 @@ See the [installer source](installers/) and [launcher guide](docs/RUST_LAUNCHER.
 
 The feature descriptions below refer to `main` unless explicitly marked as development work. Some hardened Windows installations also use deployment-specific launchers and compatibility layers that are not included in a plain source checkout.
 
+## Highly Optimized
+
+Optimus is built for fast, responsive work, even as conversations grow. Recent releases optimize the native Rust core across streaming, storage, context management, and terminal rendering to reduce pauses and unnecessary CPU, memory, and disk work.
+
+- **Smooth streaming:** reused provider connections, faster response parsing, and fewer copies let incoming replies reach the interface with less overhead.
+- **Faster long conversations:** the agent avoids repeatedly copying full chat histories, rebuilding unchanged snapshots, and redrawing unchanged terminal content.
+- **Quicker compaction:** leaner algorithms and parallel processing accelerate large context operations. CPU vector instructions on x86-64 and ARM64 speed up character counting, with a portable Rust fallback.
+- **Less disk churn:** small session and event-log writes are grouped together, with forced flushes at delivery and other durability boundaries.
+- **A leaner agent loop:** shared settings, fewer allocations, and work performed only when needed reduce the processing cost of each turn.
+
+These improvements target the local work surrounding model requests and streamed responses. Regression tests and replay benchmarks check that faster paths preserve parsed responses, retained context, and saved data, with sequential or generic fallbacks where needed.
+
 ## What makes Optimus different
 
 ### Choose IPython, Node, Clang-Repl, or Direct tools
