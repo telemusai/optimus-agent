@@ -106,13 +106,10 @@ pub fn slim_session_event_for_wire(event: &Value) -> Value {
         return event.clone();
     }
     let mut slim = candidate.clone();
-    if let Some(assistant_message_event) = candidate.get("assistantMessageEvent").and_then(Value::as_object) {
-        let mut without_partial = assistant_message_event.clone();
-        without_partial.shift_remove("partial");
-        slim.insert(
-            "assistantMessageEvent".to_string(),
-            Value::Object(without_partial),
-        );
+    if let Some(assistant_message_event) = slim.get_mut("assistantMessageEvent") {
+        if let Some(object) = assistant_message_event.as_object_mut() {
+            object.shift_remove("partial");
+        }
     }
     Value::Object(slim)
 }

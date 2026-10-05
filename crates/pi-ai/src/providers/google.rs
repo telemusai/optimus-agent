@@ -305,22 +305,26 @@ enum CurrentBlock {
 }
 
 /// TS: the `if (currentBlock) { ...text_end/thinking_end... }` flush.
+///
+/// The accumulated text lives in `output.content` (deltas append in place), so
+/// the end event reads it back from there; `block` only carries the kind.
 fn finish_block(block: &CurrentBlock, output: &AssistantMessage, stream: &AssistantMessageEventStream) {
-	match block {
-		CurrentBlock::Text(text) => {
+	match (block, output.content.last()) {
+		(CurrentBlock::Text(_), Some(ContentBlock::Text(text))) => {
 			stream.push(AssistantMessageEvent::TextEnd {
 				content_index: output.content.len() - 1,
 				content: text.text.clone(),
 				partial: output.clone(),
 			});
 		}
-		CurrentBlock::Thinking(thinking) => {
+		(CurrentBlock::Thinking(_), Some(ContentBlock::Thinking(thinking))) => {
 			stream.push(AssistantMessageEvent::ThinkingEnd {
 				content_index: output.content.len() - 1,
 				content: thinking.thinking.clone(),
 				partial: output.clone(),
 			});
 		}
+		_ => {}
 	}
 }
 
@@ -369,13 +373,13 @@ fn process_part(
 
 		let thought_signature = part.get("thoughtSignature").and_then(Value::as_str);
 		match current_block {
-			Some(CurrentBlock::Thinking(thinking)) => {
-				thinking.thinking.push_str(text);
-				thinking.thinking_signature =
-					retain_thought_signature(thinking.thinking_signature.as_deref(), thought_signature);
+			Some(CurrentBlock::Thinking(_)) => {
 				if let Some(ContentBlock::Thinking(block)) = output.content.last_mut() {
-					block.thinking = thinking.thinking.clone();
-					block.thinking_signature = thinking.thinking_signature.clone();
+					block.thinking.push_str(text);
+					block.thinking_signature = retain_thought_signature(
+						block.thinking_signature.as_deref(),
+						thought_signature,
+					);
 				}
 				stream.push(AssistantMessageEvent::ThinkingDelta {
 					content_index: output.content.len() - 1,
@@ -383,12 +387,13 @@ fn process_part(
 					partial: output.clone(),
 				});
 			}
-			Some(CurrentBlock::Text(current)) => {
-				current.text.push_str(text);
-				current.text_signature = retain_thought_signature(current.text_signature.as_deref(), thought_signature);
+			Some(CurrentBlock::Text(_)) => {
 				if let Some(ContentBlock::Text(block)) = output.content.last_mut() {
-					block.text = current.text.clone();
-					block.text_signature = current.text_signature.clone();
+					block.text.push_str(text);
+					block.text_signature = retain_thought_signature(
+						block.text_signature.as_deref(),
+						thought_signature,
+					);
 				}
 				stream.push(AssistantMessageEvent::TextDelta {
 					content_index: output.content.len() - 1,

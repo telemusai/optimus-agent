@@ -1169,7 +1169,6 @@ async fn stream_assistant_response_inner(
     llm_context: Context,
     provider_config: SimpleStreamOptions,
     request_metrics: &mut RequestMetricState,
-    partial_message: &mut Option<AssistantMessage>,
     added_partial: &mut bool,
     logical_request_settlement: &Arc<AgentLoopLogicalRequestSettlement>,
     metrics: &Option<crate::performance_metrics::AgentLoopPerformanceMetrics>,
@@ -1227,7 +1226,6 @@ async fn stream_assistant_response_inner(
         let event_for_update = event.clone();
         match event {
             AssistantMessageEvent::Start { partial } => {
-                *partial_message = Some(partial.clone());
                 context.messages.push(AgentMessage::from(partial.clone()));
                 *added_partial = true;
                 emit_event(
@@ -1247,8 +1245,12 @@ async fn stream_assistant_response_inner(
             | AssistantMessageEvent::ToolCallStart { partial, .. }
             | AssistantMessageEvent::ToolCallDelta { partial, .. }
             | AssistantMessageEvent::ToolCallEnd { partial, .. } => {
-                if partial_message.is_some() {
-                    *partial_message = Some(partial.clone());
+                if *added_partial {
+                    // The context tail IS the accumulated partial: the Start arm
+                    // pushed it and every delta overwrote it with the same
+                    // value that `partial_message` held, so the out-param can
+                    // be re-derived from it at the abort/error exits instead
+                    // of cloning the partial once more per delta.
                     if let Some(last) = context.messages.last_mut() {
                         *last = AgentMessage::from(partial.clone());
                     }
@@ -2137,7 +2139,6 @@ async fn stream_assistant_response(
         ..Default::default()
     };
     logical_request_settlement.observe_provider_attempt_number(request_metrics.provider_attempt_number);
-    let mut partial_message: Option<AssistantMessage> = None;
     let mut added_partial = false;
 
     throw_if_aborted(signal)?;
@@ -2218,13 +2219,21 @@ async fn stream_assistant_response(
         llm_context,
         provider_config,
         &mut request_metrics,
-        &mut partial_message,
         &mut added_partial,
         &logical_request_settlement,
         &metrics,
         &observed,
     )
     .await;
+
+    // The accumulated streaming partial: the context tail once a Start event
+    // added it (identical to the in-loop value by construction).
+    let partial_message = added_partial
+        .then(|| match context.messages.last() {
+            Some(AgentMessage::Message(Message::Assistant(assistant))) => Some(assistant.clone()),
+            _ => None,
+        })
+        .flatten();
 
     match result {
         Ok(message) => Ok(message),

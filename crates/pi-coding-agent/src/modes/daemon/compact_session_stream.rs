@@ -122,17 +122,15 @@ pub fn create_compact_assistant_delta(
         return Ok(None);
     }
     let assistant_message: AssistantMessage =
-        serde_json::from_value(message.clone()).map_err(|error| error.to_string())?;
+        AssistantMessage::deserialize(message).map_err(|error| error.to_string())?;
     let event_value = event
         .get("assistantMessageEvent")
         .ok_or_else(|| "message_update without assistantMessageEvent".to_string())?;
-    let mut event_object = event_value
-        .as_object()
-        .cloned()
-        .ok_or_else(|| "assistantMessageEvent must be an object".to_string())?;
-    event_object.shift_remove("partial");
+    // `CompactAssistantMessageEvent` has no `partial` field and no
+    // `deny_unknown_fields`, so the nested partial is ignored without
+    // rewriting the object first.
     let compact_event: CompactAssistantMessageEvent =
-        serde_json::from_value(Value::Object(event_object)).map_err(|error| error.to_string())?;
+        CompactAssistantMessageEvent::deserialize(event_value).map_err(|error| error.to_string())?;
 
     let content_start = compact_content_start(&assistant_message, &compact_event);
     let tool_call_arguments = compact_tool_call_arguments(&assistant_message, &compact_event);
@@ -344,8 +342,7 @@ impl CompactAssistantStreamReconstructor {
             | CompactAssistantMessageEvent::Done { .. }
             | CompactAssistantMessageEvent::Error { .. } => return None,
         }
-        let mut message = partial.clone();
-        message.content = partial.content.clone();
+        let message = partial.clone();
         let event_value = serde_json::to_value(event).ok()?;
         let mut event_object = event_value.as_object().cloned().unwrap_or_default();
         let mut outbound = serde_json::json!({
