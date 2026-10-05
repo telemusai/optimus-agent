@@ -1629,8 +1629,49 @@ pub enum WebSocketEventType {
     Close,
 }
 
+/// The value delivered to a [`WebSocketListener`]: a JSON-style event object, or
+/// the raw text of a message frame when the transport can provide it directly.
+#[derive(Clone)]
+pub enum WebSocketEvent {
+    /// Text frame payload handed through without a JSON envelope.
+    Text(String),
+    /// JS `MessageEvent`/`Event`-compatible value (message envelopes from
+    /// embedder sockets and tests, plus open/error/close events).
+    Value(Value),
+}
+
+impl WebSocketEvent {
+    /// A text frame payload, handed to listeners without a JSON envelope.
+    pub fn text(text: impl Into<String>) -> Self {
+        WebSocketEvent::Text(text.into())
+    }
+
+    /// The text carried by a message frame, following the JS `data` semantics of
+    /// [`decode_web_socket_data_sync`]; `None` for non-message events.
+    pub fn data_text(&self) -> Option<String> {
+        match self {
+            WebSocketEvent::Text(text) => Some(text.clone()),
+            WebSocketEvent::Value(value) => {
+                let data = value.get("data").cloned().unwrap_or(Value::Null);
+                decode_web_socket_data_sync(&data)
+            }
+        }
+    }
+
+    /// A JS-compat value for the event, as a browser `MessageEvent` would expose it.
+    pub fn to_value(&self) -> Value {
+        match self {
+            WebSocketEvent::Text(text) => Value::Object(Map::from_iter([(
+                "data".to_string(),
+                Value::String(text.clone()),
+            )])),
+            WebSocketEvent::Value(value) => value.clone(),
+        }
+    }
+}
+
 /// `type WebSocketListener = (event: unknown) => void`.
-pub type WebSocketListener = Arc<dyn Fn(Value) + Send + Sync>;
+pub type WebSocketListener = Arc<dyn Fn(WebSocketEvent) + Send + Sync>;
 
 /// `interface WebSocketLike` constructor: `new WebSocketCtor(url, { headers })`.
 pub type WebSocketConstructor = Arc<dyn Fn(&str, IndexMap<String, String>) -> Arc<dyn WebSocketLike> + Send + Sync>;
@@ -1933,20 +1974,20 @@ async fn connect_web_socket(
     let on_open: WebSocketListener = {
         let settle = settle.clone();
         let socket = socket.clone();
-        Arc::new(move |_event: Value| {
+        Arc::new(move |_event: WebSocketEvent| {
             settle(Ok(socket.clone()));
         })
     };
     let on_error: WebSocketListener = {
         let settle = settle.clone();
-        Arc::new(move |event: Value| {
-            settle(Err(extract_web_socket_error(&event)));
+        Arc::new(move |event: WebSocketEvent| {
+            settle(Err(extract_web_socket_error(&event.to_value())));
         })
     };
     let on_close: WebSocketListener = {
         let settle = settle.clone();
-        Arc::new(move |event: Value| {
-            settle(Err(extract_web_socket_close_error(&event)));
+        Arc::new(move |event: WebSocketEvent| {
+            settle(Err(extract_web_socket_close_error(&event.to_value())));
         })
     };
 
@@ -2348,24 +2389,23 @@ impl WebSocketParseState {
         let state = self.state.clone();
         let wake = self.wake.clone();
 
-        let on_message: WebSocketListener = Arc::new(move |event: Value| {
-            let data = event.get("data").cloned().unwrap_or(Value::Null);
-            let Some(text) = decode_web_socket_data_sync(&data) else {
-                return;
+        let on_message: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
+            let text = match event.data_text() {
+                Some(text) => text,
+                None => return,
             };
             if text.is_empty() {
                 return;
             }
             match serde_json::from_str::<Value>(&text) {
                 Ok(parsed) => {
-                    let type_ = parsed.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
                     let mut shared = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if type_ == "response.completed"
-                        || type_ == "response.done"
-                        || type_ == "response.incomplete"
-                    {
-                        shared.saw_completion = true;
-                        shared.done = true;
+                    match parsed.get("type").and_then(Value::as_str) {
+                        Some("response.completed" | "response.done" | "response.incomplete") => {
+                            shared.saw_completion = true;
+                            shared.done = true;
+                        }
+                        _ => {}
                     }
                     shared.queue.push_back(Ok(parsed));
                     drop(shared);
@@ -2387,8 +2427,8 @@ impl WebSocketParseState {
 
         let state_for_error = self.state.clone();
         let wake_for_error = self.wake.clone();
-        let on_error: WebSocketListener = Arc::new(move |event: Value| {
-            let thrown = extract_web_socket_error(&event);
+        let on_error: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
+            let thrown = extract_web_socket_error(&event.to_value());
             let mut shared = state_for_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if !shared.saw_completion && shared.failed.is_none() {
                 shared.failed = Some(thrown);
@@ -2400,7 +2440,7 @@ impl WebSocketParseState {
 
         let state_for_close = self.state.clone();
         let wake_for_close = self.wake.clone();
-        let on_close: WebSocketListener = Arc::new(move |event: Value| {
+        let on_close: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
             let mut shared = state_for_close.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if shared.saw_completion {
                 shared.done = true;
@@ -2409,7 +2449,7 @@ impl WebSocketParseState {
                 return;
             }
             if shared.failed.is_none() {
-                shared.failed = Some(extract_web_socket_close_error(&event));
+                shared.failed = Some(extract_web_socket_close_error(&event.to_value()));
             }
             shared.done = true;
             drop(shared);
@@ -3406,16 +3446,21 @@ mod tests {
 
     impl FakeSocket {
         fn emit(&self, type_: WebSocketEventType, event: Value) {
-            let listeners = self
+            let listeners: Vec<WebSocketListener> = self
                 .listeners
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&type_)
                 .cloned()
                 .unwrap_or_default();
-            for listener in listeners {
+            let event = WebSocketEvent::Value(event);
+            let Some((last, rest)) = listeners.split_last() else {
+                return;
+            };
+            for listener in rest {
                 listener(event.clone());
             }
+            last(event);
         }
     }
 
@@ -3472,7 +3517,7 @@ mod tests {
             self.inner.add_event_listener(kind, listener.clone());
             // Resolve the synthetic handshake after the connector installs its
             // listener; ready_state alone does not emit the browser open event.
-            if kind == WebSocketEventType::Open { listener(json!({})); }
+            if kind == WebSocketEventType::Open { listener(WebSocketEvent::Value(json!({}))); }
         }
         fn remove_event_listener(&self, kind: WebSocketEventType, listener: &WebSocketListener) { self.inner.remove_event_listener(kind, listener); }
         fn send(&self, body: &str) {

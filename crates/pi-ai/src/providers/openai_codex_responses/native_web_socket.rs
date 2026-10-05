@@ -7,7 +7,7 @@ use std::time::Duration;
 
 use futures::{SinkExt, StreamExt};
 use indexmap::IndexMap;
-use serde_json::{json, Value};
+use serde_json::json;
 use tokio::sync::mpsc;
 use tokio_tungstenite::tungstenite::{
     client::IntoClientRequest,
@@ -16,7 +16,7 @@ use tokio_tungstenite::tungstenite::{
 };
 use tokio_util::sync::CancellationToken;
 
-use super::{WebSocketConstructor, WebSocketEventType, WebSocketLike, WebSocketListener};
+use super::{WebSocketConstructor, WebSocketEvent, WebSocketEventType, WebSocketLike, WebSocketListener};
 
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
 const WRITE_TIMEOUT: Duration = Duration::from_secs(30);
@@ -24,8 +24,8 @@ const CLOSE_TIMEOUT: Duration = Duration::from_secs(2);
 
 #[derive(Default)]
 struct Events {
-    listeners: HashMap<WebSocketEventType, Vec<WebSocketListener>>,
-    terminal: HashMap<WebSocketEventType, Value>,
+    listeners: HashMap<WebSocketEventType, Arc<Vec<WebSocketListener>>>,
+    terminal: HashMap<WebSocketEventType, WebSocketEvent>,
 }
 
 struct SocketState {
@@ -36,7 +36,7 @@ struct SocketState {
 }
 
 impl SocketState {
-    fn emit(&self, kind: WebSocketEventType, event: Value) {
+    fn emit(&self, kind: WebSocketEventType, event: WebSocketEvent) {
         let listeners = {
             let mut events = self
                 .events
@@ -45,23 +45,29 @@ impl SocketState {
             if kind != WebSocketEventType::Message {
                 events.terminal.insert(kind, event.clone());
             }
-            events.listeners.get(&kind).cloned().unwrap_or_default()
+            events.listeners.get(&kind).cloned()
         };
         // Never invoke application callbacks while holding a transport lock.
-        for listener in listeners {
+        // The last listener takes the event by value, so the steady-state
+        // single-listener frame path dispatches without cloning the payload.
+        let Some((last, rest)) = listeners.as_ref().and_then(|listeners| listeners.split_last()) else {
+            return;
+        };
+        for listener in rest {
             listener(event.clone());
         }
+        last(event);
     }
 
     fn failed(&self, error: impl std::fmt::Display) {
         self.ready.store(3, Ordering::SeqCst);
         self.emit(
             WebSocketEventType::Error,
-            json!({"message": error.to_string()}),
+            WebSocketEvent::Value(json!({"message": error.to_string()})),
         );
         self.emit(
             WebSocketEventType::Close,
-            json!({"code": 1006, "wasClean": false}),
+            WebSocketEvent::Value(json!({"code": 1006, "wasClean": false})),
         );
     }
 }
@@ -117,10 +123,12 @@ impl WebSocketLike for NativeWebSocket {
                 .events
                 .lock()
                 .unwrap_or_else(|error| error.into_inner());
-            events
+            let listeners = events
                 .listeners
                 .entry(kind)
-                .or_default()
+                .or_insert_with(|| Arc::new(Vec::new()));
+            Arc::get_mut(listeners)
+                .expect("the listener registry is never shared beyond this lock")
                 .push(listener.clone());
             events.terminal.get(&kind).cloned()
         };
@@ -136,9 +144,24 @@ impl WebSocketLike for NativeWebSocket {
             .events
             .lock()
             .unwrap_or_else(|error| error.into_inner());
-        if let Some(listeners) = events.listeners.get_mut(&kind) {
-            listeners.retain(|registered| !Arc::ptr_eq(registered, listener));
+        let Some(listeners) = events.listeners.get_mut(&kind) else {
+            return;
+        };
+        if Arc::strong_count(listeners) > 1 {
+            // An emit may hold a snapshot; swap in a fresh registry so removal takes
+            // effect for any later emission, not only for future snapshots.
+            let mut copy: Vec<WebSocketListener> = (**listeners)
+                .iter()
+                .filter(|registered| !Arc::ptr_eq(registered, listener))
+                .cloned()
+                .collect();
+            copy.shrink_to_fit();
+            *listeners = Arc::new(copy);
+            return;
         }
+        Arc::get_mut(listeners)
+            .expect("the listener registry is never shared beyond this lock")
+            .retain(|registered| !Arc::ptr_eq(registered, listener));
     }
 }
 
@@ -202,7 +225,7 @@ async fn run_socket(
         }
     };
     state.ready.store(1, Ordering::SeqCst);
-    state.emit(WebSocketEventType::Open, json!({}));
+    state.emit(WebSocketEventType::Open, WebSocketEvent::Value(json!({})));
 
     loop {
         tokio::select! {
@@ -227,19 +250,22 @@ async fn run_socket(
             }
             incoming = socket.next() => {
                 match incoming {
-                    Some(Ok(Message::Text(text))) => state.emit(WebSocketEventType::Message, json!({"data": text.as_str()})),
-                    Some(Ok(Message::Binary(bytes))) => state.emit(WebSocketEventType::Message, json!({"data": String::from_utf8_lossy(&bytes)})),
+                    Some(Ok(Message::Text(text))) => state.emit(WebSocketEventType::Message, WebSocketEvent::text(text.as_str())),
+                    Some(Ok(Message::Binary(bytes))) => state.emit(
+                        WebSocketEventType::Message,
+                        WebSocketEvent::text(String::from_utf8_lossy(&bytes)),
+                    ),
                     Some(Ok(Message::Ping(_))) => {
                         // Tungstenite queues the matching pong; flush while otherwise idle.
                         let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.flush()).await;
                     }
                     Some(Ok(Message::Close(frame))) => {
                         state.ready.store(3, Ordering::SeqCst);
-                        state.emit(WebSocketEventType::Close, json!({
+                        state.emit(WebSocketEventType::Close, WebSocketEvent::Value(json!({
                             "code": frame.as_ref().map(|frame| u16::from(frame.code)).unwrap_or(1000),
                             "reason": frame.map(|frame| frame.reason.to_string()).unwrap_or_default(),
                             "wasClean": true,
-                        }));
+                        })));
                         let _ = tokio::time::timeout(CLOSE_TIMEOUT, socket.flush()).await;
                         return;
                     }
@@ -253,6 +279,6 @@ async fn run_socket(
     state.ready.store(3, Ordering::SeqCst);
     state.emit(
         WebSocketEventType::Close,
-        json!({"code": 1000, "wasClean": true}),
+        WebSocketEvent::Value(json!({"code": 1000, "wasClean": true})),
     );
 }
