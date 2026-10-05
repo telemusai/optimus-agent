@@ -126,7 +126,7 @@ const STOP_FINALIZATION_SIGKILL_GRACE_MS: u64 = 5000;
 const STOP_FINALIZATION_RETRY_MS: u64 = 5000;
 const STALE_RECLAIM_WAIT_MS: u64 = 10_000;
 const DESCRIPTOR_WRITE_DRAIN_TIMEOUT_MS: u64 = 5_000;
-const MAX_SUPERVISOR_PERFORMANCE_RECORDERS: usize = 32;
+pub(crate) const MAX_SUPERVISOR_PERFORMANCE_RECORDERS: usize = 32;
 // Polling loops probe existence cheaply via kill(0); the ps-backed zombie and
 // identity checks are throttled so a wedged worker cannot saturate the
 // supervisor event loop with synchronous subprocess spawns.

@@ -156,7 +156,10 @@ class SnapshotSpeedTests(unittest.TestCase):
         cap = len(dill.dumps(blobs)) - 1
         with tempfile.TemporaryDirectory() as root:
             path, manifest = os.path.join(root, "state.dill"), os.path.join(root, "state.json")
-            result = repl._snapshot_state(namespace, path, manifest, cap, cap, False)
+            # Explicit legacy: `auto` now starts fresh sessions on CAS v2 (A5).
+            result = repl._snapshot_state(
+                namespace, path, manifest, cap, cap, False, snapshot_format="legacy"
+            )
             self.assertNotIn("error", result)
             self.assertEqual(result["written_bytes"], os.path.getsize(path) + os.path.getsize(manifest))
             self.assertLessEqual(os.path.getsize(path), cap)

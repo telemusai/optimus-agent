@@ -16,6 +16,114 @@ static COMMAND_RESULT_CACHE: std::sync::LazyLock<Mutex<HashMap<String, String>>>
 /// The Node default timeout used by both shell executions.
 const CONFIG_VALUE_TIMEOUT_MS: u64 = 10_000;
 
+/// Environment override for the per-request credential cache TTL, in milliseconds.
+/// 0 restores the uncached per-request execution (current behavior before this
+/// cache existed); values are clamped to [0, 3_600_000].
+const ENV_CREDENTIAL_CACHE_TTL_MS: &str = "PRIME_AGENT_CREDENTIAL_CACHE_TTL_MS";
+const DEFAULT_CREDENTIAL_CACHE_TTL_MS: u64 = 30_000;
+const MAX_CREDENTIAL_CACHE_TTL_MS: u64 = 3_600_000;
+
+/// Bounded-TTL cache for command-backed config values that are resolved per
+/// request (`resolveConfigValueOrThrow` on the models.json provider `apiKey` /
+/// request-headers path). Those callers previously executed the credential
+/// helper on EVERY dispatch: a shell spawn per request measured as a ~0.6s
+/// pre-dispatch floor on every dgx request (wait_ms p50 608ms, p10 515ms,
+/// n=42,853, size-independent; 41-72ms on github-copilot, which resolves an
+/// in-memory OAuth token instead). Entries are invalidated by
+/// `invalidate_resolved_command_values()` whenever credentials are written,
+/// refreshed or marked stale (a 401 marks the provider auth stale, so the next
+/// resolution re-executes the helper), and additionally expire on the TTL as a
+/// rotation safety net.
+#[derive(Debug, Clone)]
+struct CachedCommandValue {
+    value: String,
+    generation: u64,
+    expires_at_ms: u64,
+}
+
+static COMMAND_VALUE_CACHE: std::sync::LazyLock<Mutex<HashMap<String, CachedCommandValue>>> =
+    std::sync::LazyLock::new(|| Mutex::new(HashMap::new()));
+static COMMAND_VALUE_CACHE_GENERATION: std::sync::atomic::AtomicU64 =
+    std::sync::atomic::AtomicU64::new(0);
+
+fn credential_cache_ttl_ms() -> u64 {
+    std::env::var(ENV_CREDENTIAL_CACHE_TTL_MS)
+        .ok()
+        .and_then(|value| value.trim().parse::<u64>().ok())
+        .unwrap_or(DEFAULT_CREDENTIAL_CACHE_TTL_MS)
+        .min(MAX_CREDENTIAL_CACHE_TTL_MS)
+}
+
+fn now_millis_monotonic() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_millis() as u64)
+        .unwrap_or(0)
+}
+
+/// Drop every cached command-backed config value. Called on credential writes,
+/// refreshes and stale markings (including the 401 path), so the next resolution
+/// re-executes the helper instead of trusting a value from before the change.
+pub fn invalidate_resolved_command_values() {
+    COMMAND_VALUE_CACHE_GENERATION.fetch_add(1, std::sync::atomic::Ordering::Release);
+    COMMAND_VALUE_CACHE
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clear();
+}
+
+/// `resolveConfigValueOrThrow` resolution with the per-request refresh window:
+/// a successful helper result is reused for the TTL (default 30s), a failed one
+/// is retried on the next call. `!command` configs only; env/literal values
+/// never enter the cache.
+fn resolve_config_value_with_refresh_window(config: &str) -> Option<String> {
+    if !config.starts_with('!') {
+        return resolve_env_or_literal(config);
+    }
+    let ttl_ms = credential_cache_ttl_ms();
+    if ttl_ms == 0 {
+        // Escape hatch: fully restore uncached behavior. Drop any stored entry
+        // so a value cached under an earlier TTL cannot resurface if the
+        // setting is raised again at runtime.
+        COMMAND_VALUE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(config);
+        return execute_command_uncached(config);
+    }
+    let generation = COMMAND_VALUE_CACHE_GENERATION.load(std::sync::atomic::Ordering::Acquire);
+    let now = now_millis_monotonic();
+    {
+        let cache = COMMAND_VALUE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(entry) = cache.get(config) {
+            if entry.generation == generation && entry.expires_at_ms > now {
+                return Some(entry.value.clone());
+            }
+        }
+    }
+    let result = execute_command_uncached(config);
+    if let Some(value) = &result {
+        let mut cache = COMMAND_VALUE_CACHE
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        // Store the generation sampled BEFORE the helper ran: if an invalidation
+        // (credential write, refresh, 401 stale marking) landed while it executed,
+        // the entry is discarded on the next read and the helper re-runs. This
+        // keeps the "re-resolve on 401" contract strict.
+        cache.insert(
+            config.to_string(),
+            CachedCommandValue {
+                value: value.clone(),
+                generation,
+                expires_at_ms: now_millis_monotonic().saturating_add(ttl_ms),
+            },
+        );
+    }
+    result
+}
+
 /// `resolveConfigValue(config)`.
 ///
 /// - If it starts with "!", executes the rest as a shell command and uses
@@ -353,8 +461,15 @@ pub fn resolve_config_value_uncached(config: &str) -> Option<String> {
 }
 
 /// `resolveConfigValueOrThrow(config, description)`.
+///
+/// Command-backed values resolve through the per-request refresh window
+/// (`resolve_config_value_with_refresh_window`) instead of executing the helper
+/// on every call: the models.json provider `apiKey`/request-header path is
+/// per-dispatch, and an unconditionally fresh shell spawn measured as a ~0.6s
+/// pre-dispatch floor on every dgx request. Literals and env values never
+/// execute anything and never enter the cache.
 pub fn resolve_config_value_or_throw(config: &str, description: &str) -> Result<String, String> {
-    if let Some(resolved_value) = resolve_config_value_uncached(config) {
+    if let Some(resolved_value) = resolve_config_value_with_refresh_window(config) {
         return Ok(resolved_value);
     }
     if config.starts_with('!') {

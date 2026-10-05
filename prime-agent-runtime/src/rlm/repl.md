@@ -30,7 +30,7 @@ event.
 | `execute` | `{"type":"execute","id":str,"code":str}` |
 | `interrupt` | `{"type":"interrupt","id"?:str}` — no reply |
 | `host_reply` | `{"type":"host_reply","id":str,"data":{"status":"ok","result":{...}}}` or an error envelope — no reply |
-| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"cas_root"?:str,"snapshot_format"?:"auto"|"legacy"|"cas-v2","max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool}` |
+| `snapshot` | `{"type":"snapshot","id":str,"path":str,"manifest_path":str,"cas_root"?:str,"snapshot_format"?:"auto"|"legacy"|"cas-v2","max_bytes"?:int,"max_variable_bytes"?:int,"prune_oversized"?:bool,"snapshot_budget_ms"?:int}` |
 | `restore` | `{"type":"restore","id":str,"path":str,"cas_root"?:str,"source"?:"auto"|"current"|"previous"|"legacy","max_bytes"?:int,"max_variable_bytes"?:int}` |
 | `snapshot_export_legacy` | `{"type":"snapshot_export_legacy","id":str,"path":str,"manifest_path":str,"cas_root":str,"source"?:"current"|"previous","max_bytes"?:int,"max_variable_bytes"?:int}` |
 | `list_names` | `{"type":"list_names","id":str}` |
@@ -66,7 +66,8 @@ runtime keeps serving. Closing stdin is equivalent to `shutdown`.
 - `{"event":"error","id":str|null,"ename":str,"evalue":str,"traceback":[str,...]}`
 - `{"event":"done","id":str,"status":"ok"|"error"}` — exactly one per id'd
   request, always after all of that request's other events. A snapshot `done`
-  adds `saved`, `skipped`, `pruned`, `bytes`, format/byte metadata, and a
+  adds `saved`, `skipped`, `pruned`, `dropped` (bounded list of budget-excluded
+  names), `bytes`, format/byte metadata, and a
   numeric-only `metrics` object; a restore `done` adds `restored`, `failed`,
   format/generation and explicit-recovery flags; an export adds `exported` and
   its source generation; a `list_names` `done` adds `names`; a failed state
@@ -169,19 +170,39 @@ skipped. Live `BashHandle` values are excluded before traversal; a completed
 
 A name whose pickle exceeds `max_variable_bytes` or whose inclusion would make
 the legacy outer dict pickle exceed `max_bytes` is skipped and reported.
-Aggregate selection preserves insertion-order prefix trimming and includes the
-legacy outer-container overhead, including in CAS mode. With
+Aggregate selection preserves prefix trimming (budget-ordered, see below) and
+includes the legacy outer-container overhead, including in CAS mode. With
 `prune_oversized`, only names exceeding the per-variable cap are deleted from
 the namespace and listed in `pruned`; aggregate-cap skips stay live. Pruning
 happens only after the authoritative format commit.
 
-The default writer is legacy for a session with no v2 root. Legacy uses
-`path` plus the version-1 side manifest at `manifest_path`. Supplying
-`snapshot_format:"cas-v2"` explicitly initializes the session-local
-`cas_root`; when an older host omits `cas_root`, the runtime derives the sibling
-`.v2` root from `path`. `auto` continues v2 whenever any entry exists at that
-root. An explicit legacy write is refused once a v2 root exists, so newer work
-cannot fork into a stale legacy file.
+Per-variable change detection (CAS mode): within one process, a name still
+bound to the exact same object of a provably immutable exact type (None, bool,
+int, float, complex, str, bytes, and the exact datetime/decimal types) reuses
+its previously pickled blob instead of re-pickling; anything else — every
+mutable container, array, DataFrame, closure, or module — is re-serialized on
+every save, so in-place mutations are never served from cache. Blob files this
+process already wrote or hash-verified are not re-read on later saves; restore
+still fully re-reads and re-hashes every blob it uses.
+
+Budget-aware snapshots (A6): a request with `snapshot_budget_ms` orders the
+eligible names by their last observed per-name serialization cost (fast names
+first, unknown names at the observed median) and stops starting new names once
+roughly three quarters of the budget is spent. Names left out are listed in the
+bounded `dropped` result field and, with their full list, in the generation
+manifest and the legacy manifest; `dropped_names_count` reports the total.
+The first name is always attempted, and after one name is secured a name whose
+known cost cannot fit the remaining budget is not started. A partial snapshot
+still commits durably instead of being discarded on a timeout.
+
+The default writer for a fresh session (no v2 root and no legacy payload) is
+CAS v2. Legacy uses `path` plus the version-1 side manifest at `manifest_path`.
+Supplying `snapshot_format:"legacy"` explicitly keeps a fresh session on the
+legacy writer (the rollback flag). When an older host omits `cas_root`, the
+runtime derives the sibling `.v2` root from `path`. `auto` continues v2
+whenever any entry exists at that root, and continues legacy whenever a legacy
+payload exists. An explicit legacy write is refused once a v2 root exists, so
+newer work cannot fork into a stale legacy file.
 
 CAS v2 contains:
 
@@ -224,7 +245,10 @@ all per-name dill work and CAS legacy-envelope counting;
 `serialization_cpu_ms` uses the authoritative serializer thread CPU clock when
 available. `serialized_bytes` is retained logical per-name bytes.
 `written_bytes` is actual attempted file bytes for the successful operation;
-CAS hash equality can reduce it without reducing serialization CPU. Node owns
+CAS hash equality can reduce it without reducing serialization CPU.
+`serialization_reused_names` counts names served from the per-variable digest
+cache, and `dropped_names_count` counts names excluded by the snapshot budget.
+Node owns
 queue, following-cell, and end-to-end clocks; clocks are never subtracted
 across processes.
 

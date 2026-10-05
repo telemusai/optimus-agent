@@ -32,6 +32,7 @@ impl CompactionMetrics {
                 model: Some(Some(model.id.clone())),
                 api: Some(Some(model.api.clone())),
                 component: Some(PerformanceMetricComponent::Compaction),
+                tool: None,
             },
         }
     }

@@ -31,6 +31,7 @@ from collections.abc import Awaitable, Callable
 from typing import Any
 
 from .bash import BashHandle, _kill_live_handles
+from . import snapshot as snapshot_store
 from .snapshot import (
     DEFAULT_SNAPSHOT_MAX_BYTES,
     DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES,
@@ -38,9 +39,12 @@ from .snapshot import (
     _fsync_directory,
     cas_root_for_legacy_path,
     cas_state_present,
+    order_names_by_serialization_cost,
     read_cas_payload,
     restore_cas_v2,
     snapshot_cas_v2,
+    snapshot_deadline_ns,
+    snapshot_history_for_root,
 )
 from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
 from .snapshot_restore import ALWAYS_SKIP as _ALWAYS_SKIP, RESTORE_SKIP as _RESTORE_SKIP, prepare_restored_values
@@ -683,14 +687,22 @@ def _snapshot_state(
     *,
     snapshot_format: str = "auto",
     cas_root: str | None = None,
+    budget_ms: int | None = None,
 ) -> dict[str, Any]:
     if snapshot_format not in {"auto", "legacy", "cas-v2"}:
         return {"error": "snapshot_format must be auto, legacy, or cas-v2"}
+    if budget_ms is not None and (isinstance(budget_ms, bool) or not isinstance(budget_ms, int) or budget_ms < 0):
+        return {"error": "budget_ms must be a non-negative integer"}
     effective_cas_root = cas_root or cas_root_for_legacy_path(path)
     has_cas = cas_state_present(effective_cas_root)
     if snapshot_format == "legacy" and has_cas:
         return {"error": "CAS v2 state exists; refusing to fork newer work into stale legacy state"}
-    if snapshot_format == "cas-v2" or (snapshot_format == "auto" and has_cas):
+    # A5: `auto` continues whichever representation is already on disk, and a
+    # fresh session (neither state) now starts on CAS v2 so blob-level write
+    # dedupe applies from the first snapshot. An existing legacy payload keeps
+    # writing legacy state; `snapshot_format=legacy` forces it for fresh roots.
+    has_legacy = os.path.exists(path)
+    if snapshot_format == "cas-v2" or (snapshot_format == "auto" and (has_cas or not has_legacy)):
         return snapshot_cas_v2(
             ns,
             effective_cas_root,
@@ -700,6 +712,7 @@ def _snapshot_state(
             _ALWAYS_SKIP,
             BashHandle,
             committed,
+            budget_ms=budget_ms,
         )
 
     total_started = time.monotonic_ns()
@@ -725,10 +738,20 @@ def _snapshot_state(
     payload: dict[str, bytes] = {}
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
+    dropped: list[str] = []
     total = 0
     missing = object()
-    for name in list(ns.keys()):
-        if name.startswith("_") or name in _ALWAYS_SKIP:
+    history = snapshot_history_for_root(effective_cas_root)
+    history_names = list(ns.keys())
+    snapshot_store._forget_missing_names(history, history_names)
+    if budget_ms is not None:
+        ordered_names = order_names_by_serialization_cost(history_names, history)
+    else:
+        ordered_names = history_names
+    deadline = snapshot_deadline_ns(budget_ms)
+    deadline_hit = False
+    for name in ordered_names:
+        if not isinstance(name, str) or name.startswith("_") or name in _ALWAYS_SKIP:
             continue
         value = ns.get(name, missing)
         if value is missing:
@@ -743,6 +766,22 @@ def _snapshot_state(
                 "reason": "BashHandle is a runtime-owned process handle and cannot be snapshotted",
             })
             continue
+        if deadline is not None and not deadline_hit and time.monotonic_ns() >= deadline:
+            # Budget exhausted (A6): keep the already-serialized names and land
+            # a durable partial snapshot instead of discarding everything.
+            deadline_hit = True
+        if deadline_hit:
+            dropped.append(name)
+            continue
+        if deadline is not None and payload:
+            # A6: with at least one name already secured, do not start a name
+            # whose last observed serialization cost cannot fit the remaining
+            # budget. The first name is always attempted so a namespace
+            # dominated by one slow value still makes progress.
+            expected_ms = history.durations_ms.get(name)
+            if expected_ms is not None and time.monotonic_ns() + expected_ms * 1_000_000 > deadline:
+                dropped.append(name)
+                continue
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
         buffer = io.BytesIO()
@@ -768,6 +807,7 @@ def _snapshot_state(
             elapsed_ns = time.monotonic_ns() - serialization_started
             serialization_wall_ns += elapsed_ns
             variable_metrics.record(name, elapsed_ns, path_metrics)
+            snapshot_store._record_duration(history, name, elapsed_ns)
             if serialization_cpu_started is not None and thread_clock is not None:
                 serialization_cpu_ns += thread_clock() - serialization_cpu_started
         if total + len(blob) > max_bytes:
@@ -862,6 +902,7 @@ def _snapshot_state(
                 "savedNames": saved,
                 "skipped": skipped,
                 "pruned": pruned,
+                "dropped": sorted(dropped),
                 "bytes": bytes_written,
                 "pythonVersion": sys.version.split()[0],
                 "timestamp": datetime.datetime.now(datetime.timezone.utc).isoformat(),
@@ -897,6 +938,7 @@ def _snapshot_state(
             "saved": saved,
             "skipped": skipped,
             "pruned": pruned,
+            "dropped": sorted(dropped)[:snapshot_store.DROPPED_NAMES_RESULT_LIMIT],
             "bytes": bytes_written,
             "format": "legacy",
             "logical_bytes": sum(len(blob) for blob in payload.values()),
@@ -911,6 +953,8 @@ def _snapshot_state(
                 "total_wall_ms": (time.monotonic_ns() - total_started) / 1_000_000,
                 "snapshot_legacy_captures": 1,
                 "snapshot_cas_captures": 0,
+                "serialization_reused_names": 0,
+                "dropped_names_count": len(dropped),
                 **envelope_metrics,
                 **variable_metrics.summarize(payload),
             },
@@ -1144,6 +1188,11 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
             snapshot_format = req.get("snapshot_format", "auto")
             if not isinstance(snapshot_format, str):
                 return {"error": "snapshot_format must be a string"}
+            budget_ms = req.get("snapshot_budget_ms")
+            if budget_ms is not None and (
+                isinstance(budget_ms, bool) or not isinstance(budget_ms, int) or budget_ms < 0
+            ):
+                return {"error": "snapshot_budget_ms must be a non-negative integer"}
             # realpath resolves symlinks, so aliased paths cannot silently clobber the payload.
             if os.path.realpath(req["path"]) == os.path.realpath(req["manifest_path"]):
                 return {"error": "path and manifest_path must differ"}
@@ -1157,6 +1206,7 @@ async def _handle_state(req: dict[str, Any], ns: dict[str, Any]) -> None:
                 committed,
                 snapshot_format=snapshot_format,
                 cas_root=cas_root,
+                budget_ms=budget_ms,
             )
         if request_type == "snapshot_export_legacy":
             source = req.get("source", "current")

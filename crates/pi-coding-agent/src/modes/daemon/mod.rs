@@ -9,6 +9,7 @@ pub mod daemon_client;
 pub mod daemon_client_env;
 pub mod daemon_errors;
 pub mod daemon_extension_binding;
+pub mod daemon_lifecycle_metrics;
 pub mod daemon_mode;
 pub mod daemon_protocol;
 pub mod daemon_routed_client;

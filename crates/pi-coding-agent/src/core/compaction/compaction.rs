@@ -55,6 +55,11 @@ pub struct CompactionDetails {
     pub modified_files: Vec<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub provider_checkpoint: Option<ProviderCompactionCheckpoint>,
+    /// A7: set when the episode deadline forced the keep-recent-tail truncation
+    /// fallback instead of a model-generated summary. Absent on every
+    /// pre-A7 entry, so deserialization stays compatible.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_fallback: Option<bool>,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -434,6 +439,25 @@ const CONSOLIDATING_UPDATE_SUMMARIZATION_PROMPT: &str = "The messages above are 
 
 const TURN_PREFIX_SUMMARIZATION_PROMPT: &str = "This is the PREFIX of a turn that was too large to keep. The SUFFIX (recent work) is retained.\n\nSummarize the prefix to provide context for the retained suffix:\n\n## Original Request\n[What did the user ask for in this turn?]\n\n## Early Progress\n- [Key decisions and work done in the prefix]\n\n## Context for Suffix\n- [Information needed to understand the retained recent work]\n\nBe concise. Focus on what's needed to understand the kept suffix.";
 
+/// B2 (`compaction.prompt = "v2"`): first-compaction prompt variant. Identical
+/// structured format; the closing instruction adds exact-anchor preservation,
+/// consolidation of repetition, and the stated output budget.
+const SUMMARIZATION_PROMPT_V2: &str = "The messages above are a conversation to summarize. Create a structured context checkpoint summary that another LLM will use to continue the work.\n\nUse this EXACT format:\n\n## Goal\n[What is the user trying to accomplish? Can be multiple items if the session covers different tasks.]\n\n## Constraints & Preferences\n- [Any constraints, preferences, or requirements mentioned by user]\n- [Or \"(none)\" if none were mentioned]\n\n## Progress\n### Done\n- [x] [Completed tasks/changes]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Issues preventing progress, if any]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale]\n\n## Next Steps\n1. [Ordered list of what should happen next]\n\n## Critical Context\n- [Any data, examples, or references needed to continue]\n- [Or \"(none)\" if not applicable]\n\nKeep each section concise. Preserve exact anchors - file paths, IDs, function names, error messages, and decisions - exactly as written. Consolidate repeated facts into one complete statement. Stay within the stated summary budget.";
+
+/// B2: iterative-update prompt variant (policy `off`). Same rules as the legacy
+/// update prompt, plus anchor/consolidation/budget instructions.
+const UPDATE_SUMMARIZATION_PROMPT_V2: &str = "The messages above are NEW conversation messages to incorporate into the existing summary provided in <previous-summary> tags.\n\nUpdate the existing structured summary with new information. RULES:\n- PRESERVE all existing information from the previous summary\n- ADD new progress, decisions, and context from the new messages\n- UPDATE the Progress section: move items from \"In Progress\" to \"Done\" when completed\n- UPDATE \"Next Steps\" based on what was accomplished\n- PRESERVE exact anchors: file paths, IDs, function names, error messages, and decisions, exactly as written\n- If something is no longer relevant, you may remove it\n- Consolidate repeated facts into one complete statement\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals, add new ones if the task expanded]\n\n## Constraints & Preferences\n- [Preserve existing, add new ones discovered]\n\n## Progress\n### Done\n- [x] [Include previously done items AND newly completed items]\n\n### In Progress\n- [ ] [Current work - update based on progress]\n\n### Blocked\n- [Current blockers - remove if resolved]\n\n## Key Decisions\n- **[Decision]**: [Brief rationale] (preserve all previous, add new)\n\n## Next Steps\n1. [Update based on current state]\n\n## Critical Context\n- [Preserve important context, add new if needed]\n\nKeep each section concise. Consolidate repeated facts into one complete statement. Stay within the stated summary budget.";
+
+/// B2: consolidating-update prompt variant. Drops the two pathological legacy
+/// instructions ("Do not apply a character/token cap, tail truncation, or
+/// arbitrary deletion to make it short" and "Never omit a unique required
+/// fact") and instead instructs: preserve exact anchors (paths/IDs/errors/
+/// decisions), consolidate repetition, and stay within the stated budget.
+/// Evidence (15-day /monitor review): unbounded "never omit" + "no cap"
+/// instructions correlate with output-token-driven episode duration
+/// (r=0.85), p90 pause 369s, max 1,194s.
+const CONSOLIDATING_UPDATE_SUMMARIZATION_PROMPT_V2: &str = "The messages above are ONLY the NEW conversation material that moved out of the retained tail. Incorporate it into the existing summary in <previous-summary> tags in this same response. Do not make another merge pass.\n\nUpdate the structured summary using these rules:\n- Preserve every enduring user constraint, preference, correction, refinement, safety rule, and requested acceptance gate. Obsolete progress is not evidence that an enduring constraint expired.\n- Preserve decisions together with their reasons and provenance. Do not merge distinct decisions merely because their wording is similar.\n- Preserve unresolved work and blockers. Mark a blocker resolved or replace an old status only when the new messages demonstrate the superseding fact; record the resolution or replacement so its history remains understandable.\n- Preserve exact anchors - file paths, IDs, hashes, sizes, commands, function names, critical errors, decisions, and evidence locations needed to inspect durable source material - exactly as written.\n- Preserve kernel-state and continual-harness facts, including useful Python names and persistence/reload warnings.\n- Preserve tool-call/result relationships needed to understand actions. Never treat an opaque provider checkpoint as ordinary text-summary material.\n- Consolidate repetition: state a repeated fact once, completely, instead of accumulating another bullet for the same unchanged fact. When uncertain whether facts are duplicates or superseded, retain both and state the uncertainty.\n- Add every genuinely new fact. The summary may grow when new information exists.\n- Keep exact user wording when the prior summary or new messages identify it as verbatim or critical.\n\nUse this EXACT format:\n\n## Goal\n[Preserve existing goals and add genuinely new goals]\n\n## Constraints & Preferences\n- [Consolidated enduring constraints and preferences]\n- [Or \"(none)\" only if neither source contains any]\n\n## Progress\n### Done\n- [x] [Previously and newly completed work, without duplicate bullets]\n\n### In Progress\n- [ ] [Current work]\n\n### Blocked\n- [Current unresolved blockers, plus resolution provenance for removed blockers when important]\n\n## Key Decisions\n- **[Decision]**: [Reason and provenance]\n\n## Next Steps\n1. [Current ordered steps]\n\n## Critical Context\n- [Exact anchors, errors, kernel/harness facts, and other facts needed to continue]\n- [Or \"(none)\" only if neither source contains any]\n\nBe concise by consolidating repetition and replacing demonstrably superseded status. Stay within the stated summary budget: when the summary would exceed it, compress by consolidating repetition and dropping superseded status, never by removing a unique anchor.";
+
 const KERNEL_PERSIST_SUMMARY_NOTE: &str = "Note: the Python kernel keeps running after this summary — every Python variable, import, and helper you defined stays available. The cells that defined them won't appear above, so record in the summary any names worth remembering so you reuse them instead of redefining them.";
 
 /** Details stored in CompactionEntry.details for file tracking */
@@ -441,18 +465,44 @@ pub fn build_summarization_prompt(
     custom_instructions: Option<&str>,
     previous_summary: Option<&str>,
     summary_update_policy: &SummaryUpdatePolicy,
+    prompt_version: &CompactionPromptVersion,
+    summary_budget_tokens: Option<f64>,
 ) -> String {
+    let v2 = prompt_version == COMPACTION_PROMPT_V2;
     let mut base_prompt = match previous_summary {
         Some(_) => {
             if summary_update_policy == CONSOLIDATE_REPEATED_SUMMARY_POLICY {
-                CONSOLIDATING_UPDATE_SUMMARIZATION_PROMPT
+                if v2 {
+                    CONSOLIDATING_UPDATE_SUMMARIZATION_PROMPT_V2
+                } else {
+                    CONSOLIDATING_UPDATE_SUMMARIZATION_PROMPT
+                }
+            } else if v2 {
+                UPDATE_SUMMARIZATION_PROMPT_V2
             } else {
                 UPDATE_SUMMARIZATION_PROMPT
             }
         }
-        None => SUMMARIZATION_PROMPT,
+        None => {
+            if v2 {
+                SUMMARIZATION_PROMPT_V2
+            } else {
+                SUMMARIZATION_PROMPT
+            }
+        }
     }
     .to_string();
+    if v2 {
+        // B2: state the output budget the request actually enforces, so the
+        // "stay within the stated summary budget" instruction is concrete.
+        if let Some(budget) = summary_budget_tokens {
+            if budget.is_finite() && budget > 0.0 {
+                base_prompt += &format!(
+                    "\n\nSummary output budget: stay within {budget:.0} tokens."
+                );
+            }
+        }
+    }
     if let Some(custom_instructions) = custom_instructions {
         base_prompt += &format!("\n\n<user-instructions>\nThe user provided these instructions for this summary. Follow them with high priority while keeping the section format above: emphasize what they ask to focus on, and preserve verbatim anything they ask to remember.\n{custom_instructions}\n</user-instructions>");
     }
@@ -605,6 +655,338 @@ pub fn resolve_summary_update_policy(
     }
 }
 
+// ---------------------------------------------------------------------------
+// B2: compaction prompt variant (`compaction.prompt = "legacy" | "v2"`)
+// ---------------------------------------------------------------------------
+
+pub const COMPACTION_PROMPT_LEGACY: &str = "legacy";
+pub const COMPACTION_PROMPT_V2: &str = "v2";
+pub const COMPACTION_PROMPT_ENV: &str = "PRIME_AGENT_COMPACTION_PROMPT";
+pub type CompactionPromptVersion = String;
+
+/// Resolves the prompt variant the same way `resolve_summary_update_policy`
+/// resolves the update policy: explicit setting wins, then the environment,
+/// then the legacy default.
+pub fn resolve_compaction_prompt_version(
+    configured: Option<&str>,
+    environment: Option<&str>,
+) -> CompactionPromptVersion {
+    match configured {
+        // An explicitly configured value is authoritative; an unrecognized
+        // value fails safe to legacy without consulting the environment.
+        Some(COMPACTION_PROMPT_V2) => return COMPACTION_PROMPT_V2.to_string(),
+        Some(_) => return COMPACTION_PROMPT_LEGACY.to_string(),
+        None => {}
+    }
+    let environment = environment
+        .map(str::to_string)
+        .or_else(|| std::env::var(COMPACTION_PROMPT_ENV).ok());
+    if environment.as_deref() == Some(COMPACTION_PROMPT_V2) {
+        COMPACTION_PROMPT_V2.to_string()
+    } else {
+        COMPACTION_PROMPT_LEGACY.to_string()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// B3: summary output budget mode (`compaction.summaryBudgetMode`)
+// ---------------------------------------------------------------------------
+
+pub const SUMMARY_BUDGET_MODE_LEGACY: &str = "legacy";
+pub const SUMMARY_BUDGET_MODE_SCALED: &str = "scaled";
+pub const SUMMARY_BUDGET_MODE_ENV: &str = "PRIME_AGENT_COMPACTION_SUMMARY_BUDGET_MODE";
+pub type SummaryBudgetMode = String;
+
+pub fn resolve_summary_budget_mode(
+    configured: Option<&str>,
+    environment: Option<&str>,
+) -> SummaryBudgetMode {
+    match configured {
+        // An explicitly configured value is authoritative; an unrecognized
+        // value fails safe to legacy without consulting the environment.
+        Some(SUMMARY_BUDGET_MODE_SCALED) => return SUMMARY_BUDGET_MODE_SCALED.to_string(),
+        Some(_) => return SUMMARY_BUDGET_MODE_LEGACY.to_string(),
+        None => {}
+    }
+    let environment = environment
+        .map(str::to_string)
+        .or_else(|| std::env::var(SUMMARY_BUDGET_MODE_ENV).ok());
+    if environment.as_deref() == Some(SUMMARY_BUDGET_MODE_SCALED) {
+        SUMMARY_BUDGET_MODE_SCALED.to_string()
+    } else {
+        SUMMARY_BUDGET_MODE_LEGACY.to_string()
+    }
+}
+
+/// B3: the output-token budget handed to the summarizer.
+///
+/// Legacy (default): flat `(0.8 * reserve_tokens).floor()` (13,107 tokens at
+/// the default 16,384 reserve). Scaled: `min(8000, max(2000,
+/// compacted_input_tokens / 40))`, where `compacted_input_tokens` is the live
+/// context size being compacted (`preparation.tokens_before`).
+pub fn summary_output_budget(
+    reserve_tokens: f64,
+    mode: &SummaryBudgetMode,
+    compacted_input_tokens: f64,
+) -> f64 {
+    if mode == SUMMARY_BUDGET_MODE_SCALED {
+        let scaled = if compacted_input_tokens.is_finite() && compacted_input_tokens > 0.0 {
+            compacted_input_tokens / 40.0
+        } else {
+            0.0
+        };
+        scaled.clamp(2000.0, 8000.0).floor()
+    } else {
+        (0.8 * reserve_tokens).floor()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// A7: compaction retry backoff + cooldown + episode deadline
+// ---------------------------------------------------------------------------
+
+/// Error text produced when the model-driven summary phase exceeds the
+/// configured episode deadline. Distinct from provider errors so the fallback
+/// can be recognized without parsing provider text.
+pub const COMPACTION_DEADLINE_ERROR_MESSAGE: &str = "Compaction summary deadline exceeded";
+pub const COMPACTION_DEADLINE_MS_ENV: &str = "PRIME_AGENT_COMPACTION_DEADLINE_MS";
+/// Default episode deadline for the model-driven summary phase: 5 minutes.
+/// Evidence: p50 compaction pause 159s, p90 369s, max 1,194s; inputs during
+/// compaction wait 165s median (max 40min) vs 11s outside.
+pub const DEFAULT_COMPACTION_DEADLINE_MS: f64 = 300_000.0;
+
+/// Resolves the episode deadline in milliseconds. `0` (or negative) disables
+/// the deadline. Explicit setting wins, then the environment, then the
+/// 5-minute default.
+pub fn resolve_compaction_deadline_ms(configured: Option<f64>, environment: Option<&str>) -> f64 {
+    if let Some(configured) = configured {
+        if configured.is_finite() && configured >= 0.0 {
+            return configured;
+        }
+    }
+    if let Some(environment) = environment
+        .map(str::to_string)
+        .or_else(|| std::env::var(COMPACTION_DEADLINE_MS_ENV).ok())
+    {
+        if let Ok(value) = environment.trim().parse::<f64>() {
+            if value.is_finite() && value >= 0.0 {
+                return value;
+            }
+        }
+    }
+    DEFAULT_COMPACTION_DEADLINE_MS
+}
+
+/// A7: configurable pacing for automatic compaction re-attacks after summary
+/// failures. Defaults implement the specified ladder: exponential backoff
+/// between retries (30s -> 2min -> 5min cap), and once
+/// `max_consecutive_failures` consecutive summary failures have landed, a
+/// 10-minute cooldown gates the next re-attempt. Filtered/refused failures
+/// keep a slower ladder (60s -> 30min cap), mirroring the pre-A7 behavior for
+/// providers that refuse repeated identical requests.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionRetryConfig {
+    /// Delay after the first consecutive failure. Default 30s.
+    pub initial_delay_ms: u64,
+    /// Ladder cap between retries. Default 5min (300,000ms).
+    pub max_delay_ms: u64,
+    /// Consecutive failures after which the cooldown applies. Default 3.
+    pub max_consecutive_failures: u32,
+    /// Cooldown before re-attempting compaction after the failure cap.
+    /// Default 10min (600,000ms).
+    pub cooldown_ms: u64,
+    /// Filtered/refused ladder start. Default 60s.
+    pub filtered_initial_delay_ms: u64,
+    /// Filtered/refused ladder cap. Default 30min (1,800,000ms).
+    pub filtered_max_delay_ms: u64,
+}
+
+impl Default for CompactionRetryConfig {
+    fn default() -> Self {
+        CompactionRetryConfig {
+            initial_delay_ms: 30_000,
+            max_delay_ms: 300_000,
+            max_consecutive_failures: 3,
+            cooldown_ms: 600_000,
+            filtered_initial_delay_ms: 60_000,
+            filtered_max_delay_ms: 1_800_000,
+        }
+    }
+}
+
+pub const COMPACTION_RETRY_INITIAL_DELAY_MS_ENV: &str = "PRIME_AGENT_COMPACTION_RETRY_INITIAL_MS";
+pub const COMPACTION_RETRY_MAX_DELAY_MS_ENV: &str = "PRIME_AGENT_COMPACTION_RETRY_MAX_MS";
+pub const COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES_ENV: &str =
+    "PRIME_AGENT_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES";
+pub const COMPACTION_RETRY_COOLDOWN_MS_ENV: &str = "PRIME_AGENT_COMPACTION_RETRY_COOLDOWN_MS";
+
+impl CompactionRetryConfig {
+    fn env_u64(name: &str) -> Option<u64> {
+        std::env::var(name).ok().and_then(|value| {
+            value
+                .trim()
+                .parse::<u64>()
+                .ok()
+                .filter(|parsed| *parsed > 0)
+        })
+    }
+
+    fn env_u32(name: &str) -> Option<u32> {
+        Self::env_u64(name).and_then(|parsed| u32::try_from(parsed).ok())
+    }
+
+    /// Resolves the retry config: explicit settings win, then the
+    /// environment, then the A7 defaults.
+    pub fn resolve(overrides: Option<&CompactionRetryOverrides>) -> CompactionRetryConfig {
+        let mut config = CompactionRetryConfig::default();
+        let overrides = overrides.cloned().unwrap_or_default();
+        if let Some(initial) = overrides
+            .initial_delay_ms
+            .filter(|value| *value > 0)
+            .or_else(|| Self::env_u64(COMPACTION_RETRY_INITIAL_DELAY_MS_ENV))
+        {
+            config.initial_delay_ms = initial;
+        }
+        if let Some(max) = overrides
+            .max_delay_ms
+            .filter(|value| *value > 0)
+            .or_else(|| Self::env_u64(COMPACTION_RETRY_MAX_DELAY_MS_ENV))
+        {
+            config.max_delay_ms = max;
+        }
+        if let Some(max_consecutive) = overrides
+            .max_consecutive_failures
+            .filter(|value| *value > 0)
+            .or_else(|| Self::env_u32(COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES_ENV))
+        {
+            config.max_consecutive_failures = max_consecutive;
+        }
+        if let Some(cooldown) = overrides
+            .cooldown_ms
+            .filter(|value| *value > 0)
+            .or_else(|| Self::env_u64(COMPACTION_RETRY_COOLDOWN_MS_ENV))
+        {
+            config.cooldown_ms = cooldown;
+        }
+        config
+    }
+
+    /// Delay that must elapse after the `consecutive_failures`-th consecutive
+    /// failure before compaction is re-attempted.
+    ///
+    /// * `n < max_consecutive_failures`: exponential ladder
+    ///   `initial * 4^(n-1)` capped at `max_delay_ms` (30s, 2min, 5min...).
+    /// * `n >= max_consecutive_failures`: the cooldown, never shorter than the
+    ///   ladder cap for the failure kind (filtered keeps its 30-minute bound).
+    pub fn retry_delay(
+        &self,
+        kind: SummaryFailureKind,
+        consecutive_failures: u32,
+    ) -> std::time::Duration {
+        let (initial_ms, ladder_cap_ms) = match kind {
+            SummaryFailureKind::FilteredOrRefused => {
+                (self.filtered_initial_delay_ms, self.filtered_max_delay_ms)
+            }
+            _ => (self.initial_delay_ms, self.max_delay_ms),
+        };
+        let failures = consecutive_failures.max(1);
+        if failures >= self.max_consecutive_failures {
+            let cooldown_ms = self.cooldown_ms.max(ladder_cap_ms);
+            return std::time::Duration::from_millis(cooldown_ms);
+        }
+        let shift = (failures - 1).min(16);
+        let delay_ms = initial_ms
+            .saturating_mul(1u64 << (2 * shift))
+            .min(ladder_cap_ms);
+        std::time::Duration::from_millis(delay_ms)
+    }
+}
+
+/// Setting-supplied retry overrides (`compaction.retryInitialMs` etc.).
+/// `None` fields fall through to the environment and then the defaults.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct CompactionRetryOverrides {
+    pub initial_delay_ms: Option<u64>,
+    pub max_delay_ms: Option<u64>,
+    pub max_consecutive_failures: Option<u32>,
+    pub cooldown_ms: Option<u64>,
+}
+
+/// A7: backoff state machine for automatic compaction re-attacks. Pure state
+/// plus config; the session owns one instance for its lifetime and records
+/// every classified summary outcome into it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct CompactionRetryBackoff {
+    pub config: CompactionRetryConfig,
+    /// Capped at `config.max_consecutive_failures`; the streak stops growing
+    /// so the cooldown stays the configured value instead of escalating
+    /// forever.
+    pub consecutive_failures: u32,
+    pub last_failure: Option<std::time::Instant>,
+    /// Classification of the most recent failure; the pending cooldown
+    /// mirrors the failure that must be recovered from.
+    pub kind: SummaryFailureKind,
+}
+
+impl CompactionRetryBackoff {
+    pub fn new(config: CompactionRetryConfig) -> Self {
+        CompactionRetryBackoff {
+            config,
+            consecutive_failures: 0,
+            last_failure: None,
+            kind: SummaryFailureKind::Other,
+        }
+    }
+
+    /// Records one failed summary attempt. `now` is injected for testability.
+    pub fn record_failure(
+        &mut self,
+        kind: SummaryFailureKind,
+        now: std::time::Instant,
+    ) -> std::time::Duration {
+        self.consecutive_failures = self
+            .consecutive_failures
+            .saturating_add(1)
+            .min(self.config.max_consecutive_failures);
+        self.last_failure = Some(now);
+        self.kind = kind;
+        self.pending_delay()
+    }
+
+    /// A successful compaction proves the summary path works; the streak
+    /// starts clean.
+    pub fn record_success(&mut self) {
+        self.consecutive_failures = 0;
+        self.last_failure = None;
+    }
+
+    /// Delay that applies after the most recent failure.
+    pub fn pending_delay(&self) -> std::time::Duration {
+        if self.consecutive_failures == 0 {
+            return std::time::Duration::ZERO;
+        }
+        self.config
+            .retry_delay(self.kind, self.consecutive_failures)
+    }
+
+    /// Remaining cooldown before the next re-attempt, `None` when a
+    /// re-attempt is allowed now.
+    pub fn cooldown_remaining(&self, now: std::time::Instant) -> Option<std::time::Duration> {
+        let last_failure = self.last_failure?;
+        let delay = self.pending_delay();
+        let elapsed = now.duration_since(last_failure);
+        if elapsed >= delay {
+            None
+        } else {
+            Some(delay - elapsed)
+        }
+    }
+
+    pub fn in_cooldown(&self, now: std::time::Instant) -> bool {
+        self.cooldown_remaining(now).is_some()
+    }
+}
+
 fn trim_trailing_slashes(value: &str) -> &str {
     value.trim_end_matches('/')
 }
@@ -636,6 +1018,18 @@ pub struct CompactionSettings {
     pub keep_recent_tokens: f64,
     /// Opt-in iterative-summary consolidation. Default off until semantic quality is proven.
     pub summary_update_policy: Option<SummaryUpdatePolicy>,
+    /// B2: prompt variant, `"legacy"` (default) or `"v2"`. `None` resolves to legacy.
+    pub prompt: Option<CompactionPromptVersion>,
+    /// B3: summary output budget mode, `"legacy"` (default) or `"scaled"`.
+    /// `None` resolves to legacy.
+    pub summary_budget_mode: Option<SummaryBudgetMode>,
+    /// B4: explicit compaction trigger threshold as a fraction of the context
+    /// limit, in `(0, 1]`. `None` keeps the current behavior
+    /// (`min(cap, window - reserve_tokens)`).
+    pub trigger_threshold: Option<f64>,
+    /// A7: hard deadline in milliseconds for the model-driven summary phase of
+    /// a compaction episode. `0` disables the deadline. Default 300,000 (5 min).
+    pub deadline_ms: f64,
 }
 
 pub fn default_compaction_settings() -> CompactionSettings {
@@ -644,6 +1038,10 @@ pub fn default_compaction_settings() -> CompactionSettings {
         reserve_tokens: 16384.0,
         keep_recent_tokens: 20000.0,
         summary_update_policy: Some(SUMMARY_UPDATE_POLICY_OFF.to_string()),
+        prompt: Some(COMPACTION_PROMPT_LEGACY.to_string()),
+        summary_budget_mode: Some(SUMMARY_BUDGET_MODE_LEGACY.to_string()),
+        trigger_threshold: None,
+        deadline_ms: DEFAULT_COMPACTION_DEADLINE_MS,
     }
 }
 
@@ -757,6 +1155,15 @@ fn should_compact_with_cap(
     }
     if context_window <= 0.0 {
         return false;
+    }
+    // B4: an explicit trigger threshold (a fraction of the context limit)
+    // replaces the reserve-derived boundary. The hard cap still applies: the
+    // threshold cannot push the trigger past what the summarizer can chew.
+    if let Some(threshold) = settings
+        .trigger_threshold
+        .filter(|threshold| threshold.is_finite() && *threshold > 0.0)
+    {
+        return context_tokens >= f64::min(cap, threshold * context_window);
     }
     context_tokens >= f64::min(cap, context_window - settings.reserve_tokens)
 }
@@ -1236,7 +1643,8 @@ pub async fn generate_summary(
 ) -> Result<SummarySlice, String> {
     generate_summary_with_options(current_messages, model, reserve_tokens, api_key, signal,
         custom_instructions, previous_summary, thinking_level, retry, summary_call,
-        summary_update_policy, None, &CompactionMetrics::new(None, model)).await
+        summary_update_policy, None, &CompactionMetrics::new(None, model),
+        &COMPACTION_PROMPT_LEGACY.to_string(), (0.8 * reserve_tokens).floor()).await
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1247,22 +1655,33 @@ async fn generate_summary_with_options(
     retry: Option<&ProviderRetryPolicy>, summary_call: SummaryCallRunner,
     summary_update_policy: &SummaryUpdatePolicy, request_options: Option<&CompactionOptions>,
     metrics: &CompactionMetrics,
+    prompt_version: &CompactionPromptVersion, summary_budget_tokens: f64,
 ) -> Result<SummarySlice, String> {
     let instructions = {
         let custom_instructions = custom_instructions.map(str::to_string);
         let summary_update_policy = summary_update_policy.clone();
+        let prompt_version = prompt_version.clone();
+        let summary_budget_tokens = if summary_budget_tokens.is_finite()
+            && summary_budget_tokens > 0.0
+        {
+            Some(summary_budget_tokens)
+        } else {
+            None
+        };
         move |previous: Option<&str>| {
             build_summarization_prompt(
                 custom_instructions.as_deref(),
                 previous,
                 &summary_update_policy,
+                &prompt_version,
+                summary_budget_tokens,
             )
         }
     };
     generate_bounded_summary(
         current_messages,
         model,
-        (0.8 * reserve_tokens).floor(),
+        summary_budget_tokens_for_request(summary_budget_tokens, reserve_tokens),
         api_key,
         signal,
         thinking_level,
@@ -1275,6 +1694,19 @@ async fn generate_summary_with_options(
         metrics,
     )
     .await
+}
+
+/// The wire `max_tokens` request budget. B3 modes already computed the
+/// intended budget; the legacy default keeps the historical flat fraction.
+fn summary_budget_tokens_for_request(
+    summary_budget_tokens: f64,
+    reserve_tokens: f64,
+) -> f64 {
+    if summary_budget_tokens.is_finite() && summary_budget_tokens > 0.0 {
+        summary_budget_tokens
+    } else {
+        (0.8 * reserve_tokens).floor()
+    }
 }
 
 /// Reconstructing history after a model switch can exceed the destination's input limit.
@@ -1791,13 +2223,19 @@ pub async fn compact(
     retry: Option<&ProviderRetryPolicy>,
     provider_context: Option<(&Context, Option<&CompactionOptions>)>,
 ) -> Result<CompactionResult, String> {
-    compact_with_metrics(preparation, model, api_key, custom_instructions, signal, thinking_level,
+    compact_with_metrics(preparation, model, api_key, None, custom_instructions, signal, thinking_level,
         summary_call, retry, provider_context, &CompactionMetrics::new(None, model)).await
 }
+
+/// B1 (`compaction.summaryModel`): when set, the text-summary wire calls route
+/// to this `(model, api_key)` pair instead of the session model. Native
+/// provider compaction always uses the session model.
+pub type SummaryModelOverride<'a> = Option<(&'a Model, &'a str)>;
 
 #[allow(clippy::too_many_arguments)]
 pub async fn compact_with_metrics(
     preparation: &CompactionPreparation, model: &Model, api_key: &str,
+    summary_model: SummaryModelOverride<'_>,
     custom_instructions: Option<&str>, signal: Option<&tokio_util::sync::CancellationToken>,
     thinking_level: Option<&ThinkingLevel>, summary_call: SummaryCallRunner,
     retry: Option<&ProviderRetryPolicy>, provider_context: Option<(&Context, Option<&CompactionOptions>)>,
@@ -1911,6 +2349,7 @@ pub async fn compact_with_metrics(
                         read_files,
                         modified_files,
                         provider_checkpoint: Some(remote.checkpoint),
+                        deadline_fallback: None,
                     }),
                 });
             }
@@ -1919,82 +2358,135 @@ pub async fn compact_with_metrics(
     }
     let text_instructions = with_retained_state(custom_instructions, retained_state_anchor.as_deref());
     let custom_instructions = Some(text_instructions.as_str());
-    let mut slices: Vec<SummarySlice> = Vec::new();
-    let summary: String;
     // `settings.summaryUpdatePolicy ?? SUMMARY_UPDATE_POLICY_OFF` is read once per
     // summarisation call; `generateSummary` takes it by reference.
     let summary_update_policy = settings
         .summary_update_policy
         .clone()
         .unwrap_or_else(|| SUMMARY_UPDATE_POLICY_OFF.to_string());
-
-    if *is_split_turn && !turn_prefix_messages.is_empty() {
-        // Split turns make two wire calls with different bodies; each needs its own identity.
-        let history_future = async {
-            if !messages_to_summarize.is_empty() || previous_summary.is_some() {
-                generate_summary_with_options(
-                    messages_to_summarize,
-                    model,
-                    settings.reserve_tokens,
-                    api_key,
-                    signal,
-                    custom_instructions,
-                    previous_summary.as_deref(),
-                    thinking_level,
-                    retry,
-                    summary_call.clone(),
-                    &summary_update_policy,
-                    request_options,
-                    metrics,
-                )
-                .await
-            } else {
-                Ok(SummarySlice {
-                    summary: "No prior history.".to_string(),
-                    usage: None,
-                })
-            }
-        };
-        let prefix_future = generate_turn_prefix_summary(
-            turn_prefix_messages,
-            model,
-            settings.reserve_tokens,
-            api_key,
-            signal,
-            thinking_level,
-            retry,
-            summary_call.clone(),
-            request_options,
-            metrics,
-            retained_state_anchor.as_deref(),
-        );
-        let (history_result, turn_prefix_result) = tokio::try_join!(history_future, prefix_future)?;
-        slices.push(history_result.clone());
-        slices.push(turn_prefix_result.clone());
-        summary = format!(
-            "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
-            history_result.summary, turn_prefix_result.summary
-        );
+    // B2/B3: prompt variant and output budget for the text-summary calls.
+    let prompt_version = settings
+        .prompt
+        .clone()
+        .unwrap_or_else(|| COMPACTION_PROMPT_LEGACY.to_string());
+    let summary_budget_mode = settings
+        .summary_budget_mode
+        .clone()
+        .unwrap_or_else(|| SUMMARY_BUDGET_MODE_LEGACY.to_string());
+    let summary_budget_tokens =
+        summary_output_budget(settings.reserve_tokens, &summary_budget_mode, *tokens_before);
+    // B1: text-summary model override. Native compaction above always uses the
+    // session model; only the summarizer calls route to the override.
+    let (text_model, text_api_key) = match summary_model {
+        Some((model, api_key)) => (model.clone(), api_key.to_string()),
+        None => (model.clone(), api_key.to_string()),
+    };
+    // A7: hard deadline for the model-driven summary phase. `0` disables.
+    // The native provider path keeps its own bounded retry policy; the
+    // deadline bounds the dominant cost (evidence: duration correlates with
+    // output tokens, r=0.85; p90 pause 369s, max 1,194s).
+    let deadline = if settings.deadline_ms.is_finite() && settings.deadline_ms > 0.0 {
+        Some(std::time::Duration::from_millis(settings.deadline_ms as u64))
     } else {
-        let result = generate_summary_with_options(
-            messages_to_summarize,
-            model,
-            settings.reserve_tokens,
-            api_key,
-            signal,
-            custom_instructions,
-            previous_summary.as_deref(),
-            thinking_level,
-            retry,
-            summary_call,
-            &summary_update_policy,
-            request_options,
-            metrics,
-        )
-        .await?;
-        summary = result.summary.clone();
-        slices.push(result);
-    }
+        None
+    };
+    // A child token cancels the in-flight summary calls when the deadline
+    // fires; it still cancels together with the episode's own signal.
+    let summary_signal = local_signal.child_token();
+    let text_summary_phase = async {
+        let mut slices: Vec<SummarySlice> = Vec::new();
+        let summary: String;
+
+        if *is_split_turn && !turn_prefix_messages.is_empty() {
+            // Split turns make two wire calls with different bodies; each needs its own identity.
+            let history_future = async {
+                if !messages_to_summarize.is_empty() || previous_summary.is_some() {
+                    generate_summary_with_options(
+                        messages_to_summarize,
+                        &text_model,
+                        settings.reserve_tokens,
+                        &text_api_key,
+                        Some(&summary_signal),
+                        custom_instructions,
+                        previous_summary.as_deref(),
+                        thinking_level,
+                        retry,
+                        summary_call.clone(),
+                        &summary_update_policy,
+                        request_options,
+                        metrics,
+                        &prompt_version,
+                        summary_budget_tokens,
+                    )
+                    .await
+                } else {
+                    Ok(SummarySlice {
+                        summary: "No prior history.".to_string(),
+                        usage: None,
+                    })
+                }
+            };
+            let prefix_future = generate_turn_prefix_summary(
+                turn_prefix_messages,
+                &text_model,
+                settings.reserve_tokens,
+                &text_api_key,
+                Some(&summary_signal),
+                thinking_level,
+                retry,
+                summary_call.clone(),
+                request_options,
+                metrics,
+                retained_state_anchor.as_deref(),
+            );
+            let (history_result, turn_prefix_result) =
+                tokio::try_join!(history_future, prefix_future)?;
+            slices.push(history_result.clone());
+            slices.push(turn_prefix_result.clone());
+            summary = format!(
+                "{}\n\n---\n\n**Turn Context (split turn):**\n\n{}",
+                history_result.summary, turn_prefix_result.summary
+            );
+        } else {
+            let result = generate_summary_with_options(
+                messages_to_summarize,
+                &text_model,
+                settings.reserve_tokens,
+                &text_api_key,
+                Some(&summary_signal),
+                custom_instructions,
+                previous_summary.as_deref(),
+                thinking_level,
+                retry,
+                summary_call,
+                &summary_update_policy,
+                request_options,
+                metrics,
+                &prompt_version,
+                summary_budget_tokens,
+            )
+            .await?;
+            summary = result.summary.clone();
+            slices.push(result);
+        }
+        Ok::<_, String>((slices, summary))
+    };
+    let (slices, summary) = match deadline {
+        None => text_summary_phase.await?,
+        Some(deadline) => {
+            let deadline_signal = summary_signal.clone();
+            tokio::select! {
+                biased;
+                _ = tokio::time::sleep(deadline) => {
+                    // A7: keep-recent-tail truncation instead of an unbounded
+                    // summary attempt. Cancel detached provider workers first.
+                    deadline_signal.cancel();
+                    return Ok(deadline_truncation_result(preparation, settings.deadline_ms));
+                }
+                outcome = text_summary_phase => outcome?,
+            }
+        }
+    };
     let (read_files, modified_files) = compute_file_lists(file_ops);
     let mut summary = summary + &format_file_operations(&read_files, &modified_files);
     if native_compaction_unsupported {
@@ -2021,9 +2513,42 @@ pub async fn compact_with_metrics(
             read_files,
             modified_files,
             provider_checkpoint: None,
+            deadline_fallback: None,
         }),
         usage,
     })
+}
+
+/// A7: keep-recent-tail truncation fallback for an episode whose
+/// model-driven summary phase exceeded the configured deadline. No further
+/// model calls are made: the retained tail (already selected by the cut
+/// point) stays in the live context and the summarized region is replaced by
+/// this marker, plus the file inventory extracted from the dropped region.
+fn deadline_truncation_result(
+    preparation: &CompactionPreparation,
+    deadline_ms: f64,
+) -> CompactionResult {
+    let (read_files, modified_files) = compute_file_lists(&preparation.file_ops);
+    let summary = format!(
+        "## Goal\nCompaction deadline fallback: the model-generated summary did not complete within the configured compaction deadline ({deadline_ms:.0} ms), so the conversation was truncated to the retained recent tail.\n\n## Constraints & Preferences\n- See the retained recent tail below the compaction boundary; the session transcript keeps the full record.\n\n## Progress\n### Done\n- [x] History before the compaction boundary was dropped after the deadline elapsed.\n\n### In Progress\n- [ ] Continue the work from the retained recent tail.\n\n### Blocked\n- Compaction summary generation exceeded the deadline; re-run compaction when the summarizer is available.\n\n## Key Decisions\n- **Keep-recent-tail truncation**: applied instead of a model summary once the deadline elapsed.\n\n## Next Steps\n1. Continue the work from the retained recent tail.\n2. Consult the session transcript file for the full record of the dropped region.\n\n## Critical Context\n- Older history was truncated without a model summary.\n- The file inventory below lists the files touched in the dropped region."
+    );
+    let mut summary =
+        summary + &format_file_operations(&read_files, &modified_files);
+    if preparation.is_split_turn && !preparation.turn_prefix_messages.is_empty() {
+        summary += "\n\n**Turn note:** the cut split a turn; its prefix was part of the truncated region.";
+    }
+    CompactionResult {
+        summary,
+        first_kept_entry_id: preparation.first_kept_entry_id.clone(),
+        tokens_before: preparation.tokens_before,
+        details: Some(CompactionDetails {
+            read_files,
+            modified_files,
+            provider_checkpoint: None,
+            deadline_fallback: Some(true),
+        }),
+        usage: None,
+    }
 }
 
 fn provider_request_error(error: String) -> ProviderRequestError {
@@ -2065,6 +2590,278 @@ async fn generate_turn_prefix_summary(
         metrics,
     )
     .await
+}
+
+#[cfg(test)]
+mod a7_backoff_state_machine_tests {
+    use super::*;
+
+    fn explicit_config() -> CompactionRetryConfig {
+        // Explicit values so the environment cannot skew the machine under test.
+        CompactionRetryConfig {
+            initial_delay_ms: 30_000,
+            max_delay_ms: 300_000,
+            max_consecutive_failures: 3,
+            cooldown_ms: 600_000,
+            filtered_initial_delay_ms: 60_000,
+            filtered_max_delay_ms: 1_800_000,
+        }
+    }
+
+    #[test]
+    fn default_config_matches_the_a7_specified_ladder() {
+        let config = CompactionRetryConfig::default();
+        assert_eq!(config.initial_delay_ms, 30_000);
+        assert_eq!(config.max_delay_ms, 300_000);
+        assert_eq!(config.max_consecutive_failures, 3);
+        assert_eq!(config.cooldown_ms, 600_000);
+        assert_eq!(config.filtered_initial_delay_ms, 60_000);
+        assert_eq!(config.filtered_max_delay_ms, 1_800_000);
+        let delay = |kind, count| config.retry_delay(kind, count);
+        // Exponential ladder between retries: 30s -> 2min, capped at 5min.
+        assert_eq!(delay(SummaryFailureKind::Other, 1), std::time::Duration::from_millis(30_000));
+        assert_eq!(delay(SummaryFailureKind::Other, 2), std::time::Duration::from_millis(120_000));
+        assert_eq!(delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(600_000));
+        assert_eq!(delay(SummaryFailureKind::Other, u32::MAX), std::time::Duration::from_millis(600_000));
+        // Filtered/refused failures keep the slower bounded ladder; the
+        // cooldown never falls below that ladder's 30-minute cap.
+        assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 1), std::time::Duration::from_millis(60_000));
+        assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 2), std::time::Duration::from_millis(240_000));
+        assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 3), std::time::Duration::from_millis(1_800_000));
+        // The 5-minute ladder cap shows between rungs when the failure cap is wider.
+        let wider = CompactionRetryConfig { max_consecutive_failures: 5, ..config.clone() };
+        assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(300_000));
+        assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 4), std::time::Duration::from_millis(300_000));
+        assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 5), std::time::Duration::from_millis(600_000));
+        // Zero failures means no wait.
+        assert_eq!(config.retry_delay(SummaryFailureKind::Other, 0), std::time::Duration::from_millis(30_000));
+    }
+
+    #[test]
+    fn state_machine_caps_the_streak_and_reopens_after_the_cooldown() {
+        let mut backoff = CompactionRetryBackoff::new(explicit_config());
+        let now = std::time::Instant::now();
+        assert_eq!(backoff.cooldown_remaining(now), None);
+        assert!(!backoff.in_cooldown(now));
+
+        // Three consecutive failures: the streak caps at max_consecutive_failures.
+        let armed = backoff.record_failure(SummaryFailureKind::Other, now);
+        assert_eq!(armed, std::time::Duration::from_millis(30_000));
+        assert_eq!(backoff.consecutive_failures, 1);
+        let armed = backoff.record_failure(SummaryFailureKind::Other, now);
+        assert_eq!(armed, std::time::Duration::from_millis(120_000));
+        let armed = backoff.record_failure(SummaryFailureKind::Other, now);
+        assert_eq!(armed, std::time::Duration::from_millis(600_000));
+        for _ in 0..4 {
+            backoff.record_failure(SummaryFailureKind::Other, now);
+        }
+        assert_eq!(backoff.consecutive_failures, 3, "the streak stops growing at the cap");
+
+        // Inside the cooldown the gate holds; just past it, it reopens.
+        assert_eq!(
+            backoff.cooldown_remaining(now + std::time::Duration::from_millis(599_999)),
+            Some(std::time::Duration::from_millis(1)),
+            "a capped failure streak is cooling down"
+        );
+        assert_eq!(
+            backoff.cooldown_remaining(now + std::time::Duration::from_millis(600_000)),
+            None,
+            "the gate reopens after the cooldown"
+        );
+
+        // A success resets the streak entirely.
+        backoff.record_failure(SummaryFailureKind::Other, now);
+        backoff.record_success();
+        assert_eq!(backoff.consecutive_failures, 0);
+        assert_eq!(backoff.cooldown_remaining(now), None);
+    }
+
+    #[test]
+    fn state_machine_switches_ladders_with_the_failure_kind() {
+        let mut backoff = CompactionRetryBackoff::new(explicit_config());
+        let now = std::time::Instant::now();
+        backoff.record_failure(SummaryFailureKind::FilteredOrRefused, now);
+        assert_eq!(
+            backoff.pending_delay(),
+            std::time::Duration::from_millis(60_000),
+            "the pending cooldown mirrors the failure that must be recovered from"
+        );
+        backoff.record_failure(SummaryFailureKind::Other, now);
+        assert_eq!(
+            backoff.pending_delay(),
+            std::time::Duration::from_millis(120_000),
+            "the ladder follows the most recent failure kind"
+        );
+    }
+
+    #[test]
+    fn deadline_resolution_honors_setting_env_and_zero_disable() {
+        // The default is the 5-minute episode deadline.
+        assert_eq!(
+            resolve_compaction_deadline_ms(None, Some("")),
+            DEFAULT_COMPACTION_DEADLINE_MS
+        );
+        // An explicit setting wins over the environment.
+        assert_eq!(resolve_compaction_deadline_ms(Some(123_456.0), None), 123_456.0);
+        assert_eq!(
+            resolve_compaction_deadline_ms(Some(123_456.0), Some("999999")),
+            123_456.0
+        );
+        // Zero disables the deadline; negatives fall through to the default.
+        assert_eq!(resolve_compaction_deadline_ms(Some(0.0), None), 0.0);
+        assert_eq!(
+            resolve_compaction_deadline_ms(Some(-1.0), None),
+            DEFAULT_COMPACTION_DEADLINE_MS
+        );
+    }
+}
+
+#[cfg(test)]
+mod b_fix_flag_tests {
+    use super::*;
+
+    #[test]
+    fn prompt_version_defaults_to_legacy_and_reads_setting_and_env() {
+        assert_eq!(
+            resolve_compaction_prompt_version(None, None),
+            COMPACTION_PROMPT_LEGACY
+        );
+        assert_eq!(
+            resolve_compaction_prompt_version(Some("v2"), None),
+            COMPACTION_PROMPT_V2
+        );
+        assert_eq!(
+            resolve_compaction_prompt_version(Some("legacy"), None),
+            COMPACTION_PROMPT_LEGACY
+        );
+        assert_eq!(
+            resolve_compaction_prompt_version(None, Some("v2")),
+            COMPACTION_PROMPT_V2
+        );
+        // Unknown values fall back to legacy, never to an undefined variant.
+        assert_eq!(
+            resolve_compaction_prompt_version(Some("v3"), Some("v2")),
+            COMPACTION_PROMPT_LEGACY
+        );
+    }
+
+    #[test]
+    fn v2_prompts_drop_the_pathological_instructions_and_state_the_budget() {
+        let legacy = build_summarization_prompt(
+            None,
+            Some("previous"),
+            &CONSOLIDATE_REPEATED_SUMMARY_POLICY.to_string(),
+            &COMPACTION_PROMPT_LEGACY.to_string(),
+            Some(13_107.0),
+        );
+        assert!(legacy.contains("Do not apply a character/token cap, tail truncation, or arbitrary deletion to make it short."));
+        assert!(legacy.contains("Never omit a unique required fact."));
+        assert!(!legacy.contains("Summary output budget"));
+
+        let v2 = build_summarization_prompt(
+            None,
+            Some("previous"),
+            &CONSOLIDATE_REPEATED_SUMMARY_POLICY.to_string(),
+            &COMPACTION_PROMPT_V2.to_string(),
+            Some(13_107.0),
+        );
+        assert!(!v2.contains("Do not apply a character/token cap, tail truncation, or arbitrary deletion to make it short."));
+        assert!(!v2.contains("Never omit a unique required fact."));
+        assert!(v2.contains("Summary output budget: stay within 13107 tokens."));
+        // B2 contract: preserve exact anchors, consolidate repetition, stay
+        // within the stated budget, and keep the structured format identical.
+        assert!(v2.contains("Preserve exact anchors"));
+        assert!(v2.contains("Consolidate repetition"));
+        assert!(v2.contains("Stay within the stated summary budget"));
+        for section in [
+            "## Goal",
+            "## Constraints & Preferences",
+            "## Progress",
+            "## Key Decisions",
+            "## Next Steps",
+            "## Critical Context",
+        ] {
+            assert!(v2.contains(section), "v2 keeps the {section} heading");
+        }
+        // The first-compaction and plain-update variants exist too, so the
+        // flag is meaningful in every policy configuration.
+        let first_v2 = build_summarization_prompt(
+            None,
+            None,
+            &SUMMARY_UPDATE_POLICY_OFF.to_string(),
+            &COMPACTION_PROMPT_V2.to_string(),
+            Some(8000.0),
+        );
+        assert!(first_v2.contains("Stay within the stated summary budget."));
+        assert!(first_v2.contains("Summary output budget: stay within 8000 tokens."));
+        let update_v2 = build_summarization_prompt(
+            None,
+            Some("previous"),
+            &SUMMARY_UPDATE_POLICY_OFF.to_string(),
+            &COMPACTION_PROMPT_V2.to_string(),
+            Some(8000.0),
+        );
+        assert!(update_v2.contains("PRESERVE exact anchors"));
+    }
+
+    #[test]
+    fn budget_mode_resolves_and_scales() {
+        assert_eq!(
+            resolve_summary_budget_mode(None, None),
+            SUMMARY_BUDGET_MODE_LEGACY
+        );
+        assert_eq!(
+            resolve_summary_budget_mode(Some("scaled"), None),
+            SUMMARY_BUDGET_MODE_SCALED
+        );
+        assert_eq!(
+            resolve_summary_budget_mode(None, Some("scaled")),
+            SUMMARY_BUDGET_MODE_SCALED
+        );
+        assert_eq!(
+            resolve_summary_budget_mode(Some("bogus"), Some("scaled")),
+            SUMMARY_BUDGET_MODE_LEGACY
+        );
+        // Legacy keeps the flat 0.8 * reserve budget.
+        assert_eq!(
+            summary_output_budget(16_384.0, &SUMMARY_BUDGET_MODE_LEGACY.to_string(), 250_905.0),
+            13_107.0
+        );
+        // Scaled clamps to [2000, 8000] around compacted_input_tokens / 40.
+        let scaled = |tokens| {
+            summary_output_budget(16_384.0, &SUMMARY_BUDGET_MODE_SCALED.to_string(), tokens)
+        };
+        assert_eq!(scaled(250_905.0), 6_272.0);
+        assert_eq!(scaled(40_000.0), 2_000.0);
+        assert_eq!(scaled(20_000.0), 2_000.0);
+        assert_eq!(scaled(400_000.0), 8_000.0);
+        assert_eq!(scaled(0.0), 2_000.0);
+        assert_eq!(scaled(f64::NAN), 2_000.0);
+    }
+
+    #[test]
+    fn trigger_threshold_replaces_the_reserve_boundary_but_keeps_the_cap() {
+        let mut settings = default_compaction_settings();
+        settings.enabled = true;
+        settings.reserve_tokens = 16_384.0;
+        // Default: no threshold, current behavior (min(cap, window - reserve)).
+        assert!(should_compact(250_000.0, 1_050_000.0, &settings));
+        assert!(!should_compact(249_999.0, 1_050_000.0, &settings));
+        // An explicit 0.5 threshold on a 400k window triggers at half the
+        // window (200k is below the 250k hard cap, so the threshold rules).
+        settings.trigger_threshold = Some(0.5);
+        assert!(should_compact(200_000.0, 400_000.0, &settings));
+        assert!(!should_compact(199_999.0, 400_000.0, &settings));
+        // The hard cap still applies: 0.9 of a 1.05M window would be 945k, but
+        // the 250k cap keeps the summarizer's input bounded.
+        settings.trigger_threshold = Some(0.9);
+        assert!(should_compact(250_000.0, 1_050_000.0, &settings));
+        assert!(!should_compact(249_999.0, 1_050_000.0, &settings));
+        // Out-of-range thresholds are ignored (current behavior).
+        settings.trigger_threshold = Some(1.5);
+        assert!(should_compact(250_000.0, 1_050_000.0, &settings));
+        assert!(!should_compact(249_999.0, 1_050_000.0, &settings));
+    }
 }
 
 #[cfg(test)]
@@ -2367,6 +3164,7 @@ mod summary_retry_safety_tests {
             None,
             None,
             None,
+            None,
             default_summary_call_runner(None),
             None,
             None,
@@ -2398,6 +3196,7 @@ mod summary_retry_safety_tests {
             &fixture_preparation(false),
             &model,
             "unused",
+            None,
             None,
             None,
             None,
@@ -2480,8 +3279,9 @@ mod summary_retry_safety_tests {
         }
         let metrics = CompactionMetrics::new(None, &model);
         let policy = SUMMARY_UPDATE_POLICY_OFF.to_string();
+        let prompt_version = COMPACTION_PROMPT_LEGACY.to_string();
         let instructions =
-            move |previous: Option<&str>| build_summarization_prompt(None, previous, &policy);
+            move |previous: Option<&str>| build_summarization_prompt(None, previous, &policy, &prompt_version, None);
         let result = generate_bounded_summary(
             &messages,
             &model,
@@ -2577,6 +3377,7 @@ mod summary_retry_safety_tests {
             &fixture_preparation(true),
             &model,
             "unused",
+            None,
             None,
             None,
             None,

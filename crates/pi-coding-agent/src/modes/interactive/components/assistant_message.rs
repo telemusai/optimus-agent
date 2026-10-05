@@ -336,6 +336,13 @@ pub struct AssistantMessageComponent {
     is_streaming: bool,
     error_dismissed: bool,
     container: Container,
+    /// A11: bumped by every mutator that can change rendered output
+    /// (`update_content`, `set_expanded`, `set_hide_thinking_block`,
+    /// `set_hidden_thinking_label`) and by `invalidate`. The transcript's row
+    /// cache uses it to skip re-rendering unchanged assistant messages; the
+    /// `dirty` reconcile flag alone cannot express "unchanged since the last
+    /// frame" because render clears it.
+    revision: u64,
 }
 
 impl AssistantMessageComponent {
@@ -375,6 +382,7 @@ impl AssistantMessageComponent {
             is_streaming: false,
             error_dismissed: false,
             container,
+            revision: 0,
         };
 
         if let Some(message) = message {
@@ -387,12 +395,14 @@ impl AssistantMessageComponent {
     pub fn set_hide_thinking_block(&mut self, hide: bool) {
         self.hide_thinking_block = hide;
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Port of `setHiddenThinkingLabel`.
     pub fn set_hidden_thinking_label(&mut self, label: &str) {
         self.hidden_thinking_label = label.to_string();
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Port of `setExpanded`.
@@ -400,6 +410,7 @@ impl AssistantMessageComponent {
         if self.expanded != expanded {
             self.expanded = expanded;
             self.dirty = true;
+            self.revision = self.revision.wrapping_add(1);
         }
     }
 
@@ -408,6 +419,7 @@ impl AssistantMessageComponent {
         self.last_message = Some(message);
         self.is_streaming = is_streaming;
         self.dirty = true;
+        self.revision = self.revision.wrapping_add(1);
     }
 
     /// Hide only the request-error decoration, preserving the message and any
@@ -798,11 +810,22 @@ impl Component for AssistantMessageComponent {
         self.container.get_selection_regions()
     }
 
+    /// A11: lets the transcript skip re-rendering this row while no mutator
+    /// ran. The revision covers every mutation path above; width and global
+    /// style changes are part of the row cache key.
+    fn render_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+
     fn invalidate(&mut self) {
         self.container.invalidate();
         // Force a full rebuild so theme-dependent children are recreated.
         self.last_signature = None;
         self.dirty = true;
+        // Mermaid transforms and theme-dependent markdown are rebuilt from
+        // live settings during reconcile, so an external invalidate must also
+        // invalidate any memoized row output.
+        self.revision = self.revision.wrapping_add(1);
     }
 }
 

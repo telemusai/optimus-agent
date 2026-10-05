@@ -40,6 +40,7 @@ pub enum PerformanceMetricOperation {
     UiMenuOpen,
     UiSessionOpen,
     Recorder,
+    DaemonLifecycle,
 }
 
 impl PerformanceMetricOperation {
@@ -67,6 +68,7 @@ impl PerformanceMetricOperation {
             PerformanceMetricOperation::UiMenuOpen => "ui_menu_open",
             PerformanceMetricOperation::UiSessionOpen => "ui_session_open",
             PerformanceMetricOperation::Recorder => "recorder",
+            PerformanceMetricOperation::DaemonLifecycle => "daemon_lifecycle",
         }
     }
 }
@@ -76,12 +78,17 @@ impl PerformanceMetricOperation {
 pub enum PerformanceMetricOutcome {
     /// An in-flight start row. A paired terminal row with the same correlation
     /// IDs follows; only terminal outcomes (success/failure/cancelled/
-    /// unavailable) count as completed attempts.
+    /// unavailable/timeout) count as completed attempts.
     Started,
     Success,
     Failure,
     Cancelled,
     Unavailable,
+    /// The operation exceeded an explicit deadline. Terminal, like the other
+    /// non-started outcomes. Used by the UI ack deadline so a prompt that never
+    /// receives its acknowledgement is classified as a timeout rather than
+    /// reported as an inflated failure duration.
+    Timeout,
 }
 
 impl PerformanceMetricOutcome {
@@ -92,7 +99,58 @@ impl PerformanceMetricOutcome {
             PerformanceMetricOutcome::Failure => "failure",
             PerformanceMetricOutcome::Cancelled => "cancelled",
             PerformanceMetricOutcome::Unavailable => "unavailable",
+            PerformanceMetricOutcome::Timeout => "timeout",
         }
+    }
+}
+
+/// A3: bounded failure-classification token for failure/cancelled events.
+///
+/// Monitored failure events carried no error class, status, or message (0 of
+/// 4,466 in a 15-day window), so even a 141-attempt auth storm stayed
+/// undiagnosable. The class is a fixed vocabulary derived from structured
+/// provider failures, transport errors, or bounded message heuristics; it
+/// never carries raw provider text.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PerformanceMetricErrorClass {
+    Auth,
+    RateLimit,
+    Network,
+    Server,
+    Client,
+    Timeout,
+    Cancelled,
+    Unknown,
+}
+
+impl PerformanceMetricErrorClass {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            PerformanceMetricErrorClass::Auth => "auth",
+            PerformanceMetricErrorClass::RateLimit => "rate_limit",
+            PerformanceMetricErrorClass::Network => "network",
+            PerformanceMetricErrorClass::Server => "server",
+            PerformanceMetricErrorClass::Client => "client",
+            PerformanceMetricErrorClass::Timeout => "timeout",
+            PerformanceMetricErrorClass::Cancelled => "cancelled",
+            PerformanceMetricErrorClass::Unknown => "unknown",
+        }
+    }
+
+    /// Inverse of [`as_str`] for recorder-side validation of persisted tokens.
+    pub fn from_token(token: &str) -> Option<Self> {
+        Some(match token {
+            "auth" => PerformanceMetricErrorClass::Auth,
+            "rate_limit" => PerformanceMetricErrorClass::RateLimit,
+            "network" => PerformanceMetricErrorClass::Network,
+            "server" => PerformanceMetricErrorClass::Server,
+            "client" => PerformanceMetricErrorClass::Client,
+            "timeout" => PerformanceMetricErrorClass::Timeout,
+            "cancelled" => PerformanceMetricErrorClass::Cancelled,
+            "unknown" => PerformanceMetricErrorClass::Unknown,
+            _ => return None,
+        })
     }
 }
 
@@ -162,7 +220,10 @@ pub enum PerformanceMetricMeasurement {
     UiPendingCount,
     UiEventCount,
     UiTickFallbackCount,
-    MaxMs,
+    UiTickFallbackSkipped,
+    UiAckDeadlineMs,
+    RenderMs,
+    DiffMs,    MaxMs,
 }
 
 impl PerformanceMetricMeasurement {
@@ -231,7 +292,10 @@ impl PerformanceMetricMeasurement {
             PerformanceMetricMeasurement::UiPendingCount => "ui_pending_count",
             PerformanceMetricMeasurement::UiEventCount => "ui_event_count",
             PerformanceMetricMeasurement::UiTickFallbackCount => "ui_tick_fallback_count",
-            PerformanceMetricMeasurement::MaxMs => "max_ms",
+            PerformanceMetricMeasurement::UiTickFallbackSkipped => "ui_tick_fallback_skipped",
+            PerformanceMetricMeasurement::UiAckDeadlineMs => "ui_ack_deadline_ms",
+            PerformanceMetricMeasurement::RenderMs => "render_ms",
+            PerformanceMetricMeasurement::DiffMs => "diff_ms",            PerformanceMetricMeasurement::MaxMs => "max_ms",
         }
     }
 }
@@ -293,6 +357,12 @@ pub struct PerformanceMetricIdentity {
     pub api: Option<Option<String>>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub component: Option<PerformanceMetricComponent>,
+    /// A4: the tool metric's tool name. 62% of monitored tool failures were
+    /// unattributable because only the opaque tool-call id was recorded. Like
+    /// the provider/model/API strings this is a short control-character
+    /// sanitized, length-bounded identifier, never tool arguments or output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub tool: Option<String>,
 }
 
 /// Provider totals and categories must not be summed again. Overlap fields stay
@@ -348,6 +418,22 @@ pub struct PerformanceMetricEvent {
     pub measurements: Option<PerformanceMetricMeasurements>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<PerformanceMetricUsageV1>,
+    /// A15: fixed lowercase stage token for staged operations (for example
+    /// `daemon_lifecycle` start/stop/crash/stale_detected/relaunch). A bounded
+    /// `[a-z0-9_]` token of at most 32 characters, never free-form text.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// A3: bounded failure classification for failure/cancelled outcomes.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<PerformanceMetricErrorClass>,
+    /// A3: provider HTTP status observed for the failed attempt, when any.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// A3: bounded error text, opt-in at the recorder through
+    /// `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT=1` (default off). Emitters
+    /// must pass [`sanitize_performance_metric_error_message`] output.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 impl PerformanceMetricEvent {
@@ -359,6 +445,10 @@ impl PerformanceMetricEvent {
             outcome: None,
             measurements: None,
             usage: None,
+            stage: None,
+            error_class: None,
+            http_status: None,
+            error_message: None,
         }
     }
 }
@@ -381,6 +471,19 @@ pub struct PerformanceMetricRecordV1 {
     pub measurements: Option<PerformanceMetricMeasurements>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub usage: Option<PerformanceMetricUsageV1>,
+    /// A15: fixed lowercase stage token (see [`PerformanceMetricEvent::stage`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub stage: Option<String>,
+    /// A3: bounded failure classification (see
+    /// [`PerformanceMetricEvent::error_class`]).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_class: Option<PerformanceMetricErrorClass>,
+    /// A3: provider HTTP status observed for the failed attempt.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub http_status: Option<u16>,
+    /// A3: bounded opt-in error text (recorder-gated; default dropped).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub error_message: Option<String>,
 }
 
 /// `PerformanceMetricCorrelation & { sessionId: string }`.
@@ -519,6 +622,256 @@ pub fn safe_record_performance_metric(
     let _ = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recorder.record(event)));
 }
 
+/// Maximum length of an opt-in `error_message` value, in characters.
+pub const PERFORMANCE_METRICS_ERROR_MESSAGE_MAX_CHARS: usize = 256;
+
+/// A3: bounds and sanitizes an error message before it can reach an event.
+///
+/// Control characters become `?` (matching the correlation/identity
+/// sanitization contract) and the text is truncated to
+/// [`PERFORMANCE_METRICS_ERROR_MESSAGE_MAX_CHARS`] characters. Recorders must
+/// sanitize again before persisting: emitters cannot be trusted to pre-bound
+/// third-party error text.
+pub fn sanitize_performance_metric_error_message(message: Option<&str>) -> Option<String> {
+    let message = message?.trim();
+    if message.is_empty() {
+        return None;
+    }
+    let sanitized: String = message
+        .chars()
+        .map(|character| {
+            let code = character as u32;
+            if code <= 0x1f || code == 0x7f {
+                '?'
+            } else {
+                character
+            }
+        })
+        .take(PERFORMANCE_METRICS_ERROR_MESSAGE_MAX_CHARS)
+        .collect();
+    if sanitized.is_empty() {
+        None
+    } else {
+        Some(sanitized)
+    }
+}
+
+/// A3: A15 stage tokens are fixed lowercase snake-case words. This bound keeps
+/// the stage a closed vocabulary even if a future emitter adds one.
+pub const PERFORMANCE_METRICS_STAGE_MAX_CHARS: usize = 32;
+
+/// A3/A15: validates a stage token (`[a-z0-9_]{1,32}`), returning it unchanged
+/// or `None` so no free-form text can enter the stage field.
+pub fn sanitize_performance_metric_stage(stage: Option<&str>) -> Option<String> {
+    let stage = stage?.trim();
+    if stage.is_empty() {
+        return None;
+    }
+    let valid = !stage.is_empty()
+        && stage.len() <= PERFORMANCE_METRICS_STAGE_MAX_CHARS
+        && stage
+            .chars()
+            .all(|character| character.is_ascii_lowercase() || character.is_ascii_digit() || character == '_');
+    if valid {
+        Some(stage.to_string())
+    } else {
+        None
+    }
+}
+
+/// A3: the failure detail one terminal event should carry. Only the bounded
+/// class, status, and opt-in message; no structured provider payloads.
+#[derive(Debug, Clone, PartialEq)]
+pub struct PerformanceMetricFailure {
+    pub class: PerformanceMetricErrorClass,
+    pub http_status: Option<u16>,
+    /// Already passed through [`sanitize_performance_metric_error_message`].
+    pub message: Option<String>,
+}
+
+impl PerformanceMetricFailure {
+    /// A user-initiated cancellation carries no provider status or text.
+    pub fn cancelled() -> Self {
+        Self {
+            class: PerformanceMetricErrorClass::Cancelled,
+            http_status: None,
+            message: None,
+        }
+    }
+
+    /// An unclassified failure with an optional observed status.
+    pub fn unknown_with_status(http_status: Option<u16>) -> Self {
+        Self {
+            class: PerformanceMetricErrorClass::Unknown,
+            http_status,
+            message: None,
+        }
+    }
+
+    /// Maps the shared provider failure classification plus its HTTP status
+    /// onto the bounded metric vocabulary.
+    pub fn from_stream_failure_info(info: &pi_ai::utils::stream_failure::StreamFailureInfo) -> Self {
+        Self {
+            class: error_class_from_stream_failure_kind(&info.kind, info.status),
+            http_status: bounded_http_status(info.status),
+            // `raw` is a provider payload and must never enter telemetry; the
+            // short provider error type (e.g. "overloaded_error") is the only
+            // bounded text this path contributes.
+            message: sanitize_performance_metric_error_message(info.provider_error_type.as_deref()),
+        }
+    }
+
+    /// Best-effort classification of an `anyhow` error from the agent loop:
+    /// a structured [`pi_ai::utils::stream_failure::StreamFailureError`] in the
+    /// chain wins, then transport errors, then bounded message heuristics.
+    pub fn from_anyhow_error(error: &anyhow::Error) -> Self {
+        for cause in error.chain() {
+            if let Some(failure) = cause.downcast_ref::<pi_ai::utils::stream_failure::StreamFailureError>() {
+                return Self::from_stream_failure_info(&failure.info);
+            }
+            if let Some(transport) = cause.downcast_ref::<reqwest::Error>() {
+                return Self {
+                    class: if transport.is_timeout() {
+                        PerformanceMetricErrorClass::Timeout
+                    } else {
+                        PerformanceMetricErrorClass::Network
+                    },
+                    http_status: transport
+                        .status()
+                        .map(|status| status.as_u16())
+                        .and_then(|status| (100..=599).contains(&status).then_some(status)),
+                    message: sanitize_performance_metric_error_message(Some(&error.to_string())),
+                };
+            }
+        }
+        Self::classify_message(&error.to_string())
+    }
+
+    /// Classifies a terminal provider message: the persisted
+    /// `provider_stream_failure` diagnostic is authoritative, then the raw stop
+    /// reason, then the bounded error-message heuristics.
+    pub fn from_assistant_message(message: &AssistantMessage) -> Self {
+        for diagnostic in message.diagnostics.iter().flatten() {
+            if diagnostic.type_ != "provider_stream_failure" {
+                continue;
+            }
+            let details = diagnostic.details.as_ref();
+            let kind = details
+                .and_then(|details| details.get("kind"))
+                .and_then(Value::as_str);
+            let status = details
+                .and_then(|details| details.get("status"))
+                .and_then(|value| value.as_i64());
+            let text = diagnostic
+                .error
+                .as_ref()
+                .map(|error| error.message.as_str())
+                .unwrap_or_default();
+            return Self {
+                class: error_class_from_stream_failure_kind(kind.unwrap_or("unknown"), status),
+                http_status: bounded_http_status(status),
+                message: sanitize_performance_metric_error_message(Some(text)),
+            };
+        }
+        if let Some(raw) = message.stop_reason_raw.as_deref() {
+            let kind = pi_ai::utils::stream_failure::classify_stream_failure(Some(raw), None);
+            return Self {
+                class: error_class_from_stream_failure_kind(kind, None),
+                http_status: None,
+                message: sanitize_performance_metric_error_message(message.error_message.as_deref()),
+            };
+        }
+        match message.error_message.as_deref() {
+            Some(text) => Self::classify_message(text),
+            None => Self::unknown_with_status(None),
+        }
+    }
+
+    /// Bounded message heuristics for errors that carry no structured class.
+    pub fn classify_message(text: &str) -> Self {
+        Self {
+            class: classify_error_message_text(text),
+            http_status: None,
+            message: sanitize_performance_metric_error_message(Some(text)),
+        }
+    }
+}
+
+/// Keeps only real HTTP statuses; `0`, negatives, and redirects are dropped.
+fn bounded_http_status(status: Option<i64>) -> Option<u16> {
+    let status = status?;
+    (100..=599).contains(&status).then_some(status as u16)
+}
+
+/// Maps the provider failure kind vocabulary (plus an optional status) onto
+/// the metric error classes.
+fn error_class_from_stream_failure_kind(kind: &str, status: Option<i64>) -> PerformanceMetricErrorClass {
+    match kind {
+        "auth" => PerformanceMetricErrorClass::Auth,
+        "rate_limit" => PerformanceMetricErrorClass::RateLimit,
+        "overloaded" | "server_error" => PerformanceMetricErrorClass::Server,
+        "request_interrupted" => PerformanceMetricErrorClass::Cancelled,
+        "refusal" | "safety" | "permission" | "invalid_request" | "malformed_response" => {
+            PerformanceMetricErrorClass::Client
+        }
+        _ => match status {
+            Some(status) if (100..=599).contains(&status) => match status {
+                408 => PerformanceMetricErrorClass::Timeout,
+                429 => PerformanceMetricErrorClass::RateLimit,
+                401 => PerformanceMetricErrorClass::Auth,
+                status if status >= 500 => PerformanceMetricErrorClass::Server,
+                status if status >= 400 => PerformanceMetricErrorClass::Client,
+                _ => PerformanceMetricErrorClass::Unknown,
+            },
+            _ => PerformanceMetricErrorClass::Unknown,
+        },
+    }
+}
+
+/// Heuristic classifier for unstructured error text. Ordered so that the most
+/// specific transport verdicts win; every pattern is lowercase-ASCII only.
+fn classify_error_message_text(text: &str) -> PerformanceMetricErrorClass {
+    static PATTERNS: once_cell::sync::Lazy<Vec<(&'static str, PerformanceMetricErrorClass)>> =
+        once_cell::sync::Lazy::new(|| {
+            vec![
+                ("timed out", PerformanceMetricErrorClass::Timeout),
+                ("timeout", PerformanceMetricErrorClass::Timeout),
+                ("deadline", PerformanceMetricErrorClass::Timeout),
+                ("unauthorized", PerformanceMetricErrorClass::Auth),
+                ("invalid api key", PerformanceMetricErrorClass::Auth),
+                ("authentication", PerformanceMetricErrorClass::Auth),
+                ("api key", PerformanceMetricErrorClass::Auth),
+                ("rate limit", PerformanceMetricErrorClass::RateLimit),
+                ("too many requests", PerformanceMetricErrorClass::RateLimit),
+                ("quota", PerformanceMetricErrorClass::RateLimit),
+                ("connection", PerformanceMetricErrorClass::Network),
+                ("connect", PerformanceMetricErrorClass::Network),
+                ("dns", PerformanceMetricErrorClass::Network),
+                ("network", PerformanceMetricErrorClass::Network),
+                ("refused", PerformanceMetricErrorClass::Network),
+                ("unreachable", PerformanceMetricErrorClass::Network),
+                ("reset by peer", PerformanceMetricErrorClass::Network),
+                ("broken pipe", PerformanceMetricErrorClass::Network),
+                ("overloaded", PerformanceMetricErrorClass::Server),
+                ("internal server", PerformanceMetricErrorClass::Server),
+                ("server error", PerformanceMetricErrorClass::Server),
+                ("bad gateway", PerformanceMetricErrorClass::Server),
+                ("service unavailable", PerformanceMetricErrorClass::Server),
+                ("invalid request", PerformanceMetricErrorClass::Client),
+                ("not found", PerformanceMetricErrorClass::Client),
+                ("bad request", PerformanceMetricErrorClass::Client),
+                ("invalid", PerformanceMetricErrorClass::Client),
+            ]
+        });
+    let lowered = text.to_lowercase();
+    for (pattern, class) in PATTERNS.iter() {
+        if lowered.contains(pattern) {
+            return *class;
+        }
+    }
+    PerformanceMetricErrorClass::Unknown
+}
+
 fn normalized_positive_token_count(value: f64) -> Option<f64> {
     // Normalized Usage uses zero both for an explicit zero and for a missing raw
     // field. Without the provider observation hook, only positive values prove
@@ -652,6 +1005,136 @@ mod tests {
         settlement.observe_provider_attempt_number(2);
         settlement.observe_provider_attempt_number(1);
         assert_eq!(settlement.max_provider_attempt_number(), 2);
+    }
+
+    #[test]
+    fn error_message_sanitizer_bounds_and_strips_control_characters() {
+        // Trailing whitespace is trimmed before sanitization, so only the
+        // interior control character is replaced.
+        assert_eq!(
+            sanitize_performance_metric_error_message(Some("a\u{0}b\n")),
+            Some("a?b".to_string())
+        );
+        assert_eq!(
+            sanitize_performance_metric_error_message(Some("a\u{0}b\u{1}c")),
+            Some("a?b?c".to_string())
+        );
+        let long = "x".repeat(600);
+        let sanitized = sanitize_performance_metric_error_message(Some(&long)).expect("bounded");
+        assert_eq!(sanitized.chars().count(), PERFORMANCE_METRICS_ERROR_MESSAGE_MAX_CHARS);
+        assert_eq!(sanitize_performance_metric_error_message(Some("   ")), None);
+        assert_eq!(sanitize_performance_metric_error_message(None), None);
+    }
+
+    #[test]
+    fn stage_tokens_must_be_bounded_lowercase_words() {
+        assert_eq!(sanitize_performance_metric_stage(Some("stale_detected")).as_deref(), Some("stale_detected"));
+        assert_eq!(sanitize_performance_metric_stage(Some("start")).as_deref(), Some("start"));
+        assert_eq!(sanitize_performance_metric_stage(Some("Stale Detected")), None);
+        assert_eq!(sanitize_performance_metric_stage(Some("has space")), None);
+        assert_eq!(sanitize_performance_metric_stage(Some(&"x".repeat(33))), None);
+        assert_eq!(sanitize_performance_metric_stage(Some("")), None);
+        assert_eq!(sanitize_performance_metric_stage(None), None);
+    }
+
+    #[test]
+    fn stream_failure_kinds_map_to_bounded_error_classes() {
+        let failure = |kind: &str, status: Option<i64>| {
+            PerformanceMetricFailure::from_stream_failure_info(&pi_ai::utils::stream_failure::StreamFailureInfo {
+                kind: kind.to_string(),
+                provider_error_type: Some("overloaded_error".to_string()),
+                status,
+                request_id: None,
+                retry_after_ms: None,
+                raw: None,
+            })
+        };
+        assert_eq!(failure("auth", Some(401)).class, PerformanceMetricErrorClass::Auth);
+        assert_eq!(failure("auth", Some(401)).http_status, Some(401));
+        assert_eq!(failure("rate_limit", Some(429)).class, PerformanceMetricErrorClass::RateLimit);
+        assert_eq!(failure("overloaded", Some(529)).class, PerformanceMetricErrorClass::Server);
+        assert_eq!(failure("server_error", Some(500)).class, PerformanceMetricErrorClass::Server);
+        assert_eq!(failure("request_interrupted", None).class, PerformanceMetricErrorClass::Cancelled);
+        assert_eq!(failure("invalid_request", Some(400)).class, PerformanceMetricErrorClass::Client);
+        assert_eq!(failure("unknown", None).class, PerformanceMetricErrorClass::Unknown);
+        // A status alone can classify an otherwise unknown kind.
+        assert_eq!(failure("weird", Some(408)).class, PerformanceMetricErrorClass::Timeout);
+        assert_eq!(failure("weird", Some(503)).class, PerformanceMetricErrorClass::Server);
+        // The bounded message keeps the short provider error type, never the raw payload.
+        assert_eq!(failure("auth", None).message.as_deref(), Some("overloaded_error"));
+        assert_eq!(failure("auth", None).class, PerformanceMetricErrorClass::Auth);
+    }
+
+    #[test]
+    fn anyhow_errors_classify_through_the_chain_then_heuristics() {
+        let stream_failure = pi_ai::utils::stream_failure::StreamFailureError::new(
+            "Provider rate limit exceeded",
+            pi_ai::utils::stream_failure::StreamFailureInfo {
+                kind: "rate_limit".to_string(),
+                provider_error_type: None,
+                status: Some(429),
+                request_id: None,
+                retry_after_ms: None,
+                raw: None,
+            },
+        );
+        let error = anyhow::anyhow!(stream_failure);
+        let classified = PerformanceMetricFailure::from_anyhow_error(&error);
+        assert_eq!(classified.class, PerformanceMetricErrorClass::RateLimit);
+        assert_eq!(classified.http_status, Some(429));
+
+        let network = PerformanceMetricFailure::classify_message("connection refused by peer");
+        assert_eq!(network.class, PerformanceMetricErrorClass::Network);
+        let timeout = PerformanceMetricFailure::classify_message("request timed out after 30s");
+        assert_eq!(timeout.class, PerformanceMetricErrorClass::Timeout);
+        let auth = PerformanceMetricFailure::classify_message("invalid api key provided");
+        assert_eq!(auth.class, PerformanceMetricErrorClass::Auth);
+        let unknown = PerformanceMetricFailure::classify_message("something odd happened");
+        assert_eq!(unknown.class, PerformanceMetricErrorClass::Unknown);
+    }
+
+    #[test]
+    fn assistant_message_diagnostics_classify_the_terminal_failure() {
+        let mut message = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        message.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+        message.diagnostics = Some(vec![pi_ai::utils::diagnostics::AssistantMessageDiagnostic {
+            type_: "provider_stream_failure".to_string(),
+            timestamp: 0,
+            error: Some(pi_ai::utils::diagnostics::DiagnosticErrorInfo {
+                name: Some("StreamFailureError".to_string()),
+                message: "Provider rate limit exceeded (429)".to_string(),
+                stack: None,
+                code: None,
+            }),
+            details: Some(serde_json::Map::from_iter([
+                ("kind".to_string(), serde_json::json!("rate_limit")),
+                ("status".to_string(), serde_json::json!(429)),
+            ])),
+        }]);
+        let classified = PerformanceMetricFailure::from_assistant_message(&message);
+        assert_eq!(classified.class, PerformanceMetricErrorClass::RateLimit);
+        assert_eq!(classified.http_status, Some(429));
+        assert!(classified.message.as_deref().is_some_and(|text| text.contains("rate limit")));
+
+        let mut raw_only = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        raw_only.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+        raw_only.stop_reason_raw = Some("SAFETY".to_string());
+        let classified = PerformanceMetricFailure::from_assistant_message(&raw_only);
+        assert_eq!(classified.class, PerformanceMetricErrorClass::Client);
+
+        let mut text_only = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        text_only.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+        text_only.error_message = Some("connection error while streaming".to_string());
+        let classified = PerformanceMetricFailure::from_assistant_message(&text_only);
+        assert_eq!(classified.class, PerformanceMetricErrorClass::Network);
+    }
+
+    #[test]
+    fn cancelled_failures_carry_no_status_or_text() {
+        let cancelled = PerformanceMetricFailure::cancelled();
+        assert_eq!(cancelled.class, PerformanceMetricErrorClass::Cancelled);
+        assert_eq!(cancelled.http_status, None);
+        assert_eq!(cancelled.message, None);
     }
 
     #[test]

@@ -23,7 +23,7 @@ const DEFAULT_FLUSH_INTERVAL_MS: usize = 1_000;
 const DEFAULT_CLOSE_TIMEOUT_MS: usize = 1_000;
 
 /// `OPERATIONS`.
-const OPERATIONS: [PerformanceMetricOperation; 22] = [
+const OPERATIONS: [PerformanceMetricOperation; 23] = [
     PerformanceMetricOperation::LogicalRequest,
     PerformanceMetricOperation::ProviderAttempt,
     PerformanceMetricOperation::Tool,
@@ -46,15 +46,17 @@ const OPERATIONS: [PerformanceMetricOperation; 22] = [
     PerformanceMetricOperation::UiMenuOpen,
     PerformanceMetricOperation::UiSessionOpen,
     PerformanceMetricOperation::Recorder,
+    PerformanceMetricOperation::DaemonLifecycle,
 ];
 
 /// `OUTCOMES`.
-const OUTCOMES: [PerformanceMetricOutcome; 5] = [
+const OUTCOMES: [PerformanceMetricOutcome; 6] = [
     PerformanceMetricOutcome::Started,
     PerformanceMetricOutcome::Success,
     PerformanceMetricOutcome::Failure,
     PerformanceMetricOutcome::Cancelled,
     PerformanceMetricOutcome::Unavailable,
+    PerformanceMetricOutcome::Timeout,
 ];
 
 /// `COMPONENTS`.
@@ -218,6 +220,8 @@ pub struct LocalPerformanceMetricRecorderOptions {
     pub wall_now: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
     pub random_id: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     pub file_io: Option<Arc<dyn PerformanceMetricFileIo>>,
+    /// A3: explicit override for the error-text gate (test seam).
+    pub error_text_enabled: Option<bool>,
 }
 
 /// `interface EnvironmentPerformanceMetricRecorderOptions`.
@@ -237,6 +241,9 @@ pub struct EnvironmentPerformanceMetricRecorderOptions {
     pub wall_now: Option<Arc<dyn Fn() -> f64 + Send + Sync>>,
     pub random_id: Option<Arc<dyn Fn() -> String + Send + Sync>>,
     pub file_io: Option<Arc<dyn PerformanceMetricFileIo>>,
+    /// A3: overrides the `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT`
+    /// environment gate for tests; `None` reads the environment (default off).
+    pub error_text_enabled: Option<bool>,
 }
 
 /// `defaultFileIO`.
@@ -421,12 +428,17 @@ fn sanitize_identity(value: Option<&Value>) -> Option<PerformanceMetricIdentity>
         model: sanitize_nullable_string(map.get("model"), 160),
         api: sanitize_nullable_string(map.get("api"), 96),
         component,
+        // A4: the tool name is an identifier like the provider/model/API
+        // strings, so it gets the same bounded, control-character-safe
+        // treatment.
+        tool: sanitize_string(map.get("tool"), 96),
     };
     // `Object.values(sanitized).some((item) => item !== undefined)`.
     if sanitized.provider.is_some()
         || sanitized.model.is_some()
         || sanitized.api.is_some()
         || sanitized.component.is_some()
+        || sanitized.tool.is_some()
     {
         Some(sanitized)
     } else {
@@ -491,6 +503,42 @@ fn opt_in_enabled(value: Option<&str>) -> bool {
     }
 }
 
+/// A3: a failure class survives only when it is a known vocabulary token.
+fn sanitize_error_class(value: Option<&Value>) -> Option<pi_agent_core::performance_metrics::PerformanceMetricErrorClass> {
+    let token = value.and_then(Value::as_str)?;
+    pi_agent_core::performance_metrics::PerformanceMetricErrorClass::from_token(token)
+}
+
+/// A3: only real HTTP statuses are observable; anything else is dropped.
+fn sanitize_http_status(value: Option<&Value>) -> Option<u16> {
+    let status = value.and_then(Value::as_i64)?;
+    if (100..=599).contains(&status) {
+        Some(status as u16)
+    } else {
+        None
+    }
+}
+
+/// A15: a stage must be the bounded `[a-z0-9_]{1,32}` token the emitter
+/// already validated; the recorder revalidates so a misbehaving emitter
+/// cannot push free-form text through the stage field.
+fn sanitize_stage(value: Option<&Value>) -> Option<String> {
+    let stage = value.and_then(Value::as_str)?;
+    pi_agent_core::performance_metrics::sanitize_performance_metric_stage(Some(stage))
+}
+
+/// A3: error text is persisted only when the recorder was built with the
+/// opt-in flag (`PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT=1`, default off).
+/// The text is bounded and control-character sanitized like every other
+/// recorded string, so the privacy-preserving default stays "no error text".
+fn sanitize_error_message(value: Option<&Value>, enabled: bool) -> Option<String> {
+    if !enabled {
+        return None;
+    }
+    let text = value.and_then(Value::as_str)?;
+    pi_agent_core::performance_metrics::sanitize_performance_metric_error_message(Some(text))
+}
+
 /// `safeFileSegment(value, fallback)`.
 fn safe_file_segment(value: &str, fallback: &str) -> String {
     let mut sanitized = String::new();
@@ -546,6 +594,9 @@ pub struct LocalPerformanceMetricRecorderInner {
     flush_requested: AtomicBool,
     /// `flushInFlight` - only one drain runs at a time.
     flush_lock: tokio::sync::Mutex<()>,
+    /// A3: whether bounded error text may be persisted. Default off; enabled
+    /// only through `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT`.
+    error_text_enabled: bool,
 }
 
 #[derive(Default)]
@@ -623,6 +674,11 @@ impl LocalPerformanceMetricRecorder {
             100,
             60_000,
         ) as u64;
+        // A3: the error-text gate is read once per recorder so a persisted
+        // record's shape cannot flip mid-session, and the default stays off.
+        let error_text_enabled = options.error_text_enabled.unwrap_or_else(|| {
+            opt_in_enabled(std::env::var("PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT").ok().as_deref())
+        });
         let inner = Arc::new(LocalPerformanceMetricRecorderInner {
             session_id,
             log_path,
@@ -642,6 +698,7 @@ impl LocalPerformanceMetricRecorder {
             closed: AtomicBool::new(false),
             flush_requested: AtomicBool::new(false),
             flush_lock: tokio::sync::Mutex::new(()),
+            error_text_enabled,
         });
 
         // `setInterval(() => void this.flush(), flushIntervalMs).unref()`: the
@@ -785,6 +842,10 @@ impl LocalPerformanceMetricRecorderInner {
             outcome: None,
             measurements: None,
             usage: None,
+            stage: None,
+            error_class: None,
+            http_status: None,
+            error_message: None,
         };
         let identity_value = event
             .identity
@@ -812,6 +873,33 @@ impl LocalPerformanceMetricRecorderInner {
             .as_ref()
             .map(|usage| serde_json::to_value(usage).unwrap_or(Value::Null));
         record.usage = sanitize_usage(usage_value.as_ref());
+        // A3/A15: the bounded failure detail and stage token survive only their
+        // allowlists; error text additionally requires the opt-in gate.
+        record.stage = sanitize_stage(
+            event
+                .stage
+                .as_ref()
+                .map(|stage| Value::String(stage.clone()))
+                .as_ref(),
+        );
+        record.error_class = sanitize_error_class(
+            event
+                .error_class
+                .as_ref()
+                .map(|class| Value::String(class.as_str().to_string()))
+                .as_ref(),
+        );
+        record.http_status = event.http_status.map(|status| Value::from(status as i64)).and_then(|value| {
+            sanitize_http_status(Some(&value))
+        });
+        record.error_message = sanitize_error_message(
+            event
+                .error_message
+                .as_ref()
+                .map(|message| Value::String(message.clone()))
+                .as_ref(),
+            self.error_text_enabled,
+        );
         let json = serde_json::to_string(&record).ok()?;
         Some(format!("{json}\n"))
     }
@@ -840,6 +928,7 @@ impl LocalPerformanceMetricRecorderInner {
                     model: None,
                     api: None,
                     component: Some(PerformanceMetricComponent::Recorder),
+                    tool: None,
                 }),
                 outcome: Some(PerformanceMetricOutcome::Unavailable),
                 measurements: Some(
@@ -851,6 +940,10 @@ impl LocalPerformanceMetricRecorderInner {
                     .collect(),
                 ),
                 usage: None,
+                stage: None,
+                error_class: None,
+                http_status: None,
+                error_message: None,
             });
             // The TypeScript throws when the drop metric cannot be encoded; the
             // enclosing catch then re-accounts every lost record.
@@ -1045,6 +1138,12 @@ pub fn create_local_performance_metric_recorder_from_environment(
             .as_ref(),
         2048,
     );
+    // A3: the error-text gate follows the same env source as the opt-in itself,
+    // so an explicitly provided env map decides, and the process env is read
+    // only when no map was supplied.
+    let error_text_enabled = Some(opt_in_enabled(
+        env.get("PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT").map(String::as_str),
+    ));
     create_local_performance_metric_recorder(LocalPerformanceMetricRecorderOptions {
         directory: configured_directory
             .unwrap_or_else(|| join_path(&options.agent_dir, "performance-metrics")),
@@ -1060,6 +1159,7 @@ pub fn create_local_performance_metric_recorder_from_environment(
         wall_now: options.wall_now,
         random_id: options.random_id,
         file_io: options.file_io,
+        error_text_enabled: options.error_text_enabled.or(error_text_enabled),
     })
 }
 
@@ -1105,6 +1205,7 @@ fn to_iso_string(millis: f64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use pi_agent_core::performance_metrics::PerformanceMetricErrorClass;
     use pi_agent_core::performance_metrics::PerformanceMetricMeasurements;
 
     /// `MemoryFileIO` from the reference test file.
@@ -1128,6 +1229,13 @@ mod tests {
 
         fn read(&self, path: &str) -> Option<String> {
             self.files.lock().unwrap().get(path).cloned()
+        }
+
+        /// `(io, files)` so a test can construct the recorder and still read
+        /// back what was written.
+        fn pair() -> (Arc<Self>, Arc<Mutex<HashMap<String, String>>>) {
+            let io = Arc::new(Self::new());
+            (Arc::clone(&io), Arc::clone(&io.files))
         }
     }
 
@@ -1217,6 +1325,7 @@ mod tests {
                 model: Some(Some("gpt-test".to_string())),
                 api: Some(Some("openai-responses".to_string())),
                 component: Some(PerformanceMetricComponent::Agent),
+                tool: None,
             }),
             outcome: Some(PerformanceMetricOutcome::Success),
             measurements: Some(measurements),
@@ -1231,6 +1340,10 @@ mod tests {
                 reasoning_included_in_output: None,
                 estimator: None,
             }),
+            stage: None,
+            error_class: None,
+            http_status: None,
+            error_message: None,
         }
     }
 
@@ -1522,6 +1635,7 @@ mod tests {
                 agent_dir: agent_dir.to_string_lossy().to_string(),
                 session_id: "session-disabled".to_string(),
                 env: Some(HashMap::new()),
+                error_text_enabled: None,
                 max_buffered_records: None,
                 max_buffered_bytes: None,
                 max_record_bytes: None,
@@ -1544,6 +1658,7 @@ mod tests {
                 agent_dir: agent_dir.to_string_lossy().to_string(),
                 session_id: "session-enabled".to_string(),
                 env: Some(env.clone()),
+                error_text_enabled: None,
                 max_buffered_records: None,
                 max_buffered_bytes: None,
                 max_record_bytes: None,
@@ -1574,6 +1689,7 @@ mod tests {
                 agent_dir: agent_dir.to_string_lossy().to_string(),
                 session_id: "session-configured".to_string(),
                 env: Some(env),
+                error_text_enabled: None,
                 max_buffered_records: None,
                 max_buffered_bytes: None,
                 max_record_bytes: None,
@@ -1589,6 +1705,84 @@ mod tests {
         )
         .expect("configured recorder");
         assert!(configured.log_path().starts_with(metrics_dir.to_string_lossy().as_ref()));
+    }
+
+    /// A3: `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT=1` is the only way the
+    /// environment factory turns bounded error text on; the default stays off.
+    #[tokio::test]
+    async fn environment_error_text_gate_defaults_off_and_enables_explicitly() {
+        let agent_dir = std::env::temp_dir().join("perf-metrics-error-text-gate");
+        let _ = std::fs::remove_dir_all(&agent_dir);
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+
+        let mut env: HashMap<String, String> = HashMap::new();
+        env.insert("PRIME_AGENT_PERFORMANCE_METRICS".to_string(), "true".to_string());
+        let off = create_local_performance_metric_recorder_from_environment(
+            EnvironmentPerformanceMetricRecorderOptions {
+                agent_dir: agent_dir.to_string_lossy().to_string(),
+                session_id: "error-text-off".to_string(),
+                env: Some(env.clone()),
+                error_text_enabled: None,
+                max_buffered_records: None,
+                max_buffered_bytes: None,
+                max_record_bytes: None,
+                max_file_bytes: None,
+                max_files: None,
+                flush_interval_ms: Some(60_000),
+                close_timeout_ms: None,
+                monotonic_now: None,
+                wall_now: None,
+                random_id: None,
+                file_io: None,
+            },
+        )
+        .expect("recorder with error text off");
+        let mut event = PerformanceMetricEvent::new(PerformanceMetricOperation::ProviderAttempt);
+        event.outcome = Some(PerformanceMetricOutcome::Failure);
+        event.error_message = Some("Provider overloaded".to_string());
+        off.record(event);
+        off.flush().await;
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(off.log_path()).expect("log written"),
+        )
+        .expect("valid record");
+        assert!(record.get("error_message").is_none(), "default keeps error text out");
+
+        env.insert(
+            "PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT".to_string(),
+            "1".to_string(),
+        );
+        let on = create_local_performance_metric_recorder_from_environment(
+            EnvironmentPerformanceMetricRecorderOptions {
+                agent_dir: agent_dir.to_string_lossy().to_string(),
+                session_id: "error-text-on".to_string(),
+                env: Some(env),
+                error_text_enabled: None,
+                max_buffered_records: None,
+                max_buffered_bytes: None,
+                max_record_bytes: None,
+                max_file_bytes: None,
+                max_files: None,
+                flush_interval_ms: Some(60_000),
+                close_timeout_ms: None,
+                monotonic_now: None,
+                wall_now: None,
+                random_id: None,
+                file_io: None,
+            },
+        )
+        .expect("recorder with error text on");
+        let mut event = PerformanceMetricEvent::new(PerformanceMetricOperation::ProviderAttempt);
+        event.outcome = Some(PerformanceMetricOutcome::Failure);
+        event.error_message = Some("Provider overloaded".to_string());
+        on.record(event);
+        on.flush().await;
+        let record: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(on.log_path()).expect("log written"),
+        )
+        .expect("valid record");
+        assert_eq!(record["error_message"], serde_json::json!("Provider overloaded"));
+        let _ = std::fs::remove_dir_all(&agent_dir);
     }
 
     #[test]
@@ -1640,5 +1834,97 @@ mod tests {
 
         assert!(sanitize_usage(Some(&serde_json::json!({ "source": "unknown" }))).is_none());
         assert!(sanitize_usage(Some(&serde_json::json!(3))).is_none());
+    }
+
+    #[test]
+    fn failure_detail_sanitizers_bound_the_new_fields() {
+        use pi_agent_core::performance_metrics::PerformanceMetricErrorClass;
+        assert_eq!(
+            sanitize_error_class(Some(&serde_json::json!("rate_limit"))),
+            Some(PerformanceMetricErrorClass::RateLimit)
+        );
+        assert_eq!(sanitize_error_class(Some(&serde_json::json!("made_up_class"))), None);
+        assert_eq!(sanitize_error_class(Some(&serde_json::json!(42))), None);
+        assert_eq!(sanitize_http_status(Some(&serde_json::json!(429))), Some(429));
+        assert_eq!(sanitize_http_status(Some(&serde_json::json!(99))), None);
+        assert_eq!(sanitize_http_status(Some(&serde_json::json!(600))), None);
+        assert_eq!(
+            sanitize_stage(Some(&serde_json::json!("stale_detected"))).as_deref(),
+            Some("stale_detected")
+        );
+        assert_eq!(sanitize_stage(Some(&serde_json::json!("not a token"))), None);
+        // Error text obeys the recorder gate and the shared string bounds.
+        assert_eq!(sanitize_error_message(Some(&serde_json::json!("boom")), true).as_deref(), Some("boom"));
+        assert_eq!(sanitize_error_message(Some(&serde_json::json!("boom")), false), None);
+        assert_eq!(sanitize_error_message(Some(&serde_json::json!("   ")), true), None);
+        let long = "e".repeat(300);
+        let bounded = sanitize_error_message(Some(&serde_json::json!(long)), true).expect("bounded");
+        assert_eq!(
+            bounded.chars().count(),
+            pi_agent_core::performance_metrics::PERFORMANCE_METRICS_ERROR_MESSAGE_MAX_CHARS
+        );
+    }
+
+    /// A3/A15: the persisted record keeps the failure class, status, and stage,
+    /// and drops error text unless the recorder was built with the opt-in.
+    #[tokio::test]
+    async fn records_keep_failure_detail_and_drop_ungated_error_text() {
+        async fn first_record_line(error_text_enabled: Option<bool>) -> serde_json::Value {
+            let (io, files) = MemoryFileIo::pair();
+            let recorder = LocalPerformanceMetricRecorder::new(LocalPerformanceMetricRecorderOptions {
+                directory: "C:/isolated/failure-detail".into(),
+                session_id: "failure-detail".into(),
+                file_io: Some(io),
+                error_text_enabled,
+                ..Default::default()
+            });
+            let mut event = PerformanceMetricEvent::new(PerformanceMetricOperation::ProviderAttempt);
+            event.outcome = Some(PerformanceMetricOutcome::Failure);
+            event.error_class = Some(PerformanceMetricErrorClass::RateLimit);
+            event.http_status = Some(429);
+            event.stage = Some("stale_detected".to_string());
+            event.error_message = Some("Provider rate limit exceeded".to_string());
+            recorder.record(event);
+            recorder.flush().await;
+            let files = files.lock().unwrap();
+            let (_, content) = files.iter().next().expect("one metrics file");
+            let line = content.lines().next().expect("one record line");
+            serde_json::from_str(line).expect("valid JSON record")
+        }
+
+        let record = first_record_line(None).await;
+        assert_eq!(record["error_class"], serde_json::json!("rate_limit"));
+        assert_eq!(record["http_status"], serde_json::json!(429));
+        assert_eq!(record["stage"], serde_json::json!("stale_detected"));
+        assert!(record.get("error_message").is_none(), "error text must stay absent by default");
+
+        let record = first_record_line(Some(true)).await;
+        assert_eq!(record["error_message"], serde_json::json!("Provider rate limit exceeded"));
+    }
+
+    /// A4: the tool identity name survives the sanitizer into the persisted record.
+    #[tokio::test]
+    async fn records_keep_the_tool_name_on_tool_metrics() {
+        let (io, files) = MemoryFileIo::pair();
+        let recorder = LocalPerformanceMetricRecorder::new(LocalPerformanceMetricRecorderOptions {
+            directory: "C:/isolated/tool-name".into(),
+            session_id: "tool-name".into(),
+            file_io: Some(io),
+            ..Default::default()
+        });
+        let mut event = PerformanceMetricEvent::new(PerformanceMetricOperation::Tool);
+        event.identity = Some(PerformanceMetricIdentity {
+            component: Some(PerformanceMetricComponent::Tool),
+            tool: Some("web_search".to_string()),
+            ..Default::default()
+        });
+        event.outcome = Some(PerformanceMetricOutcome::Failure);
+        recorder.record(event);
+        recorder.flush().await;
+        let files = files.lock().unwrap();
+        let (_, content) = files.iter().next().expect("one metrics file");
+        let record: serde_json::Value =
+            serde_json::from_str(content.lines().next().expect("one record line")).expect("valid JSON record");
+        assert_eq!(record["identity"]["tool"], serde_json::json!("web_search"));
     }
 }

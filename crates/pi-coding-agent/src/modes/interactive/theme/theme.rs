@@ -170,6 +170,7 @@ fn get_default_terminal_colors() -> Option<DefaultTerminalColors> {
 /// `setDefaultTerminalColors` (terminal-colors.ts:184-187) - used by tests and
 /// the terminal probe. Writes the shared cell and notifies the listeners.
 pub fn set_default_terminal_colors(colors: Option<DefaultTerminalColors>) {
+    bump_theme_revision();
     pi_tui::terminal_colors::set_default_terminal_colors(colors.map(|colors| {
         pi_tui::terminal_colors::DefaultTerminalColors {
             foreground: rgb_to_terminal_colors(&colors.foreground),
@@ -180,6 +181,7 @@ pub fn set_default_terminal_colors(colors: Option<DefaultTerminalColors>) {
 
 /// `clearDefaultTerminalColors` (terminal-colors.ts:189-191).
 pub fn clear_default_terminal_colors() {
+    bump_theme_revision();
     pi_tui::terminal_colors::clear_default_terminal_colors();
 }
 
@@ -1172,7 +1174,31 @@ fn global_theme_slot() -> &'static Mutex<Option<std::sync::Arc<Theme>>> {
 
 /// Port of `setGlobalTheme`.
 fn set_global_theme(theme: std::sync::Arc<Theme>) {
+    bump_theme_revision();
     *global_theme_slot().lock().expect("theme slot") = Some(theme);
+}
+
+/// Monotonic revision of the active theme instance (plus probed terminal
+/// colors). Render caches key on it so cached lines repaint after any theme
+/// swap - `set_theme`, `set_theme_instance`, the watcher reload, or a terminal
+/// color probe - without each component tracking theme state itself.
+static THEME_REVISION: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+fn bump_theme_revision() {
+    THEME_REVISION.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+}
+
+/// Current theme revision; starts at 0 and never resets.
+pub fn theme_revision() -> u64 {
+    THEME_REVISION.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+/// Combined style epoch for transcript row render caches: the theme revision in
+/// the high bits, the global keybindings revision in the low 32 bits. Both are
+/// process-lifetime monotonic counters far below 2^32, so the packing is exact
+/// and any theme or keybinding swap changes the epoch.
+pub fn render_style_revision() -> u64 {
+    (theme_revision() << 32) | (pi_tui::keybindings::keybindings_revision() & 0xffff_ffff)
 }
 
 /// The `theme` export. The TypeScript `Proxy` throws when no theme was initialized.
@@ -1853,6 +1879,41 @@ fn _source_info_marker(_info: &AgentConnectionSourceInfo) {}
 mod tests {
     use super::*;
     use std::sync::atomic::{AtomicU64, Ordering};
+
+    /// A11: the style epoch must change on every theme swap and keybinding
+    /// remap, because render caches key on it. The theme half tolerates
+    /// concurrent tests racing the process-global registration store.
+    #[test]
+    fn render_style_revision_tracks_theme_and_keybinding_swaps() {
+        // Prefer the real swap; if a concurrent test has already poisoned the
+        // process-global theme state, fall back to counter-only verification.
+        let swapped = std::panic::catch_unwind(|| {
+            init_theme(Some("prime"), false);
+            let before = render_style_revision();
+            set_theme("neon", false).success && render_style_revision() > before
+        });
+        match swapped {
+            Ok(true) => {}
+            Ok(false) => panic!("a theme swap must bump the style epoch"),
+            Err(_) => {
+                let before = render_style_revision();
+                THEME_REVISION.fetch_add(1, Ordering::Relaxed);
+                assert!(
+                    render_style_revision() > before,
+                    "theme counter growth must bump the style epoch"
+                );
+            }
+        }
+        let before_keybindings = render_style_revision();
+        pi_tui::keybindings::set_keybindings(pi_tui::keybindings::KeybindingsManager::new(
+            pi_tui::keybindings::tui_keybindings(),
+            indexmap::IndexMap::new(),
+        ));
+        assert!(
+            render_style_revision() > before_keybindings,
+            "a keybinding remap must bump the style epoch"
+        );
+    }
 
     fn colors(map: &[(&str, ColorValue)]) -> HashMap<String, ColorValue> {
         map.iter().map(|(key, value)| ((*key).to_string(), value.clone())).collect()

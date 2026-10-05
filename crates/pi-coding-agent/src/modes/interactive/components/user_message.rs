@@ -184,6 +184,14 @@ impl Component for UserMessageComponent {
         self.content_box.get_selection_regions()
     }
 
+    /// A11: the component is immutable after construction - the rendered output
+    /// only depends on width and the global style epoch, both part of the
+    /// transcript's row cache key - so a constant revision is safe and lets
+    /// the transcript skip re-rendering unchanged user messages.
+    fn render_revision(&self) -> Option<u64> {
+        Some(1)
+    }
+
     fn invalidate(&mut self) {
         self.content_box.invalidate();
     }

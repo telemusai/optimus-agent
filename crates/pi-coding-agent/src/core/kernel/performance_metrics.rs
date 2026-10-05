@@ -48,6 +48,13 @@ impl PerformanceMetricRecorder for KernelPerformanceMetricAdapter {
             measurements: Some(measurements),
             correlation: None,
             usage: None,
+            // The kernel event carries no failure detail or stage today; the
+            // fields stay explicit so a future emitter cannot inherit stale
+            // struct defaults by accident.
+            stage: None,
+            error_class: None,
+            http_status: None,
+            error_message: None,
         });
     }
 }

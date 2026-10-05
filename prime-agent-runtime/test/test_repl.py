@@ -588,7 +588,17 @@ class ReplTest(unittest.TestCase):
                 ]
             )
             self.assertEqual(one(self.repl.execute("s1", setup), "done")["status"], "ok")
-            self.repl.send({"type": "snapshot", "id": "s2", "path": path, "manifest_path": manifest_path})
+            self.repl.send(
+                {
+                    "type": "snapshot",
+                    "id": "s2",
+                    "path": path,
+                    "manifest_path": manifest_path,
+                    # This test pins the legacy wire format; `auto` now starts
+                    # fresh sessions on CAS v2 (A5).
+                    "snapshot_format": "legacy",
+                }
+            )
             done = one(self.repl.until_done("s2"), "done")
             self.assertEqual(done["status"], "ok")
             self.assertEqual(sorted(done["saved"]), ["bump", "socket", "x"])
@@ -1386,6 +1396,10 @@ class ReplTest(unittest.TestCase):
                     "manifest_path": manifest_path,
                     "max_variable_bytes": 1024,
                     "prune_oversized": True,
+                    # Legacy writer mechanics: the failure is injected into the
+                    # legacy manifest commit; `auto` now starts fresh sessions on
+                    # CAS v2 (A5).
+                    "snapshot_format": "legacy",
                 }
             )
             done = one(self.repl.until_done("m2"), "done")
@@ -1851,6 +1865,9 @@ class SnapshotPruneShieldTest(unittest.TestCase):
                     max_bytes=1 << 20,
                     max_variable_bytes=1024,
                     prune_oversized=True,
+                    # Injects SIGINT into the legacy manifest commit; `auto` now
+                    # starts fresh sessions on CAS v2 (A5).
+                    snapshot_format="legacy",
                 )
             # The parked SIGINT is consumed: the committed destructive snapshot
             # reports success instead of surfacing KeyboardInterrupt.
@@ -2090,6 +2107,9 @@ class SnapshotPairConsistencyTest(unittest.TestCase):
     def _snap(self, ns, path=None, manifest_path=None, **kw):
         args = dict(max_bytes=1 << 20, max_variable_bytes=1 << 20, prune_oversized=False)
         args.update(kw)
+        # These tests inject faults into the legacy payload/manifest commit pair;
+        # `auto` now starts fresh sessions on CAS v2 (A5).
+        args.setdefault("snapshot_format", "legacy")
         return self.snapshot(ns, path or self.path, manifest_path or self.manifest_path, **args)
 
     def _old_pair(self, path=None, manifest_path=None):

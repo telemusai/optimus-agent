@@ -90,7 +90,8 @@ use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::compaction::{
     calculate_context_tokens, compact, default_compaction_settings, estimate_context_tokens,
     estimate_tokens, prepare_compaction, should_compact_for_model, CompactionPreparation,
-    CompactionResult, CompactionSessionEntry, CompactionSettings, COMPACT_SKILL_NAME,
+    CompactionRetryConfig, CompactionResult, CompactionSessionEntry, CompactionSettings,
+    COMPACT_SKILL_NAME,
 };
 use crate::core::compaction::utils::serialize_conversation;
 use crate::core::context_tree::{
@@ -653,27 +654,22 @@ pub const COMPACTION_REASON_THRESHOLD: &str = "threshold";
 pub const COMPACTION_REASON_OVERFLOW: &str = "overflow";
 pub const COMPACTION_REASON_REQUESTED: &str = "requested";
 
-/// Bounded retry pacing for automatic threshold-compaction failures.
+/// A7: bounded retry pacing for automatic threshold-compaction failures.
 ///
-/// The 2026-09-18 episode re-attacked the failing summary call on every turn
-/// end (18 failed attempts in 4m51s, some ~5s apart). Each automatic
-/// threshold-compaction failure arms an exponential cooldown that doubles up
-/// to a fixed ceiling; the streak stops growing at the cap, so the retry rate
-/// stays bounded and compaction is never locked out permanently. Requested and
-/// overflow compaction, queued human input and the transcript are untouched.
-const THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS: u64 = 5_000;
-const THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS: u64 = 120_000;
-const THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES: u32 = 6;
-/// A provider that refused or filtered one summary attempt may refuse a
-/// repeat of the same request, so repeated automatic attempts are paced back
-/// instead of re-attacking on a short cadence. The filtered ladder starts
-/// slower and climbs to a longer bounded ceiling. Still exponential and
-/// still capped: never a permanent lockout, and manual/requested compaction
-/// is never gated. This is retry pacing only; no claim is made about the
+/// The 15-day /monitor review measured 21% failed episodes and one session
+/// re-attacking 35 consecutive times for ~2h; the pre-A7 5s->120s ladder
+/// re-attacked every 2 minutes forever after the cap. Pacing now comes from
+/// `CompactionRetryConfig` (core/compaction/compaction.rs): exponential
+/// backoff between retries (30s -> 2min, capped at 5min), and once
+/// `max_consecutive_failures` (default 3) consecutive summary failures have
+/// landed, a 10-minute cooldown gates the next re-attempt. Filtered/refused
+/// failures keep a slower ladder (60s -> 30min cap). The streak stops growing
+/// at the cap, so the cooldown stays the configured value instead of
+/// escalating forever, and compaction is never locked out permanently.
+/// Requested and overflow compaction, queued human input and the transcript
+/// are untouched; this is retry pacing only and makes no claim about the
 /// provider's next outcome.
-const THRESHOLD_COMPACTION_FILTERED_BACKOFF_INITIAL_MS: u64 = 60_000;
-const THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS: u64 = 1_800_000;
-
+///
 /// Consecutive automatic threshold-compaction failures and when the last one
 /// landed. Session-lifetime only; a restart starts without a cooldown.
 #[derive(Debug, Clone, Copy)]
@@ -708,26 +704,7 @@ struct CompactionAttemptEvidence {
     model: String,
 }
 
-/// `initial * 2^(failures - 1)`, clamped to the ceiling selected by the failure
-/// kind: filtered/refused failures use the longer bounded ladder.
-fn threshold_compaction_retry_backoff_delay(
-    kind: crate::core::compaction::compaction::SummaryFailureKind,
-    consecutive_failures: u32,
-) -> std::time::Duration {
-    let (initial_ms, max_ms) = match kind {
-        crate::core::compaction::compaction::SummaryFailureKind::FilteredOrRefused => (
-            THRESHOLD_COMPACTION_FILTERED_BACKOFF_INITIAL_MS,
-            THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS,
-        ),
-        _ => (
-            THRESHOLD_COMPACTION_RETRY_BACKOFF_INITIAL_MS,
-            THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS,
-        ),
-    };
-    let shift = consecutive_failures.saturating_sub(1).min(16);
-    let delay_ms = initial_ms.saturating_mul(1u64 << shift).min(max_ms);
-    std::time::Duration::from_millis(delay_ms)
-}
+
 
 /// Truthful short label for the cooldown an automatic threshold retry just
 /// armed, used in the user-facing recovery hint. Reports the actual delay for
@@ -2632,6 +2609,17 @@ pub struct AgentSession {
     /// `"idle" | "attempted" | "reported"`
     overflow_recovery: Mutex<String>,
     continue_after_threshold_compaction: AtomicBool,
+    /// A2 (durable-summary input release): set once a compaction's summary is
+    /// persisted AND the live agent context has been swapped to the compacted
+    /// context. While set, the remaining compaction restore bookkeeping
+    /// (SessionCompact announcement, kernel-state sync) no longer blocks
+    /// session input admission. A compaction whose branch still carries a
+    /// provider checkpoint keeps input blocked until the full restore ends,
+    /// because `restore_provider_context_for_model` replaces the live context
+    /// again at the end of restore. Cleared at the start of every compaction
+    /// attempt; a stale `true` between episodes is inert because the flag is
+    /// only consulted while `is_compacting()` holds.
+    compaction_input_admission_released: AtomicBool,
     threshold_compaction_failure_streak: Mutex<Option<ThresholdCompactionFailureState>>,
     /// Sanitized boundary/request-shape evidence for the compaction attempt in
     /// flight. Entry IDs, counts and model IDs only; never summary content.
@@ -3023,6 +3011,7 @@ impl AgentSession {
             compaction_operation: Mutex::new(None),
             overflow_recovery: Mutex::new("idle".to_string()),
             continue_after_threshold_compaction: AtomicBool::new(false),
+            compaction_input_admission_released: AtomicBool::new(false),
             threshold_compaction_failure_streak: Mutex::new(None),
             compaction_attempt_evidence: Mutex::new(None),
             pending_requested_compaction: Mutex::new(None),
@@ -11004,7 +10993,7 @@ impl AgentSession {
     fn runtime_activity(&self) -> RuntimeActivity {
         RuntimeActivity {
             lower_agent_run: self.is_streaming(),
-            compaction: self.is_compacting(),
+            compaction: self.compaction_blocks_session_input(),
             retry: self.is_retrying(),
             bash: self.is_bash_running(),
             refinement_apply: self.refine_in_flight.lock().unwrap().is_some(),
@@ -11567,9 +11556,22 @@ impl AgentSession {
         self.execute_queued_session_command(action, epoch).await
     }
 
+    /// A2: compaction blocks session input only until its durable summary is
+    /// live. Once the persisted summary has replaced the live context, the
+    /// restore tail (announcement + kernel-state sync) overlaps input delivery
+    /// instead of pausing it.
+    fn compaction_blocks_session_input(&self) -> bool {
+        self.is_compacting()
+            && !self
+                .compaction_input_admission_released
+                .load(Ordering::SeqCst)
+    }
+
     /// `_isBusyForSessionInput(point)`.
     fn is_busy_for_session_input(&self, point: &str) -> bool {
-        let external_busy = self.is_compacting() || self.is_retrying() || self.is_bash_running();
+        let external_busy = self.compaction_blocks_session_input()
+            || self.is_retrying()
+            || self.is_bash_running();
         if point == "pump" {
             return external_busy
                 || self.disposed.load(Ordering::SeqCst)
@@ -13999,6 +14001,21 @@ impl AgentSession {
         // idle wait and `waitForHeadlessIdle`), so a cancelled continuation cannot
         // strand them.
         self.settle_post_compaction_continue(None);
+    }
+
+    /// A2: release session-input admission while a compaction restore is
+    /// still running. Wakes parked input waiters and schedules the pump so a
+    /// queued input that arrived mid-compaction is delivered now, not after
+    /// the restore tail finishes.
+    fn release_compaction_input_admission(self: &Arc<Self>) {
+        if self
+            .compaction_input_admission_released
+            .swap(true, Ordering::SeqCst)
+        {
+            return;
+        }
+        self.notify_session_input_checkpoint_change();
+        self.schedule_session_input_pump();
     }
 
     /// `this._compactionOperation = compactionOperation` plus its resolver
@@ -16686,6 +16703,7 @@ impl AgentSession {
                         custom_instructions.clone(),
                         controller.clone(),
                         Some(auth),
+                        true,
                     )
                     .await;
                 match &result {
@@ -16914,8 +16932,10 @@ impl AgentSession {
                     // requested compaction stay ungated, and the conversation
                     // history is preserved either way; a context-overflow
                     // conversation is not promised to continue unchanged.
-                    let delay =
-                        threshold_compaction_retry_backoff_delay(state.kind, state.consecutive_failures);
+                    let delay = self.threshold_compaction_retry_backoff_delay(
+                        state.kind,
+                        state.consecutive_failures,
+                    );
                     message.push_str(&format!(
                         " Automatic compaction retries are paused for {}; a manual compaction request or selecting another summarization model retries immediately.",
                         threshold_compaction_cooldown_hint(delay)
@@ -16954,10 +16974,42 @@ impl AgentSession {
     /// Remaining cooldown before the next automatic threshold-compaction
     /// attempt, or `None` when the gate is open. Only the automatic threshold
     /// path consults this; requested, manual and overflow compaction never do.
+    /// A7: the retry pacing config for automatic compaction re-attacks.
+    /// Explicit `compaction.retry*` settings win, then the environment, then
+    /// the A7 defaults (30s -> 2min ladder capped at 5min, 3 consecutive
+    /// failures, 10-minute cooldown). The filtered ladder keeps its module
+    /// defaults because it is not settings-exposed.
+    fn threshold_compaction_retry_config(&self) -> CompactionRetryConfig {
+        let retry = self
+            .settings_manager
+            .lock()
+            .unwrap()
+            .get_compaction_retry_settings();
+        CompactionRetryConfig {
+            initial_delay_ms: retry.initial_delay_ms,
+            max_delay_ms: retry.max_delay_ms,
+            max_consecutive_failures: retry.max_consecutive_failures,
+            cooldown_ms: retry.cooldown_ms,
+            ..CompactionRetryConfig::default()
+        }
+    }
+
+    /// A7: delay that must elapse after the `consecutive_failures`-th
+    /// consecutive failure before compaction is re-attempted.
+    fn threshold_compaction_retry_backoff_delay(
+        &self,
+        kind: crate::core::compaction::compaction::SummaryFailureKind,
+        consecutive_failures: u32,
+    ) -> std::time::Duration {
+        self.threshold_compaction_retry_config()
+            .retry_delay(kind, consecutive_failures)
+    }
+
     fn threshold_compaction_retry_cooldown_remaining(&self) -> Option<std::time::Duration> {
+        let config = self.threshold_compaction_retry_config();
         let streak = self.threshold_compaction_failure_streak.lock().unwrap();
         let state = streak.as_ref()?;
-        let delay = threshold_compaction_retry_backoff_delay(state.kind, state.consecutive_failures);
+        let delay = config.retry_delay(state.kind, state.consecutive_failures);
         let elapsed = state.last_failure.elapsed();
         if elapsed >= delay {
             None
@@ -16975,12 +17027,14 @@ impl AgentSession {
         &self,
         kind: crate::core::compaction::compaction::SummaryFailureKind,
     ) {
+        // Read the config before the streak lock so the two locks never nest.
+        let config = self.threshold_compaction_retry_config();
         let mut streak = self.threshold_compaction_failure_streak.lock().unwrap();
         let consecutive_failures = streak
             .as_ref()
             .map(|state| state.consecutive_failures.saturating_add(1))
             .unwrap_or(1)
-            .min(THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES);
+            .min(config.max_consecutive_failures);
         *streak = Some(ThresholdCompactionFailureState {
             consecutive_failures,
             last_failure: std::time::Instant::now(),
@@ -17605,6 +17659,7 @@ impl AgentSession {
             custom_instructions.map(|value| value.to_string()),
             signal,
             Some(auth),
+            false,
         )
         .await
     }
@@ -17652,7 +17707,7 @@ impl AgentSession {
         custom_instructions: Option<String>,
         signal: CancellationToken,
     ) -> Result<crate::core::compaction::compaction::CompactionResult, String> {
-        self.perform_compaction_unmeasured_full(custom_instructions, signal, None)
+        self.perform_compaction_unmeasured_full(custom_instructions, signal, None, false)
             .await
     }
 
@@ -17745,12 +17800,24 @@ impl AgentSession {
     }
 
     /// The shared compaction body.
+    ///
+    /// `release_input_after_swap` is set by the automatic compaction paths
+    /// (threshold/requested/overflow): they arm the A2 durable-summary input
+    /// release after the context swap. The manual paths pass `false` because
+    /// `compact` disconnects the session from agent events for the episode,
+    /// so a turn overlapping the restore tail would miss agent events.
     async fn perform_compaction_unmeasured_full(
         self: &Arc<Self>,
         custom_instructions: Option<String>,
         signal: CancellationToken,
         auth: Option<RequestAuth>,
+        release_input_after_swap: bool,
     ) -> Result<crate::core::compaction::compaction::CompactionResult, String> {
+        // A2: every attempt starts with input admission blocked; the release
+        // flag below is armed only after this attempt's durable summary has
+        // replaced the live context.
+        self.compaction_input_admission_released
+            .store(false, Ordering::SeqCst);
         let model = self
             .model()
             .ok_or_else(|| format_no_model_selected_message())?;
@@ -17924,15 +17991,48 @@ impl AgentSession {
                     };
                     // TS 8322: `providerRetryPolicy(this.settingsManager)`.
                     let retry = self.provider_retry_policy();
+                    // B1 (`compaction.summaryModel`): resolve the summarizer
+                    // override before the call. An unresolvable or
+                    // unauthenticated override falls back to the session model
+                    // (the flag is opt-in; a broken override must not break
+                    // compaction). Evidence: glm-5.3 compacts in 42.7s median
+                    // vs azure gpt-6-astra 332s.
+                    let summary_override = self.resolve_compaction_summary_model().await;
+                    let (summary_model, summary_headers) = match &summary_override {
+                        Some((override_model, override_auth)) => {
+                            let headers = if override_auth.headers.is_empty() {
+                                None
+                            } else {
+                                Some(
+                                    override_auth
+                                        .headers
+                                        .iter()
+                                        .map(|(key, value)| {
+                                            (key.clone(), Value::String(value.clone()))
+                                        })
+                                        .collect(),
+                                )
+                            };
+                            (
+                                Some((
+                                    override_model,
+                                    override_auth.api_key.as_str(),
+                                )),
+                                headers,
+                            )
+                        }
+                        None => (None, headers.clone()),
+                    };
                     crate::core::compaction::compaction::compact_with_metrics(
                         &preparation,
                         &model,
                         &auth.api_key,
+                        summary_model,
                         custom_instructions.as_deref(),
                         Some(&signal),
                         Some(&self.thinking_level()),
                         crate::core::compaction::compaction::default_summary_call_runner(
-                            headers.clone(),
+                            summary_headers,
                         ),
                         Some(&crate::core::compaction::compaction::ProviderRetryPolicy {
                             enabled: retry.enabled,
@@ -17988,6 +18088,31 @@ impl AgentSession {
                         state.messages = context.messages;
                     }));
                     self.restore_late_ipython_sent_agent_messages();
+                    // A2 (durable-summary input release): the summary is durable
+                    // (append_compaction above) and the live context is now the
+                    // compacted context, and there is no await between the persist
+                    // and this swap, so no turn can have started in between.
+                    // Release session-input admission for the remaining restore
+                    // bookkeeping (announcement + kernel-state sync) - but only
+                    // when no provider checkpoint waits in the branch:
+                    // `restore_provider_context_for_model` replaces the live
+                    // context a second time at the end of restore, so a
+                    // concurrently started turn could be wiped from live state.
+                    let branch_has_provider_checkpoint = self
+                        .session_manager
+                        .lock()
+                        .unwrap()
+                        .get_branch(None)
+                        .iter()
+                        .any(|entry| {
+                            entry.get("type").and_then(Value::as_str) == Some("compaction")
+                                && has_provider_checkpoint(
+                                    &entry.get("details").cloned().unwrap_or(Value::Null),
+                                )
+                        });
+                    if !branch_has_provider_checkpoint && release_input_after_swap {
+                        self.release_compaction_input_admission();
+                    }
                 }
                 // TS 8388-8397: the newest compaction entry is announced to extensions.
                 let saved_entry = {
@@ -19004,6 +19129,68 @@ impl AgentSession {
             reserve_tokens: resolved.reserve_tokens,
             keep_recent_tokens: resolved.keep_recent_tokens,
             summary_update_policy: Some(resolved.summary_update_policy.clone()),
+            prompt: Some(resolved.prompt.clone()),
+            summary_budget_mode: Some(resolved.summary_budget_mode.clone()),
+            trigger_threshold: resolved.trigger_threshold,
+            deadline_ms: resolved.deadline_ms,
+        }
+    }
+
+    /// B1 (`compaction.summaryModel`): resolves the configured summarizer
+    /// override (`"provider/model-id"`, or a bare model id that matches exactly
+    /// one registry model) to a `(Model, RequestAuth)` pair. Returns `None`
+    /// (inherit the session model) when nothing is configured or the override
+    /// cannot be resolved or authenticated.
+    async fn resolve_compaction_summary_model(
+        self: &Arc<Self>,
+    ) -> Option<(Model, RequestAuth)> {
+        let configured = self
+            .settings_manager
+            .lock()
+            .unwrap()
+            .get_compaction_summary_model()?;
+        // The registry guard is !Send, so the lookup stays in a sync helper and
+        // the guard never lives across the auth await below.
+        let resolved_model = self.resolve_summary_model_from_registry(&configured)?;
+        let auth = self
+            .get_required_request_auth(&resolved_model)
+            .await
+            .ok()?;
+        Some((resolved_model, auth))
+    }
+
+    /// B1 (`compaction.summaryModel`): registry lookup half of
+    /// `resolve_compaction_summary_model`. Sync on purpose: the guard is not
+    /// `Send`, so it must not be alive across any await.
+    fn resolve_summary_model_from_registry(&self, configured: &str) -> Option<Model> {
+        let registry = self.model_registry.lock().unwrap();
+        match configured.split_once('/') {
+            Some((provider, model_id)) => registry
+                .find(&provider.trim().to_string(), &model_id.trim().to_string())
+                .or_else(|| {
+                    // A slashed spec may also name a provider display alias;
+                    // fall back to a unique id match before giving up.
+                    let matches: Vec<_> = registry
+                        .get_available()
+                        .into_iter()
+                        .filter(|model| model.id == configured.trim())
+                        .collect();
+                    match matches.as_slice() {
+                        [only] => Some(only.clone()),
+                        _ => None,
+                    }
+                }),
+            None => {
+                let matches: Vec<_> = registry
+                    .get_available()
+                    .into_iter()
+                    .filter(|model| model.id == configured.trim())
+                    .collect();
+                match matches.as_slice() {
+                    [only] => Some(only.clone()),
+                    _ => None,
+                }
+            }
         }
     }
 
@@ -19215,7 +19402,21 @@ mod post_compaction_continuation_tests {
     ///
     /// Mirrors the soak fixture's wiring
     /// (`crates/pi-coding-agent/tests/long_session_soak.rs:1474-1533`).
+    /// Every extension runner registers the jev observer extension, whose
+    /// footer renders through the global theme slot; the unit fixture never
+    /// initializes it, so any fixture that drives real session events panics
+    /// and poisons the slot. Initialize the default built-in theme once for
+    /// the whole test process (pre-existing failure this repairs: the
+    /// theme-slot poisoning in `failed_threshold_summary_preserves_history_...`).
+    fn ensure_theme_initialized() {
+        static THEME_INIT: std::sync::Once = std::sync::Once::new();
+        THEME_INIT.call_once(|| {
+            crate::modes::interactive::theme::theme::init_theme(None, false);
+        });
+    }
+
     pub(super) async fn test_session_with_credentials() -> Arc<AgentSession> {
+        ensure_theme_initialized();
         test_session_with_credentials_at_depth(0).await
     }
 
@@ -22081,57 +22282,62 @@ mod post_compaction_continuation_tests {
         }
 
         #[test]
-        fn threshold_compaction_retry_backoff_doubles_and_caps() {
-            use crate::core::compaction::compaction::SummaryFailureKind;
-            let delay =
-                |kind, count| threshold_compaction_retry_backoff_delay(kind, count);
-            // Unclassified/transport failures keep the existing short ladder.
-            assert_eq!(delay(SummaryFailureKind::Other, 1), std::time::Duration::from_millis(5_000));
-            assert_eq!(delay(SummaryFailureKind::Other, 2), std::time::Duration::from_millis(10_000));
-            assert_eq!(delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(20_000));
-            assert_eq!(delay(SummaryFailureKind::Other, 4), std::time::Duration::from_millis(40_000));
-            assert_eq!(delay(SummaryFailureKind::Other, 5), std::time::Duration::from_millis(80_000));
-            assert_eq!(delay(SummaryFailureKind::Other, 6), std::time::Duration::from_millis(120_000));
-            assert_eq!(
-                delay(SummaryFailureKind::Other, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
-                std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
-            );
-            // A provider filter/refusal starts at one minute - not at the
-            // ceiling - and escalates to the bounded 30-minute cap.
+        fn threshold_compaction_retry_ladder_and_cooldown_match_the_a7_defaults() {
+            use crate::core::compaction::compaction::{CompactionRetryConfig, SummaryFailureKind};
+            // Explicit config so the environment cannot skew the ladder under test.
+            let config = CompactionRetryConfig {
+                initial_delay_ms: 30_000,
+                max_delay_ms: 300_000,
+                max_consecutive_failures: 3,
+                cooldown_ms: 600_000,
+                filtered_initial_delay_ms: 60_000,
+                filtered_max_delay_ms: 1_800_000,
+            };
+            let delay = |kind, count| config.retry_delay(kind, count);
+            // Unclassified/transport failures: 30s -> 2min exponential ladder
+            // (x4 per rung, capped at the 5-minute ladder cap).
+            assert_eq!(delay(SummaryFailureKind::Other, 1), std::time::Duration::from_millis(30_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 2), std::time::Duration::from_millis(120_000));
+            // After 3 consecutive failures the 10-minute cooldown gates the
+            // next re-attempt, never shorter than the ladder cap.
+            assert_eq!(delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(600_000));
+            assert_eq!(delay(SummaryFailureKind::Other, 100), std::time::Duration::from_millis(600_000));
+            // A provider filter/refusal keeps the slower ladder (60s -> 4min)
+            // and its 30-minute cooldown bound.
             assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 1), std::time::Duration::from_millis(60_000));
-            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 2), std::time::Duration::from_millis(120_000));
-            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 3), std::time::Duration::from_millis(240_000));
-            assert_eq!(
-                delay(SummaryFailureKind::FilteredOrRefused, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES),
-                std::time::Duration::from_millis(1_800_000)
-            );
-            assert_eq!(
-                delay(SummaryFailureKind::FilteredOrRefused, THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 100),
-                std::time::Duration::from_millis(THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS)
-            );
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 2), std::time::Duration::from_millis(240_000));
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 3), std::time::Duration::from_millis(1_800_000));
+            assert_eq!(delay(SummaryFailureKind::FilteredOrRefused, 100), std::time::Duration::from_millis(1_800_000));
+            // The 5-minute ladder cap applies between retries whenever the
+            // consecutive-failure cap is configured above it.
+            let wider = CompactionRetryConfig { max_consecutive_failures: 5, ..config.clone() };
+            assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 3), std::time::Duration::from_millis(300_000));
+            assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 4), std::time::Duration::from_millis(300_000));
+            assert_eq!(wider.retry_delay(SummaryFailureKind::Other, 5), std::time::Duration::from_millis(600_000));
         }
 
         #[test]
         fn cooldown_hints_report_the_actual_delay_not_the_ceiling() {
-            use crate::core::compaction::compaction::SummaryFailureKind;
+            use crate::core::compaction::compaction::{CompactionRetryConfig, SummaryFailureKind};
+            let config = CompactionRetryConfig::default();
             assert_eq!(
-                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                threshold_compaction_cooldown_hint(config.retry_delay(
                     SummaryFailureKind::FilteredOrRefused,
                     1
                 )),
                 "about 1 minute"
             );
             assert_eq!(
-                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                threshold_compaction_cooldown_hint(config.retry_delay(
                     SummaryFailureKind::FilteredOrRefused,
-                    3
+                    2
                 )),
                 "about 4 minutes"
             );
             assert_eq!(
-                threshold_compaction_cooldown_hint(threshold_compaction_retry_backoff_delay(
+                threshold_compaction_cooldown_hint(config.retry_delay(
                     SummaryFailureKind::FilteredOrRefused,
-                    THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES
+                    3
                 )),
                 "about 30 minutes"
             );
@@ -22142,7 +22348,9 @@ mod post_compaction_continuation_tests {
             let agent = ScriptedAgent::new(vec![]);
             let session = test_session(agent);
             assert!(!session.threshold_compaction_retry_in_cooldown());
-            for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
+            // A7 defaults: the streak caps at 3 consecutive failures, and the
+            // capped streak cools down for the 10-minute cooldown.
+            for _ in 0..3 + 4 {
                 session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             }
             assert_eq!(
@@ -22153,7 +22361,7 @@ mod post_compaction_continuation_tests {
                     .as_ref()
                     .unwrap()
                     .consecutive_failures,
-                THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES,
+                3,
                 "the streak stops growing at the cap"
             );
             let remaining = session
@@ -22162,21 +22370,21 @@ mod post_compaction_continuation_tests {
             assert!(
                 remaining
                     > std::time::Duration::from_millis(
-                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000
+                        600_000 - 1_000
                     )
             );
             assert!(
                 remaining
-                    <= std::time::Duration::from_millis(THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS)
+                    <= std::time::Duration::from_millis(600_000)
             );
-            // Backdate the last failure past the ceiling: the gate opens again and
+            // Backdate the last failure past the cooldown: the gate opens again and
             // the next turn end may retry compaction.
             {
                 let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
                 let state = streak.as_mut().unwrap();
                 state.last_failure = std::time::Instant::now()
                     .checked_sub(std::time::Duration::from_millis(
-                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS + 1,
+                        600_000 + 1,
                     ))
                     .expect("the backdated instant stays representable");
             }
@@ -22244,7 +22452,8 @@ mod post_compaction_continuation_tests {
         async fn threshold_compaction_is_skipped_during_the_cooldown_and_retried_after_it() {
             let (session, events) = gated_session().await;
             let settings = session.compaction_settings();
-            // Two failed threshold attempts arm a 10s cooldown.
+            // Two failed threshold attempts arm the A7 second-rung 2-minute
+            // backoff.
             session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             session.record_threshold_compaction_failure(SummaryFailureKind::Other);
             assert!(session.threshold_compaction_retry_in_cooldown());
@@ -22262,7 +22471,7 @@ mod post_compaction_continuation_tests {
                 let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
                 let state = streak.as_mut().unwrap();
                 state.last_failure = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(11))
+                    .checked_sub(std::time::Duration::from_secs(121))
                     .expect("the backdated instant stays representable");
             }
             let _ = session.check_compaction(&settings, false).await.unwrap();
@@ -22303,7 +22512,7 @@ mod post_compaction_continuation_tests {
                 let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
                 let state = streak.as_mut().unwrap();
                 state.last_failure = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_secs(11))
+                    .checked_sub(std::time::Duration::from_secs(121))
                     .expect("the backdated instant stays representable");
             }
             assert!(session.threshold_compaction_needed(&context).await);
@@ -22580,35 +22789,31 @@ mod post_compaction_continuation_tests {
                 !session.threshold_compaction_retry_in_cooldown(),
                 "the first filtered cooldown expires after 60s"
             );
-            // Escalation: a second filtered failure arms 120s. Repeated
-            // refused attempts are paced back past the entire unclassified
-            // cadence instead of re-attacking every couple of minutes.
+            // Escalation: a second filtered failure arms 240s (the A7 filtered
+            // ladder's second rung). Repeated refused attempts are paced back
+            // instead of re-attacking every couple of minutes.
             session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
             {
                 let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
                 let state = streak.as_mut().unwrap();
                 state.last_failure = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_millis(
-                        THRESHOLD_COMPACTION_RETRY_BACKOFF_MAX_MS - 1_000,
-                    ))
+                    .checked_sub(std::time::Duration::from_millis(239_000))
                     .expect("the backdated instant stays representable");
             }
             assert!(
                 session.threshold_compaction_retry_in_cooldown(),
-                "the escalated filtered cooldown outlasts the unclassified ceiling"
+                "the escalated filtered cooldown (240s) still holds just inside the window"
             );
             // The ladder stays bounded: at the cap the delay is 30 minutes,
             // and the gate reopens after it - never a permanent lockout.
-            for _ in 0..THRESHOLD_COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES + 4 {
+            for _ in 0..3 + 4 {
                 session.record_threshold_compaction_failure(SummaryFailureKind::FilteredOrRefused);
             }
             {
                 let mut streak = session.threshold_compaction_failure_streak.lock().unwrap();
                 let state = streak.as_mut().unwrap();
                 state.last_failure = std::time::Instant::now()
-                    .checked_sub(std::time::Duration::from_millis(
-                        THRESHOLD_COMPACTION_FILTERED_BACKOFF_MAX_MS + 1,
-                    ))
+                    .checked_sub(std::time::Duration::from_millis(1_800_001))
                     .expect("the backdated instant stays representable");
             }
             assert!(
@@ -22727,6 +22932,434 @@ mod post_compaction_continuation_tests {
             session.dispose_async(Some(false)).await;
         }
     }
+
+    // ---------------------------------------------------------------------------
+    // A2: deliver queued session input at persist time, before the restore
+    // tail finishes. The release is armed by the automatic compaction paths
+    // after the durable summary has replaced the live context; the manual
+    // path never arms it (it disconnects the session from agent events).
+    //
+    // The compaction is driven by a free-standing task with an idle agent, the
+    // architecturally supported overlap: the at-turn-boundary compaction runs
+    // inside the agent run (the pump waits for run settlement), so the
+    // free-pump scenario is the one where early delivery is observable.
+    // ---------------------------------------------------------------------------
+    #[cfg(test)]
+    mod a2_input_release_tests {
+        use super::*;
+        use crate::core::compaction::compaction::SummaryFailureKind;
+        use pi_ai::api_registry::{register_api_provider_simple, ApiProviderSimple};
+        use pi_ai::utils::event_stream::AssistantMessageEventStream;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        /// Parks the `session_compact` extension handler so the restore tail
+        /// stays open (no `compaction_end` yet) after the live-context swap.
+        struct RestoreGate {
+            entered: AtomicBool,
+            hold: AtomicBool,
+            entered_notify: tokio::sync::Notify,
+            release_notify: tokio::sync::Notify,
+        }
+
+        impl RestoreGate {
+            fn new() -> Self {
+                RestoreGate {
+                    entered: AtomicBool::new(false),
+                    hold: AtomicBool::new(true),
+                    entered_notify: tokio::sync::Notify::new(),
+                    release_notify: tokio::sync::Notify::new(),
+                }
+            }
+
+            fn release(&self) {
+                self.hold.store(false, Ordering::SeqCst);
+                self.release_notify.notify_waiters();
+            }
+
+            async fn wait_entered(&self) {
+                let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+                while !self.entered.load(Ordering::SeqCst) {
+                    assert!(
+                        std::time::Instant::now() < deadline,
+                        "the session_compact handler was never entered"
+                    );
+                    let _ = tokio::time::timeout(
+                        std::time::Duration::from_millis(20),
+                        self.entered_notify.notified(),
+                    )
+                    .await;
+                }
+            }
+        }
+
+        /// `test_session_with_credentials` plus a parking `session_compact`
+        /// extension handler (the only difference from the stock fixture).
+        async fn session_with_parked_restore() -> (Arc<AgentSession>, Arc<RestoreGate>) {
+            ensure_theme_initialized();
+            let provider = pi_ai::providers::faux::register_faux_provider(Some(
+                pi_ai::providers::faux::RegisterFauxProviderOptions {
+                    provider: Some(format!("unit-{}", uuid::Uuid::new_v4())),
+                    tokens_per_second: Some(0.0),
+                    ..Default::default()
+                },
+            ));
+            let model = provider.get_model();
+            let scratch = std::env::temp_dir().canonicalize().unwrap();
+            let root = tempfile::Builder::new()
+                .prefix("agent-session-a2-")
+                .tempdir_in(scratch)
+                .unwrap();
+            let cwd_path = root.path().join("workspace");
+            let agent_dir_path = root.path().join("agent");
+            std::fs::create_dir_all(&cwd_path).unwrap();
+            std::fs::create_dir_all(&agent_dir_path).unwrap();
+            let cwd = cwd_path.to_string_lossy().to_string();
+            let agent_dir = agent_dir_path.to_string_lossy().to_string();
+
+            let settings = Arc::new(Mutex::new(
+                crate::core::settings_manager::SettingsManager::in_memory(
+                    serde_json::json!({
+                        "autoRefine": {"enabled": false},
+                        "retry": {"enabled": false},
+                        "compaction": {"enabled": true, "reserveTokens": 500, "keepRecentTokens": 100},
+                        "telemetryEnabled": false,
+                        "agentTracesEnabled": false,
+                    })
+                    .as_object()
+                    .unwrap()
+                    .clone(),
+                ),
+            ));
+            let session_manager = Arc::new(Mutex::new(
+                crate::core::session_manager::SessionManager::in_memory(Some(&cwd), Some(&agent_dir))
+                    .unwrap(),
+            ));
+            let auth_storage = Arc::new(tokio::sync::Mutex::new(
+                crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
+            ));
+            let model_registry = Arc::new(Mutex::new(
+                crate::core::model_registry::ModelRegistry::in_memory(
+                    crate::core::auth_storage::AuthStorage::in_memory(Default::default(), None),
+                ),
+            ));
+            auth_storage
+                .lock()
+                .await
+                .set_runtime_api_key(&model.provider, "unit-faux-key");
+            model_registry
+                .lock()
+                .unwrap()
+                .set_runtime_api_key(&model.provider, "unit-faux-key");
+
+            let restore_gate = Arc::new(RestoreGate::new());
+            let factory_gate = Arc::clone(&restore_gate);
+            let factory: crate::core::extensions::types::ExtensionFactory = Arc::new(
+                move |api: Arc<dyn crate::core::extensions::types::ExtensionApi>| {
+                    let restore_gate = Arc::clone(&factory_gate);
+                    Box::pin(async move {
+                        let handler: crate::core::extensions::types::ExtensionHandler = {
+                            let restore_gate = Arc::clone(&restore_gate);
+                            Arc::new(
+                                move |event: crate::core::extensions::types::ExtensionEvent,
+                                      _context: Arc<
+                                    dyn crate::core::extensions::types::ExtensionContext,
+                                >| {
+                                    let restore_gate = Arc::clone(&restore_gate);
+                                    let is_compact = matches!(
+                                        event,
+                                        crate::core::extensions::types::ExtensionEvent::SessionCompact(_)
+                                    );
+                                    Box::pin(async move {
+                                        if is_compact {
+                                            restore_gate.entered.store(true, Ordering::SeqCst);
+                                            restore_gate.entered_notify.notify_waiters();
+                                            while restore_gate.hold.load(Ordering::SeqCst) {
+                                                let _ = tokio::time::timeout(
+                                                    std::time::Duration::from_millis(50),
+                                                    restore_gate.release_notify.notified(),
+                                                )
+                                                .await;
+                                            }
+                                        }
+                                        None
+                                    })
+                                },
+                            )
+                        };
+                        api.on("session_compact", handler);
+                        Ok(())
+                    })
+                },
+            );
+
+            let services = crate::core::agent_session_services::create_agent_session_services(
+                crate::core::agent_session_services::CreateAgentSessionServicesOptions {
+                    cwd: cwd.clone(),
+                    agent_dir: Some(agent_dir.clone()),
+                    auth_storage: Some(Arc::clone(&auth_storage)),
+                    settings_manager: Some(Arc::clone(&settings)),
+                    model_registry: Some(Arc::clone(&model_registry)),
+                    extension_flag_values: None,
+                    no_builtin_herdr_reporter: Some(true),
+                    telemetry_disabled: Some(true),
+                    resource_loader_options: Some(
+                        crate::core::resource_loader::DefaultResourceLoaderOptions {
+                            cwd: cwd.clone(),
+                            agent_dir: agent_dir.clone(),
+                            settings_manager: Some(Arc::clone(&settings)),
+                            no_extensions: true,
+                            no_skills: true,
+                            no_prompt_templates: true,
+                            no_themes: true,
+                            no_context_files: true,
+                            bundled_skills_dir: Some(None),
+                            extension_factories: vec![factory],
+                            ..Default::default()
+                        },
+                    ),
+                },
+            )
+            .await
+            .expect("session services");
+            let created = crate::core::agent_session_services::create_agent_session_from_services(
+                crate::core::agent_session_services::CreateAgentSessionFromServicesOptions {
+                    services: Arc::new(services),
+                    session_manager,
+                    session_start_event: None,
+                    creation: crate::core::agent_session_services::AgentSessionCreationOptions {
+                        model: Some(model),
+                        no_tools: Some("all".to_string()),
+                        prewarm_ipython_kernel: Some(false),
+                        telemetry_disabled: Some(true),
+                        ..Default::default()
+                    },
+                },
+            )
+            .await
+            .expect("agent session");
+            std::mem::forget(root);
+            (created.session, restore_gate)
+        }
+
+        #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+        async fn queued_input_is_delivered_while_the_restore_tail_is_still_open() {
+            const QUEUED: &str = "A2 queued human input delivered at persist time.";
+            let (session, restore_gate) = session_with_parked_restore().await;
+            let api = format!("a2-summary-{}", uuid::Uuid::new_v4());
+            let summary_calls = Arc::new(AtomicUsize::new(0));
+            let release_summary = CancellationToken::new();
+            let calls = summary_calls.clone();
+            let release = release_summary.clone();
+            register_api_provider_simple(
+                ApiProviderSimple {
+                    api: api.clone().into(),
+                    stream: Arc::new(|_, _, _| panic!("unexpected base stream")),
+                    stream_simple: Arc::new(move |model, _, _| {
+                        calls.fetch_add(1, Ordering::SeqCst);
+                        let model = model.clone();
+                        let stream = AssistantMessageEventStream::new();
+                        let output = stream.clone();
+                        let release = release.clone();
+                        tokio::spawn(async move {
+                            // Park the summarization wire call: the compaction
+                            // stays in its summary phase until the test opens it.
+                            release.cancelled().await;
+                            let mut message =
+                                AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 0);
+                            message.stop_reason = "stop".into();
+                            message.content = vec![pi_ai::types::ContentBlock::Text(
+                                pi_ai::types::TextContent::new(
+                                    "## Goal\nA2 durable summary body\n## Constraints & Preferences\nNone.\n## Progress\nSummarized.\n## Key Decisions\nPreserve evidence.\n## Next Steps\nContinue.\n## Critical Context\nFixture.",
+                                ),
+                            )];
+                            output.push(pi_ai::types::AssistantMessageEvent::Done {
+                                reason: "stop".into(),
+                                message,
+                            });
+                            output.end(None);
+                        });
+                        stream
+                    }),
+                    compact: None,
+                    supports_compaction: None,
+                },
+                None,
+            );
+            let mut state = session.agent.state();
+            state.model.api = api;
+            state.model.context_window = 100_000.0;
+            state.model.max_tokens = 4_000.0;
+            for turn in 0..2 {
+                let mut manager = session.session_manager.lock().unwrap();
+                manager
+                    .append_message(AgentMessage::Message(Message::User(UserMessage::new(
+                        UserContent::Text(format!("preserved user turn {turn} ").repeat(200)),
+                        turn,
+                    ))))
+                    .unwrap();
+                let mut assistant = AssistantMessage::new(
+                    state.model.api.clone(),
+                    state.model.provider.clone(),
+                    state.model.id.clone(),
+                    turn,
+                );
+                assistant.content = vec![pi_ai::types::ContentBlock::Text(
+                    pi_ai::types::TextContent::new(format!("preserved reply {turn}")),
+                )];
+                assistant.usage.input = 99_900.0;
+                manager
+                    .append_message(AgentMessage::Message(Message::Assistant(assistant)))
+                    .unwrap();
+            }
+            state.messages = session
+                .session_manager
+                .lock()
+                .unwrap()
+                .build_session_context(Some(&state.model))
+                .messages;
+            session.agent.set_state(state);
+
+            let delivered_calls = Arc::new(AtomicUsize::new(0));
+            let delivered = delivered_calls.clone();
+            let ends = Arc::new(Mutex::new(Vec::<AgentSessionEvent>::new()));
+            let sink = ends.clone();
+            session.subscribe(Arc::new(move |event| {
+                if matches!(event, AgentSessionEvent::CompactionEnd { .. }) {
+                    sink.lock().unwrap().push(event);
+                }
+            }));
+            session
+                .agent
+                .set_stream_fn(Arc::new(move |model, context, _| {
+                    let delivered = delivered.clone();
+                    Box::pin(async move {
+                        assert!(
+                            serde_json::to_string(&context.messages)
+                                .unwrap()
+                                .contains(QUEUED),
+                            "the queued input must reach the model: {:?}",
+                            context.messages.iter().map(|message| message.role()).collect::<Vec<_>>()
+                        );
+                        delivered.fetch_add(1, Ordering::SeqCst);
+                        let stream = AssistantMessageEventStream::new();
+                        let mut message =
+                            AssistantMessage::new(model.api.clone(), model.provider.clone(), model.id.clone(), 5);
+                        message.content = vec![pi_ai::types::ContentBlock::Text(
+                            pi_ai::types::TextContent::new("Queued input received."),
+                        )];
+                        stream.push(pi_ai::types::AssistantMessageEvent::Done {
+                            reason: "stop".into(),
+                            message,
+                        });
+                        stream.end(None);
+                        stream
+                    })
+                }));
+
+            // Drive the automatic threshold compaction on a free-standing task:
+            // the agent is idle and the input pump is free, so the only gate on
+            // queued input delivery is the compaction admission under test.
+            let compact_session = session.clone();
+            let compaction = tokio::spawn(async move {
+                compact_session
+                    .run_auto_compaction(COMPACTION_REASON_THRESHOLD, false)
+                    .await
+            });
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                while summary_calls.load(Ordering::SeqCst) == 0 {
+                    tokio::task::yield_now().await;
+                }
+            })
+            .await
+            .expect("the summarization call started");
+            assert!(
+                session.compaction_blocks_session_input(),
+                "the summary phase blocks session input"
+            );
+
+            // Queue the input while the compaction is in its summary phase: it
+            // must wait behind the compaction fence.
+            session
+                .steer(QUEUED, None, None, None, Some(true))
+                .await
+                .unwrap();
+            assert_eq!(
+                delivered_calls.load(Ordering::SeqCst),
+                0,
+                "queued input waits while the summary is in flight"
+            );
+
+            // Complete the summary: persist -> live-context swap -> A2 release ->
+            // the restore tail parks inside the session_compact handler.
+            release_summary.cancel();
+            restore_gate.wait_entered().await;
+            assert!(
+                session.is_compacting(),
+                "the compaction is still running inside its restore tail"
+            );
+            assert!(
+                !session.compaction_blocks_session_input(),
+                "A2: input admission is released once the durable summary is live"
+            );
+
+            // THE A2 property: the queued input's turn reaches the provider
+            // while the restore tail is still parked (compaction_end not yet
+            // emitted).
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+            while delivered_calls.load(Ordering::SeqCst) == 0 {
+                assert!(
+                    std::time::Instant::now() < deadline,
+                    "the queued input was not delivered while the restore was still open"
+                );
+                assert!(
+                    ends.lock().unwrap().is_empty(),
+                    "delivery must precede compaction_end"
+                );
+                tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+            }
+            assert_eq!(
+                ends.lock().unwrap().len(),
+                0,
+                "the restore is parked: compaction_end cannot have been emitted yet"
+            );
+
+            // Release the restore tail and settle everything.
+            restore_gate.release();
+            assert!(
+                !tokio::time::timeout(std::time::Duration::from_secs(30), compaction)
+                    .await
+                    .expect("compaction bounded")
+                    .expect("compaction joined")
+            );
+            tokio::time::timeout(std::time::Duration::from_secs(30), session.wait_for_idle())
+                .await
+                .expect("queued input drains")
+                .expect("session settles");
+            assert_eq!(
+                ends.lock().unwrap().len(),
+                1,
+                "the successful compaction reported exactly one compaction_end"
+            );
+            assert!(
+                session
+                    .session_manager
+                    .lock()
+                    .unwrap()
+                    .get_entries()
+                    .iter()
+                    .any(|entry| entry.get("type").and_then(Value::as_str) == Some("compaction")),
+                "the successful compaction committed a durable entry"
+            );
+            assert_eq!(
+                delivered_calls.load(Ordering::SeqCst),
+                1,
+                "the queued input is delivered exactly once"
+            );
+            assert!(!session.threshold_compaction_retry_in_cooldown());
+            session.dispose_async(Some(false)).await;
+        }
+    }
+
 
     // ---------------------------------------------------------------------------
     // T11 refinement and extension lifecycle parity (H-01, H-02, H-03, H-04,

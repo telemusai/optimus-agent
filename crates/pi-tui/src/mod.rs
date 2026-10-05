@@ -24,8 +24,8 @@ pub use crate::editor_component::{EditorComponent, EditorPasteSnapshot};
 pub use crate::fullscreen::{clipped_fullscreen_dock_height, FullscreenViewport, ScrollInfo, FULLSCREEN_MIN_TRANSCRIPT_ROWS};
 pub use crate::fuzzy::{fuzzy_filter, fuzzy_filter_scored, fuzzy_match, FuzzyMatch, ScoredItem};
 pub use crate::keybindings::{
-    get_keybindings, set_keybindings, Keybinding, KeybindingConflict, KeybindingDefinition, KeybindingDefinitions,
-    Keybindings, KeybindingsConfig, KeybindingsManager, TUI_KEYBINDINGS,
+    get_keybindings, keybindings_revision, set_keybindings, Keybinding, KeybindingConflict, KeybindingDefinition,
+    KeybindingDefinitions, Keybindings, KeybindingsConfig, KeybindingsManager, TUI_KEYBINDINGS,
 };
 pub use crate::keys::{
     decode_kitty_printable, is_key_release, is_key_repeat, is_kitty_protocol_active, key, matches_key, parse_key,
@@ -56,7 +56,7 @@ pub use crate::terminal_image::{
 };
 pub use crate::tui::{
     is_focusable, Component, Container, Focusable, FullscreenOptions, OverlayAnchor, OverlayHandle, OverlayMargin,
-    OverlayOptions, SizeValue, TuiStopOptions, CURSOR_MARKER, TUI,
+    OverlayOptions, RenderPhaseTimings, SizeValue, TuiStopOptions, CURSOR_MARKER, TUI,
 };
 pub use crate::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 

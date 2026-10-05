@@ -1,0 +1,12 @@
+- Added a configurable inter-chunk inactivity deadline to OpenAI-completions and Anthropic SSE streams so stalled bodies fail over instead of hanging, and enabled session-affinity headers for DGX providers.
+- Added a process-level credential/command resolution cache with invalidation on auth changes to remove the repeated per-request resolution cost.
+- Added auth-aware retry, a per-provider circuit breaker and retry-ordinal caps behind opt-in environment flags, with pre-existing retry semantics preserved by default.
+- Added failure-reason telemetry (error class, HTTP status, opt-in bounded message), tool names on tool metrics, and per-phase render and daemon lifecycle metrics to local performance records.
+- Added endpoint health demotion in the model registry that reorders persistently slow or failing endpoints without removing them.
+- Added exponential backoff to the stale-daemon relaunch path and lifecycle telemetry for supervisor start/stop/crash/relaunch.
+- Added a compaction retry ladder with streak cooldowns and a summary-phase deadline that falls back to tail truncation, and released queued session input once the durable summary is persisted for automatic compaction paths.
+- Added opt-in compaction settings for a dedicated summary model, revised consolidation prompts, scaled summary output budgets and trigger thresholds, plus an offline quality-validation harness over recorded episodes.
+- Started fresh sessions on the CAS-v2 snapshot format, added per-variable change detection, budget-aware partial snapshots that land durable state instead of discarding it on timeout, and an opt-in adaptive snapshot debounce for large states.
+- Added render memoization for transcript components, gated the idle fallback repaint, and added an explicit UI acknowledgement deadline with timeout classification.
+- Extended the performance-metrics operation and measurement allowlists for UI event/tick operations, snapshot substage timing and submit-latency measurements.
+- Ported onto upstream v0.1.24: the SSE idle deadline rides the new single-pass SSE readers and pooled HTTP clients, and the snapshot/UI work composes with the merged local-work reduction; the local pi-ai variant's defaultMaxTokens/sglangTokenBudget registry plumbing is not part of this port (upstream pi-ai has no such fields).

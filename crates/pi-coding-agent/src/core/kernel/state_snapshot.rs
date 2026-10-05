@@ -116,6 +116,10 @@ pub struct SnapshotPerformanceMetadata {
     #[serde(skip)]
     pub snapshot_legacy_captures: Option<f64>,
     pub serialized_bytes: Option<f64>,
+    /// A5: names reused from the per-variable digest cache (not re-pickled).
+    pub serialization_reused_names: Option<f64>,
+    /// A6: names dropped from a budget-aware partial snapshot.
+    pub dropped_names_count: Option<f64>,
     pub write_ms: Option<f64>,
     pub written_bytes: Option<f64>,
     pub total_wall_ms: Option<f64>,
@@ -138,6 +142,10 @@ pub struct SnapshotResult {
     /// Oversized live variables removed by an explicit compaction snapshot.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub pruned: Option<Vec<String>>,
+    /// A6: names dropped by the snapshot time budget (bounded list; the
+    /// generation manifest keeps the full list).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub dropped: Option<Vec<String>>,
     /// Legacy-equivalent payload bytes, including outer-container overhead.
     pub bytes: u64,
     /// Sum of retained independent per-name dill blobs.
