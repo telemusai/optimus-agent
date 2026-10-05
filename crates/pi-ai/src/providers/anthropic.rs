@@ -770,12 +770,22 @@ fn find_block_index(blocks: &[AnthropicBlock], index: i64) -> Option<usize> {
 
 /// Sync the streaming scratch blocks back into `output.content`.
 ///
-/// The TypeScript keeps one array where the `index` field is deleted at
-/// `content_block_stop` and in the catch block. The port keeps `output.content`
-/// index-clean at all times and projects the scratch state onto it whenever the
-/// partial message is pushed.
+/// Only the terminal paths (Done/Error) call this: mid-stream events carry
+/// `partial_from_blocks` instead, so `output.content` stays empty while the
+/// stream is live. The TypeScript keeps one array where the `index` field is
+/// deleted at `content_block_stop` and in the catch block; the port keeps
+/// `output.content` index-clean at the same boundaries.
 fn sync_output_content(output: &mut AssistantMessage, blocks: &[AnthropicBlock]) {
 	output.content = blocks.iter().map(AnthropicBlock::to_content_block).collect();
+}
+
+/// The partial carried by mid-stream events: the message fields plus the
+/// scratch blocks projected once. `output.content` stays empty until the
+/// terminal sync, so this is the only content construction per event.
+fn partial_from_blocks(output: &AssistantMessage, blocks: &[AnthropicBlock]) -> AssistantMessage {
+	let mut partial = output.clone();
+	partial.content = blocks.iter().map(AnthropicBlock::to_content_block).collect();
+	partial
 }
 
 /// TS: `streamAnthropic`.
@@ -978,10 +988,10 @@ async fn run_stream_anthropic(
 						text: String::new(),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::TextStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("thinking") => {
@@ -991,10 +1001,10 @@ async fn run_stream_anthropic(
 						redacted: None,
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ThinkingStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("redacted_thinking") => {
@@ -1008,10 +1018,10 @@ async fn run_stream_anthropic(
 						redacted: Some(true),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ThinkingStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("tool_use") => {
@@ -1041,10 +1051,10 @@ async fn run_stream_anthropic(
 						partial_json: StreamingJsonAccumulator::default(),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ToolCallStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				_ => {}
@@ -1067,11 +1077,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::TextDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1091,11 +1101,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::ThinkingDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1121,11 +1131,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::ToolCallDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1147,7 +1157,8 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							// No event: the next projected partial or the terminal
+							// sync picks the signature up.
 						}
 					}
 				}
@@ -1194,11 +1205,11 @@ async fn run_stream_anthropic(
 							*stored = tool_call.clone();
 							*scratch = StreamingJsonAccumulator::default();
 						}
-						sync_output_content(output, &blocks);
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::ToolCallEnd {
 							content_index: index,
 							tool_call,
-							partial: output.clone(),
+							partial,
 						});
 					}
 				}
