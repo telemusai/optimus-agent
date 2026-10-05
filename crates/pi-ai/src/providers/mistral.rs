@@ -1350,10 +1350,9 @@ async fn consume_chat_stream(
 						});
 						current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
 					}
-					if let Some(CurrentBlock::Text(block)) = current_block.as_mut() {
-						block.text.push_str(&text_delta);
+					if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
 						if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
-							target.text = block.text.clone();
+							target.text.push_str(&text_delta);
 						}
 					}
 					stream.push(AssistantMessageEvent::TextDelta {
@@ -1394,10 +1393,9 @@ async fn consume_chat_stream(
 						});
 						current_block = Some(CurrentBlock::Thinking(ThinkingContent::new(String::new())));
 					}
-					if let Some(CurrentBlock::Thinking(block)) = current_block.as_mut() {
-						block.thinking.push_str(&thinking_delta);
+					if let Some(CurrentBlock::Thinking(_)) = current_block.as_ref() {
 						if let Some(ContentBlock::Thinking(target)) = output.content.last_mut() {
-							target.thinking = block.thinking.clone();
+							target.thinking.push_str(&thinking_delta);
 						}
 					}
 					stream.push(AssistantMessageEvent::ThinkingDelta {
@@ -1421,10 +1419,9 @@ async fn consume_chat_stream(
 						});
 						current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
 					}
-					if let Some(CurrentBlock::Text(block)) = current_block.as_mut() {
-						block.text.push_str(&text_delta);
+					if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
 						if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
-							target.text = block.text.clone();
+							target.text.push_str(&text_delta);
 						}
 					}
 					stream.push(AssistantMessageEvent::TextDelta {
@@ -1543,24 +1540,26 @@ enum CurrentBlock {
 
 /// TS: `finishCurrentBlock(block?)`.
 fn finish_current_block(block: &CurrentBlock, output: &AssistantMessage, stream: &AssistantMessageEventStream) {
-	match block {
-		CurrentBlock::Text(text) => {
+	// The accumulated text lives in `output.content` (deltas append in place);
+	// `block` only carries the kind.
+	match (block, output.content.last()) {
+		(CurrentBlock::Text(_), Some(ContentBlock::Text(text))) => {
 			stream.push(AssistantMessageEvent::TextEnd {
-				content_index: output.content.len() - 1,
-				content: text.text.clone(),
-				partial: output.clone(),
-			});
+					content_index: output.content.len() - 1,
+					content: text.text.clone(),
+					partial: output.clone(),
+				});
 		}
-		CurrentBlock::Thinking(thinking) => {
+		(CurrentBlock::Thinking(_), Some(ContentBlock::Thinking(thinking))) => {
 			stream.push(AssistantMessageEvent::ThinkingEnd {
-				content_index: output.content.len() - 1,
-				content: thinking.thinking.clone(),
-				partial: output.clone(),
-			});
+					content_index: output.content.len() - 1,
+					content: thinking.thinking.clone(),
+						partial: output.clone(),
+				});
 		}
+		_ => {}
 	}
 }
-
 /// TS: `chunk.usage?.promptTokens || 0`.
 fn number_field(value: &Value, key: &str) -> f64 {
 	value.get(key).and_then(Value::as_f64).unwrap_or(0.0)

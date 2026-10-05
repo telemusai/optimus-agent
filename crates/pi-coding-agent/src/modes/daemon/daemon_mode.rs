@@ -8092,8 +8092,7 @@ impl DaemonSessionState {
                 if let Some(message) = event.get("message") {
                     if message.get("role").and_then(Value::as_str) == Some("assistant") {
                         if !message.is_null() {
-                            if let Ok(parsed) = serde_json::from_value::<AgentMessage>(message.clone())
-                            {
+                            if let Ok(parsed) = AgentMessage::deserialize(message) {
                                 view.streaming_message = Some(parsed);
                             }
                         }
@@ -8254,7 +8253,10 @@ impl AgentDaemon {
                 self.write(&client, &sequenced);
             } else {
                 let line = serialized
-                    .get_or_insert_with(|| serialize_json_line(&sequenced.to_value()))
+                    .get_or_insert_with(|| match &sequenced {
+                        DaemonOutbound::Raw(value) => serialize_json_line(value),
+                        other => serialize_json_line(&other.to_value()),
+                    })
                     .clone();
                 self.write_serialized(&client, &line, Some(&sequenced));
             }
@@ -8347,19 +8349,35 @@ impl AgentDaemon {
     fn add_session_event_meta(
         &self,
         state: &Arc<StdMutex<ActiveSessionState>>,
-        message: DaemonOutbound,
+        mut message: DaemonOutbound,
     ) -> DaemonOutbound {
-        let mut value = message.to_value();
-        if !is_sequenced_session_outbound(message.type_name()) || value.get("meta").is_some_and(|meta| !meta.is_null()) {
+        if !is_sequenced_session_outbound(message.type_name()) {
             return message;
         }
+        // Take the owned wire value out of `Raw` (the common case) instead of
+        // cloning it; non-Raw variants serialize as before.
+        let mut value = match std::mem::replace(&mut message, DaemonOutbound::Raw(Value::Null)) {
+            DaemonOutbound::Raw(value) => value,
+            other => {
+                let value = other.to_value();
+                message = other;
+                value
+            }
+        };
+        if value.get("meta").is_some_and(|meta| !meta.is_null()) {
+            return DaemonOutbound::Raw(value);
+        }
+        let active_session_id = message
+            .active_session_id()
+            .unwrap_or_default()
+            .to_string();
         let (generation, sequence) = {
             let mut state = state.lock().expect("active session poisoned");
             state.last_event_sequence += 1;
             (state.event_generation.clone(), state.last_event_sequence)
         };
         let meta = create_daemon_event_meta(
-            message.active_session_id().unwrap_or(""),
+            &active_session_id,
             sequence,
             now_iso(),
             &generation,
@@ -8434,13 +8452,21 @@ impl AgentDaemon {
             let state = client.state.lock().expect("daemon client poisoned");
             state.transport.as_deref() == Some("private-framed") && state.authentication_role.as_deref() != Some("session_client")
         };
-        let value = message.to_value();
+        // Borrow the `Raw` payload (the common case) instead of cloning it.
+        let owned;
+        let value = match message {
+            DaemonOutbound::Raw(value) => value,
+            other => {
+                owned = other.to_value();
+                &owned
+            }
+        };
         if compact_allowed {
-            if let Ok(Some(delta)) = create_compact_assistant_delta(&value) {
+            if let Ok(Some(delta)) = create_compact_assistant_delta(value) {
                 return self.write_serialized_encoded(client, serialize_json_line(&serde_json::to_value(delta).expect("compact delta is serializable")).as_bytes(), message, "assistant-delta", None);
             }
         }
-        self.write_serialized(client, &serialize_json_line(&value), Some(message))
+        self.write_serialized(client, &serialize_json_line(value), Some(message))
     }
 
     /// `writeSerialized(client, line, message, payloadEncoding = "jsonl", snapshotPurpose?)`.

@@ -770,12 +770,22 @@ fn find_block_index(blocks: &[AnthropicBlock], index: i64) -> Option<usize> {
 
 /// Sync the streaming scratch blocks back into `output.content`.
 ///
-/// The TypeScript keeps one array where the `index` field is deleted at
-/// `content_block_stop` and in the catch block. The port keeps `output.content`
-/// index-clean at all times and projects the scratch state onto it whenever the
-/// partial message is pushed.
+/// Only the terminal paths (Done/Error) call this: mid-stream events carry
+/// `partial_from_blocks` instead, so `output.content` stays empty while the
+/// stream is live. The TypeScript keeps one array where the `index` field is
+/// deleted at `content_block_stop` and in the catch block; the port keeps
+/// `output.content` index-clean at the same boundaries.
 fn sync_output_content(output: &mut AssistantMessage, blocks: &[AnthropicBlock]) {
 	output.content = blocks.iter().map(AnthropicBlock::to_content_block).collect();
+}
+
+/// The partial carried by mid-stream events: the message fields plus the
+/// scratch blocks projected once. `output.content` stays empty until the
+/// terminal sync, so this is the only content construction per event.
+fn partial_from_blocks(output: &AssistantMessage, blocks: &[AnthropicBlock]) -> AssistantMessage {
+	let mut partial = output.clone();
+	partial.content = blocks.iter().map(AnthropicBlock::to_content_block).collect();
+	partial
 }
 
 /// TS: `streamAnthropic`.
@@ -978,10 +988,10 @@ async fn run_stream_anthropic(
 						text: String::new(),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::TextStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("thinking") => {
@@ -991,10 +1001,10 @@ async fn run_stream_anthropic(
 						redacted: None,
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ThinkingStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("redacted_thinking") => {
@@ -1008,10 +1018,10 @@ async fn run_stream_anthropic(
 						redacted: Some(true),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ThinkingStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				Some("tool_use") => {
@@ -1041,10 +1051,10 @@ async fn run_stream_anthropic(
 						partial_json: StreamingJsonAccumulator::default(),
 						index: index as i64,
 					});
-					sync_output_content(output, &blocks);
+					let partial = partial_from_blocks(output, &blocks);
 					out.push(AssistantMessageEvent::ToolCallStart {
-						content_index: output.content.len() - 1,
-						partial: output.clone(),
+						content_index: blocks.len() - 1,
+						partial,
 					});
 				}
 				_ => {}
@@ -1067,11 +1077,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::TextDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1091,11 +1101,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::ThinkingDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1121,11 +1131,11 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							let partial = partial_from_blocks(output, &blocks);
 							out.push(AssistantMessageEvent::ToolCallDelta {
 								content_index: index,
 								delta,
-								partial: output.clone(),
+								partial,
 							});
 						}
 					}
@@ -1147,7 +1157,8 @@ async fn run_stream_anthropic(
 							_ => false,
 						};
 						if applied {
-							sync_output_content(output, &blocks);
+							// No event: the next projected partial or the terminal
+							// sync picks the signature up.
 						}
 					}
 				}
@@ -1161,17 +1172,19 @@ async fn run_stream_anthropic(
 				// stops using it for the block.
 				match &blocks[index] {
 					AnthropicBlock::Text { text, .. } => {
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::TextEnd {
 							content_index: index,
 							content: text.clone(),
-							partial: output.clone(),
+							partial,
 						});
 					}
 					AnthropicBlock::Thinking { thinking, .. } => {
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::ThinkingEnd {
 							content_index: index,
 							content: thinking.clone(),
-							partial: output.clone(),
+							partial,
 						});
 					}
 					AnthropicBlock::ToolCall { partial_json, .. } => {
@@ -1194,11 +1207,11 @@ async fn run_stream_anthropic(
 							*stored = tool_call.clone();
 							*scratch = StreamingJsonAccumulator::default();
 						}
-						sync_output_content(output, &blocks);
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::ToolCallEnd {
 							content_index: index,
 							tool_call,
-							partial: output.clone(),
+							partial,
 						});
 					}
 				}
@@ -2588,6 +2601,57 @@ mod tests {
 			assert_eq!(message.content[0].as_tool_call().unwrap().arguments, serde_json::from_str::<Value>(&args).unwrap().as_object().unwrap().clone());
 			server.await.unwrap();
 		}
+	}
+
+	#[tokio::test]
+	async fn text_end_partial_carries_accumulated_content() {
+		use serde_json::json;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+		let mut body = event(json!({"type":"message_start", "message":{"id":"fixture-message","usage":{"input_tokens":1,"output_tokens":0}}}));
+		body.push_str(&event(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})));
+		body.push_str(&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}})));
+		body.push_str(&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}})));
+		body.push_str(&event(json!({"type":"content_block_stop","index":0})));
+		body.push_str(&event(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})));
+		body.push_str(&event(json!({"type":"message_stop"})));
+		let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = tokio::spawn(async move {
+			let (mut socket,_) = listener.accept().await.unwrap(); let mut request = Vec::new();
+			loop {
+				let mut buffer = [0;4096]; let count = socket.read(&mut buffer).await.unwrap(); assert_ne!(count,0);
+				request.extend_from_slice(&buffer[..count]);
+				if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+					let headers = std::str::from_utf8(&request[..end]).unwrap();
+						let length: usize = headers.lines().filter_map(|line| line.split_once(':')).find(|(key,_)| key.eq_ignore_ascii_case("content-length")).unwrap().1.trim().parse().unwrap();
+						if request.len() >= end + 4 + length {break;}
+				}
+			}
+			let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+			socket.write_all(response.as_bytes()).await.unwrap();
+		});
+		let mut model = test_model("anthropic", "fixture"); model.base_url = format!("http://{address}");
+		let mut options = AnthropicOptions::default(); options.stream.api_key = Some("synthetic-fixture-key".into());
+		let stream = stream_anthropic(&model, &context_with_user("fixture"), Some(options));
+		let mut stream = std::pin::pin!(stream);
+		let mut text_end_partial = None; let mut done_message = None;
+		while let Some(item) = stream.next().await {
+			match item {
+				AssistantMessageEvent::TextEnd { partial, .. } => text_end_partial = Some(partial),
+				AssistantMessageEvent::Done { message, .. } => done_message = Some(message),
+				AssistantMessageEvent::Error { error, .. } => panic!("unexpected stream error: {:?}", error.error_message),
+				_ => {}
+			}
+		}
+		server.await.unwrap();
+		let partial = text_end_partial.expect("TextEnd event");
+		let text: String = partial.content.iter().filter_map(|block| block.as_text().map(|text| text.text.clone())).collect();
+		assert_eq!(text, "hello world", "TextEnd partial must carry the accumulated content");
+		let done = done_message.expect("Done event");
+		let done_text: String = done.content.iter().filter_map(|block| block.as_text().map(|text| text.text.clone())).collect();
+		assert_eq!(done_text, "hello world");
+		assert_eq!(partial.stop_reason, done.stop_reason);
 	}
 
 	#[test]
