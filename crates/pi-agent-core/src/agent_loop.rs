@@ -1211,10 +1211,9 @@ fn create_observed_callbacks(
 async fn abort_stalled_stream(
     context: &mut AgentContext,
     config: &AgentLoopConfig,
-    signal: Option<&CancellationToken>,
+    producer_signal: Option<&CancellationToken>,
     emit: &AgentEventSink,
     request_metrics: &mut RequestMetricState,
-    partial_message: Option<&AssistantMessage>,
     added_partial: &bool,
     logical_request_settlement: &Arc<AgentLoopLogicalRequestSettlement>,
     metrics: &Option<crate::performance_metrics::AgentLoopPerformanceMetrics>,
@@ -1225,6 +1224,14 @@ async fn abort_stalled_stream(
     attempt_started: tokio::time::Instant,
     last_event_at: tokio::time::Instant,
 ) -> anyhow::Result<AssistantMessage> {
+    let partial_message = if *added_partial {
+        match context.messages.last() {
+            Some(AgentMessage::Message(Message::Assistant(assistant))) => Some(assistant),
+            _ => None,
+        }
+    } else {
+        None
+    };
     let elapsed = limit.elapsed_since(attempt_started, last_event_at);
     let configured = limit.configured(&watchdog);
     crate::stream_watchdog::log_stream_stall(
@@ -1235,10 +1242,9 @@ async fn abort_stalled_stream(
         request_metrics.provider_attempt_number,
         partial_message,
     );
-    // Stop reading the provider stream, then mirror `closeIterator()` on the
-    // abort token like the cancellation arm does.
+    // Cancel this attempt without cancelling the host's retry group.
     response.request_cancel();
-    close_stream(signal);
+    close_stream(producer_signal);
     let stall_message = crate::stream_watchdog::create_stream_stall_message(
         config,
         partial_message,
@@ -1255,6 +1261,7 @@ async fn abort_stalled_stream(
         PerformanceMetricOutcome::Failure,
         request_metrics,
         observed,
+        terminal_failure_detail(&stall_message).as_ref(),
     );
     if *added_partial {
         if let Some(last) = context.messages.last_mut() {
@@ -1301,6 +1308,7 @@ async fn stream_assistant_response_inner(
     let receipt = pi_ai::utils::event_stream::StreamTaskReceipt::new_unsupported();
     let model = config.model.clone();
     let invocation = receipt.clone();
+    let producer_signal = provider_config.stream.signal.clone();
     if let Some(scope) = &config.execution_scope {
         scope.register_stream(receipt.clone()).map_err(anyhow::Error::msg)?;
     }
@@ -1332,10 +1340,9 @@ async fn stream_assistant_response_inner(
             return abort_stalled_stream(
                 context,
                 config,
-                signal,
+                producer_signal.as_ref(),
                 emit,
                 request_metrics,
-                partial_message.as_ref(),
                 &*added_partial,
                 logical_request_settlement,
                 metrics,
@@ -1382,10 +1389,9 @@ async fn stream_assistant_response_inner(
                 return abort_stalled_stream(
                     context,
                     config,
-                    signal,
+                    producer_signal.as_ref(),
                     emit,
                     request_metrics,
-                    partial_message.as_ref(),
                     &*added_partial,
                     logical_request_settlement,
                     metrics,
@@ -2436,7 +2442,7 @@ async fn stream_assistant_response(
     // `delete providerConfig.performanceMetrics` - the loop never serializes the recorder.
     let mut provider_config = config.provider_options();
     provider_config.stream.api_key = resolved_api_key;
-    provider_config.stream.signal = signal.cloned();
+    provider_config.stream.signal = Some(signal.map(CancellationToken::child_token).unwrap_or_default());
     let observed = create_observed_callbacks(config, metrics.clone(), &request_metrics);
     provider_config.stream.on_payload = Some(observed.on_payload.clone());
     provider_config.stream.on_response = Some(observed.on_response.clone());
@@ -4058,6 +4064,72 @@ mod stream_watchdog_loop_tests {
             .iter()
             .find(|diagnostic| diagnostic.type_ == "provider_stream_failure")
             .and_then(|diagnostic| diagnostic.details.as_ref())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn watchdog_after_deltas_uses_latest_context_and_records_failure_metrics() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        #[derive(Default)]
+        struct Recorder(Mutex<Vec<PerformanceMetricEvent>>);
+        impl PerformanceMetricRecorder for Recorder {
+            fn session_id(&self) -> &str { "watchdog-merge" }
+            fn monotonic_now(&self) -> f64 { 10.0 }
+            fn next_id(&self, scope: crate::performance_metrics::PerformanceMetricIdScope) -> String {
+                format!("{scope:?}-watchdog-merge")
+            }
+            fn record(&self, event: PerformanceMetricEvent) { self.0.lock().unwrap().push(event); }
+            fn flush(&self) {}
+            fn close(&self) {}
+        }
+        for deadline in [false, true] {
+            let _gap = EnvVarGuard::set(STREAM_EVENT_GAP_MS_ENV, if deadline { "0" } else { "5000" }.into());
+            let _deadline = EnvVarGuard::set(STREAM_DEADLINE_MS_ENV, if deadline { "60000" } else { "0" }.into());
+            let recorder = Arc::new(Recorder::default());
+            let mut config = AgentLoopConfig::new(watchdog_model());
+            config.performance_metrics = Some(crate::performance_metrics::AgentLoopPerformanceMetrics::new(recorder.clone()));
+            let producer_signal = Arc::new(Mutex::new(None));
+            let captured_signal = producer_signal.clone();
+            let stream_fn: StreamFn = Arc::new(move |model, _, options| {
+                *captured_signal.lock().unwrap() = options.stream.signal.clone();
+                let stream = AssistantMessageEventStream::new();
+                let mut partial = AssistantMessage::new(model.api, model.provider, model.id, 1);
+                partial.content = vec![ContentBlock::Text(TextContent::new("first"))];
+                partial.usage.output = 1.0;
+                stream.push(AssistantMessageEvent::Start { partial: partial.clone() });
+                partial.content = vec![ContentBlock::Text(TextContent::new("latest"))];
+                partial.usage.output = 7.0;
+                partial.response_id = Some("latest-response".into());
+                stream.push(AssistantMessageEvent::TextDelta { content_index: 0, delta: "latest".into(), partial });
+                Box::pin(async move { stream })
+            });
+            let emit: AgentEventSink = Arc::new(move |event| Box::pin(async move {
+                if deadline && matches!(event, AgentEvent::MessageUpdate { .. }) {
+                    tokio::time::advance(Duration::from_secs(60)).await;
+                }
+                Ok(())
+            }));
+            let parent_signal = CancellationToken::new();
+            let messages = run_agent_loop(vec![user_prompt()], AgentContext::default(), config, emit, Some(parent_signal.clone()), Some(stream_fn)).await.unwrap();
+            assert!(!parent_signal.is_cancelled(), "the host must remain able to retry");
+            assert!(producer_signal.lock().unwrap().as_ref().unwrap().is_cancelled(), "the stalled producer must stop");
+            let Some(AgentMessage::Message(Message::Assistant(terminal))) = messages.last() else {
+                panic!("missing watchdog terminal");
+            };
+            assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+            assert!(terminal.content.is_empty(), "incomplete output must not be accepted");
+            assert_eq!(terminal.usage.output, 7.0);
+            assert_eq!(terminal.response_id.as_deref(), Some("latest-response"));
+            let details = provider_stream_failure_details(terminal).unwrap();
+            assert_eq!(details["partialContentBlocks"], serde_json::json!(1));
+            assert_eq!(details["limit"], if deadline { "stream_deadline" } else { "event_gap" });
+            let records = recorder.0.lock().unwrap();
+            for operation in [PerformanceMetricOperation::ProviderAttempt, PerformanceMetricOperation::LogicalRequest] {
+                let matching: Vec<_> = records.iter().filter(|record| record.operation == operation).collect();
+                assert_eq!(matching.len(), 1);
+                assert_eq!(matching[0].outcome, Some(PerformanceMetricOutcome::Failure));
+                assert!(matching[0].error_class.is_some());
+            }
+        }
     }
 
     #[tokio::test(start_paused = true)]
