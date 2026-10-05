@@ -133,6 +133,12 @@ fn should_ignore_directory_fsync_error(error: &std::io::Error, platform: &str) -
 
 fn fsync_directory_sync(path: &str, platform: &str) -> std::io::Result<()> {
     let result = (|| -> std::io::Result<()> {
+        // Windows cannot fsync directories: the attempt below is a guaranteed
+        // failure of the tolerated access-denied class, so skip the syscalls
+        // outright. Unix platforms still open and sync.
+        if platform == "win32" {
+            return Ok(());
+        }
         let file = std::fs::File::open(path)?;
         file.sync_all()
     })();
@@ -150,6 +156,11 @@ fn fsync_directory_sync(path: &str, platform: &str) -> std::io::Result<()> {
 
 async fn fsync_directory(path: &str, platform: &str) -> std::io::Result<()> {
     let result = (|| -> std::io::Result<()> {
+        // Same win32 gate as the sync twin: the attempt is a guaranteed
+        // tolerated failure, so the syscalls are skipped.
+        if platform == "win32" {
+            return Ok(());
+        }
         let file = std::fs::File::open(path)?;
         file.sync_all()
     })();
@@ -551,6 +562,33 @@ mod tests {
         let result = write_file_atomic_sync(path.to_str().unwrap(), "new", WriteFileAtomicOptions::default());
         assert!(result.is_err());
         assert!(!path.exists());
+    }
+
+    #[test]
+    fn win32_directory_fsync_is_skipped_without_opening_the_directory() {
+        let dir = temp_dir();
+        // A win32 platform never attempts the open: even a missing directory
+        // (an error every other platform reports) succeeds as the no-op the
+        // tolerated access-denied failure already made it.
+        fsync_directory_sync(&dir.join("missing").to_string_lossy(), "win32").unwrap();
+    }
+
+    #[tokio::test]
+    async fn win32_async_directory_fsync_is_skipped_without_opening_the_directory() {
+        let dir = temp_dir();
+        fsync_directory(&dir.join("missing").to_string_lossy(), "win32")
+            .await
+            .unwrap();
+    }
+
+    #[test]
+    fn non_win32_directory_fsync_still_opens_and_reports_errors() {
+        let dir = temp_dir();
+        // Unix semantics: the directory is opened and a missing one is an
+        // error (only the win32 access-denied class is tolerated).
+        let error =
+            fsync_directory_sync(&dir.join("missing").to_string_lossy(), "linux").unwrap_err();
+        assert_eq!(error.kind(), std::io::ErrorKind::NotFound);
     }
 
     #[test]

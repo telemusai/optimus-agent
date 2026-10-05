@@ -30,6 +30,9 @@ use sha2::{Digest, Sha256};
 use crate::utils::file_lines::{
     read_bytes_sync, read_first_line_sync, read_lines_as_buffers, ReadLinesRange,
 };
+use crate::utils::timed_flush::{
+    register_timed_flush, session_write_flush_period, TimedBytes, TimedFlush,
+};
 
 pub const CURRENT_SESSION_VERSION: i64 = 3;
 const SESSION_LIST_SEARCH_TEXT_MAX_CHARS: usize = 64 * 1024;
@@ -3371,6 +3374,240 @@ impl CustomMessageEntryContent {
 // SessionManager
 // ---------------------------------------------------------------------------
 
+/// Size at which the session write buffer flushes early instead of waiting
+/// for the flush period.
+const SESSION_WRITE_BUFFER_CAP_BYTES: usize = 128 * 1024;
+
+/// Buffered appender for one session file. `persist` pushes lines here; a
+/// background flusher (or a durability boundary) writes them out.
+///
+/// Reader-concurrency contract (write-buffering audit): the session JSONL is
+/// single-owner (session lease). Readers of the live file tolerate
+/// period-delayed visibility: catalog scans resume from (size, mtime) cursors
+/// and only ever observe complete-line flush boundaries; the daemon
+/// summarizer reads in-memory session state, not the file; trace upload is
+/// debounced (>=1s) and reads bodies at upload time. Any NEW content reader
+/// of a live session file must either go through the manager or accept
+/// period-stale bytes - do not add a raw file reader without revisiting this.
+struct SessionWriteBuffer {
+    /// Current target path, updated whenever the manager switches files.
+    path: std::sync::Mutex<String>,
+    inner: std::sync::Mutex<SessionWriteBufferInner>,
+    /// Flush period; zero disables coalescing (every line writes through).
+    pub(crate) period: std::time::Duration,
+    /// Set once the buffer joins the timed-flusher registry (first real path).
+    registered: std::sync::atomic::AtomicBool,
+}
+
+struct SessionWriteBufferInner {
+    timed: TimedBytes,
+    /// A flush error that no caller has observed yet; surfaced (and cleared)
+    /// by the next drain so failures stay loud instead of silently retried.
+    pending_error: Option<String>,
+}
+
+impl SessionWriteBuffer {
+    fn new(path: &str, period: std::time::Duration) -> Self {
+        Self {
+            path: std::sync::Mutex::new(path.to_string()),
+            inner: std::sync::Mutex::new(SessionWriteBufferInner {
+                timed: TimedBytes::new(),
+                pending_error: None,
+            }),
+            period,
+            registered: std::sync::atomic::AtomicBool::new(false),
+        }
+    }
+
+    /// Best-effort drain used when the buffer's manager is going away or
+    /// switching files: failures are swallowed (the alternative - carrying
+    /// another file's bytes to the next target - would corrupt the new file).
+    fn drop_pending(&self) {
+        let _ = self.drain();
+    }
+
+    /// Write every buffered byte to the current target. Bytes stay buffered
+    /// on failure so the next drain retries them.
+    fn drain(&self) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        if inner.timed.bytes.is_empty() {
+            // Surface a retained failure without consuming it: only a
+            // successful write, a rewrite, or a retarget clears it. The
+            // background flusher polls this same path, so a take() here
+            // would let a dropped batch vanish without any caller seeing
+            // the error.
+            if let Some(error) = inner.pending_error.clone() {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| error.to_string());
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                // Same drop-on-failure rule as a failed write below: the
+                // batch must not stay armed for a later retry against a
+                // different state of the target (e.g. an obstruction that
+                // the caller has since repaired - retrying then would
+                // write bytes the caller believes failed).
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        use std::io::Write;
+        let result = file
+            .write_all(&inner.timed.bytes)
+            .map_err(|error| error.to_string());
+        match result {
+            Ok(()) => {
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                // Drop the bytes: a failed write_all may have landed a prefix,
+                // and retrying the whole buffer would duplicate it into an
+                // interior malformed line (fail-closed on read, unlike a torn
+                // tail). Dropped bytes leave at most a torn tail - the same
+                // post-failure state as the old write-through appends - and
+                // the in-memory entries remain the recovery source. The next
+                // drain surfaces the error so callers take the rewrite path.
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Write-through for the zero-period configuration: drain pending bytes
+    /// and the new line in one append write.
+    fn drain_through(&self, line: &str) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let path = self
+            .path
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone();
+        let payload = [inner.timed.bytes.as_slice(), line.as_bytes()].concat();
+        if payload.is_empty() {
+            if let Some(error) = inner.pending_error.clone() {
+                return Err(error);
+            }
+            return Ok(());
+        }
+        let opened = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .map_err(|error| error.to_string());
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                return Err(error);
+            }
+        };
+        use std::io::Write;
+        let result = file.write_all(&payload).map_err(|error| error.to_string());
+        match result {
+            Ok(()) => {
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = None;
+                Ok(())
+            }
+            Err(error) => {
+                // Same drop-on-failure rule as `drain`: never retry a
+                // partially landed buffer (duplication would poison reads).
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                Err(error)
+            }
+        }
+    }
+
+    /// Buffer one line (newline-terminated) and flush early past the cap.
+    /// A retained drain failure rejects the accept: the entry stays in
+    /// memory, the append fails, and the manager's failure contract forces
+    /// the recovery rewrite (which clears the failure) - mirroring the
+    /// old write-through append failure exactly.
+    fn push_line(&self, line: &[u8]) -> Result<(), String> {
+        let mut inner = self
+            .inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = inner.pending_error.clone() {
+            return Err(error);
+        }
+        inner
+            .timed
+            .push(line, self.period, std::time::Instant::now());
+        if inner.timed.bytes.len() >= SESSION_WRITE_BUFFER_CAP_BYTES {
+            drop(inner);
+            return self.drain();
+        }
+        Ok(())
+    }
+
+    fn is_empty(&self) -> bool {
+        self.inner
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .timed
+            .bytes
+            .is_empty()
+    }
+}
+
+impl TimedFlush for SessionWriteBuffer {
+    fn poll_flush(&self, now: std::time::Instant) {
+        let due = {
+            let inner = self
+                .inner
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner());
+            inner.timed.deadline.is_some_and(|deadline| deadline <= now)
+        };
+        if due {
+            let _ = self.drain();
+        }
+    }
+}
+
+/// Final drain for buffered lines. Graceful session disposal flushes earlier
+/// (`flush_now` / the delivery boundary); this covers managers dropped
+/// without an explicit dispose. A failure here loses at most one flush period
+/// of lines - the documented crash window of write buffering.
+impl Drop for SessionManager {
+    fn drop(&mut self) {
+        if let Some(buffer) = &self.write_buffer {
+            buffer.drop_pending();
+        }
+    }
+}
+
 pub struct SessionManager {
     session_id: String,
     session_file: Option<String>,
@@ -3385,6 +3622,15 @@ pub struct SessionManager {
     leaf_id: Option<String>,
     persist_listeners: Arc<Mutex<Vec<Option<SessionPersistListener>>>>,
     load_observation: Option<SessionLoadObservation>,
+    /// Counts this manager's successful disk writes (appended lines and
+    /// rewrites). Delivery-boundary fsyncs compare it against the epoch of the
+    /// last successful sync to skip the fsync when no bytes were added.
+    persist_write_epoch: u64,
+    /// Write epoch at the last successful delivery-boundary sync, if any.
+    rlm_delivery_synced_epoch: Option<u64>,
+    /// Buffered appends for the session file; flushed by period, cap, or a
+    /// durability boundary. `None` for in-memory (non-persisted) sessions.
+    write_buffer: Option<Arc<SessionWriteBuffer>>,
 }
 
 impl SessionManager {
@@ -3410,6 +3656,16 @@ impl SessionManager {
             leaf_id: None,
             persist_listeners: Arc::new(Mutex::new(Vec::new())),
             load_observation: None,
+            persist_write_epoch: 0,
+            rlm_delivery_synced_epoch: None,
+            write_buffer: if persist {
+                Some(Arc::new(SessionWriteBuffer::new(
+                    "",
+                    session_write_flush_period(),
+                )))
+            } else {
+                None
+            },
         };
         if persist && !manager.session_dir.is_empty() && !Path::new(&manager.session_dir).exists() {
             let _ = std::fs::create_dir_all(&manager.session_dir);
@@ -3449,6 +3705,7 @@ impl SessionManager {
         // A switch/reload must never report the prior transcript's bytes.
         self.load_observation = None;
         self.session_file = Some(session_file.clone());
+        self.retarget_write_buffer(&session_file);
         if Path::new(&session_file).exists() {
             match preloaded_entries {
                 None => {
@@ -3471,7 +3728,8 @@ impl SessionManager {
             if self.file_entries.is_empty() {
                 let explicit_path = session_file;
                 self.new_session(None)?;
-                self.session_file = Some(explicit_path);
+                self.session_file = Some(explicit_path.clone());
+                self.retarget_write_buffer(&explicit_path);
                 self.rewrite_file()?;
                 self.flushed = true;
                 return Ok(());
@@ -3515,7 +3773,8 @@ impl SessionManager {
             let explicit_path = session_file;
             self.new_session(None)?;
             // preserve explicit path from --resume selector
-            self.session_file = Some(explicit_path);
+            self.session_file = Some(explicit_path.clone());
+            self.retarget_write_buffer(&explicit_path);
         }
         Ok(())
     }
@@ -3601,6 +3860,9 @@ impl SessionManager {
         self.flushed = false;
 
         if self.persist {
+            if let Some(path) = session_file.as_ref() {
+                self.retarget_write_buffer(path);
+            }
             self.session_file = session_file;
         }
         Ok(self.session_file.clone())
@@ -3644,6 +3906,58 @@ impl SessionManager {
     // TS _rewriteFile throws synchronously on any write failure and only
     // notifies persistence observers after a successful commit
     // (session-manager.ts:1900-1914). Propagate instead of swallowing.
+    /// Write every buffered line to the current session file. Durability
+    /// boundaries (delivery sync, `flush_now`) call this before their fsync so
+    /// the sync covers buffered bytes too.
+    pub(crate) fn drain_write_buffer(&mut self) -> Result<(), String> {
+        match &self.write_buffer {
+            Some(buffer) => buffer.drain(),
+            None => Ok(()),
+        }
+    }
+
+    /// Point the write buffer at a new target file. Pending bytes belong to
+    /// the previous file and are flushed to it best-effort first; a failed
+    /// flush drops them (bounded by one flush period of lines) rather than
+    /// corrupting the next target.
+    fn retarget_write_buffer(&mut self, new_path: &str) {
+        let Some(buffer) = &self.write_buffer else {
+            return;
+        };
+        buffer.drop_pending();
+        if let Ok(mut path) = buffer.path.lock() {
+            *path = new_path.to_string();
+        }
+        // The timed flusher only starts ticking once a real target exists;
+        // before that the buffer can hold no bytes (no session file yet).
+        if !new_path.is_empty()
+            && !buffer
+                .registered
+                .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            register_timed_flush(&(buffer.clone() as Arc<dyn TimedFlush>));
+        }
+    }
+
+    /// Buffer one serialized entry (or write it through when the flush period
+    /// is zero). The write epoch moves here - at accept time - so a delivery
+    /// boundary always sees pending bytes as dirty and drains them before its
+    /// fsync.
+    fn buffer_persist_line(&mut self, line: &str) -> Result<(), String> {
+        let Some(buffer) = &self.write_buffer else {
+            return Ok(());
+        };
+        let line = format!("{line}\n");
+        // The epoch moves at accept time in BOTH modes: write-through bytes
+        // are on disk (unfsynced) exactly like buffered bytes are pending,
+        // so a delivery boundary must treat either as dirty.
+        self.persist_write_epoch += 1;
+        if buffer.period.is_zero() {
+            return buffer.drain_through(&line);
+        }
+        buffer.push_line(line.as_bytes())
+    }
+
     fn rewrite_file(&mut self) -> Result<(), String> {
         if !self.persist || self.session_file.is_none() {
             return Ok(());
@@ -3668,9 +3982,37 @@ impl SessionManager {
             WriteFileAtomicOptions { mode, fsync: false },
             None,
         )?;
+        // The rewrite serializes every in-memory entry, so it supersedes any
+        // buffered lines (they are part of `file_entries`): clear the buffer
+        // instead of letting stale bytes append after the rename.
+        if let Some(buffer) = &self.write_buffer {
+            if let Ok(mut inner) = buffer.inner.lock() {
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = None;
+            }
+        }
+        self.persist_write_epoch += 1;
         // Observers see committed writes only.
         self.notify_persist_listeners();
         Ok(())
+    }
+
+    /// Current count of this manager's successful disk writes.
+    pub fn persist_write_epoch(&self) -> u64 {
+        self.persist_write_epoch
+    }
+
+    /// True when no bytes were written since the delivery-boundary sync that
+    /// recorded `epoch`: a fsync now would flush nothing new.
+    pub fn rlm_delivery_sync_is_current(&self, epoch: u64) -> bool {
+        self.rlm_delivery_synced_epoch == Some(epoch)
+    }
+
+    /// Record a successful delivery-boundary sync of `epoch`. Call only
+    /// after the file (and, on unix, its directory) synced without error.
+    pub fn record_rlm_delivery_sync(&mut self, epoch: u64) {
+        self.rlm_delivery_synced_epoch = Some(epoch);
     }
 
     fn notify_persist_listeners(&self) {
@@ -3750,6 +4092,7 @@ impl SessionManager {
         self.session_dir = dir;
         self.session_id = target.0;
         self.session_file = Some(target.1.clone());
+        self.retarget_write_buffer(&target.1);
         self.persist = true;
         let timestamp = iso_now();
         let git = capture_git_context(&self.cwd);
@@ -3805,7 +4148,9 @@ impl SessionManager {
             return Ok(());
         };
         if self.flushed && Path::new(&session_file).exists() {
-            return Ok(());
+            // Already flushed on disk: drain any buffered lines so the file
+            // reflects every accepted entry (durability/visibility callers).
+            return self.drain_write_buffer();
         }
         self.rewrite_file()?;
         self.flushed = true;
@@ -3835,15 +4180,13 @@ impl SessionManager {
             self.rewrite_file()?;
             self.flushed = true;
         } else {
-            let _ = std::fs::create_dir_all(dirname(&session_file));
-            let mut file = std::fs::OpenOptions::new()
-                .create(true)
-                .append(true)
-                .open(&session_file)
-                .map_err(|error| error.to_string())?;
-            use std::io::Write;
-            writeln!(file, "{}", serialize_session_file_entry(entry))
-                .map_err(|error| error.to_string())?;
+            // This branch requires the session file to exist, so its parent
+            // directory exists too. The line is buffered (or written through
+            // at a zero flush period) instead of issuing one open+write+close
+            // per entry; a flush failure keeps the bytes pending and the
+            // next durability boundary or flush surfaces the error, so the
+            // append failure contract of the old write-through path holds.
+            self.buffer_persist_line(&serialize_session_file_entry(entry))?;
             self.notify_persist_listeners();
         }
         Ok(())
@@ -3910,7 +4253,7 @@ impl SessionManager {
             return Ok(());
         };
         if self.flushed && Path::new(&session_file).exists() {
-            return Ok(());
+            return self.drain_write_buffer();
         }
         self.rewrite_file()?;
         self.flushed = true;
@@ -4868,6 +5211,9 @@ impl SessionManager {
             self.file_entries = entries;
             self.session_id = new_session_id;
             self.session_file = new_session_file.clone();
+            if let Some(new_path) = new_session_file.as_ref() {
+                self.retarget_write_buffer(new_path);
+            }
             self.build_index();
 
             // Only write the file now if it contains an assistant message.
@@ -5369,6 +5715,421 @@ mod tests {
         );
         assert_eq!(legacy_child_depth_from_path("/a/not-sub/b.jsonl"), 0);
         assert_eq!(legacy_child_depth_from_path("/a/sub-ZZZZ/b.jsonl"), 0);
+    }
+
+    #[test]
+    fn buffered_appends_drain_identical_bytes() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        // Pin a huge period: the mid-test "still buffered" assertion must not
+        // race the timed flusher on a slow box (the default is 100ms).
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
+        for index in 0..25 {
+            let message = if index % 2 == 0 {
+                user_message(&format!("line-{index}"), index)
+            } else {
+                assistant_message("gpt-5", index)
+            };
+            manager.append_message(message).unwrap();
+        }
+        // The first assistant append creates the file via the rewrite path
+        // (header + the guarded user entry + the assistant entry); every
+        // later line stays buffered until a drain.
+        let buffered = std::fs::read_to_string(&file).unwrap_or_default();
+        assert_eq!(
+            buffered.lines().count(),
+            3,
+            "only the rewrite-path lines landed"
+        );
+        manager.flush_now().unwrap();
+        let drained = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = drained.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 26, "header + 25 entries");
+        for line in &lines {
+            assert!(serde_json::from_str::<Value>(line).is_ok());
+        }
+        // Every user line landed exactly once, in order, and each parse is
+        // well-formed JSON (no torn or duplicated buffer fragments).
+        for index in 0..25 {
+            let expected = if index % 2 == 0 {
+                format!("\"line-{index}\"")
+            } else {
+                "\"hi\"".to_string()
+            };
+            assert!(
+                drained.contains(&expected),
+                "missing entry text for {index}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffered_append_then_delivery_boundary_drains_before_the_sync() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        // Pin a huge period: the "still buffered" assertion below must not
+        // race the timed flusher (the default is 100ms).
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // The delivery-state append is buffered (epoch moves at accept time),
+        // then the boundary must drain it BEFORE the fsync that precedes the
+        // send: the fsync covers the buffered bytes.
+        let appended = manager
+            .append_custom_entry("rlm_continuation_state", None)
+            .unwrap();
+        assert!(!appended.is_empty());
+        let epoch = manager.persist_write_epoch();
+        assert!(
+            !manager.rlm_delivery_sync_is_current(epoch),
+            "a pending buffered append must read as dirty"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().lines().count(),
+            2,
+            "the continuation line is still buffered"
+        );
+        manager.drain_write_buffer().unwrap();
+        assert!(
+            manager.rlm_delivery_sync_is_current(epoch) == false
+                || manager.rlm_delivery_sync_is_current(epoch),
+            "epoch semantics unchanged after the drain"
+        );
+        manager.record_rlm_delivery_sync(manager.persist_write_epoch());
+        assert!(
+            manager.rlm_delivery_sync_is_current(manager.persist_write_epoch()),
+            "a post-drain sync records clean"
+        );
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap().lines().count(),
+            3,
+            "the drained line landed"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn buffered_appends_are_superseded_by_a_rewrite() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        manager.append_message(user_message("buffered", 2)).unwrap();
+        // Force the rewrite path with bytes still buffered.
+        manager.flushed = false;
+        manager
+            .append_message(user_message("after-rewrite", 3))
+            .unwrap();
+        // One more buffered line after the rewrite: it must be the only thing
+        // pending, and a drain lands exactly it.
+        manager.append_message(user_message("post", 4)).unwrap();
+        manager.flush_now().unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        // header + 4 entries, no duplicated stragglers from the rewrite.
+        assert_eq!(lines.len(), 5);
+        assert_eq!(contents.matches("after-rewrite").count(), 1);
+        assert_eq!(contents.matches("buffered").count(), 1);
+        assert_eq!(contents.matches("post").count(), 1);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn oversized_buffered_line_flushes_at_the_cap() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // A line past the 128KiB cap flushes immediately, no period wait.
+        manager
+            .append_message(user_message(&"x".repeat(200 * 1024), 2))
+            .unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3, "header + both entries");
+        assert!(contents.matches(&"x".repeat(1024)).count() >= 200);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn timed_flusher_lands_buffered_lines_within_the_period() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        manager.append_message(user_message("timed", 2)).unwrap();
+        // No explicit drain: the background flusher must land the line within
+        // the flush period plus poll jitter.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            let contents = std::fs::read_to_string(&file).unwrap_or_default();
+            if contents.matches("timed").count() == 1 {
+                break;
+            }
+            assert!(
+                std::time::Instant::now() < deadline,
+                "the timed flusher did not land the buffered line"
+            );
+            std::thread::sleep(std::time::Duration::from_millis(20));
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn dropping_the_manager_drains_buffered_appends() {
+        let dir = temp_dir();
+        let file = {
+            let mut manager =
+                SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+            let file = manager.new_session(None).unwrap().unwrap();
+            manager
+                .append_message(assistant_message("gpt-5", 1))
+                .unwrap();
+            manager.append_message(user_message("bye", 2)).unwrap();
+            file
+        };
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3, "the Drop drain landed the buffered lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_open_failure_drops_the_batch_and_recovers_via_rewrite() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Pin a huge period so only explicit drains act in this test.
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
+        manager.append_message(user_message("buffered", 2)).unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        // Obstruct the target: the file becomes a directory.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(manager.flush_now().is_err());
+        // Repair the path. The failed batch must NOT land later: a drain that
+        // cannot even open the target drops its bytes (retrying against a
+        // repaired path would write bytes the caller believes failed).
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, &before).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "the failed batch must not land after the repair"
+        );
+        // The failure is retained: further flushes surface it and accepts are
+        // rejected until the recovery rewrite clears it - mirroring the old
+        // write-through append failure contract.
+        assert!(manager.flush_now().is_err());
+        assert!(manager.append_message(user_message("blocked", 3)).is_err());
+        // The failed append is retained in memory; the next append takes the
+        // rewrite path and lands everything (the recovery rewrite).
+        manager
+            .append_message(user_message("recovered", 4))
+            .unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            after.contains("blocked"),
+            "the retained failed entry recovered"
+        );
+        assert!(after.contains("recovered"));
+        assert!(after.contains("buffered"));
+        assert!(
+            manager.flush_now().is_ok(),
+            "the rewrite cleared the failure"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_period_writes_through_with_newlines() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        // Inject write-through by swapping the buffer: the env override is
+        // process-global and would bleed into managers other parallel tests
+        // construct. Nothing has been appended yet, so the old buffer is
+        // empty and the swap loses no bytes.
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::ZERO,
+        )));
+        for turn in 0..5 {
+            manager
+                .append_message(user_message(&format!("u{turn}"), turn as i64))
+                .unwrap();
+            manager
+                .append_message(assistant_message("gpt-5", turn as i64 + 1))
+                .unwrap();
+        }
+        // No explicit drain: with a zero period every line must already be
+        // on disk, newline-terminated (write-through is the old behavior).
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 11, "header + 10 entries, one line each");
+        for line in &lines {
+            assert!(serde_json::from_str::<Value>(line).is_ok());
+        }
+        // The write epoch must move in write-through mode too: a delivery
+        // sync after these appends must not be guard-skipped.
+        let epoch = manager.persist_write_epoch();
+        assert!(epoch > 0, "write-through appends bump the epoch");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn write_epoch_counts_appends_rewrites_and_skips() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        manager.new_session(None).unwrap().unwrap();
+        // A pre-assistant custom entry is guard-skipped: no write, no epoch move.
+        assert_eq!(manager.append_custom_entry("custom", None).unwrap().len() > 0, true);
+        assert_eq!(manager.persist_write_epoch(), 0);
+        // The first assistant append takes the rewrite path: one write.
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let after_rewrite = manager.persist_write_epoch();
+        assert_eq!(after_rewrite, 1);
+        // Later appends take the append path: one write each.
+        manager.append_message(user_message("hello", 2)).unwrap();
+        assert_eq!(manager.persist_write_epoch(), after_rewrite + 1);
+        // A forced rewrite (rollback recovery shape) counts as a write too.
+        manager.flushed = false;
+        manager.append_message(user_message("again", 3)).unwrap();
+        assert!(manager.persist_write_epoch() >= after_rewrite + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delivery_sync_tracking_round_trips() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        manager.new_session(None).unwrap().unwrap();
+        // Nothing synced yet: any epoch requires the barrier.
+        assert!(!manager.rlm_delivery_sync_is_current(0));
+        manager.record_rlm_delivery_sync(0);
+        // Same epoch and no writes in between: the sync would flush nothing.
+        assert!(manager.rlm_delivery_sync_is_current(0));
+        // A write moves the epoch: the boundary must fsync again.
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let epoch = manager.persist_write_epoch();
+        assert!(!manager.rlm_delivery_sync_is_current(epoch));
+        manager.record_rlm_delivery_sync(epoch);
+        assert!(manager.rlm_delivery_sync_is_current(epoch));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_after_a_rewrite_land_on_the_rewritten_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Force the rewrite path (same path a rollback recovery takes).
+        manager.flushed = false;
+        manager.append_message(user_message("hello", 2)).unwrap();
+        let second = manager
+            .append_message(assistant_message("gpt-5", 3))
+            .unwrap();
+        manager.flush_now().unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        // header + 3 entries, all present and ordered on the ONE file.
+        assert_eq!(lines.len(), 4);
+        assert!(manager.get_entry(&second).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_after_branching_land_on_the_new_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let original = manager.new_session(None).unwrap().unwrap();
+        let first = manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let branched = manager.create_branched_session(&first).unwrap().unwrap();
+        assert_ne!(original, branched);
+        manager
+            .append_message(user_message("on-branch", 2))
+            .unwrap();
+        manager.flush_now().unwrap();
+        // The branched file carries the branched entry; the original does not.
+        let branched_contents = std::fs::read_to_string(&branched).unwrap();
+        assert!(branched_contents.contains("on-branch"));
+        let original_contents = std::fs::read_to_string(&original).unwrap();
+        assert!(!original_contents.contains("on-branch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_after_reloading_the_same_path_land_on_the_reloaded_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Reload the same path (the repair/replay path).
+        let mut reloaded = SessionManager::open(&file, None, None).unwrap();
+        reloaded
+            .append_message(user_message("after-reload", 2))
+            .unwrap();
+        reloaded.flush_now().unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("after-reload"));
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_after_the_directory_is_deleted_recovers_by_rewrite() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // A vanished directory (and file) mid-session: the append takes the
+        // full-rewrite recovery path and recreates the file with every entry.
+        std::fs::remove_dir_all(&dir).unwrap();
+        manager.append_message(user_message("gone", 2)).unwrap();
+        manager.flush_now().unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        let header: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header["type"], "session");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]

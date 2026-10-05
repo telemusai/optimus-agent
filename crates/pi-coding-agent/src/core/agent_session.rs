@@ -5900,6 +5900,19 @@ impl AgentSession {
         })?;
         manager
             .append_custom_entry_with_rollback(RLM_CONTINUATION_STATE_CUSTOM_TYPE, Some(value))?;
+        // Dirty-tracking: the fsync-before-send boundary only protects bytes
+        // that were appended since the last successful sync. When nothing was
+        // written (a guard-skipped append and no other write), the reopen and
+        // fsync would flush nothing new and are skipped. Any write - this
+        // append or any other - moves the epoch and keeps the fsync.
+        let write_epoch = manager.persist_write_epoch();
+        if manager.rlm_delivery_sync_is_current(write_epoch) {
+            return Ok(());
+        }
+        // Pending buffered lines count as dirty (the epoch moved at accept
+        // time), so drain them first: the fsync below must cover them for the
+        // append -> fsync -> send ordering to hold.
+        manager.drain_write_buffer()?;
         // Keep the manager locked through the durability barrier: a rewrite or
         // later ledger append must not replace the file while it is synced.
         std::fs::OpenOptions::new()
@@ -5913,6 +5926,7 @@ impl AgentSession {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| error.to_string())?;
         }
+        manager.record_rlm_delivery_sync(write_epoch);
         Ok(())
     }
 

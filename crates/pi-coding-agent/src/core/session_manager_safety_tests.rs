@@ -135,6 +135,9 @@ async fn session_safety_tail_repair_preserves_prefix_and_allows_distinct_append(
         let mut manager = SessionManager::open_async(&file.to_string_lossy(), None, None).await.unwrap();
         let parent = manager.get_leaf_id().unwrap();
         let added = manager.append_session_info("after repair").unwrap();
+        // Write buffering defers disk visibility by the flush period; drain
+        // before asserting on-disk bytes (the repair contract under test).
+        manager.flush_now().unwrap();
         let bytes = std::fs::read(&file).unwrap();
         assert!(bytes.starts_with(&prefix));
         assert_eq!(bytes.last(), Some(&b'\n'));
