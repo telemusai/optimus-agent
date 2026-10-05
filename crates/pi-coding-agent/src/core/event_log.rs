@@ -217,6 +217,11 @@ impl EventLog {
             }
             if state.clean_tail_len != Some(len) {
                 self.repair_tail_sync()?;
+                // The tail was externally modified since this instance's last
+                // clean append: the held handle may point at a file that is no
+                // longer the one at this path, so drop it and let the append
+                // reopen whatever the probe just validated.
+                state.append_handle = None;
                 // The repair may have truncated a torn tail: re-read the length
                 // the append lands on (a vanished file recreates below).
                 pre_append_len = std::fs::metadata(&self.path)
@@ -521,6 +526,31 @@ mod tests {
             .replay_sync(parse_line, ReplayOptions::default())
             .unwrap();
         assert_eq!(events, vec![json!({"a": 1}), json!({"b": 2})]);
+    }
+
+    #[test]
+    fn fast_path_reopens_after_an_external_file_replacement() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("replaced.jsonl");
+        let log = EventLog::new(
+            path.to_string_lossy().to_string(),
+            EventLogOptions::default(),
+        );
+        log.append_sync(&[json!({"a": 1})], false, None).unwrap();
+        // An external actor replaces the ledger with a different file at the
+        // same path: the next append must land on the file at the path, not on
+        // the detached pre-replacement handle.
+        let replacement = dir.path().join("replacement.jsonl");
+        std::fs::write(&replacement, b"{\"rival\":1}\n{\"other\":2}\n").unwrap();
+        std::fs::rename(&replacement, &path).unwrap();
+        log.append_sync(&[json!({"b": 2})], false, None).unwrap();
+        let events = log
+            .replay_sync(parse_line, ReplayOptions::default())
+            .unwrap();
+        assert_eq!(
+            events,
+            vec![json!({"rival": 1}), json!({"other": 2}), json!({"b": 2})]
+        );
     }
 
     #[test]
