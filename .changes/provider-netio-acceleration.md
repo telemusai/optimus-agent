@@ -1,0 +1,3 @@
+- Model provider HTTP requests now reuse pooled connections with per-provider policies (redirect, HTTP/1.x, proxy) instead of constructing a fresh client per request, cutting TCP and TLS setup from every streaming turn; timeouts and credentials stay per request.
+- SSE stream readers for OpenAI-compatible, Anthropic, Google, and Mistral now scan events in a single pass without per-event buffer copies or rescans, reducing per-stream allocations by about a fifth and removing quadratic reader cost on bursty segments.
+- Registered provider streams are returned directly instead of through a forwarding task, removing one scheduler hop and queue per event and fixing settlement receipts for covered providers that used the forwarding wrapper.
