@@ -7847,6 +7847,15 @@ impl AgentSession {
                 message,
                 assistant_message_event,
             } => {
+                // Hot path: message_update fires per streamed delta and the
+                // payload serializes the whole accumulated partial message.
+                // When no extension subscribed to message_update, the
+                // serialized value was built and dropped unseen, so skip the
+                // serialization entirely (the runner itself would iterate
+                // zero handlers and return None).
+                if !runner.has_handlers("message_update") {
+                    return;
+                }
                 let _ = runner
                     .emit(ExtensionEvent::MessageUpdate(MessageUpdatePayload {
                         message: serde_json::to_value(message).unwrap_or(Value::Null),

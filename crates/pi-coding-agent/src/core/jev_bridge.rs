@@ -552,7 +552,7 @@ pub const JEV_EVENTS: [&str; 12] = [
 
 struct CachedSettings {
     loaded: Instant,
-    settings: JevSettings,
+    settings: Arc<JevSettings>,
 }
 
 fn settings_cache() -> &'static Mutex<Option<CachedSettings>> {
@@ -562,12 +562,16 @@ fn settings_cache() -> &'static Mutex<Option<CachedSettings>> {
 
 /// Load Jev settings with a tiny TTL cache. Off-mode cost: one cached read
 /// per event; no client, no network, no tasks.
-fn load_settings_cached() -> JevSettings {
+fn load_settings_cached() -> Arc<JevSettings> {
     let (settings, resync_handlers) = {
         let mut cache = settings_cache().lock().unwrap_or_else(|p| p.into_inner());
         if let Some(cached) = cache.as_ref() {
             if cached.loaded.elapsed() < SETTINGS_TTL {
-                return cached.settings.clone();
+                // Shared read: every consumer gets the same immutable
+                // snapshot without a per-read deep clone of the BTreeMap-heavy
+                // settings value. A reload replaces the whole Arc, so no
+                // reader can observe a torn value.
+                return Arc::clone(&cached.settings);
             }
         }
         let agent_dir = get_agent_dir();
@@ -577,7 +581,7 @@ fn load_settings_cached() -> JevSettings {
         // An external settings change (including Off->On with no consumer
         // visit during Off) therefore always moves the revision, while TTL
         // re-reads of unchanged settings do not invalidate live stamps.
-        let changed = cache.as_ref().is_none_or(|cached| cached.settings != settings);
+        let changed = cache.as_ref().is_none_or(|cached| *cached.settings != settings);
         if changed {
             SETTINGS_REVISION.fetch_add(1, Ordering::SeqCst);
         }
@@ -590,9 +594,10 @@ fn load_settings_cached() -> JevSettings {
         let was_active = cache.as_ref().is_some_and(|cached| active_requested_from(&cached.settings));
         let now_active = active_requested_from(&settings);
         let resync_handlers = was_active != now_active;
+        let settings = Arc::new(settings);
         *cache = Some(CachedSettings {
             loaded: Instant::now(),
-            settings: settings.clone(),
+            settings: Arc::clone(&settings),
         });
         (settings, resync_handlers)
     };
@@ -659,7 +664,7 @@ fn sync_active_handlers() {
 /// can take effect in the same session. Client and tasks remain lazy.
 pub fn maybe_register_jev_observer(extensions: &mut Vec<SharedExtension>) {
     let settings = load_settings_cached();
-    let core = Arc::new(JevBridgeCore::new(settings));
+    let core = Arc::new(JevBridgeCore::new((*settings).clone()));
     {
         let mut bridges = live_bridges().lock().unwrap_or_else(|p| p.into_inner());
         bridges.retain(|core| core.strong_count() > 0);
