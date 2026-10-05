@@ -2766,14 +2766,27 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                 json!({ "entries": entries.len() }),
                 warmup,
                 iters,
-                move || {
-                    manager
-                        .lock()
-                        .unwrap()
-                        .build_session_context(None)
-                        .messages
-                        .len() as f64
+                {
+                    let manager = Arc::clone(&manager);
+                    move || {
+                        manager
+                            .lock()
+                            .unwrap()
+                            .build_session_context(None)
+                            .messages
+                            .len() as f64
+                    }
                 },
+            ));
+            // The branch Value clone the compaction prepare/restore phases
+            // perform (get_branch). Added for the C1 crossover measurement;
+            // pre-existing kernels are unchanged.
+            kernels.push(bench_kernel(
+                "session_manager_get_branch",
+                json!({ "entries": entries.len() }),
+                warmup,
+                iters,
+                move || manager.lock().unwrap().get_branch(None).len() as f64,
             ));
         }
         // 9. jev prepare_context (fingerprint serialize+hash passes included).

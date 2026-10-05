@@ -5900,6 +5900,19 @@ impl AgentSession {
         })?;
         manager
             .append_custom_entry_with_rollback(RLM_CONTINUATION_STATE_CUSTOM_TYPE, Some(value))?;
+        // Dirty-tracking: the fsync-before-send boundary only protects bytes
+        // that were appended since the last successful sync. When nothing was
+        // written (a guard-skipped append and no other write), the reopen and
+        // fsync would flush nothing new and are skipped. Any write - this
+        // append or any other - moves the epoch and keeps the fsync.
+        let write_epoch = manager.persist_write_epoch();
+        if manager.rlm_delivery_sync_is_current(write_epoch) {
+            return Ok(());
+        }
+        // Pending buffered lines count as dirty (the epoch moved at accept
+        // time), so drain them first: the fsync below must cover them for the
+        // append -> fsync -> send ordering to hold.
+        manager.drain_write_buffer()?;
         // Keep the manager locked through the durability barrier: a rewrite or
         // later ledger append must not replace the file while it is synced.
         std::fs::OpenOptions::new()
@@ -5913,6 +5926,7 @@ impl AgentSession {
                 .and_then(|directory| directory.sync_all())
                 .map_err(|error| error.to_string())?;
         }
+        manager.record_rlm_delivery_sync(write_epoch);
         Ok(())
     }
 
@@ -7833,6 +7847,15 @@ impl AgentSession {
                 message,
                 assistant_message_event,
             } => {
+                // Hot path: message_update fires per streamed delta and the
+                // payload serializes the whole accumulated partial message.
+                // When no extension subscribed to message_update, the
+                // serialized value was built and dropped unseen, so skip the
+                // serialization entirely (the runner itself would iterate
+                // zero handlers and return None).
+                if !runner.has_handlers("message_update") {
+                    return;
+                }
                 let _ = runner
                     .emit(ExtensionEvent::MessageUpdate(MessageUpdatePayload {
                         message: serde_json::to_value(message).unwrap_or(Value::Null),
@@ -17844,10 +17867,37 @@ impl AgentSession {
                 let entries = self.session_manager.lock().unwrap().get_branch(None);
                 // `pathEntries` are the branch entries; this module reads them as the
                 // compaction-module entry shapes.
-                let path_entries: Vec<CompactionSessionEntry> = entries
-                    .iter()
-                    .filter_map(compaction_session_entry_from)
-                    .collect();
+                // Per-entry Value -> typed conversion is pure; large branches
+                // convert in parallel (slice order preserved), any failure
+                // runs the sequential filter_map.
+                // Byte-aware gate mirroring the branch clone: fires from
+                // ~4096 entries, or ~1024 text-heavy entries (middle-entry
+                // probe).
+                let heavy = entries.len()
+                    >= crate::core::compaction::parallel::ENTRY_PARSE_HEAVY_COUNT
+                    && entries[entries.len() / 2]
+                        .get("message")
+                        .map(crate::core::compaction::parallel::approx_value_string_bytes)
+                        .unwrap_or(0)
+                        >= crate::core::compaction::parallel::ENTRY_PARSE_HEAVY_ENTRY_BYTES;
+                let parallel = heavy
+                    || entries.len() >= crate::core::compaction::parallel::ENTRY_PARSE_THRESHOLD;
+                let path_entries: Vec<CompactionSessionEntry> = match parallel
+                    .then(|| {
+                        crate::core::compaction::parallel::try_parallel_map(
+                            &entries,
+                            2,
+                            |entry, _| compaction_session_entry_from(entry),
+                        )
+                    })
+                    .flatten()
+                {
+                    Some(converted) => converted.into_iter().flatten().collect(),
+                    None => entries
+                        .iter()
+                        .filter_map(compaction_session_entry_from)
+                        .collect(),
+                };
                 // tokensBefore measures the active context, including unpersisted outcomes,
                 // not transcript size. Native compaction receives this same context.
                 // Harness digests are regenerated and excluded from both.

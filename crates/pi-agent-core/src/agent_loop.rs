@@ -714,15 +714,17 @@ pub fn run_agent_loop(
 ) -> BoxFuture<'static, anyhow::Result<Vec<AgentMessage>>> {
     Box::pin(async move {
         let mut new_messages: Vec<AgentMessage> = prompts.clone();
+        // The context param is owned and unread after this point, so moving its
+        // fields avoids a full deep copy of the message history per run; the
+        // resulting context value is identical to the previous clone.
         let mut current_context = AgentContext {
-            system_prompt: context.system_prompt.clone(),
+            system_prompt: context.system_prompt,
             messages: context
                 .messages
-                .iter()
-                .cloned()
+                .into_iter()
                 .chain(prompts.iter().cloned())
                 .collect(),
-            tools: context.tools.clone(),
+            tools: context.tools,
         };
 
         emit_event(&emit, AgentEvent::AgentStart).await?;
@@ -771,10 +773,12 @@ pub fn run_agent_loop_continue(
         }
 
         let mut new_messages: Vec<AgentMessage> = Vec::new();
+        // Owned context: move the fields instead of deep-cloning the history
+        // (the value is identical; only the copies differ).
         let mut current_context = AgentContext {
-            system_prompt: context.system_prompt.clone(),
-            messages: context.messages.clone(),
-            tools: context.tools.clone(),
+            system_prompt: context.system_prompt,
+            messages: context.messages,
+            tools: context.tools,
         };
 
         emit_event(&emit, AgentEvent::AgentStart).await?;

@@ -225,46 +225,90 @@ async fn run_stream_google(
 	let mut chunks = SseChunkStream::new(response, options.stream.signal.clone());
 
 	while let Some(chunk) = chunks.next().await? {
-		// @google/genai documents GenerateContentResponse.responseId as an output-only field
-		// used to identify each response. Keep the first non-empty one from the stream.
-		if output.response_id.is_none() {
-			if let Some(response_id) = chunk.get("responseId").and_then(Value::as_str) {
-				if !response_id.is_empty() {
-					output.response_id = Some(response_id.to_string());
+		// Typed shape for the common chunk; Value fallback keeps the exact
+		// consumer semantics for anything the shape does not cover.
+		match chunk {
+			GoogleChunkEvent::Typed(typed) => {
+				// @google/genai documents GenerateContentResponse.responseId as an output-only field
+				// used to identify each response. Keep the first non-empty one from the stream.
+				if output.response_id.is_none() {
+					if let Some(response_id) = typed.response_id.as_deref() {
+						if !response_id.is_empty() {
+							output.response_id = Some(response_id.to_string());
+						}
+					}
+				}
+				let candidate = typed.candidates.first();
+				if let Some(candidate) = candidate {
+					if let Some(parts) = candidate.content.as_ref().map(|content| &content.parts) {
+						for part in parts {
+							process_typed_part(part, output, stream, &mut current_block)?;
+						}
+					}
+				}
+
+				if let Some(finish_reason) = candidate.and_then(|candidate| candidate.finish_reason.as_deref()) {
+					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					if output
+						.content
+						.iter()
+						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+					{
+						output.stop_reason = "toolUse".to_string();
+					}
+					if output.stop_reason == "error" {
+						output.stop_reason_raw = Some(finish_reason.to_string());
+					}
+				}
+
+				if let Some(usage_metadata) = &typed.usage_metadata {
+					output.usage = super::google_usage::normalize(usage_metadata);
+					calculate_cost(model, &mut output.usage, None);
 				}
 			}
-		}
-		let candidate = chunk.get("candidates").and_then(Value::as_array).and_then(|list| list.first());
-		if let Some(parts) = candidate
-			.and_then(|candidate| candidate.get("content"))
-			.and_then(|content| content.get("parts"))
-			.and_then(Value::as_array)
-		{
-			for part in parts {
-				process_part(part, output, stream, &mut current_block)?;
-			}
-		}
+			GoogleChunkEvent::Value(chunk) => {
+				// @google/genai documents GenerateContentResponse.responseId as an output-only field
+				// used to identify each response. Keep the first non-empty one from the stream.
+				if output.response_id.is_none() {
+					if let Some(response_id) = chunk.get("responseId").and_then(Value::as_str) {
+						if !response_id.is_empty() {
+							output.response_id = Some(response_id.to_string());
+						}
+					}
+				}
+				let candidate = chunk.get("candidates").and_then(Value::as_array).and_then(|list| list.first());
+				if let Some(parts) = candidate
+					.and_then(|candidate| candidate.get("content"))
+					.and_then(|content| content.get("parts"))
+					.and_then(Value::as_array)
+				{
+					for part in parts {
+						process_part(part, output, stream, &mut current_block)?;
+					}
+				}
 
-		if let Some(finish_reason) = candidate
-			.and_then(|candidate| candidate.get("finishReason"))
-			.and_then(Value::as_str)
-		{
-			output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
-			if output
-				.content
-				.iter()
-				.any(|block| matches!(block, ContentBlock::ToolCall(_)))
-			{
-				output.stop_reason = "toolUse".to_string();
-			}
-			if output.stop_reason == "error" {
-				output.stop_reason_raw = Some(finish_reason.to_string());
-			}
-		}
+				if let Some(finish_reason) = candidate
+					.and_then(|candidate| candidate.get("finishReason"))
+					.and_then(Value::as_str)
+				{
+					output.stop_reason = map_stop_reason(finish_reason).map_err(GoogleStreamError::Message)?;
+					if output
+						.content
+						.iter()
+						.any(|block| matches!(block, ContentBlock::ToolCall(_)))
+					{
+						output.stop_reason = "toolUse".to_string();
+					}
+					if output.stop_reason == "error" {
+						output.stop_reason_raw = Some(finish_reason.to_string());
+					}
+				}
 
-		if let Some(usage_metadata) = chunk.get("usageMetadata") {
-			output.usage = super::google_usage::normalize(usage_metadata);
-			calculate_cost(model, &mut output.usage, None);
+				if let Some(usage_metadata) = chunk.get("usageMetadata") {
+					output.usage = super::google_usage::normalize(usage_metadata);
+					calculate_cost(model, &mut output.usage, None);
+				}
+			}
 		}
 	}
 
@@ -326,6 +370,138 @@ fn finish_block(block: &CurrentBlock, output: &AssistantMessage, stream: &Assist
 		}
 		_ => {}
 	}
+}
+
+/// `process_part` for the typed part shape: same behavior, borrowed from
+/// the typed chunk with no `Value` lookups.
+fn process_typed_part(
+	part: &TypedGooglePart,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+	current_block: &mut Option<CurrentBlock>,
+) -> Result<(), GoogleStreamError> {
+	if let Some(text) = part.text.as_deref() {
+		let is_thinking = part.thought == Some(true);
+		let needs_new_block = match current_block {
+			None => true,
+			Some(CurrentBlock::Thinking(_)) => !is_thinking,
+			Some(CurrentBlock::Text(_)) => is_thinking,
+		};
+		if needs_new_block {
+			if let Some(block) = current_block.take() {
+				finish_block(&block, output, stream);
+			}
+			if is_thinking {
+				output.content.push(ContentBlock::Thinking(ThinkingContent {
+					thinking: String::new(),
+					thinking_signature: None,
+					..Default::default()
+				}));
+				stream.push(AssistantMessageEvent::ThinkingStart {
+					content_index: output.content.len() - 1,
+					partial: output.clone(),
+				});
+				*current_block = Some(CurrentBlock::Thinking(ThinkingContent {
+					thinking: String::new(),
+					thinking_signature: None,
+					..Default::default()
+				}));
+			} else {
+				output.content.push(ContentBlock::Text(TextContent::new("")));
+				stream.push(AssistantMessageEvent::TextStart {
+					content_index: output.content.len() - 1,
+					partial: output.clone(),
+				});
+				*current_block = Some(CurrentBlock::Text(TextContent::new("")));
+			}
+		}
+
+		let thought_signature = part.thought_signature.as_deref();
+		match current_block {
+			Some(CurrentBlock::Thinking(_)) => {
+				if let Some(ContentBlock::Thinking(block)) = output.content.last_mut() {
+					block.thinking.push_str(text);
+					block.thinking_signature = retain_thought_signature(
+						block.thinking_signature.as_deref(),
+						thought_signature,
+					);
+				}
+				stream.push(AssistantMessageEvent::ThinkingDelta {
+					content_index: output.content.len() - 1,
+					delta: text.to_string(),
+					partial: output.clone(),
+				});
+			}
+			Some(CurrentBlock::Text(_)) => {
+				if let Some(ContentBlock::Text(block)) = output.content.last_mut() {
+					block.text.push_str(text);
+					block.text_signature = retain_thought_signature(
+						block.text_signature.as_deref(),
+						thought_signature,
+					);
+				}
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: output.content.len() - 1,
+					delta: text.to_string(),
+					partial: output.clone(),
+				});
+			}
+			None => {}
+		}
+	}
+
+	if let Some(function_call) = &part.function_call {
+		if let Some(block) = current_block.take() {
+			finish_block(&block, output, stream);
+		}
+
+		let provided_id = function_call.get("id").and_then(Value::as_str);
+		let name = function_call.get("name").and_then(Value::as_str).unwrap_or("");
+		// TS: `!providedId || output.content.some(...)` - an empty string id is
+		// falsy in JS, so it is regenerated.
+		let needs_new_id = match provided_id {
+			None | Some("") => true,
+			Some(provided_id) => output.content.iter().any(|block| match block {
+				ContentBlock::ToolCall(tool_call) => tool_call.id == provided_id,
+				_ => false,
+			}),
+		};
+		let tool_call_id = if needs_new_id {
+			format!("{}_{}_{}", name, now_ms(), next_tool_call_counter())
+		} else {
+			provided_id.unwrap_or_default().to_string()
+		};
+
+		let arguments = match function_call.get("args") {
+			Some(Value::Object(map)) => map.clone(),
+			_ => Map::new(),
+		};
+		let tool_call = ToolCall {
+			id: tool_call_id,
+			name: name.to_string(),
+			arguments,
+			thought_signature: part.thought_signature.clone(),
+			..Default::default()
+		};
+
+		output.content.push(ContentBlock::ToolCall(tool_call.clone()));
+		stream.push(AssistantMessageEvent::ToolCallStart {
+			content_index: output.content.len() - 1,
+			partial: output.clone(),
+		});
+		stream.push(AssistantMessageEvent::ToolCallDelta {
+			content_index: output.content.len() - 1,
+			delta: serde_json::to_string(&tool_call.arguments).unwrap_or_else(|_| "{}".to_string()),
+			partial: output.clone(),
+		});
+		stream.push(AssistantMessageEvent::ToolCallEnd {
+			content_index: output.content.len() - 1,
+			tool_call,
+			partial: output.clone(),
+		});
+	}
+
+	Ok(())
 }
 
 /// The inner `for (const part of candidate.content.parts)` body.
@@ -882,12 +1058,177 @@ fn javascript_number(value: Option<&Value>) -> Option<f64> {
 	}
 }
 
+/// One drained chunk: the typed shape when the payload fits it, the parsed
+/// `Value` otherwise. Both preserve the exact consumer semantics; the
+/// consumer's fallback branches only read `Value`.
+enum GoogleChunkEvent {
+	Typed(TypedGoogleChunk),
+	Value(Value),
+}
+
+#[cfg(test)]
+impl GoogleChunkEvent {
+	fn as_value(&self) -> Value {
+		match self {
+			GoogleChunkEvent::Value(value) => value.clone(),
+			GoogleChunkEvent::Typed(typed) => serde_json::to_value(TypedView::from(typed)).unwrap_or(Value::Null),
+		}
+	}
+}
+
+#[cfg(test)]
+impl PartialEq for GoogleChunkEvent {
+	fn eq(&self, other: &Self) -> bool {
+		self.as_value() == other.as_value()
+	}
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for GoogleChunkEvent {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(formatter, "{:?}", self.as_value())
+	}
+}
+
+#[cfg(test)]
+impl PartialEq<Value> for GoogleChunkEvent {
+	fn eq(&self, other: &Value) -> bool {
+		&self.as_value() == other
+	}
+}
+
+/// Test-only view mirroring the typed fields, so `to_value` yields the same
+/// shape the Value path produced for the fields the consumer reads.
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedView<'a> {
+	#[serde(rename = "responseId", skip_serializing_if = "Option::is_none")]
+	response_id: &'a Option<String>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	candidates: Vec<TypedCandidateView<'a>>,
+	#[serde(rename = "usageMetadata", skip_serializing_if = "Option::is_none")]
+	usage_metadata: &'a Option<Value>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedCandidateView<'a> {
+	#[serde(rename = "finishReason", skip_serializing_if = "Option::is_none")]
+	finish_reason: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	content: Option<TypedContentView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedContentView<'a> {
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	parts: Vec<TypedPartView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedPartView<'a> {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	text: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	thought: &'a Option<bool>,
+	#[serde(rename = "thoughtSignature", skip_serializing_if = "Option::is_none")]
+	thought_signature: &'a Option<String>,
+	#[serde(rename = "functionCall", skip_serializing_if = "Option::is_none")]
+	function_call: &'a Option<Value>,
+}
+
+#[cfg(test)]
+impl<'a> From<&'a TypedGoogleChunk> for TypedView<'a> {
+	fn from(typed: &'a TypedGoogleChunk) -> Self {
+		TypedView {
+			response_id: &typed.response_id,
+			candidates: typed
+				.candidates
+				.iter()
+				.map(|candidate| TypedCandidateView {
+					finish_reason: &candidate.finish_reason,
+					content: candidate.content.as_ref().map(|content| TypedContentView {
+						parts: content
+							.parts
+							.iter()
+							.map(|part| TypedPartView {
+								text: &part.text,
+								thought: &part.thought,
+								thought_signature: &part.thought_signature,
+								function_call: &part.function_call,
+							})
+							.collect(),
+					}),
+				})
+				.collect(),
+			usage_metadata: &typed.usage_metadata,
+		}
+	}
+}
+
+/// One `data:` chunk in the consumer's own shape: the fields the streaming
+/// loop reads, parsed straight from the chunk text with no `Value` DOM.
+/// `usageMetadata` and `functionCall.args` keep the `Value` DOM (they are
+/// cloned into output anyway). Field tolerances mirror the Value reads.
+#[derive(serde::Deserialize, Default)]
+struct TypedGoogleChunk {
+	#[serde(rename = "responseId", default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	response_id: Option<String>,
+	#[serde(default)]
+	candidates: Vec<TypedGoogleCandidate>,
+	#[serde(rename = "usageMetadata", default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	usage_metadata: Option<Value>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedGoogleCandidate {
+	#[serde(rename = "finishReason", default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	finish_reason: Option<String>,
+	#[serde(default)]
+	content: Option<TypedGoogleContent>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedGoogleContent {
+	#[serde(default)]
+	parts: Vec<TypedGooglePart>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedGooglePart {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	text: Option<String>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_bool")]
+	thought: Option<bool>,
+	#[serde(rename = "thoughtSignature", default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	thought_signature: Option<String>,
+	#[serde(rename = "functionCall", default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	function_call: Option<Value>,
+}
+
+/// Parse one `data:` payload with the typed shape; `None` falls back to the
+/// `Value` parse (which keeps the exact existing error text). Only
+/// GenerateContent-looking payloads (a `candidates`, `usageMetadata`, or
+/// `responseId` member) take the typed shape, so unrelated JSON keeps the
+/// `Value` path verbatim.
+fn parse_typed_google_chunk(processed: &str) -> Option<TypedGoogleChunk> {
+	let looks_like_chunk = processed.contains("\"candidates\"")
+		|| processed.contains("\"usageMetadata\"")
+		|| processed.contains("\"responseId\"");
+	if !looks_like_chunk {
+		return None;
+	}
+	serde_json::from_str(processed).ok()
+}
+
 /// Local SSE reader for `alt=sse` streaming: splits on the SDK's delimiters and
 /// yields the parsed `data:` JSON payloads.
 struct SseChunkStream {
 	chunks: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
 	buffer: String,
-	pending: Vec<Value>,
+	pending: Vec<GoogleChunkEvent>,
 	byte_pending: Vec<u8>,
 	finished: bool,
 	signal: Option<tokio_util::sync::CancellationToken>,
@@ -906,7 +1247,7 @@ impl SseChunkStream {
 	}
 
 	/// TS: the `for await (const chunk of googleStream)` loop body.
-	async fn next(&mut self) -> Result<Option<Value>, GoogleStreamError> {
+	async fn next(&mut self) -> Result<Option<GoogleChunkEvent>, GoogleStreamError> {
 		loop {
 			if !self.pending.is_empty() {
 				return Ok(Some(self.pending.remove(0)));
@@ -993,13 +1334,19 @@ impl SseChunkStream {
 			let trimmed_event = event.trim();
 			if trimmed_event.starts_with("data:") {
 				let processed = trimmed_event["data:".len()..].trim();
-				match serde_json::from_str::<Value>(processed) {
-					Ok(value) => self.pending.push(value),
-					Err(error) => {
-						return Err(GoogleStreamError::Message(format!(
-							"exception parsing stream chunk {}. {}",
-							processed, error
-						)))
+				// Typed shape first (no Value DOM for the hot fields); the
+				// Value fallback keeps the exact existing error text.
+				if let Some(typed) = parse_typed_google_chunk(processed) {
+					self.pending.push(GoogleChunkEvent::Typed(typed));
+				} else {
+					match serde_json::from_str::<Value>(processed) {
+						Ok(value) => self.pending.push(GoogleChunkEvent::Value(value)),
+						Err(error) => {
+							return Err(GoogleStreamError::Message(format!(
+								"exception parsing stream chunk {}. {}",
+								processed, error
+							)))
+						}
 					}
 				}
 			}
@@ -1675,7 +2022,7 @@ mod tests {
 			signal: None,
 		};
 		stream.drain_events().unwrap();
-		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2})]);
+		assert_eq!(pending_values(&stream), vec![json!({"a": 1}), json!({"b": 2})]);
 	}
 
 	#[test]
@@ -1707,7 +2054,7 @@ mod tests {
 			signal: None,
 		};
 		stream.drain_events().unwrap();
-		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
+		assert_eq!(pending_values(&stream), vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
 		assert_eq!(stream.buffer, "");
 
 		// A `\r\n\r\n` straddling two pushes is one delimiter, not two events.
@@ -1723,7 +2070,68 @@ mod tests {
 		assert!(split.pending.is_empty());
 		split.buffer.push_str("\r\ndata: {\"b\": 2}\n\n");
 		split.drain_events().unwrap();
-		assert_eq!(split.pending, vec![json!({"a": 1}), json!({"b": 2})]);
+		assert_eq!(pending_values(&split), vec![json!({"a": 1}), json!({"b": 2})]);
+	}
+
+	fn pending_values(stream: &SseChunkStream) -> Vec<Value> {
+		stream.pending.iter().map(|event| event.as_value()).collect()
+	}
+
+	#[test]
+	fn typed_chunk_parses_the_fields_the_value_consumer_reads() {
+		let payloads = [
+			r#"{"candidates":[{"content":{"parts":[{"text":"hi"}]},"finishReason":"STOP"}]}"#,
+			r#"{"candidates":[{"content":{"parts":[{"text":"th","thought":true,"thoughtSignature":"sig"}]}}]}"#,
+			r#"{"candidates":[{"content":{"parts":[{"functionCall":{"name":"read","args":{"path":"/tmp"}}}]}}]}"#,
+			r#"{ "responseId" : "resp-1", "usageMetadata": {"totalTokenCount": 9} }"#,
+			// wrong-typed members read as absent
+			r#"{"candidates":[{"content":{"parts":[{"text":42}]},"finishReason":7}]}"#,
+			// null members read as absent
+			r#"{"candidates":[{"content":{"parts":[{"text":null}]},"finishReason":null}]}"#,
+			// empty candidates list
+			r#"{"candidates":[]}"#,
+		];
+		for payload in payloads {
+			let typed = parse_typed_google_chunk(payload).unwrap();
+			let value: Value = serde_json::from_str(payload).unwrap();
+			assert_eq!(
+				typed.response_id.as_deref(),
+				value.get("responseId").and_then(Value::as_str),
+				"responseId mismatch on {payload}"
+			);
+			let typed_candidate = typed.candidates.first();
+			let value_candidate = value.get("candidates").and_then(Value::as_array).and_then(|list| list.first());
+			assert_eq!(
+				typed_candidate.map(|candidate| candidate.finish_reason.as_deref()).flatten(),
+				value_candidate.and_then(|candidate| candidate.get("finishReason")).and_then(Value::as_str),
+				"finishReason mismatch on {payload}"
+			);
+			let typed_parts: &[TypedGooglePart] = typed_candidate
+				.and_then(|candidate| candidate.content.as_ref())
+				.map(|content| content.parts.as_slice())
+				.unwrap_or(&[]);
+			let value_parts: Vec<Value> = value_candidate
+				.and_then(|candidate| candidate.get("content"))
+				.and_then(|content| content.get("parts"))
+				.and_then(Value::as_array)
+				.map(|parts| parts.to_vec())
+				.unwrap_or_default();
+			assert_eq!(typed_parts.len(), value_parts.len(), "part count mismatch on {payload}");
+			for (typed_part, value_part) in typed_parts.iter().zip(value_parts.iter()) {
+				assert_eq!(typed_part.text.as_deref(), value_part.get("text").and_then(Value::as_str), "text mismatch on {payload}");
+				assert_eq!(typed_part.thought, value_part.get("thought").and_then(Value::as_bool), "thought mismatch on {payload}");
+				assert_eq!(
+					typed_part.thought_signature.as_deref(),
+					value_part.get("thoughtSignature").and_then(Value::as_str),
+					"thoughtSignature mismatch on {payload}"
+				);
+				assert_eq!(
+					typed_part.function_call.as_ref(),
+					value_part.get("functionCall"),
+					"functionCall mismatch on {payload}"
+				);
+			}
+		}
 	}
 
 	fn byte_stream(chunks: Vec<&[u8]>) -> SseChunkStream {
@@ -1835,6 +2243,7 @@ mod tests {
 			&bytes[second_split..],
 		]);
 		let chunk = stream.next().await.unwrap().unwrap();
+		let chunk = chunk.as_value();
 		assert_eq!(chunk["candidates"][0]["content"]["parts"][0]["text"], json!("caf\u{e9} \u{1F388}"));
 		assert!(stream.next().await.unwrap().is_none());
 	}

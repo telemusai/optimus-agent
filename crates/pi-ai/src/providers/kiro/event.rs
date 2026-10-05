@@ -17,7 +17,62 @@ pub fn crc32(bytes: &[u8]) -> u32 {
 
 pub struct Frame {
     pub headers: HashMap<String, String>,
-    pub payload: Value,
+    pub payload: FramePayload,
+}
+
+/// One frame's JSON payload: the typed shape when the payload fits it, the
+/// parsed `Value` otherwise (non-object payloads). Both preserve the
+/// consumer's exact read semantics.
+pub enum FramePayload {
+    Typed(TypedKiroPayload),
+    Value(Value),
+}
+
+/// A Kiro frame payload in the consumer's own shape: the members
+/// `State::process` reads, parsed without building a `Value` DOM. Presence
+/// booleans keep `Value::get(..).is_some()` semantics (a `null` member
+/// still counts as present); wrong-typed members read as absent.
+#[derive(serde::Deserialize, Default)]
+pub struct TypedKiroPayload {
+    #[serde(rename = "error", default, deserialize_with = "crate::utils::typed_json::any_present")]
+    pub error_present: bool,
+    #[serde(rename = "Error", default, deserialize_with = "crate::utils::typed_json::any_present")]
+    pub error_capital_present: bool,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+    pub content: Option<String>,
+    #[serde(rename = "contextUsagePercentage", default, deserialize_with = "crate::utils::typed_json::optional_f64")]
+    pub context_usage_percentage: Option<f64>,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+    pub usage: Option<Value>,
+    #[serde(rename = "inputTokens", default, deserialize_with = "crate::utils::typed_json::optional_u64")]
+    pub input_tokens: Option<u64>,
+    #[serde(rename = "outputTokens", default, deserialize_with = "crate::utils::typed_json::optional_u64")]
+    pub output_tokens: Option<u64>,
+    #[serde(rename = "toolUseId", default, deserialize_with = "crate::utils::typed_json::optional_string")]
+    pub tool_use_id: Option<String>,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+    pub name: Option<String>,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+    pub input: Option<Value>,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_bool")]
+    pub stop: Option<bool>,
+    #[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+    pub message: Option<String>,
+}
+
+fn parse_payload(payload: &[u8]) -> Result<FramePayload, String> {
+    let looks_like_object = payload
+        .iter()
+        .find(|byte| !byte.is_ascii_whitespace())
+        .map(|byte| *byte == b'{')
+        .unwrap_or(false);
+    if looks_like_object {
+        if let Ok(typed) = serde_json::from_slice::<TypedKiroPayload>(payload) {
+            return Ok(FramePayload::Typed(typed));
+        }
+    }
+    let value = serde_json::from_slice::<Value>(payload).map_err(|_| "Invalid JSON in Kiro event")?;
+    Ok(FramePayload::Value(value))
 }
 
 pub fn decode(buffer: &mut Vec<u8>) -> Result<Vec<Frame>, String> {
@@ -87,11 +142,92 @@ pub fn decode(buffer: &mut Vec<u8>) -> Result<Vec<Frame>, String> {
             }
             cursor += size;
         }
-        let payload = serde_json::from_slice(&frame[12 + header_len..total - 4])
-            .map_err(|_| "Invalid JSON in Kiro event")?;
+        let payload = parse_payload(&frame[12 + header_len..total - 4])?;
         frames.push(Frame { headers, payload });
         offset += total;
     }
     buffer.drain(..offset);
     Ok(frames)
+}
+
+#[cfg(test)]
+mod typed_payload_tests {
+	use super::{parse_payload, FramePayload};
+	use serde_json::Value;
+
+	/// The typed reads must equal the Value reads for every payload the
+	/// Value consumer accepted (wrong-typed members read as absent, nulls
+	/// keep presence semantics, non-objects fall back to Value).
+	#[test]
+	fn typed_payload_reads_match_the_value_reads() {
+		let payloads: Vec<&[u8]> = vec![
+			br#"{"content":"Hi"}"#,
+			br#"{"content":null}"#,
+			br#"{"content":42}"#,
+			br#"{"usage":{"inputTokens":11,"outputTokens":7}}"#,
+			br#"{"usage":null,"inputTokens":3,"outputTokens":4}"#,
+			br#"{"inputTokens":3,"outputTokens":4}"#,
+			br#"{"usage":"nope"}"#,
+			br#"{"contextUsagePercentage":0.1}"#,
+			br#"{"contextUsagePercentage":750.0}"#,
+			br#"{"toolUseId":"t-1","name":"read"}"#,
+			br#"{"toolUseId":5,"name":""}"#,
+			br#"{"input":"{\"a\":1}"}"#,
+			br#"{"input":null}"#,
+			br#"{"input":{"a":1}}"#,
+			br#"{"stop":true}"#,
+			br#"{"stop":"true"}"#,
+			br#"{"error":null}"#,
+			br#"{"Error":"boom"}"#,
+			br#"{"message":"exception detail"}"#,
+			br#"{"unknown":"member"}"#,
+			b"[1, 2]",
+			b"\"just text\"",
+		];
+		for payload in &payloads {
+			let frame = match parse_payload(payload) {
+				Ok(FramePayload::Typed(typed)) => typed,
+				Ok(FramePayload::Value(_)) => continue, // fallback: Value path is the old consumer
+				Err(_) => panic!("payload rejected: {payload:?}"),
+			};
+			let value: Value = serde_json::from_slice(payload).unwrap();
+			assert_eq!(
+				frame.error_present || frame.error_capital_present,
+				value.get("error").is_some() || value.get("Error").is_some(),
+				"error presence mismatch on {payload:?}"
+			);
+			assert_eq!(
+				frame.content.as_deref(),
+				value["content"].as_str(),
+				"content mismatch on {payload:?}"
+			);
+			assert_eq!(
+				frame.context_usage_percentage,
+				value["contextUsagePercentage"].as_f64(),
+				"contextUsagePercentage mismatch on {payload:?}"
+			);
+			assert_eq!(frame.usage.as_ref(), value.get("usage"), "usage mismatch on {payload:?}");
+			let usage = frame.usage.as_ref();
+			let (input, out) = match usage {
+				Some(usage) => (usage["inputTokens"].as_u64(), usage["outputTokens"].as_u64()),
+				None => (frame.input_tokens, frame.output_tokens),
+			};
+			let old_usage = value.get("usage").unwrap_or(&value);
+			assert_eq!(input, old_usage["inputTokens"].as_u64(), "inputTokens mismatch on {payload:?}");
+			assert_eq!(out, old_usage["outputTokens"].as_u64(), "outputTokens mismatch on {payload:?}");
+			assert_eq!(
+				frame.tool_use_id.as_deref(),
+				value["toolUseId"].as_str(),
+				"toolUseId mismatch on {payload:?}"
+			);
+			assert_eq!(frame.name.as_deref(), value["name"].as_str(), "name mismatch on {payload:?}");
+			assert_eq!(frame.input.as_ref(), value.get("input"), "input mismatch on {payload:?}");
+			assert_eq!(frame.stop, value["stop"].as_bool(), "stop mismatch on {payload:?}");
+			assert_eq!(
+				frame.message.as_deref(),
+				value["message"].as_str(),
+				"message mismatch on {payload:?}"
+			);
+		}
+	}
 }
