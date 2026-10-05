@@ -9,3 +9,4 @@
 - Started fresh sessions on the CAS-v2 snapshot format, added per-variable change detection, budget-aware partial snapshots that land durable state instead of discarding it on timeout, and an opt-in adaptive snapshot debounce for large states.
 - Added render memoization for transcript components, gated the idle fallback repaint, and added an explicit UI acknowledgement deadline with timeout classification.
 - Extended the performance-metrics operation and measurement allowlists for UI event/tick operations, snapshot substage timing and submit-latency measurements.
+- Ported onto upstream v0.1.24: the SSE idle deadline rides the new single-pass SSE readers and pooled HTTP clients, and the snapshot/UI work composes with the merged local-work reduction; the local pi-ai variant's defaultMaxTokens/sglangTokenBudget registry plumbing is not part of this port (upstream pi-ai has no such fields).
