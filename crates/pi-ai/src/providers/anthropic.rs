@@ -649,10 +649,47 @@ fn anthropic_sse_error(data: &str, request_id: Option<&str>) -> StreamFailureErr
 /// (the consumer copies them into blocks/events anyway).
 #[derive(serde::Deserialize, Debug)]
 struct TypedContentBlockDelta {
+	/// The `type` member gates the typed fast path: only the exact
+	/// `content_block_delta` string claims it. Any other value, a wrong
+	/// type, a missing member, or a duplicate falls back to the `Value`
+	/// consumer, which dispatches on `get("type")` exactly like the
+	/// pre-typed code.
+	#[serde(rename = "type", deserialize_with = "content_block_delta_tag::deserialize")]
+	#[allow(dead_code)] // zero-sized gate marker: written by serde, never read
+	event_tag: ContentBlockDeltaTag,
 	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_i64")]
 	index: Option<i64>,
 	#[serde(default)]
 	delta: Option<TypedAnthropicDelta>,
+}
+
+/// Marker for the exact `content_block_delta` type member.
+#[derive(Debug)]
+struct ContentBlockDeltaTag;
+
+mod content_block_delta_tag {
+	use super::ContentBlockDeltaTag;
+
+	pub fn deserialize<'de, D>(deserializer: D) -> Result<ContentBlockDeltaTag, D::Error>
+	where
+		D: serde::Deserializer<'de>,
+	{
+		struct TagVisitor;
+		impl<'de> serde::de::Visitor<'de> for TagVisitor {
+			type Value = ContentBlockDeltaTag;
+			fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+				formatter.write_str("the exact string \"content_block_delta\"")
+			}
+			fn visit_str<E: serde::de::Error>(self, value: &str) -> Result<Self::Value, E> {
+				if value == "content_block_delta" {
+					Ok(ContentBlockDeltaTag)
+				} else {
+					Err(E::invalid_value(serde::de::Unexpected::Str(value), &self))
+				}
+			}
+		}
+		deserializer.deserialize_str(TagVisitor)
+	}
 }
 
 /// The `delta` member of a `content_block_delta`: `type` plus the payload
@@ -678,6 +715,24 @@ impl TypedAnthropicDelta {
 	}
 }
 
+#[cfg(test)]
+impl TypedContentBlockDelta {
+	/// Test view: the fields the Value branch reads, off a parsed `Value`.
+	fn from_value(value: &Value) -> Self {
+		Self {
+			event_tag: ContentBlockDeltaTag,
+			index: value.get("index").and_then(Value::as_i64),
+			delta: value.pointer("/delta").map(|delta| TypedAnthropicDelta {
+				type_: delta.get("type").and_then(Value::as_str).map(str::to_string),
+				text: delta.get("text").and_then(Value::as_str).map(str::to_string),
+				thinking: delta.get("thinking").and_then(Value::as_str).map(str::to_string),
+				partial_json: delta.get("partial_json").and_then(Value::as_str).map(str::to_string),
+				signature: delta.get("signature").and_then(Value::as_str).map(str::to_string),
+			}),
+		}
+	}
+}
+
 /// One event from the Anthropic stream: the typed hot delta, or the
 /// repaired `Value` for every other shape.
 #[derive(Debug)]
@@ -686,15 +741,14 @@ enum AnthropicParsed {
 	Value(Value),
 }
 
-/// Parse one SSE payload for the consumer: the typed shape for a strict
-/// `content_block_delta` event, the repaired `Value` otherwise. Error text
-/// matches `parse_json_with_repair` exactly so failure reporting is
-/// unchanged.
-fn parse_typed_anthropic_event(data: &str, event_name: Option<&str>) -> Result<AnthropicParsed, String> {
-	if event_name == Some("content_block_delta") {
-		if let Ok(typed) = serde_json::from_str::<TypedContentBlockDelta>(data) {
-			return Ok(AnthropicParsed::Delta(typed));
-		}
+/// Parse one SSE payload for the consumer: the typed shape when the
+/// payload's `type` member is exactly `content_block_delta` (the member
+/// the Value consumer dispatches on, not the SSE event name), the repaired
+/// `Value` otherwise. Error text matches `parse_json_with_repair` exactly
+/// so failure reporting is unchanged.
+fn parse_typed_anthropic_event(data: &str) -> Result<AnthropicParsed, String> {
+	if let Ok(typed) = serde_json::from_str::<TypedContentBlockDelta>(data) {
+		return Ok(AnthropicParsed::Delta(typed));
 	}
 	parse_json_with_repair(data).map(AnthropicParsed::Value)
 }
@@ -755,7 +809,7 @@ impl AnthropicEventIterator {
 				continue;
 			}
 
-			match parse_typed_anthropic_event(&sse.data, sse.event.as_deref()) {
+			match parse_typed_anthropic_event(&sse.data) {
 				Ok(event) => {
 					let event_type = match &event {
 						AnthropicParsed::Delta(_) => "content_block_delta",
@@ -2667,6 +2721,49 @@ mod tests {
 		})
 	}
 
+	/// The typed fast path must be gated on the payload's `type` member,
+	/// not the SSE event name: a `message_stop` payload delivered under the
+	/// `content_block_delta` event name still runs the message_stop branch
+	/// (and sets `saw_message_end`), exactly like the Value consumer.
+	#[test]
+	fn payload_type_member_not_the_event_name_gates_the_typed_path() {
+		let payload = r#"{"type":"message_stop"}"#;
+		match parse_typed_anthropic_event(payload).expect("parse") {
+			AnthropicParsed::Value(value) => {
+				assert_eq!(value.get("type").and_then(Value::as_str), Some("message_stop"));
+			}
+			AnthropicParsed::Delta(_) => panic!("payload with type=message_stop must take the Value path"),
+		}
+		// end to end: the iterator must bookkeep the message_stop and not
+		// fail with "ended before message_stop" at end of stream.
+		let body = concat!(
+			"event: message_start\ndata: {\"type\":\"message_start\",\"message\":{}}\n\n",
+			"event: content_block_delta\ndata: {\"type\":\"message_stop\"}\n\n",
+		);
+		let events = collect_events(body);
+		assert_eq!(events.len(), 2, "{events:?}");
+		assert_eq!(
+			events[1].get("type").and_then(Value::as_str),
+			Some("message_stop"),
+			"the message_stop payload must survive as its own event"
+		);
+	}
+
+	/// A payload without a top-level `type` member must take the Value path
+	/// (the old dispatch read `get("type").and_then(as_str)` = None and
+	/// silently ignored it), never a processed typed delta.
+	#[test]
+	fn missing_type_member_takes_the_value_path() {
+		let payload = r#"{"index":0,"delta":{"type":"text_delta","text":"hi"}}"#;
+		match parse_typed_anthropic_event(payload).expect("parse") {
+			AnthropicParsed::Value(value) => {
+				assert_eq!(value.get("type"), None);
+				assert_eq!(value.pointer("/delta/text").and_then(Value::as_str), Some("hi"));
+			}
+			AnthropicParsed::Delta(_) => panic!("type-less payload must take the Value path"),
+		}
+	}
+
 	#[test]
 	fn typed_delta_parses_the_fields_the_value_branch_reads() {
 		let payloads = [
@@ -2683,14 +2780,11 @@ mod tests {
 			r#"{"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"x","extra":1},"extra":"y"}"#,
 		];
 		for payload in payloads {
-			let typed = parse_typed_anthropic_event(payload, Some("content_block_delta")).unwrap();
+			let typed = parse_typed_anthropic_event(payload).unwrap();
 			let value = parse_json_with_repair(payload).unwrap();
 			let (typed_event, typed_value) = match typed {
 				AnthropicParsed::Delta(typed) => (typed, None),
-				AnthropicParsed::Value(value) => (
-					serde_json::from_str::<TypedContentBlockDelta>(payload).unwrap(),
-					Some(value),
-				),
+				AnthropicParsed::Value(value) => (TypedContentBlockDelta::from_value(&value), Some(value)),
 			};
 			let _ = typed_value;
 			let value_index = value.get("index").and_then(Value::as_i64);

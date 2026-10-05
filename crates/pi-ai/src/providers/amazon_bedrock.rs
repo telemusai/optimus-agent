@@ -1727,6 +1727,20 @@ struct BedrockPayload {
 	usage: Option<Value>,
 }
 
+/// The Value fallback: read each member off the DOM exactly the way the
+/// pre-typed code did, so a payload the typed struct rejects (wrong-typed
+/// members, duplicate keys) keeps its exact behavior.
+fn bedrock_payload_from_value(value: &Value) -> BedrockPayload {
+	BedrockPayload {
+		content_block_index: value.get("contentBlockIndex").and_then(Value::as_u64),
+		role: value.get("role").and_then(Value::as_str).map(str::to_string),
+		start: value.get("start").cloned(),
+		delta: value.get("delta").cloned(),
+		stop_reason: value.get("stopReason").and_then(Value::as_str).map(str::to_string),
+		usage: value.get("usage").cloned(),
+	}
+}
+
 /// Map a decoded frame onto the `ConverseStreamOutput` member the TypeScript switches on.
 pub fn parse_bedrock_stream_event(frame: &EventStreamFrame) -> Result<BedrockStreamEvent, ProviderError> {
 	let message_type = frame.headers.get(":message-type").map(String::as_str).unwrap_or("event");
@@ -1774,8 +1788,19 @@ pub fn parse_bedrock_stream_event(frame: &EventStreamFrame) -> Result<BedrockStr
 			}
 			BedrockPayload::default()
 		} else {
-			serde_json::from_slice::<BedrockPayload>(&frame.payload)
-				.map_err(|error| ProviderError::message(error.to_string()))?
+			match serde_json::from_slice::<BedrockPayload>(&frame.payload) {
+				Ok(payload) => payload,
+				// A shape the typed struct cannot cover (a wrong-typed
+				// member such as a string `contentBlockIndex`, duplicate
+				// keys) keeps the unchanged Value consumer semantics: parse
+				// the DOM and read each member the way the pre-typed code
+				// did. Malformed JSON keeps the old error.
+				Err(_) => {
+					let value: Value = serde_json::from_slice(&frame.payload)
+						.map_err(|error| ProviderError::message(error.to_string()))?;
+					bedrock_payload_from_value(&value)
+				}
+			}
 		}
 	};
 
@@ -2505,57 +2530,100 @@ mod tests {
 
 	#[test]
 	fn typed_payload_reads_match_the_value_reads() {
-		let payloads: Vec<&[u8]> = vec![
-			br#"{"contentBlockIndex":2,"delta":{"text":"hi"}}"#,
-			br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\":1}"}}}"#,
-			br#"{"start":{"toolUse":{"toolUseId":"t1","name":"read"}},"contentBlockIndex":1}"#,
-			br#"{"role":"assistant"}"#,
-			br#"{"stopReason":"end_turn"}"#,
-			br#"{"usage":{"inputTokens":5,"outputTokens":2}}"#,
-			// wrong-typed members read as absent
-			br#"{"contentBlockIndex":"2","role":7,"stopReason":42}"#,
+		// (event type, payload) pairs, all through the production
+		// decode + parse path; the expected events use the pre-typed Value
+		// reads so the typed shape must agree field for field.
+		let cases: Vec<(&str, &[u8])> = vec![
+			("contentBlockDelta", br#"{"contentBlockIndex":2,"delta":{"text":"hi"}}"#),
+			("contentBlockDelta", br#"{"contentBlockIndex":0,"delta":{"toolUse":{"input":"{\"a\":1}"}}}"#),
+			("contentBlockStart", br#"{"start":{"toolUse":{"toolUseId":"t1","name":"read"}},"contentBlockIndex":1}"#),
+			("messageStart", br#"{"role":"assistant"}"#),
+			("messageStop", br#"{"stopReason":"end_turn"}"#),
+			("metadata", br#"{"usage":{"inputTokens":5,"outputTokens":2}}"#),
+			// wrong-typed members read as absent (no stream abort)
+			("contentBlockDelta", br#"{"contentBlockIndex":"2","role":7,"stopReason":42}"#),
+			("contentBlockDelta", br#"{"contentBlockIndex":1e3,"delta":{"text":"f"}}"#),
 			// null members read as absent
-			br#"{"contentBlockIndex":null,"role":null,"stopReason":null,"delta":null}"#,
+			("contentBlockDelta", br#"{"contentBlockIndex":null,"role":null,"stopReason":null,"delta":null}"#),
 			// unknown members ignored
-			br#"{"extra":1,"contentBlockIndex":3}"#,
-			// non-object payload: every read absent, no error
-			br#"[1,2,3]"#,
-			br#""text""#,
+			("contentBlockDelta", br#"{"extra":1,"contentBlockIndex":3}"#),
+			// non-object payloads: every read absent, no error
+			("contentBlockDelta", b"[1, 2]"),
+			("messageStart", b"\"text\""),
 		];
-		for payload in payloads.iter().copied() {
-			let looks_like_object = payload
-				.iter()
-				.find(|byte| !byte.is_ascii_whitespace())
-				.map(|byte| *byte == b'{')
-				.unwrap_or(false);
-			let typed: BedrockPayload = if looks_like_object {
-				serde_json::from_slice(payload).ok().unwrap_or_default()
-			} else {
-				BedrockPayload::default()
-			};
+		for (event_type, payload) in cases {
+			let mut buffer = frame(
+				&[(":message-type", "event"), (":event-type", event_type)],
+				payload,
+			);
+			let frames = decode_event_stream_frames(&mut buffer).unwrap();
+			assert_eq!(frames.len(), 1);
+			let event = parse_bedrock_stream_event(&frames[0])
+				.unwrap_or_else(|error| panic!("{event_type} {payload:?}: {error}"));
 			let value: Value = serde_json::from_slice(payload).unwrap();
-			assert_eq!(
-				typed.content_block_index,
-				value.get("contentBlockIndex").and_then(Value::as_u64),
-				"contentBlockIndex mismatch on {payload:?}"
-			);
-			assert_eq!(
-				typed.role.as_deref(),
-				value.get("role").and_then(Value::as_str),
-				"role mismatch on {payload:?}"
-			);
-			assert_eq!(
-				typed.stop_reason.as_deref(),
-				value.get("stopReason").and_then(Value::as_str),
-				"stopReason mismatch on {payload:?}"
-			);
-			assert_eq!(typed.start.as_ref(), value.get("start"), "start mismatch on {payload:?}");
-			assert_eq!(typed.delta.as_ref(), value.get("delta"), "delta mismatch on {payload:?}");
-			assert_eq!(typed.usage.as_ref(), value.get("usage"), "usage mismatch on {payload:?}");
+			let content_block_index = value
+				.get("contentBlockIndex")
+				.and_then(Value::as_u64)
+				.unwrap_or(0) as usize;
+			let expected = match event_type {
+				"messageStart" => BedrockStreamEvent::MessageStart {
+					role: value
+						.get("role")
+						.and_then(Value::as_str)
+						.unwrap_or("user")
+						.to_string(),
+				},
+				"contentBlockStart" => BedrockStreamEvent::ContentBlockStart {
+					content_block_index,
+					start: value.get("start").cloned().unwrap_or(Value::Null),
+				},
+				"contentBlockDelta" => BedrockStreamEvent::ContentBlockDelta {
+					content_block_index,
+					delta: value.get("delta").cloned().unwrap_or(Value::Null),
+				},
+				"messageStop" => BedrockStreamEvent::MessageStop {
+					stop_reason: value
+						.get("stopReason")
+						.and_then(Value::as_str)
+						.map(str::to_string),
+				},
+				"metadata" => BedrockStreamEvent::Metadata {
+					usage: value.get("usage").cloned().unwrap_or(Value::Null),
+				},
+				other => panic!("unknown event type {other}"),
+			};
+			assert_eq!(event, expected, "mismatch on {event_type} {payload:?}");
 		}
 	}
 
-	use super::*;
+	/// Wrong-typed `contentBlockIndex` must not abort the stream: the
+	/// pre-typed reads treated it as absent (index 0).
+	#[test]
+	fn wrong_typed_content_block_index_keeps_the_value_reads() {
+		for payload in [
+			&br#"{"contentBlockIndex":"2","delta":{"text":"hi"}}"#[..],
+			&br#"{"contentBlockIndex":1e3,"delta":{"text":"hi"}}"#[..],
+			&br#"{"contentBlockIndex":18446744073709551616,"delta":{"text":"hi"}}"#[..],
+		] {
+			let mut buffer = frame(
+				&[(":message-type", "event"), (":event-type", "contentBlockDelta")],
+				payload,
+			);
+			let frames = decode_event_stream_frames(&mut buffer).unwrap();
+			match parse_bedrock_stream_event(&frames[0]) {
+				Ok(BedrockStreamEvent::ContentBlockDelta { content_block_index, delta }) => {
+					assert_eq!(content_block_index, 0, "wrong-typed index must read as 0");
+					assert_eq!(
+						delta.get("text").and_then(Value::as_str),
+						Some("hi"),
+						"delta must still parse on {payload:?}"
+					);
+				}
+				other => panic!("expected ContentBlockDelta, got {other:?} on {payload:?}"),
+			}
+		}
+	}
+use super::*;
 	use crate::types::{InputModality, ModelCost, ThinkingLevelMap, ToolResultMessage};
 
 	fn model(id: &str, name: &str) -> Model {

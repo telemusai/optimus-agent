@@ -435,9 +435,6 @@ where
 }
 
 #[cfg(test)]
-
-
-#[cfg(test)]
 mod any_present_tests {
 	use super::any_present;
 	use serde::Deserialize;
@@ -459,6 +456,7 @@ mod any_present_tests {
 	}
 }
 
+#[cfg(test)]
 mod tests {
 	use super::*;
 	use serde::Deserialize;
