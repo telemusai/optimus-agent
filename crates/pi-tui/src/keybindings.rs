@@ -386,7 +386,20 @@ thread_local! {
     static GLOBAL_KEYBINDINGS: RefCell<Option<KeybindingsManager>> = const { RefCell::new(None) };
 }
 
+thread_local! {
+    /// Monotonic counter bumped on every global keybinding swap. Render caches
+    /// fold it into their key so hint text like `(Ctrl+O to expand)` repaints
+    /// after a remap (see `set_keybindings` callers in the interactive host).
+    static KEYBINDINGS_REVISION: std::cell::Cell<u64> = const { std::cell::Cell::new(0) };
+}
+
+/// Current global keybindings revision; starts at 0 and never resets.
+pub fn keybindings_revision() -> u64 {
+    KEYBINDINGS_REVISION.with(|revision| revision.get())
+}
+
 pub fn set_keybindings(keybindings: KeybindingsManager) {
+    KEYBINDINGS_REVISION.with(|revision| revision.set(revision.get().wrapping_add(1)));
     GLOBAL_KEYBINDINGS.with(|k| *k.borrow_mut() = Some(keybindings));
 }
 
@@ -403,6 +416,14 @@ pub fn get_keybindings() -> KeybindingsManager {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A11: every global keybinding swap bumps the revision render caches key on.
+    #[test]
+    fn revision_bumps_on_set_keybindings() {
+        let before = keybindings_revision();
+        set_keybindings(KeybindingsManager::new(tui_keybindings(), IndexMap::new()));
+        assert!(keybindings_revision() > before);
+    }
 
     #[test]
     fn defaults_resolve_and_match() {

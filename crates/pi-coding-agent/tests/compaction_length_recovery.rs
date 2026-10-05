@@ -163,7 +163,7 @@ async fn split_history_and_turn_prefix_have_independent_bounded_length_recovery(
         messages_to_summarize:vec![message("HISTORY-WORK")], turn_prefix_messages:vec![message("PREFIX-WORK")],
         is_split_turn:true, tokens_before:250_001.0, retained_state_anchor: None, previous_summary:None, file_ops:create_file_ops(), settings:default_compaction_settings() };
     let metrics = CompactionMetrics::new(None, &model);
-    let result = compact_with_metrics(&preparation, &model, "fixture-unused", None, None, None,
+    let result = compact_with_metrics(&preparation, &model, "fixture-unused", None, None, None, None,
         default_summary_call_runner(None), None, None, &metrics).await.unwrap();
     assert!(result.summary.contains(VALID) && result.summary.contains(PREFIX));
     let seen = seen.lock().unwrap();

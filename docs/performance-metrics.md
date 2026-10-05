@@ -6,6 +6,8 @@ Prime's performance metrics are a disposable, process-local JSONL sidecar. They 
 
 The coding-agent boundary creates a recorder only when `PRIME_AGENT_PERFORMANCE_METRICS` is exactly one of `1`, `true`, `yes`, or `on` (case-insensitive). `PRIME_AGENT_PERFORMANCE_METRICS_DIR` can select an absolute sidecar root. The default is `<agentDir>/performance-metrics`.
 
+`PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT` enables the one bounded error-text field described under "Failure classification". It defaults to off, accepts the same `1`/`true`/`yes`/`on` tokens, and is only read when the metrics opt-in itself is on. With it off, failure records keep the class, status, and stage fields and drop `error_message`.
+
 Each recorder uses a unique file named `performance-v1-<session>-<instance>.jsonl`. Rotation creates `.1`, `.2`, and `.3` by default. The file-count and byte limits apply to one recorder instance and its own prefix only. They do not currently impose a directory-wide bound across repeated session reopen or unrelated recorder instances. Directory-wide retention remains a live gate because deleting files from active or unrelated sessions is unsafe without an ownership protocol. Sidecars can be deleted without session rollback. Disabling the opt-in is the complete behavior rollback.
 
 Defaults and hard clamps:
@@ -28,13 +30,13 @@ The Rust metric types and recorder live in `crates/pi-agent-core/src/performance
 
 ### Operation and measurement allowlists
 
-Operations are `logical_request`, `provider_attempt`, `tool`, `snapshot`, `compaction`, `file_retry`, `session_reopen`, `session_input`, and `recorder`. The Rust host also records `compaction_prepare`, `compaction_history`, `compaction_prefix`, `compaction_native`, `compaction_persist`, and `compaction_restore`.
+Operations are `logical_request`, `provider_attempt`, `tool`, `snapshot`, `compaction`, `file_retry`, `session_reopen`, `session_input`, `recorder`, and `daemon_lifecycle`. The Rust host also records `compaction_prepare`, `compaction_history`, `compaction_prefix`, `compaction_native`, `compaction_persist`, and `compaction_restore`.
 
 Measurements are `total_ms`, `wait_ms`, `dispatch_to_response_headers_ms`, `transport_open_ack_ms`, `dispatch_to_first_event_ms`, `dispatch_to_first_visible_ms`, `local_gateway_wait_ms`, `upstream_wait_ms`, `serialization_ms`, `serialization_cpu_ms`, `write_ms`, `queue_ms`, `next_cell_delay_ms`, `reopen_ms`, `serialized_bytes`, `written_bytes`, `read_bytes`, `retry_count`, `attempt_count`, `attempt_ordinal`, and `dropped_count`.
 
 `transport_open_ack_ms` is the pre-network `onPayload` edge to a transport-level send acknowledgement. A WebSocket transport has no HTTP response yet when it reports that its socket accepted the bytes, so it calls `onResponse` with the headers `x-optimus-transport: websocket` and `x-optimus-response-edge: transport_send_ack`. The host records that instant here and leaves `dispatch_to_response_headers_ms` `null`, because no HTTP header edge was observed. A response without the ack marker keeps the normal header-edge meaning, so the two stages are never mixed. The Azure WebSocket `transport_open_ack_ms` distribution and the SSE `dispatch_to_response_headers_ms` distribution measure different events and must not be compared as one population.
 
-A measurement is a finite nonnegative number or `null`. `null` means unavailable. It is not zero. Unknown keys and arbitrary runtime fields are removed. Correlation and provider/model/API strings are control-character sanitized and length bounded. The schema has no prompt, content, arguments, error text, path, header, credential, reasoning text, or checkpoint field.
+A measurement is a finite nonnegative number or `null`. `null` means unavailable. It is not zero. Unknown keys and arbitrary runtime fields are removed. Correlation and provider/model/API strings are control-character sanitized and length bounded. The schema has no prompt, content, arguments, path, header, credential, reasoning text, or checkpoint field. The only error-text field is the opt-in, bounded, sanitized `error_message` described under "Failure classification"; with that gate off the schema carries no error text at all.
 
 Every persisted record adds:
 
@@ -84,7 +86,7 @@ try {
 }
 ```
 
-Never pass `error`, tool names, file paths, source values, or serialized data to the event. Telemetry must be recorded after authoritative work, and failure to record must be ignored.
+Never pass raw errors, file paths, source values, or serialized data to the event. Tool records carry the tool name through the bounded `identity.tool` field, and failure records carry only the classified `error_class`, `http_status`, and the gated `error_message` described under "Failure classification"; no other error surface exists. Telemetry must be recorded after authoritative work, and failure to record must be ignored.
 
 ## Agent request semantics
 
@@ -120,6 +122,24 @@ The `onPayload` edge is not a socket-write timestamp. It can include provider SD
 `attempt_count` is the number of provider attempts the logical request's own settlement observed, so it is reported for a completed group. A `provider_attempt` record keeps `attempt_count` `null`: one record is one attempt, and its `attempt_ordinal` already says which one it is, so a per-attempt count of `1` would add no information and could be misread as the group count. `provider_attempt.wait_ms` is reported only for ordinal 1: for that attempt it is the same request-start to `onPayload` window as `logical_request.wait_ms`. A retried attempt has no single honest wait and stays `null`.
 
 Each local stream invocation emits one terminal `provider_attempt`. A standalone one-attempt Agent also emits one `logical_request`. A retry-owning host emits exactly one outer logical terminal for the complete retry group. Authoritative raw usage belongs only to `provider_attempt`; the outer logical terminal omits usage. Reporting must not sum nested operation durations. Tool execution emits one terminal `tool` record. Stream deltas do not write metric records.
+
+## Failure classification (A3)
+
+Every terminal `logical_request`, `provider_attempt`, and `tool` failure record can carry three bounded fields. They are also emitted on `daemon_lifecycle` failures.
+
+- `error_class`: one of `auth`, `rate_limit`, `network`, `server`, `client`, `timeout`, `cancelled`, or `unknown`. The class comes from the structured `StreamFailureError`/`StreamFailureInfo` kind when one exists, from the HTTP status (5xx server, 4xx client, 401/403 auth, 429 rate limit), from `reqwest` error categories, or from a bounded message heuristic for plain error strings. `cancelled` is set only by explicit cancellation tokens.
+- `http_status`: the provider HTTP status observed for the failed attempt, when one was observed. It is `null` for transport failures that never reached a response.
+- `error_message`: off by default. When `PRIME_AGENT_PERFORMANCE_METRICS_ERROR_TEXT` enables it, the recorder keeps at most 256 characters, replaces every control character with `?`, and trims the result. Sources are allowlisted: the provider's structured error type code, or the same classification heuristic strings — never a raw provider payload, response body, or I/O error text.
+
+The recorder sanitizes all three on the way in: `error_class` must be a known token or is dropped, `http_status` must be an integer in 100–599, and an ungated `error_message` is dropped rather than recorded. Fields absent from the source stay `null`, which means unobserved, not zero.
+
+## Tool identity (A4)
+
+A `tool` record sets `identity.tool` to the invoked tool name (bounded, control-character sanitized). Tool failures are therefore attributable to the tool without reading any adjacent session content. The field is absent on non-tool operations.
+
+## Daemon lifecycle (A15)
+
+The daemon supervisor writes one `daemon_lifecycle` operation per lifecycle transition, using its own recorder instance named `supervisor-<generation>`. The stages are the fixed tokens `start`, `stop`, `crash`, `stale_detected`, and `relaunch`. Worker-scoped stages put the worker id in `correlation.actionId`; supervisor-scoped stages leave it unset. Outcomes follow the normal allowlist; the supervisor start/stop and worker launch/stop pair the success and failure outcomes, a lost worker connection is a `crash` failure with its bounded error class, a stale-registration detection and reclaim is `stale_detected`, and a recovery-ladder or retry relaunch is `relaunch`. The stale-daemon relaunch client also uses a fixed backoff ladder (1 s, 2 s, 5 s, capped at 10 s) so a stale daemon cannot be relaunched in a hot loop; the ladder is covered by unit tests.
 
 ## Usage and overlap
 

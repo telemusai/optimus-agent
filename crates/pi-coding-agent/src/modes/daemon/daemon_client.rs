@@ -380,7 +380,16 @@ fn default_daemon_request_timeout(command_type: &str) -> u64 {
 const DEFAULT_RECONNECT_TIMEOUT_MS: u64 = 60_000;
 const RECONNECT_CONNECT_TIMEOUT_MS: u64 = 1000;
 const RECONNECT_HELLO_TIMEOUT_MS: u64 = 3000;
-const MAX_RECONNECT_DELAY_MS: u64 = 2000;
+/// A15: the stale-daemon relaunch backoff ladder (1s, 2s, 5s, capped at 10s).
+/// The previous 100ms·2^n ladder capped at 2s let a schema-flap relaunch
+/// loop spin 767 recover_daemon attempts in one minute (09-20 03:38); this
+/// ladder bounds the same window to at most a handful of relaunches.
+const RECONNECT_BACKOFF_LADDER_MS: [u64; 4] = [1000, 2000, 5000, 10_000];
+
+/// The delay after relaunch attempt `attempt` before trying again.
+fn reconnect_backoff_delay_ms(attempt: u32) -> u64 {
+    RECONNECT_BACKOFF_LADDER_MS[(attempt as usize).min(RECONNECT_BACKOFF_LADDER_MS.len() - 1)]
+}
 
 /// LF-only JSONL framing: payload strings may contain U+2028/U+2029, so records
 /// must split on `\n` only (mirrors `attachJsonlLineReader`).
@@ -1370,9 +1379,9 @@ impl DaemonClient {
             if remaining.is_zero() {
                 break;
             }
-            let backoff = 100u64 * 2u64.pow(attempt.min(5));
+            let backoff = reconnect_backoff_delay_ms(attempt);
             let delay_ms = remaining.as_millis() as u64;
-            let delay_ms = delay_ms.min(MAX_RECONNECT_DELAY_MS).min(backoff);
+            let delay_ms = delay_ms.min(backoff);
             attempt += 1;
             tokio::time::sleep(Duration::from_millis(delay_ms)).await;
         }
@@ -1539,6 +1548,21 @@ mod jev_compatibility_tests;
 mod tests {
     use super::super::daemon_protocol::*;
     use super::*;
+
+    #[test]
+    fn reconnect_backoff_ladder_bounded() {
+        // A15: each relaunch waits at least 1s and at most 10s, so a stale
+        // daemon cannot be re-launched in a hot loop.
+        assert_eq!(reconnect_backoff_delay_ms(0), 1000);
+        assert_eq!(reconnect_backoff_delay_ms(1), 2000);
+        assert_eq!(reconnect_backoff_delay_ms(2), 5000);
+        assert_eq!(reconnect_backoff_delay_ms(3), 10_000);
+        assert_eq!(reconnect_backoff_delay_ms(4), 10_000);
+        assert_eq!(reconnect_backoff_delay_ms(100), 10_000);
+        // 767 relaunches in one minute requires an average interval of ~78ms;
+        // the ladder's 1s minimum bounds the same window to at most 60.
+        assert!(reconnect_backoff_delay_ms(0) >= 1000);
+    }
 
     #[test]
     fn jsonl_serialization_is_lf_terminated() {

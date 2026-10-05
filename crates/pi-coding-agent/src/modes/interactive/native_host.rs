@@ -158,6 +158,11 @@ impl<T: TuiComponent> TuiComponent for SharedComponent<T> {
     fn get_selection_regions(&self) -> Vec<pi_tui::selection_metadata::TableCellSelectionRegion> {
         self.0.borrow().get_selection_regions()
     }
+    /// A11: forwarded so the transcript row cache can see the shared
+    /// component's revision (agent messages, assistant messages, notices).
+    fn render_revision(&self) -> Option<u64> {
+        self.0.borrow().render_revision()
+    }
 }
 
 struct Transcript {
@@ -189,6 +194,50 @@ struct Transcript {
     assistants: Vec<Rc<RefCell<AssistantMessageComponent>>>,
     tools: HashMap<String, Rc<RefCell<ToolExecutionComponent>>>,
     wrapped_lines: TranscriptWrapCache,
+    /// A11: memoized render output per row (see `render_row_cached`).
+    row_cache: Vec<RowRenderCache>,
+}
+
+/// A11: per-row render memoization entry, aligned by index with `Transcript::rows`
+/// (rows are append-only; `replace` clears both together). `width_bits` is the
+/// raw f64 width the lines were rendered at, `revision` the row component's
+/// `render_revision`, and `style` the global style epoch (theme + keybindings).
+#[derive(Default)]
+struct RowRenderCache {
+    width_bits: u64,
+    revision: u64,
+    style: u64,
+    lines: Vec<String>,
+}
+
+/// A11: render one transcript row, reusing the previous frame's lines when the
+/// row reports an unchanged revision at the same width and style epoch. Rows
+/// without a revision contract (animated tool panels, extension surfaces) keep
+/// rendering every frame, exactly as before.
+fn render_row_cached(
+    cache: &mut Vec<RowRenderCache>,
+    index: usize,
+    row: &mut Box<dyn TuiComponent>,
+    width: f64,
+    style: u64,
+) -> Vec<String> {
+    let Some(revision) = row.render_revision() else {
+        return row.render(width);
+    };
+    let width_bits = width.to_bits();
+    if let Some(entry) = cache.get(index) {
+        if entry.width_bits == width_bits && entry.revision == revision && entry.style == style {
+            return entry.lines.clone();
+        }
+    }
+    let lines = row.render(width);
+    let entry = RowRenderCache { width_bits, revision, style, lines: lines.clone() };
+    if cache.len() == index {
+        cache.push(entry);
+    } else if let Some(slot) = cache.get_mut(index) {
+        *slot = entry;
+    }
+    lines
 }
 
 #[derive(Default)]
@@ -307,6 +356,7 @@ impl Transcript {
             assistants: Vec::new(),
             tools: HashMap::new(),
             wrapped_lines: TranscriptWrapCache::default(),
+            row_cache: Vec::new(),
         }
     }
     fn replace(&mut self, messages: Vec<AgentMessage>) {
@@ -314,6 +364,8 @@ impl Transcript {
         self.local_receipts.clear();
         self.timeline_cache.clear();
         self.history = None;
+        // A11: rows and their memoized renders are cleared together.
+        self.row_cache.clear();
         self.clipboard_notice = native_clipboard::Notice::default();
         self.request_errors = native_errors::PendingErrors::default();
         self.rows.clear();
@@ -627,15 +679,21 @@ impl TuiComponent for Transcript {
         }
         drop(mode);
         keys.resize(lines.len(), None);
+        // A11: memoize per-row renders so an idle huge transcript stops
+        // re-wrapping/re-styling every unchanged message each frame (monitor
+        // 01a0d88d: idle worst frame 37.3ms at 4 frames/s; target <5ms).
+        // Cached output is byte-identical: a row is skipped only when its own
+        // revision, the width, and the style epoch are all unchanged.
+        let style = render_style_revision();
         if let Some(history) = &mut self.history {
             for (index, row) in history.rows.iter_mut().enumerate() {
-                let rendered = row.render(width);
+                let rendered = render_row_cached(&mut history.row_cache, index, row, width, style);
                 keys.extend(std::iter::repeat_n(history.row_keys.get(&index).cloned(), rendered.len()));
                 lines.extend(rendered);
             }
         }
         for (index, row) in self.rows.iter_mut().enumerate() {
-            let rendered = row.render(width);
+            let rendered = render_row_cached(&mut self.row_cache, index, row, width, style);
             keys.extend(std::iter::repeat_n(self.row_keys.get(&index).cloned(), rendered.len()));
             lines.extend(rendered);
         }
@@ -736,6 +794,9 @@ impl TuiComponent for Transcript {
         for row in &mut self.rows {
             row.invalidate();
         }
+        // A11: an explicit invalidate (theme swap, host refresh) drops all
+        // memoized row output; the next frame re-renders from live state.
+        self.row_cache.clear();
     }
 }
 
@@ -1797,6 +1858,8 @@ async fn run_terminal(
     let mut last_tick = Instant::now();
     let mut terminal_progress = false;
     let mut last_loader_tick = Instant::now();
+    // A12: safety-net cadence for the gated 250ms fallback repaint.
+    let mut fallback_tick_index: u64 = 0;
     let mut selector: Option<Rc<RefCell<pi_tui::components::select_list::SelectList>>> = None;
     let mut overlay: Option<pi_tui::tui::OverlayHandle> = None;
     let (selection_send, selection_receive) = mpsc::channel::<Option<String>>();
@@ -3225,7 +3288,24 @@ async fn run_terminal(
             mode.borrow_mut().tick_working_pulse();
             // Custom components have no complete dirty/revision contract.
             ui_metrics.fallback_tick();
-            ui.borrow_mut().request_render();
+            // A12: the fallback repaint used to fire unconditionally, which
+            // kept every idle session painting 4 frames/s - in multi-MB
+            // transcripts that alone cost ~15% of a core (monitor 01a0d88d).
+            // With `OPTIMUS_UI_IDLE_TICK_PAINT=0` it fires only while an
+            // animation is live (streaming/compaction/bash, covered anyway by
+            // the 80ms loader tick) or every 10th tick as a safety net for
+            // custom components without a dirty contract. Real events keep
+            // repainting immediately. Defaults to the old unconditional paint.
+            fallback_tick_index = fallback_tick_index.wrapping_add(1);
+            let animation_live = {
+                let mode = mode.borrow();
+                mode.is_agent_streaming() || mode.is_agent_compacting() || mode.is_bash_running()
+            };
+            if idle_fallback_paint_enabled() || animation_live || fallback_tick_index % 10 == 0 {
+                ui.borrow_mut().request_render();
+            } else {
+                ui_metrics.fallback_tick_skipped();
+            }
             last_tick = Instant::now();
         }
         // The pi-tui `Loader` repaints on an 80 ms interval; the host tick is
@@ -3265,6 +3345,10 @@ async fn run_terminal(
                 state.session_actions.steering.iter().chain(&state.session_actions.follow_ups).cloned(),
             ) { ui.borrow_mut().request_render(); }
         }
+        // A13: settle submissions whose ack deadline elapsed so a prompt stuck
+        // behind compaction (or a lost reply) reports a bounded timeout instead
+        // of hanging until the session ends.
+        ui_metrics.expire_ack_deadlines();
         let pending_count = ui_metrics.pending_count();
         if transcript.borrow().local_sending_count != pending_count {
             transcript.borrow_mut().local_sending_count = pending_count;
@@ -3274,9 +3358,9 @@ async fn run_terminal(
         ui.borrow_mut().poll_selection_auto_scroll();
         let render_requested = ui.borrow().render_requested();
         let render_started = Instant::now();
-        ui.borrow_mut().run_pending_render(now_ms());
+        let render_phases = ui.borrow_mut().run_pending_render(now_ms());
         if render_requested {
-            ui_metrics.rendered(render_started.elapsed());
+            ui_metrics.rendered(render_started.elapsed(), &render_phases);
             // A scrolled/covered receipt is not proof of a receipt on screen.
             let receipt_visible = !ui.borrow().has_overlay()
                 && (!ui.borrow().is_fullscreen() || ui.borrow().get_scroll_info().is_some_and(|info| info.following));

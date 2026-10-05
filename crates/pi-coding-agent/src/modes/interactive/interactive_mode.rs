@@ -38,7 +38,7 @@ use crate::core::goals::{empty_goal_state, GoalStatus};
 use super::prompt_stash_state::{ClientPromptStashStore, PromptStash, PromptStashState};
 use super::queue_selection::{QueueSelection, QueueSelectionItem};
 use super::resume_hint::format_resume_hint;
-use super::theme::theme::{theme, ThemeColor};
+use super::theme::theme::{render_style_revision, theme, ThemeColor};
 use super::theme::working_icon::{set_working_pulse_frame, WORKING_ICON_INTERVAL_MS};
 
 // ---------------------------------------------------------------------------
@@ -57,6 +57,20 @@ pub const ASYNC_BASH_COMPLETION_PREVIEW_LABEL: &str = "Bash";
 /// `APP_NAME` (config.ts). The TypeScript constant is `piConfigName || "pi"`.
 pub fn app_name() -> String {
     crate::utils::tools_manager::app_name()
+}
+
+/// A12: when true (default, the current behavior) the host's 250ms fallback
+/// tick always repaints. Setting `OPTIMUS_UI_IDLE_TICK_PAINT=0` gates that
+/// repaint: it fires only while an animation is live (streaming, compaction,
+/// bash) or on every 10th tick as a safety net for custom components without
+/// a dirty contract. Read once per process.
+pub fn idle_fallback_paint_enabled() -> bool {
+    static ENABLED: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ENABLED.get_or_init(|| {
+        std::env::var("OPTIMUS_UI_IDLE_TICK_PAINT")
+            .map(|value| !matches!(value.trim().to_ascii_lowercase().as_str(), "0" | "false" | "off" | "no"))
+            .unwrap_or(true)
+    })
 }
 
 const HEARTBEAT_LEGACY_PROMPT_MIN_TOLERANCE_MS: f64 = 15_000.0;
@@ -3301,7 +3315,14 @@ impl InteractiveMode {
     pub fn tick_working_pulse(&mut self) {
         self.pulse_frame += 1;
         set_working_pulse_frame(self.pulse_frame);
-        self.ui.request_render();
+        // A12: the pulse frame is only displayed by running tools/cells, so an
+        // idle pulse needs no repaint. `working_pulse_active` tracks streaming;
+        // when it is false nothing on screen consumes the new frame, and the
+        // host's gated fallback tick (see `idle_fallback_paint_enabled`)
+        // skips the paint. The frame still advances for late consumers.
+        if self.working_pulse_active || idle_fallback_paint_enabled() {
+            self.ui.request_render();
+        }
     }
 
     /// Port of the `showCtrlCExitHint` timeout callback

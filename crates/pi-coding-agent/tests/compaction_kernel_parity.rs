@@ -59,7 +59,8 @@ use pi_coding_agent::core::compaction::compaction::{
     build_summarization_prompt, calculate_context_tokens, compact, default_compaction_settings,
     default_summary_call_runner, estimate_context_tokens, estimate_tokens, generate_summary,
     prepare_compaction, should_compact, should_compact_for_model, CompactionSessionEntry,
-    CompactionSettings, MAX_COMPACTION_CONTEXT_TOKENS,
+    CompactionSettings, COMPACTION_PROMPT_LEGACY, MAX_COMPACTION_CONTEXT_TOKENS,
+    SUMMARY_BUDGET_MODE_LEGACY,
 };
 use pi_coding_agent::core::compaction::utils::{
     serialize_conversation, strip_file_operations, SUMMARIZATION_SYSTEM_PROMPT,
@@ -870,6 +871,10 @@ fn should_compact_boundary_table_pins_the_inclusive_threshold() {
             reserve_tokens: reserve,
             keep_recent_tokens: 20_000.0,
             summary_update_policy: Some("off".to_string()),
+            prompt: Some(COMPACTION_PROMPT_LEGACY.to_string()),
+            summary_budget_mode: Some(SUMMARY_BUDGET_MODE_LEGACY.to_string()),
+            trigger_threshold: None,
+            deadline_ms: 0.0,
         };
         assert_eq!(
             should_compact(context_tokens, context_window, &settings),
@@ -964,6 +969,10 @@ fn should_compact_for_model_boundary_table_pins_both_caps() {
         reserve_tokens: 16_384.0,
         keep_recent_tokens: 20_000.0,
         summary_update_policy: Some("off".to_string()),
+        prompt: Some(COMPACTION_PROMPT_LEGACY.to_string()),
+        summary_budget_mode: Some(SUMMARY_BUDGET_MODE_LEGACY.to_string()),
+        trigger_threshold: None,
+        deadline_ms: 0.0,
     };
     disabled.enabled = false;
     assert!(!should_compact_for_model(900_000.0, &azure_gpt, &disabled));
@@ -1401,11 +1410,11 @@ async fn generate_summary_pins_chunk_covering_budget_formula_and_previous_summar
         // Previous-summary chaining: chunk 1 has no block; every later chunk's
         // suffix starts with the previous chunk's summary in the exact block.
         let expected_suffix = if index == 0 {
-            build_summarization_prompt(None, None, &policy)
+            build_summarization_prompt(None, None, &policy, &COMPACTION_PROMPT_LEGACY.to_string(), None)
         } else {
             format!(
                 "<previous-summary>\n{VALID_SUMMARY}\n</previous-summary>\n\n{}",
-                build_summarization_prompt(None, Some(VALID_SUMMARY), &policy)
+                build_summarization_prompt(None, Some(VALID_SUMMARY), &policy, &COMPACTION_PROMPT_LEGACY.to_string(), None)
             )
         };
         assert_eq!(suffix, expected_suffix, "request {index} suffix");
@@ -1479,7 +1488,7 @@ async fn generate_summary_seeds_the_first_request_with_the_stripped_previous_sum
     let (_chunk, suffix) = body.split_once("\n</conversation>\n\n").unwrap();
     let expected_suffix = format!(
         "<previous-summary>\n{stripped}\n</previous-summary>\n\n{}",
-        build_summarization_prompt(None, Some(&stripped), &policy)
+        build_summarization_prompt(None, Some(&stripped), &policy, &COMPACTION_PROMPT_LEGACY.to_string(), None)
     );
     assert_eq!(suffix, expected_suffix);
     assert!(!suffix.contains("<read-files>"));
@@ -1508,7 +1517,7 @@ async fn generate_summary_seeds_the_first_request_with_the_stripped_previous_sum
         .strip_prefix("<conversation>\n")
         .unwrap();
     let (_chunk, suffix) = body.split_once("\n</conversation>\n\n").unwrap();
-    assert_eq!(suffix, build_summarization_prompt(None, None, &policy));
+    assert_eq!(suffix, build_summarization_prompt(None, None, &policy, &COMPACTION_PROMPT_LEGACY.to_string(), None));
     assert!(!suffix.contains("<previous-summary>"));
 }
 

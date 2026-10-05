@@ -56,7 +56,8 @@ use pi_ai::models::get_model_input_limit;
 use pi_coding_agent::core::compaction::compaction::{
     build_summarization_prompt, default_compaction_settings, estimate_context_tokens,
     estimate_tokens, find_cut_point, prepare_compaction, should_compact_for_model,
-    CompactionSessionEntry, SUMMARY_UPDATE_POLICY_OFF, MAX_COMPACTION_CONTEXT_TOKENS,
+    CompactionSessionEntry, COMPACTION_PROMPT_LEGACY, SUMMARY_UPDATE_POLICY_OFF,
+    MAX_COMPACTION_CONTEXT_TOKENS,
 };
 use pi_coding_agent::core::compaction::utils::{
     serialize_conversation, SUMMARIZATION_SYSTEM_PROMPT,
@@ -2676,6 +2677,8 @@ fn run_bench_local(cli: &Cli) -> Result<i32, String> {
                 Some(custom_instructions.as_str()),
                 None,
                 &policy,
+                &COMPACTION_PROMPT_LEGACY.to_string(),
+                None,
             );
             let suffix_chars = suffix.chars().count();
             for window in [model.context_window, chunk_context_window] {

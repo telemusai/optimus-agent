@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import contextlib
 import datetime
+import decimal
 import errno
 import hashlib
 import json
@@ -20,7 +21,7 @@ import tempfile
 import threading
 import time
 import uuid
-from collections.abc import Iterator
+from collections.abc import Iterable, Iterator
 from typing import Any
 
 from .snapshot_serializer import SnapshotPathMetrics, SnapshotSerializationMetrics, dump_snapshot_value
@@ -40,6 +41,18 @@ DEFAULT_SNAPSHOT_MAX_BYTES = 256 * 1024 * 1024
 DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES = 16 * 1024 * 1024
 MAX_GC_ENTRIES = 4096
 MAX_GC_DELETIONS = 128
+# Per-root ceiling for cached reusable blobs (A5). Mirrors the default aggregate
+# snapshot cap so a full default-sized namespace can be reused between saves.
+MAX_SNAPSHOT_CACHE_BYTES = 256 * 1024 * 1024
+# Digests whose on-disk blob this process already wrote or verified (A5). Bounds
+# unbounded growth of the trust set across a long-lived kernel.
+MAX_VERIFIED_DIGESTS = 4096
+# Share of a snapshot time budget spent serializing; the rest is reserved for
+# the durable write phase so a partial result still commits before the host's
+# hard execution timeout aborts the request (A6).
+SNAPSHOT_BUDGET_SERIALIZATION_SHARE = 0.75
+# Bounded dropped-name list in the wire result; the generation keeps the full list.
+DROPPED_NAMES_RESULT_LIMIT = 8
 
 _HASH_RE = re.compile(r"^[0-9a-f]{64}$")
 _GENERATION_RE = re.compile(r"^[0-9a-f]{32}$")
@@ -429,6 +442,9 @@ def _read_generation(
     pruned = _validate_string_list(value.get("pruned"), "pruned")
     if pruned != sorted(pruned):
         raise SnapshotStoreError("generation pruned names are not sorted")
+    dropped_names = _validate_string_list(value.get("dropped", []), "dropped")
+    if dropped_names != sorted(dropped_names):
+        raise SnapshotStoreError("generation dropped names are not sorted")
     if value.get("logicalSerializedBytes") != logical_bytes:
         raise SnapshotStoreError("generation logical byte count is invalid")
     envelope_bytes = value.get("legacyEnvelopeBytes")
@@ -445,6 +461,7 @@ def _read_generation(
         "savedNames": saved_names,
         "skipped": skipped,
         "pruned": pruned,
+        "dropped": dropped_names,
         "logicalSerializedBytes": logical_bytes,
         "legacyEnvelopeBytes": envelope_bytes,
         "maxBytes": declared_max_bytes,
@@ -555,6 +572,126 @@ def _count_envelope(
     return writer.written
 
 
+# Exact immutable types whose pickled form cannot change while the object
+# identity is unchanged. Anything else (mutable containers, arrays, DataFrames,
+# closures, modules, ...) is re-serialized on every save: an in-place mutation
+# must never be hidden by a cached blob (see test_snapshot_v2.py round-trips).
+_IMMUTABLE_VALUE_TYPES = frozenset(
+    {
+        type(None),
+        bool,
+        int,
+        float,
+        complex,
+        str,
+        bytes,
+        datetime.date,
+        datetime.datetime,
+        datetime.time,
+        datetime.timedelta,
+        datetime.timezone,
+        decimal.Decimal,
+    }
+)
+
+
+class _ReusableBlob:
+    """One name's cached serialization of an immutable value (A5)."""
+
+    __slots__ = ("value", "kind", "blob", "digest", "size")
+
+    def __init__(self, value: Any, blob: bytes, digest: str) -> None:
+        self.value = value
+        self.kind = type(value)
+        self.blob = blob
+        self.digest = digest
+        self.size = len(blob)
+
+
+class _RootHistory:
+    """Per-root snapshot history shared by the CAS v2 and legacy writers.
+
+    ``durations_ms`` feeds the budget-aware fast-names-first ordering (A6);
+    ``reusable`` and ``verified_digests`` feed per-variable change detection and
+    write dedupe (A5). Only content-free data leaves this object through metrics.
+    """
+
+    __slots__ = ("durations_ms", "reusable", "verified_digests", "cached_blob_bytes")
+
+    def __init__(self) -> None:
+        self.durations_ms: dict[str, float] = {}
+        self.reusable: dict[str, _ReusableBlob] = {}
+        self.verified_digests: set[str] = set()
+        self.cached_blob_bytes = 0
+
+
+_ROOT_HISTORY_LOCK = threading.Lock()
+_ROOT_HISTORIES: dict[str, _RootHistory] = {}
+
+
+def _history_key(root: str) -> str:
+    return os.path.normcase(os.path.abspath(root))
+
+
+def snapshot_history_for_root(root: str) -> _RootHistory:
+    """Return (creating if needed) the per-root snapshot history."""
+    key = _history_key(root)
+    with _ROOT_HISTORY_LOCK:
+        return _ROOT_HISTORIES.setdefault(key, _RootHistory())
+
+
+def _forget_missing_names(history: _RootHistory, names: Iterable[str]) -> None:
+    """Drop cached blobs and durations for names no longer in the namespace."""
+    live = {name for name in names if isinstance(name, str)}
+    for name in list(history.reusable):
+        if name not in live:
+            history.cached_blob_bytes -= history.reusable.pop(name).size
+    for name in list(history.durations_ms):
+        if name not in live:
+            del history.durations_ms[name]
+
+
+def _remember_reusable_blob(history: _RootHistory, name: str, value: Any, blob: bytes, digest: str, budget: int) -> None:
+    """Cache one fresh immutable serialization, respecting the memory budget."""
+    if type(value) not in _IMMUTABLE_VALUE_TYPES:
+        return
+    previous = history.reusable.pop(name, None)
+    if previous is not None:
+        history.cached_blob_bytes -= previous.size
+    if history.cached_blob_bytes + len(blob) > budget:
+        return
+    history.reusable[name] = _ReusableBlob(value, blob, digest)
+    history.cached_blob_bytes += len(blob)
+
+
+def order_names_by_serialization_cost(names: Iterable[str], history: _RootHistory) -> list[str]:
+    """Fast names first, slow names last (A6 two-phase ordering).
+
+    Names without history use the median observed duration so a single new
+    huge variable neither runs first nor is permanently starved.
+    """
+    candidates = [name for name in names if isinstance(name, str)]
+    durations = history.durations_ms
+    if not durations or len(candidates) <= 1:
+        return candidates
+    known = sorted(durations.values())
+    fallback = known[len(known) // 2]
+    return sorted(candidates, key=lambda name: (durations.get(name, fallback), name))
+
+
+def snapshot_deadline_ns(budget_ms: int | None) -> int | None:
+    """Serialization deadline for a budget; the remainder is write-phase time."""
+    if budget_ms is None:
+        return None
+    budget_ns = max(0, int(budget_ms)) * 1_000_000
+    return time.monotonic_ns() + int(budget_ns * SNAPSHOT_BUDGET_SERIALIZATION_SHARE)
+
+
+def _record_duration(history: _RootHistory, name: str, elapsed_ns: int) -> None:
+    if isinstance(name, str):
+        history.durations_ms[name] = elapsed_ns / 1_000_000
+
+
 def _serialize_namespace(
     ns: dict[str, Any],
     *,
@@ -563,7 +700,18 @@ def _serialize_namespace(
     prune_oversized: bool,
     always_skip: set[str],
     handle_type: type[Any],
-) -> tuple[dict[str, bytes], list[dict[str, str]], list[str], int, int, dict[str, float | int | None]]:
+    history: _RootHistory | None = None,
+    budget_ms: int | None = None,
+) -> tuple[
+    dict[str, bytes],
+    dict[str, str],
+    list[dict[str, str]],
+    list[str],
+    list[str],
+    int,
+    int,
+    dict[str, float | int | None],
+]:
     try:
         import dill
     except Exception as error:
@@ -573,12 +721,23 @@ def _serialize_namespace(
     wall_start = time.monotonic_ns()
     cpu_start = _thread_cpu_ns()
     payload: dict[str, bytes] = {}
+    digests: dict[str, str] = {}
     skipped: list[dict[str, str]] = []
     oversized: list[str] = []
+    dropped: list[str] = []
+    reused_names = 0
     total = 0
     variable_metrics = SnapshotSerializationMetrics()
     missing = object()
-    for name in list(ns.keys()):
+    cache_budget = min(max_bytes, MAX_SNAPSHOT_CACHE_BYTES)
+    names = list(ns.keys())
+    if history is not None:
+        _forget_missing_names(history, names)
+        if budget_ms is not None:
+            names = order_names_by_serialization_cost(names, history)
+    deadline = snapshot_deadline_ns(budget_ms)
+    deadline_hit = False
+    for name in names:
         if not isinstance(name, str) or name.startswith("_") or name in always_skip:
             continue
         value = ns.get(name, missing)
@@ -592,6 +751,52 @@ def _serialize_namespace(
                     "reason": "BashHandle is a runtime-owned process handle and cannot be snapshotted",
                 }
             )
+            continue
+        if deadline is not None and not deadline_hit and time.monotonic_ns() >= deadline:
+            # Budget exhausted (A6): land the already-serialized names durably.
+            # Slow names are last by ordering, so this drops the slowest tail.
+            deadline_hit = True
+        if deadline_hit:
+            dropped.append(name)
+            continue
+        if deadline is not None and history is not None and payload:
+            # A6: with at least one name already secured, do not start a name
+            # whose last observed serialization cost cannot fit the remaining
+            # budget. The first name is always attempted so a namespace
+            # dominated by one slow value still makes progress.
+            expected_ns = history.durations_ms.get(name)
+            if (
+                expected_ns is not None
+                and time.monotonic_ns() + expected_ns * 1_000_000 > deadline
+            ):
+                dropped.append(name)
+                continue
+        cached = history.reusable.get(name) if history is not None else None
+        if (
+            cached is not None
+            and cached.kind is type(value)
+            and cached.value is value
+            and cached.kind in _IMMUTABLE_VALUE_TYPES
+        ):
+            # Same immutable object as the last successful save: its pickled
+            # form cannot have changed, so reuse the blob without re-pickling.
+            blob = cached.blob
+            remaining = max_bytes - total
+            limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
+            if len(blob) > limit:
+                history.reusable.pop(name, None)
+                history.cached_blob_bytes -= cached.size
+                if not prune_oversized and remaining < max_variable_bytes:
+                    skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
+                else:
+                    skipped.append({"name": name, "reason": "exceeds per-variable snapshot size cap"})
+                    oversized.append(name)
+                continue
+            payload[name] = blob
+            digests[name] = cached.digest
+            total += len(blob)
+            reused_names += 1
+            variable_metrics.record(name, 0)
             continue
         remaining = max_bytes - total
         limit = max_variable_bytes if prune_oversized else min(max_variable_bytes, remaining)
@@ -616,12 +821,18 @@ def _serialize_namespace(
             skipped.append({"name": name, "reason": f"{type(error).__name__}: {_safe_str(error)[:200]}"})
             continue
         finally:
-            variable_metrics.record(name, time.monotonic_ns() - serialization_started, path_metrics)
+            elapsed_ns = time.monotonic_ns() - serialization_started
+            variable_metrics.record(name, elapsed_ns, path_metrics)
+            if history is not None:
+                _record_duration(history, name, elapsed_ns)
         if total + len(blob) > max_bytes:
             skipped.append({"name": name, "reason": "exceeds aggregate snapshot size cap"})
             continue
         payload[name] = blob
+        digests[name] = hashlib.sha256(blob).hexdigest()
         total += len(blob)
+        if history is not None:
+            _remember_reusable_blob(history, name, value, blob, digests[name], cache_budget)
 
     envelope_metrics: dict[str, float | int] = {
         "serialization_envelope_count_ms": 0.0,
@@ -655,24 +866,45 @@ def _serialize_namespace(
         "serialization_wall_ms": _elapsed_ms(wall_start, wall_end),
         "serialization_cpu_ms": _elapsed_ms(cpu_start, cpu_end),
         "serialized_bytes": logical_bytes,
+        "serialization_reused_names": reused_names,
+        "dropped_names_count": len(dropped),
         **envelope_metrics,
         **variable_metrics.summarize(payload),
     }
-    return payload, skipped, oversized, envelope_bytes, logical_bytes, metrics
+    return payload, digests, skipped, oversized, dropped, envelope_bytes, logical_bytes, metrics
 
 
-def _write_blob(root: str, digest: str, blob: bytes, written: list[int]) -> None:
+def _write_blob(
+    root: str,
+    digest: str,
+    blob: bytes,
+    written: list[int],
+    verified_digests: set[str] | None = None,
+) -> None:
     path = _owned_path(root, BLOBS_DIRNAME, f"{digest}.blob")
     _require_owned_parent(root, path)
     if os.path.lexists(path):
+        if verified_digests is not None and digest in verified_digests:
+            # This process already wrote or hash-verified this exact blob, so
+            # re-reading it on every save only re-pays I/O for unchanged data.
+            # Restore still fully re-reads and re-hashes every blob it uses.
+            return
         existing = _read_regular_file(path, max_bytes=len(blob), expected_size=len(blob))
         if hashlib.sha256(existing).hexdigest() != digest or existing != blob:
             raise SnapshotStoreError(f"existing CAS blob does not match its hash: {digest}")
+        if verified_digests is not None:
+            if len(verified_digests) >= MAX_VERIFIED_DIGESTS:
+                verified_digests.clear()
+            verified_digests.add(digest)
         return
     _atomic_write_bytes(path, blob, written)
     persisted = _read_regular_file(path, max_bytes=len(blob), expected_size=len(blob))
     if hashlib.sha256(persisted).hexdigest() != digest or persisted != blob:
         raise SnapshotStoreError(f"persisted CAS blob validation failed: {digest}")
+    if verified_digests is not None:
+        if len(verified_digests) >= MAX_VERIFIED_DIGESTS:
+            verified_digests.clear()
+        verified_digests.add(digest)
 
 
 def _new_generation_id(root: str) -> str:
@@ -783,8 +1015,15 @@ def snapshot_cas_v2(
     always_skip: set[str],
     handle_type: type[Any],
     committed: list[dict[str, Any]] | None = None,
+    *,
+    budget_ms: int | None = None,
 ) -> dict[str, Any]:
-    """Serialize all eligible names and atomically publish one CAS generation."""
+    """Serialize all eligible names and atomically publish one CAS generation.
+
+    With ``budget_ms`` set (A6), names that do not fit the serialization
+    deadline are dropped from this generation and reported, and the partial
+    result still commits durably instead of being discarded on timeout.
+    """
     total_start = time.monotonic_ns()
     metrics: dict[str, float | int | None] = {
         "serialization_wall_ms": None,
@@ -795,16 +1034,23 @@ def snapshot_cas_v2(
         "total_wall_ms": None,
         "snapshot_cas_captures": 1,
         "snapshot_legacy_captures": 0,
+        "serialization_reused_names": None,
+        "dropped_names_count": None,
     }
     written = [0]
     try:
-        payload, skipped, oversized, envelope_bytes, logical_bytes, serialization = _serialize_namespace(
-            ns,
-            max_bytes=max_bytes,
-            max_variable_bytes=max_variable_bytes,
-            prune_oversized=prune_oversized,
-            always_skip=always_skip,
-            handle_type=handle_type,
+        history = snapshot_history_for_root(root)
+        payload, digests, skipped, oversized, dropped, envelope_bytes, logical_bytes, serialization = (
+            _serialize_namespace(
+                ns,
+                max_bytes=max_bytes,
+                max_variable_bytes=max_variable_bytes,
+                prune_oversized=prune_oversized,
+                always_skip=always_skip,
+                handle_type=handle_type,
+                history=history,
+                budget_ms=budget_ms,
+            )
         )
         metrics.update(serialization)
         write_start = time.monotonic_ns()
@@ -823,8 +1069,8 @@ def snapshot_cas_v2(
 
         entries: list[dict[str, Any]] = []
         for name, blob in payload.items():
-            digest = hashlib.sha256(blob).hexdigest()
-            _write_blob(root, digest, blob, written)
+            digest = digests[name]
+            _write_blob(root, digest, blob, written, history.verified_digests)
             entries.append({"name": name, "sha256": digest, "size": len(blob)})
 
         saved = sorted(payload)
@@ -838,6 +1084,7 @@ def snapshot_cas_v2(
             "savedNames": saved,
             "skipped": skipped,
             "pruned": pruned,
+            "dropped": sorted(dropped),
             "logicalSerializedBytes": logical_bytes,
             "legacyEnvelopeBytes": envelope_bytes,
             "maxBytes": max_bytes,
@@ -880,6 +1127,7 @@ def snapshot_cas_v2(
                 "saved": saved,
                 "skipped": skipped,
                 "pruned": pruned,
+                "dropped": sorted(dropped)[:DROPPED_NAMES_RESULT_LIMIT],
                 "bytes": envelope_bytes,
                 "format": "cas-v2",
                 "generation": generation_id,

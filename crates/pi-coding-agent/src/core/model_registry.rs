@@ -1191,6 +1191,9 @@ pub struct ModelRegistry {
     fetch_fn: Option<FetchFn>,
     /// `entitlementRefreshChain` - serializes entitlement refreshes.
     entitlement_refresh_chain: Arc<tokio::sync::Mutex<()>>,
+    /// A10: in-process rolling endpoint health used only to reorder
+    /// `get_available`; never persisted, never sent anywhere.
+    endpoint_health: Arc<std::sync::Mutex<HashMap<String, EndpointHealthStats>>>,
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1205,6 +1208,228 @@ struct BackgroundAuthorization {
     fingerprint: String,
 }
 
+
+// ---------------------------------------------------------------------------
+// A10: endpoint health demotion (same model id, dying route)
+// ---------------------------------------------------------------------------
+//
+// Measured over a 15-day /monitor window (1.77M events): azure-openai-managed
+// gpt-6-astra degraded from p50 20s to p50 63s while it (together with the
+// codex gpt-6-astra route) kept receiving traffic; together the two held
+// 47.4% of all recorded wait time. The registry had no local memory of an
+// endpoint's recent outcomes, so a dying route kept its list position.
+//
+// This is an in-process, local-observation-only health tracker. It never
+// removes an endpoint and never changes an explicit `find(provider, model)`
+// selection; it only reorders the candidate list (`get_available`) so a
+// degraded sibling of the same model id sorts last. With no observations the
+// behavior is identical to the previous ordering.
+
+/// EWMA weight per observation. 0.2 needs ~9 recent failures to push a clean
+/// endpoint over the 5% threshold and ~9 successes to recover a demoted one.
+const ENDPOINT_HEALTH_EWMA_ALPHA: f64 = 0.2;
+/// Demotion requires at least this many total observations, so a single bad
+/// request can never demote an endpoint.
+const ENDPOINT_HEALTH_MIN_SAMPLES: u64 = 20;
+/// A recent failure rate above this fraction demotes an endpoint.
+const ENDPOINT_HEALTH_FAILURE_RATE_THRESHOLD: f64 = 0.05;
+/// A recent EWMA latency above this multiple of the best fresh sibling
+/// latency of the same model id demotes an endpoint.
+const ENDPOINT_HEALTH_LATENCY_RATIO_THRESHOLD: f64 = 3.0;
+/// Observations older than this no longer count: the process cannot demote on
+/// stale evidence, which is also the idle auto-recovery path.
+const ENDPOINT_HEALTH_STATS_STALE_MS: i64 = 10 * 60_000;
+/// A continuously demoted endpoint becomes probe-eligible again after this
+/// long, so one ordering probe can refresh its stats even while degraded.
+const ENDPOINT_HEALTH_PROBE_AFTER_MS: i64 = 5 * 60_000;
+/// Env var that disables the reordering entirely (`0|false|no|off`).
+const ENDPOINT_HEALTH_DEMOTION_ENV: &str = "PRIME_AGENT_ENDPOINT_HEALTH_DEMOTION";
+
+/// Pure env parsing so tests can exercise the flag without process env races.
+pub fn endpoint_health_demotion_env_enabled(value: Option<&str>) -> bool {
+    match value {
+        Some(value) => !["0", "false", "no", "off"].contains(&value.trim().to_lowercase().as_str()),
+        None => true,
+    }
+}
+
+fn endpoint_health_demotion_enabled() -> bool {
+    static ENABLED: once_cell::sync::Lazy<bool> = once_cell::sync::Lazy::new(|| {
+        endpoint_health_demotion_env_enabled(std::env::var(ENDPOINT_HEALTH_DEMOTION_ENV).ok().as_deref())
+    });
+    *ENABLED
+}
+
+/// Rolling per-endpoint health, keyed by `provider:model_id`.
+#[derive(Debug, Clone, Default)]
+pub struct EndpointHealthStats {
+    /// EWMA of the failure indicator (1.0 on failure, 0.0 on success).
+    failure_rate: f64,
+    /// EWMA of the observed request latency in milliseconds, when observed.
+    latency_ms: Option<f64>,
+    /// Total observations ever recorded in this process.
+    samples: u64,
+    /// Wall-clock millisecond timestamp of the last observation.
+    last_observed_at_ms: i64,
+    /// When the endpoint was first seen demoted by the current streak.
+    demoted_since_ms: Option<i64>,
+}
+
+impl EndpointHealthStats {
+    fn observe(&mut self, succeeded: bool, latency_ms: Option<f64>, now_ms: i64) {
+        let outcome = if succeeded { 0.0 } else { 1.0 };
+        self.failure_rate = self.failure_rate * (1.0 - ENDPOINT_HEALTH_EWMA_ALPHA)
+            + outcome * ENDPOINT_HEALTH_EWMA_ALPHA;
+        if let Some(latency_ms) = latency_ms.filter(|latency| latency.is_finite() && *latency >= 0.0) {
+            self.latency_ms = Some(match self.latency_ms {
+                Some(previous) => {
+                    previous * (1.0 - ENDPOINT_HEALTH_EWMA_ALPHA)
+                        + latency_ms * ENDPOINT_HEALTH_EWMA_ALPHA
+                }
+                None => latency_ms,
+            });
+        }
+        self.samples = self.samples.saturating_add(1);
+        self.last_observed_at_ms = now_ms;
+    }
+
+    fn fresh(&self, now_ms: i64) -> bool {
+        now_ms.saturating_sub(self.last_observed_at_ms) <= ENDPOINT_HEALTH_STATS_STALE_MS
+    }
+
+    fn failure_demoted(&self) -> bool {
+        self.samples >= ENDPOINT_HEALTH_MIN_SAMPLES
+            && self.failure_rate > ENDPOINT_HEALTH_FAILURE_RATE_THRESHOLD
+    }
+
+    /// True when this endpoint's stats justify demotion relative to the best
+    /// fresh sibling latency of the same model id.
+    fn latency_demoted(&self, best_sibling_latency_ms: Option<f64>) -> bool {
+        let Some(latency_ms) = self.latency_ms else { return false };
+        let Some(best) = best_sibling_latency_ms else { return false };
+        best > 0.0 && latency_ms > best * ENDPOINT_HEALTH_LATENCY_RATIO_THRESHOLD
+    }
+}
+
+/// The demotion decision, computed from a snapshot so unit tests can drive it
+/// without a registry. Returns the demoted `provider:model_id` keys.
+///
+/// Siblings are endpoints that share a model id under a different provider. An
+/// endpoint is demoted when, with fresh stats and enough samples, its recent
+/// failure rate exceeds 5% or its EWMA latency exceeds 3x the best fresh
+/// sibling. A demotion auto-recovers when the stats improve (the EWMA decays
+/// with successes), when the stats go stale, or - as a probe - after
+/// `ENDPOINT_HEALTH_PROBE_AFTER_MS` of continuous demotion.
+pub fn endpoint_health_demotions(
+    entries: &HashMap<String, EndpointHealthStats>,
+    models: &[Model],
+    now_ms: i64,
+) -> HashSet<String> {
+    // Best fresh, sufficiently sampled latency per model id.
+    let mut best_latency_by_model: HashMap<&str, f64> = HashMap::new();
+    for model in models {
+        let key = ModelRegistry::get_model_request_key(&model.provider, &model.id);
+        let Some(stats) = entries.get(&key) else { continue };
+        // A failure-demoted endpoint is never the healthy baseline for a
+        // sibling; a latency-demoted endpoint can never be the best anyway.
+        if !stats.fresh(now_ms)
+            || stats.samples < ENDPOINT_HEALTH_MIN_SAMPLES
+            || stats.failure_demoted()
+        {
+            continue;
+        }
+        if let Some(latency_ms) = stats.latency_ms {
+            let best = best_latency_by_model.entry(model.id.as_str()).or_insert(f64::INFINITY);
+            if latency_ms < *best {
+                *best = latency_ms;
+            }
+        }
+    }
+
+    let mut demoted = HashSet::new();
+    for model in models {
+        let key = ModelRegistry::get_model_request_key(&model.provider, &model.id);
+        let Some(stats) = entries.get(&key) else { continue };
+        if !stats.fresh(now_ms) || stats.samples < ENDPOINT_HEALTH_MIN_SAMPLES {
+            continue;
+        }
+        let best_sibling = best_latency_by_model.get(model.id.as_str()).copied();
+        let is_demoted = stats.failure_demoted() || stats.latency_demoted(best_sibling);
+        if !is_demoted {
+            continue;
+        }
+        // A continuously demoted endpoint periodically becomes probe-eligible
+        // again so fresh observations can recover it.
+        if let Some(demoted_since) = stats.demoted_since_ms {
+            if now_ms.saturating_sub(demoted_since) >= ENDPOINT_HEALTH_PROBE_AFTER_MS {
+                continue;
+            }
+        }
+        demoted.insert(key);
+    }
+    demoted
+}
+
+impl ModelRegistry {
+    /// A10: records one local observation of an endpoint (`provider`, `model`
+    /// pair). Hosts call this after each provider request completes; the stats
+    /// are in-process only and never leave the registry.
+    pub fn record_endpoint_observation(
+        &self,
+        provider: &str,
+        model_id: &str,
+        succeeded: bool,
+        latency_ms: Option<f64>,
+    ) {
+        let key = Self::get_model_request_key(provider, model_id);
+        let mut health = self.endpoint_health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now_ms = now_millis();
+        health.entry(key).or_default().observe(succeeded, latency_ms, now_ms);
+    }
+
+    /// The currently demoted endpoint keys for this registry's catalog. Also
+    /// maintains the `demoted_since` streaks that drive probe eligibility.
+    fn demoted_endpoint_keys(&self) -> HashSet<String> {
+        if !endpoint_health_demotion_enabled() {
+            return HashSet::new();
+        }
+        let now_ms = now_millis();
+        let mut health = self.endpoint_health.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let demoted = endpoint_health_demotions(&health, &self.models, now_ms);
+        for (key, stats) in health.iter_mut() {
+            if demoted.contains(key) {
+                if stats.demoted_since_ms.is_none() {
+                    stats.demoted_since_ms = Some(now_ms);
+                }
+            } else {
+                stats.demoted_since_ms = None;
+            }
+        }
+        demoted
+    }
+
+    /// Stable partition: healthy endpoints keep their catalog order first,
+    /// demoted endpoints follow in their own order. Nothing is removed.
+    fn reorder_models_by_endpoint_health(&self, models: Vec<Model>) -> Vec<Model> {
+        let demoted = self.demoted_endpoint_keys();
+        if demoted.is_empty() {
+            return models;
+        }
+        // Stable partition: each side keeps the catalog's relative order, so a
+        // demotion only moves an endpoint behind its healthy siblings.
+        let mut healthy = Vec::with_capacity(models.len());
+        let mut degraded = Vec::new();
+        for model in models {
+            if demoted.contains(&Self::get_model_request_key(&model.provider, &model.id)) {
+                degraded.push(model);
+            } else {
+                healthy.push(model);
+            }
+        }
+        healthy.append(&mut degraded);
+        healthy
+    }
+}
 
 impl ModelRegistry {
     fn new(auth_storage: AuthStorage, models_json_path: Option<String>) -> Self {
@@ -1229,6 +1454,7 @@ impl ModelRegistry {
             on_oauth_providers_reset: None,
             fetch_fn: None,
             entitlement_refresh_chain: Arc::new(tokio::sync::Mutex::new(())),
+            endpoint_health: Arc::new(std::sync::Mutex::new(HashMap::new())),
         };
         registry.load_models();
         registry
@@ -1765,8 +1991,14 @@ impl ModelRegistry {
 
     /// Get only models that have auth configured.
     /// This is a fast check that doesn't refresh OAuth tokens.
+    ///
+    /// A10: a same-model endpoint whose locally observed failure rate or
+    /// latency crossed the demotion thresholds sorts after its healthy
+    /// siblings (never removed). Without recorded observations this is the
+    /// plain catalog order.
     pub fn get_available(&self) -> Vec<Model> {
-        self.models
+        let available: Vec<Model> = self
+            .models
             .iter()
             .filter(|model| {
                 if is_private_prime_inference_model(&model.provider, &model.id)
@@ -1777,7 +2009,8 @@ impl ModelRegistry {
                 self.has_configured_auth(model)
             })
             .cloned()
-            .collect()
+            .collect();
+        self.reorder_models_by_endpoint_health(available)
     }
 
     /// Reload local state and private authorization. Public Prime Inference
@@ -2540,11 +2773,22 @@ impl ModelRegistry {
         }
     }
 
+    /// Drop cached command-backed credential values. The models.json request-auth
+    /// sources (`models_json_command`) mark stale outside auth storage, so the
+    /// stale-marking entry points below must invalidate the per-request
+    /// credential cache themselves: a 401/403 must re-execute the credential
+    /// helper on the next resolution, not reuse the rejected value.
+    fn invalidate_resolved_command_values(&self) {
+        crate::core::resolve_config_value::invalidate_resolved_command_values();
+    }
+
     /// Forget stale-auth markings; a structured auth failure on the next request
     /// re-marks the provider.
     pub fn clear_provider_auth_stale(&mut self, provider: &str) {
         self.stale_provider_request_auth_sources().remove(provider);
         self.auth_storage.clear_auth_stale(provider);
+        // User-driven re-selection: resolve from scratch on the next request.
+        self.invalidate_resolved_command_values();
     }
 
     pub fn get_current_provider_auth_source_token(&self, provider: &str) -> Option<AuthSourceToken> {
@@ -2601,6 +2845,9 @@ impl ModelRegistry {
 
         if token.source != "models_json_key" && token.source != "models_json_command" {
             marked = self.auth_storage.mark_auth_source_stale(token) || marked;
+        }
+        if marked {
+            self.invalidate_resolved_command_values();
         }
 
         marked
@@ -4315,5 +4562,176 @@ mod tests {
         let text = format!("{:?}", config);
         assert!(!text.contains("super-secret"), "{}", text);
         assert!(text.contains("Custom"));
+    }
+
+    // -----------------------------------------------------------------------
+    // A10: endpoint health demotion
+    // -----------------------------------------------------------------------
+
+    fn endpoint_models() -> Vec<Model> {
+        vec![
+            Model::new("gpt-6-astra", "GPT-6 Astra", "openai-responses", "azure-openai-managed", "https://azure.invalid"),
+            Model::new("gpt-6-astra", "GPT-6 Astra", "openai-responses", "openai-codex", "https://codex.invalid"),
+            Model::new("claude-opus-5-5", "Opus", "anthropic", "anthropic", "https://anthropic.invalid"),
+        ]
+    }
+
+    fn observe_many(
+        entries: &mut HashMap<String, EndpointHealthStats>,
+        key: &str,
+        succeeded: bool,
+        latency_ms: Option<f64>,
+        count: u64,
+        now_ms: i64,
+    ) {
+        for _ in 0..count {
+            entries.entry(key.to_string()).or_default().observe(succeeded, latency_ms, now_ms);
+        }
+    }
+
+    #[test]
+    fn endpoint_health_env_flag_defaults_on_and_disables_explicitly() {
+        assert!(endpoint_health_demotion_env_enabled(None));
+        assert!(endpoint_health_demotion_env_enabled(Some("1")));
+        assert!(endpoint_health_demotion_env_enabled(Some("yes")));
+        assert!(!endpoint_health_demotion_env_enabled(Some("0")));
+        assert!(!endpoint_health_demotion_env_enabled(Some("off")));
+        assert!(!endpoint_health_demotion_env_enabled(Some("FALSE")));
+    }
+
+    #[test]
+    fn endpoint_health_requires_twenty_fresh_samples_before_demoting() {
+        let models = endpoint_models();
+        let mut entries = HashMap::new();
+        let now = 1_000_000_i64;
+        // 19 failures are not enough evidence.
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", false, Some(200.0), 19, now);
+        assert!(endpoint_health_demotions(&entries, &models, now).is_empty());
+        // The 20th failure crosses the threshold.
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", false, Some(200.0), 1, now);
+        assert_eq!(
+            endpoint_health_demotions(&entries, &models, now),
+            HashSet::from(["azure-openai-managed:gpt-6-astra".to_string()])
+        );
+    }
+
+    #[test]
+    fn endpoint_health_recovers_when_stats_improve() {
+        let models = endpoint_models();
+        let mut entries = HashMap::new();
+        let now = 1_000_000_i64;
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", false, Some(200.0), 25, now);
+        assert_eq!(
+            endpoint_health_demotions(&entries, &models, now),
+            HashSet::from(["azure-openai-managed:gpt-6-astra".to_string()])
+        );
+        // Successes decay the EWMA below the 5% threshold: auto-recovery.
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", true, Some(200.0), 30, now);
+        assert!(endpoint_health_demotions(&entries, &models, now).is_empty());
+    }
+
+    #[test]
+    fn endpoint_health_goes_stale_and_stops_demoting() {
+        let models = endpoint_models();
+        let mut entries = HashMap::new();
+        let now = 1_000_000_i64;
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", false, Some(200.0), 25, now);
+        // Ten minutes later the evidence is stale, so the endpoint recovers.
+        let later = now + ENDPOINT_HEALTH_STATS_STALE_MS + 1;
+        assert!(endpoint_health_demotions(&entries, &models, later).is_empty());
+    }
+
+    #[test]
+    fn endpoint_health_demotes_slow_routes_against_the_best_sibling() {
+        let models = endpoint_models();
+        let mut entries = HashMap::new();
+        let now = 1_000_000_i64;
+        // Azure route drifted from p50 20s to 63s while codex stayed fast.
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", true, Some(63_000.0), 25, now);
+        observe_many(&mut entries, "openai-codex:gpt-6-astra", true, Some(20_000.0), 25, now);
+        assert_eq!(
+            endpoint_health_demotions(&entries, &models, now),
+            HashSet::from(["azure-openai-managed:gpt-6-astra".to_string()]),
+            "63s is more than 3x the 20s sibling, so only the azure route demotes"
+        );
+        // Without a healthy sibling baseline nothing demotes: the only route
+        // for a model is never demoted for being slow.
+        let mut single = HashMap::new();
+        observe_many(&mut single, "azure-openai-managed:gpt-6-astra", true, Some(63_000.0), 25, now);
+        assert!(endpoint_health_demotions(&single, &endpoint_models()[..2], now).is_empty());
+    }
+
+    #[test]
+    fn endpoint_health_probe_reopens_a_continuously_demoted_endpoint() {
+        let models = endpoint_models();
+        let mut entries = HashMap::new();
+        let now = 1_000_000_i64;
+        observe_many(&mut entries, "azure-openai-managed:gpt-6-astra", false, Some(200.0), 25, now);
+        entries
+            .get_mut("azure-openai-managed:gpt-6-astra")
+            .unwrap()
+            .demoted_since_ms = Some(now);
+        // Still within the cooldown: stays demoted.
+        assert_eq!(
+            endpoint_health_demotions(&entries, &models, now + ENDPOINT_HEALTH_PROBE_AFTER_MS - 1),
+            HashSet::from(["azure-openai-managed:gpt-6-astra".to_string()])
+        );
+        // After the probe window the endpoint becomes ordering-eligible again.
+        assert!(endpoint_health_demotions(&entries, &models, now + ENDPOINT_HEALTH_PROBE_AFTER_MS).is_empty());
+    }
+
+    #[test]
+    fn get_available_reorders_but_never_removes_a_demoted_endpoint() {
+        let dir = tempfile::tempdir().unwrap();
+        let config = json!({"providers": {
+            "azure-openai-managed": {
+                "api": "openai-responses", "baseUrl": "https://azure.invalid/v1", "apiKey": "k",
+                "models": [{"id": "gpt-6-astra"}]
+            },
+            "openai-codex": {
+                "api": "openai-codex-responses", "baseUrl": "https://codex.invalid/v1", "apiKey": "k",
+                "models": [{"id": "gpt-6-astra"}]
+            }
+        }});
+        let registry = registry_with_config(dir.path(), &config.to_string());
+        let astra_routes = || -> Vec<String> {
+            registry
+                .get_available()
+                .iter()
+                .filter(|model| model.id == "gpt-6-astra")
+                .map(|model| model.provider.clone())
+                .collect()
+        };
+        let before = astra_routes();
+        let expected_routes: HashSet<String> = HashSet::from([
+            "azure-openai-managed".to_string(),
+            "openai-codex".to_string(),
+        ]);
+        assert_eq!(
+            before.iter().cloned().collect::<HashSet<String>>(),
+            expected_routes,
+            "both custom endpoints are available with auth configured"
+        );
+        // The catalog decides which sibling is first; demote that one.
+        let first = before[0].clone();
+        let second = before[1].clone();
+
+        // 25 local failures demote the first endpoint.
+        for _ in 0..25 {
+            registry.record_endpoint_observation(&first, "gpt-6-astra", false, Some(500.0));
+        }
+        assert_eq!(
+            astra_routes(),
+            vec![second.clone(), first.clone()],
+            "the degraded route sorts last but is never removed"
+        );
+        // An explicit selection is never demoted away.
+        assert!(registry.find(&first, "gpt-6-astra").is_some());
+
+        // Successes recover the ordering.
+        for _ in 0..30 {
+            registry.record_endpoint_observation(&first, "gpt-6-astra", true, Some(500.0));
+        }
+        assert_eq!(astra_routes(), before, "recovered endpoints return to catalog order");
     }
 }

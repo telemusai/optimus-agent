@@ -21,13 +21,17 @@ use crate::core::kernel::shared::{
     ExecError, ExecuteOptions, ExecuteResult, ExecuteStatus, HostRequestHandlers,
     InternalExecuteResult, KernelAttachment, KernelClient, KernelDiffDisplay, KernelError,
     KernelManagerOptions, KernelRestoreOptions, KernelSentAgentMessage, KernelShutdownOptions, KernelSettlement,
-    KernelSnapshotConfig, KernelStartOptions, ParsedAttachment, PerformanceMetricEvent,
-    PerformanceMetricOutcome, PerformanceMetricRecorder, SharedPromise, StreamName,
-    AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME,
+    KernelSnapshotConfig, KernelSnapshotDebounceMode, KernelStartOptions, ParsedAttachment,
+    PerformanceMetricEvent, PerformanceMetricOutcome, PerformanceMetricRecorder, SharedPromise,
+    StreamName, AGENT_MESSAGE_DISPLAY_MIME, ATTACHMENT_DISPLAY_MIME, BASH_ACTIVITY_DISPLAY_MIME,
     DEFAULT_MAX_OUTPUT_CHARS, DEFAULT_SNAPSHOT_DEBOUNCE_MS, DIFF_DISPLAY_MIME,
     HOST_REQUEST_SHUTDOWN_TIMEOUT_MS, KERNEL_ABORT_GRACE_MS, KERNEL_BUSY_REUSE_WAIT_MS,
     KERNEL_SHUTDOWN_TIMEOUT_MS, MAX_ATTACHMENT_DATA_CHARS, MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS,
-    SNAPSHOT_EXECUTION_TIMEOUT_MS,
+    MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS, MIN_SNAPSHOT_BUDGET_MS, SNAPSHOT_ADAPTIVE_DEBOUNCE_MS,
+    SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_BYTES, SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_MS,
+    SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_BYTES, SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_MS,
+    SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_BYTES, SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS,
+    SNAPSHOT_ADAPTIVE_MAX_STALE_MS, SNAPSHOT_BUDGET_MARGIN_MS, SNAPSHOT_EXECUTION_TIMEOUT_MS,
 };
 use crate::core::kernel::state_snapshot::{
     cas_snapshot_root_for_legacy_path, cas_snapshot_state_exists, KernelRestoreSource,
@@ -288,6 +292,8 @@ fn as_snapshot_performance_metadata(value: Option<&Value>) -> Option<SnapshotPer
         snapshot_cas_captures: as_metric_number_field(value.get("snapshot_cas_captures")),
         snapshot_legacy_captures: as_metric_number_field(value.get("snapshot_legacy_captures")),
         serialized_bytes: as_metric_number_field(value.get("serialized_bytes")),
+        serialization_reused_names: as_metric_number_field(value.get("serialization_reused_names")),
+        dropped_names_count: as_metric_number_field(value.get("dropped_names_count")),
         write_ms: as_metric_number_field(value.get("write_ms")),
         written_bytes: as_metric_number_field(value.get("written_bytes")),
         total_wall_ms: as_metric_number_field(value.get("total_wall_ms")),
@@ -667,6 +673,14 @@ pub struct KernelState {
     start_promise: Mutex<Option<Arc<SharedPromise<()>>>>,
     /// Pending debounced auto-snapshot, if one has been scheduled.
     snapshot_timer: Mutex<Option<SnapshotTimerHandle>>,
+    /// A6: serialized bytes of the last successful snapshot (adaptive timeout input).
+    last_snapshot_serialized_bytes: Mutex<Option<u64>>,
+    /// A6: total wall time (ms) of the last successful snapshot (adaptive timeout input).
+    last_snapshot_wall_ms: Mutex<Option<f64>>,
+    /// A6: escalated hard timeout while snapshots abort or land partial.
+    snapshot_timeout_escalation_ms: Mutex<Option<u64>>,
+    /// B5: wall-clock ms of the most recent durable snapshot or restore.
+    last_durable_snapshot_ms: Mutex<Option<f64>>,
     /// While the final dispose snapshot is flushing, new external executions are rejected.
     flushing_snapshot_for_dispose: AtomicBool,
     /// In-flight final snapshot flush; concurrent teardowns join it instead of re-flushing.
@@ -736,6 +750,10 @@ impl KernelState {
             graceful_shutdown_promise: Mutex::new(None),
             start_promise: Mutex::new(None),
             snapshot_timer: Mutex::new(None),
+            last_snapshot_serialized_bytes: Mutex::new(None),
+            last_snapshot_wall_ms: Mutex::new(None),
+            snapshot_timeout_escalation_ms: Mutex::new(None),
+            last_durable_snapshot_ms: Mutex::new(None),
             flushing_snapshot_for_dispose: AtomicBool::new(false),
             snapshot_flush_for_dispose: Mutex::new(None),
             protocol_repair_promise: Mutex::new(None),
@@ -3410,10 +3428,13 @@ impl KernelState {
     }
 
     /// Persist the namespace, then remove variables above the per-variable cap.
+    /// A6: no soft budget here - a pruning snapshot must never drop (and then
+    /// delete) a name it was asked to compact.
     async fn prune_oversized_variables(self: &Arc<Self>) -> Option<SnapshotResult> {
         self.capture_snapshot(CaptureSnapshotOptions {
             execution_timeout_ms: Some(SNAPSHOT_EXECUTION_TIMEOUT_MS),
             prune_oversized: true,
+            adaptive_timeout: false,
         })
         .await
     }
@@ -3585,6 +3606,14 @@ impl KernelState {
                     "snapshot_legacy_captures",
                     metadata.and_then(|metadata| metadata.snapshot_legacy_captures),
                 ),
+                (
+                    "serialization_reused_names",
+                    metadata.and_then(|metadata| metadata.serialization_reused_names),
+                ),
+                (
+                    "dropped_names_count",
+                    metadata.and_then(|metadata| metadata.dropped_names_count),
+                ),
                 ("write_ms", metadata.and_then(|metadata| metadata.write_ms)),
                 (
                     "serialized_bytes",
@@ -3603,6 +3632,19 @@ impl KernelState {
         safe_record_performance_metric(Some(&state.recorder), event);
     }
 
+    /// A6: hard execution timeout for the next snapshot attempt.
+    fn next_snapshot_timeout_ms(&self) -> u64 {
+        let serialized_bytes = *self.last_snapshot_serialized_bytes.lock().unwrap();
+        let wall_ms = *self.last_snapshot_wall_ms.lock().unwrap();
+        let escalation_ms = *self.snapshot_timeout_escalation_ms.lock().unwrap();
+        adaptive_snapshot_timeout_ms(serialized_bytes, wall_ms, escalation_ms)
+    }
+
+    /// A6/B5: record a durable point in time (successful snapshot or restore).
+    fn mark_snapshot_durable(&self) {
+        *self.last_durable_snapshot_ms.lock().unwrap() = Some(now_ms());
+    }
+
     async fn capture_snapshot(
         self: &Arc<Self>,
         options: CaptureSnapshotOptions,
@@ -3611,6 +3653,21 @@ impl KernelState {
         if !self.is_running() {
             return None;
         }
+        // A6: the scheduled auto-snapshot uses an adaptive hard timeout; the
+        // explicit prune and dispose paths keep the fixed baseline.
+        let execution_timeout_ms = if options.adaptive_timeout {
+            Some(self.next_snapshot_timeout_ms())
+        } else {
+            options.execution_timeout_ms
+        };
+        // A6: give the runtime a soft budget so it lands a durable partial
+        // snapshot instead of being interrupted mid-write by the hard timeout.
+        // Pruning compaction must not drop names it is about to delete.
+        let snapshot_budget_ms = if options.prune_oversized {
+            None
+        } else {
+            execution_timeout_ms.map(snapshot_budget_ms_for)
+        };
         let recorder = self.options.performance_metrics.clone();
         let metric_state = recorder.map(|recorder| SnapshotMetricState {
             started_at: safe_metric_now(Some(&recorder)),
@@ -3634,7 +3691,7 @@ impl KernelState {
                 return None;
             }
             let cas_root = self.cas_root_path();
-            let request = json!({
+            let mut request = json!({
                 "type": "snapshot",
                 "path": cfg.path.clone(),
                 "manifest_path": cfg.manifest_path.clone(),
@@ -3644,6 +3701,12 @@ impl KernelState {
                 "max_variable_bytes": cfg.max_variable_bytes.unwrap_or(DEFAULT_SNAPSHOT_MAX_VARIABLE_BYTES),
                 "prune_oversized": options.prune_oversized,
             });
+            if let Some(budget) = snapshot_budget_ms {
+                request
+                    .as_object_mut()
+                    .expect("snapshot request is an object")
+                    .insert("snapshot_budget_ms".to_string(), json!(budget));
+            }
             let r = self
                 .enqueue_request(
                     &request,
@@ -3652,7 +3715,7 @@ impl KernelState {
                         internal: true,
                         ..Default::default()
                     },
-                    options.execution_timeout_ms,
+                    execution_timeout_ms,
                     metric_state.clone(),
                 )
                 .await;
@@ -3673,6 +3736,16 @@ impl KernelState {
                 } else {
                     PerformanceMetricOutcome::Failure
                 };
+                if r.result.status == ExecuteStatus::Aborted {
+                    // A6: the attempt burned its whole hard timeout. Escalate
+                    // the next attempt's deadline; do not retry immediately
+                    // (the next debounced capture picks this up).
+                    let used = execution_timeout_ms.unwrap_or(SNAPSHOT_EXECUTION_TIMEOUT_MS);
+                    let escalated = used
+                        .saturating_mul(2)
+                        .clamp(SNAPSHOT_EXECUTION_TIMEOUT_MS, MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS);
+                    *self.snapshot_timeout_escalation_ms.lock().unwrap() = Some(escalated);
+                }
                 let how = if r.result.status == ExecuteStatus::Aborted {
                     "timed out"
                 } else {
@@ -3689,16 +3762,45 @@ impl KernelState {
             }
             let fields = r.done_fields.clone().unwrap_or_default();
             let pruned = as_string_array_field(fields.get("pruned"));
+            let dropped = as_string_array_field(fields.get("dropped"));
             let format = if fields.get("format").and_then(|value| value.as_str()) == Some("cas-v2") {
                 KernelSnapshotFormat::CasV2
             } else {
                 KernelSnapshotFormat::Legacy
             };
             metric_outcome = PerformanceMetricOutcome::Success;
+            // A6: feed the adaptive timeout and the durability clock. A partial
+            // landing (dropped names) keeps the escalation growing so the next
+            // attempt gets a longer budget; a clean full snapshot resets it.
+            {
+                let logical = as_metric_number_field(fields.get("logical_bytes"))
+                    .or(metric_metadata.as_ref().and_then(|metadata| metadata.serialized_bytes))
+                    .unwrap_or(0.0) as u64;
+                *self.last_snapshot_serialized_bytes.lock().unwrap() = Some(logical);
+                *self.last_snapshot_wall_ms.lock().unwrap() =
+                    metric_metadata.as_ref().and_then(|metadata| metadata.total_wall_ms);
+                let partial = metric_metadata
+                    .as_ref()
+                    .and_then(|metadata| metadata.dropped_names_count)
+                    .unwrap_or(0.0)
+                    > 0.0
+                    || !dropped.is_empty();
+                *self.snapshot_timeout_escalation_ms.lock().unwrap() = if partial {
+                    let used = execution_timeout_ms.unwrap_or(SNAPSHOT_EXECUTION_TIMEOUT_MS);
+                    Some(
+                        (used + used / 2)
+                            .clamp(SNAPSHOT_EXECUTION_TIMEOUT_MS, MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS),
+                    )
+                } else {
+                    None
+                };
+            }
+            self.mark_snapshot_durable();
             Some(SnapshotResult {
                 saved: as_string_array_field(fields.get("saved")),
                 skipped: as_reason_array(fields.get("skipped")),
                 pruned: if pruned.is_empty() { None } else { Some(pruned) },
+                dropped: if dropped.is_empty() { None } else { Some(dropped) },
                 bytes: as_metric_number_field(fields.get("bytes")).unwrap_or(0.0) as u64,
                 logical_bytes: as_metric_number_field(fields.get("logical_bytes"))
                     .or(metric_metadata.as_ref().and_then(|metadata| metadata.serialized_bytes))
@@ -3849,6 +3951,9 @@ impl KernelState {
         }
         let fields = r.done_fields.clone().unwrap_or_default();
         self.pending_restore.store(false, Ordering::SeqCst);
+        // A revived namespace is durable on disk by definition: restart the
+        // B5 staleness clock from this point.
+        self.mark_snapshot_durable();
         Some(RestoreResult {
             restored: as_string_array_field(fields.get("restored")),
             failed: as_reason_array(fields.get("failed")),
@@ -4010,22 +4115,63 @@ impl KernelState {
         let Some(cfg) = self.options.snapshot.as_ref() else {
             return;
         };
-        let debounce = cfg.debounce_ms.unwrap_or(DEFAULT_SNAPSHOT_DEBOUNCE_MS);
+        let adaptive = cfg.debounce_mode == Some(KernelSnapshotDebounceMode::Adaptive);
+        let debounce = if adaptive {
+            // B5: scale the window with the last serialized state so heavy
+            // sessions stop re-pickling hundreds of MB every ~30 s.
+            adaptive_snapshot_debounce_ms(*self.last_snapshot_serialized_bytes.lock().unwrap())
+        } else {
+            cfg.debounce_ms.unwrap_or(DEFAULT_SNAPSHOT_DEBOUNCE_MS)
+        };
+        // B5: tier-4 deferral never lets the last durable snapshot age past the
+        // staleness cap, even under rapid back-to-back cells that keep re-arming
+        // the window. Past the cap the next capture runs at the small-session
+        // delay instead of waiting for idleness.
+        let stale = self.snapshot_staleness_exceeded();
+        let tier4_idle = adaptive && debounce >= SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS && !stale;
+        let delay = if adaptive && stale {
+            SNAPSHOT_ADAPTIVE_DEBOUNCE_MS
+        } else {
+            debounce
+        };
         let mut timer = self.snapshot_timer.lock().unwrap();
         if let Some(existing) = timer.take() {
             existing.clear();
         }
         let this = self.clone();
         let handle = self.owned_tasks.spawn(async move {
-            tokio::time::sleep(Duration::from_millis(debounce)).await;
+            // B5 tier 4 (>=150 MB): only-on-idle. While a cell keeps the
+            // kernel busy the window is re-armed, capped by a staleness bound
+            // so the last durable snapshot never ages past the cap.
+            if tier4_idle {
+                loop {
+                    tokio::time::sleep(Duration::from_millis(SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS)).await;
+                    if !this.snapshot_staleness_exceeded() && this.active_execution().is_some() {
+                        continue;
+                    }
+                    break;
+                }
+            } else {
+                tokio::time::sleep(Duration::from_millis(delay)).await;
+            }
             *this.snapshot_timer.lock().unwrap() = None;
             this.capture_snapshot(CaptureSnapshotOptions {
                 execution_timeout_ms: Some(SNAPSHOT_EXECUTION_TIMEOUT_MS),
                 prune_oversized: false,
+                adaptive_timeout: true,
             })
             .await;
         });
         *timer = handle.map(|handle| SnapshotTimerHandle { handle });
+    }
+
+    /// B5: true when the last durable snapshot is older than the staleness cap.
+    fn snapshot_staleness_exceeded(&self) -> bool {
+        let last = *self.last_durable_snapshot_ms.lock().unwrap();
+        match last {
+            Some(last) => now_ms() - last > SNAPSHOT_ADAPTIVE_MAX_STALE_MS as f64,
+            None => false,
+        }
     }
 
     fn clear_snapshot_timer(&self) {
@@ -4102,6 +4248,9 @@ impl KernelState {
             self.capture_snapshot(CaptureSnapshotOptions {
                 execution_timeout_ms: Some(SNAPSHOT_EXECUTION_TIMEOUT_MS),
                 prune_oversized: false,
+                // A6: the final flush still gets a soft budget so a heavy
+                // namespace lands a durable partial instead of nothing.
+                adaptive_timeout: false,
             })
             .await;
         }
@@ -4240,6 +4389,8 @@ impl KernelClient for ReplKernelManager {
 struct CaptureSnapshotOptions {
     execution_timeout_ms: Option<u64>,
     prune_oversized: bool,
+    /// A6: compute the hard timeout adaptively from snapshot history.
+    adaptive_timeout: bool,
 }
 
 /// Latching one-shot notification: `settle` before a wait still releases it.
@@ -4346,6 +4497,62 @@ fn snapshot_format_field(format: Option<KernelSnapshotFormat>) -> &'static str {
     match format {
         Some(format) => format.as_str(),
         None => "auto",
+    }
+}
+
+/// A6: adaptive hard timeout for snapshot execution.
+///
+/// Scales the 60 s baseline with the last successful snapshot (its serialized
+/// volume at ~4 MB/s and its wall time with 25% headroom), and escalates
+/// multiplicatively while attempts abort or land partial. The result is clamped
+/// to `[SNAPSHOT_EXECUTION_TIMEOUT_MS, MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS]`.
+fn adaptive_snapshot_timeout_ms(
+    serialized_bytes: Option<u64>,
+    wall_ms: Option<f64>,
+    escalation_ms: Option<u64>,
+) -> u64 {
+    let base = SNAPSHOT_EXECUTION_TIMEOUT_MS;
+    let mut timeout = base;
+    if let Some(bytes) = serialized_bytes {
+        timeout = timeout.max(base + (bytes / (4 * 1024 * 1024)) * 1000);
+    }
+    if let Some(wall) = wall_ms {
+        if wall.is_finite() && wall > 0.0 {
+            timeout = timeout.max(base + (wall * 1.25) as u64);
+        }
+    }
+    if let Some(escalation) = escalation_ms {
+        timeout = timeout.max(escalation);
+    }
+    timeout.clamp(SNAPSHOT_EXECUTION_TIMEOUT_MS, MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS)
+}
+
+/// A6: soft serialization budget handed to the runtime. Leaves
+/// `SNAPSHOT_BUDGET_MARGIN_MS` of the hard timeout for the durable write phase.
+fn snapshot_budget_ms_for(timeout_ms: u64) -> u64 {
+    timeout_ms
+        .saturating_sub(SNAPSHOT_BUDGET_MARGIN_MS)
+        .max(MIN_SNAPSHOT_BUDGET_MS)
+}
+
+/// B5: adaptive debounce window from the last snapshot's serialized size.
+///
+/// Tiers (evidence: heavy sessions re-pickled 268 MB every ~30 s):
+/// `<10 MB -> 1.5 s`, `<50 MB -> 5 s`, `<150 MB -> 15 s`, `>=150 MB -> 30 s`
+/// (plus the only-on-idle deferral in `schedule_snapshot`). `None` (no snapshot
+/// yet) keeps the small-session default.
+fn adaptive_snapshot_debounce_ms(last_serialized_bytes: Option<u64>) -> u64 {
+    let Some(bytes) = last_serialized_bytes else {
+        return SNAPSHOT_ADAPTIVE_DEBOUNCE_MS;
+    };
+    if bytes < SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_BYTES {
+        SNAPSHOT_ADAPTIVE_DEBOUNCE_MS
+    } else if bytes < SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_BYTES {
+        SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_MS
+    } else if bytes < SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_BYTES {
+        SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_MS
+    } else {
+        SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS
     }
 }
 
@@ -4586,7 +4793,8 @@ mod tests {
         for event in events.iter() {
             assert_eq!(event.operation, "snapshot");
             assert!(!event.measurements.iter().any(|(key, _)| *key == "private_variable_name"));
-            assert_eq!(event.measurements.len(), 33);
+            // A5/A6: serialization_reused_names and dropped_names_count were added.
+            assert_eq!(event.measurements.len(), 35);
         }
     }
 
@@ -4601,6 +4809,58 @@ mod tests {
             snapshot_format_field(Some(KernelSnapshotFormat::Legacy)),
             "legacy"
         );
+    }
+
+    #[test]
+    fn adaptive_snapshot_timeout_scales_with_history_and_escalation() {
+        use super::adaptive_snapshot_timeout_ms as timeout;
+        // No history: the fixed 60 s baseline.
+        assert_eq!(timeout(None, None, None), SNAPSHOT_EXECUTION_TIMEOUT_MS);
+        // 268 MB at 4 MB/s adds ~67 s of headroom.
+        assert_eq!(timeout(Some(268 * 1024 * 1024), None, None), 127_000);
+        // Wall-time history dominates when it is the larger term.
+        assert_eq!(timeout(Some(1024), Some(90_000.0), None), 172_500);
+        // Escalation is honored but clamped to the hard ceiling.
+        assert_eq!(timeout(None, None, Some(240_000)), MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS);
+        assert_eq!(timeout(None, None, Some(90_000)), 90_000);
+        // Never below the baseline: zero-size history and non-positive wall
+        // times keep the fixed 60 s floor.
+        assert_eq!(timeout(Some(0), None, None), SNAPSHOT_EXECUTION_TIMEOUT_MS);
+        assert_eq!(timeout(None, Some(0.0), None), SNAPSHOT_EXECUTION_TIMEOUT_MS);
+        assert_eq!(timeout(None, Some(-5.0), None), SNAPSHOT_EXECUTION_TIMEOUT_MS);
+    }
+
+    #[test]
+    fn snapshot_budget_leaves_write_headroom() {
+        use super::snapshot_budget_ms_for as budget;
+        assert_eq!(budget(SNAPSHOT_EXECUTION_TIMEOUT_MS), 50_000);
+        assert_eq!(budget(MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS), 170_000);
+        assert_eq!(budget(12_000), MIN_SNAPSHOT_BUDGET_MS);
+        assert_eq!(budget(0), MIN_SNAPSHOT_BUDGET_MS);
+    }
+
+    #[test]
+    fn adaptive_debounce_tiers_follow_serialized_size() {
+        use super::adaptive_snapshot_debounce_ms as debounce;
+        // No snapshot yet keeps the small-session default (B5: small sessions unchanged).
+        assert_eq!(debounce(None), SNAPSHOT_ADAPTIVE_DEBOUNCE_MS);
+        assert_eq!(debounce(Some(0)), SNAPSHOT_ADAPTIVE_DEBOUNCE_MS);
+        assert_eq!(debounce(Some(10 * 1024 * 1024 - 1)), SNAPSHOT_ADAPTIVE_DEBOUNCE_MS);
+        assert_eq!(debounce(Some(10 * 1024 * 1024)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_MS);
+        assert_eq!(debounce(Some(50 * 1024 * 1024 - 1)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_MS);
+        assert_eq!(debounce(Some(50 * 1024 * 1024)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_MS);
+        assert_eq!(debounce(Some(150 * 1024 * 1024 - 1)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_MS);
+        assert_eq!(debounce(Some(150 * 1024 * 1024)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS);
+        assert_eq!(debounce(Some(268 * 1024 * 1024)), SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS);
+    }
+
+    #[test]
+    fn snapshot_debounce_mode_parses_wire_names() {
+        assert_eq!(KernelSnapshotDebounceMode::from_str("legacy"), Some(KernelSnapshotDebounceMode::Legacy));
+        assert_eq!(KernelSnapshotDebounceMode::from_str("adaptive"), Some(KernelSnapshotDebounceMode::Adaptive));
+        assert_eq!(KernelSnapshotDebounceMode::from_str("auto"), None);
+        assert_eq!(KernelSnapshotDebounceMode::Legacy.as_str(), "legacy");
+        assert_eq!(KernelSnapshotDebounceMode::Adaptive.as_str(), "adaptive");
     }
 
     #[test]

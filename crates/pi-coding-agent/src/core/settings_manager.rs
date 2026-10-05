@@ -83,6 +83,30 @@ pub struct CompactionSettings {
     /// Behavior-changing iterative summary prompt. Default: off until semantic quality is proven.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub summary_update_policy: Option<SummaryUpdatePolicySetting>,
+    /// B1: summarizer model override, `"provider/model-id"`. Default: inherit.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_model: Option<String>,
+    /// B2: prompt variant, `"legacy"` (default) or `"v2"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub prompt: Option<String>,
+    /// B3: summary output budget mode, `"legacy"` (default) or `"scaled"`.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub summary_budget_mode: Option<String>,
+    /// B4: compaction trigger threshold, fraction of the context limit in (0, 1].
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub trigger_threshold: Option<f64>,
+    /// A7: episode deadline for the model-driven summary phase, in ms. 0 disables.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub deadline_ms: Option<f64>,
+    /// A7: automatic-retry pacing knobs.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_initial_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_max_ms: Option<u64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_max_consecutive_failures: Option<u32>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_cooldown_ms: Option<u64>,
 }
 
 /// `interface BranchSummarySettings`.
@@ -238,6 +262,27 @@ pub struct TelemetrySettings {
     pub notice_shown: Option<bool>,
 }
 
+/// A7: resolved automatic-compaction retry pacing.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ResolvedCompactionRetrySettings {
+    pub initial_delay_ms: u64,
+    pub max_delay_ms: u64,
+    pub max_consecutive_failures: u32,
+    pub cooldown_ms: u64,
+}
+
+impl Default for ResolvedCompactionRetrySettings {
+    fn default() -> Self {
+        ResolvedCompactionRetrySettings {
+            initial_delay_ms: 30_000,
+            max_delay_ms: 300_000,
+            max_consecutive_failures: 3,
+            cooldown_ms: 600_000,
+        }
+    }
+}
+
 /// `getCompactionSettings()` record.
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -246,6 +291,18 @@ pub struct ResolvedCompactionSettings {
     pub reserve_tokens: f64,
     pub keep_recent_tokens: f64,
     pub summary_update_policy: SummaryUpdatePolicySetting,
+    /// B1: raw summarizer model override (`"provider/model-id"`), `None` = inherit.
+    pub summary_model: Option<String>,
+    /// B2: `"legacy"` (default) or `"v2"`.
+    pub prompt: String,
+    /// B3: `"legacy"` (default) or `"scaled"`.
+    pub summary_budget_mode: String,
+    /// B4: explicit trigger threshold (fraction of the context limit), `None` = current behavior.
+    pub trigger_threshold: Option<f64>,
+    /// A7: episode deadline for the model-driven summary phase, in ms. 0 disables.
+    pub deadline_ms: f64,
+    /// A7: automatic-retry pacing.
+    pub retry: ResolvedCompactionRetrySettings,
 }
 
 /// `getBranchSummarySettings()` record.
@@ -797,6 +854,23 @@ mod keys {
     pub const KEEP_RECENT_TOKENS: &str = "keepRecentTokens";
     pub const AGENT_CALLABLE: &str = "agentCallable";
     pub const SUMMARY_UPDATE_POLICY: &str = "summaryUpdatePolicy";
+    /// B1: summarizer model override, `"provider/model-id"` (e.g.
+    /// `"dgx-glm53/glm-5.3"`). Absent = inherit the session model.
+    pub const SUMMARY_MODEL: &str = "summaryModel";
+    /// B2: prompt variant, `"legacy"` (default) or `"v2"`.
+    pub const COMPACTION_PROMPT: &str = "prompt";
+    /// B3: summary output budget mode, `"legacy"` (default) or `"scaled"`.
+    pub const SUMMARY_BUDGET_MODE: &str = "summaryBudgetMode";
+    /// B4: compaction trigger threshold, a fraction of the context limit in (0, 1].
+    pub const TRIGGER_THRESHOLD: &str = "triggerThreshold";
+    /// A7: episode deadline for the model-driven summary phase, in ms. 0 disables.
+    pub const COMPACTION_DEADLINE_MS: &str = "deadlineMs";
+    /// A7: automatic-retry pacing knobs (see `CompactionRetryConfig` in
+    /// core/compaction/compaction.rs for defaults and semantics).
+    pub const COMPACTION_RETRY_INITIAL_MS: &str = "retryInitialMs";
+    pub const COMPACTION_RETRY_MAX_MS: &str = "retryMaxMs";
+    pub const COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES: &str = "retryMaxConsecutiveFailures";
+    pub const COMPACTION_RETRY_COOLDOWN_MS: &str = "retryCooldownMs";
     pub const SKIP_PROMPT: &str = "skipPrompt";
     pub const NOTICE_SHOWN: &str = "noticeShown";
     pub const MAX_RETRIES: &str = "maxRetries";
@@ -1418,6 +1492,21 @@ fn nested_f64(settings: &Settings, key: &str, nested: &str) -> Option<f64> {
         .and_then(value_to_f64)
 }
 
+fn nested_u64(settings: &Settings, key: &str, nested: &str) -> Option<u64> {
+    settings
+        .get(key)
+        .and_then(|value| value.as_object())
+        .and_then(|object| object.get(nested))
+        .and_then(value_to_f64)
+        .and_then(|value| {
+            if value.is_finite() && value >= 0.0 && value <= u64::MAX as f64 {
+                Some(value as u64)
+            } else {
+                None
+            }
+        })
+}
+
 fn nested_string(settings: &Settings, key: &str, nested: &str) -> Option<String> {
     settings
         .get(key)
@@ -1798,6 +1887,116 @@ impl SettingsManager {
         SUMMARY_UPDATE_POLICY_OFF.to_string()
     }
 
+    /// B1: raw summarizer model override (`"provider/model-id"`). Explicit
+    /// setting wins, then `PRIME_AGENT_COMPACTION_SUMMARY_MODEL`, then inherit.
+    pub fn get_compaction_summary_model(&self) -> Option<String> {
+        nested_string(&self.settings, keys::COMPACTION, keys::SUMMARY_MODEL)
+            .map(|value| value.trim().to_string())
+            .filter(|value| !value.is_empty())
+            .or_else(|| {
+                env_flag("PRIME_AGENT_COMPACTION_SUMMARY_MODEL")
+                    .map(|value| value.trim().to_string())
+                    .filter(|value| !value.is_empty())
+            })
+    }
+
+    /// B2: prompt variant. Explicit setting wins, then
+    /// `PRIME_AGENT_COMPACTION_PROMPT`, then `"legacy"`.
+    pub fn get_compaction_prompt(&self) -> String {
+        let configured = nested_string(&self.settings, keys::COMPACTION, keys::COMPACTION_PROMPT);
+        match configured.as_deref() {
+            Some("v2") => return "v2".to_string(),
+            // An unrecognized value fails safe to legacy without consulting
+            // the environment (an explicit setting is authoritative).
+            Some(_) => return "legacy".to_string(),
+            None => {}
+        }
+        if env_flag("PRIME_AGENT_COMPACTION_PROMPT").as_deref() == Some("v2") {
+            return "v2".to_string();
+        }
+        "legacy".to_string()
+    }
+
+    /// B3: summary output budget mode. Explicit setting wins, then
+    /// `PRIME_AGENT_COMPACTION_SUMMARY_BUDGET_MODE`, then `"legacy"`.
+    pub fn get_compaction_summary_budget_mode(&self) -> String {
+        let configured =
+            nested_string(&self.settings, keys::COMPACTION, keys::SUMMARY_BUDGET_MODE);
+        match configured.as_deref() {
+            Some("scaled") => return "scaled".to_string(),
+            // An unrecognized value fails safe to legacy without consulting
+            // the environment (an explicit setting is authoritative).
+            Some(_) => return "legacy".to_string(),
+            None => {}
+        }
+        if env_flag("PRIME_AGENT_COMPACTION_SUMMARY_BUDGET_MODE").as_deref() == Some("scaled") {
+            return "scaled".to_string();
+        }
+        "legacy".to_string()
+    }
+
+    /// B4: explicit compaction trigger threshold, a fraction of the context
+    /// limit in (0, 1]. Explicit setting wins, then
+    /// `PRIME_AGENT_COMPACTION_TRIGGER_THRESHOLD`, then `None` (current
+    /// reserve-derived behavior).
+    pub fn get_compaction_trigger_threshold(&self) -> Option<f64> {
+        let from_settings = nested_f64(&self.settings, keys::COMPACTION, keys::TRIGGER_THRESHOLD)
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0);
+        if from_settings.is_some() {
+            return from_settings;
+        }
+        env_flag("PRIME_AGENT_COMPACTION_TRIGGER_THRESHOLD")
+            .and_then(|value| value.trim().parse::<f64>().ok())
+            .filter(|value| value.is_finite() && *value > 0.0 && *value <= 1.0)
+    }
+
+    /// A7: episode deadline for the model-driven summary phase, in ms.
+    /// `0` disables the deadline.
+    pub fn get_compaction_deadline_ms(&self) -> f64 {
+        crate::core::compaction::compaction::resolve_compaction_deadline_ms(
+            nested_f64(&self.settings, keys::COMPACTION, keys::COMPACTION_DEADLINE_MS),
+            None,
+        )
+    }
+
+    /// A7: automatic-compaction retry pacing. Explicit settings win, then the
+    /// environment, then the A7 defaults (30s -> 2min -> 5min ladder,
+    /// 3 consecutive failures, 10-minute cooldown).
+    pub fn get_compaction_retry_settings(&self) -> ResolvedCompactionRetrySettings {
+        let overrides = crate::core::compaction::compaction::CompactionRetryOverrides {
+            initial_delay_ms: nested_u64(
+                &self.settings,
+                keys::COMPACTION,
+                keys::COMPACTION_RETRY_INITIAL_MS,
+            ),
+            max_delay_ms: nested_u64(
+                &self.settings,
+                keys::COMPACTION,
+                keys::COMPACTION_RETRY_MAX_MS,
+            ),
+            max_consecutive_failures: nested_u64(
+                &self.settings,
+                keys::COMPACTION,
+                keys::COMPACTION_RETRY_MAX_CONSECUTIVE_FAILURES,
+            )
+            .and_then(|value| u32::try_from(value).ok()),
+            cooldown_ms: nested_u64(
+                &self.settings,
+                keys::COMPACTION,
+                keys::COMPACTION_RETRY_COOLDOWN_MS,
+            ),
+        };
+        let resolved = crate::core::compaction::compaction::CompactionRetryConfig::resolve(Some(
+            &overrides,
+        ));
+        ResolvedCompactionRetrySettings {
+            initial_delay_ms: resolved.initial_delay_ms,
+            max_delay_ms: resolved.max_delay_ms,
+            max_consecutive_failures: resolved.max_consecutive_failures,
+            cooldown_ms: resolved.cooldown_ms,
+        }
+    }
+
     pub fn get_model_tool_output_policy(&self) -> ModelToolOutputPolicySetting {
         let configured = top_string(&self.settings, keys::MODEL_TOOL_OUTPUT_POLICY);
         match configured.as_deref() {
@@ -1821,6 +2020,12 @@ impl SettingsManager {
             reserve_tokens: self.get_compaction_reserve_tokens(),
             keep_recent_tokens: self.get_compaction_keep_recent_tokens(),
             summary_update_policy: self.get_summary_update_policy(),
+            summary_model: self.get_compaction_summary_model(),
+            prompt: self.get_compaction_prompt(),
+            summary_budget_mode: self.get_compaction_summary_budget_mode(),
+            trigger_threshold: self.get_compaction_trigger_threshold(),
+            deadline_ms: self.get_compaction_deadline_ms(),
+            retry: self.get_compaction_retry_settings(),
         }
     }
 

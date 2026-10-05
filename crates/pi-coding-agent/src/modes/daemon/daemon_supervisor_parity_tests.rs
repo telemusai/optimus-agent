@@ -85,6 +85,12 @@ impl SupervisorFixture {
                 session_dir: Some(root.join("sessions").to_string_lossy().into_owned()),
                 ..AgentSessionRuntimeConfig::default()
             },
+            agent_dir: root.join("agent"),
+            lifecycle: crate::modes::daemon::daemon_lifecycle_metrics::DaemonLifecycleEmitter::new(
+                &root.join("agent").to_string_lossy(),
+                &socket_path,
+                "fixture-supervisor",
+            ),
             ownership,
             workers: Mutex::new(HashMap::new()),
             clients: Mutex::new(HashMap::new()),

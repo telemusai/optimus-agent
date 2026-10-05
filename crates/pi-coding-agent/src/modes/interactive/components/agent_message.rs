@@ -2,6 +2,7 @@
 
 use pi_tui::components::spacer::Spacer;
 use pi_tui::components::text::Text;
+use pi_tui::render_cache::StyledRenderCache;
 use pi_tui::tui::{Component, Container};
 use pi_tui::utils::{truncate_to_width, visible_width, wrap_text_with_ansi};
 use std::cell::RefCell;
@@ -12,7 +13,7 @@ use crate::core::agent_messages::{
     AGENT_MESSAGE_DIRECTION_RECEIVED,
 };
 use crate::modes::interactive::components::keybinding_hints::expand_collapse_hint;
-use crate::modes::interactive::theme::theme::theme;
+use crate::modes::interactive::theme::theme::{render_style_revision, theme};
 
 /// Port of the TypeScript `collapseText`: `text.replace(/\s+/g, " ").trim()`.
 fn collapse_text(text: &str) -> String {
@@ -97,14 +98,37 @@ pub fn agent_message_body_lines(message: &str, width: f64) -> Vec<String> {
 /// Port of `AgentMessageBodyComponent`.
 struct AgentMessageBodyComponent {
     message: String,
+    /// A11: `agent_message_body_lines` re-wraps the body text on every render,
+    /// so a huge transcript re-wrapped every unchanged frame. The message is
+    /// immutable after `update_display`, so the wrapped lines are cached per
+    /// (width, style epoch) and only rebuilt on resize or a theme/keybinding
+    /// swap. The style epoch is stored as its own key part (not shifted into a
+    /// packed `u64`) so its high bits cannot be truncated. Output stays
+    /// byte-identical: a miss renders exactly the old path.
+    render_cache: StyledRenderCache,
+}
+
+impl AgentMessageBodyComponent {
+    /// The body's content never changes, so only the style epoch varies.
+    const CONTENT_REVISION: u64 = 0;
 }
 
 impl Component for AgentMessageBodyComponent {
     fn render(&mut self, width: f64) -> Vec<String> {
-        agent_message_body_lines(&self.message, width)
+        let safe_width = std::cmp::max(1, width.max(0.0).floor() as usize);
+        // Snapshot the epoch once so a concurrent swap can only under-tag (an
+        // extra re-render later), never over-tag stale lines as current.
+        let style = render_style_revision();
+        if let Some(cached) = self.render_cache.get(safe_width, Self::CONTENT_REVISION, style) {
+            return cached;
+        }
+        let lines = agent_message_body_lines(&self.message, width);
+        self.render_cache.set(safe_width, Self::CONTENT_REVISION, style, lines)
     }
 
-    fn invalidate(&mut self) {}
+    fn invalidate(&mut self) {
+        self.render_cache.invalidate();
+    }
 }
 
 /// Port of `AgentMessageComponent`.
@@ -114,6 +138,12 @@ pub struct AgentMessageComponent {
     header: Rc<RefCell<Text>>,
     expanded: bool,
     container: Container,
+    /// A11: bumped whenever a mutation can change rendered output (`expanded`
+    /// toggles; external invalidation). The message itself is immutable, so
+    /// unchanged revisions plus an unchanged style epoch mean the previous
+    /// frame's lines are still exact.
+    revision: u64,
+    render_cache: StyledRenderCache,
 }
 
 impl AgentMessageComponent {
@@ -136,6 +166,8 @@ impl AgentMessageComponent {
             header: Rc::new(RefCell::new(Text::new(String::new(), 1, 0, None))),
             expanded: false,
             container,
+            revision: 0,
+            render_cache: StyledRenderCache::new(),
         };
         component.update_display();
         component
@@ -147,6 +179,7 @@ impl AgentMessageComponent {
             return;
         }
         self.expanded = expanded;
+        self.revision = self.revision.wrapping_add(1);
         self.update_display();
     }
 
@@ -164,6 +197,7 @@ impl AgentMessageComponent {
         if self.expanded {
             content.add_child(Rc::new(RefCell::new(AgentMessageBodyComponent {
                 message: self.message.message.clone(),
+                render_cache: StyledRenderCache::new(),
             })) as Rc<RefCell<dyn Component>>);
         }
     }
@@ -196,15 +230,37 @@ impl AgentMessageComponent {
 
 impl Component for AgentMessageComponent {
     fn render(&mut self, width: f64) -> Vec<String> {
-        self.container.render(width)
+        let safe_width = std::cmp::max(1, width.max(0.0).floor() as usize);
+        // A11: exact 3-part key (width, content revision, style epoch). The
+        // style epoch is compared as a whole value, so theme/keybinding
+        // counter growth never truncates away high bits (a packed version
+        // could alias after `render_style_revision() << 32` overflowed).
+        // Snapshotting once means a concurrent swap can only under-tag (an
+        // extra re-render later), never over-tag stale lines as current.
+        let style = render_style_revision();
+        if let Some(cached) = self.render_cache.get(safe_width, self.revision, style) {
+            return cached;
+        }
+        let lines = self.container.render(width);
+        self.render_cache.set(safe_width, self.revision, style, lines)
     }
 
     fn get_selection_regions(&self) -> Vec<pi_tui::selection_metadata::TableCellSelectionRegion> {
         self.container.get_selection_regions()
     }
 
+    /// A11: lets the transcript skip re-rendering this row entirely while the
+    /// revision is unchanged (see `Transcript`'s row render cache).
+    fn render_revision(&self) -> Option<u64> {
+        Some(self.revision)
+    }
+
     fn invalidate(&mut self) {
         self.container.invalidate();
+        // Bump the revision so any memoized lines are dropped even without a
+        // width or style change; `update_display` rebuilds the children.
+        self.revision = self.revision.wrapping_add(1);
+        self.render_cache.invalidate();
         self.update_display();
     }
 }
@@ -289,6 +345,24 @@ mod tests {
             assert_eq!(spaced_lines[0], "");
             assert_eq!(&spaced_lines[1..], tight_lines.as_slice());
         }
+    }
+
+    /// A11: repeated renders at an unchanged width/revision/style return the
+    /// memoized lines byte-identically; expansion and theme swaps invalidate.
+    #[test]
+    fn memoized_render_is_byte_identical_and_invalidates_on_change() {
+        init();
+        let mut component = AgentMessageComponent::new(details("pong"), true);
+        let collapsed = component.render(80.0);
+        assert_eq!(component.render(80.0), collapsed, "unchanged frame must reuse the memoized lines");
+        assert_eq!(component.render_revision(), Some(0));
+        component.set_expanded(true);
+        assert_eq!(component.render_revision(), Some(1), "expansion bumps the revision");
+        let expanded = component.render(80.0);
+        assert_ne!(expanded, collapsed);
+        // A width change must not serve the memoized lines.
+        let resized = component.render(40.0);
+        assert!(resized.iter().all(|line| pi_tui::utils::visible_width(line) <= 40));
     }
 
     /// Test helper: drop SGR sequences so assertions read the visible text.

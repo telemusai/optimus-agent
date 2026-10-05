@@ -337,6 +337,7 @@ pub async fn generate_agent_status(params: GenerateAgentStatusParams) -> Option<
     };
 
     // One failed attempt would settle an idle session to a stale needs_input verdict.
+    let summary_started_at = std::time::Instant::now();
     let response: AssistantMessage = complete_with_provider_retry(
         &|| {
             let model = model.clone();
@@ -348,6 +349,17 @@ pub async fn generate_agent_status(params: GenerateAgentStatusParams) -> Option<
         signal.clone(),
     )
     .await;
+    // A10: feed the registry's in-process endpoint health with this locally
+    // observed outcome so a dying route can be demoted in candidate ordering.
+    registry
+        .lock()
+        .await
+        .record_endpoint_observation(
+            &model.provider,
+            &model.id,
+            response.stop_reason != STOP_REASON_ERROR,
+            Some(summary_started_at.elapsed().as_millis() as f64),
+        );
     if response.stop_reason == STOP_REASON_ERROR {
         return None;
     }

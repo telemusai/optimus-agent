@@ -53,6 +53,8 @@ class CasSnapshotTestCase(unittest.TestCase):
             int(options.get("max_bytes", 1 << 20)),
             int(options.get("max_variable_bytes", 1 << 20)),
             bool(options.get("prune_oversized", False)),
+            # Explicit legacy: `auto` now starts fresh sessions on CAS v2 (A5).
+            snapshot_format="legacy",
         )
 
     def cas_snapshot(self, namespace: dict[str, object], **options: object) -> dict[str, object]:

@@ -507,6 +507,10 @@ struct SseMessageReader {
 	final_decoded: bool,
 	trailing_flushed: bool,
 	signal: Option<tokio_util::sync::CancellationToken>,
+	/// Inter-chunk inactivity deadline, shared with the completions SSE reader:
+	/// the request deadline covers response headers only, so a silently stalled
+	/// body otherwise hangs the request (measured 10-25 min stalls on 2026-09-24).
+	idle_timeout: std::time::Duration,
 }
 
 impl SseMessageReader {
@@ -521,6 +525,7 @@ impl SseMessageReader {
 			final_decoded: false,
 			trailing_flushed: false,
 			signal,
+			idle_timeout: crate::utils::sse_frames::resolve_sse_idle_timeout(),
 		}
 	}
 
@@ -570,7 +575,19 @@ impl SseMessageReader {
 				}
 			}
 
-			match self.chunks.next().await {
+			// Each received chunk resets the inactivity budget; a silent body aborts
+			// here, dropping the byte stream (which closes the connection) instead
+			// of hanging for the transport's own failure horizon.
+			let next_chunk = tokio::select! {
+				chunk = self.chunks.next() => chunk,
+				_ = tokio::time::sleep(self.idle_timeout) => {
+					return Err(AnthropicStreamError::Message(format!(
+						"SSE stream stalled: no data received within {}ms",
+						self.idle_timeout.as_millis()
+					)));
+				}
+			};
+			match next_chunk {
 				None => {
 					self.finished = true;
 				}

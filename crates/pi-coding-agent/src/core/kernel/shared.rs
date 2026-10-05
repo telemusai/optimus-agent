@@ -30,6 +30,25 @@ pub const HOST_REQUEST_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 pub const KERNEL_SHUTDOWN_TIMEOUT_MS: u64 = 5000;
 pub const DEFAULT_SNAPSHOT_DEBOUNCE_MS: u64 = 1500;
 pub const SNAPSHOT_EXECUTION_TIMEOUT_MS: u64 = 60_000;
+/// A6: hard ceiling for the adaptive snapshot execution timeout, so a wedged
+/// snapshot can never block following cells unboundedly.
+pub const MAX_SNAPSHOT_EXECUTION_TIMEOUT_MS: u64 = 180_000;
+/// A6: headroom between the Python-side soft serialization budget and the hard
+/// execution timeout, reserved for the durable write phase.
+pub const SNAPSHOT_BUDGET_MARGIN_MS: u64 = 10_000;
+/// A6: floor for the soft budget handed to the runtime.
+pub const MIN_SNAPSHOT_BUDGET_MS: u64 = 5_000;
+/// B5: adaptive debounce tiers (legacy mode keeps the fixed default above).
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_MS: u64 = 1500;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_MS: u64 = 5000;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_MS: u64 = 15000;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_MS: u64 = 30000;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER2_BYTES: u64 = 10 * 1024 * 1024;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER3_BYTES: u64 = 50 * 1024 * 1024;
+pub const SNAPSHOT_ADAPTIVE_DEBOUNCE_TIER4_BYTES: u64 = 150 * 1024 * 1024;
+/// B5: tier-4 deferral is re-armed while the kernel stays busy, but never lets
+/// the last durable snapshot get older than this.
+pub const SNAPSHOT_ADAPTIVE_MAX_STALE_MS: u64 = 300_000;
 pub const KERNEL_ABORT_GRACE_MS: u64 = 1000;
 pub const KERNEL_BUSY_REUSE_WAIT_MS: u64 = 15_000;
 pub const KERNEL_BUSY_INTERRUPT_INTERVAL_MS: u64 = 500;
@@ -318,6 +337,32 @@ pub type HostRequestHandler =
 /// Host request handlers keyed by request type (e.g. "rlm.run", "goal.complete").
 pub type HostRequestHandlers = HashMap<String, HostRequestHandler>;
 
+/// B5 `snapshotDebounceMode`: how the post-cell auto-snapshot debounce window
+/// is chosen. `Legacy` (default) keeps the fixed `debounce_ms` window.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "kebab-case")]
+pub enum KernelSnapshotDebounceMode {
+    Legacy,
+    Adaptive,
+}
+
+impl KernelSnapshotDebounceMode {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            KernelSnapshotDebounceMode::Legacy => "legacy",
+            KernelSnapshotDebounceMode::Adaptive => "adaptive",
+        }
+    }
+
+    pub fn from_str(value: &str) -> Option<Self> {
+        match value {
+            "legacy" => Some(KernelSnapshotDebounceMode::Legacy),
+            "adaptive" => Some(KernelSnapshotDebounceMode::Adaptive),
+            _ => None,
+        }
+    }
+}
+
 /// Where and how to persist the kernel's user namespace so it survives resume.
 #[derive(Debug, Clone, Default)]
 pub struct KernelSnapshotConfig {
@@ -327,7 +372,9 @@ pub struct KernelSnapshotConfig {
     pub manifest_path: String,
     /// Session-scoped CAS root. Derived from `path` when omitted.
     pub cas_root_path: Option<String>,
-    /// Explicitly initialize CAS v2. Absence defaults fresh roots to legacy.
+    /// Explicit snapshot format. `None` sends `auto`: the runtime continues
+    /// whichever representation is on disk and starts fresh sessions on CAS v2.
+    /// `Some(Legacy)` is the rollback flag for fresh roots.
     pub format: Option<KernelSnapshotFormat>,
     /// Maximum aggregate legacy-equivalent payload size. Default 256 MiB.
     pub max_bytes: Option<u64>,
@@ -335,6 +382,10 @@ pub struct KernelSnapshotConfig {
     pub max_variable_bytes: Option<u64>,
     /// Debounce window for the auto-snapshot after a successful execution. Default 1500 ms.
     pub debounce_ms: Option<u64>,
+    /// B5: `None`/`Legacy` (default) uses `debounce_ms`; `Adaptive` scales the
+    /// window with the last snapshot's serialized size and defers tier-4
+    /// snapshots while the kernel is busy. See `schedule_snapshot`.
+    pub debounce_mode: Option<KernelSnapshotDebounceMode>,
 }
 
 /// `KernelManagerOptions`.

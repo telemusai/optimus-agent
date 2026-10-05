@@ -209,6 +209,16 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
 		provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
 	let is_prime_inference = provider == "prime-inference" || base_url.contains("api.pinference.ai");
 
+	// dgx gateways (dgx-glm53, dgx-k3, ...) expose server-side prompt caching keyed on
+	// session-affinity headers. Measured without them: 50% of attempts hit dgx providers
+	// with 0% cachedInputTokens while inputs p50 111-132k tokens were re-prefilled every
+	// turn; where caching engaged it halved total request time. Affinity is enabled by
+	// detection for dgx provider ids only, and the per-model models.json
+	// `compatCompletions.sendSessionAffinityHeaders: false` override still wins
+	// (`getCompat`), which is the documented opt-out. Headers carry the existing
+	// conversation session id only: no prompt or request-body content changes.
+	let is_dgx = provider == "dgx" || provider.starts_with("dgx-");
+
 	let is_non_standard = provider == "cerebras"
 		|| base_url.contains("cerebras.ai")
 		|| provider == "xai"
@@ -260,7 +270,7 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
 		zai_tool_stream: false,
 		supports_strict_mode: !is_moonshot && !is_cloudflare_ai_gateway && !is_prime_inference,
 		cache_control_format,
-		send_session_affinity_headers: false,
+		send_session_affinity_headers: is_dgx,
 		supports_long_cache_retention: !(is_cloudflare_workers_ai || is_cloudflare_ai_gateway),
 	}
 }
@@ -1439,6 +1449,26 @@ impl StreamError {
 		Self { message: text, value }
 	}
 
+	/// Local transport guard, not a provider response: the SSE body went silent
+	/// between chunks for longer than the inter-chunk inactivity deadline.
+	///
+	/// `recordStreamFailure` reads `code` as the provider error type, so the
+	/// diagnostic keeps a machine-readable `sse_idle_timeout` marker while the
+	/// classification stays retryable (no permanent kind matches), letting the
+	/// provider_retry failover path switch providers instead of hanging.
+	fn sse_idle_timeout(idle_timeout: std::time::Duration) -> Self {
+		let idle_timeout_ms = idle_timeout.as_millis();
+		let message = format!("SSE stream stalled: no data received within {idle_timeout_ms}ms");
+		Self {
+			value: json!({
+				"name": "Error",
+				"message": message,
+				"code": "sse_idle_timeout",
+			}),
+			message,
+		}
+	}
+
 	/// The SDK's in-stream error throw (`Stream.fromSSEResponse`):
 	/// `if (data && data.error) throw new APIError(undefined, data.error, undefined, response.headers);`
 	fn in_stream_api_error(error: &Value, headers: &IndexMap<String, String>) -> Self {
@@ -1700,6 +1730,7 @@ async fn read_sse_data(
 	signal: Option<tokio_util::sync::CancellationToken>,
 	sender: tokio::sync::mpsc::UnboundedSender<Result<SsePayload, StreamError>>,
 	observer: Option<crate::types::OnStreamObservation>,
+	idle_timeout: std::time::Duration,
 ) {
 	let mut response = response;
 	let mut reader = SseLineReader::new();
@@ -1713,6 +1744,12 @@ async fn read_sse_data(
 		// between chunks leaves a stalled stream holding its connection open.
 		let next_chunk = tokio::select! {
 			chunk = response.chunk() => chunk,
+			_ = tokio::time::sleep(idle_timeout) => {
+				// Aborting here drops the response, which closes the body and its
+				// connection, instead of holding it open for the header deadline.
+				let _ = sender.send(Err(StreamError::sse_idle_timeout(idle_timeout)));
+				return;
+			}
 			_ = async {
 				match signal.as_ref() {
 					Some(signal) => signal.cancelled().await,
@@ -1941,7 +1978,12 @@ async fn run_stream_body(
 
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<SsePayload, StreamError>>();
 	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.clone());
-	stream.spawn(read_sse_data(response, signal.clone(), sender, observer));
+	// Inter-chunk inactivity deadline. The request timeout covers headers only, so
+	// without this a silently stalled body hangs until the transport gives up
+	// (measured 10-25 min stalls: attempts failing after ~1,483,861ms /
+	// ~1,449,350ms on 2026-09-24). Every received chunk resets the budget.
+	let sse_idle_timeout = crate::utils::sse_frames::resolve_sse_idle_timeout();
+	stream.spawn(read_sse_data(response, signal.clone(), sender, observer, sse_idle_timeout));
 	let mut finished = false;
 	let mut done = false;
 	while let Some(payload) = receiver.recv().await {
@@ -2562,6 +2604,97 @@ mod provider_settlement_tests {
     }
 
     async fn join_server(server: tokio::task::JoinHandle<()>) {
+        tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn sse_idle_timeout_error_classifies_as_retryable_not_permanent() {
+        // The timeout is a transport failure, not a provider verdict: the diagnostic
+        // must keep a machine-readable marker while staying a retryable kind, so
+        // the provider_retry failover path can switch providers.
+        let mut output = AssistantMessage::new("openai-completions".to_string(), "fixture".to_string(), "fixture".to_string(), 0);
+        output.stop_reason = "error".to_string();
+        let error = StreamError::sse_idle_timeout(std::time::Duration::from_millis(120_000));
+        output.error_message = Some(error.message.clone());
+        let thrown = ThrownStreamError::Value(&error.value);
+        record_stream_failure(&base_model(), &mut output, &thrown);
+        let failure = output
+            .diagnostics
+            .as_ref()
+            .and_then(|diagnostics| diagnostics.iter().find(|diagnostic| diagnostic.type_ == "provider_stream_failure"))
+            .expect("provider_stream_failure diagnostic");
+        let details = failure.details.as_ref().expect("failure details");
+        assert_eq!(details["kind"], "unknown");
+        assert_eq!(details["providerErrorType"], "sse_idle_timeout");
+        // Every permanent kind must stay unmatched: retry/failover stays possible.
+        for permanent in ["invalid_request", "refusal", "safety", "permission", "request_interrupted"] {
+            assert_ne!(details["kind"], *permanent);
+        }
+    }
+
+    #[tokio::test]
+    async fn read_sse_data_aborts_a_silent_body_and_drops_the_connection() {
+        // One chunk, then silence: the reader must abort after the inactivity
+        // deadline (not the header deadline), surface the stall error, and close
+        // the body so the server observes the disconnect.
+        let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut request = Vec::new();
+            loop {
+                let mut bytes = [0; 4096];
+                let count = socket.read(&mut bytes).await.unwrap();
+                assert_ne!(count, 0);
+                request.extend_from_slice(&bytes[..count]);
+                if let Some(end) = request.windows(4).position(|w| w == b"\r\n\r\n") {
+                    break;
+                }
+            }
+            let body = "data: {\"choices\":[{\"delta\":{\"content\":\"partial\"}}]}\n\n";
+            socket
+                .write_all(
+                    format!(
+                        "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nTransfer-Encoding: chunked\r\n\r\n{:x}\r\n{body}\r\n",
+                        body.len()
+                    )
+                    .as_bytes(),
+                )
+                .await
+                .unwrap();
+            // Stalls forever; only a dropped response closes this read.
+            let mut byte = [0; 1];
+            assert_eq!(socket.read(&mut byte).await.unwrap(), 0, "body must be dropped on idle timeout");
+        });
+
+        let response = reqwest::Client::new()
+            .post(format!("http://{address}/chat/completions"))
+            .json(&serde_json::json!({}))
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status().as_u16(), 200);
+
+        let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<SsePayload, StreamError>>();
+        let reader = tokio::spawn(read_sse_data(
+            response,
+            None,
+            sender,
+            None,
+            std::time::Duration::from_millis(150),
+        ));
+        let first = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+        assert!(matches!(first, Ok(SsePayload::Data { .. })), "the first chunk must still arrive");
+        let second = tokio::time::timeout(Duration::from_secs(5), receiver.recv()).await.unwrap().unwrap();
+        match second {
+            Err(error) => {
+                assert!(error.message.contains("SSE stream stalled"), "{:?}", error.message);
+                assert_eq!(error.value["code"].as_str(), Some("sse_idle_timeout"));
+            }
+            Ok(SsePayload::Data { payload, .. }) => panic!("unexpected data after the stall: {payload}"),
+            Ok(SsePayload::Done) => panic!("unexpected [DONE] after the stall"),
+        }
+        reader.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
     }
 
@@ -3294,6 +3427,32 @@ mod tests {
 	// ------------------------------------------------------------------
 	// detectCompat / getCompat
 	// ------------------------------------------------------------------
+
+	#[test]
+	fn detects_dgx_session_affinity_and_keeps_the_models_json_opt_out() {
+		// dgx providers (dgx-glm53, dgx-k3, ...) get session-affinity headers by
+		// detection; every other provider id stays off.
+		for provider in ["dgx", "dgx-glm53", "dgx-k3"] {
+			let mut model = base_model();
+			model.provider = provider.to_string();
+			let compat = get_compat(&model);
+			assert!(compat.send_session_affinity_headers, "{provider}");
+		}
+		for provider in ["openai", "zai", "github-copilot", "dgxproxy"] {
+			let mut model = base_model();
+			model.provider = provider.to_string();
+			assert!(!get_compat(&model).send_session_affinity_headers, "{provider}");
+		}
+
+		// The per-provider models.json override is the documented disable path and
+		// must keep winning over detection.
+		let mut model = compat_model(OpenAICompletionsCompat {
+			send_session_affinity_headers: Some(false),
+			..Default::default()
+		});
+		model.provider = "dgx-k3".to_string();
+		assert!(!get_compat(&model).send_session_affinity_headers);
+	}
 
 	#[test]
 	fn detects_non_standard_providers_by_url() {

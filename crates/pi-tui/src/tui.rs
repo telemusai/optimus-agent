@@ -61,6 +61,37 @@ pub(crate) fn extract_kitty_image_ids(line: &str) -> Vec<u32> {
     Vec::new()
 }
 
+/// Per-phase wall-clock timings for one rendered frame (A15). `render_ms`
+/// covers component rendering, `diff_ms` the frame compose/diff work, and
+/// `write_ms` the terminal write itself. Phases that did not run stay `0.0`;
+/// the values are additive diagnostics only and never gate rendering.
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct RenderPhaseTimings {
+    pub render_ms: f64,
+    pub diff_ms: f64,
+    pub write_ms: f64,
+}
+
+/// A15: finalizes inline-path render phase timings when the diff tail exits.
+/// The tail has several early `return`s after full repaints; the guard writes
+/// the completed timings into the TUI's `last_render_phases` slot on drop.
+struct RenderPhaseGuard<'a> {
+    phases: RenderPhaseTimings,
+    started: std::time::Instant,
+    write_ms: &'a std::cell::Cell<f64>,
+    slot: &'a mut RenderPhaseTimings,
+}
+
+impl Drop for RenderPhaseGuard<'_> {
+    fn drop(&mut self) {
+        let write_ms = self.write_ms.get();
+        let tail_ms = self.started.elapsed().as_secs_f64() * 1000.0;
+        self.phases.write_ms = write_ms;
+        self.phases.diff_ms = (tail_ms - write_ms).max(0.0);
+        *self.slot = self.phases;
+    }
+}
+
 /// Port of the `Component` interface - all components must implement this.
 pub trait Component {
     /// Render the component to lines for the given viewport width.
@@ -103,6 +134,17 @@ pub trait Component {
 
     /// Invalidate any cached rendering state.
     fn invalidate(&mut self);
+
+    /// Monotonic revision of this component's rendered content, used by
+    /// transcript owners to skip re-rendering unchanged rows (A11). `None`
+    /// (the default) marks the component as not safely cacheable: the owner
+    /// re-renders it every frame, exactly as before. Components that opt in
+    /// must bump the revision on EVERY change that can alter rendered output
+    /// (content, expansion, visibility); width and global style (theme,
+    /// keybindings) changes are handled by the owner's cache key.
+    fn render_revision(&self) -> Option<u64> {
+        None
+    }
 
     /// Focus hook used by the `isFocusable` type guard. Components that implement
     /// [`Focusable`] override this so the TUI can drive the `focused` flag.
@@ -517,6 +559,8 @@ pub struct TUI {
     selection_auto_scroll_column: i64,
     focus_order_counter: u64,
     overlay_stack: Vec<OverlayEntry>,
+    /// Phase timings of the most recent `do_render` (A15); reset per frame.
+    last_render_phases: RenderPhaseTimings,
 }
 
 impl TUI {
@@ -576,6 +620,7 @@ impl TUI {
             selection_auto_scroll_column: 0,
             focus_order_counter: 0,
             overlay_stack: Vec::new(),
+            last_render_phases: RenderPhaseTimings::default(),
         }
     }
 
@@ -1093,15 +1138,19 @@ impl TUI {
     /// it every iteration), so it also services the selection auto-scroll
     /// timeout armed by `updateSelectionAutoScroll` (tui.ts:814-833), whose
     /// `setTimeout` chain the Rust port cannot own itself.
-    pub fn run_pending_render(&mut self, now_ms: f64) {
+    /// Returns the per-phase timings of the frame just rendered (A15), or
+    /// default (zeroed) timings when nothing was queued. The owner loop
+    /// records them on the `ui_render` metric; the values are diagnostics only.
+    pub fn run_pending_render(&mut self, now_ms: f64) -> RenderPhaseTimings {
         self.poll_selection_auto_scroll();
         self.render_timer_active = false;
         if self.stopped || !self.render_requested {
-            return;
+            return RenderPhaseTimings::default();
         }
         self.render_requested = false;
         self.last_render_at_ms = now_ms;
         self.do_render();
+        std::mem::take(&mut self.last_render_phases)
     }
 
     /// Port of `enterFullscreen`.
@@ -2207,7 +2256,12 @@ impl TUI {
         None
     }
 
-    fn render_fullscreen(&mut self) {
+    fn render_fullscreen(&mut self) -> RenderPhaseTimings {
+        // A15: per-phase timings for the fullscreen frame - component render,
+        // compose/diff, terminal write - so monitor data can attribute worst
+        // frames without extra instrumentation runs.
+        let mut phases = RenderPhaseTimings::default();
+        let render_started = std::time::Instant::now();
         let width = self.terminal.columns();
         let height = self.terminal.rows();
         self.sync_fullscreen_mouse_tracking();
@@ -2221,11 +2275,11 @@ impl TUI {
         let mut padding_line = String::new();
         let scroll_components: Vec<Rc<RefCell<dyn Component>>> = match &self.fullscreen {
             Some(fullscreen) => fullscreen.scroll.clone(),
-            None => return,
+            None => return phases,
         };
         let dock_component = match &self.fullscreen {
             Some(fullscreen) => fullscreen.dock.clone(),
-            None => return,
+            None => return phases,
         };
         let dock = with_fullscreen_image_fallback(|| dock_component.borrow_mut().render(width as f64));
         let header_budget = (height / 4).min(height.saturating_sub(
@@ -2259,6 +2313,8 @@ impl TUI {
                 transcript.extend(component_lines);
             }
         });
+        phases.render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        let diff_started = std::time::Instant::now();
 
         let (mut frame, window_height, scroll_info, viewport_controls) =
             match self.fullscreen.as_mut() {
@@ -2282,7 +2338,7 @@ impl TUI {
                         fullscreen.viewport_controls,
                     )
                 }
-                None => return,
+                None => return phases,
             };
 
         let dock_regions = self.create_dock_selection_regions(&frame, window_height, width);
@@ -2346,12 +2402,16 @@ impl TUI {
             }
         }
         let buffer = write_buffer.into_inner();
+        let write_started = std::time::Instant::now();
         self.terminal.write(&buffer);
+        phases.write_ms = write_started.elapsed().as_secs_f64() * 1000.0;
         if cursor_pos.is_some() && self.show_hardware_cursor {
             self.terminal.show_cursor();
         } else {
             self.terminal.hide_cursor();
         }
+        phases.diff_ms = (diff_started.elapsed().as_secs_f64() * 1000.0 - phases.write_ms).max(0.0);
+        phases
     }
 
     /// Port of `doRender`: paints one frame (fullscreen or inline differ).
@@ -2359,6 +2419,8 @@ impl TUI {
         if self.stopped {
             return;
         }
+        let mut phases = RenderPhaseTimings::default();
+        let render_started = std::time::Instant::now();
         // TS `OverlayHandle.hide()` splices `overlayStack` synchronously
         // (packages/tui/src/tui.ts:448-461), so a hide() issued from an async
         // event stops compositing on the next frame. The Rust handle can only
@@ -2368,7 +2430,8 @@ impl TUI {
         self.sync_overlays();
         if self.fullscreen.is_some() {
             self.preserve_viewport_on_next_render = false;
-            self.render_fullscreen();
+            let fullscreen_phases = self.render_fullscreen();
+            self.last_render_phases = fullscreen_phases;
             return;
         }
         // One-shot: consume here so it never leaks into a later render.
@@ -2415,6 +2478,20 @@ impl TUI {
         let cursor_pos = self.extract_cursor_position(&mut new_lines, height);
 
         self.apply_line_resets(&mut new_lines);
+
+        // A15: component rendering is done; the guard below attributes the
+        // diff tail (compose + escape buffer) and the terminal writes on every
+        // exit path, including the early returns after a full repaint.
+        phases.render_ms = render_started.elapsed().as_secs_f64() * 1000.0;
+        let write_ms = std::cell::Cell::new(0.0f64);
+        // The underscore binding is deliberate: the guard's `Drop` finalizes
+        // the phase timings on every exit path below without being read.
+        let _phase_guard = RenderPhaseGuard {
+            phases,
+            started: std::time::Instant::now(),
+            write_ms: &write_ms,
+            slot: &mut self.last_render_phases,
+        };
 
         let full_redraw_count = &mut self.full_redraw_count;
         let terminal = &mut self.terminal;
@@ -2492,7 +2569,9 @@ impl TUI {
                     }
                 }
                 buffer.push_str("\x1b[?2026l"); // End synchronized output
+                let write_started = std::time::Instant::now();
                 terminal.write(&buffer);
+                write_ms.set(write_ms.get() + write_started.elapsed().as_secs_f64() * 1000.0);
                 *cursor_row = new_lines.len().saturating_sub(1);
                 *hardware_cursor_row_field = *cursor_row;
                 // Reset (not just grow) the high-water mark to the repainted content.
@@ -3056,7 +3135,9 @@ impl TUI {
         }
 
         // Write entire buffer at once
+        let write_started = std::time::Instant::now();
         terminal.write(&buffer);
+        write_ms.set(write_ms.get() + write_started.elapsed().as_secs_f64() * 1000.0);
 
         // Track cursor position for next render
         // cursorRow tracks end of content (for viewport calculation)

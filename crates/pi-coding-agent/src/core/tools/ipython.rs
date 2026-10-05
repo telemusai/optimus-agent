@@ -372,6 +372,10 @@ pub struct IpythonToolOptions {
     pub snapshot_dir: Option<String>,
     /// Explicit snapshot writer opt-in. Omitted preserves legacy/default continuation behavior.
     pub snapshot_format: Option<KernelSnapshotFormat>,
+    /// B5 `snapshot_debounce_mode`: `None`/`legacy` (default) keeps the fixed
+    /// post-cell debounce; `adaptive` scales the window with the last snapshot's
+    /// serialized size and defers huge-state snapshots while the kernel is busy.
+    pub snapshot_debounce_mode: Option<crate::core::kernel::shared::KernelSnapshotDebounceMode>,
     /// Content-free snapshot timings routed through the owning session's live monitor.
     pub performance_metrics: Option<Arc<dyn PerformanceMetricRecorder>>,
     /// Opt-in model-facing output policy. Execution itself is never cached.
@@ -900,6 +904,7 @@ impl IpythonKernelProvisioner {
                 max_bytes: None,
                 max_variable_bytes: None,
                 debounce_ms: None,
+                debounce_mode: self.options.as_ref().and_then(|options| options.snapshot_debounce_mode),
             }),
             on_background_work_settled: self.options.as_ref().and_then(|options| options.on_background_work_settled.clone()),
             bootstrap_code: Some(bootstrap_code.clone()),

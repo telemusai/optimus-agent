@@ -1012,6 +1012,14 @@ impl AuthStorage {
         }
     }
 
+    /// Drop cached command-backed credential values. Wired into every auth state
+    /// mutation below: a 401/403 marks the provider auth stale, and the next
+    /// resolution must re-execute the credential helper instead of reusing a
+    /// cached value from before the rejection.
+    fn invalidate_resolved_command_values(&self) {
+        crate::core::resolve_config_value::invalidate_resolved_command_values();
+    }
+
     fn get_auth_source_token_for_candidate(
         &self,
         provider: &str,
@@ -1052,12 +1060,14 @@ impl AuthStorage {
             stale.push(token.clone());
         }
         self.stale_auth_sources.insert(token.provider.clone(), stale);
+        self.invalidate_resolved_command_values();
         true
     }
 
     /// Forget every stale marking for a provider (explicit user re-selection).
     pub fn clear_auth_stale(&mut self, provider: &str) {
         self.stale_auth_sources.remove(provider);
+        self.invalidate_resolved_command_values();
     }
 
     fn clear_stale_auth_source(&mut self, provider: &str, source: ActiveAuthStatusSource) {
@@ -1176,6 +1186,9 @@ impl AuthStorage {
     fn adopt_loaded_data(&mut self, content: Option<&str>) {
         let (data, errors) = Self::parse_storage_data_with_errors(content);
         self.data = data;
+        // A reload observed a new auth.json generation (login, OAuth refresh, peer
+        // process): cached command-backed values predate it.
+        self.invalidate_resolved_command_values();
         match errors.first() {
             None => self.load_error = None,
             Some(first) => {
@@ -1295,6 +1308,9 @@ impl AuthStorage {
         self.clear_stale_auth_source(provider, AUTH_SOURCE_STORED);
         self.data.insert(provider.to_string(), credential.clone());
         self.persist_provider_change(provider, Some(&credential));
+        // A credential write must drop cached command-backed values: the new
+        // credential may rotate what those helpers return.
+        self.invalidate_resolved_command_values();
     }
 
     /// Remove credential for a provider.
@@ -1302,6 +1318,7 @@ impl AuthStorage {
         self.clear_stale_auth_source(provider, AUTH_SOURCE_STORED);
         self.data.shift_remove(provider);
         self.persist_provider_change(provider, None);
+        self.invalidate_resolved_command_values();
     }
 
     /// Remove a provider's credential with the disk write verified: returns an

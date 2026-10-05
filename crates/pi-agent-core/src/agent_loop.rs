@@ -23,9 +23,9 @@ use pi_ai::utils::validation::validate_tool_arguments;
 use crate::performance_metrics::{
     elapsed_metric_ms, performance_metric_usage_from_assistant, provider_metric_usage,
     safe_record_performance_metric, AgentLoopLogicalRequestSettlement, PerformanceMetricComponent,
-    PerformanceMetricCorrelation, PerformanceMetricEvent, PerformanceMetricIdentity,
-    PerformanceMetricMeasurement, PerformanceMetricOperation, PerformanceMetricOutcome,
-    PerformanceMetricRecorder, PerformanceMetricUsageV1,
+    PerformanceMetricCorrelation, PerformanceMetricEvent, PerformanceMetricFailure,
+    PerformanceMetricIdentity, PerformanceMetricMeasurement, PerformanceMetricOperation,
+    PerformanceMetricOutcome, PerformanceMetricRecorder, PerformanceMetricUsageV1,
 };
 use crate::types::{
     AgentContext, AgentEvent, AgentLoopConfig, AgentMessage, AgentTool, AgentToolCall,
@@ -67,6 +67,10 @@ struct RequestMetricState {
     /// but as its own stage: `dispatch_to_response_headers_ms` stays null because no
     /// HTTP header edge was observed.
     transport_open_ack_at: Option<f64>,
+    /// A3: the real HTTP status of the last observed response header edge. A
+    /// WebSocket send acknowledgement is deliberately not a status. Only failure
+    /// terminals read this field, so successful attempts stay unchanged.
+    observed_http_status: Option<u16>,
     /// The host decides whether error terminals are retried. Success and cancellation
     /// settle here; a failed terminal waits for the host's retry decision.
     defer_logical_request_terminal: bool,
@@ -105,6 +109,11 @@ pub struct LogicalRequestMetricFinalizer {
     pub defer_terminal: bool,
     pub first_event_at: Option<f64>,
     pub first_visible_at: Option<f64>,
+    /// A3: the failure detail of the attempt that settled this logical
+    /// request, replayed on the deferred terminal. Deferred by the host, so a
+    /// later `finalize_performance_metric_logical_request` call without this
+    /// field reclassifies from the terminal message itself.
+    pub failure: Option<PerformanceMetricFailure>,
 }
 
 /// How long a correlation entry may live. A host-owned logical request that never settles
@@ -306,7 +315,14 @@ pub fn finalize_performance_metric_logical_request(
             return;
         };
         let outcome = outcome.unwrap_or_else(|| request_metric_outcome(&message.stop_reason));
-        settle_logical_request_metric(&state, outcome);
+        // A3: the host settles with only the terminal message, so the failure
+        // detail is re-derived from its persisted diagnostics.
+        let failure = match outcome {
+            PerformanceMetricOutcome::Failure => Some(PerformanceMetricFailure::from_assistant_message(message)),
+            PerformanceMetricOutcome::Cancelled => Some(PerformanceMetricFailure::cancelled()),
+            _ => None,
+        };
+        settle_logical_request_metric(&state, outcome, failure.as_ref());
     }));
 }
 
@@ -320,7 +336,11 @@ pub fn get_performance_metric_request_correlation(
         .and_then(|registry| correlation_for_message(&registry, message))
 }
 
-fn settle_logical_request_metric(state: &LogicalRequestMetricFinalizer, outcome: PerformanceMetricOutcome) {
+fn settle_logical_request_metric(
+    state: &LogicalRequestMetricFinalizer,
+    outcome: PerformanceMetricOutcome,
+    failure: Option<&PerformanceMetricFailure>,
+) {
     if !state.settlement.settle_once() {
         return;
     }
@@ -376,6 +396,12 @@ fn settle_logical_request_metric(state: &LogicalRequestMetricFinalizer, outcome:
             outcome: Some(outcome),
             measurements: Some(measurements),
             usage: None,
+            // A3: failure terminals carry the bounded class/status/message; a
+            // cancellation carries only its class.
+            stage: None,
+            error_class: failure.map(|failure| failure.class),
+            http_status: failure.and_then(|failure| failure.http_status),
+            error_message: failure.and_then(|failure| failure.message.clone()),
         },
     );
 }
@@ -398,6 +424,18 @@ fn next_metric_id(
 ) -> Option<String> {
     let recorder = config.performance_metrics.as_ref()?.recorder.clone();
     std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| recorder.next_id(scope))).ok()
+}
+
+/// A3: the failure detail for a terminal assistant message. The outcome is
+/// derived from the stop reason; the class/status/message come from the
+/// message's persisted provider-failure diagnostics, stop reason, or bounded
+/// error text.
+fn terminal_failure_detail(message: &AssistantMessage) -> Option<PerformanceMetricFailure> {
+    match request_metric_outcome(&message.stop_reason) {
+        PerformanceMetricOutcome::Failure => Some(PerformanceMetricFailure::from_assistant_message(message)),
+        PerformanceMetricOutcome::Cancelled => Some(PerformanceMetricFailure::cancelled()),
+        _ => None,
+    }
 }
 
 fn request_metric_outcome(stop_reason: &StopReason) -> PerformanceMetricOutcome {
@@ -1073,8 +1111,15 @@ fn create_observed_callbacks(
                         if slot.transport_open_ack_at.is_none() {
                             slot.transport_open_ack_at = metric_now(&config);
                         }
-                    } else if slot.response_headers_at.is_none() {
-                        slot.response_headers_at = metric_now(&config);
+                    } else {
+                        if slot.response_headers_at.is_none() {
+                            slot.response_headers_at = metric_now(&config);
+                        }
+                        // A3: keep the observed HTTP status for failure
+                        // attribution; a send acknowledgement carries no status.
+                        if (100..=599).contains(&provider_response.status) {
+                            slot.observed_http_status = Some(provider_response.status as u16);
+                        }
                     }
                     // A missing label must not erase an already observed label: the
                     // provider may have reported its transport on its own stage (B5).
@@ -1287,6 +1332,7 @@ async fn stream_assistant_response_inner(
                     request_metric_outcome(&final_message.stop_reason),
                     request_metrics,
                     observed,
+                    terminal_failure_detail(&final_message).as_ref(),
                 );
                 if *added_partial {
                     if let Some(last) = context.messages.last_mut() {
@@ -1329,6 +1375,7 @@ async fn stream_assistant_response_inner(
         request_metric_outcome(&final_message.stop_reason),
         request_metrics,
         observed,
+        terminal_failure_detail(&final_message).as_ref(),
     );
     if *added_partial {
         if let Some(last) = context.messages.last_mut() {
@@ -1628,6 +1675,16 @@ fn record_tool_performance_metric(
         PerformanceMetricMeasurement::TotalMs,
         elapsed_metric_ms(started_at, metric_now(config)),
     );
+    // A4: the tool name is in scope at this terminal and makes the 62% of
+    // monitored tool failures that were attributable only by opaque call ids
+    // diagnosable. It is an identifier, never arguments or output.
+    // A3: failure terminals carry the bounded class and the opt-in message;
+    // cancellations carry only their class.
+    let failure = match outcome {
+        PerformanceMetricOutcome::Failure => Some(tool_failure_detail(finalized)),
+        PerformanceMetricOutcome::Cancelled => Some(PerformanceMetricFailure::cancelled()),
+        _ => None,
+    };
     safe_record_performance_metric(
         Some(&metrics.recorder),
         PerformanceMetricEvent {
@@ -1644,12 +1701,32 @@ fn record_tool_performance_metric(
                 model: None,
                 api: None,
                 component: Some(PerformanceMetricComponent::Tool),
+                tool: Some(finalized.tool_call.name.clone()),
             }),
             outcome: Some(outcome),
             measurements: Some(measurements),
             usage: None,
+            stage: None,
+            error_class: failure.as_ref().map(|failure| failure.class),
+            http_status: failure.as_ref().and_then(|failure| failure.http_status),
+            error_message: failure.as_ref().and_then(|failure| failure.message.clone()),
         },
     );
+}
+
+/// A3: a tool failure is classified from its result's first text block using
+/// the bounded transport/auth/network heuristics; tool results have no HTTP
+/// status. The message is opt-in at the recorder and bounded here.
+fn tool_failure_detail(finalized: &FinalizedToolCallOutcome) -> PerformanceMetricFailure {
+    let error_text = finalized
+        .result
+        .content
+        .iter()
+        .find_map(|block| block.as_text().map(str::to_string));
+    match error_text {
+        Some(text) => PerformanceMetricFailure::classify_message(&text),
+        None => PerformanceMetricFailure::unknown_with_status(None),
+    }
 }
 
 fn should_terminate_tool_batch(finalized_calls: &[FinalizedToolCallOutcome]) -> bool {
@@ -2240,6 +2317,7 @@ async fn stream_assistant_response(
                     PerformanceMetricOutcome::Cancelled,
                     &mut request_metrics,
                     &observed,
+                    Some(&PerformanceMetricFailure::cancelled()),
                 );
                 if added_partial {
                     if let Some(last) = context.messages.last_mut() {
@@ -2272,6 +2350,7 @@ async fn stream_assistant_response(
                 PerformanceMetricOutcome::Failure,
                 &mut request_metrics,
                 &observed,
+                Some(&PerformanceMetricFailure::from_anyhow_error(&error)),
             );
             if let Some(partial) = partial_message.as_ref() {
                 // This partial will not receive a terminal message_end for the host to settle.
@@ -2292,6 +2371,7 @@ fn finish_request_metrics(
     outcome: PerformanceMetricOutcome,
     request_metrics: &mut RequestMetricState,
     observed: &ObservedCallbacks,
+    failure: Option<&PerformanceMetricFailure>,
 ) {
     if metrics.is_none() || request_metrics.finished {
         return;
@@ -2304,6 +2384,9 @@ fn finish_request_metrics(
             request_metrics.response_headers_at.or(observed_state.response_headers_at);
         request_metrics.transport_open_ack_at =
             request_metrics.transport_open_ack_at.or(observed_state.transport_open_ack_at);
+        // A3: the observed response status backs the failure's `http_status`
+        // when the classifier could not derive one from the error itself.
+        request_metrics.observed_http_status = observed_state.observed_http_status;
         request_metrics.first_raw_at = observed_state.first_raw_at;
         request_metrics.first_thinking_at = observed_state.first_thinking_at;
         request_metrics.first_tool_at = observed_state.first_tool_at;
@@ -2338,6 +2421,7 @@ fn finish_request_metrics(
                 .unwrap_or_else(|| config.model.api.clone()),
         )),
         component: None,
+        tool: None,
     };
     let logical_finalizer = LogicalRequestMetricFinalizer {
         recorder: metrics.as_ref().expect("metrics checked above").recorder.clone(),
@@ -2352,6 +2436,7 @@ fn finish_request_metrics(
         defer_terminal: request_metrics.defer_logical_request_terminal,
         first_event_at: request_metrics.first_event_at,
         first_visible_at: request_metrics.first_visible_at,
+        failure: failure.cloned(),
     };
     let metrics_ref = metrics.as_ref().expect("metrics checked above");
     if let Some(message) = message {
@@ -2433,6 +2518,12 @@ fn finish_request_metrics(
 
     let mut event_identity = identity.clone();
     event_identity.component = Some(PerformanceMetricComponent::Provider);
+    // A3: failure terminals carry the bounded class, the observed status (the
+    // classifier's own status wins over the wire-observed one), and the
+    // opt-in bounded message. Cancellations carry only their class.
+    let attempt_http_status = failure
+        .and_then(|failure| failure.http_status)
+        .or(request_metrics.observed_http_status);
     safe_record_performance_metric(
         Some(&metrics_ref.recorder),
         PerformanceMetricEvent {
@@ -2442,6 +2533,18 @@ fn finish_request_metrics(
             outcome: Some(outcome),
             measurements: Some(attempt_measurements),
             usage,
+            stage: None,
+            error_class: failure.map(|failure| failure.class),
+            http_status: if outcome == PerformanceMetricOutcome::Failure {
+                attempt_http_status
+            } else {
+                None
+            },
+            error_message: if outcome == PerformanceMetricOutcome::Failure {
+                failure.and_then(|failure| failure.message.clone())
+            } else {
+                None
+            },
         },
     );
     // Only an error awaits the host's retry decision. A success or cancellation
@@ -2450,7 +2553,7 @@ fn finish_request_metrics(
         && request_metrics.defer_logical_request_terminal
         && !logical_finalizer.settlement.is_settled();
     if message.is_none() || outcome != PerformanceMetricOutcome::Failure || !host_owns_live_group {
-        settle_logical_request_metric(&logical_finalizer, outcome);
+        settle_logical_request_metric(&logical_finalizer, outcome, failure);
     }
 }
 
@@ -2922,6 +3025,7 @@ mod tests {
             PerformanceMetricOutcome::Success,
             &mut request_metrics,
             &observed,
+            None,
         );
 
         let records = capture.0.lock().unwrap();
@@ -2959,6 +3063,161 @@ mod tests {
         let slot = sse_observed.timestamps.lock().unwrap();
         assert_eq!(slot.response_headers_at, Some(10.0), "an SSE header edge stays on the header stage");
         assert!(slot.transport_open_ack_at.is_none(), "SSE has no transport send acknowledgement");
+    }
+
+    /// A3: a failed provider attempt carries the bounded failure class, the
+    /// wire-observed HTTP status, and no text unless the emitter supplied one.
+    #[tokio::test]
+    async fn failed_provider_attempt_records_error_class_and_http_status() {
+        let capture = Arc::new(CaptureMetrics::default());
+        let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+        config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let state = RequestMetricState::default();
+        let observed = create_observed_callbacks(&config, config.performance_metrics.clone(), &state);
+        observed.on_payload.clone()(json!({"model": "m"}), &config.model).await;
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("x-optimus-transport".to_string(), "sse".to_string());
+        observed
+            .on_response
+            .clone()(pi_ai::types::ProviderResponse { status: 429, headers }, &config.model)
+            .await;
+
+        let mut final_message = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        final_message.stop_reason = pi_ai::types::STOP_REASON_ERROR.to_string();
+        let mut request_metrics = observed.timestamps.lock().unwrap().clone();
+        let settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        let failure = PerformanceMetricFailure::from_stream_failure_info(
+            &pi_ai::utils::stream_failure::StreamFailureInfo {
+                kind: "rate_limit".to_string(),
+                provider_error_type: None,
+                status: Some(429),
+                request_id: None,
+                retry_after_ms: None,
+                raw: None,
+            },
+        );
+        finish_request_metrics(
+            &config,
+            &config.performance_metrics,
+            &settlement,
+            Some(&final_message),
+            PerformanceMetricOutcome::Failure,
+            &mut request_metrics,
+            &observed,
+            Some(&failure),
+        );
+
+        let records = capture.0.lock().unwrap();
+        let attempt = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::ProviderAttempt)
+            .expect("a provider attempt is recorded");
+        assert_eq!(attempt.error_class, Some(crate::performance_metrics::PerformanceMetricErrorClass::RateLimit));
+        assert_eq!(attempt.http_status, Some(429));
+        assert_eq!(attempt.error_message, None, "no message was supplied, so none is recorded");
+        let logical = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::LogicalRequest)
+            .expect("the logical request terminal is recorded");
+        assert_eq!(
+            logical.error_class,
+            Some(crate::performance_metrics::PerformanceMetricErrorClass::RateLimit),
+            "the settled logical request replays the failure class"
+        );
+    }
+
+    /// A3: a cancellation carries only its class; a successful attempt stays
+    /// free of failure fields even when a status was observed on the wire.
+    #[tokio::test]
+    async fn cancelled_and_successful_attempts_do_not_carry_failure_detail() {
+        let capture = Arc::new(CaptureMetrics::default());
+        let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+        config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let observed = create_observed_callbacks(&config, config.performance_metrics.clone(), &RequestMetricState::default());
+        observed.on_payload.clone()(json!({"model": "m"}), &config.model).await;
+        let mut headers = indexmap::IndexMap::new();
+        headers.insert("x-optimus-transport".to_string(), "sse".to_string());
+        observed
+            .on_response
+            .clone()(pi_ai::types::ProviderResponse { status: 200, headers }, &config.model)
+            .await;
+
+        let mut final_message = AssistantMessage::new("openai-responses", "openai", "m", 1);
+        let mut request_metrics = observed.timestamps.lock().unwrap().clone();
+        let settlement = Arc::new(crate::performance_metrics::AgentLoopLogicalRequestSettlement::new());
+        finish_request_metrics(
+            &config,
+            &config.performance_metrics,
+            &settlement,
+            Some(&final_message),
+            PerformanceMetricOutcome::Success,
+            &mut request_metrics,
+            &observed,
+            None,
+        );
+
+        let records = capture.0.lock().unwrap();
+        let attempt = records
+            .iter()
+            .find(|event| event.operation == PerformanceMetricOperation::ProviderAttempt)
+            .expect("a provider attempt is recorded");
+        assert_eq!(attempt.error_class, None);
+        assert_eq!(attempt.http_status, None, "a successful attempt never reports a failure status");
+        assert_eq!(attempt.error_message, None);
+    }
+
+    /// A4: the tool metric carries the tool name so failures are attributable,
+    /// and a failed tool result carries its bounded failure class.
+    #[test]
+    fn tool_metrics_record_the_tool_name_and_failure_class() {
+        let capture = Arc::new(CaptureMetrics::default());
+        let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
+        config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
+        let assistant_message = AssistantMessage::new("openai-responses", "openai", "m", 1);
+
+        let tool_call = crate::types::AgentToolCall::new("call_1", "web_search", serde_json::Map::new());
+        let failing = FinalizedToolCallOutcome {
+            tool_call,
+            result: crate::types::AgentToolResult {
+                content: vec![crate::types::ContentBlock::text("connection refused while fetching results")],
+                details: serde_json::json!({}),
+                is_error: Some(true),
+                terminate: None,
+            },
+            is_error: true,
+        };
+        record_tool_performance_metric(&config, &assistant_message, &failing, Some(1.0), None);
+
+        let succeeding = FinalizedToolCallOutcome {
+            tool_call: crate::types::AgentToolCall::new("call_2", "read_file", serde_json::Map::new()),
+            result: crate::types::AgentToolResult {
+                content: vec![crate::types::ContentBlock::text("ok")],
+                details: serde_json::json!({}),
+                is_error: Some(false),
+                terminate: None,
+            },
+            is_error: false,
+        };
+        record_tool_performance_metric(&config, &assistant_message, &succeeding, Some(1.0), None);
+
+        let records = capture.0.lock().unwrap();
+        let failed = records
+            .iter()
+            .find(|event| event.correlation.as_ref().and_then(|c| c.tool_call_id.as_deref()) == Some("call_1"))
+            .expect("the failed tool metric is recorded");
+        assert_eq!(failed.identity.as_ref().and_then(|identity| identity.tool.as_deref()), Some("web_search"));
+        assert_eq!(failed.outcome, Some(PerformanceMetricOutcome::Failure));
+        assert_eq!(failed.error_class, Some(crate::performance_metrics::PerformanceMetricErrorClass::Network));
+        assert_eq!(failed.error_message.as_deref(), Some("connection refused while fetching results"));
+
+        let succeeded = records
+            .iter()
+            .find(|event| event.correlation.as_ref().and_then(|c| c.tool_call_id.as_deref()) == Some("call_2"))
+            .expect("the successful tool metric is recorded");
+        assert_eq!(succeeded.identity.as_ref().and_then(|identity| identity.tool.as_deref()), Some("read_file"));
+        assert_eq!(succeeded.outcome, Some(PerformanceMetricOutcome::Success));
+        assert_eq!(succeeded.error_class, None);
+        assert_eq!(succeeded.error_message, None);
     }
 
     /// B5: the transport label is observable for a provider that never reports a response
@@ -3050,6 +3309,7 @@ mod tests {
             PerformanceMetricOutcome::Success,
             &mut request_metrics,
             &observed,
+            None,
         );
         let records = capture.0.lock().unwrap();
         let attempt = records
@@ -3112,6 +3372,7 @@ mod tests {
             PerformanceMetricOutcome::Success,
             &mut request_metrics,
             &observed,
+            None,
         );
         let records = capture.0.lock().unwrap();
         let attempt = records
@@ -3362,9 +3623,10 @@ mod tests {
             defer_terminal: false,
             first_event_at: Some(3.0),
             first_visible_at: Some(4.0),
+            failure: None,
         };
-        settle_logical_request_metric(&finalizer, PerformanceMetricOutcome::Success);
-        settle_logical_request_metric(&finalizer, PerformanceMetricOutcome::Failure);
+        settle_logical_request_metric(&finalizer, PerformanceMetricOutcome::Success, None);
+        settle_logical_request_metric(&finalizer, PerformanceMetricOutcome::Failure, None);
         assert!(finalizer.settlement.is_settled());
     }
 

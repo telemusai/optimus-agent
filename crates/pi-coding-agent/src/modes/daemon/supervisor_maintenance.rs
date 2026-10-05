@@ -306,6 +306,14 @@ impl Supervisor {
         remove_file_durably(&self.descriptor_dir.join(format!("{}.json", descriptor.worker_id)).to_string_lossy(), RemoveFileDurablyOptions { fsync_dir: true, platform: None }).await.map_err(|error| error.to_string())?;
         self.retire_worker_journals(&descriptor).await;
         self.workers.lock().unwrap().remove(&descriptor.worker_id);
+        // A15: a provably dead registration was reclaimed after being detected
+        // stale; previously this stayed invisible while journals piled up.
+        self.lifecycle.emit(
+            super::super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_STALE_DETECTED,
+            PerformanceMetricOutcome::Success,
+            Some(&descriptor.worker_id),
+            None,
+        );
         Ok(true)
     }
 

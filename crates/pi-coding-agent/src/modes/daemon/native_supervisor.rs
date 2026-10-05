@@ -34,7 +34,9 @@ use super::super::agent_roster::{
 };
 use super::super::daemon_client::DaemonClientRequestOptions;
 use super::super::daemon_errors::DaemonSessionRecoveringError;
+use super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter;
 use super::super::daemon_protocol::{self, DaemonResponse};
+use pi_agent_core::performance_metrics::PerformanceMetricOutcome;
 use super::super::daemon_session_id::matches_session_id_suffix;
 use super::super::daemon_session_list::{summary_for_inactive_session, SessionSummary};
 use crate::core::session_manager::SessionInfo;
@@ -221,6 +223,10 @@ struct Supervisor {
     socket_path: String,
     descriptor_dir: PathBuf,
     config: AgentSessionRuntimeConfig,
+    /// A15: the agent dir backing the lifecycle telemetry recorder.
+    agent_dir: PathBuf,
+    /// A15: opt-in daemon lifecycle telemetry; a no-op when disabled.
+    lifecycle: super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter,
     ownership: DaemonSupervisorOwnership,
     workers: Mutex<HashMap<String, Arc<Worker>>>,
     clients: Mutex<HashMap<String, Arc<PublicClient>>>,
@@ -296,11 +302,20 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
     let delivery_journal = AgentMessageDeliveryJournal::new(
         &descriptor_dir.join(AGENT_MESSAGE_DELIVERY_JOURNAL_FILE).to_string_lossy(),
     );
+    // A15: the supervisor identity for lifecycle telemetry; the generation is
+    // stable for one supervisor run and distinguishes restarted supervisors.
+    let supervisor_generation = ownership.snapshot().generation;
+    let lifecycle = super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::new(
+        &agent_dir,
+        &socket_path,
+        &supervisor_generation,
+    );
     let supervisor = Arc::new(Supervisor {
         eviction_fence: tokio::sync::RwLock::new(()), idle_eviction_task: Mutex::new(None),
         socket_path: socket_path.clone(), journal: Mutex::new(journal),
         agent_message_delivery_journal: Mutex::new(delivery_journal),
-        descriptor_dir, config, ownership, workers: Mutex::new(HashMap::new()), clients: Mutex::new(HashMap::new()), opening: tokio::sync::RwLock::new(()), pauses: Mutex::new(HashMap::new()),
+        descriptor_dir, config, ownership, agent_dir: PathBuf::from(&agent_dir), lifecycle,
+        workers: Mutex::new(HashMap::new()), clients: Mutex::new(HashMap::new()), opening: tokio::sync::RwLock::new(()), pauses: Mutex::new(HashMap::new()),
         catalog: Arc::new(DaemonCatalogClient::new(Arc::new(|message| eprintln!("Daemon catalog: {message}")))), stopped: CancellationToken::new(),
         roster: Mutex::new(None), pending_roster_changed: Mutex::new(HashSet::new()), pending_roster_removed: Mutex::new(HashSet::new()),
         published_roster_ids: Mutex::new(HashSet::new()), roster_push_scheduled: AtomicBool::new(false),
@@ -315,6 +330,9 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
     // because its mutation sink needs a `Weak` to the finished `Arc`.
     supervisor.init_roster();
     let mut identity = None;
+    // A15: set to true once this supervisor finished startup, so the post-hoc
+    // failure emit below cannot double-report a started supervisor.
+    let mut lifecycle_started = false;
     let result = async {
         prepare_daemon_socket_path(&socket_path, lease.clone()).await.map_err(|error| error.to_string())?;
         std::fs::create_dir_all(&supervisor.descriptor_dir).map_err(|error| error.to_string())?;
@@ -360,6 +378,15 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
             supervisor.ownership.snapshot().generation,
             socket_path
         );
+        // A15: the supervisor finished startup; make the start visible to the
+        // performance-metrics monitor (opt-in sidecar, default off).
+        lifecycle_started = true;
+        supervisor.lifecycle.emit(
+            super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_START,
+            PerformanceMetricOutcome::Success,
+            None,
+            None,
+        );
         loop {
             #[cfg(unix)] {
                 let accepted = tokio::select! { _ = supervisor.stopped.cancelled() => break, result = listener.accept() => result };
@@ -375,6 +402,27 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
         }
         Ok(())
     }.await;
+    // A15: a supervisor that never reached the accept loop failed to start;
+    // a supervisor that did is stopping now. Both are lifecycle events the
+    // monitor previously could not see at all.
+    if !lifecycle_started {
+        supervisor.lifecycle.emit(
+            super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_START,
+            PerformanceMetricOutcome::Failure,
+            None,
+            result.as_ref().err().map(|error: &String| {
+                super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::classify_failure(error.as_str())
+            }).as_ref(),
+        );
+    }
+    supervisor.lifecycle.emit(
+        super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_STOP,
+        if result.is_ok() { PerformanceMetricOutcome::Success } else { PerformanceMetricOutcome::Failure },
+        None,
+        result.as_ref().err().map(|error: &String| {
+            super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::classify_failure(error.as_str())
+        }).as_ref(),
+    );
     supervisor.stopped.cancel();
     let idle_task = supervisor.idle_eviction_task.lock().unwrap().take();
     if let Some(task) = idle_task { let _ = task.await; }
@@ -388,6 +436,8 @@ pub(crate) async fn run_daemon_supervisor_mode(socket_path: Option<String>, mut 
     if identity.is_some() { cleanup_daemon_socket_path(&socket_path, identity, lease.as_deref()); }
     let release = supervisor.ownership.release().await;
     if let Some(lease) = lease { lease.release().await; }
+    // A15: bounded flush of the lifecycle telemetry before the supervisor exits.
+    supervisor.lifecycle.close().await;
     result.and(release)
 }
 
@@ -514,6 +564,18 @@ impl Supervisor {
         }
         if self.stopped.is_cancelled() { return; }
         self.invalidate_worker_input_pauses(worker);
+        // A15: a lost worker connection is a crash-class lifecycle event with
+        // its bounded error class; previously it was invisible to the monitor.
+        {
+            let worker_id = worker.descriptor.lock().unwrap().worker_id.clone();
+            let failure = super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::classify_failure(error);
+            self.lifecycle.emit(
+                super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_CRASH,
+                PerformanceMetricOutcome::Failure,
+                Some(&worker_id),
+                Some(&failure),
+            );
+        }
         self.mark_worker_roster_entries(worker, Some(DAEMON_WORKER_LIFECYCLE_RECOVERING));
         // `isWorkerRecoveryEligible` (3881, 3923-3925): no concurrent ladder may be
         // admitted for the same worker.
@@ -592,6 +654,13 @@ impl Supervisor {
                             if let Err(error) = self.persist_worker(&ready) { eprintln!("Could not persist worker descriptor {}: {error}", ready.worker_id); }
                         }
                         worker.deferred_recovery_rounds.store(0, Ordering::SeqCst);
+                        // A15: the recovery ladder reconnected this worker.
+                        self.lifecycle.emit(
+                            super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_RELAUNCH,
+                            PerformanceMetricOutcome::Success,
+                            Some(&descriptor_worker_id),
+                            None,
+                        );
                         return Ok(());
                     }
                     Err(error) => {
@@ -1164,7 +1233,16 @@ impl Supervisor {
                         self.roster().lock().unwrap().amend(&entry.agent_id, RosterEntryMarks { status_label: None, last_heard_from_at: Some(Some(last_heard_from_at.clone())) });
                     }
                 }
-                worker.roster_stale.store(true, Ordering::SeqCst);
+                if !worker.roster_stale.swap(true, Ordering::SeqCst) {
+                    // A15: report each staleness transition, not every sweep.
+                    let worker_id = worker.descriptor.lock().unwrap().worker_id.clone();
+                    self.lifecycle.emit(
+                        super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_STALE_DETECTED,
+                        PerformanceMetricOutcome::Unavailable,
+                        Some(&worker_id),
+                        None,
+                    );
+                }
             } else {
                 self.clear_roster_staleness(&worker);
             }
@@ -1602,7 +1680,18 @@ impl Supervisor {
             }
             if descriptor.owner_client_id.is_some() { return Err("Client-owned session recovery requires the owning client environment".into()); }
             let recovery = recovery_command(&descriptor)?;
-            self.launch_worker(&recovery, owner, Some(descriptor)).await
+            let worker_id = descriptor.worker_id.clone();
+            let relaunched = self.launch_worker(&recovery, owner, Some(descriptor)).await;
+            // A15: a retry that re-launched a parked worker is a relaunch.
+            if relaunched.is_ok() {
+                self.lifecycle.emit(
+                    super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_RELAUNCH,
+                    PerformanceMetricOutcome::Success,
+                    Some(&worker_id),
+                    None,
+                );
+            }
+            relaunched
         }).await
     }
 
@@ -1746,6 +1835,15 @@ impl Supervisor {
             }
         }
         tokio::spawn(async move { let _ = child.wait().await; });
+        // A15: every worker launch outcome is visible to lifecycle telemetry.
+        self.lifecycle.emit(
+            super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_START,
+            if result.is_ok() { PerformanceMetricOutcome::Success } else { PerformanceMetricOutcome::Failure },
+            Some(&descriptor.worker_id),
+            result.as_ref().err().map(|error: &String| {
+                super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::classify_failure(error.as_str())
+            }).as_ref(),
+        );
         result
     }
     /// The registration half of `parseCommandAndRegisterPromptAdmission` (daemon-supervisor.ts:1899-1919):
@@ -2468,7 +2566,17 @@ impl Supervisor {
                     // interrupted cleanup once the process is gone, so a dead worker is never left
                     // registered for the next boot to recover.
                     self.schedule_worker_stop_finalization(worker);
-                    return Err(format!("Session worker {} did not stop{}", descriptor.worker_id, if sigkill_sent { " after SIGKILL" } else { "" }));
+                    let message = format!("Session worker {} did not stop{}", descriptor.worker_id, if sigkill_sent { " after SIGKILL" } else { "" });
+                    // A15: a stop that timed out keeps escalating in the
+                    // background; report the observed failure class.
+                    let failure = super::super::daemon_lifecycle_metrics::DaemonLifecycleEmitter::classify_failure(&message);
+                    self.lifecycle.emit(
+                        super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_STOP,
+                        PerformanceMetricOutcome::Failure,
+                        Some(&descriptor.worker_id),
+                        Some(&failure),
+                    );
+                    return Err(message);
                 }
                 break;
             }
@@ -2501,6 +2609,13 @@ impl Supervisor {
         // with it, resident rows are passivated.
         self.flip_worker_roster_entries_inactive(worker);
         self.broadcast_heartbeats_changed();
+        // A15: the worker stopped cleanly.
+        self.lifecycle.emit(
+            super::super::daemon_lifecycle_metrics::DAEMON_LIFECYCLE_STAGE_STOP,
+            PerformanceMetricOutcome::Success,
+            Some(&descriptor.worker_id),
+            None,
+        );
         Ok(())
     }
     async fn dispatch(self: &Arc<Self>, public: &Arc<PublicClient>, mut body: Map<String, Value>) -> Result<Option<DaemonResponse>, String> {
