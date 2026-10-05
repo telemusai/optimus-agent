@@ -77,6 +77,71 @@ impl<'de> Visitor<'de> for BorrowedStrVisitor {
 	}
 }
 
+/// `#[serde(default, deserialize_with = "optional_string")]`
+/// `Option<String>`: string values are kept; any other JSON shape
+/// (including `null`) yields `None`, matching `get(field).and_then(Value::as_str)`
+/// followed by a `.to_string()`.
+pub fn optional_string<'de, D>(deserializer: D) -> Result<Option<String>, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	struct OptionalStringVisitor;
+
+	impl<'de> Visitor<'de> for OptionalStringVisitor {
+		type Value = Option<String>;
+
+		fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
+			formatter.write_str("any JSON value")
+		}
+
+		fn visit_str<E: DeError>(self, value: &str) -> Result<Self::Value, E> {
+			Ok(Some(value.to_string()))
+		}
+
+		fn visit_borrowed_str<E: DeError>(self, value: &'de str) -> Result<Self::Value, E> {
+			Ok(Some(value.to_string()))
+		}
+
+		fn visit_unit<E: DeError>(self) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_none<E: DeError>(self) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_some<D: serde::Deserializer<'de>>(self, deserializer: D) -> Result<Self::Value, D::Error> {
+			deserializer.deserialize_any(self)
+		}
+
+		fn visit_bool<E: DeError>(self, _value: bool) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_i64<E: DeError>(self, _value: i64) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_u64<E: DeError>(self, _value: u64) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_f64<E: DeError>(self, _value: f64) -> Result<Self::Value, E> {
+			Ok(None)
+		}
+
+		fn visit_seq<A: serde::de::SeqAccess<'de>>(self, _seq: A) -> Result<Self::Value, A::Error> {
+			Ok(None)
+		}
+
+		fn visit_map<A: serde::de::MapAccess<'de>>(self, _map: A) -> Result<Self::Value, A::Error> {
+			Ok(None)
+		}
+	}
+
+	deserializer.deserialize_any(OptionalStringVisitor)
+}
+
 /// `#[serde(default, deserialize_with = "optional_value")]`
 /// `Option<Value>`: any JSON value; `null` stays `Some(Value::Null)` so
 /// `filter(|value| !value.is_null())` semantics survive.
