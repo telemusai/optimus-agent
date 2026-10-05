@@ -209,15 +209,9 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
 		provider == "cloudflare-ai-gateway" || base_url.contains("gateway.ai.cloudflare.com");
 	let is_prime_inference = provider == "prime-inference" || base_url.contains("api.pinference.ai");
 
-	// dgx gateways (dgx-glm53, dgx-k3, ...) expose server-side prompt caching keyed on
-	// session-affinity headers. Measured without them: 50% of attempts hit dgx providers
-	// with 0% cachedInputTokens while inputs p50 111-132k tokens were re-prefilled every
-	// turn; where caching engaged it halved total request time. Affinity is enabled by
-	// detection for dgx provider ids only, and the per-model models.json
-	// `compatCompletions.sendSessionAffinityHeaders: false` override still wins
-	// (`getCompat`), which is the documented opt-out. Headers carry the existing
-	// conversation session id only: no prompt or request-body content changes.
-	let is_dgx = provider == "dgx" || provider.starts_with("dgx-");
+	// Session-affinity headers are endpoint-specific. DGX gateways can reject them
+	// with HTTP 400, so provider names must not implicitly enable them. Compatible
+	// endpoints can opt in through sendSessionAffinityHeaders.
 
 	let is_non_standard = provider == "cerebras"
 		|| base_url.contains("cerebras.ai")
@@ -270,7 +264,7 @@ fn detect_compat(model: &Model) -> ResolvedCompat {
 		zai_tool_stream: false,
 		supports_strict_mode: !is_moonshot && !is_cloudflare_ai_gateway && !is_prime_inference,
 		cache_control_format,
-		send_session_affinity_headers: is_dgx,
+		send_session_affinity_headers: false,
 		supports_long_cache_retention: !(is_cloudflare_workers_ai || is_cloudflare_ai_gateway),
 	}
 }
@@ -3429,29 +3423,39 @@ mod tests {
 	// ------------------------------------------------------------------
 
 	#[test]
-	fn detects_dgx_session_affinity_and_keeps_the_models_json_opt_out() {
-		// dgx providers (dgx-glm53, dgx-k3, ...) get session-affinity headers by
-		// detection; every other provider id stays off.
-		for provider in ["dgx", "dgx-glm53", "dgx-k3"] {
-			let mut model = base_model();
-			model.provider = provider.to_string();
-			let compat = get_compat(&model);
-			assert!(compat.send_session_affinity_headers, "{provider}");
-		}
-		for provider in ["openai", "zai", "github-copilot", "dgxproxy"] {
+	fn session_affinity_is_not_inferred_from_provider_names() {
+		for provider in ["dgx", "dgx-glm53", "dgx-k3", "openai", "zai", "github-copilot", "dgxproxy"] {
 			let mut model = base_model();
 			model.provider = provider.to_string();
 			assert!(!get_compat(&model).send_session_affinity_headers, "{provider}");
 		}
+	}
 
-		// The per-provider models.json override is the documented disable path and
-		// must keep winning over detection.
-		let mut model = compat_model(OpenAICompletionsCompat {
-			send_session_affinity_headers: Some(false),
-			..Default::default()
-		});
-		model.provider = "dgx-k3".to_string();
-		assert!(!get_compat(&model).send_session_affinity_headers);
+	#[test]
+	fn dgx_clients_send_affinity_headers_only_with_explicit_opt_in() {
+		for provider in ["dgx", "dgx-glm53", "dgx-k3"] {
+			for enabled in [None, Some(false), Some(true)] {
+				let mut model = compat_model(OpenAICompletionsCompat {
+					send_session_affinity_headers: enabled,
+					..Default::default()
+				});
+				model.provider = provider.to_string();
+				let compat = get_compat(&model);
+				assert_eq!(compat.send_session_affinity_headers, enabled == Some(true));
+				for session_id in [None, Some("session-1")] {
+					let client = create_client(
+						&model, &context(vec![user_text("hi")]), Some("fixture-key"), None,
+						session_id, &compat, None,
+					).expect("client");
+					let expected = session_id.filter(|_| enabled == Some(true))
+						.map(|id| Some(id.to_string()));
+					for header in ["session_id", "x-client-request-id", "x-session-affinity"] {
+						assert_eq!(client.default_headers.get(header), expected.as_ref(),
+							"{provider}, enabled={enabled:?}, session_id={session_id:?}, header={header}");
+					}
+				}
+			}
+		}
 	}
 
 	#[test]
