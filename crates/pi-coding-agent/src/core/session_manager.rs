@@ -4497,11 +4497,27 @@ impl SessionManager {
         // failure falls back to the sequential clone.
         let mut refs: Vec<&SessionEntry> = Vec::new();
         self.visit_branch(from_id, |entry| refs.push(entry));
-        match crate::core::compaction::parallel::try_parallel_map(
-            &refs,
-            crate::core::compaction::parallel::ENTRY_CLONE_THRESHOLD,
-            |entry, _| (*entry).clone(),
-        ) {
+        // Byte-aware gate: the clone is allocation-count-bound, so it pays
+        // from ~4096 entries regardless of size, or from ~1024 text-heavy
+        // entries (probed on the middle entry; homogeneous branches are the
+        // norm). Below both, the sequential clone runs.
+        let heavy = refs.len() >= crate::core::compaction::parallel::ENTRY_CLONE_HEAVY_COUNT
+            && refs[refs.len() / 2]
+                .get("message")
+                .map(crate::core::compaction::parallel::approx_value_string_bytes)
+                .unwrap_or(0)
+                >= crate::core::compaction::parallel::ENTRY_CLONE_HEAVY_ENTRY_BYTES;
+        let parallel = heavy || refs.len() >= crate::core::compaction::parallel::ENTRY_CLONE_THRESHOLD;
+        match parallel
+            .then(|| {
+                crate::core::compaction::parallel::try_parallel_map(
+                    &refs,
+                    2,
+                    |entry, _| (*entry).clone(),
+                )
+            })
+            .flatten()
+        {
             Some(cloned) => cloned,
             None => refs.into_iter().cloned().collect(),
         }

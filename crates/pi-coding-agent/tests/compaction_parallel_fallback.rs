@@ -45,24 +45,26 @@ fn fill(seed: u64, len: usize) -> String {
     out
 }
 
-/// A conversation well above every site threshold, with the message shapes
-/// that exercise the serializers: plain text, thinking, tool calls, tool
-/// results (including oversized ones that truncate), and duplicate call ids.
+/// A conversation above every site gate (1600 messages, ~30 MB: >= 24 MB with
+/// >= 4 KB average parts, >= 1536 entries, >= 4096-byte middle entry), with
+/// the message shapes that exercise the serializers: plain text, thinking,
+/// tool calls, tool results (including oversized ones that truncate), and
+/// duplicate call ids.
 fn large_messages() -> Vec<AgentMessage> {
     let mut messages: Vec<AgentMessage> = Vec::new();
-    for index in 0..900 {
+    for index in 0..1600 {
         match index % 6 {
             0 => messages.push(AgentMessage::Message(Message::User(UserMessage::new(
-                UserContent::Text(fill(index as u64 + 1, 1200)),
+                UserContent::Text(fill(index as u64 + 1, 20_000)),
                 1_000_000 + index as i64,
             )))),
             1 | 4 => {
                 let mut content = vec![ContentBlock::Thinking(pi_ai::types::ThinkingContent::new(
-                    fill(index as u64 + 2, 400),
+                    fill(index as u64 + 2, 6_000),
                 ))];
                 content.push(ContentBlock::Text(TextContent::new(fill(
                     index as u64 + 3,
-                    1500,
+                    14_000,
                 ))));
                 messages.push(AgentMessage::Message(Message::Assistant(AssistantMessage {
                     content,
@@ -78,7 +80,7 @@ fn large_messages() -> Vec<AgentMessage> {
                 );
                 arguments.insert(
                     "content".to_string(),
-                    serde_json::Value::String(fill(index as u64 + 4, 300)),
+                    serde_json::Value::String(fill(index as u64 + 4, 2_000)),
                 );
                 messages.push(AgentMessage::Message(Message::Assistant(AssistantMessage {
                     content: vec![ContentBlock::ToolCall(ToolCall::new(
@@ -98,7 +100,7 @@ fn large_messages() -> Vec<AgentMessage> {
                     if index % 3 == 0 { "ipython" } else { "read" }.to_string(),
                     vec![ImageOrTextContent::Text(TextContent::new(fill(
                         index as u64 + 5,
-                        if index % 9 == 0 { 9000 } else { 1500 },
+                        20_000,
                     )))],
                     index % 10 == 0,
                     1_000_000 + index as i64,

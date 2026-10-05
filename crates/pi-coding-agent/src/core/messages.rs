@@ -1175,12 +1175,17 @@ pub fn create_heartbeat_prompt_message(
 pub fn without_harness_digests_for_compaction(messages: &[AgentMessage]) -> Vec<AgentMessage> {
     // Per-message pure filter+strip; large inputs map in parallel and keep
     // slice order (identical list), any failure runs the sequential path.
-    if let Some(mapped) = crate::core::compaction::parallel::try_parallel_map(
-        messages,
-        crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD,
-        |message, _| strip_harness_digest(message),
-    ) {
-        return mapped.into_iter().flatten().collect();
+    if messages.len() >= crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD
+        && crate::core::compaction::parallel::approx_agent_messages_bytes(messages)
+            >= crate::core::compaction::parallel::CONVERT_BYTES_THRESHOLD
+    {
+        if let Some(mapped) = crate::core::compaction::parallel::try_parallel_map(
+            messages,
+            crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD,
+            |message, _| strip_harness_digest(message),
+        ) {
+            return mapped.into_iter().flatten().collect();
+        }
     }
     messages
         .iter()
@@ -1240,7 +1245,14 @@ pub fn convert_to_llm(
     // output is identical; any parallel failure falls back to the sequential
     // loop.
     let policy_input = apply_model_tool_output_policy(messages, options);
-    let items: Vec<ConvertedItem> =
+    // The byte term keeps message-dense but text-light sessions sequential:
+    // the conversion of a ~13 MB list is memcpy-bound and dispatch does not
+    // pay for itself below the measured crossover.
+    let convert_parallel = policy_input.len()
+        >= crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD
+        && crate::core::compaction::parallel::approx_agent_messages_bytes(&policy_input)
+            >= crate::core::compaction::parallel::CONVERT_BYTES_THRESHOLD;
+    let items: Vec<ConvertedItem> = if convert_parallel {
         match crate::core::compaction::parallel::try_parallel_map(
             &policy_input,
             crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD,
@@ -1251,7 +1263,13 @@ pub fn convert_to_llm(
                 .iter()
                 .map(convert_single_message)
                 .collect(),
-        };
+        }
+    } else {
+        policy_input
+            .iter()
+            .map(convert_single_message)
+            .collect()
+    };
     let mut converted: Vec<Message> = Vec::with_capacity(items.len());
     for item in items {
         match item {

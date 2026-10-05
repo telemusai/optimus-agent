@@ -34,6 +34,7 @@
 //! smallest input size at which the parallel path reproducibly beat the
 //! sequential one with margin on the development host.
 
+use pi_agent_core::types::AgentMessage;
 use std::panic::{catch_unwind, AssertUnwindSafe};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::LazyLock;
@@ -190,30 +191,183 @@ pub(crate) fn try_parallel_map<T: Sync, R: Send>(
 }
 
 // ---------------------------------------------------------------------------
-// Size thresholds (measured crossovers; see reports/C1/crossover.md)
+// Size gates (measured crossovers; evidence in reports/C1/crossover.md)
 // ---------------------------------------------------------------------------
+//
+// Measurement basis: `compaction_replay bench-local` on the development host
+// (shared 6c/12t EPYC 74F3, busy), min-of-15 iterations, sequential reference
+// from the pre-change binary and from `PRIME_AGENT_COMPACTION_PARALLEL=0` on
+// the post-change binary (both agree within noise). Parallel dispatch costs
+// ~0.3-0.55 ms per site call on this host, so each gate is set at the smallest
+// measured point where the parallel path beat sequential by >= ~1.25x, with
+// the element count and byte terms that separated winners from losers.
+//
+// Byte terms use `approx_*_bytes` lower bounds (O(fields), no decoding), so a
+// session just below the true byte crossover stays sequential.
 
-/// Per-message token estimation (`estimate_tokens` maps over whole sessions).
+/// Byte-gate scale shared by the byte-aware sites (24 MiB).
+pub(crate) const LARGE_SESSION_BYTES: usize = 24 * 1024 * 1024;
+
+/// Per-message token estimation, full-scan fallback: wins 2.9x at 37 MB,
+/// loses below ~13 MB (0.3 ms work cannot amortize dispatch). Byte term
+/// interpolated between the 13 MB loss and the 37 MB win.
 pub(crate) const TOKEN_ESTIMATE_MESSAGES_THRESHOLD: usize = 512;
+pub(crate) const TOKEN_ESTIMATE_BYTES_THRESHOLD: usize = 20 * 1024 * 1024;
 
-/// Message extraction in `prepare_compaction` (per-entry clone into the
-/// summarizer input).
-pub(crate) const EXTRACT_MESSAGES_THRESHOLD: usize = 256;
+/// Message extraction in `prepare_compaction`: wins 1.58x at 4096 entries /
+/// 37 MB; even at 13 MB; loses below 10 MB.
+pub(crate) const EXTRACT_MESSAGES_THRESHOLD: usize = 1024;
+pub(crate) const EXTRACT_BYTES_THRESHOLD: usize = LARGE_SESSION_BYTES;
 
-/// `convert_to_llm` per-message conversion (and the identity policy clone).
-pub(crate) const CONVERT_MESSAGES_THRESHOLD: usize = 256;
+/// `convert_to_llm` per-message conversion: wins 1.44x at 4096 messages /
+/// 37 MB; even at 9-13 MB.
+pub(crate) const CONVERT_MESSAGES_THRESHOLD: usize = 1024;
+pub(crate) const CONVERT_BYTES_THRESHOLD: usize = LARGE_SESSION_BYTES;
 
-/// `serialize_conversation` per-message part rendering.
+/// `serialize_conversation` part rendering: wins 1.36-1.62x at >= 8 MB with
+/// >= 4 KB average message size; even-to-loss at 13 MB of 1.6 KB messages
+/// (many tiny parts pay dispatch plus allocator contention per part).
 pub(crate) const SERIALIZE_MESSAGES_THRESHOLD: usize = 256;
+pub(crate) const SERIALIZE_BYTES_THRESHOLD: usize = 8 * 1024 * 1024;
+pub(crate) const SERIALIZE_AVG_MESSAGE_BYTES: usize = 4096;
 
-/// `get_branch` per-entry `Value` clone.
-pub(crate) const ENTRY_CLONE_THRESHOLD: usize = 512;
+/// `get_branch` per-entry `Value` clone: allocation-count-bound. Wins from
+/// 4096 entries regardless of size (1.38x at 0.6 MB, 1.27x at 13 MB), and
+/// from 1024 entries when the entries are text-heavy (1.24x at 9.3 MB,
+/// 1.43x at 37 MB); loses at 1024 x 1.7 MB and is even at 2048 x 1.2 MB.
+pub(crate) const ENTRY_CLONE_THRESHOLD: usize = 4096;
+pub(crate) const ENTRY_CLONE_HEAVY_COUNT: usize = 1024;
+pub(crate) const ENTRY_CLONE_HEAVY_ENTRY_BYTES: usize = 4096;
 
-/// `compaction_session_entry_from` per-entry parse.
-pub(crate) const ENTRY_PARSE_THRESHOLD: usize = 256;
+/// `compaction_session_entry_from` per-entry parse: same per-entry `Value`
+/// shape as the branch clone; contributes to the prepare-phase win at xlarge
+/// (1276 entries / 32 MB, replay phase rows 99 -> 74 ms).
+pub(crate) const ENTRY_PARSE_THRESHOLD: usize = ENTRY_CLONE_THRESHOLD;
+pub(crate) const ENTRY_PARSE_HEAVY_COUNT: usize = ENTRY_CLONE_HEAVY_COUNT;
+pub(crate) const ENTRY_PARSE_HEAVY_ENTRY_BYTES: usize = ENTRY_CLONE_HEAVY_ENTRY_BYTES;
 
-/// Session-context restore: per-entry `append_message` parse/clone.
-pub(crate) const RESTORE_ENTRIES_THRESHOLD: usize = 256;
+/// Session-context restore, per-entry parse: wins 1.17-1.61x from 1536
+/// entries (per-entry serde parse dominates, independent of total bytes);
+/// 384-1024 entries sit within run-to-run noise.
+pub(crate) const RESTORE_ENTRIES_THRESHOLD: usize = 1536;
 
-/// Session-context restore: final per-message clone of the context messages.
-pub(crate) const CONTEXT_CLONE_THRESHOLD: usize = 512;
+/// Session-context restore, final per-message clone of the context messages.
+pub(crate) const CONTEXT_CLONE_THRESHOLD: usize = 1536;
+
+/// Cheap lower bound of a message's byte weight: text lengths only, plus a
+/// fixed per-block allowance for tool-call arguments (serializing them would
+/// cost a large fraction of the work being gated). O(fields), no decoding.
+pub(crate) fn approx_agent_message_bytes(message: &AgentMessage) -> usize {
+    use pi_agent_core::types::{CustomAgentMessage, CustomMessageContent};
+    use pi_ai::types::{ContentBlock, ImageOrTextContent, Message, UserContent};
+    match message {
+        AgentMessage::Message(Message::User(user)) => match &user.content {
+            UserContent::Text(text) => text.len(),
+            UserContent::Blocks(blocks) => blocks
+                .iter()
+                .map(|block| match block {
+                    ImageOrTextContent::Text(text) => text.text.len(),
+                    ImageOrTextContent::Image(_) => 4096,
+                })
+                .sum(),
+        },
+        AgentMessage::Message(Message::Assistant(assistant)) => assistant
+            .content
+            .iter()
+            .map(|block| match block {
+                ContentBlock::Text(text) => text.text.len(),
+                ContentBlock::Thinking(thinking) => thinking.thinking.len(),
+                ContentBlock::ToolCall(call) => call.name.len() + 64,
+            })
+            .sum(),
+        AgentMessage::Message(Message::ToolResult(result)) => result
+            .content
+            .iter()
+            .map(|block| match block {
+                ImageOrTextContent::Text(text) => text.text.len(),
+                ImageOrTextContent::Image(_) => 4096,
+            })
+            .sum(),
+        AgentMessage::Custom(CustomAgentMessage::BashExecution {
+            command, output, ..
+        }) => command.len() + output.len(),
+        AgentMessage::Custom(CustomAgentMessage::Custom { content, .. }) => match content {
+            CustomMessageContent::Text(text) => text.len(),
+            CustomMessageContent::Blocks(blocks) => blocks
+                .iter()
+                .map(|block| match block {
+                    pi_agent_core::types::ContentBlock::Text(text) => text.text.len(),
+                    pi_agent_core::types::ContentBlock::Image(_) => 4096,
+                })
+                .sum(),
+        },
+        AgentMessage::Custom(CustomAgentMessage::BranchSummary { summary, .. }) => summary.len(),
+        AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
+            summary,
+            harness_digest,
+            ..
+        }) => summary.len() + harness_digest.as_deref().map_or(0, str::len),
+    }
+}
+
+/// Byte lower bound for a slice of agent messages.
+pub(crate) fn approx_agent_messages_bytes(messages: &[AgentMessage]) -> usize {
+    messages.iter().map(approx_agent_message_bytes).sum()
+}
+
+/// Byte lower bound for converted LLM messages (the `serialize_conversation`
+/// input shape).
+pub(crate) fn approx_llm_messages_bytes(messages: &[pi_ai::types::Message]) -> usize {
+    use pi_ai::types::{ContentBlock, ImageOrTextContent, Message, UserContent};
+    messages
+        .iter()
+        .map(|message| match message {
+            Message::User(user) => match &user.content {
+                UserContent::Text(text) => text.len(),
+                UserContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|block| match block {
+                        ImageOrTextContent::Text(text) => text.text.len(),
+                        ImageOrTextContent::Image(_) => 4096,
+                    })
+                    .sum(),
+            },
+            Message::Assistant(assistant) => assistant
+                .content
+                .iter()
+                .map(|block| match block {
+                    ContentBlock::Text(text) => text.text.len(),
+                    ContentBlock::Thinking(thinking) => thinking.thinking.len(),
+                    ContentBlock::ToolCall(call) => call.name.len() + 64,
+                })
+                .sum(),
+            Message::ToolResult(result) => result
+                .content
+                .iter()
+                .map(|block| match block {
+                    ImageOrTextContent::Text(text) => text.text.len(),
+                    ImageOrTextContent::Image(_) => 4096,
+                })
+                .sum(),
+        })
+        .sum()
+}
+
+/// Recursive string-length sum of a JSON value: a cheap byte-weight estimate
+/// for one entry (bounded cost; used only on a single probe entry, never over
+/// a whole branch).
+pub(crate) fn approx_value_string_bytes(value: &serde_json::Value) -> usize {
+    use serde_json::Value;
+    match value {
+        Value::String(text) => text.len(),
+        Value::Array(items) => items.iter().map(approx_value_string_bytes).sum(),
+        Value::Object(fields) => fields
+            .values()
+            .map(approx_value_string_bytes)
+            .sum::<usize>()
+            + fields.len() * 16,
+        Value::Number(_) => 24,
+        Value::Bool(_) => 4,
+        Value::Null => 0,
+    }
+}

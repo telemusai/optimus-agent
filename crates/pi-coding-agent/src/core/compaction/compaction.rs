@@ -35,7 +35,9 @@ use serde_json::Value;
 
 use crate::core::compaction::charcount::{count_chars, scan_chars_forward};
 use crate::core::compaction::parallel::{
-    try_parallel_map, EXTRACT_MESSAGES_THRESHOLD, TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
+    approx_agent_message_bytes, approx_agent_messages_bytes, try_parallel_map,
+    EXTRACT_BYTES_THRESHOLD, EXTRACT_MESSAGES_THRESHOLD, TOKEN_ESTIMATE_BYTES_THRESHOLD,
+    TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
 };
 use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::metrics::CompactionMetrics;
@@ -1109,13 +1111,23 @@ pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimat
     let Some((usage, index)) = get_last_assistant_usage_info(messages) else {
         // No usable usage: the estimate sums every message. Element estimates
         // are pure, so large sessions map them in parallel and fold the sums
-        // in slice order (identical f64 addition order). Any parallel failure
-        // falls back to the sequential loop below.
-        let per_message: Option<Vec<f64>> = try_parallel_map(
-            messages,
-            TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
-            |message, _| estimate_tokens(message),
-        );
+        // in slice order (identical f64 addition order). The byte term keeps
+        // message-dense but text-light sessions sequential: the scan of a
+        // ~13 MB transcript is already sub-millisecond and cannot amortize
+        // thread dispatch. Any parallel failure falls back to the sequential
+        // loop below.
+        let per_message: Option<Vec<f64>> =
+            if messages.len() >= TOKEN_ESTIMATE_MESSAGES_THRESHOLD
+                && approx_agent_messages_bytes(messages) >= TOKEN_ESTIMATE_BYTES_THRESHOLD
+            {
+                try_parallel_map(
+                    messages,
+                    TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
+                    |message, _| estimate_tokens(message),
+                )
+            } else {
+                None
+            };
         if let Some(per_message) = per_message {
             let mut estimated = 0.0;
             for tokens in per_message {
@@ -1480,6 +1492,32 @@ pub struct CompactionPreparation {
     pub settings: CompactionSettings,
 }
 
+/// Byte lower bound of the entry slice the preparation extracts (text
+/// lengths only; see `approx_agent_message_bytes`).
+fn approx_compaction_entries_bytes(entries: &[CompactionSessionEntry]) -> usize {
+    entries
+        .iter()
+        .map(|entry| match entry {
+            CompactionSessionEntry::Message { message, .. } => {
+                approx_agent_message_bytes(message)
+            }
+            CompactionSessionEntry::CustomMessage { content, .. } => match content {
+                pi_agent_core::types::CustomMessageContent::Text(text) => text.len(),
+                pi_agent_core::types::CustomMessageContent::Blocks(blocks) => blocks
+                    .iter()
+                    .map(|block| match block {
+                        pi_agent_core::types::ContentBlock::Text(text) => text.text.len(),
+                        pi_agent_core::types::ContentBlock::Image(_) => 4096,
+                    })
+                    .sum(),
+            },
+            CompactionSessionEntry::BranchSummary { summary, .. } => summary.len(),
+            CompactionSessionEntry::Compaction { summary, .. } => summary.len(),
+            CompactionSessionEntry::Other { .. } => 0,
+        })
+        .sum()
+}
+
 pub fn prepare_compaction(
     path_entries: &[CompactionSessionEntry],
     settings: &CompactionSettings,
@@ -1546,18 +1584,30 @@ pub fn prepare_compaction(
         cut_point.first_kept_entry_index
     };
     // Per-entry extraction is a pure clone; large sessions map it in parallel
-    // and keep the slice order, so the message list is identical. Any parallel
-    // failure falls back to the sequential loop.
-    let messages_to_summarize: Vec<AgentMessage> = match try_parallel_map(
-        &path_entries[boundary_start..history_end],
-        EXTRACT_MESSAGES_THRESHOLD,
-        |entry, _| get_message_from_entry_for_compaction(entry),
-    ) {
-        Some(messages) => messages.into_iter().flatten().collect(),
-        None => path_entries[boundary_start..history_end]
+    // and keep the slice order, so the message list is identical. The byte term
+    // keeps entry-dense but text-light sessions sequential (clone work below
+    // ~24 MB does not amortize thread dispatch). Any parallel failure falls
+    // back to the sequential loop.
+    let summarize_entries = &path_entries[boundary_start..history_end];
+    let extract_parallel = summarize_entries.len() >= EXTRACT_MESSAGES_THRESHOLD
+        && approx_compaction_entries_bytes(summarize_entries) >= EXTRACT_BYTES_THRESHOLD;
+    let messages_to_summarize: Vec<AgentMessage> = if extract_parallel {
+        match try_parallel_map(
+            summarize_entries,
+            EXTRACT_MESSAGES_THRESHOLD,
+            |entry, _| get_message_from_entry_for_compaction(entry),
+        ) {
+            Some(messages) => messages.into_iter().flatten().collect(),
+            None => summarize_entries
+                .iter()
+                .filter_map(get_message_from_entry_for_compaction)
+                .collect(),
+        }
+    } else {
+        summarize_entries
             .iter()
             .filter_map(get_message_from_entry_for_compaction)
-            .collect(),
+            .collect()
     };
     let mut turn_prefix_messages: Vec<AgentMessage> = Vec::new();
     if cut_point.is_split_turn {

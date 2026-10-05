@@ -204,7 +204,21 @@ enum SerializePlan {
 }
 
 fn serialize_conversation_parallel(messages: &[Message]) -> Option<String> {
-    use crate::core::compaction::parallel::{try_parallel_map, SERIALIZE_MESSAGES_THRESHOLD};
+    use crate::core::compaction::parallel::{
+        approx_llm_messages_bytes, try_parallel_map, SERIALIZE_AVG_MESSAGE_BYTES,
+        SERIALIZE_BYTES_THRESHOLD, SERIALIZE_MESSAGES_THRESHOLD,
+    };
+    // Byte-aware gate: part rendering is memcpy-bound, so the crossover sits
+    // at ~8 MB of conversation text with >= ~4 KB average parts. Many tiny
+    // parts pay dispatch and allocator contention per part and stay
+    // sequential.
+    let bytes = approx_llm_messages_bytes(messages);
+    if messages.len() < SERIALIZE_MESSAGES_THRESHOLD
+        || bytes < SERIALIZE_BYTES_THRESHOLD
+        || bytes / messages.len() < SERIALIZE_AVG_MESSAGE_BYTES
+    {
+        return None;
+    }
     let mut calls: HashMap<&str, usize> = HashMap::new();
     let mut next_call = 1usize;
     let mut plan: Vec<SerializePlan> = Vec::with_capacity(messages.len());
