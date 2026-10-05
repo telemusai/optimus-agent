@@ -1,0 +1,2 @@
+- Fixed watchdog integration after merging stream-copy and metrics improvements: stalled requests derive the latest partial state from the context tail and record terminal failure details without restoring per-delta copies.
+- Fixed stream watchdog cancellation to stop only the stalled provider attempt, leaving the host cancellation token usable for retry and failover.
