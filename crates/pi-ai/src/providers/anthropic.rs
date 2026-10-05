@@ -422,7 +422,7 @@ fn split_line_at(text: &str, from: usize) -> Option<(usize, usize)> {
 
 /// TS: `consumeLine(text)`. Kept for the line-splitting regression test; the
 /// reader scans with offsets so no per-line remainder is copied.
-#[allow(dead_code)]
+#[cfg(test)]
 fn consume_line(text: &str) -> Option<(String, String)> {
 	let (line_break_index, next_index) = split_line_at(text, 0)?;
 	Some((text[..line_break_index].to_string(), text[next_index..].to_string()))

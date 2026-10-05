@@ -2165,6 +2165,9 @@ fn bedrock_client_policy(config: &BedrockClientConfig) -> crate::providers::shar
 	}
 }
 
+/// Kept for the client-builder option tests; `build_http_client` shares the
+/// pooled client instead of constructing one.
+#[cfg(test)]
 fn bedrock_http_client_builder(config: &BedrockClientConfig) -> reqwest::ClientBuilder {
 	bedrock_client_policy(config).builder()
 }

@@ -1567,7 +1567,7 @@ impl SseLineReader {
 
 /// `findDoubleNewlineIndex` from the SDK line decoder. Kept for the framing
 /// regression test; the reader above is line-based.
-#[allow(dead_code)]
+#[cfg(test)]
 fn find_double_newline_index(data: &[u8]) -> Option<usize> {
 	let mut i = 0usize;
 	while i + 1 < data.len() {
@@ -1595,6 +1595,7 @@ fn observe_local_phase(observer: Option<&crate::types::OnStreamObservation>, pha
 
 /// Reads the response body and forwards each `data:` payload as it arrives, so
 /// the caller emits events incrementally like the SDK's async iterator.
+#[cfg(test)]
 fn observe_sse_payload(observer: Option<&crate::types::OnStreamObservation>, payload: &str) {
 	observe_sse_payload_parsed(observer, payload, None);
 }

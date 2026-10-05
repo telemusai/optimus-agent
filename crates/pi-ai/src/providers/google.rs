@@ -1673,6 +1673,20 @@ mod tests {
 		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2})]);
 	}
 
+	#[test]
+	fn sse_chunk_stream_reports_malformed_chunks() {
+		let mut stream = SseChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: "data: {oops}\n\n".to_string(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: true,
+			signal: None,
+		};
+		let error = stream.drain_events().unwrap_err();
+		assert!(error.message().starts_with("exception parsing stream chunk {oops}."));
+	}
+
 	/// The offset scan must agree with the per-delimiter min-index scan on mixed
 	/// delimiters, including a `\r\r` that is followed by a newline (the `\r\r`
 	/// wins; the trailing `\n` starts the next event) and a `\r\n` pair that only
