@@ -1,0 +1,1 @@
+- Codex WebSocket turns no longer wrap every text frame in a JSON envelope before parsing: frame text reaches the stream parser directly, one queue hand-off replaces two, and the steady-state frame path allocates once instead of ten times per event.
