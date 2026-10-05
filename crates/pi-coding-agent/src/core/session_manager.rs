@@ -3355,6 +3355,12 @@ pub struct SessionManager {
     leaf_id: Option<String>,
     persist_listeners: Arc<Mutex<Vec<Option<SessionPersistListener>>>>,
     load_observation: Option<SessionLoadObservation>,
+    /// Counts this manager's successful disk writes (appended lines and
+    /// rewrites). Delivery-boundary fsyncs compare it against the epoch of the
+    /// last successful sync to skip the fsync when no bytes were added.
+    persist_write_epoch: u64,
+    /// Write epoch at the last successful delivery-boundary sync, if any.
+    rlm_delivery_synced_epoch: Option<u64>,
 }
 
 impl SessionManager {
@@ -3380,6 +3386,8 @@ impl SessionManager {
             leaf_id: None,
             persist_listeners: Arc::new(Mutex::new(Vec::new())),
             load_observation: None,
+            persist_write_epoch: 0,
+            rlm_delivery_synced_epoch: None,
         };
         if persist && !manager.session_dir.is_empty() && !Path::new(&manager.session_dir).exists() {
             let _ = std::fs::create_dir_all(&manager.session_dir);
@@ -3638,9 +3646,27 @@ impl SessionManager {
             WriteFileAtomicOptions { mode, fsync: false },
             None,
         )?;
+        self.persist_write_epoch += 1;
         // Observers see committed writes only.
         self.notify_persist_listeners();
         Ok(())
+    }
+
+    /// Current count of this manager's successful disk writes.
+    pub fn persist_write_epoch(&self) -> u64 {
+        self.persist_write_epoch
+    }
+
+    /// True when no bytes were written since the delivery-boundary sync that
+    /// recorded `epoch`: a fsync now would flush nothing new.
+    pub fn rlm_delivery_sync_is_current(&self, epoch: u64) -> bool {
+        self.rlm_delivery_synced_epoch == Some(epoch)
+    }
+
+    /// Record a successful delivery-boundary sync of `epoch`. Call only
+    /// after the file (and, on unix, its directory) synced without error.
+    pub fn record_rlm_delivery_sync(&mut self, epoch: u64) {
+        self.rlm_delivery_synced_epoch = Some(epoch);
     }
 
     fn notify_persist_listeners(&self) {
@@ -3819,6 +3845,7 @@ impl SessionManager {
             use std::io::Write;
             writeln!(file, "{}", serialize_session_file_entry(entry))
                 .map_err(|error| error.to_string())?;
+            self.persist_write_epoch += 1;
             self.notify_persist_listeners();
         }
         Ok(())
@@ -5313,6 +5340,51 @@ mod tests {
         );
         assert_eq!(legacy_child_depth_from_path("/a/not-sub/b.jsonl"), 0);
         assert_eq!(legacy_child_depth_from_path("/a/sub-ZZZZ/b.jsonl"), 0);
+    }
+
+    #[test]
+    fn write_epoch_counts_appends_rewrites_and_skips() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        manager.new_session(None).unwrap().unwrap();
+        // A pre-assistant custom entry is guard-skipped: no write, no epoch move.
+        assert_eq!(manager.append_custom_entry("custom", None).unwrap().len() > 0, true);
+        assert_eq!(manager.persist_write_epoch(), 0);
+        // The first assistant append takes the rewrite path: one write.
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let after_rewrite = manager.persist_write_epoch();
+        assert_eq!(after_rewrite, 1);
+        // Later appends take the append path: one write each.
+        manager.append_message(user_message("hello", 2)).unwrap();
+        assert_eq!(manager.persist_write_epoch(), after_rewrite + 1);
+        // A forced rewrite (rollback recovery shape) counts as a write too.
+        manager.flushed = false;
+        manager.append_message(user_message("again", 3)).unwrap();
+        assert!(manager.persist_write_epoch() >= after_rewrite + 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn delivery_sync_tracking_round_trips() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        manager.new_session(None).unwrap().unwrap();
+        // Nothing synced yet: any epoch requires the barrier.
+        assert!(!manager.rlm_delivery_sync_is_current(0));
+        manager.record_rlm_delivery_sync(0);
+        // Same epoch and no writes in between: the sync would flush nothing.
+        assert!(manager.rlm_delivery_sync_is_current(0));
+        // A write moves the epoch: the boundary must fsync again.
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let epoch = manager.persist_write_epoch();
+        assert!(!manager.rlm_delivery_sync_is_current(epoch));
+        manager.record_rlm_delivery_sync(epoch);
+        assert!(manager.rlm_delivery_sync_is_current(epoch));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
