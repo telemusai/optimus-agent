@@ -5909,6 +5909,10 @@ impl AgentSession {
         if manager.rlm_delivery_sync_is_current(write_epoch) {
             return Ok(());
         }
+        // Pending buffered lines count as dirty (the epoch moved at accept
+        // time), so drain them first: the fsync below must cover them for the
+        // append -> fsync -> send ordering to hold.
+        manager.drain_write_buffer()?;
         // Keep the manager locked through the durability barrier: a rewrite or
         // later ledger append must not replace the file while it is synced.
         std::fs::OpenOptions::new()
