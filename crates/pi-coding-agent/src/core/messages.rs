@@ -1173,38 +1173,59 @@ pub fn create_heartbeat_prompt_message(
 /// - Custom extensions and tools
 /// Mechanical memory snapshots are regenerated after compaction, never summarized.
 pub fn without_harness_digests_for_compaction(messages: &[AgentMessage]) -> Vec<AgentMessage> {
+    // Per-message pure filter+strip; large inputs map in parallel and keep
+    // slice order (identical list), any failure runs the sequential path.
+    if messages.len() >= crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD
+        && crate::core::compaction::parallel::approx_agent_messages_bytes(messages)
+            >= crate::core::compaction::parallel::CONVERT_BYTES_THRESHOLD
+    {
+        if let Some(mapped) = crate::core::compaction::parallel::try_parallel_map(
+            messages,
+            crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD,
+            |message, _| strip_harness_digest(message),
+        ) {
+            return mapped.into_iter().flatten().collect();
+        }
+    }
     messages
         .iter()
-        .filter(|message| {
-            !matches!(
-                message,
-                AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. })
-                    if custom_type == HARNESS_DIGEST_CUSTOM_TYPE
-            )
-        })
-        .map(|message| match message {
-            AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
-                summary,
-                provider_context,
-                tokens_before,
-                retained_message_count,
-                custom_instructions,
-                harness_digest,
-                timestamp,
-            }) if harness_digest.is_some() => {
-                AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
-                    summary: summary.clone(),
-                    provider_context: provider_context.clone(),
-                    tokens_before: *tokens_before,
-                    retained_message_count: *retained_message_count,
-                    custom_instructions: custom_instructions.clone(),
-                    harness_digest: None,
-                    timestamp: *timestamp,
-                })
-            }
-            other => other.clone(),
-        })
+        .filter_map(strip_harness_digest)
         .collect()
+}
+
+/// The per-message step of `without_harness_digests_for_compaction`:
+/// `None` drops harness-digest custom messages; compaction summaries are
+/// stripped of their digest.
+fn strip_harness_digest(message: &AgentMessage) -> Option<AgentMessage> {
+    if matches!(
+        message,
+        AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, .. })
+            if custom_type == HARNESS_DIGEST_CUSTOM_TYPE
+    ) {
+        return None;
+    }
+    Some(match message {
+        AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
+            summary,
+            provider_context,
+            tokens_before,
+            retained_message_count,
+            custom_instructions,
+            harness_digest,
+            timestamp,
+        }) if harness_digest.is_some() => {
+            AgentMessage::Custom(CustomAgentMessage::CompactionSummary {
+                summary: summary.clone(),
+                provider_context: provider_context.clone(),
+                tokens_before: *tokens_before,
+                retained_message_count: *retained_message_count,
+                custom_instructions: custom_instructions.clone(),
+                harness_digest: None,
+                timestamp: *timestamp,
+            })
+        }
+        other => other.clone(),
+    })
 }
 
 /// One `convertToLlm` result item: a message, or the compaction summary pair.
@@ -1218,8 +1239,54 @@ pub fn convert_to_llm(
     messages: &[AgentMessage],
     options: &ModelToolOutputPolicyOptions,
 ) -> Vec<Message> {
-    let mut converted: Vec<Message> = Vec::new();
-    for message in apply_model_tool_output_policy(messages, options) {
+    // The policy pass is sequential (stateful deduplication); the per-message
+    // conversion below is a pure function of each policy-adjusted message.
+    // Large inputs convert in parallel and flatten in slice order, so the
+    // output is identical; any parallel failure falls back to the sequential
+    // loop.
+    let policy_input = apply_model_tool_output_policy(messages, options);
+    // The byte term keeps message-dense but text-light sessions sequential:
+    // the conversion of a ~13 MB list is memcpy-bound and dispatch does not
+    // pay for itself below the measured crossover.
+    let convert_parallel = policy_input.len()
+        >= crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD
+        && crate::core::compaction::parallel::approx_agent_messages_bytes(&policy_input)
+            >= crate::core::compaction::parallel::CONVERT_BYTES_THRESHOLD;
+    let items: Vec<ConvertedItem> = if convert_parallel {
+        match crate::core::compaction::parallel::try_parallel_map(
+            &policy_input,
+            crate::core::compaction::parallel::CONVERT_MESSAGES_THRESHOLD,
+            |message, _| convert_single_message(message),
+        ) {
+            Some(items) => items,
+            None => policy_input
+                .iter()
+                .map(convert_single_message)
+                .collect(),
+        }
+    } else {
+        policy_input
+            .iter()
+            .map(convert_single_message)
+            .collect()
+    };
+    let mut converted: Vec<Message> = Vec::with_capacity(items.len());
+    for item in items {
+        match item {
+            ConvertedItem::One(message) => converted.push(message),
+            ConvertedItem::Two(first, second) => {
+                converted.push(first);
+                converted.push(second);
+            }
+            ConvertedItem::None => {}
+        }
+    }
+    converted
+}
+
+/// One `convertToLlm` step for a single (policy-adjusted) message.
+fn convert_single_message(message: &AgentMessage) -> ConvertedItem {
+    {
         let item = match &message {
             AgentMessage::Custom(CustomAgentMessage::BashExecution {
                 command,
@@ -1347,14 +1414,6 @@ pub fn convert_to_llm(
             }
             AgentMessage::Message(message) => ConvertedItem::One(message.clone()),
         };
-        match item {
-            ConvertedItem::One(message) => converted.push(message),
-            ConvertedItem::Two(first, second) => {
-                converted.push(first);
-                converted.push(second);
-            }
-            ConvertedItem::None => {}
-        }
+        item
     }
-    converted
 }
