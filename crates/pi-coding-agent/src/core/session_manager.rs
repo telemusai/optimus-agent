@@ -3805,7 +3805,12 @@ impl SessionManager {
             self.rewrite_file()?;
             self.flushed = true;
         } else {
-            let _ = std::fs::create_dir_all(dirname(&session_file));
+            // This branch requires the session file to exist, so its parent
+            // directory exists too: the per-append `create_dir_all` was a
+            // no-op syscall and is gone. If the file vanishes between the
+            // existence check and the open, the open fails like any other
+            // I/O error (`persist` errors, `flushed` stays false, recovery
+            // rewrites) instead of recreating an empty file mid-session.
             let mut file = std::fs::OpenOptions::new()
                 .create(true)
                 .append(true)
@@ -5308,6 +5313,89 @@ mod tests {
         );
         assert_eq!(legacy_child_depth_from_path("/a/not-sub/b.jsonl"), 0);
         assert_eq!(legacy_child_depth_from_path("/a/sub-ZZZZ/b.jsonl"), 0);
+    }
+
+    #[test]
+    fn appends_after_a_rewrite_land_on_the_rewritten_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Force the rewrite path (same path a rollback recovery takes).
+        manager.flushed = false;
+        manager.append_message(user_message("hello", 2)).unwrap();
+        let second = manager
+            .append_message(assistant_message("gpt-5", 3))
+            .unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        // header + 3 entries, all present and ordered on the ONE file.
+        assert_eq!(lines.len(), 4);
+        assert!(manager.get_entry(&second).is_some());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_after_branching_land_on_the_new_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let original = manager.new_session(None).unwrap().unwrap();
+        let first = manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        let branched = manager.create_branched_session(&first).unwrap().unwrap();
+        assert_ne!(original, branched);
+        manager
+            .append_message(user_message("on-branch", 2))
+            .unwrap();
+        // The branched file carries the branched entry; the original does not.
+        let branched_contents = std::fs::read_to_string(&branched).unwrap();
+        assert!(branched_contents.contains("on-branch"));
+        let original_contents = std::fs::read_to_string(&original).unwrap();
+        assert!(!original_contents.contains("on-branch"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn appends_after_reloading_the_same_path_land_on_the_reloaded_file() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Reload the same path (the repair/replay path).
+        let mut reloaded = SessionManager::open(&file, None, None).unwrap();
+        reloaded
+            .append_message(user_message("after-reload", 2))
+            .unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        assert!(contents.contains("after-reload"));
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn append_after_the_directory_is_deleted_recovers_by_rewrite() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // A vanished directory (and file) mid-session: the append takes the
+        // full-rewrite recovery path and recreates the file with every entry.
+        std::fs::remove_dir_all(&dir).unwrap();
+        manager.append_message(user_message("gone", 2)).unwrap();
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 3);
+        let header: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(header["type"], "session");
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
