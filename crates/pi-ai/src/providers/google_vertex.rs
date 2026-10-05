@@ -843,7 +843,10 @@ async fn send_request(
 		}
 	}
 
-	let mut request = reqwest::Client::new().post(&url).headers(headers).json(&body);
+	let mut request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
+		.post(&url)
+		.headers(headers)
+		.json(&body);
 	if let Some(timeout_ms) = options.stream.timeout_ms {
 		request = request.timeout(std::time::Duration::from_millis(timeout_ms.max(0.0) as u64));
 	}
@@ -1226,24 +1229,13 @@ impl SseChunkStream {
 
 	/// TS: the delimiter scan inside `processStreamResponse`.
 	fn drain_events(&mut self) -> Result<(), GoogleVertexStreamError> {
-		const DELIMITERS: [&str; 3] = ["\n\n", "\r\r", "\r\n\r\n"];
-		loop {
-			let mut delimiter_index: Option<usize> = None;
-			let mut delimiter_length = 0usize;
-			for delimiter in DELIMITERS {
-				if let Some(index) = self.buffer.find(delimiter) {
-					if delimiter_index.map_or(true, |current| index < current) {
-						delimiter_index = Some(index);
-						delimiter_length = delimiter.len();
-					}
-				}
-			}
-			let Some(delimiter_index) = delimiter_index else {
-				return Ok(());
-			};
-			let event_string = self.buffer[..delimiter_index].to_string();
-			self.buffer = self.buffer[delimiter_index + delimiter_length..].to_string();
-			let trimmed_event = event_string.trim();
+		// The earliest of the SDK's three delimiters, each found from where the
+		// previous one ended; the consumed prefix is dropped once per call.
+		let mut cursor = 0usize;
+		while let Some((index, length)) = next_delimiter(&self.buffer, cursor) {
+			let event = &self.buffer[cursor..index];
+			cursor = index + length;
+			let trimmed_event = event.trim();
 			if trimmed_event.starts_with("data:") {
 				let processed = trimmed_event["data:".len()..].trim();
 				match serde_json::from_str::<Value>(processed) {
@@ -1257,7 +1249,33 @@ impl SseChunkStream {
 				}
 			}
 		}
+		if cursor > 0 {
+			self.buffer.drain(..cursor);
+		}
+		Ok(())
 	}
+}
+
+/// The earliest of `["\n\n", "\r\r", "\r\n\r\n"]` at or after `from`, as
+/// (index, length). The three never tie at one index (distinct leading pairs), so
+/// this matches the per-delimiter min-index scan byte for byte.
+fn next_delimiter(buffer: &str, from: usize) -> Option<(usize, usize)> {
+	let bytes = buffer.as_bytes();
+	let mut index = from;
+	while index + 1 < bytes.len() {
+		match (bytes[index], bytes[index + 1]) {
+			(b'\n', b'\n') => return Some((index, 2)),
+			(b'\r', b'\r') => return Some((index, 2)),
+			(b'\r', b'\n') => {
+				if index + 3 < bytes.len() && bytes[index + 2] == b'\r' && bytes[index + 3] == b'\n' {
+					return Some((index, 4));
+				}
+			}
+			_ => {}
+		}
+		index += 1;
+	}
+	None
 }
 
 // ---------------------------------------------------------------------------
@@ -1841,6 +1859,40 @@ mod tests {
 			signal: None,
 		};
 		assert!(broken.drain_events().unwrap_err().message().starts_with("exception parsing stream chunk nope."));
+	}
+
+	/// The offset scan must agree with the per-delimiter min-index scan on mixed
+	/// delimiters, including a `\r\r` that is followed by a newline (the `\r\r`
+	/// wins; the trailing `\n` starts the next event) and a `\r\n` pair that only
+	/// closes an event when the full `\r\n\r\n` arrives across chunks.
+	#[test]
+	fn sse_chunk_stream_splits_mixed_delimiters() {
+		let mut stream = SseChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: "data: {\"a\": 1}\r\rdata: {\"b\": 2}\r\n\r\ndata: {\"c\": 3}\r\r\n\n".to_string(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: true,
+			signal: None,
+		};
+		stream.drain_events().unwrap();
+		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
+		assert_eq!(stream.buffer, "");
+
+		// A `\r\n\r\n` straddling two pushes is one delimiter, not two events.
+		let mut split = SseChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: "data: {\"a\": 1}\r\n".to_string(),
+			pending: Vec::new(),
+			byte_pending: Vec::new(),
+			finished: true,
+			signal: None,
+		};
+		split.drain_events().unwrap();
+		assert!(split.pending.is_empty());
+		split.buffer.push_str("\r\ndata: {\"b\": 2}\n\n");
+		split.drain_events().unwrap();
+		assert_eq!(split.pending, vec![json!({"a": 1}), json!({"b": 2})]);
 	}
 
 	fn byte_stream(chunks: Vec<&[u8]>) -> SseChunkStream {

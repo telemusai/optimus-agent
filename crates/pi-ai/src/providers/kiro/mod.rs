@@ -183,10 +183,7 @@ impl Access {
 }
 
 pub(crate) fn client() -> Result<reqwest::Client, String> {
-    reqwest::Client::builder()
-        .redirect(reqwest::redirect::Policy::none())
-        .connect_timeout(Duration::from_secs(15))
-        .build()
+    crate::providers::shared_http::try_shared_client(crate::providers::shared_http::ClientPolicy::Kiro)
         .map_err(|_| "Cannot initialize Kiro HTTP client".into())
 }
 

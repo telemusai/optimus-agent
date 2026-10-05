@@ -524,7 +524,7 @@ async fn send_request(
 		}
 	}
 
-	let mut request = reqwest::Client::new()
+	let mut request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
 		.post(&url)
 		.headers(headers)
 		.json(&Value::Object(payload.clone()));
@@ -1165,26 +1165,13 @@ impl MistralChunkStream {
 
 	/// TS: `findBoundary` + `parseMessage` + the `[DONE]` short circuit.
 	fn drain_events(&mut self) -> Result<(), MistralStreamError> {
-		const BOUNDARIES: [&str; 8] = [
-			"\r\n\r\n", "\r\n\r", "\r\n\n", "\r\r\n", "\n\r\n", "\r\r", "\n\r", "\n\n",
-		];
-		loop {
-			let mut boundary_index: Option<usize> = None;
-			let mut boundary_length = 0usize;
-			for boundary in BOUNDARIES {
-				if let Some(index) = self.buffer.find(boundary) {
-					if boundary_index.map_or(true, |current| index < current) {
-						boundary_index = Some(index);
-						boundary_length = boundary.len();
-					}
-				}
-			}
-			let Some(boundary_index) = boundary_index else {
-				return Ok(());
-			};
-			let message = self.buffer[..boundary_index].to_string();
-			self.buffer = self.buffer[boundary_index + boundary_length..].to_string();
-			let Some(data) = parse_sse_message(&message) else {
+		// The earliest of the SDK's eight boundaries, each found from where the
+		// previous one ended; the consumed prefix is dropped once per call.
+		let mut cursor = 0usize;
+		while let Some((index, length)) = next_boundary(&self.buffer, cursor) {
+			let message = &self.buffer[cursor..index];
+			cursor = index + length;
+			let Some(data) = parse_sse_message(message) else {
 				continue;
 			};
 			if data == "[DONE]" {
@@ -1203,7 +1190,57 @@ impl MistralChunkStream {
 				}
 			}
 		}
+		if cursor > 0 {
+			self.buffer.drain(..cursor);
+		}
+		Ok(())
 	}
+}
+
+/// The earliest of `["\r\n\r\n", "\r\n\r", "\r\n\n", "\r\r\n", "\n\r\n",
+/// "\r\r", "\n\r", "\n\n"]` at or after `from`, as (index, length). At a
+/// given index the longest candidate wins, matching the array order that the
+/// per-boundary min-index scan uses for its only possible ties
+/// (`\r\n\r\n`/`\r\n\r`, `\r\r\n`/`\r\r`, `\n\r\n`/`\n\r`).
+fn next_boundary(buffer: &str, from: usize) -> Option<(usize, usize)> {
+	let bytes = buffer.as_bytes();
+	let mut index = from;
+	while index + 1 < bytes.len() {
+		let length = match (bytes[index], bytes[index + 1]) {
+			(b'\r', b'\n') => {
+				if index + 3 < bytes.len() && bytes[index + 2] == b'\r' && bytes[index + 3] == b'\n' {
+					4
+				} else if index + 2 < bytes.len() && bytes[index + 2] == b'\r' {
+					3
+				} else if index + 2 < bytes.len() && bytes[index + 2] == b'\n' {
+					3
+				} else {
+					0
+				}
+			}
+			(b'\r', b'\r') => {
+				if index + 2 < bytes.len() && bytes[index + 2] == b'\n' {
+					3
+				} else {
+					2
+				}
+			}
+			(b'\n', b'\r') => {
+				if index + 2 < bytes.len() && bytes[index + 2] == b'\n' {
+					3
+				} else {
+					2
+				}
+			}
+			(b'\n', b'\n') => 2,
+			_ => 0,
+		};
+		if length > 0 {
+			return Some((index, length));
+		}
+		index += 1;
+	}
+	None
 }
 
 /// TS: `parseMessage(chunk, parse, state, dataRequired)` - returns the joined
@@ -2100,6 +2137,40 @@ mod tests {
 		assert!(error.error_message().starts_with("malformed json: "));
 	}
 
+
+	/// The offset scan must agree with the per-boundary min-index scan on the
+	/// eight boundary forms, including the 3-byte ones and a `\r\n\r\n` that
+	/// straddles two pushes (one boundary, not two events).
+	#[test]
+	fn chunk_stream_splits_mixed_boundaries() {
+		let mut stream = MistralChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: "data: {\"a\":1}\r\n\rdata: {\"b\":2}\n\rdata: {\"c\":3}\r\rdata: [DONE]\r\n\r\n".to_string(),
+			pending: Vec::new(),
+			pending_bytes: Vec::new(),
+			done: false,
+			finished: false,
+			signal: None,
+		};
+		stream.drain_events().unwrap();
+		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
+		assert!(stream.done);
+
+		let mut split = MistralChunkStream {
+			chunks: Box::pin(futures::stream::empty()),
+			buffer: "data: {\"a\":1}\r\n".to_string(),
+			pending: Vec::new(),
+			pending_bytes: Vec::new(),
+			done: false,
+			finished: false,
+			signal: None,
+		};
+		split.drain_events().unwrap();
+		assert!(split.pending.is_empty());
+		split.buffer.push_str("\r\ndata: {\"b\":2}\r\n\n");
+		split.drain_events().unwrap();
+		assert_eq!(split.pending, vec![json!({"a": 1}), json!({"b": 2})]);
+	}
 	fn byte_stream(chunks: Vec<&[u8]>) -> MistralChunkStream {
 		let items: Vec<reqwest::Result<bytes::Bytes>> = chunks
 			.into_iter()

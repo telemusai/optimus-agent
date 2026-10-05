@@ -630,7 +630,7 @@ async fn send_request(
 	}
 	let _ = model;
 
-	let mut request = reqwest::Client::new()
+	let mut request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
 		.post(&url)
 		.headers(headers)
 		.json(&Value::Object(params.clone()));

@@ -15,7 +15,6 @@ use crate::api_registry::SimpleStreamFunction;
 use crate::types::{
 	AssistantMessage, Context, Model, SimpleStreamOptions, StreamFunction, StreamOptions, Usage,
 };
-use crate::utils::event_stream::{create_assistant_message_event_stream, AssistantMessageEventStream};
 
 use super::amazon_bedrock::{stream_bedrock, stream_simple_bedrock, BedrockOptions};
 use super::amazon_bedrock_responses::{
@@ -256,17 +255,6 @@ pub fn set_bedrock_provider_module(module: BedrockProviderModule) {
 	});
 }
 
-/// TS: `forwardStream(target, source)`
-fn forward_stream(target: AssistantMessageEventStream, source: AssistantMessageEventStream) {
-	let sink = target.clone();
-	target.spawn(async move {
-		while let Some(event) = source.next().await {
-			sink.push(event);
-		}
-		sink.end(None);
-	});
-}
-
 /// TS: `createLazyLoadErrorMessage(model, error)`
 fn create_lazy_load_error_message(model: &Model, error: &str) -> AssistantMessage {
 	AssistantMessage {
@@ -283,25 +271,24 @@ fn create_lazy_load_error_message(model: &Model, error: &str) -> AssistantMessag
 }
 
 /// TS: `createLazyStream(loadModule)`
+///
+/// The TS original forwards the module's events into a fresh outer stream;
+/// this port returns the module's stream itself, so no forwarding task and
+/// second event queue are created per invocation.
 fn create_lazy_stream(load_module: fn() -> LazyProviderModule) -> StreamFunction {
 	Arc::new(move |model: &Model, context: &Context, options: Option<&StreamOptions>| {
-		let outer = create_assistant_message_event_stream();
 		let module = load_module();
-		let inner = (module.stream)(model, context, options);
-		forward_stream(outer.clone(), inner);
-		outer
+		(module.stream)(model, context, options)
 	})
 }
 
 /// TS: `createLazySimpleStream(loadModule)` (register-builtins.ts:218-239) - the
 /// module's `streamSimple` is invoked with the caller's `SimpleStreamOptions`.
+/// Like [`create_lazy_stream`], the module's stream is returned directly.
 fn create_lazy_simple_stream(load_module: fn() -> LazyProviderModule) -> SimpleStreamFunction {
 	Arc::new(move |model: &Model, context: &Context, options: Option<&SimpleStreamOptions>| {
-		let outer = create_assistant_message_event_stream();
 		let module = load_module();
-		let inner = (module.stream_simple)(model, context, options);
-		forward_stream(outer.clone(), inner);
-		outer
+		(module.stream_simple)(model, context, options)
 	})
 }
 
@@ -620,6 +607,7 @@ mod tests {
 	use super::*;
 	use crate::api_registry::API_REGISTRY_TEST_LOCK;
 	use crate::types::{InputModality, Message, UserContent, UserMessage};
+	use crate::utils::event_stream::create_assistant_message_event_stream;
 
 	fn model(api: &str, provider: &str, id: &str) -> Model {
 		Model {
@@ -753,31 +741,60 @@ mod tests {
 		assert!(simple_options(None).is_none());
 	}
 
+	/// A module whose stream functions return an already-ended stream. A lazy
+	/// wrapper that forwards into a second stream would still be open when the
+	/// call returns; returning the module's stream must expose its state and
+	/// terminal event immediately.
+	fn ended_stream_module() -> LazyProviderModule {
+		LazyProviderModule {
+			compact: None,
+			stream: Arc::new(|_model: &Model, _context: &Context, _options: Option<&StreamOptions>| {
+				let stream = create_assistant_message_event_stream();
+				let partial = AssistantMessage {
+					api: "test".to_string(),
+					provider: "test".to_string(),
+					model: "test".to_string(),
+					usage: Usage::zero(),
+					stop_reason: "stop".to_string(),
+					..Default::default()
+				};
+				stream.push(crate::types::AssistantMessageEvent::Start { partial: partial.clone() });
+				stream.push(crate::types::AssistantMessageEvent::Done {
+					reason: "stop".to_string(),
+					message: partial,
+				});
+				stream.end(None);
+				stream
+			}),
+			stream_simple: Arc::new(
+				|_model: &Model, _context: &Context, _options: Option<&SimpleStreamOptions>| {
+					let stream = create_assistant_message_event_stream();
+					stream.end(None);
+					stream
+				},
+			),
+		}
+	}
+
 	#[tokio::test]
-	async fn forward_stream_pushes_events_and_ends() {
-		let source = create_assistant_message_event_stream();
-		let target = create_assistant_message_event_stream();
-		forward_stream(target.clone(), source.clone());
-		let partial = AssistantMessage {
-			api: "test".to_string(),
-			provider: "test".to_string(),
-			model: "test".to_string(),
-			usage: Usage::zero(),
-			stop_reason: "stop".to_string(),
-			..Default::default()
-		};
-		source.push(crate::types::AssistantMessageEvent::Start { partial: partial.clone() });
-		source.push(crate::types::AssistantMessageEvent::Done {
-			reason: "stop".to_string(),
-			message: partial.clone(),
-		});
-		source.end(Some(partial.clone()));
-		let first = target.next().await.expect("start event");
+	async fn lazy_stream_returns_the_module_stream_without_forwarding() {
+		let lazy = create_lazy_stream(ended_stream_module);
+		let stream = lazy(&model("anthropic-messages", "anthropic", "claude"), &context(), None);
+		assert!(stream.is_done());
+		let first = stream.next().await.expect("start event");
 		assert!(matches!(first, crate::types::AssistantMessageEvent::Start { .. }));
-		let second = target.next().await.expect("done event");
+		let second = stream.next().await.expect("done event");
 		assert!(matches!(second, crate::types::AssistantMessageEvent::Done { .. }));
-		assert!(target.next().await.is_none());
-		assert_eq!(target.result().await.model, "test");
+		assert!(stream.next().await.is_none());
+		assert_eq!(stream.result().await.model, "test");
+	}
+
+	#[tokio::test]
+	async fn lazy_simple_stream_returns_the_module_stream_without_forwarding() {
+		let lazy = create_lazy_simple_stream(ended_stream_module);
+		let stream = lazy(&model("anthropic-messages", "anthropic", "claude"), &context(), None);
+		assert!(stream.is_done());
+		assert!(stream.next().await.is_none());
 	}
 
 	#[test]

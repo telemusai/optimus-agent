@@ -1375,10 +1375,12 @@ async fn fetch_codex_response(
             header_map.insert(name, header_value);
         }
     }
-    let mut request = reqwest::Client::new()
-        .post(url)
-        .headers(header_map)
-        .body(body_json.to_string());
+    let mut request = crate::providers::shared_http::shared_client(
+        crate::providers::shared_http::ClientPolicy::Default,
+    )
+    .post(url)
+    .headers(header_map)
+    .body(body_json.to_string());
     if let Some(timeout_ms) = options.stream.timeout_ms {
         request = request.timeout(std::time::Duration::from_millis(timeout_ms.max(0.0) as u64));
     }

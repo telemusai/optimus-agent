@@ -20,5 +20,6 @@ pub mod openai_responses_shared;
 pub mod opencode_headers;
 pub mod register_builtins;
 pub(crate) mod responses_transport;
+pub mod shared_http;
 pub mod simple_options;
 pub mod transform_messages;

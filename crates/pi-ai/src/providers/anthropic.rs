@@ -355,13 +355,10 @@ fn flush_sse_event(state: &mut SseDecoderState) -> Option<ServerSentEvent> {
 	}
 
 	let event = ServerSentEvent {
-		event: state.event.clone(),
-		data: state.data.join("\n"),
-		raw: state.raw.clone(),
+		event: state.event.take(),
+		data: std::mem::take(&mut state.data).join("\n"),
+		raw: std::mem::take(&mut state.raw),
 	};
-	state.event = None;
-	state.data = Vec::new();
-	state.raw = Vec::new();
 	Some(event)
 }
 
@@ -409,17 +406,25 @@ fn next_line_break_index(text: &str) -> Option<usize> {
 	}
 }
 
-/// TS: `consumeLine(text)`.
-fn consume_line(text: &str) -> Option<(String, String)> {
-	let line_break_index = next_line_break_index(text)?;
-
+/// TS: `consumeLine(text)`, over the unconsumed suffix starting at `from`:
+/// returns (line end, next line start) as offsets, so the reader hands
+/// `decode_sse_line` a borrowed slice instead of copying the remainder per line.
+fn split_line_at(text: &str, from: usize) -> Option<(usize, usize)> {
+	let line_break_index = from + next_line_break_index(&text[from..])?;
 	let mut next_index = line_break_index + 1;
 	if text.as_bytes()[line_break_index] == b'\r'
 		&& text.as_bytes().get(next_index).copied() == Some(b'\n')
 	{
 		next_index += 1;
 	}
+	Some((line_break_index, next_index))
+}
 
+/// TS: `consumeLine(text)`. Kept for the line-splitting regression test; the
+/// reader scans with offsets so no per-line remainder is copied.
+#[cfg(test)]
+fn consume_line(text: &str) -> Option<(String, String)> {
+	let (line_break_index, next_index) = split_line_at(text, 0)?;
 	Some((text[..line_break_index].to_string(), text[next_index..].to_string()))
 }
 
@@ -494,6 +499,9 @@ struct SseMessageReader {
 	chunks: ByteStream,
 	byte_pending: Vec<u8>,
 	buffer: String,
+	/// Start of the unconsumed suffix in `buffer`; the consumed prefix is dropped
+	/// once per network chunk instead of copying the remainder per line.
+	cursor: usize,
 	state: SseDecoderState,
 	finished: bool,
 	final_decoded: bool,
@@ -507,6 +515,7 @@ impl SseMessageReader {
 			chunks,
 			byte_pending: Vec::new(),
 			buffer: String::new(),
+			cursor: 0,
 			state: SseDecoderState::default(),
 			finished: false,
 			final_decoded: false,
@@ -517,12 +526,17 @@ impl SseMessageReader {
 
 	async fn next(&mut self) -> Result<Option<ServerSentEvent>, AnthropicStreamError> {
 		loop {
-			if let Some((line, rest)) = consume_line(&self.buffer) {
-				self.buffer = rest;
-				if let Some(event) = decode_sse_line(&line, &mut self.state) {
+			if let Some((line_end, next_line_start)) = split_line_at(&self.buffer, self.cursor) {
+				let line = &self.buffer[self.cursor..line_end];
+				self.cursor = next_line_start;
+				if let Some(event) = decode_sse_line(line, &mut self.state) {
 					return Ok(Some(event));
 				}
 				continue;
+			}
+			if self.cursor > 0 {
+				self.buffer.drain(..self.cursor);
+				self.cursor = 0;
 			}
 
 			if self.finished {
@@ -532,9 +546,11 @@ impl SseMessageReader {
 					self.final_decoded = true;
 					continue;
 				}
-				if !self.buffer.is_empty() {
-					let line = std::mem::take(&mut self.buffer);
-					if let Some(event) = decode_sse_line(&line, &mut self.state) {
+				if self.cursor < self.buffer.len() {
+					let line_end = self.buffer.len();
+					let line = &self.buffer[self.cursor..line_end];
+					self.cursor = line_end;
+					if let Some(event) = decode_sse_line(line, &mut self.state) {
 						return Ok(Some(event));
 					}
 					continue;
@@ -2416,7 +2432,7 @@ async fn send_messages_request(
 	let headers = build_request_headers(client, timeout_ms, true);
 	let body = serde_json::to_string(params).map_err(|error| AnthropicStreamError::Message(error.to_string()))?;
 
-	let request = reqwest::Client::new()
+	let request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
 		.post(&url)
 		.body(body)
 		.timeout(std::time::Duration::from_millis(timeout_ms as u64));
