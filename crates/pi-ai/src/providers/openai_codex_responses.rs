@@ -1629,8 +1629,49 @@ pub enum WebSocketEventType {
     Close,
 }
 
+/// The value delivered to a [`WebSocketListener`]: a JSON-style event object, or
+/// the raw text of a message frame when the transport can provide it directly.
+#[derive(Clone)]
+pub enum WebSocketEvent {
+    /// Text frame payload handed through without a JSON envelope.
+    Text(String),
+    /// JS `MessageEvent`/`Event`-compatible value (message envelopes from
+    /// embedder sockets and tests, plus open/error/close events).
+    Value(Value),
+}
+
+impl WebSocketEvent {
+    /// A text frame payload, handed to listeners without a JSON envelope.
+    pub fn text(text: impl Into<String>) -> Self {
+        WebSocketEvent::Text(text.into())
+    }
+
+    /// The text carried by a message frame, following the JS `data` semantics of
+    /// [`decode_web_socket_data_sync`]; `None` for non-message events.
+    pub fn data_text(&self) -> Option<String> {
+        match self {
+            WebSocketEvent::Text(text) => Some(text.clone()),
+            WebSocketEvent::Value(value) => {
+                let data = value.get("data").cloned().unwrap_or(Value::Null);
+                decode_web_socket_data_sync(&data)
+            }
+        }
+    }
+
+    /// A JS-compat value for the event, as a browser `MessageEvent` would expose it.
+    pub fn to_value(&self) -> Value {
+        match self {
+            WebSocketEvent::Text(text) => Value::Object(Map::from_iter([(
+                "data".to_string(),
+                Value::String(text.clone()),
+            )])),
+            WebSocketEvent::Value(value) => value.clone(),
+        }
+    }
+}
+
 /// `type WebSocketListener = (event: unknown) => void`.
-pub type WebSocketListener = Arc<dyn Fn(Value) + Send + Sync>;
+pub type WebSocketListener = Arc<dyn Fn(WebSocketEvent) + Send + Sync>;
 
 /// `interface WebSocketLike` constructor: `new WebSocketCtor(url, { headers })`.
 pub type WebSocketConstructor = Arc<dyn Fn(&str, IndexMap<String, String>) -> Arc<dyn WebSocketLike> + Send + Sync>;
@@ -1933,20 +1974,20 @@ async fn connect_web_socket(
     let on_open: WebSocketListener = {
         let settle = settle.clone();
         let socket = socket.clone();
-        Arc::new(move |_event: Value| {
+        Arc::new(move |_event: WebSocketEvent| {
             settle(Ok(socket.clone()));
         })
     };
     let on_error: WebSocketListener = {
         let settle = settle.clone();
-        Arc::new(move |event: Value| {
-            settle(Err(extract_web_socket_error(&event)));
+        Arc::new(move |event: WebSocketEvent| {
+            settle(Err(extract_web_socket_error(&event.to_value())));
         })
     };
     let on_close: WebSocketListener = {
         let settle = settle.clone();
-        Arc::new(move |event: Value| {
-            settle(Err(extract_web_socket_close_error(&event)));
+        Arc::new(move |event: WebSocketEvent| {
+            settle(Err(extract_web_socket_close_error(&event.to_value())));
         })
     };
 
@@ -2234,6 +2275,26 @@ struct WebSocketParseShared {
     saw_completion: bool,
 }
 
+/// One lock acquisition that takes an event off the shared queue, or reports
+/// the settled state when the queue is empty.
+enum SharedPoll {
+    Event(Result<Value, CodexThrown>),
+    Pending,
+    Done,
+}
+
+fn poll_shared(shared: &Mutex<WebSocketParseShared>) -> SharedPoll {
+    let mut shared = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(event) = shared.queue.pop_front() {
+        return SharedPoll::Event(event);
+    }
+    if shared.done {
+        SharedPoll::Done
+    } else {
+        SharedPoll::Pending
+    }
+}
+
 /// `parseWebSocket(socket, signal?)`.
 pub fn parse_web_socket(
     socket: Arc<dyn WebSocketLike>,
@@ -2242,10 +2303,6 @@ pub fn parse_web_socket(
     let mut state = WebSocketParseState {
         socket,
         signal,
-        queue: VecDeque::new(),
-        done: false,
-        failed: None,
-        saw_completion: false,
         wake: Arc::new(tokio::sync::Notify::new()),
         state: Arc::new(Mutex::new(WebSocketParseShared::default())),
         listeners: None,
@@ -2261,7 +2318,9 @@ pub fn parse_web_socket(
             }
             state.ensure_listeners();
             loop {
-                state.sync_from_shared();
+                // Abort wins over queued events and over settlement, matching the
+                // TypeScript generator (and the pre-optimization port): a cancelled
+                // request never delivers one more frame.
                 if state
                     .signal
                     .as_ref()
@@ -2272,11 +2331,10 @@ pub fn parse_web_socket(
                     state.cleanup();
                     return Some((Err(CodexThrown::error("Request was aborted")), state));
                 }
-                if let Some(event) = state.queue.pop_front() {
-                    return Some((event, state));
-                }
-                if state.done {
-                    break;
+                match poll_shared(&state.state) {
+                    SharedPoll::Event(event) => return Some((event, state)),
+                    SharedPoll::Pending => {}
+                    SharedPoll::Done => break,
                 }
                 let notified = state.wake.notified();
                 tokio::pin!(notified);
@@ -2298,15 +2356,18 @@ pub fn parse_web_socket(
                 }
             }
 
-            state.sync_from_shared();
             // A TypeScript generator throws once, then is exhausted. `done`
             // tracks the socket; `finished` tracks this generator's final yield.
             state.finished = true;
             state.cleanup();
-            if let Some(failed) = state.failed.clone() {
+            let settled = {
+                let shared = state.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                (shared.failed.clone(), shared.saw_completion)
+            };
+            if let Some(failed) = settled.0 {
                 return Some((Err(failed), state));
             }
-            if !state.saw_completion {
+            if !settled.1 {
                 return Some((
                     Err(CodexThrown::error(
                         "WebSocket stream closed before response.completed",
@@ -2322,10 +2383,6 @@ pub fn parse_web_socket(
 struct WebSocketParseState {
     socket: Arc<dyn WebSocketLike>,
     signal: Option<tokio_util::sync::CancellationToken>,
-    queue: VecDeque<Result<Value, CodexThrown>>,
-    done: bool,
-    failed: Option<CodexThrown>,
-    saw_completion: bool,
     wake: Arc<tokio::sync::Notify>,
     state: Arc<Mutex<WebSocketParseShared>>,
     listeners: Option<Vec<(WebSocketEventType, WebSocketListener)>>,
@@ -2348,24 +2405,23 @@ impl WebSocketParseState {
         let state = self.state.clone();
         let wake = self.wake.clone();
 
-        let on_message: WebSocketListener = Arc::new(move |event: Value| {
-            let data = event.get("data").cloned().unwrap_or(Value::Null);
-            let Some(text) = decode_web_socket_data_sync(&data) else {
-                return;
+        let on_message: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
+            let text = match event.data_text() {
+                Some(text) => text,
+                None => return,
             };
             if text.is_empty() {
                 return;
             }
             match serde_json::from_str::<Value>(&text) {
                 Ok(parsed) => {
-                    let type_ = parsed.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
                     let mut shared = state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-                    if type_ == "response.completed"
-                        || type_ == "response.done"
-                        || type_ == "response.incomplete"
-                    {
-                        shared.saw_completion = true;
-                        shared.done = true;
+                    match parsed.get("type").and_then(Value::as_str) {
+                        Some("response.completed" | "response.done" | "response.incomplete") => {
+                            shared.saw_completion = true;
+                            shared.done = true;
+                        }
+                        _ => {}
                     }
                     shared.queue.push_back(Ok(parsed));
                     drop(shared);
@@ -2387,8 +2443,8 @@ impl WebSocketParseState {
 
         let state_for_error = self.state.clone();
         let wake_for_error = self.wake.clone();
-        let on_error: WebSocketListener = Arc::new(move |event: Value| {
-            let thrown = extract_web_socket_error(&event);
+        let on_error: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
+            let thrown = extract_web_socket_error(&event.to_value());
             let mut shared = state_for_error.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if !shared.saw_completion && shared.failed.is_none() {
                 shared.failed = Some(thrown);
@@ -2400,7 +2456,7 @@ impl WebSocketParseState {
 
         let state_for_close = self.state.clone();
         let wake_for_close = self.wake.clone();
-        let on_close: WebSocketListener = Arc::new(move |event: Value| {
+        let on_close: WebSocketListener = Arc::new(move |event: WebSocketEvent| {
             let mut shared = state_for_close.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
             if shared.saw_completion {
                 shared.done = true;
@@ -2409,7 +2465,7 @@ impl WebSocketParseState {
                 return;
             }
             if shared.failed.is_none() {
-                shared.failed = Some(extract_web_socket_close_error(&event));
+                shared.failed = Some(extract_web_socket_close_error(&event.to_value()));
             }
             shared.done = true;
             drop(shared);
@@ -2436,18 +2492,6 @@ impl WebSocketParseState {
         }
     }
 
-    /// Moves the shared queue/failure state into this generator step.
-    fn sync_from_shared(&mut self) {
-        let mut shared = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Some(event) = shared.queue.pop_front() {
-            self.queue.push_back(event);
-        }
-        self.done = shared.done;
-        if self.failed.is_none() {
-            self.failed = shared.failed.clone();
-        }
-        self.saw_completion = shared.saw_completion;
-    }
 }
 
 /// `requestBodyWithoutInput(body)`.
@@ -3406,16 +3450,21 @@ mod tests {
 
     impl FakeSocket {
         fn emit(&self, type_: WebSocketEventType, event: Value) {
-            let listeners = self
+            let listeners: Vec<WebSocketListener> = self
                 .listeners
                 .lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .get(&type_)
                 .cloned()
                 .unwrap_or_default();
-            for listener in listeners {
+            let event = WebSocketEvent::Value(event);
+            let Some((last, rest)) = listeners.split_last() else {
+                return;
+            };
+            for listener in rest {
                 listener(event.clone());
             }
+            last(event);
         }
     }
 
@@ -3472,7 +3521,7 @@ mod tests {
             self.inner.add_event_listener(kind, listener.clone());
             // Resolve the synthetic handshake after the connector installs its
             // listener; ready_state alone does not emit the browser open event.
-            if kind == WebSocketEventType::Open { listener(json!({})); }
+            if kind == WebSocketEventType::Open { listener(WebSocketEvent::Value(json!({}))); }
         }
         fn remove_event_listener(&self, kind: WebSocketEventType, listener: &WebSocketListener) { self.inner.remove_event_listener(kind, listener); }
         fn send(&self, body: &str) {
@@ -3703,6 +3752,45 @@ mod tests {
         let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
         assert!(error.message.starts_with("Invalid Codex WebSocket JSON:"));
         assert_eq!(error.name, "CodexProtocolError");
+        assert!(next_socket_event(&mut stream).await.is_none());
+        assert_no_socket_listeners(&socket);
+    }
+
+    /// Abort wins over already-queued events: the generator yields the abort error
+    /// before any queued frame, matching the pre-optimization port and the TS
+    /// generator (a cancelled request never delivers one more delta).
+    #[tokio::test]
+    async fn parse_web_socket_abort_wins_over_queued_events() {
+        let socket = fake_socket();
+        socket.ready_state.store(1, std::sync::atomic::Ordering::SeqCst);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let mut stream = parse_web_socket(socket.clone(), Some(signal.clone()));
+        // Queue two events while the stream is idle, then cancel.
+        socket.emit(WebSocketEventType::Message, json!({ "data": json!({ "type": "response.created" }).to_string() }));
+        socket.emit(WebSocketEventType::Message, json!({ "data": json!({ "type": "response.output_text.delta", "delta": "queued" }).to_string() }));
+        signal.cancel();
+        let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
+        assert_eq!(error.message, "Request was aborted");
+        assert!(next_socket_event(&mut stream).await.is_none());
+        assert_no_socket_listeners(&socket);
+    }
+
+    /// A cancelled signal also wins over a completed socket: the stream reports
+    /// the abort, not the successful settlement.
+    #[tokio::test]
+    async fn parse_web_socket_abort_wins_over_completed_settlement() {
+        let socket = fake_socket();
+        socket.ready_state.store(1, std::sync::atomic::Ordering::SeqCst);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let mut stream = parse_web_socket(socket.clone(), Some(signal.clone()));
+        socket.emit(
+            WebSocketEventType::Message,
+            json!({ "data": json!({ "type": "response.completed", "response": { "id": "resp_1", "status": "completed" } }).to_string() }),
+        );
+        socket.emit(WebSocketEventType::Close, json!({ "code": 1000, "wasClean": true }));
+        signal.cancel();
+        let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
+        assert_eq!(error.message, "Request was aborted");
         assert!(next_socket_event(&mut stream).await.is_none());
         assert_no_socket_listeners(&socket);
     }

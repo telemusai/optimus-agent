@@ -6,8 +6,9 @@ use base64::Engine;
 use futures::{SinkExt, StreamExt};
 use pi_ai::providers::openai_codex_responses::{
     close_openai_codex_web_socket_sessions, get_openai_codex_web_socket_debug_stats,
-    stream_openai_codex_responses, try_compact_openai_codex_responses, OpenAICodexResponsesOptions, JWT_CLAIM_PATH,
-    OPENAI_BETA_RESPONSES_WEBSOCKETS,
+    get_web_socket_constructor, stream_openai_codex_responses, try_compact_openai_codex_responses,
+    OpenAICodexResponsesOptions, JWT_CLAIM_PATH, OPENAI_BETA_RESPONSES_WEBSOCKETS, WebSocketEvent,
+    WebSocketEventType, WebSocketLike, WebSocketListener,
 };
 use pi_ai::types::{
     AssistantMessage, Context, Message, Model, StreamOptions, UserContent, UserMessage,
@@ -669,4 +670,66 @@ async fn native_busy_cached_connection_is_not_shared_between_concurrent_turns() 
     assert_eq!(cached.response_id.as_deref(), Some("cached"));
     close_openai_codex_web_socket_sessions(Some("native-busy"));
     server.await.unwrap();
+}
+
+/// Adding a listener while an emission is dispatching must not panic: emit holds its
+/// registry snapshot outside the events lock for the whole dispatch, so add has to
+/// append through a fresh registry instead of mutating the shared Vec in place.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn native_add_listener_while_an_emission_is_dispatching_does_not_panic() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let port = listener.local_addr().unwrap().port();
+    let server = tokio::spawn(async move {
+        let (tcp, _) = listener.accept().await.unwrap();
+        let mut socket = tokio_tungstenite::accept_async(tcp).await.unwrap();
+        let _ = tokio::time::timeout(Duration::from_secs(5), socket.next()).await;
+        socket
+            .send(Frame::Text(r#"{"type":"response.created"}"#.into()))
+            .await
+            .unwrap();
+        tokio::time::sleep(Duration::from_secs(10)).await;
+    });
+    let constructor = get_web_socket_constructor().expect("native WebSocket constructor");
+    let socket = constructor(
+        &format!("ws://127.0.0.1:{port}/codex/responses"),
+        indexmap::IndexMap::new(),
+    );
+    for _ in 0..1000 {
+        if socket.ready_state() == Some(1) {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    assert_eq!(socket.ready_state(), Some(1), "socket never opened");
+
+    let (entered, dispatch_started) = std::sync::mpsc::channel::<()>();
+    let blocker: WebSocketListener = Arc::new(move |_event: WebSocketEvent| {
+        entered.send(()).unwrap();
+        std::thread::sleep(Duration::from_millis(600));
+    });
+    socket.add_event_listener(WebSocketEventType::Message, blocker);
+    socket.send("{}");
+
+    let socket_for_add = socket.clone();
+    let adder = std::thread::spawn(move || {
+        dispatch_started
+            .recv_timeout(Duration::from_secs(5))
+            .expect("listener dispatch started (frame arrived)");
+        let extra: WebSocketListener = Arc::new(|_event: WebSocketEvent| {});
+        socket_for_add.add_event_listener(WebSocketEventType::Message, extra);
+        "added"
+    });
+    tokio::time::sleep(Duration::from_secs(2)).await;
+    match adder.join() {
+        Ok(message) => assert_eq!(message, "added"),
+        Err(payload) => {
+            let message = payload
+                .downcast_ref::<String>()
+                .cloned()
+                .or_else(|| payload.downcast_ref::<&str>().map(|text| text.to_string()))
+                .unwrap_or_else(|| "<non-string panic>".to_string());
+            panic!("add_event_listener panicked while an emission was dispatching: {message}");
+        }
+    }
+    server.abort();
 }
