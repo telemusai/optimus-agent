@@ -1469,57 +1469,105 @@ fn is_cancelled(signal: Option<&tokio_util::sync::CancellationToken>) -> bool {
 
 /// The SSE `data` payloads of one response body, in order.
 ///
-/// Mirrors `_iterSSEMessages` + `SSEDecoder` + `LineDecoder`: a double newline
-/// delimits a chunk, `\r` is stripped, `:` comments are ignored, and `[DONE]`
-/// terminates the stream.
-struct SseDecoder {
-	event: Option<String>,
-	data: Vec<String>,
+/// Mirrors `_iterSSEMessages` + `SSEDecoder` + `LineDecoder` in a single pass:
+/// a `\n` ends a line, a trailing `\r` is stripped, `:` comments are ignored,
+/// and an empty line flushes the pending event. Unlike the previous
+/// block-splitting reader there is no rescan from byte 0, no per-event drain,
+/// and no per-line String: lines are borrowed slices and `data:` values
+/// accumulate into one buffer that becomes the payload.
+struct SseLineReader {
+	line: Vec<u8>,
+	data: Vec<u8>,
+	has_data: bool,
+	saw_event: bool,
 }
 
-impl SseDecoder {
+impl SseLineReader {
 	fn new() -> Self {
 		Self {
-			event: None,
+			line: Vec::new(),
 			data: Vec::new(),
+			has_data: false,
+			saw_event: false,
 		}
 	}
 
-	fn decode(&mut self, line: &str) -> Option<(Option<String>, String)> {
-		let mut line = line.to_string();
-		if line.ends_with('\r') {
-			line.pop();
-		}
-		if line.is_empty() {
-			// empty line and we didn't previously encounter any messages
-			if self.event.is_none() && self.data.is_empty() {
-				return None;
+	/// Feed one network chunk. Each payload is passed to `on_payload` the moment
+	/// its terminating empty line is framed, so a burst chunk does not delay the
+	/// first event behind the framing of the whole chunk; a `false` return stops
+	/// the scan exactly where the previous reader returned.
+	fn push(&mut self, bytes: &[u8], mut on_payload: impl FnMut(String) -> bool) -> bool {
+		for &byte in bytes {
+			if byte == b'\n' {
+				let line = std::mem::take(&mut self.line);
+				if let Some(payload) = self.decode_line(&line) {
+					if !on_payload(payload) {
+						return false;
+					}
+				}
+			} else {
+				self.line.push(byte);
 			}
-			let event = self.event.take();
-			let data = self.data.join("\n");
-			self.data.clear();
-			return Some((event, data));
+		}
+		true
+	}
+
+	/// The end-of-body pass over whatever remains: a line that ends on a newline
+	/// has already been decoded, so only the pending event can still flush; an
+	/// unterminated tail line accumulates and is dropped, exactly like the
+	/// previous reader's tail split.
+	fn finish(&mut self) -> Option<String> {
+		let line = std::mem::take(&mut self.line);
+		self.decode_line(&line)
+	}
+
+	/// One `SSEDecoder::decode` step over a borrowed line.
+	fn decode_line(&mut self, line: &[u8]) -> Option<String> {
+		let line = String::from_utf8_lossy(line);
+		let line = match line.strip_suffix('\r') {
+			Some(stripped) => stripped,
+			None => line.as_ref(),
+		};
+		if line.is_empty() {
+			return self.flush();
 		}
 		if line.starts_with(':') {
 			return None;
 		}
-		let (fieldname, mut value) = match line.find(':') {
-			Some(index) => (line[..index].to_string(), line[index + 1..].to_string()),
-			None => (line.clone(), String::new()),
+		let (fieldname, value) = match line.find(':') {
+			Some(index) => (&line[..index], &line[index + 1..]),
+			None => (line.as_ref(), ""),
 		};
-		if value.starts_with(' ') {
-			value.remove(0);
-		}
+		let value = value.strip_prefix(' ').unwrap_or(value);
 		if fieldname == "event" {
-			self.event = Some(value);
+			self.saw_event = true;
 		} else if fieldname == "data" {
-			self.data.push(value);
+			if self.has_data {
+				self.data.push(b'\n');
+			}
+			self.data.extend_from_slice(value.as_bytes());
+			self.has_data = true;
 		}
 		None
 	}
+
+	/// The empty-line flush: `data` joins with `\n` like `Vec::join`, and an
+	/// `event`-only block still flushes an empty payload.
+	fn flush(&mut self) -> Option<String> {
+		if !self.has_data && !self.saw_event {
+			return None;
+		}
+		let payload = String::from_utf8_lossy(&self.data).into_owned();
+		self.data.clear();
+		self.has_data = false;
+		self.saw_event = false;
+		Some(payload)
+	}
 }
 
-/// `findDoubleNewlineIndex` from the SDK line decoder.
+/// `findDoubleNewlineIndex` from the SDK line decoder. Kept for the framing
+/// regression test; the reader above is line-based.
+#[allow(dead_code)]
 fn find_double_newline_index(data: &[u8]) -> Option<usize> {
 	let mut i = 0usize;
 	while i + 1 < data.len() {
@@ -1548,6 +1596,16 @@ fn observe_local_phase(observer: Option<&crate::types::OnStreamObservation>, pha
 /// Reads the response body and forwards each `data:` payload as it arrives, so
 /// the caller emits events incrementally like the SDK's async iterator.
 fn observe_sse_payload(observer: Option<&crate::types::OnStreamObservation>, payload: &str) {
+	observe_sse_payload_parsed(observer, payload, None);
+}
+
+/// `parsed` is the payload's `Value` when the reader already parsed it for the
+/// consumer, so an attached observer never forces a second JSON parse per event.
+fn observe_sse_payload_parsed(
+	observer: Option<&crate::types::OnStreamObservation>,
+	payload: &str,
+	parsed: Option<&Value>,
+) {
 	let Some(observer) = observer else { return; };
 	// Observe at the network reader, before parser/UI queues. Never include content,
 	// and do no extra JSON parsing when local monitoring is disabled.
@@ -1557,7 +1615,15 @@ fn observe_sse_payload(observer: Option<&crate::types::OnStreamObservation>, pay
 			observer("terminal");
 			return;
 		}
-		let Ok(chunk) = serde_json::from_str::<Value>(payload) else { return; };
+		let owned;
+		let chunk: &Value = match parsed {
+			Some(chunk) => chunk,
+			None => {
+				let Ok(parsed) = serde_json::from_str::<Value>(payload) else { return; };
+				owned = parsed;
+				&owned
+			}
+		};
 		if chunk.get("error").map(js_truthy).unwrap_or(false) {
 			observer("terminal");
 		}
@@ -1598,8 +1664,34 @@ fn observe_chunk_usage(raw: &Value, model: &Model, options: Option<&OpenAIComple
 }
 
 enum SsePayload {
-	Data(String),
+	/// The raw payload plus its parsed `Value` when the reader already parsed it
+	/// for an attached observer; `None` means the consumer parses it.
+	Data { payload: String, parsed: Option<Value> },
 	Done,
+}
+
+/// Runs one payload through the observation seam and the channel: the observer
+/// sees the same stages as before, a `[DONE]` payload terminates the stream,
+/// and a closed receiver stops the reader.
+fn forward_sse_payload(
+	payload: String,
+	observer: Option<&crate::types::OnStreamObservation>,
+	sender: &tokio::sync::mpsc::UnboundedSender<Result<SsePayload, StreamError>>,
+) -> bool {
+	// Parse only when the observer is attached (the consumer would otherwise
+	// parse the same bytes again) and never for the [DONE] sentinel, which the
+	// observation seam classifies before parsing.
+	let parsed = if observer.is_some() && !payload.starts_with("[DONE]") {
+		serde_json::from_str::<Value>(&payload).ok()
+	} else {
+		None
+	};
+	observe_sse_payload_parsed(observer, &payload, parsed.as_ref());
+	if payload.starts_with("[DONE]") {
+		let _ = sender.send(Ok(SsePayload::Done));
+		return false;
+	}
+	sender.send(Ok(SsePayload::Data { payload, parsed })).is_ok()
 }
 
 async fn read_sse_data(
@@ -1609,8 +1701,7 @@ async fn read_sse_data(
 	observer: Option<crate::types::OnStreamObservation>,
 ) {
 	let mut response = response;
-	let mut decoder = SseDecoder::new();
-	let mut line_buffer: Vec<u8> = Vec::new();
+	let mut reader = SseLineReader::new();
 
 	loop {
 		if is_cancelled(signal.as_ref()) {
@@ -1644,38 +1735,14 @@ async fn read_sse_data(
 				return;
 			}
 		};
-		let mut buffer = line_buffer.clone();
-		buffer.extend_from_slice(&chunk);
-		while let Some(index) = find_double_newline_index(&buffer) {
-			let block: Vec<u8> = buffer.drain(..index).collect();
-			let text = String::from_utf8_lossy(&block).to_string();
-			for line in text.split('\n') {
-				if let Some((_, payload)) = decoder.decode(line) {
-					observe_sse_payload(observer.as_ref(), &payload);
-					if payload.starts_with("[DONE]") {
-						let _ = sender.send(Ok(SsePayload::Done));
-						return;
-					}
-					if sender.send(Ok(SsePayload::Data(payload))).is_err() {
-						return;
-					}
-				}
-			}
+		if !reader.push(&chunk, |payload| forward_sse_payload(payload, observer.as_ref(), &sender)) {
+			return;
 		}
-		line_buffer = buffer;
 	}
 
-	let tail = String::from_utf8_lossy(&line_buffer).to_string();
-	for line in tail.split('\n') {
-		if let Some((_, payload)) = decoder.decode(line) {
-			observe_sse_payload(observer.as_ref(), &payload);
-			if payload.starts_with("[DONE]") {
-				let _ = sender.send(Ok(SsePayload::Done));
-				return;
-			}
-			if sender.send(Ok(SsePayload::Data(payload))).is_err() {
-				return;
-			}
+	if let Some(payload) = reader.finish() {
+		if !forward_sse_payload(payload, observer.as_ref(), &sender) {
+			return;
 		}
 	}
 }
@@ -1877,12 +1944,16 @@ async fn run_stream_body(
 	let mut finished = false;
 	let mut done = false;
 	while let Some(payload) = receiver.recv().await {
-		let payload = match payload? {
-			SsePayload::Data(payload) => payload,
+		let (payload, parsed) = match payload? {
+			SsePayload::Data { payload, parsed } => (payload, parsed),
 			SsePayload::Done => { done = true; break; }
 		};
-		let Ok(chunk) = serde_json::from_str::<Value>(&payload) else {
-			continue;
+		let chunk = match parsed {
+			Some(chunk) => chunk,
+			None => {
+				let Ok(chunk) = serde_json::from_str::<Value>(&payload) else { continue; };
+				chunk
+			}
 		};
 		if !chunk.is_object() {
 			continue;
@@ -4406,23 +4477,71 @@ mod message_tests {
 		env.remove("PI_CACHE_RETENTION");
 	}
 
-	#[test]
-	fn sse_decoder_joins_multiline_data() {
-		let mut decoder = SseDecoder::new();
-		assert!(decoder.decode("data: {\"a\":").is_none());
-		assert!(decoder.decode("data: 1}").is_none());
-		let (_, payload) = decoder.decode("").expect("payload");
-		assert_eq!(payload, "{\"a\":\n1}");
+	fn collected(reader: &mut SseLineReader, bytes: &[u8]) -> Vec<String> {
+		let mut payloads = Vec::new();
+		reader.push(bytes, |payload| {
+			payloads.push(payload);
+			true
+		});
+		payloads
 	}
 
 	#[test]
-	fn sse_decoder_ignores_comments_and_carriage_returns() {
-		let mut decoder = SseDecoder::new();
-		assert!(decoder.decode(": keep-alive").is_none());
-		assert!(decoder.decode("data: x\r").is_none());
-		let (_, payload) = decoder.decode("").expect("payload");
-		assert_eq!(payload, "x");
-		assert!(decoder.decode("").is_none());
+	fn sse_line_reader_joins_multiline_data() {
+		let mut reader = SseLineReader::new();
+		assert!(collected(&mut reader, "data: {\"a\":\n".as_bytes()).is_empty());
+		assert_eq!(
+			collected(&mut reader, "data: 1}\n\n".as_bytes()),
+			vec!["{\"a\":\n1}".to_string()]
+		);
+		assert!(reader.finish().is_none());
+	}
+
+	#[test]
+	fn sse_line_reader_ignores_comments_and_carriage_returns() {
+		let mut reader = SseLineReader::new();
+		assert!(collected(&mut reader, ": keep-alive\r\n".as_bytes()).is_empty());
+		assert_eq!(collected(&mut reader, "data: x\r\n\n".as_bytes()), vec!["x".to_string()]);
+		assert!(collected(&mut reader, "\n".as_bytes()).is_empty());
+	}
+
+	/// The line-based reader must agree with the retired block splitter on mixed
+	/// terminators: `data:` lines carry their `event:` field's flush, a lone `\r`
+	/// line ends an event like the SDK's LineDecoder, and an event-only block
+	/// still flushes an empty payload (the observer sees its raw_event stage).
+	#[test]
+	fn sse_line_reader_handles_mixed_terminators_and_event_only_blocks() {
+		let mut reader = SseLineReader::new();
+		assert_eq!(
+			collected(&mut reader, "event: message\ndata: a\n\r\ndata: b\r\n\r\n".as_bytes()),
+			vec!["a".to_string(), "b".to_string()]
+		);
+		// `\r\r` is line content, not a terminator: only the final `\r` is stripped.
+		assert_eq!(collected(&mut reader, "data: c\r\r\n\n".as_bytes()), vec!["c\r".to_string()]);
+		assert_eq!(collected(&mut reader, "event: ping\n\n".as_bytes()), vec![String::new()]);
+		// An unterminated tail is dropped, a line-terminated one flushes.
+		assert!(collected(&mut reader, "data: c".as_bytes()).is_empty());
+		assert!(reader.finish().is_none());
+		let mut tail = SseLineReader::new();
+		assert!(collected(&mut tail, "data: c\n".as_bytes()).is_empty());
+		assert_eq!(tail.finish(), Some("c".to_string()));
+	}
+
+	/// The callback must stop the scan where the previous reader returned: a
+	/// `[DONE]` payload ends the stream without framing the rest of the chunk.
+	#[test]
+	fn sse_line_reader_stops_when_the_callback_stops() {
+		let mut reader = SseLineReader::new();
+		let mut seen = Vec::new();
+		let stopped = reader.push(
+			"data: a\n\ndata: [DONE]\n\ndata: b\n\n".as_bytes(),
+			|payload| {
+				seen.push(payload);
+				seen.len() < 2
+			},
+		);
+		assert!(!stopped);
+		assert_eq!(seen, vec!["a".to_string(), "[DONE]".to_string()]);
 	}
 
 	#[test]
