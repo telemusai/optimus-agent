@@ -1,0 +1,1 @@
+- Fixed HTTP 400 failures on DGX gateways by requiring explicit `sendSessionAffinityHeaders: true` before adding session-affinity headers.
