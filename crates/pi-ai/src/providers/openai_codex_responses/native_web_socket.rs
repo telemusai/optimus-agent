@@ -127,9 +127,19 @@ impl WebSocketLike for NativeWebSocket {
                 .listeners
                 .entry(kind)
                 .or_insert_with(|| Arc::new(Vec::new()));
-            Arc::get_mut(listeners)
-                .expect("the listener registry is never shared beyond this lock")
-                .push(listener.clone());
+            if Arc::strong_count(listeners) > 1 {
+                // An emit holds a snapshot outside the lock while it dispatches, so
+                // the shared Vec cannot be mutated in place; append through a fresh
+                // registry instead. The in-flight snapshot keeps firing the listeners
+                // that existed when it was taken.
+                let mut copy = (**listeners).clone();
+                copy.push(listener.clone());
+                *listeners = Arc::new(copy);
+            } else {
+                Arc::get_mut(listeners)
+                    .expect("an unshared listener registry is uniquely owned here")
+                    .push(listener.clone());
+            }
             events.terminal.get(&kind).cloned()
         };
         // A native IO task may finish the handshake before its caller subscribes.

@@ -2318,11 +2318,9 @@ pub fn parse_web_socket(
             }
             state.ensure_listeners();
             loop {
-                match poll_shared(&state.state) {
-                    SharedPoll::Event(event) => return Some((event, state)),
-                    SharedPoll::Pending => {}
-                    SharedPoll::Done => break,
-                }
+                // Abort wins over queued events and over settlement, matching the
+                // TypeScript generator (and the pre-optimization port): a cancelled
+                // request never delivers one more frame.
                 if state
                     .signal
                     .as_ref()
@@ -2332,6 +2330,11 @@ pub fn parse_web_socket(
                     state.finished = true;
                     state.cleanup();
                     return Some((Err(CodexThrown::error("Request was aborted")), state));
+                }
+                match poll_shared(&state.state) {
+                    SharedPoll::Event(event) => return Some((event, state)),
+                    SharedPoll::Pending => {}
+                    SharedPoll::Done => break,
                 }
                 let notified = state.wake.notified();
                 tokio::pin!(notified);
@@ -3749,6 +3752,45 @@ mod tests {
         let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
         assert!(error.message.starts_with("Invalid Codex WebSocket JSON:"));
         assert_eq!(error.name, "CodexProtocolError");
+        assert!(next_socket_event(&mut stream).await.is_none());
+        assert_no_socket_listeners(&socket);
+    }
+
+    /// Abort wins over already-queued events: the generator yields the abort error
+    /// before any queued frame, matching the pre-optimization port and the TS
+    /// generator (a cancelled request never delivers one more delta).
+    #[tokio::test]
+    async fn parse_web_socket_abort_wins_over_queued_events() {
+        let socket = fake_socket();
+        socket.ready_state.store(1, std::sync::atomic::Ordering::SeqCst);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let mut stream = parse_web_socket(socket.clone(), Some(signal.clone()));
+        // Queue two events while the stream is idle, then cancel.
+        socket.emit(WebSocketEventType::Message, json!({ "data": json!({ "type": "response.created" }).to_string() }));
+        socket.emit(WebSocketEventType::Message, json!({ "data": json!({ "type": "response.output_text.delta", "delta": "queued" }).to_string() }));
+        signal.cancel();
+        let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
+        assert_eq!(error.message, "Request was aborted");
+        assert!(next_socket_event(&mut stream).await.is_none());
+        assert_no_socket_listeners(&socket);
+    }
+
+    /// A cancelled signal also wins over a completed socket: the stream reports
+    /// the abort, not the successful settlement.
+    #[tokio::test]
+    async fn parse_web_socket_abort_wins_over_completed_settlement() {
+        let socket = fake_socket();
+        socket.ready_state.store(1, std::sync::atomic::Ordering::SeqCst);
+        let signal = tokio_util::sync::CancellationToken::new();
+        let mut stream = parse_web_socket(socket.clone(), Some(signal.clone()));
+        socket.emit(
+            WebSocketEventType::Message,
+            json!({ "data": json!({ "type": "response.completed", "response": { "id": "resp_1", "status": "completed" } }).to_string() }),
+        );
+        socket.emit(WebSocketEventType::Close, json!({ "code": 1000, "wasClean": true }));
+        signal.cancel();
+        let error = next_socket_event(&mut stream).await.unwrap().unwrap_err();
+        assert_eq!(error.message, "Request was aborted");
         assert!(next_socket_event(&mut stream).await.is_none());
         assert_no_socket_listeners(&socket);
     }
