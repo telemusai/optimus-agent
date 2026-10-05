@@ -777,6 +777,13 @@ async fn event_log_pass(point: &PointDef, pass_index: usize, pass_dir: &Path, co
 		}
 		op_ns.push(op_started.elapsed().as_nanos() as u64);
 	}
+	// Land any still-buffered bytes inside the measured window: the final
+	// drain is part of the true cost of the buffered configuration, and the
+	// parity read below must observe every accepted append.
+	if let Err(error) = ledger.flush_sync() {
+		ALLOC_GATE.store(false, Ordering::Relaxed);
+		return PassRecord::failed(pass_index, format!("flush_sync: {error}"));
+	}
 	let wall_ns = started.elapsed().as_nanos() as u64;
 	let alloc = match (count_allocs, alloc_before) {
 		(true, Some((count, bytes))) => {
@@ -1191,6 +1198,13 @@ async fn session_pass(point: &PointDef, pass_index: usize, pass_dir: &Path, coun
 			return PassRecord::failed(pass_index, format!("append assistant turn {turn}: {error}"));
 		}
 		op_ns.push(op_started.elapsed().as_nanos() as u64);
+	}
+	// Land any still-buffered lines inside the measured window: the final
+	// drain is part of the true cost of the buffered configuration, and the
+	// parity read below must observe every accepted append.
+	if let Err(error) = manager.flush_now() {
+		ALLOC_GATE.store(false, Ordering::Relaxed);
+		return PassRecord::failed(pass_index, format!("flush_now: {error}"));
 	}
 	let wall_ns = started.elapsed().as_nanos() as u64;
 	let alloc = match (count_allocs, alloc_before) {
@@ -1873,6 +1887,354 @@ fn print_point_row(point: &Value) {
 }
 
 // ---------------------------------------------------------------------------
+// Flush-period probe (R5 item 1): one phase per (stream, T) at a fixed event
+// rate; the parent samples physical-disk counters per phase externally, so
+// every phase is bracketed by PROBE-START / PROBE-END marker lines.
+// ---------------------------------------------------------------------------
+
+struct ProbePhase {
+	stream: &'static str,
+	flush_ms: u64,
+	events: usize,
+	wall_ms: u64,
+	op_p50_ns: u64,
+	op_p95_ns: u64,
+	drain_ns: u64,
+	io: Option<IoSnapshot>,
+	parity_ok: bool,
+	digest_hex: String,
+}
+
+fn probe_percentile(mut values: Vec<u64>, fraction: f64) -> u64 {
+	if values.is_empty() {
+		return 0;
+	}
+	values.sort_unstable();
+	let count = values.len();
+	values[((fraction * (count - 1) as f64).round() as usize).min(count - 1)]
+}
+
+/// Sleep until the target tick so the event stream keeps a fixed rate
+/// (drift-corrected: the deadline is absolute, not a fixed sleep).
+fn sleep_until(target: Instant) {
+	let now = Instant::now();
+	if target > now {
+		std::thread::sleep(target - now);
+	}
+}
+
+fn probe_phase_json(phase: &ProbePhase) -> Value {
+	json!({
+		"stream": phase.stream,
+		"flush_ms": phase.flush_ms,
+		"events": phase.events,
+		"wall_ms": phase.wall_ms,
+		"op_p50_us": phase.op_p50_ns / 1000,
+		"op_p95_us": phase.op_p95_ns / 1000,
+		"drain_us": phase.drain_ns / 1000,
+		"write_ops": phase.io.map(|io| io.write_ops),
+		"write_bytes": phase.io.map(|io| io.write_bytes),
+		"read_ops": phase.io.map(|io| io.read_ops),
+		"other_ops": phase.io.map(|io| io.other_ops),
+		"parity_ok": phase.parity_ok,
+		"digest12": phase.digest_hex.chars().take(12).collect::<String>(),
+	})
+}
+
+/// One probe phase for the semantic-edge ledger stream: `events` single-event
+/// non-durable appends at `interval`, then one timed final drain.
+fn probe_evlog_phase(flush_ms: u64, events: usize, interval: std::time::Duration, phase_dir: &Path) -> Result<ProbePhase, String> {
+	let artifacts_dir = phase_dir.join("artifacts");
+	std::fs::create_dir_all(&artifacts_dir).map_err(|error| format!("mkdir artifacts: {error}"))?;
+	let ledger_path = artifacts_dir.join("semantic-edges.jsonl");
+	let ledger = EventLog::new(ledger_path.to_string_lossy().to_string(), EventLogOptions::default());
+	let mut expected = String::new();
+	let mut op_ns: Vec<u64> = Vec::with_capacity(events);
+	let io_before = io_snapshot();
+	let started = Instant::now();
+	for index in 0..events {
+		let event = if index % 2 == 0 {
+			SemanticEdgeLedgerEvent::RequestStarted {
+				request_id: format!("probe-req-{index:05}"),
+				session_id: SESSION_ID.to_string(),
+				compaction_id: None,
+			}
+		} else {
+			SemanticEdgeLedgerEvent::RequestFinished {
+				request_id: format!("probe-req-{:05}", index - 1),
+			}
+		};
+		expected.push_str(&serde_json::to_string(&event).map_err(|error| error.to_string())?);
+		expected.push('\n');
+		let value = serde_json::to_value(&event).map_err(|error| error.to_string())?;
+		sleep_until(started + interval * index as u32);
+		let op_started = Instant::now();
+		ledger
+			.append_sync(&[value], false, None)
+			.map_err(|error| format!("probe append {index}: {error}"))?;
+		op_ns.push(op_started.elapsed().as_nanos() as u64);
+	}
+	let drain_started = Instant::now();
+	ledger.flush_sync().map_err(|error| format!("probe flush: {error}"))?;
+	let drain_ns = drain_started.elapsed().as_nanos() as u64;
+	let wall_ms = started.elapsed().as_millis() as u64;
+	let io = io_delta(io_before, io_snapshot());
+	let actual = std::fs::read_to_string(&ledger_path).map_err(|error| format!("probe read: {error}"))?;
+	let parity_ok = actual == expected;
+	let digest_hex = sha256_hex(actual.as_bytes());
+	Ok(ProbePhase {
+		stream: "evlog",
+		flush_ms,
+		events,
+		wall_ms,
+		op_p50_ns: probe_percentile(op_ns.clone(), 0.50),
+		op_p95_ns: probe_percentile(op_ns, 0.95),
+		drain_ns,
+		io,
+		parity_ok,
+		digest_hex,
+	})
+}
+
+/// One probe phase for the session JSONL stream: `events` assistant-message
+/// appends at `interval` (deterministic content, fixed timestamps), then one
+/// timed final drain.
+fn probe_session_phase(flush_ms: u64, events: usize, interval: std::time::Duration, phase_dir: &Path) -> Result<ProbePhase, String> {
+	let sessions_dir = phase_dir.join("sessions");
+	std::fs::create_dir_all(&sessions_dir).map_err(|error| format!("mkdir sessions: {error}"))?;
+	let cwd = phase_dir.to_string_lossy().to_string();
+	let mut manager = SessionManager::create(&cwd, Some(&sessions_dir.to_string_lossy()))
+		.map_err(|error| format!("SessionManager::create: {error}"))?;
+	manager
+		.new_session(Some(&NewSessionOptions {
+			id: Some(SESSION_ID.to_string()),
+			..Default::default()
+		}))
+		.map_err(|error| format!("new_session: {error}"))?;
+	let mut op_ns: Vec<u64> = Vec::with_capacity(events);
+	let io_before = io_snapshot();
+	let started = Instant::now();
+	for turn in 0..events {
+		let assistant = AgentMessage::from(AssistantMessage {
+			content: vec![ContentBlock::Text(TextContent::new(session_assistant_text(turn)))],
+			api: "bench-fixture".to_string(),
+			provider: "bench-fixture".to_string(),
+			model: "bench-model".to_string(),
+			usage: Usage::zero(),
+			timestamp: 1_772_000_000_000 + turn as i64,
+			..Default::default()
+		});
+		sleep_until(started + interval * turn as u32);
+		let op_started = Instant::now();
+		manager
+			.append_message(assistant)
+			.map_err(|error| format!("probe append turn {turn}: {error}"))?;
+		op_ns.push(op_started.elapsed().as_nanos() as u64);
+	}
+	let drain_started = Instant::now();
+	manager.flush_now().map_err(|error| format!("probe flush_now: {error}"))?;
+	let drain_ns = drain_started.elapsed().as_nanos() as u64;
+	let wall_ms = started.elapsed().as_millis() as u64;
+	let io = io_delta(io_before, io_snapshot());
+	let raw = {
+		let jsonl_files: Vec<PathBuf> = std::fs::read_dir(&sessions_dir)
+			.map_err(|error| format!("read sessions dir: {error}"))?
+			.filter_map(|entry| entry.ok())
+			.map(|entry| entry.path())
+			.filter(|path| path.extension().map(|ext| ext == "jsonl").unwrap_or(false))
+			.collect();
+		if jsonl_files.len() != 1 {
+			return Err(format!("expected exactly one session file, found {}", jsonl_files.len()));
+		}
+		std::fs::read_to_string(&jsonl_files[0]).map_err(|error| format!("read session file: {error}"))?
+	};
+	let lines: Vec<&str> = raw.lines().filter(|line| !line.trim().is_empty()).collect();
+	let expected_lines = events + 1;
+	let lines_ok = lines.len() == expected_lines;
+	let parse_ok = lines.iter().all(|line| serde_json::from_str::<Value>(line).is_ok());
+	let parity_ok = lines_ok && parse_ok;
+	// Entry ids are random uuids and the header embeds the phase-specific cwd
+	// and wall-clock timestamp, so the cross-T byte-identity check digests the
+	// normalized lines (id/parentId/cwd pinned, timestamp zeroed; entry
+	// timestamps are already fixed constants here).
+	let mut normalized = String::new();
+	for line in &lines {
+		let mut value: Value = serde_json::from_str(line).map_err(|error| format!("parse line: {error}"))?;
+		if let Value::Object(map) = &mut value {
+			for field in ["id", "parentId", "cwd"] {
+				if let Some(value) = map.get_mut(field) {
+					if value.is_string() {
+						*value = Value::String(field.to_string());
+					}
+				}
+			}
+			if let Some(timestamp) = map.get_mut("timestamp") {
+				// Entry timestamps are fixed constants; the header's is the
+				// wall-clock ISO string - pin either shape.
+				*timestamp = Value::from(0);
+			}
+		}
+		normalized.push_str(&serde_json::to_string(&value).map_err(|error| error.to_string())?);
+		normalized.push('\n');
+	}
+	let digest_hex = sha256_hex(normalized.as_bytes());
+	Ok(ProbePhase {
+		stream: "session",
+		flush_ms,
+		events,
+		wall_ms,
+		op_p50_ns: probe_percentile(op_ns.clone(), 0.50),
+		op_p95_ns: probe_percentile(op_ns, 0.95),
+		drain_ns,
+		io,
+		parity_ok,
+		digest_hex,
+	})
+}
+
+async fn run_probe(cli: &Cli) -> Result<(), String> {
+	let out = cli.required("out")?;
+	let flush_list_raw = cli.optional("flush-ms-list").unwrap_or_else(|| "0,50,100,250,500,1000".to_string());
+	let mut flush_ms_list: Vec<u64> = Vec::new();
+	for raw in flush_list_raw.split(',') {
+		let value = raw
+			.trim()
+			.parse::<u64>()
+			.map_err(|error| format!("--flush-ms-list entry {raw:?}: {error}"))?;
+		if !flush_ms_list.contains(&value) {
+			flush_ms_list.push(value);
+		}
+	}
+	if flush_ms_list.is_empty() {
+		return Err("--flush-ms-list must contain at least one value".to_string());
+	}
+	let rate = cli.number_usize("rate", 40)?.max(1);
+	let secs = cli.number_usize("secs", 20)?.max(1);
+	let stream = cli.optional("stream").unwrap_or_else(|| "both".to_string());
+	if !["both", "evlog", "session"].contains(&stream.as_str()) {
+		return Err(format!("--stream must be one of both|evlog|session, got {stream}"));
+	}
+	let keep = cli.flag("keep-tmp");
+	let root = prepare_tmp_root()?;
+	let events = rate * secs;
+	let interval = std::time::Duration::from_nanos((1_000_000_000u64 / rate as u64).max(1));
+	let run_evlog = stream == "both" || stream == "evlog";
+	let run_session = stream == "both" || stream == "session";
+	let streams: Vec<&str> = if run_evlog && run_session {
+		vec!["evlog", "session"]
+	} else if run_evlog {
+		vec!["evlog"]
+	} else {
+		vec!["session"]
+	};
+	println!(
+		"# probe: streams={:?} T={:?} rate={rate}/s secs={secs} events/phase={events}",
+		streams, flush_ms_list
+	);
+	let started = Instant::now();
+	let mut phases: Vec<ProbePhase> = Vec::new();
+	let mut failures: Vec<String> = Vec::new();
+	for flush_ms in &flush_ms_list {
+		// The buffers capture the period at construction; re-set the override
+		// before each phase builds its objects.
+		std::env::set_var("PRIME_AGENT_WRITE_FLUSH_MS", flush_ms.to_string());
+		for stream_name in &streams {
+			println!("PROBE-START stream={stream_name} flush_ms={flush_ms} rate={rate} secs={secs}");
+			let phase_dir = root.join(format!("probe-{stream_name}-{flush_ms:04}"));
+			if phase_dir.exists() {
+				std::fs::remove_dir_all(&phase_dir).map_err(|error| format!("clean phase dir: {error}"))?;
+			}
+			let phase_result = if *stream_name == "evlog" {
+				probe_evlog_phase(*flush_ms, events, interval, &phase_dir)
+			} else {
+				probe_session_phase(*flush_ms, events, interval, &phase_dir)
+			};
+			match phase_result {
+				Ok(phase) => {
+					let io_write_ops = phase.io.map(|io| io.write_ops).unwrap_or(0);
+					let io_write_bytes = phase.io.map(|io| io.write_bytes).unwrap_or(0);
+					println!(
+						"PROBE-END stream={stream_name} flush_ms={flush_ms} events={} wall_ms={} wrop={} wrbytes={} op_p50_us={} drain_us={} parity={}",
+						phase.events,
+						phase.wall_ms,
+						io_write_ops,
+						io_write_bytes,
+						phase.op_p50_ns / 1000,
+						phase.drain_ns / 1000,
+						if phase.parity_ok { "ok" } else { "NO" }
+					);
+					phases.push(phase);
+				}
+				Err(error) => {
+					println!("PROBE-END stream={stream_name} flush_ms={flush_ms} FAILED");
+					failures.push(format!("stream={stream_name} flush_ms={flush_ms}: {error}"));
+				}
+			}
+			if !keep {
+				let _ = std::fs::remove_dir_all(&phase_dir);
+			}
+		}
+	}
+	// Cross-T byte identity: the same event stream must produce identical
+	// bytes regardless of the flush period (buffered vs write-through).
+	let mut cross_t_ok = true;
+	for stream_name in &streams {
+		let mut reference: Option<(u64, String)> = None;
+		for phase in &phases {
+			if phase.stream != *stream_name {
+				continue;
+			}
+			match &reference {
+				None => reference = Some((phase.flush_ms, phase.digest_hex.clone())),
+				Some((_, digest)) => {
+					if *digest != phase.digest_hex {
+						cross_t_ok = false;
+						failures.push(format!(
+							"stream={stream_name}: T={} digest {} != T={} digest {}",
+							phase.flush_ms,
+							phase.digest_hex,
+							reference.as_ref().unwrap().0,
+							digest
+						));
+					}
+				}
+			}
+		}
+	}
+	let args = json!({
+		"flush_ms_list": flush_ms_list,
+		"rate": rate,
+		"secs": secs,
+		"stream": stream,
+		"events_per_phase": events,
+	});
+	let phase_jsons: Vec<Value> = phases.iter().map(probe_phase_json).collect();
+	let parity_ok = phases.iter().all(|phase| phase.parity_ok) && cross_t_ok;
+	let report = json!({
+		"subcommand": "probe",
+		"args": args,
+		"binary": {"sha256": exe_sha256().ok(), "git": git_info()},
+		"host": {
+			"os": std::env::consts::OS,
+			"arch": std::env::consts::ARCH,
+			"available_parallelism": std::thread::available_parallelism().map(|n| n.get()).unwrap_or(1),
+			"tmp_root": root.to_string_lossy(),
+		},
+		"phases": phase_jsons,
+		"cross_t_digests_match": cross_t_ok,
+		"parity_ok": parity_ok,
+		"failures": failures,
+	});
+	write_json(Path::new(&out), &report)?;
+	cleanup_tmp_root(&root, keep);
+	println!("probe complete in {:.1}s, wrote {out}", started.elapsed().as_secs_f64());
+	if !parity_ok {
+		return Err("probe parity failure: see report".to_string());
+	}
+	Ok(())
+}
+
+// ---------------------------------------------------------------------------
 // Hand-rolled CLI
 // ---------------------------------------------------------------------------
 
@@ -1939,13 +2301,18 @@ impl Cli {
 fn usage() -> String {
 	"usage:\n\
 	disk_write_bench matrix --out <json> [--runs R] [--warmup W] [--alloc-runs A]\n\
-	[--quick] [--keep-tmp]\n\
+	[--quick] [--keep-tmp] [--flush-ms MS]\n\
 	disk_write_bench point --out <json> --name <point> [--runs R] [--warmup W]\n\
-	[--alloc-runs A] [--keep-tmp]\n\
+	[--alloc-runs A] [--keep-tmp] [--flush-ms MS]\n\
+	disk_write_bench probe --out <json> [--flush-ms-list 0,50,100,250,500,1000]\n\
+	[--rate 40] [--secs 20] [--stream both|evlog|session] [--keep-tmp]\n\
 	disk_write_bench list\n\
 	disk_write_bench help\n\
 	defaults: runs=3 warmup=1 alloc-runs=1\n\
 	--quick: reduced matrix (smoke)\n\
+	--flush-ms: buffered-write flush period (PRIME_AGENT_WRITE_FLUSH_MS)\n\
+	probe: per-T phases (write-through control at T=0) at a fixed event rate;\n\
+	PROBE-START/PROBE-END lines bracket each phase for external sampling\n\
 	--keep-tmp: keep the harness tmp tree after the run\n\
 	tmp root: <system temp>/optimus-diskio-bench (wiped at start and exit)"
 		.to_string()
@@ -2042,12 +2409,24 @@ async fn main() {
 			std::process::exit(2);
 		}
 	};
+	// The write buffers capture their flush period at construction, so the
+	// override must be in the environment before any SessionManager or
+	// EventLog is built. Applies to matrix/point (buffered AFTER runs) and to
+	// probe phases (each phase re-sets it before constructing its objects).
+	if let Some(flush_ms) = cli.optional("flush-ms") {
+		if flush_ms.parse::<u64>().is_err() {
+			eprintln!("--flush-ms must be a non-negative integer of milliseconds");
+			std::process::exit(2);
+		}
+		std::env::set_var("PRIME_AGENT_WRITE_FLUSH_MS", flush_ms.clone());
+	}
 	let result = match cli.subcommand.as_str() {
 		"matrix" => {
 			let quick = cli.flag("quick");
 			run_matrix(&cli, quick).await
 		}
 		"point" => run_single_point(&cli).await,
+		"probe" => run_probe(&cli).await,
 		"list" => {
 			for point in full_matrix() {
 				println!("{}", point.name);
