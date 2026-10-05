@@ -1064,11 +1064,266 @@ fn remap_completion_chunk(chunk: Value) -> Value {
 	Value::Object(chunk)
 }
 
+/// One drained chunk: the typed shape when the payload fits it, the
+/// remapped `Value` otherwise (remap keeps the map-rebuild semantics for
+/// payloads with both key spellings).
+enum MistralChunkEvent {
+	Typed(TypedMistralChunk),
+	Value(Value),
+}
+
+/// One Mistral SSE `data:` payload in the consumer's own shape: the fields
+/// the streaming loop reads, with the SDK's inbound key remaps applied at
+/// parse time (usage snake_case, `finish_reason`, `tool_calls`,
+/// `tool_call_id`) instead of the per-event `remap_completion_chunk` map
+/// rebuild. `function.arguments` is read as a JSON string (the wire form);
+/// non-string arguments keep the Value fallback.
+#[derive(serde::Deserialize)]
+struct TypedMistralChunk {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	id: Option<String>,
+	#[serde(default)]
+	usage: Option<TypedMistralUsage>,
+	#[serde(default)]
+	choices: Vec<TypedMistralChoice>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedMistralUsage {
+	#[serde(rename = "promptTokens", alias = "prompt_tokens", default, deserialize_with = "crate::utils::typed_json::optional_f64")]
+	prompt_tokens: Option<f64>,
+	#[serde(rename = "completionTokens", alias = "completion_tokens", default, deserialize_with = "crate::utils::typed_json::optional_f64")]
+	completion_tokens: Option<f64>,
+	#[serde(rename = "totalTokens", alias = "total_tokens", default, deserialize_with = "crate::utils::typed_json::optional_f64")]
+	total_tokens: Option<f64>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedMistralChoice {
+	#[serde(rename = "finishReason", alias = "finish_reason", default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	finish_reason: Option<String>,
+	#[serde(default)]
+	delta: Option<TypedMistralDelta>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedMistralDelta {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	content: Option<Value>,
+	#[serde(rename = "toolCalls", alias = "tool_calls", default)]
+	tool_calls: Vec<TypedMistralToolCall>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedMistralToolCall {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	id: Option<String>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_i64")]
+	index: Option<i64>,
+	#[serde(default)]
+	function: Option<TypedMistralFunction>,
+}
+
+#[derive(serde::Deserialize, Default)]
+struct TypedMistralFunction {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_string")]
+	name: Option<String>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	arguments: Option<Value>,
+}
+
+#[cfg(test)]
+impl TypedMistralChunk {
+	/// The remapped-shape view the consumer reads (test parity assertions).
+	fn as_value_for_assert(&self) -> Value {
+		serde_json::to_value(TypedChunkView::from(self)).unwrap_or(Value::Null)
+	}
+}
+
+#[cfg(test)]
+impl MistralChunkEvent {
+	fn as_value(&self) -> Value {
+		match self {
+			MistralChunkEvent::Value(value) => value.clone(),
+			MistralChunkEvent::Typed(typed) => serde_json::to_value(TypedChunkView::from(typed)).unwrap_or(Value::Null),
+		}
+	}
+}
+
+#[cfg(test)]
+impl PartialEq for MistralChunkEvent {
+	fn eq(&self, other: &Self) -> bool {
+		self.as_value() == other.as_value()
+	}
+}
+
+#[cfg(test)]
+impl std::fmt::Debug for MistralChunkEvent {
+	fn fmt(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+		write!(formatter, "{:?}", self.as_value())
+	}
+}
+
+#[cfg(test)]
+impl PartialEq<Value> for MistralChunkEvent {
+	fn eq(&self, other: &Value) -> bool {
+		&self.as_value() == other
+	}
+}
+
+/// Test-only view mirroring the typed fields (already remapped), so
+/// `to_value` yields the same shape the Value path produced for the fields
+/// the consumer reads.
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedChunkView<'a> {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	id: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	usage: Option<TypedUsageView<'a>>,
+	#[serde(skip_serializing_if = "Vec::is_empty")]
+	choices: Vec<TypedChoiceView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedUsageView<'a> {
+	#[serde(rename = "promptTokens", serialize_with = "serialize_f64_as_json_number", skip_serializing_if = "Option::is_none")]
+	prompt_tokens: &'a Option<f64>,
+	#[serde(rename = "completionTokens", serialize_with = "serialize_f64_as_json_number", skip_serializing_if = "Option::is_none")]
+	completion_tokens: &'a Option<f64>,
+	#[serde(rename = "totalTokens", serialize_with = "serialize_f64_as_json_number", skip_serializing_if = "Option::is_none")]
+	total_tokens: &'a Option<f64>,
+}
+
+/// Test-only: render integral f64s as JSON integers, matching how the wire
+/// integers survive the Value path (serde_json keeps `7` an integer).
+#[cfg(test)]
+fn serialize_f64_as_json_number<S: serde::Serializer>(
+	value: &Option<f64>,
+	serializer: S,
+) -> Result<S::Ok, S::Error> {
+	match value {
+		Some(value) if value.fract() == 0.0 && value.abs() <= 9.007_199_254_740_992e15 => {
+			serializer.serialize_i64(*value as i64)
+		}
+		Some(value) => serializer.serialize_f64(*value),
+		None => serializer.serialize_none(),
+	}
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedChoiceView<'a> {
+	#[serde(rename = "finishReason", skip_serializing_if = "Option::is_none")]
+	finish_reason: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	delta: Option<TypedDeltaView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedDeltaView<'a> {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	content: &'a Option<Value>,
+	#[serde(rename = "toolCalls", skip_serializing_if = "Vec::is_empty")]
+	tool_calls: Vec<TypedToolCallView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedToolCallView<'a> {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	id: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	index: &'a Option<i64>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	function: Option<TypedFunctionView<'a>>,
+}
+
+#[cfg(test)]
+#[derive(serde::Serialize)]
+struct TypedFunctionView<'a> {
+	#[serde(skip_serializing_if = "Option::is_none")]
+	name: &'a Option<String>,
+	#[serde(skip_serializing_if = "Option::is_none")]
+	arguments: &'a Option<Value>,
+}
+
+#[cfg(test)]
+impl<'a> From<&'a TypedMistralChunk> for TypedChunkView<'a> {
+	fn from(typed: &'a TypedMistralChunk) -> Self {
+		TypedChunkView {
+			id: &typed.id,
+			usage: typed.usage.as_ref().map(|usage| TypedUsageView {
+				prompt_tokens: &usage.prompt_tokens,
+				completion_tokens: &usage.completion_tokens,
+				total_tokens: &usage.total_tokens,
+			}),
+			choices: typed
+				.choices
+				.iter()
+				.map(|choice| TypedChoiceView {
+					finish_reason: &choice.finish_reason,
+					delta: choice.delta.as_ref().map(|delta| TypedDeltaView {
+						content: &delta.content,
+						tool_calls: delta
+							.tool_calls
+							.iter()
+							.map(|tool_call| TypedToolCallView {
+								id: &tool_call.id,
+								index: &tool_call.index,
+								function: tool_call.function.as_ref().map(|function| TypedFunctionView {
+									name: &function.name,
+									arguments: &function.arguments,
+								}),
+							})
+							.collect(),
+					}),
+				})
+				.collect(),
+		}
+	}
+}
+
+/// Parse one `data:` payload with the typed shape; `None` falls back to the
+/// Value parse + `remap_completion_chunk` (which keeps the exact error text
+/// and the map-rebuild semantics for payloads with both key spellings).
+fn parse_typed_mistral_chunk(data: &str) -> Option<TypedMistralChunk> {
+	// serde would map a JSON sequence onto the struct by position; a
+	// non-object payload keeps the Value path (every field read absent).
+	if !data.trim_start().starts_with('{') {
+		return None;
+	}
+	// Only CompletionChunk-looking payloads (an id, usage, or choices
+	// member) take the typed shape, so unrelated JSON keeps the Value path.
+	if !(data.contains("\"id\"") || data.contains("\"usage\"") || data.contains("\"choices\"")) {
+		return None;
+	}
+	// The remap is 1:1 per key, so a payload carrying BOTH spellings of a
+	// remapped key keeps both keys on the Value path; the typed alias would
+	// collapse them. Route such payloads (and any typed-shape mismatch) to
+	// the Value fallback.
+	for both in [
+		["promptTokens", "prompt_tokens"],
+		["completionTokens", "completion_tokens"],
+		["totalTokens", "total_tokens"],
+		["finishReason", "finish_reason"],
+		["toolCalls", "tool_calls"],
+		["toolCallId", "tool_call_id"],
+	] {
+		if data.contains(both[0]) && data.contains(both[1]) {
+			return None;
+		}
+	}
+	serde_json::from_str(data).ok()
+}
+
 /// The Mistral SSE transport (`EventStream` in the SDK).
 struct MistralChunkStream {
 	chunks: std::pin::Pin<Box<dyn futures::Stream<Item = reqwest::Result<bytes::Bytes>> + Send>>,
 	buffer: String,
-	pending: Vec<Value>,
+	pending: Vec<MistralChunkEvent>,
 	/// Bytes that form an incomplete UTF-8 sequence at the end of a network chunk.
 	/// `parseMessage` decodes each message with `new TextDecoder("utf-8")`, which is
 	/// stateful across the chunks that make up one message, so these bytes must wait
@@ -1093,7 +1348,7 @@ impl MistralChunkStream {
 	}
 
 	/// TS: `for await (const event of mistralStream)` - each item is `event.data`.
-	async fn next(&mut self) -> Result<Option<Value>, MistralStreamError> {
+	async fn next(&mut self) -> Result<Option<MistralChunkEvent>, MistralStreamError> {
 		loop {
 			if !self.pending.is_empty() {
 				return Ok(Some(self.pending.remove(0)));
@@ -1178,10 +1433,16 @@ impl MistralChunkStream {
 				self.done = true;
 				return Ok(());
 			}
+			// Typed shape first: the inbound remap happens at parse time, so
+			// the per-event `remap_completion_chunk` map rebuild is skipped.
+			if let Some(typed) = parse_typed_mistral_chunk(&data) {
+				self.pending.push(MistralChunkEvent::Typed(typed));
+				continue;
+			}
 			match serde_json::from_str::<Value>(&data) {
 				// `CompletionEvent$inboundSchema`: `JSON.parse(data)` then the chunk schema's
 				// inbound remap.
-				Ok(value) => self.pending.push(remap_completion_chunk(value)),
+				Ok(value) => self.pending.push(MistralChunkEvent::Value(remap_completion_chunk(value))),
 				Err(error) => {
 					return Err(MistralStreamError::Message(format!(
 						"malformed json: {}",
@@ -1275,6 +1536,456 @@ fn parse_sse_message(message: &str) -> Option<String> {
 	Some(data_lines.join("\n"))
 }
 
+/// The typed consumer: same behavior as the Value fallback, reading the
+/// already-remapped members of `TypedMistralChunk` (no per-event map
+/// rebuild, no `delta` deep clone, no `toolCalls` array clone).
+#[allow(clippy::too_many_arguments)]
+fn handle_mistral_typed_chunk(
+	typed: &TypedMistralChunk,
+	model: &Model,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+	current_block: &mut Option<CurrentBlock>,
+	tool_blocks_by_key: &mut IndexMap<String, usize>,
+	partial_args_by_index: &mut HashMap<usize, String>,
+) {
+	// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
+	// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
+	if output.response_id.is_none() {
+		if let Some(id) = typed.id.as_deref() {
+			if !id.is_empty() {
+				output.response_id = Some(id.to_string());
+			}
+		}
+	}
+
+	if let Some(usage) = &typed.usage {
+		output.usage.input = usage.prompt_tokens.unwrap_or(0.0);
+		output.usage.output = usage.completion_tokens.unwrap_or(0.0);
+		output.usage.cache_read = 0.0;
+		output.usage.cache_write = 0.0;
+		let total_tokens = usage.total_tokens.unwrap_or(0.0);
+		output.usage.total_tokens = if total_tokens != 0.0 {
+			total_tokens
+		} else {
+			output.usage.input + output.usage.output
+		};
+		calculate_cost(model, &mut output.usage, None);
+	}
+
+	let Some(choice) = typed.choices.first() else {
+		return;
+	};
+
+	if let Some(finish_reason) = choice.finish_reason.as_deref() {
+		output.stop_reason = map_chat_stop_reason(Some(finish_reason));
+		if output.stop_reason == "error" {
+			output.stop_reason_raw = Some(finish_reason.to_string());
+		}
+	}
+
+	let delta = choice.delta.as_ref();
+	if let Some(content) = delta.and_then(|delta| delta.content.as_ref()) {
+		let content_items: Vec<Value> = match content {
+			Value::String(text) => vec![Value::String(text.clone())],
+			Value::Array(items) => items.clone(),
+			_ => Vec::new(),
+		};
+		for item in content_items {
+			if let Value::String(text) = &item {
+				let text_delta = sanitize_surrogates(text);
+				if !matches!(current_block, Some(CurrentBlock::Text(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output.content.push(ContentBlock::Text(TextContent::new(String::new())));
+					stream.push(AssistantMessageEvent::TextStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
+						target.text.push_str(&text_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: output.content.len() - 1,
+					delta: text_delta,
+					partial: output.clone(),
+				});
+				continue;
+			}
+
+			let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+			if item_type == "thinking" {
+				let delta_text = item
+					.get("thinking")
+					.and_then(Value::as_array)
+					.map(|parts| {
+						parts
+							.iter()
+							.map(|part| part.get("text").and_then(Value::as_str).unwrap_or_default())
+							.collect::<Vec<_>>()
+							.join("")
+					})
+					.unwrap_or_default();
+				let thinking_delta = sanitize_surrogates(&delta_text);
+				if thinking_delta.is_empty() {
+					continue;
+				}
+				if !matches!(current_block, Some(CurrentBlock::Thinking(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output
+						.content
+						.push(ContentBlock::Thinking(ThinkingContent::new(String::new())));
+					stream.push(AssistantMessageEvent::ThinkingStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Thinking(ThinkingContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Thinking(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Thinking(target)) = output.content.last_mut() {
+						target.thinking.push_str(&thinking_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::ThinkingDelta {
+					content_index: output.content.len() - 1,
+					delta: thinking_delta,
+					partial: output.clone(),
+				});
+				continue;
+			}
+
+			if item_type == "text" {
+				let text_delta = sanitize_surrogates(item.get("text").and_then(Value::as_str).unwrap_or_default());
+				if !matches!(current_block, Some(CurrentBlock::Text(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output.content.push(ContentBlock::Text(TextContent::new(String::new())));
+					stream.push(AssistantMessageEvent::TextStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
+						target.text.push_str(&text_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: output.content.len() - 1,
+					delta: text_delta,
+					partial: output.clone(),
+				});
+			}
+		}
+	}
+
+	let tool_calls = delta.map(|delta| delta.tool_calls.iter()).unwrap_or_default();
+	for tool_call in tool_calls {
+		if let Some(block) = current_block.take() {
+			finish_current_block(&block, output, stream);
+		}
+		let raw_id = tool_call.id.as_deref().unwrap_or_default();
+		let call_id = if !raw_id.is_empty() && raw_id != "null" {
+			raw_id.to_string()
+		} else {
+			let index = tool_call.index.unwrap_or(0);
+			derive_mistral_tool_call_id(&format!("toolcall:{}", index), 0)
+		};
+		let index = tool_call.index.unwrap_or(0);
+		let key = format!("{}:{}", call_id, index);
+		let mut block_index = tool_blocks_by_key.get(&key).copied();
+
+		if let Some(existing_index) = block_index {
+			if !matches!(
+				output.content.get(existing_index),
+				Some(ContentBlock::ToolCall(_))
+			) {
+				block_index = None;
+			}
+		}
+
+		if block_index.is_none() {
+			let name = tool_call
+				.function
+				.as_ref()
+				.and_then(|function| function.name.as_deref())
+				.unwrap_or_default()
+				.to_string();
+			let tool_block = ToolCall::new(call_id.clone(), name, Map::new());
+			output.content.push(ContentBlock::ToolCall(tool_block));
+			tool_blocks_by_key.insert(key.clone(), output.content.len() - 1);
+			partial_args_by_index.insert(output.content.len() - 1, String::new());
+			stream.push(AssistantMessageEvent::ToolCallStart {
+				content_index: output.content.len() - 1,
+				partial: output.clone(),
+			});
+		}
+
+		let args_delta = match tool_call.function.as_ref().and_then(|function| function.arguments.as_ref()) {
+			Some(Value::String(arguments)) => arguments.clone(),
+			Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+			None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_else(|_| "{}".to_string()),
+		};
+		let index = tool_blocks_by_key.get(&key).copied().unwrap_or(0);
+		let partial_args = format!(
+			"{}{}",
+			partial_args_by_index.get(&index).cloned().unwrap_or_default(),
+			args_delta
+		);
+		partial_args_by_index.insert(index, partial_args.clone());
+		if let Some(ContentBlock::ToolCall(block)) = output.content.get_mut(index) {
+			block.arguments = match parse_streaming_json(Some(&partial_args)) {
+				Value::Object(map) => map,
+				_ => Map::new(),
+			};
+		}
+		stream.push(AssistantMessageEvent::ToolCallDelta {
+			content_index: index,
+			delta: args_delta,
+			partial: output.clone(),
+		});
+	}
+}
+
+/// The Value fallback consumer: the pre-typed reads, unchanged. Kept for
+/// every payload the typed shape does not cover (non-object chunks, both
+/// key spellings of a remapped member, wrong-typed members, malformed
+/// shapes the Value reads tolerate).
+#[allow(clippy::too_many_arguments)]
+fn handle_mistral_value_chunk(
+	chunk: &Value,
+	model: &Model,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+	current_block: &mut Option<CurrentBlock>,
+	tool_blocks_by_key: &mut IndexMap<String, usize>,
+	partial_args_by_index: &mut HashMap<usize, String>,
+) {
+	// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
+	// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
+	if output.response_id.is_none() {
+		if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+			if !id.is_empty() {
+				output.response_id = Some(id.to_string());
+			}
+		}
+	}
+
+	if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
+		output.usage.input = number_field(usage, "promptTokens");
+		output.usage.output = number_field(usage, "completionTokens");
+		output.usage.cache_read = 0.0;
+		output.usage.cache_write = 0.0;
+		let total_tokens = number_field(usage, "totalTokens");
+		output.usage.total_tokens = if total_tokens != 0.0 {
+			total_tokens
+		} else {
+			output.usage.input + output.usage.output
+		};
+		calculate_cost(model, &mut output.usage, None);
+	}
+
+	let choice = chunk
+		.get("choices")
+		.and_then(Value::as_array)
+		.and_then(|choices| choices.first());
+	let Some(choice) = choice else {
+		return;
+	};
+
+	if let Some(finish_reason) = choice.get("finishReason").and_then(Value::as_str) {
+		output.stop_reason = map_chat_stop_reason(Some(finish_reason));
+		if output.stop_reason == "error" {
+			output.stop_reason_raw = Some(finish_reason.to_string());
+		}
+	}
+
+	let delta = choice.get("delta").cloned().unwrap_or(Value::Object(Map::new()));
+	if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
+		let content_items: Vec<Value> = match content {
+			Value::String(text) => vec![Value::String(text.clone())],
+			Value::Array(items) => items.clone(),
+			_ => Vec::new(),
+		};
+		for item in content_items {
+			if let Value::String(text) = &item {
+				let text_delta = sanitize_surrogates(text);
+				if !matches!(current_block, Some(CurrentBlock::Text(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output.content.push(ContentBlock::Text(TextContent::new(String::new())));
+					stream.push(AssistantMessageEvent::TextStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
+						target.text.push_str(&text_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: output.content.len() - 1,
+					delta: text_delta,
+					partial: output.clone(),
+				});
+				continue;
+			}
+
+			let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
+			if item_type == "thinking" {
+				let delta_text = item
+					.get("thinking")
+					.and_then(Value::as_array)
+					.map(|parts| {
+						parts
+							.iter()
+							.map(|part| part.get("text").and_then(Value::as_str).unwrap_or_default())
+							.collect::<Vec<_>>()
+							.join("")
+					})
+					.unwrap_or_default();
+				let thinking_delta = sanitize_surrogates(&delta_text);
+				if thinking_delta.is_empty() {
+					continue;
+				}
+				if !matches!(current_block, Some(CurrentBlock::Thinking(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output
+						.content
+						.push(ContentBlock::Thinking(ThinkingContent::new(String::new())));
+					stream.push(AssistantMessageEvent::ThinkingStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Thinking(ThinkingContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Thinking(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Thinking(target)) = output.content.last_mut() {
+						target.thinking.push_str(&thinking_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::ThinkingDelta {
+					content_index: output.content.len() - 1,
+					delta: thinking_delta,
+					partial: output.clone(),
+				});
+				continue;
+			}
+
+			if item_type == "text" {
+				let text_delta = sanitize_surrogates(item.get("text").and_then(Value::as_str).unwrap_or_default());
+				if !matches!(current_block, Some(CurrentBlock::Text(_))) {
+					if let Some(block) = current_block.take() {
+						finish_current_block(&block, output, stream);
+					}
+					output.content.push(ContentBlock::Text(TextContent::new(String::new())));
+					stream.push(AssistantMessageEvent::TextStart {
+						content_index: output.content.len() - 1,
+						partial: output.clone(),
+					});
+					*current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
+				}
+				if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
+					if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
+						target.text.push_str(&text_delta);
+					}
+				}
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: output.content.len() - 1,
+					delta: text_delta,
+					partial: output.clone(),
+				});
+			}
+		}
+	}
+
+	let tool_calls = delta
+		.get("toolCalls")
+		.and_then(Value::as_array)
+		.cloned()
+		.unwrap_or_default();
+	for tool_call in tool_calls {
+		if let Some(block) = current_block.take() {
+			finish_current_block(&block, output, stream);
+		}
+		let raw_id = tool_call.get("id").and_then(Value::as_str).unwrap_or_default();
+		let call_id = if !raw_id.is_empty() && raw_id != "null" {
+			raw_id.to_string()
+		} else {
+			let index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
+			derive_mistral_tool_call_id(&format!("toolcall:{}", index), 0)
+		};
+		let index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
+		let key = format!("{}:{}", call_id, index);
+		let mut block_index = tool_blocks_by_key.get(&key).copied();
+
+		if let Some(existing_index) = block_index {
+			if !matches!(
+				output.content.get(existing_index),
+				Some(ContentBlock::ToolCall(_))
+			) {
+				block_index = None;
+			}
+		}
+
+		if block_index.is_none() {
+			let name = tool_call
+				.get("function")
+				.and_then(|function| function.get("name"))
+				.and_then(Value::as_str)
+				.unwrap_or_default()
+				.to_string();
+			let tool_block = ToolCall::new(call_id.clone(), name, Map::new());
+			output.content.push(ContentBlock::ToolCall(tool_block));
+			tool_blocks_by_key.insert(key.clone(), output.content.len() - 1);
+			partial_args_by_index.insert(output.content.len() - 1, String::new());
+			stream.push(AssistantMessageEvent::ToolCallStart {
+				content_index: output.content.len() - 1,
+				partial: output.clone(),
+			});
+		}
+
+		let function = tool_call.get("function").cloned().unwrap_or(Value::Object(Map::new()));
+		let args_delta = match function.get("arguments") {
+			Some(Value::String(arguments)) => arguments.clone(),
+			Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
+			None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_else(|_| "{}".to_string()),
+		};
+		let index = tool_blocks_by_key.get(&key).copied().unwrap_or(0);
+		let partial_args = format!(
+			"{}{}",
+			partial_args_by_index.get(&index).cloned().unwrap_or_default(),
+			args_delta
+		);
+		partial_args_by_index.insert(index, partial_args.clone());
+		if let Some(ContentBlock::ToolCall(block)) = output.content.get_mut(index) {
+			block.arguments = match parse_streaming_json(Some(&partial_args)) {
+				Value::Object(map) => map,
+				_ => Map::new(),
+			};
+		}
+		stream.push(AssistantMessageEvent::ToolCallDelta {
+			content_index: index,
+			delta: args_delta,
+			partial: output.clone(),
+		});
+	}
+}
+
 /// TS: `consumeChatStream(model, output, stream, mistralStream)`.
 async fn consume_chat_stream(
 	model: &Model,
@@ -1290,219 +2001,25 @@ async fn consume_chat_stream(
 	let mut partial_args_by_index: HashMap<usize, String> = HashMap::new();
 
 	while let Some(chunk) = mistral_stream.next().await? {
-		// Mistral's streamed CompletionChunk carries an id field. Keep the first non-empty one,
-		// mirroring how OpenAI-style streaming exposes a stable response identifier per stream.
-		if output.response_id.is_none() {
-			if let Some(id) = chunk.get("id").and_then(Value::as_str) {
-				if !id.is_empty() {
-					output.response_id = Some(id.to_string());
-				}
-			}
-		}
-
-		if let Some(usage) = chunk.get("usage").filter(|usage| !usage.is_null()) {
-			output.usage.input = number_field(usage, "promptTokens");
-			output.usage.output = number_field(usage, "completionTokens");
-			output.usage.cache_read = 0.0;
-			output.usage.cache_write = 0.0;
-			let total_tokens = number_field(usage, "totalTokens");
-			output.usage.total_tokens = if total_tokens != 0.0 {
-				total_tokens
-			} else {
-				output.usage.input + output.usage.output
-			};
-			calculate_cost(model, &mut output.usage, None);
-		}
-
-		let choice = chunk
-			.get("choices")
-			.and_then(Value::as_array)
-			.and_then(|choices| choices.first());
-		let Some(choice) = choice else {
-			continue;
-		};
-
-		if let Some(finish_reason) = choice.get("finishReason").and_then(Value::as_str) {
-			output.stop_reason = map_chat_stop_reason(Some(finish_reason));
-			if output.stop_reason == "error" {
-				output.stop_reason_raw = Some(finish_reason.to_string());
-			}
-		}
-
-		let delta = choice.get("delta").cloned().unwrap_or(Value::Object(Map::new()));
-		if let Some(content) = delta.get("content").filter(|content| !content.is_null()) {
-			let content_items: Vec<Value> = match content {
-				Value::String(text) => vec![Value::String(text.clone())],
-				Value::Array(items) => items.clone(),
-				_ => Vec::new(),
-			};
-			for item in content_items {
-				if let Value::String(text) = &item {
-					let text_delta = sanitize_surrogates(text);
-					if !matches!(current_block, Some(CurrentBlock::Text(_))) {
-						if let Some(block) = current_block.take() {
-							finish_current_block(&block, output, stream);
-						}
-						output.content.push(ContentBlock::Text(TextContent::new(String::new())));
-						stream.push(AssistantMessageEvent::TextStart {
-							content_index: output.content.len() - 1,
-							partial: output.clone(),
-						});
-						current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
-					}
-					if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
-						if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
-							target.text.push_str(&text_delta);
-						}
-					}
-					stream.push(AssistantMessageEvent::TextDelta {
-						content_index: output.content.len() - 1,
-						delta: text_delta,
-						partial: output.clone(),
-					});
-					continue;
-				}
-
-				let item_type = item.get("type").and_then(Value::as_str).unwrap_or_default();
-				if item_type == "thinking" {
-					let delta_text = item
-						.get("thinking")
-						.and_then(Value::as_array)
-						.map(|parts| {
-							parts
-								.iter()
-								.map(|part| part.get("text").and_then(Value::as_str).unwrap_or_default())
-								.collect::<Vec<_>>()
-								.join("")
-						})
-						.unwrap_or_default();
-					let thinking_delta = sanitize_surrogates(&delta_text);
-					if thinking_delta.is_empty() {
-						continue;
-					}
-					if !matches!(current_block, Some(CurrentBlock::Thinking(_))) {
-						if let Some(block) = current_block.take() {
-							finish_current_block(&block, output, stream);
-						}
-						output
-							.content
-							.push(ContentBlock::Thinking(ThinkingContent::new(String::new())));
-						stream.push(AssistantMessageEvent::ThinkingStart {
-							content_index: output.content.len() - 1,
-							partial: output.clone(),
-						});
-						current_block = Some(CurrentBlock::Thinking(ThinkingContent::new(String::new())));
-					}
-					if let Some(CurrentBlock::Thinking(_)) = current_block.as_ref() {
-						if let Some(ContentBlock::Thinking(target)) = output.content.last_mut() {
-							target.thinking.push_str(&thinking_delta);
-						}
-					}
-					stream.push(AssistantMessageEvent::ThinkingDelta {
-						content_index: output.content.len() - 1,
-						delta: thinking_delta,
-						partial: output.clone(),
-					});
-					continue;
-				}
-
-				if item_type == "text" {
-					let text_delta = sanitize_surrogates(item.get("text").and_then(Value::as_str).unwrap_or_default());
-					if !matches!(current_block, Some(CurrentBlock::Text(_))) {
-						if let Some(block) = current_block.take() {
-							finish_current_block(&block, output, stream);
-						}
-						output.content.push(ContentBlock::Text(TextContent::new(String::new())));
-						stream.push(AssistantMessageEvent::TextStart {
-							content_index: output.content.len() - 1,
-							partial: output.clone(),
-						});
-						current_block = Some(CurrentBlock::Text(TextContent::new(String::new())));
-					}
-					if let Some(CurrentBlock::Text(_)) = current_block.as_ref() {
-						if let Some(ContentBlock::Text(target)) = output.content.last_mut() {
-							target.text.push_str(&text_delta);
-						}
-					}
-					stream.push(AssistantMessageEvent::TextDelta {
-						content_index: output.content.len() - 1,
-						delta: text_delta,
-						partial: output.clone(),
-					});
-				}
-			}
-		}
-
-		let tool_calls = delta
-			.get("toolCalls")
-			.and_then(Value::as_array)
-			.cloned()
-			.unwrap_or_default();
-		for tool_call in tool_calls {
-			if let Some(block) = current_block.take() {
-				finish_current_block(&block, output, stream);
-			}
-			let raw_id = tool_call.get("id").and_then(Value::as_str).unwrap_or_default();
-			let call_id = if !raw_id.is_empty() && raw_id != "null" {
-				raw_id.to_string()
-			} else {
-				let index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
-				derive_mistral_tool_call_id(&format!("toolcall:{}", index), 0)
-			};
-			let index = tool_call.get("index").and_then(Value::as_i64).unwrap_or(0);
-			let key = format!("{}:{}", call_id, index);
-			let mut block_index = tool_blocks_by_key.get(&key).copied();
-
-			if let Some(existing_index) = block_index {
-				if !matches!(
-					output.content.get(existing_index),
-					Some(ContentBlock::ToolCall(_))
-				) {
-					block_index = None;
-				}
-			}
-
-			if block_index.is_none() {
-				let name = tool_call
-					.get("function")
-					.and_then(|function| function.get("name"))
-					.and_then(Value::as_str)
-					.unwrap_or_default()
-					.to_string();
-				let tool_block = ToolCall::new(call_id.clone(), name, Map::new());
-				output.content.push(ContentBlock::ToolCall(tool_block));
-				tool_blocks_by_key.insert(key.clone(), output.content.len() - 1);
-				partial_args_by_index.insert(output.content.len() - 1, String::new());
-				stream.push(AssistantMessageEvent::ToolCallStart {
-					content_index: output.content.len() - 1,
-					partial: output.clone(),
-				});
-			}
-
-			let function = tool_call.get("function").cloned().unwrap_or(Value::Object(Map::new()));
-			let args_delta = match function.get("arguments") {
-				Some(Value::String(arguments)) => arguments.clone(),
-				Some(other) => serde_json::to_string(other).unwrap_or_else(|_| "{}".to_string()),
-				None => serde_json::to_string(&Value::Object(Map::new())).unwrap_or_else(|_| "{}".to_string()),
-			};
-			let index = tool_blocks_by_key.get(&key).copied().unwrap_or(0);
-			let partial_args = format!(
-				"{}{}",
-				partial_args_by_index.get(&index).cloned().unwrap_or_default(),
-				args_delta
-			);
-			partial_args_by_index.insert(index, partial_args.clone());
-			if let Some(ContentBlock::ToolCall(block)) = output.content.get_mut(index) {
-				block.arguments = match parse_streaming_json(Some(&partial_args)) {
-					Value::Object(map) => map,
-					_ => Map::new(),
-				};
-			}
-			stream.push(AssistantMessageEvent::ToolCallDelta {
-				content_index: index,
-				delta: args_delta,
-				partial: output.clone(),
-			});
+		match chunk {
+			MistralChunkEvent::Typed(typed) => handle_mistral_typed_chunk(
+				&typed,
+				model,
+				output,
+				stream,
+				&mut current_block,
+				&mut tool_blocks_by_key,
+				&mut partial_args_by_index,
+			),
+			MistralChunkEvent::Value(chunk) => handle_mistral_value_chunk(
+				&chunk,
+				model,
+				output,
+				stream,
+				&mut current_block,
+				&mut tool_blocks_by_key,
+				&mut partial_args_by_index,
+			),
 		}
 	}
 
@@ -2117,7 +2634,7 @@ mod tests {
 			signal: None,
 		};
 		stream.drain_events().unwrap();
-		assert_eq!(stream.pending, vec![json!({"id": "a"})]);
+		assert_eq!(pending_values(&stream), vec![json!({"id": "a"})]);
 		assert!(stream.done);
 	}
 
@@ -2152,7 +2669,7 @@ mod tests {
 			signal: None,
 		};
 		stream.drain_events().unwrap();
-		assert_eq!(stream.pending, vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
+		assert_eq!(pending_values(&stream), vec![json!({"a": 1}), json!({"b": 2}), json!({"c": 3})]);
 		assert!(stream.done);
 
 		let mut split = MistralChunkStream {
@@ -2168,8 +2685,99 @@ mod tests {
 		assert!(split.pending.is_empty());
 		split.buffer.push_str("\r\ndata: {\"b\":2}\r\n\n");
 		split.drain_events().unwrap();
-		assert_eq!(split.pending, vec![json!({"a": 1}), json!({"b": 2})]);
+		assert_eq!(pending_values(&split), vec![json!({"a": 1}), json!({"b": 2})]);
 	}
+	fn pending_values(stream: &MistralChunkStream) -> Vec<Value> {
+		stream.pending.iter().map(|event| event.as_value()).collect()
+	}
+
+	#[test]
+	fn typed_chunk_matches_the_remapped_value_chunk() {
+		let payloads = [
+			// common wire shapes
+			r#"{"id":"a","choices":[{"delta":{"content":"hi"},"finish_reason":null}]}"#,
+			r#"{"id":"b","choices":[{"delta":{"tool_calls":[{"id":"call-1","index":0,"function":{"name":"read","arguments":"{\"path\":\"/tmp\"}"}}]},"finish_reason":"tool_calls"}]}"#,
+			r#"{"id":"c","usage":{"prompt_tokens":7,"completion_tokens":3,"total_tokens":10},"choices":[]}"#,
+			r#"{ "usage" : { "prompt_tokens" : 7 , "completion_tokens" : 3 } }"#,
+			// content as array of typed items
+			r#"{"choices":[{"delta":{"content":[{"type":"text","text":"a"},{"type":"thinking","thinking":[{"text":"b"}]}]}}]}"#,
+			// wrong-typed members read as absent
+			r#"{"id":5,"usage":"nope","choices":[{"finish_reason":9,"delta":{"tool_calls":[{"id":3,"index":"x","function":"str"}]}}]}"#,
+			// null members read as absent
+			r#"{"id":null,"usage":null,"choices":[{"delta":null,"finish_reason":null}]}"#,
+			// unknown members ignored
+			r#"{"id":"d","model":"x","created":1,"choices":[{"delta":{"role":"assistant","content":"z"},"finish_reason":"stop"}]}"#,
+			// duplicate snake keys: last value wins, same as the remap's map insert
+			r#"{"usage":{"prompt_tokens":1,"prompt_tokens":2},"choices":[]}"#,
+			// both spellings present: typed falls back to the Value path
+			r#"{"usage":{"prompt_tokens":1,"promptTokens":2},"choices":[]}"#,
+			// non-object payload: Value path (reads absent)
+			"[1, 2]",
+		];
+		for payload in payloads {
+			let typed = parse_typed_mistral_chunk(payload);
+			let value = remap_completion_chunk(serde_json::from_str::<Value>(payload).unwrap());
+			match typed {
+				Some(typed) => {
+					let view = typed.as_value_for_assert();
+					assert_eq!(
+						typed.id.as_deref(),
+						value.get("id").and_then(Value::as_str),
+						"id mismatch on {payload}"
+					);
+					assert_eq!(
+						view.get("usage"),
+						value.get("usage").filter(|usage| !usage.is_null()),
+						"usage mismatch on {payload}"
+					);
+					assert_eq!(
+						typed.choices.len(),
+						value
+							.get("choices")
+							.and_then(Value::as_array)
+							.map(Vec::as_slice)
+							.map(<[Value]>::len)
+							.unwrap_or(0),
+						"choices length mismatch on {payload}"
+					);
+					let typed_choice = typed.choices.first();
+					let value_choice = value
+						.get("choices")
+						.and_then(Value::as_array)
+						.and_then(|choices| choices.first());
+					assert_eq!(
+						typed_choice.map(|choice| choice.finish_reason.as_deref()).flatten(),
+						value_choice.and_then(|choice| choice.get("finishReason")).and_then(Value::as_str),
+						"finishReason mismatch on {payload}"
+					);
+					let typed_delta = typed_choice.and_then(|choice| choice.delta.as_ref());
+					let value_delta = value_choice
+						.and_then(|choice| choice.get("delta"))
+						.map(|delta| delta.get("content").filter(|content| !content.is_null()).cloned())
+						.flatten();
+					assert_eq!(
+						typed_delta.and_then(|delta| delta.content.as_ref()),
+						value_delta.as_ref(),
+						"delta.content mismatch on {payload}"
+					);
+					let typed_calls = typed_delta.map(|delta| delta.tool_calls.len()).unwrap_or(0);
+					let value_calls = value_choice
+						.and_then(|choice| choice.get("delta"))
+						.and_then(|delta| delta.get("toolCalls"))
+						.and_then(Value::as_array)
+						.map(|calls| calls.len())
+						.unwrap_or(0);
+					assert_eq!(typed_calls, value_calls, "toolCalls length mismatch on {payload}");
+				}
+				None => {
+					// Fallback: both key spellings, non-object payloads, or
+					// wrong-typed members (e.g. a string `usage`) route to the
+					// Value path, which is the unchanged pre-typed consumer.
+				}
+			}
+		}
+	}
+
 	fn byte_stream(chunks: Vec<&[u8]>) -> MistralChunkStream {
 		let items: Vec<reqwest::Result<bytes::Bytes>> = chunks
 			.into_iter()
@@ -2255,7 +2863,7 @@ mod tests {
 			"\"function\":{\"name\":\"read\",\"arguments\":\"{}\"}}]},\"finish_reason\":\"tool_calls\"}]}\n\n"
 		);
 		let mut stream = byte_stream(vec![frame.as_bytes()]);
-		let chunk = stream.next().await.unwrap().unwrap();
+		let chunk = stream.next().await.unwrap().unwrap().as_value();
 		assert_eq!(chunk["usage"]["promptTokens"], json!(7));
 		assert_eq!(chunk["usage"]["totalTokens"], json!(10));
 		assert_eq!(chunk["choices"][0]["finishReason"], json!("tool_calls"));
@@ -2277,7 +2885,7 @@ mod tests {
 			&bytes[first_split..second_split],
 			&bytes[second_split..],
 		]);
-		let chunk = stream.next().await.unwrap().unwrap();
+		let chunk = stream.next().await.unwrap().unwrap().as_value();
 		assert_eq!(
 			chunk["choices"][0]["delta"]["content"],
 			json!("caf\u{e9} \u{1F388}")
