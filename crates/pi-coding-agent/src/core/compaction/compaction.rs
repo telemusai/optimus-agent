@@ -34,6 +34,9 @@ use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use serde_json::Value;
 
 use crate::core::compaction::charcount::{count_chars, scan_chars_forward};
+use crate::core::compaction::parallel::{
+    try_parallel_map, EXTRACT_MESSAGES_THRESHOLD, TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
+};
 use crate::core::compaction::checkpoint::has_provider_checkpoint;
 use crate::core::compaction::metrics::CompactionMetrics;
 use crate::core::compaction::utils::{
@@ -1104,6 +1107,27 @@ fn get_last_assistant_usage_info(messages: &[AgentMessage]) -> Option<(Usage, us
 /// If there are messages after the last usage, estimate their tokens with estimateTokens.
 pub fn estimate_context_tokens(messages: &[AgentMessage]) -> ContextUsageEstimate {
     let Some((usage, index)) = get_last_assistant_usage_info(messages) else {
+        // No usable usage: the estimate sums every message. Element estimates
+        // are pure, so large sessions map them in parallel and fold the sums
+        // in slice order (identical f64 addition order). Any parallel failure
+        // falls back to the sequential loop below.
+        let per_message: Option<Vec<f64>> = try_parallel_map(
+            messages,
+            TOKEN_ESTIMATE_MESSAGES_THRESHOLD,
+            |message, _| estimate_tokens(message),
+        );
+        if let Some(per_message) = per_message {
+            let mut estimated = 0.0;
+            for tokens in per_message {
+                estimated += tokens;
+            }
+            return ContextUsageEstimate {
+                tokens: estimated,
+                usage_tokens: 0.0,
+                trailing_tokens: estimated,
+                last_usage_index: None,
+            };
+        }
         let mut estimated = 0.0;
         for message in messages {
             estimated += estimate_tokens(message);
@@ -1521,12 +1545,20 @@ pub fn prepare_compaction(
     } else {
         cut_point.first_kept_entry_index
     };
-    let mut messages_to_summarize: Vec<AgentMessage> = Vec::new();
-    for index in boundary_start..history_end {
-        if let Some(message) = get_message_from_entry_for_compaction(&path_entries[index]) {
-            messages_to_summarize.push(message);
-        }
-    }
+    // Per-entry extraction is a pure clone; large sessions map it in parallel
+    // and keep the slice order, so the message list is identical. Any parallel
+    // failure falls back to the sequential loop.
+    let messages_to_summarize: Vec<AgentMessage> = match try_parallel_map(
+        &path_entries[boundary_start..history_end],
+        EXTRACT_MESSAGES_THRESHOLD,
+        |entry, _| get_message_from_entry_for_compaction(entry),
+    ) {
+        Some(messages) => messages.into_iter().flatten().collect(),
+        None => path_entries[boundary_start..history_end]
+            .iter()
+            .filter_map(get_message_from_entry_for_compaction)
+            .collect(),
+    };
     let mut turn_prefix_messages: Vec<AgentMessage> = Vec::new();
     if cut_point.is_split_turn {
         let turn_start = cut_point.turn_start_index.unwrap_or(0);

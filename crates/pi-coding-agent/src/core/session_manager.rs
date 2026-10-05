@@ -1149,17 +1149,38 @@ pub fn build_session_context_with_entry_ids(
     // summary records where clients should present it among retained messages.
     let mut message_entries: Vec<SessionContextMessage> = Vec::new();
 
-    fn append_message(entry: &SessionEntry, target: &mut Vec<SessionContextMessage>) {
+    // The per-entry parse is a pure function of the entry; large paths run it
+    // in parallel and keep the slice order (identical list). Any parallel
+    // failure falls back to the sequential loop inside `extend_context_messages`.
+    fn extend_context_messages(entries: &[&SessionEntry], target: &mut Vec<SessionContextMessage>) {
+        if let Some(parsed) = crate::core::compaction::parallel::try_parallel_map(
+            entries,
+            crate::core::compaction::parallel::RESTORE_ENTRIES_THRESHOLD,
+            |entry, _| context_message_for_entry(entry),
+        ) {
+            target.extend(parsed.into_iter().flatten());
+            return;
+        }
+        for entry in entries {
+            if let Some(message) = context_message_for_entry(entry) {
+                target.push(message);
+            }
+        }
+    }
+
+    /// One path entry -> its session-context message, if it contributes one.
+    fn context_message_for_entry(entry: &SessionEntry) -> Option<SessionContextMessage> {
         match entry_type(entry) {
             "message" => {
                 if let Some(message) = entry.get("message") {
                     if let Ok(message) = serde_json::from_value::<AgentMessage>(message.clone()) {
-                        target.push(SessionContextMessage {
+                        return Some(SessionContextMessage {
                             entry_id: entry_id(entry),
                             message,
                         });
                     }
                 }
+                None
             }
             "custom_message" => {
                 let custom_type = entry
@@ -1174,7 +1195,7 @@ pub fn build_session_context_with_entry_ids(
                     .unwrap_or(false);
                 let details = entry.get("details").cloned();
                 let timestamp = entry_timestamp(entry);
-                target.push(SessionContextMessage {
+                Some(SessionContextMessage {
                     entry_id: entry_id(entry),
                     message: create_custom_message(
                         &custom_type,
@@ -1183,7 +1204,7 @@ pub fn build_session_context_with_entry_ids(
                         details,
                         &timestamp,
                     ),
-                });
+                })
             }
             "branch_summary" => {
                 let summary = entry
@@ -1198,13 +1219,14 @@ pub fn build_session_context_with_entry_ids(
                         .unwrap_or_default()
                         .to_string();
                     let timestamp = entry_timestamp(entry);
-                    target.push(SessionContextMessage {
+                    return Some(SessionContextMessage {
                         entry_id: entry_id(entry),
                         message: create_branch_summary_message(&summary, &from_id, &timestamp),
                     });
                 }
+                None
             }
-            _ => {}
+            _ => None,
         }
     }
 
@@ -1224,23 +1246,20 @@ pub fn build_session_context_with_entry_ids(
             // The context remains summary-first for the model; retainedMessageCount records
             // the exact chronological presentation boundary for clients.
             let mut retained_messages: Vec<SessionContextMessage> = Vec::new();
-            let mut found_first_kept = false;
-            for index in 0..compaction_idx {
-                if provider_context.is_some() {
-                    break;
-                }
-                let entry = &path[index];
-                if entry_id(entry)
-                    == compaction
-                        .get("firstKeptEntryId")
-                        .and_then(Value::as_str)
-                        .unwrap_or_default()
-                {
-                    found_first_kept = true;
-                }
-                if found_first_kept {
-                    append_message(entry, &mut retained_messages);
-                }
+            if provider_context.is_none() {
+                let first_kept_id = compaction
+                    .get("firstKeptEntryId")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                let first_kept = if first_kept_id.is_empty() {
+                    compaction_idx
+                } else {
+                    path[..compaction_idx]
+                        .iter()
+                        .position(|entry| entry_id(entry) == first_kept_id)
+                        .unwrap_or(compaction_idx)
+                };
+                extend_context_messages(&path[first_kept..compaction_idx], &mut retained_messages);
             }
 
             message_entries.push(SessionContextMessage {
@@ -1272,26 +1291,37 @@ pub fn build_session_context_with_entry_ids(
             });
             message_entries.extend(retained_messages);
 
-            for entry in path.iter().skip(compaction_idx + 1) {
-                append_message(entry, &mut message_entries);
-            }
+            extend_context_messages(&path[compaction_idx + 1..], &mut message_entries);
         }
         None => {
-            for entry in &path {
-                append_message(entry, &mut message_entries);
-            }
+            extend_context_messages(&path, &mut message_entries);
         }
     }
 
+    // The final context clone is per-item and order-preserving; large paths
+    // clone in parallel (identical lists), any failure runs the sequential
+    // clone.
+    let (messages, entry_ids): (Vec<AgentMessage>, Vec<String>) =
+        match crate::core::compaction::parallel::try_parallel_map(
+            &message_entries,
+            crate::core::compaction::parallel::CONTEXT_CLONE_THRESHOLD,
+            |item, _| (item.message.clone(), item.entry_id.clone()),
+        ) {
+            Some(pairs) => pairs.into_iter().unzip(),
+            None => (
+                message_entries
+                    .iter()
+                    .map(|item| item.message.clone())
+                    .collect(),
+                message_entries
+                    .iter()
+                    .map(|item| item.entry_id.clone())
+                    .collect(),
+            ),
+        };
     SessionContextWithEntryIds {
-        messages: message_entries
-            .iter()
-            .map(|item| item.message.clone())
-            .collect(),
-        entry_ids: message_entries
-            .iter()
-            .map(|item| item.entry_id.clone())
-            .collect(),
+        messages,
+        entry_ids,
         thinking_level,
         service_tier,
         model,
@@ -4461,15 +4491,30 @@ impl SessionManager {
     }
 
     pub fn get_branch(&self, from_id: Option<&str>) -> Vec<SessionEntry> {
-        let mut path = Vec::new();
-        self.visit_branch(from_id, |entry| path.push(entry.clone()));
-        path
+        // The borrow walk is sequential and cheap; the per-entry Value clone
+        // dominates on long branches. Large branches clone the entries in
+        // parallel (slice order preserved, identical output); any parallel
+        // failure falls back to the sequential clone.
+        let mut refs: Vec<&SessionEntry> = Vec::new();
+        self.visit_branch(from_id, |entry| refs.push(entry));
+        match crate::core::compaction::parallel::try_parallel_map(
+            &refs,
+            crate::core::compaction::parallel::ENTRY_CLONE_THRESHOLD,
+            |entry, _| (*entry).clone(),
+        ) {
+            Some(cloned) => cloned,
+            None => refs.into_iter().cloned().collect(),
+        }
     }
 
     /// Visit indexed branch entries in transcript order without cloning message
     /// bodies. The temporary path contains references only, including for very
     /// large restored Python state or tool output entries.
-    pub fn visit_branch(&self, from_id: Option<&str>, mut visit: impl FnMut(&SessionEntry)) {
+    pub fn visit_branch<'a>(
+        &'a self,
+        from_id: Option<&str>,
+        mut visit: impl FnMut(&'a SessionEntry),
+    ) {
         let mut path = Vec::new();
         let mut current = from_id.or(self.leaf_id.as_deref()).and_then(|id| self.by_id.get(id));
         let mut visited = HashSet::new();

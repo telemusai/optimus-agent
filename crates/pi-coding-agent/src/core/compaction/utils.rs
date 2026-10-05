@@ -177,6 +177,160 @@ fn char_boundary_before(text: &str, count: usize) -> usize {
 /// Tool results are truncated to keep the summarization request within
 /// reasonable token budgets. Full content is not needed for summarization.
 pub fn serialize_conversation(messages: &[Message]) -> String {
+    // Two passes with identical output to the historical single pass:
+    //
+    // Pass 1 (sequential, cheap) plans the tool-call numbering exactly as the
+    // single pass did: numbers are assigned in message order, and a tool
+    // result resolves against the numbering state at its own position, so a
+    // result whose call appears later renders "call outside excerpt".
+    //
+    // Pass 2 renders each message's parts independently (a pure function of
+    // the message plus its plan entry); large conversations render the parts
+    // in parallel and concatenate them in message order. Parts are always
+    // non-empty, so joining with "\n\n" reproduces the appended stream
+    // byte-for-byte. Any parallel failure falls back to the sequential
+    // single-pass renderer below.
+    if let Some(serialized) = serialize_conversation_parallel(messages) {
+        return serialized;
+    }
+    serialize_conversation_sequential(messages)
+}
+
+/// Per-message plan entry produced by the numbering pass.
+enum SerializePlan {
+    User,
+    Assistant { call_numbers: Vec<usize> },
+    ToolResult { identity: Option<usize> },
+}
+
+fn serialize_conversation_parallel(messages: &[Message]) -> Option<String> {
+    use crate::core::compaction::parallel::{try_parallel_map, SERIALIZE_MESSAGES_THRESHOLD};
+    let mut calls: HashMap<&str, usize> = HashMap::new();
+    let mut next_call = 1usize;
+    let mut plan: Vec<SerializePlan> = Vec::with_capacity(messages.len());
+    for message in messages {
+        match message {
+            Message::User(_) => plan.push(SerializePlan::User),
+            Message::Assistant(assistant) => {
+                let mut call_numbers = Vec::new();
+                for block in &assistant.content {
+                    if let pi_ai::types::ContentBlock::ToolCall(tool_call) = block {
+                        let index = next_call;
+                        next_call += 1;
+                        calls.insert(tool_call.id.as_str(), index);
+                        call_numbers.push(index);
+                    }
+                }
+                plan.push(SerializePlan::Assistant { call_numbers });
+            }
+            Message::ToolResult(tool_result) => {
+                plan.push(SerializePlan::ToolResult {
+                    identity: calls.get(tool_result.tool_call_id.as_str()).copied(),
+                });
+            }
+        }
+    }
+    let part_lists: Vec<Vec<String>> = try_parallel_map(
+        messages,
+        SERIALIZE_MESSAGES_THRESHOLD,
+        |message, index| serialize_message_parts(message, &plan[index]),
+    )?;
+    let count: usize = part_lists.iter().map(Vec::len).sum();
+    let mut parts: Vec<String> = Vec::with_capacity(count);
+    for list in part_lists {
+        parts.extend(list);
+    }
+    Some(parts.join("\n\n"))
+}
+
+/// Render one message's serialized parts (0 to 3 non-empty strings).
+fn serialize_message_parts(message: &Message, plan: &SerializePlan) -> Vec<String> {
+    let mut parts: Vec<String> = Vec::new();
+    match message {
+        Message::User(user) => {
+            let content = user.content.text();
+            if !content.is_empty() {
+                parts.push(format!("[User]: {content}"));
+            }
+        }
+        Message::Assistant(assistant) => {
+            let SerializePlan::Assistant { call_numbers } = plan else {
+                return parts;
+            };
+            let mut text_parts: Vec<&str> = Vec::new();
+            let mut thinking_parts: Vec<&str> = Vec::new();
+            let mut tool_calls: Vec<String> = Vec::new();
+            let mut next_number = 0usize;
+            for block in &assistant.content {
+                match block {
+                    pi_ai::types::ContentBlock::Text(text) => text_parts.push(&text.text),
+                    pi_ai::types::ContentBlock::Thinking(thinking) => {
+                        thinking_parts.push(&thinking.thinking)
+                    }
+                    pi_ai::types::ContentBlock::ToolCall(tool_call) => {
+                        let args_str = tool_call
+                            .arguments
+                            .iter()
+                            .map(|(key, value)| {
+                                format!(
+                                    "{key}={}",
+                                    serde_json::to_string(value).unwrap_or_default()
+                                )
+                            })
+                            .collect::<Vec<_>>()
+                            .join(", ");
+                        let index = call_numbers[next_number];
+                        next_number += 1;
+                        tool_calls.push(format!("#{index} {}({args_str})", tool_call.name));
+                    }
+                }
+            }
+            if !thinking_parts.is_empty() {
+                parts.push(format!(
+                    "[Assistant thinking]: {}",
+                    thinking_parts.join("\n")
+                ));
+            }
+            if !text_parts.is_empty() {
+                parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
+            }
+            if !tool_calls.is_empty() {
+                parts.push(format!("[Assistant tool calls]: {}", tool_calls.join("; ")));
+            }
+        }
+        Message::ToolResult(tool_result) => {
+            let SerializePlan::ToolResult { identity } = plan else {
+                return parts;
+            };
+            let content: String = tool_result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pi_ai::types::ImageOrTextContent::Text(text) => Some(text.text.clone()),
+                    pi_ai::types::ImageOrTextContent::Image(_) => None,
+                })
+                .collect::<Vec<_>>()
+                .join("");
+            if !content.is_empty() {
+                let identity = match identity {
+                    Some(index) => format!("#{index} {}", tool_result.tool_name),
+                    None => format!("{} (call outside excerpt)", tool_result.tool_name),
+                };
+                parts.push(format!(
+                    "[Tool result {}{}]: {}",
+                    identity,
+                    if tool_result.is_error { " ERROR" } else { "" },
+                    truncate_for_summary(&content, TOOL_RESULT_MAX_CHARS)
+                ));
+            }
+        }
+    }
+    parts
+}
+
+/// The historical single-pass renderer, kept unchanged as the sequential path
+/// and the fallback for the parallel renderer.
+fn serialize_conversation_sequential(messages: &[Message]) -> String {
     let mut calls: HashMap<String, usize> = HashMap::new();
     let mut next_call = 1usize;
     // The parts are appended directly: collecting them first and joining

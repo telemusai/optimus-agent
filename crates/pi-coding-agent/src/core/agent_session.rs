@@ -17844,10 +17844,21 @@ impl AgentSession {
                 let entries = self.session_manager.lock().unwrap().get_branch(None);
                 // `pathEntries` are the branch entries; this module reads them as the
                 // compaction-module entry shapes.
-                let path_entries: Vec<CompactionSessionEntry> = entries
-                    .iter()
-                    .filter_map(compaction_session_entry_from)
-                    .collect();
+                // Per-entry Value -> typed conversion is pure; large branches
+                // convert in parallel (slice order preserved), any failure
+                // runs the sequential filter_map.
+                let path_entries: Vec<CompactionSessionEntry> =
+                    match crate::core::compaction::parallel::try_parallel_map(
+                        &entries,
+                        crate::core::compaction::parallel::ENTRY_PARSE_THRESHOLD,
+                        |entry, _| compaction_session_entry_from(entry),
+                    ) {
+                        Some(converted) => converted.into_iter().flatten().collect(),
+                        None => entries
+                            .iter()
+                            .filter_map(compaction_session_entry_from)
+                            .collect(),
+                    };
                 // tokensBefore measures the active context, including unpersisted outcomes,
                 // not transcript size. Native compaction receives this same context.
                 // Harness digests are regenerated and excluded from both.
