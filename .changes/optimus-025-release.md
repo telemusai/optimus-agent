@@ -1,0 +1,1 @@
+- Changed Optimus Agent to version 0.1.25 for the DGX compatibility fix and merged write, parsing, and compaction improvements.
