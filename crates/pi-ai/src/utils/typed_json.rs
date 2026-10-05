@@ -142,6 +142,26 @@ where
 	deserializer.deserialize_any(OptionalStringVisitor)
 }
 
+/// `#[serde(default, deserialize_with = "...::any_present")]` `bool`:
+/// `true` whenever the member is present, whatever it holds - including
+/// `null` - matching `Value::get(..).is_some()` presence semantics.
+pub fn any_present<'de, D>(deserializer: D) -> Result<bool, D::Error>
+where
+	D: serde::Deserializer<'de>,
+{
+	struct AnyPresentVisitor;
+	impl<'de> serde::de::Visitor<'de> for AnyPresentVisitor {
+		type Value = bool;
+		fn expecting(&self, formatter: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+			formatter.write_str("any value")
+		}
+		fn visit_unit<E>(self) -> Result<Self::Value, E> {
+			Ok(true)
+		}
+	}
+	deserializer.deserialize_ignored_any(AnyPresentVisitor)
+}
+
 /// `#[serde(default, deserialize_with = "optional_value")]`
 /// `Option<Value>`: any JSON value; `null` stays `Some(Value::Null)` so
 /// `filter(|value| !value.is_null())` semantics survive.
@@ -415,6 +435,30 @@ where
 }
 
 #[cfg(test)]
+
+
+#[cfg(test)]
+mod any_present_tests {
+	use super::any_present;
+	use serde::Deserialize;
+
+	#[derive(Deserialize, Default, PartialEq, Debug)]
+	struct Probe {
+		#[serde(default, deserialize_with = "any_present")]
+		present: bool,
+	}
+
+	#[test]
+	fn presence_counts_null_but_not_absence() {
+		assert_eq!(serde_json::from_str::<Probe>(r#"{}"#).unwrap(), Probe { present: false });
+		assert_eq!(serde_json::from_str::<Probe>(r#"{"present":null}"#).unwrap(), Probe { present: true });
+		assert_eq!(serde_json::from_str::<Probe>(r#"{"present":0}"#).unwrap(), Probe { present: true });
+		assert_eq!(serde_json::from_str::<Probe>(r#"{"present":false}"#).unwrap(), Probe { present: true });
+		assert_eq!(serde_json::from_str::<Probe>(r#"{"present":"x"}"#).unwrap(), Probe { present: true });
+		assert_eq!(serde_json::from_str::<Probe>(r#"{"present":[]}"#).unwrap(), Probe { present: true });
+	}
+}
+
 mod tests {
 	use super::*;
 	use serde::Deserialize;

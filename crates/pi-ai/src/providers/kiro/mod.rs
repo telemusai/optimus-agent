@@ -382,16 +382,19 @@ async fn run(
                 frame.headers.get(":message-type").map(String::as_str),
                 Some("exception" | "error")
             ) {
+                let message = match &frame.payload {
+                    event::FramePayload::Typed(typed) => typed.message.as_deref(),
+                    event::FramePayload::Value(value) => value["message"].as_str(),
+                };
                 return Err(format!(
                     "Kiro stream error: {}",
-                    access.error(
-                        frame.payload["message"]
-                            .as_str()
-                            .unwrap_or("provider exception")
-                    )
+                    access.error(message.unwrap_or("provider exception"))
                 ));
             }
-            state.process(&frame.payload, output, stream)?;
+            match &frame.payload {
+                event::FramePayload::Typed(typed) => state.process_typed(typed, output, stream)?,
+                event::FramePayload::Value(value) => state.process(value, output, stream)?,
+            }
         }
     }
     if !buffer.is_empty() {
@@ -592,6 +595,122 @@ impl State {
         let text = std::mem::take(&mut self.text);
         self.emit(text, output, stream);
     }
+    /// The typed consumer: same behavior as `process`, reading
+    /// `TypedKiroPayload` members instead of a `Value` DOM.
+    fn process_typed(
+        &mut self,
+        typed: &event::TypedKiroPayload,
+        output: &mut AssistantMessage,
+        stream: &AssistantMessageEventStream,
+    ) -> Result<(), String> {
+        if typed.error_present || typed.error_capital_present {
+            return Err("Kiro reported an error in the response stream".into());
+        }
+        if let Some(content) = typed.content.as_deref() {
+            self.text.push_str(content);
+            self.flush_text(output, stream, false);
+        }
+        if let Some(pct) = typed
+            .context_usage_percentage
+            .filter(|pct| pct.is_finite() && (0.0..=100.0).contains(pct))
+        {
+            self.context_percentage = Some(pct);
+            self.complete = true;
+        }
+        // `value.get("usage").unwrap_or(value)` reads the members off the
+        // payload itself when the `usage` member is absent; a `null` usage
+        // (kept as `Some(Value::Null)`) reads as absent members.
+        let (usage_input, usage_output) = match &typed.usage {
+            Some(usage) => (
+                usage["inputTokens"].as_u64(),
+                usage["outputTokens"].as_u64(),
+            ),
+            None => (typed.input_tokens, typed.output_tokens),
+        };
+        if let (Some(input), Some(out)) = (usage_input, usage_output) {
+            output.usage.input = input as f64;
+            output.usage.output = out as f64;
+            self.exact_usage = true;
+        }
+        if let Some(id) = typed.tool_use_id.as_deref() {
+            let same = self.tool.as_ref().is_some_and(|(index, _)| {
+                output.content[*index]
+                    .as_tool_call()
+                    .is_some_and(|c| c.id == id)
+            });
+            if !same {
+                if self.tool.is_some() {
+                    return Err(
+                        "Kiro started a tool call before completing the preceding call".into(),
+                    );
+                }
+                let name = typed
+                    .name
+                    .as_deref()
+                    .filter(|s| !s.is_empty())
+                    .ok_or("Kiro tool call has no name")?;
+                self.flush_text(output, stream, true);
+                self.close_text(output, stream);
+                let index = output.content.len();
+                output.content.push(ContentBlock::ToolCall(ToolCall::new(
+                    id,
+                    name,
+                    Default::default(),
+                )));
+                self.tool = Some((index, String::new()));
+                stream.push(AssistantMessageEvent::ToolCallStart {
+                    content_index: index,
+                    partial: output.clone(),
+                });
+            }
+        }
+        if let Some(input) = &typed.input {
+            let (index, arguments) = self
+                .tool
+                .as_mut()
+                .ok_or("Kiro returned tool input without a tool call")?;
+            let delta = if let Some(text) = input.as_str() {
+                text.to_string()
+            } else if input.is_object() {
+                input.to_string()
+            } else {
+                return Err("Invalid Kiro tool input".into());
+            };
+            arguments.push_str(&delta);
+            if arguments.len() > 16 * 1024 * 1024 {
+                return Err("Kiro tool input is too large".into());
+            }
+            stream.push(AssistantMessageEvent::ToolCallDelta {
+                content_index: *index,
+                delta,
+                partial: output.clone(),
+            });
+        }
+        if typed.stop == Some(true) {
+            if let Some((index, arguments)) = self.tool.take() {
+                let parsed = serde_json::from_str::<serde_json::Map<String, Value>>(
+                    if arguments.trim().is_empty() {
+                        "{}"
+                    } else {
+                        &arguments
+                    },
+                )
+                .map_err(|_| "Kiro returned invalid tool arguments; tool was not executed")?;
+                let ContentBlock::ToolCall(call) = &mut output.content[index] else {
+                    unreachable!()
+                };
+                call.arguments = parsed;
+                let call = call.clone();
+                stream.push(AssistantMessageEvent::ToolCallEnd {
+                    content_index: index,
+                    tool_call: call,
+                    partial: output.clone(),
+                });
+            }
+        }
+        Ok(())
+    }
+
     fn process(
         &mut self,
         value: &Value,
