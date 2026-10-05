@@ -10,6 +10,7 @@ pub(crate) mod sse_frames;
 pub mod stream_failure;
 pub mod typebox_helpers;
 pub mod validation;
+pub mod typed_json;
 
 /// `Date.now()` - Unix timestamp in milliseconds.
 pub fn now_ms() -> i64 {

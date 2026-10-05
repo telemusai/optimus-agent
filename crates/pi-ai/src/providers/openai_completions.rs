@@ -1872,8 +1872,613 @@ async fn post_chat_completions(
 }
 
 // ---------------------------------------------------------------------------
+// Typed chunk parsing (borrowed fast path)
+// ---------------------------------------------------------------------------
+
+/// One `data:` SSE payload, borrowed from the payload buffer.
+///
+/// Field tolerances mirror the `Value` consumer exactly: wrong-typed fields
+/// read as absent, unknown fields are ignored, `null` is absent, and rare
+/// members (`usage`, `error`, `reasoning_details`) keep the `Value` DOM so it
+/// is only built when the member is present.
+#[derive(serde::Deserialize)]
+struct TypedChunk<'a> {
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	id: Option<&'a str>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	model: Option<&'a str>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	usage: Option<Value>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	error: Option<Value>,
+	#[serde(default)]
+	choices: Vec<TypedChoice<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypedChoice<'a> {
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::truthy_lenient_string")]
+	finish_reason: Option<crate::utils::typed_json::TruthyLenientString<'a>>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	usage: Option<Value>,
+	#[serde(default)]
+	delta: Option<TypedDelta<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypedDelta<'a> {
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	content: Option<&'a str>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	reasoning_content: Option<&'a str>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	reasoning: Option<&'a str>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	reasoning_text: Option<&'a str>,
+	#[serde(default)]
+	tool_calls: Vec<TypedToolCall<'a>>,
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_value")]
+	reasoning_details: Option<Value>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypedToolCall<'a> {
+	#[serde(default, deserialize_with = "crate::utils::typed_json::optional_i64")]
+	index: Option<i64>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	id: Option<&'a str>,
+	#[serde(default)]
+	function: Option<TypedFunction<'a>>,
+}
+
+#[derive(serde::Deserialize)]
+struct TypedFunction<'a> {
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	name: Option<&'a str>,
+	#[serde(borrow, default, deserialize_with = "crate::utils::typed_json::optional_borrowed_str")]
+	arguments: Option<&'a str>,
+}
+
+
+/// Parse one payload with the typed shape; `None` routes to the `Value`
+/// fallback (not JSON, not an object, or any typed-shape mismatch, so a
+/// duplicate-key or exotic document keeps the exact old behavior).
+fn parse_typed_chunk(payload: &str) -> Option<TypedChunk<'_>> {
+	if !payload.trim_start().starts_with('{') {
+		return None;
+	}
+	serde_json::from_str(payload).ok()
+}
+
+// ---------------------------------------------------------------------------
 // Stream body
 // ---------------------------------------------------------------------------
+
+/// The `Value` consumer: every payload the typed shape does not cover
+/// (duplicate keys, exotic field shapes, observer-parsed chunks) and all
+/// `reasoning_details` handling (arbitrary-key maps stay a DOM).
+#[allow(clippy::too_many_arguments)]
+fn handle_value_chunk(
+	chunk: Value,
+	model: &Model,
+	options_ref: Option<&OpenAICompletionsOptions>,
+	output: &mut AssistantMessage,
+	state: &mut StreamState,
+	stream: &AssistantMessageEventStream,
+	cache_write_cost: Option<f64>,
+	response_headers: &IndexMap<String, String>,
+	finished: &mut bool,
+) -> Result<(), StreamError> {
+	// SDK `Stream.fromSSEResponse`: `if (data && data.error) throw new APIError(...)`,
+	// so an error event delivered inside the SSE body fails the stream instead of
+	// being silently skipped and reported as a successful run.
+	if let Some(error) = chunk.get("error").filter(|error| js_truthy(error)) {
+		return Err(StreamError::in_stream_api_error(error, &response_headers));
+	}
+
+	// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
+	// and each chunk in a streamed completion carries the same id.
+	if output.response_id.as_deref().map(str::is_empty).unwrap_or(true) {
+		if let Some(id) = chunk.get("id").and_then(Value::as_str) {
+			output.response_id = Some(id.to_string());
+		}
+	}
+	if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str) {
+		if !chunk_model.is_empty() && chunk_model != model.id {
+			if output.response_model.as_deref().map(str::is_empty).unwrap_or(true) {
+				output.response_model = Some(chunk_model.to_string());
+			}
+		}
+	}
+	let chunk_usage = chunk.get("usage").filter(|value| js_truthy(value));
+	if let Some(chunk_usage) = chunk_usage {
+		output.usage = parse_chunk_usage(chunk_usage, model, cache_write_cost);
+		observe_chunk_usage(chunk_usage, model, options_ref, stream);
+	}
+
+	let choice = chunk
+		.get("choices")
+		.and_then(Value::as_array)
+		.and_then(|choices| choices.first())
+		.cloned();
+	let Some(choice) = choice else {
+		return Ok(());
+	};
+
+	// Fallback: some providers (e.g., Moonshot) return usage
+	// in choice.usage instead of the standard chunk.usage
+	if chunk_usage.is_none() {
+		if let Some(choice_usage) = choice.get("usage").filter(|value| js_truthy(value)) {
+			output.usage = parse_chunk_usage(choice_usage, model, cache_write_cost);
+			observe_chunk_usage(choice_usage, model, options_ref, stream);
+		}
+	}
+
+	if let Some(finish_reason) = choice.get("finish_reason").filter(|value| js_truthy(value)) {
+		*finished = true;
+		let finish_reason_result = map_stop_reason(Some(finish_reason));
+		output.stop_reason = finish_reason_result.stop_reason;
+		if let Some(error_message) = finish_reason_result.error_message {
+			output.error_message = Some(error_message);
+		}
+	}
+
+	if let Some(delta) = choice.get("delta").filter(|delta| !delta.is_null()) {
+		let content = delta.get("content").and_then(Value::as_str);
+		if let Some(content) = content {
+			if !content.is_empty() {
+				let index = ensure_text_block(state, output, stream);
+				if let StreamingBlock::Text(block) = &mut state.blocks[index] {
+					block.text.push_str(content);
+				}
+				let partial = partial_message(output, state);
+				stream.push(AssistantMessageEvent::TextDelta {
+					content_index: index,
+					delta: content.to_string(),
+					partial,
+				});
+			}
+		}
+
+		// Some endpoints return reasoning in reasoning_content (llama.cpp),
+		// or reasoning (other openai compatible endpoints)
+		// Use the first non-empty reasoning field to avoid duplication
+		// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
+		let reasoning_fields = ["reasoning_content", "reasoning", "reasoning_text"];
+		let mut found_reasoning_field: Option<&str> = None;
+		for field in reasoning_fields {
+			if let Some(value) = delta.get(field).and_then(Value::as_str) {
+				if !value.is_empty() {
+					found_reasoning_field = Some(field);
+					break;
+				}
+			}
+		}
+
+		if let Some(found_reasoning_field) = found_reasoning_field {
+			if let Some(delta_text) = delta.get(found_reasoning_field).and_then(Value::as_str) {
+				if !delta_text.is_empty() {
+					let index = ensure_thinking_block(state, output, stream, found_reasoning_field);
+					if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
+						block.thinking.push_str(delta_text);
+					}
+					let partial = partial_message(output, state);
+					stream.push(AssistantMessageEvent::ThinkingDelta {
+						content_index: index,
+						delta: delta_text.to_string(),
+						partial,
+					});
+				}
+			}
+		}
+
+		if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
+			for tool_call in tool_calls {
+				let index = ensure_tool_call_block(state, output, stream, tool_call);
+				let tool_call_id = tool_call.get("id").and_then(Value::as_str);
+				let tool_call_name = tool_call
+					.get("function")
+					.and_then(|function| function.get("name"))
+					.and_then(Value::as_str);
+				let mut register_id: Option<String> = None;
+				if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
+					if block.tool_call.id.is_empty() {
+						if let Some(tool_call_id) = tool_call_id {
+							block.tool_call.id = tool_call_id.to_string();
+							register_id = Some(tool_call_id.to_string());
+						}
+					}
+					if block.tool_call.name.is_empty() {
+						if let Some(tool_call_name) = tool_call_name {
+							block.tool_call.name = tool_call_name.to_string();
+						}
+					}
+				}
+				if let Some(register_id) = register_id {
+					state.tool_call_blocks_by_id.insert(register_id, index);
+				}
+
+				let mut delta_text = String::new();
+				if let Some(arguments) = tool_call
+					.get("function")
+					.and_then(|function| function.get("arguments"))
+					.and_then(Value::as_str)
+				{
+					delta_text = arguments.to_string();
+					if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
+						let partial_args = block.partial_args.get_or_insert_with(StreamingJsonAccumulator::default);
+						if let Some(parsed) = partial_args.append(arguments) {
+							block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+						}
+					}
+				}
+				let partial = partial_message(output, state);
+				stream.push(AssistantMessageEvent::ToolCallDelta {
+					content_index: index,
+					delta: delta_text,
+					partial,
+				});
+			}
+		}
+
+		// `Array.isArray` accepts an empty array, and `reasoningDetailsByIndex`
+		// stays empty, so an empty list only skips the block creation below.
+		if let Some(reasoning_details) = delta.get("reasoning_details").and_then(Value::as_array) {
+			for detail in reasoning_details {
+				let Some(detail_record) = detail.as_object() else {
+					continue;
+				};
+				let explicit_index = detail_record.get("index").and_then(Value::as_i64);
+				let index = explicit_index.unwrap_or(state.next_reasoning_details_index);
+				state.next_reasoning_details_index = state.next_reasoning_details_index.max(index + 1);
+				let previous_detail = state.reasoning_details_by_index.get(&index).cloned();
+				let mut merged_detail = previous_detail.clone().unwrap_or_default();
+				for (key, value) in detail_record {
+					merged_detail.insert(key.clone(), value.clone());
+				}
+				for field in ["text", "summary"] {
+					let previous_fragment = previous_detail
+						.as_ref()
+						.and_then(|detail| detail.get(field))
+						.and_then(Value::as_str);
+					let fragment = detail_record.get(field).and_then(Value::as_str);
+					if let (Some(previous_fragment), Some(fragment)) = (previous_fragment, fragment) {
+						merged_detail.insert(
+							field.to_string(),
+							Value::String(format!("{previous_fragment}{fragment}")),
+						);
+					}
+				}
+				state.reasoning_details_by_index.insert(index, merged_detail);
+				if detail_record.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
+					&& detail_record.get("id").and_then(Value::as_str).is_some()
+					&& detail_record.get("data").map(|data| !data.is_null()).unwrap_or(false)
+				{
+					let detail_id = detail_record.get("id").and_then(Value::as_str).unwrap_or_default();
+					let matching = state.blocks.iter_mut().find(|block| match block {
+						StreamingBlock::ToolCall(tool_call) => tool_call.tool_call.id == detail_id,
+						_ => false,
+					});
+					if let Some(StreamingBlock::ToolCall(tool_call)) = matching {
+						tool_call.tool_call.thought_signature = Some(Value::Object(detail_record.clone()).to_string());
+					}
+				}
+			}
+	if !state.reasoning_details_by_index.is_empty() {
+				let index = match state.reasoning_details_block {
+					Some(index) => index,
+					None => {
+						let mut block = ThinkingContent::new("");
+						block.redacted = Some(true);
+						state.blocks.push(StreamingBlock::Thinking(block));
+						let index = state.blocks.len() - 1;
+						state.reasoning_details_block = Some(index);
+						let partial = partial_message(output, state);
+						stream.push(AssistantMessageEvent::ThinkingStart {
+							content_index: index,
+							partial,
+						});
+						index
+					}
+				};
+				let mut indexes: Vec<i64> = state.reasoning_details_by_index.keys().copied().collect();
+				indexes.sort_unstable();
+				let details: Vec<Map<String, Value>> = indexes
+					.iter()
+					.filter_map(|index| state.reasoning_details_by_index.get(index).cloned())
+					.collect();
+				if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
+					block.thinking_signature = Some(encode_reasoning_details(&details));
+				}
+			}
+			}
+		}
+	Ok(())
+}
+
+/// The borrowed fast path for the common chunk shapes: same observable
+/// behavior as `handle_value_chunk`, no `Value` DOM for the hot fields.
+#[allow(clippy::too_many_arguments)]
+fn handle_typed_chunk(
+	typed: TypedChunk<'_>,
+	model: &Model,
+	options_ref: Option<&OpenAICompletionsOptions>,
+	output: &mut AssistantMessage,
+	state: &mut StreamState,
+	stream: &AssistantMessageEventStream,
+	cache_write_cost: Option<f64>,
+	response_headers: &IndexMap<String, String>,
+	finished: &mut bool,
+) -> Result<(), StreamError> {
+	if let Some(error) = typed.error.as_ref().filter(|error| js_truthy(error)) {
+		return Err(StreamError::in_stream_api_error(error, response_headers));
+	}
+	if output.response_id.as_deref().map(str::is_empty).unwrap_or(true) {
+		if let Some(id) = typed.id {
+			output.response_id = Some(id.to_string());
+		}
+	}
+	if let Some(chunk_model) = typed.model {
+		if !chunk_model.is_empty() && chunk_model != model.id {
+			if output.response_model.as_deref().map(str::is_empty).unwrap_or(true) {
+				output.response_model = Some(chunk_model.to_string());
+			}
+		}
+	}
+	let chunk_usage = typed.usage.as_ref().filter(|value| js_truthy(value));
+	if let Some(chunk_usage) = chunk_usage {
+		output.usage = parse_chunk_usage(chunk_usage, model, cache_write_cost);
+		observe_chunk_usage(chunk_usage, model, options_ref, stream);
+	}
+	// `choices.first()` matches the Value consumer; a non-object array element
+	// deserializes to a default-shaped choice whose field reads all yield
+	// `None`, like `choices[0]` on a non-object did.
+	let Some(choice) = typed.choices.first() else {
+		return Ok(());
+	};
+	if chunk_usage.is_none() {
+		if let Some(choice_usage) = choice.usage.as_ref().filter(|value| js_truthy(value)) {
+			output.usage = parse_chunk_usage(choice_usage, model, cache_write_cost);
+			observe_chunk_usage(choice_usage, model, options_ref, stream);
+		}
+	}
+	if let Some(finish_reason) = choice.finish_reason.as_ref().filter(|reason| reason.is_truthy()) {
+		*finished = true;
+		let reason_value = Value::String(finish_reason.as_str().to_string());
+		let finish_reason_result = map_stop_reason(Some(&reason_value));
+		output.stop_reason = finish_reason_result.stop_reason;
+		if let Some(error_message) = finish_reason_result.error_message {
+			output.error_message = Some(error_message);
+		}
+	}
+	let Some(delta) = choice.delta.as_ref() else {
+		return Ok(());
+	};
+	if let Some(content) = delta.content {
+		if !content.is_empty() {
+			let index = ensure_text_block(state, output, stream);
+			if let StreamingBlock::Text(block) = &mut state.blocks[index] {
+				block.text.push_str(content);
+			}
+			let partial = partial_message(output, state);
+			stream.push(AssistantMessageEvent::TextDelta {
+				content_index: index,
+				delta: content.to_string(),
+				partial,
+			});
+		}
+	}
+
+	// Some endpoints return reasoning in reasoning_content (llama.cpp),
+	// or reasoning (other openai compatible endpoints)
+	// Use the first non-empty reasoning field to avoid duplication
+	// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
+	let reasoning_fields = [
+		("reasoning_content", delta.reasoning_content),
+		("reasoning", delta.reasoning),
+		("reasoning_text", delta.reasoning_text),
+	];
+	if let Some((field_name, found_reasoning_field)) = reasoning_fields
+		.iter()
+		.find_map(|(name, field)| field.filter(|text| !text.is_empty()).map(|text| (*name, text)))
+	{
+		let index = ensure_thinking_block(state, output, stream, field_name);
+		if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
+			block.thinking.push_str(found_reasoning_field);
+		}
+		let partial = partial_message(output, state);
+		stream.push(AssistantMessageEvent::ThinkingDelta {
+			content_index: index,
+			delta: found_reasoning_field.to_string(),
+			partial,
+		});
+	}
+
+	for tool_call in &delta.tool_calls {
+		let index = ensure_typed_tool_call_block(state, output, stream, tool_call);
+		let tool_call_id = tool_call.id;
+		let tool_call_name = tool_call.function.as_ref().and_then(|function| function.name);
+		let mut register_id: Option<&str> = None;
+		if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
+			if block.tool_call.id.is_empty() {
+				if let Some(tool_call_id) = tool_call_id {
+					block.tool_call.id = tool_call_id.to_string();
+					register_id = Some(tool_call_id);
+				}
+			}
+			if block.tool_call.name.is_empty() {
+				if let Some(tool_call_name) = tool_call_name {
+					block.tool_call.name = tool_call_name.to_string();
+				}
+			}
+		}
+		if let Some(register_id) = register_id {
+			state.tool_call_blocks_by_id.insert(register_id.to_string(), index);
+		}
+
+		let mut delta_text = String::new();
+		if let Some(arguments) = tool_call.function.as_ref().and_then(|function| function.arguments) {
+			delta_text = arguments.to_string();
+			if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
+				let partial_args = block.partial_args.get_or_insert_with(StreamingJsonAccumulator::default);
+				if let Some(parsed) = partial_args.append(arguments) {
+					block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
+				}
+			}
+		}
+		let partial = partial_message(output, state);
+		stream.push(AssistantMessageEvent::ToolCallDelta {
+			content_index: index,
+			delta: delta_text,
+			partial,
+		});
+	}
+
+	if let Some(reasoning_details) = delta.reasoning_details.as_ref().and_then(Value::as_array) {
+		handle_reasoning_details(reasoning_details, state, output, stream);
+	}
+	Ok(())
+}
+
+/// The `reasoning_details` merge from the Value consumer, shared by both paths.
+fn handle_reasoning_details(
+	reasoning_details: &[Value],
+	state: &mut StreamState,
+	output: &mut AssistantMessage,
+	stream: &AssistantMessageEventStream,
+) {
+	for detail in reasoning_details {
+		let Some(detail_record) = detail.as_object() else {
+			continue;
+		};
+		let explicit_index = detail_record.get("index").and_then(Value::as_i64);
+		let index = explicit_index.unwrap_or(state.next_reasoning_details_index);
+		state.next_reasoning_details_index = state.next_reasoning_details_index.max(index + 1);
+		let previous_detail = state.reasoning_details_by_index.get(&index).cloned();
+		let mut merged_detail = previous_detail.clone().unwrap_or_default();
+		for (key, value) in detail_record {
+			merged_detail.insert(key.clone(), value.clone());
+		}
+		for field in ["text", "summary"] {
+			let previous_fragment = previous_detail
+				.as_ref()
+				.and_then(|detail| detail.get(field))
+				.and_then(Value::as_str);
+			let fragment = detail_record.get(field).and_then(Value::as_str);
+			if let (Some(previous_fragment), Some(fragment)) = (previous_fragment, fragment) {
+				merged_detail.insert(
+					field.to_string(),
+					Value::String(format!("{previous_fragment}{fragment}")),
+				);
+			}
+		}
+		state.reasoning_details_by_index.insert(index, merged_detail);
+		if detail_record.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
+			&& detail_record.get("id").and_then(Value::as_str).is_some()
+			&& detail_record.get("data").map(|data| !data.is_null()).unwrap_or(false)
+		{
+			let detail_id = detail_record.get("id").and_then(Value::as_str).unwrap_or_default();
+			let matching = state.blocks.iter_mut().find(|block| match block {
+				StreamingBlock::ToolCall(tool_call) => tool_call.tool_call.id == detail_id,
+				_ => false,
+			});
+			if let Some(StreamingBlock::ToolCall(tool_call)) = matching {
+				tool_call.tool_call.thought_signature = Some(Value::Object(detail_record.clone()).to_string());
+			}
+		}
+	}
+
+	if !state.reasoning_details_by_index.is_empty() {
+		let index = match state.reasoning_details_block {
+			Some(index) => index,
+			None => {
+				let mut block = ThinkingContent::new("");
+				block.redacted = Some(true);
+				state.blocks.push(StreamingBlock::Thinking(block));
+				let index = state.blocks.len() - 1;
+				state.reasoning_details_block = Some(index);
+				let partial = partial_message(output, state);
+				stream.push(AssistantMessageEvent::ThinkingStart {
+					content_index: index,
+					partial,
+				});
+				index
+			}
+		};
+		let mut indexes: Vec<i64> = state.reasoning_details_by_index.keys().copied().collect();
+		indexes.sort_unstable();
+		let details: Vec<Map<String, Value>> = indexes
+			.iter()
+			.filter_map(|index| state.reasoning_details_by_index.get(index).cloned())
+			.collect();
+		if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
+			block.thinking_signature = Some(encode_reasoning_details(&details));
+		}
+	}
+}
+
+/// `ensure_tool_call_block` for the borrowed tool-call shape. Same block
+/// bookkeeping, no `Value` lookups.
+fn ensure_typed_tool_call_block(
+	state: &mut StreamState,
+	output: &AssistantMessage,
+	stream: &AssistantMessageEventStream,
+	tool_call: &TypedToolCall<'_>,
+) -> usize {
+	let stream_index = tool_call.index;
+	let tool_call_id = tool_call.id.unwrap_or_default();
+	let tool_call_name = tool_call
+		.function
+		.as_ref()
+		.and_then(|function| function.name)
+		.unwrap_or_default();
+
+	let mut block_index = stream_index.and_then(|index| state.tool_call_blocks_by_index.get(&index).copied());
+	if block_index.is_none() && !tool_call_id.is_empty() {
+		block_index = state.tool_call_blocks_by_id.get(tool_call_id).copied();
+	}
+	let index = match block_index {
+		Some(index) => index,
+		None => {
+			let block = StreamingToolCallBlock {
+				tool_call: ToolCall::new(tool_call_id.to_string(), tool_call_name.to_string(), Map::new()),
+				partial_args: Some(StreamingJsonAccumulator::default()),
+				stream_index,
+			};
+			state.blocks.push(StreamingBlock::ToolCall(block));
+			let index = state.blocks.len() - 1;
+			if let Some(stream_index) = stream_index {
+				state.tool_call_blocks_by_index.insert(stream_index, index);
+			}
+			if !tool_call_id.is_empty() {
+				state.tool_call_blocks_by_id.insert(tool_call_id.to_string(), index);
+			}
+			let partial = partial_message(output, state);
+			stream.push(AssistantMessageEvent::ToolCallStart {
+				content_index: index,
+				partial,
+			});
+			index
+		}
+	};
+
+	let mut register_index: Option<i64> = None;
+	if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
+		if let Some(stream_index) = stream_index {
+			if block.stream_index.is_none() {
+				block.stream_index = Some(stream_index);
+				register_index = Some(stream_index);
+			}
+		}
+	}
+	if let Some(stream_index) = register_index {
+		state.tool_call_blocks_by_index.insert(stream_index, index);
+	}
+	if !tool_call_id.is_empty() {
+		state.tool_call_blocks_by_id.insert(tool_call_id.to_string(), index);
+	}
+	index
+}
 
 /// The TypeScript async IIFE body, minus the try/catch (the caller adds it).
 ///
@@ -1985,6 +2590,25 @@ async fn run_stream_body(
 			SsePayload::Data { payload, parsed } => (payload, parsed),
 			SsePayload::Done => { done = true; break; }
 		};
+		// Fast path: borrowed typed parse of the payload the reader owns.
+		// Observer-attached streams arrive with the parsed Value already (the
+		// reader parsed it once for the observer) and keep the Value path.
+		if parsed.is_none() {
+			if let Some(typed) = parse_typed_chunk(&payload) {
+				handle_typed_chunk(
+					typed,
+					model,
+					options_ref,
+					output,
+					state,
+					stream,
+					cache_write_cost,
+					&response_headers,
+					&mut finished,
+				)?;
+				continue;
+			}
+		}
 		let chunk = match parsed {
 			Some(chunk) => chunk,
 			None => {
@@ -1996,231 +2620,19 @@ async fn run_stream_body(
 			continue;
 		}
 
-		// SDK `Stream.fromSSEResponse`: `if (data && data.error) throw new APIError(...)`,
-		// so an error event delivered inside the SSE body fails the stream instead of
-		// being silently skipped and reported as a successful run.
-		if let Some(error) = chunk.get("error").filter(|error| js_truthy(error)) {
-			return Err(StreamError::in_stream_api_error(error, &response_headers));
-		}
-
-		// OpenAI documents ChatCompletionChunk.id as the unique chat completion identifier,
-		// and each chunk in a streamed completion carries the same id.
-		if output.response_id.as_deref().map(str::is_empty).unwrap_or(true) {
-			if let Some(id) = chunk.get("id").and_then(Value::as_str) {
-				output.response_id = Some(id.to_string());
-			}
-		}
-		if let Some(chunk_model) = chunk.get("model").and_then(Value::as_str) {
-			if !chunk_model.is_empty() && chunk_model != model.id {
-				if output.response_model.as_deref().map(str::is_empty).unwrap_or(true) {
-					output.response_model = Some(chunk_model.to_string());
-				}
-			}
-		}
-		let chunk_usage = chunk.get("usage").filter(|value| js_truthy(value));
-		if let Some(chunk_usage) = chunk_usage {
-			output.usage = parse_chunk_usage(chunk_usage, model, cache_write_cost);
-			observe_chunk_usage(chunk_usage, model, options_ref, stream);
-		}
-
-		let choice = chunk
-			.get("choices")
-			.and_then(Value::as_array)
-			.and_then(|choices| choices.first())
-			.cloned();
-		let Some(choice) = choice else {
-			continue;
-		};
-
-		// Fallback: some providers (e.g., Moonshot) return usage
-		// in choice.usage instead of the standard chunk.usage
-		if chunk_usage.is_none() {
-			if let Some(choice_usage) = choice.get("usage").filter(|value| js_truthy(value)) {
-				output.usage = parse_chunk_usage(choice_usage, model, cache_write_cost);
-				observe_chunk_usage(choice_usage, model, options_ref, stream);
-			}
-		}
-
-		if let Some(finish_reason) = choice.get("finish_reason").filter(|value| js_truthy(value)) {
-			finished = true;
-			let finish_reason_result = map_stop_reason(Some(finish_reason));
-			output.stop_reason = finish_reason_result.stop_reason;
-			if let Some(error_message) = finish_reason_result.error_message {
-				output.error_message = Some(error_message);
-			}
-		}
-
-		if let Some(delta) = choice.get("delta").filter(|delta| !delta.is_null()) {
-			let content = delta.get("content").and_then(Value::as_str);
-			if let Some(content) = content {
-				if !content.is_empty() {
-					let index = ensure_text_block(state, output, stream);
-					if let StreamingBlock::Text(block) = &mut state.blocks[index] {
-						block.text.push_str(content);
-					}
-					let partial = partial_message(output, state);
-					stream.push(AssistantMessageEvent::TextDelta {
-						content_index: index,
-						delta: content.to_string(),
-						partial,
-					});
-				}
-			}
-
-			// Some endpoints return reasoning in reasoning_content (llama.cpp),
-			// or reasoning (other openai compatible endpoints)
-			// Use the first non-empty reasoning field to avoid duplication
-			// (e.g., chutes.ai returns both reasoning_content and reasoning with same content)
-			let reasoning_fields = ["reasoning_content", "reasoning", "reasoning_text"];
-			let mut found_reasoning_field: Option<&str> = None;
-			for field in reasoning_fields {
-				if let Some(value) = delta.get(field).and_then(Value::as_str) {
-					if !value.is_empty() {
-						found_reasoning_field = Some(field);
-						break;
-					}
-				}
-			}
-
-			if let Some(found_reasoning_field) = found_reasoning_field {
-				if let Some(delta_text) = delta.get(found_reasoning_field).and_then(Value::as_str) {
-					if !delta_text.is_empty() {
-						let index = ensure_thinking_block(state, output, stream, found_reasoning_field);
-						if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
-							block.thinking.push_str(delta_text);
-						}
-						let partial = partial_message(output, state);
-						stream.push(AssistantMessageEvent::ThinkingDelta {
-							content_index: index,
-							delta: delta_text.to_string(),
-							partial,
-						});
-					}
-				}
-			}
-
-			if let Some(tool_calls) = delta.get("tool_calls").and_then(Value::as_array) {
-				for tool_call in tool_calls {
-					let index = ensure_tool_call_block(state, output, stream, tool_call);
-					let tool_call_id = tool_call.get("id").and_then(Value::as_str);
-					let tool_call_name = tool_call
-						.get("function")
-						.and_then(|function| function.get("name"))
-						.and_then(Value::as_str);
-					let mut register_id: Option<String> = None;
-					if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
-						if block.tool_call.id.is_empty() {
-							if let Some(tool_call_id) = tool_call_id {
-								block.tool_call.id = tool_call_id.to_string();
-								register_id = Some(tool_call_id.to_string());
-							}
-						}
-						if block.tool_call.name.is_empty() {
-							if let Some(tool_call_name) = tool_call_name {
-								block.tool_call.name = tool_call_name.to_string();
-							}
-						}
-					}
-					if let Some(register_id) = register_id {
-						state.tool_call_blocks_by_id.insert(register_id, index);
-					}
-
-					let mut delta_text = String::new();
-					if let Some(arguments) = tool_call
-						.get("function")
-						.and_then(|function| function.get("arguments"))
-						.and_then(Value::as_str)
-					{
-						delta_text = arguments.to_string();
-						if let StreamingBlock::ToolCall(block) = &mut state.blocks[index] {
-							let partial_args = block.partial_args.get_or_insert_with(StreamingJsonAccumulator::default);
-							if let Some(parsed) = partial_args.append(arguments) {
-								block.tool_call.arguments = parsed.as_object().cloned().unwrap_or_default();
-							}
-						}
-					}
-					let partial = partial_message(output, state);
-					stream.push(AssistantMessageEvent::ToolCallDelta {
-						content_index: index,
-						delta: delta_text,
-						partial,
-					});
-				}
-			}
-
-			// `Array.isArray` accepts an empty array, and `reasoningDetailsByIndex`
-			// stays empty, so an empty list only skips the block creation below.
-			if let Some(reasoning_details) = delta.get("reasoning_details").and_then(Value::as_array) {
-				for detail in reasoning_details {
-					let Some(detail_record) = detail.as_object() else {
-						continue;
-					};
-					let explicit_index = detail_record.get("index").and_then(Value::as_i64);
-					let index = explicit_index.unwrap_or(state.next_reasoning_details_index);
-					state.next_reasoning_details_index = state.next_reasoning_details_index.max(index + 1);
-					let previous_detail = state.reasoning_details_by_index.get(&index).cloned();
-					let mut merged_detail = previous_detail.clone().unwrap_or_default();
-					for (key, value) in detail_record {
-						merged_detail.insert(key.clone(), value.clone());
-					}
-					for field in ["text", "summary"] {
-						let previous_fragment = previous_detail
-							.as_ref()
-							.and_then(|detail| detail.get(field))
-							.and_then(Value::as_str);
-						let fragment = detail_record.get(field).and_then(Value::as_str);
-						if let (Some(previous_fragment), Some(fragment)) = (previous_fragment, fragment) {
-							merged_detail.insert(
-								field.to_string(),
-								Value::String(format!("{previous_fragment}{fragment}")),
-							);
-						}
-					}
-					state.reasoning_details_by_index.insert(index, merged_detail);
-					if detail_record.get("type").and_then(Value::as_str) == Some("reasoning.encrypted")
-						&& detail_record.get("id").and_then(Value::as_str).is_some()
-						&& detail_record.get("data").map(|data| !data.is_null()).unwrap_or(false)
-					{
-						let detail_id = detail_record.get("id").and_then(Value::as_str).unwrap_or_default();
-						let matching = state.blocks.iter_mut().find(|block| match block {
-							StreamingBlock::ToolCall(tool_call) => tool_call.tool_call.id == detail_id,
-							_ => false,
-						});
-						if let Some(StreamingBlock::ToolCall(tool_call)) = matching {
-							tool_call.tool_call.thought_signature = Some(Value::Object(detail_record.clone()).to_string());
-						}
-					}
-				}
-				if !state.reasoning_details_by_index.is_empty() {
-					let index = match state.reasoning_details_block {
-						Some(index) => index,
-						None => {
-							let mut block = ThinkingContent::new("");
-							block.redacted = Some(true);
-							state.blocks.push(StreamingBlock::Thinking(block));
-							let index = state.blocks.len() - 1;
-							state.reasoning_details_block = Some(index);
-							let partial = partial_message(output, state);
-							stream.push(AssistantMessageEvent::ThinkingStart {
-								content_index: index,
-								partial,
-							});
-							index
-						}
-					};
-					let mut indexes: Vec<i64> = state.reasoning_details_by_index.keys().copied().collect();
-					indexes.sort_unstable();
-					let details: Vec<Map<String, Value>> = indexes
-						.iter()
-						.filter_map(|index| state.reasoning_details_by_index.get(index).cloned())
-						.collect();
-					if let StreamingBlock::Thinking(block) = &mut state.blocks[index] {
-						block.thinking_signature = Some(encode_reasoning_details(&details));
-					}
-				}
-			}
-		}
+		handle_value_chunk(
+			chunk,
+			model,
+			options_ref,
+			output,
+			state,
+			stream,
+			cache_write_cost,
+			&response_headers,
+			&mut finished,
+		)?;
 	}
+
 
 	if is_cancelled(signal.as_ref()) {
 		return Err(abort_error());
@@ -2945,6 +3357,168 @@ mod provider_settlement_tests {
         assert!(!joined.cancel_requested);
         join_server(server).await;
     }
+	// ------------------------------------------------------------------
+	// J1: typed/Value parse-path parity for weird-but-accepted chunks
+	// ------------------------------------------------------------------
+
+	/// Runs one payload through both consumer paths and returns the emitted
+	/// events (JSON-serialized) plus the resulting output message.
+	async fn consume_through_both_paths(payload: &str) -> (Vec<Value>, Vec<Value>, AssistantMessage, AssistantMessage) {
+		fn fresh_output() -> AssistantMessage {
+			let mut output = AssistantMessage::new(
+				"openai-completions".to_string(),
+				"fixture".to_string(),
+				"repro-model".to_string(),
+				0,
+			);
+			output.usage = crate::types::Usage::zero();
+			output
+		}
+		let model = std::sync::Arc::new(base_model());
+
+		let collect = |stream: AssistantMessageEventStream| async move {
+			let mut events = Vec::new();
+			while let Some(event) = stream.next().await {
+				events.push(serde_json::to_value(&event).unwrap());
+			}
+			events
+		};
+
+		let model_for_typed = model.clone();
+		let consume = move |payload: String| { let model = model_for_typed.clone(); async move {
+			let stream = AssistantMessageEventStream::new_owned();
+			let mut output = fresh_output();
+			let mut state = StreamState::new();
+			let mut finished = false;
+			let headers = IndexMap::new();
+			let took_typed = if let Some(typed) = parse_typed_chunk(&payload) {
+				handle_typed_chunk(
+					typed,
+					&model,
+					None,
+					&mut output,
+					&mut state,
+					&stream,
+					None,
+					&headers,
+					&mut finished,
+				)
+				.unwrap();
+				true
+			} else {
+				false
+			};
+			if !took_typed {
+				let chunk: Value = serde_json::from_str(&payload).unwrap();
+				handle_value_chunk(
+					chunk,
+					&model,
+					None,
+					&mut output,
+					&mut state,
+					&stream,
+					None,
+					&headers,
+					&mut finished,
+				)
+				.unwrap();
+			}
+			stream.end(None);
+			let events = collect(stream.clone()).await;
+			(events, output)
+		} };
+		let (typed_events, typed_output) = consume(payload.to_string()).await;
+		// The reference run must ALWAYS take the Value consumer.
+		let stream = AssistantMessageEventStream::new_owned();
+		let mut output = fresh_output();
+		let mut state = StreamState::new();
+		let mut finished = false;
+		let headers = IndexMap::new();
+		let chunk: Value = serde_json::from_str(payload).unwrap();
+		handle_value_chunk(
+			chunk,
+			&model,
+			None,
+			&mut output,
+			&mut state,
+			&stream,
+			None,
+			&headers,
+			&mut finished,
+		)
+		.unwrap();
+		stream.end(None);
+		let value_events = collect(stream).await;
+
+		(typed_events, value_events, typed_output, output)
+	}
+
+	#[tokio::test]
+	async fn typed_and_value_paths_agree_on_weird_but_accepted_chunks() {
+		let payloads = [
+			// minimal text delta
+			r#"{"choices":[{"delta":{"content":"hi"}}]}"#,
+			// empty content string is skipped like the Value path
+			r#"{"choices":[{"delta":{"content":""}}]}"#,
+			// reasoning via the second field name
+			r#"{"choices":[{"delta":{"reasoning":"think"}}]}"#,
+			// reasoning_content wins over reasoning
+			r#"{"choices":[{"delta":{"reasoning_content":"a","reasoning":"b"}}]}"#,
+			// non-string content reads as absent
+			r#"{"choices":[{"delta":{"content":42}}]}"#,
+			// finish_reason as a number (non-string re-serialization)
+			r#"{"choices":[{"delta":{},"finish_reason":42}]}"#,
+			// falsy finish_reasons are not terminal
+			r#"{"choices":[{"delta":{},"finish_reason":0}]}"#,
+			r#"{"choices":[{"delta":{},"finish_reason":""}]}"#,
+			r#"{"choices":[{"delta":{},"finish_reason":false}]}"#,
+			// truthy string "0" IS terminal on the Value path (JS non-empty string)
+			r#"{"choices":[{"delta":{},"finish_reason":"0"}]}"#,
+			// tool call delta with fragmentary arguments
+			r##"{"choices":[{"delta":{"tool_calls":[{"index":0,"id":"call_1","function":{"name":"read","arguments":"{\"path\":"}}]}}]}"##,
+			// tool call without function member
+			r#"{"choices":[{"delta":{"tool_calls":[{"index":0}]}}]}"#,
+			// usage in the chunk root
+			r#"{"choices":[],"usage":{"prompt_tokens":10,"completion_tokens":2,"total_tokens":12}}"#,
+			// usage inside the choice (Moonshot fallback)
+			r#"{"choices":[{"delta":{},"usage":{"prompt_tokens":5,"completion_tokens":1}}]}"#,
+			// id + model echo
+			r#"{"id":"chatcmpl-1","model":"other-model","choices":[{"delta":{"content":"x"}}]}"#,
+			// null members read as absent
+			r#"{"id":null,"model":null,"choices":[{"delta":null,"finish_reason":null}],"usage":null}"#,
+			// unknown fields are ignored
+			r#"{"extra":{"nested":true},"choices":[{"delta":{"content":"y","unknown":1}}]}"#,
+			// empty choices array
+			r#"{"choices":[]}"#,
+			// reasoning_details array with a text merge
+			r#"{"choices":[{"delta":{"reasoning_details":[{"type":"reasoning.text","text":"abc"}]}}]}"#,
+			// reasoning_details with junk element (skipped by both paths)
+			r#"{"choices":[{"delta":{"reasoning_details":["junk",{"type":"reasoning.text","text":"z"}]}}]}"#,
+		];
+		for payload in payloads {
+			let (typed_events, value_events, _a, _b) = consume_through_both_paths(payload).await;
+			assert_eq!(
+				typed_events, value_events,
+				"typed and Value paths disagree on {payload}"
+			);
+		}
+	}
+
+	#[tokio::test]
+	async fn typed_path_handles_duplicate_keys_via_the_value_fallback() {
+		// Duplicate `choices`: the typed parser overwrites with the LAST visit,
+		// the Value DOM keeps the last occurrence for `choices` too, but the
+		// nested first-element selection differs — so this payload must NOT
+		// take the typed path (parse_typed_chunk cannot detect it cheaply, so
+		// the parity harness feeds it through the Value consumer).
+		let payload = r#"{"choices":[{"delta":{"content":"a"}}],"choices":[{"delta":{"content":"b"}}]}"#;
+		let (_typed_events, value_events, _a, _b) = consume_through_both_paths(payload).await;
+		// The Value consumer reads `choices[0]` = the last duplicate's first
+		// element (both duplicates are objects, IndexMap keeps one `choices`
+		// key with the second array).
+		assert!(value_events.iter().any(|event| event["delta"] == json!("b")));
+	}
+
 }
 
 /// Shared fixtures for the unit tests below.
