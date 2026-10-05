@@ -2275,6 +2275,26 @@ struct WebSocketParseShared {
     saw_completion: bool,
 }
 
+/// One lock acquisition that takes an event off the shared queue, or reports
+/// the settled state when the queue is empty.
+enum SharedPoll {
+    Event(Result<Value, CodexThrown>),
+    Pending,
+    Done,
+}
+
+fn poll_shared(shared: &Mutex<WebSocketParseShared>) -> SharedPoll {
+    let mut shared = shared.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(event) = shared.queue.pop_front() {
+        return SharedPoll::Event(event);
+    }
+    if shared.done {
+        SharedPoll::Done
+    } else {
+        SharedPoll::Pending
+    }
+}
+
 /// `parseWebSocket(socket, signal?)`.
 pub fn parse_web_socket(
     socket: Arc<dyn WebSocketLike>,
@@ -2283,10 +2303,6 @@ pub fn parse_web_socket(
     let mut state = WebSocketParseState {
         socket,
         signal,
-        queue: VecDeque::new(),
-        done: false,
-        failed: None,
-        saw_completion: false,
         wake: Arc::new(tokio::sync::Notify::new()),
         state: Arc::new(Mutex::new(WebSocketParseShared::default())),
         listeners: None,
@@ -2302,7 +2318,11 @@ pub fn parse_web_socket(
             }
             state.ensure_listeners();
             loop {
-                state.sync_from_shared();
+                match poll_shared(&state.state) {
+                    SharedPoll::Event(event) => return Some((event, state)),
+                    SharedPoll::Pending => {}
+                    SharedPoll::Done => break,
+                }
                 if state
                     .signal
                     .as_ref()
@@ -2312,12 +2332,6 @@ pub fn parse_web_socket(
                     state.finished = true;
                     state.cleanup();
                     return Some((Err(CodexThrown::error("Request was aborted")), state));
-                }
-                if let Some(event) = state.queue.pop_front() {
-                    return Some((event, state));
-                }
-                if state.done {
-                    break;
                 }
                 let notified = state.wake.notified();
                 tokio::pin!(notified);
@@ -2339,15 +2353,18 @@ pub fn parse_web_socket(
                 }
             }
 
-            state.sync_from_shared();
             // A TypeScript generator throws once, then is exhausted. `done`
             // tracks the socket; `finished` tracks this generator's final yield.
             state.finished = true;
             state.cleanup();
-            if let Some(failed) = state.failed.clone() {
+            let settled = {
+                let shared = state.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                (shared.failed.clone(), shared.saw_completion)
+            };
+            if let Some(failed) = settled.0 {
                 return Some((Err(failed), state));
             }
-            if !state.saw_completion {
+            if !settled.1 {
                 return Some((
                     Err(CodexThrown::error(
                         "WebSocket stream closed before response.completed",
@@ -2363,10 +2380,6 @@ pub fn parse_web_socket(
 struct WebSocketParseState {
     socket: Arc<dyn WebSocketLike>,
     signal: Option<tokio_util::sync::CancellationToken>,
-    queue: VecDeque<Result<Value, CodexThrown>>,
-    done: bool,
-    failed: Option<CodexThrown>,
-    saw_completion: bool,
     wake: Arc<tokio::sync::Notify>,
     state: Arc<Mutex<WebSocketParseShared>>,
     listeners: Option<Vec<(WebSocketEventType, WebSocketListener)>>,
@@ -2476,18 +2489,6 @@ impl WebSocketParseState {
         }
     }
 
-    /// Moves the shared queue/failure state into this generator step.
-    fn sync_from_shared(&mut self) {
-        let mut shared = self.state.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
-        while let Some(event) = shared.queue.pop_front() {
-            self.queue.push_back(event);
-        }
-        self.done = shared.done;
-        if self.failed.is_none() {
-            self.failed = shared.failed.clone();
-        }
-        self.saw_completion = shared.saw_completion;
-    }
 }
 
 /// `requestBodyWithoutInput(body)`.
