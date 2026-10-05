@@ -44,3 +44,7 @@ serde_yaml = { workspace = true }
 toml = { workspace = true }
 tracing = { workspace = true }
 pi-ai = { workspace = true }
+
+[dev-dependencies]
+# `start_paused` clock control for the stream-watchdog timing tests.
+tokio = { workspace = true, features = ["test-util"] }

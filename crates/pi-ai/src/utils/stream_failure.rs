@@ -29,6 +29,14 @@ pub const KIND_INVALID_REQUEST: StreamFailureKind = "invalid_request";
 pub const KIND_MALFORMED_RESPONSE: StreamFailureKind = "malformed_response";
 pub const KIND_REQUEST_INTERRUPTED: StreamFailureKind = "request_interrupted";
 pub const KIND_UNKNOWN: StreamFailureKind = "unknown";
+/// Locally detected stall of the agent loop's provider stream (no events within
+/// the event-gap window, or the overall stream deadline elapsed). Never produced
+/// by `classify_stream_failure`: the agent loop records it directly.
+pub const KIND_STREAM_STALL: StreamFailureKind = "stream_stall";
+/// Locally detected length-capped completion converted into a retryable failure
+/// by `PRIME_AGENT_RETRY_TRUNCATED_RESPONSE`. Never produced by
+/// `classify_stream_failure`: the agent loop records it directly.
+pub const KIND_TRUNCATED_RESPONSE: StreamFailureKind = "truncated_response";
 
 #[derive(Debug, Clone, Default, PartialEq, serde::Serialize, serde::Deserialize)]
 pub struct StreamFailureInfo {
