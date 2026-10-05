@@ -1172,17 +1172,19 @@ async fn run_stream_anthropic(
 				// stops using it for the block.
 				match &blocks[index] {
 					AnthropicBlock::Text { text, .. } => {
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::TextEnd {
 							content_index: index,
 							content: text.clone(),
-							partial: output.clone(),
+							partial,
 						});
 					}
 					AnthropicBlock::Thinking { thinking, .. } => {
+						let partial = partial_from_blocks(output, &blocks);
 						out.push(AssistantMessageEvent::ThinkingEnd {
 							content_index: index,
 							content: thinking.clone(),
-							partial: output.clone(),
+							partial,
 						});
 					}
 					AnthropicBlock::ToolCall { partial_json, .. } => {
@@ -2599,6 +2601,57 @@ mod tests {
 			assert_eq!(message.content[0].as_tool_call().unwrap().arguments, serde_json::from_str::<Value>(&args).unwrap().as_object().unwrap().clone());
 			server.await.unwrap();
 		}
+	}
+
+	#[tokio::test]
+	async fn text_end_partial_carries_accumulated_content() {
+		use serde_json::json;
+		use tokio::io::{AsyncReadExt, AsyncWriteExt};
+		let event = |value: Value| format!("event: {}\ndata: {value}\n\n", value["type"].as_str().unwrap());
+		let mut body = event(json!({"type":"message_start", "message":{"id":"fixture-message","usage":{"input_tokens":1,"output_tokens":0}}}));
+		body.push_str(&event(json!({"type":"content_block_start","index":0,"content_block":{"type":"text","text":""}})));
+		body.push_str(&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"hello "}})));
+		body.push_str(&event(json!({"type":"content_block_delta","index":0,"delta":{"type":"text_delta","text":"world"}})));
+		body.push_str(&event(json!({"type":"content_block_stop","index":0})));
+		body.push_str(&event(json!({"type":"message_delta","delta":{"stop_reason":"end_turn"},"usage":{"output_tokens":2}})));
+		body.push_str(&event(json!({"type":"message_stop"})));
+		let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0)).await.unwrap();
+		let address = listener.local_addr().unwrap();
+		let server = tokio::spawn(async move {
+			let (mut socket,_) = listener.accept().await.unwrap(); let mut request = Vec::new();
+			loop {
+				let mut buffer = [0;4096]; let count = socket.read(&mut buffer).await.unwrap(); assert_ne!(count,0);
+				request.extend_from_slice(&buffer[..count]);
+				if let Some(end) = request.windows(4).position(|bytes| bytes == b"\r\n\r\n") {
+					let headers = std::str::from_utf8(&request[..end]).unwrap();
+						let length: usize = headers.lines().filter_map(|line| line.split_once(':')).find(|(key,_)| key.eq_ignore_ascii_case("content-length")).unwrap().1.trim().parse().unwrap();
+						if request.len() >= end + 4 + length {break;}
+				}
+			}
+			let response = format!("HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",body.len());
+			socket.write_all(response.as_bytes()).await.unwrap();
+		});
+		let mut model = test_model("anthropic", "fixture"); model.base_url = format!("http://{address}");
+		let mut options = AnthropicOptions::default(); options.stream.api_key = Some("synthetic-fixture-key".into());
+		let stream = stream_anthropic(&model, &context_with_user("fixture"), Some(options));
+		let mut stream = std::pin::pin!(stream);
+		let mut text_end_partial = None; let mut done_message = None;
+		while let Some(item) = stream.next().await {
+			match item {
+				AssistantMessageEvent::TextEnd { partial, .. } => text_end_partial = Some(partial),
+				AssistantMessageEvent::Done { message, .. } => done_message = Some(message),
+				AssistantMessageEvent::Error { error, .. } => panic!("unexpected stream error: {:?}", error.error_message),
+				_ => {}
+			}
+		}
+		server.await.unwrap();
+		let partial = text_end_partial.expect("TextEnd event");
+		let text: String = partial.content.iter().filter_map(|block| block.as_text().map(|text| text.text.clone())).collect();
+		assert_eq!(text, "hello world", "TextEnd partial must carry the accumulated content");
+		let done = done_message.expect("Done event");
+		let done_text: String = done.content.iter().filter_map(|block| block.as_text().map(|text| text.text.clone())).collect();
+		assert_eq!(done_text, "hello world");
+		assert_eq!(partial.stop_reason, done.stop_reason);
 	}
 
 	#[test]
