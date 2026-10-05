@@ -4,4 +4,5 @@ pub mod agent_loop;
 pub mod execution_scope;
 pub mod performance_metrics;
 pub mod proxy;
+pub mod stream_watchdog;
 pub mod types;

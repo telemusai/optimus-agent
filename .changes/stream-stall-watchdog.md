@@ -1,0 +1,3 @@
+- Added a default-on stream stall watchdog for provider responses: `PRIME_AGENT_STREAM_EVENT_GAP_MS` (default 120s) aborts an attempt when no stream event arrives within the window, and `PRIME_AGENT_STREAM_DEADLINE_MS` (default 15 min) caps the whole stream phase; both aborts are retried through the normal provider-retry path and can be disabled with `0`.
+- Added a structured warning whenever an assistant response ends at the provider output cap (`stop_reason "length"`), including the reported token usage.
+- Added opt-in `PRIME_AGENT_RETRY_TRUNCATED_RESPONSE` (default off; `1/true/yes/on` enables) to treat length-capped responses as retryable provider failures instead of accepting the truncated message.

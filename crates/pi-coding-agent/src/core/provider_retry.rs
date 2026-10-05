@@ -70,9 +70,26 @@ pub fn provider_stream_failure_kind(message: &AssistantMessage) -> Option<String
     kind.as_str().map(|kind| kind.to_string())
 }
 
+/// Locally detected stream-watchdog failures: the agent loop's event-gap /
+/// deadline stall abort, and the opt-in `PRIME_AGENT_RETRY_TRUNCATED_RESPONSE`
+/// conversion of a length-capped completion. Both are recorded by the agent
+/// loop itself, never parsed from a provider payload.
+pub fn is_stream_watchdog_failure(message: &AssistantMessage) -> bool {
+    matches!(
+        provider_stream_failure_kind(message).as_deref(),
+        Some(pi_ai::utils::stream_failure::KIND_STREAM_STALL)
+            | Some(pi_ai::utils::stream_failure::KIND_TRUNCATED_RESPONSE)
+    )
+}
+
 /// Reissuing an uncertain request or already-started response could replay work.
 /// Empty block placeholders alone are not evidence that output was produced.
+/// Stream-watchdog failures are exempt: a stalled or truncated attempt never
+/// executed any of its partial content, so retrying cannot replay work.
 pub fn cannot_replay_provider_failure(message: &AssistantMessage) -> bool {
+    if is_stream_watchdog_failure(message) {
+        return false;
+    }
     message.stop_reason == pi_ai::types::STOP_REASON_ERROR
         && (provider_stream_failure_kind(message).as_deref() == Some("request_interrupted")
             || message.content.iter().any(|block| match block {
@@ -585,6 +602,75 @@ mod tests {
         assert_eq!(provider_stream_failure_retry_after_ms(&message), None);
         assert!(provider_stream_failure_details(&message).is_some());
         assert_eq!(provider_stream_failure_kind(&AssistantMessage::default()), None);
+    }
+
+    #[test]
+    fn stream_watchdog_failures_are_retryable_even_with_partial_content() {
+        let mut stall = error_message(Some("stream_stall"));
+        stall.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
+            "partial",
+        ))];
+        // The kinds are not on the permanent list ...
+        assert!(!is_permanent_provider_failure_kind(
+            Some(pi_ai::utils::stream_failure::KIND_STREAM_STALL),
+            0.0
+        ));
+        assert!(!is_permanent_provider_failure_kind(
+            Some(pi_ai::utils::stream_failure::KIND_TRUNCATED_RESPONSE),
+            5.0
+        ));
+        // ... they are recognized as stream-watchdog failures ...
+        assert!(is_stream_watchdog_failure(&stall));
+        assert!(!is_stream_watchdog_failure(&error_message(Some("server_error"))));
+        assert!(!is_stream_watchdog_failure(&AssistantMessage::default()));
+        // ... and they bypass the replay guard so the host retries them.
+        assert!(!cannot_replay_provider_failure(&stall));
+        let mut truncated = error_message(Some("truncated_response"));
+        truncated.content = vec![pi_ai::types::ContentBlock::ToolCall(pi_ai::types::ToolCall::new(
+            "id", "tool", Default::default(),
+        ))];
+        assert!(is_stream_watchdog_failure(&truncated));
+        assert!(!cannot_replay_provider_failure(&truncated));
+        // The guard still applies to ordinary partial-content failures.
+        let mut ordinary = error_message(Some("server_error"));
+        ordinary.content = vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
+            "partial",
+        ))];
+        assert!(!is_stream_watchdog_failure(&ordinary));
+        assert!(cannot_replay_provider_failure(&ordinary));
+    }
+
+    #[tokio::test]
+    async fn complete_with_provider_retry_retries_a_stream_stall_failure() {
+        let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let counter = attempts.clone();
+        let mut options = ProviderRetryExecutionOptions::default();
+        options.sleep = Some(Arc::new(|_delay, _signal| Box::pin(async {})));
+        let message = complete_with_provider_retry(
+            move || {
+                let counter = counter.clone();
+                async move {
+                    let attempt = counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    if attempt == 0 {
+                        let mut stall = error_message(Some("stream_stall"));
+                        stall.content =
+                            vec![pi_ai::types::ContentBlock::Text(pi_ai::types::TextContent::new(
+                                "partial",
+                            ))];
+                        stall
+                    } else {
+                        AssistantMessage {
+                            stop_reason: STOP_REASON_STOP.to_string(),
+                            ..Default::default()
+                        }
+                    }
+                }
+            },
+            options,
+        )
+        .await;
+        assert_eq!(message.stop_reason, STOP_REASON_STOP);
+        assert_eq!(attempts.load(std::sync::atomic::Ordering::SeqCst), 2);
     }
 
     #[test]

@@ -1159,6 +1159,84 @@ fn create_observed_callbacks(
     }
 }
 
+/// The stall-watchdog abort path: stop the producer, log one structured
+/// warning, and finish the attempt as a retryable provider failure so the
+/// host's provider-retry policy can re-issue the request instead of hanging.
+#[allow(clippy::too_many_arguments)]
+async fn abort_stalled_stream(
+    context: &mut AgentContext,
+    config: &AgentLoopConfig,
+    signal: Option<&CancellationToken>,
+    emit: &AgentEventSink,
+    request_metrics: &mut RequestMetricState,
+    partial_message: Option<&AssistantMessage>,
+    added_partial: &bool,
+    logical_request_settlement: &Arc<AgentLoopLogicalRequestSettlement>,
+    metrics: &Option<crate::performance_metrics::AgentLoopPerformanceMetrics>,
+    observed: &ObservedCallbacks,
+    response: &pi_ai::utils::event_stream::AssistantMessageEventStream,
+    limit: crate::stream_watchdog::StreamStallLimit,
+    watchdog: crate::stream_watchdog::StreamWatchdogConfig,
+    attempt_started: tokio::time::Instant,
+    last_event_at: tokio::time::Instant,
+) -> anyhow::Result<AssistantMessage> {
+    let elapsed = limit.elapsed_since(attempt_started, last_event_at);
+    let configured = limit.configured(&watchdog);
+    crate::stream_watchdog::log_stream_stall(
+        &config.model,
+        limit,
+        elapsed,
+        configured,
+        request_metrics.provider_attempt_number,
+        partial_message,
+    );
+    // Stop reading the provider stream, then mirror `closeIterator()` on the
+    // abort token like the cancellation arm does.
+    response.request_cancel();
+    close_stream(signal);
+    let stall_message = crate::stream_watchdog::create_stream_stall_message(
+        config,
+        partial_message,
+        limit,
+        elapsed,
+        configured,
+        request_metrics.provider_attempt_number,
+    );
+    finish_request_metrics(
+        config,
+        metrics,
+        logical_request_settlement,
+        Some(&stall_message),
+        PerformanceMetricOutcome::Failure,
+        request_metrics,
+        observed,
+    );
+    if *added_partial {
+        if let Some(last) = context.messages.last_mut() {
+            *last = AgentMessage::from(stall_message.clone());
+        }
+    } else {
+        context.messages.push(AgentMessage::from(stall_message.clone()));
+    }
+    if !*added_partial {
+        emit_event(
+            emit,
+            AgentEvent::MessageStart {
+                message: AgentMessage::from(stall_message.clone()),
+            },
+        )
+        .await?;
+    }
+    emit_event(
+        emit,
+        AgentEvent::MessageEnd {
+            message: AgentMessage::from(stall_message.clone()),
+        },
+    )
+    .await?;
+    Ok(stall_message)
+}
+
 #[allow(clippy::too_many_arguments)]
 async fn stream_assistant_response_inner(
     context: &mut AgentContext,
@@ -1194,7 +1272,38 @@ async fn stream_assistant_response_inner(
         maybe_abortable(async move { Ok::<_, anyhow::Error>(future.await) }, signal.cloned()).await?
     };
 
+    // Stream stall watchdog: bounds a silent event gap and the overall stream
+    // phase of this attempt (`crate::stream_watchdog` documents the incident).
+    let watchdog = crate::stream_watchdog::StreamWatchdogConfig::from_env();
+    let attempt_started = tokio::time::Instant::now();
+    let deadline_at = watchdog
+        .stream_deadline
+        .map(|stream_deadline| attempt_started + stream_deadline);
+    let mut last_event_at = attempt_started;
+
     loop {
+        // Checked before the select so a continuous event stream cannot starve
+        // the deadline arm below.
+        if deadline_at.is_some_and(|deadline_at| tokio::time::Instant::now() >= deadline_at) {
+            return abort_stalled_stream(
+                context,
+                config,
+                signal,
+                emit,
+                request_metrics,
+                partial_message.as_ref(),
+                &*added_partial,
+                logical_request_settlement,
+                metrics,
+                observed,
+                &response,
+                crate::stream_watchdog::StreamStallLimit::StreamDeadline,
+                watchdog,
+                attempt_started,
+                last_event_at,
+            )
+            .await;
+        }
         let next = match signal {
             Some(signal) => {
                 let signal = signal.clone();
@@ -1204,16 +1313,53 @@ async fn stream_assistant_response_inner(
                     _ = signal.cancelled() => {
                         response_for_close.request_cancel();
                         close_stream(Some(&signal));
-                        return Err(create_abort_error());
+                        crate::stream_watchdog::WatchdogNext::Cancelled
                     }
-                    next = response.next() => next,
+                    next = crate::stream_watchdog::next_with_event_gap(&response, watchdog.event_gap) => next,
+                    _ = crate::stream_watchdog::deadline_timer(deadline_at) => {
+                        crate::stream_watchdog::WatchdogNext::Stall(
+                            crate::stream_watchdog::StreamStallLimit::StreamDeadline,
+                        )
+                    }
                 }
             }
-            None => response.next().await,
+            None => tokio::select! {
+                next = crate::stream_watchdog::next_with_event_gap(&response, watchdog.event_gap) => next,
+                _ = crate::stream_watchdog::deadline_timer(deadline_at) => {
+                    crate::stream_watchdog::WatchdogNext::Stall(
+                        crate::stream_watchdog::StreamStallLimit::StreamDeadline,
+                    )
+                }
+            },
+        };
+        let next = match next {
+            crate::stream_watchdog::WatchdogNext::Cancelled => return Err(create_abort_error()),
+            crate::stream_watchdog::WatchdogNext::Stall(limit) => {
+                return abort_stalled_stream(
+                    context,
+                    config,
+                    signal,
+                    emit,
+                    request_metrics,
+                    partial_message.as_ref(),
+                    &*added_partial,
+                    logical_request_settlement,
+                    metrics,
+                    observed,
+                    &response,
+                    limit,
+                    watchdog,
+                    attempt_started,
+                    last_event_at,
+                )
+                .await;
+            }
+            crate::stream_watchdog::WatchdogNext::Event(next) => next,
         };
         let Some(event) = next else {
             break;
         };
+        last_event_at = tokio::time::Instant::now();
         if request_metrics.first_event_at.is_none() {
             request_metrics.first_event_at = metric_now(config);
         }
@@ -1279,6 +1425,11 @@ async fn stream_assistant_response_inner(
                         }
                     }
                 }
+                let final_message = crate::stream_watchdog::surface_truncated_response(
+                    config,
+                    final_message,
+                    request_metrics.provider_attempt_number,
+                );
                 finish_request_metrics(
                     config,
                     metrics,
@@ -1321,6 +1472,11 @@ async fn stream_assistant_response_inner(
         signal.cloned(),
     )
     .await?;
+    let final_message = crate::stream_watchdog::surface_truncated_response(
+        config,
+        final_message,
+        request_metrics.provider_attempt_number,
+    );
     finish_request_metrics(
         config,
         metrics,
@@ -3466,5 +3622,331 @@ mod tests {
     fn tool_execution_mode_sequential_forces_sequential_batches() {
         let config = AgentLoopConfig::new(Model::new("unknown", "unknown", "unknown", "unknown", ""));
         assert_eq!(config.resolved_tool_execution(), ToolExecutionMode::Parallel);
+    }
+}
+
+/// Watchdog behavior through the real agent loop pump (`stream_assistant_response_inner`).
+#[cfg(test)]
+mod stream_watchdog_loop_tests {
+    use super::*;
+    use crate::stream_watchdog::testing::{EnvVarGuard, ENV_TESTS};
+    use crate::stream_watchdog::{
+        RETRY_TRUNCATED_RESPONSE_ENV, STREAM_DEADLINE_MS_ENV, STREAM_EVENT_GAP_MS_ENV,
+    };
+    use pi_ai::types::{UserContent, UserMessage};
+    use pi_ai::utils::event_stream::AssistantMessageEventStream;
+    use std::time::Duration;
+
+    fn watchdog_model() -> Model {
+        Model::new(
+            "watchdog-model",
+            "Watchdog Model",
+            "openai-completions",
+            "openai",
+            "https://example.test",
+        )
+    }
+
+    fn user_prompt() -> AgentMessage {
+        AgentMessage::from(UserMessage {
+            role: "user".to_string(),
+            content: UserContent::Text("question".to_string()),
+            provider_context: None,
+            timestamp: 1,
+        })
+    }
+
+    /// Runs one agent loop turn against `stream_fn` and returns the terminal
+    /// assistant message.
+    async fn run_turn(stream_fn: StreamFn) -> AssistantMessage {
+        let context = AgentContext {
+            system_prompt: String::new(),
+            messages: Vec::new(),
+            tools: None,
+        };
+        let stream = agent_loop(
+            vec![user_prompt()],
+            context,
+            AgentLoopConfig::new(watchdog_model()),
+            None,
+            Some(stream_fn),
+        );
+        let mut terminal: Option<AssistantMessage> = None;
+        while let Some(event) = stream.next().await {
+            if let AgentEvent::AgentEnd { messages } = event {
+                terminal = messages.into_iter().rev().find_map(|message| match message {
+                    AgentMessage::Message(Message::Assistant(assistant)) => Some(assistant),
+                    _ => None,
+                });
+            }
+        }
+        terminal.expect("the run must produce a terminal assistant message")
+    }
+
+    /// A stream function whose stream never yields an event.
+    fn never_yielding_stream_fn() -> StreamFn {
+        Arc::new(|_model, _context, _options| {
+            let stream = AssistantMessageEventStream::new();
+            Box::pin(async move { stream })
+        })
+    }
+
+    /// A stream function that emits `count` text events `interval` apart and
+    /// then goes silent, never delivering a terminal event.
+    fn trickling_stream_fn(interval: Duration, count: u64) -> StreamFn {
+        Arc::new(move |_model, _context, _options| {
+            let handle = AssistantMessageEventStream::new();
+            let producer = handle.producer_handle();
+            let spawning_producer = producer.clone();
+            spawning_producer.spawn(async move {
+                for index in 0..count {
+                    let mut partial = AssistantMessage::new(
+                        "openai-completions",
+                        "openai",
+                        "watchdog-model",
+                        index as i64,
+                    );
+                    partial.content = vec![ContentBlock::Text(TextContent::new("chunk"))];
+                    if index == 0 {
+                        producer.push(AssistantMessageEvent::Start { partial });
+                    } else {
+                        producer.push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "chunk".to_string(),
+                            partial,
+                        });
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+                // Stay silent forever, like the stalled producer of the incident.
+                tokio::time::sleep(Duration::from_secs(600)).await;
+            });
+            Box::pin(async move { handle })
+        })
+    }
+
+    /// A stream function that immediately completes with `message`.
+    fn completed_stream_fn(message: AssistantMessage) -> StreamFn {
+        Arc::new(move |_model, _context, _options| {
+            let handle = AssistantMessageEventStream::new();
+            let producer = handle.producer_handle();
+            let message = message.clone();
+            let spawning_producer = producer.clone();
+            spawning_producer.spawn(async move {
+                producer.push(AssistantMessageEvent::Done {
+                    reason: message.stop_reason.clone(),
+                    message,
+                });
+            });
+            Box::pin(async move { handle })
+        })
+    }
+
+    /// A stream that emits `count` events `interval` apart and then completes.
+    fn paced_stream_fn(interval: Duration, count: u64, final_message: AssistantMessage) -> StreamFn {
+        Arc::new(move |_model, _context, _options| {
+            let handle = AssistantMessageEventStream::new();
+            let producer = handle.producer_handle();
+            let final_message = final_message.clone();
+            let spawning_producer = producer.clone();
+            spawning_producer.spawn(async move {
+                for index in 0..count {
+                    let mut partial = AssistantMessage::new(
+                        "openai-completions",
+                        "openai",
+                        "watchdog-model",
+                        index as i64,
+                    );
+                    partial.content = vec![ContentBlock::Text(TextContent::new("chunk"))];
+                    if index == 0 {
+                        producer.push(AssistantMessageEvent::Start { partial });
+                    } else {
+                        producer.push(AssistantMessageEvent::TextDelta {
+                            content_index: 0,
+                            delta: "chunk".to_string(),
+                            partial,
+                        });
+                    }
+                    tokio::time::sleep(interval).await;
+                }
+                producer.push(AssistantMessageEvent::Done {
+                    reason: final_message.stop_reason.clone(),
+                    message: final_message,
+                });
+            });
+            Box::pin(async move { handle })
+        })
+    }
+
+    fn provider_stream_failure_details(
+        message: &AssistantMessage,
+    ) -> Option<&serde_json::Map<String, serde_json::Value>> {
+        message
+            .diagnostics
+            .as_ref()?
+            .iter()
+            .find(|diagnostic| diagnostic.type_ == "provider_stream_failure")
+            .and_then(|diagnostic| diagnostic.details.as_ref())
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stalled_stream_aborts_within_the_event_gap_with_a_retryable_error() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _gap = EnvVarGuard::set(STREAM_EVENT_GAP_MS_ENV, "5000".to_string());
+        let _deadline = EnvVarGuard::set(STREAM_DEADLINE_MS_ENV, "0".to_string());
+
+        let terminal = run_turn(never_yielding_stream_fn()).await;
+
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+        assert!(terminal.content.is_empty(), "a stall must not adopt partial content");
+        assert!(
+            terminal
+                .error_message
+                .as_deref()
+                .is_some_and(|error_message| error_message.contains("stalled")),
+            "got {:?}",
+            terminal.error_message
+        );
+        let details = provider_stream_failure_details(&terminal)
+            .expect("the stall is recorded as a provider_stream_failure");
+        assert_eq!(details.get("kind").and_then(|kind| kind.as_str()), Some("stream_stall"));
+        assert_eq!(
+            details.get("limit").and_then(|limit| limit.as_str()),
+            Some("event_gap")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn stream_deadline_bounds_a_trickling_stream() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _gap = EnvVarGuard::set(STREAM_EVENT_GAP_MS_ENV, "0".to_string());
+        let _deadline = EnvVarGuard::set(STREAM_DEADLINE_MS_ENV, "60000".to_string());
+
+        // Events every 20s are always within any gap; only the 60s deadline fires.
+        let terminal = run_turn(trickling_stream_fn(Duration::from_secs(20), 3)).await;
+
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+        let details = provider_stream_failure_details(&terminal)
+            .expect("the stall is recorded as a provider_stream_failure");
+        assert_eq!(details.get("kind").and_then(|kind| kind.as_str()), Some("stream_stall"));
+        assert_eq!(
+            details.get("limit").and_then(|limit| limit.as_str()),
+            Some("stream_deadline")
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn paced_events_within_the_gap_do_not_trip_the_watchdog() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _gap = EnvVarGuard::set(STREAM_EVENT_GAP_MS_ENV, "5000".to_string());
+        let _deadline = EnvVarGuard::set(STREAM_DEADLINE_MS_ENV, "0".to_string());
+
+        // Three events four seconds apart (total 12s > the 5s gap): the timer
+        // must reset on every event, or the run would abort.
+        let mut final_message =
+            AssistantMessage::new("openai-completions", "openai", "watchdog-model", 99);
+        final_message.stop_reason = pi_ai::types::STOP_REASON_STOP.to_string();
+        final_message.content = vec![ContentBlock::Text(TextContent::new("done"))];
+
+        let terminal = run_turn(paced_stream_fn(Duration::from_secs(4), 3, final_message)).await;
+
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_STOP);
+        assert!(terminal.error_message.is_none());
+        assert!(provider_stream_failure_details(&terminal).is_none());
+    }
+
+    fn length_capped_message() -> AssistantMessage {
+        let mut message =
+            AssistantMessage::new("openai-completions", "openai", "watchdog-model", 7);
+        message.stop_reason = pi_ai::types::STOP_REASON_LENGTH.to_string();
+        message.content = vec![ContentBlock::Text(TextContent::new("truncated mid-sentence"))];
+        message.usage = Usage {
+            input: 223_489.0,
+            output: 131_072.0,
+            total_tokens: 354_561.0,
+            ..Usage::zero()
+        };
+        message
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn length_capped_response_is_accepted_and_logged_by_default() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _flag = EnvVarGuard::set(RETRY_TRUNCATED_RESPONSE_ENV, "0".to_string());
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let sink_target = captured.clone();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry: &Value| {
+            sink_target.lock().unwrap().push(entry.clone());
+        })));
+
+        let terminal = run_turn(completed_stream_fn(length_capped_message())).await;
+
+        pi_ai::log::set_log_sink(None);
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_LENGTH);
+        assert!(
+            terminal
+                .content
+                .iter()
+                .any(|block| matches!(block, ContentBlock::Text(text) if text.text == "truncated mid-sentence")),
+            "the truncated message is accepted unchanged by default"
+        );
+        assert!(terminal.error_message.is_none());
+        assert!(provider_stream_failure_details(&terminal).is_none());
+
+        let warnings: Vec<Value> = captured
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|entry| {
+                entry.get("component").and_then(|component| component.as_str())
+                    == Some("agent-core.stream-watchdog")
+                    && entry.get("level").and_then(|level| level.as_str()) == Some("warn")
+            })
+            .cloned()
+            .collect();
+        assert_eq!(warnings.len(), 1, "exactly one structured warning per capped turn");
+        let warning = &warnings[0];
+        assert_eq!(
+            warning.get("stopReason").and_then(|reason| reason.as_str()),
+            Some(pi_ai::types::STOP_REASON_LENGTH)
+        );
+        assert_eq!(
+            warning.get("outputTokens").and_then(|tokens| tokens.as_f64()),
+            Some(131_072.0)
+        );
+        assert_eq!(
+            warning.get("retryEnabled").and_then(|enabled| enabled.as_bool()),
+            Some(false)
+        );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn length_capped_response_becomes_a_retryable_failure_when_opted_in() {
+        let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let _flag = EnvVarGuard::set(RETRY_TRUNCATED_RESPONSE_ENV, "true".to_string());
+
+        let terminal = run_turn(completed_stream_fn(length_capped_message())).await;
+
+        assert_eq!(terminal.stop_reason, pi_ai::types::STOP_REASON_ERROR);
+        assert!(
+            terminal
+                .error_message
+                .as_deref()
+                .is_some_and(|error_message| error_message.contains("length cap")),
+            "got {:?}",
+            terminal.error_message
+        );
+        assert!(terminal.content.is_empty(), "the truncated content is dropped for the retry");
+        assert_eq!(terminal.usage.output, 131_072.0, "usage is preserved for accounting");
+        let details = provider_stream_failure_details(&terminal)
+            .expect("the conversion is recorded as a provider_stream_failure");
+        assert_eq!(
+            details.get("kind").and_then(|kind| kind.as_str()),
+            Some("truncated_response")
+        );
+        assert_eq!(
+            details.get("outputTokens").and_then(|tokens| tokens.as_f64()),
+            Some(131_072.0)
+        );
     }
 }
