@@ -3879,12 +3879,15 @@ impl SessionManager {
         let Some(buffer) = &self.write_buffer else {
             return Ok(());
         };
-        if buffer.period.is_zero() {
-            return buffer.drain_through(line);
-        }
-        let pushed = buffer.push_line(format!("{line}\n").as_bytes());
+        let line = format!("{line}\n");
+        // The epoch moves at accept time in BOTH modes: write-through bytes
+        // are on disk (unfsynced) exactly like buffered bytes are pending,
+        // so a delivery boundary must treat either as dirty.
         self.persist_write_epoch += 1;
-        pushed
+        if buffer.period.is_zero() {
+            return buffer.drain_through(&line);
+        }
+        buffer.push_line(line.as_bytes())
     }
 
     fn rewrite_file(&mut self) -> Result<(), String> {
@@ -5793,6 +5796,42 @@ mod tests {
         let contents = std::fs::read_to_string(&file).unwrap();
         let lines: Vec<&str> = contents.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 3, "the Drop drain landed the buffered lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn zero_period_writes_through_with_newlines() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        // Inject write-through by swapping the buffer: the env override is
+        // process-global and would bleed into managers other parallel tests
+        // construct. Nothing has been appended yet, so the old buffer is
+        // empty and the swap loses no bytes.
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::ZERO,
+        )));
+        for turn in 0..5 {
+            manager
+                .append_message(user_message(&format!("u{turn}"), turn as i64))
+                .unwrap();
+            manager
+                .append_message(assistant_message("gpt-5", turn as i64 + 1))
+                .unwrap();
+        }
+        // No explicit drain: with a zero period every line must already be
+        // on disk, newline-terminated (write-through is the old behavior).
+        let contents = std::fs::read_to_string(&file).unwrap();
+        let lines: Vec<&str> = contents.trim_end().split('\n').collect();
+        assert_eq!(lines.len(), 11, "header + 10 entries, one line each");
+        for line in &lines {
+            assert!(serde_json::from_str::<Value>(line).is_ok());
+        }
+        // The write epoch must move in write-through mode too: a delivery
+        // sync after these appends must not be guard-skipped.
+        let epoch = manager.persist_write_epoch();
+        assert!(epoch > 0, "write-through appends bump the epoch");
         let _ = std::fs::remove_dir_all(&dir);
     }
 
