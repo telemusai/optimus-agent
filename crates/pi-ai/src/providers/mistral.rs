@@ -1545,10 +1545,10 @@ fn finish_current_block(block: &CurrentBlock, output: &AssistantMessage, stream:
 	match (block, output.content.last()) {
 		(CurrentBlock::Text(_), Some(ContentBlock::Text(text))) => {
 			stream.push(AssistantMessageEvent::TextEnd {
-				content_index: output.content.len() - 1,
+					content_index: output.content.len() - 1,
 					content: text.text.clone(),
 					partial: output.clone(),
-			});
+				});
 		}
 		(CurrentBlock::Thinking(_), Some(ContentBlock::Thinking(thinking))) => {
 			stream.push(AssistantMessageEvent::ThinkingEnd {
