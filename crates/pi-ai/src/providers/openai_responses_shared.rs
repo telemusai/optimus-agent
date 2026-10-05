@@ -729,7 +729,7 @@ pub async fn process_responses_stream(
 
     let result = async {
     while let Some(event) = openai_stream.next().await {
-        let event_type = get_str(&event, "type").unwrap_or_default().to_string();
+        let event_type = get_str(&event, "type").unwrap_or_default();
 
         if event_type == "response.created" {
             if let Some(id) = get(&event, "response").and_then(|response| get_str(response, "id")) {
@@ -883,12 +883,11 @@ pub async fn process_responses_stream(
                 let last_part_type = current_item
                     .as_ref()
                     .and_then(|item| last_array_item(item, "content"))
-                    .and_then(item_type)
-                    .map(str::to_string);
+                    .and_then(item_type);
                 if last_part_type.is_none() {
                     continue;
                 }
-                if last_part_type.as_deref() == Some("output_text") {
+                if last_part_type == Some("output_text") {
                     let delta = string_or_empty(get(&event, "delta"));
                     let index = current_block.as_ref().expect("checked").index();
                     if let ContentBlock::Text(text) = &mut output.content[index] {
@@ -916,12 +915,11 @@ pub async fn process_responses_stream(
                 let last_part_type = current_item
                     .as_ref()
                     .and_then(|item| last_array_item(item, "content"))
-                    .and_then(item_type)
-                    .map(str::to_string);
+                    .and_then(item_type);
                 if last_part_type.is_none() {
                     continue;
                 }
-                if last_part_type.as_deref() == Some("refusal") {
+                if last_part_type == Some("refusal") {
                     let delta = string_or_empty(get(&event, "delta"));
                     let index = current_block.as_ref().expect("checked").index();
                     if let ContentBlock::Text(text) = &mut output.content[index] {
