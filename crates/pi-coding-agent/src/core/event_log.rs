@@ -16,7 +16,9 @@ use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::{Arc, Mutex, OnceLock, Weak};
 use std::time::{Duration, Instant};
 
-use crate::utils::timed_flush::{register_timed_flush, write_flush_period, TimedBytes, TimedFlush};
+use crate::utils::timed_flush::{
+    event_log_write_flush_period, register_timed_flush, TimedBytes, TimedFlush,
+};
 
 pub type EventLogLogger = std::sync::Arc<dyn Fn(String) + Send + Sync>;
 
@@ -305,7 +307,7 @@ impl EventLog {
             path: path.into(),
             options,
             append_state: std::sync::Mutex::new(EventLogAppendState::default()),
-            write_period: write_flush_period(),
+            write_period: event_log_write_flush_period(),
             shared_buffer: OnceLock::new(),
         }
     }

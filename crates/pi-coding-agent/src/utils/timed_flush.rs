@@ -29,7 +29,9 @@ fn registry() -> &'static Mutex<Vec<Weak<dyn TimedFlush>>> {
 /// Register a buffer with the flusher thread. Spawns the thread on first use.
 pub(crate) fn register_timed_flush(buffer: &Arc<dyn TimedFlush>) {
     {
-        let mut registry = registry().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut registry = registry()
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         registry.retain(|weak| weak.strong_count() > 0);
         registry.push(Arc::downgrade(buffer));
     }
@@ -45,13 +47,11 @@ fn spawn_flusher_once() {
                 std::thread::sleep(POLL_INTERVAL);
                 let now = Instant::now();
                 let buffers: Vec<Arc<dyn TimedFlush>> = {
-                    let mut registry =
-                        registry().lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+                    let mut registry = registry()
+                        .lock()
+                        .unwrap_or_else(|poisoned| poisoned.into_inner());
                     registry.retain(|weak| weak.strong_count() > 0);
-                    registry
-                        .iter()
-                        .filter_map(|weak| weak.upgrade())
-                        .collect()
+                    registry.iter().filter_map(|weak| weak.upgrade()).collect()
                 };
                 for buffer in buffers {
                     buffer.poll_flush(now);
@@ -61,19 +61,46 @@ fn spawn_flusher_once() {
     });
 }
 
-/// The default flush period for buffered appends.
-// PROBE-PENDING: placeholder until the T probe (R5 item 1) measures the knee;
-// the shipped default must be the measured value, not this hypothesis.
-pub(crate) const DEFAULT_WRITE_FLUSH_MS: u64 = 250;
+/// Default session-JSONL flush period, in milliseconds.
+///
+/// Probe-measured (R5 item 1; 40 events/s, release build, 800 appends per
+/// phase): append latency plateaus at T >= 50 — session op_p50 508us at
+/// write-through vs 156-167us for every T in {50,100,250,500,1000} — so past
+/// 50 the only tradeoff is write-op count vs the crash window. Session lines
+/// carry conversation entries, so the default stays conservative: 100ms is a
+/// 5x write-op reduction (800 -> 161) with at most 100ms of entries at risk.
+pub(crate) const SESSION_WRITE_FLUSH_MS: u64 = 100;
+
+/// Default event-log flush period, in milliseconds.
+///
+/// The semantic-edge ledger is a crash-tolerant cache: `replay_sync` skips a
+/// torn final line and the append path truncates it, so losing up to 250ms of
+/// records to a crash costs only re-derivable edges. The same probe table
+/// shows the deeper period buys an 11x write-op reduction (800 -> 73) at the
+/// same plateau latency — the disk-churn reduction is the point on this
+/// AV-on-write host.
+pub(crate) const EVENT_LOG_WRITE_FLUSH_MS: u64 = 250;
 
 /// Effective flush period from `PRIME_AGENT_WRITE_FLUSH_MS`, falling back to
-/// the default. `0` disables buffering-time coalescing (every append flushes).
-pub(crate) fn write_flush_period() -> Duration {
+/// `default_ms`. `0` disables coalescing (every append writes through). One
+/// env knob deliberately governs both streams so benches and probes can pin
+/// a uniform T across them.
+fn write_flush_period_or(default_ms: u64) -> Duration {
     let ms = std::env::var("PRIME_AGENT_WRITE_FLUSH_MS")
         .ok()
         .and_then(|value| value.trim().parse::<u64>().ok())
-        .unwrap_or(DEFAULT_WRITE_FLUSH_MS);
+        .unwrap_or(default_ms);
     Duration::from_millis(ms)
+}
+
+/// Flush period for the session JSONL write buffer.
+pub(crate) fn session_write_flush_period() -> Duration {
+    write_flush_period_or(SESSION_WRITE_FLUSH_MS)
+}
+
+/// Flush period for the event-log write buffers.
+pub(crate) fn event_log_write_flush_period() -> Duration {
+    write_flush_period_or(EVENT_LOG_WRITE_FLUSH_MS)
 }
 
 /// A byte buffer with a flush deadline. Shared shape of the session and

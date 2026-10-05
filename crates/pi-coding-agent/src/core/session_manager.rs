@@ -31,7 +31,7 @@ use crate::utils::file_lines::{
     read_bytes_sync, read_first_line_sync, read_lines_as_buffers, ReadLinesRange,
 };
 use crate::utils::timed_flush::{
-    register_timed_flush, write_flush_period, TimedBytes, TimedFlush, DEFAULT_WRITE_FLUSH_MS,
+    register_timed_flush, session_write_flush_period, TimedBytes, TimedFlush,
 };
 
 pub const CURRENT_SESSION_VERSION: i64 = 3;
@@ -3409,16 +3409,35 @@ impl SessionWriteBuffer {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone();
         if inner.timed.bytes.is_empty() {
-            if let Some(error) = inner.pending_error.take() {
+            // Surface a retained failure without consuming it: only a
+            // successful write, a rewrite, or a retarget clears it. The
+            // background flusher polls this same path, so a take() here
+            // would let a dropped batch vanish without any caller seeing
+            // the error.
+            if let Some(error) = inner.pending_error.clone() {
                 return Err(error);
             }
             return Ok(());
         }
-        let mut file = std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                // Same drop-on-failure rule as a failed write below: the
+                // batch must not stay armed for a later retry against a
+                // different state of the target (e.g. an obstruction that
+                // the caller has since repaired - retrying then would
+                // write bytes the caller believes failed).
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                return Err(error);
+            }
+        };
         use std::io::Write;
         let result = file
             .write_all(&inner.timed.bytes)
@@ -3460,16 +3479,25 @@ impl SessionWriteBuffer {
             .clone();
         let payload = [inner.timed.bytes.as_slice(), line.as_bytes()].concat();
         if payload.is_empty() {
-            if let Some(error) = inner.pending_error.take() {
+            if let Some(error) = inner.pending_error.clone() {
                 return Err(error);
             }
             return Ok(());
         }
-        let mut file = std::fs::OpenOptions::new()
+        let opened = std::fs::OpenOptions::new()
             .create(true)
             .append(true)
             .open(&path)
-            .map_err(|error| error.to_string())?;
+            .map_err(|error| error.to_string());
+        let mut file = match opened {
+            Ok(file) => file,
+            Err(error) => {
+                inner.timed.bytes.clear();
+                inner.timed.deadline = None;
+                inner.pending_error = Some(error.clone());
+                return Err(error);
+            }
+        };
         use std::io::Write;
         let result = file.write_all(&payload).map_err(|error| error.to_string());
         match result {
@@ -3491,11 +3519,18 @@ impl SessionWriteBuffer {
     }
 
     /// Buffer one line (newline-terminated) and flush early past the cap.
+    /// A retained drain failure rejects the accept: the entry stays in
+    /// memory, the append fails, and the manager's failure contract forces
+    /// the recovery rewrite (which clears the failure) - mirroring the
+    /// old write-through append failure exactly.
     fn push_line(&self, line: &[u8]) -> Result<(), String> {
         let mut inner = self
             .inner
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(error) = inner.pending_error.clone() {
+            return Err(error);
+        }
         inner
             .timed
             .push(line, self.period, std::time::Instant::now());
@@ -3594,7 +3629,10 @@ impl SessionManager {
             persist_write_epoch: 0,
             rlm_delivery_synced_epoch: None,
             write_buffer: if persist {
-                Some(Arc::new(SessionWriteBuffer::new("", write_flush_period())))
+                Some(Arc::new(SessionWriteBuffer::new(
+                    "",
+                    session_write_flush_period(),
+                )))
             } else {
                 None
             },
@@ -5623,6 +5661,12 @@ mod tests {
         let dir = temp_dir();
         let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
         let file = manager.new_session(None).unwrap().unwrap();
+        // Pin a huge period: the mid-test "still buffered" assertion must not
+        // race the timed flusher on a slow box (the default is 100ms).
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
         for index in 0..25 {
             let message = if index % 2 == 0 {
                 user_message(&format!("line-{index}"), index)
@@ -5668,6 +5712,12 @@ mod tests {
         let dir = temp_dir();
         let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
         let file = manager.new_session(None).unwrap().unwrap();
+        // Pin a huge period: the "still buffered" assertion below must not
+        // race the timed flusher (the default is 100ms).
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
         manager
             .append_message(assistant_message("gpt-5", 1))
             .unwrap();
@@ -5796,6 +5846,60 @@ mod tests {
         let contents = std::fs::read_to_string(&file).unwrap();
         let lines: Vec<&str> = contents.trim_end().split('\n').collect();
         assert_eq!(lines.len(), 3, "the Drop drain landed the buffered lines");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn drain_open_failure_drops_the_batch_and_recovers_via_rewrite() {
+        let dir = temp_dir();
+        let mut manager = SessionManager::create("/work", Some(&dir.to_string_lossy())).unwrap();
+        let file = manager.new_session(None).unwrap().unwrap();
+        manager
+            .append_message(assistant_message("gpt-5", 1))
+            .unwrap();
+        // Pin a huge period so only explicit drains act in this test.
+        manager.write_buffer = Some(Arc::new(SessionWriteBuffer::new(
+            &file,
+            std::time::Duration::from_secs(3600),
+        )));
+        manager.append_message(user_message("buffered", 2)).unwrap();
+        let before = std::fs::read_to_string(&file).unwrap();
+        // Obstruct the target: the file becomes a directory.
+        std::fs::remove_file(&file).unwrap();
+        std::fs::create_dir(&file).unwrap();
+        assert!(manager.flush_now().is_err());
+        // Repair the path. The failed batch must NOT land later: a drain that
+        // cannot even open the target drops its bytes (retrying against a
+        // repaired path would write bytes the caller believes failed).
+        std::fs::remove_dir(&file).unwrap();
+        std::fs::write(&file, &before).unwrap();
+        std::thread::sleep(std::time::Duration::from_millis(50));
+        assert_eq!(
+            std::fs::read_to_string(&file).unwrap(),
+            before,
+            "the failed batch must not land after the repair"
+        );
+        // The failure is retained: further flushes surface it and accepts are
+        // rejected until the recovery rewrite clears it - mirroring the old
+        // write-through append failure contract.
+        assert!(manager.flush_now().is_err());
+        assert!(manager.append_message(user_message("blocked", 3)).is_err());
+        // The failed append is retained in memory; the next append takes the
+        // rewrite path and lands everything (the recovery rewrite).
+        manager
+            .append_message(user_message("recovered", 4))
+            .unwrap();
+        let after = std::fs::read_to_string(&file).unwrap();
+        assert!(
+            after.contains("blocked"),
+            "the retained failed entry recovered"
+        );
+        assert!(after.contains("recovered"));
+        assert!(after.contains("buffered"));
+        assert!(
+            manager.flush_now().is_ok(),
+            "the rewrite cleared the failure"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
