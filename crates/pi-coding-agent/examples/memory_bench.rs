@@ -123,30 +123,34 @@ struct QuestionSpec {
 }
 
 #[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
 struct ManifestSettings {
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "recall_on")]
     recall_on: bool,
-    #[serde(default)]
+    #[serde(default, alias = "max_recall_chars")]
     max_recall_chars: Option<i64>,
-    #[serde(default)]
+    #[serde(default, alias = "max_recall_entries")]
     max_recall_entries: Option<i64>,
     /// Override memory.maxExtractionTokens (None = production default 4096).
-    #[serde(default)]
+    #[serde(default, alias = "max_extraction_tokens")]
     max_extraction_tokens: Option<i64>,
+    /// Override memory.maxImportChunkChars (None = production default 40000).
+    #[serde(default, alias = "max_import_chunk_chars")]
+    max_import_chunk_chars: Option<i64>,
     /// Extra driver-level retries for a failed import_run invocation (the job
     /// checkpoints per chunk, so a retry resumes where it stopped).
-    #[serde(default = "default_import_run_retries")]
+    #[serde(default = "default_import_run_retries", alias = "import_run_retries")]
     import_run_retries: u32,
-    #[serde(default)]
+    #[serde(default, alias = "auto_refine")]
     auto_refine: Option<Value>,
-    #[serde(default = "default_question_timeout_s")]
+    #[serde(default = "default_question_timeout_s", alias = "question_timeout_s")]
     question_timeout_s: u64,
-    #[serde(default = "default_ingest_timeout_s")]
+    #[serde(default = "default_ingest_timeout_s", alias = "ingest_timeout_s")]
     ingest_timeout_s: u64,
-    #[serde(default = "default_import_run_timeout_s")]
+    #[serde(default = "default_import_run_timeout_s", alias = "import_run_timeout_s")]
     import_run_timeout_s: u64,
     /// Disable the session toolset for question answering (default true).
-    #[serde(default = "default_true")]
+    #[serde(default = "default_true", alias = "disable_tools")]
     disable_tools: bool,
 }
 
@@ -157,6 +161,7 @@ impl Default for ManifestSettings {
             max_recall_chars: None,
             max_recall_entries: None,
             max_extraction_tokens: None,
+            max_import_chunk_chars: None,
             import_run_retries: default_import_run_retries(),
             auto_refine: None,
             question_timeout_s: default_question_timeout_s(),
@@ -274,6 +279,9 @@ impl EnvScratch {
         }
         if let Some(max_extraction_tokens) = settings.max_extraction_tokens {
             memory["maxExtractionTokens"] = json!(max_extraction_tokens);
+        }
+        if let Some(max_import_chunk_chars) = settings.max_import_chunk_chars {
+            memory["maxImportChunkChars"] = json!(max_import_chunk_chars);
         }
         let document = json!({
             "autoRefine": auto_refine,

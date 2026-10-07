@@ -485,6 +485,20 @@ impl MemoryJobs {
             let new_edits: Vec<crate::core::refinement::refinement::RefinementEdit> = unique
                 .into_iter()
                 .filter(|edit| {
+                    // Idempotent skip: an existing entry with the same id makes the create
+                    // edit a no-op (apply_refinement_proposal would mark it not-applied and
+                    // fail the whole import). The id-space is model-chosen, so collisions
+                    // across import jobs are legitimate, not conflicts.
+                    if let Some(id) = edit.id.as_deref() {
+                        if current
+                            .entries
+                            .get("memory")
+                            .map(|bucket| bucket.contains_key(id))
+                            .unwrap_or(false)
+                        {
+                            return false;
+                        }
+                    }
                     let content = edit.content.clone().unwrap_or_default().trim().to_string();
                     !current
                         .entries
