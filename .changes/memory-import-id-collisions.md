@@ -1,0 +1,2 @@
+- Fixed session import failing with `entry already exists` when the extractor reuses one memory id across chunks of the same session; import apply now keeps the last extraction per create id.
+- Fixed session import stalling on resumable preview jobs persisted by older builds: apply recomputes the deduplicated proposal when the stored accepted proposal predates the id-collision filter.
