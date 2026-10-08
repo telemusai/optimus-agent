@@ -490,6 +490,33 @@ impl MemoryJobs {
                         });
                     }
                 }
+                let mut edit = edit;
+                if edit.action == "create" {
+                    let invalid = edit
+                        .id
+                        .as_deref()
+                        .map(|id| {
+                            id.is_empty()
+                                || id.len() > 160
+                                || ["__proto__", "constructor", "prototype"].contains(&id)
+                                || !id
+                                    .chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        })
+                        .unwrap_or(true);
+                    if invalid {
+                        // The store rejects invalid ids outright ("Invalid memory
+                        // ID"), which would abort the whole import. Models
+                        // sometimes emit an empty id on a create; derive a stable
+                        // one from the edit content instead of failing.
+                        let content_key = hash(&format!(
+                            "{}:{}",
+                            edit.kind,
+                            edit.content.clone().unwrap_or_default().trim()
+                        ));
+                        edit.id = Some(format!("imported_{:.48}", &content_key[..24.min(content_key.len())]));
+                    }
+                }
                 seen.push(key);
                 unique.push(edit);
             }
