@@ -478,6 +478,45 @@ impl MemoryJobs {
                 if seen.contains(&key) {
                     continue;
                 }
+                // Chunks are extracted independently, so the model can re-emit
+                // one id with different content across chunks of the same
+                // session. Only one create per id can apply; a repeat would
+                // fail the whole import with "entry already exists". Keep the
+                // last extraction so the most recent chunk summary wins.
+                if edit.action == "create" {
+                    if let Some(id) = edit.id.as_deref() {
+                        unique.retain(|kept| {
+                            !(kept.action == "create" && kept.id.as_deref() == Some(id))
+                        });
+                    }
+                }
+                let mut edit = edit;
+                if edit.action == "create" {
+                    let invalid = edit
+                        .id
+                        .as_deref()
+                        .map(|id| {
+                            id.is_empty()
+                                || id.len() > 160
+                                || ["__proto__", "constructor", "prototype"].contains(&id)
+                                || !id
+                                    .chars()
+                                    .all(|c| c.is_ascii_alphanumeric() || c == '_' || c == '-')
+                        })
+                        .unwrap_or(true);
+                    if invalid {
+                        // The store rejects invalid ids outright ("Invalid memory
+                        // ID"), which would abort the whole import. Models
+                        // sometimes emit an empty id on a create; derive a stable
+                        // one from the edit content instead of failing.
+                        let content_key = hash(&format!(
+                            "{}:{}",
+                            edit.kind,
+                            edit.content.clone().unwrap_or_default().trim()
+                        ));
+                        edit.id = Some(format!("imported_{:.48}", &content_key[..24.min(content_key.len())]));
+                    }
+                }
                 seen.push(key);
                 unique.push(edit);
             }
@@ -485,6 +524,20 @@ impl MemoryJobs {
             let new_edits: Vec<crate::core::refinement::refinement::RefinementEdit> = unique
                 .into_iter()
                 .filter(|edit| {
+                    // Idempotent skip: an existing entry with the same id makes the create
+                    // edit a no-op (apply_refinement_proposal would mark it not-applied and
+                    // fail the whole import). The id-space is model-chosen, so collisions
+                    // across import jobs are legitimate, not conflicts.
+                    if let Some(id) = edit.id.as_deref() {
+                        if current
+                            .entries
+                            .get("memory")
+                            .map(|bucket| bucket.contains_key(id))
+                            .unwrap_or(false)
+                        {
+                            return false;
+                        }
+                    }
                     let content = edit.content.clone().unwrap_or_default().trim().to_string();
                     !current
                         .entries
@@ -873,6 +926,74 @@ mod tests {
         assert!(overview["chunks"][0]["index"] == serde_json::json!(0));
         assert!(overview["chunks"][0]["sourceIds"].as_array().unwrap().len() >= 1);
         assert!(overview["chunks"][0].get("records").is_none());
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn repeated_create_ids_across_chunks_keep_the_last_extraction() {
+        let (jobs, root) = fixture();
+        let runtime = runtime();
+        let mut lines = Vec::new();
+        for index in 0..4 {
+            lines.push(
+                serde_json::to_string(&serde_json::json!({
+                    "type": "message", "id": format!("row_{index}"),
+                    "message": {"role": "user", "content": format!("note {index} {}", "x".repeat(40_000)), "timestamp": index}
+                }))
+                .unwrap(),
+            );
+        }
+        let path = root.join("repeated.jsonl");
+        std::fs::write(&path, lines.join("\n")).unwrap();
+        let job = runtime
+            .block_on(jobs.prepare(&path.to_string_lossy()))
+            .unwrap();
+        assert!(job.chunks.len() > 1, "expected multiple chunks");
+        let calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let calls_handle = calls.clone();
+        let extract: MemoryExtractor = Arc::new(move |_| {
+            let calls = calls_handle.clone();
+            Box::pin(async move {
+                let index = calls.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                Ok(ExtractionResult {
+                    proposal: normalize_refinement_proposal(&serde_json::json!({
+                        "summary": "s", "rationale": "r", "expectedOutcome": "o",
+                        "edits": [{"action": "create", "kind": "memory", "id": "shared_topic", "title": "Shared", "content": format!("extraction_{index}")}]
+                    })),
+                    input: 1.0,
+                    output: 1.0,
+                })
+            })
+        });
+        let mut completed = runtime
+            .block_on(jobs.run(&job.id, extract.clone(), None))
+            .unwrap();
+        while completed.status == ImportJobStatus::Pending {
+            completed = runtime
+                .block_on(jobs.run(&job.id, extract.clone(), None))
+                .unwrap();
+        }
+        assert_eq!(completed.status, ImportJobStatus::Preview);
+        let total = calls.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(total > 1, "expected multiple chunk extractions");
+        let applied = runtime.block_on(jobs.apply(&job.id, 0)).expect("apply");
+        assert_eq!(applied.status, ImportJobStatus::Applied);
+        let accepted = applied.accepted_proposal.expect("accepted proposal");
+        let shared: Vec<_> = accepted
+            .edits
+            .iter()
+            .filter(|edit| edit.id.as_deref() == Some("shared_topic"))
+            .collect();
+        assert_eq!(shared.len(), 1, "one create per id");
+        let store = jobs.store.read().unwrap();
+        let bucket = store.entries.get("memory").expect("memory bucket");
+        let entry = bucket.get("shared_topic").expect("stored entry");
+        assert_eq!(entry.content, shared[0].content.clone().unwrap_or_default());
+        assert_eq!(
+            entry.content,
+            format!("extraction_{}", total - 1),
+            "last chunk extraction wins"
+        );
         std::fs::remove_dir_all(&root).ok();
     }
 
