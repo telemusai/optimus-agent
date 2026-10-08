@@ -152,6 +152,11 @@ struct ManifestSettings {
     /// Disable the session toolset for question answering (default true).
     #[serde(default = "default_true", alias = "disable_tools")]
     disable_tools: bool,
+    /// Optional benchmark answering-protocol wrapper: the prompt becomes the
+    /// instruction, a blank line, then "Question: <question>" so the model
+    /// answers directly instead of narrating agent-style tool intent.
+    #[serde(default, alias = "answer_instruction")]
+    answer_instruction: Option<String>,
 }
 
 impl Default for ManifestSettings {
@@ -168,6 +173,7 @@ impl Default for ManifestSettings {
             ingest_timeout_s: default_ingest_timeout_s(),
             import_run_timeout_s: default_import_run_timeout_s(),
             disable_tools: true,
+            answer_instruction: None,
         }
     }
 }
@@ -841,11 +847,17 @@ async fn run_question(
         );
     }
 
+    let effective_question = match &manifest.settings.answer_instruction {
+        Some(instruction) => {
+            format!("{instruction}\n\nQuestion: {}", question.question)
+        }
+        None => question.question.clone(),
+    };
     let prompt_result = tokio::time::timeout(
         Duration::from_secs(manifest.settings.question_timeout_s),
         async {
             session
-                .prompt_and_wait(&question.question, None)
+                .prompt_and_wait(&effective_question, None)
                 .await
                 .map_err(|error| format!("prompt failed: {error}"))?;
             session
