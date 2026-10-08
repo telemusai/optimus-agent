@@ -157,6 +157,10 @@ struct ManifestSettings {
     /// answers directly instead of narrating agent-style tool intent.
     #[serde(default, alias = "answer_instruction")]
     answer_instruction: Option<String>,
+    /// Optional override for the session-import extraction instruction
+    /// (memory.importInstructions in settings.json).
+    #[serde(default, alias = "import_instructions")]
+    import_instructions: Option<String>,
 }
 
 impl Default for ManifestSettings {
@@ -174,6 +178,7 @@ impl Default for ManifestSettings {
             import_run_timeout_s: default_import_run_timeout_s(),
             disable_tools: true,
             answer_instruction: None,
+            import_instructions: None,
         }
     }
 }
@@ -279,6 +284,9 @@ impl EnvScratch {
         let mut memory = json!({"recall": settings.recall_on});
         if let Some(max_chars) = settings.max_recall_chars {
             memory["maxRecallChars"] = json!(max_chars);
+        }
+        if let Some(instructions) = &settings.import_instructions {
+            memory["importInstructions"] = json!(instructions);
         }
         if let Some(max_entries) = settings.max_recall_entries {
             memory["maxRecallEntries"] = json!(max_entries);
