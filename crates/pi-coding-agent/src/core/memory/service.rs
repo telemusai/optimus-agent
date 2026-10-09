@@ -643,7 +643,17 @@ pub fn create_memory_host_handlers(
                                     base_delay_ms: retry.base_delay_ms,
                                     max_retry_delay_ms: retry.max_retry_delay_ms,
                                 }),
-                                instructions: Some("Extract durable host-neutral project facts only. Only create edits of kind memory with cited sourceIds. Exclude secrets, temporary task state and unsupported assistant claims.".to_string()),
+                                instructions: Some(
+        memory
+            .store
+            .settings()
+            .import_instructions
+            .clone()
+            .unwrap_or_else(|| {
+                "Extract durable host-neutral project facts only. Only create edits of kind memory with cited sourceIds. Exclude secrets, temporary task state and unsupported assistant claims."
+                    .to_string()
+            }),
+    ),
                                 ..Default::default()
                             },
                         ).await

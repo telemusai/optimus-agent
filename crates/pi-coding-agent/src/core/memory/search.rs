@@ -1,5 +1,5 @@
 //! Port of packages/coding-agent/src/core/memory/search.ts
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 
 use serde::{Deserialize, Serialize};
@@ -225,6 +225,35 @@ pub fn search_memory(
     }
     corpus.extend(additional.iter().cloned());
     let terms = words(query);
+    // Inverse document frequency over the searched corpus: rare terms
+    // discriminate better than terms present in most entries. Weighting
+    // matched terms by idf keeps the mean-over-terms score shape while
+    // demoting ubiquitous filler matches.
+    let mut document_frequency: HashMap<String, usize> = HashMap::new();
+    for SearchCorpus { state, .. } in &corpus {
+        for bucket in state.entries.values() {
+            for entry in bucket.values() {
+                let mut seen: HashSet<String> = HashSet::new();
+                seen.extend(words(&format!(
+                    "{} {} {}",
+                    entry.title, entry.path, entry.id
+                )));
+                seen.extend(words(&entry.content));
+                for term in seen {
+                    *document_frequency.entry(term).or_default() += 1;
+                }
+            }
+        }
+    }
+    let total_documents: f64 = {
+        let mut count = 0.0;
+        for SearchCorpus { state, .. } in &corpus {
+            for bucket in state.entries.values() {
+                count += bucket.len() as f64;
+            }
+        }
+        count
+    };
     let mut hits: Vec<MemoryHit> = Vec::new();
     for SearchCorpus {
         state,
@@ -262,11 +291,21 @@ pub fn search_memory(
                 if !terms.is_empty() && matched.is_empty() {
                     continue;
                 }
-                let score = matched
-                    .iter()
-                    .map(|term| if title_set.contains(term) { 3.0 } else { 1.0 })
-                    .sum::<f64>()
-                    / (terms.len().max(1) as f64);
+                let score = {
+                    let idf = |term: &str| -> f64 {
+                        let df = document_frequency
+                            .get(term)
+                            .copied()
+                            .unwrap_or(0) as f64;
+                        ((total_documents + 1.0) / (df + 1.0)).ln() + 1.0
+                    };
+                    let denominator: f64 = terms.iter().map(|term| idf(term)).sum::<f64>();
+                    let numerator: f64 = matched
+                        .iter()
+                        .map(|term| if title_set.contains(term) { 3.0 } else { 1.0 } * idf(term))
+                        .sum();
+                    if denominator > 0.0 { numerator / denominator } else { 0.0 }
+                };
                 let scope = if host_id.is_some() {
                     MemoryScope::Host
                 } else {

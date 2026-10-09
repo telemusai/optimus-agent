@@ -157,6 +157,14 @@ struct ManifestSettings {
     /// answers directly instead of narrating agent-style tool intent.
     #[serde(default, alias = "answer_instruction")]
     answer_instruction: Option<String>,
+    /// Optional override for the session-import extraction instruction
+    /// (memory.importInstructions in settings.json).
+    #[serde(default, alias = "import_instructions")]
+    import_instructions: Option<String>,
+    /// Skip environment ingestion entirely (nomem variant: questions are answered
+    /// without memory recall, so extraction is wasted work).
+    #[serde(default, alias = "skip_ingest")]
+    skip_ingest: bool,
 }
 
 impl Default for ManifestSettings {
@@ -174,6 +182,8 @@ impl Default for ManifestSettings {
             import_run_timeout_s: default_import_run_timeout_s(),
             disable_tools: true,
             answer_instruction: None,
+            import_instructions: None,
+            skip_ingest: false,
         }
     }
 }
@@ -280,6 +290,9 @@ impl EnvScratch {
         if let Some(max_chars) = settings.max_recall_chars {
             memory["maxRecallChars"] = json!(max_chars);
         }
+        if let Some(instructions) = &settings.import_instructions {
+            memory["importInstructions"] = json!(instructions);
+        }
         if let Some(max_entries) = settings.max_recall_entries {
             memory["maxRecallEntries"] = json!(max_entries);
         }
@@ -317,13 +330,18 @@ impl EnvScratch {
             for (position, event) in session.events.iter().enumerate() {
                 let row_id = format!("m_{:04}", position + 1);
                 let timestamp = base_timestamp_ms + (position as i64) * 60_000;
+                // Imported-transcript fidelity: benchmark conversations are
+                // two external speakers, not a user talking to this assistant.
+                // Relabel every event as user-origin so the extractor's
+                // evidence rules (assistant assertions are not verified facts)
+                // do not silently drop half the conversation.
                 let row = json!({
                     "type": "message",
                     "id": row_id,
                     "parentId": previous_id,
                     "timestamp": timestamp,
                     "message": {
-                        "role": event.role,
+                        "role": "user",
                         "content": [{"type": "text", "text": event.text}],
                         "timestamp": timestamp as f64,
                     },
@@ -1079,6 +1097,16 @@ async fn run(manifest: Manifest, models_source: &Path) -> Result<(), String> {
         scratch_by_env.insert(env.env_id.clone(), scratch.clone());
 
         let key = record_key(&[&manifest.run_id, &env.env_id]);
+        if manifest.settings.skip_ingest {
+            scratch_by_env.insert(env.env_id.clone(), scratch.clone());
+            eprintln!(
+                "[env {}/{}] {} ingest skipped (skipIngest)",
+                position + 1,
+                manifest.envs.len(),
+                env.env_id
+            );
+            continue;
+        }
         if done_envs.contains(&key) {
             eprintln!(
                 "[env {}/{}] {} already ingested (env.jsonl); skipping ingest",

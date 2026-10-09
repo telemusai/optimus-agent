@@ -491,6 +491,13 @@ impl MemoryJobs {
                     }
                 }
                 let mut edit = edit;
+                // The extractor sometimes copies a display projectId into edit
+                // metadata; the store rejects foreign project ids outright
+                // ("Memory belongs to another project"), aborting the whole
+                // import. Drop the field and let the store stamp its own.
+                if let Some(metadata) = edit.metadata.as_mut() {
+                    metadata.shift_remove("projectId");
+                }
                 if edit.action == "create" {
                     let invalid = edit
                         .id

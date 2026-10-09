@@ -40,6 +40,10 @@ pub struct MemorySettings {
     pub max_import_chunk_chars: i64,
     #[serde(rename = "maxImportChunksPerRun")]
     pub max_import_chunks_per_run: i64,
+    /// Optional override for the session-import extraction instruction.
+    /// None keeps the built-in default instruction.
+    #[serde(default, skip_serializing_if = "Option::is_none", rename = "importInstructions")]
+    pub import_instructions: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<Option<SharedConfig>>,
 }
@@ -60,6 +64,7 @@ pub fn default_memory_settings() -> MemorySettings {
         max_import_bytes: 32 * 1024 * 1024,
         max_import_chunk_chars: 40000,
         max_import_chunks_per_run: 4,
+        import_instructions: None,
         shared: None,
     }
 }
@@ -212,6 +217,7 @@ pub struct PartialMemorySettings {
     pub max_import_bytes: Option<i64>,
     pub max_import_chunk_chars: Option<i64>,
     pub max_import_chunks_per_run: Option<i64>,
+    pub import_instructions: Option<String>,
     pub shared: Option<Option<SharedConfig>>,
 }
 
@@ -251,6 +257,11 @@ pub fn validate_settings(value: &Value) -> Result<PartialMemorySettings, String>
                 "maxImportChunkChars" => result.max_import_chunk_chars = Some(number),
                 _ => result.max_import_chunks_per_run = Some(number),
             }
+        }
+    }
+    if let Some(Value::String(instructions)) = source.get("importInstructions") {
+        if !instructions.trim().is_empty() {
+            result.import_instructions = Some(instructions.trim().to_string());
         }
     }
     match source.get("shared") {
@@ -853,6 +864,9 @@ fn apply_settings(settings: &mut MemorySettings, patch: &PartialMemorySettings) 
     if let Some(value) = patch.max_import_chunks_per_run {
         settings.max_import_chunks_per_run = value;
     }
+    if let Some(value) = &patch.import_instructions {
+        settings.import_instructions = Some(value.clone());
+    }
     if patch.shared.is_some() {
         settings.shared = patch.shared.clone();
     }
@@ -892,6 +906,12 @@ fn merge_settings_patch(target: &mut JsonMap, patch: &PartialMemorySettings) {
             .max_import_chunks_per_run
             .map(|value| Value::from(value)),
     );
+    if let Some(instructions) = &patch.import_instructions {
+        target.insert(
+            "importInstructions".to_string(),
+            Value::String(instructions.clone()),
+        );
+    }
     if let Some(shared) = &patch.shared {
         target.insert(
             "shared".to_string(),
