@@ -552,17 +552,25 @@ impl MemoryStore {
         let options = options.clone();
         self.exclusive(move || {
             let doc = self.read()?;
-            let fingerprint = hash(
-                &serde_json::to_string(&serde_json::json!({
-                    "proposal": proposal,
-                    "sources": options.sources.as_deref().unwrap_or(&[]),
-                    "host": options.host,
-                    "replaceMetadata": options.replace_metadata,
-                }))
-                .unwrap_or_default(),
+            let mut fingerprint_payload = serde_json::json!({
+                "proposal": proposal,
+                "sources": options.sources.as_deref().unwrap_or(&[]),
+                "host": options.host,
+                "replaceMetadata": options.replace_metadata,
+            });
+            let legacy_fingerprint = hash(
+                &serde_json::to_string(&fingerprint_payload).unwrap_or_default(),
             );
+            // Old receipts collapsed omission and []; keep them as read-only retry aliases.
+            // Bind source intent for new empty-source receipts without changing nonempty hashes.
+            let fingerprint = if options.sources.as_deref().unwrap_or(&[]).is_empty() {
+                fingerprint_payload["sourcesProvided"] = Value::Bool(options.sources.is_some());
+                hash(&serde_json::to_string(&fingerprint_payload).unwrap_or_default())
+            } else {
+                legacy_fingerprint.clone()
+            };
             if let Some(prior) = doc.memory.events.get(&options.event_id) {
-                if prior != &fingerprint {
+                if prior != &fingerprint && prior != &legacy_fingerprint {
                     return Err("Event ID reused with different content".to_string());
                 }
                 let result = doc
@@ -866,6 +874,12 @@ fn apply_settings(settings: &mut MemorySettings, patch: &PartialMemorySettings) 
     }
     if let Some(value) = patch.learning {
         settings.learning = value;
+    }
+    if let Some(value) = patch.recall_query_distillation {
+        settings.recall_query_distillation = value;
+    }
+    if let Some(value) = patch.recall_rerank {
+        settings.recall_rerank = value;
     }
     if let Some(value) = patch.max_recall_chars {
         settings.max_recall_chars = value;

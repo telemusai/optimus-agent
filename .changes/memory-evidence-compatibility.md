@@ -1,0 +1,4 @@
+- Fixed opt-in memory recall settings propagation and bounded query-distillation/reranking fallback, cancellation, and cache behavior; defaults remain disabled.
+- Fixed memory update provenance preservation and source-intent retry handling while retaining legacy snapshot and receipt compatibility.
+- Fixed lexical memory ranking so entries outside the allowed scope or inactive selection cannot affect relevance scores.
+- Added offline regression coverage for memory compatibility, source-intent retries, scoped ranking, and actual recall-hook activation.

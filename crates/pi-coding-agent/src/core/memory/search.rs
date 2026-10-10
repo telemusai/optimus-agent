@@ -225,36 +225,7 @@ pub fn search_memory(
     }
     corpus.extend(additional.iter().cloned());
     let terms = words(query);
-    // Inverse document frequency over the searched corpus: rare terms
-    // discriminate better than terms present in most entries. Weighting
-    // matched terms by idf keeps the mean-over-terms score shape while
-    // demoting ubiquitous filler matches.
-    let mut document_frequency: HashMap<String, usize> = HashMap::new();
-    for SearchCorpus { state, .. } in &corpus {
-        for bucket in state.entries.values() {
-            for entry in bucket.values() {
-                let mut seen: HashSet<String> = HashSet::new();
-                seen.extend(words(&format!(
-                    "{} {} {}",
-                    entry.title, entry.path, entry.id
-                )));
-                seen.extend(words(&entry.content));
-                for term in seen {
-                    *document_frequency.entry(term).or_default() += 1;
-                }
-            }
-        }
-    }
-    let total_documents: f64 = {
-        let mut count = 0.0;
-        for SearchCorpus { state, .. } in &corpus {
-            for bucket in state.entries.values() {
-                count += bucket.len() as f64;
-            }
-        }
-        count
-    };
-    let mut hits: Vec<MemoryHit> = Vec::new();
+    let mut candidates = Vec::new();
     for SearchCorpus {
         state,
         scope: base_scope,
@@ -266,7 +237,11 @@ pub fn search_memory(
                 if project_id.is_some() && project_id != Some(store.project.id.as_str()) {
                     continue;
                 }
-                let host_id = entry.metadata.get("hostId").and_then(Value::as_str).filter(|id| !id.is_empty());
+                let host_id = entry
+                    .metadata
+                    .get("hostId")
+                    .and_then(Value::as_str)
+                    .filter(|id| !id.is_empty());
                 if host_id.is_some() && host_id != Some(store.host_id.as_str()) {
                     continue;
                 }
@@ -283,46 +258,58 @@ pub fn search_memory(
                         .into_iter()
                         .collect();
                 let body_set: HashSet<String> = words(&entry.content).into_iter().collect();
-                let matched: Vec<String> = terms
-                    .iter()
-                    .filter(|term| title_set.contains(*term) || body_set.contains(*term))
-                    .cloned()
-                    .collect();
-                if !terms.is_empty() && matched.is_empty() {
-                    continue;
-                }
-                let score = {
-                    let idf = |term: &str| -> f64 {
-                        let df = document_frequency
-                            .get(term)
-                            .copied()
-                            .unwrap_or(0) as f64;
-                        ((total_documents + 1.0) / (df + 1.0)).ln() + 1.0
-                    };
-                    let denominator: f64 = terms.iter().map(|term| idf(term)).sum::<f64>();
-                    let numerator: f64 = matched
-                        .iter()
-                        .map(|term| if title_set.contains(term) { 3.0 } else { 1.0 } * idf(term))
-                        .sum();
-                    if denominator > 0.0 { numerator / denominator } else { 0.0 }
-                };
                 let scope = if host_id.is_some() {
                     MemoryScope::Host
                 } else {
                     *base_scope
                 };
-                let refs = sources(entry);
-                hits.push(MemoryHit {
-                    id: format!("{}:{}:{}", scope.as_str(), entry.kind.as_str(), entry.id),
-                    scope,
-                    entry: entry.clone(),
-                    score,
-                    matched,
-                    freshness: MemoryFreshness::Unknown,
-                    sources: refs,
-                });
+                candidates.push((entry, scope, title_set, body_set));
             }
         }
+    }
+    // Count every eligible entry, including nonmatches, once per term. Entries
+    // excluded from this search must not affect the scores of allowed hits.
+    let mut document_frequency: HashMap<String, usize> = HashMap::new();
+    for (_, _, title_set, body_set) in &candidates {
+        for term in title_set.union(body_set) {
+            *document_frequency.entry(term.clone()).or_default() += 1;
+        }
+    }
+    let total_documents = candidates.len() as f64;
+    let idf = |term: &str| -> f64 {
+        let df = document_frequency.get(term).copied().unwrap_or(0) as f64;
+        ((total_documents + 1.0) / (df + 1.0)).ln() + 1.0
+    };
+    let denominator: f64 = terms.iter().map(|term| idf(term)).sum();
+    let mut hits: Vec<MemoryHit> = Vec::new();
+    for (entry, scope, title_set, body_set) in candidates {
+        let matched: Vec<String> = terms
+            .iter()
+            .filter(|term| title_set.contains(*term) || body_set.contains(*term))
+            .cloned()
+            .collect();
+        if !terms.is_empty() && matched.is_empty() {
+            continue;
+        }
+        let numerator: f64 = matched
+            .iter()
+            .map(|term| if title_set.contains(term) { 3.0 } else { 1.0 } * idf(term))
+            .sum();
+        let score = if denominator > 0.0 {
+            numerator / denominator
+        } else {
+            0.0
+        };
+        let refs = sources(entry);
+        hits.push(MemoryHit {
+            id: format!("{}:{}:{}", scope.as_str(), entry.kind.as_str(), entry.id),
+            scope,
+            entry: entry.clone(),
+            score,
+            matched,
+            freshness: MemoryFreshness::Unknown,
+            sources: refs,
+        });
     }
     hits.sort_by(|left, right| {
         right
@@ -444,6 +431,303 @@ mod tests {
             "created_at": "2026-01-01T00:00:00.000Z", "updated_at": "2026-01-01T00:00:00.000Z", "version": 1
         }))
         .unwrap()
+    }
+
+    fn corpus(scope: MemoryScope, entries: Vec<HarnessEntry>) -> SearchCorpus {
+        let mut state = empty_document("project_test").harness();
+        for entry in entries {
+            state
+                .entries
+                .get_mut(entry.kind.as_str())
+                .unwrap()
+                .insert(entry.id.clone(), entry);
+        }
+        SearchCorpus { state, scope }
+    }
+
+    #[test]
+    fn foreign_entries_cannot_change_allowed_scores_or_order() {
+        let (store, root) = fixture();
+        let allowed = corpus(
+            MemoryScope::Global,
+            vec![entry("alpha", "Amber", ""), entry("beta", "Cobalt", "")],
+        );
+        let baseline = search_memory(
+            &store,
+            "amber cobalt",
+            std::slice::from_ref(&allowed),
+            false,
+        );
+        assert_eq!(baseline.len(), 2);
+        assert_eq!(baseline[0].entry.id, "alpha");
+        assert_eq!(baseline[1].entry.id, "beta");
+        assert!(baseline.iter().all(|hit| (hit.score - 1.5).abs() < 1e-12));
+
+        let foreign_host = "00000000-0000-0000-0000-000000000000";
+        let metadata_cases = [
+            serde_json::json!({"projectId": "project_other"}),
+            serde_json::json!({"hostId": foreign_host}),
+            serde_json::json!({"projectId": "project_other", "hostId": store.host_id}),
+            serde_json::json!({"projectId": store.project.id, "hostId": foreign_host}),
+            serde_json::json!({"projectId": "project_other", "hostId": foreign_host}),
+            serde_json::json!({"projectId": ""}),
+        ];
+        for metadata in metadata_cases {
+            for kind in crate::core::refinement::refinement::RefinementKind::ALL {
+                let mut foreign = entry("foreign", "Amber", "amber amber hidden-only");
+                foreign.kind = kind;
+                foreign.metadata = store_record(&metadata).unwrap();
+                let forbidden = corpus(MemoryScope::Session, vec![foreign]);
+                for include_inactive in [false, true] {
+                    let hits = search_memory(
+                        &store,
+                        "amber cobalt",
+                        &[allowed.clone(), forbidden.clone()],
+                        include_inactive,
+                    );
+                    assert_eq!(hits, baseline, "{metadata:?}, {kind:?}, {include_inactive}");
+                    let hidden_term_query = "amber cobalt hidden-only";
+                    assert_eq!(
+                        search_memory(
+                            &store,
+                            hidden_term_query,
+                            &[allowed.clone(), forbidden.clone()],
+                            include_inactive,
+                        ),
+                        search_memory(
+                            &store,
+                            hidden_term_query,
+                            std::slice::from_ref(&allowed),
+                            include_inactive,
+                        ),
+                        "hidden-only query term: {metadata:?}, {kind:?}, {include_inactive}",
+                    );
+                    for query in ["", "amber cobalt"] {
+                        assert!(search_memory(
+                            &store,
+                            query,
+                            std::slice::from_ref(&forbidden),
+                            include_inactive,
+                        )
+                        .is_empty());
+                    }
+                }
+            }
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn inactive_entries_affect_scores_only_when_included() {
+        let (store, root) = fixture();
+        let allowed = corpus(
+            MemoryScope::Global,
+            vec![entry("alpha", "Amber", ""), entry("beta", "Cobalt", "")],
+        );
+        let baseline = search_memory(
+            &store,
+            "amber cobalt hidden-only",
+            std::slice::from_ref(&allowed),
+            false,
+        );
+        let unmarked = corpus(
+            MemoryScope::Global,
+            vec![entry("inactive", "Amber", "hidden-only")],
+        );
+        let all_active = search_memory(
+            &store,
+            "amber cobalt hidden-only",
+            &[allowed.clone(), unmarked],
+            false,
+        );
+        let expected_scores: Vec<_> = all_active.iter().map(|hit| (&hit.id, hit.score)).collect();
+        let metadata_cases = [
+            serde_json::json!({"supersededBy": "replacement"}),
+            serde_json::json!({"supersededBy": null}),
+            serde_json::json!({"status": "superseded"}),
+            serde_json::json!({"detached": true}),
+            serde_json::json!({"detached": false}),
+            serde_json::json!({"detached": null}),
+        ];
+        for metadata in metadata_cases {
+            let mut inactive = entry("inactive", "Amber", "hidden-only");
+            inactive.metadata = store_record(&metadata).unwrap();
+            let inactive_corpus = corpus(MemoryScope::Global, vec![inactive]);
+            let additional = [allowed.clone(), inactive_corpus.clone()];
+            assert_eq!(
+                search_memory(&store, "amber cobalt hidden-only", &additional, false),
+                baseline
+            );
+            let included = search_memory(&store, "amber cobalt hidden-only", &additional, true);
+            let included_scores: Vec<_> = included.iter().map(|hit| (&hit.id, hit.score)).collect();
+            assert_eq!(included_scores, expected_scores, "{metadata:?}");
+            assert_ne!(
+                included
+                    .iter()
+                    .find(|hit| hit.entry.id == "alpha")
+                    .unwrap()
+                    .score,
+                baseline[0].score
+            );
+            assert!(
+                search_memory(&store, "", std::slice::from_ref(&inactive_corpus), false).is_empty()
+            );
+            let only_inactive = search_memory(&store, "amber", &[inactive_corpus], true);
+            assert_eq!(only_inactive.len(), 1);
+            assert_eq!(only_inactive[0].score, 3.0);
+        }
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn eligible_corpus_preserves_idf_and_field_weights() {
+        let (store, root) = fixture();
+        let mut first = entry("id-term", "Rare RARE", "rare common common");
+        first.path = "path-term".to_string();
+        let mut nonmatching = entry("third", "Notes", "unrelated");
+        nonmatching.kind = crate::core::refinement::refinement::RefinementKind::Prompt;
+        let additional = [
+            corpus(MemoryScope::Global, vec![first]),
+            corpus(
+                MemoryScope::Session,
+                vec![entry("second", "Common", "common")],
+            ),
+            corpus(MemoryScope::Shared, vec![nonmatching]),
+        ];
+        let query = "RARE common id-term path-term rare absent";
+        let hits = search_memory(&store, query, &additional, false);
+        assert_eq!(hits.len(), 2);
+        assert_eq!(hits[0].id, "global:memory:id-term");
+        assert_eq!(hits[1].id, "session:memory:second");
+        let rare_idf = 2.0_f64.ln() + 1.0;
+        let common_idf = (4.0_f64 / 3.0).ln() + 1.0;
+        let absent_idf = 4.0_f64.ln() + 1.0;
+        let denominator = 3.0 * rare_idf + common_idf + absent_idf;
+        assert!((hits[0].score - (9.0 * rare_idf + common_idf) / denominator).abs() < 1e-12);
+        assert!((hits[1].score - 3.0 * common_idf / denominator).abs() < 1e-12);
+        assert_eq!(
+            hits[0].matched,
+            vec!["rare", "common", "id-term", "path-term"]
+        );
+        assert_eq!(hits[1].matched, vec!["common"]);
+        assert_eq!(search_memory(&store, query, &additional, true), hits);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn eligible_metadata_preserves_legacy_scope_rules() {
+        let (store, root) = fixture();
+        let metadata_cases = [
+            serde_json::json!({}),
+            serde_json::json!({"projectId": store.project.id}),
+            serde_json::json!({"projectId": null, "hostId": null}),
+            serde_json::json!({"projectId": 42, "hostId": false}),
+            serde_json::json!({"hostId": ""}),
+            serde_json::json!({"status": "active"}),
+            serde_json::json!({"status": "Superseded"}),
+        ];
+        let mut entries = Vec::new();
+        for (index, metadata) in metadata_cases.iter().enumerate() {
+            let mut allowed = entry(&format!("allowed_{index}"), "Amber", "");
+            allowed.metadata = store_record(metadata).unwrap();
+            entries.push(allowed);
+        }
+        let mut host_entry = entry("host", "Amber", "");
+        host_entry.metadata = store_record(&serde_json::json!({
+            "projectId": store.project.id,
+            "hostId": store.host_id,
+        }))
+        .unwrap();
+        entries.push(host_entry);
+        let additional = [corpus(MemoryScope::Global, entries)];
+        let hits = search_memory(&store, "amber", &additional, false);
+        assert_eq!(hits.len(), metadata_cases.len() + 1);
+        assert_eq!(hits[0].id, "host:memory:host");
+        assert_eq!(hits[0].scope, MemoryScope::Host);
+        assert!(hits[1..].iter().all(|hit| hit.scope == MemoryScope::Global));
+        assert!(hits.iter().all(|hit| hit.score == 3.0));
+        assert_eq!(search_memory(&store, "amber", &additional, true), hits);
+        std::fs::remove_dir_all(&root).ok();
+    }
+
+    #[test]
+    fn unicode_matches_and_tie_breaks_are_stable() {
+        let (store, root) = fixture();
+        assert_eq!(
+            words("ÉCOLE école 東京 a １２"),
+            vec!["école", "東京", "１２"]
+        );
+        let mut additional: Vec<_> = [
+            MemoryScope::Global,
+            MemoryScope::Shared,
+            MemoryScope::Host,
+            MemoryScope::Project,
+            MemoryScope::Session,
+        ]
+        .into_iter()
+        .map(|scope| {
+            corpus(
+                scope,
+                vec![
+                    entry("zeta", "ÉCOLE 東京", ""),
+                    entry("alpha", "École 東京", ""),
+                ],
+            )
+        })
+        .collect();
+        let expected_ids: Vec<_> = [
+            MemoryScope::Session,
+            MemoryScope::Project,
+            MemoryScope::Host,
+            MemoryScope::Shared,
+            MemoryScope::Global,
+        ]
+        .into_iter()
+        .flat_map(|scope| ["alpha", "zeta"].map(|id| format!("{}:memory:{id}", scope.as_str())))
+        .collect();
+        let hits = search_memory(&store, "東京 ÉCOLE 東京 a", &additional, false);
+        assert_eq!(
+            hits.iter().map(|hit| hit.id.clone()).collect::<Vec<_>>(),
+            expected_ids
+        );
+        for hit in &hits {
+            assert_eq!(hit.score, 3.0);
+            assert_eq!(hit.matched, vec!["東京", "école"]);
+            assert_eq!(hit.freshness, MemoryFreshness::Unknown);
+        }
+        additional.reverse();
+        assert_eq!(
+            search_memory(&store, "東京 ÉCOLE 東京 a", &additional, false),
+            hits
+        );
+        let empty_query = search_memory(&store, "! a", &additional, false);
+        assert_eq!(
+            empty_query
+                .iter()
+                .map(|hit| hit.id.clone())
+                .collect::<Vec<_>>(),
+            expected_ids
+        );
+        assert!(empty_query
+            .iter()
+            .all(|hit| hit.score == 0.0 && hit.matched.is_empty()));
+
+        let duplicate_ids = [
+            corpus(
+                MemoryScope::Global,
+                vec![entry("same", "École 東京", "first")],
+            ),
+            corpus(
+                MemoryScope::Global,
+                vec![entry("same", "École 東京", "second")],
+            ),
+        ];
+        let duplicates = search_memory(&store, "東京 école", &duplicate_ids, false);
+        assert_eq!(duplicates.len(), 2);
+        assert_eq!(duplicates[0].id, duplicates[1].id);
+        assert_eq!(duplicates[0].entry.content, "first");
+        assert_eq!(duplicates[1].entry.content, "second");
+        std::fs::remove_dir_all(&root).ok();
     }
 
     #[test]
