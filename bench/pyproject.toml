@@ -1,0 +1,9 @@
+[project]
+name = "optimus-memory-bench"
+version = "0.1.0"
+description = "Portable offline-first memory benchmark converters and evaluators"
+requires-python = ">=3.11"
+dependencies = []
+
+[tool.uv]
+package = false

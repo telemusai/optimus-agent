@@ -1,0 +1,80 @@
+[
+  {
+    "qid": "synthetic_cue_0",
+    "env": {
+      "env_id": "synthetic_cue_0",
+      "sessions": [
+        {
+          "session_id": "synthetic-session",
+          "ts": null,
+          "events": [
+            {
+              "role": "user",
+              "text": "I need a bicycle helmet.",
+              "ext_id": "synthetic-cue",
+              "ts": null
+            }
+          ]
+        }
+      ],
+      "ground_truth_refs": [
+        "synthetic-cue"
+      ]
+    },
+    "question": "What should I buy for my next ride?",
+    "evidence_cue": "The rider needs a bicycle helmet.",
+    "category": "invented-cue"
+  },
+  {
+    "qid": "synthetic_cue_1",
+    "env": {
+      "env_id": "synthetic_cue_1",
+      "sessions": [
+        {
+          "session_id": "synthetic-session",
+          "ts": null,
+          "events": [
+            {
+              "role": "user",
+              "text": "I need a bicycle helmet.",
+              "ext_id": "synthetic-cue",
+              "ts": null
+            }
+          ]
+        }
+      ],
+      "ground_truth_refs": [
+        "synthetic-cue"
+      ]
+    },
+    "question": "What should I buy for my next ride?",
+    "evidence_cue": "The rider needs a bicycle helmet.",
+    "category": "invented-cue"
+  },
+  {
+    "qid": "synthetic_cue_2",
+    "env": {
+      "env_id": "synthetic_cue_2",
+      "sessions": [
+        {
+          "session_id": "synthetic-session",
+          "ts": null,
+          "events": [
+            {
+              "role": "user",
+              "text": "I need a bicycle helmet.",
+              "ext_id": "synthetic-cue",
+              "ts": null
+            }
+          ]
+        }
+      ],
+      "ground_truth_refs": [
+        "synthetic-cue"
+      ]
+    },
+    "question": "What should I buy for my next ride?",
+    "evidence_cue": "The rider needs a bicycle helmet.",
+    "category": "invented-cue"
+  }
+]
