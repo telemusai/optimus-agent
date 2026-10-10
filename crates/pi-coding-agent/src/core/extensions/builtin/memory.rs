@@ -37,6 +37,57 @@ fn refinement_retry_policy(settings: &Mutex<SettingsManager>) -> crate::core::re
     }
 }
 
+/// One bounded LLM call used by recall-time query distillation and rerank.
+/// Returns the first text blocks joined, or None on any failure (callers fall back).
+async fn recall_llm_text(
+    ctx: &Arc<dyn ExtensionContext>,
+    system_prompt: &str,
+    user_prompt: &str,
+    max_tokens: f64,
+) -> Option<String> {
+    let model = ctx.model()?;
+    let (api_key, headers) = api_key_and_headers(ctx, &model).await.ok()?;
+    let complete = crate::core::memory::extraction::completion_fn_for(
+        model,
+        api_key,
+        headers,
+        None,
+    );
+    let request = crate::core::refinement::refinement::RefinementCompletionRequest {
+        system_prompt: system_prompt.to_string(),
+        messages: vec![crate::core::memory::evidence::AgentMessage::User {
+            content: serde_json::Value::String(user_prompt.to_string()),
+            timestamp: 0.0,
+        }],
+        max_tokens,
+    };
+    let message = complete(request).await;
+    if message.error_message.is_some() {
+        return None;
+    }
+    let text = message
+        .content
+        .iter()
+        .filter_map(|block| match block {
+            crate::core::refinement::refinement::AssistantContent::Text { text } => {
+                Some(text.clone())
+            }
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("");
+    let trimmed = text.trim();
+    if trimmed.is_empty() {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
+}
+
+const RECALL_DISTILL_SYSTEM: &str = "You compress a conversational message into a search query. Reply with the search query only: one or two short lines naming the entities, attributes, and changes the speaker is really asking about. Strip greetings, filler, and politeness. Never answer the message; only restate its information need as search keywords.";
+
+const RECALL_RERANK_SYSTEM: &str = "You filter search results for relevance. Given the query and candidate memories (id + title), reply with ONLY a JSON array of the ids that are truly relevant to the query, best first, no explanations. Keep at most the ids that help answer; an empty array is acceptable.";
+
 pub const MEMORY_CONTROL_CUSTOM_TYPE: &str = "prime-agent.memory-control";
 pub const MEMORY_RESULT_CUSTOM_TYPE: &str = "prime-agent.memory-result";
 pub const MEMORY_COMMAND_CUSTOM_TYPE: &str = "prime-agent.memory-command";
@@ -433,6 +484,25 @@ fn create_memory_extension_impl(
                         .and_then(|user| serde_json::to_value(user).ok().and_then(|value| serde_json::from_value::<crate::core::memory::evidence::AgentMessage>(value).ok()).and_then(|message| collect_evidence(&[message]).into_iter().next()))
                         .map(|evidence| evidence.text)
                         .unwrap_or_default();
+                    // Optional recall-time query distillation: one bounded LLM call
+                    // that strips conversational filler from the recall query.
+                    // Any failure falls back to the raw message text.
+                    let query = if memory.store.settings().recall_query_distillation
+                        && !query.is_empty()
+                    {
+                        recall_llm_text(
+                            &ctx,
+                            RECALL_DISTILL_SYSTEM,
+                            &format!("Message:\n{query}\n\nSearch query:"),
+                            64.0,
+                        )
+                        .await
+                        .map(|distilled| distilled.lines().take(2).collect::<Vec<_>>().join(" "))
+                        .filter(|distilled| !distilled.trim().is_empty())
+                        .unwrap_or(query)
+                    } else {
+                        query
+                    };
                     let key = hash(&format!(
                         "{}:{}:{}",
                         user_timestamp(&user)
@@ -451,20 +521,89 @@ fn create_memory_extension_impl(
                     let normal_memory = memory.clone();
                     let normal_query = query.clone();
                     let normal_key = key.clone();
-                    let normal = tokio::task::spawn_blocking(move || {
+                    let rerank_enabled = memory.store.settings().recall_rerank;
+                    let rerank_ctx = ctx.clone();
+                    let normal = async move {
                         match cached {
-                            Some((cached_key, recall)) if cached_key == normal_key && !supplemental_enabled => recall,
+                            Some((cached_key, recall)) if cached_key == normal_key && !supplemental_enabled => {
+                                Ok::<Arc<CachedRecall>, String>(recall)
+                            }
                             _ => {
-                                let mut hits = if normal_query.is_empty() { Vec::new() } else { normal_memory.search(&normal_query, false) };
-                                let recalled = normal_memory.render_recall(&hits);
-                                hits.retain(|hit| recalled.ids.contains(&hit.id));
-                                Arc::new(CachedRecall { hits, recalled: Arc::new(recalled) })
+                                let mut hits = {
+                                    let normal_memory = normal_memory.clone();
+                                    let normal_query = normal_query.clone();
+                                    tokio::task::spawn_blocking(move || {
+                                        if normal_query.is_empty() { Vec::new() } else { normal_memory.search(&normal_query, false) }
+                                    })
+                                    .await
+                                    .map_err(|_| "Memory recall worker failed".to_string())?
+                                };
+                                // Optional LLM rerank of the lexical top hits:
+                                // one bounded call, reorder by returned ids, fall back
+                                // to lexical order on any failure.
+                                if rerank_enabled && !hits.is_empty() {
+                                    let candidates: Vec<String> = hits
+                                        .iter()
+                                        .take(20)
+                                        .map(|hit| {
+                                            format!("- {}: {}", hit.id, hit.entry.title)
+                                        })
+                                        .collect();
+                                    if let Some(ordered) = recall_llm_text(
+                                        &rerank_ctx,
+                                        RECALL_RERANK_SYSTEM,
+                                        &format!(
+                                            "Query: {normal_query}\n\nCandidates:\n{}",
+                                            candidates.join("\n")
+                                        ),
+                                        512.0,
+                                    )
+                                    .await
+                                    .and_then(|text| {
+                                        let trimmed = text.trim().trim_start_matches('`').trim_start_matches("json").trim();
+                                        let start = trimmed.find('[')?;
+                                        let end = trimmed.rfind(']')?;
+                                        let parsed: Vec<String> =
+                                            serde_json::from_str(&trimmed[start..=end]).ok()?;
+                                        Some(parsed)
+                                    }) {
+                                        let order: HashMap<&str, usize> = ordered
+                                            .iter()
+                                            .enumerate()
+                                            .map(|(position, id)| (id.as_str(), position))
+                                            .collect();
+                                        let mut matched: Vec<_> = hits
+                                            .iter()
+                                            .filter(|hit| order.contains_key(hit.id.as_str()))
+                                            .cloned()
+                                            .collect();
+                                        matched.sort_by_key(|hit| {
+                                            order.get(hit.id.as_str()).copied().unwrap_or(usize::MAX)
+                                        });
+                                        if !matched.is_empty() {
+                                            hits = matched;
+                                        }
+                                    }
+                                }
+                                let normal_memory = normal_memory.clone();
+                                let (hits, recalled) = tokio::task::spawn_blocking(move || {
+                                    let recalled = normal_memory.render_recall(&hits);
+                                    let mut hits = hits;
+                                    hits.retain(|hit| recalled.ids.contains(&hit.id));
+                                    (hits, Arc::new(recalled))
+                                })
+                                .await
+                                .map_err(|_| "Memory recall worker failed".to_string())?;
+                                Ok(Arc::new(CachedRecall { hits, recalled }))
                             }
                         }
-                    });
+                    };
                     let (baseline, supplemental) = tokio::join!(normal,
                         crate::core::jev_bridge::memory::retrieve(ctx.clone(), memory.clone(), &query));
-                    let baseline = baseline.map_err(|_| "Memory recall worker failed".to_string())?;
+                    let baseline = match baseline {
+                        Ok(value) => value,
+                        Err(_) => return Err("Memory recall worker failed".to_string()),
+                    };
                     recalled_turns
                         .lock()
                         .unwrap_or_else(|poisoned| poisoned.into_inner())
