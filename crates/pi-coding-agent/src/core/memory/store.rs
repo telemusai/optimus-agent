@@ -44,6 +44,14 @@ pub struct MemorySettings {
     /// None keeps the built-in default instruction.
     #[serde(default, skip_serializing_if = "Option::is_none", rename = "importInstructions")]
     pub import_instructions: Option<String>,
+    /// Distill the recall query with one bounded LLM call before lexical search.
+    /// Falls back to the raw message text if the call fails or returns nothing.
+    #[serde(default, rename = "recallQueryDistillation")]
+    pub recall_query_distillation: bool,
+    /// Rerank lexical search hits with one bounded LLM call before recall rendering.
+    /// Falls back to lexical order if the call fails or returns nothing parseable.
+    #[serde(default, rename = "recallRerank")]
+    pub recall_rerank: bool,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub shared: Option<Option<SharedConfig>>,
 }
@@ -65,6 +73,8 @@ pub fn default_memory_settings() -> MemorySettings {
         max_import_chunk_chars: 40000,
         max_import_chunks_per_run: 4,
         import_instructions: None,
+        recall_query_distillation: false,
+        recall_rerank: false,
         shared: None,
     }
 }
@@ -218,6 +228,8 @@ pub struct PartialMemorySettings {
     pub max_import_chunk_chars: Option<i64>,
     pub max_import_chunks_per_run: Option<i64>,
     pub import_instructions: Option<String>,
+    pub recall_query_distillation: Option<bool>,
+    pub recall_rerank: Option<bool>,
     pub shared: Option<Option<SharedConfig>>,
 }
 
@@ -233,15 +245,24 @@ const LIMITS: [(&str, i64, i64); 6] = [
 pub fn validate_settings(value: &Value) -> Result<PartialMemorySettings, String> {
     let source = record(value)?;
     let mut result = PartialMemorySettings::default();
-    for key in ["recall", "learning"] {
+    for key in [
+        "recall",
+        "learning",
+        "recallQueryDistillation",
+        "recallRerank",
+    ] {
         if let Some(raw) = source.get(key) {
             let boolean = raw
                 .as_bool()
                 .ok_or_else(|| format!("{key} must be boolean"))?;
-            if key == "recall" {
-                result.recall = Some(boolean);
-            } else {
-                result.learning = Some(boolean);
+            match key {
+                "recall" => result.recall = Some(boolean),
+                "learning" => result.learning = Some(boolean),
+                "recallQueryDistillation" => {
+                    result.recall_query_distillation = Some(boolean)
+                }
+                "recallRerank" => result.recall_rerank = Some(boolean),
+                _ => {}
             }
         }
     }
@@ -880,6 +901,11 @@ fn merge_settings_patch(target: &mut JsonMap, patch: &PartialMemorySettings) {
     };
     set("recall", patch.recall.map(Value::Bool));
     set("learning", patch.learning.map(Value::Bool));
+    set(
+        "recallQueryDistillation",
+        patch.recall_query_distillation.map(Value::Bool),
+    );
+    set("recallRerank", patch.recall_rerank.map(Value::Bool));
     set(
         "maxRecallChars",
         patch.max_recall_chars.map(|value| Value::from(value)),

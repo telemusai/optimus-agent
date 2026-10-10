@@ -165,6 +165,12 @@ struct ManifestSettings {
     /// without memory recall, so extraction is wasted work).
     #[serde(default, alias = "skip_ingest")]
     skip_ingest: bool,
+    /// Enable recall-time LLM query distillation (memory.recallQueryDistillation).
+    #[serde(default, alias = "recall_query_distillation")]
+    recall_query_distillation: bool,
+    /// Enable recall-time LLM rerank of lexical hits (memory.recallRerank).
+    #[serde(default, alias = "recall_rerank")]
+    recall_rerank: bool,
 }
 
 impl Default for ManifestSettings {
@@ -184,6 +190,8 @@ impl Default for ManifestSettings {
             answer_instruction: None,
             import_instructions: None,
             skip_ingest: false,
+            recall_query_distillation: false,
+            recall_rerank: false,
         }
     }
 }
@@ -287,6 +295,12 @@ impl EnvScratch {
             }
         }
         let mut memory = json!({"recall": settings.recall_on});
+        if settings.recall_query_distillation {
+            memory["recallQueryDistillation"] = json!(true);
+        }
+        if settings.recall_rerank {
+            memory["recallRerank"] = json!(true);
+        }
         if let Some(max_chars) = settings.max_recall_chars {
             memory["maxRecallChars"] = json!(max_chars);
         }
