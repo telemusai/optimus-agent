@@ -1042,4 +1042,182 @@ mod tests {
         assert_eq!(error, "The operation was aborted");
         std::fs::remove_dir_all(&root).ok();
     }
+
+    #[test]
+    fn temporal_prepare_preserves_anchor_on_every_lossless_chunk_and_reload() {
+        let (jobs, root) = fixture();
+        let runtime = runtime();
+        runtime
+            .block_on(
+                jobs.store
+                    .configure(&serde_json::json!({"maxImportChunkChars": 4096})),
+            )
+            .unwrap();
+        let text = format!(
+            "I repaired the observatory clock yesterday. {}",
+            "\u{1f680}".repeat(9000)
+        );
+        let timestamp = 1_709_294_400_000.0;
+        let source = root.join("temporal-chunks.jsonl");
+        std::fs::write(
+            &source,
+            serde_json::json!({
+                "type": "message", "id": "row", "timestamp": "2099-01-01T00:00:00Z",
+                "message": {"role": "user", "content": text, "timestamp": timestamp}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = runtime
+            .block_on(jobs.prepare(&source.to_string_lossy()))
+            .unwrap();
+        assert!(job.chunks.len() > 1);
+        assert_eq!(job.coverage.evidence_records, 1);
+        let mut joined = String::new();
+        let mut offset = 0;
+        for chunk in &job.chunks {
+            let label_text = serialize_evidence(&chunk.records, usize::MAX / 4);
+            assert!(label_text.contains(r#""timestamp":"2024-03-01T12:00:00.000Z""#));
+            assert!(!label_text.contains("2099-01-01"));
+            assert!(js_len(&label_text) <= 4096);
+            for record in &chunk.records {
+                assert_eq!(record.timestamp, Some(timestamp));
+                assert_eq!(record.id, format!("row:{offset}"));
+                assert_eq!(record.sha256, hash(&text));
+                joined.push_str(&record.text);
+                offset += js_len(&record.text);
+            }
+        }
+        assert_eq!(joined, text);
+        assert_eq!(jobs.get(&job.id).unwrap(), job);
+        assert_eq!(
+            std::fs::read_to_string(&source).unwrap(),
+            std::fs::read_to_string(Path::new(&jobs.dir).join(format!("{}.source.jsonl", job.id)))
+                .unwrap()
+        );
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_prepare_never_promotes_row_append_time_to_an_observation_date() {
+        let (jobs, root) = fixture();
+        let runtime = runtime();
+        let source = root.join("undated.jsonl");
+        let rows = [
+            serde_json::json!({"type": "message", "id": "missing", "timestamp": "2024-03-01T12:00:00Z",
+                "message": {"role": "assistant", "content": "I finished yesterday."}}),
+            serde_json::json!({"type": "message", "id": "zero", "timestamp": 1_700_000_000_000i64,
+                "message": {"role": "user", "content": "A later event", "timestamp": 0}}),
+        ];
+        std::fs::write(
+            &source,
+            rows.iter()
+                .map(Value::to_string)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+        .unwrap();
+        let job = runtime
+            .block_on(jobs.prepare(&source.to_string_lossy()))
+            .unwrap();
+        assert_eq!(job.coverage.evidence_records, 2);
+        let records: Vec<_> = job
+            .chunks
+            .iter()
+            .flat_map(|chunk| &chunk.records)
+            .cloned()
+            .collect();
+        assert_eq!(
+            records[0].origin,
+            super::super::evidence::MemoryOrigin::Assistant
+        );
+        assert!(records.iter().all(|record| record.timestamp.is_none()));
+        let text = serialize_evidence(&records, 80_000);
+        assert!(!text.contains("\"timestamp\""));
+        assert!(!text.contains("2023-11-14"));
+        assert!(!text.contains("2024-03-01"));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_old_import_job_loads_without_rewrite_or_timestamp_backfill() {
+        let (jobs, root) = fixture();
+        std::fs::create_dir_all(&jobs.dir).unwrap();
+        let id = "import_0123456789abcdef01234567";
+        let value = serde_json::json!({
+            "schema": 1.0, "id": id, "source": "legacy.jsonl", "sourceHash": "legacy-source",
+            "status": "pending", "chunks": [{"records": [{
+                "id": "legacy:0", "origin": "user", "text": "Last year", "sha256": "legacy-hash",
+                "uri": "file:///legacy.jsonl#L1"
+            }], "startLine": 1, "endLine": 1}],
+            "nextChunk": 0, "expectedRevision": 0,
+            "coverage": {"lines": 1, "evidenceRecords": 1, "excludedLines": []},
+            "usage": {"input": 0.0, "output": 0.0}
+        });
+        let path = jobs.path(id).unwrap();
+        let raw = serde_json::to_string_pretty(&value).unwrap();
+        std::fs::write(&path, &raw).unwrap();
+        let job = jobs.get(id).unwrap();
+        assert_eq!(job.schema, 1.0);
+        assert_eq!(job.chunks[0].records[0].timestamp, None);
+        assert_eq!(serde_json::to_value(&job).unwrap(), value);
+        assert_eq!(jobs.list(), vec![job]);
+        assert_eq!(std::fs::read_to_string(path).unwrap(), raw);
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_invalid_message_timestamp_keeps_existing_exclusion_semantics() {
+        let (jobs, root) = fixture();
+        let runtime = runtime();
+        let source = root.join("invalid-temporal.jsonl");
+        let invalid = [
+            serde_json::json!("not a date"),
+            Value::Null,
+            serde_json::json!({}),
+            serde_json::json!(true),
+        ];
+        let rows: Vec<_> = invalid.into_iter().enumerate().map(|(index, timestamp)| {
+            serde_json::json!({"type": "message", "id": format!("row-{index}"), "timestamp": 1_700_000_000_000i64,
+                "message": {"role": "user", "content": "An observation", "timestamp": timestamp}}).to_string()
+        }).collect();
+        std::fs::write(&source, rows.join("\n")).unwrap();
+        let job = runtime
+            .block_on(jobs.prepare(&source.to_string_lossy()))
+            .unwrap();
+        assert_eq!(job.coverage.evidence_records, 0);
+        assert_eq!(job.coverage.excluded_lines, vec![1, 2, 3, 4]);
+        assert!(job.chunks.is_empty());
+        let nonfinite = root.join("nonfinite.jsonl");
+        std::fs::write(
+            &nonfinite,
+            r#"{"type":"message","message":{"role":"user","timestamp":NaN}}"#,
+        )
+        .unwrap();
+        let error = runtime
+            .block_on(jobs.prepare(&nonfinite.to_string_lossy()))
+            .unwrap_err();
+        assert!(error.starts_with("Invalid session JSON at line 1; preserved input at "));
+        std::fs::remove_dir_all(root).unwrap();
+    }
+
+    #[test]
+    fn temporal_evidence_change_does_not_change_legacy_memory_document_schema() {
+        let value = serde_json::json!({
+            "schema": 1.0,
+            "entries": {"memory": {"legacy": {
+                "id": "legacy", "kind": "memory", "title": "Legacy", "content": "No event date",
+                "path": "", "source": "legacy import", "created_at": "2020-01-01T00:00:00Z",
+                "updated_at": "2020-01-01T00:00:00Z", "version": 1,
+                "metadata": {"projectId": "legacy-project", "sources": [{
+                    "id": "row", "origin": "user", "sha256": "legacy-hash", "uri": "file:///legacy#L1"
+                }]}, "reference": {}, "arguments": {}
+            }}, "prompt": {}, "skill": {}, "subagent": {}},
+            "refinements": [],
+            "memory": {"schema": 1.0, "projectId": "legacy-project", "revision": 0,
+                "history": [], "events": {}}
+        });
+        let document = super::super::store::validate_document(&value, "legacy-project").unwrap();
+        assert_eq!(serde_json::to_value(document).unwrap(), value);
+    }
 }

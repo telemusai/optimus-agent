@@ -1,0 +1,3 @@
+- Added internal memory observation timestamps while preserving legacy source and public import response shapes.
+- Added isolated, versioned memory benchmark capture and independent local evaluation with synthetic fixtures and source notices.
+- Added privacy-limited recall helper diagnostics without enabling helpers or changing their output limits.

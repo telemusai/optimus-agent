@@ -1,0 +1,90 @@
+{
+  "schema": "memory-bench-portable-provenance/2",
+  "integration_base": "43b1993eb",
+  "capture_protocol": "optimus-memory-capture/temporal-authority/1.0.0",
+  "evaluator_version": "optimus-memory-evaluation/2.0.0",
+  "local_scoring_version": "optimus-local-scoring/1.0.0",
+  "model_policy": {
+    "provider": "dgx-glm53",
+    "model": "glm-5.3",
+    "jev": false,
+    "live_opt_in_required": true,
+    "server_identity_not_attested": true
+  },
+  "upstream": {
+    "longmemeval": {
+      "repository": "https://github.com/xiaowu0162/LongMemEval",
+      "commit": "9e0b455f4ef0e2ab8f2e582289761153549043fc",
+      "license_file": "licenses/LongMemEval-MIT.txt",
+      "license_url": "https://raw.githubusercontent.com/xiaowu0162/LongMemEval/9e0b455f4ef0e2ab8f2e582289761153549043fc/LICENSE",
+      "license_sha256": "d3c4b9aa54759df6ded337978a6f3b55b75615e5e4525c3b82d7e2627d4b9732",
+      "source_path": "src/evaluation/evaluate_qa.py",
+      "source_utf8_lf_sha256": "ecce9c4c79dc89d99534ac17b383a5cbb5b9f0c69ee98adaf0684742e3d95251",
+      "local_boundaries": [
+        "eval/judges.py:LME_TEMPLATE_*",
+        "eval/judges.py:build_longmemeval_prompt",
+        "eval/judges.py:judge_longmemeval"
+      ],
+      "modifications": "Separate templates/DGX adapters; offline opt-in, explicit credential env/config, stdlib transport, new cache, 2048-token campaign budget."
+    },
+    "lme_v2": {
+      "repository": "https://github.com/xiaowu0162/LongMemEval-V2",
+      "commit": "2cc8c540bdb87fe6761629b585e727e1c4704520",
+      "license_file": "licenses/LongMemEval-V2-Apache-2.0.txt",
+      "license_url": "https://raw.githubusercontent.com/xiaowu0162/LongMemEval-V2/2cc8c540bdb87fe6761629b585e727e1c4704520/LICENSE",
+      "license_sha256": "c71d239df91726fc519c6eb72d318ec65820627232b2f796219e87dcf35d0ab4",
+      "source_path": "evaluation/qa_eval_metrics.py",
+      "source_utf8_lf_sha256": "f8ba659e237c4282a07a92538090ea500ce8483820b390b1d19af187c01417ac",
+      "local_boundaries": [
+        "eval/deterministic.py:normalize_phrase/split_phrases/norm_phrase_set_match/norm_phrase_set_match_ordered/mc_choice_match/mc_choice_set_match/_extract_multi_select_letters/extract_boxed_answer/is_unknown",
+        "eval/judges.py:V2_* and v2_* builders/parsers and judge_lme_v2_*",
+        "converters/common.py:decode_lme_v2_eval"
+      ],
+      "modifications": "Stdlib/common-format dispatch; limited eval-option parser, boxed integration, explicit DGX transport, max_tokens field, timeout/retry changes and new protocol identity.",
+      "notice_status": "Pinned full-tree review found no NOTICE file; inspected source has no extra copyright header."
+    },
+    "nltk": {
+      "repository": "https://github.com/nltk/nltk",
+      "commit": "b417a98a9497b4a27067043e35e64c388e060686",
+      "license_file": "licenses/NLTK-Apache-2.0.txt",
+      "license_url": "https://raw.githubusercontent.com/nltk/nltk/b417a98a9497b4a27067043e35e64c388e060686/LICENSE.txt",
+      "license_sha256": "cfc7749b96f63bd31c3c42b5c471bf756814053e847c10f3eb003417bc523d30",
+      "source_path": "nltk/stem/porter.py",
+      "source_utf8_lf_sha256": "2d75d36dc9e83fc40857c72632fa1ea59208b531c5a91a765b62e63af57fa7d4",
+      "local_boundaries": [
+        "eval/porter.py:PorterStemmer and methods/rule lists"
+      ],
+      "modifications": "Modified source port; removed dependencies/base class/CLI/docs, added type hints/helpers/iterative consonant flags.",
+      "copyright": "Copyright (C) 2001-2026 NLTK Project",
+      "notice_status": "Pinned full-tree review found no NOTICE file."
+    }
+  },
+  "independent_local_module": {
+    "path": "eval/local_scoring.py",
+    "authoring_task": "astra-original-metrics: parent math/rubric-only specification; no held/reference evaluator exposure",
+    "proposal_raw_sha256": "0e5d64df9e01064fa22755675b82314a2623fb63b20151ac68074053d160d4ba",
+    "utf8_lf_sha256": "36f82134ea0e383c64f3addb61709b029f02f3fc1b106dc4584c1cc8ab9cbd8b",
+    "proposal_tests_raw_sha256": "90fe344567aa0862a5d5cbce2e9e1b9ea44e54662c65cad7e820d5167f08c980",
+    "proposal_synthetic_tests_passed": 74,
+    "distributed_tests": "tests/test_local_scoring.py (only import path adapted)",
+    "official_parity": false
+  },
+  "excluded": [
+    "CC-BY-NC LoCoMo evaluator/presentation source",
+    "unlicensed LoCoMo-Plus prompt/parser/duration/stitching source",
+    "MemoryLake source/assets",
+    "datasets",
+    "historical runs/scores/caches",
+    "credential/model configs",
+    "reference repositories",
+    "private held-source archive"
+  ],
+  "protocol_changes": {
+    "capture": "Opt-in temporal-authority capture: real event timestamps or absent, conservative origin mapping, no synthetic timeline. Historical frozen replay remains unchanged and is not relabeled.",
+    "lme_v2_capture": "Capture protocol temporal-authority/1.0.0 / authority revision 1: browser URL and capped observation become toolResult; agent Action/Thought and task metadata remain assistant, never user. Question presentation and scoring protocols are unchanged.",
+    "locomo": "New local F1 normalizer removes a/an/the, not and; generic math from independent module; explicit new choice association with unlabeled shuffle before lettering; corrected category labels; old date-presentation text removed.",
+    "locomo_plus": "Caller-normalized environments only; new independent semantic rubric and strict JSON boolean parser; no Cognitive/partial-score parity.",
+    "cache": "New evaluator-version namespace; old campaign cache is neither migrated nor consulted.",
+    "bindings": "Canonical full question-set hash plus raw question-file hashes; evaluator/source/request identity; explicit requested/effective variant and dedup; per-selected-record and per-result question/record hashes. Strict caller-declared opaque scoring-question hash/protocol/visible-text agreement; exact run_id/benchmark/variant/env_id snapshot joins. Label is local artifact consistency only, not presentation or gold proof. Legacy unbound inputs require explicit opt-in and have no overlap inference."
+  }
+}

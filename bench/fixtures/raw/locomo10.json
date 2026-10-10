@@ -1,0 +1,71 @@
+[
+  {
+    "sample_id": "synthetic_conv",
+    "conversation": {
+      "speaker_a": "Avery",
+      "speaker_b": "Blair",
+      "session_1_date_time": "1:00 pm on 1 January, 2026",
+      "session_1": [
+        {
+          "speaker": "Avery",
+          "text": "I ride a blue bicycle.",
+          "dia_id": "D1:1"
+        },
+        {
+          "speaker": "Blair",
+          "text": "I like green parks.",
+          "dia_id": "D1:2",
+          "blip_caption": "A green park"
+        }
+      ],
+      "session_2_date_time": "1:00 pm on 8 January, 2026",
+      "session_2": [
+        {
+          "speaker": "Avery",
+          "text": "I will visit on 9 January.",
+          "dia_id": "D2:1"
+        }
+      ]
+    },
+    "qa": [
+      {
+        "question": "Name the color and vehicle.",
+        "answer": "blue, bicycle",
+        "category": 1,
+        "evidence": [
+          "D1:1"
+        ]
+      },
+      {
+        "question": "When is the visit?",
+        "answer": "9 January",
+        "category": 2,
+        "evidence": [
+          "D2:1"
+        ]
+      },
+      {
+        "question": "What is ridden?",
+        "answer": "bicycle; a vehicle",
+        "category": 3,
+        "evidence": [
+          "D1:1"
+        ]
+      },
+      {
+        "question": "What color is the park?",
+        "answer": "green",
+        "category": 4,
+        "evidence": [
+          "D1:2"
+        ]
+      },
+      {
+        "question": "What pet does Avery own?",
+        "adversarial_answer": "cat",
+        "category": 5,
+        "evidence": []
+      }
+    ]
+  }
+]

@@ -1,0 +1,2 @@
+{"id": "synthetic_web", "domain": "web", "environment": "synthetic", "question_type": "static-environment", "question": "Which button starts the task?", "answer": "Start", "image": null, "eval_function": "norm_phrase_set_match|lower=true|normalize_hyphen=true|strip_punct=true|separators=,;|require_non_empty=true"}
+{"id": "synthetic_enterprise", "domain": "enterprise", "environment": "synthetic", "question_type": "procedure", "question": "Which option opens the queue?", "answer": "A", "image": null, "eval_function": "mc_choice_match|require_non_empty=true"}

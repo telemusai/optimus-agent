@@ -37,11 +37,45 @@ fn refinement_retry_policy(settings: &Mutex<SettingsManager>) -> crate::core::re
     }
 }
 
+#[derive(Clone, Default, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RecallHelperUsage {
+    input: Option<f64>,
+    output: Option<f64>,
+    total_tokens: Option<f64>,
+    reasoning_tokens: Option<f64>,
+}
+
+impl RecallHelperUsage {
+    fn observe(&mut self, observation: pi_ai::types::ProviderUsageObservation) {
+        // Observations are counter snapshots, not deltas. An absent field keeps
+        // its last observation; explicit unknown/invalid values clear it.
+        for (target, observed) in [
+            (&mut self.input, observation.input_tokens),
+            (&mut self.output, observation.output_tokens),
+            (&mut self.total_tokens, observation.total_tokens),
+            (&mut self.reasoning_tokens, observation.reasoning_tokens),
+        ] {
+            if let Some(value) = observed {
+                *target = value.filter(|value| value.is_finite() && *value >= 0.0);
+            }
+        }
+    }
+}
+
 #[derive(Clone, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
 struct RecallHelperReport {
     enabled: bool,
     attempted: bool,
     outcome: &'static str,
+    stop_reason: Option<&'static str>,
+    emitted_text_chars: Option<usize>,
+    latency_ms: Option<f64>,
+    usage: RecallHelperUsage,
+    usage_source: Option<&'static str>,
+    cancelled: Option<bool>,
+    provider_error: Option<bool>,
 }
 
 impl RecallHelperReport {
@@ -50,7 +84,40 @@ impl RecallHelperReport {
             enabled,
             attempted: false,
             outcome,
+            stop_reason: None,
+            emitted_text_chars: None,
+            latency_ms: None,
+            usage: RecallHelperUsage::default(),
+            usage_source: None,
+            cancelled: None,
+            provider_error: None,
         }
+    }
+
+    fn observe_terminal(&mut self, message: &pi_ai::types::AssistantMessage) {
+        // StopReason is an open string type. Never persist arbitrary provider text.
+        self.stop_reason = Some(match message.stop_reason.as_str() {
+            pi_ai::types::STOP_REASON_STOP => "stop",
+            pi_ai::types::STOP_REASON_LENGTH => "length",
+            pi_ai::types::STOP_REASON_TOOL_USE => "toolUse",
+            pi_ai::types::STOP_REASON_ERROR => "error",
+            pi_ai::types::STOP_REASON_ABORTED => "aborted",
+            _ => "unknown",
+        });
+        self.emitted_text_chars = Some(
+            message
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pi_ai::types::ContentBlock::Text(text) => Some(text.text.chars().count()),
+                    _ => None,
+                })
+                .sum(),
+        );
+        self.provider_error = Some(
+            message.error_message.is_some()
+                || message.stop_reason == pi_ai::types::STOP_REASON_ERROR,
+        );
     }
 }
 
@@ -71,7 +138,8 @@ async fn recall_llm_text(
         report: RecallHelperReport::skipped(true, "cancelled"),
     };
     let signal = ctx.signal().unwrap_or_default();
-    if signal.is_cancelled() {
+    result.report.cancelled = Some(signal.is_cancelled());
+    if result.report.cancelled == Some(true) {
         return result;
     }
     let Some(model) = ctx.model() else {
@@ -80,22 +148,36 @@ async fn recall_llm_text(
     };
     let auth = tokio::select! {
         biased;
-        _ = signal.cancelled() => return result,
+        _ = signal.cancelled() => {
+            result.report.cancelled = Some(true);
+            return result;
+        }
         auth = api_key_and_headers(ctx, &model) => auth,
     };
     let Ok((api_key, headers)) = auth else {
         result.report.outcome = "auth_unavailable";
         return result;
     };
-    if signal.is_cancelled() {
+    result.report.cancelled = Some(signal.is_cancelled());
+    if result.report.cancelled == Some(true) {
         return result;
     }
+    let observed_usage = Arc::new(Mutex::new(None::<RecallHelperUsage>));
+    let captured_usage = observed_usage.clone();
     let options = pi_ai::types::SimpleStreamOptions {
         stream: pi_ai::types::StreamOptions {
             max_tokens: Some(max_tokens),
             api_key: Some(api_key),
             headers: headers.map(|headers| headers.into_iter().collect()),
             signal: Some(signal.clone()),
+            on_usage_observation: Some(Arc::new(move |observation, _model| {
+                captured_usage
+                    .lock()
+                    .unwrap_or_else(|poisoned| poisoned.into_inner())
+                    .get_or_insert_with(RecallHelperUsage::default)
+                    .observe(observation);
+                Box::pin(async {})
+            })),
             ..Default::default()
         },
         ..Default::default()
@@ -108,17 +190,36 @@ async fn recall_llm_text(
         ))],
         tools: None,
     };
+    let started = std::time::Instant::now();
     let stream = pi_ai::stream::stream_simple(&model, &context, Some(&options));
     result.report.attempted = true;
     let message = tokio::select! {
         biased;
         _ = signal.cancelled() => {
             stream.request_cancel();
-            return result;
+            // Observe an already delivered result without waiting for cancellation
+            // acknowledgement or fabricating an aborted provider stop reason.
+            stream.result_if_ready()
         }
-        message = stream.result() => message,
+        message = stream.result() => Some(message),
     };
-    if signal.is_cancelled() || message.stop_reason == pi_ai::types::STOP_REASON_ABORTED {
+    result.report.latency_ms = Some(started.elapsed().as_secs_f64() * 1000.0);
+    result.report.cancelled = Some(signal.is_cancelled());
+    if let Some(usage) = observed_usage
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone()
+    {
+        result.report.usage = usage;
+        result.report.usage_source = Some("provider_observation");
+    }
+    let Some(message) = message else {
+        return result;
+    };
+    result.report.observe_terminal(&message);
+    if result.report.cancelled == Some(true)
+        || message.stop_reason == pi_ai::types::STOP_REASON_ABORTED
+    {
         return result;
     }
     if message.error_message.is_some() || message.stop_reason == pi_ai::types::STOP_REASON_ERROR {
@@ -1217,7 +1318,8 @@ mod recall_runtime_tests {
     };
     use pi_ai::types::{
         AssistantMessage, AssistantMessageEvent, ContentBlock, Context, Message, Model,
-        SimpleStreamOptions, TextContent, UserContent, UserMessage,
+        ProviderUsageObservation, SimpleStreamOptions, TextContent, ThinkingContent, UserContent,
+        UserMessage,
     };
     use pi_ai::utils::event_stream::AssistantMessageEventStream;
     use serde_json::json;
@@ -1288,13 +1390,19 @@ mod recall_runtime_tests {
         options: SimpleStreamOptions,
     }
 
+    struct RecallResponse {
+        message: AssistantMessage,
+        usage: Vec<ProviderUsageObservation>,
+        terminal: bool,
+    }
+
     struct RecallFixture {
         _temp: tempfile::TempDir,
         memory: MemoryService,
         runner: Arc<ExtensionRunner>,
         provider_id: String,
         requests: Arc<Mutex<Vec<RecallRequest>>>,
-        responses: Arc<Mutex<VecDeque<AssistantMessage>>>,
+        responses: Arc<Mutex<VecDeque<RecallResponse>>>,
         errors: Arc<Mutex<Vec<String>>>,
         diagnostics: Arc<Mutex<Vec<Value>>>,
         registry: Arc<FixtureRegistry>,
@@ -1349,7 +1457,7 @@ mod recall_runtime_tests {
             .unwrap();
             let provider_id = format!("recall-runtime-{}", uuid::Uuid::new_v4());
             let requests = Arc::new(Mutex::new(Vec::<RecallRequest>::new()));
-            let responses = Arc::new(Mutex::new(VecDeque::<AssistantMessage>::new()));
+            let responses = Arc::new(Mutex::new(VecDeque::<RecallResponse>::new()));
             let captured = requests.clone();
             let queued = responses.clone();
             let signal = CancellationToken::new();
@@ -1365,11 +1473,12 @@ mod recall_runtime_tests {
                             context: context.clone(),
                             options: options.unwrap().clone(),
                         });
-                        let mut message = queued
+                        let response = queued
                             .lock()
                             .unwrap()
                             .pop_front()
                             .expect("unexpected extra recall LLM call");
+                        let mut message = response.message;
                         message.api = model.api.clone();
                         message.model = model.id.clone();
                         message.provider = model.provider.clone();
@@ -1377,6 +1486,14 @@ mod recall_runtime_tests {
                             provider_signal.cancel();
                         }
                         let stream = AssistantMessageEventStream::new();
+                        if let Some(observer) = &options.unwrap().stream.on_usage_observation {
+                            for observation in response.usage {
+                                stream.spawn(observer(observation, model));
+                            }
+                        }
+                        if !response.terminal {
+                            return stream;
+                        }
                         let event = if matches!(message.stop_reason.as_str(), "error" | "aborted") {
                             AssistantMessageEvent::Error {
                                 reason: message.stop_reason.clone(),
@@ -1493,7 +1610,15 @@ mod recall_runtime_tests {
         }
 
         fn queue(&self, message: AssistantMessage) {
-            self.responses.lock().unwrap().push_back(message);
+            self.queue_observed(message, Vec::new());
+        }
+
+        fn queue_observed(&self, message: AssistantMessage, usage: Vec<ProviderUsageObservation>) {
+            self.responses.lock().unwrap().push_back(RecallResponse {
+                message,
+                usage,
+                terminal: true,
+            });
         }
 
         async fn emit(&self, messages: Vec<Value>) -> Vec<Value> {
@@ -1555,6 +1680,248 @@ mod recall_runtime_tests {
             panic!("recall input must be text")
         };
         text
+    }
+
+    fn observed_usage(
+        input: f64,
+        output: f64,
+        total: f64,
+        reasoning: f64,
+    ) -> ProviderUsageObservation {
+        ProviderUsageObservation {
+            input_tokens: Some(Some(input)),
+            output_tokens: Some(Some(output)),
+            total_tokens: Some(Some(total)),
+            reasoning_tokens: Some(Some(reasoning)),
+            ..Default::default()
+        }
+    }
+
+    fn assert_no_helper_observations(report: &Value) {
+        for field in [
+            "stopReason",
+            "emittedTextChars",
+            "latencyMs",
+            "usageSource",
+            "cancelled",
+            "providerError",
+        ] {
+            assert!(report[field].is_null(), "unexpected {field}: {report}");
+        }
+        for counter in ["input", "output", "totalTokens", "reasoningTokens"] {
+            assert!(
+                report["usage"][counter].is_null(),
+                "unexpected {counter}: {report}"
+            );
+        }
+    }
+
+    fn assert_dispatch_latency(report: &Value) {
+        let latency = report["latencyMs"]
+            .as_f64()
+            .expect("observed dispatch latency");
+        assert!(latency.is_finite() && latency >= 0.0);
+    }
+
+    #[tokio::test]
+    async fn runtime_recall_helper_telemetry_distinguishes_length_empty_error_and_aborted() {
+        for (distill, helper) in [(true, "queryDistillation"), (false, "rerank")] {
+            for (reason, text, error, outcome) in [
+                ("length", "", None, "empty_output"),
+                ("stop", " \n\t", None, "empty_output"),
+                (
+                    "error",
+                    " é🦀\nPRIVATE_COMPLETION",
+                    Some("PRIVATE_PROVIDER_ERROR"),
+                    "provider_error",
+                ),
+                (
+                    "stop",
+                    "PRIVATE_COMPLETION",
+                    Some("PRIVATE_PROVIDER_ERROR"),
+                    "provider_error",
+                ),
+                ("aborted", "PRIVATE_COMPLETION", None, "cancelled"),
+            ] {
+                let fixture = RecallFixture::new(distill, !distill).await;
+                let mut response = failed_response(reason, text, error);
+                response.stop_reason_raw = Some("PRIVATE_RAW_STOP_REASON".to_string());
+                response
+                    .content
+                    .push(ContentBlock::Thinking(ThinkingContent::new(
+                        "PRIVATE_REASONING",
+                    )));
+                fixture.queue_observed(response, vec![observed_usage(101.0, 64.0, 165.0, 64.0)]);
+                let messages = fixture.recall("quasar PRIVATE_QUERY", 1).await;
+                assert_eq!(recall_ids(&messages), vec![ALPHA, BETA]);
+                assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+                let diagnostic = fixture.last_diagnostic();
+                let report = &diagnostic["recallHelpers"][helper];
+                assert_eq!(report["enabled"], true);
+                assert_eq!(report["attempted"], true);
+                assert_eq!(report["outcome"], outcome);
+                assert_eq!(report["stopReason"], reason);
+                assert_eq!(
+                    report["emittedTextChars"].as_u64(),
+                    Some(text.chars().count() as u64)
+                );
+                assert_eq!(
+                    report["cancelled"], false,
+                    "provider abort is not a local signal"
+                );
+                assert_eq!(
+                    report["providerError"],
+                    reason == "error" || error.is_some()
+                );
+                assert_eq!(report["usageSource"], "provider_observation");
+                assert_eq!(
+                    report["usage"],
+                    json!({"input":101.0,"output":64.0,"totalTokens":165.0,"reasoningTokens":64.0})
+                );
+                assert_dispatch_latency(report);
+                let serialized = diagnostic.to_string();
+                for marker in [
+                    "PRIVATE_",
+                    "synthetic-recall-key",
+                    RECALL_DISTILL_SYSTEM,
+                    RECALL_RERANK_SYSTEM,
+                ] {
+                    assert!(
+                        !serialized.contains(marker),
+                        "diagnostic leaked private content"
+                    );
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_recall_helper_telemetry_usage_is_presence_aware_and_never_sums_snapshots() {
+        let unknown = json!({"input":null,"output":null,"totalTokens":null,"reasoningTokens":null});
+        for (observations, expected, source) in [
+            (Vec::new(), unknown.clone(), None),
+            (
+                vec![ProviderUsageObservation::default()],
+                unknown.clone(),
+                Some("provider_observation"),
+            ),
+            (
+                vec![observed_usage(0.0, 0.0, 0.0, 0.0)],
+                json!({"input":0.0,"output":0.0,"totalTokens":0.0,"reasoningTokens":0.0}),
+                Some("provider_observation"),
+            ),
+            (
+                vec![
+                    observed_usage(10.0, 3.0, 13.0, 1.0),
+                    ProviderUsageObservation {
+                        input_tokens: Some(Some(30.0)),
+                        output_tokens: Some(None),
+                        total_tokens: Some(None),
+                        reasoning_tokens: None,
+                        ..Default::default()
+                    },
+                ],
+                json!({"input":30.0,"output":null,"totalTokens":null,"reasoningTokens":1.0}),
+                Some("provider_observation"),
+            ),
+            (
+                vec![
+                    observed_usage(10.0, 3.0, 13.0, 1.0),
+                    observed_usage(-1.0, f64::INFINITY, f64::NAN, -2.0),
+                ],
+                unknown,
+                Some("provider_observation"),
+            ),
+            (
+                vec![ProviderUsageObservation {
+                    input_tokens: Some(Some(7.0)),
+                    output_tokens: Some(Some(2.0)),
+                    ..Default::default()
+                }],
+                json!({"input":7.0,"output":2.0,"totalTokens":null,"reasoningTokens":null}),
+                Some("provider_observation"),
+            ),
+        ] {
+            let fixture = RecallFixture::new(true, false).await;
+            let mut response = text_response("");
+            // Normalized message counters must never masquerade as reported usage.
+            response.usage.input = 900.0;
+            response.usage.output = 100.0;
+            response.usage.total_tokens = 1000.0;
+            fixture.queue_observed(response, observations);
+            assert_eq!(
+                recall_ids(&fixture.recall("quasar", 1).await),
+                vec![ALPHA, BETA]
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            let diagnostic = fixture.last_diagnostic();
+            let report = &diagnostic["recallHelpers"]["queryDistillation"];
+            assert_eq!(report["usage"], expected);
+            assert_eq!(report["usageSource"], json!(source));
+            assert_eq!(report["emittedTextChars"], 0);
+            assert_no_helper_observations(&diagnostic["recallHelpers"]["rerank"]);
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_recall_helper_telemetry_local_cancel_without_terminal_retains_partial_usage() {
+        for (distill, helper) in [(true, "queryDistillation"), (false, "rerank")] {
+            let fixture = RecallFixture::new(distill, !distill).await;
+            fixture.cancel_on_request.store(true, Ordering::SeqCst);
+            fixture.responses.lock().unwrap().push_back(RecallResponse {
+                message: text_response("PRIVATE_UNDELIVERED_COMPLETION"),
+                usage: vec![ProviderUsageObservation {
+                    input_tokens: Some(Some(3.0)),
+                    reasoning_tokens: Some(Some(0.0)),
+                    ..Default::default()
+                }],
+                terminal: false,
+            });
+            assert_eq!(
+                recall_ids(&fixture.recall("quasar", 1).await),
+                vec![ALPHA, BETA]
+            );
+            assert_eq!(fixture.requests.lock().unwrap().len(), 1);
+            let diagnostic = fixture.last_diagnostic();
+            let report = &diagnostic["recallHelpers"][helper];
+            assert_eq!(report["attempted"], true);
+            assert_eq!(report["outcome"], "cancelled");
+            assert_eq!(report["cancelled"], true);
+            for field in ["stopReason", "emittedTextChars", "providerError"] {
+                assert!(
+                    report[field].is_null(),
+                    "unobserved {field} must stay unknown"
+                );
+            }
+            assert_dispatch_latency(report);
+            assert_eq!(report["usageSource"], "provider_observation");
+            assert_eq!(
+                report["usage"],
+                json!({"input":3.0,"output":null,"totalTokens":null,"reasoningTokens":0.0})
+            );
+            assert!(!diagnostic.to_string().contains("PRIVATE_"));
+        }
+    }
+
+    #[tokio::test]
+    async fn runtime_recall_helper_telemetry_allowlists_stop_reasons_and_counts_untrimmed_text() {
+        let fixture = RecallFixture::new(false, true).await;
+        let text = " \té🦀 \n";
+        fixture.queue(failed_response("PRIVATE_UNKNOWN_REASON", text, None));
+        assert_eq!(
+            recall_ids(&fixture.recall("quasar", 1).await),
+            vec![ALPHA, BETA]
+        );
+        let diagnostic = fixture.last_diagnostic();
+        let report = &diagnostic["recallHelpers"]["rerank"];
+        assert_eq!(report["stopReason"], "unknown");
+        assert_eq!(report["outcome"], "invalid_output");
+        assert_eq!(
+            report["emittedTextChars"].as_u64(),
+            Some(text.chars().count() as u64)
+        );
+        assert!(!diagnostic.to_string().contains("PRIVATE_"));
+        assert_eq!(fixture.requests.lock().unwrap().len(), 1);
     }
 
     #[tokio::test]
@@ -1880,8 +2247,22 @@ mod recall_runtime_tests {
         assert_eq!(fixture.registry.calls.load(Ordering::SeqCst), 0);
         let diagnostic = fixture.last_diagnostic();
         for helper in ["queryDistillation", "rerank"] {
-            assert_eq!(diagnostic["recallHelpers"][helper]["attempted"], false);
-            assert_eq!(diagnostic["recallHelpers"][helper]["outcome"], "cancelled");
+            let report = &diagnostic["recallHelpers"][helper];
+            assert_eq!(report["attempted"], false);
+            assert_eq!(report["outcome"], "cancelled");
+            assert_eq!(report["cancelled"], true);
+            for field in [
+                "latencyMs",
+                "stopReason",
+                "emittedTextChars",
+                "usageSource",
+                "providerError",
+            ] {
+                assert!(report[field].is_null());
+            }
+            for counter in ["input", "output", "totalTokens", "reasoningTokens"] {
+                assert!(report["usage"][counter].is_null());
+            }
         }
     }
 
@@ -1917,15 +2298,39 @@ mod recall_runtime_tests {
             diagnostic["recallHelpers"]["rerank"]["outcome"],
             "cancelled"
         );
+        let report = &diagnostic["recallHelpers"]["queryDistillation"];
+        assert_eq!(report["cancelled"], true);
+        assert_eq!(
+            report["stopReason"], "stop",
+            "already delivered terminal reason is not fabricated as aborted"
+        );
+        assert_eq!(report["emittedTextChars"], 6);
+        assert_eq!(report["providerError"], false);
+        assert_dispatch_latency(report);
+        assert!(diagnostic["recallHelpers"]["rerank"]["latencyMs"].is_null());
     }
 
     #[tokio::test]
     async fn runtime_recall_cache_reuses_both_helpers_until_turn_or_settings_change() {
         let fixture = RecallFixture::new(true, true).await;
-        fixture.queue(text_response("nebula"));
-        fixture.queue(text_response(&json!([NEBULA]).to_string()));
+        fixture.queue_observed(
+            text_response("nebula"),
+            vec![observed_usage(10.0, 2.0, 12.0, 0.0)],
+        );
+        fixture.queue_observed(
+            text_response(&json!([NEBULA]).to_string()),
+            vec![observed_usage(20.0, 8.0, 28.0, 0.0)],
+        );
         let first = fixture.recall("quasar", 1).await;
         assert_eq!(recall_ids(&first), vec![NEBULA]);
+        let first_diagnostic = fixture.last_diagnostic();
+        for (helper, input) in [("queryDistillation", 10.0), ("rerank", 20.0)] {
+            let report = &first_diagnostic["recallHelpers"][helper];
+            assert_eq!(report["attempted"], true);
+            assert_eq!(report["usageSource"], "provider_observation");
+            assert_eq!(report["usage"]["input"].as_f64(), Some(input));
+            assert_dispatch_latency(report);
+        }
         let mut with_tool_result = first;
         with_tool_result.push(json!({"role":"toolResult", "toolCallId":"fixture-call", "toolName":"fixture", "content":[{"type":"text","text":"synthetic tool output"}], "isError":false, "timestamp":2}));
         let repeated = fixture.emit(with_tool_result).await;
@@ -1941,7 +2346,21 @@ mod recall_runtime_tests {
             assert_eq!(diagnostic["recallHelpers"][helper]["enabled"], true);
             assert_eq!(diagnostic["recallHelpers"][helper]["attempted"], false);
             assert_eq!(diagnostic["recallHelpers"][helper]["outcome"], "cache_hit");
+            assert_no_helper_observations(&diagnostic["recallHelpers"][helper]);
         }
+        let attempted: usize = fixture
+            .diagnostics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                ["queryDistillation", "rerank"]
+                    .into_iter()
+                    .filter(|helper| diagnostic["recallHelpers"][*helper]["attempted"] == true)
+                    .count()
+            })
+            .sum();
+        assert_eq!(attempted, 2, "cache reuse is not a new helper attempt");
         fixture.queue(text_response("quasar"));
         fixture.queue(text_response(&json!([BETA, ALPHA]).to_string()));
         assert_eq!(
@@ -1969,6 +2388,19 @@ mod recall_runtime_tests {
             "settings change invalidates recall but disabled helpers never run"
         );
         assert_eq!(fixture.last_diagnostic()["cacheHit"], false);
+        let attempted: usize = fixture
+            .diagnostics
+            .lock()
+            .unwrap()
+            .iter()
+            .map(|diagnostic| {
+                ["queryDistillation", "rerank"]
+                    .into_iter()
+                    .filter(|helper| diagnostic["recallHelpers"][*helper]["attempted"] == true)
+                    .count()
+            })
+            .sum();
+        assert_eq!(attempted, fixture.requests.lock().unwrap().len());
     }
 
     async fn seed_host_collision(fixture: &RecallFixture, outside_top_twenty: bool) -> String {

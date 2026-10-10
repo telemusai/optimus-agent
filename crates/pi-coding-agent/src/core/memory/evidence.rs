@@ -1,4 +1,5 @@
 //! Port of packages/coding-agent/src/core/memory/evidence.ts
+use chrono::{DateTime, SecondsFormat, Utc};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value};
 use sha2::{Digest, Sha256};
@@ -115,6 +116,9 @@ pub struct Evidence {
     pub revision: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none", rename = "projectPath")]
     pub project_path: Option<String>,
+    /// Source observation time in Unix milliseconds; absent is not an anchor.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub timestamp: Option<f64>,
 }
 
 impl Evidence {
@@ -191,6 +195,18 @@ fn content_to_text(content: &Value) -> String {
     }
 }
 
+fn timestamp_datetime(timestamp: f64) -> Option<DateTime<Utc>> {
+    // Zero is the local AgentMessage serde default for a missing timestamp.
+    if !timestamp.is_finite()
+        || timestamp == 0.0
+        || timestamp < i64::MIN as f64
+        || timestamp >= i64::MAX as f64
+    {
+        return None;
+    }
+    DateTime::<Utc>::from_timestamp_millis(timestamp.floor() as i64)
+}
+
 pub fn message_evidence(
     message: &AgentMessage,
     uri: Option<&str>,
@@ -242,6 +258,16 @@ pub fn message_evidence(
     if origin == MemoryOrigin::Tool && text.contains("[memory data; not new evidence]") {
         origin = MemoryOrigin::Derived;
     }
+    let timestamp = match message {
+        AgentMessage::User { timestamp, .. }
+        | AgentMessage::Assistant { timestamp, .. }
+        | AgentMessage::ToolResult { timestamp, .. }
+        | AgentMessage::BashExecution { timestamp, .. }
+        | AgentMessage::Custom { timestamp, .. }
+        | AgentMessage::CompactionSummary { timestamp, .. }
+        | AgentMessage::BranchSummary { timestamp, .. } => *timestamp,
+        AgentMessage::Other => 0.0,
+    };
     let sha256 = hash(&text);
     let id = match entry_id {
         Some(value) => value.to_string(),
@@ -256,16 +282,6 @@ pub fn message_evidence(
                 AgentMessage::BranchSummary { .. } => "branchSummary",
                 AgentMessage::Other => "unknown",
             };
-            let timestamp = match message {
-                AgentMessage::User { timestamp, .. }
-                | AgentMessage::Assistant { timestamp, .. }
-                | AgentMessage::ToolResult { timestamp, .. }
-                | AgentMessage::BashExecution { timestamp, .. }
-                | AgentMessage::Custom { timestamp, .. }
-                | AgentMessage::CompactionSummary { timestamp, .. }
-                | AgentMessage::BranchSummary { timestamp, .. } => *timestamp,
-                AgentMessage::Other => 0.0,
-            };
             let digest = hash(&format!("{role}:{}:{sha256}", js_number(timestamp)));
             format!("msg_{}", &digest[..24.min(digest.len())])
         }
@@ -279,6 +295,7 @@ pub fn message_evidence(
         uri: uri.map(str::to_string),
         revision: None,
         project_path: None,
+        timestamp: timestamp_datetime(timestamp).map(|_| timestamp),
     })
 }
 
@@ -304,6 +321,12 @@ fn label_json(record: &Evidence) -> String {
     map.insert("sha256".to_string(), Value::String(record.sha256.clone()));
     if let Some(uri) = &record.uri {
         map.insert("uri".to_string(), Value::String(uri.clone()));
+    }
+    if let Some(timestamp) = record.timestamp.and_then(timestamp_datetime) {
+        map.insert(
+            "timestamp".to_string(),
+            Value::String(timestamp.to_rfc3339_opts(SecondsFormat::Millis, true)),
+        );
     }
     serde_json::to_string(&Value::Object(map)).unwrap_or_default()
 }
@@ -414,5 +437,176 @@ mod tests {
         assert_eq!(evidence.id, again.id);
         assert!(evidence.id.starts_with("msg_"));
         assert_eq!(evidence.id.len(), 4 + 24);
+    }
+
+    #[test]
+    fn temporal_evidence_populates_message_times_without_changing_origins_or_ids() {
+        let timestamp = 1_684_158_960_000.0;
+        for (role, origin) in [
+            ("user", MemoryOrigin::User),
+            ("assistant", MemoryOrigin::Assistant),
+            ("toolResult", MemoryOrigin::Tool),
+            ("bashExecution", MemoryOrigin::Tool),
+        ] {
+            let source = message(json!({
+                "role": role, "content": "An observation", "output": "An observation",
+                "timestamp": timestamp
+            }));
+            let record = message_evidence(&source, None, None).unwrap();
+            assert_eq!(record.origin, origin);
+            assert_eq!(record.timestamp, Some(timestamp));
+            let digest = hash(&format!(
+                "{role}:{}:{}",
+                js_number(timestamp),
+                record.sha256
+            ));
+            assert_eq!(record.id, format!("msg_{}", &digest[..24]));
+            assert!(serde_json::to_value(record.source())
+                .unwrap()
+                .get("timestamp")
+                .is_none());
+        }
+    }
+
+    #[test]
+    fn temporal_evidence_keeps_relative_text_and_exposes_only_its_observation_anchor() {
+        let timestamp = DateTime::parse_from_rfc3339("2024-03-01T12:00:00Z")
+            .unwrap()
+            .timestamp_millis() as f64;
+        let text = "I repaired the observatory clock yesterday.";
+        let record = message_evidence(
+            &message(json!({"role": "user", "content": text, "timestamp": timestamp})),
+            Some("file:///synthetic-session.jsonl#L1"),
+            Some("row"),
+        )
+        .unwrap();
+        let label: Value = serde_json::from_str(&label_json(&record)).unwrap();
+        assert_eq!(label["timestamp"], "2024-03-01T12:00:00.000Z");
+        let window = serialize_evidence(&[record], 4096);
+        assert!(window.contains(text));
+        assert!(
+            !window.contains("2024-02-29"),
+            "transport must not resolve event dates"
+        );
+    }
+
+    #[test]
+    fn temporal_evidence_none_preserves_legacy_label_bytes_and_serde_shape() {
+        let fixture = json!({
+            "id": "row", "origin": "user", "text": "Last year", "sha256": "digest",
+            "uri": "file:///synthetic.jsonl#L1"
+        });
+        let record: Evidence = serde_json::from_value(fixture.clone()).unwrap();
+        assert_eq!(record.timestamp, None);
+        assert_eq!(serde_json::to_value(&record).unwrap(), fixture);
+        assert_eq!(
+            label_json(&record),
+            r#"{"id":"row","origin":"user","sha256":"digest","uri":"file:///synthetic.jsonl#L1"}"#
+        );
+        let mut without_uri = record;
+        without_uri.uri = None;
+        assert_eq!(
+            label_json(&without_uri),
+            r#"{"id":"row","origin":"user","sha256":"digest"}"#
+        );
+    }
+
+    #[test]
+    fn temporal_evidence_absent_zero_nonfinite_and_out_of_range_do_not_anchor() {
+        let missing = message_evidence(
+            &message(json!({"role": "user", "content": "Yesterday"})),
+            None,
+            Some("row"),
+        )
+        .unwrap();
+        assert_eq!(missing.timestamp, None);
+        let legacy = label_json(&missing);
+        for timestamp in [
+            0.0,
+            -0.0,
+            f64::NAN,
+            f64::INFINITY,
+            f64::NEG_INFINITY,
+            f64::MAX,
+            -f64::MAX,
+            i64::MAX as f64,
+            i64::MIN as f64,
+        ] {
+            let source = AgentMessage::User {
+                content: json!("Yesterday"),
+                timestamp,
+            };
+            let record = message_evidence(&source, None, Some("row")).unwrap();
+            assert_eq!(record.timestamp, None);
+            assert_eq!(label_json(&record), legacy);
+            // Callers can build Evidence directly; labels must validate again.
+            let direct = Evidence {
+                timestamp: Some(timestamp),
+                ..record
+            };
+            assert_eq!(label_json(&direct), legacy);
+        }
+    }
+
+    #[test]
+    fn temporal_evidence_accepts_pre_epoch_and_normalizes_fractional_ms_downward() {
+        for (timestamp, expected) in [
+            (-1.0, "1969-12-31T23:59:59.999Z"),
+            (-0.25, "1969-12-31T23:59:59.999Z"),
+            (1.75, "1970-01-01T00:00:00.001Z"),
+        ] {
+            let record = message_evidence(
+                &AgentMessage::User {
+                    content: json!("An observation"),
+                    timestamp,
+                },
+                None,
+                Some("row"),
+            )
+            .unwrap();
+            assert_eq!(record.timestamp, Some(timestamp));
+            let label: Value = serde_json::from_str(&label_json(&record)).unwrap();
+            assert_eq!(label["timestamp"], expected);
+        }
+    }
+
+    #[test]
+    fn temporal_evidence_serde_round_trips_ms_and_rejects_wrong_types() {
+        let mut value = json!({"id": "row", "origin": "user", "text": "x", "sha256": "h"});
+        for timestamp in [Value::Null, json!(1_684_158_960_123.0)] {
+            value["timestamp"] = timestamp.clone();
+            let record: Evidence = serde_json::from_value(value.clone()).unwrap();
+            assert_eq!(record.timestamp, timestamp.as_f64());
+            let encoded = serde_json::to_value(&record).unwrap();
+            if timestamp.is_null() {
+                assert!(encoded.get("timestamp").is_none());
+            } else {
+                assert_eq!(encoded["timestamp"], timestamp);
+                assert_eq!(serde_json::from_value::<Evidence>(encoded).unwrap(), record);
+            }
+        }
+        for invalid in [
+            json!("2023-05-08T13:56:00"),
+            json!(true),
+            json!({}),
+            json!([]),
+        ] {
+            value["timestamp"] = invalid;
+            assert!(serde_json::from_value::<Evidence>(value.clone()).is_err());
+        }
+    }
+
+    #[test]
+    fn temporal_evidence_labels_still_respect_utf16_window_budget() {
+        let record = message_evidence(
+            &message(json!({"role": "user", "content": "\u{1f680}".repeat(1000),
+                "timestamp": 1_684_158_960_000.0})),
+            None,
+            Some("row"),
+        )
+        .unwrap();
+        for budget in [0, 64, 128, 300, 4096] {
+            assert!(js_len(&serialize_evidence(std::slice::from_ref(&record), budget)) <= budget);
+        }
     }
 }

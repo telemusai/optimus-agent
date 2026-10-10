@@ -1,0 +1,34 @@
+[
+  {
+    "question_id": "synthetic_lme",
+    "question_type": "single-session-user",
+    "question": "What color is the bicycle?",
+    "answer": "blue",
+    "question_date": "2026/01/03 (Sat) 12:00",
+    "answer_session_ids": [
+      "s1"
+    ],
+    "haystack_dates": [
+      "2026/01/02 (Fri) 12:00",
+      "2026/01/01 (Thu) 12:00"
+    ],
+    "haystack_session_ids": [
+      "s2",
+      "s1"
+    ],
+    "haystack_sessions": [
+      [
+        {
+          "role": "assistant",
+          "content": "I will remember that."
+        }
+      ],
+      [
+        {
+          "role": "user",
+          "content": "My bicycle is blue."
+        }
+      ]
+    ]
+  }
+]

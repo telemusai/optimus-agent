@@ -402,7 +402,13 @@ impl MemoryService {
                 if index < 0 || index as usize >= job.chunks.len() {
                     return Err("Invalid import chunk index".to_string());
                 }
-                Ok(serde_json::to_value(&job.chunks[index as usize]).unwrap_or(Value::Null))
+                // Keep the existing public response shape. Anchors remain internal
+                // until a separately negotiated wire capability exposes them.
+                let mut chunk = job.chunks[index as usize].clone();
+                for record in &mut chunk.records {
+                    record.timestamp = None;
+                }
+                Ok(serde_json::to_value(&chunk).unwrap_or(Value::Null))
             }
             "import_run" => {
                 let extract = extract.ok_or_else(|| {
@@ -680,4 +686,55 @@ pub fn create_memory_host_handlers(
     });
     handlers.insert("memory.request".to_string(), handler);
     handlers
+}
+
+#[cfg(test)]
+mod temporal_tests {
+    use super::*;
+
+    #[tokio::test]
+    async fn temporal_import_chunk_response_keeps_legacy_shape_without_mutating_saved_anchors() {
+        let temp = tempfile::tempdir().unwrap();
+        let cwd = temp.path().join("repo");
+        let agent = temp.path().join("agent");
+        std::fs::create_dir_all(&cwd).unwrap();
+        std::fs::create_dir_all(&agent).unwrap();
+        let service =
+            MemoryService::new(&cwd.to_string_lossy(), &agent.to_string_lossy(), None).unwrap();
+        let source = temp.path().join("dated.jsonl");
+        std::fs::write(
+            &source,
+            serde_json::json!({
+                "type": "message", "id": "source", "message": {"role": "user",
+                    "content": "I repaired the clock yesterday.", "timestamp": 1_709_294_400_000i64}
+            })
+            .to_string(),
+        )
+        .unwrap();
+        let job = service
+            .jobs
+            .prepare(&source.to_string_lossy())
+            .await
+            .unwrap();
+        let before = service.jobs.get(&job.id).unwrap();
+        assert_eq!(
+            before.chunks[0].records[0].timestamp,
+            Some(1_709_294_400_000.0)
+        );
+        let payload = serde_json::json!({"id": job.id, "chunk": 0});
+        let response = service
+            .request("import_chunk", payload.as_object().unwrap(), None)
+            .await
+            .unwrap();
+        let mut legacy = job.chunks[0].clone();
+        for record in &mut legacy.records {
+            record.timestamp = None;
+        }
+        assert_eq!(response, serde_json::to_value(legacy).unwrap());
+        assert!(response["records"][0].get("timestamp").is_none());
+        assert_eq!(service.jobs.get(&job.id).unwrap(), before);
+        let rendered = super::super::evidence::serialize_evidence(&before.chunks[0].records, 4096);
+        assert!(rendered.contains(r#""timestamp":"2024-03-01T12:00:00.000Z""#));
+        assert!(!agent.join("models.json").exists());
+    }
 }
