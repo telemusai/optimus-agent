@@ -1,0 +1,3 @@
+- Added offline frozen-memory exports, native lexical recall replay, and explicit paired benchmark comparison with input provenance.
+- Added regression tests for snapshot safety, legacy artifact compatibility, duplicate handling, and score/run binding.
+- Added a corrected memory-reference evidence checkpoint and documented private-output and benchmark interpretation limits.

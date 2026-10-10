@@ -263,7 +263,10 @@ impl MemoryService {
                     Some(edits) if edits.len() == proposal.edits.len() => {}
                     _ => return Err("Invalid proposal edits".to_string()),
                 }
-                let sources = self.validate_sources(payload.get("sources"))?;
+                let sources = payload
+                    .get("sources")
+                    .map(|value| self.validate_sources(Some(value)))
+                    .transpose()?;
                 let result = self
                     .store
                     .apply(
@@ -273,7 +276,7 @@ impl MemoryService {
                             expected_revision: revision()?,
                             host: payload.get("host") == Some(&Value::Bool(true)),
                             automatic: payload.get("automatic") == Some(&Value::Bool(true)),
-                            sources: Some(sources),
+                            sources,
                             replace_metadata: false,
                         },
                     )

@@ -15,7 +15,8 @@ async def read(id: str):
     return await request("read", id=id)
 
 async def apply(proposal: dict, *, event_id: str, revision: int, sources=None, host=False, automatic=False):
-    return await request("apply", proposal=proposal, eventId=event_id, revision=revision, sources=sources or [], host=host, automatic=automatic)
+    source_payload = {} if sources is None else {"sources": sources}
+    return await request("apply", proposal=proposal, eventId=event_id, revision=revision, host=host, automatic=automatic, **source_payload)
 
 async def handoff(task: str, state: str, decisions: str, unresolved: str, *, event_id: str, revision: int, sources=None, automatic=False):
     return await request("handoff", task=task, state=state, decisions=decisions, unresolved=unresolved, eventId=event_id, revision=revision, sources=sources or [], automatic=automatic)
