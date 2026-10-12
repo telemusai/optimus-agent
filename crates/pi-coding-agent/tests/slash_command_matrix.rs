@@ -49,6 +49,7 @@ const COMMANDS: &[&str] = &[
     "system-prompt",
     "traces",
     "tree",
+    "ultrafast",
     "update",
 ];
 
