@@ -110,7 +110,7 @@ fn jev_old_client_new_daemon_accepts_legacy_commands_and_additive_metadata() {
         "data": {"mode": "compare-active", "activeMode": true, "applied": false,
             "compareMode": true, "features": {"tool_requirement": true}, "compactionEnabled": false}
     });
-    let response = daemon_response_from_value(&frame);
+    let response = daemon_response_from_value(frame);
     let legacy: LegacySettings = serde_json::from_value(response.data.unwrap()).unwrap();
     assert_eq!(legacy.mode, "compare-active");
     assert!(legacy.active_mode);
@@ -129,7 +129,7 @@ fn jev_old_client_new_daemon_accepts_legacy_commands_and_additive_metadata() {
     // Missing optional metadata from an older daemon is not a parsing/startup error.
     let old = json!({"type": "response", "command": "jev_get_status", "success": true,
         "data": {"mode": "compare", "pipeline": null}});
-    assert!(daemon_response_from_value(&old).success);
+    assert!(daemon_response_from_value(old).success);
 }
 
 #[cfg(unix)]
@@ -144,6 +144,37 @@ async fn connected_client(frame: Value) -> (Arc<DaemonClient>, tokio::net::UnixS
     client.quick_connected.store(true, Ordering::SeqCst);
     client.handle_line(&frame.to_string()).await;
     (client, peer)
+}
+
+#[cfg(unix)]
+#[tokio::test]
+async fn owned_response_dispatch_keeps_acknowledgments_and_unmatched_listeners() {
+    let (client, peer) = connected_client(hello(DAEMON_SCHEMA_REVISION, &[])).await;
+    let mut peer = Framed::new(peer, LinesCodec::new());
+    let result = Arc::new(StdMutex::new(None));
+    client.state.lock().await.pending.insert("pending".into(), PendingDaemonRequest {
+        command_type: "list".into(), timeout_ms: 1000, on_progress: None,
+        wire_data: String::new(), awaiting_reconnect: false, acknowledge_result: true,
+        recoverable: true, compatibilities: Vec::new(), deadline: Instant::now() + Duration::from_secs(1),
+        result: result.clone(), wake: Arc::new(Notify::new()),
+    });
+    let seen = Arc::new(StdMutex::new(Vec::new()));
+    let listener_seen = seen.clone();
+    let unsubscribe = client.on_message(Arc::new(move |frame| listener_seen.lock().unwrap().push(frame.clone())));
+    let mut frame = json!({"type":"response","command":"list","id":"pending","success":true,"data":{"nested":[1,2,3]}});
+    client.handle_line(&frame.to_string()).await;
+    assert_eq!(result.lock().unwrap().take().unwrap().unwrap().data, Some(frame["data"].clone()));
+    assert!(client.state.lock().await.pending.is_empty());
+    assert!(seen.lock().unwrap().is_empty());
+    let ack = tokio::time::timeout(Duration::from_secs(1), peer.next()).await.unwrap().unwrap().unwrap();
+    let ack: Value = serde_json::from_str(&ack).unwrap();
+    assert_eq!(ack["command"]["type"], "ack_result");
+    assert_eq!(ack["command"]["commandId"], "pending");
+    frame["id"] = json!("unmatched");
+    client.handle_line(&frame.to_string()).await;
+    assert_eq!(*seen.lock().unwrap(), vec![frame]);
+    unsubscribe();
+    client.close().await;
 }
 
 #[cfg(unix)]
@@ -256,7 +287,7 @@ fn jev_usage_metadata_is_optional_for_both_peer_generations() {
     struct LegacyPipeline { success_count: u64 }
     let frame = json!({"type":"response", "command":"jev_get_status", "success":true,
         "data":{"pipeline":{"success_count":2, "usage":{"requests":2, "input_tokens":120}}}});
-    let response = daemon_response_from_value(&frame);
+    let response = daemon_response_from_value(frame);
     let legacy: LegacyPipeline = serde_json::from_value(response.data.unwrap()["pipeline"].clone()).unwrap();
     assert_eq!(legacy.success_count, 2);
     assert_eq!(daemon_outbound_compatibility("response"), DaemonCommandCompatibility::legacy());
@@ -387,4 +418,38 @@ fn jev_memory_metadata_is_optional_for_old_and_new_peers() {
     let new: pi_jev::config::JevFeatures = serde_json::from_value(json!({"memory_relevance":true})).unwrap();
     assert!(!new.memory);
     assert_eq!(daemon_outbound_compatibility("response"), DaemonCommandCompatibility::legacy());
+}
+
+#[test]
+fn explicit_model_limits_are_optional_for_old_and_new_daemon_peers() {
+    use pi_ai::{providers::simple_options::build_base_options, types::Model};
+    for revision in [37, DAEMON_SCHEMA_REVISION] {
+        let frame = hello(revision, &["model_catalog"]);
+        for command in ["get_model_catalog", "get_state"] {
+            assert!(supported(&frame, json!({"type": command}).as_object().unwrap()));
+        }
+    }
+    let old_model = json!({
+        "id": "fixture", "name": "Fixture", "api": "openai-responses",
+        "provider": "fixture", "baseUrl": "http://127.0.0.1:1",
+        "reasoning": false, "input": ["text"], "cost": {"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0},
+        "contextWindow": 200000, "maxTokens": 128000
+    });
+    let mut model: Model = serde_json::from_value(old_model).unwrap();
+    assert!(!model.max_tokens_explicit);
+    assert_eq!(build_base_options(&model, None, None).max_tokens, Some(32000.0));
+    assert!(serde_json::to_value(&model).unwrap().get("maxTokensExplicit").is_none());
+    model.max_tokens_explicit = true;
+    let wire = serde_json::to_value(&model).unwrap();
+    assert_eq!(wire["maxTokensExplicit"], true);
+    assert_eq!(serde_json::from_value::<Model>(wire.clone()).unwrap(), model);
+    #[derive(Deserialize)]
+    #[serde(rename_all = "camelCase")]
+    struct LegacyModel { id: String, max_tokens: f64 }
+    let legacy: LegacyModel = serde_json::from_value(wire).unwrap();
+    assert_eq!(legacy.id, "fixture");
+    assert_eq!(legacy.max_tokens, 128000.0);
+    for event in ["response", "session_attached", "session_event"] {
+        assert_eq!(daemon_outbound_compatibility(event), DaemonCommandCompatibility::legacy());
+    }
 }

@@ -224,3 +224,41 @@ fn selected_model_switches_recompute_the_policy_and_input_bound() {
     assert!(!should_compact_for_model(300_000.0, &selected, &settings));
     assert_boundary(&selected, &settings, 400_000.0);
 }
+
+#[test]
+fn explicit_output_limit_reserves_full_context_without_double_subtracting_input_ceiling() {
+    let mut settings = default_compaction_settings();
+    let mut selected = model("anthropic", "fixture");
+    selected.context_window = 200_000.0;
+    selected.max_tokens = 128_000.0;
+    assert_boundary(&selected, &settings, 183_616.0);
+    selected.max_tokens_explicit = true;
+    assert_boundary(&selected, &settings, 72_000.0);
+    selected.max_input_tokens = Some(100_000.0);
+    assert_boundary(&selected, &settings, 72_000.0);
+    settings.trigger_threshold = Some(1.0);
+    assert_boundary(&selected, &settings, 72_000.0);
+    settings.trigger_threshold = Some(0.5);
+    assert_boundary(&selected, &settings, 50_000.0);
+    settings.enabled = false;
+    assert!(!should_compact_for_model(200_000.0, &selected, &settings));
+}
+
+#[test]
+fn explicit_output_limit_keeps_policy_caps_and_larger_reserves() {
+    let mut settings = default_compaction_settings();
+    for (provider, cap) in [("openai", 250_000.0), ("azure-openai-managed", 400_000.0)] {
+        let mut selected = model(provider, "gpt-fixture");
+        selected.max_tokens = 128_000.0;
+        selected.max_tokens_explicit = true;
+        assert_boundary(&selected, &settings, cap);
+        selected.context_window = 200_000.0;
+        settings.reserve_tokens = 150_000.0;
+        assert_boundary(&selected, &settings, 50_000.0);
+        settings.reserve_tokens = 16_384.0;
+        for output in [0.0, -1.0, f64::INFINITY] {
+            selected.max_tokens = output;
+            assert_boundary(&selected, &settings, 183_616.0);
+        }
+    }
+}

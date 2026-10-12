@@ -1,0 +1,4 @@
+- Fixed explicitly configured model output limits being capped at 32,000 tokens, and reserved their output space when deciding when to compact.
+- Fixed shell integration markers interfering with fullscreen terminal rendering while preserving styles, links, and inline output.
+- Changed daemon response decoding to move large JSON payloads instead of copying them.
+- Changed kernel protocol blank-line handling to scan ASCII whitespace first while retaining Unicode whitespace support.

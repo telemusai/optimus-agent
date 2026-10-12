@@ -1614,7 +1614,7 @@ impl KernelState {
                         if !this.is_current_child(&child_state) {
                             return;
                         }
-                        if line.trim().is_empty() {
+                        if line.trim_ascii().trim().is_empty() {
                             continue;
                         }
                         let event: Value = match serde_json::from_str(&line) {
@@ -4559,6 +4559,45 @@ fn adaptive_snapshot_debounce_ms(last_serialized_bytes: Option<u64>) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn protocol_reader_skips_large_ascii_and_unicode_blank_lines() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::create_dir(dir.path().join("rlm")).unwrap();
+        std::fs::write(dir.path().join("rlm/__init__.py"), "").unwrap();
+        std::fs::write(dir.path().join("rlm/repl.py"), r#"import json,sys
+print(json.dumps({"event":"ready","protocol":3}),flush=True)
+for line in sys.stdin:
+    request=json.loads(line)
+    if request['type']=='execute':
+        sys.stdout.write(' ' * (8 * 1024 * 1024) + '\n \t\r\v\f\u00a0\u2003 \n')
+        print(json.dumps({"event":"stdout","id":request['id'],"text":"hello 世界"}),flush=True)
+        print(json.dumps({"event":"done","id":request['id'],"status":"ok"}),flush=True)
+    elif request['type']=='shutdown':
+        print(json.dumps({"event":"done","id":request['id'],"status":"ok"}),flush=True)
+        break
+"#).unwrap();
+        let manager = new_repl_kernel_manager(KernelManagerOptions {
+            python: Some("python3".into()),
+            cwd: Some(dir.path().to_string_lossy().into()),
+            env: Some(HashMap::from([
+                ("PYTHONPATH".into(), dir.path().to_string_lossy().into()),
+                ("PRIME_AGENT_INTERNAL_ORPHAN_PROCESS_JOURNAL".into(), dir.path().join("orphans.jsonl").to_string_lossy().into()),
+            ])),
+            ..Default::default()
+        });
+        let result = tokio::time::timeout(Duration::from_secs(10),
+            manager.execute("fixture".into(), ExecuteOptions::default())).await;
+        let shutdown = manager.shutdown(KernelShutdownOptions::default()).await;
+        manager.kill().await;
+        let result = result.expect("reader must reach done").unwrap();
+        assert_eq!(result.status, ExecuteStatus::Ok);
+        assert_eq!(result.stdout, "hello 世界");
+        assert!(result.stderr.is_empty());
+        assert!(manager.state.kernel_stderr.lock().unwrap().is_empty());
+        shutdown.unwrap();
+    }
 
     #[tokio::test]
     async fn nine_kernel_shared_snapshot_timing_survives_older_release() {

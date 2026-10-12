@@ -312,6 +312,7 @@ pub fn build_prime_inference_models(
             context_window,
             max_input_tokens: None,
             max_tokens,
+            max_tokens_explicit: false,
             featured: if template.map(|model| model.featured == Some(true)).unwrap_or(false) {
                 Some(true)
             } else {
@@ -606,6 +607,7 @@ mod tests {
             context_window: 200_000.0,
             max_input_tokens: None,
             max_tokens: 131_072.0,
+            max_tokens_explicit: false,
             featured: Some(true),
             native_compaction: None,
             headers: None,

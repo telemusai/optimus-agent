@@ -1218,6 +1218,13 @@ pub fn should_compact_for_model(
     } else {
         MAX_COMPACTION_CONTEXT_TOKENS
     };
+    // Explicit output allowances must fit the full context even when the user
+    // selected a fractional trigger or the provider advertises a separate input ceiling.
+    let cap = if model.max_tokens_explicit && model.max_tokens.is_finite() && model.max_tokens > 0.0 {
+        cap.min((model.context_window - model.max_tokens).max(0.0))
+    } else {
+        cap
+    };
     should_compact_with_cap(context_tokens, get_model_input_limit(model), settings, cap)
 }
 

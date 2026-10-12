@@ -1480,6 +1480,9 @@ pub struct Model {
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_input_tokens: Option<f64>,
     pub max_tokens: f64,
+    /// The output limit was explicitly configured rather than supplied by a catalog.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub max_tokens_explicit: bool,
     /// Flagship model surfaced above non-featured models of the same provider in pickers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub featured: Option<bool>,

@@ -7,7 +7,11 @@ pub fn build_base_options(model: &Model, options: Option<&SimpleStreamOptions>, 
 	base.temperature = options.and_then(|o| o.stream.temperature);
 	base.max_tokens = options
 		.and_then(|o| o.stream.max_tokens)
-		.or_else(|| if model.max_tokens > 0.0 { Some(model.max_tokens.min(32000.0)) } else { None });
+		.or_else(|| {
+			(model.max_tokens > 0.0).then(|| {
+				if model.max_tokens_explicit { model.max_tokens } else { model.max_tokens.min(32000.0) }
+			})
+		});
 	base.signal = options.and_then(|o| o.stream.signal.clone());
 	// TS: `apiKey || options?.apiKey`
 	base.api_key = match api_key {
@@ -108,6 +112,15 @@ mod tests {
 		let model = model_with_max_tokens(100_000.0);
 		let options = build_base_options(&model, None, None);
 		assert_eq!(options.max_tokens, Some(32000.0));
+	}
+
+	#[test]
+	fn base_options_honors_configured_model_limit_and_request_override() {
+		let model = Model { max_tokens_explicit: true, ..model_with_max_tokens(128_000.0) };
+		assert_eq!(build_base_options(&model, None, None).max_tokens, Some(128_000.0));
+		let mut simple = SimpleStreamOptions::default();
+		simple.stream.max_tokens = Some(64_000.0);
+		assert_eq!(build_base_options(&model, Some(&simple), None).max_tokens, Some(64_000.0));
 	}
 
 	#[test]

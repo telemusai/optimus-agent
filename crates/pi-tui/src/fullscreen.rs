@@ -1059,11 +1059,9 @@ impl FullscreenViewport {
         height: usize,
         cursor_pos: Option<(usize, usize)>,
     ) {
-        let frame: Vec<String> = if frame.len() > height {
-            frame[frame.len() - height..].to_vec()
-        } else {
-            frame.to_vec()
-        };
+        // Shell prompt markers can disrupt cursor positioning in alternate-screen terminals.
+        let frame: Vec<String> = frame[frame.len().saturating_sub(height)..]
+            .iter().map(|line| strip_shell_markers(line)).collect();
 
         let mut buffer = String::from("\x1b[?2026h");
         let previous_images: Vec<_> = self.prev_frame.iter().enumerate().filter(|(_, line)| is_image_line(line)).collect();
@@ -1161,6 +1159,28 @@ impl FullscreenViewport {
     }
 }
 
+fn strip_shell_markers(line: &str) -> String {
+    if !line.contains("\x1b]133;") {
+        return line.to_string();
+    }
+    let scanner = crate::utils::create_ansi_code_extractor(line);
+    let mut output = String::with_capacity(line.len());
+    let mut copied = 0;
+    let mut scanned = 0;
+    for (start, _) in line.match_indices('\x1b') {
+        if start < scanned { continue; }
+        if let Some(code) = scanner.get(line, start) {
+            scanned = start + code.length;
+            if code.code.starts_with("\x1b]133;") {
+                output.push_str(&line[copied..start]);
+                copied = scanned;
+            }
+        }
+    }
+    output.push_str(&line[copied..]);
+    output
+}
+
 fn trim_end(s: &str) -> String {
     s.trim_end().to_string()
 }
@@ -1168,6 +1188,32 @@ fn trim_end(s: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn painting_strips_shell_markers_without_changing_styles_links_or_source() {
+        let styled = "\x1b[31m\x1b]8;;https://example.test\x07hello 世界\x1b]8;;\x1b\\\x1b[0m";
+        let source = format!("\x1b]133;A\x07\x1b]133;B\x1b\\{styled}\x1b]133;C\x07\x1b]133;D;0\x1b\\");
+        let frame = vec![source.clone()];
+        let mut viewport = FullscreenViewport::new();
+        let mut output = String::new();
+        viewport.paint(&mut |s| output.push_str(s), &frame, 40, 1, Some((0, 3)));
+        assert!(!output.contains("\x1b]133;"));
+        assert!(output.contains(styled));
+        assert!(output.contains("\x1b[1;4H"));
+        assert_eq!(frame[0], source, "inline renderers still own their markers");
+        output.clear();
+        viewport.paint(&mut |s| output.push_str(s), &[styled.into()], 40, 1, None);
+        assert_eq!(output, "\x1b[?2026h\x1b[?2026l", "marker changes must not repaint rows");
+    }
+
+    #[test]
+    fn shell_marker_filter_preserves_graphics_and_unrelated_osc_sequences() {
+        let graphics = "\x1b_Ga=T,f=100;AAAA\x1b\\";
+        let title = "\x1b]1337;File=name=test;inline=1:AAAA\x07";
+        assert_eq!(strip_shell_markers(&format!("{graphics}\x1b]133;A\x07{title}")), format!("{graphics}{title}"));
+        assert_eq!(strip_shell_markers("plain text"), "plain text");
+        assert_eq!(strip_shell_markers("unfinished\x1b]133;A"), "unfinished\x1b]133;A");
+    }
 
     #[test]
     fn managed_images_render_only_when_the_whole_rectangle_is_visible() {

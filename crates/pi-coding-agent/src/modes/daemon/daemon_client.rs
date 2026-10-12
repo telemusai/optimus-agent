@@ -487,8 +487,8 @@ pub(crate) fn command_compatibilities(body: &DaemonCommandBody) -> Vec<DaemonCom
 }
 
 /// `message as DaemonResponse` for a frame `isDaemonResponse` already accepted.
-fn daemon_response_from_value(value: &Value) -> DaemonResponse {
-    let candidate = value.as_object().expect("is_daemon_response checked the object");
+fn daemon_response_from_value(mut value: Value) -> DaemonResponse {
+    let candidate = value.as_object_mut().expect("is_daemon_response checked the object");
     DaemonResponse {
         id: candidate.get("id").and_then(Value::as_str).map(str::to_string),
         type_: "response".to_string(),
@@ -498,11 +498,10 @@ fn daemon_response_from_value(value: &Value) -> DaemonResponse {
             .unwrap_or_default()
             .to_string(),
         success: candidate.get("success").and_then(Value::as_bool).unwrap_or(false),
-        data: candidate.get("data").cloned(),
+        data: candidate.remove("data"),
         error: candidate.get("error").and_then(Value::as_str).map(str::to_string),
         error_info: candidate
-            .get("errorInfo")
-            .cloned()
+            .remove("errorInfo")
             .and_then(|value| serde_json::from_value(value).ok()),
     }
 }
@@ -1203,10 +1202,10 @@ impl DaemonClient {
             if let Some(id) = message.get("id").and_then(Value::as_str) {
                 let pending = self.state.lock().await.pending.remove(id);
                 if let Some(pending) = pending {
-                    let acknowledge = pending.acknowledge_result;
-                    pending.settle(Ok(daemon_response_from_value(&message)));
-                    if acknowledge {
-                        self.acknowledge_command_result(id).await;
+                    let acknowledge_id = pending.acknowledge_result.then(|| id.to_string());
+                    pending.settle(Ok(daemon_response_from_value(message)));
+                    if let Some(id) = acknowledge_id {
+                        self.acknowledge_command_result(&id).await;
                     }
                     return;
                 }
@@ -1677,11 +1676,41 @@ mod tests {
             "id": "daemon_1", "type": "response", "command": "list", "success": true, "data": { "x": 1 }
         });
         assert!(is_daemon_response(&ok));
-        let response = daemon_response_from_value(&ok);
+        let response = daemon_response_from_value(ok);
         assert_eq!(response.id.as_deref(), Some("daemon_1"));
         assert!(response.success);
         assert_eq!(response.data, Some(serde_json::json!({ "x": 1 })));
         assert!(!is_daemon_response(&serde_json::json!({ "type": "response", "command": "list" })));
+    }
+
+    #[test]
+    fn response_parsing_moves_large_payloads_without_copying() {
+        let frame = serde_json::json!({
+            "type": "response", "command": "get_history", "success": true,
+            "data": {"messages": [{"text": "x".repeat(8 * 1024 * 1024)}]}
+        });
+        let allocation = frame["data"]["messages"][0]["text"].as_str().unwrap().as_ptr();
+        let response = daemon_response_from_value(frame);
+        let text = response.data.as_ref().unwrap()["messages"][0]["text"].as_str().unwrap();
+        assert_eq!(text.len(), 8 * 1024 * 1024);
+        assert_eq!(text.as_ptr(), allocation, "payload must retain its original allocation");
+    }
+
+    #[test]
+    fn owned_response_parser_preserves_permissive_optional_fields() {
+        for extra in [
+            serde_json::json!({}),
+            serde_json::json!({"data": null}),
+            serde_json::json!({"data": [1, {"nested": true}], "id": 7, "error": false}),
+            serde_json::json!({"id": "request", "error": "failed", "errorInfo": "malformed"}),
+            serde_json::json!({"errorInfo": {"code": "unknown_command", "message": "unknown"}, "future": true}),
+        ] {
+            let mut frame = serde_json::json!({"type": "response", "command": "list", "success": false});
+            frame.as_object_mut().unwrap().extend(extra.as_object().unwrap().clone());
+            let expected = DaemonResponse::from_value(&frame).unwrap();
+            assert!(is_daemon_response(&frame));
+            assert_eq!(daemon_response_from_value(frame), expected);
+        }
     }
 
     #[test]

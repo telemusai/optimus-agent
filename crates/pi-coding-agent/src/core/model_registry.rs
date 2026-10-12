@@ -952,6 +952,7 @@ pub fn apply_model_override(model: &Model, override_value: &ModelOverride) -> Mo
     }
     if let Some(max_tokens) = override_value.max_tokens {
         result.max_tokens = max_tokens;
+        result.max_tokens_explicit = true;
     }
 
     if let Some(cost) = &override_value.cost {
@@ -1972,6 +1973,7 @@ impl ModelRegistry {
                     context_window: model_def.context_window.unwrap_or(128_000.0),
                     max_input_tokens: model_def.max_input_tokens,
                     max_tokens: model_def.max_tokens.unwrap_or(16_384.0),
+                    max_tokens_explicit: model_def.max_tokens.is_some(),
                     featured: None,
                     native_compaction: model_def.native_compaction.clone(),
                     headers: None,
@@ -3339,6 +3341,7 @@ impl ModelRegistry {
                     context_window: model_def.context_window.unwrap_or(0.0),
                     max_input_tokens: model_def.max_input_tokens,
                     max_tokens: model_def.max_tokens.unwrap_or(0.0),
+                    max_tokens_explicit: model_def.max_tokens.is_some(),
                     featured: None,
                     native_compaction: model_def.native_compaction.clone(),
                     headers: None,

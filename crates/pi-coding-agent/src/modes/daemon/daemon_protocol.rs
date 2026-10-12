@@ -71,8 +71,10 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 35 gates Node selection and the three-mode toggle; legacy explicit modes remain compatible.
 // Revision 36 gates Clang selection and four-mode cycling; legacy toggle retains three modes.
 // Revision 37 adds optional Jev memory-retrieval capability and feature metadata; no new commands.
-pub const DAEMON_SCHEMA_REVISION: u32 = 37;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-37-jev-memory";
+// Revision 38 adds optional maxTokensExplicit model metadata. Older readers ignore it;
+// newer readers default to catalog limits when it is absent. No command or startup gate.
+pub const DAEMON_SCHEMA_REVISION: u32 = 38;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-38-explicit-model-tokens";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -2155,6 +2157,7 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "get_history_range" => DaemonCommandCompatibility::gated(29, Capability::HistoryRanges),
         "get_rlm_children" => DaemonCommandCompatibility::gated(17, Capability::AuthoritativeChildRoster),
         "replace_acp_mcp_servers" => DaemonCommandCompatibility::gated(22, Capability::AcpMcpServers),
+        // Revision 38's model metadata is additive; catalog reads retain the existing gate.
         "get_model_catalog" => DaemonCommandCompatibility::capability(Capability::ModelCatalog),
         "mutate_queued_message" => {
             DaemonCommandCompatibility::gated(15, Capability::QueueMessageMutation)
@@ -2767,7 +2770,8 @@ impl DaemonOutbound {
 /// `DAEMON_OUTBOUND_COMPATIBILITY`. Revision 28's opaque context is owned by the
 /// worker; message/snapshot consumers may ignore it, so response and session
 /// channels retain their protocol-7 floor. Revisions 30 and 31 add no event types;
-/// optional Jev response metadata is ignored by legacy readers.
+/// optional Jev response metadata is ignored by legacy readers. Revision 38's
+/// maxTokensExplicit model metadata is also optional on responses and snapshots.
 pub fn daemon_outbound_compatibility(outbound: &'static str) -> DaemonCommandCompatibility {
     use DaemonServerCapability as Capability;
     match outbound {
@@ -3082,7 +3086,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-jev-memory"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-explicit-model-tokens"));
     }
 
     #[test]

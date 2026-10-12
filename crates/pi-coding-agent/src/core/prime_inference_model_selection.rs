@@ -89,6 +89,7 @@ mod tests {
             context_window: 200_000.0,
             max_input_tokens: None,
             max_tokens: 131_072.0,
+            max_tokens_explicit: false,
             featured: None,
             native_compaction: None,
             headers: None,
