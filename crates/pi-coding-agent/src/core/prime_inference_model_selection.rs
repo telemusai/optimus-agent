@@ -90,6 +90,7 @@ mod tests {
             max_input_tokens: None,
             max_tokens: 131_072.0,
             max_tokens_explicit: false,
+            default_max_tokens: None,
             featured: None,
             native_compaction: None,
             headers: None,

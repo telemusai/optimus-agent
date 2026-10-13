@@ -409,7 +409,10 @@ async fn native_response_event_or_invalid_json_never_replays_over_either_transpo
             "partial",
             json!({"type":"response.created","response":{"id":"started"}}).to_string(),
         ),
+        ("in-progress", json!({"type":"response.in_progress"}).to_string()),
         ("unknown", json!({"extension_event":true}).to_string()),
+        ("unknown-type", json!({"type":"unrecognized.extension"}).to_string()),
+        ("text", json!({"type":"response.output_text.delta","delta":"partial"}).to_string()),
         ("invalid", "not valid json".to_string()),
     ] {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();

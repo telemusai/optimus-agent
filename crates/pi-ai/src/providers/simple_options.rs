@@ -5,13 +5,25 @@ use crate::types::{Model, SimpleStreamOptions, StreamOptions, ThinkingBudgets, T
 pub fn build_base_options(model: &Model, options: Option<&SimpleStreamOptions>, api_key: Option<&str>) -> StreamOptions {
 	let mut base = StreamOptions::default();
 	base.temperature = options.and_then(|o| o.stream.temperature);
-	base.max_tokens = options
-		.and_then(|o| o.stream.max_tokens)
-		.or_else(|| {
-			(model.max_tokens > 0.0).then(|| {
-				if model.max_tokens_explicit { model.max_tokens } else { model.max_tokens.min(32000.0) }
+	base.max_tokens = if let Some(default_max_tokens) = model.default_max_tokens {
+		// An explicit default opts into a separate default/ceiling policy. Keep
+		// invalid values visible to the provider's validation rather than hiding
+		// them with f64::min (which would silently replace NaN).
+		let requested = options.and_then(|o| o.stream.max_tokens).unwrap_or(default_max_tokens);
+		Some(if requested.is_finite() && model.max_tokens.is_finite() && model.max_tokens > 0.0 {
+			requested.min(model.max_tokens)
+		} else {
+			requested
+		})
+	} else {
+		options
+			.and_then(|o| o.stream.max_tokens)
+			.or_else(|| {
+				(model.max_tokens > 0.0).then(|| {
+					if model.max_tokens_explicit { model.max_tokens } else { model.max_tokens.min(32000.0) }
+				})
 			})
-		});
+	};
 	base.signal = options.and_then(|o| o.stream.signal.clone());
 	// TS: `apiKey || options?.apiKey`
 	base.api_key = match api_key {

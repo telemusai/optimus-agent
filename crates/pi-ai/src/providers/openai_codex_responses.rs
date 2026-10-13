@@ -2707,10 +2707,18 @@ async fn process_web_socket_stream(
     let raw_events = parse_web_socket(socket.clone(), options.stream.signal.clone()).inspect({
         let on_start = on_start.clone();
         let observation_options = options.stream.clone();
+        let mut received_event = false;
         move |event| {
-            if let Ok(event) = event { observe_event(&observation_options, event); }
-            // Output may have side effects even if the shared parser ignores its subtype.
-            if event.as_ref().is_ok_and(is_output_producing_event) {
+            if let Ok(event) = event {
+                received_event = true;
+                observe_event(&observation_options, event);
+            }
+            // Metadata or an unknown event makes subsequent transport loss
+            // ambiguous. Block replay, but keep explicit stale-chain rejection
+            // retryable before output; that rejection is a Codex API error.
+            if event.as_ref().is_ok_and(is_output_producing_event)
+                || (received_event && event.as_ref().is_err_and(|error| !is_codex_non_transport_error(error)))
+            {
                 on_start();
             }
         }

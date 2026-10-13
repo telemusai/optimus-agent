@@ -1,0 +1,5 @@
+- Added opt-in SGLang final-request token budgeting for existing OpenAI-compatible models, using exact chat tokenization or zero-output image prefill before clamping output to available context.
+- Added opt-in hash-only final HTTP payload audit receipts for guarded models; no prompts, hidden reasoning, credentials, or images are written.
+- Fixed image budgeting to use expanded raw input token IDs rather than billed prompt usage, retaining generation-stub tokens in the context limit.
+- Added optional `defaultMaxTokens` model configuration to separate the usual output budget from the `maxTokens` ceiling. Simple-provider requests can override that default up to the ceiling; models without the field retain their prior behavior. Registry refresh, extension models, and serialized model metadata preserve the setting. Automatic compaction thresholds are unchanged.
+- Fixed local SGLang budget integration to retain upstream pooled transport for unguarded models while keeping guarded count/generation policy and exact serialized-body audit checks.

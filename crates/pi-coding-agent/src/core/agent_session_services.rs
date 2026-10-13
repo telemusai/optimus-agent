@@ -252,6 +252,7 @@ fn model_definition(model: &crate::core::extensions::types::ProviderModelConfig)
         context_window: Some(model.context_window),
         max_input_tokens: model.max_input_tokens,
         max_tokens: Some(model.max_tokens),
+        default_max_tokens: model.default_max_tokens,
         native_compaction: serde_json::from_value(model.native_compaction.clone().unwrap_or(Value::Null)).ok(),
         headers: None,
         compat: serde_json::from_value(model.compat.clone().unwrap_or(Value::Null)).ok(),

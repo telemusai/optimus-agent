@@ -1,0 +1,8 @@
+- Fixed Chat Completions streams waiting for HTTP EOF after recognized provider DONE messages.
+- Changed converted message payloads and native snapshot fragments to avoid unnecessary copies while preserving payload and snapshot bytes.
+- Changed eligible plain-HTTP token-count calls to reuse bounded transport clients without caching counts or credentials.
+- Fixed deterministic token-budget and known count HTTP failures to retain retry classification.
+- Added content-free snapshot substage and Jev pre-context assessment timing and usage-knownness records.
+- Changed Jev diagnostic writes to batch within each result phase without changing durable control transactions.
+- Changed canonical interactive message display to use typed payloads with the existing validation fallback.
+- Added local Sending receipts and submission-phase timing without claiming host admission from local display.

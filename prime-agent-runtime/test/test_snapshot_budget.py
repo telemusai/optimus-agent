@@ -76,16 +76,30 @@ class SnapshotFormatDefaultTest(BudgetTestCase):
         self.assertEqual(restored, {"value": 1})
         self.assertEqual(info["format"], "cas-v2")
 
-    def test_auto_continues_an_existing_legacy_session(self) -> None:
+    def test_auto_migrates_an_existing_legacy_session_once(self) -> None:
         first = self.snapshot({"value": 1}, snapshot_format="legacy")
         self.assertEqual(first["format"], "legacy")
+        # The explicit legacy flag remains the rollback: it keeps writing legacy.
+        rollback = self.snapshot({"value": 0}, snapshot_format="legacy")
+        self.assertEqual(rollback["format"], "legacy")
+        self.assertFalse(os.path.exists(self.cas_root))
+        # The next automatic save migrates the session onto CAS v2...
         second = self.snapshot({"value": 2})
         self.assertNotIn("error", second)
-        self.assertEqual(second["format"], "legacy")
+        self.assertEqual(second["format"], "cas-v2")
+        self.assertTrue(second["migrated_from_legacy"])
+        # ...keeps the legacy pair on disk for older readers...
         self.assertTrue(os.path.isfile(self.legacy_path))
-        self.assertFalse(os.path.exists(self.cas_root))
-        restored, _ = self.restore()
+        self.assertTrue(os.path.isfile(self.manifest_path))
+        restored, info = self.restore()
         self.assertEqual(restored, {"value": 2})
+        self.assertEqual(info["format"], "cas-v2")
+        # ...and later automatic saves continue CAS v2 without re-migrating.
+        third = self.snapshot({"value": 3})
+        self.assertEqual(third["format"], "cas-v2")
+        self.assertNotIn("migrated_from_legacy", third)
+        restored, _ = self.restore()
+        self.assertEqual(restored["value"], 3)
 
     def test_auto_continues_an_existing_cas_session(self) -> None:
         self.snapshot({"value": 1})

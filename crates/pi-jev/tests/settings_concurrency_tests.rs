@@ -1,4 +1,4 @@
-use pi_jev::{JevMode, JevSettingsStore};
+use pi_jev::{JevMode, JevSettings, JevSettingsStore};
 
 #[test]
 fn stale_settings_cannot_overwrite_another_sessions_change() {
@@ -48,6 +48,33 @@ fn settings_writer_child() {
             std::thread::sleep(std::time::Duration::from_millis(5));
         }
     }
+}
+
+#[test]
+fn cached_reader_sees_another_process_write() {
+    // Cross-process cache safety: a reader whose cache is already warm must
+    // observe a write made by a SEPARATE process through the same
+    // temp+rename save path (fresh mtime busts the stat check).
+    let dir = tempfile::tempdir().unwrap();
+    let store = JevSettingsStore::new(dir.path());
+    store.save(&JevSettings::default()).unwrap();
+    let warm = store.load();
+    assert!(warm.sessions.is_empty(), "the cache starts from an empty file");
+    let mut child = std::process::Command::new(std::env::current_exe().unwrap())
+        .args(["--exact", "settings_writer_child"])
+        .env("JEV_TEST_SETTINGS_DIR", dir.path())
+        .env("JEV_TEST_WRITER_ID", "cross-process")
+        .stdout(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    assert!(child.wait().unwrap().success());
+    let loaded = store.load();
+    assert_eq!(
+        loaded.sessions.len(),
+        10,
+        "a write from another process must bust this store's cache"
+    );
+    assert_eq!(loaded.session_mode("cross-process-0"), Some(JevMode::Compare));
 }
 
 #[test]

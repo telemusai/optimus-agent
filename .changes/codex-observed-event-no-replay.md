@@ -1,0 +1,1 @@
+- Fixed Codex WebSocket reconnect and SSE fallback replay after observed response metadata or unknown events followed by transport loss, while retaining bounded explicit stale-continuation recovery.

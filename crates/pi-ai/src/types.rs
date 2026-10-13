@@ -1105,6 +1105,11 @@ pub struct OpenAICompletionsCompat {
     /// Whether the provider supports the `store` field. Default: auto-detected from URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_store: Option<bool>,
+    /// Whether the provider derives token budgets from the SGLang server
+    /// runtime (local overlay): budget mirrors the serving stack, not the
+    /// model catalog. Default: off.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sglang_token_budget: Option<bool>,
     /// Whether the provider supports the `developer` role (vs `system`). Default: auto-detected from URL.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub supports_developer_role: Option<bool>,
@@ -1483,6 +1488,10 @@ pub struct Model {
     /// The output limit was explicitly configured rather than supplied by a catalog.
     #[serde(default, skip_serializing_if = "std::ops::Not::not")]
     pub max_tokens_explicit: bool,
+    /// Default requested output budget; `max_tokens` remains the output ceiling.
+    /// Absent keeps the legacy simple-provider default (at most 32,000 tokens).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_tokens: Option<f64>,
     /// Flagship model surfaced above non-featured models of the same provider in pickers.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub featured: Option<bool>,

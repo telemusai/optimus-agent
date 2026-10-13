@@ -3149,6 +3149,9 @@ mod tests {
     /// edge. It is measured on its own stage and the header stage stays unavailable.
     #[tokio::test]
     async fn websocket_send_ack_is_not_recorded_as_a_response_header_edge() {
+        // finish_request_metrics registers the terminal message in the process-global
+        // correlation registry, so this test shares the registry lock.
+        let _guard = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         #[derive(Default)]
         struct Capture(std::sync::Mutex<Vec<PerformanceMetricEvent>>);
         impl PerformanceMetricRecorder for Capture {
@@ -3244,6 +3247,9 @@ mod tests {
     /// wire-observed HTTP status, and no text unless the emitter supplied one.
     #[tokio::test]
     async fn failed_provider_attempt_records_error_class_and_http_status() {
+        // finish_request_metrics registers the terminal message in the process-global
+        // correlation registry, so this test shares the registry lock.
+        let _guard = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let capture = Arc::new(CaptureMetrics::default());
         let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
         config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
@@ -3305,6 +3311,9 @@ mod tests {
     /// free of failure fields even when a status was observed on the wire.
     #[tokio::test]
     async fn cancelled_and_successful_attempts_do_not_carry_failure_detail() {
+        // finish_request_metrics registers the terminal message in the process-global
+        // correlation registry, so this test shares the registry lock.
+        let _guard = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         let capture = Arc::new(CaptureMetrics::default());
         let mut config = AgentLoopConfig::new(Model::new("m", "M", "openai-responses", "openai", "http://localhost"));
         config.performance_metrics = Some(AgentLoopPerformanceMetrics::new(capture.clone()));
@@ -3910,6 +3919,7 @@ mod tests {
 #[cfg(test)]
 mod stream_watchdog_loop_tests {
     use super::*;
+    use super::rlm_t16_tests::REGISTRY_TESTS;
     use crate::stream_watchdog::testing::{EnvVarGuard, ENV_TESTS};
     use crate::stream_watchdog::{
         RETRY_TRUNCATED_RESPONSE_ENV, STREAM_DEADLINE_MS_ENV, STREAM_EVENT_GAP_MS_ENV,
@@ -4073,6 +4083,9 @@ mod stream_watchdog_loop_tests {
     #[tokio::test(start_paused = true)]
     async fn watchdog_after_deltas_uses_latest_context_and_records_failure_metrics() {
         let _guard = ENV_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+        // The aborted attempt is finished with metrics, so its terminal message is
+        // registered in the process-global correlation registry: share that lock too.
+        let _registry = REGISTRY_TESTS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         #[derive(Default)]
         struct Recorder(Mutex<Vec<PerformanceMetricEvent>>);
         impl PerformanceMetricRecorder for Recorder {

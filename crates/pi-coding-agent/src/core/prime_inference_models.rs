@@ -37,6 +37,7 @@ pub fn private_prime_inference_models() -> Vec<Model> {
         max_input_tokens: None,
         max_tokens: 131_072.0,
         max_tokens_explicit: false,
+        default_max_tokens: None,
         featured: Some(true),
         native_compaction: None,
         headers: None,

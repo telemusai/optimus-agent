@@ -39,6 +39,7 @@ from .snapshot import (
     _fsync_directory,
     cas_root_for_legacy_path,
     cas_state_present,
+    manifest_path_for_legacy_path,
     order_names_by_serialization_cost,
     read_cas_payload,
     restore_cas_v2,
@@ -714,6 +715,29 @@ def _snapshot_state(
             committed,
             budget_ms=budget_ms,
         )
+    if snapshot_format == "auto" and has_legacy:
+        # B: an existing legacy session migrates onto CAS v2 on its next
+        # automatic save so only changed blobs are rewritten from then on.
+        # The complete v2 root is built in a hidden sibling directory and
+        # flipped live with one atomic rename; the legacy payload+manifest
+        # stay untouched on disk for older binaries without CAS v2 support
+        # (and for the explicit `legacy` rollback flag on fresh roots).
+        migrated = snapshot_store.migrate_legacy_to_cas(
+            ns,
+            effective_cas_root,
+            max_bytes,
+            max_variable_bytes,
+            prune_oversized,
+            _ALWAYS_SKIP,
+            BashHandle,
+            committed,
+            budget_ms=budget_ms,
+        )
+        if "error" not in migrated:
+            return migrated
+        # A failed flip (full disk, rename race) leaves the legacy pair intact
+        # and current; fall through to the legacy writer so this save still
+        # lands durably, and retry the migration on the next debounced save.
 
     total_started = time.monotonic_ns()
     import datetime
@@ -871,6 +895,50 @@ def _snapshot_state(
             outer_serialization_wall_ns += time.monotonic_ns() - count_started
             if count_cpu_started is not None and thread_clock is not None:
                 serialization_cpu_ns += thread_clock() - count_cpu_started
+            saved = sorted(payload.keys())
+            pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+            outcome_digest = snapshot_store.legacy_outcome_digest(payload, skipped, pruned, dropped)
+            if snapshot_store.unchanged_legacy_checkpoint(history, path, manifest_path, outcome_digest):
+                # The durable legacy payload and manifest are byte-identical
+                # to this outcome (digest match) and nothing replaced them
+                # since this process committed them (size+mtime match), so the
+                # disk write is a pure no-op. Nothing is written, so atomic
+                # replacement and the last-valid-checkpoint invariant are
+                # untouched; a crash loses only a rewrite of identical bytes.
+                for name in pruned:
+                    ns.pop(name, None)
+                unchanged_result: dict[str, Any] = {
+                    "saved": saved,
+                    "skipped": skipped,
+                    "pruned": pruned,
+                    "dropped": sorted(dropped)[:snapshot_store.DROPPED_NAMES_RESULT_LIMIT],
+                    "bytes": envelope_bytes,
+                    "format": "legacy",
+                    "logical_bytes": sum(len(blob) for blob in payload.values()),
+                    "written_bytes": 0,
+                    "backward_readable": True,
+                    "skipped_unchanged": True,
+                    "metrics": {
+                        "serialization_wall_ms": (serialization_wall_ns + outer_serialization_wall_ns) / 1_000_000,
+                        "serialization_cpu_ms": serialization_cpu_ns / 1_000_000 if thread_clock is not None else None,
+                        "serialized_bytes": sum(len(blob) for blob in payload.values()),
+                        "write_ms": 0.0,
+                        "written_bytes": 0,
+                        "total_wall_ms": (time.monotonic_ns() - total_started) / 1_000_000,
+                        "snapshot_legacy_captures": 0,
+                        "snapshot_cas_captures": 0,
+                        "serialization_reused_names": 0,
+                        "dropped_names_count": len(dropped),
+                        "snapshot_skipped_unchanged": 1,
+                        **envelope_metrics,
+                        **variable_metrics.summarize(payload),
+                    },
+                }
+                # Publish like a committed save: an interrupt arriving here
+                # finds the truthful skipped result (see _handle_state).
+                if committed is not None:
+                    committed.append(unchanged_result)
+                return unchanged_result
             fh, tmp = stage_temp(path, "wb")
             with fh:
                 def dump_to_temp(candidate: dict[str, bytes]) -> int | None:
@@ -895,8 +963,6 @@ def _snapshot_state(
                 bytes_written = dump_to_temp(payload)
                 if bytes_written is None:
                     return {"error": "write failed: snapshot exceeds aggregate snapshot size cap"}
-            saved = sorted(payload.keys())
-            pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
             manifest = {
                 "version": 1,
                 "savedNames": saved,
@@ -932,6 +998,12 @@ def _snapshot_state(
             # Fail before the prune deletions so a bad manifest path never destroys state.
             return {"error": f"manifest write failed: {err}"}
         persistence_elapsed_ns = time.monotonic_ns() - persistence_started
+        # Record the committed outcome so the next save can skip an identical
+        # rewrite. Still under the parked SIGINT: the stat must observe the
+        # just-replaced pair, and an interrupt here must not misreport the
+        # committed save (the record is best-effort; a stat failure simply
+        # disables the next skip).
+        snapshot_store.remember_legacy_checkpoint(history, path, manifest_path, outcome_digest)
         for name in pruned:
             ns.pop(name, None)
         result = {
@@ -993,7 +1065,15 @@ def _restore_state(
         return {"error": "restore source must be auto, current, previous, or legacy"}
     effective_cas_root = cas_root or cas_root_for_legacy_path(path)
     has_cas = cas_state_present(effective_cas_root)
-    if source in {"current", "previous"} or (source == "auto" and has_cas):
+    # B: after a one-way legacy -> CAS v2 migration, a binary without CAS v2
+    # support may keep writing fresher legacy state on top of the flipped
+    # root. Auto-restore then revives the newer legacy payload (and flags it)
+    # instead of silently discarding that downgraded work; the next automatic
+    # save re-merges it into a new CAS generation.
+    diverted_to_legacy = (
+        source == "auto" and has_cas and snapshot_store.legacy_payload_is_fresher(path, effective_cas_root)
+    )
+    if source in {"current", "previous"} or (source == "auto" and has_cas and not diverted_to_legacy):
         cas_source = "previous" if source == "previous" else "current"
         return restore_cas_v2(
             ns,
@@ -1005,9 +1085,10 @@ def _restore_state(
             max_variable_bytes=max_variable_bytes,
         )
 
+    legacy_selected = source == "legacy" or diverted_to_legacy
     if not os.path.exists(path):
         result: dict[str, Any] = {"restored": [], "failed": [], "reason": "snapshot not found"}
-        if source == "legacy" and has_cas:
+        if legacy_selected and has_cas:
             result.update({"legacy_recovery": True, "unsaved_work_possible": True})
         return result
     try:
@@ -1021,6 +1102,15 @@ def _restore_state(
         return {"error": f"load failed: {_safe_str(err)}"}
     if not isinstance(payload, dict):
         return {"error": "corrupt snapshot: not a dict"}
+    # Seed the unchanged-skip record from the payload just read: the next save
+    # skips only when it re-serializes to exactly these bytes (round-trip
+    # stability), and the manifest supplies the recorded outcome's metadata.
+    snapshot_store.remember_restored_legacy_checkpoint(
+        snapshot_history_for_root(effective_cas_root),
+        path,
+        manifest_path_for_legacy_path(path),
+        payload,
+    )
 
     staged: dict[str, Any] = {}
     failed: list[dict[str, str]] = []
@@ -1033,7 +1123,7 @@ def _restore_state(
             failed.append({"name": name, "reason": f"{type(err).__name__}: {_safe_str(err)[:200]}"})
     prepared, backfill, revive_failed = prepare_restored_values(staged, ns, _RESTORE_SKIP)
     result: dict[str, Any] = {"restored": sorted(prepared), "failed": failed + revive_failed, "format": "legacy"}
-    if source == "legacy" and has_cas:
+    if legacy_selected and has_cas:
         result.update({"legacy_recovery": True, "unsaved_work_possible": True})
     # Park SIGINT across the whole apply so it is all-or-nothing; the parked interrupt is consumed by the commit (as in snapshot).
     previous = signal.signal(signal.SIGINT, lambda signum, frame: None)

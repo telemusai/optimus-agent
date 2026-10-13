@@ -84,6 +84,9 @@ pub struct ModelDefinition {
     pub max_input_tokens: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub max_tokens: Option<f64>,
+    /// Default requested output budget; `maxTokens` remains the output ceiling.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_tokens: Option<f64>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub native_compaction: Option<NativeCompactionCapability>,
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1974,6 +1977,7 @@ impl ModelRegistry {
                     max_input_tokens: model_def.max_input_tokens,
                     max_tokens: model_def.max_tokens.unwrap_or(16_384.0),
                     max_tokens_explicit: model_def.max_tokens.is_some(),
+                    default_max_tokens: model_def.default_max_tokens,
                     featured: None,
                     native_compaction: model_def.native_compaction.clone(),
                     headers: None,
@@ -3342,6 +3346,7 @@ impl ModelRegistry {
                     max_input_tokens: model_def.max_input_tokens,
                     max_tokens: model_def.max_tokens.unwrap_or(0.0),
                     max_tokens_explicit: model_def.max_tokens.is_some(),
+                    default_max_tokens: model_def.default_max_tokens,
                     featured: None,
                     native_compaction: model_def.native_compaction.clone(),
                     headers: None,

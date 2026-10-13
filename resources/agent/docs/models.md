@@ -215,10 +215,17 @@ If your command is slow, expensive, rate-limited, or should keep using a previou
 | `input` | No | `["text"]` | Input types: `["text"]` or `["text", "image"]` |
 | `contextWindow` | No | `128000` | Context window size in tokens |
 | `maxInputTokens` | No | `contextWindow` | Optional positive integer cap on input tokens, no larger in effect than `contextWindow` |
-| `maxTokens` | No | `16384` | Maximum output tokens |
+| `maxTokens` | No | `16384` | Maximum output tokens (ceiling) |
+| `defaultMaxTokens` | No | omitted | Positive integer default requested output budget, no greater than `maxTokens`. When omitted, simple-provider defaults keep the legacy `min(maxTokens, 32000)` policy. |
 | `cost` | No | all zeros | `{"input": 0, "output": 0, "cacheRead": 0, "cacheWrite": 0}` (per million tokens) |
 | `compat` | No | provider `compat` | Provider compatibility overrides. Merged with provider-level `compat` when both are set. |
 | `nativeCompaction` | No | omitted | Exact model-scoped native compaction capability; currently staged only for `azure-openai-managed/gpt-6-astra` |
+
+### Separate output default and ceiling
+
+`defaultMaxTokens` separates the usual requested output budget from `maxTokens`, the output ceiling. For example, a model may use `contextWindow: 1048576`, `maxTokens: 262144`, and `defaultMaxTokens: 131072`. Existing `StreamOptions.maxTokens` overrides the default for an individual request; opted-in simple-provider requests are capped at `maxTokens`. Models without this field keep their existing output defaults and override behavior.
+
+This does not reserve the output ceiling on every request or change automatic compaction. The existing 250,000-token compaction rule still applies independently of the advertised context window. Context estimates used by compaction are not exact tokenizer counts. The SGLang preflight is a separate opt-in guard for the final serialized request; it must reduce output to fit the remaining verified context or fail before generation, rather than remove history to make room.
 
 ### Staged Azure Astra native compaction
 
@@ -332,7 +339,7 @@ Use `modelOverrides` to customize specific built-in models without replacing the
 }
 ```
 
-`modelOverrides` supports these fields per model: `name`, `reasoning`, `thinkingLevelMap`, `input`, `cost` (partial), `contextWindow`, `maxInputTokens`, `maxTokens`, `headers`, `compat`.
+`modelOverrides` supports these fields per model: `name`, `reasoning`, `thinkingLevelMap`, `input`, `cost` (partial), `contextWindow`, `maxInputTokens`, `maxTokens`, `defaultMaxTokens`, `headers`, `compat`.
 
 Behavior notes:
 - `modelOverrides` are applied to built-in provider models.
@@ -421,6 +428,7 @@ For providers with partial OpenAI compatibility, use the `compat` field.
 
 | Field | Description |
 |-------|-------------|
+| `sglangTokenBudget` | Opt-in SGLang request-time token-budget preflight on the same authenticated API endpoint. Requires a server with the supported chat token-count contract. Default: `false`. |
 | `supportsStore` | Provider supports `store` field |
 | `supportsDeveloperRole` | Use `developer` vs `system` role |
 | `supportsReasoningEffort` | Support for `reasoning_effort` parameter |

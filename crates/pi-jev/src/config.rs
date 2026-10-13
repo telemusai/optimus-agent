@@ -12,7 +12,7 @@
 use std::fmt;
 use std::io::Write;
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock, Weak};
 
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
@@ -1078,24 +1078,131 @@ pub fn jev_dir_for(agent_dir: impl AsRef<Path>) -> PathBuf {
     agent_dir.as_ref().join("jev")
 }
 
+/// Cheap change identity of a settings file: data modification time in
+/// nanoseconds since the Unix epoch, plus the file length. RELIES ON THE
+/// WRITE DISCIPLINE: saves go through a fresh temp file + atomic rename, so
+/// every save leaves a new mtime behind, and NTFS stamps writes at 100 ns
+/// granularity - two different contents colliding on BOTH (mtime_ns, len)
+/// is therefore assumed impossible. On filesystems with coarser timestamps
+/// (e.g. FAT's 2 s) that assumption is weaker; the agent dir is not expected
+/// to live on one.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct SettingsFileStat {
+    mtime_ns: u64,
+    len: u64,
+}
+
+fn settings_file_stat(metadata: &std::fs::Metadata) -> Option<SettingsFileStat> {
+    // Unreadable or pre-epoch mtimes cannot be trusted to move on rewrite,
+    // so they opt out of the cache entirely (always a full read).
+    let since_epoch = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?;
+    Some(SettingsFileStat {
+        mtime_ns: since_epoch.as_nanos() as u64,
+        len: metadata.len(),
+    })
+}
+
+/// One cached settings snapshot behind interior mutability, shared by every
+/// [`JevSettingsStore`] instance for the same settings file. The
+/// `(stat, snapshot)` pair swap happens under one mutex, so a reader
+/// observes either the old or the new pair, never a mix.
+struct SharedSettingsCache {
+    entry: Mutex<Option<(SettingsFileStat, Arc<JevSettings>)>>,
+    /// Full read+parse passes served by this cache (unit-test evidence only).
+    #[cfg(test)]
+    full_loads: std::sync::atomic::AtomicU64,
+}
+
+impl SharedSettingsCache {
+    fn shared() -> Arc<Self> {
+        Arc::new(Self {
+            entry: Mutex::new(None),
+            #[cfg(test)]
+            full_loads: std::sync::atomic::AtomicU64::new(0),
+        })
+    }
+
+    /// Drops the cached snapshot. Called after every write attempt through
+    /// any store sharing this cache (safety rule: a store must never serve
+    /// its own pre-save view; the stat check in `load` covers every other
+    /// writer, including other processes).
+    fn invalidate(&self) {
+        *self.entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) = None;
+    }
+}
+
+/// Live per-file caches. The hot call sites build a fresh store per call
+/// (`JevSettingsStore::new(get_agent_dir()).load()`), so a strictly
+/// per-object cache could never serve them; the registry lets every store
+/// instance for one settings path share one cache instead. Keys are the raw
+/// store paths: a key miss (two spellings of one file) only duplicates the
+/// cached snapshot, never correctness - every load still stats the real
+/// file. `Weak` values let an unused cache be reclaimed with its last store.
+static SETTINGS_CACHES: OnceLock<Mutex<std::collections::HashMap<PathBuf, Weak<SharedSettingsCache>>>> =
+    OnceLock::new();
+
+fn settings_cache_for_path(path: &Path) -> Arc<SharedSettingsCache> {
+    let registry = SETTINGS_CACHES.get_or_init(|| Mutex::new(std::collections::HashMap::new()));
+    let mut caches = registry.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
+    if let Some(cache) = caches.get(path).and_then(Weak::upgrade) {
+        return cache;
+    }
+    // Opportunistic sweep: long-lived processes (and the test binary's many
+    // temp dirs) never accumulate dead keys.
+    caches.retain(|_, cache| cache.strong_count() > 0);
+    let cache = SharedSettingsCache::shared();
+    caches.insert(path.to_path_buf(), Arc::downgrade(&cache));
+    cache
+}
+
 /// Settings store bound to one agent dir. `agent_dir` is injected to keep it testable and to
 /// keep every test's state inside its own temporary directory.
-#[derive(Debug, Clone)]
+///
+/// Change-aware cache: every instance for the same settings file shares one
+/// cached snapshot (see [`SETTINGS_CACHES`]). `load` re-reads and re-parses
+/// the file only when its `(mtime_ns, len)` identity moves, and `save` drops
+/// the snapshot so a store never serves its own pre-save view.
 pub struct JevSettingsStore {
     path: PathBuf,
+    cache: Arc<SharedSettingsCache>,
+}
+
+impl Clone for JevSettingsStore {
+    fn clone(&self) -> Self {
+        Self {
+            path: self.path.clone(),
+            cache: Arc::clone(&self.cache),
+        }
+    }
+}
+
+impl fmt::Debug for JevSettingsStore {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        // Mirrors the pre-cache derive output: the cached snapshot itself
+        // would be megabytes of log noise.
+        f.debug_struct("JevSettingsStore")
+            .field("path", &self.path)
+            .finish()
+    }
 }
 
 impl JevSettingsStore {
     /// Store for an explicit agent dir.
     pub fn new(agent_dir: impl AsRef<Path>) -> Self {
-        Self {
-            path: jev_dir_for(agent_dir).join(SETTINGS_FILE_NAME),
-        }
+        Self::from_path(jev_dir_for(agent_dir).join(SETTINGS_FILE_NAME))
     }
 
     /// Store for an explicit settings file path.
     pub fn from_path(path: impl Into<PathBuf>) -> Self {
-        Self { path: path.into() }
+        let path = path.into();
+        Self {
+            cache: settings_cache_for_path(&path),
+            path,
+        }
     }
 
     /// Settings file path.
@@ -1105,13 +1212,60 @@ impl JevSettingsStore {
 
     /// Loads settings. A missing file yields defaults; a corrupt file yields defaults and
     /// never panics (a broken settings file must not block startup).
+    ///
+    /// Change-aware cache: the file is stat'ed first, and a `(mtime_ns,
+    /// len)` that matches the cached snapshot returns a clone of it,
+    /// skipping the full read + parse + validate. Safety rules, each
+    /// covered by tests: (a) a stat that differs NEVER serves the cache, so
+    /// a disable or credential revocation is never masked; (b) a malformed
+    /// or unreadable file keeps the defaults behavior and is never cached,
+    /// so the next good write is always seen; (c) a missing file yields
+    /// defaults and clears the cache; (d) a save through any store sharing
+    /// this cache invalidates it; (e) the snapshot is only cached when the
+    /// stat is stable across the read (double-stat), so a write racing this
+    /// load can never leave old bytes paired with a new stat.
     pub fn load(&self) -> JevSettings {
+        // Fast path: stat only.
+        let stat_before = std::fs::metadata(&self.path).ok().as_ref().and_then(settings_file_stat);
+        if let Some(stat) = stat_before {
+            let cached = self.cache
+                .entry
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .as_ref()
+                .and_then(|(cached_stat, snapshot)| {
+                    (*cached_stat == stat).then(|| (**snapshot).clone())
+                });
+            if let Some(settings) = cached {
+                return settings;
+            }
+        }
+        #[cfg(test)]
+        self.cache.full_loads.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        // Slow path: the original full read + parse + validate.
         let bytes = std::fs::read(&self.path).ok();
-        let mut settings = bytes.as_deref()
+        let parsed = bytes
+            .as_deref()
             .and_then(|bytes| serde_json::from_slice::<JevSettings>(bytes).ok())
-            .filter(|settings| settings.validate().is_ok())
-            .unwrap_or_default();
+            .filter(|settings| settings.validate().is_ok());
+        let mut settings = parsed.clone().unwrap_or_default();
         settings.loaded_generation = Some(settings_generation(bytes.as_deref()));
+        // Cache refresh, per the safety rules above.
+        match std::fs::metadata(&self.path) {
+            Ok(metadata) => {
+                if let Some(after) = settings_file_stat(&metadata) {
+                    if parsed.is_some() && stat_before == Some(after) {
+                        *self.cache.entry.lock().unwrap_or_else(|poisoned| poisoned.into_inner()) =
+                            Some((after, Arc::new(settings.clone())));
+                    }
+                }
+            }
+            // A missing file yields defaults and clears the cache: the next
+            // good write (recreating the file) must never be masked.
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => self.cache.invalidate(),
+            // Unreadable metadata: defaults, cache untouched (never cached).
+            Err(_) => {}
+        }
         settings
     }
 
@@ -1173,6 +1327,12 @@ impl JevSettingsStore {
             drop(file);
             std::fs::rename(&temp, &self.path)
         })();
+        // SAFETY RULE (d): every completed write attempt drops the cached
+        // snapshot for this file, so this store (and every store sharing its
+        // cache) never serves its own pre-save view. Writers in OTHER
+        // processes are covered by the stat check in `load`: the atomic
+        // rename leaves a fresh mtime behind.
+        self.cache.invalidate();
         if result.is_err() {
             let _ = std::fs::remove_file(&temp);
         }
@@ -1183,6 +1343,283 @@ impl JevSettingsStore {
 /// Convenience: shared settings store for an agent dir.
 pub fn settings_store(agent_dir: impl AsRef<Path>) -> Arc<JevSettingsStore> {
     Arc::new(JevSettingsStore::new(agent_dir))
+}
+
+/// Safety rules for the change-aware settings cache in [`JevSettingsStore`].
+/// Each test maps to one rule from the load/save doc comments.
+#[cfg(test)]
+mod settings_cache_tests {
+    use super::*;
+    use std::sync::atomic::Ordering;
+
+    /// Full read+parse passes served by the shared cache of this path.
+    fn full_loads(store: &JevSettingsStore) -> u64 {
+        store.cache.full_loads.load(Ordering::Relaxed)
+    }
+
+    fn snapshot_is_cached(store: &JevSettingsStore) -> bool {
+        store
+            .cache
+            .entry
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_some()
+    }
+
+    /// Writes the file directly, like an operator or an external process.
+    fn write_file(path: &Path, contents: &[u8]) {
+        std::fs::create_dir_all(path.parent().expect("settings parent")).unwrap();
+        std::fs::write(path, contents).unwrap();
+    }
+
+    #[test]
+    fn unchanged_file_is_served_from_the_cache_without_reparse() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut settings = JevSettings::default();
+        settings.set_session_mode("alpha", JevMode::Compare);
+        store.save(&settings).unwrap();
+        let first = store.load();
+        assert_eq!(first.session_mode("alpha"), Some(JevMode::Compare));
+        let baseline = full_loads(&store);
+        assert!(baseline >= 1, "the first load after a save is a full read");
+        assert!(snapshot_is_cached(&store), "a good load primes the cache");
+        // 50 loads of an unchanged file: same value, zero full re-parses.
+        for _ in 0..50 {
+            let cached = store.load();
+            assert_eq!(cached.session_mode("alpha"), Some(JevMode::Compare));
+        }
+        assert_eq!(
+            full_loads(&store),
+            baseline,
+            "an unchanged (mtime_ns, len) must skip the full read+parse"
+        );
+        // A rewrite (new mtime) re-parses and serves the fresh value.
+        let mut next = store.load();
+        next.set_session_mode("alpha", JevMode::Off);
+        store.save(&next).unwrap();
+        let after = store.load();
+        assert_eq!(after.session_mode("alpha"), Some(JevMode::Off));
+        assert!(
+            full_loads(&store) > baseline,
+            "a changed stat must fall back to the full read"
+        );
+    }
+
+    #[test]
+    fn fresh_store_instances_for_one_path_share_the_cache() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut settings = JevSettings::default();
+        settings.set_session_mode("alpha", JevMode::Compare);
+        store.save(&settings).unwrap();
+        let _warm = store.load();
+        let baseline = full_loads(&store);
+        // The hot callers build a fresh store per call; they must hit the
+        // same shared cache instead of re-parsing every time.
+        for _ in 0..10 {
+            let hot_caller = JevSettingsStore::new(directory.path());
+            assert_eq!(hot_caller.load().session_mode("alpha"), Some(JevMode::Compare));
+        }
+        assert_eq!(
+            full_loads(&store),
+            baseline,
+            "fresh instances on the same path must be served by the shared cache"
+        );
+    }
+
+    #[test]
+    fn disable_after_enable_is_visible_across_store_instances() {
+        let directory = tempfile::tempdir().unwrap();
+        let store_a = JevSettingsStore::new(directory.path());
+        let store_b = JevSettingsStore::new(directory.path());
+        let mut enable = JevSettings::default();
+        enable.set_session_mode("alpha", JevMode::Compare);
+        store_b.save(&enable).unwrap();
+        assert_eq!(
+            store_a.load().session_mode("alpha"),
+            Some(JevMode::Compare),
+            "an enable through B is seen by A"
+        );
+        // B disables; A's cached enable must NEVER be served again.
+        let mut disable = store_b.load();
+        disable.set_session_mode("alpha", JevMode::Off);
+        store_b.save(&disable).unwrap();
+        assert_eq!(
+            store_a.load().session_mode("alpha"),
+            Some(JevMode::Off),
+            "a disable must not be masked by A's cache"
+        );
+    }
+
+    #[test]
+    fn malformed_file_is_never_cached_and_a_fix_is_seen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        write_file(store.path(), b"broken settings");
+        for _ in 0..3 {
+            let loaded = store.load();
+            assert_eq!(
+                loaded.effective_mode("alpha"),
+                JevMode::Off,
+                "a malformed file yields defaults"
+            );
+        }
+        assert!(
+            !snapshot_is_cached(&store),
+            "malformed content must never be cached"
+        );
+        assert!(
+            full_loads(&store) >= 3,
+            "every malformed load is a real read, so the next good write is observable"
+        );
+        // An operator fixes the file by hand; the next load must pick it up.
+        let mut fixed = JevSettings::default();
+        fixed.set_session_mode("alpha", JevMode::Active);
+        write_file(store.path(), &serde_json::to_vec_pretty(&fixed).unwrap());
+        let healed = store.load();
+        assert_eq!(healed.session_mode("alpha"), Some(JevMode::Active));
+        assert!(snapshot_is_cached(&store), "the healed file is cacheable again");
+    }
+
+    #[test]
+    fn missing_file_yields_defaults_clears_the_cache_then_a_new_file_is_seen() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut settings = JevSettings::default();
+        settings.set_session_mode("alpha", JevMode::Compare);
+        store.save(&settings).unwrap();
+        assert!(store.load().session_mode("alpha").is_some());
+        assert!(snapshot_is_cached(&store), "a good load primes the cache");
+        std::fs::remove_file(store.path()).unwrap();
+        let missing = store.load();
+        assert_eq!(
+            missing.effective_mode("alpha"),
+            JevMode::Off,
+            "a missing file yields defaults"
+        );
+        assert!(missing.sessions.is_empty());
+        assert!(
+            !snapshot_is_cached(&store),
+            "a missing file clears the cache"
+        );
+        // A NEW file at the same path must be picked up, never stale state.
+        let mut fresh = JevSettings::default();
+        fresh.set_session_mode("alpha", JevMode::Active);
+        store.save(&fresh).unwrap();
+        let reloaded = store.load();
+        assert_eq!(reloaded.session_mode("alpha"), Some(JevMode::Active));
+    }
+
+    #[test]
+    fn save_invalidates_the_stores_own_cache_view() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let other = JevSettingsStore::new(directory.path());
+        let mut settings = JevSettings::default();
+        settings.set_session_mode("alpha", JevMode::Compare);
+        store.save(&settings).unwrap();
+        assert_eq!(store.load().session_mode("alpha"), Some(JevMode::Compare));
+        let mut next = store.load();
+        next.set_session_mode("alpha", JevMode::Off);
+        store.save(&next).unwrap();
+        assert_eq!(
+            store.load().session_mode("alpha"),
+            Some(JevMode::Off),
+            "save-then-load on the same store returns fresh values"
+        );
+        assert_eq!(
+            other.load().session_mode("alpha"),
+            Some(JevMode::Off),
+            "a second instance sharing the cache sees the save too"
+        );
+    }
+
+    #[test]
+    fn concurrent_loads_and_saves_stay_coherent() {
+        let directory = tempfile::tempdir().unwrap();
+        let store = JevSettingsStore::new(directory.path());
+        let mut base = JevSettings::default();
+        base.set_session_mode("alpha", JevMode::Off);
+        store.save(&base).unwrap();
+        // A snapshot loaded BEFORE the race; saving it afterwards must be
+        // refused by the generation guard.
+        let stale = store.load();
+        let stop = Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let writer = {
+            let store = store.clone();
+            let stop = Arc::clone(&stop);
+            std::thread::spawn(move || {
+                for round in 0..40u64 {
+                    let mode = if round % 2 == 0 { JevMode::Compare } else { JevMode::Off };
+                    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+                    loop {
+                        let mut settings = store.load();
+                        settings.set_session_mode("alpha", mode);
+                        match store.save(&settings) {
+                            Ok(()) => break,
+                            Err(_) if std::time::Instant::now() < deadline => continue,
+                            Err(error) => panic!("writer failed to settle: {error}"),
+                        }
+                    }
+                }
+                stop.store(true, Ordering::SeqCst);
+            })
+        };
+        let mut readers = Vec::new();
+        for _ in 0..8 {
+            let store = store.clone();
+            let stop = Arc::clone(&stop);
+            readers.push(std::thread::spawn(move || {
+                let mut last_revision = 0u64;
+                while !stop.load(Ordering::SeqCst) {
+                    let settings = store.load();
+                    // No torn state: each load is one coherent snapshot with
+                    // a valid schema and a mode/revision pair that could have
+                    // been produced by one single save (base: Off at
+                    // revision 1, then Compare at even, Off at odd).
+                    assert!(settings.validate().is_ok());
+                    let mode = settings.session_mode("alpha").expect("session always set");
+                    let revision = settings.write_revision;
+                    match mode {
+                        JevMode::Compare => assert_eq!(
+                            revision % 2,
+                            0,
+                            "Compare snapshots carry an even revision"
+                        ),
+                        JevMode::Off => assert_eq!(
+                            revision % 2,
+                            1,
+                            "Off snapshots carry an odd revision"
+                        ),
+                        other => panic!("unexpected mode: {other:?}"),
+                    }
+                    assert!(
+                        revision >= last_revision,
+                        "revisions never move backwards for one reader"
+                    );
+                    last_revision = revision;
+                }
+            }));
+        }
+        writer.join().expect("writer thread");
+        for reader in readers {
+            reader.join().expect("reader thread");
+        }
+        // The generation guard still rejects the pre-race snapshot.
+        let refused = store.save(&stale);
+        assert!(
+            refused.is_err(),
+            "the generation guard must reject the stale pre-race save"
+        );
+        // The final state is a coherent last write.
+        let final_settings = store.load();
+        assert!(matches!(
+            final_settings.session_mode("alpha"),
+            Some(JevMode::Compare) | Some(JevMode::Off)
+        ));
+        assert!(final_settings.validate().is_ok());
+    }
 }
 
 #[cfg(test)]

@@ -39,7 +39,10 @@ mod tests {
         assert_eq!(value["supported"], false);
         assert_eq!(value["auditResume"]["supported"], false);
         assert_eq!(value["provenance"]["protocolVersion"], 7);
-        assert_eq!(value["provenance"]["schemaRevision"], 32);
+        assert_eq!(
+            value["provenance"]["schemaRevision"],
+            crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_REVISION,
+        );
         assert_eq!(value["limits"]["stopTimeoutMsMax"], 10_000);
         assert!(value["targetProfile"].is_null());
     }

@@ -8,6 +8,12 @@
 
 use std::collections::HashMap;
 
+#[path = "openai_sglang_budget.rs"]
+mod sglang_budget;
+
+#[path = "openai_http_client_pool.rs"]
+mod http_client_pool;
+
 use indexmap::IndexMap;
 use serde_json::{json, Map, Value};
 
@@ -1390,6 +1396,29 @@ impl StreamError {
 		Self { message, value }
 	}
 
+	fn invalid_request(message: &'static str) -> Self {
+		Self {
+			message: message.to_string(),
+			value: json!({ "name": "Error", "message": message, "code": "invalid_request" }),
+		}
+	}
+
+	fn count_http_error(status: u16, headers: &reqwest::header::HeaderMap) -> Self {
+		let message = format!("SGLang budget: count HTTP status {status}.");
+		let mut safe_headers = Map::new();
+		for name in ["retry-after", "retry-after-ms"] {
+			if let Some(value) = headers.get(name).and_then(|value| value.to_str().ok()) {
+				safe_headers.insert(name.to_string(), json!(value));
+			}
+		}
+		let retry_after_ms = crate::utils::stream_failure::parse_retry_after_ms(Some(&Value::Object(safe_headers)))
+			.filter(|ms| ms.is_finite() && *ms >= 0.0);
+		Self {
+			message: message.clone(),
+			value: json!({ "name": "Error", "message": message, "status": status, "retryAfterMs": retry_after_ms }),
+		}
+	}
+
 	/// TS SDK `APIError.makeMessage(status, error, message)` text.
 	fn api_error_message(status: Option<u16>, error: Option<&Value>, message: Option<&str>) -> String {
 		// `const msg = error?.message ? typeof error.message === 'string' ? error.message :
@@ -1785,6 +1814,7 @@ async fn post_chat_completions(
 	body: &Value,
 	signal: Option<&tokio_util::sync::CancellationToken>,
 	timeout_ms: Option<f64>,
+	audit: Option<(&Model, &sglang_budget::BudgetReceipt)>,
 	observer: Option<&crate::types::OnStreamObservation>,
 ) -> Result<reqwest::Response, StreamError> {
 	let url = format!("{}/chat/completions", client.base_url.trim_end_matches('/'));
@@ -1799,7 +1829,17 @@ async fn post_chat_completions(
 		headers.insert(name.clone(), value.clone());
 	}
 
-	let mut builder = shared_client(ClientPolicy::Default).post(&url);
+	// Guarded requests retain mutable native TLS/proxy policy; ordinary models
+	// keep upstream's shared generation transport.
+	let http_client = if audit.is_some() {
+		let lease = http_client_pool::acquire(&url, http_client_pool::RedirectPolicy::Generation)
+			.map_err(|_| StreamError::new("Cannot initialize completion HTTP client."))?;
+		observe_local_phase(observer, lease.phase);
+		lease.client
+	} else {
+		shared_client(ClientPolicy::Default)
+	};
+	let mut builder = http_client.post(&url);
 	for (name, value) in &headers {
 		match value {
 			Some(value) => builder = builder.header(name.as_str(), value.as_str()),
@@ -1808,8 +1848,19 @@ async fn post_chat_completions(
 	}
 	observe_local_phase(observer, "generation_serialize_start");
 	builder = builder.json(body);
-	// RequestBuilder may retain an error; this phase does not prove success.
-	observe_local_phase(observer, "generation_serialize_returned");
+	if let Some((model, receipt)) = audit {
+		let request = builder.build()
+			.map_err(|_| StreamError::new("SGLang dispatch: request serialization failed."))?;
+		observe_local_phase(observer, "generation_serialize_complete");
+		let serialized = request.body().and_then(reqwest::Body::as_bytes)
+			.ok_or_else(|| StreamError::new("SGLang audit: serialized request body unavailable."))?;
+		// Re-wrap the exact built request; no body serialization follows the audit.
+		sglang_budget::audit(model, body, receipt, serialized)?;
+		builder = reqwest::RequestBuilder::from_parts(http_client, request);
+	} else {
+		// RequestBuilder may retain an error; this phase does not prove success.
+		observe_local_phase(observer, "generation_serialize_returned");
+	}
 
 	// TS: `...(options?.timeoutMs !== undefined ? { timeout: options.timeoutMs } : {})`
 	// -> the openai@6.47.0 SDK falls back to `OpenAI.DEFAULT_TIMEOUT = 600000` (10 minutes),
@@ -2556,7 +2607,10 @@ async fn run_stream_body(
 	let timeout_ms = options_ref.and_then(|options| options.stream.timeout_ms);
 
 	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.as_ref());
-	let response = post_chat_completions(&client, &params, signal.as_ref(), timeout_ms, observer).await?;
+	let budget = sglang_budget::guard_observed(model, &client, &mut params, signal.as_ref(), timeout_ms, observer).await?;
+	let response = post_chat_completions(
+		&client, &params, signal.as_ref(), timeout_ms, budget.as_ref().map(|receipt| (model, receipt)), observer,
+	).await?;
 	let status = response.status().as_u16();
 	if let Some(on_response) = options_ref.and_then(|options| options.stream.on_response.clone()) {
 		let mut response_record = crate::types::ProviderResponse {
@@ -3154,7 +3208,7 @@ mod provider_settlement_tests {
             default_headers: IndexMap::new(),
         };
         let body = json!({"model": "fixture", "messages": []});
-        let baseline = post_chat_completions(&client, &body, None, None, None).await.unwrap_err();
+        let baseline = post_chat_completions(&client, &body, None, None, None, None).await.unwrap_err();
         for panic_in_observer in [false, true] {
             let phases = Arc::new(Mutex::new(Vec::<String>::new()));
             let capture = phases.clone();
@@ -3162,7 +3216,7 @@ mod provider_settlement_tests {
                 capture.lock().unwrap().push(phase.to_string());
                 if panic_in_observer { panic!("synthetic observer failure"); }
             });
-            let failure = post_chat_completions(&client, &body, None, None, Some(&observer)).await.unwrap_err();
+            let failure = post_chat_completions(&client, &body, None, None, None, Some(&observer)).await.unwrap_err();
             assert_eq!(failure.message, baseline.message);
             assert_eq!(failure.value, baseline.value);
             assert_eq!(*phases.lock().unwrap(), vec![

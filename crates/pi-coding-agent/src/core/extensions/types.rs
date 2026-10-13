@@ -1800,6 +1800,8 @@ pub struct ProviderModelConfig {
     pub max_input_tokens: Option<f64>,
     pub max_tokens: f64,
     #[serde(skip_serializing_if = "Option::is_none")]
+    pub default_max_tokens: Option<f64>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     pub native_compaction: Option<Value>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub headers: Option<Map<String, Value>>,

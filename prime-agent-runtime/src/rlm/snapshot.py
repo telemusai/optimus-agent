@@ -15,6 +15,7 @@ import hashlib
 import json
 import os
 import re
+import shutil
 import signal
 import stat
 import tempfile
@@ -104,6 +105,15 @@ def cas_state_present(root: str) -> bool:
 def cas_root_for_legacy_path(path: str) -> str:
     """Derive the v2 sibling used when an older host supplies only `path`."""
     return f"{path[:-len('.dill')]}.v2" if path.endswith(".dill") else f"{path}.v2"
+
+
+def manifest_path_for_legacy_path(path: str) -> str:
+    """Derive the legacy manifest sibling from a payload path.
+
+    Restore requests carry only the payload path; the writer commits the
+    manifest next to it with the same basename and a `.json` extension.
+    """
+    return f"{path[:-len('.dill')]}.json" if path.endswith(".dill") else f"{path}.json"
 
 
 def _thread_cpu_ns() -> int | None:
@@ -608,21 +618,62 @@ class _ReusableBlob:
         self.size = len(blob)
 
 
+class _PersistedLegacyCheckpoint:
+    """Identity of the legacy files this process last saw committed (A skip).
+
+    Recorded only after a fully committed legacy write (payload and manifest
+    both replaced) or after a restore validated the on-disk pair, so a digest
+    match plus matching file size and mtime proves the durable state already
+    equals the outcome the next save would produce.
+    """
+
+    __slots__ = (
+        "digest",
+        "payload_size",
+        "payload_mtime_ns",
+        "manifest_size",
+        "manifest_mtime_ns",
+    )
+
+    def __init__(
+        self,
+        digest: str,
+        payload_size: int,
+        payload_mtime_ns: int,
+        manifest_size: int,
+        manifest_mtime_ns: int,
+    ) -> None:
+        self.digest = digest
+        self.payload_size = payload_size
+        self.payload_mtime_ns = payload_mtime_ns
+        self.manifest_size = manifest_size
+        self.manifest_mtime_ns = manifest_mtime_ns
+
+
 class _RootHistory:
     """Per-root snapshot history shared by the CAS v2 and legacy writers.
 
     ``durations_ms`` feeds the budget-aware fast-names-first ordering (A6);
     ``reusable`` and ``verified_digests`` feed per-variable change detection and
-    write dedupe (A5). Only content-free data leaves this object through metrics.
+    write dedupe (A5); ``legacy_checkpoints`` feeds the unchanged-outcome write
+    skip for the single-file legacy representation. Only content-free data
+    leaves this object through metrics.
     """
 
-    __slots__ = ("durations_ms", "reusable", "verified_digests", "cached_blob_bytes")
+    __slots__ = (
+        "durations_ms",
+        "reusable",
+        "verified_digests",
+        "cached_blob_bytes",
+        "legacy_checkpoints",
+    )
 
     def __init__(self) -> None:
         self.durations_ms: dict[str, float] = {}
         self.reusable: dict[str, _ReusableBlob] = {}
         self.verified_digests: set[str] = set()
         self.cached_blob_bytes = 0
+        self.legacy_checkpoints: dict[str, _PersistedLegacyCheckpoint] = {}
 
 
 _ROOT_HISTORY_LOCK = threading.Lock()
@@ -690,6 +741,211 @@ def snapshot_deadline_ns(budget_ms: int | None) -> int | None:
 def _record_duration(history: _RootHistory, name: str, elapsed_ns: int) -> None:
     if isinstance(name, str):
         history.durations_ms[name] = elapsed_ns / 1_000_000
+
+
+# ---------------------------------------------------------------------------
+# Unchanged-outcome write skip
+# ---------------------------------------------------------------------------
+
+
+def _canonical_outcome_digest(
+    payload_digests: Iterable[tuple[str, str]],
+    skipped: Iterable[dict[str, str]],
+    pruned: Iterable[str],
+    dropped: Iterable[str],
+) -> str:
+    """Digest of one snapshot's full persisted outcome.
+
+    Covers the serialized payload (per-name blob hashes, so in-place mutations
+    of lists/dicts/objects change it) plus the saved/skipped/pruned/dropped
+    metadata a save commits alongside. Any difference means the next save must
+    write; size caps are deliberately excluded because they only decide which
+    names make it into the payload, which the payload digest already reflects.
+    """
+    canonical = {
+        "payload": sorted((name, digest) for name, digest in payload_digests),
+        "skipped": sorted(
+            ({"name": entry["name"], "reason": entry["reason"]} for entry in skipped),
+            key=lambda entry: (entry["name"], entry["reason"]),
+        ),
+        "pruned": sorted(pruned),
+        "dropped": sorted(dropped),
+    }
+    return hashlib.sha256(
+        json.dumps(canonical, sort_keys=True, separators=(",", ":")).encode("utf-8")
+    ).hexdigest()
+
+
+def legacy_outcome_digest(
+    payload: dict[str, bytes],
+    skipped: list[dict[str, str]],
+    pruned: list[str],
+    dropped: list[str],
+) -> str:
+    """Outcome digest for the single-file legacy representation."""
+    return _canonical_outcome_digest(
+        ((name, hashlib.sha256(blob).hexdigest()) for name, blob in payload.items()),
+        skipped,
+        pruned,
+        dropped,
+    )
+
+
+def _generation_outcome_digest(generation: dict[str, Any]) -> str:
+    """Outcome digest of one committed CAS generation."""
+    return _canonical_outcome_digest(
+        ((entry["name"], entry["sha256"]) for entry in generation["entries"]),
+        generation["skipped"],
+        generation["pruned"],
+        generation["dropped"],
+    )
+
+
+def _file_identity(path: str) -> tuple[int, int] | None:
+    """Size and mtime of a plain regular file, or None when it is not one."""
+    try:
+        info = os.lstat(path)
+    except OSError:
+        return None
+    if _is_reparse(info) or not stat.S_ISREG(info.st_mode):
+        return None
+    return info.st_size, info.st_mtime_ns
+
+
+def remember_legacy_checkpoint(
+    history: _RootHistory,
+    path: str,
+    manifest_path: str,
+    digest: str,
+) -> None:
+    """Record the legacy pair this process just committed or validated.
+
+    Best-effort: a stat failure drops the record so the next save writes.
+    """
+    payload_identity = _file_identity(path)
+    manifest_identity = _file_identity(manifest_path)
+    if payload_identity is None or manifest_identity is None:
+        history.legacy_checkpoints.pop(_history_key(path), None)
+        return
+    history.legacy_checkpoints[_history_key(path)] = _PersistedLegacyCheckpoint(
+        digest,
+        payload_identity[0],
+        payload_identity[1],
+        manifest_identity[0],
+        manifest_identity[1],
+    )
+
+
+def unchanged_legacy_checkpoint(
+    history: _RootHistory,
+    path: str,
+    manifest_path: str,
+    digest: str,
+) -> bool:
+    """True when the durable legacy files still hold exactly the recorded outcome.
+
+    The size+mtime re-check proves nothing replaced the files since this
+    process last committed them (a rewrite always moves the mtime), so the
+    digest match means the bytes on disk already equal the next save's result.
+    """
+    checkpoint = history.legacy_checkpoints.get(_history_key(path))
+    if checkpoint is None or checkpoint.digest != digest:
+        return False
+    payload_identity = _file_identity(path)
+    manifest_identity = _file_identity(manifest_path)
+    if payload_identity is None or manifest_identity is None:
+        return False
+    return payload_identity == (
+        checkpoint.payload_size,
+        checkpoint.payload_mtime_ns,
+    ) and manifest_identity == (checkpoint.manifest_size, checkpoint.manifest_mtime_ns)
+
+
+def forget_legacy_checkpoint(history: _RootHistory, path: str) -> None:
+    """Drop the recorded legacy outcome (e.g. the target moved to CAS v2)."""
+    history.legacy_checkpoints.pop(_history_key(path), None)
+
+
+def remember_restored_legacy_checkpoint(
+    history: _RootHistory,
+    path: str,
+    manifest_path: str,
+    payload: dict[str, Any],
+) -> None:
+    """Seed the skip record from a legacy payload just read off disk.
+
+    The manifest (small, written alongside the payload) supplies the exact
+    skipped/pruned/dropped metadata of the last commit; when it is missing or
+    disagrees with the payload, no record is made and the next save writes.
+    """
+    try:
+        with open(manifest_path, encoding="utf-8") as handle:
+            manifest = json.load(handle)
+    except (OSError, ValueError):
+        return
+    if not isinstance(manifest, dict) or manifest.get("savedNames") != sorted(payload):
+        return
+    skipped = manifest.get("skipped", [])
+    pruned = manifest.get("pruned", [])
+    dropped = manifest.get("dropped", [])
+    if not isinstance(skipped, list) or not isinstance(pruned, list) or not isinstance(dropped, list):
+        return
+    if not all(
+        isinstance(entry, dict) and isinstance(entry.get("name"), str) and isinstance(entry.get("reason"), str)
+        for entry in skipped
+    ):
+        return
+    if not all(isinstance(name, str) for name in pruned) or not all(
+        isinstance(name, str) for name in dropped
+    ):
+        return
+    # A legacy payload written by anything other than this writer (foreign or
+    # hand-made files) has no per-name blob layout; record nothing for it.
+    if not all(isinstance(blob, (bytes, bytearray)) for blob in payload.values()):
+        return
+    remember_legacy_checkpoint(
+        history,
+        path,
+        manifest_path,
+        legacy_outcome_digest(payload, skipped, pruned, dropped),
+    )
+
+
+def _cas_generation_for_unchanged_outcome(
+    root: str,
+    pointer: dict[str, Any],
+    payload: dict[str, bytes],
+    skipped: list[dict[str, str]],
+    pruned: list[str],
+    dropped: list[str],
+    *,
+    max_bytes: int,
+    max_variable_bytes: int,
+) -> dict[str, Any] | None:
+    """The committed current generation when it already equals this outcome.
+
+    Reads the pointer and generation fresh from disk (never memory), so the
+    comparison cannot go stale across process restarts or external writes.
+    Returns None when anything differs or cannot be validated; the caller then
+    runs the normal write path with its own full validation and error surface.
+    """
+    try:
+        _validate_format(root)
+        generation = _read_generation(
+            root,
+            pointer["current"],
+            max_bytes=max_bytes,
+            max_variable_bytes=max_variable_bytes,
+        )
+    except SnapshotStoreError:
+        return None
+    if _generation_outcome_digest(generation) != legacy_outcome_digest(payload, skipped, pruned, dropped):
+        return None
+    for entry in generation["entries"]:
+        identity = _file_identity(_owned_path(root, BLOBS_DIRNAME, f"{entry['sha256']}.blob"))
+        if identity is None or identity[0] != entry["size"]:
+            return None
+    return generation
 
 
 def _serialize_namespace(
@@ -1054,9 +1310,57 @@ def snapshot_cas_v2(
         )
         metrics.update(serialization)
         write_start = time.monotonic_ns()
-        _initialize_for_write(root, written)
         root = _require_absolute_root(root)
-        pointer = _read_pointer(root, required=False)
+        # Read the pointer from a read-only view before creating anything: the
+        # unchanged-outcome skip below must decide from durable state alone.
+        pointer = _read_pointer(root, required=False) if os.path.isdir(root) else None
+        saved = sorted(payload)
+        pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
+        if pointer is not None:
+            unchanged = _cas_generation_for_unchanged_outcome(
+                root,
+                pointer,
+                payload,
+                skipped,
+                pruned,
+                dropped,
+                max_bytes=max_bytes,
+                max_variable_bytes=max_variable_bytes,
+            )
+            if unchanged is not None:
+                # The committed current generation already holds exactly this
+                # outcome: skip the blob, generation, and pointer rewrites. The
+                # pointer and generation were re-read from disk, so this can
+                # only trigger when the durable state equals what this save
+                # would write; a crash therefore loses nothing.
+                for name in pruned:
+                    ns.pop(name, None)
+                result: dict[str, Any] = {
+                    "saved": saved,
+                    "skipped": skipped,
+                    "pruned": pruned,
+                    "dropped": sorted(dropped)[:DROPPED_NAMES_RESULT_LIMIT],
+                    "bytes": envelope_bytes,
+                    "format": "cas-v2",
+                    "generation": unchanged["generation"],
+                    "logical_bytes": logical_bytes,
+                    "written_bytes": 0,
+                    "backward_readable": False,
+                    "skipped_unchanged": True,
+                    "metrics": {
+                        **metrics,
+                        "write_ms": _elapsed_ms(write_start, time.monotonic_ns()),
+                        "written_bytes": 0,
+                        "total_wall_ms": _elapsed_ms(total_start, time.monotonic_ns()),
+                        "snapshot_cas_captures": 0,
+                        "snapshot_legacy_captures": 0,
+                        "snapshot_skipped_unchanged": 1,
+                    },
+                }
+                if committed is not None:
+                    committed.append(result)
+                return result
+        _initialize_for_write(root, written)
         if pointer is not None:
             # A generation promoted to `previous` must still be complete now.
             with open_cas_generation(
@@ -1073,8 +1377,6 @@ def snapshot_cas_v2(
             _write_blob(root, digest, blob, written, history.verified_digests)
             entries.append({"name": name, "sha256": digest, "size": len(blob)})
 
-        saved = sorted(payload)
-        pruned = sorted(name for name in oversized if name in ns) if prune_oversized else []
         generation_id = _new_generation_id(root)
         generation = {
             "format": CAS_FORMAT,
@@ -1152,6 +1454,123 @@ def snapshot_cas_v2(
         metrics["written_bytes"] = written[0]
         metrics["total_wall_ms"] = _elapsed_ms(total_start, time.monotonic_ns())
         return {"error": f"CAS v2 snapshot failed: {_safe_str(error)}", "metrics": metrics}
+
+
+# ---------------------------------------------------------------------------
+# One-way legacy -> CAS v2 migration
+# ---------------------------------------------------------------------------
+
+# Sibling temp roots carry this marker; a hard crash can leave one behind.
+_MIGRATION_DIRNAME_MARKER = ".migrating-"
+# A migration temp root untouched for this long is abandoned, not active (an
+# in-flight migration touches files continuously).
+_MIGRATION_STALE_AFTER_S = 3600.0
+
+
+def legacy_payload_is_fresher(legacy_path: str, cas_root: str) -> bool:
+    """True when a legacy payload is newer than the v2 pointer (B).
+
+    A binary without CAS v2 support keeps writing the legacy pair after a
+    session flipped to v2; the mtime comparison detects that downgraded work
+    so auto-restore can revive it instead of the older committed generation.
+    Any doubt (missing file, non-regular entry) keeps the default v2 choice.
+    """
+    try:
+        legacy_info = os.lstat(legacy_path)
+        pointer_info = os.lstat(_owned_path(cas_root, CURRENT_FILENAME))
+    except OSError:
+        return False
+    if _is_reparse(legacy_info) or not stat.S_ISREG(legacy_info.st_mode):
+        return False
+    if _is_reparse(pointer_info) or not stat.S_ISREG(pointer_info.st_mode):
+        return False
+    return legacy_info.st_mtime_ns > pointer_info.st_mtime_ns
+
+
+def _cleanup_stale_migration_roots(cas_root: str) -> None:
+    """Best-effort removal of migration temp roots abandoned by hard crashes."""
+    parent = os.path.dirname(cas_root) or "."
+    prefix = os.path.basename(cas_root) + _MIGRATION_DIRNAME_MARKER
+    now = time.time()
+    try:
+        with os.scandir(parent) as iterator:
+            entries = [entry for entry in iterator if entry.name.startswith(prefix)]
+    except OSError:
+        return
+    for entry in entries[:16]:
+        try:
+            if not entry.is_dir(follow_symlinks=False):
+                continue
+            if now - entry.stat(follow_symlinks=False).st_mtime < _MIGRATION_STALE_AFTER_S:
+                continue
+            shutil.rmtree(entry.path, ignore_errors=True)
+        except OSError:
+            continue
+
+
+def migrate_legacy_to_cas(
+    ns: dict[str, Any],
+    cas_root: str,
+    max_bytes: int,
+    max_variable_bytes: int,
+    prune_oversized: bool,
+    always_skip: set[str],
+    handle_type: type[Any],
+    committed: list[dict[str, Any]] | None = None,
+    *,
+    budget_ms: int | None = None,
+) -> dict[str, Any]:
+    """Migrate one legacy session onto CAS v2 with an atomic directory flip.
+
+    The complete v2 root (blobs, generation, pointer) is built inside a
+    hidden sibling directory and flipped live with a single ``rename`` of that
+    directory, so a crash at any point leaves either the fully untouched
+    legacy state or a fully committed v2 root - never a half-migrated session
+    that auto-restore would strand. The legacy payload and manifest are kept
+    (never rewritten, never deleted) so older binaries without CAS v2 support
+    still restore this session; from the flip onward automatic saves continue
+    on CAS v2 and only changed blobs are rewritten.
+    """
+    root = _require_absolute_root(cas_root)
+    parent = os.path.dirname(root) or "."
+    _cleanup_stale_migration_roots(root)
+    temp_root = tempfile.mkdtemp(
+        prefix=os.path.basename(root) + _MIGRATION_DIRNAME_MARKER, dir=parent
+    )
+    try:
+        result = snapshot_cas_v2(
+            ns,
+            temp_root,
+            max_bytes,
+            max_variable_bytes,
+            prune_oversized,
+            always_skip,
+            handle_type,
+            committed,
+            budget_ms=budget_ms,
+        )
+        if "error" in result:
+            return result
+        try:
+            os.rename(temp_root, root)
+        except OSError as error:
+            # `snapshot_cas_v2` published its success into `committed` before
+            # the flip failed; that entry describes the discarded temp root,
+            # so retract it - the caller's legacy fallback publishes the real
+            # outcome (this request's committed list holds only this attempt).
+            if committed is not None:
+                committed.clear()
+            return {
+                "error": f"legacy to CAS v2 migration flip failed: {_safe_str(error)}",
+                "metrics": result.get("metrics"),
+            }
+        _fsync_directory(parent)
+        return {**result, "migrated_from_legacy": True}
+    finally:
+        # After a successful rename this is a no-op (the directory moved); on
+        # any failure it removes the half-built root so nothing is left behind.
+        if os.path.lexists(temp_root):
+            shutil.rmtree(temp_root, ignore_errors=True)
 
 
 def restore_cas_v2(
