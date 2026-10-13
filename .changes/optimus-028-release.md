@@ -1,1 +1,4 @@
-- Changed Optimus Agent to version 0.1.28 with Windows background-helper console fixes and updated compaction recovery regression coverage.
+- Changed Optimus Agent to version 0.1.28 with Windows background-helper console fixes, provider transport and token-budget improvements, and updated compaction recovery regression coverage.
+- Changed Python kernel checkpoints to skip unchanged durable state and automatically migrate legacy sessions to content-addressed snapshots while preserving legacy recovery files.
+- Changed Jev settings loading to reuse cached settings when the file is unchanged and reload after changes.
+- Changed code-search guidance to focus on source files and exclude datasets, generated reports, caches, and build outputs by default, while allowing explicit data searches.
