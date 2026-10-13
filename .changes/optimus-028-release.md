@@ -1,0 +1,1 @@
+- Changed Optimus Agent to version 0.1.28 with Windows background-helper console fixes and updated compaction recovery regression coverage.
