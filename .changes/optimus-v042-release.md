@@ -1,0 +1,1 @@
+- Changed the native workspace, bundled resources, and Python runtime versions to 0.1.42 for the Claude compaction recovery and experimental OCC3 release.
