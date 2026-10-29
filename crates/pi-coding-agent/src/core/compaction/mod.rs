@@ -1,5 +1,6 @@
 pub mod branch_summarization;
 pub mod charcount;
+mod claude;
 pub mod checkpoint;
 pub mod compaction;
 pub mod metrics;

@@ -1,0 +1,3 @@
+- Fixed direct Claude compaction refusal recovery using Anthropic's recommended server-side alternate Claude routing for supported models, without changing the conversation model or credentials.
+- Fixed refusal classification and preserved Anthropic's refusal explanation and request ID when a summary cannot be produced; existing conversation history remains intact.
+- Fixed summary usage accounting and serving-model traces when Anthropic routes a summary to an alternate Claude model.

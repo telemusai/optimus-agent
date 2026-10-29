@@ -39,6 +39,8 @@ use crate::providers::opencode_headers::with_opencode_headers;
 use crate::providers::simple_options::{adjust_max_tokens_for_thinking, build_base_options};
 use crate::providers::transform_messages::try_transform_messages;
 
+mod refusal;
+
 /// The pinned `@anthropic-ai/sdk` version, used for the `User-Agent` header
 /// (`${this.constructor.name}/JS ${VERSION}` -> `Anthropic/JS 0.91.1`).
 const ANTHROPIC_SDK_VERSION: &str = "0.91.1";
@@ -1077,6 +1079,8 @@ async fn run_stream_anthropic(
 	});
 
 	let mut blocks: Vec<AnthropicBlock> = Vec::new();
+	let mut refusal_details = None;
+	let fallback_enabled = params.get("fallbacks").and_then(Value::as_str) == Some("default");
 
 	let chunks: ByteStream = Box::pin(response.bytes_stream());
 	let reader = SseMessageReader::new(chunks, options.stream.signal.clone());
@@ -1104,6 +1108,9 @@ async fn run_stream_anthropic(
 			.as_ref()
 			.unwrap_or_else(|| NULL_EVENT.get_or_init(|| Value::Null));
 		if event_type == "message_start" {
+			if fallback_enabled {
+				refusal::observe_serving_model(output, model, event.pointer("/message/model"));
+			}
 			output.response_id = event.pointer("/message/id").and_then(Value::as_str).map(str::to_string);
 			// Capture initial token usage from message_start event.
 			// This ensures we have input token counts even if the stream is aborted early.
@@ -1132,6 +1139,9 @@ async fn run_stream_anthropic(
 		} else if event_type == "content_block_start" {
 			let index = number_or_zero(event.get("index"));
 			match event.pointer("/content_block/type").and_then(Value::as_str) {
+				Some("fallback") if fallback_enabled => {
+					refusal::observe_serving_model(output, model, event.pointer("/content_block/to/model"));
+				}
 				Some("text") => {
 					blocks.push(AnthropicBlock::Text {
 						text: String::new(),
@@ -1392,10 +1402,15 @@ async fn run_stream_anthropic(
 				}
 			}
 		} else if event_type == "message_delta" {
+			if let Some(details) = event.pointer("/delta/stop_details") {
+				refusal_details = details.is_object().then(|| details.clone());
+			}
 			if let Some(stop_reason) = event.pointer("/delta/stop_reason").and_then(Value::as_str) {
 				output.stop_reason = map_stop_reason(stop_reason)?;
 				if matches!(output.stop_reason.as_str(), "error" | "length") {
 					output.stop_reason_raw = Some(stop_reason.to_string());
+				} else {
+					output.stop_reason_raw = None;
 				}
 			}
 			// Only update usage fields if present (not null).
@@ -1437,6 +1452,9 @@ async fn run_stream_anthropic(
 				cache_write: Some(cache_write),
 			});
 			calculate_cost(model, &mut output.usage, overrides.as_ref());
+			if fallback_enabled {
+				refusal::apply_iteration_usage(output, model, event.pointer("/usage/iterations"), cache_control.as_ref());
+			}
 		}
 	}
 
@@ -1464,9 +1482,10 @@ async fn run_stream_anthropic(
 	}
 
 	if output.stop_reason == "aborted" || output.stop_reason == "error" {
-		return Err(AnthropicStreamError::Failure(stream_failure_from_stop_reason(
+		return Err(AnthropicStreamError::Failure(refusal::failure(
 			output.stop_reason_raw.as_deref(),
 			request_id.as_deref(),
+			refusal_details.as_ref(),
 		)));
 	}
 
@@ -2617,7 +2636,10 @@ async fn send_messages_request(
 	let timeout_ms = options.stream.timeout_ms.unwrap_or(600_000.0);
 	let base_url = client.base_url.clone().unwrap_or_else(|| model.base_url.clone());
 	let url = build_messages_url(&base_url);
-	let headers = build_request_headers(client, timeout_ms, true);
+	let mut headers = build_request_headers(client, timeout_ms, true);
+	if params.get("fallbacks").and_then(Value::as_str) == Some("default") {
+		refusal::enable_default_routing(&mut headers);
+	}
 	let body = serde_json::to_string(params).map_err(|error| AnthropicStreamError::Message(error.to_string()))?;
 
 	let request = crate::providers::shared_http::shared_client(crate::providers::shared_http::ClientPolicy::Default)
