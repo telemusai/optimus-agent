@@ -1,0 +1,1 @@
+- Fixed Claude compaction refusals caused by serializing internal thinking as ordinary conversation text; handoffs now summarize visible requests, actions, results, and decisions while preserving the saved transcript.

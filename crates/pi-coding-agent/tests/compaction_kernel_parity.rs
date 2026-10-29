@@ -1187,7 +1187,6 @@ fn serialize_conversation_golden_corpus() {
     ];
     let serialized = serialize_conversation(&messages);
     let expected = "[User]: hello\n\n\
-[Assistant thinking]: why\n\n\
 [Assistant]: answer\nmore\n\n\
 [Assistant tool calls]: #1 edit(path=\"a.ts\", count=2, nested={\"k\":[1,2]}); #2 ipython()\n\n\
 [Tool result #1 edit]: ok\n\n\
@@ -1212,7 +1211,7 @@ fn serialize_conversation_preserves_control_characters_and_crlf() {
 fn summarization_system_prompt_is_pinned() {
     // The chunk budget subtracts this prompt's char count; pin both its length
     // and its opening so any edit is caught.
-    assert_eq!(SUMMARIZATION_SYSTEM_PROMPT.chars().count(), 317);
+    assert_eq!(SUMMARIZATION_SYSTEM_PROMPT.chars().count(), 419);
     assert!(SUMMARIZATION_SYSTEM_PROMPT.starts_with(
         "You are a context summarization assistant."
     ));

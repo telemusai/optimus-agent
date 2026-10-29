@@ -2,7 +2,10 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use pi_agent_core::types::{AgentMessage, ThinkingLevel};
-use pi_ai::types::{Model, UserContent, UserMessage};
+use pi_ai::types::{
+    AssistantMessage, ContentBlock, ImageOrTextContent, Message, Model, TextContent,
+    ThinkingContent, ToolCall, ToolResultMessage, UserContent, UserMessage,
+};
 use pi_coding_agent::core::compaction::compaction::{
     classify_summary_failure, default_summary_call_runner, generate_summary, ProviderRetryPolicy,
     SummaryCallRunner, SummaryFailureKind, SummarySlice,
@@ -122,17 +125,46 @@ impl Fixture {
 }
 
 async fn summarize(model: &Model, runner: SummaryCallRunner) -> Result<SummarySlice, String> {
-    let messages = [AgentMessage::from(UserMessage::new(
-        UserContent::Text("Preserve the original history and its acceptance gates.".into()),
-        0,
-    ))];
+    let messages = [
+        AgentMessage::from(UserMessage::new(
+            UserContent::Text("Preserve the original history and its acceptance gates.".into()),
+            0,
+        )),
+        AgentMessage::Message(Message::Assistant(AssistantMessage {
+            api: model.api.clone(),
+            provider: model.provider.clone(),
+            model: model.id.clone(),
+            content: vec![
+                ContentBlock::Thinking(ThinkingContent {
+                    thinking: "PRIVATE_REASONING_SENTINEL".into(),
+                    thinking_signature: Some("PRIVATE_SIGNATURE_SENTINEL".into()),
+                    ..Default::default()
+                }),
+                ContentBlock::Text(TextContent::new("Run the build, then finish packaging.")),
+                ContentBlock::ToolCall(ToolCall::new(
+                    "call-build",
+                    "ipython",
+                    serde_json::from_value(json!({"code":"print('BUILD_OK')"})).unwrap(),
+                )),
+            ],
+            ..Default::default()
+        })),
+        AgentMessage::Message(Message::ToolResult(ToolResultMessage::new(
+            "call-build",
+            "ipython",
+            vec![ImageOrTextContent::Text(TextContent::new("BUILD_OK"))],
+            false,
+            1,
+        ))),
+    ];
+    let original = messages.clone();
     let retry = ProviderRetryPolicy {
         enabled: false,
         max_retries: 0,
         base_delay_ms: 0.0,
         max_retry_delay_ms: 0.0,
     };
-    tokio::time::timeout(
+    let result = tokio::time::timeout(
         Duration::from_secs(5),
         generate_summary(
             &messages,
@@ -149,7 +181,37 @@ async fn summarize(model: &Model, runner: SummaryCallRunner) -> Result<SummarySl
         ),
     )
     .await
-    .expect("local summarization fixture timed out")
+    .expect("local summarization fixture timed out");
+    assert_eq!(
+        messages, original,
+        "summary preparation must not rewrite history"
+    );
+    result
+}
+
+#[tokio::test]
+async fn claude_summary_sends_observable_work_without_flattening_private_reasoning() {
+    let fixture = Fixture::new("claude-opus-5-5", vec![("end_turn", None)]).await;
+    summarize(&fixture.model, default_summary_call_runner(None))
+        .await
+        .unwrap();
+    let requests = fixture.requests.lock().unwrap();
+    assert_eq!(requests.len(), 1);
+    let payload = requests[0].to_string();
+    assert!(!payload.contains("PRIVATE_REASONING_SENTINEL"));
+    assert!(!payload.contains("PRIVATE_SIGNATURE_SENTINEL"));
+    assert!(!payload.contains("[Assistant thinking]"));
+    for evidence in [
+        "acceptance gates",
+        "finish packaging",
+        "#1 ipython",
+        "BUILD_OK",
+    ] {
+        assert!(
+            payload.contains(evidence),
+            "missing observable work: {evidence}"
+        );
+    }
 }
 
 #[tokio::test]
