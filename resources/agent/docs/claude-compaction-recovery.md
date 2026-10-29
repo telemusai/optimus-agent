@@ -1,5 +1,20 @@
 # Claude compaction recovery
 
+Summary transcripts exclude internal thinking blocks, including signed and
+redacted blocks, instead of flattening them into `[Assistant thinking]` text.
+Visible assistant responses, user requests, tool calls and tool results remain
+available to the summarizer. This applies to both serialization paths and to
+conversation, split-turn and branch summaries; the stored conversation is not
+rewritten. The handoff instructions focus on observable work and decisions.
+
+A local HTTP trace of Claude Code 2.1.310 confirmed that its compaction request
+keeps thinking in typed assistant blocks rather than promoting it into ordinary
+user text. Optimus follows the same separation by omitting thinking from its
+bounded text summary input. It retains its own handoff schema and chunking;
+the complete request is not a byte-for-byte copy of Claude Code's request.
+Anthropic's `reasoning_extraction` category has no recommended alternate model:
+correct the request instead of attempting to route around that refusal.
+
 Direct Anthropic summary requests for Opus 5.5, Opus 5, Fable 5/5.1 and
 Sonnet 5.5 enable Anthropic's `fallbacks: "default"` routing with the
 `server-side-fallback-2026-07-01` beta. Anthropic chooses an allowed alternate

@@ -291,6 +291,8 @@ fn char_boundary_before(text: &str, count: usize) -> usize {
 /// This prevents the model from treating it as a conversation to continue.
 /// Call convertToLlm() first to handle custom message types.
 ///
+/// Thinking blocks are deliberately excluded: a handoff records observable work,
+/// not model-internal reasoning promoted into ordinary transcript text.
 /// Tool results are truncated to keep the summarization request within
 /// reasonable token budgets. Full content is not needed for summarization.
 pub fn serialize_conversation(messages: &[Message]) -> String {
@@ -389,15 +391,12 @@ fn serialize_message_parts(message: &Message, plan: &SerializePlan) -> Vec<Strin
                 return parts;
             };
             let mut text_parts: Vec<&str> = Vec::new();
-            let mut thinking_parts: Vec<&str> = Vec::new();
             let mut tool_calls: Vec<String> = Vec::new();
             let mut next_number = 0usize;
             for block in &assistant.content {
                 match block {
                     pi_ai::types::ContentBlock::Text(text) => text_parts.push(&text.text),
-                    pi_ai::types::ContentBlock::Thinking(thinking) => {
-                        thinking_parts.push(&thinking.thinking)
-                    }
+                    pi_ai::types::ContentBlock::Thinking(_) => {}
                     pi_ai::types::ContentBlock::ToolCall(tool_call) => {
                         let args_str = tool_call
                             .arguments
@@ -415,12 +414,6 @@ fn serialize_message_parts(message: &Message, plan: &SerializePlan) -> Vec<Strin
                         tool_calls.push(format!("#{index} {}({args_str})", tool_call.name));
                     }
                 }
-            }
-            if !thinking_parts.is_empty() {
-                parts.push(format!(
-                    "[Assistant thinking]: {}",
-                    thinking_parts.join("\n")
-                ));
             }
             if !text_parts.is_empty() {
                 parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
@@ -459,7 +452,7 @@ fn serialize_message_parts(message: &Message, plan: &SerializePlan) -> Vec<Strin
     parts
 }
 
-/// The historical single-pass renderer, kept unchanged as the sequential path
+/// The single-pass renderer, kept equivalent to the parallel path
 /// and the fallback for the parallel renderer.
 fn serialize_conversation_sequential(messages: &[Message]) -> String {
     let mut calls: HashMap<String, usize> = HashMap::new();
@@ -481,15 +474,12 @@ fn serialize_conversation_sequential(messages: &[Message]) -> String {
             }
             Message::Assistant(assistant) => {
                 let mut text_parts: Vec<&str> = Vec::new();
-                let mut thinking_parts: Vec<&str> = Vec::new();
                 let mut tool_calls: Vec<String> = Vec::new();
 
                 for block in &assistant.content {
                     match block {
                         pi_ai::types::ContentBlock::Text(text) => text_parts.push(&text.text),
-                        pi_ai::types::ContentBlock::Thinking(thinking) => {
-                            thinking_parts.push(&thinking.thinking)
-                        }
+                        pi_ai::types::ContentBlock::Thinking(_) => {}
                         pi_ai::types::ContentBlock::ToolCall(tool_call) => {
                             let args_str = tool_call
                                 .arguments
@@ -510,10 +500,6 @@ fn serialize_conversation_sequential(messages: &[Message]) -> String {
                     }
                 }
 
-                if !thinking_parts.is_empty() {
-                    push_part(&mut out, "[Assistant thinking]: ");
-                    out.push_str(&thinking_parts.join("\n"));
-                }
                 if !text_parts.is_empty() {
                     push_part(&mut out, "[Assistant]: ");
                     out.push_str(&text_parts.join("\n"));
@@ -559,7 +545,7 @@ fn push_part(out: &mut String, prefix: &str) {
     out.push_str(prefix);
 }
 
-pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
+pub const SUMMARIZATION_SYSTEM_PROMPT: &str = "You are a context summarization assistant. Your task is to read a conversation between a user and an AI coding assistant, then produce a structured summary following the exact format specified. Base the handoff on user requests, visible assistant responses, tool actions, results, and decisions.\n\nDo NOT continue the conversation. Do NOT respond to any questions in the conversation. ONLY output the structured summary.";
 
 /// `extractFileOpsFromMessage` accepts the coding-agent custom assistant shape too;
 /// this helper mirrors the TypeScript `"content" in message` guard for callers that
@@ -697,8 +683,36 @@ mod tests {
         let text = serialize_conversation(&messages);
         assert_eq!(
             text,
-            "[User]: hello\n\n[Assistant thinking]: why\n\n[Assistant]: answer\n\n[Assistant tool calls]: #1 edit(path=\"a.ts\")\n\n[Tool result #1 edit]: ok"
+            "[User]: hello\n\n[Assistant]: answer\n\n[Assistant tool calls]: #1 edit(path=\"a.ts\")\n\n[Tool result #1 edit]: ok"
         );
+    }
+
+    #[test]
+    fn summary_renderers_exclude_signed_redacted_and_thinking_only_blocks() {
+        let thinking = pi_ai::types::ThinkingContent {
+            thinking: "PRIVATE_REASONING_SENTINEL".into(),
+            thinking_signature: Some("SIGNATURE_SENTINEL".into()),
+            ..Default::default()
+        };
+        for redacted in [None, Some(true)] {
+            for visible in [None, Some("The build passed. Continue packaging.")] {
+                let mut content = vec![ContentBlock::Thinking(pi_ai::types::ThinkingContent {
+                    redacted,
+                    ..thinking.clone()
+                })];
+                if let Some(text) = visible {
+                    content.push(ContentBlock::Text(TextContent::new(text)));
+                }
+                let message = Message::Assistant(AssistantMessage { content, ..Default::default() });
+                let original = message.clone();
+                let expected = visible.map(|text| format!("[Assistant]: {text}")).unwrap_or_default();
+                assert_eq!(serialize_conversation_sequential(std::slice::from_ref(&message)), expected);
+                assert_eq!(serialize_message_parts(&message, &SerializePlan::Assistant {
+                    call_numbers: vec![],
+                }).join("\n\n"), expected);
+                assert_eq!(message, original, "saved conversation must remain intact");
+            }
+        }
     }
 
     #[test]
@@ -868,14 +882,11 @@ mod tests {
                     }
                     Message::Assistant(assistant) => {
                         let mut text_parts: Vec<String> = Vec::new();
-                        let mut thinking_parts: Vec<String> = Vec::new();
                         let mut tool_calls: Vec<String> = Vec::new();
                         for block in &assistant.content {
                             match block {
                                 ContentBlock::Text(text) => text_parts.push(text.text.clone()),
-                                ContentBlock::Thinking(thinking) => {
-                                    thinking_parts.push(thinking.thinking.clone())
-                                }
+                                ContentBlock::Thinking(_) => {}
                                 ContentBlock::ToolCall(tool_call) => {
                                     let args_str = tool_call
                                         .arguments
@@ -894,12 +905,6 @@ mod tests {
                                     tool_calls.push(format!("#{index} {}({args_str})", tool_call.name));
                                 }
                             }
-                        }
-                        if !thinking_parts.is_empty() {
-                            parts.push(format!(
-                                "[Assistant thinking]: {}",
-                                thinking_parts.join("\n")
-                            ));
                         }
                         if !text_parts.is_empty() {
                             parts.push(format!("[Assistant]: {}", text_parts.join("\n")));
