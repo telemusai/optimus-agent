@@ -12,6 +12,7 @@ import contextlib
 import copy
 import errno
 import hashlib
+import importlib
 import inspect
 import io
 import json
@@ -231,6 +232,100 @@ class PackagedArtifactTests(ErrorAssertions, unittest.TestCase):
         self.assertNotIn("private-sentinel", trace)
         self.assertEqual(output.getvalue(), "")
         self.assertEqual(str(profile.ProfileError("private-sentinel")), "profile_invalid")
+
+
+class RegisteredMethodTests(ErrorAssertions, unittest.TestCase):
+    """Registry extension: challengers registered, advertised surface unchanged."""
+
+    def test_registered_methods_are_advertised_plus_challengers(self):
+        advertised = profile.advertised_methods()
+        registered = profile.registered_methods()
+        self.assertEqual(advertised, (profile.PER_MESSAGE_METHOD, profile.CALIBRATED_METHOD))
+        self.assertEqual(registered, (profile.PER_MESSAGE_METHOD, profile.CALIBRATED_METHOD,
+                                     profile.PROCRUSTES_METHOD, profile.PROCRUSTES_METHOD_SO,
+                                     profile.PROCRUSTES_METHOD_PLAIN))
+        self.assertTrue(set(advertised) < set(registered))
+        for method in registered:
+            descriptor = profile.method_descriptor(method)
+            self.assertEqual(set(descriptor), {"method_id", "representation", "alignment",
+                                               "fit_source", "solver",
+                                               "predictor_position_offset", "precision",
+                                               "requires_calibration_artifact",
+                                               "artifact_module", "artifact_schema"})
+            self.assertEqual(descriptor["predictor_position_offset"], -1)
+            self.assertEqual(descriptor["precision"], "float32")
+            self.assertEqual(descriptor["solver"].count("."), 2)
+            self.assertEqual(descriptor["representation"], "final_layer_prenorm_predictor")
+            if descriptor["requires_calibration_artifact"]:
+                module = importlib.import_module(descriptor["artifact_module"])
+                self.assertEqual(module.ARTIFACT_SCHEMA, descriptor["artifact_schema"])
+                self.assertTrue(callable(module.apply_map))
+                self.assertTrue(callable(module.deserialize_artifact))
+                self.assertTrue(callable(module.artifact_digest))
+                self.assertTrue(callable(module.artifact_bytes))
+            else:
+                self.assertIsNone(descriptor["artifact_module"])
+                self.assertIsNone(descriptor["artifact_schema"])
+            self.assertEqual(profile.require_method(method), method)
+            receipt = profile.receipt_descriptor(method)
+            self.assertEqual(set(receipt), {"method_id", "representation", "alignment",
+                                            "predictor_position_offset", "precision"})
+
+    def test_challenger_alignment_labels_are_distinct(self):
+        labels = {profile.method_descriptor(method)["alignment"]
+                  for method in profile.registered_methods()}
+        self.assertEqual(len(labels), len(profile.registered_methods()))
+
+    def test_binding_types_dispatch_through_the_registry(self):
+        import dataclasses
+
+        from occ3_sglang.statebridge_calibrated import CalibrationBinding
+        from occ3_sglang.statebridge_calibrated_procrustes import ProcrustesBinding
+        calibrated = static_profile()
+        calibrated["method"] = profile.CALIBRATED_METHOD
+        values = dict(CalibrationBinding(
+            method_id=profile.CALIBRATED_METHOD, hidden_dim=6144, rows=512, layer_index=77,
+            ridge=1.5, ridge_rel=0.02, solve_residual=0.01, hyperparameters={"rho": 0.02},
+            capture_span_policy="whole_completed_response_tail_v1",
+            model_fingerprint=calibrated["model_fingerprint"], checkpoint_revision="rev-1",
+            tokenizer_fingerprint="sha256:" + "b" * 64, embedding_id="glm53-tp8-vocab",
+            capture_method_id="glm53.final-prenorm.capture.v1",
+            predictor_position_offset=-1, precision="float32", corpus_digest="c" * 64,
+            fit_manifest_digest="d" * 64, validation_record_digest="",
+            validation_artifact_digest="").scalars())
+        binding = CalibrationBinding(**values)
+        self.assertEqual(profile.validate_method_binding(binding, calibrated)["method_id"],
+                         profile.CALIBRATED_METHOD)
+        # A Procrustes binding class does not belong to the dual-ridge method:
+        # the registry refuses a binding built by another method's module.
+        foreign = ProcrustesBinding(
+            method_id=profile.PROCRUSTES_METHOD, variant="o", r=64, eta=0.01, a0=0.0,
+            rotation_defect=1e-6, rotation_determinant=1.0, hidden_dim=6144, rows=512,
+            layer_index=77, model_fingerprint=calibrated["model_fingerprint"],
+            checkpoint_revision="rev-1", tokenizer_fingerprint="sha256:" + "b" * 64,
+            embedding_id="glm53-tp8-vocab", capture_method_id="glm53.final-prenorm.capture.v1",
+            capture_span_policy="whole_completed_response_tail_v1",
+            predictor_position_offset=-1, precision="float32",
+            fit_manifest_digest="d" * 64, corpus_digest="c" * 64, rank_hidden=64,
+            rank_embedding=64, participation_hidden=2.0, participation_embedding=2.0,
+            whitening_gain_hidden=1.0, whitening_gain_embedding=1.0)
+        self.error_code("profile_invalid", lambda:
+                        profile.validate_method_binding(foreign, calibrated))
+        forged = dataclasses.replace(binding)
+        object.__setattr__(forged, "method_id", profile.PROCRUSTES_METHOD)
+        self.error_code("profile_invalid", lambda:
+                        profile.validate_method_binding(forged, calibrated))
+        # A calibrated binding under the message method is refused as before.
+        message = static_profile()
+        self.error_code("profile_invalid", lambda:
+                        profile.validate_method_binding(binding, message))
+
+    def test_a_pinned_profile_still_names_only_advertised_methods(self):
+        self.assertTrue(static_profile()["method"] == profile.PER_MESSAGE_METHOD
+                        or static_profile()["method"] in profile.advertised_methods())
+        challenger = static_profile()
+        challenger["method"] = profile.PROCRUSTES_METHOD
+        self.error_code("profile_invalid", lambda: profile._validate_profile(challenger))
 
 
 class ParentTokenTests(ErrorAssertions, unittest.TestCase):

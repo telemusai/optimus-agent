@@ -22,15 +22,17 @@ from starlette.responses import JSONResponse, Response, StreamingResponse
 from .attachment_contract import (
     AttachmentError, AuthenticatedContext, BackendReadiness, CaptureIntent,
     CaptureWorkerDescriptor, ConsumeWorkerDescriptor, InferenceAttachment, MAX_RECEIPT_BYTES, RECEIPT_HEADER,
-    SOURCE_RECEIPT_HEADER, SourceEnrollment, Reservation, TERMINAL_ACK_HEADER, TERMINAL_MODE,
+    SOURCE_RECEIPT_HEADER, SourceEnrollment, Reservation, SPAN_POLICIES_V2, TERMINAL_ACK_HEADER, TERMINAL_MODE,
     canonical, digest, identifier, normalize_worker_descriptor, parse_opt_in, parse_terminal_mode,
 )
+from .span_policy import resolve_runtime_markers, wire_marker_entries
 from .prefix_layout import LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve_prefix_layout
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
     validate_evidence, SourceCaptureEvidence, SourceToolProvenance, source_receipt_bytes,
-    source_receipt_upper_bound, validate_source_enrollment, validate_source_evidence,
+    source_receipt_upper_bound, source_receipt_v2_upper_bound, validate_source_enrollment,
+    validate_source_evidence,
 )
 
 CHAT_TARGET = "sglang.srt.entrypoints.openai.serving_chat.OpenAIServingChat"
@@ -484,8 +486,14 @@ class ChatAttachmentAdapter:
                 raise AttachmentError("attachment_expired")
             if attachment.expires_at_epoch - now > self.profile.max_ttl_seconds:
                 raise AttachmentError("unsupported_profile")
-            receipt = (source_receipt_upper_bound(self.profile.max_receipt_bytes) if source
-                       else receipt_bytes(attachment, self.profile.max_receipt_bytes))
+            if source and attachment.span_policy in SPAN_POLICIES_V2:
+                # The v2 source receipt carries the bounded span block, so the
+                # pre-dispatch header budget reserves its measured upper bound.
+                receipt = source_receipt_v2_upper_bound(self.profile.max_receipt_bytes)
+            elif source:
+                receipt = source_receipt_upper_bound(self.profile.max_receipt_bytes)
+            else:
+                receipt = receipt_bytes(attachment, self.profile.max_receipt_bytes)
             header = SOURCE_RECEIPT_HEADER if source else RECEIPT_HEADER
             if (len(receipt) + len(header) + 4 + self.profile.ordinary_header_reserve
                     > self.profile.aggregate_header_bytes):
@@ -698,6 +706,19 @@ class ChatAttachmentAdapter:
                     obj.text, obj.input_ids = None, pinned
                 object.__setattr__(ctx, "prefix_offset", layout.offset)
                 object.__setattr__(ctx, "prefix_layout", layout.layout)
+            elif ctx.attachment.span_policy in SPAN_POLICIES_V2:
+                # v2 opt-in: the attested marker ids travel on the request's
+                # private custom_params channel, resolved once per tokenizer.
+                # The adapter's entries overwrite any client-supplied occ3 key,
+                # so the channel cannot be spoofed from the request body.
+                custom = obj.sampling_params.get("custom_params")
+                if custom is not None and not isinstance(custom, dict):
+                    raise AttachmentError("unsupported_profile")
+                try:
+                    entries = wire_marker_entries(*resolve_runtime_markers(tm.tokenizer))
+                except Exception:
+                    raise AttachmentError("unsupported_profile", 409) from None
+                obj.sampling_params["custom_params"] = {**(custom or {}), **entries}
             protected = copy.deepcopy({k: v for k, v in vars(obj).items()
                                        if k != "occ3_worker_descriptor"})
             view = NativeRequestView(obj, budget, digest(sampling), bool(obj.stream),
@@ -863,7 +884,7 @@ class ChatAttachmentAdapter:
         if ctx.cancel_requested:
             raise AttachmentError("client_disconnected", 499)
         if source:
-            provenance = audit.source_provenance()
+            provenance = audit.source_provenance(ctx.attachment.span_policy)
             evidence = await self.backend.finish_source(ctx.enrollment, ctx.reservation, completion, provenance)
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
@@ -1546,7 +1567,7 @@ class ChatAttachmentAdapter:
         """Run the same genuine backend proof as the buffered path, then bind it."""
         source = type(ctx.attachment) is CaptureIntent
         if source:
-            provenance = audit.source_provenance()
+            provenance = audit.source_provenance(ctx.attachment.span_policy)
             evidence = await self.backend.finish_source(ctx.enrollment, ctx.reservation, completion, provenance)
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)

@@ -833,3 +833,19 @@ def test_identifier_alphabet_matches_both_current_consumers_without_importing_th
         declaration = assignments[0].value
         assert isinstance(declaration, ast.Call)
         assert package._IDENTIFIER.pattern == ast.literal_eval(declaration.args[0])
+
+
+def test_offline_prepare_and_apply_survive_a_blocked_registry_import(fixture, monkeypatch):
+    """The build path never imports occ3_sglang, so even a poisoned registry
+    module cannot be pulled in: the static registry read is the only source."""
+    import sys as _sys
+    import types as _types
+
+    class _Poison:
+        def __getattr__(self, name):
+            raise AssertionError("runtime import attempted: occ3_sglang." + name)
+
+    monkeypatch.setitem(_sys.modules, "occ3_sglang", _Poison())
+    monkeypatch.setitem(_sys.modules, "occ3_sglang.native_profile", _Poison())
+    plan = fixture.prepare()
+    assert package.apply(plan, disposable=True)["ok"] is True

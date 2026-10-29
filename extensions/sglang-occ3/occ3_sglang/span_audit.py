@@ -442,8 +442,15 @@ def _check_positions(positions, count: int) -> bool:
 
 
 def _boundary_checks(thinking: _MarkerHit | None, begin: _MarkerHit | None,
-                     finish: _MarkerHit | None, message: _MarkerHit | None) -> None:
-    """Reject marker layouts that cannot describe one assistant message."""
+                     finish: _MarkerHit | None, message: _MarkerHit | None,
+                     alternate: _MarkerHit | None = None) -> None:
+    """Reject marker layouts that cannot describe one assistant message.
+
+    ``alternate`` is the optional second reasoning terminator (doc
+    SOURCE-SPAN-SELECTION.md 4.3): reasoning may end at ``thinking_end`` or at
+    ``tool_call_start``. It is normally the same marker as ``begin``, so the
+    begin-ordering checks below deliberately allow that equality.
+    """
     if finish is not None and begin is None:
         raise SpanContractError("lineage")
     if begin is not None:
@@ -457,6 +464,13 @@ def _boundary_checks(thinking: _MarkerHit | None, begin: _MarkerHit | None,
         _decline()
     if finish is not None and message is not None and message.start < finish.end:
         _decline()
+    if alternate is not None:
+        if thinking is not None and alternate.start < thinking.end:
+            _decline()  # a second terminator inside the reasoning head
+        if begin is not None and alternate.start > begin.start:
+            _decline()  # a second terminator inside the tool region
+        if message is not None and message.start < alternate.end:
+            _decline()
 
 
 def _decline():
@@ -471,7 +485,8 @@ def _run_of(kind: str, start: int, end: int, positions) -> SpanRun:
 
 
 def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
-                      markers: SpanMarkers, *, accepted_total: int | None = None) -> SpanAudit:
+                      markers: SpanMarkers, *, accepted_total: int | None = None,
+                      reasoning_end_ids: Sequence[int] | None = None) -> SpanAudit:
     """Classify a retained accepted window without a tokenizer.
 
     ``token_ids`` and ``positions`` are parallel sequences for the retained rows,
@@ -482,6 +497,13 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     it (``WorkerRuntime.align`` does: ``record.accepted_count``).  When it is
     larger than the retained window, ``message_truncated`` is True because a
     marker before the window cannot have been observed.
+
+    ``reasoning_end_ids`` is the optional second reasoning terminator: reasoning
+    ends at the FIRST of ``thinking_end`` or this marker (the GLM template lets
+    ``tool_call_start`` close a thinking block with no thinking-end at all).
+    Rows before that first terminator are ``THINKING`` instead of ``UNKNOWN``.
+    The marker does not join ``markers_supplied``/``marker_occurrences``, which
+    keep describing the four ``SpanMarkers`` fields only.
 
     Raises :class:`SpanContractError` (``code == "lineage"``) on inconsistent
     input, contradictory markers or a bounded-resource breach.  Never guesses.
@@ -505,19 +527,28 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     contiguous = _check_positions(positions, count)
 
     thinking = _find(token_ids, count, markers.thinking_end_ids)
+    alternate = (_find(token_ids, count, _marker_ids(reasoning_end_ids))
+                 if reasoning_end_ids is not None else None)
     begin = _find(token_ids, count, markers.tool_call_begin_ids)
     finish = _find(token_ids, count, markers.tool_call_end_ids)
     message = _find(token_ids, count, markers.message_end_ids)
-    _boundary_checks(thinking, begin, finish, message)
+    _boundary_checks(thinking, begin, finish, message, alternate)
+
+    # The reasoning terminator is the FIRST of the two; rows before it are
+    # THINKING even when no thinking-end marker occurs in the window.
+    if alternate is not None and (thinking is None or alternate.start < thinking.start):
+        terminator = alternate
+    else:
+        terminator = thinking
 
     flags = bytearray(count)
-    for hit in (thinking, begin, finish, message):
+    for hit in (thinking, alternate, begin, finish, message):
         if hit is not None:
             for index in range(hit.start, hit.end):
                 flags[index] = 1
 
-    thinking_start = -1 if thinking is None else thinking.start
-    thinking_end = -1 if thinking is None else thinking.end
+    thinking_start = -1 if terminator is None else terminator.start
+    thinking_end = -1 if terminator is None else terminator.end
     begin_end = -1 if begin is None else begin.end
     finish_end = -1 if finish is None else finish.end
     message_end = -1 if message is None else message.end

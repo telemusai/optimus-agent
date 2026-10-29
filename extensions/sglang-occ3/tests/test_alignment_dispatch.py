@@ -1,9 +1,10 @@
-"""Method dispatch: one solver per advertised method id, never a substitute."""
+"""Method dispatch: one solver per registered method id, never a substitute."""
 from __future__ import annotations
 
 import inspect
-from dataclasses import replace
 import os
+from dataclasses import replace
+from pathlib import Path
 
 import pytest
 
@@ -12,15 +13,18 @@ from occ3_sglang.latent_types import LatentError, RuntimeProfile
 from occ3_sglang.native_profile import CALIBRATED_METHOD, PER_MESSAGE_METHOD
 
 DIM, ROWS = 6144, 128
+FINGERPRINT = "sha256:" + "a" * 64
 # An absolute path that never has to exist: these cases refuse before any read.
 PLACEHOLDER = os.path.join(os.path.abspath("."), "placeholder.occ3cal")
 
 
-def _provenance():
-    return statebridge_calibrated.CalibrationProvenance(
-        layer_index=77, model_fingerprint="sha256:" + "a" * 64, checkpoint_revision="rev-1",
-        tokenizer_fingerprint="sha256:" + "b" * 64, embedding_id="glm53-tp8-vocab",
-        capture_method_id="glm53.final-prenorm.capture.v1")
+def _provenance(**changes):
+    values = dict(layer_index=77, model_fingerprint=FINGERPRINT,
+                  checkpoint_revision="rev-1", tokenizer_fingerprint="sha256:" + "b" * 64,
+                  embedding_id="glm53-tp8-vocab",
+                  capture_method_id="glm53.final-prenorm.capture.v1")
+    values.update(changes)
+    return statebridge_calibrated.CalibrationProvenance(**values)
 
 
 def _corpus(dim=DIM, rows=ROWS, seed=0):
@@ -35,11 +39,21 @@ def _corpus(dim=DIM, rows=ROWS, seed=0):
     return hidden, embeddings
 
 
+def _artifact(seed=2):
+    hidden, embeddings = _corpus(seed=seed)
+    partition = {"hidden": hidden, "embeddings": embeddings,
+                 "row_turn_ids": ("turn-0",) * rows_for(hidden),
+                 "turn_ids": ("turn-0",), "manifest_digest": ""}
+    return statebridge_calibrated.fit_map(partition, {"rho": 0.02}, provenance=_provenance())
+
+
+def rows_for(hidden):
+    return int(hidden.shape[0])
+
+
 @pytest.fixture(scope="module")
 def calibrated_artifact():
-    hidden, embeddings = _corpus()
-    return statebridge_calibrated.fit_calibration(hidden, embeddings, provenance=_provenance(),
-                                                 turn_ids=["turn-0", "turn-1"])
+    return _artifact(seed=0)
 
 
 @pytest.fixture(scope="module")
@@ -51,7 +65,7 @@ def artifact_file(tmp_path_factory, calibrated_artifact):
 
 def _fields(**changes):
     values = dict(runtime_epoch="epoch", runtime_generation=9,
-                  model_fingerprint="sha256:" + "a" * 64, model_id="glm-5.3")
+                  model_fingerprint=FINGERPRINT, model_id="glm-5.3")
     values.update(changes)
     return values
 
@@ -67,41 +81,42 @@ def _calibrated_profile(path, digest):
 
 def test_per_message_profile_dispatches_to_the_shipped_solver(monkeypatch):
     torch = pytest.importorskip("torch")
-    calls, frozen_calls = [], []
+    calls, apply_calls = [], []
     original = statebridge.align_hidden_sequence
     monkeypatch.setattr(statebridge, "align_hidden_sequence",
                         lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
-    monkeypatch.setattr(statebridge_calibrated, "apply_calibration",
-                        lambda *args, **kwargs: frozen_calls.append(args))
+    monkeypatch.setattr(statebridge_calibrated, "apply_map",
+                        lambda *args, **kwargs: apply_calls.append(args))
     hidden = torch.randn(8, DIM)
     embeddings = torch.randn(8, DIM)
     aligner = alignment_dispatch.aligner_for(_message_profile())
     prefix, info = aligner(hidden, embeddings, 1.0)
-    assert len(calls) == 1 and frozen_calls == []
+    assert len(calls) == 1 and apply_calls == []
     assert isinstance(info, statebridge.AlignmentInfo) and info.hidden_dim == DIM
     assert prefix.shape == hidden.shape
 
 
 def test_calibrated_profile_dispatches_to_the_frozen_transform(monkeypatch):
     torch = pytest.importorskip("torch")
-    calls, shipped_calls = [], []
-    original = statebridge_calibrated.apply_calibration
-    monkeypatch.setattr(statebridge_calibrated, "apply_calibration",
-                        lambda *args, **kwargs: calls.append(args) or original(*args, **kwargs))
+    apply_calls, shipped_calls = [], []
+    original = statebridge_calibrated.apply_map
+    monkeypatch.setattr(statebridge_calibrated, "apply_map",
+                        lambda *args, **kwargs: apply_calls.append(args) or original(*args, **kwargs))
     monkeypatch.setattr(statebridge, "align_hidden_sequence",
                         lambda *args, **kwargs: shipped_calls.append(args))
-    artifact = statebridge_calibrated.fit_calibration(*_corpus(seed=1), provenance=_provenance(),
-                                                     turn_ids=["turn-0", "turn-1"])
+    artifact = _artifact(seed=1)
     # The profile pins the digest of the artifact it is bound to, so the pair is
     # accepted even though the path is never read on this branch.
-    profile = _calibrated_profile(PLACEHOLDER, statebridge_calibrated.artifact_digest(artifact))
+    profile = _calibrated_profile(PLACEHOLDER, artifact.content_digest)
     aligner = alignment_dispatch.aligner_for(profile, artifact)
     prefix, info = aligner(torch.randn(8, DIM), torch.randn(8, DIM), 1.0)
-    assert len(calls) == 1 and shipped_calls == []
+    assert len(apply_calls) == 1 and shipped_calls == []
     assert isinstance(info, alignment_dispatch.CalibratedAlignmentInfo)
     assert info.method == CALIBRATED_METHOD and info.hidden_dim == DIM
+    assert info.artifact_digest == artifact.content_digest
     assert info.artifact_digest == statebridge_calibrated.artifact_digest(artifact)
     assert prefix.shape == (8, DIM)
+    assert aligner.serving is None  # fit default is N0: raw served rows
 
 
 def test_missing_artifact_refuses_and_never_uses_the_shipped_solver(monkeypatch):
@@ -162,7 +177,7 @@ def test_the_shipped_method_ignores_an_artifact_as_before(monkeypatch):
     assert len(calls) == 1
 
 
-def test_an_unadvertised_method_id_is_refused_not_dispatched():
+def test_an_unregistered_method_id_is_refused_not_dispatched():
     profile = _message_profile()
     object.__setattr__(profile, "method", "statebridge.glm53.final-prenorm-predictor.unknown.v1")
     with pytest.raises(alignment_dispatch.AlignmentRefusal) as caught:
@@ -170,23 +185,39 @@ def test_an_unadvertised_method_id_is_refused_not_dispatched():
     assert caught.value.code == "profile"
 
 
-def _artifact():
-    return statebridge_calibrated.fit_calibration(*_corpus(seed=2), provenance=_provenance(),
-                                                  turn_ids=["turn-0", "turn-1"])
-
-
 def test_the_frozen_artifact_loads_only_through_the_profile_reference(artifact_file, calibrated_artifact):
-    digest = statebridge_calibrated.artifact_digest(calibrated_artifact)
+    digest = calibrated_artifact.content_digest
     profile = _calibrated_profile(artifact_file, digest)
     loaded = alignment_dispatch.load_frozen_artifact(profile)
     assert statebridge_calibrated.artifact_digest(loaded) == digest
     assert loaded.binding.method_id == CALIBRATED_METHOD
+    assert loaded.binding.layer_index == 77
+    assert loaded.binding.model_fingerprint == FINGERPRINT
     assert alignment_dispatch.load_frozen_artifact(_message_profile()) is None
     assert alignment_dispatch.frozen_artifact_reference(_message_profile()) is None
 
 
+def test_load_refuses_a_binding_for_another_model_or_layer(artifact_file, tmp_path):
+    # The profile carries the runtime identity; an artifact bound for another
+    # model or layer is refused at load even when its digest matches the pin.
+    artifact = _artifact(seed=5)
+    path = tmp_path / "other.occ3cal"
+    path.write_bytes(statebridge_calibrated.serialize_artifact(artifact))
+    for name, changes in (("model", {"model_fingerprint": "sha256:" + "f" * 64}),
+                          ("layer", {"layer_index": 76})):
+        forged = replace(artifact,
+                         binding=replace(artifact.binding, **changes), content_digest=None)
+        forged_bytes = statebridge_calibrated.serialize_artifact(forged)
+        forged_path = tmp_path / ("forged-%s.occ3cal" % name)
+        forged_path.write_bytes(forged_bytes)
+        profile = _calibrated_profile(forged_path, statebridge_calibrated.artifact_digest(forged))
+        with pytest.raises(alignment_dispatch.AlignmentRefusal) as caught:
+            alignment_dispatch.load_frozen_artifact(profile)
+        assert caught.value.code == "identity"
+
+
 def test_a_missing_or_swapped_file_refuses_before_loading(artifact_file, tmp_path, calibrated_artifact):
-    digest = statebridge_calibrated.artifact_digest(calibrated_artifact)
+    digest = calibrated_artifact.content_digest
     absent = _calibrated_profile(tmp_path / "absent.occ3cal", digest)
     with pytest.raises(alignment_dispatch.AlignmentRefusal) as caught:
         alignment_dispatch.load_frozen_artifact(absent)
@@ -229,14 +260,18 @@ def test_capture_metadata_reports_the_method_and_only_the_digest_it_has():
 
 
 def test_the_worker_resolves_one_aligner_and_calls_it_once():
-    from pathlib import Path
     from occ3_sglang import latent_worker
     source = Path(latent_worker.__file__).read_text(encoding="utf-8")
     assert source.count("self.aligner = aligner_for(profile, self.calibration)") == 1
     assert source.count("aligned, _ = self.aligner(h, embeddings, self.target_norm)") == 1
     assert "align_hidden_sequence(" not in source
+    assert "method_metadata(self.profile, self.calibration_digest)" in source
+    assert '"artifact_digest"' in source
+    # The renorm step is serving-config driven: N0 skips the norm measurement.
+    assert "_serving_renorm(self.aligner)" in source
+    # Artifact bytes are charged at install and reported per rank and aggregate.
+    assert "artifact_resident_bytes(self.calibration)" in source
+    assert '"artifact_bytes_all_ranks"' in source
     signature = inspect.signature(latent_worker.WorkerRuntime.__init__)
     assert signature.parameters["artifact"].default is None
     assert "artifact" in inspect.signature(latent_worker.install_worker).parameters
-    assert "method_metadata(self.profile, self.calibration_digest)" in source
-    assert '"artifact_digest"' in source

@@ -95,12 +95,13 @@ def _sym(matrix, power, floor, torch):
 
 def alignment_diagnostics(hidden, embeddings, prefix=None, *, target_norm,
                           ridge=1e-3, eigen_floor=1e-6, rank_rtol=1e-5,
-                          anchor_alpha=0.0, sensitivity=True):
+                          anchor_alpha=0.0, sensitivity=True, generator=None):
     """Return DIAGNOSTIC_KEYS scalars for one alignment. Never raises on content.
 
     sensitivity=True costs two extra thin solves (row-rolled hidden states and
-    row-shuffled hidden states). Both are deterministic permutations, so the
-    measurement is reproducible without a random seed.
+    row-shuffled hidden states). Both are deterministic permutations; the
+    shuffle draws from an explicit torch.Generator (a fresh local one when
+    none is passed), never from the serving model RNG.
     """
     torch = _torch_of(hidden)
     require(hidden.ndim == 2 and hidden.shape == embeddings.shape, "profile")
@@ -121,7 +122,10 @@ def alignment_diagnostics(hidden, embeddings, prefix=None, *, target_norm,
             other = _solve(rolled, embeddings, target_norm, ridge=ridge, eigen_floor=eigen_floor,
                            rank_rtol=rank_rtol, torch=torch)["prefix"]
             hidden_sensitivity = float((other - z).norm() / z.norm().clamp_min(eigen_floor))
-            permuted = hidden[torch.randperm(hidden.shape[0], device=hidden.device)]
+            if generator is None:
+                generator = torch.Generator(device=hidden.device).manual_seed(0)
+            permuted = hidden[torch.randperm(hidden.shape[0], generator=generator,
+                                            device=hidden.device)]
             other = _solve(permuted, embeddings, target_norm, ridge=ridge, eigen_floor=eigen_floor,
                            rank_rtol=rank_rtol, torch=torch)["prefix"]
             shuffled_sensitivity = float((other - z).norm() / z.norm().clamp_min(eigen_floor))
@@ -173,65 +177,124 @@ def workspace_elements(rows, hidden_dim):
 
 
 CALIBRATED_DIAGNOSTIC_KEYS = (
-    "rows", "hidden_dim", "hidden_norm_mean", "embedding_norm_mean", "prefix_norm_mean",
-    "cos_prefix_to_embedding", "relative_prefix_error", "predicted_r2",
-    "hidden_sensitivity", "shuffled_hidden_sensitivity", "copier_flag", "nonfinite_count",
-    "anchor_alpha",
+    "rows", "hidden_dim", "serving_n1",
+    "hidden_norm_mean", "embedding_norm_mean",
+    "raw_prefix_norm_mean", "served_prefix_norm_mean",
+    "raw_cos_prefix_to_embedding", "served_cos_prefix_to_embedding",
+    "raw_relative_prefix_error", "served_relative_prefix_error",
+    "raw_predicted_r2", "served_predicted_r2",
+    "hidden_sensitivity", "shuffled_hidden_sensitivity",
+    "raw_copier_flag", "served_copier_flag",
+    "nonfinite_count", "anchor_alpha",
 )
-CALIBRATED_FLOATS = ("hidden_norm_mean", "embedding_norm_mean", "prefix_norm_mean",
-                     "cos_prefix_to_embedding", "relative_prefix_error", "predicted_r2",
+CALIBRATED_FLOATS = ("hidden_norm_mean", "embedding_norm_mean",
+                     "raw_prefix_norm_mean", "served_prefix_norm_mean",
+                     "raw_cos_prefix_to_embedding", "served_cos_prefix_to_embedding",
+                     "raw_relative_prefix_error", "served_relative_prefix_error",
+                     "raw_predicted_r2", "served_predicted_r2",
                      "hidden_sensitivity", "shuffled_hidden_sensitivity", "anchor_alpha")
 # LIVE-WINDOW-1 Section 5: any candidate whose cosine to the embedding copier
 # stays above this is not a candidate, whatever its other numbers say.
 COPIER_COSINE_LIMIT = 0.9
+_DIAGNOSTIC_FLOOR = 1e-6
+
+
+def _method_surface(artifact):
+    """The artifact method's apply/serving callables, through the registry."""
+    import importlib
+
+    from .native_profile import method_descriptor
+    try:
+        descriptor = method_descriptor(artifact.method_id)
+        module = importlib.import_module(descriptor["artifact_module"])
+    except Exception:
+        raise LatentError("profile") from None
+    return module.apply_map, module.serving_transform
+
+
+def _cosine_mean(left, right, torch):
+    norms = left.norm(dim=-1).clamp_min(_DIAGNOSTIC_FLOOR) * \
+        right.norm(dim=-1).clamp_min(_DIAGNOSTIC_FLOOR)
+    return float(((left * right).sum(-1) / norms).mean())
 
 
 def frozen_map_diagnostics(artifact, hidden, embeddings, *, target_norm=None,
                            anchor_alpha=0.0):
-    """DIAGNOSTIC-style scalars for the frozen calibrated map, not the per-message fit.
+    """CALIBRATED_DIAGNOSTIC_KEYS scalars for one frozen map, any registered method.
 
-    The per-message diagnostics re-solve the production operator on the same
-    rows, so they cannot report a frozen map's state dependence. Here the prefix
-    is apply_calibration() of the artifact, and the sensitivity is the change of
-    that output when the hidden rows are rolled or reversed. The result carries
-    the pre-registered copier flag so a map that reproduces the embeddings is
-    visible in the receipt.
+    The prefix is the method's apply_map (raw rows, no renormalisation inside
+    the apply) followed by its serving transform under the artifact binding's
+    serving config. The raw and served metric families are computed and kept
+    separate: raw rows against the captured embeddings, served rows against
+    the embeddings renormalised with the same statistic. The sensitivity terms
+    and the copier flag use the SAME artifact and serving normalisation in
+    both terms (evaluation protocol v2 R1): a shuffled output is never
+    compared against a differently-normalised correct output.
     """
-    from .statebridge_calibrated import apply_calibration
+    apply, serve = _method_surface(artifact)
     torch = _torch_of(hidden)
     require(hidden.ndim == 2 and hidden.shape == embeddings.shape, "profile")
     require(hidden.shape[0] >= 2 and hidden.device == embeddings.device, "profile")
     require(hidden.shape[1] == artifact.hidden_dim, "profile")
-    require(hidden.device == artifact.mean_hidden.device, "profile")
+    binding = artifact.binding
+    require(binding is not None, "profile")
+    serving = getattr(binding, "serving", None)
+    if serving is not None:
+        require(isinstance(target_norm, (int, float)) and not isinstance(target_norm, bool)
+                and math.isfinite(target_norm) and target_norm > 0.0, "profile")
     with torch.no_grad():
         h, e = hidden.float(), embeddings.float()
         require(bool(torch.isfinite(h).all()) and bool(torch.isfinite(e).all()), "numerical")
-        norms = e.norm(dim=-1, keepdim=True).clamp_min(torch.finfo(e.dtype).tiny)
-        scalar = float(norms.mean()) if target_norm is None else float(target_norm)
-        require(math.isfinite(scalar) and scalar > 0.0, "numerical")
-        calibrated = e * (scalar / norms)
-        prefix = apply_calibration(artifact, h, scalar)
-        cos = (prefix * calibrated).sum(-1) / (prefix.norm(dim=-1).clamp_min(1e-6) *
-                                              calibrated.norm(dim=-1).clamp_min(1e-6))
-        mean_cos = float(cos.mean())
-        residual = float((prefix - calibrated).pow(2).sum())
-        baseline = float((calibrated - calibrated.mean(0, keepdim=True)).pow(2).sum())
-        require(math.isfinite(residual) and baseline > 0.0, "numerical")
-        rolled = apply_calibration(artifact, torch.roll(h, 1, 0), scalar)
-        reversed_rows = apply_calibration(artifact, torch.flip(h, [0]).contiguous(), scalar)
-        floor = float(prefix.norm().clamp_min(1e-6))
+        z_raw = apply(artifact, h, torch_module=torch)
+        z_served = serve(serving, z_raw, nu=target_norm)
+        require(z_raw.shape == e.shape and z_served.shape == e.shape, "profile")
+        # The served reference carries the same normalisation as the served
+        # rows; the raw family compares raw rows against the captured scale.
+        if serving is None:
+            served_target = e
+        else:
+            norms = e.norm(dim=-1, keepdim=True).clamp_min(_DIAGNOSTIC_FLOOR)
+            served_target = e * (float(target_norm) / norms)
+        raw_cos = _cosine_mean(z_raw, e, torch)
+        served_cos = _cosine_mean(z_served, served_target, torch)
+
+        def view(predicted, target):
+            residual = float((predicted - target).pow(2).sum())
+            baseline = float((target - target.mean(0, keepdim=True)).pow(2).sum())
+            require(math.isfinite(residual) and math.isfinite(baseline) and baseline > 0.0,
+                    "numerical")
+            return {"relative": float((predicted - target).norm()
+                                      / target.norm().clamp_min(_DIAGNOSTIC_FLOOR)),
+                    "r2": 1.0 - residual / baseline}
+
+        raw = view(z_raw, e)
+        served = view(z_served, served_target)
+        # R1: both terms of every sensitivity use the same artifact and the
+        # same serving transform; the denominator is the correct served output.
+        rolled = serve(serving, apply(artifact, torch.roll(h, 1, 0), torch_module=torch),
+                       nu=target_norm)
+        reversed_rows = serve(serving, apply(artifact, torch.flip(h, [0]).contiguous(),
+                                             torch_module=torch),
+                              nu=target_norm)
+        floor = max(float(z_served.norm()), _DIAGNOSTIC_FLOOR)
         result = {
             "rows": int(h.shape[0]), "hidden_dim": int(h.shape[1]),
+            "serving_n1": int(serving is not None),
             "hidden_norm_mean": float(h.norm(dim=-1).mean()),
             "embedding_norm_mean": float(e.norm(dim=-1).mean()),
-            "prefix_norm_mean": float(prefix.norm(dim=-1).mean()),
-            "cos_prefix_to_embedding": mean_cos,
-            "relative_prefix_error": float((prefix - calibrated).norm() / calibrated.norm().clamp_min(1e-6)),
-            "predicted_r2": float(1.0 - residual / baseline),
-            "hidden_sensitivity": float((rolled - prefix).norm() / floor),
-            "shuffled_hidden_sensitivity": float((reversed_rows - prefix).norm() / floor),
-            "copier_flag": int(mean_cos > COPIER_COSINE_LIMIT),
-            "nonfinite_count": int((~torch.isfinite(prefix)).sum()),
+            "raw_prefix_norm_mean": float(z_raw.norm(dim=-1).mean()),
+            "served_prefix_norm_mean": float(z_served.norm(dim=-1).mean()),
+            "raw_cos_prefix_to_embedding": raw_cos,
+            "served_cos_prefix_to_embedding": served_cos,
+            "raw_relative_prefix_error": raw["relative"],
+            "served_relative_prefix_error": served["relative"],
+            "raw_predicted_r2": raw["r2"],
+            "served_predicted_r2": served["r2"],
+            "hidden_sensitivity": float((rolled - z_served).norm() / floor),
+            "shuffled_hidden_sensitivity": float((reversed_rows - z_served).norm() / floor),
+            "raw_copier_flag": int(raw_cos > COPIER_COSINE_LIMIT),
+            "served_copier_flag": int(served_cos > COPIER_COSINE_LIMIT),
+            "nonfinite_count": int((~torch.isfinite(z_served)).sum()),
             "anchor_alpha": float(anchor_alpha),
         }
     validate_calibrated(result)
@@ -247,7 +310,10 @@ def validate_calibrated(result):
         if isinstance(value, float):
             require(value == value and abs(value) != float("inf"), "numerical")
     require(result["rows"] >= 2 and result["hidden_dim"] > 2, "profile")
-    require(result["copier_flag"] in (0, 1), "profile")
+    require(result["serving_n1"] in (0, 1), "profile")
+    require(result["raw_copier_flag"] in (0, 1) and result["served_copier_flag"] in (0, 1),
+            "profile")
     require(result["nonfinite_count"] == 0, "numerical")
-    require(-1.0 <= result["cos_prefix_to_embedding"] <= 1.0, "numerical")
+    for key in ("raw_cos_prefix_to_embedding", "served_cos_prefix_to_embedding"):
+        require(-1.0 <= result[key] <= 1.0, "numerical")
     return True

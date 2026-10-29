@@ -1,70 +1,72 @@
-"""Pooled calibration corpora and turn-disjoint held-out evaluation.
+"""Three-way calibration corpora, frozen split manifests and shared evaluation.
 
 The live window measured the hidden-to-embedding relation inside single turns,
 because that was all it captured: 51 fit rows of 6144 dimensions. A pooled
 corpus of whole turns has strictly more capacity, and the only honest way to
 score it is to hold out whole turns, never rows.
 
-Two rules define this module:
+Three rules define this module:
 
-1. A turn is the split unit. Every row of a turn is either in the calibration
-   corpus or in the evaluation set. No adjacent position of one generation can
-   appear on both sides.
-2. A quality number is reported only when it is measurable. Fewer than
-   MIN_EVALUATION_TURNS evaluation turns, or a frozen map that does not beat the
-   mean predictor on the held-out turns, raises LatentError instead of returning
-   a number.
+1. A turn is the split unit. split_manifest freezes a FIT, VALIDATION and
+   FINAL TEST partition of whole turns, grouped by caller-supplied source
+   fact/context families so near-duplicate prompts never cross partitions.
+   FIT fits; VALIDATION selects hyperparameters and the serving variant;
+   TEST is never touched by fitting or selection.
+2. Evaluation records, never gates. evaluate_map scores a frozen artifact on
+   an independent partition and returns the complete metric record of spec
+   section 12: raw and served metrics kept distinct, per-turn, turn-macro and
+   pooled views, negatives recorded, undefined denominators recorded as
+   undefined instead of raising.
+3. Promotion happens only in validate_for_activation, which consumes a policy
+   and a validation record bound to the artifact digest. Nothing in this
+   module refuses a measurement because its quality is poor.
 
 Turn order is the ascending sha256 of the turn id, never insertion order, so a
-row budget truncates the same turns on every run and on every host. The budget
-is an upper bound: whole turns are taken from that order until the next turn
-would exceed it, and the report states the budget and the rows actually used.
+row budget truncates the same turns on every run and on every host.
 
 The controls are the campaign's matched arms as a scoring library, not a live
 runner: correct state, wrong-sender state, shuffled state, matched-shape null
-state, no attachment, and reference-token-only. A later task wires them to the
-GPU. They are kept mathematically distinct so a null or shuffled arm cannot be
-mistaken for the correct arm.
-
-What one evaluation reports, all scalar:
-  eval_r2, eval_relative_error, eval_cosine   quality on whole held-out turns
-  fit_heldout_r2                              the fit's own row-order estimate
-  refit_sensitivity                           output change when the map is
-                                              re-fitted on a rolled calibration
-                                              block (correspondence destroyed)
-  hidden_roll_sensitivity                     output change when the evaluated
-  hidden_permute_sensitivity                  hidden rows are rolled/reversed
-  independent_reference_sensitivity/-_cosine  an unrelated sender's hidden rows
-                                              through the same frozen map
-  token_reference_cosine                      an unrelated turn's token channel
-                                              against this turn's embeddings
-  separation                                  per-control correct-minus-control
-                                              margin and accuracy, if supplied
-  corpus_digest, artifact_digest              what was fitted, exactly
-A metric that was not measured is None, never zero: absent controls and an
-unbound artifact are reported as absent.
+state, no attachment, and reference-token-only. They are kept mathematically
+distinct so a null or shuffled arm cannot be mistaken for the correct arm.
+A metric that was not measured is None, never zero.
 """
 from __future__ import annotations
 
 import hashlib
+import json
 import math
 import re
-from dataclasses import dataclass
+import sys
+from collections.abc import Mapping
+from dataclasses import dataclass, replace
 
 from .latent_types import require
-from .statebridge_calibrated import (
-    DEFAULT_RIDGE_REL, MIN_CALIBRATION_ROWS, MIN_HELDOUT_R2,
-    CalibrationProvenance, apply_calibration, artifact_digest, fit_calibration,
-)
+from .statebridge_calibrated import (MIN_CALIBRATION_ROWS, PARTITION_FIELDS,
+                                     serving_transform)
 
 M_ROW_BUDGETS = (512, 1024, 2048)
-MIN_EVALUATION_TURNS = 4
 MIN_TURN_ROWS = 2
-DEFAULT_EVAL_STRIDE = 3
 TURN_ORDER_DOMAIN = "optimus.occ3.calibration-turn-order.v1"
+SPLIT_DOMAIN = "optimus.occ3.calibration-split.v2"
+SPLIT_SCHEMA = "optimus.occ3.calibration-split.v2"
+PARTITION_DIGEST_DOMAIN = "optimus.occ3.calibration-partition.v1"
+RECORD_SCHEMA = "optimus.occ3.evaluation-record.v1"
+SELECTION_SCHEMA = "optimus.occ3.calibration-selection.v1"
 NORM_FLOOR = 1e-6
-# Only the re-fit diagnostic fits a corpus whose quality guard must be off.
-REFIT_DIAGNOSTIC_MIN_R2 = -1.0
+RHO_GRID = (0.002, 0.02, 0.2)
+SERVING_VARIANTS = ("n0", "n1")
+
+VIEW_KEYS = ("r2_standard", "r2_vs_fit_mean", "sse", "sst_test", "sse_vs_fit_mean",
+             "relative_frobenius", "mean_row_cosine", "raw_row_norm_mean",
+             "served_r2_standard", "served_r2_vs_fit_mean", "served_relative_frobenius",
+             "served_mean_row_cosine", "served_row_norm_mean", "rows")
+RECORD_KEYS = frozenset({
+    "schema", "method_id", "artifact_digest", "corpus_digest", "fit_manifest_digest",
+    "partition_manifest_digest", "serving", "nu", "rows", "turns",
+    "output_variance", "output_effective_rank", "served_output_variance",
+    "served_output_effective_rank", "per_turn", "turn_macro", "pooled",
+    "undefined_denominators",
+}) | frozenset(VIEW_KEYS) - {"rows"}
 
 CONTROL_KINDS = ("correct", "wrong-sender", "shuffled", "null",
                  "no-attachment", "reference-token-only")
@@ -73,22 +75,6 @@ SOURCE_HIDDEN = "hidden"
 SOURCE_TOKEN = "token-reference"
 SOURCE_NONE = "none"
 
-EVALUATION_KEYS = (
-    "row_budget", "rows_used", "available_fit_turns", "fit_turns", "eval_turns",
-    "fit_rows", "eval_rows", "ridge_rel", "ridge", "fit_heldout_r2",
-    "eval_r2", "eval_relative_error", "eval_cosine",
-    "refit_sensitivity", "hidden_roll_sensitivity", "hidden_permute_sensitivity",
-    "independent_reference_sensitivity", "independent_reference_cosine",
-    "token_reference_cosine", "corpus_digest", "artifact_digest", "separation",
-)
-_OPTIONAL_FLOATS = ("independent_reference_sensitivity", "independent_reference_cosine",
-                    "token_reference_cosine")
-_COUNTS = ("row_budget", "rows_used", "available_fit_turns", "fit_turns", "eval_turns",
-           "fit_rows", "eval_rows")
-_FLOATS = ("ridge_rel", "ridge", "fit_heldout_r2", "eval_r2", "eval_relative_error",
-           "eval_cosine", "refit_sensitivity", "hidden_roll_sensitivity",
-           "hidden_permute_sensitivity")
-_SEPARATION_KEYS = frozenset({"trials", "delta_margin", "delta_accuracy"})
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._:/-]{1,256}\Z")
 
 
@@ -101,13 +87,43 @@ def _identifier(value):
     return type(value) is str and _IDENTIFIER.fullmatch(value) is not None
 
 
+def _canonical(value):
+    return json.dumps(value, sort_keys=True, separators=(",", ":"),
+                      ensure_ascii=True, allow_nan=False).encode("ascii")
+
+
+def _byte_order():
+    require(sys.byteorder == "little", "profile")
+    return sys.byteorder
+
+
+def _matrix_digest(matrix, torch, tag):
+    """Content digest of one float32 matrix image; numpy memcpy, array fallback."""
+    require(getattr(matrix, "ndim", 0) == 2, "profile")
+    flat = matrix.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+    try:
+        import numpy
+    except ImportError:
+        import array
+        raw = array.array("f", flat.view(-1).tolist()).tobytes()
+    else:
+        raw = bytes(memoryview(numpy.ascontiguousarray(flat.numpy())))
+    require(len(raw) == int(flat.numel()) * 4, "numerical")
+    value = hashlib.sha256()
+    value.update(f"{tag}:{int(matrix.shape[0])}x{int(matrix.shape[1])}:float32:".encode("ascii"))
+    value.update(raw)
+    return value.hexdigest()
+
+
 @dataclass(frozen=True)
 class TurnBlock:
-    """Every row of one captured turn, tagged by its turn id.
+    """Every row of one captured turn, tagged by its turn id and family.
 
     reference_embeddings is the token channel of the same span (no hidden
     state). wrong_sender_hidden is a matched-shape hidden block from a
-    different sender. Both are optional because they are controls, and a
+    different sender. family groups turns that share a source fact or context,
+    so near-duplicate prompts stay on one side of a split; a turn without a
+    family is its own family. The optional controls may be absent, and a
     control that was not captured must read as absent, never as zero.
     """
     turn_id: str
@@ -115,9 +131,11 @@ class TurnBlock:
     embeddings: object
     reference_embeddings: object = None
     wrong_sender_hidden: object = None
+    family: object = None
 
     def __post_init__(self):
         require(_identifier(self.turn_id), "profile")
+        require(self.family is None or _identifier(self.family), "profile")
         require(getattr(self.hidden, "ndim", None) == 2
                 and getattr(self.embeddings, "ndim", None) == 2, "profile")
         require(tuple(int(x) for x in self.hidden.shape)
@@ -150,22 +168,78 @@ def ordered_blocks(blocks):
     return tuple(sorted(values, key=lambda value: turn_order_key(value.turn_id)))
 
 
-def split_turns(blocks, *, eval_stride=DEFAULT_EVAL_STRIDE):
-    """Partition whole turns: every eval_stride-th turn evaluates, the rest fit.
+def _family_key(family):
+    return hashlib.sha256(f"{SPLIT_DOMAIN}|{family}".encode("utf-8")).hexdigest()
 
-    Both partitions are non-empty by construction and share no turn id, so no
-    row of one generation can reach the calibration corpus and the evaluation
-    set at the same time.
+
+def _partition(name, blocks, torch):
+    """One contract partition: {turn_ids, hidden, embeddings, row_turn_ids,
+    manifest_digest}, rows pooled in digest order and bound by content digest."""
+    values = ordered_blocks(blocks)
+    require(bool(values), "profile")
+    hidden = torch.cat([value.hidden for value in values], dim=0).contiguous()
+    embeddings = torch.cat([value.embeddings for value in values], dim=0).contiguous()
+    turn_ids = tuple(value.turn_id for value in values)
+    row_turn_ids = tuple(turn_id for value in values
+                         for turn_id in (value.turn_id,) * value.rows)
+    body = {"domain": PARTITION_DIGEST_DOMAIN, "partition": name,
+            "rows": int(hidden.shape[0]), "hidden_dim": int(hidden.shape[1]),
+            "byte_order": _byte_order(), "turn_ids": list(turn_ids),
+            "row_turn_ids": list(row_turn_ids),
+            "hidden": _matrix_digest(hidden, torch, "hidden"),
+            "embeddings": _matrix_digest(embeddings, torch, "embeddings")}
+    digest = hashlib.sha256(_canonical(body)).hexdigest()
+    return {"turn_ids": turn_ids, "hidden": hidden, "embeddings": embeddings,
+            "row_turn_ids": row_turn_ids, "manifest_digest": digest}
+
+
+def split_manifest(corpus, *, fit_turns, validation_turns, test_turns,
+                   torch_module=None):
+    """Freeze the three-way whole-turn split: fit, validation, final test.
+
+    Turns are grouped by family (the turn id itself when no family is given),
+    families are ordered by sha256, and each whole family is assigned to the
+    partition furthest below its turn target, so no family ever crosses a
+    partition and the result depends only on turn ids, families and targets.
+    Targets are approximate because families are atomic; every turn is
+    assigned, the manifest records the actual counts, and a partition that
+    would end up empty is refused.
     """
-    require(type(eval_stride) is int and 2 <= eval_stride <= 16, "profile")
-    ordered = ordered_blocks(blocks)
-    require(len(ordered) >= eval_stride, "profile")
-    fit_blocks = tuple(value for index, value in enumerate(ordered) if index % eval_stride)
-    eval_blocks = tuple(value for index, value in enumerate(ordered) if not index % eval_stride)
-    require(bool(fit_blocks) and bool(eval_blocks), "profile")
-    require(not ({value.turn_id for value in fit_blocks}
-                 & {value.turn_id for value in eval_blocks}), "identity")
-    return fit_blocks, eval_blocks
+    torch = torch_module or _torch()
+    targets = {}
+    for name, count in (("fit", fit_turns), ("validation", validation_turns),
+                       ("test", test_turns)):
+        require(type(count) is int and not isinstance(count, bool) and count >= 1,
+                "profile")
+        targets[name] = count
+    blocks = ordered_blocks(corpus)
+    families = {}
+    for block in blocks:
+        families.setdefault(block.family if block.family is not None else block.turn_id,
+                            []).append(block)
+    ordered_families = sorted(families, key=_family_key)
+    keys = [_family_key(family) for family in ordered_families]
+    require(len(set(keys)) == len(keys), "identity")
+    assigned = {name: [] for name in ("fit", "validation", "test")}
+    counts = {name: 0 for name in ("fit", "validation", "test")}
+    for family in ordered_families:
+        members = tuple(families[family])
+        target = max(targets, key=lambda name: targets[name] - counts[name])
+        assigned[target].extend(members)
+        counts[target] += len(members)
+    for name in ("fit", "validation", "test"):
+        require(bool(assigned[name]), "profile")
+    partitions = {name: _partition(name, assigned[name], torch)
+                  for name in ("fit", "validation", "test")}
+    manifest = {"schema": SPLIT_SCHEMA,
+                "fit": partitions["fit"], "validation": partitions["validation"],
+                "test": partitions["test"], "turns": counts, "targets": dict(targets),
+                "manifest_digest": hashlib.sha256(_canonical({
+                    "schema": SPLIT_SCHEMA, "targets": dict(targets), "turns": counts,
+                    "partitions": {name: partitions[name]["manifest_digest"]
+                                   for name in ("fit", "validation", "test")},
+                })).hexdigest()}
+    return manifest
 
 
 def select_calibration_rows(fit_blocks, row_budget):
@@ -198,14 +272,6 @@ def pooled_rows(blocks, *, torch_module=None):
     return hidden.contiguous(), embeddings.contiguous()
 
 
-def _optional_rows(blocks, name, torch_module):
-    """Pooled optional control rows, or None when any chosen turn lacks them."""
-    if any(getattr(value, name) is None for value in blocks):
-        return None
-    torch = torch_module or _torch()
-    return torch.cat([getattr(value, name) for value in blocks], dim=0).contiguous()
-
-
 def _unit(matrix, floor=NORM_FLOOR):
     return matrix / matrix.norm(dim=-1, keepdim=True).clamp_min(floor)
 
@@ -221,19 +287,8 @@ def _scaled_target(embeddings, target_norm):
     return embeddings * (target_norm / norms)
 
 
-def _r2(predicted, target):
-    residual = float((predicted - target).pow(2).sum())
-    baseline = float((target - target.mean(0, keepdim=True)).pow(2).sum())
-    require(math.isfinite(residual) and baseline > 0.0, "numerical")
-    return 1.0 - residual / baseline
-
-
 def _relative_error(predicted, target):
     return float((predicted - target).norm() / target.norm().clamp_min(NORM_FLOOR))
-
-
-def _change(left, right):
-    return float((left - right).norm() / right.norm().clamp_min(NORM_FLOOR))
 
 
 def _median(values):
@@ -301,16 +356,19 @@ def control_rows(block, kind, *, torch_module=None):
     return SOURCE_NONE, None
 
 
-def score_controls(artifact, block, *, target_norm=None, torch_module=None):
+def score_controls(apply, artifact, block, *, target_norm=None, torch_module=None):
     """Score every control arm of one turn against that turn's embeddings.
 
-    target_norm defaults to the turn's own mean row norm because a single turn
-    is a diagnostic; the pooled evaluation always passes the calibration mean,
-    which is the scalar the frozen map was fitted under. Only the attached arms
-    produce a cosine: the no-attachment arm has no rows, so it reports
-    attached=0 with no score instead of a fabricated zero.
+    apply is the method's apply_map; the hidden arms go through the frozen map
+    and then the N1 serving transform at the matched radius, so every attached
+    arm is compared at the same scale. target_norm defaults to the turn's own
+    mean row norm because a single turn is a diagnostic; the pooled evaluation
+    always passes the calibration mean. Only the attached arms produce a
+    cosine: the no-attachment arm reports attached=0 with no score instead of
+    a fabricated zero.
     """
     torch = torch_module or _torch()
+    require(callable(apply), "profile")
     require(isinstance(block, TurnBlock), "profile")
     with torch.no_grad():
         embeddings = block.embeddings.float()
@@ -328,7 +386,8 @@ def score_controls(artifact, block, *, target_norm=None, torch_module=None):
                 continue
             rows = rows.float()
             require(bool(torch.isfinite(rows).all()), "numerical")
-            prefix = (apply_calibration(artifact, rows, scalar, torch_module=torch)
+            prefix = (serving_transform({"kind": "n1"},
+                                        apply(artifact, rows, torch_module=torch), nu=scalar)
                       if source == SOURCE_HIDDEN else _scaled_target(rows, scalar))
             require(bool(torch.isfinite(prefix).all()), "numerical")
             result[kind] = {"kind": kind, "source": source, "rows": int(prefix.shape[0]),
@@ -339,120 +398,381 @@ def score_controls(artifact, block, *, target_norm=None, torch_module=None):
         return result
 
 
-def evaluate_turn_disjoint(blocks, *, row_budget=512, eval_stride=DEFAULT_EVAL_STRIDE,
-                           ridge_rel=DEFAULT_RIDGE_REL, min_eval_turns=MIN_EVALUATION_TURNS,
-                           min_eval_r2=MIN_HELDOUT_R2, provenance=None,
-                           candidate_scores=None, torch_module=None):
-    """Fit on whole calibration turns, score on whole held-out turns.
+def _require_partition(partition, torch):
+    """The contract partition, for evaluation: exactly five keys, whole turns."""
+    require(isinstance(partition, Mapping), "profile")
+    require(set(partition) == set(PARTITION_FIELDS), "profile")
+    hidden, embeddings = partition["hidden"], partition["embeddings"]
+    for matrix in (hidden, embeddings):
+        require(hasattr(matrix, "dtype") and matrix.dtype.is_floating_point, "profile")
+        require(getattr(matrix, "ndim", None) == 2, "profile")
+    require(hidden.shape == embeddings.shape, "profile")
+    require(hidden.device == embeddings.device, "profile")
+    rows = int(hidden.shape[0])
+    require(rows >= 2, "profile")
+    row_turn_ids = partition["row_turn_ids"]
+    turn_ids = partition["turn_ids"]
+    require(isinstance(row_turn_ids, (tuple, list)) and isinstance(turn_ids, (tuple, list)),
+            "profile")
+    row_turn_ids, turn_ids = tuple(row_turn_ids), tuple(turn_ids)
+    require(len(row_turn_ids) == rows, "profile")
+    require(all(_identifier(value) for value in row_turn_ids), "profile")
+    require(all(_identifier(value) for value in turn_ids), "profile")
+    require(len(set(turn_ids)) == len(turn_ids) and set(turn_ids) == set(row_turn_ids),
+            "profile")
+    digest = partition["manifest_digest"]
+    require(type(digest) is str and (digest == "" or len(digest) == 64), "profile")
+    return hidden, embeddings, row_turn_ids, turn_ids, digest
 
-    The artifact is fitted on the selected calibration turns only. The target
-    radius is the mean row norm of the calibration embeddings, never of the
-    evaluation rows, so no evaluation-side quantity reaches the map or its
-    scale. A held-out R^2 below min_eval_r2 raises LatentError("numerical"):
-    the corpus has no signal the frozen map can carry.
+
+def _serving_config(serving):
+    require(serving is None or (type(serving) is dict and set(serving) == {"kind"}
+                                and serving["kind"] == "n1"), "profile")
+    return None if serving is None else dict(serving)
+
+
+def _fit_embedding_mean(artifact, dim):
+    for name in ("mean_embedding", "mu_e"):
+        value = getattr(artifact, name, None)
+        if value is not None:
+            require(getattr(value, "ndim", None) in (1, 2)
+                    and int(value.numel()) == dim, "profile")
+            return value.reshape(1, dim)
+    require(False, "profile")
+
+
+def _row_metrics(predicted, target, mu_fit):
+    """Pooled spec-12 block for one row subset; None on a zero denominator."""
+    sse = float((predicted - target).pow(2).sum())
+    sst = float((target - target.mean(0, keepdim=True)).pow(2).sum())
+    sse_mean = float((target - mu_fit).pow(2).sum())
+    require(math.isfinite(sse) and math.isfinite(sst) and math.isfinite(sse_mean),
+            "numerical")
+    return {"sse": sse, "sst_test": sst, "sse_vs_fit_mean": sse_mean,
+            "r2_standard": None if sst == 0.0 else 1.0 - sse / sst,
+            "r2_vs_fit_mean": None if sse_mean == 0.0 else 1.0 - sse / sse_mean,
+            "relative_frobenius": float((predicted - target).norm()
+                                         / max(float(target.norm()), NORM_FLOOR)),
+            "mean_row_cosine": _cosine(predicted, target)}
+
+
+def _view(z_raw, z_served, target, mu_fit):
+    """One uniform metric view: raw and served kept distinct, plus row count."""
+    raw = _row_metrics(z_raw, target, mu_fit)
+    served = _row_metrics(z_served, target, mu_fit)
+    return {"r2_standard": raw["r2_standard"], "r2_vs_fit_mean": raw["r2_vs_fit_mean"],
+            "sse": raw["sse"], "sst_test": raw["sst_test"],
+            "sse_vs_fit_mean": raw["sse_vs_fit_mean"],
+            "relative_frobenius": raw["relative_frobenius"],
+            "mean_row_cosine": raw["mean_row_cosine"],
+            "raw_row_norm_mean": float(z_raw.norm(dim=-1).mean()),
+            "served_r2_standard": served["r2_standard"],
+            "served_r2_vs_fit_mean": served["r2_vs_fit_mean"],
+            "served_relative_frobenius": served["relative_frobenius"],
+            "served_mean_row_cosine": served["mean_row_cosine"],
+            "served_row_norm_mean": float(z_served.norm(dim=-1).mean()),
+            "rows": int(target.shape[0])}
+
+
+def _output_stats(z, torch):
+    """Variance and effective rank of the output rows, in float64 for stability."""
+    centered = z - z.mean(0, keepdim=True)
+    variance = float(centered.pow(2).sum() / centered.shape[0])
+    singular = torch.linalg.svdvals(centered.double())
+    weights = singular.pow(2)
+    total = float(weights.sum())
+    require(math.isfinite(variance) and math.isfinite(total), "numerical")
+    if total <= 0.0:
+        return variance, 0.0
+    share = weights / total
+    entropy = float(torch.where(share > 0, share * share.log(), torch.zeros(())).sum())
+    return variance, float(math.exp(-entropy))
+
+
+def evaluate_map(apply, artifact, partition, *, serving=None, nu=None,
+                 torch_module=None):
+    """Score a frozen artifact on an INDEPENDENT partition; record, never gate.
+
+    apply is the method's apply_map. The artifact is scored on the partition's
+    rows before any serving transform and again after the optional serving
+    transform, and both metric sets are kept distinct. Zero denominators are
+    recorded as undefined values plus entries in undefined_denominators;
+    negative scores are recorded, never suppressed. mu_E_fit for
+    r2_vs_fit_mean comes from the frozen artifact, never from the partition.
     """
     torch = torch_module or _torch()
-    require(provenance is None or isinstance(provenance, CalibrationProvenance), "profile")
-    require(type(min_eval_turns) is int and min_eval_turns >= 1, "profile")
-    require(type(min_eval_r2) is float and math.isfinite(min_eval_r2), "profile")
-    fit_blocks, eval_blocks = split_turns(blocks, eval_stride=eval_stride)
-    require(len(eval_blocks) >= min_eval_turns, "profile")
-    selected, rows_used = select_calibration_rows(fit_blocks, row_budget)
-    hidden, embeddings = pooled_rows(selected, torch_module=torch)
-    turn_ids = None if provenance is None else [value.turn_id for value in selected]
-    artifact = fit_calibration(hidden, embeddings, ridge_rel=ridge_rel, provenance=provenance,
-                               turn_ids=turn_ids, torch_module=torch)
-    target_norm = float(embeddings.norm(dim=-1).mean())
-    require(math.isfinite(target_norm) and target_norm > 0.0, "numerical")
-    reference_hidden = _optional_rows(eval_blocks, "wrong_sender_hidden", torch)
-    reference_tokens = _optional_rows(eval_blocks, "reference_embeddings", torch)
-    eval_hidden, eval_embeddings = pooled_rows(eval_blocks, torch_module=torch)
+    require(callable(apply), "profile")
+    hidden, embeddings, row_turn_ids, turn_ids, digest = _require_partition(partition, torch)
+    config = _serving_config(serving)
+    nu_used = None
+    if config is not None:
+        require(isinstance(nu, (int, float)) and not isinstance(nu, bool)
+                and math.isfinite(nu) and nu > 0.0, "profile")
+        nu_used = float(nu)
     with torch.no_grad():
-        eval_hidden = eval_hidden.float()
-        eval_embeddings = eval_embeddings.float()
-        require(bool(torch.isfinite(eval_hidden).all())
-                and bool(torch.isfinite(eval_embeddings).all()), "numerical")
-        target = _scaled_target(eval_embeddings, target_norm)
-        predicted = apply_calibration(artifact, eval_hidden, target_norm, torch_module=torch)
-        quality = _r2(predicted, target)
-        require(quality >= min_eval_r2, "numerical")
-        # Re-fit sensitivity: the calibration rows are rolled by one position, so
-        # the hidden-to-embedding correspondence is destroyed, and the map is
-        # fitted again. The fit's own quality guard would refuse that corpus by
-        # design, so it is disabled for this diagnostic only; the resulting map is
-        # never returned, serialized or described. A plain re-fit on the same rows
-        # in any order reproduces the identical transform, because the means, the
-        # Gram and the map are permutation invariant; only the row-order held-out
-        # estimate inside the fit is not.
-        refit = fit_calibration(torch.roll(hidden, 1, 0), embeddings, ridge_rel=ridge_rel,
-                                min_heldout_r2=REFIT_DIAGNOSTIC_MIN_R2, torch_module=torch)
-        refit_output = apply_calibration(refit, eval_hidden, target_norm, torch_module=torch)
-        rolled = apply_calibration(artifact, torch.roll(eval_hidden, 1, 0), target_norm,
-                                   torch_module=torch)
-        permuted = apply_calibration(artifact, torch.flip(eval_hidden, [0]).contiguous(),
-                                     target_norm, torch_module=torch)
-        reference_sensitivity = reference_cosine = None
-        if reference_hidden is not None:
-            other = apply_calibration(artifact, reference_hidden.float(), target_norm,
-                                      torch_module=torch)
-            reference_sensitivity = _change(other, predicted)
-            reference_cosine = _cosine(other, target)
-        token_cosine = None
-        if reference_tokens is not None:
-            token_cosine = _cosine(_scaled_target(reference_tokens.float(), target_norm), target)
-        result = {
-            "row_budget": int(row_budget), "rows_used": int(rows_used),
-            "available_fit_turns": len(fit_blocks), "fit_turns": len(selected),
-            "eval_turns": len(eval_blocks), "fit_rows": int(hidden.shape[0]),
-            "eval_rows": int(eval_hidden.shape[0]),
-            "ridge_rel": float(artifact.ridge_rel), "ridge": float(artifact.ridge),
-            "fit_heldout_r2": float(artifact.heldout_r2), "eval_r2": float(quality),
-            "eval_relative_error": _relative_error(predicted, target),
-            "eval_cosine": _cosine(predicted, target),
-            "refit_sensitivity": _change(refit_output, predicted),
-            "hidden_roll_sensitivity": _change(rolled, predicted),
-            "hidden_permute_sensitivity": _change(permuted, predicted),
-            "independent_reference_sensitivity": reference_sensitivity,
-            "independent_reference_cosine": reference_cosine,
-            "token_reference_cosine": token_cosine,
-            "corpus_digest": None if artifact.binding is None else artifact.binding.corpus_digest,
-            "artifact_digest": (None if artifact.binding is None
-                                else artifact_digest(artifact, torch_module=torch)),
-            "separation": separate_candidates(candidate_scores),
+        embeddings = embeddings.float()
+        require(bool(torch.isfinite(embeddings).all()), "numerical")
+        z_raw = apply(artifact, hidden, torch_module=torch)
+        require(getattr(z_raw, "ndim", None) == 2 and tuple(
+            int(x) for x in z_raw.shape) == tuple(int(x) for x in embeddings.shape),
+            "profile")
+        z = z_raw.detach().to(dtype=torch.float64)
+        served_raw = serving_transform(config, z_raw, nu=nu_used)
+        z_served = served_raw.detach().to(dtype=torch.float64)
+        target = embeddings.to(dtype=torch.float64)
+        mu_fit = _fit_embedding_mean(artifact, target.shape[1]).to(dtype=torch.float64)
+        pooled = _view(z, z_served, target, mu_fit)
+        raw_variance, raw_rank = _output_stats(z, torch)
+        served_variance, served_rank = _output_stats(z_served, torch)
+        indices = {}
+        for index, turn_id in enumerate(row_turn_ids):
+            indices.setdefault(turn_id, []).append(index)
+        per_turn = {}
+        undefined = []
+        for turn_id in turn_ids:
+            selection = indices.get(turn_id)
+            require(bool(selection), "profile")
+            rows = torch.tensor(selection, dtype=torch.long)
+            view = _view(z[rows], z_served[rows], target[rows], mu_fit)
+            for name in ("r2_standard", "r2_vs_fit_mean", "served_r2_standard",
+                         "served_r2_vs_fit_mean"):
+                if view[name] is None:
+                    undefined.append(f"{name}@{turn_id}")
+            per_turn[turn_id] = view
+        turn_macro = {}
+        for name in VIEW_KEYS[:-1]:
+            values = [per_turn[turn_id][name] for turn_id in turn_ids
+                      if per_turn[turn_id][name] is not None]
+            turn_macro[name] = sum(values) / len(values) if values else None
+        for name in ("r2_standard", "r2_vs_fit_mean", "served_r2_standard",
+                     "served_r2_vs_fit_mean"):
+            if pooled[name] is None:
+                undefined.append(name)
+        binding = getattr(artifact, "binding", None)
+        record = {
+            "schema": RECORD_SCHEMA,
+            "method_id": getattr(artifact, "method_id", None),
+            "artifact_digest": getattr(artifact, "content_digest", None),
+            "corpus_digest": getattr(binding, "corpus_digest", None),
+            "fit_manifest_digest": getattr(binding, "fit_manifest_digest", None),
+            "partition_manifest_digest": digest,
+            "serving": config, "nu": nu_used,
+            "rows": pooled["rows"], "turns": len(turn_ids),
+            "output_variance": raw_variance, "output_effective_rank": raw_rank,
+            "served_output_variance": served_variance,
+            "served_output_effective_rank": served_rank,
+            "per_turn": per_turn, "turn_macro": turn_macro, "pooled": pooled,
+            "undefined_denominators": undefined,
         }
-    validate_evaluation(result)
-    return result
+        record.update({name: pooled[name] for name in VIEW_KEYS[:-1]})
+    return record
 
 
-def validate_evaluation(result):
-    """Fixed key set, exact scalar types, bounded values. No tensor content."""
-    require(isinstance(result, dict) and set(result) == set(EVALUATION_KEYS), "profile")
-    for name in _COUNTS:
-        value = result[name]
-        require(type(value) is int and not isinstance(value, bool) and value >= 0, "profile")
-    require(result["row_budget"] in M_ROW_BUDGETS, "profile")
-    require(result["rows_used"] <= result["row_budget"], "profile")
-    require(result["fit_turns"] <= result["available_fit_turns"] and result["eval_turns"] >= 1,
-            "profile")
-    for name in _FLOATS:
-        value = result[name]
-        require(type(value) is float and not isinstance(value, bool) and math.isfinite(value),
-                "numerical")
-    require(0.0 < result["ridge_rel"] < 1.0 and result["ridge"] > 0.0, "profile")
-    for name in _OPTIONAL_FLOATS:
-        value = result[name]
-        require(value is None or (type(value) is float and math.isfinite(value)), "numerical")
-    for name in ("corpus_digest", "artifact_digest"):
-        value = result[name]
+def record_digest(record):
+    """Digest of one evaluation record; promotion evidence is pinned by it."""
+    require(isinstance(record, Mapping), "profile")
+    return hashlib.sha256(_canonical(record)).hexdigest()
+
+
+def validate_metrics_record(record):
+    """Fixed key set, exact scalar types, bounded structure. No tensor content."""
+    require(isinstance(record, Mapping) and set(record) == set(RECORD_KEYS), "profile")
+    require(record["schema"] == RECORD_SCHEMA, "profile")
+    require(type(record["method_id"]) is str, "profile")
+    for name in ("artifact_digest", "corpus_digest", "fit_manifest_digest",
+                 "partition_manifest_digest"):
+        value = record[name]
         require(value is None or (type(value) is str and len(value) == 64), "profile")
-    require((result["corpus_digest"] is None) == (result["artifact_digest"] is None), "profile")
-    separation_value = result["separation"]
-    require(type(separation_value) is dict and set(separation_value) <= set(CONTROL_KINDS),
+    require(record["serving"] is None
+            or (type(record["serving"]) is dict and set(record["serving"]) == {"kind"}
+                and record["serving"]["kind"] == "n1"), "profile")
+    require(record["nu"] is None
+            or (isinstance(record["nu"], (int, float)) and not isinstance(record["nu"], bool)
+                and math.isfinite(record["nu"])), "profile")
+    for name in ("rows", "turns"):
+        require(type(record[name]) is int and not isinstance(record[name], bool)
+                and record[name] >= 0, "profile")
+    for name in VIEW_KEYS[:-1]:
+        value = record[name]
+        require(value is None or (type(value) is float and math.isfinite(value)),
+                "numerical")
+    for name in ("output_variance", "output_effective_rank", "served_output_variance",
+                 "served_output_effective_rank"):
+        value = record[name]
+        require(type(value) is float and math.isfinite(value), "numerical")
+    require(type(record["per_turn"]) is dict, "profile")
+    for turn_id, view in record["per_turn"].items():
+        require(type(turn_id) is str and type(view) is dict, "profile")
+        require(set(view) == set(VIEW_KEYS), "profile")
+        require(type(view["rows"]) is int, "profile")
+        for name in VIEW_KEYS[:-1]:
+            require(view[name] is None
+                    or (type(view[name]) is float and math.isfinite(view[name])),
+                    "numerical")
+    require(type(record["turn_macro"]) is dict
+            and set(record["turn_macro"]) == set(VIEW_KEYS) - {"rows"}, "profile")
+    for value in record["turn_macro"].values():
+        require(value is None or (type(value) is float and math.isfinite(value)),
+                "numerical")
+    require(type(record["pooled"]) is dict and set(record["pooled"]) == set(VIEW_KEYS),
             "profile")
-    for name, value in separation_value.items():
-        require(name != "correct" and type(value) is dict, "profile")
-        require(set(value) == _SEPARATION_KEYS, "profile")
-        require(type(value["trials"]) is int and value["trials"] >= 1, "profile")
-        for key in ("delta_margin", "delta_accuracy"):
-            require(type(value[key]) is float and math.isfinite(value[key]), "numerical")
+    for name, value in record["pooled"].items():
+        if name == "rows":
+            require(type(value) is int, "profile")
+        else:
+            require(value is None or (type(value) is float and math.isfinite(value)),
+                    "numerical")
+    require(type(record["undefined_denominators"]) is list, "profile")
+    require(all(type(name) is str for name in record["undefined_denominators"]),
+            "profile")
+    require(len(record["per_turn"]) == record["turns"], "profile")
+    require(sum(view["rows"] for view in record["per_turn"].values()) == record["rows"],
+            "profile")
     return True
+
+
+def validate_for_activation(artifact, validation_record, policy):
+    """The only promotion gate: allow or a named refusal, never a raised gate.
+
+    The record must be bound to the artifact: either its artifact_digest equals
+    the artifact's verified content digest, or the artifact binding pins the
+    record by digest (bind_validation_evidence) and the record must still name
+    the artifact it was measured against. Policy thresholds are fixed by the
+    caller as {"min_<metric>": value} or {"max_<metric>": value} pairs over
+    numeric record fields; an undefined metric is a refusal, not a zero.
+    """
+    if not isinstance(validation_record, Mapping):
+        return ("refuse", "record")
+    for name in ("schema", "artifact_digest", "rows", "turns", "r2_standard",
+                 "r2_vs_fit_mean"):
+        if name not in validation_record:
+            return ("refuse", "record")
+    binding = getattr(artifact, "binding", None)
+    if binding is None:
+        return ("refuse", "unbound")
+    pinned = getattr(binding, "validation_record_digest", "") or ""
+    if pinned:
+        if record_digest(validation_record) != pinned:
+            return ("refuse", "validation_evidence")
+        expected = getattr(binding, "validation_artifact_digest", "") or ""
+        if expected != validation_record["artifact_digest"]:
+            return ("refuse", "artifact_digest")
+    else:
+        digest = getattr(artifact, "content_digest", None)
+        if digest is not None:
+            if validation_record["artifact_digest"] != digest:
+                return ("refuse", "artifact_digest")
+        else:
+            for name in ("corpus_digest", "fit_manifest_digest"):
+                expected = getattr(binding, name, None)
+                if not expected or validation_record.get(name) != expected:
+                    return ("refuse", "artifact_digest")
+            if validation_record.get("method_id") != getattr(artifact, "method_id", None):
+                return ("refuse", "artifact_digest")
+    if not isinstance(policy, Mapping) or not policy:
+        return ("refuse", "policy")
+    for name in sorted(policy):
+        threshold = policy[name]
+        if not (isinstance(threshold, (int, float)) and not isinstance(threshold, bool)
+                and math.isfinite(threshold)):
+            return ("refuse", "policy")
+        if name.startswith("min_"):
+            metric, below = name[4:], True
+        elif name.startswith("max_"):
+            metric, below = name[4:], False
+        else:
+            return ("refuse", "policy")
+        if metric not in validation_record:
+            return ("refuse", "policy")
+        value = validation_record[metric]
+        if value is None:
+            return ("refuse", "undefined:" + metric)
+        if not isinstance(value, (int, float)) or isinstance(value, bool) \
+                or not math.isfinite(value):
+            return ("refuse", "policy")
+        if below and value < threshold:
+            return ("refuse", name)
+        if not below and value > threshold:
+            return ("refuse", name)
+    return ("allow", None)
+
+
+def bind_validation_evidence(artifact, validation_record, serving):
+    """Pin the promotion evidence and the serving choice into the binding.
+
+    Returns a new artifact with identical tensors; the original digest
+    changes, so the pinned record keeps the digest it was measured against
+    (validation_artifact_digest) and the gate re-checks that pairing. The
+    served artifact re-validates against the same record it was made from.
+    """
+    require(isinstance(validation_record, Mapping)
+            and "artifact_digest" in validation_record, "profile")
+    binding = getattr(artifact, "binding", None)
+    require(binding is not None, "profile")
+    digest = getattr(artifact, "content_digest", None)
+    require(type(digest) is str and digest == validation_record["artifact_digest"],
+            "identity")
+    pinned = replace(binding,
+                     validation_record_digest=record_digest(validation_record),
+                     validation_artifact_digest=validation_record["artifact_digest"],
+                     serving=_serving_config(serving))
+    return replace(artifact, binding=pinned, content_digest=None)
+
+
+def select_calibrated_map(fit, apply, fit_partition, validation_partition, *,
+                          hyperparams_grid=None, serving_grid=SERVING_VARIANTS,
+                          nu=None, torch_module=None):
+    """Fit on FIT for every grid point; select hyperparameters and serving on VALIDATION.
+
+    The final test partition is not an argument and can never enter fitting or
+    selection. Hyperparameters are chosen by the raw r2_standard the frozen map
+    earns on validation; the serving variant is chosen by the served r2 the
+    same artifact earns on validation under N0 or N1. Ties keep the earlier
+    grid entry, so the selection is deterministic.
+    """
+    torch = torch_module or _torch()
+    require(callable(fit) and callable(apply), "profile")
+    grid = tuple(dict(value) for value in
+                 (hyperparams_grid if hyperparams_grid is not None
+                  else tuple({"rho": rho} for rho in RHO_GRID)))
+    require(bool(grid), "profile")
+    variants = tuple(serving_grid)
+    require(bool(variants) and set(variants) <= {"n0", "n1"}, "profile")
+    if "n1" in variants:
+        require(isinstance(nu, (int, float)) and not isinstance(nu, bool)
+                and math.isfinite(nu) and nu > 0.0, "profile")
+        nu = float(nu)
+
+    def raw_score(record):
+        value = record["r2_standard"]
+        return float("-inf") if value is None else float(value)
+
+    candidates = []
+    for hyperparams in grid:
+        artifact = fit(fit_partition, hyperparams, torch_module=torch)
+        record = evaluate_map(apply, artifact, validation_partition, torch_module=torch)
+        candidates.append((hyperparams, artifact, record))
+    best_hyper, best_artifact, _ = max(candidates, key=lambda entry: raw_score(entry[2]))
+    serving_candidates = []
+    for variant in variants:
+        config = None if variant == "n0" else {"kind": "n1"}
+        record = evaluate_map(apply, best_artifact, validation_partition,
+                              serving=config, nu=nu, torch_module=torch)
+        serving_candidates.append((variant, config, record))
+
+    def served_score(entry):
+        value = entry[2]["served_r2_standard"]
+        return float("-inf") if value is None else float(value)
+
+    best_variant, best_config, best_record = max(serving_candidates, key=served_score)
+    return {"schema": SELECTION_SCHEMA,
+            "hyperparams": dict(best_hyper), "serving": best_config,
+            "serving_variant": best_variant, "artifact": best_artifact,
+            "validation_record": best_record,
+            "candidates": [{"hyperparams": dict(hyperparams),
+                            "r2_standard": record["r2_standard"],
+                            "artifact_digest": record["artifact_digest"]}
+                           for hyperparams, _, record in candidates],
+            "serving_candidates": [{"variant": variant,
+                                    "served_r2_standard": record["served_r2_standard"]}
+                                   for variant, _, record in serving_candidates]}

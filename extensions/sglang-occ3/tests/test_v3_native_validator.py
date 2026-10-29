@@ -222,7 +222,7 @@ def test_admission_accepts_synthetic_pinned_inputs(tmp_path):
 
 @pytest.mark.parametrize("mutate,code", [
     (lambda p: p.pop("native_validator"), "native_validator_inputs_missing"),
-    (lambda p: p.update(native_validator={"method_id": nv.METHOD_ID}),
+    (lambda p: p.update(native_validator={"method_id": PER_MESSAGE}),
      "admission_fieldset_invalid"),
     (lambda p: p["native_validator"].update(method_id="other-method"), "method_mismatch"),
     (lambda p: p["native_validator"]["harness_artifact"].update(
@@ -1087,3 +1087,281 @@ def test_after_phase_refuses_equal_before_and_after_pins(tmp_path):
     result = make_validator(journal, phase="after_restart").after_restart()
     assert result["ok"] is False
     assert result["code"] == "profile_digest_pins_not_per_boot"
+
+
+# -- registered-method admission (registry-driven validator) ------------------
+# The single-method rejection: a plan naming the calibrated method used to be
+# refused at the hardcoded method constant. The validator now consults the
+# registry; every registered method with its declared fieldset validates and
+# every unregistered id still fails closed.
+from occ3_sglang import native_profile as registry
+
+PER_MESSAGE = registry.PER_MESSAGE_METHOD
+CALIBRATED = registry.CALIBRATED_METHOD
+
+
+def calibrated_pinned():
+    """Synthetic calibrated-method pinned inputs (registry-advertised id)."""
+    block = copy.deepcopy(PINNED)
+    block["method_id"] = CALIBRATED
+    block["static_input_sha256"] = "7" * 64
+    profile = block["admission_template"]["source_profile"]
+    profile["method"] = CALIBRATED
+    profile["calibration_path"] = "/occ3/calibration/synthetic-frozen-artifact.bin"
+    profile["calibration_digest"] = "5" * 64
+    identity = block["admission_template"]["identity"]
+    identity["latent_method"] = CALIBRATED
+    block["admission_template"]["fingerprint"] = "sha256:" + nv._canonical_sha256(identity)
+    return block
+
+
+def calibrated_plan(**changes):
+    return plan(validator=VALIDATOR_KEY, native_validator=calibrated_pinned(), **changes)
+
+
+def expected_static_input(plan_value):
+    """The static derivation input digest this plan's pins must re-pin."""
+    block = plan_value["native_validator"]
+    if block["method_id"] == PER_MESSAGE:
+        return nv.PIN_STATIC_INPUT_SHA256
+    return block["static_input_sha256"]
+
+
+def pin_document_for(plan_value, phase, observed, **overrides):
+    document = {
+        "schema": PIN_SCHEMA,
+        "phase": phase,
+        "attempt_id": ATTEMPT,
+        "static_input_sha256": expected_static_input(plan_value),
+        "runtime_epoch": observed["runtime_epoch"],
+        "runtime_generation": observed["runtime_generation"],
+        "profile_digest": nv._derived_profile_digest(
+            plan_value["native_validator"]["admission_template"]["source_profile"], observed),
+        "written_at": int(time.time()),
+    }
+    document.update(overrides)
+    return document
+
+
+def write_pin_for(plan_value, journal, phase, observed, **overrides):
+    life.private_json(journal.directory / ("admission-pin-" + phase + ".json"),
+                      pin_document_for(plan_value, phase, observed, **overrides), exclusive=True)
+
+
+def calibrated_report(plan_value, phase):
+    """Example report rewritten onto the calibrated method and its profile."""
+    report = copy.deepcopy(EXAMPLE["report_before" if phase == "before_restart"
+                                    else "report_after"])
+    block = plan_value["native_validator"]
+    report["binding"]["method_id"] = block["method_id"]
+    report["binding"]["identity_fingerprint"] = block["admission_template"]["fingerprint"]
+    report["binding"]["profile_digest"] = nv._derived_profile_digest(
+        block["admission_template"]["source_profile"], report["observed"])
+    return report
+
+
+def write_calibrated_report(plan_value, journal, phase, report):
+    report = copy.deepcopy(report)
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / ("native-phase-suite-" + phase + ".json"), report)
+    write_pin_for(plan_value, journal, phase, report["observed"])
+
+
+def test_calibrated_method_plan_is_admitted_at_preflight(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    result = make_validator(journal).pre_mutation_admission()
+    assert result["ok"] is True, result
+    assert result["method_id"] == CALIBRATED
+    assert result["bindings"]["identity_fingerprint"] == \
+        calibrated_pinned()["admission_template"]["fingerprint"]
+
+
+def test_unregistered_method_string_is_still_refused(tmp_path):
+    journal = make_journal(tmp_path, native_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    plan_value["native_validator"]["method_id"] = \
+        "statebridge.glm53.final-prenorm-predictor.unknown.v1"
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "method_mismatch"
+
+
+def test_calibrated_method_runs_the_full_phase_flow(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    write_calibrated_report(plan_value, journal, "before_restart",
+                           calibrated_report(plan_value, "before_restart"))
+    result = make_validator(journal).before_restart()
+    assert result["ok"] is True, result
+    assert result["method_id"] == CALIBRATED
+    challenge = json.loads(
+        (journal.directory / "validator-challenge-before_restart.json").read_text())
+    assert challenge["method_id"] == CALIBRATED
+    after_state(journal)
+    write_calibrated_report(plan_value, journal, "after_restart",
+                           calibrated_report(plan_value, "after_restart"))
+    result = make_validator(journal, phase="after_restart").after_restart()
+    assert result["ok"] is True, result
+
+
+def test_per_message_profile_may_not_carry_a_calibration_reference(tmp_path):
+    journal = make_journal(tmp_path, native_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    profile = plan_value["native_validator"]["admission_template"]["source_profile"]
+    profile["calibration_path"] = "/occ3/calibration/synthetic-frozen-artifact.bin"
+    profile["calibration_digest"] = "5" * 64
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "source_profile_invalid"
+
+
+def test_calibrated_profile_requires_its_calibration_reference(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    profile = plan_value["native_validator"]["admission_template"]["source_profile"]
+    profile.pop("calibration_path")
+    profile.pop("calibration_digest")
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "source_profile_invalid"
+
+
+@pytest.mark.parametrize("field,value,code", [
+    ("calibration_path", "relative/path.bin", "source_calibration_path_invalid"),
+    ("calibration_path", "", "source_calibration_path_invalid"),
+    ("calibration_digest", "not-a-digest", "source_calibration_digest_invalid"),
+])
+def test_calibrated_reference_must_be_absolute_and_digest_pinned(tmp_path, field, value, code):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    profile = plan_value["native_validator"]["admission_template"]["source_profile"]
+    profile[field] = value
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == code
+
+
+def test_calibrated_identity_must_name_the_same_method(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    identity = plan_value["native_validator"]["admission_template"]["identity"]
+    identity["latent_method"] = PER_MESSAGE
+    plan_value["native_validator"]["admission_template"]["fingerprint"] = \
+        "sha256:" + nv._canonical_sha256(identity)
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "identity_method_mismatch"
+
+
+def test_calibrated_source_profile_must_name_the_same_method(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    profile = plan_value["native_validator"]["admission_template"]["source_profile"]
+    profile["method"] = PER_MESSAGE
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "source_method_mismatch"
+
+
+def test_calibrated_plan_without_declared_static_input_is_refused(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = copy.deepcopy(state["plan"])
+    plan_value["native_validator"].pop("static_input_sha256")
+    result = NativeHandoffValidator(plan_value, journal, state).pre_mutation_admission()
+    assert result["ok"] is False and result["code"] == "admission_fieldset_invalid"
+
+
+def test_calibrated_pin_must_repin_the_declared_static_input(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    report = calibrated_report(plan_value, "before_restart")
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / "native-phase-suite-before_restart.json", report)
+    write_pin_for(plan_value, journal, "before_restart", report["observed"],
+                  static_input_sha256=nv.PIN_STATIC_INPUT_SHA256)
+    result = make_validator(journal).before_restart()
+    assert result["ok"] is False and result["code"] == "pin_static_input_mismatch"
+
+
+# -- readiness records cannot survive an incompatible change ------------------
+def test_profile_digest_binds_the_calibration_artifact():
+    profile = calibrated_pinned()["admission_template"]["source_profile"]
+    observed = EXAMPLE["report_before"]["observed"]
+    base = nv._derived_profile_digest(profile, observed)
+    swapped = nv._derived_profile_digest(dict(profile, calibration_digest="6" * 64), observed)
+    assert base != swapped
+    # The per-message profile digests stay byte-identical to the frozen wire
+    # contract: no calibration fields enter its derivation.
+    assert nv._derived_profile_digest(
+        PINNED["admission_template"]["source_profile"], observed) == FIXTURE_PIN_BEFORE
+
+
+def test_readiness_record_cannot_survive_an_artifact_digest_change(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    write_calibrated_report(plan_value, journal, "before_restart",
+                           calibrated_report(plan_value, "before_restart"))
+    assert make_validator(journal).before_restart()["ok"] is True
+    # The frozen artifact is swapped under the plan without re-admission: the
+    # after-phase binding still names the OLD artifact's profile digest, so the
+    # derivation receipt must refuse it by name.
+    after_state(journal)
+    swapped = copy.deepcopy(plan_value)
+    swapped["native_validator"]["admission_template"]["source_profile"]["calibration_digest"] = \
+        "6" * 64
+    report = calibrated_report(plan_value, "after_restart")
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / "native-phase-suite-after_restart.json", report)
+    write_pin_for(plan_value, journal, "after_restart", report["observed"])
+    validator = NativeHandoffValidator(swapped, journal, journal.read())
+    result = validator.after_restart()
+    assert result["ok"] is False and result["code"] == "report_profile_derivation_mismatch"
+
+
+def test_readiness_record_cannot_survive_a_profile_digest_change(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    report = calibrated_report(plan_value, "before_restart")
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / "native-phase-suite-before_restart.json", report)
+    write_pin_for(plan_value, journal, "before_restart", report["observed"],
+                  profile_digest="e" * 64)
+    result = make_validator(journal).before_restart()
+    assert result["ok"] is False and result["code"] == "report_profile_binding_mismatch"
+
+
+def test_readiness_record_cannot_survive_a_method_change(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    report = calibrated_report(plan_value, "before_restart")
+    report["binding"]["method_id"] = PER_MESSAGE
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / "native-phase-suite-before_restart.json", report)
+    write_pin_for(plan_value, journal, "before_restart", report["observed"])
+    result = make_validator(journal).before_restart()
+    assert result["ok"] is False and result["code"] == "report_method_mismatch"
+
+
+def test_readiness_record_cannot_survive_a_runtime_generation_change(tmp_path):
+    journal = make_journal(tmp_path, calibrated_plan())
+    state = journal.read()
+    plan_value = state["plan"]
+    before_state(journal)
+    report = calibrated_report(plan_value, "before_restart")
+    report["completed_at"] = int(time.time()) + 30
+    life.private_json(journal.directory / "native-phase-suite-before_restart.json", report)
+    write_pin_for(plan_value, journal, "before_restart", report["observed"],
+                  runtime_generation=report["observed"]["runtime_generation"] + 1)
+    result = make_validator(journal).before_restart()
+    assert result["ok"] is False and result["code"] == "pin_generation_mismatch"

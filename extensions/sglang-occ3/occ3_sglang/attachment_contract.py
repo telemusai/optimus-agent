@@ -9,6 +9,25 @@ from typing import Any
 
 RECEIPT_HEADER = "x-optimus-occ3-receipt"
 MAX_RECEIPT_BYTES = 2048
+#: Capture-intent schemas. v2 exists only to admit the content_tail_v2 span
+#: policy family; every v1 wire keeps its exact meaning.
+CAPTURE_SCHEMA_V1 = "occ3.capture.v1"
+CAPTURE_SCHEMA_V2 = "occ3.capture.v2"
+#: Source receipt schemas. v2 keeps the 21 v1 fields and adds the bounded
+#: occ3.span.v1 block of SOURCE-SPAN-SELECTION.md section 6.2.
+SOURCE_SCHEMA_V1 = "occ3.source.v1"
+SOURCE_SCHEMA_V2 = "occ3.source.v2"
+#: The only v1 span policy. It stays the default everywhere and is admitted
+#: only under CAPTURE_SCHEMA_V1.
+SPAN_POLICY_V1 = "whole_completed_response_tail_v1"
+#: The v2 policy family (SOURCE-SPAN-SELECTION.md section 4). Admitted only
+#: under CAPTURE_SCHEMA_V2; no last_accepted member exists.
+SPAN_POLICIES_V2 = ("content_tail_no_tool_v2", "content_tail_v2",
+                    "content_tail_last64_v2", "content_tail_last32_v2")
+#: Version of the receipt span block and of the marker table shape.
+SPAN_SCHEMA_V1 = "occ3.span.v1"
+MARKER_SCHEMA_V1 = "occ3.span.markers.v1"
+SPAN_TERMINATORS = ("thinking_end", "tool_call_start", "none")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._:/-]{1,256}\Z")
 
 
@@ -159,8 +178,15 @@ class CaptureIntent:
         if (not 1 <= uint(self.retained_count_limit, 128) <= 128
                 or uint(self.max_capture_bytes) == 0):
             raise AttachmentError("invalid_attachment", 400)
-        if (self.schema != "occ3.capture.v1"
-                or self.span_policy != "whole_completed_response_tail_v1"):
+        # Schema-gated span policy: the v1 default is unchanged, and the v2
+        # family is admitted only under the v2 schema (doc section 6.1).
+        if self.schema == CAPTURE_SCHEMA_V1:
+            admitted = self.span_policy == SPAN_POLICY_V1
+        elif self.schema == CAPTURE_SCHEMA_V2:
+            admitted = self.span_policy in SPAN_POLICIES_V2
+        else:
+            admitted = False
+        if not admitted:
             raise AttachmentError("unsupported_profile", 409)
 
     @classmethod
@@ -290,9 +316,30 @@ class SourceEnrollment:
             raise AttachmentError("invalid_evidence")
 
 
+#: The 21 v1 fields; a v1 wire carries exactly these and nothing else.
+_SOURCE_RECEIPT_V1_FIELDS = (
+    "intent_digest", "source_handle", "native_rid", "response_id", "capture_commit_id",
+    "accepted_span_start", "accepted_span_end", "retained_count", "predictor_position_offset",
+    "representation", "layer_index", "hidden_dim", "dtype", "layout_digest", "ready_ranks",
+    "expected_ranks", "accepted_sequence_digest", "output_sha256", "expires_at_epoch",
+    "byte_count", "schema",
+)
+#: The bounded occ3.span.v1 block of the v2 receipt (doc section 6.2). The
+#: class counts cover the retained window; the aligned span stays
+#: accepted_span_start/_end and retained_count.
+_SOURCE_RECEIPT_SPAN_FIELDS = (
+    "span_schema", "span_policy", "span_marker_profile", "span_marker_schema",
+    "span_reasoning_terminator", "span_turn_end_attested",
+    "span_thinking_count", "span_content_count", "span_tool_call_count",
+    "span_tool_arguments_count", "span_control_count", "span_unknown_count",
+    "span_window_start_position", "span_window_end_position", "span_contiguous",
+    "span_contains_final_content", "span_contains_tool_call", "span_message_truncated",
+)
+
+
 @dataclass(frozen=True, repr=False)
 class SourceCaptureReceipt:
-    """Strict 21-field source wire, not a persisted or authorized GPU lease."""
+    """Strict 21-field source wire plus the schema-gated v2 span block."""
     intent_digest: str
     source_handle: str
     native_rid: str
@@ -313,7 +360,25 @@ class SourceCaptureReceipt:
     output_sha256: str
     expires_at_epoch: int
     byte_count: int
-    schema: str = "occ3.source.v1"
+    schema: str = SOURCE_SCHEMA_V1
+    span_schema: str | None = None
+    span_policy: str | None = None
+    span_marker_profile: str | None = None
+    span_marker_schema: str | None = None
+    span_reasoning_terminator: str | None = None
+    span_turn_end_attested: bool | None = None
+    span_thinking_count: int | None = None
+    span_content_count: int | None = None
+    span_tool_call_count: int | None = None
+    span_tool_arguments_count: int | None = None
+    span_control_count: int | None = None
+    span_unknown_count: int | None = None
+    span_window_start_position: int | None = None
+    span_window_end_position: int | None = None
+    span_contiguous: bool | None = None
+    span_contains_final_content: bool | None = None
+    span_contains_tool_call: bool | None = None
+    span_message_truncated: bool | None = None
 
     def __post_init__(self):
         for name in ("intent_digest", "layout_digest", "accepted_sequence_digest", "output_sha256"):
@@ -324,8 +389,7 @@ class SourceCaptureReceipt:
         for name in ("accepted_span_start", "accepted_span_end", "expires_at_epoch", "byte_count"):
             uint(getattr(self, name))
         uint(self.layer_index, 2**32 - 1)
-        if (self.schema != "occ3.source.v1"
-                or type(self.predictor_position_offset) is not int or self.predictor_position_offset != -1
+        if (type(self.predictor_position_offset) is not int or self.predictor_position_offset != -1
                 or self.representation != "final_layer_prenorm_predictor"
                 or not 1 <= uint(self.retained_count, 128) <= 128
                 or self.accepted_span_end <= self.accepted_span_start
@@ -336,15 +400,62 @@ class SourceCaptureReceipt:
                 or type(self.dtype) is not str or self.dtype not in DTYPE_BYTES
                 or self.byte_count != self.retained_count * self.hidden_dim * DTYPE_BYTES[self.dtype]):
             raise AttachmentError("invalid_evidence")
+        block = [getattr(self, name) for name in _SOURCE_RECEIPT_SPAN_FIELDS]
+        if self.schema == SOURCE_SCHEMA_V1:
+            # A v1 wire carries exactly the 21 fields; any span block is refused.
+            if any(value is not None for value in block):
+                raise AttachmentError("invalid_evidence")
+        elif self.schema == SOURCE_SCHEMA_V2:
+            if any(value is None for value in block):
+                raise AttachmentError("invalid_evidence")
+            self._check_span_block()
+        else:
+            raise AttachmentError("invalid_evidence")
+
+    def _check_span_block(self):
+        """Doc section 6.2 cross-field invariants, both ends identical."""
+        counts = [getattr(self, name) for name in
+                  ("span_thinking_count", "span_content_count", "span_tool_call_count",
+                   "span_tool_arguments_count", "span_control_count", "span_unknown_count")]
+        if (self.span_schema != SPAN_SCHEMA_V1
+                or self.span_policy not in SPAN_POLICIES_V2
+                or self.span_marker_schema != MARKER_SCHEMA_V1
+                or self.span_reasoning_terminator not in SPAN_TERMINATORS):
+            raise AttachmentError("invalid_evidence")
+        bounded_identifier(self.span_marker_profile, 64)
+        for name in ("span_turn_end_attested", "span_contiguous", "span_contains_final_content",
+                     "span_contains_tool_call", "span_message_truncated"):
+            if type(getattr(self, name)) is not bool:
+                raise AttachmentError("invalid_evidence")
+        for value in counts:
+            if type(value) is not int or not 0 <= uint(value, 128) <= 128:
+                raise AttachmentError("invalid_evidence")
+        width = uint(self.span_window_end_position) - uint(self.span_window_start_position)
+        # A contiguous window's rows exactly fill its width; a non-contiguous
+        # one has at least one gap, so its rows are strictly fewer. Either way
+        # the counts must be honest about which one they are.
+        counts_fit = sum(counts) == width if self.span_contiguous else sum(counts) < width
+        if (width <= 0 or not counts_fit or self.retained_count > sum(counts)):
+            raise AttachmentError("invalid_evidence")
+        if self.span_policy == "content_tail_no_tool_v2" and self.span_contains_tool_call:
+            raise AttachmentError("invalid_evidence")
+        if self.span_turn_end_attested is False and not self.span_message_truncated:
+            raise AttachmentError("invalid_evidence")
 
     @classmethod
     def parse(cls, value):
-        if not isinstance(value, dict) or set(value) != set(cls.__dataclass_fields__):
+        if not isinstance(value, dict):
+            raise AttachmentError("invalid_evidence")
+        v1 = set(_SOURCE_RECEIPT_V1_FIELDS)
+        if set(value) not in (v1, v1 | set(_SOURCE_RECEIPT_SPAN_FIELDS)):
             raise AttachmentError("invalid_evidence")
         return cls(**value)
 
     def wire(self):
-        return asdict(self)
+        value = asdict(self)
+        if self.schema == SOURCE_SCHEMA_V1:
+            return {name: value[name] for name in _SOURCE_RECEIPT_V1_FIELDS}
+        return value
 
 
 @dataclass(frozen=True, repr=False)
@@ -417,6 +528,10 @@ class CaptureWorkerDescriptor:
     span_policy: str
     max_prefix_tokens: int
     max_capture_bytes: int
+    #: Resolved marker-profile identifier (doc section 6.1). Empty for the v1
+    #: span policy; a bounded identifier for the v2 family. The marker ids
+    #: themselves never travel here: they use the private custom_params channel.
+    marker_profile: str = ""
     schema: str = "occ3.sglang.worker.v1"
     operation: str = "capture"
 
@@ -434,7 +549,12 @@ class CaptureWorkerDescriptor:
                 or type(self.deadline) not in (int, float) or not math.isfinite(self.deadline)
                 or self.deadline <= 0 or self.schema != "occ3.sglang.worker.v1"
                 or self.operation != "capture"
-                or self.span_policy != "whole_completed_response_tail_v1"):
+                or self.span_policy not in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2):
+            raise AttachmentError("invalid_evidence")
+        if self.span_policy == SPAN_POLICY_V1:
+            if self.marker_profile != "":
+                raise AttachmentError("invalid_evidence")
+        elif not 1 <= len(self.marker_profile) <= 64 or identifier(self.marker_profile) is None:
             raise AttachmentError("invalid_evidence")
 
 

@@ -2933,6 +2933,8 @@ mod tests {
             enabled: true,
             validation: pi_ai::types::Occ3Validation::Unverified,
             fallback: vec![],
+            method: None,
+            artifact_digest: None,
         };
         let policy = occ3_send_policy_for_send(Some("session-file"), Some(&config), "listener", "msg", |_| async { unreachable!() }).await;
         assert!(!policy.enabled);
@@ -2949,6 +2951,8 @@ mod tests {
             enabled: true,
             validation: pi_ai::types::Occ3Validation::LiveVerified,
             fallback: vec![],
+            method: None,
+            artifact_digest: None,
         };
         // With a temp session file that has occ3 enabled.
         let dir = std::env::temp_dir().join(format!("occ3-test-{}", std::process::id()));
@@ -3000,6 +3004,8 @@ mod tests {
             enabled: true,
             validation: pi_ai::types::Occ3Validation::LiveVerified,
             fallback: vec![],
+            method: None,
+            artifact_digest: None,
         };
         let dir = std::env::temp_dir().join(format!("occ3-test-fail-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();

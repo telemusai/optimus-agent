@@ -65,6 +65,9 @@ use pi_ai::types::{
 use pi_ai::utils::event_stream::AssistantMessageEventStream;
 use std::time::Duration;
 use tokio_util::sync::CancellationToken;
+use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use tokio::sync::Notify;
+use std::sync::atomic::AtomicUsize;
 
 const GAP_CONNECTOR_ID: &str = "gap2-occ3-connector";
 const GAP_METHOD: &str = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1";
@@ -990,6 +993,258 @@ async fn native_send_acknowledges_a_queued_admission_without_requiring_consumpti
     assert!(!receipt_is_latent_completion(&fixture, &message_id));
     // Teardown: release the held turn.
     let _ = tokio::time::timeout(Duration::from_secs(10), fixture.child.session.abort()).await;
+}
+
+/// Red-first (defect 5): the daemon stamps the delivery marker once at
+/// admission and discards the stamp result, so a QUEUED native body lands in
+/// the transcript only later, unmarked; the control-only body then misreports
+/// as an ordinary text delivery (a TXT pulse). A queued delivery that
+/// completes later must pulse Latent: the receiver consumes the attachment
+/// through a real provider request whose verified completed-use receipt
+/// upgrades the delivery, and the landed body carries its marker.
+#[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+async fn native_send_queued_body_landing_after_admission_projects_latent_completion() {
+    let fixture = NativeHandoffFixture::new().await;
+    // Hold the receiver busy with one turn that completes on release.
+    let entered = CancellationToken::new();
+    let release = Arc::new(Notify::new());
+    install_releasing_holding_provider(&fixture.child.session, entered.clone(), release.clone());
+    let child = Arc::clone(&fixture.child.session);
+    tokio::spawn(async move {
+        let _ = child.prompt("hold the receiver busy", None).await;
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), entered.cancelled())
+            .await
+            .is_ok(),
+        "the holding turn never started"
+    );
+    // One local completion server: the fixture model's base URL is
+    // http://127.0.0.1:40000/v1, so the real provider request lands here.
+    let (server, hits) = spawn_local_completion_server().await;
+    let prepared = fixture.prepared_handoff().await;
+    let message_id = prepared.message_id();
+    let receipt = tokio::time::timeout(
+        Duration::from_secs(30),
+        fixture
+            .parent
+            .controller
+            .clone()
+            .unwrap()
+            .send_prepared_native_handoff(prepared.prepared),
+    )
+    .await
+    .expect("the send must settle")
+    .expect("the busy receiver must accept a queued admission");
+    assert_eq!(receipt.delivery_status, "queued".to_string());
+    // Restore the real provider: the queued body is consumed through a real
+    // inference request (real `stream_simple` over the local server), not a
+    // scripted stream. Only the api-key resolution is shortcut with the same
+    // synthetic key the fixture registered; everything downstream (the
+    // attachment claim, the request and the verified completed-use receipt)
+    // runs for real.
+    install_local_completion_provider(&fixture.child.session);
+    // Release the held turn; the queue pump lands the body and the receiver
+    // completes its own consumption.
+    release.notify_waiters();
+    let child = Arc::clone(&fixture.child.session);
+    // Under a full-suite parallel run the queue pump and the provider round
+    // trip can be starved, so the budget is generous, not a behavior claim.
+    let landed = tokio::time::timeout(Duration::from_secs(120), async {
+        loop {
+            if receipt_is_latent_completion(&fixture, &message_id) {
+                return;
+            }
+            // Waiting for input idle schedules the queue pump from the
+            // inside, so a completed holding turn cannot leave the queued
+            // delivery parked.
+            child.wait_for_session_input_idle().await.ok();
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
+    })
+    .await;
+    let _ = tokio::time::timeout(Duration::from_secs(5), server).await;
+    assert!(
+        hits.load(Ordering::SeqCst) >= 1,
+        "the receiver must make one real provider request"
+    );
+    assert!(
+        landed.is_ok(),
+        "the landed queued body must project as a latent completion"
+    );
+    let audit = fixture
+        .child
+        .native
+        .as_ref()
+        .expect("child permit")
+        .audit();
+    let record = audit["receiver"]
+        .as_array()
+        .expect("receiver audit")
+        .iter()
+        .find(|record| record["message_id"].as_str() == Some(message_id.as_str()))
+        .expect("the queued admission is journaled");
+    assert_eq!(
+        record["status"],
+        serde_json::json!("CONSUMED"),
+        "the queued delivery must be consumed, not left admitted: {audit}"
+    );
+}
+
+/// A completion provider for the queued-delivery test: the real
+/// `stream_simple` stack with the fixture's synthetic api key, so the
+/// receiver's inference request and its OCC-3 receipt verification run for
+/// real against the local completion server.
+fn install_local_completion_provider(session: &Arc<AgentSession>) {
+    // The process-wide registry registers its built-ins on the first real
+    // provider use only, and a parallel test that registered a faux provider
+    // can consume that one shot; register the built-ins explicitly before the
+    // receiver's own request must resolve one.
+    pi_ai::stream::ensure_builtin_api_providers_registered();
+    session.agent.set_stream_fn(Arc::new(|model, context, mut options| {
+        Box::pin(async move {
+            options.stream.api_key = Some("gap2-fixture-key".to_string());
+            // Resolve outside `stream_simple`, so a missing provider is a real
+            // failure here instead of a panic inside the stream.
+            let mut waited = 0u64;
+            let provider = loop {
+                if let Some(provider) = pi_ai::api_registry::get_api_provider(&model.api) {
+                    break provider;
+                }
+                if waited >= 200 {
+                    // Surface the standard missing-provider panic.
+                    pi_ai::stream::stream_simple(&model, &context, Some(&options));
+                    unreachable!("stream_simple panics when the provider is missing");
+                }
+                tokio::time::sleep(Duration::from_millis(50)).await;
+                waited += 1;
+            };
+            (provider.stream_simple)(&model, &context, Some(&options))
+        })
+    }));
+}
+
+/// A holding provider that finishes its turn when `release` is notified, so
+/// the queue pump can land the queued delivery afterwards.
+fn install_releasing_holding_provider(
+    session: &Arc<AgentSession>,
+    entered: CancellationToken,
+    release: Arc<Notify>,
+) {
+    session.agent.set_stream_fn(Arc::new(move |model, _, _| {
+        let entered = entered.clone();
+        let release = release.clone();
+        Box::pin(async move {
+            entered.cancel();
+            release.notified().await;
+            let stream = AssistantMessageEventStream::new();
+            let message = scripted_completion(&model);
+            stream.push(AssistantMessageEvent::Done {
+                reason: message.stop_reason.clone(),
+                message,
+            });
+            stream
+        })
+    }));
+}
+
+/// One plain OpenAI-style SSE completion, plus the verified
+/// `x-optimus-occ3-receipt` header when the request carries an OCC-3
+/// attachment.
+fn local_sse() -> String {
+    let chunks = vec![
+        serde_json::json!({"id":"local-completion","choices":[{"index":0,"delta":{"role":"assistant"},"finish_reason":null}]}),
+        serde_json::json!({"id":"local-completion","choices":[{"index":0,"delta":{"content":"queued delivery completed"},"finish_reason":null}]}),
+        serde_json::json!({"id":"local-completion","choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ];
+    let mut body = chunks
+        .into_iter()
+        .map(|chunk| format!("data: {chunk}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
+/// A local completion server on the fixture model's fixed base URL port.
+/// Returns the server task and its request counter.
+async fn spawn_local_completion_server() -> (tokio::task::JoinHandle<()>, Arc<AtomicUsize>) {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:40000")
+        .await
+        .expect("bind the local completion port");
+    let hits = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&hits);
+    let server = tokio::spawn(async move {
+        loop {
+            let (mut socket, _) = match listener.accept().await {
+                Ok(pair) => pair,
+                Err(_) => break,
+            };
+            let hits = Arc::clone(&counter);
+            tokio::spawn(async move {
+                let mut bytes = Vec::new();
+                let end;
+                loop {
+                    let mut part = [0u8; 4096];
+                    let n = socket.read(&mut part).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&part[..n]);
+                    if let Some(i) = bytes.windows(4).position(|w| w == b"\r\n\r\n") {
+                        end = i + 4;
+                        break;
+                    }
+                }
+                let head = String::from_utf8_lossy(&bytes[..end]).to_string();
+                let size = head
+                    .lines()
+                    .find_map(|line| {
+                        line.to_ascii_lowercase()
+                            .strip_prefix("content-length:")
+                            .map(|value| value.trim().parse::<usize>().ok())
+                    })
+                    .flatten()
+                    .unwrap_or(0);
+                while bytes.len() < end + size {
+                    let mut part = [0u8; 4096];
+                    let n = socket.read(&mut part).await.unwrap_or(0);
+                    if n == 0 {
+                        return;
+                    }
+                    bytes.extend_from_slice(&part[..n]);
+                }
+                let body: serde_json::Value =
+                    serde_json::from_slice(&bytes[end..end + size]).unwrap_or_default();
+                hits.fetch_add(1, Ordering::SeqCst);
+                let mut headers: Vec<(&str, String)> = Vec::new();
+                if let Some(attachment) = body.get("occ3") {
+                    headers.push((
+                        "x-optimus-occ3-receipt",
+                        serde_json::json!({
+                            "attachment": attachment,
+                            "consumed": true,
+                            "injected_state": true,
+                            "fallback_used": false,
+                        })
+                        .to_string(),
+                    ));
+                }
+                let payload = local_sse();
+                let mut head = format!(
+                    "HTTP/1.1 200 OK\r\nContent-Type: text/event-stream\r\nContent-Length: {}\r\nConnection: close\r\n",
+                    payload.len()
+                );
+                for (name, value) in &headers {
+                    head.push_str(&format!("{name}: {value}\r\n"));
+                }
+                head.push_str("\r\n");
+                socket.write_all(head.as_bytes()).await.unwrap();
+                socket.write_all(payload.as_bytes()).await.unwrap();
+                socket.shutdown().await.unwrap();
+            });
+        }
+    });
+    (server, hits)
 }
 
 /// The duplicate branch: replaying the same prepared handoff is refused

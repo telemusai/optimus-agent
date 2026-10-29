@@ -23,12 +23,17 @@ from types import MappingProxyType
 
 from .latent_types import ALIGNMENT as PER_MESSAGE_ALIGNMENT
 from .latent_types import METHOD as PER_MESSAGE_METHOD
+from .statebridge_calibrated import ARTIFACT_SCHEMA as CALIBRATED_SCHEMA
 from .statebridge_calibrated import METHOD_ID as CALIBRATED_METHOD
+from .statebridge_calibrated_procrustes import ARTIFACT_SCHEMA as PROCRUSTES_SCHEMA
+from .statebridge_calibrated_procrustes import METHOD_ID as PROCRUSTES_METHOD
+from .statebridge_calibrated_procrustes import METHOD_ID_PLAIN as PROCRUSTES_METHOD_PLAIN
+from .statebridge_calibrated_procrustes import METHOD_ID_SO as PROCRUSTES_METHOD_SO
 
 __all__ = ["ProfileError", "load_pinned_profile", "load_source_attestation",
            "get_runtime_incarnation", "PER_MESSAGE_METHOD", "CALIBRATED_METHOD",
-           "advertised_methods", "method_descriptor", "require_method",
-           "receipt_descriptor", "validate_method_binding"]
+           "advertised_methods", "registered_methods", "method_descriptor",
+           "require_method", "receipt_descriptor", "validate_method_binding"]
 
 _PROFILE_LIMIT = 16384
 _SOURCE_LIMIT = 65536
@@ -85,25 +90,52 @@ def _require(condition, code="profile_invalid"):
 # and the negotiated method separately.
 _METHOD_FIELDS = frozenset({"method_id", "representation", "alignment", "fit_source",
                             "solver", "predictor_position_offset", "precision",
-                            "requires_calibration_artifact"})
+                            "requires_calibration_artifact", "artifact_module",
+                            "artifact_schema"})
 _RECEIPT_FIELDS = ("method_id", "representation", "alignment", "predictor_position_offset",
                    "precision")
 
 
-def _method_entry(method_id, alignment, fit_source, solver, requires_calibration_artifact):
+def _method_entry(method_id, alignment, fit_source, solver, requires_calibration_artifact,
+                  artifact_module, artifact_schema):
     return {"method_id": method_id, "representation": "final_layer_prenorm_predictor",
             "alignment": alignment, "fit_source": fit_source, "solver": solver,
             "predictor_position_offset": -1, "precision": "float32",
-            "requires_calibration_artifact": requires_calibration_artifact}
+            "requires_calibration_artifact": requires_calibration_artifact,
+            "artifact_module": artifact_module, "artifact_schema": artifact_schema}
 
 
+# The advertised table is also the offline deployment surface: the packaging
+# static parse reads exactly this assignment (deploy/v3/native_package
+# _static_registry), and a pinned profile may name only an advertised id.
 _METHODS = {entry["method_id"]: MappingProxyType(entry) for entry in (
     _method_entry(PER_MESSAGE_METHOD, PER_MESSAGE_ALIGNMENT, "message-rows",
-                  "occ3_sglang.statebridge.align_hidden_sequence", False),
+                  "occ3_sglang.statebridge.align_hidden_sequence", False, None, None),
     _method_entry(CALIBRATED_METHOD, "frozen-dual-ridge.v1", "independent-calibration-turns",
-                  "occ3_sglang.statebridge_calibrated.apply_calibration", True),
+                  "occ3_sglang.statebridge_calibrated.apply_map", True,
+                  "occ3_sglang.statebridge_calibrated", CALIBRATED_SCHEMA),
 )}
 _METHOD_IDS = tuple(_METHODS)
+# Registered challengers (spec section 10): dispatchable frozen methods whose
+# own artifact modules live in this same registry. They are not yet pinnable by
+# a packaged profile: the packaging static parse reads only the table above, so
+# merging them into the advertised surface belongs to the deployment wave.
+_CHALLENGER_METHODS = {entry["method_id"]: MappingProxyType(entry) for entry in (
+    _method_entry(PROCRUSTES_METHOD, "frozen-lowrank-whitened-procrustes.v1",
+                  "independent-calibration-turns",
+                  "occ3_sglang.statebridge_calibrated_procrustes.apply_map", True,
+                  "occ3_sglang.statebridge_calibrated_procrustes", PROCRUSTES_SCHEMA),
+    _method_entry(PROCRUSTES_METHOD_SO, "frozen-lowrank-whitened-procrustes-so.v1",
+                  "independent-calibration-turns",
+                  "occ3_sglang.statebridge_calibrated_procrustes.apply_map", True,
+                  "occ3_sglang.statebridge_calibrated_procrustes", PROCRUSTES_SCHEMA),
+    _method_entry(PROCRUSTES_METHOD_PLAIN, "frozen-lowrank-whitened-procrustes-plain.v1",
+                  "independent-calibration-turns",
+                  "occ3_sglang.statebridge_calibrated_procrustes.apply_map", True,
+                  "occ3_sglang.statebridge_calibrated_procrustes", PROCRUSTES_SCHEMA),
+)}
+_REGISTERED = MappingProxyType({**_METHODS, **_CHALLENGER_METHODS})
+_REGISTERED_IDS = tuple(_REGISTERED)
 
 
 def _validate_method(descriptor):
@@ -116,20 +148,38 @@ def _validate_method(descriptor):
              and descriptor["predictor_position_offset"] == -1)
     _require(descriptor["precision"] == "float32")
     _require(type(descriptor["requires_calibration_artifact"]) is bool)
+    if descriptor["requires_calibration_artifact"]:
+        for name in ("artifact_module", "artifact_schema"):
+            item = descriptor[name]
+            _require(type(item) is str and _IDENTIFIER.fullmatch(item) is not None)
+    else:
+        _require(descriptor["artifact_module"] is None and descriptor["artifact_schema"] is None)
     return descriptor
 
 
 def advertised_methods():
-    """Every method this build may pin or negotiate, in registry order."""
+    """Every method a pinned profile may name, in registry order.
+
+    The packaging path parses exactly this table offline, so it is the
+    shippable surface; the registered challengers are dispatchable for
+    research through registered_methods() but are not yet pinnable here.
+    """
     for descriptor in _METHODS.values():
         _validate_method(descriptor)
     return _METHOD_IDS
 
 
+def registered_methods():
+    """Every method id this registry holds, advertised or challenger, in registry order."""
+    for descriptor in _REGISTERED.values():
+        _validate_method(descriptor)
+    return _REGISTERED_IDS
+
+
 def method_descriptor(method_id):
-    """Immutable identity of one advertised method and its solver."""
-    _require(type(method_id) is str and method_id in _METHODS)
-    return _validate_method(_METHODS[method_id])
+    """Immutable identity of one registered method and its solver."""
+    _require(type(method_id) is str and method_id in _REGISTERED)
+    return _validate_method(_REGISTERED[method_id])
 
 
 def require_method(method_id):
@@ -145,23 +195,25 @@ def receipt_descriptor(method_id):
 
 
 def validate_method_binding(binding, profile, *, negotiated_method_id=None):
-    """Refuse a calibration artifact that does not match the negotiated method.
+    """Refuse a calibration binding that does not match the negotiated method.
 
     The per-message method takes no artifact at all, so a calibrated artifact
-    presented under it is refused instead of served. The calibrated method
-    takes one whose method id, dimensions, layer, model fingerprint, precision
-    and predictor position all equal the pinned profile and the registry.
+    presented under it is refused instead of served. Every artifact-requiring
+    method dispatches its binding type through the registry: the binding class
+    must live in the method's own artifact module, and its method id,
+    dimensions, layer, model fingerprint, precision and predictor position all
+    equal the pinned profile and the registry entry. No single binding class
+    is assumed for all methods.
     """
     _validate_profile(profile)
     negotiated = profile["method"] if negotiated_method_id is None else negotiated_method_id
     _require(negotiated == profile["method"])
     descriptor = method_descriptor(negotiated)
-    from .statebridge_calibrated import CalibrationBinding
-
     if not descriptor["requires_calibration_artifact"]:
         _require(binding is None)
         return descriptor
-    _require(isinstance(binding, CalibrationBinding))
+    _require(binding is not None
+             and type(binding).__module__ == descriptor["artifact_module"], "profile")
     _require(binding.method_id == negotiated)
     _require(binding.hidden_dim == profile["hidden_dim"])
     _require(binding.layer_index == profile["layer_index"])

@@ -1,7 +1,7 @@
 """Offline injection-lineage regression using pinned native method bodies.
 
-No SGLang model or CUDA runtime is loaded. Set OCC3_SGLANG_SOURCE to the
-unpatched, pinned SGLang checkout.
+No SGLang model or CUDA runtime is loaded. The unpatched, pinned checkout is
+resolved from OCC3_SGLANG_SOURCE_BASE (see _source_pins.py for the runbook).
 """
 from __future__ import annotations
 import ast
@@ -9,7 +9,6 @@ import contextlib
 import dataclasses
 import hashlib
 import json
-import os
 import sys
 import types
 from pathlib import Path
@@ -17,12 +16,13 @@ from unittest.mock import patch
 
 import pytest
 
+from _source_pins import pristine_root, srt_dir
 from occ3_sglang import latent_worker as worker
 from occ3_sglang.attachment_contract import ConsumeWorkerDescriptor
 from occ3_sglang.latent_types import RuntimeProfile, RequestSlice
 
 ROOT = Path(__file__).resolve().parents[3]
-SG = Path(os.environ.get("OCC3_SGLANG_SOURCE", "")) / "python/sglang/srt"
+SG = srt_dir(pristine_root())
 NS = types.SimpleNamespace
 
 def source_method(text, owner, name, scope):
@@ -105,7 +105,7 @@ class ShapeOnlyBatch:
 
 def observe_injection_span(no_copy, outcome):
     if not (SG / "model_executor/runner/eager_runner.py").is_file():
-        pytest.skip("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE")
+        pytest.skip("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE_BASE")
     descriptor = consume()
     item = RequestSlice(descriptor, 0, 8, 8 if outcome == "no_prefix" else 0, 0, True)
     mode = NS(is_extend=lambda **kw: True, is_target_verify=lambda: False,
@@ -200,7 +200,7 @@ def test_decode_does_not_reinject_prefill_embeddings(mode_name):
     from enum import IntEnum, auto
 
     if not (SG / "model_executor/forward_batch_info.py").is_file():
-        pytest.skip("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE")
+        pytest.skip("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE_BASE")
     mode_source = patched_source("model_executor/forward_batch_info.py")
     mode_node = next(n for n in ast.parse(mode_source).body
                      if isinstance(n, ast.ClassDef) and n.name == "ForwardMode")

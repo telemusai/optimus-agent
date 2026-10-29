@@ -15,6 +15,7 @@ from occ3_sglang.attachment_contract import (AuthenticatedContext, CaptureIntent
 from occ3_sglang.chat_adapter import NativeRequestView
 from occ3_sglang.use_receipts import NativeCompletion, SourceToolCall, SourceToolProvenance
 from test_latent_types import profile
+from test_span_markers import FakeTokenizer, NoEncodeTokenizer
 
 
 def health(p):
@@ -71,6 +72,63 @@ async def test_source_exact_enrollment_prepare_bind_and_commit():
     evidence=await backend.finish_source(enrollment,reservation,completion,provenance)
     assert evidence.commit.capture_commit_id=="commit" and evidence.bound_output_sha256=="d"*64
     assert client.calls[-1][1]["binding"]["tool_call_id"]=="tool"
+
+
+@pytest.mark.asyncio
+async def test_source_commit_carries_method_metadata_without_type_error():
+    # Red test: the worker's method_metadata() has added method_id (and
+    # artifact_digest for a calibrated method) to record.source_metadata since
+    # wave 445d1cdd4, so production source captures reach finish_source with
+    # more keys than SourceCaptureCommit(**record["source"]) accepts. The
+    # backend must project the commit, not splat the worker metadata.
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+    enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    native=NS(rid="native-rid",sampling_params={"max_new_tokens":200},input_ids=[1,2],stream=True)
+    view=NativeRequestView(native,200,"s",True,identity.deadline_monotonic)
+    reservation=await backend.prepare_source(enrollment,view)
+    backend.bind_source(enrollment,reservation,native)
+    client.record["source"]=dict(capture_commit_id="commit",accepted_span_start=2,accepted_span_end=10,
+        retained_count=8,predictor_position_offset=-1,representation="final_layer_prenorm_predictor",
+        layer_index=77,hidden_dim=6144,dtype="bfloat16",layout_digest="b"*64,ready_ranks=8,expected_ranks=8,
+        accepted_sequence_digest="c"*64,expires_at_epoch=expiry,byte_count=8*6144*2,
+        method_id=p.method,artifact_digest="e"*64)
+    provenance=SourceToolProvenance(tool_calls=())
+    completion=NativeCompletion("native-rid","stop","d"*64,50,True)
+    evidence=await backend.finish_source(enrollment,reservation,completion,provenance)
+    assert evidence.commit.capture_commit_id=="commit" and evidence.bound_output_sha256=="d"*64
+
+
+@pytest.mark.asyncio
+async def test_v2_enroll_resolves_marker_profile_from_the_tokenizer():
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    client.tm=NS(tokenizer=FakeTokenizer())
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry,
+        schema="occ3.capture.v2",span_policy="content_tail_v2")
+    enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    descriptor=backend.attempts["attempt"]["descriptor"]
+    assert descriptor.marker_profile=="glm45_glm47_xml_kv.v1"
+    assert descriptor.span_policy=="content_tail_v2"
+    # The attested marker ids never travel on the descriptor.
+    assert not any(isinstance(v,list) for v in asdict(descriptor).values())
+    assert enrollment.attempt_id=="attempt"
+
+
+@pytest.mark.asyncio
+async def test_v2_enroll_refuses_an_unattestable_tokenizer():
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    client.tm=NS(tokenizer=NoEncodeTokenizer())
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry,
+        schema="occ3.capture.v2",span_policy="content_tail_v2")
+    with pytest.raises(LatentError) as caught:
+        await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    assert caught.value.code=="profile" and not backend.attempts
 
 
 @pytest.mark.asyncio

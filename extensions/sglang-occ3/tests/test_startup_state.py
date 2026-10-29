@@ -18,6 +18,7 @@ from httpx import ASGITransport, AsyncClient
 from starlette.requests import Request
 
 from occ3_sglang import native_install as install
+from occ3_sglang.native_profile import advertised_methods
 from test_native_install import KEY, pinned_auth, transaction_fixture
 
 AUTH = {"Authorization": "Bearer " + KEY}
@@ -179,7 +180,8 @@ async def test_declined_status_is_truthful(phase, monkeypatch):
         assert payload["rollback_completed"] is True  # nothing was mutated
         caps = await client.get("/occ3/v1/capabilities", headers=AUTH)
         advertisement = caps.json()
-        assert advertisement["supported"] is False and advertisement["methods"] == []
+        assert advertisement["supported"] is False
+        assert advertisement["methods"] == list(advertised_methods())
         assert advertisement["reason"] == "native_install_declined"
         assert advertisement["native"]["installed"] is False
         assert advertisement["native"]["state"] == "DECLINED"
@@ -285,7 +287,8 @@ async def test_no_capability_advertisement_on_decline(phase, monkeypatch, family
         assert status.json()["state"] == "DECLINED" and status.json()["code"] == code
         caps = await client.get("/occ3/v1/capabilities", headers=AUTH)
         advertisement = caps.json()
-        assert advertisement["supported"] is False and advertisement["methods"] == []
+        assert advertisement["supported"] is False
+        assert advertisement["methods"] == list(advertised_methods())
         assert advertisement["reason"] == "native_install_declined"
         assert advertisement["native"]["installed"] is False
         assert advertisement["native"]["source_ready"] is False

@@ -1,7 +1,5 @@
-"""Turn-disjoint pooled calibration, held-out evaluation and matched controls."""
+"""Three-way manifests, shared evaluation, the promotion gate and grid selection."""
 from __future__ import annotations
-
-import functools
 
 import pytest
 
@@ -14,74 +12,88 @@ def _model(rank, dim, seed=1000):
             torch.randn(rank, dim, generator=generator) / rank ** 0.5)
 
 
-def _make_turns(count=12, rows=60, dim=32, rank=8, kappa=0.9, seed=0, independent=False):
+def _turns(count=16, rows=40, dim=32, rank=8, kappa=0.9, seed=0, independent=False,
+           constant_embeddings=False, family_size=0, start=0):
     from occ3_sglang.calibration_corpus import TurnBlock
     left, right = _model(rank, dim)
-    other_left, other_right = _model(rank + 1, dim, seed=2000)
+    other_right = _model(rank + 1, dim, seed=2000)[1]
     generator = torch.Generator().manual_seed(seed)
     blocks = []
-    for index in range(count):
+    for index in range(start, start + count):
         factor = torch.randn(rows, rank, generator=generator)
         noise_h = torch.randn(rows, dim, generator=generator)
         noise_e = torch.randn(rows, dim, generator=generator)
-        hidden = kappa ** 0.5 * (factor @ left) + (1.0 - kappa) ** 0.5 * noise_h
         if independent:
-            embeddings = torch.randn(rows, dim, generator=generator)
             hidden = torch.randn(rows, dim, generator=generator)
+            embeddings = torch.randn(rows, dim, generator=generator)
+        elif constant_embeddings:
+            hidden = torch.randn(rows, dim, generator=generator)
+            embeddings = torch.full((rows, dim), 0.5)
         else:
+            hidden = kappa ** 0.5 * (factor @ left) + (1.0 - kappa) ** 0.5 * noise_h
             embeddings = kappa ** 0.5 * (factor @ right) + (1.0 - kappa) ** 0.5 * noise_e
         tokens = (kappa ** 0.5 * (torch.randn(rows, rank + 1, generator=generator) @ other_right)
                   + (1.0 - kappa) ** 0.5 * torch.randn(rows, dim, generator=generator))
-        blocks.append(TurnBlock(turn_id=f"turn-{index:02d}", hidden=hidden, embeddings=embeddings,
-                               reference_embeddings=tokens,
-                               wrong_sender_hidden=torch.randn(rows, dim, generator=generator)))
+        family = None if family_size == 0 else f"fam-{index // family_size:03d}"
+        blocks.append(TurnBlock(turn_id=f"turn-{index:03d}", hidden=hidden,
+                                embeddings=embeddings, reference_embeddings=tokens,
+                                wrong_sender_hidden=torch.randn(rows, dim,
+                                                                generator=generator),
+                                family=family))
     return blocks
 
 
-@functools.lru_cache(maxsize=None)
-def _corpus(count=12, rows=60, seed=0, independent=False):
-    return tuple(_make_turns(count=count, rows=rows, seed=seed, independent=independent))
+def _manifest(blocks, fit_turns=8, validation_turns=4, test_turns=4):
+    from occ3_sglang.calibration_corpus import split_manifest
+    return split_manifest(blocks, fit_turns=fit_turns, validation_turns=validation_turns,
+                          test_turns=test_turns)
 
 
-@functools.lru_cache(maxsize=None)
-def _artifact(rows_budget=512):
-    from occ3_sglang.calibration_corpus import (pooled_rows, select_calibration_rows,
-                                                split_turns)
-    from occ3_sglang.statebridge_calibrated import fit_calibration
-    fit_blocks, _ = split_turns(_corpus())
-    selected, _ = select_calibration_rows(fit_blocks, rows_budget)
-    hidden, embeddings = pooled_rows(selected)
-    return fit_calibration(hidden, embeddings), float(embeddings.norm(dim=-1).mean())
+def _fitted(blocks=None, provenance=True):
+    from occ3_sglang.statebridge_calibrated import CalibrationProvenance, fit_map
+    manifest = _manifest(blocks if blocks is not None else _turns())
+    identity = None
+    if provenance:
+        identity = CalibrationProvenance(
+            layer_index=77, model_fingerprint="sha256:" + "a" * 64,
+            checkpoint_revision="rev-1", tokenizer_fingerprint="sha256:" + "b" * 64,
+            embedding_id="glm53-tp8-vocab",
+            capture_method_id="glm53.final-prenorm.capture.v1")
+    artifact = fit_map(manifest["fit"], {"rho": 0.02}, provenance=identity)
+    return manifest, artifact
 
 
-def test_split_is_turn_disjoint():
-    from occ3_sglang.calibration_corpus import split_turns
-    blocks = _corpus()
-    fit_blocks, eval_blocks = split_turns(blocks)
-    assert {value.turn_id for value in fit_blocks}.isdisjoint(
-        {value.turn_id for value in eval_blocks})
-    assert sorted([value.turn_id for value in fit_blocks + eval_blocks]) == sorted(
-        [value.turn_id for value in blocks])
-    assert len(fit_blocks) + len(eval_blocks) == len(blocks)
+def _validation_block(manifest, blocks, index=0):
+    turn_ids = list(manifest["validation"]["turn_ids"])
+    wanted = turn_ids[index]
+    return next(block for block in blocks if block.turn_id == wanted)
 
 
-def test_equal_length_turns_still_split_by_turn():
-    from occ3_sglang.calibration_corpus import split_turns
-    blocks = _corpus(rows=60)
-    assert len({value.rows for value in blocks}) == 1
-    fit_blocks, eval_blocks = split_turns(blocks)
-    assert len(eval_blocks) == 4 and len(fit_blocks) == 8
-    assert all(set(value.turn_id for value in partition).isdisjoint(
-        {other.turn_id for other in (eval_blocks if partition is fit_blocks else fit_blocks)})
-        for partition in (fit_blocks, eval_blocks))
-    for partition in (fit_blocks, eval_blocks):
-        assert sum(value.rows for value in partition) % 60 == 0
+def test_turn_block_refuses_a_shape_mismatch_and_bad_family():
+    from occ3_sglang.calibration_corpus import TurnBlock
+    from occ3_sglang.latent_types import LatentError
+    generator = torch.Generator().manual_seed(1)
+    hidden = torch.randn(8, 16, generator=generator)
+    with pytest.raises(LatentError):
+        TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=torch.randn(8, 32,
+                                                                         generator=generator))
+    with pytest.raises(LatentError):
+        TurnBlock(turn_id="turn x", hidden=hidden, embeddings=hidden.clone())
+    with pytest.raises(LatentError):
+        TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=hidden.clone(),
+                   reference_embeddings=torch.randn(4, 16,
+                                                     generator=generator))
+    with pytest.raises(LatentError):
+        TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=hidden.clone(),
+                   family="family 9")
+    TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=hidden.clone(),
+              family="fam-9")
 
 
 def test_duplicate_turn_ids_are_refused():
     from occ3_sglang.calibration_corpus import TurnBlock, ordered_blocks
     from occ3_sglang.latent_types import LatentError
-    blocks = _corpus()
+    blocks = _turns()
     duplicate = TurnBlock(turn_id=blocks[0].turn_id, hidden=blocks[1].hidden,
                           embeddings=blocks[1].embeddings)
     with pytest.raises(LatentError) as caught:
@@ -89,130 +101,378 @@ def test_duplicate_turn_ids_are_refused():
     assert caught.value.code == "identity"
 
 
-def test_turn_block_refuses_a_shape_mismatch():
-    from occ3_sglang.calibration_corpus import TurnBlock
+def test_split_manifest_partitions_are_whole_turn_disjoint_and_covering():
+    from occ3_sglang.calibration_corpus import PARTITION_FIELDS
+    blocks = _turns()
+    manifest = _manifest(blocks)
+    for name in ("fit", "validation", "test"):
+        partition = manifest[name]
+        assert set(partition) == set(PARTITION_FIELDS)
+        assert len(partition["manifest_digest"]) == 64
+        assert len(partition["row_turn_ids"]) == partition["hidden"].shape[0]
+        assert set(partition["row_turn_ids"]) == set(partition["turn_ids"])
+    ids = [set(manifest[name]["turn_ids"]) for name in ("fit", "validation", "test")]
+    assert ids[0].isdisjoint(ids[1]) and ids[0].isdisjoint(ids[2]) and ids[1].isdisjoint(ids[2])
+    assert set().union(*ids) == {block.turn_id for block in blocks}
+    assert manifest["turns"] == {"fit": 8, "validation": 4, "test": 4}
+
+
+def test_split_manifest_is_deterministic_regardless_of_input_order():
+    blocks = _turns()
+    first = _manifest(blocks)
+    second = _manifest(list(reversed(blocks)))
+    assert first["manifest_digest"] == second["manifest_digest"]
+    for name in ("fit", "validation", "test"):
+        assert first[name]["manifest_digest"] == second[name]["manifest_digest"]
+        assert first[name]["turn_ids"] == second[name]["turn_ids"]
+
+
+def test_split_manifest_keeps_families_whole():
+    blocks = _turns(family_size=4)
+    manifest = _manifest(blocks)
+    family_turns = {}
+    for index, block in enumerate(blocks):
+        family_turns.setdefault(block.family, set()).add(block.turn_id)
+    for name in ("fit", "validation", "test"):
+        assigned = set(manifest[name]["turn_ids"])
+        for family, turns in family_turns.items():
+            assert not turns & assigned or turns <= assigned
+
+
+def test_split_manifest_refuses_impossible_or_bad_targets():
     from occ3_sglang.latent_types import LatentError
-    hidden = torch.randn(8, 16)
-    with pytest.raises(LatentError):
-        TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=torch.randn(8, 32))
-    with pytest.raises(LatentError):
-        TurnBlock(turn_id="turn x", hidden=hidden, embeddings=hidden.clone())
-    with pytest.raises(LatentError):
-        TurnBlock(turn_id="turn-x", hidden=hidden, embeddings=hidden.clone(),
-                  reference_embeddings=torch.randn(4, 16))
+    blocks = _turns(count=15, family_size=5)
+    with pytest.raises(LatentError) as caught:
+        _manifest(blocks, fit_turns=12, validation_turns=2, test_turns=2)
+    assert caught.value.code == "profile"
+    blocks = _turns()
+    with pytest.raises(LatentError) as caught:
+        _manifest(blocks, fit_turns=0, validation_turns=4, test_turns=4)
+    assert caught.value.code == "profile"
+    with pytest.raises(LatentError) as caught:
+        _manifest(blocks, fit_turns=8.0, validation_turns=4, test_turns=4)
+    assert caught.value.code == "profile"
 
 
 def test_row_budget_is_a_supported_value_and_reported():
-    from occ3_sglang.calibration_corpus import M_ROW_BUDGETS, evaluate_turn_disjoint
+    from occ3_sglang.calibration_corpus import M_ROW_BUDGETS, select_calibration_rows
     from occ3_sglang.latent_types import LatentError
     assert M_ROW_BUDGETS == (512, 1024, 2048)
+    blocks = _turns(count=12, rows=200)
     with pytest.raises(LatentError) as caught:
-        evaluate_turn_disjoint(_corpus(), row_budget=600)
+        select_calibration_rows(blocks, 600)
     assert caught.value.code == "profile"
-    report = evaluate_turn_disjoint(_corpus(), row_budget=1024)
-    assert report["row_budget"] == 1024
-    assert report["rows_used"] == 480 <= report["row_budget"]
-    assert report["fit_turns"] == 8 and report["available_fit_turns"] == 8
+    selected, used = select_calibration_rows(blocks, 1024)
+    assert used == 1000 <= 1024
+    assert used == sum(block.rows for block in selected)
 
 
 def test_m_truncation_is_deterministic_and_takes_whole_turns():
-    from occ3_sglang.calibration_corpus import select_calibration_rows, split_turns
-    blocks = _corpus(rows=200, count=12)
-    fit_blocks, _ = split_turns(blocks)
-    first = select_calibration_rows(fit_blocks, 512)
+    from occ3_sglang.calibration_corpus import ordered_blocks, select_calibration_rows
+    blocks = _turns(count=12, rows=200)
+    ordered = ordered_blocks(blocks)
+    first = select_calibration_rows(ordered, 512)
     assert first[1] == 400
-    assert [value.turn_id for value in first[0]] == [
-        value.turn_id for value in fit_blocks[:2]]
-    assert select_calibration_rows(list(reversed(fit_blocks)), 512) == first
-    assert select_calibration_rows(fit_blocks[1:], 512) == select_calibration_rows(
-        fit_blocks[1:], 512)
-    assert select_calibration_rows(fit_blocks, 1024)[1] == 1000
-    assert select_calibration_rows(fit_blocks, 2048)[1] == 1600
-    for budget, rows in ((512, 400), (1024, 1000), (2048, 1600)):
-        selected, used = select_calibration_rows(fit_blocks, budget)
-        assert used == sum(value.rows for value in selected) == rows
+    assert [block.turn_id for block in first[0]] == [
+        block.turn_id for block in ordered[:2]]
+    assert select_calibration_rows(list(reversed(ordered)), 512) == first
+    assert select_calibration_rows(ordered, 1024)[1] == 1000
+    assert select_calibration_rows(ordered, 2048)[1] == 2000
+    for budget, rows in ((512, 400), (1024, 1000), (2048, 2000)):
+        selected, used = select_calibration_rows(ordered, budget)
+        assert used == sum(block.rows for block in selected) == rows
 
 
-def test_refuses_below_the_evaluation_turn_floor():
-    from occ3_sglang.calibration_corpus import MIN_EVALUATION_TURNS, evaluate_turn_disjoint
+def test_evaluation_records_every_contract_key():
+    from occ3_sglang.calibration_corpus import RECORD_KEYS, VIEW_KEYS, evaluate_map
+    from occ3_sglang.calibration_corpus import validate_metrics_record
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert set(record) == set(RECORD_KEYS)
+    assert validate_metrics_record(record)
+    assert record["rows"] == manifest["validation"]["hidden"].shape[0]
+    assert record["turns"] == 4
+    assert set(record["pooled"]) == set(VIEW_KEYS)
+    assert set(record["turn_macro"]) == set(VIEW_KEYS) - {"rows"}
+    assert set(record["per_turn"]) == set(manifest["validation"]["turn_ids"])
+    for view in record["per_turn"].values():
+        assert set(view) == set(VIEW_KEYS)
+    assert record["r2_standard"] > 0.5
+    assert record["raw_row_norm_mean"] > 0.0
+    assert record["undefined_denominators"] == []
+
+
+def test_raw_and_served_metrics_are_kept_distinct():
+    from occ3_sglang.calibration_corpus import evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    raw = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert raw["served_r2_standard"] == raw["r2_standard"]
+    assert raw["served_row_norm_mean"] == raw["raw_row_norm_mean"]
+    nu = 5.0 * raw["raw_row_norm_mean"]
+    served = evaluate_map(apply_map, artifact, manifest["validation"],
+                          serving={"kind": "n1"}, nu=nu)
+    assert served["served_row_norm_mean"] == pytest.approx(nu, rel=1e-4)
+    assert served["served_r2_standard"] != served["r2_standard"]
+    assert served["served_r2_standard"] < served["r2_standard"]
+    assert served["nu"] == nu and served["serving"] == {"kind": "n1"}
+
+
+def test_negative_r2_is_recorded_never_suppressed():
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_metrics_record
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted(_turns(independent=True, seed=3))
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert validate_metrics_record(record)
+    assert record["r2_standard"] is None or record["r2_standard"] < 0.3
+
+
+def test_zero_denominators_are_recorded_as_undefined():
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_metrics_record
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted(_turns(constant_embeddings=True, seed=5))
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert validate_metrics_record(record)
+    assert record["r2_standard"] is None and record["r2_vs_fit_mean"] is None
+    assert record["sst_test"] == 0.0 and record["sse_vs_fit_mean"] == 0.0
+    assert set(record["undefined_denominators"]) >= {"r2_standard", "r2_vs_fit_mean"}
+    first_turn = manifest["validation"]["turn_ids"][0]
+    assert f"r2_standard@{first_turn}" in record["undefined_denominators"]
+
+
+def test_turn_macro_is_the_unweighted_mean_over_turns():
+    from occ3_sglang.calibration_corpus import evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    values = [record["per_turn"][turn_id]["r2_standard"]
+              for turn_id in manifest["validation"]["turn_ids"]]
+    assert record["turn_macro"]["r2_standard"] == pytest.approx(sum(values) / len(values))
+    assert "rows" not in record["turn_macro"]
+
+
+def test_evaluation_refuses_a_malformed_partition():
     from occ3_sglang.latent_types import LatentError
-    assert MIN_EVALUATION_TURNS == 4
-    short = _corpus()[:6]
+    from occ3_sglang.calibration_corpus import evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
     with pytest.raises(LatentError) as caught:
-        evaluate_turn_disjoint(short, row_budget=512)
+        evaluate_map(apply_map, artifact, {**manifest["validation"], "extra": 1})
+    assert caught.value.code == "profile"
+    broken = {**manifest["validation"],
+              "row_turn_ids": manifest["validation"]["row_turn_ids"][:-1]}
+    with pytest.raises(LatentError) as caught:
+        evaluate_map(apply_map, artifact, broken)
     assert caught.value.code == "profile"
 
 
-def test_fails_closed_on_a_corpus_without_signal():
-    from occ3_sglang.calibration_corpus import evaluate_turn_disjoint
+def test_serving_n1_requires_a_vocabulary_norm():
     from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.calibration_corpus import evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
     with pytest.raises(LatentError) as caught:
-        evaluate_turn_disjoint(_corpus(count=12, rows=80, independent=True), row_budget=512)
-    assert caught.value.code == "numerical"
+        evaluate_map(apply_map, artifact, manifest["validation"], serving={"kind": "n1"})
+    assert caught.value.code == "profile"
 
 
-def test_evaluation_reports_every_required_field():
-    from occ3_sglang.calibration_corpus import EVALUATION_KEYS, evaluate_turn_disjoint
-    from occ3_sglang.statebridge_calibrated import CalibrationProvenance
-    provenance = CalibrationProvenance(
-        layer_index=77, model_fingerprint="sha256:" + "a" * 64, checkpoint_revision="rev-1",
-        tokenizer_fingerprint="sha256:" + "b" * 64, embedding_id="glm53-tp8-vocab",
-        capture_method_id="glm53.final-prenorm.capture.v1")
-    report = evaluate_turn_disjoint(_corpus(), row_budget=512, provenance=provenance)
-    assert set(report) == set(EVALUATION_KEYS)
-    assert report["eval_turns"] == 4 and report["fit_turns"] == 8
-    assert report["eval_cosine"] > 0.6, report["eval_cosine"]
-    assert report["eval_r2"] > 0.10, report["eval_r2"]
-    assert report["eval_relative_error"] < 1.0
-    assert report["refit_sensitivity"] > 0.3, report["refit_sensitivity"]
-    assert report["hidden_roll_sensitivity"] > 0.3
-    assert report["hidden_permute_sensitivity"] > 0.3
-    assert report["independent_reference_cosine"] is not None
-    assert report["independent_reference_cosine"] < 0.5
-    assert report["independent_reference_sensitivity"] > 0.3
-    assert report["token_reference_cosine"] is not None and report["token_reference_cosine"] < 0.5
-    assert len(report["corpus_digest"]) == 64 and len(report["artifact_digest"]) == 64
-    assert report["separation"] == {}
+def test_record_digest_is_canonical():
+    from occ3_sglang.calibration_corpus import evaluate_map, record_digest
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    first = evaluate_map(apply_map, artifact, manifest["validation"])
+    second = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert record_digest(first) == record_digest(second)
+    assert len(record_digest(first)) == 64
+    altered = dict(first, rows=first["rows"] + 1)
+    assert record_digest(altered) != record_digest(first)
 
 
-def test_evaluation_is_deterministic_for_a_permuted_input():
-    from occ3_sglang.calibration_corpus import evaluate_turn_disjoint
-    forward = evaluate_turn_disjoint(_corpus(), row_budget=512)
-    backward = evaluate_turn_disjoint(tuple(reversed(_corpus())), row_budget=512)
-    assert forward == backward
+def test_validate_metrics_record_rejects_tampering():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_metrics_record
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert validate_metrics_record(record)
+    with pytest.raises(LatentError):
+        validate_metrics_record({k: v for k, v in record.items() if k != "rows"})
+    with pytest.raises(LatentError):
+        validate_metrics_record(dict(record, r2_standard="high"))
+    with pytest.raises(LatentError):
+        validate_metrics_record(dict(record, rows=3.5))
+    with pytest.raises(LatentError):
+        validate_metrics_record(dict(record, schema="other"))
+
+
+def test_the_gate_allows_refuses_and_binds():
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_for_activation
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert validate_for_activation(artifact, record, {"min_r2_standard": 0.1,
+                                                      "min_turns": 1}) == ("allow", None)
+    assert validate_for_activation(artifact, record, {"min_r2_standard": 0.99}) == (
+        "refuse", "min_r2_standard")
+    assert validate_for_activation(artifact, record, {"r2_standard": 0.1}) == (
+        "refuse", "policy")
+    assert validate_for_activation(artifact, record, {"min_nonsense": 1}) == (
+        "refuse", "policy")
+    assert validate_for_activation(artifact, record, {}) == ("refuse", "policy")
+    assert validate_for_activation(artifact, {"rows": 1}, {}) == ("refuse", "record")
+    assert validate_for_activation(artifact, record, {"min_mean_row_cosine": 2.0}) == (
+        "refuse", "min_mean_row_cosine")
+    other_manifest, other = _fitted(_turns(seed=91))
+    other_record = evaluate_map(apply_map, other, other_manifest["validation"])
+    assert validate_for_activation(artifact, other_record, {"min_r2_standard": 0.1}) == (
+        "refuse", "artifact_digest")
+
+
+def test_the_gate_refuses_unbound_artifacts_and_undefined_metrics():
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_for_activation
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted(provenance=False)
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert validate_for_activation(artifact, record, {"min_r2_standard": 0.1}) == (
+        "refuse", "unbound")
+    flat_manifest, flat = _fitted(_turns(constant_embeddings=True, seed=7))
+    flat_record = evaluate_map(apply_map, flat, flat_manifest["validation"])
+    assert validate_for_activation(flat, flat_record, {"min_r2_standard": 0.1}) == (
+        "refuse", "undefined:r2_standard")
+
+
+def test_bind_validation_evidence_pins_the_record():
+    from dataclasses import replace
+    from occ3_sglang.calibration_corpus import (bind_validation_evidence, evaluate_map,
+                                                record_digest, validate_for_activation)
+    from occ3_sglang.statebridge_calibrated import (TENSOR_NAMES, apply_map,
+                                                    artifact_digest)
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    policy = {"min_r2_standard": 0.1}
+    pinned = bind_validation_evidence(artifact, record, {"kind": "n1"})
+    assert pinned.binding.validation_record_digest == record_digest(record)
+    assert pinned.binding.validation_artifact_digest == record["artifact_digest"]
+    assert pinned.binding.serving == {"kind": "n1"}
+    assert pinned.content_digest is None
+    for name in TENSOR_NAMES:
+        assert torch.equal(getattr(pinned, name), getattr(artifact, name))
+    assert validate_for_activation(pinned, record, policy) == ("allow", None)
+    tampered = dict(record, r2_standard=record["r2_standard"] + 1.0)
+    assert validate_for_activation(pinned, tampered, policy) == (
+        "refuse", "validation_evidence")
+    assert artifact_digest(pinned) != record["artifact_digest"]
+
+
+def test_bind_validation_evidence_refuses_a_foreign_record():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.calibration_corpus import bind_validation_evidence, evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    other_manifest, other = _fitted(_turns(seed=93))
+    other_record = evaluate_map(apply_map, other, other_manifest["validation"])
+    with pytest.raises(LatentError) as caught:
+        bind_validation_evidence(artifact, other_record, None)
+    assert caught.value.code == "identity"
+
+
+def test_grid_selection_runs_the_rho_grid_on_validation_only():
+    from occ3_sglang.calibration_corpus import (RHO_GRID, evaluate_map,
+                                                select_calibrated_map)
+    from occ3_sglang.statebridge_calibrated import apply_map, fit_map
+    manifest = _manifest(_turns(seed=13))
+    selection = select_calibrated_map(fit_map, apply_map, manifest["fit"],
+                                      manifest["validation"], nu=2.0)
+    rhos = sorted(candidate["hyperparams"]["rho"]
+                  for candidate in selection["candidates"])
+    assert rhos == sorted(RHO_GRID)
+    manual = []
+    for rho in RHO_GRID:
+        artifact = fit_map(manifest["fit"], {"rho": rho})
+        manual.append((rho, evaluate_map(apply_map, artifact,
+                                         manifest["validation"])["r2_standard"]))
+    best = max(manual, key=lambda pair: pair[1])[0]
+    assert selection["hyperparams"] == {"rho": best}
+    assert (selection["validation_record"]["partition_manifest_digest"]
+            == manifest["validation"]["manifest_digest"])
+    served_best = max(selection["serving_candidates"],
+                      key=lambda entry: entry["served_r2_standard"])["variant"]
+    assert selection["serving_variant"] == served_best
+
+
+def test_grid_selection_never_touches_the_test_partition():
+    from occ3_sglang.calibration_corpus import select_calibrated_map
+    from occ3_sglang.statebridge_calibrated import apply_map, fit_map
+    blocks = _turns(seed=17)
+    manifest = _manifest(blocks)
+    seen = {"fit": [], "apply": []}
+
+    def fit_spy(partition, hyperparams, **kwargs):
+        seen["fit"].append(partition["manifest_digest"])
+        return fit_map(partition, hyperparams, **kwargs)
+
+    def apply_spy(artifact, hidden, **kwargs):
+        seen["apply"].append(hidden)
+        return apply_map(artifact, hidden, **kwargs)
+
+    select_calibrated_map(fit_spy, apply_spy, manifest["fit"], manifest["validation"],
+                          nu=1.0)
+    assert set(seen["fit"]) == {manifest["fit"]["manifest_digest"]}
+    for hidden in seen["apply"]:
+        assert torch.equal(hidden, manifest["validation"]["hidden"])
+        assert not torch.equal(hidden, manifest["test"]["hidden"])
+
+
+def test_grid_n1_selection_requires_a_vocabulary_norm():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.calibration_corpus import select_calibrated_map
+    from occ3_sglang.statebridge_calibrated import apply_map, fit_map
+    manifest = _manifest(_turns(seed=19))
+    with pytest.raises(LatentError) as caught:
+        select_calibrated_map(fit_map, apply_map, manifest["fit"], manifest["validation"],
+                              serving_grid=("n1",))
+    assert caught.value.code == "profile"
+    selection = select_calibrated_map(fit_map, apply_map, manifest["fit"],
+                                      manifest["validation"], serving_grid=("n1",), nu=2.0)
+    assert selection["serving_variant"] == "n1" and selection["serving"] == {"kind": "n1"}
 
 
 def test_controls_separate_correct_from_shuffled_and_null():
-    from occ3_sglang.calibration_corpus import CONTROL_KINDS, split_turns, score_controls
-    artifact, target_norm = _artifact()
-    _, eval_blocks = split_turns(_corpus())
-    scores = score_controls(artifact, eval_blocks[0], target_norm=target_norm)
+    from occ3_sglang.calibration_corpus import CONTROL_KINDS, score_controls
+    from occ3_sglang.statebridge_calibrated import apply_map
+    blocks = _turns()
+    manifest, artifact = _fitted(blocks)
+    scalar = float(manifest["fit"]["embeddings"].norm(dim=-1).mean())
+    scores = score_controls(apply_map, artifact, _validation_block(manifest, blocks),
+                            target_norm=scalar)
     assert set(scores) == set(CONTROL_KINDS)
     correct = scores["correct"]["cosine"]
     assert correct > 0.8
     for control in ("shuffled", "null", "wrong-sender", "reference-token-only"):
         assert scores[control]["attached"] == 1
         assert scores[control]["cosine"] < correct - 0.3, (control, scores[control])
-    assert scores["shuffled"]["cosine"] < 0.5 and scores["null"]["cosine"] < 0.5
 
 
 def test_no_attachment_has_no_score_and_reference_tokens_are_not_the_state():
-    from occ3_sglang.calibration_corpus import (SOURCE_NONE, SOURCE_TOKEN, split_turns,
-                                                score_controls)
-    artifact, target_norm = _artifact()
-    _, eval_blocks = split_turns(_corpus())
-    scores = score_controls(artifact, eval_blocks[1], target_norm=target_norm)
+    from occ3_sglang.calibration_corpus import SOURCE_NONE, SOURCE_TOKEN, score_controls
+    from occ3_sglang.statebridge_calibrated import apply_map
+    blocks = _turns()
+    manifest, artifact = _fitted(blocks)
+    scalar = float(manifest["fit"]["embeddings"].norm(dim=-1).mean())
+    block = _validation_block(manifest, blocks, index=1)
+    scores = score_controls(apply_map, artifact, block, target_norm=scalar)
     assert scores["no-attachment"] == {"kind": "no-attachment", "source": SOURCE_NONE,
-                                      "rows": 0, "attached": 0, "cosine": None,
-                                      "relative_error": None}
+                                       "rows": 0, "attached": 0, "cosine": None,
+                                       "relative_error": None}
     assert scores["reference-token-only"]["source"] == SOURCE_TOKEN
-    assert scores["reference-token-only"]["rows"] == eval_blocks[1].rows
+    assert scores["reference-token-only"]["rows"] == block.rows
     assert scores["correct"]["source"] == "hidden"
 
 
 def test_shuffled_and_null_rows_are_mathematically_distinct():
     from occ3_sglang.calibration_corpus import control_rows
-    block = _corpus()[0]
+    block = _turns(count=1)[0]
     _, correct = control_rows(block, "correct")
     _, shuffled = control_rows(block, "shuffled")
     _, null = control_rows(block, "null")
@@ -233,42 +493,18 @@ def test_separation_math():
     assert result["delta_margin"] == pytest.approx(1.0)
 
 
-def test_candidate_separation_is_reported_and_validated():
-    from occ3_sglang.calibration_corpus import evaluate_turn_disjoint, validate_evaluation
-    from occ3_sglang.latent_types import LatentError
-    report = evaluate_turn_disjoint(
-        _corpus(), row_budget=512,
-        candidate_scores={"correct": [1.0] * 8, "shuffled": [-1.0] * 8, "null": [-2.0] * 8})
-    assert validate_evaluation(report)
-    assert report["separation"]["shuffled"]["delta_accuracy"] == pytest.approx(1.0)
-    assert report["separation"]["null"]["delta_margin"] == pytest.approx(3.0)
-    with pytest.raises(LatentError):
-        evaluate_turn_disjoint(_corpus(), row_budget=512, candidate_scores={"shuffled": [1.0]})
-    with pytest.raises(LatentError):
-        validate_evaluation(dict(report, separation={"shuffled": {"trials": 1}}))
+def test_the_digest_free_fallback_allows_unequal_validation_rows():
+    """A hand-built artifact without a content digest still validates a record
+    measured on a differently sized validation partition."""
+    import dataclasses as _dc
 
-
-def test_fit_transform_is_permutation_invariant_over_calibration_rows():
-    """Re-ordering the calibration rows cannot change the frozen transform.
-
-    The means, the Gram and the map are permutation invariant, so the only
-    order-dependent quantity in a fit is its internal row-order held-out
-    estimate. This is why re-fit sensitivity has to destroy the row
-    correspondence to move the output at all.
-    """
-    from occ3_sglang.calibration_corpus import pooled_rows, select_calibration_rows, split_turns
-    from occ3_sglang.statebridge_calibrated import apply_calibration, fit_calibration
-    fit_blocks, _ = split_turns(_corpus())
-    selected, _ = select_calibration_rows(fit_blocks, 512)
-    hidden, embeddings = pooled_rows(selected)
-    first = fit_calibration(hidden, embeddings)
-    order = torch.arange(hidden.shape[0] - 1, -1, -1)
-    second = fit_calibration(hidden.index_select(0, order), embeddings.index_select(0, order))
-    inverse = torch.argsort(order)
-    restored = second.gram.index_select(0, inverse).index_select(1, inverse)
-    assert first.ridge == pytest.approx(second.ridge, rel=1e-5)
-    assert torch.allclose(first.gram, restored, atol=1e-4)
-    assert torch.allclose(first.mean_hidden, second.mean_hidden, atol=1e-6)
-    message = hidden[:16]
-    assert torch.allclose(apply_calibration(first, message, 2.0),
-                          apply_calibration(second, message, 2.0), atol=1e-4)
+    from occ3_sglang.calibration_corpus import evaluate_map, validate_for_activation
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    assert record["rows"] != artifact.rows
+    bare = _dc.replace(artifact, content_digest=None)
+    policy = {"min_r2_standard": 0.1, "min_turns": 1}
+    assert validate_for_activation(bare, record, policy) == ("allow", None)
+    assert validate_for_activation(bare, dict(record, method_id="other"), policy) == (
+        "refuse", "artifact_digest")

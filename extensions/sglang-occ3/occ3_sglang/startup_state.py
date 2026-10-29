@@ -7,8 +7,10 @@ module through plugin.load(); the import itself never mutates any app and the
 routes are only mounted by explicit registration call sites.
 
 Truthfulness rules (normative, see the phase-split design):
-- ``supported`` stays false and ``methods`` stays empty in every state; the
-  server never self-certifies live proof. Only the controller validates.
+- ``supported`` stays false in every state; the server never self-certifies
+  live proof. Only the controller validates. ``methods`` lists the method
+  ids the installed registry advertises (build capability), which is not a
+  readiness or live-proof claim.
 - ``code``/``stage``/``attempt`` are fixed-taxonomy values or null; exception
   text, paths, principals and secrets never enter a payload or log line.
 - The identity route never fabricates the incarnation tuple: before
@@ -283,6 +285,20 @@ def status_payload():
     }
 
 
+def _advertised_methods():
+    """Registry method ids: what this build supports, never what is live.
+
+    Read from the method registry (occ3_sglang.native_profile), which is
+    metadata-only: importing it pulls no torch, no sglang and no model state.
+    A registry that cannot be read advertises nothing rather than guessing.
+    """
+    try:
+        from .native_profile import advertised_methods
+        return list(advertised_methods())
+    except Exception:
+        return []
+
+
 def capabilities_payload():
     """Superset of the old advertisement; availability is never advertised."""
     identity = compute_identity(_state().tokenizer_manager)
@@ -294,7 +310,7 @@ def capabilities_payload():
         "experimental_prompt_kv_path": "/occ3/v1/latent/capabilities",
         "model_fingerprint": fingerprint(identity),
         "connector_id": "sglang-occ3",
-        "methods": [],
+        "methods": _advertised_methods(),
         "experimental_baselines": ["text-radix", "source-prompt-kv-handle-v1"],
         "protocol": "occ3-v1",
         "api_version": "v1",

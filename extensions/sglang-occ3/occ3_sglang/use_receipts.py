@@ -12,7 +12,8 @@ from dataclasses import asdict, dataclass
 from .attachment_contract import (
     AttachmentError, InferenceAttachment, MAX_RECEIPT_BYTES, Reservation,
     SourceCaptureReceipt, SourceEnrollment, bounded_identifier, canonical, digest,
-    identifier, sha256_hex, strict_json, uint,
+    identifier, sha256_hex, strict_json, uint, MARKER_SCHEMA_V1, SOURCE_SCHEMA_V1,
+    SOURCE_SCHEMA_V2, SPAN_POLICY_V1, SPAN_POLICIES_V2, SPAN_SCHEMA_V1, SPAN_TERMINATORS,
 )
 
 VALID_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "function_call"})
@@ -161,13 +162,13 @@ class NativeOutputAudit:
                         raise AttachmentError("native_completion_failed")
                     target[key] += fragment
 
-    def source_provenance(self):
+    def source_provenance(self, scope: str = SPAN_POLICY_V1):
         if not self.source:
             raise AttachmentError("unsupported_profile")
         calls = tuple(SourceToolCall(value["id"], value["name"]) for value in self.tool_calls.values())
         if self.finish_reason in ("tool_calls", "function_call") and not calls:
             raise AttachmentError("native_completion_failed")
-        return SourceToolProvenance(calls)
+        return SourceToolProvenance(calls, scope)
 
     def _account(self, chunk: bytes):
         self.size += len(chunk)
@@ -371,13 +372,25 @@ class SourceToolCall:
         identifier(self.name)
 
 
+#: The v2 receipt span-block field names, in fixed order.
+SPAN_BLOCK_FIELDS = ("span_schema", "span_policy", "span_marker_profile",
+                     "span_marker_schema", "span_reasoning_terminator",
+                     "span_turn_end_attested", "span_thinking_count",
+                     "span_content_count", "span_tool_call_count",
+                     "span_tool_arguments_count", "span_control_count",
+                     "span_unknown_count", "span_window_start_position",
+                     "span_window_end_position", "span_contiguous",
+                     "span_contains_final_content", "span_contains_tool_call",
+                     "span_message_truncated")
+
+
 @dataclass(frozen=True, repr=False)
 class SourceToolProvenance:
     tool_calls: tuple[SourceToolCall, ...]
-    scope: str = "whole_completed_response_tail_v1"
+    scope: str = SPAN_POLICY_V1
 
     def __post_init__(self):
-        if (self.scope != "whole_completed_response_tail_v1"
+        if (self.scope not in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2
                 or type(self.tool_calls) is not tuple or len(self.tool_calls) > 1
                 or any(type(call) is not SourceToolCall for call in self.tool_calls)):
             raise AttachmentError("unsupported_profile")
@@ -391,7 +404,13 @@ class SourceToolProvenance:
 
 @dataclass(frozen=True, repr=False)
 class SourceCaptureCommit:
-    """Actual worker commit metadata. No frontend byte digest is invented here."""
+    """Actual worker commit metadata. No frontend byte digest is invented here.
+
+    The 15 v1 fields are exactly the v1 receipt's non-identity fields.  The
+    optional occ3.span.v1 block is all-present for a content_tail_v2 capture and
+    all-None for a v1 capture; the deep cross-field invariants are enforced
+    where the block becomes public, in SourceCaptureReceipt.
+    """
     capture_commit_id: str
     accepted_span_start: int
     accepted_span_end: int
@@ -407,6 +426,56 @@ class SourceCaptureCommit:
     accepted_sequence_digest: str
     expires_at_epoch: int
     byte_count: int
+    span_schema: str | None = None
+    span_policy: str | None = None
+    span_marker_profile: str | None = None
+    span_marker_schema: str | None = None
+    span_reasoning_terminator: str | None = None
+    span_turn_end_attested: bool | None = None
+    span_thinking_count: int | None = None
+    span_content_count: int | None = None
+    span_tool_call_count: int | None = None
+    span_tool_arguments_count: int | None = None
+    span_control_count: int | None = None
+    span_unknown_count: int | None = None
+    span_window_start_position: int | None = None
+    span_window_end_position: int | None = None
+    span_contiguous: bool | None = None
+    span_contains_final_content: bool | None = None
+    span_contains_tool_call: bool | None = None
+    span_message_truncated: bool | None = None
+
+    def __post_init__(self):
+        block = [getattr(self, name) for name in SPAN_BLOCK_FIELDS]
+        present = [value is not None for value in block]
+        if all(present):
+            for name in ("span_schema", "span_policy", "span_marker_profile",
+                         "span_marker_schema", "span_reasoning_terminator"):
+                if type(getattr(self, name)) is not str:
+                    raise AttachmentError("invalid_evidence")
+            for name in ("span_turn_end_attested", "span_contiguous",
+                         "span_contains_final_content", "span_contains_tool_call",
+                         "span_message_truncated"):
+                if type(getattr(self, name)) is not bool:
+                    raise AttachmentError("invalid_evidence")
+            for name in ("span_thinking_count", "span_content_count", "span_tool_call_count",
+                         "span_tool_arguments_count", "span_control_count",
+                         "span_unknown_count", "span_window_start_position",
+                         "span_window_end_position"):
+                if type(getattr(self, name)) is not int:
+                    raise AttachmentError("invalid_evidence")
+        elif any(present):
+            raise AttachmentError("invalid_evidence")
+
+    @property
+    def is_v2(self) -> bool:
+        return self.span_schema is not None
+
+    def span_block(self) -> dict:
+        """The bounded span block, or None for a v1 capture."""
+        if not self.is_v2:
+            return None
+        return {name: getattr(self, name) for name in SPAN_BLOCK_FIELDS}
 
 
 @dataclass(frozen=True, repr=False)
@@ -445,6 +514,36 @@ def source_receipt_upper_bound(limit: int = MAX_RECEIPT_BYTES) -> bytes:
         ready_ranks=2**32 - 1, expected_ranks=2**32 - 1,
         accepted_sequence_digest="f" * 64, output_sha256="f" * 64,
         expires_at_epoch=2**64 - 1, byte_count=128 * (2**32 - 1) * 2)
+    return source_receipt_bytes(receipt, limit)
+
+
+def source_receipt_v2_upper_bound(limit: int = MAX_RECEIPT_BYTES) -> bytes:
+    """Valid maximum-width occ3.source.v2 wire: the doc's unmeasured case.
+
+    Same worst-case v1 fields as :func:`source_receipt_upper_bound`, plus the
+    bounded span block at its widest admissible values.  The adapter's header
+    admission uses this for a v2 capture so the pre-dispatch budget reserves
+    what the receipt can actually cost.
+    """
+    receipt = SourceCaptureReceipt(
+        intent_digest="f" * 64, source_handle="x" * 128, native_rid="x" * 96,
+        response_id="x" * 96, capture_commit_id="x" * 96,
+        accepted_span_start=2**64 - 1 - 128, accepted_span_end=2**64 - 1,
+        retained_count=128, predictor_position_offset=-1,
+        representation="final_layer_prenorm_predictor", layer_index=2**32 - 1,
+        hidden_dim=2**32 - 1, dtype="bfloat16", layout_digest="f" * 64,
+        ready_ranks=2**32 - 1, expected_ranks=2**32 - 1,
+        accepted_sequence_digest="f" * 64, output_sha256="f" * 64,
+        expires_at_epoch=2**64 - 1, byte_count=128 * (2**32 - 1) * 2,
+        schema=SOURCE_SCHEMA_V2,
+        span_schema=SPAN_SCHEMA_V1, span_policy=max(SPAN_POLICIES_V2),
+        span_marker_profile="x" * 64, span_marker_schema=MARKER_SCHEMA_V1,
+        span_reasoning_terminator="tool_call_start", span_turn_end_attested=True,
+        span_thinking_count=128, span_content_count=128, span_tool_call_count=128,
+        span_tool_arguments_count=128, span_control_count=128, span_unknown_count=128,
+        span_window_start_position=0, span_window_end_position=2**64 - 1,
+        span_contiguous=False, span_contains_final_content=True,
+        span_contains_tool_call=True, span_message_truncated=True)
     return source_receipt_bytes(receipt, limit)
 
 
@@ -488,7 +587,21 @@ def validate_source_evidence(intent, enrollment, reservation, descriptor, comple
             or commit.expires_at_epoch != enrollment.expires_at_epoch
             or commit.byte_count > intent.max_capture_bytes):
         raise AttachmentError("invalid_evidence")
+    # Schema-gated receipt: a v2 intent requires the bounded span block and the
+    # v2 source schema; a v1 intent refuses any block (doc section 6.2).
+    block = {name: getattr(commit, name) for name in SPAN_BLOCK_FIELDS}
+    if intent.span_policy in SPAN_POLICIES_V2:
+        if (commit.span_schema is None or commit.span_policy != intent.span_policy
+                or commit.span_marker_profile != descriptor.marker_profile):
+            raise AttachmentError("invalid_evidence")
+        schema = SOURCE_SCHEMA_V2
+    else:
+        if commit.span_schema is not None:
+            raise AttachmentError("invalid_evidence")
+        schema = SOURCE_SCHEMA_V1
     return SourceCaptureReceipt(
         intent_digest=intent.binding_digest, source_handle=enrollment.source_handle,
         native_rid=completion.native_rid, response_id=evidence.response_id,
-        output_sha256=completion.output_sha256, **asdict(commit))
+        output_sha256=completion.output_sha256, schema=schema,
+        **{name: value for name, value in asdict(commit).items() if name not in SPAN_BLOCK_FIELDS},
+        **block)

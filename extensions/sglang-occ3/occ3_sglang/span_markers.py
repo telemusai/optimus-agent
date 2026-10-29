@@ -86,6 +86,7 @@ import operator
 from dataclasses import dataclass
 from typing import Dict, Tuple
 
+from .attachment_contract import MARKER_SCHEMA_V1
 from .latent_types import LatentError
 from .span_audit import MAX_MARKER_ID, MAX_MARKER_TOKENS, SpanMarkers
 
@@ -99,7 +100,9 @@ __all__ = [
 
 #: Version of the resolved-table contract.  A receipt that names a marker
 #: profile must name both this schema and the profile string below.
-MARKER_SCHEMA = "occ3.span.markers.v1"
+#: Single-sourced from the binding contract module so the v2 receipt block
+#: and the marker table can never drift apart.
+MARKER_SCHEMA = MARKER_SCHEMA_V1
 
 #: Role order is fixed so every tuple and dict in this module is comparable.
 ROLES = (

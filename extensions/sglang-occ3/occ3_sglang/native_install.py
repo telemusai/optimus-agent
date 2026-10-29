@@ -355,10 +355,11 @@ _REQUIRED_PLUGIN = {
     "attachment_contract.py", "use_receipts.py", "latent_backend.py",
     "latent_control_api.py", "latent_worker.py", "latent_types.py",
     "latent_registry.py", "statebridge.py", "startup_state.py",
-    # The independent-calibration method and its evaluation surface are part of
-    # the installed byte identity: an unattested copy could be swapped under a
-    # profile that names the calibrated method id.
-    "statebridge_calibrated.py", "calibration_corpus.py", "calibration_probe.py",
+    # The independent-calibration methods and their evaluation surface are part
+    # of the installed byte identity: an unattested copy could be swapped under
+    # a profile that names a calibrated method id.
+    "statebridge_calibrated.py", "statebridge_calibrated_procrustes.py",
+    "calibration_corpus.py", "calibration_probe.py", "alignment_dispatch.py",
     "align_diagnostics.py",
 }
 

@@ -458,6 +458,115 @@ fn key_text_primary_only(keybinding: &str) -> String {
 mod tests {
     use super::*;
 
+    /// L-1 narrow-terminal regression, measured against the real caller
+    /// composition (native_host_subagents::update_communication): the
+    /// four-slot indicator string narrowed by the production status_line
+    /// stages at the caller's own budget (terminal width - 2), with and
+    /// without the tray right status, and with the selectable open hint.
+    ///
+    /// Measured bands (see the campaign report): the caller's stages keep
+    /// the slots down to the compact-health stage boundary (width 59);
+    /// below that the status the caller supplies carries no slots at all
+    /// (out of this component's ownership). Within this component the rule
+    /// is: whenever the supplied status carries the OCC3 slot and fits one
+    /// row, the render must show it - no ellipsization may eat it - and at
+    /// widths 104-110 the four-segment status renders on one more status
+    /// row instead of overflowing or losing the slot.
+    /// The production caller's four status stages
+    /// (`context_health_indicator::status_line`) at the caller's own budget,
+    /// `width - 2`. Identifiers, TPS and health survive before the optional
+    /// communication slots, so below the compact-health boundary the caller
+    /// supplies a status with no slot in it at all.
+    fn caller_status(width: usize) -> String {
+        let indicators = ["TXT", "OCC1", "OCC2", "OCC3"]
+            .iter()
+            .map(|label| format!("\x1b[2;38;5;39m\u{25cb} {label}\x1b[22;39m"))
+            .collect::<Vec<_>>()
+            .join("  ");
+        let throughput = "\x1b[1;38;5;196mSTREAM TPS ~50.0\x1b[22;39m";
+        let health_full = "\x1b[1;38;5;82mCTX HEALTH GREEN 100\x1b[22;39m";
+        let health_compact = "\x1b[1;38;5;82mCTX G100\x1b[22;39m";
+        let budget = width.saturating_sub(2);
+        [
+            format!("{indicators}  {throughput}  {health_full}"),
+            format!("{indicators}  {throughput}  {health_compact}"),
+            format!("{throughput}  {health_full}"),
+            format!("{throughput}  {health_compact}"),
+        ]
+        .into_iter()
+        .find(|candidate| visible_width(candidate) <= budget)
+        .unwrap_or_else(|| health_compact.to_string())
+    }
+
+    #[test]
+    fn l1_occ3_slot_never_ellipsized_when_the_caller_status_carries_it() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        for width in 20..=200usize {
+            let status = caller_status(width);
+            for with_right in [false, true] {
+                let mut line = SubagentSummaryLine::default();
+                line.set_always_visible(true);
+                line.set_subagent_counts(SubagentSummaryCounts {
+                    total: 3,
+                    running: 1,
+                    idle: 1,
+                    inactive: 1,
+                    ..Default::default()
+                });
+                line.set_communication_status(Some(status.clone()));
+                if with_right {
+                    line.set_right_status(Some(RightStatus {
+                        full: "Jev C+A \u{b7} 12 req".into(),
+                        compact: "Jev 12r".into(),
+                        minimal: "Jev".into(),
+                    }));
+                }
+                line.set_openable(true);
+                let rows = line.render(width as f64);
+                assert!(
+                    rows.iter().all(|row| visible_width(row) <= width),
+                    "width {width} overflows its row"
+                );
+                let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
+                let carried = status.contains("OCC3");
+                if carried && visible_width(&status) + 2 <= width {
+                    assert!(
+                        text.contains("OCC3"),
+                        "width {width} (right={with_right}) ellipsized the OCC3 slot away:\n{text}"
+                    );
+                }
+                // The L-1 row rule: at the widths where the four-segment
+                // status cannot sit inline with the counts, the summary
+                // renders one more status row and keeps the slot.
+                if (104..=110).contains(&width) && carried {
+                    assert!(
+                        rows.len() >= 4,
+                        "width {width} (right={with_right}) must render one more status row:\n{rows:?}"
+                    );
+                    assert!(text.contains("OCC3"), "width {width} lost OCC3");
+                }
+            }
+        }
+    }
+
+    /// The measured band, pinned: the caller's stages first carry the four
+    /// slots when the compact-health stage fits its budget, and every width
+    /// from there up renders the OCC3 slot. Below that width the caller
+    /// supplies no slot at all, which this component cannot recover: that
+    /// band is the caller's documented stage policy, not ellipsization here.
+    #[test]
+    fn l1_measured_band_is_where_the_caller_stages_first_carry_the_slots() {
+        let first = (2..=200usize)
+            .find(|width| caller_status(*width).contains("OCC3"))
+            .expect("the caller must carry the slots at some width");
+        assert_eq!(first, 59, "measured compact-health stage boundary");
+        for width in first..=200usize {
+            assert!(
+                caller_status(width).contains("OCC3"),
+                "width {width} lost the slots above the measured boundary"
+            );
+        }
+    }
 
     #[test]
     fn communication_indicators_remain_visible_with_jev_and_respect_terminal_width() {

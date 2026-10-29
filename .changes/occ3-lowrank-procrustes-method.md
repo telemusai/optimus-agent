@@ -1,0 +1,1 @@
+- Added the frozen low-rank whitened Procrustes alignment method (statebridge_calibrated_procrustes.py) with separate artifact schema and method identities for the O(r), SO(r) and unwhitened-comparator variants, FIT-only closed-form fitting, rank-safe basis selection, and a 19-test numerical suite including SciPy cross-checks.

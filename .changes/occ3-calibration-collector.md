@@ -1,0 +1,2 @@
+- Added the protected calibration corpus collector: bounded per-turn capture records with refusal records, family-atomic whole-turn three-way split via the shared manifest builder, and digest-verified read-back (manifest self digest, file sha before load, tensor content digests, partition and corpus digests).
+- Budget selections are round-robin prefixes of one fixed digest order with nested 512/1024/2048 row budgets that never pad, always report actual rows, and cannot be changed by validation-turn mutation.

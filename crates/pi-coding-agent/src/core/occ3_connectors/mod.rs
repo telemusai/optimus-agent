@@ -12,6 +12,23 @@ pub mod sglang;
 use std::sync::{Mutex, OnceLock};
 
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
+use crate::core::occ::occ3::types::Occ3Method;
+
+/// The coarse negotiation family for a full dotted method id. The
+/// [`Occ3Method`] enum stays the wire-level negotiation family (envelope,
+/// capabilities, registry support); the full identity keeps flowing
+/// through the string-equality seams (readiness `method_id`, publication
+/// `intent.method`, inference `attachment.method`). A dotted id outside
+/// every known family has no negotiation route and is refused.
+pub fn method_family(latent_method: &str) -> Option<Occ3Method> {
+    if latent_method.starts_with("statebridge") {
+        Some(Occ3Method::StatebridgePrefix)
+    } else if latent_method.starts_with("kv-handoff") {
+        Some(Occ3Method::KvHandoff)
+    } else {
+        None
+    }
+}
 
 /// Process-wide live connector registry. Populated by the embedding
 /// host (daemon startup or the first live model configuration) after a

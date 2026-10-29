@@ -8,13 +8,17 @@ the embedding rows of the same tokens.
 
 Everything here returns integers and floats, or a short bounded list of floats
 with no positional information. Nothing is written that could reconstruct a
-hidden state, and no token id is recorded.
+hidden state, and no token id is recorded. Every random draw uses an explicit
+torch.Generator (a fresh probe-local one when none is passed), never the
+serving model RNG.
 """
 from __future__ import annotations
 
-from .calibration_corpus import (DEFAULT_EVAL_STRIDE, EVALUATION_KEYS,
-                                 evaluate_turn_disjoint, split_turns)
+from .calibration_corpus import (RECORD_KEYS, evaluate_map, ordered_blocks,
+                                 select_calibration_rows, split_manifest,
+                                 validate_metrics_record)
 from .latent_types import require
+from .statebridge_calibrated import MIN_CALIBRATION_ROWS, apply_map, fit_map
 
 PROBE_KEYS = (
     "rows", "hidden_dim", "union_rank",
@@ -29,6 +33,10 @@ PROBE_KEYS = (
     "nonfinite_count",
 )
 _LIST_GROUPS = 10
+# The frozen dual ridge cannot fit a partition below the contract row floor, so
+# a turn whose held-out half cannot reach it records an undefined within-turn
+# prediction (None) instead of a fabricated number.
+_UNDEFINED_KEYS = ("heldout_r2_within_turn",)
 
 
 def _sym(matrix, power, floor, torch):
@@ -90,8 +98,35 @@ def _eff_rank(matrix, torch):
     return float((total * total) / (values * values).sum().clamp_min(1e-30))
 
 
+def _within_turn_prediction(hidden, embeddings, torch):
+    """Held-out within-turn R^2 of the frozen dual ridge against the fit mean.
+
+    Fits on the first rows (at least the contract row floor), predicts the rows
+    after them. A turn too short to hold a contract-sized fit records None:
+    the measurement is undefined, never fabricated.
+    """
+    rows = int(hidden.shape[0])
+    fit_rows = max(MIN_CALIBRATION_ROWS, rows // 2)
+    if rows - fit_rows < 2:
+        return None
+    with torch.no_grad():
+        fit_hidden, fit_embeddings = hidden[:fit_rows].float(), embeddings[:fit_rows].float()
+        partition = {"hidden": fit_hidden, "embeddings": fit_embeddings,
+                     "row_turn_ids": ("probe-fit-half",) * fit_rows,
+                     "turn_ids": ("probe-fit-half",), "manifest_digest": ""}
+        artifact = fit_map(partition, {"rho": 0.02}, torch_module=torch)
+        probe_hidden, probe_embeddings = hidden[fit_rows:].float(), embeddings[fit_rows:].float()
+        predicted = apply_map(artifact, probe_hidden, torch_module=torch)
+        residual = float((predicted - probe_embeddings).pow(2).sum())
+        baseline = float((probe_embeddings - artifact.mean_embedding.float()).pow(2).sum())
+    import math
+    if not (math.isfinite(residual) and math.isfinite(baseline) and baseline > 0.0):
+        return None
+    return 1.0 - residual / baseline
+
+
 def probe_relation(hidden, embeddings, prefix=None, *, ridge=1e-3, eigen_floor=1e-6,
-                   rank_rtol=1e-5, torch_module=None):
+                   rank_rtol=1e-5, generator=None, torch_module=None):
     """Fixed-key scalar summary of one captured turn."""
     torch = torch_module or _import_torch()
     require(hidden.ndim == 2 and hidden.shape == embeddings.shape, "profile")
@@ -110,19 +145,15 @@ def probe_relation(hidden, embeddings, prefix=None, *, ridge=1e-3, eigen_floor=1
         rolled = canonical_spectrum(torch.roll(hidden, 1, 0), embeddings, ridge=ridge,
                                     eigen_floor=eigen_floor, rank_rtol=rank_rtol,
                                     torch_module=torch)["prefix"]
-        permuted = canonical_spectrum(hidden[torch.randperm(hidden.shape[0], device=hidden.device)],
+        if generator is None:
+            generator = torch.Generator(device=hidden.device).manual_seed(0)
+        permuted = canonical_spectrum(hidden[torch.randperm(hidden.shape[0],
+                                                           generator=generator,
+                                                           device=hidden.device)],
                                       embeddings, ridge=ridge, eigen_floor=eigen_floor,
                                       rank_rtol=rank_rtol, torch_module=torch)["prefix"]
         values = main["canonical"]
-        # The canonical spectrum alone CANNOT separate a real relation from none:
-        # whitening makes two full-rank clouds congruent, so it saturates near 1
-        # for independent data too. What separates them is out-of-sample
-        # prediction inside the turn: fit on the first half of the rows and
-        # predict the embeddings of the second half.
-        from .statebridge_calibrated import heldout_r2
-        heldout = heldout_r2(hidden, embeddings, 0.02 * float(
-            (hidden.float() - hidden.float().mean(0, keepdim=True)).pow(2).sum(1).mean()), torch,
-            split=0.5)
+        heldout = _within_turn_prediction(hidden, embeddings, torch)
         size = values.numel()
         grouped = [float(values[start:start + max(1, size // _LIST_GROUPS)].mean())
                    for start in range(0, size, max(1, size // _LIST_GROUPS))][:_LIST_GROUPS]
@@ -140,7 +171,7 @@ def probe_relation(hidden, embeddings, prefix=None, *, ridge=1e-3, eigen_floor=1
             "canonical_above_095": int((values > 0.95).sum()),
             "canonical_above_099": int((values > 0.99).sum()),
             "canonical_decile": grouped,
-            "heldout_r2_within_turn": float(heldout),
+            "heldout_r2_within_turn": heldout,
             "procrustes_residual": float(main["residual"]),
             "cos_prefix_to_embedding": cos,
             "relative_prefix_to_embedding": relative,
@@ -163,6 +194,12 @@ def validate_probe(result):
             require(isinstance(value, list) and 1 <= len(value) <= _LIST_GROUPS, "profile")
             require(all(type(x) is float and x == x for x in value), "numerical")
             continue
+        if key in _UNDEFINED_KEYS:
+            require(value is None or (type(value) in (int, float)
+                                      and not isinstance(value, bool)), "profile")
+            if value is not None:
+                require(value == value and abs(value) != float("inf"), "numerical")
+            continue
         require(type(value) in (int, float) and not isinstance(value, bool), "profile")
         if isinstance(value, float):
             require(value == value and abs(value) != float("inf"), "numerical")
@@ -172,24 +209,34 @@ def validate_probe(result):
 
 
 DEFAULT_POOLED_ROW_BUDGET = 512
-# One schema: the pooled probe reports exactly the pooled evaluation keys.
-POOLED_PROBE_KEYS = EVALUATION_KEYS
+# One schema: the pooled probe reports exactly the evaluation-record keys.
+POOLED_PROBE_KEYS = RECORD_KEYS
 
 
-def probe_pooled_turn_disjoint(blocks, *, row_budget=DEFAULT_POOLED_ROW_BUDGET,
-                              eval_stride=DEFAULT_EVAL_STRIDE, provenance=None):
-    """Turn-disjoint pooled probe: the number LIVE-WINDOW-1 Section 5 asks for.
+def probe_pooled_turn_disjoint(corpus, fit, apply, *, row_budget=DEFAULT_POOLED_ROW_BUDGET,
+                               fit_turns, validation_turns, test_turns, hyperparams=None,
+                               serving=None, nu=None, torch_module=None):
+    """Turn-disjoint pooled probe on the three-partition corpus API.
 
-    PROBE_KEYS is the per-turn schema of one capture and stays unchanged; a
-    pooled corpus needs whole-turn held-out turns, so it is reported under its
-    own fixed key set. Per-turn capture limits are the same as probe_relation:
-    no turn is pooled outside the size the capture path can produce.
+    The corpus is bounded by the row budget, frozen into the fit/validation/test
+    split manifest, fitted on the FIT partition only and scored on the FINAL TEST
+    partition: the pooled number is an evaluate_map record, kept distinct per
+    raw/served view, never a gate. Per-turn capture limits are the same as
+    probe_relation: no turn is pooled outside the size the capture path can
+    produce.
     """
-    values = tuple(blocks)
-    require(len(values) >= 2, "profile")
+    torch = torch_module or _import_torch()
+    require(callable(fit) and callable(apply), "profile")
+    values = ordered_blocks(corpus)
     for block in values:
         require(2 <= block.rows <= 128 and block.hidden.shape[1] > 2 * block.rows, "profile")
-        require(block.embeddings.shape == block.hidden.shape, "profile")
-    split_turns(values, eval_stride=eval_stride)
-    return evaluate_turn_disjoint(values, row_budget=row_budget, eval_stride=eval_stride,
-                                  provenance=provenance)
+    selected, _ = select_calibration_rows(values, row_budget)
+    manifest = split_manifest(selected, fit_turns=fit_turns,
+                             validation_turns=validation_turns, test_turns=test_turns,
+                             torch_module=torch)
+    hyperparams = {} if hyperparams is None else dict(hyperparams)
+    artifact = fit(manifest["fit"], hyperparams, torch_module=torch)
+    record = evaluate_map(apply, artifact, manifest["test"], serving=serving, nu=nu,
+                          torch_module=torch)
+    validate_metrics_record(record)
+    return record

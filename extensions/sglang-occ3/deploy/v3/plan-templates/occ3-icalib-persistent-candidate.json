@@ -1,0 +1,171 @@
+{
+ "attempt_id": "occ3-icalib-wave3-persistent",
+ "base_url": "https://to-be-filled-at-window.invalid",
+ "candidate_image_id": "sha256:1111111111111111111111111111111111111111111111111111111111111111",
+ "docker_socket": "/var/run/docker.sock",
+ "ingress_base_url": "https://to-be-filled-at-window.invalid",
+ "mode": "production",
+ "model": "glm-5.3",
+ "native_validator": {
+  "admission_template": {
+   "fingerprint": "sha256:e48c4dc9b2abf7ed7f32a0f4cededc40978074511ec79e84b0670baa65e88180",
+   "identity": {
+    "architecture": "to-be-filled-at-window",
+    "chat_template_fingerprint": "to-be-filled-at-window",
+    "checkpoint_revision": "to-be-filled-at-window",
+    "kv_layout": "to-be-filled-at-window",
+    "latent_method": "statebridge.glm53.final-prenorm-predictor.calibrated-dual-ridge.v1",
+    "model_id": "glm-5.3",
+    "quantisation": "to-be-filled-at-window",
+    "runtime": "to-be-filled-at-window",
+    "tensor_geometry": "to-be-filled-at-window",
+    "tokenizer_fingerprint": "to-be-filled-at-window",
+    "weight_fingerprint": "to-be-filled-at-window"
+   },
+   "source_profile": {
+    "anchor_alpha": 0.0,
+    "calibration_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "calibration_path": "/occ3/calibration/to-be-filled-at-window-artifact",
+    "dtype": "bfloat16",
+    "expected_ranks": 8,
+    "hidden_dim": 6144,
+    "layer_index": 77,
+    "layout_strategy_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+    "max_active": 1,
+    "max_live_bytes": 268435456,
+    "max_prefix_tokens": 128,
+    "max_records": 256,
+    "max_ttl_seconds": 3600,
+    "method": "statebridge.glm53.final-prenorm-predictor.calibrated-dual-ridge.v1",
+    "model_fingerprint": "sha256:db2c8830820da8bd3370bbfacf0799e33085ef7b8b1ca27840b88e3e8101b732",
+    "model_id": "glm-5.3",
+    "tile_rows": 256,
+    "workspace_bytes": 134217728
+   }
+  },
+  "budget_resource_receipt": {
+   "receipt_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "review_digest": "0000000000000000000000000000000000000000000000000000000000000000",
+   "root_reviewed": true
+  },
+  "control_spec": {
+   "after_cases": [
+    "stale_handle_post",
+    "positive",
+    "no_state"
+   ],
+   "before_cases": [
+    "positive",
+    "no_state",
+    "stale_handle_pre"
+   ],
+   "max_attempts": 1,
+   "no_replay": true,
+   "one_shot": true
+  },
+  "credential_references": {
+   "api_key": "!occ3-icalib-wave3-key-reference",
+   "headers": {
+    "x-pomerium-authorization": "!occ3-icalib-wave3-pomerium-reference"
+   }
+  },
+  "endpoint": {
+   "control_root": "/occ3/v1/native/",
+   "inference_path": "/v1",
+   "origin": "https://to-be-filled-at-window.invalid"
+  },
+  "harness_artifact": {
+   "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "build_manifest_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "platform": "windows-x86_64"
+  },
+  "interface_versions": {
+   "challenge": "optimus.occ3.validator-phase-challenge.v1",
+   "control": [
+    "occ3.sessions.enroll.v1",
+    "occ3.publish.v1",
+    "occ3.publication.status.v1",
+    "occ3.retire.v1"
+   ],
+   "report": "optimus.occ3.native-phase-suite.v1"
+  },
+  "layout_strategy": {
+   "bound_at": "post_start_enrollment",
+   "observed_fields": [
+    "runtime_epoch",
+    "runtime_generation",
+    "tp_layout_digest",
+    "hidden_dim",
+    "layer_index",
+    "dtype",
+    "expected_ranks",
+    "ready_ranks"
+   ]
+  },
+  "max_budget": {
+   "context_window": 1048576,
+   "default_max_tokens": 131072,
+   "max_tokens": 262144,
+   "reasoning": true,
+   "thinking_level": "max"
+  },
+  "method_id": "statebridge.glm53.final-prenorm-predictor.calibrated-dual-ridge.v1",
+  "offline_selftest": {
+   "binary_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "exit_code": 0,
+   "report_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+  },
+  "source_manifest": {
+   "cargo_lock_sha256": "0000000000000000000000000000000000000000000000000000000000000000",
+   "files": {
+    "occ3_native_phase_suite.rs": "0000000000000000000000000000000000000000000000000000000000000000"
+   }
+  },
+  "static_input_sha256": "0000000000000000000000000000000000000000000000000000000000000000"
+ },
+ "original_id": "0000000000000000000000000000000000000000000000000000000000000000",
+ "original_image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+ "persistence_policy": "persist_candidate_on_success",
+ "preserved_original": {
+  "container_id": "0000000000000000000000000000000000000000000000000000000000000000",
+  "image_id": "sha256:0000000000000000000000000000000000000000000000000000000000000000",
+  "name": "to-be-filled-at-window"
+ },
+ "schema": "optimus.occ3.v3-plan.bootstrap.v1",
+ "to_be_filled_at_window": [
+  "original_id",
+  "original_image_id",
+  "candidate_image_id",
+  "preserved_original.container_id",
+  "preserved_original.image_id",
+  "preserved_original.name",
+  "base_url",
+  "ingress_base_url",
+  "native_validator.static_input_sha256",
+  "native_validator.harness_artifact.binary_sha256",
+  "native_validator.harness_artifact.build_manifest_sha256",
+  "native_validator.source_manifest.files",
+  "native_validator.source_manifest.cargo_lock_sha256",
+  "native_validator.offline_selftest.report_sha256",
+  "native_validator.offline_selftest.binary_sha256",
+  "native_validator.admission_template.identity.architecture",
+  "native_validator.admission_template.identity.checkpoint_revision",
+  "native_validator.admission_template.identity.weight_fingerprint",
+  "native_validator.admission_template.identity.tokenizer_fingerprint",
+  "native_validator.admission_template.identity.chat_template_fingerprint",
+  "native_validator.admission_template.identity.quantisation",
+  "native_validator.admission_template.identity.tensor_geometry",
+  "native_validator.admission_template.identity.kv_layout",
+  "native_validator.admission_template.identity.runtime",
+  "native_validator.admission_template.fingerprint",
+  "native_validator.admission_template.source_profile.layout_strategy_digest",
+  "native_validator.admission_template.source_profile.calibration_path",
+  "native_validator.admission_template.source_profile.calibration_digest",
+  "native_validator.budget_resource_receipt.receipt_sha256",
+  "native_validator.budget_resource_receipt.review_digest",
+  "native_validator.endpoint.origin",
+  "native_validator.credential_references.api_key",
+  "native_validator.credential_references.headers.x-pomerium-authorization"
+ ],
+ "validator": "native_handoff_v1"
+}

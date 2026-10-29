@@ -3347,6 +3347,11 @@ impl AgentSession {
         if !self.agent.set_native_state_hooks(state.receiver_resolver(),state.source_hooks()) {return Err("Native callbacks unsupported".into());}
         tools.push(state.handoff_tool(controller));
         self.agent.update_state(Box::new(move |live|live.tools=Some(tools)));
+        // A queued control body lands in the transcript only after this
+        // point; the restamp listener keeps its delivery marker in step with
+        // the receiver's record so the activity projection never
+        // misreports it as text.
+        state.install_delivery_restamp(Arc::clone(&self.agent))?;
         *installed=Some(state); Ok(())
     }
     pub fn experimental_native_occ3(&self) -> Option<Arc<occ3_state::Occ3NativeSession>> {
@@ -17101,6 +17106,48 @@ impl AgentSession {
             api_key,
             headers: resolved.headers.clone().unwrap_or_default(),
         })
+    }
+
+    /// Host-resolved control-plane credentials for the OCC-3 activation
+    /// handshake. The OCC-3 control plane is keyed to the provider the
+    /// session is already running on, so the credential this session
+    /// resolves for its own requests is the only credential activation may
+    /// use; nothing comes from `models.json`. Resolved headers are filtered
+    /// to the connector's control-header allowlist, so unapproved names
+    /// never reach the connector (which would refuse them before any HTTP).
+    /// A missing key is not an error: the deployment may be unkeyed.
+    pub async fn occ3_activation_credentials(
+        self: &Arc<Self>,
+        model: &Model,
+    ) -> Result<(Option<String>, Option<indexmap::IndexMap<String, String>>), String> {
+        let registry = self.model_registry.clone();
+        let request_model = model.clone();
+        let resolved = crate::core::sdk::with_model_registry(registry, move |registry| {
+            Box::pin(async move { registry.get_api_key_and_headers(&request_model).await })
+        })
+        .await
+        .unwrap_or_else(|error| crate::core::model_registry::ResolvedRequestAuth {
+            ok: false,
+            api_key: None,
+            headers: None,
+            error: Some(error),
+        });
+        if !resolved.ok {
+            return Err(resolved.error.unwrap_or_default());
+        }
+        let headers = resolved.headers.and_then(|headers| {
+            let filtered: indexmap::IndexMap<String, String> = headers
+                .into_iter()
+                .filter(|(name, _)| {
+                    crate::core::occ3_connectors::sglang::control_header_name_is_allowed(name)
+                })
+                .collect();
+            (!filtered.is_empty()).then_some(filtered)
+        });
+        Ok((
+            resolved.api_key.filter(|key| !key.is_empty()),
+            headers,
+        ))
     }
 
     /// The TS `catch` arm of `_runAutoCompaction` (agent-session.ts:9670-9714).

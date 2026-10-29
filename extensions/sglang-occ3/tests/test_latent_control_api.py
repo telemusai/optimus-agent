@@ -9,7 +9,7 @@ from starlette.requests import Request
 
 from occ3_sglang.latent_control_api import BrokerAuthority, create_router
 from occ3_sglang.latent_types import LatentError, SessionEnrollment, bounded_payload
-from occ3_sglang.attachment_contract import AttachmentError
+from occ3_sglang.attachment_contract import (AttachmentError, _SOURCE_RECEIPT_V1_FIELDS)
 from occ3_sglang import startup_state
 from test_latent_types import profile
 from test_latent_backend import SyntheticClient, health
@@ -252,5 +252,7 @@ async def test_real_backend_projection_fixture_epoch_and_generation_are_not_alia
     assert len(result["request_negatives"])==2 and len(result["response_negatives"])==4
     assert result["gpu_validated"] is False
     assert len(result["unchanged_source_contract"]["intent_fields"])==13
-    assert len(result["unchanged_source_contract"]["receipt_fields"])==21
+    # A v1 wire carries exactly the 21 v1 fields; the receipt type also carries
+    # the schema-gated v2 span block, so pin the v1 subset, not the total count.
+    assert set(_SOURCE_RECEIPT_V1_FIELDS) <= set(result["unchanged_source_contract"]["receipt_fields"])
     assert "runtime_id" not in result["unchanged_source_contract"]["receipt_fields"]

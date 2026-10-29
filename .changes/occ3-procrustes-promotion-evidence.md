@@ -1,0 +1,3 @@
+- Fixed method-B artifacts carrying no content digest: fitted Procrustes maps now pin their digest at fit, verify it at serialization and restore it on load, so validation evidence can be promoted through the shared gate like method A.
+- Added the promotion-evidence binding fields (validation record digest, measured-artifact digest, serving config) to the Procrustes binding with the same validation rules as method A, and describe() stays scalar-only by emitting the serving kind.
+- Removed the promotion-gate fallback comparing validation rows against fit rows, which falsely refused any map measured on a differently sized validation partition; the method and manifest-digest checks remain.

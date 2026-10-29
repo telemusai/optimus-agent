@@ -1,0 +1,2 @@
+- Pinned the Procrustes method module and the alignment dispatch module in the required attested plugin list, so an unattested copy of either cannot be swapped under a profile that names a calibrated method id.
+- Updated the capabilities advertisement tests to the registry contract (advertised method ids) instead of the stale empty-list pin from before the method registry existed.

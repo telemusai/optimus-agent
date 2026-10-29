@@ -351,6 +351,47 @@ def test_counts_follow_the_fixed_class_order():
     assert [span.count for span in audit.spans] == [1, 1, 0, 0, 1, 0]
 
 
+def test_alternate_reasoning_terminator_closes_thinking_at_tool_start():
+    # The GLM template lets tool_call_start close a thinking block with no
+    # thinking-end at all: the first of the two terminators wins.
+    audit = classify([1, 2, TOOL_BEGIN, 4, TOOL_END, MSG_END], reasoning_end_ids=(TOOL_BEGIN,))
+    assert audit.counts[THINKING] == 2
+    assert audit.counts[CONTENT] == 0
+    assert audit.contains_tool_call is True
+    # The window still holds no thinking-end occurrence.
+    assert audit.marker_occurrences[0] == ("thinking_end_ids", 0)
+
+
+def test_alternate_terminator_after_a_real_thinking_end_loses():
+    audit = classify([1, THINK, 3, TOOL_BEGIN, 4, TOOL_END, MSG_END], reasoning_end_ids=(TOOL_BEGIN,))
+    assert audit.counts[THINKING] == 1
+    assert audit.counts[CONTENT] == 1
+    assert audit.marker_occurrences[0] == ("thinking_end_ids", 1)
+
+
+def test_alternate_terminator_never_joins_marker_occurrences():
+    audit = classify([1, 2, TOOL_BEGIN, 4, TOOL_END, MSG_END], reasoning_end_ids=(TOOL_BEGIN,))
+    assert [name for name, _ in audit.marker_occurrences] == [
+        "thinking_end_ids", "tool_call_begin_ids", "tool_call_end_ids", "message_end_ids"]
+    assert audit.markers_supplied == ("thinking_end_ids", "tool_call_begin_ids",
+                                      "tool_call_end_ids", "message_end_ids")
+
+
+def test_alternate_terminator_inside_the_reasoning_head_declines():
+    with pytest.raises(SpanContractError):
+        classify([TOOL_BEGIN, 1, 2, THINK, 5, MSG_END], reasoning_end_ids=(TOOL_BEGIN,))
+
+
+def test_alternate_terminator_inside_the_tool_region_declines():
+    with pytest.raises(SpanContractError):
+        classify([1, THINK, 3, TOOL_BEGIN, 4, TOOL_END, MSG_END], reasoning_end_ids=(TOOL_END,))
+
+
+def test_alternate_terminator_overlapping_the_message_end_declines():
+    with pytest.raises(SpanContractError):
+        classify([1, 2, 3, MSG_END], reasoning_end_ids=(MSG_END,))
+
+
 def test_selection_unpacks_as_two_bounds():
     audit = classify([1, THINK, 2, 3])
     start, end = span_from_policy(audit, "final_content")

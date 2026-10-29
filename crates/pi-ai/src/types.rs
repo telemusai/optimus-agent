@@ -1245,6 +1245,16 @@ pub struct Occ3Capability {
     /// Preferred fallback chain, e.g. `["occ2", "occ1", "text"]`.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub fallback: Vec<String>,
+    /// Full dotted native method id the deployment binds to, e.g.
+    /// `statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1`.
+    /// Identity only: never a method implementation or artifact content.
+    /// Absent accepts the method the live handshake verifies.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub method: Option<String>,
+    /// sha256 digest of the frozen calibration artifact the deployment
+    /// binds to. Identity only: the artifact is never carried.
+    #[serde(rename = "artifactDigest", default, skip_serializing_if = "Option::is_none")]
+    pub artifact_digest: Option<String>,
 }
 
 fn default_true() -> bool {
@@ -1838,5 +1848,45 @@ mod tests {
         };
         let value = serde_json::to_value(&observation).unwrap();
         assert_eq!(value, json!({"inputTokens": null, "outputTokens": 12.0}));
+    }
+
+    #[test]
+    fn occ3_method_and_artifact_digest_are_optional_identity_fields() {
+        let base = json!({
+            "protocol": "occ3-v1",
+            "connector": "sglang",
+            "endpoint": "http://127.0.0.1:30001",
+            "apiVersion": "v1",
+            "sameModelOnly": true,
+            "enabled": true,
+            "validation": "live-verified",
+            "fallback": ["occ2", "occ1", "text"],
+        });
+        // An occ3-v1 block without the new keys still parses: adding the
+        // method/artifact identity fields changes no existing models.json.
+        let legacy: Occ3Capability = serde_json::from_value(base.clone()).unwrap();
+        assert_eq!(legacy.method, None);
+        assert_eq!(legacy.artifact_digest, None);
+        assert_eq!(serde_json::to_value(&legacy).unwrap(), base);
+        // The wire keys are `method` and `artifactDigest`; absent means
+        // unset, and serialization never invents keys.
+        let declared = json!({
+            "method": "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1",
+            "artifactDigest": "0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef",
+        });
+        let mut wire = base.clone();
+        for (key, value) in declared.as_object().unwrap() {
+            wire[key] = value.clone();
+        }
+        let capability: Occ3Capability = serde_json::from_value(wire.clone()).unwrap();
+        assert_eq!(
+            capability.method.as_deref(),
+            Some("statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1")
+        );
+        assert_eq!(
+            capability.artifact_digest.as_deref(),
+            Some("0123456789abcdef0123456789abcdef0123456789abcdef0123456789abcdef")
+        );
+        assert_eq!(serde_json::to_value(&capability).unwrap(), wire);
     }
 }

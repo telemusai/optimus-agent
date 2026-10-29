@@ -1,9 +1,11 @@
 """Tensor-free backend records. GPU objects live only in latent_worker/registry."""
 from __future__ import annotations
 
+import ast
 import math
 import os
 import re
+import sys
 from dataclasses import asdict, dataclass
 from typing import Any
 
@@ -13,6 +15,10 @@ from .attachment_contract import (CaptureWorkerDescriptor, ConsumeWorkerDescript
 METHOD = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1"
 ALIGNMENT = "union-subspace-procrustes.v1"
 HEX = re.compile(r"[0-9a-f]{64}\Z")
+_REGISTRY_MODULE_NAME = __package__ + ".native_profile"
+_REGISTRY_SOURCE = "native_profile.py"
+_REGISTRY_SOURCE_LIMIT = 2 * 1024 * 1024
+_METHOD_TABLE = {"method_id", "requires_calibration_artifact"}
 
 
 class LatentError(RuntimeError):
@@ -60,29 +66,153 @@ def require_members(checks, code="profile"):
         raise LatentError(code, members=failed)
 
 
-def advertised_method(value):
-    """True when value is a method id the native registry advertises.
+def _registry_constants(tree):
+    """Module-level constant assignments of one parsed module: name -> value."""
+    constants = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, (str, int, float, bool))):
+            constants[node.targets[0].id] = node.value.value
+    return constants
 
-    native_profile.py owns the one list of methods this build may pin, capture
-    or negotiate, so a profile names either the per-message method (the default
-    below) or the independent-calibration method, and never a copy of either.
-    The registry is imported lazily: latent_types must stay importable while
-    native_profile imports it.
+
+def _registry_value(node, environment):
+    """Evaluate one registry expression: a constant, a known name, or a sign."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in environment:
+        return environment[node.id]
+    if (isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
+            and type(node.operand.value) in (int, float)
+            and isinstance(node.op, (ast.USub, ast.UAdd))):
+        operand = node.operand.value
+        return -operand if isinstance(node.op, ast.USub) else operand
+    return None
+
+
+def _parsed_registry_table():
+    """The method table parsed from the registry source; no occ3_sglang import.
+
+    The model is the offline static parse the deployment packaging path uses:
+    only the registry's own constructs are understood and anything else fails
+    closed to None. Used only when the registry module itself cannot be
+    imported; a registry that is present but unusable (a stubbed embedded
+    host) never reaches this, only the local default stays nameable there.
+    """
+    try:
+        with open(os.path.join(os.path.dirname(__file__), _REGISTRY_SOURCE), "rb") as handle:
+            raw = handle.read(_REGISTRY_SOURCE_LIMIT + 1)
+    except OSError:
+        return None
+    if not 0 < len(raw) <= _REGISTRY_SOURCE_LIMIT:
+        return None
+    try:
+        tree = ast.parse(raw.decode("utf-8"), _REGISTRY_SOURCE)
+    except (SyntaxError, ValueError, UnicodeError, RecursionError):
+        return None
+    environment = dict(_registry_constants(tree))
+    for node in tree.body:
+        if (isinstance(node, ast.ImportFrom) and node.module and node.level >= 1
+                and re.fullmatch(r"[A-Za-z0-9_.]+", node.module) and "\\" not in node.module
+                and "/" not in node.module):
+            for alias in node.names:
+                if alias.name == "*":
+                    return None
+                try:
+                    sibling = os.path.join(os.path.dirname(__file__),
+                                           node.module.split(".")[-1] + ".py")
+                    with open(sibling, "rb") as handle:
+                        source = handle.read(_REGISTRY_SOURCE_LIMIT + 1)
+                    imported = ast.parse(source.decode("utf-8"), node.module)
+                except (OSError, SyntaxError, ValueError, UnicodeError, RecursionError):
+                    return None
+                constants = _registry_constants(imported)
+                if alias.name not in constants:
+                    return None
+                environment[alias.asname or alias.name] = constants[alias.name]
+    parameters = entry = None
+    for node in tree.body:
+        if (isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef))
+                and node.name == "_method_entry"):
+            arguments = node.args
+            if (arguments.posonlyargs or arguments.vararg or arguments.kwonlyargs
+                    or arguments.kwarg or arguments.defaults or entry is not None):
+                return None
+            parameters = [item.arg for item in arguments.args]
+            if (len(node.body) != 1 or not isinstance(node.body[0], ast.Return)
+                    or not isinstance(node.body[0].value, ast.Dict)):
+                return None
+            entry = node.body[0].value
+    if not parameters or entry is None:
+        return None
+    table = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id.endswith("_METHODS")
+                and isinstance(node.value, ast.DictComp) and len(node.value.generators) == 1
+                and isinstance(node.value.generators[0].iter, (ast.Tuple, ast.List))):
+            for call in node.value.generators[0].iter.elts:
+                if not (isinstance(call, ast.Call) and isinstance(call.func, ast.Name)
+                        and call.func.id == "_method_entry"):
+                    return None
+                bound = dict(zip(parameters, call.args))
+                for keyword in call.keywords:
+                    bound[keyword.arg] = keyword.value
+                if len(bound) != len(parameters):
+                    return None
+                scope = {name: _registry_value(value, environment)
+                         for name, value in bound.items()}
+                descriptor = {}
+                for key, value in zip(entry.keys, entry.values):
+                    if not (isinstance(key, ast.Constant) and isinstance(key.value, str)):
+                        return None
+                    descriptor[key.value] = _registry_value(value, scope)
+                if set(descriptor) < _METHOD_TABLE:
+                    return None
+                method_id, requires = descriptor["method_id"], descriptor["requires_calibration_artifact"]
+                if (type(method_id) is not str or type(requires) is not bool
+                        or method_id in table):
+                    return None
+                table[method_id] = requires
+    return table or None
+
+
+def _registered_table():
+    """Method ids the registry holds and whether each requires an artifact.
+
+    native_profile.py owns the one method table this build may name. The
+    registry is imported lazily (latent_types must stay importable while
+    native_profile imports it). When the registry module is present but
+    unusable, or no table can be read at all, only the per-message method
+    latent_types itself defines stays nameable, and it requires no artifact.
+    """
+    try:
+        from .native_profile import ProfileError, method_descriptor, registered_methods
+    except ImportError:
+        if _REGISTRY_MODULE_NAME in sys.modules:
+            return {METHOD: False}
+        return _parsed_registry_table() or {METHOD: False}
+    try:
+        return {method_id: method_descriptor(method_id)["requires_calibration_artifact"]
+                for method_id in registered_methods()}
+    except ProfileError:
+        # A registry that cannot describe its own entries is broken, not open.
+        return {METHOD: False}
+
+
+def advertised_method(value):
+    """True when value is a method id the native registry registers.
+
+    The registry decides which methods may be negotiated: the per-message
+    default below, the frozen dual-ridge method and the registered challengers.
+    An embedded host that stubs the registry can name only the local default.
     """
     if type(value) is not str:
         return False
-    try:
-        from .native_profile import ProfileError, advertised_methods
-    except ImportError:
-        # No usable registry in this host (an embedded or stubbed runtime): the
-        # per-message method is the only id latent_types itself defines, so no
-        # other id can be named and nothing else is accepted here.
-        return value == METHOD
-    try:
-        return value in advertised_methods()
-    except ProfileError:
-        # A registry that cannot describe its own entries is broken, not open.
-        return False
+    return value in _registered_table()
 
 
 def sha(value):
@@ -143,15 +273,16 @@ class RuntimeProfile:
     max_ttl_seconds: int = 3600
     anchor_alpha: float = 0.0
     tile_rows: int = 256
-    # An advertised native method id. The default is the per-message method, so
-    # an unpinned caller is unchanged; the independent-calibration method is a
-    # different id with its own artifact, never a reinterpretation of this one.
+    # A registered native method id. The default is the per-message method, so
+    # an unpinned caller is unchanged; the frozen calibration methods are
+    # different ids with their own artifacts, never a reinterpretation of this
+    # one. The registry decides which ids may be named here.
     method: str = METHOD
     # The frozen calibration artifact this profile is bound to: an absolute path
     # and the artifact_digest that the file at that path must contain. Both are
     # empty for the per-message method, which consumes no artifact. The worker
-    # resolves the pair through statebridge_calibrated.deserialize_artifact
-    # before any aligner exists, so a mismatched file is never loaded.
+    # resolves the pair through the method's own deserializer (registry
+    # dispatch) before any aligner exists, so a mismatched file is never loaded.
     calibration_path: str = ""
     calibration_digest: str = ""
 
@@ -177,7 +308,9 @@ class RuntimeProfile:
                     and "\0" not in self.calibration_path
                     and os.path.isabs(self.calibration_path), "profile")
             require(HEX.fullmatch(self.calibration_digest) is not None, "identity")
-            require(self.method != METHOD, "profile")
+            # Registry-driven, method-agnostic: a reference may only be carried
+            # by a method whose registry entry requires a calibration artifact.
+            require(_registered_table().get(self.method, False), "profile")
         require(self.max_active == 1 and 1 <= self.max_records <= 4096, "profile")
         require(0 < self.max_live_bytes <= 2**30 and 0 < self.workspace_bytes <= 2**30, "profile")
         require(self.anchor_alpha in (0.0, 0.3) and 1 <= self.tile_rows <= 4096, "profile")

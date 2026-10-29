@@ -18,44 +18,38 @@ Answer proved here (pinned SGLang e00930c5 / v0.5.21):
 
 No torch is imported and no SGLang module is loaded: the pinned source is read
 as text, and our arithmetic is mirrored in pure Python. Set
-``OCC3_SGLANG_SOURCE`` to the pinned, unpatched checkout; it defaults to the
-sibling reference checkout.
+``OCC3_SGLANG_SOURCE_BASE`` to the pristine pinned checkout (SGLang v0.5.21,
+commit e00930c5489053f26d86b179cee0d087f846acbb); it defaults to the sibling
+reference checkout. ``OCC3_SGLANG_SOURCE`` is deliberately not read here: that
+variable names the live patched source attested by the chat suites. See
+``_source_pins.py`` for the runbook.
 """
 from __future__ import annotations
 
 import hashlib
 import json
-import os
 from pathlib import Path
 
 import pytest
 
-HERE = Path(__file__).resolve()
-EXTENSION = HERE.parents[1]                     # extensions/sglang-occ3
-REPO = HERE.parents[3]                          # optimus-occ3-latent-validation
-DEFAULT_SOURCE = (REPO.parent / "occ3-latent-validation" / "references" / "sglang")
-SOURCE = Path(os.environ.get("OCC3_SGLANG_SOURCE") or DEFAULT_SOURCE)
-SRT = SOURCE / "python/sglang/srt"
+from _source_pins import (
+    DEFAULT_PRISTINE_ROOT, EXTENSION, needs_pristine_source, pinned, pristine_root,
+    srt_dir,
+)
+
+SOURCE = pristine_root()
+SRT = srt_dir(SOURCE)
 EAGLE_CUH = SOURCE / "python/sglang/kernels/jit/include/sgl_kernel/speculative/eagle.cuh"
 EAGLE_OPS = SOURCE / "python/sglang/kernels/ops/speculative/eagle.py"
 WORKER = EXTENSION / "occ3_sglang/latent_worker.py"
 PATCH_DIR = EXTENSION / "patches"
 CAPTURE_PATCH = PATCH_DIR / "capture-eager-mtp.v1.json"
 
-needs_source = pytest.mark.skipif(
-    not SRT.is_dir(), reason="pinned SGLang source absent; set OCC3_SGLANG_SOURCE"
-)
+needs_source = needs_pristine_source()
 
 
 def read(path) -> str:
     return Path(path).read_text(encoding="utf-8")
-
-
-def pinned(path) -> str:
-    """Text of a pinned-source file, or skip when the checkout is absent."""
-    if not Path(path).is_file():
-        pytest.skip(f"pinned SGLang source absent: {path} (set OCC3_SGLANG_SOURCE)")
-    return read(path)
 
 
 def once(text: str, snippet: str, where: str = "") -> int:
@@ -63,6 +57,42 @@ def once(text: str, snippet: str, where: str = "") -> int:
     found = text.count(snippet)
     assert found == 1, f"{where}: expected 1 occurrence of {snippet!r}, found {found}"
     return text.index(snippet)
+
+
+# --------------------------------------------------------------------------- #
+# The root this suite attests is the pristine checkout, never the live source
+# --------------------------------------------------------------------------- #
+def test_pristine_root_prefers_the_explicit_base_variable(monkeypatch, tmp_path):
+    monkeypatch.setenv("OCC3_SGLANG_SOURCE_BASE", str(tmp_path))
+    monkeypatch.setenv("OCC3_SGLANG_SOURCE", str(tmp_path / "live-extract"))
+    assert pristine_root() == tmp_path
+
+
+def test_pristine_root_ignores_the_live_source_variable(monkeypatch, tmp_path):
+    """The campaign env names the live extract with OCC3_SGLANG_SOURCE; that
+    partial patched tree must never silently become this suite's root."""
+    monkeypatch.delenv("OCC3_SGLANG_SOURCE_BASE", raising=False)
+    monkeypatch.setenv("OCC3_SGLANG_SOURCE", str(tmp_path))
+    assert pristine_root() == DEFAULT_PRISTINE_ROOT
+
+
+def test_pristine_root_default_is_the_reference_checkout(monkeypatch):
+    monkeypatch.delenv("OCC3_SGLANG_SOURCE_BASE", raising=False)
+    monkeypatch.delenv("OCC3_SGLANG_SOURCE", raising=False)
+    assert pristine_root() == DEFAULT_PRISTINE_ROOT
+
+
+def test_absent_pristine_root_skips_with_explicit_reason(monkeypatch, tmp_path):
+    missing = tmp_path / "absent-checkout"
+    monkeypatch.setenv("OCC3_SGLANG_SOURCE_BASE", str(missing))
+    mark = needs_pristine_source()
+    assert mark.args[0] is True
+    assert "OCC3_SGLANG_SOURCE_BASE" in mark.kwargs["reason"]
+    with pytest.raises(pytest.skip.Exception) as caught:
+        pinned(srt_dir(missing) / "speculative/eagle_utils.py")
+    message = str(caught.value)
+    assert "OCC3_SGLANG_SOURCE_BASE" in message
+    assert str(missing) in message
 
 
 # --------------------------------------------------------------------------- #

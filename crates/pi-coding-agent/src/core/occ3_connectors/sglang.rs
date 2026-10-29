@@ -17,11 +17,9 @@ use url::Url;
 
 use crate::core::occ::occ3::connector::{CaptureRequest, ConsumeRequest, Occ3Connector};
 use crate::core::occ::occ3::types::{
-    Occ3ConnectorCapabilities, Occ3Error, Occ3HandleRef, Occ3ModelIdentity, Occ3TransferMetrics,
+    Occ3ConnectorCapabilities, Occ3Error, Occ3HandleRef, Occ3Method, Occ3ModelIdentity,
+    Occ3TransferMetrics,
 };
-
-#[cfg(test)]
-use crate::core::occ::occ3::types::Occ3Method;
 
 pub const CONNECTOR_ID: &str = "sglang-occ3";
 
@@ -208,6 +206,21 @@ impl SglangOcc3Connector {
         }
         Ok(body)
     }
+
+    /// Current-incarnation runtime readiness from the live control plane.
+    /// The production activation path mints its experimental permit from
+    /// this handshake; it never fabricates an identity, a profile or a
+    /// live-verified record.
+    pub async fn runtime_identity(&self) -> Result<NativeRuntimeIdentity, Occ3Error> {
+        let body = serde_json::json!({"schema":"occ3.runtime.identity.request.v1"});
+        let identity: NativeRuntimeIdentity = self
+            .control("/occ3/v1/native/runtime/identity", &body)
+            .await?;
+        if !identity.is_self_consistent() {
+            return Err(native_invalid());
+        }
+        Ok(identity)
+    }
 }
 
 /// An explicit process-local experimental permit. Never deserialized from
@@ -265,6 +278,58 @@ impl std::fmt::Debug for NativeExperiment {
         f.write_str("NativeExperiment(<private>)")
     }
 }
+/// Current-incarnation runtime readiness from the live control plane
+/// (`POST /occ3/v1/native/runtime/identity`). Every field is
+/// server-attested; production activation mints its experimental permit
+/// from this handshake instead of fabricating an identity or a profile.
+#[derive(Debug, Clone, serde::Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct NativeRuntimeIdentity {
+    pub schema: String,
+    pub runtime_id: String,
+    pub runtime_generation: u64,
+    pub model_fingerprint: String,
+    pub method_id: String,
+    pub tp_layout_digest: String,
+    pub layer_index: u32,
+    pub hidden_dim: u32,
+    pub dtype: String,
+    pub expected_ranks: u32,
+    pub ready_ranks: u32,
+    pub profile_digest: String,
+    pub source_capture: bool,
+    pub continuous_prefix: bool,
+    pub terminal_journal: bool,
+    pub server_time_epoch: u64,
+    pub max_ttl_seconds: u64,
+    pub max_capture_bytes: u64,
+}
+
+impl NativeRuntimeIdentity {
+    /// The server-attested readiness must be a complete, self-consistent
+    /// incarnation: schema pinned, identifiers and digests well-formed,
+    /// ranks complete, capture features on, and a bounded live TTL/cap.
+    /// Only the shape is checked; identity binding is the caller's
+    /// exact-equality check.
+    pub fn is_self_consistent(&self) -> bool {
+        self.schema == "occ3.runtime.identity.v1"
+            && native_id(&self.runtime_id)
+            && native_id(&self.method_id)
+            && native_digest(&self.profile_digest)
+            && native_digest(&self.tp_layout_digest)
+            && self.expected_ranks > 0
+            && self.ready_ranks == self.expected_ranks
+            && self.hidden_dim > 0
+            && matches!(self.dtype.as_str(), "bfloat16" | "float16" | "float32")
+            && self.source_capture
+            && self.continuous_prefix
+            && self.terminal_journal
+            && self.max_ttl_seconds > 0
+            && self.max_ttl_seconds <= 86400
+            && self.max_capture_bytes > 0
+    }
+}
+
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
 struct NativeReadiness {
@@ -329,14 +394,14 @@ fn native_now() -> u64 {
         .unwrap_or_default()
         .as_secs()
 }
-fn native_id(value: &str) -> bool {
+pub(crate) fn native_id(value: &str) -> bool {
     !value.is_empty()
         && value.len() <= 256
         && value
             .bytes()
             .all(|v| v.is_ascii_alphanumeric() || b"._:-/".contains(&v))
 }
-fn native_digest(value: &str) -> bool {
+pub(crate) fn native_digest(value: &str) -> bool {
     value.len() == 64
         && value
             .bytes()
@@ -346,6 +411,13 @@ fn native_invalid() -> Occ3Error {
     Occ3Error::TransferFailed {
         reason: "native control binding invalid".into(),
     }
+}
+/// The negotiation family the permit's full dotted method id names. The
+/// envelope, the bind lease and the capability advertisement all derive
+/// it from the same server-attested method id, never from a constant.
+fn permit_method(native: &NativeExperiment) -> Result<Occ3Method, Occ3Error> {
+    crate::core::occ3_connectors::method_family(&native.permit.identity.latent_method)
+        .ok_or_else(native_invalid)
 }
 fn native_uncertain(message_id: &str) -> Occ3Error {
     Occ3Error::InferenceOutcomeUncertain {
@@ -725,7 +797,7 @@ impl Occ3Connector for SglangOcc3Connector {
         request: crate::core::occ::occ3::connector::NativePublicationRequest,
     ) -> Result<crate::core::occ::occ3::connector::NativePublication, Occ3Error> {
         use crate::core::occ::occ3::connector::NativePublication;
-        use crate::core::occ::occ3::types::{Occ3Envelope, Occ3Method};
+        use crate::core::occ::occ3::types::Occ3Envelope;
         let native = self.experiment()?;
         let intent = request.source.intent();
         let receipt = request.source.receipt().ok_or_else(native_invalid)?;
@@ -835,7 +907,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 model_fingerprint: native.permit.identity.fingerprint(),
                 runtime_id: native.permit.runtime_id.clone(),
                 connector_id: CONNECTOR_ID.into(),
-                latent_method: Occ3Method::StatebridgePrefix,
+                latent_method: permit_method(native)?,
                 state_handle: Occ3HandleRef {
                     handle_id: receipt.source_handle,
                     connector_id: CONNECTOR_ID.into(),
@@ -895,7 +967,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 model_identity: native.permit.identity.clone(),
                 runtime_id: native.permit.runtime_id.clone(),
                 generation: native.permit.runtime_generation,
-                methods: vec![crate::core::occ::occ3::types::Occ3Method::StatebridgePrefix],
+                methods: vec![permit_method(native)?],
             },
         )?;
         let lease =
@@ -983,7 +1055,7 @@ impl Occ3Connector for SglangOcc3Connector {
             protocol_version: 1,
             connector_version: "experimental-native-v1".into(),
             model_identity: native.permit.identity.clone(),
-            methods: vec![crate::core::occ::occ3::types::Occ3Method::StatebridgePrefix],
+            methods: vec![permit_method(native)?],
             tensor_formats: vec![native.permit.source_profile.dtype.clone()],
             max_state_bytes: native.permit.max_capture_bytes,
             state_ttl_seconds: native.permit.expires_at_epoch.saturating_sub(native_now()),

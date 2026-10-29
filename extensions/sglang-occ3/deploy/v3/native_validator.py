@@ -36,7 +36,6 @@ import time
 from urllib.parse import urlsplit
 
 VALIDATOR_KEY = "native_handoff_v1"
-METHOD_ID = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1"
 PHASES = ("before_restart", "after_restart")
 REPORT_SCHEMA = "optimus.occ3.native-phase-suite.v1"
 CHALLENGE_SCHEMA = "optimus.occ3.validator-phase-challenge.v1"
@@ -57,10 +56,31 @@ ADMISSION_FIELDS = ("method_id", "harness_artifact", "source_manifest", "interfa
                     "offline_selftest", "admission_template", "budget_resource_receipt",
                     "max_budget", "layout_strategy", "endpoint", "credential_references",
                     "control_spec")
+# A non-default registered method has no in-repo static derivation input file,
+# so its plan declares the digest of the per-method static input it was built
+# from; the per-phase pins must re-pin exactly that declared digest.
+STATIC_INPUT_FIELD = "static_input_sha256"
+# The pinned static profile fields every method shares. dtype and
+# layout_strategy_digest are admission-time observations and are deliberately
+# excluded from the per-boot derivation receipt.
+DERIVATION_STATIC_FIELDS = ("model_fingerprint", "model_id", "expected_ranks", "hidden_dim",
+                            "layer_index", "max_prefix_tokens", "max_live_bytes",
+                            "workspace_bytes", "max_records", "max_active", "max_ttl_seconds",
+                            "anchor_alpha", "tile_rows", "method")
+CALIBRATION_REFERENCE_FIELDS = ("calibration_path", "calibration_digest")
+# Shared admission source_profile fields for every registered method. The
+# registry adds the calibration reference for artifact-requiring methods.
+SOURCE_PROFILE_FIELDS = ("dtype", "expected_ranks", "layer_index", "hidden_dim",
+                         "layout_strategy_digest", "model_fingerprint", "model_id",
+                         "method", "anchor_alpha", "max_prefix_tokens", "max_live_bytes",
+                         "workspace_bytes", "max_records", "max_active", "max_ttl_seconds",
+                         "tile_rows")
 PIN_FIELDS = ("schema", "phase", "attempt_id", "static_input_sha256", "runtime_epoch",
               "runtime_generation", "profile_digest", "written_at")
-# Per-phase pin files re-pin the static derivation input by file digest:
-# deploy/native-build-inputs/native-profile-input.json.
+# Per-phase pin files re-pin the static derivation input by file digest. The
+# registry-default per-message method pins the reviewed file
+# deploy/native-build-inputs/native-profile-input.json; every other registered
+# method re-pins the per-method static input digest its plan declared.
 PIN_STATIC_INPUT_SHA256 = "6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a"
 REPORT_COMMON_FIELDS = ("schema", "phase", "attempt_id", "candidate_id",
                          "candidate_started_at", "validator_challenge", "harness", "binding",
@@ -231,6 +251,60 @@ def _fingerprint(value, code):
     return value
 
 
+def _method_registry():
+    """The shared method registry: the only place a native method id is defined.
+
+    Imported lazily so the offline adapter itself stays import-light; the
+    registry module is metadata-only (no torch, no sglang). Any registry
+    failure is a fixed refusal, never a bypass to a hardcoded method.
+    """
+    try:
+        from occ3_sglang import native_profile
+    except ImportError:
+        raise _Reject("method_registry_unavailable") from None
+    return native_profile
+
+
+def _method_descriptor(method_id):
+    """Registry descriptor for one admitted method id, or a fixed refusal."""
+    registry = _method_registry()
+    try:
+        descriptor = registry.method_descriptor(method_id)
+    except Exception:
+        raise _Reject("method_mismatch") from None
+    return registry, method_id, descriptor
+
+
+def _method_profile_fields(descriptor):
+    """Exact admission source_profile fieldset for one registered method.
+
+    Shared static fields for every method, plus the frozen-artifact
+    reference exactly when the registry says the method requires a
+    calibration artifact, plus any extra per-method profile fields the
+    registry descriptor declares.
+    """
+    fields = list(SOURCE_PROFILE_FIELDS)
+    if descriptor["requires_calibration_artifact"]:
+        fields += list(CALIBRATION_REFERENCE_FIELDS)
+    fields += sorted(frozenset(descriptor.get("profile_fields") or ()))
+    return tuple(fields)
+
+
+def _method_derivation_fields(descriptor):
+    """Static fields inside the per-boot profile digest for one method.
+
+    The per-message derivation stays byte-identical to the frozen wire
+    contract; an artifact-requiring method additionally binds its
+    calibration reference, so a swapped artifact can never reuse a
+    readiness record.
+    """
+    fields = list(DERIVATION_STATIC_FIELDS)
+    if descriptor["requires_calibration_artifact"]:
+        fields += list(CALIBRATION_REFERENCE_FIELDS)
+    fields += sorted(frozenset(descriptor.get("profile_fields") or ()))
+    return tuple(fields)
+
+
 def _string(value, code, *, limit=256, allow_empty=False):
     _require(isinstance(value, str) and (bool(value) or allow_empty)
              and len(value) <= limit, code)
@@ -279,28 +353,17 @@ def _derived_profile_digest(profile, observed):
     dataclasses.asdict(RuntimeProfile)): sha256 of the canonical JSON -
     sorted keys, compact separators, ASCII escapes, NaN refused - of the
     pinned STATIC profile fields plus runtime_epoch/runtime_generation as
-    observed in the harness report. The wire profile_digest is
-    incarnation-bound (fresh per boot), so it is recomputed here as the
-    anti-fabrication derivation receipt and never statically pinned.
+    observed in the harness report. The fieldset is the method's own
+    (registry-declared): an artifact-requiring method binds its calibration
+    reference too, so a swapped artifact can never reuse a readiness record.
+    The wire profile_digest is incarnation-bound (fresh per boot), so it is
+    recomputed here as the anti-fabrication derivation receipt and never
+    statically pinned.
     """
-    value = {
-        "model_fingerprint": profile["model_fingerprint"],
-        "model_id": profile["model_id"],
-        "expected_ranks": profile["expected_ranks"],
-        "hidden_dim": profile["hidden_dim"],
-        "layer_index": profile["layer_index"],
-        "max_prefix_tokens": profile["max_prefix_tokens"],
-        "max_live_bytes": profile["max_live_bytes"],
-        "workspace_bytes": profile["workspace_bytes"],
-        "max_records": profile["max_records"],
-        "max_active": profile["max_active"],
-        "max_ttl_seconds": profile["max_ttl_seconds"],
-        "anchor_alpha": profile["anchor_alpha"],
-        "tile_rows": profile["tile_rows"],
-        "method": profile["method"],
-        "runtime_epoch": observed["runtime_epoch"],
-        "runtime_generation": observed["runtime_generation"],
-    }
+    _, _, descriptor = _method_descriptor(profile["method"])
+    value = {name: profile[name] for name in _method_derivation_fields(descriptor)}
+    value["runtime_epoch"] = observed["runtime_epoch"]
+    value["runtime_generation"] = observed["runtime_generation"]
     try:
         body = json.dumps(value, separators=(",", ":"), sort_keys=True,
                           ensure_ascii=True, allow_nan=False)
@@ -320,11 +383,36 @@ class NativeHandoffValidator:
         self._challenge_factory = challenge_factory
         self._state = state
         self._before_binding = None
+        # Validated method identity, set once _pinned_inputs consults the
+        # registry; results before validation report the declared value only.
+        self._validated_method = None
+
+    def _declared_method(self):
+        block = self.plan.get("native_validator") if isinstance(self.plan, dict) else None
+        value = block.get("method_id") if isinstance(block, dict) else None
+        return value if isinstance(value, str) else None
+
+    def _method(self):
+        """The plan's validated registry method (id, registry, descriptor)."""
+        if self._validated_method is not None:
+            return self._validated_method
+        self._validated_method = _method_descriptor(self._declared_method())
+        return self._validated_method
+
+    def _expected_static_input(self):
+        """Static derivation input digest this plan's per-phase pins re-pin."""
+        registry, method_id, _ = self._method()
+        block = self.plan["native_validator"]
+        if method_id == registry.PER_MESSAGE_METHOD:
+            return PIN_STATIC_INPUT_SHA256
+        _sha_field(block[STATIC_INPUT_FIELD], "static_input_digest_invalid")
+        return block[STATIC_INPUT_FIELD]
 
     # -- shared result shapes -------------------------------------------------
     def _result(self, ok, phase, status, code=None, **details):
+        method = self._validated_method[1] if self._validated_method else self._declared_method()
         result = {"ok": ok is True, "scope": "native_handoff_method_v1",
-                  "validator": VALIDATOR_KEY, "method_id": METHOD_ID,
+                  "validator": VALIDATOR_KEY, "method_id": method,
                   "phase": phase, "status": status, "code": code,
                   "gpu_proof": False, "physical_gpu_free_proven": False,
                   "live_success_claimed": False,
@@ -367,13 +455,21 @@ class NativeHandoffValidator:
         # Depth-bound the admission document itself before structural checks.
         serialized = json.dumps(block, default=str)
         _require(_json_depth_ok(serialized.encode("utf-8")), "malformed_json")
-        _require(block.get("method_id") == METHOD_ID, "method_mismatch")
-        _exact_fields(block, ADMISSION_FIELDS, "admission_fieldset_invalid")
+        # Registry-driven method admission: only ids the installed registry
+        # advertises validate; a bogus or missing method string is refused.
+        registry, method_id, descriptor = _method_descriptor(block.get("method_id"))
+        fields = ADMISSION_FIELDS
+        if method_id != registry.PER_MESSAGE_METHOD:
+            fields = ADMISSION_FIELDS + (STATIC_INPUT_FIELD,)
+        _exact_fields(block, fields, "admission_fieldset_invalid")
+        if STATIC_INPUT_FIELD in fields:
+            _sha_field(block[STATIC_INPUT_FIELD], "static_input_digest_invalid")
+        self._validated_method = (registry, method_id, descriptor)
         self._check_harness(block["harness_artifact"])
         self._check_source_manifest(block["source_manifest"])
         self._check_interface_versions(block["interface_versions"])
         self._check_offline_selftest(block["offline_selftest"], block["harness_artifact"])
-        self._check_admission_template(block["admission_template"])
+        self._check_admission_template(block["admission_template"], method_id, descriptor)
         self._check_budget(block["budget_resource_receipt"], block["max_budget"])
         self._check_layout_strategy(block["layout_strategy"])
         self._check_endpoint(block["endpoint"])
@@ -415,23 +511,22 @@ class NativeHandoffValidator:
         _require(value["binary_sha256"] == harness["binary_sha256"],
                  "offline_selftest_binary_mismatch")
 
-    def _check_admission_template(self, value):
+    def _check_admission_template(self, value, method_id, descriptor):
         value = _exact_fields(value, ("identity", "fingerprint", "source_profile"),
                               "admission_template_invalid")
         identity = _exact_fields(value["identity"], IDENTITY_FIELDS, "identity_fieldset_invalid")
         for field in IDENTITY_FIELDS:
             _string(identity[field], "identity_field_invalid")
-        _require(identity["latent_method"] == METHOD_ID, "identity_method_mismatch")
+        _require(identity["latent_method"] == method_id, "identity_method_mismatch")
         _require(value["fingerprint"] == "sha256:" + _canonical_sha256(identity),
                  "identity_fingerprint_mismatch")
         _fingerprint(value["fingerprint"], "identity_fingerprint_invalid")
+        # Per-method fieldset: every registered method shares the static
+        # profile fields; the registry adds the frozen-artifact reference
+        # exactly for methods that require a calibration artifact (and never
+        # for the per-message method, which consumes none).
         profile = _exact_fields(value["source_profile"],
-                                ("dtype", "expected_ranks", "layer_index", "hidden_dim",
-                                 "layout_strategy_digest", "model_fingerprint",
-                                 "model_id", "method", "anchor_alpha", "max_prefix_tokens",
-                                 "max_live_bytes", "workspace_bytes", "max_records",
-                                 "max_active", "max_ttl_seconds", "tile_rows"),
-                                "source_profile_invalid")
+                                _method_profile_fields(descriptor), "source_profile_invalid")
         _require(profile["dtype"] in DTYPES, "source_dtype_unsupported")
         _require(profile["expected_ranks"] == 8, "expected_ranks_not_tp8")
         _uint(profile["layer_index"], "layer_index_invalid")
@@ -442,11 +537,21 @@ class NativeHandoffValidator:
         # OBSERVED pins moved OUT of this pre-boot-frozen admission: they
         # arrive as write-once attempt-dir pin files (admission-pin-<phase>.json,
         # _load_phase_pin) verified per phase in _verify_report.
-        # Static derivation fieldset (equals native-build-inputs/
-        # native-profile-input.json); recomputed per phase in _verify_report.
+        # Static derivation fieldset (per method; the per-message set equals
+        # native-build-inputs/native-profile-input.json); recomputed per phase.
         _string(profile["model_fingerprint"], "source_model_fingerprint_invalid", limit=128)
         _string(profile["model_id"], "source_model_id_invalid", limit=128)
-        _require(profile["method"] == METHOD_ID, "source_method_mismatch")
+        _require(profile["method"] == method_id, "source_method_mismatch")
+        if descriptor["requires_calibration_artifact"]:
+            path = profile["calibration_path"]
+            _require(isinstance(path, str) and 0 < len(path) <= 512 and path.isprintable()
+                     and os.path.isabs(path), "source_calibration_path_invalid")
+            _sha_field(profile["calibration_digest"], "source_calibration_digest_invalid")
+        for name in sorted(frozenset(descriptor.get("profile_fields") or ())):
+            extra = profile[name]
+            _require(type(extra) in (int, float, str) and not isinstance(extra, bool)
+                     and (math.isfinite(extra) if type(extra) is float
+                          else len(str(extra)) <= 256), "source_profile_invalid")
         _require(type(profile["anchor_alpha"]) in (int, float)
                  and math.isfinite(profile["anchor_alpha"]), "source_anchor_alpha_invalid")
         _uint(profile["max_prefix_tokens"], "max_prefix_tokens_invalid", positive=True)
@@ -547,7 +652,7 @@ class NativeHandoffValidator:
             "attempt_id": state["attempt_id"], "candidate_id": state["candidate_id"],
             "expected_candidate_started_at": started_at,
             "model_fingerprint": self._pinned_fingerprint(),
-            "method_id": METHOD_ID,
+            "method_id": self._method()[1],
             "expected_ranks": self._pinned_ranks(),
             "challenge": self._challenge_factory(),
             "created_at": int(time.time()),
@@ -616,7 +721,7 @@ class NativeHandoffValidator:
         template = pinned["admission_template"]
         _require(binding["identity_fingerprint"] == template["fingerprint"],
                  "report_identity_binding_mismatch")
-        _require(binding["method_id"] == METHOD_ID, "report_method_mismatch")
+        _require(binding["method_id"] == self._method()[1], "report_method_mismatch")
         _require(binding["endpoint_origin"] == pinned["endpoint"]["origin"],
                  "report_origin_binding_mismatch")
         observed = self._verify_observed(report["observed"], challenge)
@@ -675,7 +780,7 @@ class NativeHandoffValidator:
         _require(pin["phase"] == phase, "pin_phase_mismatch")
         _require(pin["attempt_id"] == challenge["attempt_id"], "pin_attempt_binding_mismatch")
         _sha_field(pin["static_input_sha256"], "pin_static_input_invalid")
-        _require(pin["static_input_sha256"] == PIN_STATIC_INPUT_SHA256,
+        _require(pin["static_input_sha256"] == self._expected_static_input(),
                  "pin_static_input_mismatch")
         _string(pin["runtime_epoch"], "pin_epoch_invalid", limit=256)
         _uint(pin["runtime_generation"], "pin_generation_invalid", positive=True)

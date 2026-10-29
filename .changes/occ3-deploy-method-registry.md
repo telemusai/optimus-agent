@@ -1,0 +1,3 @@
+- Fixed native deployment validation rejecting calibrated-method profiles: the validator now consults the shared method registry with per-method admission and source-profile fieldsets, calibration references required exactly when the registry demands them, and readiness invalidation on method/artifact/profile/generation changes.
+- Fixed the offline package build importing runtime modules: profile parsing now reads the registry by AST without importing the package.
+- Added capability advertisement of registered alignment methods and a persistent-candidate deployment plan for the calibration campaign.

@@ -1,0 +1,2 @@
+- Added the spec section 13 numerical and leakage battery: all 20 items across both calibration methods, including conditioned dual/primal agreement, explicit SPD checks, the cached-factor path, no-signal honesty through the shared gate, and cross-method artifact refusals.
+- Added a GPU parity suite for the same fixtures that skips cleanly on hosts without CUDA and runs the exact arithmetic comparisons on the target GPU during the live window.

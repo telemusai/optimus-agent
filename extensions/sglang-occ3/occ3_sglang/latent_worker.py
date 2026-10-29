@@ -7,19 +7,23 @@ from __future__ import annotations
 
 import hashlib
 import logging
+import os
+import queue
+import threading
 import time
 from array import array
 from dataclasses import asdict, dataclass
 from typing import Any
 
 from .attachment_contract import (CaptureWorkerDescriptor, ConsumeWorkerDescriptor,
-                                    MAX_CAPTURE_BYTES, digest)
+                                    MAX_CAPTURE_BYTES, SPAN_POLICY_V1, SPAN_POLICIES_V2, digest)
+from .span_policy import marker_table_from_wire, select_span_v2
 from .latent_registry import LatentRegistry
 from .latent_types import (LatentError, UniformRequestCancellation, Publication, RequestSlice, RuntimeProfile, require_members,
                            SessionEnrollment, decode_descriptor, require,
                            validate_control_payload)
 from .prefix_layout import prefix_span
-from .alignment_dispatch import aligner_for, load_frozen_artifact
+from .alignment_dispatch import aligner_for, artifact_resident_bytes, load_frozen_artifact
 from .statebridge import (anchor_tiled, mean_embedding_norm, shard_ranges, workspace_bound)
 
 logger = logging.getLogger(__name__)
@@ -45,6 +49,348 @@ def _decline_code(error):
         return "latent_" + error.code
     name = type(error).__name__
     return "exception_" + name if name.isidentifier() else "exception_unknown"
+
+
+def _serving_renorm(aligner):
+    """True when the negotiated method renormalises rows to the target norm.
+
+    The aligner exposes the serving config it will apply: N0 (None) skips the
+    renorm step, N1 and the per-message solver need the vocabulary-norm
+    statistic the worker measures from the frozen embedding matrix.
+    """
+    return getattr(aligner, "serving", None) is not None
+
+
+class _ContentState:
+    """Bounded v2 retention for one capture turn (doc section 4.4 content buffer).
+
+    The v1 ring is a plain round-robin over every accepted row, so a long
+    tool-call tail overwrites the answer rows before align ever runs. The v2
+    selector must still prove the reasoning terminator and the first
+    tool-call-start, so this buffer retains exactly the rows those rules
+    need: the thinking-end marker rows (head segment), a bounded suffix of
+    the content rows (ring segment), and the tool-call-start marker rows
+    (tail segment). Marker rows are pinned; only content rows evict.
+
+    Rows arrive per commit in accepted order. A pending window bounded by
+    the widest marker sequence resolves markers across chunk boundaries;
+    rows only enter the content segment once they leave that window, so no
+    marker row is ever misfiled as content.
+    """
+
+    __slots__ = ("table", "stop_ids", "capacity", "content_capacity", "hidden", "tokens",
+                 "positions", "window", "head_len", "tool_len", "head_count", "tool_count",
+                 "content_count", "overrun", "phase", "pending", "released")
+
+    def __init__(self, table, stop_ids, capacity):
+        self.table, self.stop_ids, self.capacity = table, stop_ids, capacity
+        self.head_len, self.tool_len = len(table.thinking_end_ids), len(table.tool_call_start_ids)
+        # Marker rows are pinned in their own segments, so the profile declines
+        # a marker set that would leave no content slot at all.
+        if self.head_len + self.tool_len + 1 > capacity:
+            raise LatentError("profile")
+        self.content_capacity = capacity - self.head_len - self.tool_len
+        self.hidden = self.tokens = self.positions = None
+        self.window = max(self.head_len, self.tool_len, len(table.turn_end_ids))
+        self.head_count = self.tool_count = self.content_count = 0
+        self.overrun = False
+        self.phase = "reasoning"
+        self.pending = []
+        self.released = False
+
+    def release(self):
+        """Drop every tensor reference; idempotent."""
+        self.hidden = self.tokens = self.positions = None
+        self.pending = []
+        self.released = True
+
+    def _write(self, slot, token, position, row):
+        self.hidden[slot].copy_(row)
+        self.tokens[slot] = token
+        self.positions[slot] = int(position)
+
+    def _take_marker(self, ids, segment):
+        entries = self.pending[-len(ids):]
+        for entry in entries:
+            entry[3] = "marker"
+        if segment == "head":
+            for offset, (token, position, row, _kind) in enumerate(entries):
+                self._write(offset, token, position, row)
+            self.head_count = 1
+        elif segment == "tool":
+            base_slot = self.capacity - self.tool_len
+            for offset, (token, position, row, _kind) in enumerate(entries):
+                self._write(base_slot + offset, token, position, row)
+            self.tool_count = 1
+
+    def _tail(self, ids):
+        if len(self.pending) < len(ids):
+            return False
+        return tuple(entry[0] for entry in self.pending[-len(ids):]) == tuple(ids)
+
+    def _match(self):
+        if self.phase == "reasoning" and self._tail(self.table.thinking_end_ids):
+            self._take_marker(self.table.thinking_end_ids, "head")
+            self.phase = "content"
+            return
+        if self._tail(self.table.tool_call_start_ids):
+            self._take_marker(self.table.tool_call_start_ids, "tool")
+            self.phase = "tool"
+            return
+        if self.phase == "content" and self._tail(self.table.turn_end_ids):
+            self._take_marker(self.table.turn_end_ids, "turn_end")
+            self.phase = "turn_end"
+
+    def _evict(self):
+        token, position, row, kind = self.pending.pop(0)
+        if kind == "content":
+            slot = self.head_len + (self.content_count % self.content_capacity)
+            self._write(slot, token, position, row)
+            self.content_count += 1
+            if self.content_count > self.content_capacity:
+                self.overrun = True
+
+    def feed(self, tokens, hidden, positions):
+        """Absorb one committed chunk (stage rows, accepted order)."""
+        if self.released:
+            raise LatentError("profile")
+        if self.hidden is None:
+            self.hidden = hidden.new_empty((self.capacity, int(hidden.shape[-1])))
+            self.tokens = tokens.new_empty(self.capacity)
+            self.positions = positions.new_empty(self.capacity)
+        for index in range(int(tokens.shape[0])):
+            token, position = int(tokens[index]), int(positions[index])
+            if self.phase == "content" and token not in self.stop_ids:
+                kind = "content"
+            elif token in self.stop_ids:
+                kind = "stop"
+            else:
+                kind = self.phase
+            self.pending.append([token, position, hidden[index], kind])
+            if self.phase in ("reasoning", "content"):
+                self._match()
+            while len(self.pending) > self.window:
+                self._evict()
+
+    def flush(self):
+        """Resolve the pending tail at turn end (align time)."""
+        while self.pending:
+            self._evict()
+
+    def rows(self):
+        """(position, token, slot) of the retained rows, in position order."""
+        slots = list(range(self.head_len)) if self.head_count else []
+        kept = min(self.content_count, self.content_capacity)
+        slots += [self.head_len + (index % self.content_capacity) for index in range(kept)]
+        if self.tool_count:
+            slots += list(range(self.capacity - self.tool_len, self.capacity))
+        return sorted((int(self.positions[slot]), int(self.tokens[slot]), slot) for slot in slots)
+
+
+def _env_turns(name, default):
+    """One bounded split-target knob: a plain int or the module default."""
+    value = os.environ.get(name, "")
+    if not value:
+        return int(default)
+    require(value == value.strip() and value.isdigit() and 1 <= int(value) <= 2 ** 31, "profile")
+    return int(value)
+
+
+def _release_content_state(record):
+    """Idempotent release of the v2 content buffer, if any."""
+    state = getattr(record, "occ3_content_state", None)
+    if state is not None:
+        state.release()
+
+
+def _prepare_v2_window(runtime, record, req, prepared):
+    """The v2 align preparation: merged ring + content window, then selection.
+
+    The retained window is the position-ordered union of the v1 ring (the
+    last rows, tool tail included) and the content buffer (terminator,
+    content suffix, tool-call-start marker). Row identity is verified against
+    the scheduler's own output_ids before any tensor is used.
+    """
+    torch = runtime.torch
+    descriptor = record.descriptor
+    state = getattr(record, "occ3_content_state", None)
+    markers = getattr(record, "occ3_span_markers", None)
+    require(state is not None and not state.released and markers is not None, "lineage")
+    table, stop_ids = markers
+    require(descriptor.span_policy in SPAN_POLICIES_V2, "lineage")
+    require(descriptor.marker_profile == table.profile and state.table is table, "lineage")
+    base = len(req.origin_input_ids) - 1
+    n_ring = min(record.accepted_count, descriptor.max_prefix_tokens)
+    require(n_ring >= 2 and record.retained, "lineage")
+    ring_h, ring_t = record.retained
+    ring_size = int(ring_h.shape[0])
+    cursor = record.accepted_count % ring_size
+    if record.accepted_count < ring_size:
+        order = torch.arange(n_ring, device=runtime.device)
+    else:
+        order = (torch.arange(n_ring, device=runtime.device) + cursor) % ring_size
+    ring_start = record.accepted_count - n_ring
+    state.flush()
+    window, seen = [], set()
+    for index in range(n_ring):
+        position = base + ring_start + index
+        # The fourth field is the ordinal into the ring-entry row views below
+        # (NOT the ring slot: for a wrapped ring they differ, and reading the
+        # slot would silently select another row's bytes).
+        window.append((position, int(ring_t[order[index]]), "ring", index))
+        seen.add(position)
+    for position, token, slot in state.rows():
+        if position not in seen:
+            window.append((position, token, "buffer", slot))
+    window.sort(key=lambda entry: entry[0])
+    token_ids = [entry[1] for entry in window]
+    positions = [entry[0] for entry in window]
+    selection = select_span_v2(token_ids, positions, position_base=base,
+                              accepted_total=record.accepted_count,
+                              policy=descriptor.span_policy, marker_table=table,
+                              stop_ids=stop_ids,
+                              reasoning_tokens=getattr(req, "reasoning_tokens", None))
+    n = selection.retained_rows
+    require(workspace_bound(n, runtime.profile.hidden_dim, runtime.profile.expected_ranks,
+                            runtime.profile.tile_rows, runtime.profile.anchor_alpha)
+            <= runtime.profile.workspace_bytes, "quota")
+    ring_rows = ring_h.index_select(0, order)
+    buffer_rows = state.hidden
+    pieces = []
+    for offset in range(selection.start_index, selection.end_index):
+        entry = window[offset]
+        row = ring_rows[entry[3]] if entry[2] == "ring" else buffer_rows[entry[3]]
+        pieces.append(row.unsqueeze(0))
+    selected = torch.cat(pieces, 0).contiguous()
+    tokens = torch.tensor([token_ids[offset] for offset in range(selection.start_index, selection.end_index)],
+                          device=runtime.device, dtype=ring_t.dtype)
+    span_tokens = list(req.output_ids[selection.accepted_span_start:selection.accepted_span_end])
+    require(tokens.shape[0] == n and selected.shape[0] == n, "lineage")
+    require(tokens.tolist() == span_tokens, "lineage")
+    prepared.update(n=n, h=selected, tokens=tokens, prefix=torch.empty_like(selected),
+                    span_selection=selection, span_markers=markers, span_base=base,
+                    span_window=len(window))
+    return {"n": n, "count": record.accepted_count, "dtype": runtime.dtype, "window": len(window)}
+
+
+class _CalibrationCapture:
+    """Optional calibration-corpus handoff, bounded and off the capture path.
+
+    Enabled only when OCC3_CALIBRATION_CAPTURE_DIR names an absolute directory.
+    The collector is built once per runtime from the scalar method identity;
+    selected spans are enqueued by rank 0 after align completes, and a single
+    daemon thread does the add/write work. Collection can never delay or fail
+    a capture: every refusal is logged with a fixed code and dropped.
+
+    The freeze targets are operator-configurable (OCC3_CALIBRATION_FIT_TURNS,
+    OCC3_CALIBRATION_VALIDATION_TURNS, OCC3_CALIBRATION_TEST_TURNS); the corpus
+    freezes only when every partition holds at least one whole family, so a
+    small validation corpus needs small targets.
+    """
+
+    QUEUE_LIMIT = 64
+
+    def __init__(self, collector, dirpath, split_turns):
+        from .calibration_collector import Collector
+        require(isinstance(collector, Collector), "profile")
+        self.collector = collector
+        self.dirpath = dirpath
+        self.split_turns = split_turns
+        self.queue = queue.Queue(maxsize=self.QUEUE_LIMIT)
+        self.dropped = 0
+        self.thread = threading.Thread(target=self._drain, name="occ3-calibration-capture", daemon=True)
+        self.thread.start()
+
+    @classmethod
+    def from_env(cls, profile, method_id, calibration_digest):
+        dirpath = os.environ.get("OCC3_CALIBRATION_CAPTURE_DIR", "")
+        if not dirpath:
+            return None
+        require(type(dirpath) is str and dirpath == dirpath.strip() and "\x00" not in dirpath
+                and os.path.isabs(dirpath) and len(dirpath) <= 512, "profile")
+        from .calibration_collector import (Collector, DEFAULT_FIT_TURNS,
+                                            DEFAULT_TEST_TURNS, DEFAULT_VALIDATION_TURNS)
+        split_turns = (_env_turns("OCC3_CALIBRATION_FIT_TURNS", DEFAULT_FIT_TURNS),
+                       _env_turns("OCC3_CALIBRATION_VALIDATION_TURNS", DEFAULT_VALIDATION_TURNS),
+                       _env_turns("OCC3_CALIBRATION_TEST_TURNS", DEFAULT_TEST_TURNS))
+        provenance = {
+            "method_id": method_id,
+            "artifact_digest": calibration_digest or "none",
+            "hidden_dim": str(int(profile.hidden_dim)),
+            "layer_index": str(int(profile.layer_index)),
+            "marker_profile_max_len": "64",
+        }
+        os.makedirs(dirpath, exist_ok=True)
+        return cls(Collector(provenance=provenance), dirpath, split_turns)
+
+    def submit(self, turn_id, family_id, span_policy, hidden, token_ids, positions,
+               span_metadata, lookup):
+        try:
+            self.queue.put_nowait({"turn_id": turn_id, "family_id": family_id,
+                                  "span_policy": span_policy, "hidden": hidden,
+                                  "token_ids": token_ids, "positions": positions,
+                                  "span_metadata": span_metadata, "lookup": lookup})
+        except queue.Full:
+            self.dropped += 1
+            if self.dropped <= 8 or self.dropped % 64 == 0:
+                logger.error("occ3 calibration queue full dropped=%d", self.dropped)
+
+    def _drain(self):
+        from .calibration_collector import CaptureRecord
+        while True:
+            item = self.queue.get()
+            try:
+                record = CaptureRecord(turn_id=item["turn_id"], family_id=item["family_id"],
+                                       hidden=item["hidden"], token_ids=item["token_ids"],
+                                       absolute_positions=item["positions"],
+                                       span_policy=item["span_policy"],
+                                       span_metadata=item["span_metadata"])
+                self.collector.add(record, embedding_lookup=item["lookup"])
+                self.collector.write(self.dirpath, fit_turns=self.split_turns[0],
+                                     validation_turns=self.split_turns[1],
+                                     test_turns=self.split_turns[2])
+            except Exception as error:
+                logger.error("occ3 calibration collection declined %s", _decline_code(error))
+
+
+def _calibration_handoff(runtime, record, prepared, embeddings):
+    """Rank-0 handoff of one aligned span to the collector, post-sync.
+
+    Refuses nothing that matters: a declined handoff only logs. The CPU copies
+    happen after the capture event synchronized, and the collector add/write
+    runs on the drain thread, so this never touches the align hot path.
+    """
+    capture = getattr(runtime, "calibration_capture", None)
+    if capture is None or runtime.rank != 0:
+        return
+    try:
+        selection = prepared["span_selection"]
+        base = prepared["span_base"]
+        table = prepared["span_markers"][0]
+        span_metadata = dict(selection.span_block(table),
+                             capture_commit_id=record.capture_commit_id,
+                             accepted_total=record.accepted_count)
+        torch = runtime.torch
+        h, tokens = prepared["h"], prepared["tokens"]
+        positions = torch.tensor([base + index for index in
+                                  range(selection.accepted_span_start, selection.accepted_span_end)],
+                                 device="cpu", dtype=torch.int64)
+        hidden = h.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        token_ids = tokens.detach().to(dtype=torch.int64, device="cpu", copy=True).contiguous()
+        reference = embeddings.detach().to(dtype=torch.float32, device="cpu", copy=True).contiguous()
+        rows_by_token = {int(token_ids[index]): reference[index]
+                         for index in range(int(reference.shape[0]))}
+
+        def lookup(token_id):
+            # The reference rows were computed for exactly the selected tokens,
+            # so an unknown id here is a binding failure the collector refuses.
+            return rows_by_token.get(int(token_id))
+
+        capture.submit(record.descriptor.capture_id, record.descriptor.source_session_id,
+                       record.descriptor.span_policy, hidden, token_ids, positions,
+                       span_metadata, lookup)
+    except Exception as error:
+        logger.error("occ3 calibration handoff declined %s", _decline_code(error))
 
 
 _RUNTIME = None
@@ -86,6 +432,17 @@ class WorkerRuntime:
         # the per-message method, which holds no artifact.
         self.calibration_digest = getattr(self.aligner, "artifact_digest", "")
         self.registry = LatentRegistry(profile)
+        # The frozen artifact is resident on every rank for the life of the
+        # runtime: charge its bytes into the rank-local live-bytes budget at
+        # install so capture reservations cannot spend them twice, and expose
+        # the all-rank aggregate for the install/health record.
+        self.artifact_bytes = 0 if self.calibration is None else artifact_resident_bytes(self.calibration)
+        require(self.artifact_bytes <= profile.max_live_bytes, "quota")
+        self.registry.charged_bytes += self.artifact_bytes
+        # Opt-in calibration-corpus capture: one collector per runtime, built from
+        # the scalar method identity only. An invalid directory declines the
+        # install ("profile") instead of guessing.
+        self.calibration_capture = _CalibrationCapture.from_env(profile, profile.method, self.calibration_digest)
         self.streams = {}
         self.poisoned = False
         self.commands = {}
@@ -220,17 +577,25 @@ class WorkerRuntime:
                 "layer_index": p.layer_index, "dtype": self.dtype,
                 "profile_digest": p.binding_digest, "source_capture": True,
                 "continuous_prefix": True, "terminal_journal": True,
-                "max_capture_bytes": MAX_CAPTURE_BYTES}
+                "max_capture_bytes": MAX_CAPTURE_BYTES,
+                "artifact_bytes": getattr(self, "artifact_bytes", 0),
+                "artifact_bytes_all_ranks": getattr(self, "artifact_bytes", 0) * p.expected_ranks}
 
-    def capture_budget(self, count):
+    def capture_budget(self, count, span_policy=SPAN_POLICY_V1):
         # Fixed ring + terminal ordered H/E/Z + stage/safe gather/dtype cast margin.
         # Small alignment solver workspace is separately reserved by profile.
         require(count in (8, 16, 32, 64, 128) and count <= self.profile.max_prefix_tokens, "profile")
+        require(span_policy in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2, "profile")
         require(workspace_bound(count, self.profile.hidden_dim, self.profile.expected_ranks,
                                 self.profile.tile_rows, self.profile.anchor_alpha)
                 <= self.profile.workspace_bytes, "quota")
-        return self.profile.expected_ranks * ((5 * count + 32) * self.profile.hidden_dim * self.element_size
-                                             + (4 * count + 64) * 8)
+        charge = (5 * count + 32) * self.profile.hidden_dim * self.element_size + (4 * count + 64) * 8
+        if span_policy in SPAN_POLICIES_V2:
+            # The v2 content buffer stores the same row capacity again (hidden
+            # rows plus token and position vectors), so the charge carries one
+            # extra count-row term.
+            charge += count * self.profile.hidden_dim * self.element_size + 2 * count * 8
+        return self.profile.expected_ranks * charge
 
     def control(self, envelope):
         command = validate_control_payload(envelope)
@@ -257,7 +622,7 @@ class WorkerRuntime:
             elif op == "reserve_capture":
                 require(set(payload) == {"descriptor", "source_handle", "state_generation", "expires_at_epoch"})
                 descriptor = decode_descriptor(payload["descriptor"])
-                charge = self.capture_budget(descriptor.max_prefix_tokens)
+                charge = self.capture_budget(descriptor.max_prefix_tokens, descriptor.span_policy)
                 record = self.registry.reserve_capture(descriptor, payload["source_handle"], payload["state_generation"],
                         payload["expires_at_epoch"], descriptor.max_capture_bytes, charge)
                 result = record.snapshot()
@@ -295,6 +660,7 @@ class WorkerRuntime:
                     require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
+                    _release_content_state(record)
                 result = self.registry.retire(handle=handle)
             else:
                 raise LatentError("invalid")
@@ -329,6 +695,8 @@ class WorkerRuntime:
         prepared = {}
         self.preflight("align_begin", lambda: _begin_gpu(self, record))
         def local_prepare():
+            if record.descriptor.span_policy in SPAN_POLICIES_V2:
+                return _prepare_v2_window(self, record, req, prepared)
             n = min(record.accepted_count, record.descriptor.max_prefix_tokens)
             require(n >= 2 and record.retained, "lineage")
             require(workspace_bound(n, self.profile.hidden_dim, self.profile.expected_ranks,
@@ -346,7 +714,10 @@ class WorkerRuntime:
         self.preflight("align_prepare", local_prepare)
         n, h, tokens = prepared["n"], prepared["h"], prepared["tokens"]
         embeddings = self.embedding(tokens)
-        if self.target_norm is None:
+        # N0 (the binding's serving config is None) must not renormalise, so
+        # the vocabulary-norm statistic is measured only for a method whose
+        # negotiated serving renormalises rows (N1 or the per-message solver).
+        if _serving_renorm(self.aligner) and self.target_norm is None:
             self.target_norm = mean_embedding_norm(self.embedding, tp_group=self.group,
                                                   tile_rows=self.profile.tile_rows)
         # All ranks reach the outcome handshake even if the root solver fails.
@@ -371,10 +742,21 @@ class WorkerRuntime:
         record.prefix = prefix
         record.events.append(event)
         record.live_refs.append((event, (h, tokens, embeddings)))
-        end = record.accepted_count
-        start = end - n
-        sequence_digest = digest(list(req.output_ids[start:end]))
-        commit = digest([record.descriptor.reservation_id, start, end, sequence_digest, self.layout_digest])
+        if "span_selection" in prepared:
+            # v2: the aligned span is the selected content run; the lineage digest
+            # additionally binds the span policy, the marker profile and the
+            # measured terminator (doc section 6.3).
+            selection = prepared["span_selection"]
+            start, end = selection.accepted_span_start, selection.accepted_span_end
+            sequence_digest = digest(list(req.output_ids[start:end]))
+            commit = digest([record.descriptor.reservation_id, start, end, sequence_digest,
+                             self.layout_digest, record.descriptor.span_policy,
+                             record.descriptor.marker_profile, selection.terminator])
+        else:
+            end = record.accepted_count
+            start = end - n
+            sequence_digest = digest(list(req.output_ids[start:end]))
+            commit = digest([record.descriptor.reservation_id, start, end, sequence_digest, self.layout_digest])
         metadata = {"capture_commit_id": commit, "accepted_span_start": start,
                     "accepted_span_end": end, "retained_count": n,
                     "predictor_position_offset": -1, "representation": "final_layer_prenorm_predictor",
@@ -384,10 +766,18 @@ class WorkerRuntime:
                     "accepted_sequence_digest": sequence_digest, "expires_at_epoch": record.expires_at_epoch,
                     "byte_count": prefix.numel() * prefix.element_size()}
         metadata.update(method_metadata(self.profile, self.calibration_digest))
+        if "span_selection" in prepared:
+            # The bounded occ3.span block rides the same source metadata; the
+            # backend projects it into the commit and the receipt carries it.
+            metadata.update(prepared["span_selection"].span_block(prepared["span_markers"][0]))
         self.preflight("source_ready", lambda: event.synchronize())
         self.consensus(metadata)
         self.preflight("align_complete", lambda: _end_gpu(self, record))
         record.capture_commit_id, record.source_metadata, record.state = commit, metadata, "ready"
+        if "span_selection" in prepared:
+            _calibration_handoff(self, record, prepared, embeddings)
+            record.occ3_span_markers = None
+            _release_content_state(record)
         # Retained ring no longer needed, but copies remain event-owned until complete.
         record.retained.clear()
         self.reap_live(record)
@@ -474,6 +864,19 @@ def admit_request(scheduler, req, value):
         require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
         original = req.origin_input_ids
         new_ids = original
+        span_markers, content_state = None, None
+        if type(descriptor) is CaptureWorkerDescriptor and descriptor.span_policy in SPAN_POLICIES_V2:
+            # v2 opt-in: the marker ids travel on the request's private
+            # custom_params channel. The profile must match the descriptor's
+            # marker_profile and the table must be round-trip attested (R0).
+            params = getattr(req, "sampling_params", None)
+            span_markers = marker_table_from_wire(getattr(params, "custom_params", None))
+            require(span_markers[0].profile == descriptor.marker_profile
+                    and span_markers[0].roundtrip_attested, "profile")
+            # Capacity decline ("profile") fires here, inside the preflight, so a
+            # marker set that would leave no content slot never enters a turn.
+            content_state = _ContentState(span_markers[0], span_markers[1],
+                                          descriptor.max_prefix_tokens)
         if type(descriptor) is ConsumeWorkerDescriptor:
             count = descriptor.expected_prefix_tokens
             at = descriptor.prefix_offset
@@ -483,17 +886,26 @@ def admit_request(scheduler, req, value):
                 new_ids = original[:at] + array(original.typecode, holes) + original[at:]
             else:
                 new_ids = list(original[:at]) + holes + list(original[at:])
-        prepared.update(descriptor=descriptor, record=record, new_ids=new_ids)
+        prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
+                        span_markers=span_markers, content_state=content_state)
+        # The continuous-prefix layout is a receiver concept: a capture never
+        # rewrites the prompt, so its consensus value carries no offset.
+        if type(descriptor) is ConsumeWorkerDescriptor:
+            layout, offset = ("marker" if descriptor.prefix_offset else "prepend"), int(descriptor.prefix_offset)
+        else:
+            layout, offset = "capture", 0
         return {"descriptor": digest(asdict(descriptor)), "tokens": digest(list(original)),
                 "state": record.state, "generation": record.state_generation,
-                "prefix_layout": "marker" if descriptor.prefix_offset else "prepend",
-                "prefix_offset": int(descriptor.prefix_offset)}
+                "prefix_layout": layout, "prefix_offset": offset}
     runtime.preflight("admit", validate)
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
     if type(descriptor) is CaptureWorkerDescriptor:
         record.admitted_capture = True
         record.state = "capturing"
+        if prepared["span_markers"] is not None:
+            record.occ3_span_markers = prepared["span_markers"]
+            record.occ3_content_state = prepared["content_state"]
     else:
         record.admitted_consume = True
         req.origin_input_ids = new_ids
@@ -776,7 +1188,7 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
                                      len(req.origin_input_ids) + output_end - 1, device=runtime.device)
             require(bool(torch.equal(stage.tokens[request_index, :count], actual)) and
                     bool(torch.equal(stage.positions[request_index, :count], positions)), "lineage")
-            prepared.update(stage=stage, count=count, actual=actual)
+            prepared.update(stage=stage, count=count, actual=actual, positions=positions)
             _end_gpu(runtime, record)
         elif terminal:
             require(req.skip_radix_cache_insert and getattr(req, "occ3_private_kv", False)
@@ -801,6 +1213,10 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
                 destination = (record.accepted_count + i) % descriptor.max_prefix_tokens
                 rh[destination].copy_(stage.hidden[request_index, i])
                 rt[destination].copy_(stage.tokens[request_index, i])
+            state = getattr(record, "occ3_content_state", None)
+            if state is not None:
+                state.feed(stage.tokens[request_index, :count],
+                           stage.hidden[request_index, :count], positions)
             event = runtime.event()
             record.events.append(event)
             record.live_refs.append((event, (stage, actual)))
@@ -866,6 +1282,7 @@ def abort_request(scheduler, req, reason):
         prepared["record"] = record
         expected = record.descriptor if type(descriptor) is CaptureWorkerDescriptor else record.consumer
         require(expected == descriptor and req.rid == descriptor.native_rid, "identity")
+        _release_content_state(record)
         runtime.fence()
         return {"reservation": descriptor.reservation_id, "rid": req.rid}
     try:
@@ -886,12 +1303,16 @@ def _probe_alignment(hidden, embeddings, prefix, profile):
     """
     import json
     import os
+    import torch
     path = os.environ.get("OCC3_ALIGN_PROBE")
     if not path:
         return
     try:
         from .calibration_probe import probe_relation
-        result = probe_relation(hidden, embeddings, prefix)
+        # An explicit probe-local generator: the serving model RNG is never
+        # drawn from, so a probe never perturbs sampling determinism.
+        result = probe_relation(hidden, embeddings, prefix,
+                                generator=torch.Generator(device=hidden.device).manual_seed(0))
         result["anchor_alpha"] = float(profile.anchor_alpha)
         result["max_prefix_tokens"] = int(profile.max_prefix_tokens)
         with open(path, "a", encoding="utf-8") as handle:

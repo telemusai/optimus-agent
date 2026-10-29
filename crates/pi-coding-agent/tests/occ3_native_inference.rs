@@ -91,6 +91,86 @@ fn admitted(envelope: Occ3Envelope) -> Occ3InferenceInbox {
     inbox
 }
 
+
+/// Method identity is the full dotted id, never just the coarse family: two
+/// complete identities of one family differ, and `bind_lease` compares the
+/// attachment's full method id against the verified identity's full method id
+/// by exact string equality (campaign spec 14/18).
+#[tokio::test]
+async fn bind_lease_binds_a_full_method_id_only_against_its_own_identity() {
+    let method_a = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1";
+    let method_b = "statebridge.glm53.calibrated-lowrank-procrustes.v1";
+    let mut identity_a = identity();
+    identity_a.latent_method = method_a.into();
+    let mut identity_b = identity();
+    identity_b.latent_method = method_b.into();
+    // One family either way: the family alone must never pass the bind.
+    assert_eq!(
+        pi_coding_agent::core::occ3_connectors::method_family(method_a),
+        pi_coding_agent::core::occ3_connectors::method_family(method_b)
+    );
+
+    let connector = MockOcc3Connector::new(identity_a.clone(), vec![Occ3Method::StatebridgePrefix]);
+    let handle = connector
+        .capture_latent(CaptureRequest {
+            message_id: "message-1".into(),
+            sender_session_id: "sender".into(),
+            receiver_session_id: "receiver".into(),
+            method: Occ3Method::StatebridgePrefix,
+            capture_context: "SOURCE_ONLY_SECRET_FIXTURE".into(),
+            ttl: Duration::from_secs(60),
+        })
+        .await
+        .unwrap();
+    let envelope = build_envelope(
+        "message-1".into(),
+        "sender".into(),
+        "receiver".into(),
+        identity_a.fingerprint(),
+        connector.runtime_id(),
+        "mock-occ3".into(),
+        Occ3Method::StatebridgePrefix,
+        handle,
+        "OCC/1\nTASK=fixture\nKIND=RESULT\nSTATUS=done".into(),
+        "occ1".into(),
+    )
+    .unwrap();
+    let target = InferenceStateTarget {
+        provider: "fixture-provider".into(),
+        model_id: "fixture-model".into(),
+        base_url: "http://127.0.0.1:1/v1".into(),
+    };
+    let runtime = VerifiedInferenceRuntime {
+        model_identity: identity_a.clone(),
+        runtime_id: connector.runtime_id(),
+        generation: 0,
+        methods: vec![Occ3Method::StatebridgePrefix],
+    };
+    let request = PrepareInferenceRequest {
+        envelope: envelope.clone(),
+        request_id: "inference-1".into(),
+        receiver_session_id: "receiver".into(),
+        receiver_identity: identity_a.clone(),
+        now_epoch: 1,
+        target: target.clone(),
+    };
+    // The attachment carries the full dotted method id, not the family.
+    let attachment = inference_attachment(&request, "mock-occ3", &runtime).unwrap();
+    assert_eq!(attachment.method, method_a);
+    let lease = pi_ai::inference_attachment::InferenceStateLease::new(target, attachment).unwrap();
+
+    let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
+    assert!(inbox.admit(envelope, "message-1", "sender", 1).unwrap());
+    assert!(inbox.claim(&["message-1".into()], 1).unwrap().is_some());
+    // The same family under a different full method id must not bind.
+    assert!(matches!(
+        inbox.bind_lease(&lease, &identity_b),
+        Err(Occ3Error::Unauthorized)
+    ));
+    // The exact full method id binds.
+    assert!(inbox.bind_lease(&lease, &identity_a).is_ok());
+}
+
 #[tokio::test]
 async fn native_attachment_is_handle_only_and_not_detached_consumption() {
     let (connector, request, runtime) = fixture().await;

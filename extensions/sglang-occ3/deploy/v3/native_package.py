@@ -1,8 +1,10 @@
 """Offline packaging for an exclusive disposable derived-image source tree.
 
-No SGLang, Torch, or OCC3 runtime imports at module load: the shipped method ids
-are read lazily from occ3_sglang/native_profile.py, which itself imports neither
-SGLang nor Torch, so the registry stays the only place a method id is written.
+No SGLang, Torch, or OCC3 runtime imports at module load and none anywhere in
+the validate/apply path: the shipped method ids are read by parsing the
+registry source (occ3_sglang/native_profile.py) instead of importing the
+package, so the build stage stays pure-file validation and the registry stays
+the only place a method id is written.
 Hashes and syntax are packaging proof, not installed-source, GPU, model-identity,
 or readiness proof. On any interrupted or failed apply, discard the disposable
 tree; this is never an in-place repair.
@@ -10,6 +12,7 @@ tree; this is never an in-place repair.
 from __future__ import annotations
 
 import argparse
+import ast
 from dataclasses import dataclass
 import hashlib
 import json
@@ -65,16 +68,161 @@ class PackageError(Exception):
 def shipped_methods():
     """Method ids a packaged profile may pin, read from the registry that owns them.
 
-    The registry in occ3_sglang/native_profile.py is the only place a native
-    method id is spelled out, so packaging never keeps a literal that can drift
-    from the installed runtime. Imported lazily: this module is an offline
-    source transform and keeps no runtime import at module load time.
+    Import-based view for callers that may import the runtime package (tests,
+    parity checks). The validate/apply path never calls this: it reads the
+    same registry through _static_registry() by parsing the source, because
+    the offline build stage must not import occ3_sglang.
     """
     try:
         from occ3_sglang import native_profile
     except ImportError:
         raise PackageError("method_registry_unavailable") from None
     return tuple(native_profile.advertised_methods())
+
+
+_REGISTRY_MODULE = "native_profile.py"
+# Separate from MAX_FILE_BYTES: source bounds are build-input policy, while the
+# registry read is an internal metadata lookup with its own fixed bound.
+_REGISTRY_MAX_BYTES = 2 * 1024 * 1024
+
+
+def _registry_source(name):
+    """Bounded read of one registry-side module from the local package tree."""
+    path = Path(__file__).resolve().parents[2] / "occ3_sglang" / name
+    try:
+        raw = path.read_bytes()
+    except OSError:
+        raise PackageError("method_registry_unavailable") from None
+    _need(len(raw) <= _REGISTRY_MAX_BYTES, "method_registry_unavailable")
+    return raw
+
+
+def _registry_constants(tree, name):
+    """Module-level constant assignments: name -> value (imports excluded)."""
+    constants = {}
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and isinstance(node.value, ast.Constant)
+                and isinstance(node.value.value, (str, int, float, bool))):
+            constants[node.targets[0].id] = node.value.value
+    return constants
+
+
+def _registry_imports(tree):
+    """Relative constant imports: local alias -> (module file, original name)."""
+    imports = {}
+    for node in tree.body:
+        if isinstance(node, ast.ImportFrom) and node.module and node.level >= 1:
+            module = node.module.lstrip(".")
+            if "/" in module or chr(92) in module or not _NAME.fullmatch(module):
+                continue
+            for alias in node.names:
+                if alias.name != "*":
+                    imports[alias.asname or alias.name] = (module + ".py", alias.name)
+    return imports
+
+
+def _registry_value(node, environment):
+    """Evaluate one registry expression: constants, names, nothing else."""
+    if isinstance(node, ast.Constant):
+        return node.value
+    if isinstance(node, ast.Name) and node.id in environment:
+        return environment[node.id]
+    if (isinstance(node, ast.UnaryOp) and isinstance(node.operand, ast.Constant)
+            and type(node.operand.value) in (int, float)
+            and isinstance(node.op, (ast.USub, ast.UAdd))):
+        value = node.operand.value
+        return -value if isinstance(node.op, ast.USub) else value
+    raise PackageError("method_registry_unavailable")
+
+
+def _registry_call_entries(tree, name):
+    """The _method_entry calls building _METHODS, in registry order."""
+    for node in tree.body:
+        if (isinstance(node, ast.Assign) and len(node.targets) == 1
+                and isinstance(node.targets[0], ast.Name)
+                and node.targets[0].id == "_METHODS"):
+            value = node.value
+            elements = None
+            if isinstance(value, ast.DictComp) and len(value.generators) == 1:
+                iterator = value.generators[0].iter
+                if isinstance(iterator, (ast.Tuple, ast.List)):
+                    elements = iterator.elts
+            elif isinstance(value, (ast.Tuple, ast.List)):
+                elements = value.elts
+            if elements is None:
+                raise PackageError("method_registry_unavailable")
+            entries = [item for item in elements if isinstance(item, ast.Call)]
+            _need(len(entries) == len(elements) and entries, "method_registry_unavailable")
+            return entries
+    raise PackageError("method_registry_unavailable")
+
+
+def _registry_entry_function(tree):
+    """The _method_entry definition: parameter names plus its return dict."""
+    for node in tree.body:
+        if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)) and node.name == "_method_entry":
+            arguments = node.args
+            _need(not arguments.posonlyargs and not arguments.vararg
+                  and not arguments.kwonlyargs and not arguments.kwarg
+                  and not arguments.defaults, "method_registry_unavailable")
+            parameters = [item.arg for item in arguments.args]
+            body = node.body
+            _need(len(body) == 1 and isinstance(body[0], ast.Return)
+                  and isinstance(body[0].value, ast.Dict), "method_registry_unavailable")
+            return parameters, body[0].value
+    raise PackageError("method_registry_unavailable")
+
+
+def _static_registry():
+    """Method descriptors parsed from the registry source; never an import.
+
+    The registry module (occ3_sglang/native_profile.py) is the single place a
+    native method id is written, but the offline build path must not import
+    occ3_sglang, so its _METHODS table is read by parsing the module and its
+    relative constant imports. The parse understands exactly the registry's
+    own constructs and fails closed on anything else; the imported view
+    (shipped_methods) must stay equal and is pinned by tests.
+    """
+    raw = _registry_source(_REGISTRY_MODULE)
+    try:
+        tree = ast.parse(raw.decode("utf-8"), _REGISTRY_MODULE)
+    except (SyntaxError, ValueError, UnicodeError, RecursionError):
+        raise PackageError("method_registry_unavailable") from None
+    environment = dict(_registry_constants(tree, _REGISTRY_MODULE))
+    for local, (module, original) in _registry_imports(tree).items():
+        imported = ast.parse(_registry_source(module).decode("utf-8"), module)
+        constants = _registry_constants(imported, module)
+        _need(original in constants, "method_registry_unavailable")
+        environment[local] = constants[original]
+    parameters, returned = _registry_entry_function(tree)
+    registry = {}
+    for call in _registry_call_entries(tree, _REGISTRY_MODULE):
+        _need(isinstance(call.func, ast.Name) and call.func.id == "_method_entry",
+              "method_registry_unavailable")
+        _need(len(call.args) <= len(parameters), "method_registry_unavailable")
+        bound = dict(zip(parameters, call.args))
+        for keyword in call.keywords:
+            _need(keyword.arg in parameters, "method_registry_unavailable")
+            bound[keyword.arg] = keyword.value
+        _need(len(bound) == len(parameters), "method_registry_unavailable")
+        scope = {name: _registry_value(value, environment)
+                 for name, value in bound.items()}
+        descriptor = {}
+        for key, value in zip(returned.keys, returned.values):
+            _need(isinstance(key, ast.Constant) and isinstance(key.value, str),
+                  "method_registry_unavailable")
+            descriptor[key.value] = _registry_value(value, scope)
+        method_id = descriptor.get("method_id")
+        _need(type(method_id) is str and _IDENTIFIER.fullmatch(method_id) is not None,
+              "method_registry_unavailable")
+        _need(type(descriptor.get("requires_calibration_artifact")) is bool,
+              "method_registry_unavailable")
+        _need(method_id not in registry, "method_registry_unavailable")
+        registry[method_id] = descriptor
+    _need(registry, "method_registry_unavailable")
+    return registry
 
 
 def default_method():
@@ -304,7 +452,8 @@ def _profile(value):
           "invalid_profile_alpha")
     # Current audited RuntimeProfile bounds, not evidence of actual model/TP/GPU state.
     # A packaged profile may only pin a method the installed registry advertises.
-    _need(value["method"] in shipped_methods(), "profile_method_not_advertised")
+    # The registry is parsed, not imported: the build path stays pure-file.
+    _need(value["method"] in _static_registry(), "profile_method_not_advertised")
     _need((value["expected_ranks"], value["hidden_dim"], value["layer_index"]) == (8, 6144, 77)
           and value["max_prefix_tokens"] in (8, 16, 32, 64, 128)
           and value["max_active"] == 1 and value["max_records"] <= 4096

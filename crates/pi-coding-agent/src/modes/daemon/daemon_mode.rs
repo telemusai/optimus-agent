@@ -16693,6 +16693,9 @@ impl AgentDaemon {
             (session, settings, model)
         };
         let Some(model) = model else { return Err(Occ3Decline::NotConfigured) };
+        let Some(agent_session) = session.agent_session() else {
+            return Err(Occ3Decline::ConnectorUnavailable);
+        };
         let (enabled, experimental, endpoint) = match settings {
             Some(settings) => {
                 let settings = settings.lock().expect("settings manager poisoned");
@@ -16704,12 +16707,21 @@ impl AgentDaemon {
             }
             None => (false, false, None),
         };
-        let request = Occ3ActivationRequest::new(&model, enabled, experimental)
-            .with_endpoint_override(endpoint);
         // Off by default: no network, no log line, no behaviour change.
         if !enabled && !experimental {
             return Err(Occ3Decline::DisabledByPolicy);
         }
+        // The control plane is keyed to the provider the session runs on, so
+        // activation uses the credential this session resolves for its own
+        // requests; nothing comes from `models.json`. An unresolvable
+        // credential is a named decline before any network.
+        let (api_key, control_headers) = agent_session
+            .occ3_activation_credentials(&model)
+            .await
+            .map_err(|_| Occ3Decline::ConnectorUnavailable)?;
+        let request = Occ3ActivationRequest::new(&model, enabled, experimental)
+            .with_endpoint_override(endpoint)
+            .with_credentials(api_key, control_headers);
         let ready = match activation::verify_cached(&request, ACTIVATION_HANDSHAKE_TIMEOUT).await {
             Ok(ready) => ready,
             Err(decline) => {
@@ -16723,9 +16735,6 @@ impl AgentDaemon {
         };
         activation::register(&ready);
         let session_id = session.session_id();
-        let Some(agent_session) = session.agent_session() else {
-            return Err(Occ3Decline::ConnectorUnavailable);
-        };
         let controller = self.create_agent_message_controller({
             let state = Arc::clone(state);
             Arc::new(move || Some(Arc::clone(&state)))

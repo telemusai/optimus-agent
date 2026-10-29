@@ -26,11 +26,14 @@ def _binding(method, *, hidden_dim=6144, layer_index=77,
     from occ3_sglang.statebridge_calibrated import CalibrationBinding
     return CalibrationBinding(
         method_id=method, hidden_dim=hidden_dim, rows=512, layer_index=layer_index,
-        ridge=1.5, ridge_rel=0.02, heldout_r2=0.31,
+        ridge=1.5, ridge_rel=0.02, solve_residual=0.01, hyperparameters={"rho": 0.02},
+        capture_span_policy="whole_completed_response_tail_v1",
         model_fingerprint=model_fingerprint, checkpoint_revision="rev-1",
         tokenizer_fingerprint="sha256:" + "b" * 64, embedding_id="glm53-tp8-vocab",
         capture_method_id="glm53.final-prenorm.capture.v1",
-        predictor_position_offset=-1, precision="float32", corpus_digest="c" * 64)
+        predictor_position_offset=-1, precision="float32", corpus_digest="c" * 64,
+        fit_manifest_digest="d" * 64, validation_record_digest="",
+        validation_artifact_digest="")
 
 
 def test_calibrated_method_is_advertised_with_its_own_identity():
@@ -43,7 +46,7 @@ def test_calibrated_method_is_advertised_with_its_own_identity():
     assert descriptor["requires_calibration_artifact"] is True
     assert descriptor["fit_source"] == "independent-calibration-turns"
     assert descriptor["alignment"] == "frozen-dual-ridge.v1"
-    assert descriptor["solver"].endswith("statebridge_calibrated.apply_calibration")
+    assert descriptor["solver"].endswith("statebridge_calibrated.apply_map")
     assert descriptor["predictor_position_offset"] == -1
     assert descriptor["precision"] == "float32"
 
@@ -61,8 +64,10 @@ def test_message_method_still_resolves_to_the_message_solver():
     assert getattr(module, function_name) is statebridge.align_hidden_sequence
     calibrated = profile.method_descriptor(profile.CALIBRATED_METHOD)["solver"]
     module_name, function_name = calibrated.rsplit(".", 1)
+    # Wave-1 module surface: the registry solver must resolve to the
+    # calibrated method's real apply function (fit_map/apply_map contract).
     assert getattr(importlib.import_module(module_name), function_name) is (
-        statebridge_calibrated.apply_calibration)
+        statebridge_calibrated.apply_map)
     assert profile.advertised_methods() == (profile.PER_MESSAGE_METHOD,
                                             profile.CALIBRATED_METHOD)
 
@@ -195,7 +200,7 @@ def test_calibrated_map_cannot_be_served_behind_the_message_method():
     torch = pytest.importorskip("torch")
     from occ3_sglang import native_profile as profile
     from occ3_sglang.latent_types import LatentError
-    from occ3_sglang.statebridge_calibrated import apply_calibration, fit_calibration
+    from occ3_sglang.statebridge_calibrated import apply_map, fit_map
     generator = torch.Generator().manual_seed(0)
     rank, dim, rows = 8, 64, 200
     left = torch.randn(rank, dim, generator=generator) / rank ** 0.5
@@ -203,11 +208,14 @@ def test_calibrated_map_cannot_be_served_behind_the_message_method():
     factor = torch.randn(rows, rank, generator=generator)
     hidden = 0.95 ** 0.5 * (factor @ left) + 0.05 ** 0.5 * torch.randn(rows, dim, generator=generator)
     embeddings = 0.95 ** 0.5 * (factor @ right) + 0.05 ** 0.5 * torch.randn(rows, dim, generator=generator)
-    artifact = fit_calibration(hidden, embeddings)
-    apply_calibration(artifact, hidden[:8], 1.0)
+    partition = {"hidden": hidden, "embeddings": embeddings,
+                 "row_turn_ids": ("turn-1",) * rows, "turn_ids": ("turn-1",),
+                 "manifest_digest": ""}
+    artifact = fit_map(partition, {"rho": 0.02})
+    apply_map(artifact, hidden[:8])
     with pytest.raises(LatentError) as caught:
-        apply_calibration(dataclasses.replace(artifact, method_id=profile.PER_MESSAGE_METHOD),
-                          hidden[:8], 1.0)
+        apply_map(dataclasses.replace(artifact, method_id=profile.PER_MESSAGE_METHOD),
+                  hidden[:8])
     assert caught.value.code == "identity"
 
 
@@ -282,3 +290,21 @@ def test_profile_falls_back_to_the_per_message_method_without_a_registry(monkeyp
     with pytest.raises(latent_types.LatentError):
         latent_types.RuntimeProfile(
             **fields, method="statebridge.glm53.final-prenorm-predictor.calibrated-dual-ridge.v1")
+
+
+def test_static_registry_read_matches_the_imported_registry():
+    """The offline build path parses the registry instead of importing it; the
+    parsed view must equal the imported one exactly, so packaging can never
+    accept a method the installed runtime does not advertise (or refuse one it
+    does)."""
+    from deploy.v3 import native_package
+    from occ3_sglang import native_profile as profile
+
+    parsed = native_package._static_registry()
+    imported = {method: dict(profile.method_descriptor(method))
+                for method in profile.advertised_methods()}
+    assert parsed == imported
+    assert set(parsed) == set(native_package.shipped_methods())
+    assert len(parsed) >= 2
+    assert parsed[profile.PER_MESSAGE_METHOD]["requires_calibration_artifact"] is False
+    assert parsed[profile.CALIBRATED_METHOD]["requires_calibration_artifact"] is True

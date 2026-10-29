@@ -10,7 +10,7 @@ use crate::core::occ::occ3::connector::{
 };
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
-use crate::core::occ::occ3::types::{Occ3DeliveryStatus, Occ3Method};
+use crate::core::occ::occ3::types::Occ3DeliveryStatus;
 use pi_agent_core::types::ContentBlock;
 use pi_agent_core::types::{
     AgentMessage, AgentTool, AgentToolResult, CustomAgentMessage, ResolveInferenceState,
@@ -103,6 +103,9 @@ pub struct Occ3NativeSession {
     inbox: Mutex<Occ3InferenceInbox>,
     source: Mutex<SourceSlot>,
     closed: std::sync::atomic::AtomicBool,
+    /// Unsubscribe for the delivery-marker restamp listener installed by
+    /// [`Self::install_delivery_restamp`]; dropped by [`Self::invalidate`].
+    restamp_unsubscribe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
 }
 impl Occ3NativeSession {
     pub async fn enroll(
@@ -132,9 +135,14 @@ impl Occ3NativeSession {
         }
         let mut registry = Occ3ConnectorRegistry::empty();
         registry.register(connector.clone(), capabilities);
+        // The family the registry must support is the family the enrollment's
+        // full dotted method id names; two methods of one family must not
+        // collide with a hard-coded single method check.
+        let family = crate::core::occ3_connectors::method_family(&enrollment.identity.latent_method)
+            .ok_or_else(failure)?;
         if !registry.supports(
             connector.connector_id(),
-            Occ3Method::StatebridgePrefix,
+            family,
             &enrollment.identity.fingerprint(),
         ) {
             return Err(failure());
@@ -144,6 +152,7 @@ impl Occ3NativeSession {
             target: target(model),
             connector,
             registry,
+            restamp_unsubscribe: Mutex::new(None),
             inbox: Mutex::new(Occ3InferenceInbox::new(session_id.into()).map_err(|_| failure())?),
             source: Mutex::new(SourceSlot {
                 budget: None,
@@ -517,6 +526,122 @@ impl Occ3NativeSession {
         }));
         Ok(marker)
     }
+
+    /// Admitted message ids, in inbox order.
+    fn admitted_message_ids(&self) -> Vec<String> {
+        self.inbox
+            .lock()
+            .map(|inbox| {
+                inbox
+                    .audit()
+                    .into_iter()
+                    .filter_map(|record| {
+                        record
+                            .get("message_id")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Whether the receiver admitted this control message id.
+    fn is_admitted(&self, message_id: &str) -> bool {
+        self.inbox
+            .lock()
+            .map(|inbox| inbox.status(message_id).is_some())
+            .unwrap_or(false)
+    }
+
+    /// The stable id of an agent-messaging control custom message, if `message`
+    /// is one.
+    fn control_message_id(message: &AgentMessage) -> Option<String> {
+        let AgentMessage::Custom(CustomAgentMessage::Custom {
+            custom_type, details, ..
+        }) = message
+        else {
+            return None;
+        };
+        if custom_type != AGENT_MESSAGE_CUSTOM_TYPE {
+            return None;
+        }
+        details
+            .as_ref()
+            .and_then(|details| details.get("id"))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    }
+
+    /// Subscribe a delivery-marker restamp on the agent's own event stream.
+    ///
+    /// The controller stamps the marker once at admission, but a QUEUED body
+    /// lands in the transcript only later, unmarked; a body that lands after
+    /// its stamp (or that was stamped before its lease was consumed) must be
+    /// restamped from the delivery record, so the content-free activity
+    /// projection classifies it by its receipt state instead of
+    /// misreporting the control-only body as ordinary text. When an admitted
+    /// body lands (message end) it is restamped pending; at every turn and
+    /// agent end all admitted ids are restamped, which upgrades a delivery to
+    /// `latent_native` exactly when its completed-use receipt exists.
+    pub fn install_delivery_restamp(
+        self: &Arc<Self>,
+        agent: Arc<dyn crate::core::agent_session::AgentHandle>,
+    ) -> Result<(), String> {
+        {
+            let guard = self
+                .restamp_unsubscribe
+                .lock()
+                .map_err(|_| failure())?;
+            if guard.is_some() {
+                return Ok(());
+            }
+        }
+        let receiver = self.clone();
+        let agent_handle = Arc::clone(&agent);
+        let unsubscribe = agent.subscribe(Arc::new(
+            move |event: pi_agent_core::types::AgentEvent,
+                  _signal: Option<tokio_util::sync::CancellationToken>| {
+                let receiver = receiver.clone();
+                let agent = Arc::clone(&agent_handle);
+                Box::pin(async move {
+                    let ids: Vec<String> = match &event {
+                        pi_agent_core::types::AgentEvent::MessageEnd { message } => {
+                            let Some(id) = Self::control_message_id(message) else {
+                                return;
+                            };
+                            // Only bodies this receiver admitted are its
+                            // markers to rewrite.
+                            if !receiver.is_admitted(&id) {
+                                return;
+                            }
+                            vec![id]
+                        }
+                        pi_agent_core::types::AgentEvent::TurnEnd { .. }
+                        | pi_agent_core::types::AgentEvent::AgentEnd { .. } => {
+                            let ids = receiver.admitted_message_ids();
+                            if ids.is_empty() {
+                                return;
+                            }
+                            ids
+                        }
+                        _ => return,
+                    };
+                    for id in ids {
+                        // Idempotent: the marker always follows the delivery
+                        // record's state; a closed receiver refuses stamps.
+                        let _ = receiver.stamp_delivery_marker(&*agent, &id);
+                    }
+                })
+            },
+        ));
+        let mut guard = self
+            .restamp_unsubscribe
+            .lock()
+            .map_err(|_| failure())?;
+        *guard = Some(Box::from(unsubscribe));
+        Ok(())
+    }
     pub fn handoff_tool(
         self: &Arc<Self>,
         controller: Arc<dyn AgentSessionMessageController>,
@@ -605,6 +730,16 @@ impl Occ3NativeSession {
             source.budget = None;
             if let Some(lease) = &source.lease {
                 lease.cancel();
+            }
+        }
+        // The ready cache is a cache of THIS connector's live handshake:
+        // once the session state is invalid, a cached ready must not be
+        // served to the next activation as if nothing had changed.
+        crate::core::occ3_connectors::activation::invalidate_ready_cache();
+        // No restamp may run for dead receiver state.
+        if let Ok(mut guard) = self.restamp_unsubscribe.lock() {
+            if let Some(unsubscribe) = guard.take() {
+                unsubscribe();
             }
         }
     }

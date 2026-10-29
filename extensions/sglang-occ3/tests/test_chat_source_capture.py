@@ -17,7 +17,7 @@ from starlette.responses import JSONResponse
 from occ3_sglang.attachment_contract import (
     AttachmentError, AuthenticatedContext, BackendReadiness, CaptureIntent,
     CaptureWorkerDescriptor, SourceCaptureReceipt, SourceEnrollment, Reservation,
-    SOURCE_RECEIPT_HEADER, canonical, digest, normalize_worker_descriptor,
+    SOURCE_RECEIPT_HEADER, SPAN_POLICIES_V2, canonical, digest, normalize_worker_descriptor,
     parse_opt_in, strict_json,
 )
 from occ3_sglang.use_receipts import (
@@ -26,6 +26,7 @@ from occ3_sglang.use_receipts import (
 )
 from test_chat_attachment import FixtureBackend, attachment, chat_request, harness, raw_request
 from test_attachment_cancellation import spin_until
+from test_span_markers import FakeTokenizer, NoEncodeTokenizer
 
 FIXTURE = json.loads((Path(__file__).parent / "fixtures/occ3_source_v1.json").read_text())
 
@@ -78,7 +79,8 @@ class SourceFixtureBackend(FixtureBackend):
         descriptor = CaptureWorkerDescriptor(enrollment.attempt_id, reservation.reservation_id,
             enrollment.native_rid, enrollment.principal_digest, a.runtime_id, a.model_fingerprint,
             a.method, self.prepares[-1][1].deadline_monotonic, a.capture_id, a.source_session_id,
-            a.turn_nonce, a.runtime_generation, a.span_policy, a.retained_count_limit, a.max_capture_bytes)
+            a.turn_nonce, a.runtime_generation, a.span_policy, a.retained_count_limit, a.max_capture_bytes,
+            "" if a.span_policy not in SPAN_POLICIES_V2 else "glm45_glm47_xml_kv.v1")
         native.occ3_worker_descriptor = (self.mutate_source_descriptor(descriptor)
                                         if self.mutate_source_descriptor else descriptor)
 
@@ -128,6 +130,26 @@ async def source_call(h, a=None, request=None, body=None, encoding="identity"):
     return response, raw, queue
 
 
+def test_shared_source_fixture_v2_units():
+    v2 = FIXTURE["v2"]
+    a = CaptureIntent.parse(v2["intent"])
+    assert canonical(a.wire()).decode() == v2["intent_canonical"]
+    assert a.binding_digest == v2["intent_sha256"]
+    assert a.schema == "occ3.capture.v2" and a.span_policy == "content_tail_v2"
+    r = SourceCaptureReceipt.parse(v2["receipt"])
+    assert len(r.wire()) == 39 and r.schema == "occ3.source.v2"
+    assert canonical(r.wire()).decode() == v2["receipt_canonical"]
+    assert digest(r.wire()) == v2["receipt_sha256"]
+    assert r.byte_count == r.retained_count * r.hidden_dim * 2
+    assert v2["max_valid_receipt_bytes"] <= 2048
+    for case in v2["negative_intents"]:
+        with pytest.raises(AttachmentError):
+            CaptureIntent.parse(case["wire"])
+    for case in v2["negative_receipts"]:
+        with pytest.raises(AttachmentError):
+            SourceCaptureReceipt.parse(case["wire"])
+
+
 def test_shared_source_fixture_canonical_bytes_and_units():
     a = CaptureIntent.parse(FIXTURE["intent"])
     r = SourceCaptureReceipt.parse(FIXTURE["receipt"])
@@ -157,6 +179,123 @@ def test_invalid_source_receipts(case):
 @pytest.mark.parametrize("key", ["duplicate_intent_json", "duplicate_receipt_json"])
 def test_duplicate_source_fields(key):
     with pytest.raises(AttachmentError): strict_json(FIXTURE[key])
+
+
+V2_BLOCK = dict(span_schema="occ3.span.v1", span_policy="content_tail_v2",
+                span_marker_profile="glm45_glm47_xml_kv.v1",
+                span_marker_schema="occ3.span.markers.v1",
+                span_reasoning_terminator="thinking_end", span_turn_end_attested=True,
+                span_thinking_count=2, span_content_count=6, span_tool_call_count=0,
+                span_tool_arguments_count=0, span_control_count=2, span_unknown_count=0,
+                span_window_start_position=9, span_window_end_position=19,
+                span_contiguous=True, span_contains_final_content=True,
+                span_contains_tool_call=False, span_message_truncated=False)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("stream", [True, False])
+async def test_v2_source_flow_injects_markers_and_receipts_the_span_block(source_harness, stream):
+    h = source_harness
+    h.tm.tokenizer = FakeTokenizer()
+    h.backend.mutate_commit = lambda commit: replace(commit, **V2_BLOCK)
+    h.backend.mutate_source_descriptor = lambda d: replace(d, marker_profile="glm45_glm47_xml_kv.v1")
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, chat_request(stream=stream))
+    assert response.status_code == 200, response.body
+    native = h.tm.calls[0]
+    custom = native.sampling_params["custom_params"]
+    assert custom["__optimus_occ3_span_marker_thinking_end"] == [101]
+    assert custom["__optimus_occ3_span_marker_tool_call_start"] == [102]
+    assert custom["__optimus_occ3_span_marker_turn_end"] == [108]
+    assert custom["__optimus_occ3_span_stop_ids"] == [108]
+    assert custom["__optimus_occ3_span_marker_profile"] == "glm45_glm47_xml_kv.v1"
+    # The ordinary sampling keys are untouched by the injection.
+    assert native.sampling_params["max_new_tokens"] == 32768
+    assert native.sampling_params["n"] == 1
+    receipt = SourceCaptureReceipt.parse(json.loads(response.headers[SOURCE_RECEIPT_HEADER]))
+    assert receipt.schema == "occ3.source.v2" and len(receipt.wire()) == 39
+    assert receipt.span_policy == "content_tail_v2" and receipt.span_content_count == 6
+    assert (receipt.accepted_span_start, receipt.accepted_span_end) == (10, 18)
+    assert receipt.retained_count == 8 and receipt.span_window_start_position == 9
+    assert receipt.span_marker_profile == "glm45_glm47_xml_kv.v1"
+    provenance = h.backend.source_finishes[0][3]
+    assert provenance.scope == "content_tail_v2"
+    assert h.adapter._active == 0 and not h.backend.retires
+
+
+@pytest.mark.asyncio
+async def test_v2_marker_channel_cannot_be_spoofed_from_the_request(source_harness):
+    h = source_harness
+    h.tm.tokenizer = FakeTokenizer()
+    h.backend.mutate_commit = lambda commit: replace(commit, **V2_BLOCK)
+    h.backend.mutate_source_descriptor = lambda d: replace(d, marker_profile="glm45_glm47_xml_kv.v1")
+    request = chat_request()
+    original = request.to_sampling_params
+
+    def spoofed(**kwargs):
+        value = original(**kwargs)
+        value["custom_params"] = {"__optimus_occ3_span_marker_thinking_end": [999],
+                                  "client_key": 1}
+        return value
+
+    request.to_sampling_params = spoofed
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, request)
+    assert response.status_code == 200, response.body
+    custom = h.tm.calls[0].sampling_params["custom_params"]
+    # The attested entries overwrite the spoofed occ3 key; unrelated keys pass.
+    assert custom["__optimus_occ3_span_marker_thinking_end"] == [101]
+    assert custom["client_key"] == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_commit_without_a_block_is_invalid_evidence(source_harness):
+    h = source_harness
+    h.tm.tokenizer = FakeTokenizer()
+    h.backend.mutate_source_descriptor = lambda d: replace(d, marker_profile="glm45_glm47_xml_kv.v1")
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, chat_request())
+    assert response.status_code != 200 and SOURCE_RECEIPT_HEADER not in response.headers
+    assert len(h.backend.retires) == 1 and len(h.tm.calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_descriptor_marker_profile_mismatch_is_invalid_evidence(source_harness):
+    h = source_harness
+    h.tm.tokenizer = FakeTokenizer()
+    h.backend.mutate_commit = lambda commit: replace(commit, **V2_BLOCK)
+    h.backend.mutate_source_descriptor = lambda d: replace(d, marker_profile="other.profile.v1")
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, chat_request())
+    assert response.status_code != 200 and SOURCE_RECEIPT_HEADER not in response.headers
+    assert len(h.backend.retires) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_unattestable_tokenizer_declines_before_generation(source_harness):
+    h = source_harness
+    h.tm.tokenizer = NoEncodeTokenizer()
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, chat_request())
+    assert response.status_code == 409 and SOURCE_RECEIPT_HEADER not in response.headers
+    assert not h.tm.calls and len(h.backend.retires) == 1
+
+
+@pytest.mark.asyncio
+async def test_v2_receipt_upper_bound_reserves_the_header_budget(source_harness):
+    # 1300 bytes hold the v1 upper bound (1234) but not the v2 one (1863):
+    # the same profile serves v1 and refuses v2 before generation.
+    h = source_harness
+    h.adapter.profile = replace(h.adapter.profile, max_receipt_bytes=1300)
+    response, _, _ = await source_call(h, intent())
+    assert response.status_code == 200
+    h.adapter.profile = replace(h.adapter.profile, max_receipt_bytes=1300)
+    h.tm.tokenizer = FakeTokenizer()
+    a = intent(schema="occ3.capture.v2", span_policy="content_tail_v2")
+    response, _, _ = await source_call(h, a, chat_request())
+    assert response.status_code != 200 and SOURCE_RECEIPT_HEADER not in response.headers
+    # Only the v1 call reached generation; the v2 call added no enrollment.
+    assert len(h.tm.calls) == 1 and len(h.backend.enrollments) == 1
 
 
 @pytest.mark.asyncio

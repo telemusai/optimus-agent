@@ -95,12 +95,12 @@ class TestPrivateCache(PinnedCase):
     def test_private_match_native_root_handles_and_namespace(self):
         """Pinned Python/Rust adapters; no model or GPU allocation."""
         import hashlib
-        from pathlib import Path
-        source = Path(os.environ.get("OCC3_SGLANG_SOURCE", "")) / "python/sglang/srt"
+        from _source_pins import pristine_root, srt_dir
+        source = srt_dir(pristine_root())
         pins = {'mem_cache/base_prefix_cache.py': '49f20555e6b96af071db38a1bd9829b322ce76381940bd2f340abced151335a9', 'mem_cache/unified_radix_cache.py': 'c6f1764166c371cf050f05c966daed8ded366365163a69f066569cc74e2575c3', 'mem_cache/rust_tree_core/adapter.py': '25c567c21768b2b5c23b4a9f63705f6cbde73b98b9a2f65323c088bd2deef3d2'}
         for path, expected in pins.items():
             if not (source / path).is_file():
-                self.skipTest("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE")
+                self.skipTest("Pinned SGLang source absent; set OCC3_SGLANG_SOURCE_BASE")
             text = (source / path).read_text(encoding="utf-8")
             self.assertEqual(hashlib.sha256(text.encode()).hexdigest(), expected)
             self.sources.text[path] = text

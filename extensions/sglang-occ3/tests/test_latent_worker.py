@@ -3,6 +3,7 @@ from array import array
 from dataclasses import replace
 from types import SimpleNamespace as NS
 import sys
+import time
 import pytest
 
 from occ3_sglang import latent_worker as w
@@ -64,6 +65,400 @@ def test_capture_budget_all_rank_units():
     runtime.profile=profile(tile_rows=1024)
     with pytest.raises(LatentError):
         runtime.capture_budget(128)
+
+
+def test_capture_budget_charges_the_v2_content_buffer_row_term():
+    runtime=object.__new__(w.WorkerRuntime)
+    runtime.profile=profile(); runtime.element_size=2
+    v1=runtime.capture_budget(128)
+    assert runtime.capture_budget(128,"content_tail_v2")==v1+8*(128*6144*2+2*128*8)
+    assert runtime.capture_budget(128,"content_tail_last64_v2")>v1
+    with pytest.raises(LatentError):
+        runtime.capture_budget(128,"guessed_content_tail_v2")
+
+
+def _marker_table():
+    from occ3_sglang.span_markers import MarkerTable
+    ids = {"thinking_start": (100,), "thinking_end": (101,),
+           "tool_call_start": (102,), "tool_call_end": (103,),
+           "argument_key_start": (104,), "argument_key_end": (105,),
+           "argument_value_start": (106,), "argument_value_end": (107,),
+           "turn_end": (108,)}
+    return MarkerTable(profile="glm45_glm47_xml_kv.v1", schema="occ3.span.markers.v1",
+                       roundtrip_attested=True, provenance=(),
+                       **{role + "_ids": seq for role, seq in ids.items()})
+
+
+def test_content_state_pins_markers_and_keeps_a_content_suffix():
+    torch = pytest.importorskip("torch")
+    table=_marker_table(); stop=frozenset((108,))
+    state=w._ContentState(table,stop,8)
+    # 6 thinking rows, terminator, 8 content rows, tool markers, filler, eos.
+    tokens=[7]*6+[101]+[51,52,53,54,55,56,57,58]+[102,103,61,108]
+    hidden=torch.arange(len(tokens)*4,dtype=torch.float32).reshape(len(tokens),4)
+    positions=torch.arange(len(tokens),dtype=torch.int64)
+    # Two chunks, with the terminator split across no boundary here: feed halves.
+    for start in (0, 10):
+        end=min(start+10,len(tokens))
+        state.feed(torch.tensor(tokens[start:end]),hidden[start:end],positions[start:end])
+    state.flush()
+    entries=state.rows()
+    assert [position for position,_,_ in entries]==[6,9,10,11,12,13,14,15]
+    assert [token for _,token,_ in entries]==[101,53,54,55,56,57,58,102]
+    assert state.overrun is True  # 8 content rows into a 6-row ring segment
+    # The pinned segments hold the marker rows; the content ring holds the suffix.
+    assert torch.equal(state.hidden[0],hidden[6])
+    assert torch.equal(state.hidden[8-1],hidden[15])
+    # The content ring keeps the LAST 6 content rows (53..58); after the wrap
+    # the oldest kept row (53) sits at slot 3 and the newest (58) at slot 2.
+    assert torch.equal(state.hidden[3],hidden[9]) and torch.equal(state.hidden[1],hidden[13])
+    assert torch.equal(state.hidden[2],hidden[14]) and torch.equal(state.hidden[4],hidden[10])
+
+
+def test_content_state_resolves_multi_token_markers_across_chunks():
+    torch = pytest.importorskip("torch")
+    table=_marker_table()
+    # A two-token thinking_end split across the chunk boundary at index 5.
+    from dataclasses import replace as _replace
+    table=_replace(table,thinking_end_ids=(101,109))
+    state=w._ContentState(table,frozenset((108,)),8)
+    tokens=[7,7,7,7]+[101,109]+[51,52,53,54]+[108]
+    hidden=torch.arange(len(tokens)*4,dtype=torch.float32).reshape(len(tokens),4)
+    positions=torch.arange(len(tokens),dtype=torch.int64)
+    for start in (0,5,10):
+        end=min(start+5,len(tokens))
+        state.feed(torch.tensor(tokens[start:end]),hidden[start:end],positions[start:end])
+    state.flush()
+    entries=state.rows()
+    assert [position for position,_,_ in entries]==[4,5,6,7,8,9]
+    assert [entry[1] for entry in entries]==[101,109,51,52,53,54]
+    assert state.phase=="turn_end" and state.overrun is False
+    # The stop row never became a content row.
+    assert 108 not in [token for _,token,_ in entries]
+
+
+def test_content_state_declines_marker_sets_consuming_the_cap():
+    table=_marker_table()
+    from dataclasses import replace as _replace
+    wide=_replace(table,thinking_end_ids=tuple(range(32)))
+    with pytest.raises(LatentError) as caught:
+        w._ContentState(wide,frozenset((108,)),8)
+    assert caught.value.code=="profile"
+
+
+def test_capture_admit_survives_the_receiver_layout_fields(monkeypatch):
+    # Red for a pre-existing defect: the admit validate's consensus return read
+    # descriptor.prefix_offset for CAPTURE descriptors too. CaptureWorkerDescriptor
+    # has no such field, so every production capture admit declined with
+    # latent_failed (occ3_admission_failed) since the layout fields were added.
+    record=NS(state="reserved",admitted_capture=False,state_generation=123)
+    runtime=NS(poisoned=False,resolve=lambda value,**kw:record,preflight=lambda phase,check:check())
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    descriptor=capture()
+    request=req()
+    w.admit_request(NS(occ3_runtime=runtime),request,descriptor)
+    assert record.admitted_capture and record.state=="capturing"
+    assert request.occ3_worker_descriptor is descriptor and request.occ3_force_eager
+    assert request.origin_input_ids==req().origin_input_ids  # capture never rewrites the prompt
+
+
+def test_v2_admit_resolves_wire_markers_and_creates_the_content_state(monkeypatch):
+    from occ3_sglang.span_policy import wire_marker_entries
+    table,stop=_marker_table(),frozenset((108,))
+    record=NS(state="reserved",admitted_capture=False,state_generation=123)
+    runtime=NS(poisoned=False,resolve=lambda value,**kw:record,preflight=lambda phase,check:check())
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    descriptor=capture(span_policy="content_tail_v2",marker_profile="glm45_glm47_xml_kv.v1")
+    request=req()
+    request.sampling_params=NS(custom_params=wire_marker_entries(table,stop))
+    w.admit_request(NS(occ3_runtime=runtime),request,descriptor)
+    assert record.admitted_capture and record.state=="capturing"
+    markers,state=record.occ3_span_markers,record.occ3_content_state
+    assert markers[0].profile=="glm45_glm47_xml_kv.v1" and markers[1]==stop
+    assert state.table is markers[0] and state.capacity==descriptor.max_prefix_tokens
+    # A v1 capture never resolves markers or creates a state.
+    v1=capture(); request2=req()
+    record2=NS(state="reserved",admitted_capture=False,state_generation=123)
+    runtime.resolve=lambda value,**kw:record2
+    w.admit_request(NS(occ3_runtime=runtime),request2,v1)
+    assert getattr(record2,"occ3_span_markers",None) is None
+    assert getattr(record2,"occ3_content_state",None) is None
+
+
+def test_v2_admit_declines_missing_or_mismatched_marker_wire(monkeypatch):
+    from occ3_sglang.span_policy import wire_marker_entries
+    table,stop=_marker_table(),frozenset((108,))
+    entries=wire_marker_entries(table,stop)
+    record=NS(state="reserved",admitted_capture=False,state_generation=123)
+    runtime=NS(poisoned=False,resolve=lambda value,**kw:record,preflight=lambda phase,check:check())
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    descriptor=capture(span_policy="content_tail_v2",marker_profile="glm45_glm47_xml_kv.v1")
+    # Missing channel entirely.
+    request=req(); request.sampling_params=NS(custom_params=None)
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(NS(occ3_runtime=runtime),request,descriptor)
+    assert caught.value.code=="profile"
+    # Profile mismatch with the descriptor.
+    mismatched=capture(span_policy="content_tail_v2",marker_profile="other.profile.v1")
+    request=req(); request.sampling_params=NS(custom_params=entries)
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(NS(occ3_runtime=runtime),request,mismatched)
+    assert caught.value.code=="profile"
+    # Unattested wire (roundtrip 0) is refused at admission (R0).
+    bad=dict(entries); bad["__optimus_occ3_span_marker_roundtrip"]=0
+    request=req(); request.sampling_params=NS(custom_params=bad)
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(NS(occ3_runtime=runtime),request,descriptor)
+    assert caught.value.code=="profile"
+
+
+def _v2_runtime():
+    runtime=object.__new__(w.WorkerRuntime)
+    import torch
+    runtime.torch=torch; runtime.device="cpu"; runtime.dtype="bfloat16"
+    runtime.profile=profile(); runtime.rank=0
+    return runtime
+
+
+def _v2_record(table, stop, tokens, dim=4, capacity=8, ring=None):
+    torch = pytest.importorskip("torch")
+    from test_latent_registry import registry
+    r,_=registry()
+    descriptor=capture(span_policy="content_tail_v2",marker_profile="glm45_glm47_xml_kv.v1",
+                       max_prefix_tokens=capacity)
+    record=r.reserve_capture(descriptor,"handle",123,400,128*1024*1024,4096)
+    record.state="capturing"; record.accepted_count=len(tokens)
+    ring=ring if ring is not None else capacity
+    rh=torch.empty((ring,dim),dtype=torch.float32); rt=torch.empty(ring,dtype=torch.int64)
+    for index in range(len(tokens)-ring,len(tokens)):
+        rh[index%ring].fill_(index); rt[index%ring]=tokens[index]
+    record.retained=[rh,rt]
+    record.occ3_span_markers=(table,stop)
+    record.occ3_content_state=w._ContentState(table,stop,capacity)
+    return record
+
+
+def test_prepare_v2_window_merges_ring_and_buffer_and_selects(monkeypatch):
+    torch = pytest.importorskip("torch")
+    table,stop=_marker_table(),frozenset((108,))
+    tokens=[7]*6+[101]+[51,52,53,54,55,56,57,58]+[102,103,61,108]
+    record=_v2_record(table,stop,tokens)
+    # Feed every chunk; the buffer sees the same rows the ring saw.
+    hidden=torch.arange(len(tokens)*4,dtype=torch.float32).reshape(len(tokens),4)
+    # Predictor convention: the state at absolute position base+k predicts
+    # accepted token k, so the feed carries base+k, exactly like the commit path.
+    positions=torch.arange(len(tokens),dtype=torch.int64)+2
+    state=record.occ3_content_state
+    for start in (0,10):
+        end=min(start+10,len(tokens))
+        state.feed(torch.tensor(tokens[start:end]),hidden[start:end],positions[start:end])
+    request=req(record.descriptor)
+    request.origin_input_ids=array("q",[1,2,3])  # base = 2
+    request.output_ids=array("q",tokens)
+    prepared={}
+    result=w._prepare_v2_window(_v2_runtime(),record,request,prepared)
+    assert result["n"]==6 and result["window"]==11 and result["count"]==19
+    selection=prepared["span_selection"]
+    assert (selection.accepted_span_start,selection.accepted_span_end)==(9,15)
+    assert selection.retained_rows==6 and selection.terminator=="thinking_end"
+    # The selected rows are the accepted content rows 9..14: the first two from
+    # the buffer (hidden arange values 36/40), the rest from the wrapped ring
+    # (filled with their accepted index), all in position order.
+    assert prepared["h"][:,0].tolist()==[36,40,11,12,13,14]
+    assert prepared["tokens"].tolist()==[53,54,55,56,57,58]
+    assert prepared["tokens"].tolist()==list(request.output_ids[9:15])
+    block=selection.span_block(table)
+    assert block["span_content_count"]==6 and block["span_thinking_count"]==0
+    assert block["span_window_start_position"]==2+6 and block["span_window_end_position"]==2+19
+
+
+def test_prepare_v2_window_refuses_a_missing_content_state():
+    torch = pytest.importorskip("torch")
+    table,stop=_marker_table(),frozenset((108,))
+    tokens=[7,101,51,52,108]
+    record=_v2_record(table,stop,tokens,ring=5)
+    record.occ3_content_state=None
+    prepared={}
+    with pytest.raises(LatentError) as caught:
+        w._prepare_v2_window(_v2_runtime(),record,req(record.descriptor),prepared)
+    assert caught.value.code=="lineage"
+
+
+def test_calibration_capture_round_trip_writes_a_corpus(monkeypatch, tmp_path):
+    torch = pytest.importorskip("torch")
+    from occ3_sglang.calibration_collector import Collector, CaptureRecord
+    import json as _json
+    directory=str(tmp_path/"corpus")
+    monkeypatch.setenv("OCC3_CALIBRATION_CAPTURE_DIR",directory)
+    monkeypatch.setenv("OCC3_CALIBRATION_FIT_TURNS","1")
+    monkeypatch.setenv("OCC3_CALIBRATION_VALIDATION_TURNS","1")
+    monkeypatch.setenv("OCC3_CALIBRATION_TEST_TURNS","1")
+    capture_hook=w._CalibrationCapture.from_env(profile(),profile().method,"")
+    assert capture_hook is not None
+    rows,dim=8,4
+    hidden=torch.arange(rows*dim,dtype=torch.float32).reshape(rows,dim)
+    token_ids=torch.tensor([51,52,53,54,55,56,57,58],dtype=torch.int64)
+    positions=torch.arange(rows,dtype=torch.int64)
+    reference=torch.arange(rows*dim,dtype=torch.float32).reshape(rows,dim)
+    def lookup(token_id):
+        return reference[token_ids.tolist().index(int(token_id))]
+    # The collector's split refuses an empty partition, so the corpus freezes
+    # once every partition holds at least one whole family.
+    for index,family in enumerate(("family-a","family-b","family-c")):
+        capture_hook.submit("capture-%d"%index,family,"content_tail_v2",hidden,token_ids,positions,
+                            {"capture_commit_id":"commit","span_policy":"content_tail_v2"},lookup)
+    manifest=tmp_path/"corpus"/"manifest.json"
+    for _ in range(200):
+        if manifest.exists(): break
+        time.sleep(0.05)
+    assert manifest.exists()
+    body=_json.loads(manifest.read_text(encoding="utf-8"))
+    assert body["schema"]=="optimus.occ3.calibration-collector-corpus.v1"
+    assert set(body["partitions"])=={"fit","validation","test"}
+    assert all(entry["span_policy"]=="content_tail_v2" for entry in body["turns"])
+    # A duplicate turn id is logged and dropped, never raised into the capture.
+    capture_hook.submit("capture-0","family-a","content_tail_v2",hidden,token_ids,positions,{},lookup)
+    for _ in range(40):
+        time.sleep(0.05)
+        if capture_hook.queue.empty(): break
+
+
+def test_calibration_handoff_copies_cpu_rows_and_never_fails_the_capture(monkeypatch):
+    torch = pytest.importorskip("torch")
+    table,stop=_marker_table(),frozenset((108,))
+    tokens=[7,101,51,52,108]
+    record=_v2_record(table,stop,tokens,ring=5)
+    state=record.occ3_content_state
+    hidden=torch.arange(len(tokens)*4,dtype=torch.float32).reshape(len(tokens),4)
+    positions=torch.arange(len(tokens),dtype=torch.int64)+2
+    state.feed(torch.tensor(tokens),hidden,positions); state.flush()
+    request=req(record.descriptor)
+    request.origin_input_ids=array("q",[1,2,3])
+    request.output_ids=array("q",tokens)
+    prepared={}
+    w._prepare_v2_window(_v2_runtime(),record,request,prepared)
+    record.capture_commit_id="commit"
+    submitted=[]
+    runtime=_v2_runtime()
+    runtime.calibration_capture=NS(submit=lambda *args,**kwargs:submitted.append(args))
+    embeddings=torch.arange(2*4,dtype=torch.float32).reshape(2,4)
+    w._calibration_handoff(runtime,record,prepared,embeddings)
+    assert len(submitted)==1
+    turn_id,family_id,policy,cpu_hidden,cpu_tokens,cpu_positions,metadata,lookup=submitted[0]
+    assert (turn_id,family_id,policy)==("capture","source","content_tail_v2")
+    assert cpu_hidden.dtype==torch.float32 and str(cpu_hidden.device)=="cpu"
+    assert cpu_positions.tolist()==[2+2,2+3]
+    assert lookup(51).tolist()==embeddings[0].tolist()
+    # A broken handoff (no rank zero) never raises into the capture.
+    runtime.rank=1
+    w._calibration_handoff(runtime,record,prepared,embeddings)
+    runtime.rank=0; runtime.calibration_capture=None
+    w._calibration_handoff(runtime,record,prepared,embeddings)
+
+
+def test_serving_renorm_reads_the_aligner_serving_config():
+    from types import SimpleNamespace as NS
+    # N0 (the binding's serving config is None) skips the renorm step; N1 and
+    # the per-message solver (which always renormalises) need the norm.
+    assert w._serving_renorm(NS(serving=None)) is False
+    assert w._serving_renorm(NS(serving={"kind": "n1"})) is True
+    assert w._serving_renorm(NS()) is False
+    from occ3_sglang import alignment_dispatch
+    from occ3_sglang.latent_types import RuntimeProfile
+    message_profile = RuntimeProfile("epoch", 9, "model-hash", "glm")
+    assert w._serving_renorm(alignment_dispatch.aligner_for(message_profile)) is True
+
+
+def _calibrated_profile(**changes):
+    from occ3_sglang.native_profile import CALIBRATED_METHOD
+    return profile(method=CALIBRATED_METHOD, **changes)
+
+
+def _calibrated_artifact():
+    torch = pytest.importorskip("torch")
+    from occ3_sglang import statebridge_calibrated
+    from occ3_sglang.native_profile import CALIBRATED_METHOD
+    generator = torch.Generator().manual_seed(21)
+    rows, dim, rank = 128, 6144, 8
+    left = torch.randn(rank, dim, generator=generator) / rank ** 0.5
+    right = torch.randn(rank, dim, generator=generator) / rank ** 0.5
+    factor = torch.randn(rows, rank, generator=generator)
+    hidden = 0.9 ** 0.5 * (factor @ left) + 0.1 ** 0.5 * torch.randn(rows, dim, generator=generator)
+    embeddings = 0.9 ** 0.5 * (factor @ right) + 0.1 ** 0.5 * torch.randn(rows, dim, generator=generator)
+    provenance = statebridge_calibrated.CalibrationProvenance(
+        layer_index=77, model_fingerprint="model-hash", checkpoint_revision="rev-1",
+        tokenizer_fingerprint="tok-hash", embedding_id="emb-hash",
+        capture_method_id="cap-hash")
+    partition = {"hidden": hidden, "embeddings": embeddings,
+                 "row_turn_ids": ("turn-0",) * rows, "turn_ids": ("turn-0",),
+                 "manifest_digest": ""}
+    artifact = statebridge_calibrated.fit_map(partition, {"rho": 0.02}, provenance=provenance)
+    assert artifact.binding.method_id == CALIBRATED_METHOD
+    return artifact
+
+
+def test_worker_install_charges_artifact_bytes_and_records_the_aggregate(monkeypatch):
+    from occ3_sglang import alignment_dispatch
+    artifact = _calibrated_artifact()
+    runner, scheduler, group = _worker_init_env(monkeypatch, radix_match=True, unified=True)
+    runner.forward_stream = NS(device="cuda:3", cuda_stream=4)
+    runtime = object.__new__(w.WorkerRuntime)
+    runtime.__init__(runner, group, _calibrated_profile(), scheduler=scheduler,
+                     artifact=artifact)
+    charged = alignment_dispatch.artifact_resident_bytes(artifact)
+    assert charged > 0
+    assert runtime.registry.charged_bytes == charged
+    assert runtime.artifact_bytes == charged
+    health = runtime.health()
+    assert health["artifact_bytes"] == charged
+    # Every rank loads its own resident copy: the aggregate is recorded too.
+    assert health["artifact_bytes_all_ranks"] == charged * runtime.profile.expected_ranks
+    # The charge leaves less headroom for capture reservations, not more.
+    with pytest.raises(LatentError) as caught:
+        runtime.capture_budget(0)
+    assert caught.value.code in ("profile", "quota")
+
+
+def test_worker_install_refuses_an_artifact_beyond_the_live_bytes_budget(monkeypatch):
+    artifact = _calibrated_artifact()
+    from occ3_sglang import statebridge_calibrated
+    assert statebridge_calibrated.artifact_bytes(artifact) > 1024
+    runner, scheduler, group = _worker_init_env(monkeypatch, radix_match=True, unified=True)
+    runner.forward_stream = NS(device="cuda:3", cuda_stream=4)
+    runtime = object.__new__(w.WorkerRuntime)
+    with pytest.raises(LatentError) as caught:
+        runtime.__init__(runner, group, _calibrated_profile(max_live_bytes=1024),
+                         scheduler=scheduler, artifact=artifact)
+    assert caught.value.code == "quota"
+
+
+def test_per_message_install_charges_no_artifact(monkeypatch):
+    runner, scheduler, group = _worker_init_env(monkeypatch, radix_match=True, unified=True)
+    runner.forward_stream = NS(device="cuda:3", cuda_stream=4)
+    runtime = object.__new__(w.WorkerRuntime)
+    runtime.__init__(runner, group, profile(), scheduler=scheduler)
+    assert runtime.artifact_bytes == 0
+    assert runtime.registry.charged_bytes == 0
+    health = runtime.health()
+    assert health["artifact_bytes"] == 0
+    assert health["artifact_bytes_all_ranks"] == 0
+
+
+def test_the_live_probe_uses_a_probe_local_generator_and_writes_scalars(tmp_path, monkeypatch):
+    torch = pytest.importorskip("torch")
+    import json
+    probe = tmp_path / "probe.jsonl"
+    monkeypatch.setenv("OCC3_ALIGN_PROBE", str(probe))
+    generator = torch.Generator().manual_seed(40)
+    hidden = torch.randn(128, 512, generator=generator)
+    embeddings = torch.randn(128, 512, generator=generator)
+    w._probe_alignment(hidden, embeddings, embeddings.clone(), profile())
+    lines = probe.read_text(encoding="utf-8").strip().split("\n")
+    assert len(lines) == 1
+    result = json.loads(lines[0])
+    from occ3_sglang.calibration_probe import PROBE_KEYS
+    assert set(result) >= set(PROBE_KEYS) | {"anchor_alpha", "max_prefix_tokens"}
+    assert not probe.with_suffix(".jsonl.error").exists()
 
 
 def test_profile_loader_uses_no_client_fields(monkeypatch):

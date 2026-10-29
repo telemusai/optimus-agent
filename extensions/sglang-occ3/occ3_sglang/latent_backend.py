@@ -7,9 +7,22 @@ import uuid
 from dataclasses import asdict
 
 from .attachment_contract import (AttachmentError, BackendReadiness, CaptureWorkerDescriptor,
-                                  ConsumeWorkerDescriptor, Reservation, SourceEnrollment, digest)
+                                  ConsumeWorkerDescriptor, Reservation, SourceEnrollment,
+                                  SPAN_POLICIES_V2, digest)
+from .span_policy import resolve_runtime_markers
 from .latent_types import LatentError, control_request, require, validate_control_payload
-from .use_receipts import (SourceCaptureCommit, SourceCaptureEvidence, TerminalUseEvidence)
+from .use_receipts import (SourceCaptureCommit, SourceCaptureEvidence, TerminalUseEvidence,
+                           SPAN_BLOCK_FIELDS)
+
+
+#: The 15 capture-commit fields the worker reports for every source capture.
+#: Method identity (method_id, artifact_digest) and the bounded occ3.span block
+#: ride the same source dict but are projected separately.
+_SOURCE_COMMIT_FIELDS = ("capture_commit_id", "accepted_span_start", "accepted_span_end",
+                          "retained_count", "predictor_position_offset", "representation",
+                          "layer_index", "hidden_dim", "dtype", "layout_digest", "ready_ranks",
+                          "expected_ranks", "accepted_sequence_digest", "expires_at_epoch",
+                          "byte_count")
 
 
 class ControlClient:
@@ -215,6 +228,13 @@ class LatentBackend:
         require(native_rid != intent.source_request_id, "identity")
         self._slot(attempt_id)
         health = await self.refresh_readiness()
+        marker_profile = ""
+        if intent.span_policy in SPAN_POLICIES_V2:
+            # v2 opt-in: the marker profile must be tokenizer-attested in this
+            # process before any reservation exists (doc section 6.1). The
+            # marker ids themselves still never travel on the descriptor; they
+            # use the per-request custom_params channel.
+            marker_profile = resolve_runtime_markers(self.client.tm.tokenizer)[0].profile
         descriptor = CaptureWorkerDescriptor(attempt_id=attempt_id, reservation_id=uuid.uuid4().hex,
             native_rid=native_rid, principal_digest=identity.principal_digest,
             runtime_epoch=intent.runtime_id, model_fingerprint=intent.model_fingerprint,
@@ -222,7 +242,7 @@ class LatentBackend:
             capture_id=intent.capture_id, source_session_id=intent.source_session_id,
             source_turn_nonce=intent.turn_nonce, runtime_generation=intent.runtime_generation,
             span_policy=intent.span_policy, max_prefix_tokens=intent.retained_count_limit,
-            max_capture_bytes=intent.max_capture_bytes)
+            max_capture_bytes=intent.max_capture_bytes, marker_profile=marker_profile)
         enrollment = SourceEnrollment(attempt_id, intent.binding_digest, native_rid,
             identity.principal_digest, uuid.uuid4().hex, int(uuid.uuid4().hex[:16], 16),
             intent.expires_at_epoch, intent.source_session_id, intent.runtime_id, intent.runtime_generation,
@@ -262,7 +282,20 @@ class LatentBackend:
             command_id="output-" + reservation.reservation_id)
         require(record["state"] == "ready" and record["source_handle"] == enrollment.source_handle
                 and record["state_generation"] == enrollment.state_generation, "identity")
-        commit = SourceCaptureCommit(**record["source"])
+        source = record["source"]
+        require(isinstance(source, dict), "identity")
+        # The worker's method_metadata() rides the same source dict (method_id
+        # and, for a calibrated method, artifact_digest) since wave 445d1cdd4.
+        # Those are method identity, not capture-commit fields: project the
+        # commit, cross-check the method id, never splat the worker metadata.
+        method_id = source.get("method_id")
+        require(method_id is None or method_id == self.profile.method, "identity")
+        artifact_digest = source.get("artifact_digest")
+        require(artifact_digest is None
+                or (type(artifact_digest) is str and 1 <= len(artifact_digest) <= 64), "identity")
+        require(all(name in source for name in _SOURCE_COMMIT_FIELDS), "identity")
+        block = {name: source.get(name) for name in SPAN_BLOCK_FIELDS}
+        commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS}, **block)
         require(commit.ready_ranks == commit.expected_ranks == enrollment.expected_ranks
                 and commit.layout_digest == enrollment.layout_digest, "ranks")
         return SourceCaptureEvidence(enrollment, reservation.reservation_id, commit,

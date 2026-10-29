@@ -90,7 +90,8 @@ def test_capabilities_advertisement_shape(client):
     assert body["supported"] is False
     assert body["reason"] == "native_latent_receiver_not_implemented"
     assert body["connector_id"] == "sglang-occ3"
-    assert body["methods"] == []
+    from occ3_sglang.native_profile import advertised_methods
+    assert body["methods"] == list(advertised_methods())
     assert body["same_model_only"] is True
     assert body["verification"] == "cached_tokens"
     assert body["model_fingerprint"]
@@ -110,7 +111,8 @@ def test_capabilities_payload_is_a_fixed_key_superset_with_native_block(client):
     assert body["native"] == {"state": "DISABLED", "code": None, "installed": False,
                               "source_ready": False, "receiver_ready": False,
                               "live_validated": False}
-    assert body["methods"] == [] and body["supported"] is False
+    from occ3_sglang.native_profile import advertised_methods
+    assert body["methods"] == list(advertised_methods()) and body["supported"] is False
 
 
 def test_dormant_identity_answers_not_ready_without_state(client):

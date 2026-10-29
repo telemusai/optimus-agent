@@ -1,0 +1,1 @@
+- Fixed source-attested OCC-3 test suites reading the pristine pinned SGLang checkout from OCC3_SGLANG_SOURCE: they now resolve it from OCC3_SGLANG_SOURCE_BASE (shared helper tests/_source_pins.py), keeping the live patched source root for the chat suites separate from the pristine upstream checkout used for patch-fit attestation.
