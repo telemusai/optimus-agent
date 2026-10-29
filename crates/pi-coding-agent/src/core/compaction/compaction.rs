@@ -2470,6 +2470,7 @@ async fn generate_bounded_summary(
                             tools: None,
                         };
                             let request_metrics = requests.next();
+                            crate::core::compaction::claude::enable_summary_recovery(&model, &mut options);
                             request_metrics.observe(&mut options);
                             let mut message = complete_simple(&model, &context, Some(&options)).await;
                             // Keep one retry owner. An empty successful response is not a usable
@@ -2527,6 +2528,15 @@ async fn generate_bounded_summary(
         }
         break response;
         };
+        if response.stop_reason != STOP_REASON_ABORTED
+            && (response.stop_reason_raw.as_deref().is_some_and(is_filtered_provider_status)
+                || matches!(provider_stream_failure_kind(&response).as_deref(), Some("refusal" | "safety")))
+        {
+            return Err(format!(
+                "Summarization returned an unusable handoff (provider refused or filtered the summary); existing conversation preserved. {}",
+                response.error_message.as_deref().unwrap_or("Retry compaction or select another summarization model.")
+            ));
+        }
         if response.stop_reason == STOP_REASON_ERROR || response.stop_reason == STOP_REASON_ABORTED
         {
             let reason = response
