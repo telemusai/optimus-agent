@@ -33,6 +33,16 @@
 //! opt-in; one-shot; ordinary sessions can never export). The offline
 //! selftest exercises the same accessor and cross-checks it against the
 //! harness-owned fixture record. No silent fallback exists.
+//!
+//! `--arm NAME` (or `OCC3_ARM`, the flag wins; an unknown name refuses at
+//! startup listing the admitted set) runs ONE experiment-arm trial instead of
+//! the frozen two-phase contract: NATIVE, NO_ATTACHMENT, FULL_TEXT,
+//! TOKEN_FULL, TOKEN_SELECTED, TOKEN_NORM, NULL_SHAPE, WRONG_SENDER. The
+//! per-arm evidence JSON (requested and effective arm, control-file readback,
+//! receipt span block, coverage verdict, receiver answers, timings) is
+//! published under the run's output directory only - the frozen report
+//! fieldset is untouched, and every control-arm expectation is pre-registered
+//! here rather than improvised.
 
 use indexmap::IndexMap;
 use pi_agent_core::agent::{Agent, AgentOptions, PromptInput};
@@ -44,7 +54,7 @@ use pi_ai::source_capture::{
 };
 use pi_ai::types::{ContentBlock as AiContentBlock, ImageOrTextContent, Message, Model, API_OPENAI_COMPLETIONS};
 use pi_coding_agent::core::agent_messages::{
-    AgentFamilyCatalogEntry, AgentSessionMessageEndpoint,
+    AgentFamilyCatalogEntry, AgentSessionMessageEndpoint, AgentSessionMessageSendInput,
 };
 use pi_coding_agent::core::agent_session::occ3_state::{
     NativeSourceBudget, Occ3NativeSession, NATIVE_HANDOFF_TOOL,
@@ -98,6 +108,21 @@ const PROFILE_DIGEST: &str = "47ba4c76ed3f1d54a1798cc8a9be9ee17b8063e0bcdbdb6a52
 const OFFLINE_PROFILE_DIGEST_BEFORE: &str = "1f69749f34cf52a200b16152b44fd24007cbcd909a9fa665e53a7307802df425";
 const OFFLINE_PROFILE_DIGEST_AFTER: &str = "52a6d89c090245d13089ec0fae62a835d38706cb30b14b17c1abea6da6b92e36";
 const STALE_CONTROL_TOKEN: &str = "offline-stale-retained-control";
+// Experiment-arm evidence (campaign section 5): a NEW per-arm journal file,
+// never a field of the frozen report schema.
+const ARM_EVIDENCE_SCHEMA: &str = "optimus.occ3.arm-evidence.v1";
+const ARM_TRIAL_SCHEMA: &str = "optimus.occ3.arm-trial.v1";
+const MAX_ARM_EVIDENCE_BYTES: usize = 64 * 1024;
+/// Selection env for the arm; the `--arm` flag wins. Mirrors the
+/// OCC3_RECEIVER_THINKING / OCC3_SPAN_POLICY operator-knob pattern.
+const ARM_ENV: &str = "OCC3_ARM";
+/// The P3 hook's control path and env override (occ3_p3_arms_hook.py
+/// control_path): the driver-side readback observes the same path a
+/// co-located driver shares with the server.
+const ARM_CONTROL_PATH_ENV: &str = "OCC3_P3_ARM_FILE";
+const ARM_CONTROL_DEFAULT_PATH: &str = "/tmp/occ3_p3_arm";
+/// The hook's MAX_CONTROL_BYTES: a larger control file selects no arm.
+const ARM_CONTROL_MAX_BYTES: usize = 64;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -749,6 +774,26 @@ fn fixture_identity() -> Occ3ModelIdentity {
     }
 }
 
+/// The armed source turn the live GLM-5.3 sender produces: reasoning, the
+/// message text as CONTENT (the run the v2 span selects and what
+/// TOKEN_FULL's coverage proof reads), then the occ3_handoff tool call.
+/// `None` degrades to the bare tool-call shape (a source prompt without a
+/// vault-code sentence, e.g. the retained-control turn).
+fn sse_source_turn(id: &str, tool_call_id: &str, content: Option<&str>) -> String {
+    let mut chunks = vec![json!({"id":id,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"retained native reasoning"},"finish_reason":null}]})];
+    if let Some(text) = content {
+        chunks.push(json!({"id":id,"choices":[{"index":0,"delta":{"content":text},"finish_reason":null}]}));
+    }
+    chunks.push(json!({"id":id,"choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"id":tool_call_id,"type":"function","function":{"name":"occ3_handoff","arguments":"{\"receiver_role\":\"child\",\"receiver_name\":\"receiver\"}"}}]},"finish_reason":null}]}));
+    chunks.push(json!({"id":id,"choices":[{"index":0,"delta":{},"finish_reason":"tool_calls"}]}));
+    let mut body = chunks
+        .into_iter()
+        .map(|v| format!("data: {v}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
 fn sse(id: &str, tool_call_id: &str, content: Option<&str>) -> String {
     let mut chunks = vec![json!({"id":id,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"retained native reasoning"},"finish_reason":null}]})];
     match content {
@@ -1099,7 +1144,10 @@ async fn serve(
                             let handle = format!("offline-source-handle-{capture_index}");
                             let rid = format!("offline-native-rid-{capture_index}");
                             let tool_call_id = format!("fixture-tool-{capture_index}");
-                            let mut output = sse(&rid, &tool_call_id, None);
+                            // The live sender states the message as content
+                            // before the handoff tool call, so the fixture
+                            // models the same armed-turn shape.
+                            let mut output = sse_source_turn(&rid, &tool_call_id, extract_fact(&body["messages"]).as_deref());
                             if let Ok(replay) = std::env::var("OCC3_REPLAY_SSE_FILE") {
                                 // Root diagnostic: serve a captured live armed-turn
                                 // SSE body instead of the synthetic one, with the
@@ -1205,8 +1253,17 @@ async fn serve(
                             send_sse(&mut socket, output, vec![("x-optimus-occ3-receipt", receipt.to_string())]).await;
                             return;
                         }
-                        // No attachment: no state, the model can only answer UNKNOWN.
-                        let output = sse("offline-completion-rid", "unused", Some(UNKNOWN_ANSWER));
+                        // No attachment: no state on the request. A model
+                        // can still answer from ordinary message text (the
+                        // FULL_TEXT text oracle: the vault-code sentence
+                        // echoes when it is present in the messages);
+                        // otherwise only UNKNOWN is honest.
+                        let fact = extract_fact(&body["messages"]);
+                        let output = sse(
+                            "offline-completion-rid",
+                            "unused",
+                            Some(fact.as_deref().unwrap_or(UNKNOWN_ANSWER)),
+                        );
                         send_sse(&mut socket, output, vec![]).await;
                     }
                     _ => panic!("Unexpected fixture route: {path}"),
@@ -1469,6 +1526,203 @@ fn validate_span_policy_env() -> Result<(), String> {
     })
 }
 
+// ---------------------------------------------------------------------------
+// Experiment arms (campaign section 5: repaired driver and controls).
+// ---------------------------------------------------------------------------
+
+/// The admitted experiment-arm set. NO_ATTACHMENT / FULL_TEXT / WRONG_SENDER
+/// are selected client-side (case construction); TOKEN_FULL / TOKEN_SELECTED /
+/// TOKEN_NORM / NULL_SHAPE are the P3 hook's content arms (control-file tokens
+/// texact / tnorm / nshape, unchanged on the wire); NATIVE is the shipped
+/// positive case with the control file proven absent.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum Arm {
+    NoAttachment,
+    FullText,
+    TokenFull,
+    TokenSelected,
+    TokenNorm,
+    NullShape,
+    Native,
+    WrongSender,
+}
+
+impl Arm {
+    fn as_str(self) -> &'static str {
+        match self {
+            Arm::NoAttachment => "NO_ATTACHMENT",
+            Arm::FullText => "FULL_TEXT",
+            Arm::TokenFull => "TOKEN_FULL",
+            Arm::TokenSelected => "TOKEN_SELECTED",
+            Arm::TokenNorm => "TOKEN_NORM",
+            Arm::NullShape => "NULL_SHAPE",
+            Arm::Native => "NATIVE",
+            Arm::WrongSender => "WRONG_SENDER",
+        }
+    }
+    fn trial_suffix(self) -> &'static str {
+        match self {
+            Arm::NoAttachment => "no-attachment",
+            Arm::FullText => "full-text",
+            Arm::TokenFull => "token-full",
+            Arm::TokenSelected => "token-selected",
+            Arm::TokenNorm => "token-norm",
+            Arm::NullShape => "null-shape",
+            Arm::Native => "native",
+            Arm::WrongSender => "wrong-sender",
+        }
+    }
+    fn parse(name: &str) -> Option<Self> {
+        [
+            Arm::NoAttachment,
+            Arm::FullText,
+            Arm::TokenFull,
+            Arm::TokenSelected,
+            Arm::TokenNorm,
+            Arm::NullShape,
+            Arm::Native,
+            Arm::WrongSender,
+        ]
+        .into_iter()
+        .find(|arm| arm.as_str() == name)
+    }
+    fn admitted_names() -> String {
+        [
+            Arm::NoAttachment,
+            Arm::FullText,
+            Arm::TokenFull,
+            Arm::TokenSelected,
+            Arm::TokenNorm,
+            Arm::NullShape,
+            Arm::Native,
+            Arm::WrongSender,
+        ]
+        .into_iter()
+        .map(|arm| arm.as_str())
+        .collect::<Vec<_>>()
+        .join("|")
+    }
+    /// The hook control-file token the arm requires, or `None` when the arm
+    /// requires NO control file (an absent/empty/unknown file leaves the
+    /// shipped NATIVE aligner in place - hook `_arm_token` semantics).
+    fn hook_token(self) -> Option<&'static str> {
+        match self {
+            Arm::TokenFull | Arm::TokenSelected => Some("texact"),
+            Arm::TokenNorm => Some("tnorm"),
+            Arm::NullShape => Some("nshape"),
+            _ => None,
+        }
+    }
+}
+
+/// Resolve the requested arm: the `--arm` flag wins over `OCC3_ARM`; an
+/// unknown name refuses at startup listing the admitted arms, before any
+/// enrollment or HTTP effect (the validate_receiver_thinking_env pattern).
+fn selected_arm(flag: Option<&str>) -> Result<Option<Arm>, String> {
+    let requested = flag
+        .map(str::to_string)
+        .or_else(|| std::env::var(ARM_ENV).ok());
+    match requested {
+        None => Ok(None),
+        Some(name) => Arm::parse(&name).map(Some).ok_or_else(|| {
+            format!(
+                "{name:?} is not an admitted experiment arm; expected one of {} (or unset for the frozen contract phase)",
+                Arm::admitted_names()
+            )
+        }),
+    }
+}
+
+/// The hook's `_arm_token` parser, mirrored driver-side: exactly one token,
+/// optionally with one trailing newline, anything else (empty included)
+/// selects no arm.
+fn hook_token_from_control_bytes(bytes: &[u8]) -> Option<&'static str> {
+    ["texact", "tnorm", "nshape"].into_iter().find(|token| {
+        let encoded = token.as_bytes();
+        bytes == encoded || bytes == [encoded, b"\n"].concat()
+    })
+}
+
+/// Driver-side readback of the arm control path. A co-located driver (or a
+/// test) observes exactly what the hook would select; a remote driver host
+/// cannot see the server's control file, and the readback then records
+/// absent/unreadable honestly - the server log line
+/// `occ3_p3_arm=<token|none> file_sha256=<hex|none>` stays the authoritative
+/// effective-arm signal for those runs.
+struct ArmControlReadback {
+    path: String,
+    /// present | absent | unreadable
+    state: &'static str,
+    sha256: Option<String>,
+    bytes: Option<u64>,
+    hook_token: Option<&'static str>,
+}
+
+fn arm_control_readback() -> ArmControlReadback {
+    let path = std::env::var(ARM_CONTROL_PATH_ENV)
+        .ok()
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| ARM_CONTROL_DEFAULT_PATH.into());
+    arm_control_readback_at(&path)
+}
+
+/// The env-free core readback at one explicit path.
+fn arm_control_readback_at(path: &str) -> ArmControlReadback {
+    let path = path.to_string();
+    match std::fs::read(&path) {
+        Ok(bytes) => ArmControlReadback {
+            path,
+            state: "present",
+            sha256: Some(sha256(&bytes)),
+            bytes: Some(bytes.len() as u64),
+            hook_token: if bytes.len() > ARM_CONTROL_MAX_BYTES {
+                None
+            } else {
+                hook_token_from_control_bytes(&bytes)
+            },
+        },
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => ArmControlReadback {
+            path,
+            state: "absent",
+            sha256: None,
+            bytes: None,
+            hook_token: None,
+        },
+        Err(_) => ArmControlReadback {
+            path,
+            state: "unreadable",
+            sha256: None,
+            bytes: None,
+            hook_token: None,
+        },
+    }
+}
+
+/// Fail-closed staging check on everything the driver can see: a control file
+/// the driver CAN read must not contradict the requested arm (a hook arm
+/// needs its exact token, an absent-control arm admits no token at all). A
+/// control file the driver cannot read is recorded, never guessed.
+fn arm_staging_check(arm: Arm, readback: &ArmControlReadback) -> Result<(), String> {
+    if readback.state != "present" {
+        return Ok(());
+    }
+    match arm.hook_token() {
+        Some(expected) if readback.hook_token != Some(expected) => Err(format!(
+            "arm_control_misstaged: {} requires control token {expected:?} at {}, read back {}",
+            arm.as_str(),
+            readback.path,
+            readback.hook_token.map(|token| token.to_string()).unwrap_or_else(|| "no arm".into())
+        )),
+        None if readback.hook_token.is_some() => Err(format!(
+            "arm_control_misstaged: {} requires NO control file, read back token {:?} at {}",
+            arm.as_str(),
+            readback.hook_token,
+            readback.path
+        )),
+        _ => Ok(()),
+    }
+}
+
 /// Receiver-role thinking budget. Default keeps the historical ThinkingLevel::Max
 /// (byte-identical requests); OCC3_RECEIVER_THINKING=low|high lowers the
 /// receiver's reasoning effort for live runs where the buffered attached-turn
@@ -1507,11 +1761,17 @@ fn receiver_wire_effort() -> Option<String> {
 }
 
 /// Receiver-side request audit through the existing on_payload hook:
-/// source facts absent, the native default max_tokens, request count.
+/// source facts absent, the native default max_tokens, request count. The
+/// forbidden set is every private value that must NOT reach the receiver in
+/// text (the positive case's nonce; WRONG_SENDER adds the second source's
+/// nonce). `require_no_occ3_keys` adds the client-side boundary proof for
+/// NO_ATTACHMENT / FULL_TEXT: the serialized body carries neither the `occ3`
+/// nor the `occ3_capture` opt-in key.
 fn attach_receiver_audit(
     options: &mut AgentOptions,
     audit: Arc<Mutex<Vec<Value>>>,
-    forbidden: String,
+    forbidden: Vec<String>,
+    require_no_occ3_keys: bool,
 ) {
     let dump_path = std::env::var("OCC3_DUMP_RECEIVER_PAYLOAD").ok();
     options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
@@ -1540,17 +1800,27 @@ fn attach_receiver_audit(
         if let Some(path) = &dump_path {
             let _ = std::fs::write(path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
         }
-        let absent = !serialized.contains(&forbidden);
+        let absent = forbidden.iter().all(|fact| !serialized.contains(fact));
+        // Exact top-level key check only: a substring scan would false-positive
+        // on ordinary message text (the suite nonce itself contains "occ3-").
+        let occ3_keys_absent = !require_no_occ3_keys
+            || payload
+                .as_object()
+                .is_some_and(|body| !body.contains_key("occ3") && !body.contains_key("occ3_capture"));
         let max_tokens = payload
             .get("max_tokens")
             .or_else(|| payload.get("max_completion_tokens"))
             .cloned();
-        audit.lock().unwrap().push(json!({
+        let mut entry = json!({
             "source_facts_absent": absent,
             "max_tokens": max_tokens,
-        }));
+        });
+        if require_no_occ3_keys {
+            entry["occ3_keys_absent"] = json!(occ3_keys_absent);
+        }
+        audit.lock().unwrap().push(entry);
         Box::pin(async move {
-            if absent {
+            if absent && occ3_keys_absent {
                 if effort_applied {
                     // on_payload's contract replaces the provider-built
                     // params only when Some is returned; returning None
@@ -1583,6 +1853,66 @@ fn receiver_audit_summary(audit: &[Value]) -> Value {
         "max_tokens": audit.first().and_then(|a| a["max_tokens"].as_u64()),
         "request_count": audit.len(),
     })
+}
+
+/// Arm-evidence variant of the receiver audit summary: adds the occ3-key
+/// boundary proof recorded per request. Never feeds the frozen report.
+fn arm_receiver_audit_summary(audit: &[Value]) -> Value {
+    json!({
+        "source_facts_absent": audit.iter().all(|a| a["source_facts_absent"] == json!(true)),
+        "occ3_keys_absent": audit.iter().all(|a| a["occ3_keys_absent"] != json!(false)),
+        "max_tokens": audit.first().and_then(|a| a["max_tokens"].as_u64()),
+        "request_count": audit.len(),
+    })
+}
+
+/// The receiver's final completed assistant message, raw: untrimmed text
+/// blocks concatenated, plus the provider's finish signal.
+fn final_assistant_raw(agent: &Agent) -> (String, Option<String>) {
+    agent
+        .state()
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Message(Message::Assistant(a)) => Some((
+                a.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AiContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+                a.stop_reason_raw.clone().or(Some(a.stop_reason.clone())),
+            )),
+            _ => None,
+        })
+        .unwrap_or_default()
+}
+
+/// Every assistant CONTENT text block of the turn, concatenated with
+/// newlines. Thinking blocks are excluded: the v2 span classifies them
+/// before the reasoning terminator, so only content text can be inside the
+/// selected span (span-boundary audit, R5/R7).
+fn assistant_text_content(agent: &Agent) -> String {
+    agent
+        .state()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Message(Message::Assistant(a)) => Some(
+                a.content
+                    .iter()
+                    .filter_map(|c| match c {
+                        AiContentBlock::Text(t) => Some(t.text.as_str()),
+                        _ => None,
+                    })
+                    .collect::<String>(),
+            ),
+            _ => None,
+        })
+        .collect::<Vec<_>>()
+        .join("\n")
 }
 
 struct FamilyInput<'a> {
@@ -1649,9 +1979,37 @@ fn observed_from(env: &PhaseEnv, source_audit: &Value) -> Value {
     })
 }
 
+/// The receiver framing shared byte-identically by the positive case, the
+/// no-state contract control and every arm trial that presents a receiver
+/// (NO_ATTACHMENT keeps it exactly; the arm's only difference from the
+/// positive case is the attachment itself).
+const RECEIVER_SYSTEM_PROMPT: &str = "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.";
+
 // ---------------------------------------------------------------------------
 // Case drivers.
 // ---------------------------------------------------------------------------
+
+/// Per-arm trial plan for the positive-path arms (NATIVE, TOKEN_FULL,
+/// TOKEN_SELECTED, TOKEN_NORM, NULL_SHAPE). `None` is the frozen contract
+/// run: byte-identical prompts and verdict enforcement. An arm plan only
+/// (a) pins the TOKEN_FULL pre-registered exact-message source prompt and
+/// (b) leaves the semantic verdict to the arm evidence instead of the
+/// contract refusal.
+struct PositiveArmPlan {
+    /// TOKEN_FULL pre-registers the intended message (arms-audit 4.5): the
+    /// source must emit it as its complete final content so the armed span
+    /// can cover it. No other arm changes the source prompt.
+    message_pinned: bool,
+}
+
+/// What one positive-path run observed, for both the frozen contract callers
+/// (case/observed/cleanup) and the arm-evidence projection.
+struct PositiveOutcome {
+    case: Value,
+    observed: Value,
+    cleanup_ok: bool,
+    arm_evidence: Value,
+}
 
 /// Positive case: one real native handoff (root correction F4: the before
 /// phase DOES publish) through the actual client path: arm_source -> source
@@ -1665,15 +2023,28 @@ async fn run_positive_case(
     source_id: &str,
     receiver_id: &str,
     nonce: &str,
-) -> Result<(Value, Value, bool), String> {
+    plan: Option<&PositiveArmPlan>,
+) -> Result<PositiveOutcome, String> {
+    let arm_started = Instant::now();
     let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let mut source_options = agent_options(
-        &env.model,
-        env.key.clone(),
-        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.",
-    );
+    // TOKEN_FULL's pre-registered source prompts; every other run keeps the
+    // historical prompt bytes exactly.
+    let message_pinned = plan.is_some_and(|plan| plan.message_pinned);
+    let source_system_prompt = if message_pinned {
+        "Preserve the private vault code in the native source turn. State the exact message as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
+    } else {
+        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
+    };
+    let source_user_prompt = if message_pinned {
+        format!(
+            "The private vault code is {nonce}. Emit exactly \"The private vault code is {nonce}.\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."
+        )
+    } else {
+        format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments.")
+    };
+    let mut source_options = agent_options(&env.model, env.key.clone(), source_system_prompt);
     if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
         // Root diagnostic: dump the armed source-turn request payload exactly
         // as serialized to the provider. No behavior change when unset.
@@ -1686,10 +2057,15 @@ async fn run_positive_case(
     let mut receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
+        RECEIVER_SYSTEM_PROMPT,
     );
     let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-    attach_receiver_audit(&mut receiver_options, audit.clone(), nonce.to_string());
+    attach_receiver_audit(
+        &mut receiver_options,
+        audit.clone(),
+        vec![nonce.to_string()],
+        false,
+    );
     let receiver_agent = Agent::new(receiver_options);
     let family = build_family(FamilyInput {
         source_id,
@@ -1713,13 +2089,14 @@ async fn run_positive_case(
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
-            input: format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
+            input: source_user_prompt,
             images: Vec::new(),
         }),
     )
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail());
+    let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
     // Evidence extraction happens before cleanup.
     let answer = normalized_final_answer(&receiver_agent);
     let answer_sha256 = sha256(answer.as_bytes());
@@ -1798,6 +2175,13 @@ async fn run_positive_case(
         && audit_summary["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
         && audit_summary["request_count"] == json!(1);
     let observed = observed_from(env, &source_audit);
+    // Arm-trial evidence (collected before cleanup; contract callers ignore
+    // it): the receiver's raw answer + finish signal, the sender's own
+    // content text, the receipt span block and the coverage verdict.
+    let (receiver_raw_answer, finish_reason) = final_assistant_raw(&receiver_agent);
+    let sender_content = assistant_text_content(&source_agent);
+    let value_in_sender_content = sender_content.contains(nonce);
+    let span_block = source.span_evidence();
     let cleanup = family.close().await;
     // Root diagnostics (env-gated so the default report keeps its exact
     // fieldset): the source capture audit and any tool-result errors, for
@@ -1819,10 +2203,34 @@ async fn run_positive_case(
         case["receiver_tool_calls"] = json!(receiver_tool_calls);
         case["source_tool_calls"] = json!(source_tool_calls);
     }
-    if !case_passed {
-        return Err(format!("positive case failed: {case}"));
-    }
-    Ok((case, observed, cleanup.is_ok()))
+    let coverage = span_coverage_verdict(span_block.as_ref(), value_in_sender_content);
+    let arm_evidence = json!({
+        "receiver_raw_answer": receiver_raw_answer,
+        "parsed_answer": answer,
+        "answer_sha256": answer_sha256,
+        "finish_reason": finish_reason,
+        "semantic_nonce_match": semantic_nonce_match,
+        "sender_final_content": sender_content,
+        "sender_final_content_contains_value": value_in_sender_content,
+        "receipt_span_block": span_block,
+        "coverage": coverage,
+        "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
+        "lease_state": receiver_phase.as_array().and_then(|e| e.first()).and_then(|e| e["lease_state"].as_str()).map(str::to_string),
+        "delivered": delivered,
+        "consumed": consumed,
+        "source_state_ok": source_state_ok,
+        "source_tool_calls": source_tool_calls,
+        "receiver_tool_calls": receiver_tool_calls,
+        "receiver_request_audit": arm_receiver_audit_summary(&audit.lock().unwrap().clone()),
+        "capture_turn_millis": capture_turn_millis,
+        "total_millis": arm_started.elapsed().as_millis() as u64,
+    });
+    Ok(PositiveOutcome {
+        case,
+        observed,
+        cleanup_ok: cleanup.is_ok(),
+        arm_evidence,
+    })
 }
 
 /// No-state control: a receiver prompt without any state attachment must
@@ -1838,10 +2246,15 @@ async fn run_no_state_case(
     let mut receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
+        RECEIVER_SYSTEM_PROMPT,
     );
     let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
-    attach_receiver_audit(&mut receiver_options, audit.clone(), nonce.to_string());
+    attach_receiver_audit(
+        &mut receiver_options,
+        audit.clone(),
+        vec![nonce.to_string()],
+        false,
+    );
     let receiver_agent = Agent::new(receiver_options);
     let family = IsolatedNativeFamily::new(vec![IsolatedNativeMember {
         catalog: AgentFamilyCatalogEntry {
@@ -1902,6 +2315,418 @@ async fn run_no_state_case(
         return Err(format!("no_state case failed: {case}"));
     }
     Ok((case, cleanup.is_ok()))
+}
+
+/// The receiver question the native envelope delivers as the final user turn
+/// (occ3_native.rs send_prepared_native_handoff; sglang.rs builds the same
+/// control_summary and PreparedNativeHandoff pins it). The NO_ATTACHMENT arm
+/// presents this question verbatim, so the ONLY difference from the positive
+/// case is the missing attachment itself.
+const NATIVE_CONTROL_SUMMARY: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.";
+
+/// NO_ATTACHMENT arm: the positive case's receiver framing with NO source
+/// handoff and NO attachment - one plain chat request that carries no occ3
+/// body keys (asserted by the payload audit: the client-side boundary
+/// proof). The server-side boundary proof already exists in the attested
+/// plugin set and is referenced, not re-implemented, here: the
+/// attachment-is-None path in chat_adapter.handle_around (chat_adapter.py
+/// 450-454) and the descriptor-None early return in
+/// latent_worker.commit_result (latent_worker.py 1211-1214) are the two
+/// server-side boundary logs for this arm; the arm evidence records both
+/// references. Expected: the exact UNKNOWN answer (non-recovery).
+async fn run_no_attachment_case(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    receiver_id: &str,
+    nonce: &str,
+) -> Result<Value, String> {
+    let arm_started = Instant::now();
+    let receiver = Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
+    let mut receiver_options = receiver_agent_options(&env.model, env.key.clone(), RECEIVER_SYSTEM_PROMPT);
+    let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    attach_receiver_audit(
+        &mut receiver_options,
+        audit.clone(),
+        vec![nonce.to_string()],
+        true,
+    );
+    let receiver_agent = Agent::new(receiver_options);
+    let family = IsolatedNativeFamily::new(vec![IsolatedNativeMember {
+        catalog: AgentFamilyCatalogEntry {
+            id: receiver_id.into(),
+            name: Some("receiver".into()),
+            depth: 0.,
+            ..Default::default()
+        },
+        endpoint: AgentSessionMessageEndpoint {
+            active_session_id: receiver_id.into(),
+            session_id: receiver_id.into(),
+            session_name: Some("receiver".into()),
+            ..Default::default()
+        },
+        agent: receiver_agent.clone(),
+        native: receiver.clone(),
+    }])?;
+    family.install()?;
+    strip_handoff_tool(&receiver_agent);
+    let action = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        receiver_agent.prompt(PromptInput::Text {
+            input: NATIVE_CONTROL_SUMMARY.into(),
+            images: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    let receiver_turn_millis = arm_started.elapsed().as_millis() as u64;
+    let (receiver_raw_answer, finish_reason) = final_assistant_raw(&receiver_agent);
+    let answer = normalized_final_answer(&receiver_agent);
+    let answer_sha256 = sha256(answer.as_bytes());
+    let semantic_nonce_match = answer == nonce;
+    let receipts = family.receipts();
+    let receiver_phase = receiver.audit()["receiver"].clone();
+    let tool_calls = count_tool_calls(&receiver_agent);
+    let audit_summary = arm_receiver_audit_summary(&audit.lock().unwrap().clone());
+    let answer_is_unknown = answer == UNKNOWN_ANSWER;
+    let structural_ok = action.is_ok()
+        && receipts.is_empty()
+        && receiver_phase.as_array().is_some_and(|e| e.is_empty())
+        && tool_calls == 0
+        && audit_summary["source_facts_absent"] == json!(true)
+        && audit_summary["occ3_keys_absent"] == json!(true)
+        && audit_summary["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
+        && audit_summary["request_count"] == json!(1);
+    let cleanup = family.close().await;
+    let evidence = json!({
+        "receiver_raw_answer": receiver_raw_answer,
+        "parsed_answer": answer,
+        "answer_sha256": answer_sha256,
+        "finish_reason": finish_reason,
+        "semantic_nonce_match": semantic_nonce_match,
+        "answer_is_unknown": answer_is_unknown,
+        "structural_ok": structural_ok,
+        "case_passed": structural_ok && answer_is_unknown && !semantic_nonce_match,
+        "messages": receipts.len(),
+        "tool_calls": tool_calls,
+        "receiver_request_audit": audit_summary,
+        "receipt_span_block": Value::Null,
+        "coverage": {"coverage_computed": "not_applicable"},
+        "server_boundary_proofs": [
+            "chat_adapter.handle_around attachment-is-None path (chat_adapter.py:450-454)",
+            "latent_worker.commit_result descriptor-None early return (latent_worker.py:1211-1214)",
+        ],
+        "receiver_turn_millis": receiver_turn_millis,
+        "total_millis": arm_started.elapsed().as_millis() as u64,
+    });
+    if !cleanup.is_ok() {
+        return Err("no_attachment arm cleanup uncertain".into());
+    }
+    Ok(evidence)
+}
+
+/// FULL_TEXT arm (the text oracle): the intended message - private value
+/// included - delivered as ORDINARY TEXT through the normal agent-message
+/// path (`IsolatedController::send_agent_message`, occ3_native.rs:264-314).
+/// No capture is armed, nothing is published, and the receiver request must
+/// carry no occ3 body keys (payload audit). The receiver must recover the
+/// value from text: a failure here is a broken ordinary text channel, not a
+/// latent-communication result.
+async fn run_full_text_case(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    source_id: &str,
+    receiver_id: &str,
+    nonce: &str,
+) -> Result<Value, String> {
+    let arm_started = Instant::now();
+    let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
+    let receiver = Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
+    let source_options = agent_options(
+        &env.model,
+        env.key.clone(),
+        "You are a SENDER agent in an authorized, operator-supervised experiment on state communication between agents of the same deployment. In this arm the harness delivers your message as ordinary text; do not call tools.",
+    );
+    let source_agent = Agent::new(source_options);
+    let mut receiver_options = receiver_agent_options(&env.model, env.key.clone(), RECEIVER_SYSTEM_PROMPT);
+    // The delivered body arrives as an agent-message custom record; the
+    // production converter renders it as the receiver's user turn (the
+    // default LLM conversion drops custom messages, which would turn every
+    // delivery into an unanswered system-only turn).
+    receiver_options.convert_to_llm = Some(Arc::new(|messages: Vec<AgentMessage>| {
+        Box::pin(async move {
+            pi_coding_agent::core::messages::convert_to_llm(
+                &messages,
+                &std::default::Default::default(),
+            )
+        })
+    }));
+    let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    // The private value IS the payload in this arm, so no source-facts
+    // prohibition applies - only the occ3-key boundary proof.
+    attach_receiver_audit(&mut receiver_options, audit.clone(), Vec::new(), true);
+    let receiver_agent = Agent::new(receiver_options);
+    let family = build_family(FamilyInput {
+        source_id,
+        receiver_id,
+        source_agent: source_agent.clone(),
+        receiver_agent: receiver_agent.clone(),
+        source_native: source.clone(),
+        receiver_native: receiver.clone(),
+    })?;
+    family.install()?;
+    strip_handoff_tool(&receiver_agent);
+    strip_handoff_tool(&source_agent);
+    // The pre-registered intended message: the same sentence TOKEN_FULL pins
+    // as the sender's complete final content.
+    let intended_message = format!("The private vault code is {nonce}.");
+    let controller = family.controller(source_id)?;
+    let send = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        controller.send_agent_message(AgentSessionMessageSendInput {
+            target: "receiver".into(),
+            message: intended_message.clone(),
+            receiver_role: None,
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    let receiver_turn_millis = arm_started.elapsed().as_millis() as u64;
+    let (receiver_raw_answer, finish_reason) = final_assistant_raw(&receiver_agent);
+    let answer = normalized_final_answer(&receiver_agent);
+    let answer_sha256 = sha256(answer.as_bytes());
+    let semantic_nonce_match = answer == nonce;
+    let delivery_status = send.as_ref().ok().map(|r| r.delivery_status.clone());
+    let receipts = family.receipts();
+    let tool_calls = count_tool_calls(&receiver_agent);
+    let audit_summary = arm_receiver_audit_summary(&audit.lock().unwrap().clone());
+    let structural_ok = send.is_ok()
+        && delivery_status.as_deref() == Some("delivered")
+        && receipts.is_empty()
+        && tool_calls == 0
+        && audit_summary["occ3_keys_absent"] == json!(true)
+        && audit_summary["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
+        && audit_summary["request_count"] == json!(1);
+    let cleanup = family.close().await;
+    let evidence = json!({
+        "receiver_raw_answer": receiver_raw_answer,
+        "parsed_answer": answer,
+        "answer_sha256": answer_sha256,
+        "finish_reason": finish_reason,
+        "semantic_nonce_match": semantic_nonce_match,
+        "intended_message": intended_message,
+        "delivery_status": delivery_status,
+        "structural_ok": structural_ok,
+        "case_passed": structural_ok && semantic_nonce_match,
+        "messages": receipts.len(),
+        "tool_calls": tool_calls,
+        "receiver_request_audit": audit_summary,
+        "receipt_span_block": Value::Null,
+        "coverage": {"coverage_computed": "not_applicable"},
+        "receiver_turn_millis": receiver_turn_millis,
+        "total_millis": arm_started.elapsed().as_millis() as u64,
+    });
+    if !cleanup.is_ok() {
+        return Err("full_text arm cleanup uncertain".into());
+    }
+    Ok(evidence)
+}
+
+/// WRONG_SENDER arm: the positive-case flow with a SECOND source session
+/// that emits its own independently generated value. Source-A captures its
+/// value but its handoff is the retained-control inert stub (never
+/// published); source-B runs the real handoff, so the one and only
+/// delivered state is B's. The scoring question: the receiver must report
+/// the DELIVERED state's value and not the other source's value. One-shot
+/// lease discipline: B's publication is consumed exactly once (one receiver
+/// prompt, one Consumed inbox record); A's unpublished capture is retired by
+/// family.close() through retire_native_source.
+async fn run_wrong_sender_case(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    source_a_id: &str,
+    source_b_id: &str,
+    receiver_id: &str,
+    delivered_nonce: &str,
+    other_nonce: &str,
+) -> Result<Value, String> {
+    let arm_started = Instant::now();
+    let source_a =
+        Occ3NativeSession::enroll(source_a_id, &env.model, connector.clone()).await?;
+    let source_b =
+        Occ3NativeSession::enroll(source_b_id, &env.model, connector.clone()).await?;
+    let receiver =
+        Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
+    let source_system_prompt = "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
+    let source_a_agent = Agent::new(agent_options(&env.model, env.key.clone(), source_system_prompt));
+    let source_b_agent = Agent::new(agent_options(&env.model, env.key.clone(), source_system_prompt));
+    let mut receiver_options = receiver_agent_options(&env.model, env.key.clone(), RECEIVER_SYSTEM_PROMPT);
+    let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    // Leakage audit across BOTH private values: neither nonce may reach the
+    // receiver's request text (the delivered value travels only as attached
+    // state; the other value must not travel at all).
+    attach_receiver_audit(
+        &mut receiver_options,
+        audit.clone(),
+        vec![delivered_nonce.to_string(), other_nonce.to_string()],
+        false,
+    );
+    let receiver_agent = Agent::new(receiver_options);
+    let member = |id: &str, name: &str, depth: f64, parent: Option<&str>, agent: Arc<Agent>, native: Arc<Occ3NativeSession>| IsolatedNativeMember {
+        catalog: AgentFamilyCatalogEntry {
+            id: id.into(),
+            name: Some(name.into()),
+            depth,
+            parent_session_id: parent.map(str::to_string),
+            ..Default::default()
+        },
+        endpoint: AgentSessionMessageEndpoint {
+            active_session_id: id.into(),
+            session_id: id.into(),
+            session_name: Some(name.into()),
+            ..Default::default()
+        },
+        agent,
+        native,
+    };
+    // The receiver is B's child: B's real occ3_handoff(receiver_role
+    // "child") authorizes against the family catalog. A stays a separate
+    // root whose captured state is never delivered.
+    let family = IsolatedNativeFamily::new(vec![
+        member(source_a_id, "source-a", 0., None, source_a_agent.clone(), source_a.clone()),
+        member(source_b_id, "source-b", 0., None, source_b_agent.clone(), source_b.clone()),
+        member(receiver_id, "receiver", 1., Some(source_b_id), receiver_agent.clone(), receiver.clone()),
+    ])?;
+    family.install()?;
+    strip_handoff_tool(&receiver_agent);
+    // A's handoff is the retained-control stub: the capture completes, the
+    // publication never happens, the first dispatch is the bounded stop.
+    let dispatched = Arc::new(AtomicBool::new(false));
+    let dispatch_count = Arc::new(AtomicU64::new(0));
+    let tool_call_id: Arc<Mutex<Option<String>>> = Arc::new(Mutex::new(None));
+    {
+        let mut state = source_a_agent.state();
+        let mut tools = state.tools.take().unwrap_or_default();
+        tools.retain(|t| t.name != NATIVE_HANDOFF_TOOL);
+        tools.push(inert_handoff_stub(
+            dispatched.clone(),
+            dispatch_count.clone(),
+            tool_call_id,
+        ));
+        state.tools = Some(tools);
+        source_a_agent.set_state(state);
+    }
+    let budget = |env: &PhaseEnv| NativeSourceBudget {
+        retained_count_limit: 128,
+        max_capture_bytes: env.max_capture_bytes,
+        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+        max_response_bytes: env.max_response_bytes,
+    };
+    source_a.arm_source(budget(env))?;
+    let action_a = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        source_a_agent.prompt(PromptInput::Text {
+            input: format!("The private vault code is {other_nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
+            images: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    if action_a.is_err()
+        || !dispatched.load(Ordering::SeqCst)
+        || dispatch_count.load(Ordering::SeqCst) != 1
+    {
+        return Err("wrong_sender source-A turn did not reach exactly one stub dispatch".into());
+    }
+    let source_a_audit = source_a.audit();
+    let a_captured_unpublished = source_a_audit["source"]["state"] == json!("Captured")
+        && source_a_audit["source"]["tool_claimed"] == json!(false)
+        && source_a_audit["source"]["handoff_admitted"] == json!(false)
+        && source_a_audit["source"]["published_message"].is_null();
+    if !a_captured_unpublished {
+        return Err(format!("wrong_sender source-A capture not retained: {source_a_audit}"));
+    }
+    source_b.arm_source(budget(env))?;
+    let action_b = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        source_b_agent.prompt(PromptInput::Text {
+            input: format!("The private vault code is {delivered_nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
+            images: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
+    let (receiver_raw_answer, finish_reason) = final_assistant_raw(&receiver_agent);
+    let answer = normalized_final_answer(&receiver_agent);
+    let answer_sha256 = sha256(answer.as_bytes());
+    let delivered_nonce_match = answer == delivered_nonce;
+    let other_nonce_match = answer == other_nonce;
+    let receipts = family.receipts();
+    let receiver_phase = receiver.audit()["receiver"].clone();
+    let consumed_count = receiver_phase
+        .as_array()
+        .map(|e| e.iter().filter(|e| e["lease_state"] == json!("Consumed")).count())
+        .unwrap_or(0);
+    let message = receipts.first();
+    let delivered = message
+        .as_ref()
+        .is_some_and(|r| r.delivery_status == "delivered");
+    let source_b_audit = source_b.audit();
+    let b_state_ok = source_b_audit["source"]["state"] == json!("Captured")
+        && source_b_audit["source"]["tool_claimed"] == json!(true)
+        && source_b_audit["source"]["handoff_admitted"] == json!(true)
+        && source_b_audit["source"]["published_message"].is_array();
+    let receiver_tool_calls = count_tool_calls(&receiver_agent);
+    let source_b_tool_calls = count_tool_calls(&source_b_agent);
+    let audit_summary = arm_receiver_audit_summary(&audit.lock().unwrap().clone());
+    let structural_ok = action_b.is_ok()
+        && delivered
+        && receipts.len() == 1
+        && consumed_count == 1
+        && b_state_ok
+        && receiver_tool_calls == 0
+        && source_b_tool_calls == 1
+        && audit_summary["source_facts_absent"] == json!(true)
+        && audit_summary["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
+        && audit_summary["request_count"] == json!(1);
+    // One-shot lease discipline evidence: exactly one publication existed
+    // (B's), it was consumed exactly once, and A's capture was never
+    // published (retired by close).
+    let cleanup = family.close().await;
+    let evidence = json!({
+        "receiver_raw_answer": receiver_raw_answer,
+        "parsed_answer": answer,
+        "answer_sha256": answer_sha256,
+        "finish_reason": finish_reason,
+        "delivered_nonce_match": delivered_nonce_match,
+        "other_nonce_match": other_nonce_match,
+        "delivered_value_sha256": sha256(delivered_nonce.as_bytes()),
+        "other_value_sha256": sha256(other_nonce.as_bytes()),
+        "delivered_source": "source-b",
+        "other_source": "source-a",
+        "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
+        "consumed_count": consumed_count,
+        "messages": receipts.len(),
+        "a_captured_unpublished": a_captured_unpublished,
+        "b_state_ok": b_state_ok,
+        "receiver_tool_calls": receiver_tool_calls,
+        "source_b_tool_calls": source_b_tool_calls,
+        "receiver_request_audit": audit_summary,
+        "receipt_span_block": Value::Null,
+        "coverage": {"coverage_computed": "not_applicable"},
+        "structural_ok": structural_ok,
+        "case_passed": structural_ok && delivered_nonce_match && !other_nonce_match,
+        "capture_turn_millis": capture_turn_millis,
+        "total_millis": arm_started.elapsed().as_millis() as u64,
+    });
+    if !cleanup.is_ok() {
+        return Err("wrong_sender arm cleanup uncertain".into());
+    }
+    Ok(evidence)
 }
 
 /// Harness-owned inert handoff stub (root correction F5): installed BEFORE the
@@ -2040,7 +2865,7 @@ async fn run_stale_pre_case(
     let receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
+        RECEIVER_SYSTEM_PROMPT,
     );
     let receiver_agent = Agent::new(receiver_options);
     let family = build_family(FamilyInput {
@@ -2745,8 +3570,23 @@ async fn run_before_phase(
     // The retained negative control runs in its own family with its own
     // connector so no close/shutdown path can ever retire it.
     let stale_connector = env.connector()?;
-    let (positive, observed, cleanup_positive) =
-        run_positive_case(env, &connector, &diagnostic_source_session(), &diagnostic_receiver_session(), &nonce).await?;
+    let positive_outcome = run_positive_case(
+        env,
+        &connector,
+        &diagnostic_source_session(),
+        &diagnostic_receiver_session(),
+        &nonce,
+        None,
+    )
+    .await?;
+    if positive_outcome.case["case_passed"] != json!(true) {
+        return Err(format!("positive case failed: {}", positive_outcome.case));
+    }
+    let (positive, observed, cleanup_positive) = (
+        positive_outcome.case,
+        positive_outcome.observed,
+        positive_outcome.cleanup_ok,
+    );
     let (no_state, cleanup_no_state) =
         run_no_state_case(env, &connector, ORIGINAL_NOSTATE_SESSION, &nonce).await?;
     let (stale_pre, artifact) = run_stale_pre_case(
@@ -2888,8 +3728,23 @@ async fn run_after_phase(
         &fresh_enrollment_runtime_epoch,
     )
     .await?;
-    let (positive, observed, cleanup_positive) =
-        run_positive_case(env, &connector, &diagnostic_source_session(), &diagnostic_receiver_session(), &nonce).await?;
+    let positive_outcome = run_positive_case(
+        env,
+        &connector,
+        &diagnostic_source_session(),
+        &diagnostic_receiver_session(),
+        &nonce,
+        None,
+    )
+    .await?;
+    if positive_outcome.case["case_passed"] != json!(true) {
+        return Err(format!("positive case failed: {}", positive_outcome.case));
+    }
+    let (positive, observed, cleanup_positive) = (
+        positive_outcome.case,
+        positive_outcome.observed,
+        positive_outcome.cleanup_ok,
+    );
     let (no_state, cleanup_no_state) =
         run_no_state_case(env, &connector, ORIGINAL_NOSTATE_SESSION, &nonce).await?;
     let shutdown = connector.shutdown().await;
@@ -2914,6 +3769,558 @@ async fn run_after_phase(
     let pretty = serde_json::to_vec_pretty(&report).map_err(|_| fail())?;
     publish_exclusive(&env.journal, "native-phase-suite-after_restart.json", &pretty)?;
     Ok(report)
+}
+
+// ---------------------------------------------------------------------------
+// Arm-trial coverage, evidence and the arm phase runner.
+// ---------------------------------------------------------------------------
+
+/// Driver-side coverage verdict for TOKEN_FULL / TOKEN_SELECTED
+/// (arms-audit 4.5). Coverage==1 requires:
+/// - a v2 receipt span block (a v1 capture has NO span selection: the fields
+///   needed for offline computation are recorded instead and the verdict is
+///   null, `coverage_computed: "offline"`);
+/// - span_message_truncated == false (no content-head loss, no over-window
+///   turn: the receipt's truncation flag is the fail-closed signal);
+/// - span_contains_final_content == true (the selected run is the final
+///   content run, which starts at the reasoning terminator);
+/// - the intended value present in the sender's own final CONTENT text: the
+///   span is that complete run, so the value's tokens are then inside the
+///   span. Thinking text is excluded by construction (the run starts after
+///   the terminator), so a value stated only in reasoning is NOT covered.
+fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) -> Value {
+    let Some(span) = span else {
+        return json!({
+            "coverage_computed": "offline",
+            "coverage_complete": null,
+            "value_in_sender_content": value_in_sender_content,
+            "note": "no receipt span block (v1 capture); span fields recorded for offline coverage computation",
+        });
+    };
+    let truncated = span["span_message_truncated"].as_bool();
+    let contains_final_content = span["span_contains_final_content"].as_bool();
+    let span_complete = truncated == Some(false) && contains_final_content == Some(true);
+    let coverage_complete = span_complete && value_in_sender_content;
+    json!({
+        "coverage_computed": "receipt_span",
+        "coverage_complete": coverage_complete,
+        "value_in_sender_content": value_in_sender_content,
+        "span_message_truncated": truncated,
+        "span_contains_final_content": contains_final_content,
+        "span_content_count": span["span_content_count"],
+        "span_thinking_count": span["span_thinking_count"],
+        "span_tool_call_count": span["span_tool_call_count"],
+        "span_window_start_position": span["span_window_start_position"],
+        "span_window_end_position": span["span_window_end_position"],
+        "retained_count": span["retained_count"],
+        "accepted_span_start": span["accepted_span_start"],
+        "accepted_span_end": span["accepted_span_end"],
+        "accepted_sequence_digest": span["accepted_sequence_digest"],
+    })
+}
+
+/// Live-only token-count cross-check for the TOKEN_FULL / TOKEN_SELECTED
+/// coverage fields: the pinned pristine SGLang 0.5.21 tree serves /tokenize
+/// and /v1/tokenize (http_server.py:1812-1824, OpenAIServingTokenize) for a
+/// plain prompt. The driver tokenizes the sender's actual final content
+/// with add_special_tokens=false and records the count next to
+/// span_content_count (arms-audit 4.5 step 3). Any failure records null and
+/// leaves the receipt-span verdict untouched; the offline fixture serves no
+/// tokenize route and is never asked.
+async fn tokenize_message_count(env: &PhaseEnv, message: &str) -> Option<(u64, &'static str)> {
+    if env.offline_records.is_some() || message.is_empty() {
+        return None;
+    }
+    let client = reqwest::Client::builder()
+        .redirect(reqwest::redirect::Policy::none())
+        .no_gzip()
+        .no_brotli()
+        .no_zstd()
+        .no_deflate()
+        .timeout(Duration::from_secs(30))
+        .build()
+        .ok()?;
+    for route in ["/tokenize", "/v1/tokenize"] {
+        let mut request = client
+            .post(format!("{}{route}", env.endpoint))
+            .header("content-type", "application/json")
+            .header("accept-encoding", "identity")
+            .bearer_auth(&*env.key)
+            .body(json!({"prompt": message, "add_special_tokens": false}).to_string());
+        if let Some(headers) = &env.control_headers {
+            for (name, value) in headers {
+                request = request.header(name.as_str(), value.as_str());
+            }
+        }
+        let Ok(response) = request.send().await else {
+            continue;
+        };
+        if !response.status().is_success() {
+            continue;
+        }
+        let Ok(body) = response.json::<Value>().await else {
+            continue;
+        };
+        if let Some(count) = body["count"].as_u64() {
+            return Some((count, route));
+        }
+    }
+    None
+}
+
+/// Whether the arm runs any capture at all: NO_ATTACHMENT and FULL_TEXT are
+/// pure client-side cases (the control file is not part of those arms).
+fn arm_runs_capture(arm: Arm) -> bool {
+    !matches!(arm, Arm::NoAttachment | Arm::FullText)
+}
+
+/// The TOKEN_FULL rule: coverage must be provably == 1. A null verdict
+/// (v1 receipt, no span block) or a false verdict (truncated span, value
+/// outside the sender's content) marks the trial invalid_coverage - never a
+/// silent pass on partial coverage.
+fn token_full_invalid_coverage(coverage: &Value) -> bool {
+    coverage["coverage_complete"].as_bool() != Some(true)
+}
+
+/// The structural pass bar for the positive-path arms: the handoff pipeline
+/// ran exactly as designed, independent of whether the receiver recovered
+/// the value (that semantic outcome is the experiment's datum, recorded in
+/// the evidence either way).
+fn positive_structural_ok(evidence: &Value) -> bool {
+    evidence["delivered"] == json!(true)
+        && evidence["consumed"] == json!(true)
+        && evidence["source_state_ok"] == json!(true)
+        && evidence["receiver_tool_calls"] == json!(0)
+        && evidence["source_tool_calls"] == json!(1)
+        && evidence["receiver_request_audit"]["source_facts_absent"] == json!(true)
+        && evidence["receiver_request_audit"]["occ3_keys_absent"] != json!(false)
+        && evidence["receiver_request_audit"]["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
+        && evidence["receiver_request_audit"]["request_count"] == json!(1)
+}
+
+/// The effective-arm block of the arm evidence: what the driver can prove
+/// about the arm that actually ran, and on what basis. Client-side arms are
+/// fully determined here; hook arms are confirmed only by a locally
+/// readable control file (otherwise the server log line
+/// `occ3_p3_arm=<token|none> file_sha256=<hex|none>` remains the signal).
+fn effective_arm_or_readback(arm: Arm, readback: &ArmControlReadback) -> Value {
+    let (effective, basis) = if !arm_runs_capture(arm) {
+        (
+            Some(arm.as_str()),
+            "client-side case construction; no capture runs, the control file is not part of this arm".to_string(),
+        )
+    } else if arm.hook_token().is_some() {
+        match readback.state {
+            "present" => (
+                Some(arm.as_str()),
+                format!(
+                    "control readback confirmed token {:?} at {}",
+                    arm.hook_token(),
+                    readback.path
+                ),
+            ),
+            state => (
+                None,
+                format!(
+                    "driver cannot read {} ({}); the server log line occ3_p3_arm=<token|none> is the effective-arm signal",
+                    readback.path, state
+                ),
+            ),
+        }
+    } else {
+        match readback.state {
+            "absent" => (
+                Some(arm.as_str()),
+                format!("control path absent at {}", readback.path),
+            ),
+            "present" => (
+                Some(arm.as_str()),
+                format!(
+                    "control file present at {} selects no arm (hook no-arm); the shipped NATIVE aligner runs",
+                    readback.path
+                ),
+            ),
+            state => (
+                None,
+                format!(
+                    "driver cannot read {} ({}); the server log line occ3_p3_arm=none is the effective-arm signal",
+                    readback.path, state
+                ),
+            ),
+        }
+    };
+    json!({
+        "effective_arm": effective,
+        "basis": basis,
+        "driver_control_path": readback.path,
+        "driver_control_state": readback.state,
+    })
+}
+
+/// Publish the per-arm evidence JSON under the run's output directory. The
+/// intended value and the receiver's raw answer appear ONLY here (local
+/// evidence file), never in the frozen report fieldset.
+fn write_arm_evidence(journal: &Path, evidence: &Value) -> Result<PathBuf, String> {
+    let trial_id = evidence["trial_id"].as_str().ok_or_else(fail)?;
+    let name = format!("arm-evidence-{trial_id}.json");
+    let bytes = canonical_json_bytes(evidence).map_err(|_| fail())?;
+    if bytes.len() > MAX_ARM_EVIDENCE_BYTES {
+        return Err("arm_evidence_oversize".into());
+    }
+    publish_exclusive(journal, &name, &bytes)?;
+    Ok(journal.join(name))
+}
+
+/// One experiment-arm trial: verify the staging the driver can see,
+/// pre-commit the private value, burn the one-shot phase claim, run the
+/// arm's case, ALWAYS publish the per-arm evidence JSON (a failed trial is
+/// recorded, never silently dropped), then apply the pre-registered
+/// verdict. The frozen report fieldset is untouched.
+async fn run_arm_phase(
+    env: &PhaseEnv,
+    challenge: &PhaseChallenge,
+    descriptor_digest: &str,
+    arm: Arm,
+) -> Result<Value, String> {
+    let pins = ReportPins {
+        binary_sha256: env.harness_binary_sha256.clone(),
+        source_manifest_sha256: env.source_manifest_sha256.clone(),
+        identity_fingerprint: env.identity.fingerprint(),
+        profile_digest: env.profile_digest.clone(),
+        endpoint_origin: url::Url::parse(&env.endpoint)
+            .map_err(|_| fail())?
+            .origin()
+            .ascii_serialization(),
+    };
+    let readback = arm_control_readback();
+    arm_staging_check(arm, &readback)?;
+    let trial_id = format!("{}-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    let arm_started_at = now();
+    let started = Instant::now();
+    // Pre-committed private values (the phase runners' F4 nonce discipline):
+    // the intended value is the one the receiver should report; WRONG_SENDER
+    // adds the never-delivered other value.
+    let intended_value = format!("occ3-{}", uuid::Uuid::new_v4());
+    let other_value = format!("occ3-{}", uuid::Uuid::new_v4());
+    let nonce_commitment = sha256(intended_value.as_bytes());
+    if env.expected_ranks != challenge.expected_ranks {
+        return Err("challenge_ranks_mismatch".into());
+    }
+    // Durable one-shot claim BEFORE any effect: the attempt is spent whether
+    // the trial passes or fails (one attempt per arm).
+    write_phase_claim(
+        &env.journal,
+        &challenge.phase,
+        challenge,
+        &pins,
+        &nonce_commitment,
+        &PreMintedIds {
+            publication_id: format!("publication-{}", uuid::Uuid::new_v4()),
+            message_id: format!("message-{}", uuid::Uuid::new_v4()),
+        },
+        descriptor_digest,
+    )?;
+    let connector = env.connector()?;
+    // Fresh per-trial session ids: a live serving process binds each session
+    // id to its first enrollment, and arm trials never reuse the frozen
+    // phase ids or each other's.
+    let source_id = format!("{}-source-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    let second_source_id =
+        format!("{}-source-b-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    let receiver_id =
+        format!("{}-receiver-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    // Run the arm's case; a structural/protocol error still yields evidence.
+    let case_result: Result<Value, String> = match arm {
+        Arm::Native | Arm::TokenFull | Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
+            let plan = PositiveArmPlan {
+                message_pinned: arm == Arm::TokenFull,
+            };
+            run_positive_case(
+                env,
+                &connector,
+                &source_id,
+                &receiver_id,
+                &intended_value,
+                Some(&plan),
+            )
+            .await
+            .map(|outcome| {
+                let mut evidence = outcome.arm_evidence;
+                evidence["structural_ok"] = json!(positive_structural_ok(&evidence));
+                evidence
+            })
+            .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
+        }
+        Arm::NoAttachment => {
+            run_no_attachment_case(env, &connector, &receiver_id, &intended_value)
+                .await
+                .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
+        }
+        Arm::FullText => {
+            run_full_text_case(env, &connector, &source_id, &receiver_id, &intended_value)
+                .await
+                .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
+        }
+        Arm::WrongSender => {
+            run_wrong_sender_case(
+                env,
+                &connector,
+                &source_id,
+                &second_source_id,
+                &receiver_id,
+                &intended_value,
+                &other_value,
+            )
+            .await
+            .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
+        }
+    };
+    let (mut case_evidence, trial_error) = match case_result {
+        Ok(evidence) => (evidence, None),
+        Err(error) => (json!({"trial_error": error.clone()}), Some(error)),
+    };
+    // Live-only token-count cross-check for the token arms; the receipt-span
+    // verdict stays authoritative.
+    if matches!(arm, Arm::TokenFull | Arm::TokenSelected) {
+        if let Some(content) = case_evidence["sender_final_content"].as_str() {
+            match tokenize_message_count(env, content).await {
+                Some((count, route)) => {
+                    case_evidence["coverage"]["tokenize_count"] = json!(count);
+                    case_evidence["coverage"]["tokenize_route"] = json!(route);
+                    case_evidence["coverage"]["tokenize_add_special_tokens"] = json!(false);
+                    case_evidence["coverage"]["tokenize_count_matches_span_content_count"] = json!(
+                        case_evidence["receipt_span_block"]["span_content_count"].as_u64()
+                            == Some(count)
+                    );
+                }
+                None => {
+                    case_evidence["coverage"]["tokenize_count"] = Value::Null;
+                    case_evidence["coverage"]["tokenize_unavailable"] = json!(true);
+                }
+            }
+        }
+    }
+    // The per-arm verdict is pre-registered per arm: NATIVE is the positive
+    // contract; TOKEN_FULL must prove coverage==1 (token_full_invalid_coverage
+    // marks anything less); the other content arms record semantics as data;
+    // NO_ATTACHMENT expects the exact UNKNOWN; FULL_TEXT must recover (text
+    // oracle); WRONG_SENDER must report the delivered value and not the
+    // other.
+    let case_passed = match arm {
+        Arm::Native => case_evidence["semantic_nonce_match"] == json!(true)
+            && case_evidence["structural_ok"] == json!(true),
+        Arm::TokenFull => {
+            // Mark, never silently pass: the trial is invalid as TOKEN_FULL
+            // when coverage < 1.
+            let invalid_coverage = token_full_invalid_coverage(&case_evidence["coverage"]);
+            if invalid_coverage {
+                case_evidence["coverage"]["invalid_coverage"] = json!(true);
+            }
+            !invalid_coverage && case_evidence["structural_ok"] == json!(true)
+        }
+        Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
+            case_evidence["structural_ok"] == json!(true)
+        }
+        Arm::NoAttachment | Arm::FullText | Arm::WrongSender => {
+            case_evidence["case_passed"] == json!(true)
+        }
+    };
+    let control_file_sha256 = match (readback.state, &readback.sha256) {
+        ("present", Some(digest)) => json!(digest),
+        ("absent", _) => json!("absent"),
+        _ => json!("unreadable"),
+    };
+    let mut evidence = json!({
+        "schema": ARM_EVIDENCE_SCHEMA,
+        "requested_arm": arm.as_str(),
+        "trial_id": trial_id,
+        "attempt_id": env.attempt_id,
+        "phase": challenge.phase,
+        "mode": if env.offline_records.is_some() {
+            "offline-synthetic-fixture"
+        } else {
+            "live-root-authorized"
+        },
+        "arm_started_at": arm_started_at,
+        "arm_completed_at": now(),
+        "timings": {
+            "arm_duration_millis": started.elapsed().as_millis() as u64,
+        },
+        "control_file": {
+            "path": readback.path,
+            "state": readback.state,
+            "sha256": readback.sha256,
+            "bytes": readback.bytes,
+            "hook_token": readback.hook_token,
+        },
+        "control_file_sha256": control_file_sha256,
+        "hook_token_required": arm.hook_token(),
+        "effective_arm_or_readback": effective_arm_or_readback(arm, &readback),
+        "intended_value": intended_value,
+        "intended_value_sha256": nonce_commitment,
+        "sessions": {
+            "source": source_id,
+            "second_source": second_source_id,
+            "receiver": receiver_id,
+        },
+        "case": case_evidence,
+    });
+    // Shared answer fields hoisted next to their arm context.
+    for key in [
+        "receiver_raw_answer",
+        "parsed_answer",
+        "answer_sha256",
+        "finish_reason",
+        "semantic_nonce_match",
+        "receipt_span_block",
+        "coverage",
+    ] {
+        if let Some(value) = evidence["case"].get(key).cloned() {
+            evidence[key] = value;
+        }
+    }
+    if arm == Arm::WrongSender {
+        evidence["wrong_sender"] = json!({
+            "delivered_value": intended_value,
+            "other_value": other_value,
+            "delivered_value_sha256": sha256(intended_value.as_bytes()),
+            "other_value_sha256": sha256(other_value.as_bytes()),
+            "delivered_value_match": evidence["case"]["delivered_nonce_match"].clone(),
+            "other_value_match": evidence["case"]["other_nonce_match"].clone(),
+            "scoring": "the receiver must report the DELIVERED state's value and not the other source's value",
+        });
+    }
+    evidence["arm_case_passed"] = json!(case_passed);
+    let evidence_path = write_arm_evidence(&env.journal, &evidence)?;
+    let summary = json!({
+        "schema": ARM_TRIAL_SCHEMA,
+        "requested_arm": arm.as_str(),
+        "trial_id": trial_id,
+        "attempt_id": env.attempt_id,
+        "phase": challenge.phase,
+        "mode": evidence["mode"],
+        "arm_case_passed": case_passed,
+        "status": if case_passed { "passed" } else { "failed" },
+        "evidence_file": evidence_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string()),
+        "answer_sha256": evidence["answer_sha256"].clone(),
+        "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
+        "coverage_complete": evidence["coverage"]["coverage_complete"].clone(),
+    });
+    if let Some(error) = trial_error {
+        return Err(error);
+    }
+    if !case_passed {
+        return Err(format!(
+            "{} arm trial failed (evidence: {}): {}",
+            arm.as_str(),
+            evidence_path.display(),
+            evidence["case"]
+        ));
+    }
+    Ok(summary)
+}
+
+/// One offline arm trial against the synthetic fixture: the arm case runs
+/// exactly like the live arm trial (claim burn, evidence publication,
+/// pre-registered verdicts) with `offline-synthetic-fixture` provenance and
+/// no live success claim.
+async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, String> {
+    let journal = match journal {
+        Some(dir) => {
+            if dir.exists() {
+                let nonempty = std::fs::read_dir(&dir)
+                    .map(|entries| entries.count() > 0)
+                    .unwrap_or(true);
+                if nonempty {
+                    return Err("journal_not_empty_no_replay".into());
+                }
+            } else {
+                std::fs::create_dir_all(&dir).map_err(|_| fail())?;
+            }
+            dir
+        }
+        None => {
+            let dir = std::env::temp_dir()
+                .join(format!("occ3-arm-trial-{}", uuid::Uuid::new_v4().simple()));
+            std::fs::create_dir_all(&dir).map_err(|_| fail())?;
+            dir
+        }
+    };
+    let (binary_sha256, manifest_sha256, _manifest) = compute_offline_pins()?;
+    let identity = fixture_identity();
+    let fingerprint = identity.fingerprint();
+    let attempt_id = format!("offline-arm-attempt-{}", uuid::Uuid::new_v4().simple());
+    let candidate_id = sha256("offline-synthetic-candidate".as_bytes());
+    let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
+    let challenge = mint_offline_challenge(
+        "before_restart",
+        &attempt_id,
+        &candidate_id,
+        &started_at,
+        &fingerprint,
+    );
+    publish_exclusive(
+        &journal,
+        "validator-challenge-before_restart.json",
+        &canonical_json_bytes(
+            &serde_json::to_value(&challenge).map_err(|_| fail())?,
+        )
+        .map_err(|_| fail())?,
+    )?;
+    let records = Arc::new(Mutex::new(FixtureRecords::default()));
+    let expires = now() + 240;
+    let epoch_state = Arc::new(Mutex::new(FixtureEpoch {
+        runtime_epoch: "offline-runtime-epoch-before".into(),
+        runtime_generation: 41,
+        expires_at_epoch: expires,
+        profile_digest: OFFLINE_PROFILE_DIGEST_BEFORE.into(),
+    }));
+    let (endpoint, server) = serve(epoch_state.clone(), records.clone()).await;
+    let env = PhaseEnv {
+        journal: journal.clone(),
+        model: offline_model(&endpoint),
+        key: Arc::new(FIXTURE_KEY.into()),
+        control_headers: Some(IndexMap::from([(
+            CONTROL_HEADER.to_string(),
+            CONTROL_VALUE.to_string(),
+        )])),
+        endpoint: endpoint.clone(),
+        identity,
+        attempt_id,
+        runtime_epoch: "offline-runtime-epoch-before".into(),
+        runtime_generation: 41,
+        expires_at_epoch: expires,
+        deadline_seconds: 20,
+        max_capture_bytes: 1048576,
+        max_response_bytes: replay_max_response_bytes(),
+        harness_binary_sha256: binary_sha256.clone(),
+        source_manifest_sha256: manifest_sha256.clone(),
+        offline_records: Some(records),
+        layer_index: LAYER_INDEX,
+        hidden_dim: HIDDEN_DIM,
+        dtype: "bfloat16".into(),
+        layout_digest: LAYOUT_DIGEST.into(),
+        expected_ranks: EXPECTED_RANKS,
+        profile_digest: OFFLINE_PROFILE_DIGEST_BEFORE.into(),
+    };
+    let descriptor_digest = effective_descriptor_digest(
+        "before_restart",
+        &env.attempt_id,
+        &candidate_id,
+        &url::Url::parse(&endpoint)
+            .map_err(|_| fail())?
+            .origin()
+            .ascii_serialization(),
+        "offline-runtime-epoch-before",
+        41,
+        &binary_sha256,
+        &manifest_sha256,
+    )?;
+    let result = run_arm_phase(&env, &challenge, &descriptor_digest, arm).await;
+    server.abort();
+    result
 }
 
 // ---------------------------------------------------------------------------
@@ -3294,6 +4701,12 @@ struct LivePhaseDescriptor {
     isolated_profile: String,
     harness_binary_sha256: String,
     source_manifest_sha256: String,
+    /// Optional experiment-arm pin. When present, the descriptor bytes - and
+    /// through `descriptor_sha256` the one-shot phase claim - bind the
+    /// attempt to this arm; a CLI/env selection that disagrees refuses.
+    /// Absent keeps the frozen contract run (the arm may still be selected
+    /// by `--arm` / `OCC3_ARM`).
+    arm: Option<String>,
 }
 
 fn control_reference_is_valid(reference: &str) -> bool {
@@ -3370,7 +4783,7 @@ fn resolve_control_headers(
     Ok(Some(resolved))
 }
 
-async fn live_phase(path: &str) -> Result<Value, String> {
+async fn live_phase(path: &str, cli_arm: Option<Arm>) -> Result<Value, String> {
     let descriptor_path = Path::new(path);
     let bytes = strict_read_bounded(descriptor_path, MAX_DESCRIPTOR_BYTES)?;
     let text = strict_decode(&bytes)?;
@@ -3404,6 +4817,29 @@ async fn live_phase(path: &str) -> Result<Value, String> {
     {
         return Err(fail());
     }
+    let descriptor_arm = match d.arm.as_deref() {
+        None => None,
+        Some(name) => Arm::parse(name).map(Some).ok_or_else(|| {
+            format!(
+                "{name:?} is not an admitted experiment arm; expected one of {}",
+                Arm::admitted_names()
+            )
+        })?,
+    };
+    // The descriptor pin is authoritative: a CLI/env selection that
+    // disagrees refuses rather than reinterpreting the staged attempt.
+    let arm = match (cli_arm, descriptor_arm) {
+        (Some(cli), Some(descriptor)) if cli != descriptor => {
+            return Err(format!(
+                "descriptor_arm_mismatch: descriptor pins {}, selection requests {}",
+                descriptor.as_str(),
+                cli.as_str()
+            ));
+        }
+        (Some(cli), _) => Some(cli),
+        (None, Some(descriptor)) => Some(descriptor),
+        (None, None) => None,
+    };
     let journal = PathBuf::from(&d.journal_directory);
     let profile = PathBuf::from(&d.isolated_profile);
     if !journal.is_absolute()
@@ -3464,10 +4900,12 @@ async fn live_phase(path: &str) -> Result<Value, String> {
         profile_digest: d.profile_digest.clone(),
     };
     let descriptor_digest = sha256(&bytes);
-    let report = if d.phase == "before_restart" {
-        run_before_phase(&env, &challenge, &descriptor_digest).await?
-    } else {
-        run_after_phase(&env, &challenge, &descriptor_digest).await?
+    let report = match arm {
+        Some(arm) => run_arm_phase(&env, &challenge, &descriptor_digest, arm).await?,
+        None if d.phase == "before_restart" => {
+            run_before_phase(&env, &challenge, &descriptor_digest).await?
+        }
+        None => run_after_phase(&env, &challenge, &descriptor_digest).await?,
     };
     Ok(report)
 }
@@ -3516,16 +4954,84 @@ async fn real_main() -> Result<(), i32> {
         eprintln!("Native phase-suite producer refused: {error}");
         return Err(1);
     }
-    let result = if args.is_empty() {
-        offline_selftest(None).await
-    } else if args.len() == 1 && args[0] == "--offline" {
-        offline_selftest(None).await
-    } else if args.len() == 2 && args[0] == "--offline" {
-        offline_selftest(Some(PathBuf::from(&args[1]))).await
-    } else if args.len() == 2 && args[0] == "--live" {
-        live_phase(&args[1]).await
-    } else {
-        Err("Usage: occ3_native_phase_suite [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]".into())
+    // CLI: [--arm ARM] with exactly one of [--offline [DIR] | --live PATH].
+    // `--offline` keeps its historical optional positional directory; a
+    // following flag is never consumed as that directory.
+    let mut offline: Option<Option<PathBuf>> = None;
+    let mut live: Option<String> = None;
+    let mut arm_flag: Option<String> = None;
+    let mut index = 0;
+    let usage = || {
+        eprintln!(
+            "Usage: occ3_native_phase_suite [--arm ARM] [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]"
+        );
+    };
+    while index < args.len() {
+        match args[index].as_str() {
+            "--arm" => {
+                let Some(value) = args.get(index + 1) else {
+                    usage();
+                    return Err(1);
+                };
+                if arm_flag.replace(value.clone()).is_some() {
+                    usage();
+                    return Err(1);
+                }
+                index += 2;
+            }
+            "--offline" => {
+                if offline.is_some() || live.is_some() {
+                    usage();
+                    return Err(1);
+                }
+                let directory = args
+                    .get(index + 1)
+                    .filter(|value| !value.starts_with("--"))
+                    .map(|value| PathBuf::from(value));
+                offline = Some(directory);
+                index += if args.get(index + 1).is_some_and(|value| !value.starts_with("--")) {
+                    2
+                } else {
+                    1
+                };
+            }
+            "--live" => {
+                if offline.is_some() || live.is_some() {
+                    usage();
+                    return Err(1);
+                }
+                let Some(value) = args.get(index + 1) else {
+                    usage();
+                    return Err(1);
+                };
+                live = Some(value.clone());
+                index += 2;
+            }
+            _ => {
+                usage();
+                return Err(1);
+            }
+        }
+    }
+    // Arm selection refuses at startup with the admitted set, before any
+    // enrollment, claim or HTTP effect.
+    let arm = match selected_arm(arm_flag.as_deref()) {
+        Ok(arm) => arm,
+        Err(error) => {
+            eprintln!("Native phase-suite producer refused: {error}");
+            return Err(1);
+        }
+    };
+    let result = match (&offline, &live, arm) {
+        (None, None, None) if args.is_empty() => offline_selftest(None).await,
+        (None, None, Some(arm)) => offline_arm_trial(arm, None).await,
+        (Some(directory), None, None) => offline_selftest(directory.clone()).await,
+        (Some(directory), None, Some(arm)) => offline_arm_trial(arm, directory.clone()).await,
+        (None, Some(path), arm) => live_phase(path, arm).await,
+        _ => {
+            usage();
+            return Err(1);
+        }
     };
     match result {
         Ok(summary) => println!("{summary}"),
@@ -4003,5 +5509,470 @@ mod gate_tests {
             "exactly one accept-encoding: identity must be accepted, got: {head}"
         );
         server.abort();
+    }
+    // ------------------------------------------------------------------
+    // Experiment-arm surface (campaign section 5).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn arm_selection_parses_every_admitted_arm_and_refuses_unknown_names() {
+        for arm in [
+            Arm::NoAttachment,
+            Arm::FullText,
+            Arm::TokenFull,
+            Arm::TokenSelected,
+            Arm::TokenNorm,
+            Arm::NullShape,
+            Arm::Native,
+            Arm::WrongSender,
+        ] {
+            assert_eq!(Arm::parse(arm.as_str()), Some(arm));
+        }
+        // The flag path: exact names only, no trimming, no case folding.
+        assert!(selected_arm(Some("NATIVE")).unwrap() == Some(Arm::Native));
+        for bogus in ["", "native", "N-None", "F-text", "T-exact", "T-norm", "N-shape", "bogus", " NATIVE "] {
+            let error = selected_arm(Some(bogus)).err().unwrap();
+            assert!(
+                error.contains("is not an admitted experiment arm"),
+                "refusal must name the problem: {error}"
+            );
+            // The refusal lists the admitted set.
+            for arm in ["NO_ATTACHMENT", "FULL_TEXT", "TOKEN_FULL", "TOKEN_SELECTED", "TOKEN_NORM", "NULL_SHAPE", "NATIVE", "WRONG_SENDER"] {
+                assert!(error.contains(arm), "refusal must list {arm}: {error}");
+            }
+        }
+        // Unset flag and unset env select nothing (frozen contract phase).
+        std::env::remove_var(ARM_ENV);
+        assert_eq!(selected_arm(None).unwrap(), None);
+        // The env selects; the flag wins over the env.
+        std::env::set_var(ARM_ENV, "TOKEN_NORM");
+        assert_eq!(selected_arm(None).unwrap(), Some(Arm::TokenNorm));
+        assert_eq!(
+            selected_arm(Some("WRONG_SENDER")).unwrap(),
+            Some(Arm::WrongSender)
+        );
+        std::env::remove_var(ARM_ENV);
+        // An unknown env value refuses with the admitted set.
+        std::env::set_var(ARM_ENV, "T-exact");
+        assert!(selected_arm(None).is_err());
+        std::env::remove_var(ARM_ENV);
+    }
+
+    #[test]
+    fn hook_token_mirror_matches_the_hook_parser_and_the_arm_map() {
+        // Exactly the hook's _arm_token: one token, one optional newline.
+        assert_eq!(hook_token_from_control_bytes(b"texact"), Some("texact"));
+        assert_eq!(hook_token_from_control_bytes(b"tnorm\n"), Some("tnorm"));
+        assert_eq!(hook_token_from_control_bytes(b"nshape\n"), Some("nshape"));
+        for none in [
+            &b""[..],
+            b"\n",
+            b"texact\n\n",
+            b" texact",
+            b"texact\nnshape",
+            b"TEXACT",
+            b"tnormx",
+            b"tfull",
+        ] {
+            assert_eq!(hook_token_from_control_bytes(none), None, "{none:?}");
+        }
+        // The arm -> required-token map keeps the wire tokens unchanged.
+        assert_eq!(Arm::TokenFull.hook_token(), Some("texact"));
+        assert_eq!(Arm::TokenSelected.hook_token(), Some("texact"));
+        assert_eq!(Arm::TokenNorm.hook_token(), Some("tnorm"));
+        assert_eq!(Arm::NullShape.hook_token(), Some("nshape"));
+        for absent in [Arm::Native, Arm::NoAttachment, Arm::FullText, Arm::WrongSender] {
+            assert_eq!(absent.hook_token(), None);
+        }
+    }
+
+    #[test]
+    fn arm_staging_check_refuses_local_control_contradictions() {
+        let present = |token: Option<&'static str>, sha: &str| ArmControlReadback {
+            path: "/tmp/occ3_p3_arm".into(),
+            state: "present",
+            sha256: Some(sha.to_string()),
+            bytes: Some(7),
+            hook_token: token,
+        };
+        // A hook arm with the right token locally passes; the wrong token or
+        // no token refuses.
+        assert!(arm_staging_check(Arm::TokenNorm, &present(Some("tnorm"), "a")).is_ok());
+        assert!(arm_staging_check(Arm::TokenNorm, &present(Some("texact"), "a")).is_err());
+        assert!(arm_staging_check(Arm::TokenNorm, &present(None, "a")).is_err());
+        // Absent-control arms refuse any recognized token, admit no-token
+        // files (the hook runs NATIVE for them) and any unreadable state.
+        assert!(arm_staging_check(Arm::Native, &present(Some("tnorm"), "a")).is_err());
+        assert!(arm_staging_check(Arm::WrongSender, &present(Some("texact"), "a")).is_err());
+        assert!(arm_staging_check(Arm::Native, &present(None, "a")).is_ok());
+        for state in ["absent", "unreadable"] {
+            let readback = ArmControlReadback {
+                path: "/tmp/occ3_p3_arm".into(),
+                state,
+                sha256: None,
+                bytes: None,
+                hook_token: None,
+            };
+            for arm in [
+                Arm::Native,
+                Arm::NoAttachment,
+                Arm::FullText,
+                Arm::TokenFull,
+                Arm::TokenSelected,
+                Arm::TokenNorm,
+                Arm::NullShape,
+                Arm::WrongSender,
+            ] {
+                // A path the driver cannot read is recorded, never guessed.
+                assert!(arm_staging_check(arm, &readback).is_ok());
+            }
+        }
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn arm_control_readback_at_reads_bytes_and_reports_absence() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-arm-readback-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        // Absent path: absent, no digest, no token.
+        let missing = dir.join("missing-control");
+        let readback = arm_control_readback_at(&missing.to_string_lossy());
+        assert_eq!(readback.state, "absent");
+        assert!(readback.sha256.is_none());
+        assert!(readback.hook_token.is_none());
+        // Present token file: digest + size + token.
+        let control = dir.join("control");
+        std::fs::write(&control, b"tnorm\n").unwrap();
+        let readback = arm_control_readback_at(&control.to_string_lossy());
+        assert_eq!(readback.state, "present");
+        assert_eq!(readback.hook_token, Some("tnorm"));
+        assert_eq!(readback.bytes, Some(6));
+        assert_eq!(readback.sha256.as_deref(), Some(sha256(b"tnorm\n").as_str()));
+        // Oversize (>64 bytes, the hook's MAX_CONTROL_BYTES): no arm.
+        let oversize = dir.join("oversize");
+        std::fs::write(&oversize, vec![b'x'; 65]).unwrap();
+        let readback = arm_control_readback_at(&oversize.to_string_lossy());
+        assert_eq!(readback.state, "present");
+        assert_eq!(readback.hook_token, None);
+        // Garbage content: present, digest recorded, no arm selected.
+        let garbage = dir.join("garbage");
+        std::fs::write(&garbage, b"garbage-content").unwrap();
+        let readback = arm_control_readback_at(&garbage.to_string_lossy());
+        assert_eq!(readback.state, "present");
+        assert!(readback.hook_token.is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// The NO_ATTACHMENT boundary proof: with require_no_occ3_keys the
+    /// payload audit flags and refuses any request carrying the occ3 or
+    /// occ3_capture opt-in key, and records the absence for clean requests.
+    #[tokio::test]
+    async fn no_attachment_payload_audit_refuses_occ3_body_keys() {
+        let mut options = agent_options(
+            &offline_model("http://127.0.0.1:9"),
+            Arc::new("key".into()),
+            "fixture",
+        );
+        let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        attach_receiver_audit(
+            &mut options,
+            audit.clone(),
+            vec![nonce.clone()],
+            true,
+        );
+        let hook = options.on_payload.take().unwrap();
+        let model = offline_model("http://127.0.0.1:9");
+        // A clean request: no occ3 keys, no nonce; passes through untouched.
+        let clean = json!({
+            "model": "m", "stream": true, "max_tokens": DEFAULT_MAX_TOKENS as u64,
+            "messages": [{"role": "user", "content": "ordinary question"}],
+        });
+        let forwarded = hook(clean, &model).await;
+        assert_eq!(forwarded, None, "a clean request must pass through");
+        // The private value still refuses (source-facts discipline).
+        let leak = json!({
+            "model": "m", "stream": true, "max_tokens": DEFAULT_MAX_TOKENS as u64,
+            "messages": [{"role": "user", "content": format!("the code is {nonce}")}],
+        });
+        let refused = hook(leak, &model).await;
+        assert_eq!(refused, Some(json!({"model": "refused", "stream": false})));
+        // The occ3 attachment opt-in key refuses.
+        for key in ["occ3", "occ3_capture"] {
+            let mut payload = json!({
+                "model": "m", "stream": true, "max_tokens": DEFAULT_MAX_TOKENS as u64,
+                "messages": [{"role": "user", "content": "ordinary question"}],
+            });
+            payload[key] = json!({"state_handle": "h"});
+            let refused = hook(payload, &model).await;
+            assert_eq!(
+                refused,
+                Some(json!({"model": "refused", "stream": false})),
+                "the {key} body key must refuse the request"
+            );
+        }
+        // Ordinary text that merely CONTAINS the substring "occ3" (e.g. the
+        // string "occ3") in message content must not false-positive the key
+        // check: it is an exact top-level-key proof.
+        let mentions = json!({
+            "model": "m", "stream": true, "max_tokens": DEFAULT_MAX_TOKENS as u64,
+            "messages": [{"role": "user", "content": "the word occ3 appears in this ordinary text"}],
+        });
+        let forwarded = hook(mentions, &model).await;
+        assert_eq!(forwarded, None);
+        let entries = audit.lock().unwrap().clone();
+        assert_eq!(entries.len(), 5);
+        assert!(
+            entries.iter().all(|e| e["source_facts_absent"] == json!(true) || e["source_facts_absent"] == json!(false)),
+            "every entry records the source-facts verdict"
+        );
+        let summary = arm_receiver_audit_summary(&entries);
+        assert_eq!(summary["occ3_keys_absent"], json!(false), "one refused occ3-key request must flag the summary");
+        assert_eq!(summary["request_count"], json!(5));
+        // The frozen-report summary stays byte-identical in shape.
+        let frozen = receiver_audit_summary(&entries);
+        assert_eq!(frozen["request_count"], json!(5));
+        assert_eq!(frozen["max_tokens"], json!(DEFAULT_MAX_TOKENS as u64));
+    }
+
+    #[test]
+    fn token_full_coverage_assertion_marks_every_incomplete_verdict_invalid() {
+        // A complete v2 span covering the value: coverage==1.
+        let span = json!({
+            "span_message_truncated": false,
+            "span_contains_final_content": true,
+            "span_content_count": 8,
+            "span_thinking_count": 0,
+            "span_tool_call_count": 0,
+            "span_window_start_position": 0,
+            "span_window_end_position": 10,
+            "retained_count": 8,
+            "accepted_span_start": 0,
+            "accepted_span_end": 8,
+            "accepted_sequence_digest": "d".repeat(64),
+        });
+        let verdict = span_coverage_verdict(Some(&span), true);
+        assert_eq!(verdict["coverage_computed"], json!("receipt_span"));
+        assert_eq!(verdict["coverage_complete"], json!(true));
+        assert!(!token_full_invalid_coverage(&verdict));
+        // The value outside the sender's content: coverage < 1 -> invalid.
+        let verdict = span_coverage_verdict(Some(&span), false);
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert!(token_full_invalid_coverage(&verdict));
+        // A truncated span (content-head loss or over-window turn): invalid.
+        let mut truncated = span.clone();
+        truncated["span_message_truncated"] = json!(true);
+        let verdict = span_coverage_verdict(Some(&truncated), true);
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["span_message_truncated"], json!(true));
+        assert!(token_full_invalid_coverage(&verdict));
+        // A span that is not the final content run: invalid.
+        let mut no_final = span.clone();
+        no_final["span_contains_final_content"] = json!(false);
+        let verdict = span_coverage_verdict(Some(&no_final), true);
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert!(token_full_invalid_coverage(&verdict));
+        // No span block at all (v1 capture): offline fields only, the null
+        // verdict is invalid for TOKEN_FULL - never a silent pass.
+        let verdict = span_coverage_verdict(None, true);
+        assert_eq!(verdict["coverage_computed"], json!("offline"));
+        assert_eq!(verdict["coverage_complete"], json!(null));
+        assert!(token_full_invalid_coverage(&verdict));
+        assert_eq!(verdict["value_in_sender_content"], json!(true));
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn arm_evidence_json_writes_canonically_and_refuses_replay() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-arm-evidence-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let evidence = json!({
+            "schema": ARM_EVIDENCE_SCHEMA,
+            "requested_arm": "TOKEN_FULL",
+            "trial_id": "token-full-fixed",
+            "intended_value": "occ3-secret",
+            "receiver_raw_answer": "occ3-secret",
+            "parsed_answer": "occ3-secret",
+            "finish_reason": "stop",
+            "coverage": {"coverage_complete": true},
+        });
+        let path = write_arm_evidence(&journal, &evidence).unwrap();
+        assert!(path.is_file());
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("arm-evidence-token-full-fixed"));
+        // Canonical bytes: sorted keys, compact, exact readback.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, canonical_json_bytes(&evidence).unwrap());
+        assert!(bytes.len() <= MAX_ARM_EVIDENCE_BYTES);
+        // One shot: the same trial id never rewrites its evidence.
+        let replay = write_arm_evidence(&journal, &evidence);
+        assert!(replay.is_err());
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Every arm runs end to end against the offline fixture: the trial
+    /// passes its pre-registered verdict and the per-arm evidence JSON is
+    /// published under the journal with the required fields.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::Native, offline_arm_trial(Arm::Native, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn no_attachment_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::NoAttachment, offline_arm_trial(Arm::NoAttachment, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn full_text_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::FullText, offline_arm_trial(Arm::FullText, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn token_full_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::TokenFull, offline_arm_trial(Arm::TokenFull, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn token_selected_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::TokenSelected, offline_arm_trial(Arm::TokenSelected, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn token_norm_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::TokenNorm, offline_arm_trial(Arm::TokenNorm, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn null_shape_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::NullShape, offline_arm_trial(Arm::NullShape, None).await).await;
+    }
+
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn wrong_sender_arm_trial_passes_offline() {
+        arm_trial_assertions(Arm::WrongSender, offline_arm_trial(Arm::WrongSender, None).await).await;
+    }
+
+    #[cfg(windows)]
+    async fn arm_trial_assertions(arm: Arm, result: Result<Value, String>) {
+        let summary = result.unwrap_or_else(|error| panic!("{} arm trial failed: {error}", arm.as_str()));
+        assert_eq!(summary["schema"], json!(ARM_TRIAL_SCHEMA));
+        assert_eq!(summary["requested_arm"], json!(arm.as_str()));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["arm_case_passed"], json!(true));
+        // The evidence file exists under the run's output dir and carries
+        // the required fields.
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        assert!(evidence_name.starts_with("arm-evidence-"), "{evidence_name}");
+        let mode = summary["mode"].as_str().unwrap();
+        let journal_root = std::env::temp_dir();
+        // The offline arm trial journals into a fresh temp dir; find the
+        // evidence file by scanning for the exact name.
+        let evidence = find_arm_evidence(&journal_root, &evidence_name)
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        assert_eq!(evidence["schema"], json!(ARM_EVIDENCE_SCHEMA));
+        assert_eq!(evidence["requested_arm"], json!(arm.as_str()));
+        assert_eq!(evidence["mode"], json!(mode));
+        assert_eq!(evidence["arm_case_passed"], json!(true));
+        assert!(evidence["trial_id"].as_str().is_some_and(|v| !v.is_empty()));
+        assert!(evidence["attempt_id"].as_str().is_some_and(|v| !v.is_empty()));
+        // requested + effective arm both recorded, control readback recorded.
+        assert!(evidence["effective_arm_or_readback"]["driver_control_state"].is_string());
+        assert!(evidence["control_file"]["state"].is_string());
+        assert!(evidence["control_file_sha256"].is_string());
+        // The intended value (local evidence file only) and answers.
+        assert!(evidence["intended_value"].as_str().is_some_and(|v| v.starts_with("occ3-")));
+        assert!(evidence["receiver_raw_answer"].is_string());
+        assert!(evidence["parsed_answer"].is_string());
+        assert!(evidence["finish_reason"].is_string());
+        assert!(evidence["timings"]["arm_duration_millis"].as_u64().is_some_and(|v| v > 0));
+        assert!(hex64(&evidence["intended_value_sha256"]));
+        // Per-arm semantics.
+        match arm {
+            Arm::Native => {
+                assert_eq!(evidence["semantic_nonce_match"], json!(true));
+                assert_eq!(evidence["case"]["structural_ok"], json!(true));
+            }
+            Arm::NoAttachment => {
+                assert_eq!(evidence["parsed_answer"], json!(UNKNOWN_ANSWER));
+                assert_eq!(evidence["semantic_nonce_match"], json!(false));
+                assert_eq!(evidence["case"]["occ3_keys_absent_via_audit"], json!(null));
+                assert_eq!(evidence["case"]["receiver_request_audit"]["occ3_keys_absent"], json!(true));
+                // The server-side boundary references are recorded.
+                assert!(evidence["case"]["server_boundary_proofs"].as_array().is_some_and(|p| p.len() == 2));
+            }
+            Arm::FullText => {
+                assert_eq!(evidence["semantic_nonce_match"], json!(true));
+                assert_eq!(evidence["case"]["receiver_request_audit"]["occ3_keys_absent"], json!(true));
+                assert_eq!(evidence["case"]["delivery_status"], json!("delivered"));
+            }
+            Arm::TokenFull => {
+                assert_eq!(evidence["coverage"]["coverage_complete"], json!(true));
+                assert_eq!(evidence["coverage"]["invalid_coverage"], json!(null));
+                assert_eq!(evidence["coverage"]["coverage_computed"], json!("receipt_span"));
+                assert!(evidence["receipt_span_block"]["span_message_truncated"].is_boolean());
+            }
+            Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
+                assert!(evidence["coverage"]["coverage_computed"].is_string());
+                assert!(evidence["receipt_span_block"].is_object());
+            }
+            Arm::WrongSender => {
+                assert_eq!(evidence["wrong_sender"]["delivered_value_match"], json!(true));
+                assert_eq!(evidence["wrong_sender"]["other_value_match"], json!(false));
+                assert_eq!(evidence["case"]["consumed_count"], json!(1));
+                assert_eq!(evidence["case"]["messages"], json!(1));
+                assert_eq!(evidence["case"]["a_captured_unpublished"], json!(true));
+            }
+        }
+        // No frozen phase report was produced by an arm trial.
+        assert!(evidence["phase"].as_str().is_some_and(|phase| !phase.is_empty()));
+    }
+
+    #[cfg(windows)]
+    fn find_arm_evidence(root: &Path, name: &str) -> Option<Value> {
+        // The offline arm trial journals under a fresh
+        // occ3-arm-trial-<uuid> directory in the temp root.
+        let mut stack = vec![root.to_path_buf()];
+        let mut visited = 0;
+        while let Some(dir) = stack.pop() {
+            visited += 1;
+            if visited > 20000 {
+                return None;
+            }
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    if path
+                        .file_name()
+                        .and_then(|n| n.to_str())
+                        .is_some_and(|n| n.starts_with("occ3-arm-trial-"))
+                    {
+                        let candidate = path.join(name);
+                        if candidate.is_file() {
+                            let bytes = std::fs::read(&candidate).unwrap();
+                            return serde_json::from_slice(&bytes).ok();
+                        }
+                    }
+                    stack.push(path);
+                }
+            }
+        }
+        None
     }
 }
