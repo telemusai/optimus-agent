@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import asyncio
+import logging
+import os
 import time
 import uuid
 from dataclasses import asdict
@@ -13,6 +15,20 @@ from .span_policy import resolve_runtime_markers
 from .latent_types import LatentError, control_request, require, validate_control_payload
 from .use_receipts import (SourceCaptureCommit, SourceCaptureEvidence, TerminalUseEvidence,
                            SPAN_BLOCK_FIELDS)
+
+logger = logging.getLogger(__name__)
+
+#: Same switch the worker's _CalibrationCapture.from_env reads. The frontend
+#: cannot see the worker's collector object, but both processes share the
+#: server environment, so this is the earliest seam that can refuse a v1
+#: capture on a collection run with a clear 4xx instead of a silently empty corpus.
+CALIBRATION_CAPTURE_ENV = "OCC3_CALIBRATION_CAPTURE_DIR"
+
+
+def calibration_collection_armed(environ=None):
+    """True when the server was started for calibration-corpus collection."""
+    environ = os.environ if environ is None else environ
+    return bool(environ.get(CALIBRATION_CAPTURE_ENV, ""))
 
 
 #: The 15 capture-commit fields the worker reports for every source capture.
@@ -233,8 +249,20 @@ class LatentBackend:
             # v2 opt-in: the marker profile must be tokenizer-attested in this
             # process before any reservation exists (doc section 6.1). The
             # marker ids themselves still never travel on the descriptor; they
-            # use the per-request custom_params channel.
-            marker_profile = resolve_runtime_markers(self.client.tm.tokenizer)[0].profile
+            # use the per-request custom_params channel. The model config
+            # supplies the generation-config stop set (GLM role tokens).
+            marker_profile = resolve_runtime_markers(
+                self.client.tm.tokenizer, getattr(self.client.tm, "model_config", None))[0].profile
+        elif calibration_collection_armed():
+            # A v1 turn is structurally uncollectable: the calibration handoff
+            # needs the v2 span selection. Refuse the enrollment loudly rather
+            # than run a collection window that accepts turns and writes no rows.
+            logger.error("occ3-bridge: calibration collection is armed (%s) but the source "
+                         "intent arms span policy v1 (%s); v1 turns are never collected. "
+                         "Re-arm the client with a content_tail_v2 family policy "
+                         "(OCC3_SPAN_POLICY) or unset the collection directory.",
+                         CALIBRATION_CAPTURE_ENV, intent.span_policy)
+            raise LatentError("profile")
         descriptor = CaptureWorkerDescriptor(attempt_id=attempt_id, reservation_id=uuid.uuid4().hex,
             native_rid=native_rid, principal_digest=identity.principal_digest,
             runtime_epoch=intent.runtime_id, model_fingerprint=intent.model_fingerprint,

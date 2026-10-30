@@ -63,7 +63,20 @@ argument_value_end    ``"</arg_value>"``   glm4_moe_detector.py:1035,
                                           glm47_moe_detector.py:318
 turn_end              the tokenizer's own schedule_batch.py:1783-1803
                       ``eos_token``
+turn stop set         ``eos_token`` plus   generation_config.json ``eos_token_id``
+(not a marker)        ``"<|user|>"`` and    (GLM-5.3: 154820, 154827, 154829),
+                      ``"<|observation|>"`` schedule_batch.py:1783-1803
 ===================== =================== ======================================
+
+The GLM chat template has no end-of-turn token.  An assistant turn ends where
+the next role token begins (``<|user|>`` after an answer, ``<|observation|>``
+after a tool call); ``<|endoftext|>`` is the tokenizer's eos/pad and is only
+one member of the generation config's stop set.  The ``turn_end`` *marker*
+therefore stays the single attested ``eos_token`` sequence, while the turn
+*stop set* (:func:`resolve_turn_stop_ids`) is the union of the tokenizer eos
+attributes, the model generation config's ``eos_token_id`` set and the
+profile's attested role-token spellings.  A selector that proves "the window
+ends at the turn boundary" must use the stop set, never the marker alone.
 
 The GLM template has no ``content`` tag: ``assistant_turn ::= thinking_block
 text_block tool_call_blocks`` (glm4_moe_detector.py:1057), so a content row is
@@ -95,7 +108,7 @@ __all__ = [
     "THINKING_CLOSE", "THINKING_OPEN",
     "MarkerResolutionError", "ArgumentDelimiters", "ContentDelimiters",
     "MarkerTable", "resolve_marker_ids", "resolve_marker_table",
-    "resolve_stop_ids", "vocabulary_bound",
+    "resolve_stop_ids", "resolve_turn_stop_ids", "vocabulary_bound",
 ]
 
 #: Version of the resolved-table contract.  A receipt that names a marker
@@ -159,6 +172,10 @@ class _Spec:
     literals: Tuple[str, ...] = ()
     attributes: Tuple[str, ...] = ()
     absentable: bool = False
+    #: Role-token spellings that end a turn under this template.  They join
+    #: the stop SET (resolve_turn_stop_ids), never the role's marker sequence:
+    #: a turn can end on any one of them, so one sequence cannot attest it.
+    stop_literals: Tuple[str, ...] = ()
 
 
 _GLM_XML_KV = (
@@ -173,7 +190,10 @@ _GLM_XML_KV = (
     # The turn-end marker is whatever this tokenizer declares as EOS; the
     # literal only corroborates it and must agree.  A parser that can stop on a
     # second id is not attestable by one sequence - see resolve_stop_ids.
-    _Spec("turn_end", literals=("<|endoftext|>",), attributes=("eos_token",)),
+    _Spec("turn_end", literals=("<|endoftext|>",), attributes=("eos_token",),
+          # The GLM template ends an assistant turn at the next role token
+          # (generation_config eos_token_id lists both alongside eos).
+          stop_literals=("<|user|>", "<|observation|>")),
 )
 
 _PROFILES = {DEFAULT_PROFILE: _GLM_XML_KV}
@@ -184,12 +204,16 @@ def _error(reason: str, role: str = "") -> MarkerResolutionError:
 
 
 def vocabulary_bound(tokenizer) -> int | None:
-    """Best-effort vocabulary size, or None when the object does not say.
+    """Best-effort token-id bound, or None when the object does not say.
 
-    ``vocab_size`` wins over ``len(tokenizer)``.  A non-positive or non-int
-    answer is ignored rather than trusted: a bound that is too small would
-    reject every marker, and one that is invented would accept an id the model
-    cannot emit.
+    The bound is the larger of ``vocab_size`` (the base vocabulary) and
+    ``len(tokenizer)`` (base plus added special tokens): the tokenizer's own
+    id space.  It is deliberately NOT the model's embedding row count, which
+    may be padded past the last real token (GLM-5.3: ``len(tokenizer)`` 154856
+    versus ``config.vocab_size`` 154880); padded rows are never token ids.  A
+    non-positive or non-int answer is ignored rather than trusted: a bound
+    that is too small would reject every marker, and one that is invented
+    would accept an id the model cannot emit.
     """
     # The bound must cover ADDED SPECIAL TOKENS: tokenizers report the base
     # embedding count in `vocab_size` while `len(tokenizer)` includes the
@@ -525,3 +549,43 @@ def resolve_stop_ids(tokenizer, extra=()) -> frozenset:
     if len(ids) > MAX_MARKER_TOKENS:
         raise _error("bounds", "turn_end")
     return frozenset(ids)
+
+
+def resolve_turn_stop_ids(tokenizer, model_config=None, *,
+                          profile: str = DEFAULT_PROFILE) -> frozenset:
+    """The full stop set the scheduler can end this model's turn on.
+
+    ``resolve_stop_ids`` reads only tokenizer attributes, which for a GLM
+    tokenizer is the single ``eos_token_id`` (``<|endoftext|>``).  The served
+    turn almost never ends there: the chat template has no end-of-turn token
+    and the model stops on the next role token, which SGLang matches through
+    ``req.eos_token_ids`` = ``model_config.hf_eos_token_id`` (the generation
+    config's ``eos_token_id`` list; GLM-5.3: 154820, 154827, 154829).  This
+    union adds that set when the caller can supply the model config, plus the
+    profile's role-token spellings attested through the tokenizer itself
+    (encode to exactly one id, decode back exactly), so the stop set is right
+    even on a seam that cannot reach the model config.  Spellings the
+    tokenizer does not know as one token are not stop ids and are skipped.
+    """
+    if type(profile) is not str or profile not in _PROFILES:
+        raise _error("profile")
+    extra = set()
+    config_ids = None if model_config is None else getattr(model_config, "hf_eos_token_id", None)
+    if type(config_ids) is int:
+        extra.add(config_ids)
+    elif isinstance(config_ids, (list, tuple, set, frozenset)):
+        for item in config_ids:
+            if type(item) is int:
+                extra.add(item)
+    bound = vocabulary_bound(tokenizer)
+    for spec in _PROFILES[profile]:
+        for text in spec.stop_literals:
+            try:
+                ids = _candidate_ids(tokenizer, text, spec.role, bound, require_roundtrip=True)
+            except MarkerResolutionError as error:
+                if error.reason in ("missing", "unattested"):
+                    continue  # this tokenizer has no such single role token
+                raise
+            if len(ids) == 1:
+                extra.add(ids[0])
+    return resolve_stop_ids(tokenizer, extra=tuple(sorted(extra)))

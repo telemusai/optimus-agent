@@ -181,6 +181,7 @@ async fn server() -> (Model, Arc<Mutex<Vec<Value>>>, tokio::task::JoinHandle<()>
                         output_sha256: sha256(output.as_bytes()),
                         expires_at_epoch: intent.expires_at_epoch,
                         byte_count: 32,
+                        span: None,
                     })
                     .unwrap()
                 )

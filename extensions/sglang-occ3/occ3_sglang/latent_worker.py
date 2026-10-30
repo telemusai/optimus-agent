@@ -353,6 +353,22 @@ class _CalibrationCapture:
                 logger.error("occ3 calibration collection declined %s", _decline_code(error))
 
 
+def _require_collectable(calibration_capture, descriptor):
+    """Refuse a v1 capture on a calibration-collection run, loudly.
+
+    The collector only ever receives a v2 span selection (align ->
+    _calibration_handoff needs prepared["span_selection"]). A v1 capture on a
+    collection run is accepted, served and never collected, which is exactly
+    how P4 accepted four turns and wrote zero corpus rows. With no collector
+    armed v1 stays admissible.
+    """
+    if calibration_capture is None or descriptor.span_policy != SPAN_POLICY_V1:
+        return
+    logger.error("occ3 calibration collection armed but capture reserved under span policy v1; "
+                 "declining (collection needs a content_tail_v2 family policy, see OCC3_SPAN_POLICY)")
+    raise LatentError("profile")
+
+
 def _calibration_handoff(runtime, record, prepared, embeddings):
     """Rank-0 handoff of one aligned span to the collector, post-sync.
 
@@ -447,6 +463,13 @@ class WorkerRuntime:
         self.poisoned = False
         self.commands = {}
         self.target_norm = None
+        # DSA sparse-attention indexer top-k (GLM-5.3: index_topk=2048). The
+        # continuous prefix is injected as ordinary rows; nothing pins them in
+        # the indexer's selection, so a receiver sequence longer than this can
+        # have prefix rows dropped from attention. Measured and flagged at
+        # consume admission, never a decline.
+        self.sparse_index_topk = None
+        self.sparse_topk_exceeded = 0
         local_error = ""
         local_layout = None
         stage = "init"
@@ -466,6 +489,8 @@ class WorkerRuntime:
             require(config.model_type == "glm_moe_dsa" and config.architectures == ["GlmMoeDsaForCausalLM"], "profile")
             require(config.hidden_size == profile.hidden_dim and config.num_hidden_layers == 78, "profile")
             require(config.quantization_config.get("quant_method") == "fp8", "profile")
+            topk = getattr(config, "index_topk", None)
+            self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -622,6 +647,7 @@ class WorkerRuntime:
             elif op == "reserve_capture":
                 require(set(payload) == {"descriptor", "source_handle", "state_generation", "expires_at_epoch"})
                 descriptor = decode_descriptor(payload["descriptor"])
+                _require_collectable(self.calibration_capture, descriptor)
                 charge = self.capture_budget(descriptor.max_prefix_tokens, descriptor.span_policy)
                 record = self.registry.reserve_capture(descriptor, payload["source_handle"], payload["state_generation"],
                         payload["expires_at_epoch"], descriptor.max_capture_bytes, charge)
@@ -900,6 +926,8 @@ def admit_request(scheduler, req, value):
     runtime.preflight("admit", validate)
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
+    if type(descriptor) is ConsumeWorkerDescriptor:
+        _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
         record.admitted_capture = True
         record.state = "capturing"
@@ -914,6 +942,26 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+
+
+def _flag_sparse_topk(runtime, prompt_rows):
+    """Flag a receiver sequence the DSA indexer can only attend sparsely.
+
+    GLM-5.3's indexer keeps the top ``index_topk`` (2048) keys per query once
+    the sequence is longer than that. The injected prefix rows are ordinary
+    positions and are not pinned into that selection, so beyond the bound the
+    receiver may attend to only some of them (decode rows grow the sequence
+    further). Bounded integers only; this never declines the turn.
+    """
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
+        return False
+    runtime.sparse_topk_exceeded = getattr(runtime, "sparse_topk_exceeded", 0) + 1
+    if getattr(runtime, "rank", 0) == 0:
+        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d: "
+                       "injected prefix rows are not pinned in DSA selection (count=%d)",
+                       int(prompt_rows), topk, runtime.sparse_topk_exceeded)
+    return True
 
 
 def _context(forward_batch):

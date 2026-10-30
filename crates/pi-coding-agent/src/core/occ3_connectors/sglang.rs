@@ -780,10 +780,19 @@ impl Occ3Connector for SglangOcc3Connector {
         if target != permit.target || max_capture_bytes > permit.max_capture_bytes {
             return Err(native_invalid());
         }
+        // v2 (content_tail_v2) is the default arming: only a v2 capture yields
+        // the span selection the calibration collector records. An unknown
+        // OCC3_SPAN_POLICY refuses here, before any enrollment side effect.
+        let arming = SourceSpanArming::from_env().map_err(|_| Occ3Error::TransferFailed {
+            reason: format!(
+                "invalid {SOURCE_SPAN_POLICY_ENV}: expected one of {}",
+                SourceSpanArming::admitted_names()
+            ),
+        })?;
         SourceCaptureLease::new(
             target,
             SourceCaptureIntent {
-                schema: SOURCE_CAPTURE_SCHEMA.into(),
+                schema: arming.schema.into(),
                 capture_id: format!("capture-{}", uuid::Uuid::new_v4()),
                 source_session_id: session_id.into(),
                 source_request_id: format!("source-{}", uuid::Uuid::new_v4()),
@@ -795,7 +804,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 retained_count_limit,
                 max_capture_bytes,
                 expires_at_epoch: enrolled.expires_at_epoch,
-                span_policy: SOURCE_SPAN_POLICY.into(),
+                span_policy: arming.span_policy.into(),
             },
             enrolled.source_profile,
             limits,

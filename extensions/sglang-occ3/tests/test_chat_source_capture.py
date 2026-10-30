@@ -207,7 +207,10 @@ async def test_v2_source_flow_injects_markers_and_receipts_the_span_block(source
     assert custom["__optimus_occ3_span_marker_thinking_end"] == [101]
     assert custom["__optimus_occ3_span_marker_tool_call_start"] == [102]
     assert custom["__optimus_occ3_span_marker_turn_end"] == [108]
-    assert custom["__optimus_occ3_span_stop_ids"] == [108]
+    # The stop set is the turn stop set, not the eos marker alone: the fake
+    # tokenizer attests <|user|> as one id (110), the GLM role token an
+    # answer turn really ends on (generation_config eos ids on GLM-5.3).
+    assert custom["__optimus_occ3_span_stop_ids"] == [108, 110]
     assert custom["__optimus_occ3_span_marker_profile"] == "glm45_glm47_xml_kv.v1"
     # The ordinary sampling keys are untouched by the injection.
     assert native.sampling_params["max_new_tokens"] == 32768

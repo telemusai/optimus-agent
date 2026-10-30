@@ -81,6 +81,7 @@ fn receipt(intent: &SourceCaptureIntent, body: &str) -> SourceCaptureReceipt {
         output_sha256: sha256(body.as_bytes()),
         expires_at_epoch: intent.expires_at_epoch,
         byte_count: 32,
+        span: None,
     }
 }
 #[derive(Clone)]

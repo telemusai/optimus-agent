@@ -398,3 +398,41 @@ def test_selection_unpacks_as_two_bounds():
     assert (start, end) == (2, 4)
     selection = span_from_policy(audit, "last_accepted")
     assert selection.bounds == (0, 4) and selection.length == 4
+
+
+# --------------------------------------------------------------------------
+# scheduler stop set: a GLM turn ends on a role token the eos marker never spells
+# --------------------------------------------------------------------------
+
+STOP_ROLE = 991    # ends the turn (generation-config eos) but is not MSG_END
+
+
+def test_stop_set_last_row_closes_the_message_like_the_marker():
+    audit = classify([1, THINK, 5, 6, STOP_ROLE], stop_ids=frozenset((MSG_END, STOP_ROLE)))
+    assert audit.counts[CONTROL_MARKERS] == 2 and audit.counts[CONTENT] == 2
+    assert audit.index_range(CONTENT) == (2, 3)
+    run = audit.last_run(CONTENT)
+    assert (run.start_index, run.end_index) == (2, 4)
+    # The eos marker itself never occurred; occurrences keep describing markers.
+    assert dict(audit.marker_occurrences)["message_end_ids"] == 0
+    # Without the stop set the same row is ordinary content: the pre-fix shape
+    # whose content run reached the window edge and failed R7 on every GLM turn.
+    plain = classify([1, THINK, 5, 6, STOP_ROLE])
+    assert plain.counts[CONTENT] == 3 and plain.last_run(CONTENT).end_index == 5
+
+
+def test_stop_set_only_qualifies_the_last_row():
+    # Generation stops at the first stop id, so an earlier one is just a row.
+    audit = classify([1, THINK, STOP_ROLE, 6, 7], stop_ids=frozenset((STOP_ROLE,)))
+    assert audit.counts[CONTENT] == 3 and audit.counts[CONTROL_MARKERS] == 1
+
+
+def test_stop_set_defers_to_an_observed_message_end_marker():
+    audit = classify([1, THINK, 5, MSG_END, STOP_ROLE], stop_ids=frozenset((STOP_ROLE,)))
+    assert audit.counts[CONTROL_MARKERS] == 2 and audit.counts[UNKNOWN] == 1
+    assert dict(audit.marker_occurrences)["message_end_ids"] == 1
+
+
+def test_stop_set_must_be_a_set():
+    with pytest.raises(SpanContractError):
+        classify([1, THINK, 5, STOP_ROLE], stop_ids=[STOP_ROLE])

@@ -39,7 +39,9 @@ use pi_agent_core::agent::{Agent, AgentOptions, PromptInput};
 use pi_agent_core::types::{
     AgentMessage, AgentState, AgentTool, AgentToolResult, ContentBlock, ThinkingLevel,
 };
-use pi_ai::source_capture::{canonical_json_bytes, sha256, SourceCaptureProfile};
+use pi_ai::source_capture::{
+    canonical_json_bytes, sha256, SourceCaptureProfile, SourceSpanArming, SOURCE_SPAN_POLICY_ENV,
+};
 use pi_ai::types::{ContentBlock as AiContentBlock, ImageOrTextContent, Message, Model, API_OPENAI_COMPLETIONS};
 use pi_coding_agent::core::agent_messages::{
     AgentFamilyCatalogEntry, AgentSessionMessageEndpoint,
@@ -1069,7 +1071,7 @@ async fn serve(
                         // accepted alongside the historical set.
                         let receiver_override = std::env::var("OCC3_RECEIVER_THINKING")
                             .ok()
-                            .filter(|v| matches!(v.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"));
+                            .filter(|v| GLM53_WIRE_EFFORTS.contains(&v.as_str()));
                         assert!(
                             body.get("reasoning_effort").and_then(Value::as_str).is_some_and(|v| matches!(v, "high" | "xhigh" | "max")
                                 || receiver_override.as_deref() == Some(v)),
@@ -1137,11 +1139,29 @@ async fn serve(
                             // prefix of bfloat16 (2 bytes per element).
                             let retained_count: u64 = 8;
                             let byte_count = retained_count * u64::from(HIDDEN_DIM) * 2;
-                            let receipt = json!({"schema":"occ3.source.v1","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":handle,"native_rid":rid,"response_id":rid,
+                            let mut receipt = json!({"schema":"occ3.source.v1","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":handle,"native_rid":rid,"response_id":rid,
                                 "capture_commit_id":format!("offline-capture-commit-{capture_index}"),"accepted_span_start":0,"accepted_span_end":8,"retained_count":retained_count,"predictor_position_offset":-1,
                                 "representation":"final_layer_prenorm_predictor","layer_index":LAYER_INDEX,"hidden_dim":HIDDEN_DIM,"dtype":"bfloat16","layout_digest":LAYOUT_DIGEST,
                                 "ready_ranks":EXPECTED_RANKS,"expected_ranks":EXPECTED_RANKS,"accepted_sequence_digest":ACCEPTED_SEQUENCE_DIGEST,
                                 "output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":byte_count});
+                            if intent["schema"] == json!("occ3.capture.v2") {
+                                // Mirror the live occ3.source.v2 wire (attachment_contract
+                                // SourceCaptureReceipt): the 21 v1 fields plus the bounded
+                                // occ3.span.v1 block, flat. A v2 intent answered with a bare
+                                // v1 receipt is refused by the client, exactly like live.
+                                receipt["schema"] = json!("occ3.source.v2");
+                                let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
+                                    "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
+                                    "span_reasoning_terminator":"thinking_end","span_turn_end_attested":true,
+                                    "span_thinking_count":0,"span_content_count":8,"span_tool_call_count":0,
+                                    "span_tool_arguments_count":0,"span_control_count":2,"span_unknown_count":0,
+                                    "span_window_start_position":0,"span_window_end_position":10,"span_contiguous":true,
+                                    "span_contains_final_content":true,"span_contains_tool_call":false,
+                                    "span_message_truncated":false});
+                                for (key, value) in span.as_object().unwrap() {
+                                    receipt[key.as_str()] = value.clone();
+                                }
+                            }
                             records.lock().unwrap().captures.push(CapturedRecord {
                                 handle,
                                 session,
@@ -1414,19 +1434,52 @@ fn agent_options(model: &Model, key: Arc<String>, system_prompt: &str) -> AgentO
     }
 }
 
+/// The only effort levels the GLM-5.3 chat template renders. The template
+/// (HF zai-org/GLM-5.3 chat_template.jinja) sets
+/// `effective_reasoning_effort = reasoning_effort if reasoning_effort in
+/// ['low', 'high'] else 'max'`, so `low` and `high` are honoured and EVERY
+/// other value - an absent key, `none`, `off`, `minimal`, `medium`, `xhigh` -
+/// renders `Reasoning Effort: Max`. It has no `enable_thinking` switch
+/// (`<think>` is prefilled in the generation prompt), so thinking cannot be
+/// turned off at all; `off` is refused rather than silently run at Max.
+const GLM53_WIRE_EFFORTS: [&str; 3] = ["low", "high", "max"];
+
+/// Refuse an OCC3_RECEIVER_THINKING value the template would silently render
+/// as Max, before any enrollment. Unset stays byte-identical (template Max).
+fn validate_receiver_thinking_env() -> Result<(), String> {
+    match std::env::var("OCC3_RECEIVER_THINKING") {
+        Err(_) => Ok(()),
+        Ok(value) if GLM53_WIRE_EFFORTS.contains(&value.as_str()) => Ok(()),
+        Ok(value) => Err(format!(
+            "OCC3_RECEIVER_THINKING={value:?} is not a GLM-5.3 chat-template effort level: the template honours only low and high and renders anything else (off, none, minimal, medium, xhigh) as Max. Use low|high|max or unset it."
+        )),
+    }
+}
+
+/// Refuse an OCC3_SPAN_POLICY the connector would refuse at capture time,
+/// before any enrollment side effect.
+fn validate_span_policy_env() -> Result<(), String> {
+    SourceSpanArming::from_env().map(|_| ()).map_err(|_| {
+        format!(
+            "{SOURCE_SPAN_POLICY_ENV}={:?} is not an admitted span policy; expected one of {} (unset arms {})",
+            std::env::var(SOURCE_SPAN_POLICY_ENV).unwrap_or_default(),
+            SourceSpanArming::admitted_names(),
+            SourceSpanArming::DEFAULT.span_policy
+        )
+    })
+}
+
 /// Receiver-role thinking budget. Default keeps the historical ThinkingLevel::Max
-/// (byte-identical requests); OCC3_RECEIVER_THINKING=off|minimal|low|medium|high
-/// lowers the receiver's reasoning effort for live runs where the buffered
-/// attached-turn stream must complete inside the gateway's idle window
-/// (measured live 2026-10-29: max-effort receiver reasoning generates 1800+
-/// tokens at ~5 tok/s with cuda graph off on attached-turn shapes, exceeding
-/// the ~340 s gateway idle cut -> 499 -> Uncertain; the source turn is unaffected).
+/// (byte-identical requests); OCC3_RECEIVER_THINKING=low|high lowers the
+/// receiver's reasoning effort for live runs where the buffered attached-turn
+/// stream must complete inside the gateway's idle window (measured live
+/// 2026-10-29: max-effort receiver reasoning generates 1800+ tokens at ~5 tok/s
+/// with cuda graph off on attached-turn shapes, exceeding the ~340 s gateway
+/// idle cut -> 499 -> Uncertain; the source turn is unaffected). The set is
+/// exactly the template's levels: see GLM53_WIRE_EFFORTS.
 fn receiver_thinking_level() -> ThinkingLevel {
     match std::env::var("OCC3_RECEIVER_THINKING").ok().as_deref() {
-        Some("off") => ThinkingLevel::Off,
-        Some("minimal") => ThinkingLevel::Minimal,
         Some("low") => ThinkingLevel::Low,
-        Some("medium") => ThinkingLevel::Medium,
         Some("high") => ThinkingLevel::High,
         _ => ThinkingLevel::Max,
     }
@@ -1442,17 +1495,15 @@ fn receiver_agent_options(model: &Model, key: Arc<String>, system_prompt: &str) 
     options
 }
 
-/// Wire-level receiver effort override: `Some(Some(level))` sets the body
-/// field, `Some(None)` removes it (effort `off`), `None` leaves the body
-/// untouched. Env-gated so unset runs stay byte-identical.
-fn receiver_wire_effort() -> Option<Option<String>> {
-    match std::env::var("OCC3_RECEIVER_THINKING").ok().as_deref() {
-        Some("off") => Some(None),
-        Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max")) => {
-            Some(Some(level.to_string()))
-        }
-        _ => None,
-    }
+/// Wire-level receiver effort override: `Some(level)` sets the body field to
+/// one of the template's own levels, `None` leaves the body untouched.
+/// Env-gated so unset runs stay byte-identical. Any other value was refused
+/// at startup (validate_receiver_thinking_env), so nothing here can send a
+/// value the template would render as Max behind the operator's back.
+fn receiver_wire_effort() -> Option<String> {
+    std::env::var("OCC3_RECEIVER_THINKING")
+        .ok()
+        .filter(|level| GLM53_WIRE_EFFORTS.contains(&level.as_str()))
 }
 
 /// Receiver-side request audit through the existing on_payload hook:
@@ -1476,21 +1527,10 @@ fn attach_receiver_audit(
         let mut payload = payload;
         if let Some(level) = effort {
             if let Some(object) = payload.as_object_mut() {
-                match level {
-                    Some(value) => {
-                        object.insert("reasoning_effort".to_string(), Value::String(value));
-                    }
-                    None => {
-                        // pi-ai's openai-compat convention for "off": send
-                        // "none" rather than dropping the key, because this
-                        // server's launch defaults force reasoning_effort
-                        // "max" whenever the request omits it.
-                        object.insert(
-                            "reasoning_effort".to_string(),
-                            Value::String("none".to_string()),
-                        );
-                    }
-                }
+                // The GLM-5.3 template honours exactly `low`/`high` and renders
+                // every other value, an absent key included, as Max; the level
+                // here is already one of GLM53_WIRE_EFFORTS.
+                object.insert("reasoning_effort".to_string(), Value::String(level));
             }
         }
         let serialized = payload.to_string();
@@ -3469,6 +3509,13 @@ fn main() {
 
 async fn real_main() -> Result<(), i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
+    // Operator knobs are checked before any enrollment or HTTP effect: a value
+    // that would silently run the receiver at Max effort, or arm a span policy
+    // the connector refuses, ends the run here with the admitted set.
+    if let Err(error) = validate_receiver_thinking_env().and_then(|_| validate_span_policy_env()) {
+        eprintln!("Native phase-suite producer refused: {error}");
+        return Err(1);
+    }
     let result = if args.is_empty() {
         offline_selftest(None).await
     } else if args.len() == 1 && args[0] == "--offline" {
