@@ -486,7 +486,8 @@ def _run_of(kind: str, start: int, end: int, positions) -> SpanRun:
 
 def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
                       markers: SpanMarkers, *, accepted_total: int | None = None,
-                      reasoning_end_ids: Sequence[int] | None = None) -> SpanAudit:
+                      reasoning_end_ids: Sequence[int] | None = None,
+                      stop_ids: frozenset | None = None) -> SpanAudit:
     """Classify a retained accepted window without a tokenizer.
 
     ``token_ids`` and ``positions`` are parallel sequences for the retained rows,
@@ -505,10 +506,20 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     The marker does not join ``markers_supplied``/``marker_occurrences``, which
     keep describing the four ``SpanMarkers`` fields only.
 
+    ``stop_ids`` is the optional scheduler stop set (``resolve_turn_stop_ids``).
+    A GLM turn ends at the next role token, which the single ``message_end``
+    marker (the tokenizer eos) never spells; when no message-end marker occurs
+    and the LAST row's id is in the stop set, that row is the turn terminator:
+    a ``CONTROL_MARKERS`` row that closes the message exactly like the marker
+    would.  Only the last row qualifies, because generation stops at the first
+    stop id, so an earlier stop id can never be a legitimate row.
+
     Raises :class:`SpanContractError` (``code == "lineage"``) on inconsistent
     input, contradictory markers or a bounded-resource breach.  Never guesses.
     """
     if type(markers) is not SpanMarkers:
+        raise SpanContractError("lineage")
+    if stop_ids is not None and not isinstance(stop_ids, (set, frozenset)):
         raise SpanContractError("lineage")
     count = _size(token_ids)
     if _size(positions) != count:
@@ -532,7 +543,14 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     begin = _find(token_ids, count, markers.tool_call_begin_ids)
     finish = _find(token_ids, count, markers.tool_call_end_ids)
     message = _find(token_ids, count, markers.message_end_ids)
-    _boundary_checks(thinking, begin, finish, message, alternate)
+    # The scheduler stop row: the last row, when it carries a stop id the
+    # message-end marker does not spell (GLM role tokens).  It closes the
+    # message like the marker; marker_occurrences keeps counting the marker.
+    terminal = message
+    if (message is None and stop_ids is not None
+            and token_ids[count - 1] in stop_ids):
+        terminal = _MarkerHit(count - 1, count, 1)
+    _boundary_checks(thinking, begin, finish, terminal, alternate)
 
     # The reasoning terminator is the FIRST of the two; rows before it are
     # THINKING even when no thinking-end marker occurs in the window.
@@ -542,7 +560,7 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
         terminator = thinking
 
     flags = bytearray(count)
-    for hit in (thinking, alternate, begin, finish, message):
+    for hit in (thinking, alternate, begin, finish, terminal):
         if hit is not None:
             for index in range(hit.start, hit.end):
                 flags[index] = 1
@@ -551,7 +569,7 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     thinking_end = -1 if terminator is None else terminator.end
     begin_end = -1 if begin is None else begin.end
     finish_end = -1 if finish is None else finish.end
-    message_end = -1 if message is None else message.end
+    message_end = -1 if terminal is None else terminal.end
 
     counts = dict.fromkeys(CLASSES, 0)
     first_index = dict.fromkeys(CLASSES, -1)

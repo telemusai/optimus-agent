@@ -508,3 +508,94 @@ def test_module_is_pure_python_and_never_imports_sglang():
     assert module.MARKER_SCHEMA == "occ3.span.markers.v1"
     assert module.DEFAULT_PROFILE == DEFAULT_PROFILE
     assert issubclass(MarkerTable, object)
+
+
+# --------------------------------------------------------------------------
+# GLM-5.3 shapes (HF zai-org/GLM-5.3: tokenizer.vocab_size=154820,
+# len(tokenizer)=154856, config.vocab_size=154880 padded embedding rows,
+# generation_config.json eos_token_id=[154820, 154827, 154829]).
+# --------------------------------------------------------------------------
+
+from types import SimpleNamespace as NS  # noqa: E402
+
+GLM53_BASE = 154820             # tokenizer.vocab_size; <|endoftext|> is the first added id
+GLM53_LEN = 154856              # len(tokenizer): base plus 36 added specials
+GLM53_PADDED = 154880           # config.vocab_size: embedding rows, never token ids
+GLM53_EOS = GLM53_BASE          # <|endoftext|> (eos and pad)
+GLM53_USER = GLM53_BASE + 7     # <|user|>: ends an answer turn
+GLM53_ASSISTANT = GLM53_BASE + 8
+GLM53_OBSERVATION = GLM53_BASE + 9  # <|observation|>: ends a tool-calling turn
+GLM53_THINK = GLM53_BASE + 21   # <think> (154841); the XML markers follow in order
+GLM53_ADDED = {
+    "<|endoftext|>": (GLM53_EOS,), "[MASK]": (GLM53_BASE + 1,), "[gMASK]": (GLM53_BASE + 2,),
+    "<sop>": (GLM53_BASE + 3,), "<eop>": (GLM53_BASE + 4,), "<|system|>": (GLM53_BASE + 5,),
+    "<|user|>": (GLM53_USER,), "<|assistant|>": (GLM53_ASSISTANT,),
+    "<|observation|>": (GLM53_OBSERVATION,),
+    THINKING_OPEN: (GLM53_THINK,), THINKING_CLOSE: (GLM53_THINK + 1,),
+    "<tool_call>": (GLM53_THINK + 2,), "</tool_call>": (GLM53_THINK + 3,),
+    "<arg_key>": (GLM53_THINK + 4,), "</arg_key>": (GLM53_THINK + 5,),
+    "<arg_value>": (GLM53_THINK + 6,), "</arg_value>": (GLM53_THINK + 7,),
+}
+GLM53_GENERATION_EOS = (GLM53_EOS, GLM53_USER, GLM53_OBSERVATION)
+
+
+class Glm53Tokenizer(FakeTokenizer):
+    """GLM-5.3-shaped tokenizer: base vocab 154820, added specials to 154856."""
+
+    def __init__(self, **kwargs):
+        kwargs.setdefault("added", GLM53_ADDED)
+        kwargs.setdefault("vocab_size", GLM53_BASE)
+        kwargs.setdefault("eos_token_id", GLM53_EOS)
+        super().__init__(**kwargs)
+
+    def __len__(self):
+        return GLM53_LEN
+
+
+def test_glm53_marker_table_resolves_every_role_above_the_base_vocab():
+    tok = Glm53Tokenizer()
+    assert vocabulary_bound(tok) == GLM53_LEN
+    markers = resolve_marker_table(tok)
+    assert markers.complete and markers.roundtrip_attested
+    for role, ids in markers.by_role().items():
+        # Every GLM-XML marker and the eos itself sit at or above the base
+        # vocab_size (the pre-#212 bound refused all nine with reason='vocab')
+        # and strictly below len(tokenizer); padded rows are never token ids.
+        assert len(ids) == 1 and GLM53_BASE <= ids[0] < GLM53_LEN < GLM53_PADDED, role
+    assert markers.turn_end_ids == (GLM53_EOS,) and GLM53_EOS >= tok.vocab_size
+    assert markers.thinking_start_ids == (GLM53_THINK,)
+    assert markers.thinking_end_ids == (GLM53_THINK + 1,)
+    assert markers.tool_call_start_ids == (GLM53_THINK + 2,)
+
+
+def test_glm53_turn_stop_set_covers_the_role_tokens_a_turn_really_ends_on():
+    """Red before the stop-set fix: the stop set was {<|endoftext|>} only.
+
+    The GLM-5.3 template has no end-of-turn token; the model ends an answer
+    on <|user|> and a tool-calling turn on <|observation|>, and SGLang stops
+    there through the generation config's eos set (req.eos_token_ids).
+    """
+    tok = Glm53Tokenizer()
+    assert resolve_stop_ids(tok) == frozenset((GLM53_EOS,))
+    config = NS(hf_eos_token_id=set(GLM53_GENERATION_EOS))
+    assert resolve_turn_stop_ids(tok, config) == frozenset(GLM53_GENERATION_EOS)
+    # Without the model config the profile's attested role spellings still cover it.
+    assert resolve_turn_stop_ids(tok) == frozenset(GLM53_GENERATION_EOS)
+    # int and list forms of hf_eos_token_id are accepted; booleans are ignored.
+    assert resolve_turn_stop_ids(tok, NS(hf_eos_token_id=GLM53_USER)) == frozenset(GLM53_GENERATION_EOS)
+    assert resolve_turn_stop_ids(tok, NS(hf_eos_token_id=[GLM53_EOS, True])) == frozenset(GLM53_GENERATION_EOS)
+    # The role tokens are encoded exactly like the markers: no special-token prefix.
+    assert all(flag is False for _, flag in tok.calls)
+
+
+def test_turn_stop_set_skips_role_spellings_the_tokenizer_lacks():
+    # test_span_markers.FakeTokenizer knows <|user|> (110) but spells
+    # <|observation|> through byte fallback: not one id, so not a stop id.
+    assert resolve_turn_stop_ids(FakeTokenizer()) == frozenset((EOS_ID, 110))
+    bare = FakeTokenizer(added={k: v for k, v in ADDED.items() if k != "<|user|>"})
+    assert resolve_turn_stop_ids(bare) == frozenset((EOS_ID,))
+    # A generation-config id outside the tokenizer id space (a padded
+    # embedding row) is refused, never trusted.
+    refusal(lambda: resolve_turn_stop_ids(Glm53Tokenizer(), NS(hf_eos_token_id={GLM53_PADDED - 1})),
+            "vocab", "turn_end")
+    refusal(lambda: resolve_turn_stop_ids(Glm53Tokenizer(), profile="invented.v9"), "profile")

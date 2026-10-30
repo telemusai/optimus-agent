@@ -1142,6 +1142,7 @@ mod tests {
             output_sha256: "d".repeat(64),
             expires_at_epoch: now() + 600,
             byte_count: 128,
+            span: None,
         };
         let export = NegativeControlExport {
             raw_source_handle: RAW_HANDLE.into(),

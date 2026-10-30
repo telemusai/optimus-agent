@@ -291,3 +291,36 @@ async def test_receiver_rejects_epoch_method_alias_before_control(field,value):
     with pytest.raises(LatentError,match="identity"):
         await backend.reserve(attachment,identity,"attempt",NativeRequestView(native,10,"s",True,identity.deadline_monotonic))
     assert not client.calls
+
+
+@pytest.mark.asyncio
+async def test_v2_enroll_wires_the_generation_config_stop_set():
+    from occ3_sglang.span_policy import resolve_runtime_markers
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    # GLM: the tokenizer eos is <|endoftext|> (108 here) while the generation
+    # config also stops on the role tokens (110 = <|user|>, 111 = <|observation|>).
+    client.tm=NS(tokenizer=FakeTokenizer(),model_config=NS(hf_eos_token_id={108,110,111}))
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry,
+        schema="occ3.capture.v2",span_policy="content_tail_v2")
+    await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    _,stop_ids=resolve_runtime_markers(client.tm.tokenizer,client.tm.model_config)
+    assert stop_ids==frozenset((108,110,111))
+    assert client.tm.tokenizer._occ3_span_markers[1]==stop_ids
+
+
+@pytest.mark.asyncio
+async def test_v1_enroll_refuses_when_calibration_collection_is_armed(monkeypatch):
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    monkeypatch.setenv("OCC3_CALIBRATION_CAPTURE_DIR","/corpus")
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+    with pytest.raises(LatentError) as caught:
+        await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    assert caught.value.code=="profile" and not backend.attempts
+    assert not any(op=="reserve_capture" for op,_,_ in client.calls)
+    monkeypatch.delenv("OCC3_CALIBRATION_CAPTURE_DIR")
+    enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    assert enrollment.attempt_id=="attempt"

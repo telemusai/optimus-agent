@@ -1146,3 +1146,37 @@ def test_kv_layout_accepts_the_production_eagle_half_open_end_layer(monkeypatch)
     scheduler=NS(token_to_kv_pool_allocator=allocator)
     result=w.validate_kv_layout(runner,scheduler,torch)
     assert result["shape"]==[1088,1,656]
+
+
+def test_reserve_capture_refuses_a_v1_capture_when_collection_is_armed(caplog):
+    # Red for the P4 blocker: a v1 capture on a collection run was accepted,
+    # served and never collected (the handoff needs prepared["span_selection"]).
+    import logging
+    caplog.set_level(logging.ERROR, logger="occ3_sglang.latent_worker")
+    w._require_collectable(None, capture())  # no collector: v1 stays admissible
+    w._require_collectable(NS(), capture(span_policy="content_tail_v2", marker_profile="glm45_glm47_xml_kv.v1"))
+    with pytest.raises(LatentError) as caught:
+        w._require_collectable(NS(), capture())
+    assert caught.value.code == "profile"
+    assert any("span policy v1" in record.getMessage() for record in caplog.records)
+
+
+def test_consume_admission_flags_prompts_beyond_the_sparse_indexer_topk(monkeypatch, caplog):
+    # GLM-5.3 DSA: index_topk=2048 keys per query; injected prefix rows are
+    # ordinary positions and nothing pins them into the selection.
+    import logging
+    caplog.set_level(logging.WARNING, logger="occ3_sglang.latent_worker")
+    d=consume(native_rid="rid")
+    record=NS(state="leased",admitted_consume=False,state_generation=123)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record,
+               preflight=lambda phase, check: check(), sparse_index_topk=8, rank=0, sparse_topk_exceeded=0)
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    r=req(); w.admit_request(NS(occ3_runtime=runtime),r,d)
+    # 8 prefix holes + 3 prompt ids = 11 rows > top-k 8: flagged, never declined.
+    assert list(r.origin_input_ids)==[0]*8+[1,2,3]
+    assert runtime.sparse_topk_exceeded==1
+    assert any("sparse indexer top-k=8" in rec.getMessage() for rec in caplog.records)
+    # At or under the bound nothing is flagged; an unknown bound never flags.
+    assert w._flag_sparse_topk(NS(sparse_index_topk=11), 11) is False
+    assert w._flag_sparse_topk(NS(), 10**6) is False
+    assert w._flag_sparse_topk(NS(sparse_index_topk=2048, rank=1), 2049) is True

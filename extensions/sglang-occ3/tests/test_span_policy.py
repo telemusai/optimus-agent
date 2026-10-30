@@ -261,3 +261,59 @@ def test_declines_are_never_a_fallback_record():
     with pytest.raises(SpanPolicyError):
         select_span_v2(tokens, positions, position_base=9, accepted_total=99,
                       policy=POLICY_CONTENT, marker_table=table(), stop_ids=STOP)
+
+
+# --------------------------------------------------------------------------
+# GLM-5.3 real ids (see test_span_markers.GLM53_*): a turn never ends on the
+# eos marker; it ends on <|user|> (answer) or <|observation|> (tool call).
+# --------------------------------------------------------------------------
+
+from test_span_markers import (  # noqa: E402
+    GLM53_EOS, GLM53_GENERATION_EOS, GLM53_OBSERVATION, GLM53_THINK, GLM53_USER,
+)
+
+GLM53_STOP = frozenset(GLM53_GENERATION_EOS)
+
+
+def glm53_table():
+    base = GLM53_THINK
+    return table(thinking_start=(base,), thinking_end=(base + 1,), tool_call_start=(base + 2,),
+                 tool_call_end=(base + 3,), argument_key_start=(base + 4,),
+                 argument_key_end=(base + 5,), argument_value_start=(base + 6,),
+                 argument_value_end=(base + 7,), turn_end=(GLM53_EOS,))
+
+
+def test_glm53_answer_turn_ends_on_the_user_role_token_not_eos():
+    """Red before the stop-set fix: R3 declined every live GLM-5.3 turn.
+
+    The tokenizer-only stop set {<|endoftext|>} never matches the row the
+    scheduler actually stopped on (<|user|>, 154827), so no v2 policy could
+    select anything on the live candidate once the marker table resolved.
+    """
+    think_end = GLM53_THINK + 1
+    turn = window([think_end, 2001, 2002, 2003, GLM53_USER], base=640)
+    declines(turn, code="lineage", marker_table=glm53_table(), stop_ids=frozenset((GLM53_EOS,)))
+    selection = selects(turn, marker_table=glm53_table(), stop_ids=GLM53_STOP)
+    assert (selection.start_index, selection.end_index) == (1, 4)
+    assert (selection.accepted_span_start, selection.accepted_span_end) == (1, 4)
+    assert selection.terminator == TERMINATOR_THINKING_END
+    block = selection.span_block(glm53_table())
+    assert block["span_content_count"] == 3 and block["span_control_count"] == 2
+    assert block["span_turn_end_attested"] is True and block["span_contains_tool_call"] is False
+    # <think> sits in the generation prompt, never in the accepted window.
+    assert GLM53_THINK not in turn[0]
+
+
+def test_glm53_tool_call_turn_ends_on_the_observation_role_token():
+    base = GLM53_THINK
+    think_end, tc_start, tc_end = base + 1, base + 2, base + 3
+    ak_start, ak_end, av_start, av_end = base + 4, base + 5, base + 6, base + 7
+    turn = window([think_end, 3001, 3002, tc_start, 3003, ak_start, 3004, ak_end,
+                   av_start, 3005, av_end, tc_end, GLM53_OBSERVATION], base=640)
+    selection = selects(turn, marker_table=glm53_table(), stop_ids=GLM53_STOP)
+    assert (selection.start_index, selection.end_index) == (1, 3)
+    assert selection.contains_tool_call is True
+    declines(turn, code="lineage", policy=POLICY_NO_TOOL, marker_table=glm53_table(),
+             stop_ids=GLM53_STOP)
+    # The eos-only stop set still declines at R3: <|observation|> is not eos.
+    declines(turn, code="lineage", marker_table=glm53_table(), stop_ids=frozenset((GLM53_EOS,)))

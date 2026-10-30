@@ -720,7 +720,8 @@ class ChatAttachmentAdapter:
                 if custom is not None and not isinstance(custom, dict):
                     raise AttachmentError("unsupported_profile")
                 try:
-                    entries = wire_marker_entries(*resolve_runtime_markers(tm.tokenizer))
+                    entries = wire_marker_entries(*resolve_runtime_markers(
+                        tm.tokenizer, getattr(tm, "model_config", None)))
                 except Exception:
                     raise AttachmentError("unsupported_profile", 409) from None
                 obj.sampling_params["custom_params"] = {**(custom or {}), **entries}

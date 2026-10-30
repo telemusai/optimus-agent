@@ -33,6 +33,9 @@ R2  window        the window does not end at the finish boundary
                   or the aligned span is not exactly as wide as its
                   selected rows (a gap inside the selection)          lineage
 R3  turn end      the last retained row's id is not in the stop set  lineage
+                  (the stop set is resolve_turn_stop_ids: eos plus the
+                  generation-config / role-token ids a GLM turn really
+                  ends on; the eos marker alone never matches them)
 R4  reasoning     neither thinking-end nor tool-call-start occurs in
                   terminator     the window                          lineage
 R5  reasoning     rows before the first terminator are REASONING, the
@@ -42,7 +45,9 @@ R6  tool-call     tool-call-start occurs without tool-call-end       lineage
                   completeness
 R7  content       the maximal CONTENT run after the terminator, before
                   region         the first tool-call-start, stopping at the
-                  stop row (a CONTROL row must bound the run)
+                  stop row (a CONTROL row must bound the run; the R3 stop
+                  row counts as CONTROL even when it is a role token the
+                  eos marker never spells)
 R8  non-empty     that run is empty                                 lineage
 R9  no-tool       content_tail_no_tool_v2 while the window holds any
                   policy          tool syntax                        lineage
@@ -80,7 +85,7 @@ from .span_audit import (CLASSES, CONTENT, MAX_ACCEPTED, MAX_MARKER_ID,
                           MAX_MARKER_TOKENS, SpanContractError, _check_positions,
                           _find, _matches, classify_accepted)
 from .span_markers import (PROFILES, ROLES, MarkerTable, resolve_marker_table,
-                           resolve_stop_ids)
+                           resolve_turn_stop_ids)
 
 __all__ = [
     "POLICY_NO_TOOL", "POLICY_CONTENT", "POLICY_LAST64", "POLICY_LAST32",
@@ -291,9 +296,11 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     else:
         terminator, terminator_kind = tool_start, TERMINATOR_TOOL_CALL_START
 
-    # R5/R7: classification with the second reasoning terminator.
+    # R5/R7: classification with the second reasoning terminator and the stop
+    # set, so the R3 stop row bounds the content run even when it is a role
+    # token (GLM ends a turn on <|user|>/<|observation|>, not the eos marker).
     audit = classify_accepted(token_ids, positions, markers, accepted_total=accepted_total,
-                             reasoning_end_ids=by_role["tool_call_start"])
+                             reasoning_end_ids=by_role["tool_call_start"], stop_ids=stop_ids)
 
     # R12 (first half): a truncated run list cannot answer "the last content run".
     _require(not audit.runs_truncated, "lineage")
@@ -425,21 +432,26 @@ def marker_table_from_wire(custom_params) -> Tuple[MarkerTable, FrozenSet[int]]:
     return table, stop_ids
 
 
-def resolve_runtime_markers(tokenizer):
+def resolve_runtime_markers(tokenizer, model_config=None):
     """Resolve and cache the marker table plus stop ids on a tokenizer.
 
     The cache lives on the tokenizer object itself, so the adapter, the
     backend and any other tokenizer-manager seam share one attested table per
-    process.  ``thinking_start`` is allowlisted absent: the GLM template may
-    prefill it and a window can legitimately contain no thinking-start row.
-    Raises :class:`span_markers.MarkerResolutionError` (code ``profile``) when
-    the tokenizer cannot attest the table.
+    process.  ``thinking_start`` is allowlisted absent: the GLM template
+    prefills ``<think>`` in the generation prompt, so a window never contains
+    a thinking-start row.  ``model_config`` is the tokenizer manager's model
+    config when the seam has it: its ``hf_eos_token_id`` (the generation
+    config's stop set, which SGLang's scheduler matches as ``req.eos_token_ids``)
+    joins the stop set, so a turn ending on a role token passes R3.  The cache
+    is reused only for an identical stop set.  Raises
+    :class:`span_markers.MarkerResolutionError` (code ``profile``) when the
+    tokenizer cannot attest the table.
     """
+    stop_ids = resolve_turn_stop_ids(tokenizer, model_config)
     cached = getattr(tokenizer, "_occ3_span_markers", None)
-    if type(cached) is tuple and len(cached) == 2:
+    if type(cached) is tuple and len(cached) == 2 and cached[1] == stop_ids:
         return cached
     table = resolve_marker_table(tokenizer, allow_absent=(_ABSENTABLE_ROLE,))
-    stop_ids = resolve_stop_ids(tokenizer)
     cached = (table, stop_ids)
     try:
         setattr(tokenizer, "_occ3_span_markers", cached)
