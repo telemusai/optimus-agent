@@ -1316,7 +1316,7 @@ impl PhaseEnv {
             target: pi_ai::inference_attachment::InferenceStateTarget {
                 provider: self.model.provider.clone(),
                 model_id: self.model.id.clone(),
-                base_url: format!("{}/v1", self.endpoint),
+                base_url: self.model.base_url.clone(),
             },
             runtime_id: self.runtime_epoch.clone(),
             runtime_generation: self.runtime_generation,
@@ -2224,6 +2224,10 @@ async fn run_positive_case(
         "receiver_request_audit": arm_receiver_audit_summary(&audit.lock().unwrap().clone()),
         "capture_turn_millis": capture_turn_millis,
         "total_millis": arm_started.elapsed().as_millis() as u64,
+        // Class-B diagnosability (2026-10-30): a refused source turn used to
+        // surface only as empty fields; name the refused-turn error so the
+        // next live failure is readable from arm evidence alone.
+        "source_turn_error": action.as_ref().err().cloned(),
     });
     Ok(PositiveOutcome {
         case,
@@ -5064,6 +5068,57 @@ mod gate_tests {
         // Escaped quotes must not confuse the key scanner.
         assert!(structural_scan(r#"{"a\"b":1,"c":2}"#).is_ok());
         assert!(structural_scan(r#"{"a\"b":1,"a\"b":2}"#).is_err());
+    }
+
+    #[test]
+    fn live_permit_target_is_the_model_target_not_endpoint_plus_v1() {
+        // Class-B regression (2026-10-30): the live descriptor's endpoint
+        // already ends in /v1 and the model's baseUrl equals it. The permit
+        // target must be the model target exactly; deriving it as
+        // endpoint + "/v1" doubled the suffix, so prepare_source_capture
+        // refused every armed source turn client-side with zero requests.
+        // Offline fixtures never caught it: their endpoint carries no /v1
+        // suffix, so both constructions coincide there.
+        let endpoint = "https://launchpad.example/v1";
+        let mut env = PhaseEnv {
+            journal: std::env::temp_dir(),
+            model: Model::new(
+                "glm-5.3",
+                "GLM-5.3 - DGX MTP",
+                API_OPENAI_COMPLETIONS,
+                "dgx-glm53",
+                endpoint,
+            ),
+            key: Arc::new(FIXTURE_KEY.into()),
+            control_headers: None,
+            endpoint: endpoint.into(),
+            identity: fixture_identity(),
+            attempt_id: "attempt".into(),
+            runtime_epoch: "epoch".into(),
+            runtime_generation: 1,
+            expires_at_epoch: now() + 240,
+            deadline_seconds: 20,
+            max_capture_bytes: 1048576,
+            max_response_bytes: 65536,
+            harness_binary_sha256: "0".repeat(64),
+            source_manifest_sha256: "0".repeat(64),
+            offline_records: None,
+            layer_index: LAYER_INDEX,
+            hidden_dim: HIDDEN_DIM,
+            dtype: "bfloat16".into(),
+            layout_digest: LAYOUT_DIGEST.into(),
+            expected_ranks: EXPECTED_RANKS,
+            profile_digest: PROFILE_DIGEST.into(),
+        };
+        let permit = env.permit();
+        assert_eq!(permit.target.base_url, "https://launchpad.example/v1");
+        assert_eq!(permit.target.provider, "dgx-glm53");
+        assert_eq!(permit.target.model_id, "glm-5.3");
+        // The offline fixture shape stays byte-identical: the fixture
+        // endpoint has no /v1 suffix and the model's baseUrl appends it.
+        env.model = offline_model("http://127.0.0.1:9");
+        env.endpoint = "http://127.0.0.1:9".into();
+        assert_eq!(env.permit().target.base_url, "http://127.0.0.1:9/v1");
     }
 
     #[test]
