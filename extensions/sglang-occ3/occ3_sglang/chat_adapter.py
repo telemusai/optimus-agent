@@ -7,6 +7,7 @@ from __future__ import annotations
 
 import asyncio
 import copy
+import os
 import inspect
 import json
 import logging
@@ -383,6 +384,10 @@ class ChatAttachmentAdapter:
         self._active = 0
         self._attempts: dict[str, float] = {}
         self._quarantined: set[asyncio.Task] = set()
+        # Root diagnostic: when set, every armed-turn response chunk is
+        # appended to this path before audit/buffering. Never set in
+        # production; no behavior change when the env var is absent.
+        self._dump_stream_path = os.environ.get("OCC3_DUMP_NATIVE_STREAM") or None
         # Terminal-only tracked tasks: unresolved abort/close operations and
         # quarantined retires that retain charged ownership until they settle.
         self._terminal_tasks: set[asyncio.Task] = set()
@@ -862,6 +867,15 @@ class ChatAttachmentAdapter:
                     raise AttachmentError("native_completion_failed")
                 audit.feed(chunk)
                 chunks.append(chunk)
+                if self._dump_stream_path is not None:
+                    # Root diagnostic: append every armed-turn chunk exactly
+                    # as the inner iterator yields it, before any audit or
+                    # buffering. No behavior change when the env var is unset.
+                    try:
+                        with open(self._dump_stream_path, "ab") as handle:
+                            handle.write(chunk)
+                    except OSError:
+                        pass
             body = b"".join(chunks)
             completion = audit.finish(ctx.native_rid)
         else:

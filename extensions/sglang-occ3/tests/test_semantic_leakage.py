@@ -60,9 +60,9 @@ ALLOWED_RECEIPT_KEYS = ("attachment", "consumed", "fallback_used", "injected_sta
 # ---------------------------------------------------------------------------
 # MIRROR constants. Strings are byte-for-byte copies of the Rust sources.
 # ---------------------------------------------------------------------------
-# agent_messages.rs:2068 and occ3_connectors/sglang.rs:849: the only accepted
+# agent_messages.rs:2250 and occ3_connectors/sglang.rs:934: the only accepted
 # native control summary. It is what the receiver reads as ordinary text.
-CONTROL_SUMMARY = "Continue the authorized task using the attached state."
+CONTROL_SUMMARY = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state."
 # examples/occ3_native_phase_suite.rs:1564 (no-state control prompt).
 NO_STATE_TASK = "Continue the authorized task. No state attachment is available for this negative control."
 # examples/occ3_native_handoff.rs:74 (the matched task text used by the handoff suite).
@@ -260,7 +260,7 @@ def ordinary_user_messages(payload):
 # E/F. MIRROR of the two OCC-3 acceptance predicates (Rust).
 # ---------------------------------------------------------------------------
 def prepared_handoff_accepts(control_summary):
-    """MIRROR agent_messages.rs:2064-2070 (``PreparedNativeHandoff::new``).
+    """MIRROR agent_messages.rs:2245-2253 (``PreparedNativeHandoff::new``).
 
     Only the pinned control summary may travel as the ordinary message body, so
     an OCC-1/OCC-2/TXT body cannot be the control summary of a native handoff.
@@ -536,7 +536,7 @@ def test_detector_rejects_exact_case_and_whitespace_variants(leak):
 
 
 @pytest.mark.parametrize("clean", [
-    "", "Continue the authorized task using the attached state.",
+    "", "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.",
     "vault-0f4c2b9e-6a11-4d3f-9f7b-2c5a8e1d0b6",  # truncated by one character
     "UNKNOWN",
 ])

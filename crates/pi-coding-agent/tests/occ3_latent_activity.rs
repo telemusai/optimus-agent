@@ -31,7 +31,7 @@ use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
 const METHOD: &str = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1";
 const FACT: &str = "source-only-4b1d-nonce-lantern-quartz";
-const CONTROL: &str = "Continue the authorized task using the attached state.";
+const CONTROL: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.";
 const SOURCE: &str = "source-session";
 const RECEIVER: &str = "receiver-session";
 const CONTROL_HEADER: &str = "x-pomerium-authorization";

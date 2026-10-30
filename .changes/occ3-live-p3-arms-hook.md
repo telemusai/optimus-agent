@@ -1,0 +1,2 @@
+- Added the live-window P3 arm instrumentation: an unattested site-packages hook (meta-path loader wrap of the shipped alignment resolver and the worker's import-time binding) with per-call control-file arm selection, fail-closed install refusals, and a staging assembler that manifests every file digest for the DGX transfer.
+- The hook's offline test file restores the real package modules, the finder list and import caches after every test, so the file can never leak wrapped modules into later suites.

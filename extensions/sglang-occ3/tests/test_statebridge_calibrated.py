@@ -187,6 +187,22 @@ def test_apply_refuses_bad_shapes_and_rows():
     assert caught.value.code == "numerical"
 
 
+def test_serving_transform_accepts_a_zero_dim_tensor_nu():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.statebridge_calibrated import serving_transform
+    z = torch.ones(4, 3)
+    z = z / z.norm(dim=-1, keepdim=True)
+    nu = torch.tensor(12.5)
+    served = serving_transform({"kind": "n1"}, z, nu=nu)
+    assert bool(torch.allclose(served.norm(dim=-1), torch.full((4,), 12.5)))
+    with pytest.raises(LatentError) as caught:
+        serving_transform({"kind": "n1"}, z, nu=torch.tensor(float("nan")))
+    assert caught.value.code == "profile"
+    with pytest.raises(LatentError) as caught:
+        serving_transform({"kind": "n1"}, z, nu=torch.ones(2))
+    assert caught.value.code == "profile"
+
+
 def test_apply_returns_raw_rows_and_serving_transform_calibrates():
     from occ3_sglang.latent_types import LatentError
     from occ3_sglang.statebridge_calibrated import apply_map, fit_map, serving_transform

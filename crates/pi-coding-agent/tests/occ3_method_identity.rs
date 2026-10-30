@@ -38,7 +38,7 @@ const METHOD_B: &str = "statebridge.glm53.calibrated-lowrank-procrustes.v1";
 const METHOD_KV: &str = "kv-handoff.glm53.final-kv.v1";
 
 const FACT: &str = "method-identity-seam-fixture-fact-4b1d";
-const CONTROL: &str = "Continue the authorized task using the attached state.";
+const CONTROL: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.";
 const SOURCE: &str = "source-session";
 const RECEIVER: &str = "receiver-session";
 

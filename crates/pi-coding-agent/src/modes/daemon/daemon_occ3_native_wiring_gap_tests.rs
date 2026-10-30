@@ -213,7 +213,7 @@ impl Occ3Connector for FixtureConnector {
                     state_size_bytes: 128,
                 },
                 control_summary:
-                    "Continue the authorized task using the attached state.".into(),
+                    "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
                 fallback_reference: "occ1".into(),
             },
         })

@@ -211,11 +211,30 @@ impl AgentSessionMessageController for IsolatedController {
             // body from the activity projection instead of reporting it as text.
             let pending = receiver.native.delivery_marker(&payload.id)?;
             stamp_occ3_delivery_record(&mut delivery.record, &pending)?;
+            // The control-only delivery record is suppressed from
+            // model-visible text by the pending delivery marker. Measured on
+            // the live window (attempt-04d) and the 2026-10-30 option-B
+            // diagnostic: without an explicit user turn the receiver's
+            // request body carries only its developer prompt, so a live
+            // model presented with the server-injected sender prefix
+            // continues the SENDER's task instead of answering as itself.
+            // The envelope's receiver-framed control summary is the
+            // sanctioned, source-fact-free question; appending it as the
+            // LAST user turn anchors the reply to the receiver's own task.
+            let receiver_question = AgentMessage::Message(pi_ai::types::Message::User(
+                pi_ai::types::UserMessage::new(
+                    pi_ai::types::UserContent::Text(
+                        prepared.envelope().control_summary.clone(),
+                    ),
+                    chrono::Utc::now().timestamp_millis(),
+                ),
+            ));
             receiver
                 .agent
-                .prompt(PromptInput::Messages(vec![AgentMessage::Custom(
-                    delivery.record,
-                )]))
+                .prompt(PromptInput::Messages(vec![
+                    AgentMessage::Custom(delivery.record),
+                    receiver_question,
+                ]))
                 .await
                 .map_err(|_| "Native receiver failed")?;
             if receiver.native.outcome(&payload.id)? != Occ3DeliveryStatus::Consumed {

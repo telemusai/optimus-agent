@@ -2049,6 +2049,11 @@ async fn buffer_source_sse(
         bytes.extend_from_slice(&chunk);
     }
     submission.verify_body(&bytes)?;
+    if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_SSE") {
+        // Root diagnostic: dump the raw armed-turn response bytes exactly as
+        // received, before any SSE parsing. No behavior change when unset.
+        let _ = std::fs::write(&path, &bytes);
+    }
     let raw = std::str::from_utf8(&bytes).map_err(|_| SourceCaptureError::InvalidCompletion)?;
     let response_id = submission.expected_response_id()?;
     let mut payloads = Vec::new();

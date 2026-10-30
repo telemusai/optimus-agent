@@ -181,8 +181,9 @@ async fn reuse_headers_body_and_rotation() {
         opts.stream.on_stream_observation = Some(Arc::new(move |phase| captured.lock().unwrap().push(phase.to_string())));
         let output = run(&model, opts).await;
         assert_eq!(output.stop_reason, "stop");
-        let client_phase = if key == "key-one" { "http_client_created" } else { "http_client_reused" };
-        assert_eq!(*phases.lock().unwrap(), vec!["count_start", client_phase, "count_serialize_start", "count_serialize_complete", "count_send_start", "count_headers_complete", "count_complete", "fresh_generation_policy", "generation_serialize_start", "generation_serialize_complete", "generation_send_start", "generation_headers_complete", "raw_event", "text", "raw_event", "terminal"]);
+        let client_phase = if key == "key-one" { "http_client_created_loopback" } else { "http_client_reused_loopback" };
+        let generation_phase = if key == "key-one" { "http_client_created_generation_loopback" } else { "http_client_reused_generation_loopback" };
+        assert_eq!(*phases.lock().unwrap(), vec!["count_start", client_phase, "count_serialize_start", "count_serialize_complete", "count_send_start", "count_headers_complete", "count_complete", generation_phase, "generation_serialize_start", "generation_serialize_complete", "generation_send_start", "generation_headers_complete", "raw_event", "text", "raw_event", "terminal"]);
         let count = fixture.next().await; let generation = fixture.next().await;
         assert_eq!(count.path, "/v1/tokenize");
         assert_eq!(generation.path, "/v1/chat/completions");
@@ -209,7 +210,7 @@ async fn reuse_headers_body_and_rotation() {
         pairs.push((count.connection, generation.connection));
     }
     assert_eq!(pairs[0].0, pairs[1].0, "each fresh exact count reuses only the NO-REDIRECT HTTP transport");
-    assert_ne!(pairs[0].1, pairs[1].1, "generation keeps fresh native TLS/default redirect policy");
+    assert_eq!(pairs[0].1, pairs[1].1, "covered loopback generation transports pool across keys (guarded pool idle cap)");
     // Changing process proxy credentials invalidates transport reuse, not request credentials.
     std::env::set_var("HTTP_PROXY", "http://fixture-two:rotated-secret@127.0.0.1:1");
     let output = run(&model, options("key-three", "session-three")).await;

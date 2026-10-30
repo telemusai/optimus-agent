@@ -346,7 +346,7 @@ fn admit_envelope(native: &Arc<Occ3NativeSession>) -> String {
                 state_size_bytes: 128,
             },
             control_summary:
-                "Continue the authorized task using the attached state.".into(),
+                "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
             fallback_reference: "occ1".into(),
         },
     };
@@ -417,7 +417,7 @@ fn admit_after_close_errs(native: &Arc<Occ3NativeSession>) {
                 state_size_bytes: 128,
             },
             control_summary:
-                "Continue the authorized task using the attached state.".into(),
+                "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
             fallback_reference: "occ1".into(),
         },
     };

@@ -1,7 +1,7 @@
 {
  "schema": "optimus.occ3.native-phase-suite-contract.v1",
  "synthetic": true,
- "note": "Authoritative frozen contract for the native phase-suite validator, contract_revision 5 (supersedes revision 4 of the epoch-aware repair; the admission no longer carries per-phase pins). Revision 5 is the admission pin-file repair: profile_digest is incarnation-bound (fresh per boot) and the live server epoch exists only after the candidate boots, so the frozen pre-boot admission is STATIC-ONLY and each phase's OBSERVED digest arrives as a write-once attempt-dir pin file (admission-pin-<phase>.json, schema occ3.admission.pin.v1, bound to the attempt, the pinned static input file digest 6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a and the phase's observed runtime_epoch/runtime_generation); each phase's report binding must equal its phase pin AND re-derive from the static fields plus the phase's observed incarnation (sha256 over sorted-key compact ASCII canonical JSON, attachment_contract.digest parity), and equal before/after pins are refused as fabricated pre-restart. All values are synthetic; no real endpoint, credential, identity, nonce, handle or artifact is present. The Rust harness must produce reports satisfying these exact fieldsets and invariants; the Python adapter is the verifier, never a proof.",
+ "note": "Authoritative frozen contract for the native phase-suite validator, contract_revision 6 (supersedes revision 5 of the admission pin-file repair and revision 4 of the epoch-aware repair; the admission no longer carries per-phase pins). Revision 5 is the admission pin-file repair; revision 6 pins the DERIVATION FIELDSET to the wire RuntimeProfile fieldset (occ3_sglang.latent_types.RuntimeProfile): the per-boot digest covers the static profile fields, the frozen-artifact reference calibration_path/calibration_digest - carried empty by the per-message method, never absent - and the observed runtime_epoch/runtime_generation, for every registered method alike. profile_digest is incarnation-bound (fresh per boot) and the live server epoch exists only after the candidate boots, so the frozen pre-boot admission is STATIC-ONLY and each phase's OBSERVED digest arrives as a write-once attempt-dir pin file (admission-pin-<phase>.json, schema occ3.admission.pin.v1, bound to the attempt, the pinned static input file digest 6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a and the phase's observed runtime_epoch/runtime_generation); each phase's report binding must equal its phase pin AND re-derive from the static fields plus the phase's observed incarnation (sha256 over sorted-key compact ASCII canonical JSON, attachment_contract.digest parity), and equal before/after pins are refused as fabricated pre-restart. All values are synthetic; no real endpoint, credential, identity, nonce, handle or artifact is present. The Rust harness must produce reports satisfying these exact fieldsets and invariants; the Python adapter is the verifier, never a proof.",
  "method_id": "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1",
  "schemas": {
   "report": "optimus.occ3.native-phase-suite.v1",
@@ -18,7 +18,7 @@
   "adapter writes one fresh exclusive per-phase challenge before any waiting; one challenge, one attempt, no replay",
   "report echoes attempt_id, candidate_id, candidate_started_at and validator_challenge exactly",
   "report harness binding equals admission-pinned binary sha256, platform and canonical source-manifest digest",
-  "report identity/method/origin bindings equal admission pins; method is statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1 only; profile_digest is incarnation-bound (per-boot) and never statically pinned: each phase's binding must equal its phase's attempt-dir admission pin file (admission-pin-<phase>.json, schema occ3.admission.pin.v1, write-once after the identity derivation receipt; static_input_sha256 pinned to native-profile-input.json 6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a) and must re-derive from the admission's static profile fields plus that phase's observed runtime_epoch/runtime_generation (sha256 over sorted-key compact ASCII canonical JSON; report_profile_derivation_mismatch otherwise); equal before/after pin digests are refused as fabricated pre-restart (profile_digest_pins_not_per_boot)",
+  "report identity/method/origin bindings equal admission pins; method is statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1 only; profile_digest is incarnation-bound (per-boot) and never statically pinned: each phase's binding must equal its phase's attempt-dir admission pin file (admission-pin-<phase>.json, schema occ3.admission.pin.v1, write-once after the identity derivation receipt; static_input_sha256 pinned to native-profile-input.json 6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a) and must re-derive from the admission's static profile fields, the frozen-artifact reference (calibration_path/calibration_digest, empty for the per-message method) and that phase's observed runtime_epoch/runtime_generation - the full RuntimeProfile fieldset, identical for every registered method (sha256 over sorted-key compact ASCII canonical JSON; report_profile_derivation_mismatch otherwise); equal before/after pin digests are refused as fabricated pre-restart (profile_digest_pins_not_per_boot)",
   "observed runtime/layout fields come from actual native enrollment on the started candidate; ready_ranks equals expected_ranks equals challenge expected_ranks",
   "positive case: normalized answer hashes to the suite nonce, one delivered message, lease Consumed before tool execution, receiver audit source_facts_absent with max_tokens 131072 and request_count 1",
   "report publication: the harness must create a uniquely named private staging file in the same filesystem/attempt directory, write exclusively and bounded, flush and fsync, verify the exact complete bytes, then publish atomically at the exact final expected name WITHOUT replacing any existing target; the final report is immutable afterwards; no final name may exist while content is incomplete; failed or partial staging remains private and ineligible; an existing final target means refuse/no-replay, never overwrite (ordinary temp+os.replace alone is NOT proof of no-replace; platform-specific no-replace atomic publication plus ACL proof is future native-harness work)",
@@ -195,7 +195,7 @@
    "binding": {
     "identity_fingerprint": "sha256:149c33621f3873019d719d4177e5df96c05144c9b0f7863815199b4b772f5efe",
     "method_id": "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1",
-    "profile_digest": "1a4da9e7993afcc0191d02a838047454e32572f29a843befda036944eb77a906",
+    "profile_digest": "7787ee97339c42d114c3bf7baf5840ac6d91197d6b47fc4803a607cb24954f0a",
     "endpoint_origin": "https://synthetic-native.invalid"
    },
    "observed": {
@@ -270,7 +270,7 @@
    "binding": {
     "identity_fingerprint": "sha256:149c33621f3873019d719d4177e5df96c05144c9b0f7863815199b4b772f5efe",
     "method_id": "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1",
-    "profile_digest": "9f4db2e622b62425ba6e763c018f4e1e1241303f922fd6b62944aea1653ea22c",
+    "profile_digest": "6dab42da9dda998d362e6eb4dfa6d88203a9f14f7a1697bfe74ba5c8161b328a",
     "endpoint_origin": "https://synthetic-native.invalid"
    },
    "observed": {
@@ -326,7 +326,7 @@
    "completed_at": 1760000000
   }
  },
- "contract_revision": 5,
+ "contract_revision": 6,
  "publication": {
   "final_name": "native-phase-suite-<phase>.json",
   "staging": "uniquely named private file in the same filesystem/attempt directory; exclusive bounded write; flush+fsync; verify exact complete bytes before publish",

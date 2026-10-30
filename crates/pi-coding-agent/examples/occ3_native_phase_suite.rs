@@ -40,7 +40,7 @@ use pi_agent_core::types::{
     AgentMessage, AgentState, AgentTool, AgentToolResult, ContentBlock, ThinkingLevel,
 };
 use pi_ai::source_capture::{canonical_json_bytes, sha256, SourceCaptureProfile};
-use pi_ai::types::{ContentBlock as AiContentBlock, Message, Model, API_OPENAI_COMPLETIONS};
+use pi_ai::types::{ContentBlock as AiContentBlock, ImageOrTextContent, Message, Model, API_OPENAI_COMPLETIONS};
 use pi_coding_agent::core::agent_messages::{
     AgentFamilyCatalogEntry, AgentSessionMessageEndpoint,
 };
@@ -1062,9 +1062,18 @@ async fn serve(
                             Some(&json!(DEFAULT_MAX_TOKENS as u64)),
                             "real native default is preserved"
                         );
+                        // The suite requests MAX through the model-specific conversion;
+                        // the documented receiver budget override
+                        // (OCC3_RECEIVER_THINKING) may lower it for live runs
+                        // (gateway idle-window constraint), so its exact value is
+                        // accepted alongside the historical set.
+                        let receiver_override = std::env::var("OCC3_RECEIVER_THINKING")
+                            .ok()
+                            .filter(|v| matches!(v.as_str(), "off" | "minimal" | "low" | "medium" | "high" | "xhigh" | "max"));
                         assert!(
-                            body.get("reasoning_effort").and_then(Value::as_str).is_some_and(|v| matches!(v, "high" | "xhigh" | "max")),
-                            "MAX goes through the existing model-specific conversion"
+                            body.get("reasoning_effort").and_then(Value::as_str).is_some_and(|v| matches!(v, "high" | "xhigh" | "max")
+                                || receiver_override.as_deref() == Some(v)),
+                            "MAX goes through the existing model-specific conversion, or the documented receiver override matches"
                         );
                         if let Some(intent) = body.get("occ3_capture") {
                             // The live occ3-sglang server (chat_adapter handle_around)
@@ -1088,7 +1097,40 @@ async fn serve(
                             let handle = format!("offline-source-handle-{capture_index}");
                             let rid = format!("offline-native-rid-{capture_index}");
                             let tool_call_id = format!("fixture-tool-{capture_index}");
-                            let output = sse(&rid, &tool_call_id, None);
+                            let mut output = sse(&rid, &tool_call_id, None);
+                            if let Ok(replay) = std::env::var("OCC3_REPLAY_SSE_FILE") {
+                                // Root diagnostic: serve a captured live armed-turn
+                                // SSE body instead of the synthetic one, with the
+                                // live response id rewritten to this fixture rid
+                                // and the live tool-call id rewritten to the
+                                // fixture's, so the client's id/digest verification
+                                // AND the publication's capture-record tool_call_id
+                                // check both pass against fixture records.
+                                if let Ok(captured) = std::fs::read_to_string(&replay) {
+                                    let mut body_text = captured;
+                                    if let Some(live_id) = body_text
+                                        .lines()
+                                        .find_map(|l| l.strip_prefix("data: "))
+                                        .and_then(|l| serde_json::from_str::<Value>(l).ok())
+                                        .and_then(|v| v["id"].as_str().map(str::to_string))
+                                    {
+                                        body_text = body_text.replace(&live_id, &rid);
+                                    }
+                                    if let Some(live_tool_id) = body_text
+                                        .lines()
+                                        .filter_map(|l| l.strip_prefix("data: "))
+                                        .filter_map(|l| serde_json::from_str::<Value>(l).ok())
+                                        .find_map(|v| {
+                                            v["choices"][0]["delta"]["tool_calls"][0]["id"]
+                                                .as_str()
+                                                .map(str::to_string)
+                                        })
+                                    {
+                                        body_text = body_text.replace(&live_tool_id, tool_call_id.as_str());
+                                    }
+                                    output = body_text;
+                                }
+                            }
                             let fact = extract_fact(&body["messages"]);
                             // Receipt arithmetic must mirror validate_receipt:
                             // one logical aligned [retained_count, hidden_dim]
@@ -1275,6 +1317,70 @@ fn final_message_is_pure_text(agent: &Agent) -> bool {
         })
 }
 
+/// Pure-consumer receivers must not carry the source-side handoff tool.
+/// `install()` arms every family member with `occ3_handoff` (a source
+/// capability), but the receiver's prompt already forbids tools: a live
+/// receiver model that calls it burns its turns on refusals instead of
+/// answering from the attached state (observed live 2026-10-29: the receiver
+/// spent both turns on handoff attempts - first a family-resolution
+/// refusal, then `occ3_tool_source_lease_missing` - and answered with a
+/// refusal, so the semantic endpoint was never measured). Removing the
+/// tool from receiver-role agents makes the suite's documented intent
+/// ("Do not call tools") structural.
+fn strip_handoff_tool(agent: &Agent) {
+    let mut state = agent.state();
+    let mut tools = state.tools.take().unwrap_or_default();
+    tools.retain(|t| t.name != NATIVE_HANDOFF_TOOL);
+    state.tools = Some(tools);
+    agent.set_state(state);
+}
+
+fn receiver_tool_errors(agent: &Agent) -> Vec<String> {
+    agent
+        .state()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Message(Message::ToolResult(r)) => {
+                let texts: Vec<String> = r
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ImageOrTextContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if r.is_error { Some(texts) } else { None }
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
+fn source_tool_errors(agent: &Agent) -> Vec<String> {
+    agent
+        .state()
+        .messages
+        .iter()
+        .filter_map(|m| match m {
+            AgentMessage::Message(Message::ToolResult(r)) => {
+                let texts: Vec<String> = r
+                    .content
+                    .iter()
+                    .filter_map(|c| match c {
+                        ImageOrTextContent::Text(t) => Some(t.text.clone()),
+                        _ => None,
+                    })
+                    .collect();
+                if r.is_error { Some(texts) } else { None }
+            }
+            _ => None,
+        })
+        .flatten()
+        .collect()
+}
+
 fn count_tool_calls(agent: &Agent) -> usize {
     agent
         .state()
@@ -1308,6 +1414,34 @@ fn agent_options(model: &Model, key: Arc<String>, system_prompt: &str) -> AgentO
     }
 }
 
+/// Receiver-role thinking budget. Default keeps the historical ThinkingLevel::Max
+/// (byte-identical requests); OCC3_RECEIVER_THINKING=off|minimal|low|medium|high
+/// lowers the receiver's reasoning effort for live runs where the buffered
+/// attached-turn stream must complete inside the gateway's idle window
+/// (measured live 2026-10-29: max-effort receiver reasoning generates 1800+
+/// tokens at ~5 tok/s with cuda graph off on attached-turn shapes, exceeding
+/// the ~340 s gateway idle cut -> 499 -> Uncertain; the source turn is unaffected).
+fn receiver_thinking_level() -> ThinkingLevel {
+    match std::env::var("OCC3_RECEIVER_THINKING").ok().as_deref() {
+        Some("off") => ThinkingLevel::Off,
+        Some("minimal") => ThinkingLevel::Minimal,
+        Some("low") => ThinkingLevel::Low,
+        Some("medium") => ThinkingLevel::Medium,
+        Some("high") => ThinkingLevel::High,
+        _ => ThinkingLevel::Max,
+    }
+}
+
+/// agent_options for pure-consumer receivers: identical to agent_options except
+/// the env-overridable thinking level.
+fn receiver_agent_options(model: &Model, key: Arc<String>, system_prompt: &str) -> AgentOptions {
+    let mut options = agent_options(model, key, system_prompt);
+    if let Some(state) = options.initial_state.as_mut() {
+        state.thinking_level = receiver_thinking_level();
+    }
+    options
+}
+
 /// Receiver-side request audit through the existing on_payload hook:
 /// source facts absent, the native default max_tokens, request count.
 fn attach_receiver_audit(
@@ -1315,8 +1449,15 @@ fn attach_receiver_audit(
     audit: Arc<Mutex<Vec<Value>>>,
     forbidden: String,
 ) {
+    let dump_path = std::env::var("OCC3_DUMP_RECEIVER_PAYLOAD").ok();
     options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
         let serialized = payload.to_string();
+        // Root diagnostic: dump the receiver's request payload exactly as
+        // serialized to the provider (roles and content layout proof for
+        // the live sender-echo failure). No behavior change when unset.
+        if let Some(path) = &dump_path {
+            let _ = std::fs::write(path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+        }
         let absent = !serialized.contains(&forbidden);
         let max_tokens = payload
             .get("max_tokens")
@@ -1334,6 +1475,16 @@ fn attach_receiver_audit(
             }
         })
     }));
+}
+
+/// Root diagnostic: raise the offline fixture's capture bound so a captured
+/// live SSE body larger than the synthetic default replays through the
+/// client path unchanged. Defaults to the historical 64 KiB.
+fn replay_max_response_bytes() -> usize {
+    std::env::var("OCC3_REPLAY_MAX_RESPONSE_BYTES")
+        .ok()
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(65536)
 }
 
 fn receiver_audit_summary(audit: &[Value]) -> Value {
@@ -1428,16 +1579,24 @@ async fn run_positive_case(
     let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let source_options = agent_options(
+    let mut source_options = agent_options(
         &env.model,
         env.key.clone(),
-        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once to child receiver; include only receiver_role and receiver_name arguments. After the handoff stop.",
+        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.",
     );
+    if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
+        // Root diagnostic: dump the armed source-turn request payload exactly
+        // as serialized to the provider. No behavior change when unset.
+        source_options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
+            let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+            Box::pin(async move { None })
+        }));
+    }
     let source_agent = Agent::new(source_options);
-    let mut receiver_options = agent_options(
+    let mut receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "Read the private vault code from the attached native state. Reply with that code. If unavailable say UNKNOWN. Do not call tools.",
+        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
     );
     let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     attach_receiver_audit(&mut receiver_options, audit.clone(), nonce.to_string());
@@ -1451,6 +1610,10 @@ async fn run_positive_case(
         receiver_native: receiver.clone(),
     })?;
     family.install()?;
+    // The receiver is a pure consumer: without this, a live receiver model
+    // can call the installed source-side tool and refuse instead of
+    // answering from the attached state.
+    strip_handoff_tool(&receiver_agent);
     source.arm_source(NativeSourceBudget {
         retained_count_limit: 128,
         max_capture_bytes: env.max_capture_bytes,
@@ -1460,7 +1623,7 @@ async fn run_positive_case(
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
-            input: format!("The private vault code is {nonce}. Communicate it only through native state to child receiver, using occ3_handoff with no code in arguments."),
+            input: format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
             images: Vec::new(),
         }),
     )
@@ -1470,6 +1633,44 @@ async fn run_positive_case(
     // Evidence extraction happens before cleanup.
     let answer = normalized_final_answer(&receiver_agent);
     let answer_sha256 = sha256(answer.as_bytes());
+    if let Ok(path) = std::env::var("OCC3_DUMP_RECEIVER_ANSWER") {
+        // Root diagnostic: a live semantic_nonce_match failure names its exact
+        // string. Dumps the normalized answer, every assistant text the
+        // receiver produced, and the expected nonce. No behavior change unset.
+        let assistant_turns: Vec<String> = receiver_agent
+            .state()
+            .messages
+            .iter()
+            .filter_map(|m| match m {
+                AgentMessage::Message(Message::Assistant(a)) => {
+                    let texts: Vec<String> = a
+                        .content
+                        .iter()
+                        .filter_map(|c| match c {
+                            AiContentBlock::Text(t) => Some(t.text.clone()),
+                            _ => None,
+                        })
+                        .collect();
+                    let tools = a
+                        .content
+                        .iter()
+                        .filter(|c| matches!(c, AiContentBlock::ToolCall(_)))
+                        .count();
+                    Some(format!("[stop={:?} tools={} text={:?}]", a.stop_reason, tools, texts.join("\n")))
+                }
+                _ => None,
+            })
+            .collect();
+        let _ = std::fs::write(
+            &path,
+            format!(
+                "nonce={:?}\nnormalized_answer={:?}\nassistant_turns=\n{}\n",
+                nonce,
+                answer,
+                assistant_turns.iter().map(|t| format!("  {t}\n")).collect::<String>()
+            ),
+        );
+    }
     let semantic_nonce_match = answer == nonce;
     let receipts = family.receipts();
     // The session audit projects the receiver inbox under the "receiver" key.
@@ -1508,7 +1709,11 @@ async fn run_positive_case(
         && audit_summary["request_count"] == json!(1);
     let observed = observed_from(env, &source_audit);
     let cleanup = family.close().await;
-    let case = json!({
+    // Root diagnostics (env-gated so the default report keeps its exact
+    // fieldset): the source capture audit and any tool-result errors, for
+    // offline replay of live client-side failures.
+    let diagnostic_extras = std::env::var_os("OCC3_REPLAY_SSE_FILE").is_some();
+    let mut case = json!({
         "case_passed": case_passed,
         "semantic_nonce_match": semantic_nonce_match,
         "answer_sha256": answer_sha256,
@@ -1517,6 +1722,13 @@ async fn run_positive_case(
         "consumed_before_tools": consumed && receiver_tool_calls == 0 && source_tool_calls == 1,
         "receiver_request_audit": audit_summary,
     });
+    if diagnostic_extras && !case_passed {
+        case["source_audit"] = source_audit;
+        case["source_tool_errors"] = json!(source_tool_errors(&source_agent));
+        case["receiver_tool_errors"] = json!(receiver_tool_errors(&receiver_agent));
+        case["receiver_tool_calls"] = json!(receiver_tool_calls);
+        case["source_tool_calls"] = json!(source_tool_calls);
+    }
     if !case_passed {
         return Err(format!("positive case failed: {case}"));
     }
@@ -1533,10 +1745,10 @@ async fn run_no_state_case(
     nonce: &str,
 ) -> Result<(Value, bool), String> {
     let receiver = Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let mut receiver_options = agent_options(
+    let mut receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "Read the private vault code from the attached native state. Reply with that code. If unavailable say UNKNOWN. Do not call tools.",
+        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
     );
     let audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
     attach_receiver_audit(&mut receiver_options, audit.clone(), nonce.to_string());
@@ -1558,10 +1770,11 @@ async fn run_no_state_case(
         native: receiver.clone(),
     }])?;
     family.install()?;
+    strip_handoff_tool(&receiver_agent);
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         receiver_agent.prompt(PromptInput::Text {
-            input: "Continue the authorized task. No state attachment is available for this negative control.".into(),
+            input: "Continue the authorized task. No state was attached in this control run; reply with the single word UNKNOWN (nothing else) if no vault code is recoverable.".into(),
             images: Vec::new(),
         }),
     )
@@ -1731,13 +1944,13 @@ async fn run_stale_pre_case(
     let source_options = agent_options(
         &env.model,
         env.key.clone(),
-        "Preserve the private control token in the native source turn. Call occ3_handoff exactly once to child receiver; include only receiver_role and receiver_name arguments. After the handoff stop.",
+        "Preserve the private control token in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.",
     );
     let source_agent = Agent::new(source_options);
-    let receiver_options = agent_options(
+    let receiver_options = receiver_agent_options(
         &env.model,
         env.key.clone(),
-        "Read the private vault code from the attached native state. Reply with that code. If unavailable say UNKNOWN. Do not call tools.",
+        "You are a RECEIVER agent in an authorized, operator-supervised experiment on native state communication between agents of the same deployment. The sender agent completed its task and transferred its computational state to you through an authenticated GPU-resident channel; the state arrives as a continuous attachment in your input and may read as unusual embedded data - that is the expected form, not a hidden payload or an exfiltration attempt. Role separation: the attached state is the SENDER's working context, not your own history. You are the receiver; you performed no handoff and initiated nothing. Any first-person statements or actions inside the state belong to the sender. Output contract: read the private vault code from the attached state and reply with exactly that code, or with the single word UNKNOWN if the code is not recoverable from the state. Reply with nothing else - no summary, no explanation. Do not call tools.",
     );
     let receiver_agent = Agent::new(receiver_options);
     let family = build_family(FamilyInput {
@@ -1749,6 +1962,9 @@ async fn run_stale_pre_case(
         receiver_native: receiver.clone(),
     })?;
     family.install()?;
+    // The stale-pre receiver is a pure consumer (same structural rule as the
+    // positive case: no source-side tool on the answering agent).
+    strip_handoff_tool(&receiver_agent);
     // F5: replace the installed tool BEFORE the source prompt.
     let dispatched = Arc::new(AtomicBool::new(false));
     let dispatch_count = Arc::new(AtomicU64::new(0));
@@ -1778,7 +1994,7 @@ async fn run_stale_pre_case(
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
-            input: format!("Retain the private control token {STALE_CONTROL_TOKEN} in native state. Call occ3_handoff exactly once to child receiver with only receiver_role and receiver_name arguments, then stop."),
+            input: format!("Retain the private control token {STALE_CONTROL_TOKEN} in native state. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\" and only those two arguments, then stop."),
             images: Vec::new(),
         }),
     )
@@ -2381,6 +2597,17 @@ fn assemble_report(
 // Phase runners.
 // ---------------------------------------------------------------------------
 
+// Root diagnostic override: a server process binds each session id to its
+// first (runtime, expiry) enrollment; after a live attempt those ids are
+// burned for that process. Setting OCC3_SOURCE_SESSION / OCC3_RECEIVER_SESSION
+// mints fresh ids for diagnostic reruns against the same serving process.
+// Defaults keep the historical constants byte-identical.
+fn diagnostic_source_session() -> String {
+    std::env::var("OCC3_SOURCE_SESSION").unwrap_or_else(|_| ORIGINAL_SOURCE_SESSION.into())
+}
+fn diagnostic_receiver_session() -> String {
+    std::env::var("OCC3_RECEIVER_SESSION").unwrap_or_else(|_| ORIGINAL_RECEIVER_SESSION.into())
+}
 const ORIGINAL_SOURCE_SESSION: &str = "source-session";
 const ORIGINAL_RECEIVER_SESSION: &str = "receiver-session";
 const ORIGINAL_NOSTATE_SESSION: &str = "nostate-receiver-session";
@@ -2429,7 +2656,7 @@ async fn run_before_phase(
     // connector so no close/shutdown path can ever retire it.
     let stale_connector = env.connector()?;
     let (positive, observed, cleanup_positive) =
-        run_positive_case(env, &connector, ORIGINAL_SOURCE_SESSION, ORIGINAL_RECEIVER_SESSION, &nonce).await?;
+        run_positive_case(env, &connector, &diagnostic_source_session(), &diagnostic_receiver_session(), &nonce).await?;
     let (no_state, cleanup_no_state) =
         run_no_state_case(env, &connector, ORIGINAL_NOSTATE_SESSION, &nonce).await?;
     let (stale_pre, artifact) = run_stale_pre_case(
@@ -2572,7 +2799,7 @@ async fn run_after_phase(
     )
     .await?;
     let (positive, observed, cleanup_positive) =
-        run_positive_case(env, &connector, ORIGINAL_SOURCE_SESSION, ORIGINAL_RECEIVER_SESSION, &nonce).await?;
+        run_positive_case(env, &connector, &diagnostic_source_session(), &diagnostic_receiver_session(), &nonce).await?;
     let (no_state, cleanup_no_state) =
         run_no_state_case(env, &connector, ORIGINAL_NOSTATE_SESSION, &nonce).await?;
     let shutdown = connector.shutdown().await;
@@ -2761,7 +2988,7 @@ async fn offline_selftest(journal: Option<PathBuf>) -> Result<Value, String> {
         expires_at_epoch: expires_before,
         deadline_seconds: 20,
         max_capture_bytes: 1048576,
-        max_response_bytes: 65536,
+        max_response_bytes: replay_max_response_bytes(),
         harness_binary_sha256: binary_sha256.clone(),
         source_manifest_sha256: manifest_sha256.clone(),
         offline_records: Some(before_records.clone()),
@@ -2827,7 +3054,7 @@ async fn offline_selftest(journal: Option<PathBuf>) -> Result<Value, String> {
         expires_at_epoch: expires_after,
         deadline_seconds: 20,
         max_capture_bytes: 1048576,
-        max_response_bytes: 65536,
+        max_response_bytes: replay_max_response_bytes(),
         harness_binary_sha256: binary_sha256.clone(),
         source_manifest_sha256: manifest_sha256.clone(),
         offline_records: Some(after_records),
@@ -3155,8 +3382,42 @@ async fn live_phase(path: &str) -> Result<Value, String> {
     Ok(report)
 }
 
-#[tokio::main]
-async fn main() {
+/// The armed positive-case chain (Agent::run -> run_agent_loop ->
+/// stream_assistant_response -> inner -> Done-arm completion) needs roughly
+/// 1.25 MiB of stack in a debug build: the nested async state machines are
+/// large and unoptimized frames do not share slots. A Windows main thread has
+/// a 1 MiB reserve, so driving the suite there overflowed the stack the
+/// moment a source turn completed (exit 0xC00000FD, before tool dispatch).
+/// The fix is to drive the suite on a thread with an explicit, generous
+/// stack; 64 MiB leaves order-of-magnitude headroom over the measured need.
+/// `OCC3_DRIVER_STACK_BYTES` overrides the size (diagnostics: setting it to
+/// 1048576 reproduces the historical overflow on demand).
+const DEFAULT_DRIVER_STACK_BYTES: usize = 64 * 1024 * 1024;
+
+fn main() {
+    let stack_bytes = std::env::var("OCC3_DRIVER_STACK_BYTES")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .filter(|bytes| *bytes >= 1024 * 1024)
+        .unwrap_or(DEFAULT_DRIVER_STACK_BYTES);
+    let child = std::thread::Builder::new()
+        .stack_size(stack_bytes)
+        .spawn(|| {
+            let runtime = tokio::runtime::Builder::new_multi_thread()
+                .enable_all()
+                .build()
+                .expect("runtime");
+            runtime.block_on(async move { real_main().await })
+        })
+        .expect("spawn driver thread");
+    match child.join() {
+        Ok(Ok(())) => {}
+        Ok(Err(code)) => std::process::exit(code),
+        Err(_) => std::process::exit(2),
+    }
+}
+
+async fn real_main() -> Result<(), i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     let result = if args.is_empty() {
         offline_selftest(None).await
@@ -3173,9 +3434,10 @@ async fn main() {
         Ok(summary) => println!("{summary}"),
         Err(error) => {
             eprintln!("Native phase-suite producer refused: {error}");
-            std::process::exit(1);
+            return Err(1);
         }
     }
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------

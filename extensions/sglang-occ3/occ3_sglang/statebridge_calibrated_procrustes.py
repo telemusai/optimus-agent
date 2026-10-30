@@ -712,6 +712,8 @@ def serving_transform(config, z_raw, *, nu=None, torch_module=None):
         return z_raw
     require(type(config) is dict and set(config) == {"kind"} and config["kind"] == "n1",
             "profile")
+    if getattr(nu, "ndim", None) == 0 and getattr(nu, "numel", lambda: None)() == 1:
+        nu = float(nu)
     require(type(nu) in (int, float) and not isinstance(nu, bool) and math.isfinite(nu)
             and nu > 0, "profile")
     with torch.no_grad():

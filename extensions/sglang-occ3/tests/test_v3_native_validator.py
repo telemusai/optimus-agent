@@ -23,6 +23,7 @@ from deploy.v3 import native_validator as nv
 from deploy.v3.live_validation import (LiveValidator, NativeHandoffValidator,
                                        SourceKvBaselineValidator, UnselectedValidator,
                                        VALIDATOR_KEY)
+from occ3_sglang.latent_types import RuntimeProfile
 
 ORIGINAL = "1" * 64
 CANDIDATE = "c" * 64
@@ -41,10 +42,12 @@ EPOCH_AFTER = EXAMPLE["attempt"]["candidate_started_at_after"]
 CHALLENGE_BEFORE = EXAMPLE["challenge_before"]["challenge"]
 CHALLENGE_AFTER = EXAMPLE["challenge_after"]["challenge"]
 PIN_SCHEMA = "occ3.admission.pin.v1"
-# Frozen offline fixture pin digests (revision-4 admission pins, kept as the
-# per-phase pin-file values the example reports bind and re-derive).
-FIXTURE_PIN_BEFORE = "1a4da9e7993afcc0191d02a838047454e32572f29a843befda036944eb77a906"
-FIXTURE_PIN_AFTER = "9f4db2e622b62425ba6e763c018f4e1e1241303f922fd6b62944aea1653ea22c"
+# Frozen offline fixture pin digests (contract_revision 6): the wire
+# RuntimeProfile derivation of the fixture's static profile plus each phase's
+# observed incarnation, including the empty calibration reference the wire
+# carries for the per-message method.
+FIXTURE_PIN_BEFORE = "7787ee97339c42d114c3bf7baf5840ac6d91197d6b47fc4803a607cb24954f0a"
+FIXTURE_PIN_AFTER = "6dab42da9dda998d362e6eb4dfa6d88203a9f14f7a1697bfe74ba5c8161b328a"
 
 
 def original_doc():
@@ -929,7 +932,10 @@ def test_depth_guard_bytes_input_requires_strict_utf8():
 # native-profile-input.json, file sha256
 # 6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a) plus the
 # TS8 live window's observed incarnation reproduces the byte-exact wire digest
-# the server reported; a different boot must never reproduce it.
+# the server serves; a different boot must never reproduce it. The wire digest
+# moved with the registry work that added calibration_path/calibration_digest to
+# RuntimeProfile: the same static profile plus incarnation now hashes the empty
+# reference pair too, so the TS8-era 14-field value 0c901d0f... is superseded.
 TS8_STATIC_PROFILE = {
     "anchor_alpha": 0.0,
     "expected_ranks": 8,
@@ -946,7 +952,7 @@ TS8_STATIC_PROFILE = {
     "tile_rows": 256,
     "workspace_bytes": 134217728,
 }
-TS8_WIRE_DIGEST = "0c901d0f47335f0e4087fbf960279e1b02d6f4bd5219d63224dd8487f00423d9"
+TS8_WIRE_DIGEST = "058af21d971d2ecaf6c795209eff27d585282ec7c2002b5f5e2467583ce45231"
 TS8_RUNTIME_EPOCH = "c2847f3de4fc43d1897644eda8dc81a9"
 TS8_RUNTIME_GENERATION = 1
 
@@ -955,6 +961,9 @@ def test_ts8_incarnation_reproduces_byte_exact_wire_digest():
     observed = {"runtime_epoch": TS8_RUNTIME_EPOCH,
                 "runtime_generation": TS8_RUNTIME_GENERATION}
     assert nv._derived_profile_digest(TS8_STATIC_PROFILE, observed) == TS8_WIRE_DIGEST
+    # Cross-check against the real wire function, so this literal can never
+    # drift from the digest the candidate actually serves.
+    assert RuntimeProfile(**TS8_STATIC_PROFILE, **observed).binding_digest == TS8_WIRE_DIGEST
 
 
 def test_profile_digest_is_per_boot_volatile():

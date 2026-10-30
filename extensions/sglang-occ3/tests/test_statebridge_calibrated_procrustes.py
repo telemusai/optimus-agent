@@ -510,6 +510,22 @@ def test_a_no_signal_corpus_fits_and_is_measured_poor_not_refused():
     assert 1.0 - good_residual / good_baseline > 0.90
 
 
+def test_serving_transform_accepts_a_zero_dim_tensor_nu():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.statebridge_calibrated_procrustes import serving_transform
+    z = torch.ones(4, 3)
+    z = z / z.norm(dim=-1, keepdim=True)
+    nu = torch.tensor(12.5)
+    served = serving_transform({"kind": "n1"}, z, nu=nu)
+    assert bool(torch.allclose(served.norm(dim=-1), torch.full((4,), 12.5)))
+    with pytest.raises(LatentError) as caught:
+        serving_transform({"kind": "n1"}, z, nu=torch.tensor(float("nan")))
+    assert caught.value.code == "profile"
+    with pytest.raises(LatentError) as caught:
+        serving_transform({"kind": "n1"}, z, nu=torch.ones(2))
+    assert caught.value.code == "profile"
+
+
 def test_serving_transform_variants():
     from occ3_sglang.latent_types import LatentError
     from occ3_sglang.statebridge_calibrated_procrustes import serving_transform

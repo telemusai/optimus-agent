@@ -2247,7 +2247,7 @@ impl PreparedNativeHandoff {
         let e = &publication.envelope;
         if e.message_id != authorization.message_id || e.sender_session_id != authorization.from.session_id
             || e.receiver_session_id != authorization.target.session_id
-            || e.control_summary != "Continue the authorized task using the attached state."
+            || e.control_summary != "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state."
         { return Err("Native handoff publication binding rejected".into()); }
         Ok(Self {authorization,publication})
     }

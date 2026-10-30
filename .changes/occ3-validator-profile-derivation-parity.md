@@ -1,0 +1,1 @@
+- Fixed the native validator's per-boot RuntimeProfile derivation so it hashes the full wire profile fieldset for every registered method: the frozen-artifact reference (`calibration_path`/`calibration_digest`, empty for the per-message method) is always part of the digest, so an honest per-message report no longer fails with `report_profile_derivation_mismatch`.

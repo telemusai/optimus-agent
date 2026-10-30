@@ -1,0 +1,1 @@
+- Fixed both frozen methods refusing a zero-dim tensor serving statistic: the n1 serving transform now accepts the norm statistic as a python number or a one-element zero-dim tensor (converted once, all existing validation kept), so a runtime that measures nu as a tensor no longer declines every calibrated serving call.

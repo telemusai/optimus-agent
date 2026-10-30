@@ -589,6 +589,8 @@ def serving_transform(config, z_raw, *, nu=None):
         return z_raw.contiguous()
     require(type(config) is dict and set(config) == {"kind"} and config["kind"] == "n1",
             "profile")
+    if getattr(nu, "ndim", None) == 0 and getattr(nu, "numel", lambda: None)() == 1:
+        nu = float(nu)
     require(_number(nu) and float(nu) > 0.0, "profile")
     served = z_raw * (float(nu) / norms)
     require(bool(served.isfinite().all()), "numerical")

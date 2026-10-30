@@ -1,0 +1,1 @@
+- The native readiness parse accepts the two registry memory-budget fields the wave-2 server now advertises, so the live proof harness can enroll against a current candidate without refusing the unknown fields.

@@ -656,18 +656,18 @@ impl Occ3NativeSession {
                 let this=this.clone(); let controller=controller.clone(); Box::pin(async move {
                     this.check().map_err(anyhow::Error::msg)?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { return Err(anyhow::anyhow!(failure())); }
-                    let object=args.as_object().ok_or_else(||anyhow::anyhow!(failure()))?;
-                    if object.len()!=2 { return Err(anyhow::anyhow!(failure())); }
-                    let role=object.get("receiver_role").and_then(Value::as_str).ok_or_else(||anyhow::anyhow!(failure()))?;
-                    let name=object.get("receiver_name").and_then(Value::as_str).filter(|v|!v.is_empty()&&v.len()<=128).ok_or_else(||anyhow::anyhow!(failure()))?;
-                    let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(failure()))?;
-                        let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(failure()))?;
-                        source.validate_tool(&tool_id,NATIVE_HANDOFF_TOOL,&args).map_err(|_|anyhow::anyhow!(failure()))?;
-                        if slot.tool_claimed {return Err(anyhow::anyhow!(failure()));} slot.tool_claimed=true; source};
+                    let object=args.as_object().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_args_not_object]", failure())))?;
+                    if object.len()!=2 { return Err(anyhow::anyhow!(format!("{} [occ3_tool_args_len]", failure()))); }
+                    let role=object.get("receiver_role").and_then(Value::as_str).ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_role_missing]", failure())))?;
+                    let name=object.get("receiver_name").and_then(Value::as_str).filter(|v|!v.is_empty()&&v.len()<=128).ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_name_missing]", failure())))?;
+                    let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
+                        let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_source_lease_missing]", failure())))?;
+                        source.validate_tool(&tool_id,NATIVE_HANDOFF_TOOL,&args).map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_validate_tool: {e}]", failure())))?;
+                        if slot.tool_claimed {return Err(anyhow::anyhow!(format!("{} [occ3_tool_already_claimed]", failure())));} slot.tool_claimed=true; source};
                     // Family authorization precedes publication and creates the
                     // real transport ID only after actual source completion.
-                    let authorized=controller.authorize_native_handoff(role.into(),name.into()).await.map_err(anyhow::Error::msg)?;
-                    if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(failure())); }
+                    let authorized=controller.authorize_native_handoff(role.into(),name.into()).await.map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_authorize: {e}]", failure())))?;
+                    if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(format!("{} [occ3_tool_sender_mismatch]", failure()))); }
                     this.check().map_err(anyhow::Error::msg)?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(failure())); }
                     let expected_message_id=authorized.message_id().to_string();
@@ -675,16 +675,16 @@ impl Occ3NativeSession {
                     let publication=this.connector.publish_native_source(NativePublicationRequest {source:source.clone(),
                         receiver_session_id:authorized.target_session_id().into(),message_id:authorized.message_id().into(),
                         publication_id:format!("publication-{}",uuid::Uuid::new_v4()),tool_call_id:tool_id,tool_name:NATIVE_HANDOFF_TOOL.into(),tool_arguments:args}).await
-                        .map_err(|_|anyhow::anyhow!(failure()))?;
-                    this.source.lock().map_err(|_|anyhow::anyhow!(failure()))?.published_message=Some((publication.envelope.message_id.clone(),publication.binding_digest.clone()));
-                    this.check().map_err(anyhow::Error::msg)?;
-                    if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(failure())); }
-                    let prepared=PreparedNativeHandoff::new(authorized,publication).map_err(anyhow::Error::msg)?;
-                    let receipt=controller.send_prepared_native_handoff(prepared).await.map_err(anyhow::Error::msg)?;
+                        .map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_publish: {e}]", failure())))?;
+                    this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_publish_lock]", failure())))?.published_message=Some((publication.envelope.message_id.clone(),publication.binding_digest.clone()));
+                    this.check().map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_check_publish: {e}]", failure())))?;
+                    if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(format!("{} [occ3_tool_signal_cancel]", failure()))); }
+                    let prepared=PreparedNativeHandoff::new(authorized,publication).map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_prepared: {e}]", failure())))?;
+                    let receipt=controller.send_prepared_native_handoff(prepared).await.map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_send: {e}]", failure())))?;
                     if receipt.id!=expected_message_id || receipt.target.session_id!=expected_receiver_id
                         || !matches!(receipt.delivery_status.as_str(),"delivered"|"queued")
-                    { return Err(anyhow::anyhow!(failure())); }
-                    this.check().map_err(anyhow::Error::msg)?;
+                    { return Err(anyhow::anyhow!(format!("{} [occ3_tool_receipt_mismatch]", failure()))); }
+                    this.check().map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_check_final: {e}]", failure())))?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(failure())); }
                     // Admission is not consumption proof. The isolated native
                     // controller separately requires Consumed; the real daemon
@@ -1023,7 +1023,7 @@ mod tests {
                 expires_at_epoch: now() + 600,
                 state_size_bytes: 128,
             },
-            control_summary: "Continue the authorized task using the attached state.".into(),
+            control_summary: "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
             fallback_reference: "occ1".into(),
         };
         PreparedNativeHandoff::new(

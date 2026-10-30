@@ -68,6 +68,13 @@ DERIVATION_STATIC_FIELDS = ("model_fingerprint", "model_id", "expected_ranks", "
                             "workspace_bytes", "max_records", "max_active", "max_ttl_seconds",
                             "anchor_alpha", "tile_rows", "method")
 CALIBRATION_REFERENCE_FIELDS = ("calibration_path", "calibration_digest")
+# The derivation fieldset is the wire fieldset: occ3_sglang.latent_types
+# RuntimeProfile always carries the frozen-artifact reference, empty for the
+# per-message method, so every method's served profile_digest hashes it. A
+# shorter per-method set can never equal the served digest (live defect,
+# window icalib-20261029T032600Z: report_profile_derivation_mismatch on every
+# honest report).
+DERIVATION_PROFILE_FIELDS = DERIVATION_STATIC_FIELDS + CALIBRATION_REFERENCE_FIELDS
 # Shared admission source_profile fields for every registered method. The
 # registry adds the calibration reference for artifact-requiring methods.
 SOURCE_PROFILE_FIELDS = ("dtype", "expected_ranks", "layer_index", "hidden_dim",
@@ -290,21 +297,6 @@ def _method_profile_fields(descriptor):
     return tuple(fields)
 
 
-def _method_derivation_fields(descriptor):
-    """Static fields inside the per-boot profile digest for one method.
-
-    The per-message derivation stays byte-identical to the frozen wire
-    contract; an artifact-requiring method additionally binds its
-    calibration reference, so a swapped artifact can never reuse a
-    readiness record.
-    """
-    fields = list(DERIVATION_STATIC_FIELDS)
-    if descriptor["requires_calibration_artifact"]:
-        fields += list(CALIBRATION_REFERENCE_FIELDS)
-    fields += sorted(frozenset(descriptor.get("profile_fields") or ()))
-    return tuple(fields)
-
-
 def _string(value, code, *, limit=256, allow_empty=False):
     _require(isinstance(value, str) and (bool(value) or allow_empty)
              and len(value) <= limit, code)
@@ -346,6 +338,28 @@ def _started_at_of(challenge):
     return started
 
 
+def _derivation_value(profile, observed):
+    """The exact RuntimeProfile fieldset the wire binding digest hashes.
+
+    occ3_sglang.latent_types.RuntimeProfile always carries the frozen-artifact
+    reference, so the fieldset is uniform for every registered method: the
+    pinned static fields, the reference pair and the observed incarnation. A
+    per-message profile names no artifact, which is the empty pair the wire
+    carries, never an absent field; any other missing field fails closed.
+    """
+    value = {}
+    for name in DERIVATION_PROFILE_FIELDS:
+        if name in profile:
+            value[name] = profile[name]
+        else:
+            _require(name in CALIBRATION_REFERENCE_FIELDS,
+                     "profile_derivation_field_missing")
+            value[name] = ""
+    value["runtime_epoch"] = observed["runtime_epoch"]
+    value["runtime_generation"] = observed["runtime_generation"]
+    return value
+
+
 def _derived_profile_digest(profile, observed):
     """Per-boot RuntimeProfile binding digest for one observed incarnation.
 
@@ -353,17 +367,16 @@ def _derived_profile_digest(profile, observed):
     dataclasses.asdict(RuntimeProfile)): sha256 of the canonical JSON -
     sorted keys, compact separators, ASCII escapes, NaN refused - of the
     pinned STATIC profile fields plus runtime_epoch/runtime_generation as
-    observed in the harness report. The fieldset is the method's own
-    (registry-declared): an artifact-requiring method binds its calibration
-    reference too, so a swapped artifact can never reuse a readiness record.
-    The wire profile_digest is incarnation-bound (fresh per boot), so it is
-    recomputed here as the anti-fabrication derivation receipt and never
-    statically pinned.
+    observed in the harness report. The fieldset is the wire fieldset
+    (DERIVATION_PROFILE_FIELDS), identical for every registered method: the
+    per-message method binds the empty calibration reference and an
+    artifact-requiring method binds its own, so a swapped artifact can never
+    reuse a readiness record. The wire profile_digest is incarnation-bound
+    (fresh per boot), so it is recomputed here as the anti-fabrication
+    derivation receipt and never statically pinned.
     """
-    _, _, descriptor = _method_descriptor(profile["method"])
-    value = {name: profile[name] for name in _method_derivation_fields(descriptor)}
-    value["runtime_epoch"] = observed["runtime_epoch"]
-    value["runtime_generation"] = observed["runtime_generation"]
+    _method_descriptor(profile["method"])
+    value = _derivation_value(profile, observed)
     try:
         body = json.dumps(value, separators=(",", ":"), sort_keys=True,
                           ensure_ascii=True, allow_nan=False)

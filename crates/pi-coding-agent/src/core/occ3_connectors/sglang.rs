@@ -351,6 +351,17 @@ struct NativeReadiness {
     /// MAX_CAPTURE_BYTES). Absent on servers built before it was advertised;
     /// present it is authoritative and gates the permit's byte budget.
     max_capture_bytes: Option<u64>,
+    /// Resident artifact bytes per rank as charged against the registry
+    /// memory budget (wave-2 latent_worker.health). Absent on servers built
+    /// before it was advertised; present it only advertises the budget and
+    /// never gates the permit's byte budget.
+    #[allow(dead_code)] // written by serde, never read: the registry budget is no client gate
+    artifact_bytes: Option<u64>,
+    /// The same charge summed over the expected ranks (the aggregate the
+    /// registry reserves). Absent on servers built before it was advertised;
+    /// informational, like `artifact_bytes`.
+    #[allow(dead_code)] // written by serde, never read: the registry budget is no client gate
+    artifact_bytes_all_ranks: Option<u64>,
 }
 #[derive(serde::Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -917,8 +928,10 @@ impl Occ3Connector for SglangOcc3Connector {
                     state_size_bytes: receipt.byte_count,
                 },
                 // Fixed control instruction: source data and tool arguments are
-                // never copied into the successful receiver message.
-                control_summary: "Continue the authorized task using the attached state.".into(),
+                // never copied into the successful receiver message. The
+                // summary is receiver-framed so the receiving model answers
+                // as itself, not in the sender's voice.
+                control_summary: "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
                 fallback_reference: "text".into(),
             },
         };
@@ -1163,6 +1176,70 @@ mod tests {
         assert_eq!(legacy.readiness.max_capture_bytes, None);
     }
 
+    // Wave-2 live regression (window icalib-20261029T032600Z, attempt-02): the
+    // candidate's readiness now also advertises the registry memory budget
+    // (`latent_worker.health` artifact_bytes / artifact_bytes_all_ranks). Non
+    // fatal fields, but `deny_unknown_fields` turned them into a hard
+    // deserialization error, so the first enroll failed and the live phase
+    // exited unavailable. Same fix as TS12 for max_capture_bytes.
+    #[test]
+    fn enrollment_readiness_parses_the_live_wave2_registry_memory_budget() {
+        // Everything except the two artifact figures is the attempt-02 live
+        // shape; the byte figures are synthetic (per rank, then times ranks).
+        let payload = r#"{"schema":"occ3.sessions.enrolled.v1","operation_id":"enroll-diag-9f42c1d0e5b2",
+"session_id":"probe-diag-5c1e77a4b903","principal_digest":"07e7990bcc87abb833e71344940cb9452a7972ea0c93a0f8d3499f750e1c70e8",
+"runtime_id":"35d36fd5635949fa93ab3f2137a6044e","runtime_generation":1,
+"model_fingerprint":"sha256:db2c8830820da8bd3370bbfacf0799e33085ef7b8b1ca27840b88e3e8101b732","expires_at_epoch":1793256638,
+"readiness":{"runtime_epoch":"35d36fd5635949fa93ab3f2137a6044e","runtime_generation":1,
+"model_fingerprint":"sha256:db2c8830820da8bd3370bbfacf0799e33085ef7b8b1ca27840b88e3e8101b732",
+"method_id":"statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1","expected_ranks":8,"ready_ranks":8,
+"tp_layout_digest":"a55bf3e06038c4683c5ddeffcb947c46e962f2184291de6d55a68b04290fa77d","hidden_dim":6144,
+"layer_index":77,"dtype":"bfloat16","profile_digest":"d80e3b88f0b9c0a3d5c1ac0b4c4e7f39a1b2c3d4e5f60718293a4b5c6d7e8f90",
+"source_capture":true,"continuous_prefix":true,"terminal_journal":true,"max_capture_bytes":134217728,
+"artifact_bytes":125829120,"artifact_bytes_all_ranks":1006632960}}"#;
+        let live: EnrollmentResponse =
+            serde_json::from_str(payload).expect("wave-2 live payload must parse");
+        assert_eq!(live.readiness.artifact_bytes, Some(125_829_120));
+        assert_eq!(live.readiness.artifact_bytes_all_ranks, Some(1_006_632_960));
+        assert_eq!(live.readiness.max_capture_bytes, Some(134_217_728));
+        // Rewrites the readiness object on the wire-text path, so every
+        // variant below is a real enrollment body, not a struct literal.
+        let wire = |drop: &[&str], add: Option<(&str, Value)>| -> String {
+            let mut value: Value = serde_json::from_str(payload).expect("payload object");
+            let readiness = value["readiness"]
+                .as_object_mut()
+                .expect("readiness object");
+            for key in drop {
+                readiness.remove(*key);
+            }
+            if let Some((key, extra)) = add {
+                readiness.insert(key.into(), extra);
+            }
+            value.to_string()
+        };
+        // Servers built before the budget was advertised still parse, both
+        // fields absent.
+        let legacy: EnrollmentResponse =
+            serde_json::from_str(&wire(&["artifact_bytes", "artifact_bytes_all_ranks"], None))
+                .expect("pre-budget payload must parse");
+        assert_eq!(legacy.readiness.artifact_bytes, None);
+        assert_eq!(legacy.readiness.artifact_bytes_all_ranks, None);
+        assert_eq!(legacy.readiness.max_capture_bytes, Some(134_217_728));
+        // Each field is independently optional, so a server that advertises
+        // only the per-rank figure still enrolls.
+        let half: EnrollmentResponse =
+            serde_json::from_str(&wire(&["artifact_bytes_all_ranks"], None))
+                .expect("half advertisement must parse");
+        assert_eq!(half.readiness.artifact_bytes, Some(125_829_120));
+        assert_eq!(half.readiness.artifact_bytes_all_ranks, None);
+        // Tolerance stays per named field: an unknown readiness field is a
+        // hard error, never silently ignored.
+        let unknown = wire(&[], Some(("registry_wall_clock_ns", json!(7))));
+        assert!(
+            serde_json::from_str::<EnrollmentResponse>(&unknown).is_err(),
+            "unknown readiness fields still fail closed"
+        );
+    }
 
     #[test]
     fn channel_ids_are_sanitized_to_the_plugin_grammar() {
