@@ -1,0 +1,60 @@
+{
+ "schema": "occ3.icalib.p3-fit-exclusion.v1",
+ "status": "DRAFT - OFFLINE - NOT RUN",
+ "window": "<WIN>",
+ "campaign": "occ3-independent-calibration",
+ "phase": "P3",
+ "purpose": "exclude every P3 diagnostic turn and family from the P5 fit, validation and test partitions and from every M-budget selection; excluded rows are NOT removed from the corpus (stage_build.py arm-order p5_exclusion note)",
+ "identifier_class": "[A-Za-z0-9._:/-]{1,256}",
+ "identifier_anchors": {
+  "wire_ids": "extensions/sglang-occ3/occ3_sglang/attachment_contract.py:31 (identifier())",
+  "corpus_turn_and_family_ids": "extensions/sglang-occ3/occ3_sglang/calibration_corpus.py (_IDENTIFIER)"
+ },
+ "turn_id_grammar": "p3-<WIN>-t<NNNN>",
+ "reserved_prefixes": ["p3-"],
+ "reserved_prefix_rule": "any corpus turn_id or family_id starting with a reserved prefix is excluded, for every window, present and future",
+ "turn_id_ranges": [
+  {"arm": "N-none", "roles": ["plain-receiver"], "first": "p3-<WIN>-t0001", "last": "p3-<WIN>-t0001"},
+  {"arm": "F-text", "roles": ["plain-receiver"], "first": "p3-<WIN>-t0002", "last": "p3-<WIN>-t0002"},
+  {"arm": "T-exact", "roles": ["source-capture", "receiver-attach"], "first": "p3-<WIN>-t0003", "last": "p3-<WIN>-t0004"},
+  {"arm": "T-norm", "roles": ["source-capture", "receiver-attach"], "first": "p3-<WIN>-t0005", "last": "p3-<WIN>-t0006"},
+  {"arm": "N-shape", "roles": ["source-capture", "receiver-attach"], "first": "p3-<WIN>-t0007", "last": "p3-<WIN>-t0008"}
+ ],
+ "excluded_turn_ids": [
+  "p3-<WIN>-t0003",
+  "p3-<WIN>-t0005",
+  "p3-<WIN>-t0007"
+ ],
+ "excluded_turn_ids_note": "the capture ids actually used; corpus turn_id == capture_id (latent_worker.py:389 capture.submit passes record.descriptor.capture_id as turn_id); filled by the driver from turns.jsonl at window close",
+ "excluded_family_ids": [
+  "p3-<WIN>-src"
+ ],
+ "excluded_family_ids_note": "corpus family_id == source_session_id (latent_worker.py:389 passes source_session_id as family_id); one source session covers all three P3 captures, so the whole P3 diagnostic corpus presence is one family",
+ "excluded_session_ids": [
+  "p3-<WIN>-src",
+  "p3-<WIN>-rcv"
+ ],
+ "other_diagnostic_namespaces": {
+  "p7-": "semantic-phase references (P/W/S/N/N0/T/F) if later enrolled; register the prefix here before any P7 session is enrolled"
+ },
+ "application": {
+  "where": "P5 partition construction, BEFORE calibration_corpus.split_manifest; exclusion is family-atomic and deterministic in turn ids and families alone",
+  "rule": "drop every corpus turn whose turn_id is in excluded_turn_ids, or starts with any reserved_prefix, or whose family_id is in excluded_family_ids or starts with any reserved_prefix; then split the remainder",
+  "must_hold": [
+   "no excluded turn appears in the FIT, VALIDATION or TEST partition",
+   "no excluded turn contributes rows to any M-budget selection (budgets are computed over FIT only, calibration_collector.py write())",
+   "the exclusion decision is recorded with the excluded-set sha256 in the P5 report",
+   "excluded rows stay in the corpus files; nothing is deleted or rewritten"
+  ]
+ },
+ "defense_in_depth": [
+  "P3 captures use span policy v1 (whole_completed_response_tail_v1); the calibration handoff runs only when prepared[span_selection] exists, which only a v2 policy builds (latent_worker.py:367; plan 2.3 consequence), so P3 turns should never enter the corpus at all",
+  "the exclusion list is the mandatory second line of defence required by stage_build.py's arm-order document",
+  "audit rule for P5: any corpus turn with span_policy whole_completed_response_tail_v1 is reported (P4 collection uses v2 content spans)"
+ ],
+ "generated_from": {
+  "turns_jsonl": "turns.jsonl",
+  "turns_jsonl_sha256": "<filled at window close>",
+  "schedule": "arm-schedule.json"
+ }
+}

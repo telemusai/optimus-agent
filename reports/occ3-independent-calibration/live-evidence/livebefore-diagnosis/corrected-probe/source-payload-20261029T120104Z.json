@@ -1,0 +1,76 @@
+{
+  "model": "glm-5.3",
+  "messages": [
+    {
+      "role": "developer",
+      "content": "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
+    },
+    {
+      "role": "user",
+      "content": [
+        {
+          "type": "text",
+          "text": "The private vault code is occ3-7729f8ed-d7de-44a5-b585-9e8278dab1af. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."
+        }
+      ]
+    },
+    {
+      "role": "assistant",
+      "content": "I'll transfer the captured source state to the child agent via the native handoff mechanism, without exposing the code in the arguments.",
+      "reasoning_content": "The user wants me to hand off source state to a child agent named \"receiver\" using the occ3_handoff tool. The instructions say not to include source facts (like the vault code) in the arguments — the tool transfers captured source state natively.\n\nI should call the tool with receiver_role \"child\" and receiver_name \"receiver\" without including the code in the arguments.",
+      "tool_calls": [
+        {
+          "id": "call_def7226195c8461a807747da",
+          "type": "function",
+          "function": {
+            "name": "occ3_handoff",
+            "arguments": "{\"receiver_name\":\"receiver\",\"receiver_role\":\"child\"}"
+          }
+        }
+      ]
+    },
+    {
+      "role": "tool",
+      "content": "Native handoff admitted: agentmsg_dbaa40d9-cb8b-42cf-97ff-a0fff6f6ae4b",
+      "tool_call_id": "call_def7226195c8461a807747da"
+    }
+  ],
+  "stream": true,
+  "stream_options": {
+    "include_usage": true
+  },
+  "store": false,
+  "max_completion_tokens": 131072,
+  "tools": [
+    {
+      "type": "function",
+      "function": {
+        "name": "occ3_handoff",
+        "description": "Transfer the captured source state to one authorized family agent. Do not include source facts in arguments.",
+        "parameters": {
+          "type": "object",
+          "additionalProperties": false,
+          "properties": {
+            "receiver_role": {
+              "type": "string",
+              "enum": [
+                "parent",
+                "sibling",
+                "child"
+              ]
+            },
+            "receiver_name": {
+              "type": "string"
+            }
+          },
+          "required": [
+            "receiver_role",
+            "receiver_name"
+          ]
+        },
+        "strict": false
+      }
+    }
+  ],
+  "reasoning_effort": "max"
+}
