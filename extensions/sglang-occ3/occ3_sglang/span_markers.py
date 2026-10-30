@@ -191,16 +191,26 @@ def vocabulary_bound(tokenizer) -> int | None:
     reject every marker, and one that is invented would accept an id the model
     cannot emit.
     """
+    # The bound must cover ADDED SPECIAL TOKENS: tokenizers report the base
+    # embedding count in `vocab_size` while `len(tokenizer)` includes the
+    # special-token additions. A model that emits its GLM-XML marker literals
+    # (thinking_open/close, tool-call brackets) as added tokens has ids ABOVE
+    # `vocab_size` but below `len(tokenizer)`; using the smaller base count
+    # rejects every marker with reason='vocab' before any roundtrip test
+    # (measured live: GLM-5.3 vocab_size=154820 vs len=154856, marker ids
+    # 154841+). Take the larger of the two so an invented-size fallback can
+    # never LOWER the bound below either honest count.
     size = getattr(tokenizer, "vocab_size", None)
-    if type(size) is int and size > 0:
-        return size
+    if type(size) is not int or size <= 0:
+        size = None
     try:
         length = len(tokenizer)
     except Exception:
-        return None
-    if type(length) is int and length > 0:
-        return length
-    return None
+        length = None
+    if type(length) is not int or length <= 0:
+        length = None
+    candidates = [value for value in (size, length) if value is not None]
+    return max(candidates) if candidates else None
 
 
 def _plain_ids(value, role: str) -> Tuple[int, ...]:

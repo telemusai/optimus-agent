@@ -211,6 +211,30 @@ def test_vocabulary_bound_prefers_vocab_size():
     assert vocabulary_bound(NoEncodeTokenizer()) is None
 
 
+def test_vocabulary_bound_covers_added_special_tokens():
+    """vocab_size counts base embeddings; len() includes added special tokens.
+
+    GLM-5.3 (measured live, window icalib-20261029T032600Z): vocab_size=154820
+    while len(tokenizer)=154856, and every GLM-XML marker literal resolves to
+    an added token ABOVE vocab_size. The bound must be the larger of the two
+    or every marker is refused with reason='vocab' before roundtrip attestation
+    (this is exactly what blocked v2 span policies on the live candidate).
+    """
+    class AddedTokens(FakeTokenizer):
+        def __len__(self):
+            return 4280
+
+    tok = AddedTokens(vocab_size=4242)
+    assert vocabulary_bound(tok) == 4280
+    # The marker table resolves when marker ids live in the added-token range.
+    assert resolve_marker_table(tok) is not None
+    # A larger vocab_size still wins over a smaller len(); the max never lowers
+    # an honest count.
+    big = FakeTokenizer(vocab_size=65536)
+    big.__class__ = big.__class__  # no len override: falls back to vocab_size
+    assert vocabulary_bound(big) == 65536
+
+
 def test_profiles_are_the_reviewed_set():
     assert PROFILES == (DEFAULT_PROFILE,)
     assert "glm45" in DEFAULT_PROFILE and "glm47" in DEFAULT_PROFILE

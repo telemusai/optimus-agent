@@ -1442,6 +1442,19 @@ fn receiver_agent_options(model: &Model, key: Arc<String>, system_prompt: &str) 
     options
 }
 
+/// Wire-level receiver effort override: `Some(Some(level))` sets the body
+/// field, `Some(None)` removes it (effort `off`), `None` leaves the body
+/// untouched. Env-gated so unset runs stay byte-identical.
+fn receiver_wire_effort() -> Option<Option<String>> {
+    match std::env::var("OCC3_RECEIVER_THINKING").ok().as_deref() {
+        Some("off") => Some(None),
+        Some(level @ ("minimal" | "low" | "medium" | "high" | "xhigh" | "max")) => {
+            Some(Some(level.to_string()))
+        }
+        _ => None,
+    }
+}
+
 /// Receiver-side request audit through the existing on_payload hook:
 /// source facts absent, the native default max_tokens, request count.
 fn attach_receiver_audit(
@@ -1451,6 +1464,35 @@ fn attach_receiver_audit(
 ) {
     let dump_path = std::env::var("OCC3_DUMP_RECEIVER_PAYLOAD").ok();
     options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
+        // Wire-level receiver effort rewrite. For provider dgx-glm53 the
+        // openai-completions client builds `reasoning_effort` from provider
+        // options only, so `initial_state.thinking_level` never reaches the
+        // body and OCC3_RECEIVER_THINKING was inert on the wire (measured
+        // 2026-10-30: four receiver dumps, all `max`). Rewriting the body here
+        // is the only place that is actually serialized. Unset keeps the
+        // request byte-identical.
+        let effort = receiver_wire_effort();
+        let effort_applied = effort.is_some();
+        let mut payload = payload;
+        if let Some(level) = effort {
+            if let Some(object) = payload.as_object_mut() {
+                match level {
+                    Some(value) => {
+                        object.insert("reasoning_effort".to_string(), Value::String(value));
+                    }
+                    None => {
+                        // pi-ai's openai-compat convention for "off": send
+                        // "none" rather than dropping the key, because this
+                        // server's launch defaults force reasoning_effort
+                        // "max" whenever the request omits it.
+                        object.insert(
+                            "reasoning_effort".to_string(),
+                            Value::String("none".to_string()),
+                        );
+                    }
+                }
+            }
+        }
         let serialized = payload.to_string();
         // Root diagnostic: dump the receiver's request payload exactly as
         // serialized to the provider (roles and content layout proof for
@@ -1469,7 +1511,15 @@ fn attach_receiver_audit(
         }));
         Box::pin(async move {
             if absent {
-                None
+                if effort_applied {
+                    // on_payload's contract replaces the provider-built
+                    // params only when Some is returned; returning None
+                    // would silently discard the effort rewrite and put
+                    // the default `max` back on the wire.
+                    Some(payload)
+                } else {
+                    None
+                }
             } else {
                 Some(json!({"model": "refused", "stream": false}))
             }
