@@ -1,6 +1,8 @@
 """Three-way manifests, shared evaluation, the promotion gate and grid selection."""
 from __future__ import annotations
 
+import math
+
 import pytest
 
 torch = pytest.importorskip("torch")
@@ -508,3 +510,266 @@ def test_the_digest_free_fallback_allows_unequal_validation_rows():
     assert validate_for_activation(bare, record, policy) == ("allow", None)
     assert validate_for_activation(bare, dict(record, method_id="other"), policy) == (
         "refuse", "artifact_digest")
+
+
+
+# -- P5: norm distribution, held-out scoring and the (r, eta) selection grid --
+
+def test_norm_distribution_fields_are_recorded_per_view():
+    from occ3_sglang.calibration_corpus import VIEW_KEYS, evaluate_map
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    record = evaluate_map(apply_map, artifact, manifest["validation"])
+    for name in ("raw_row_norm_std", "raw_row_norm_p05", "raw_row_norm_p95",
+                 "served_row_norm_std", "served_row_norm_p05", "served_row_norm_p95"):
+        assert name in VIEW_KEYS
+        assert record[name] is not None
+    # N0: the served view IS the raw view, so both distributions agree.
+    assert record["served_row_norm_mean"] == record["raw_row_norm_mean"]
+    assert record["served_row_norm_std"] == record["raw_row_norm_std"]
+    assert record["served_row_norm_p05"] == record["raw_row_norm_p05"]
+    # Distribution ordering: p05 <= mean <= p95, and a nonnegative std.
+    assert 0.0 <= record["raw_row_norm_p05"] <= record["raw_row_norm_mean"]
+    assert record["raw_row_norm_mean"] <= record["raw_row_norm_p95"]
+    assert record["raw_row_norm_std"] >= 0.0
+    for view in record["per_turn"].values():
+        for name in ("raw_row_norm_std", "raw_row_norm_p05", "raw_row_norm_p95"):
+            assert view[name] is not None
+    # The pooled numbers are the row norms of the raw aligned rows: the
+    # population std and the linear-interpolation quantiles match a manual
+    # computation in float64.
+    z = apply_map(artifact, manifest["validation"]["hidden"]).double()
+    norms = z.norm(dim=-1)
+    ordered = norms.sort().values
+
+    def quantile(q):
+        position = q * (norms.numel() - 1)
+        lower, upper = math.floor(position), math.ceil(position)
+        weight = position - lower
+        return float(ordered[lower] * (1.0 - weight) + ordered[upper] * weight)
+
+    assert record["raw_row_norm_mean"] == pytest.approx(float(norms.mean()))
+    assert record["raw_row_norm_std"] == pytest.approx(
+        float((norms - norms.mean()).pow(2).sum().sqrt() / norms.numel() ** 0.5))
+    assert record["raw_row_norm_p05"] == pytest.approx(quantile(0.05))
+    assert record["raw_row_norm_p95"] == pytest.approx(quantile(0.95))
+
+
+def test_score_heldout_completes_gaps_and_identifier_margins():
+    from occ3_sglang.calibration_corpus import (GAP_FIELDS, IDENTIFIER_FIELDS,
+                                                score_heldout)
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    records = score_heldout(apply_map, artifact, {name: manifest[name]
+                                                  for name in ("fit", "validation", "test")})
+    assert set(records) == {"fit", "validation", "test"}
+    for record in records.values():
+        for field in GAP_FIELDS:
+            assert record[field] is not None
+    # In-sample beats held-out on this fixture: a positive r2 gap and a
+    # negative relative_frobenius gap are the same (overfit) direction.
+    assert records["fit"]["r2_standard_gap_fit_validation"] >= 0.0
+    assert records["fit"]["r2_standard_gap_fit_test"] >= 0.0
+    assert records["fit"]["r2_standard_gap_validation_test"] == pytest.approx(
+        records["validation"]["r2_standard"] - records["test"]["r2_standard"])
+    assert records["fit"]["relative_frobenius_gap_fit_test"] <= 0.0
+    # The same gap values live on every completed record, and the margins are
+    # measured on the held-out partitions only.
+    assert records["test"]["r2_standard_gap_fit_test"] == pytest.approx(
+        records["fit"]["r2_standard_gap_fit_test"])
+    for name in ("validation", "test"):
+        record = records[name]
+        for field in IDENTIFIER_FIELDS:
+            assert record[field] is not None
+        assert 0.0 <= record["identifier_recovery_rate"] <= 1.0
+        assert 0.0 <= record["served_identifier_recovery_rate"] <= 1.0
+        assert record["identifier_margin_p05"] <= record["identifier_margin_mean"]
+        assert record["identifier_margin_mean"] > 0.0
+        assert record["identifier_recovery_rate"] > 0.25
+    for field in IDENTIFIER_FIELDS:
+        assert records["fit"][field] is None
+    # A no-signal corpus cannot fake recovery: the margins on independent
+    # rows collapse below the strong-signal ones.
+    noise_manifest, noise_artifact = _fitted(_turns(independent=True))
+    noise = score_heldout(apply_map, noise_artifact,
+                          {name: noise_manifest[name]
+                           for name in ("fit", "validation", "test")})
+    assert (noise["test"]["identifier_recovery_rate"]
+            < records["test"]["identifier_recovery_rate"])
+
+
+def test_score_heldout_uses_heldout_rows_for_scoring_only():
+    """The held-out reference rows change scores, never predictions."""
+    from occ3_sglang.calibration_corpus import score_heldout
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+
+    def spy(store):
+        def apply_spy(frozen, hidden, **kwargs):
+            output = apply_map(frozen, hidden, **kwargs)
+            store.append((hidden.clone(), output.clone()))
+            return output
+        return apply_spy
+
+    partitions = {name: manifest[name] for name in ("fit", "validation", "test")}
+    first, second = [], []
+    base = score_heldout(spy(first), artifact, partitions)
+    # Every apply call sees partition hidden rows, never any embeddings.
+    for hidden, _ in first:
+        assert any(torch.equal(hidden, manifest[name]["hidden"])
+                   for name in ("fit", "validation", "test"))
+        assert not any(torch.equal(hidden, manifest[name]["embeddings"])
+                       for name in ("fit", "validation", "test"))
+    # Replacing the validation reference rows cannot change one prediction.
+    shuffled = torch.flip(manifest["validation"]["embeddings"], [0]).contiguous()
+    mutated = dict(partitions, validation=dict(manifest["validation"],
+                                               embeddings=shuffled))
+    again = score_heldout(spy(second), artifact, mutated)
+    assert len(first) == len(second)
+    for (hidden_one, output_one), (hidden_two, output_two) in zip(first, second):
+        assert torch.equal(hidden_one, hidden_two)
+        assert torch.equal(output_one, output_two)
+    # The scoring itself did move: a permuted target breaks the pairing, so
+    # the recovery rate drops below the correctly paired one.
+    assert (again["validation"]["identifier_recovery_rate"]
+            < base["validation"]["identifier_recovery_rate"])
+
+
+def test_score_heldout_validates_its_partition_names_and_serving():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.calibration_corpus import score_heldout
+    from occ3_sglang.statebridge_calibrated import apply_map
+    manifest, artifact = _fitted()
+    for broken in ({}, {"holdout": manifest["validation"]},
+                   {"fit": manifest["fit"], "extra": manifest["test"]}):
+        with pytest.raises(LatentError) as caught:
+            score_heldout(apply_map, artifact, broken)
+        assert caught.value.code == "profile"
+    with pytest.raises(LatentError) as caught:
+        score_heldout(apply_map, artifact, {"validation": manifest["validation"]},
+                      serving={"kind": "n1"})
+    assert caught.value.code == "profile"
+    records = score_heldout(apply_map, artifact, {"validation": manifest["validation"]},
+                            serving={"kind": "n1"}, nu=2.0)
+    assert set(records) == {"validation"}
+    assert records["validation"]["served_row_norm_mean"] == pytest.approx(2.0)
+
+
+def test_procrustes_grid_selection_runs_the_rank_eta_grid_on_validation_only():
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.calibration_corpus import (PROCRUSTES_ETA_GRID,
+                                                PROCRUSTES_RANK_GRID,
+                                                select_procrustes_map)
+    blocks = _turns(dim=64, rank=32)
+    manifest = _manifest(blocks)
+    selection = select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                                      manifest["fit"], manifest["validation"], nu=2.0)
+    # The default grid on a 64-wide fixture: r=32 and r=64 are supportable,
+    # the ranks above the FIT partition's rank bound are skipped and recorded.
+    assert PROCRUSTES_RANK_GRID == (32, 64, 128, 256)
+    assert selection["rank_cap"] == 64
+    assert selection["skipped_ranks"] == (128, 256)
+    assert len(selection["candidates"]) == 2 * len(PROCRUSTES_ETA_GRID)
+    assert selection["hyperparams"]["variant"] == "o"
+    assert selection["hyperparams"]["r"] in (32, 64)
+    assert selection["hyperparams"]["eta"] in PROCRUSTES_ETA_GRID
+    # The selection equals a manual grid run in the same order, with ties
+    # keeping the earlier grid entry.
+    from occ3_sglang.calibration_corpus import evaluate_map
+    manual = []
+    for rank in (32, 64):
+        for eta in PROCRUSTES_ETA_GRID:
+            artifact = procrustes.fit_map(manifest["fit"], {"r": rank, "eta": eta,
+                                                            "variant": "o"})
+            record = evaluate_map(procrustes.apply_map, artifact, manifest["validation"])
+            manual.append(({"r": rank, "eta": eta}, record["r2_standard"]))
+    best_score = max(score for _, score in manual)
+    best_manual = next(hyperparams for hyperparams, score in manual if score == best_score)
+    assert selection["hyperparams"]["r"] == best_manual["r"]
+    assert selection["hyperparams"]["eta"] == best_manual["eta"]
+    served_best = max(selection["serving_candidates"],
+                      key=lambda entry: entry["served_r2_standard"])["variant"]
+    assert selection["serving_variant"] == served_best
+    assert (selection["validation_record"]["partition_manifest_digest"]
+            == manifest["validation"]["manifest_digest"])
+
+
+def test_procrustes_selection_never_touches_the_test_partition():
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.calibration_corpus import select_procrustes_map
+    blocks = _turns()
+    manifest = _manifest(blocks)
+    seen = {"fit": [], "apply": []}
+
+    def fit_spy(partition, hyperparams, **kwargs):
+        seen["fit"].append(partition["manifest_digest"])
+        return procrustes.fit_map(partition, hyperparams, **kwargs)
+
+    def apply_spy(artifact, hidden, **kwargs):
+        seen["apply"].append(hidden)
+        return procrustes.apply_map(artifact, hidden, **kwargs)
+
+    select_procrustes_map(fit_spy, apply_spy, manifest["fit"], manifest["validation"],
+                          nu=1.0)
+    assert set(seen["fit"]) == {manifest["fit"]["manifest_digest"]}
+    for hidden in seen["apply"]:
+        assert torch.equal(hidden, manifest["validation"]["hidden"])
+        assert not torch.equal(hidden, manifest["test"]["hidden"])
+
+
+def test_procrustes_selection_n1_requires_a_vocabulary_norm():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.calibration_corpus import select_procrustes_map
+    manifest = _manifest(_turns())
+    with pytest.raises(LatentError) as caught:
+        select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                              manifest["fit"], manifest["validation"],
+                              serving_grid=("n1",))
+    assert caught.value.code == "profile"
+    selection = select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                                      manifest["fit"], manifest["validation"],
+                                      serving_grid=("n1",), nu=2.0)
+    assert selection["serving_variant"] == "n1" and selection["serving"] == {"kind": "n1"}
+
+
+def test_procrustes_selection_skips_or_refuses_unsupportable_ranks():
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.calibration_corpus import select_procrustes_map
+    # The 32-wide fixture supports at most r=32: the default grid keeps r=32
+    # and records the skipped ranks instead of fitting null directions.
+    manifest = _manifest(_turns())
+    selection = select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                                      manifest["fit"], manifest["validation"], nu=1.0)
+    assert selection["rank_cap"] == 32
+    assert selection["skipped_ranks"] == (64, 128, 256)
+    assert {candidate["hyperparams"]["r"]
+            for candidate in selection["candidates"]} == {32}
+    # A grid with no supportable rank at all refuses.
+    with pytest.raises(LatentError) as caught:
+        select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                              manifest["fit"], manifest["validation"],
+                              rank_grid=(64, 128), nu=1.0)
+    assert caught.value.code == "numerical"
+    # A narrowed grid may select r=16 explicitly.
+    narrowed = select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                                     manifest["fit"], manifest["validation"],
+                                     rank_grid=(16, 32), eta_grid=(0.01,), nu=1.0)
+    assert {candidate["hyperparams"]["r"]
+            for candidate in narrowed["candidates"]} == {16, 32}
+    assert narrowed["skipped_ranks"] == ()
+
+
+def test_procrustes_selection_can_drive_the_labelled_comparators():
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.calibration_corpus import select_procrustes_map
+    manifest = _manifest(_turns())
+    for variant, method_id in (("so", procrustes.METHOD_ID_SO),
+                               ("plain", procrustes.METHOD_ID_PLAIN)):
+        selection = select_procrustes_map(procrustes.fit_map, procrustes.apply_map,
+                                          manifest["fit"], manifest["validation"],
+                                          eta_grid=(0.01,), variant=variant, nu=1.0)
+        assert selection["hyperparams"]["variant"] == variant
+        assert selection["artifact"].method_id == method_id
+        assert selection["validation_record"]["method_id"] == method_id

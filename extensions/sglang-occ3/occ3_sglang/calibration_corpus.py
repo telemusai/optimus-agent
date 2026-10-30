@@ -16,7 +16,11 @@ Three rules define this module:
    an independent partition and returns the complete metric record of spec
    section 12: raw and served metrics kept distinct, per-turn, turn-macro and
    pooled views, negatives recorded, undefined denominators recorded as
-   undefined instead of raising.
+   undefined instead of raising. The record also carries the P5 fields a
+   single-partition evaluation cannot know: the row-norm distribution
+   (mean/std/p05/p95, every view), the fit/val/test gap fields and the
+   exact-identifier-recovery margin fields, which stay None until
+   score_heldout measures them from records and held-out rows.
 3. Promotion happens only in validate_for_activation, which consumes a policy
    and a validation record bound to the artifact digest. Nothing in this
    module refuses a measurement because its quality is poor.
@@ -43,6 +47,8 @@ from dataclasses import dataclass, replace
 from .latent_types import require
 from .statebridge_calibrated import (MIN_CALIBRATION_ROWS, PARTITION_FIELDS,
                                      serving_transform)
+from .statebridge_calibrated_procrustes import ETA_GRID as PROCRUSTES_ETA_GRID
+from .statebridge_calibrated_procrustes import rank_bound
 
 M_ROW_BUDGETS = (512, 1024, 2048)
 MIN_TURN_ROWS = 2
@@ -55,18 +61,42 @@ SELECTION_SCHEMA = "optimus.occ3.calibration-selection.v1"
 NORM_FLOOR = 1e-6
 RHO_GRID = (0.002, 0.02, 0.2)
 SERVING_VARIANTS = ("n0", "n1")
+# The default (r, eta) selection grid of the frozen low-rank Procrustes
+# challenger. eta reuses the fit module's own grid; the rank axis is the
+# frozen-method selection grid {32, 64, 128, 256}. r=16 stays a legal fit
+# hyperparameter (statebridge_calibrated_procrustes.RANK_GRID admits it, and
+# the low-rank fixtures pin it), so the module constant is unchanged and only
+# this DEFAULT SELECTION grid drops it.
+PROCRUSTES_RANK_GRID = (32, 64, 128, 256)
 
 VIEW_KEYS = ("r2_standard", "r2_vs_fit_mean", "sse", "sst_test", "sse_vs_fit_mean",
              "relative_frobenius", "mean_row_cosine", "raw_row_norm_mean",
+             "raw_row_norm_std", "raw_row_norm_p05", "raw_row_norm_p95",
              "served_r2_standard", "served_r2_vs_fit_mean", "served_relative_frobenius",
-             "served_mean_row_cosine", "served_row_norm_mean", "rows")
+             "served_mean_row_cosine", "served_row_norm_mean", "served_row_norm_std",
+             "served_row_norm_p05", "served_row_norm_p95", "rows")
+# Fit/val/test gap fields: the signed pooled difference left record minus right
+# record, for the raw spec-12 headline metrics. A positive r2 gap (fit scores
+# higher than the held-out partition) is the classic overfit direction; a
+# negative relative_frobenius gap (fit error lower than held-out error) is the
+# same direction. Undefined inputs propagate as None, never as zero.
+GAP_METRICS = ("r2_standard", "relative_frobenius")
+GAP_PAIRS = (("fit", "validation"), ("fit", "test"), ("validation", "test"))
+GAP_FIELDS = tuple(f"{metric}_gap_{left}_{right}"
+                   for left, right in GAP_PAIRS for metric in GAP_METRICS)
+# Exact-identifier-recovery margin fields: the row-level offline proxy for
+# identifier recovery, cos(Z_i, E_i) - max_{j != i} cos(Z_i, E_j) over the
+# held-out rows, raw and served. None until score_heldout measures them.
+IDENTIFIER_FIELDS = ("identifier_margin_mean", "identifier_margin_p05",
+                     "identifier_recovery_rate", "served_identifier_margin_mean",
+                     "served_identifier_margin_p05", "served_identifier_recovery_rate")
 RECORD_KEYS = frozenset({
     "schema", "method_id", "artifact_digest", "corpus_digest", "fit_manifest_digest",
     "partition_manifest_digest", "serving", "nu", "rows", "turns",
     "output_variance", "output_effective_rank", "served_output_variance",
     "served_output_effective_rank", "per_turn", "turn_macro", "pooled",
     "undefined_denominators",
-}) | frozenset(VIEW_KEYS) - {"rows"}
+}) | (frozenset(VIEW_KEYS) - {"rows"}) | frozenset(GAP_FIELDS) | frozenset(IDENTIFIER_FIELDS)
 
 CONTROL_KINDS = ("correct", "wrong-sender", "shuffled", "null",
                  "no-attachment", "reference-token-only")
@@ -456,21 +486,61 @@ def _row_metrics(predicted, target, mu_fit):
             "mean_row_cosine": _cosine(predicted, target)}
 
 
+def _percentile(ordered, q):
+    """Linear-interpolation quantile of an ascending 1-D tensor.
+
+    The same convention as torch.quantile's default interpolation, computed
+    from the sorted values so the record never depends on a quantile kernel.
+    """
+    size = int(ordered.numel())
+    position = q * (size - 1)
+    lower, upper = int(math.floor(position)), int(math.ceil(position))
+    if lower == upper:
+        return float(ordered[lower])
+    weight = position - lower
+    return float(ordered[lower]) * (1.0 - weight) + float(ordered[upper]) * weight
+
+
+def _norm_stats(matrix):
+    """Norm distribution of the row norms: mean, population std, p05, p95.
+
+    The population standard deviation (ddof=0) keeps every view finite,
+    including a single-row one; p05/p95 are linear-interpolation quantiles of
+    the sorted row norms. Nothing is clamped or fabricated: a zero row
+    contributes a zero norm.
+    """
+    norms = matrix.norm(dim=-1)
+    ordered = norms.sort().values
+    count = int(ordered.numel())
+    mean = float(norms.mean())
+    variance = float((norms - mean).pow(2).sum()) / count
+    return {"mean": mean, "std": math.sqrt(variance),
+            "p05": _percentile(ordered, 0.05), "p95": _percentile(ordered, 0.95)}
+
+
 def _view(z_raw, z_served, target, mu_fit):
     """One uniform metric view: raw and served kept distinct, plus row count."""
     raw = _row_metrics(z_raw, target, mu_fit)
     served = _row_metrics(z_served, target, mu_fit)
+    raw_norms = _norm_stats(z_raw)
+    served_norms = _norm_stats(z_served)
     return {"r2_standard": raw["r2_standard"], "r2_vs_fit_mean": raw["r2_vs_fit_mean"],
             "sse": raw["sse"], "sst_test": raw["sst_test"],
             "sse_vs_fit_mean": raw["sse_vs_fit_mean"],
             "relative_frobenius": raw["relative_frobenius"],
             "mean_row_cosine": raw["mean_row_cosine"],
-            "raw_row_norm_mean": float(z_raw.norm(dim=-1).mean()),
+            "raw_row_norm_mean": raw_norms["mean"],
+            "raw_row_norm_std": raw_norms["std"],
+            "raw_row_norm_p05": raw_norms["p05"],
+            "raw_row_norm_p95": raw_norms["p95"],
             "served_r2_standard": served["r2_standard"],
             "served_r2_vs_fit_mean": served["r2_vs_fit_mean"],
             "served_relative_frobenius": served["relative_frobenius"],
             "served_mean_row_cosine": served["mean_row_cosine"],
-            "served_row_norm_mean": float(z_served.norm(dim=-1).mean()),
+            "served_row_norm_mean": served_norms["mean"],
+            "served_row_norm_std": served_norms["std"],
+            "served_row_norm_p05": served_norms["p05"],
+            "served_row_norm_p95": served_norms["p95"],
             "rows": int(target.shape[0])}
 
 
@@ -565,6 +635,11 @@ def evaluate_map(apply, artifact, partition, *, serving=None, nu=None,
             "undefined_denominators": undefined,
         }
         record.update({name: pooled[name] for name in VIEW_KEYS[:-1]})
+        # The cross-partition gap and identifier-recovery fields are measured
+        # by score_heldout from records and held-out rows; a plain evaluation
+        # records them as not measured, never as zero.
+        record.update({name: None for name in GAP_FIELDS})
+        record.update({name: None for name in IDENTIFIER_FIELDS})
     return record
 
 
@@ -593,6 +668,10 @@ def validate_metrics_record(record):
         require(type(record[name]) is int and not isinstance(record[name], bool)
                 and record[name] >= 0, "profile")
     for name in VIEW_KEYS[:-1]:
+        value = record[name]
+        require(value is None or (type(value) is float and math.isfinite(value)),
+                "numerical")
+    for name in GAP_FIELDS + IDENTIFIER_FIELDS:
         value = record[name]
         require(value is None or (type(value) is float and math.isfinite(value)),
                 "numerical")
@@ -629,6 +708,114 @@ def validate_metrics_record(record):
     require(sum(view["rows"] for view in record["per_turn"].values()) == record["rows"],
             "profile")
     return True
+
+
+def identifier_recovery(predicted, target, *, torch_module=None):
+    """Row-level exact-identifier-recovery margins of held-out rows.
+
+    For every row i the margin is cos(Z_i, E_i) - max_{j != i} cos(Z_i, E_j):
+    the aligned row must point at its own held-out reference embedding more
+    than at any other held-out row's. This is the offline scoring-only proxy
+    for exact identifier recovery; the campaign's receiver-inference margins
+    (log P(correct label) - max log P(other labels)) are supplied separately
+    by a live caller and scored by separation(). Fewer than two rows have no
+    competitor, so the margins are undefined (None), never fabricated. The
+    reference rows are used for scoring only and never enter apply.
+    """
+    torch = torch_module or _torch()
+    require(getattr(predicted, "ndim", None) == 2 and getattr(target, "ndim", None) == 2,
+            "profile")
+    require(tuple(int(x) for x in predicted.shape) == tuple(int(x) for x in target.shape),
+            "profile")
+    if int(predicted.shape[0]) < 2:
+        return None
+    with torch.no_grad():
+        z = predicted.float().to(dtype=torch.float64)
+        e = target.float().to(dtype=torch.float64)
+        require(bool(torch.isfinite(z).all()) and bool(torch.isfinite(e).all()), "numerical")
+        unit_z = z / z.norm(dim=-1, keepdim=True).clamp_min(NORM_FLOOR)
+        unit_e = e / e.norm(dim=-1, keepdim=True).clamp_min(NORM_FLOOR)
+        similarity = unit_z @ unit_e.mT
+        matched = similarity.diagonal()
+        competitor = similarity.clone()
+        competitor.fill_diagonal_(float("-inf"))
+        margins = matched - competitor.max(dim=-1).values
+        ordered = margins.sort().values
+        return {"margin_mean": float(margins.mean()),
+                "margin_p05": _percentile(ordered, 0.05),
+                "recovery_rate": float((margins > 0.0).to(dtype=torch.float64).mean())}
+
+
+def _record_gaps(records):
+    """Signed pooled-metric gaps for every pair of the provided records.
+
+    records maps partition names to evaluation records; a pair is measured
+    only when both sides are present, and an undefined metric propagates as
+    None instead of a fabricated zero. The gap is left minus right
+    (GAP_PAIRS order), over the pooled raw metrics of GAP_METRICS.
+    """
+    gaps = {}
+    for left, right in GAP_PAIRS:
+        if left not in records or right not in records:
+            continue
+        for metric in GAP_METRICS:
+            first, second = records[left][metric], records[right][metric]
+            gaps[f"{metric}_gap_{left}_{right}"] = (
+                None if first is None or second is None
+                else float(first) - float(second))
+    return gaps
+
+
+def score_heldout(apply, artifact, partitions, *, serving=None, nu=None,
+                  torch_module=None):
+    """Evaluate the provided partitions and complete the P5 record fields.
+
+    partitions maps a non-empty subset of {"fit", "validation", "test"} to
+    contract partitions. Every partition is scored by evaluate_map under one
+    serving choice, so each returned record carries its own norm-distribution
+    fields; the helper then fills the fields a single-partition evaluation
+    cannot know: the fit/val/test gap fields over the provided pairs, and the
+    exact-identifier-recovery margin fields on the held-out partitions
+    (validation and test). The held-out reference rows are used for scoring
+    only: apply never reads them, so no prediction changes. Returns a mapping
+    of partition name to the completed, validated record.
+    """
+    torch = torch_module or _torch()
+    require(callable(apply), "profile")
+    require(isinstance(partitions, Mapping) and bool(partitions), "profile")
+    require(set(partitions) <= {"fit", "validation", "test"}, "profile")
+    config = _serving_config(serving)
+    nu_used = None
+    if config is not None:
+        require(isinstance(nu, (int, float)) and not isinstance(nu, bool)
+                and math.isfinite(nu) and nu > 0.0, "profile")
+        nu_used = float(nu)
+    records = {}
+    for name in ("fit", "validation", "test"):
+        if name in partitions:
+            records[name] = evaluate_map(apply, artifact, partitions[name],
+                                         serving=serving, nu=nu, torch_module=torch)
+    gaps = _record_gaps(records)
+    completed = {}
+    for name, record in records.items():
+        value = dict(record)
+        value.update(gaps)
+        if name in ("validation", "test"):
+            hidden, embeddings = _require_partition(partitions[name], torch)[:2]
+            with torch.no_grad():
+                z_raw = apply(artifact, hidden, torch_module=torch)
+                z_served = serving_transform(config, z_raw, nu=nu_used)
+                target = embeddings.to(dtype=torch.float64)
+                margins = (identifier_recovery(z_raw, target, torch_module=torch),
+                           identifier_recovery(z_served, target, torch_module=torch))
+            for prefix, summary in zip(("identifier_", "served_identifier_"), margins):
+                if summary is not None:
+                    value[prefix + "margin_mean"] = summary["margin_mean"]
+                    value[prefix + "margin_p05"] = summary["margin_p05"]
+                    value[prefix + "recovery_rate"] = summary["recovery_rate"]
+        validate_metrics_record(value)
+        completed[name] = value
+    return completed
 
 
 def validate_for_activation(artifact, validation_record, policy):
@@ -776,3 +963,96 @@ def select_calibrated_map(fit, apply, fit_partition, validation_partition, *,
             "serving_candidates": [{"variant": variant,
                                     "served_r2_standard": record["served_r2_standard"]}
                                    for variant, _, record in serving_candidates]}
+
+
+def _raw_selection_score(record):
+    value = record["r2_standard"]
+    return float("-inf") if value is None else float(value)
+
+
+def _served_selection_score(record):
+    value = record["served_r2_standard"]
+    return float("-inf") if value is None else float(value)
+
+
+def _procrustes_grid(rank_grid, eta_grid, variant):
+    """The ordered hyperparameter dicts of a low-rank Procrustes selection grid.
+
+    Rank-major then eta-major, both in the given order (the frozen defaults
+    ascend), so ties in the selection keep the earlier grid entry. The
+    defaults are the frozen-method selection grid PROCRUSTES_RANK_GRID x the
+    fit module's own ETA_GRID; a caller may narrow either axis (r=16 is a
+    legal explicit choice) but never silently extend it past what the fit
+    module accepts.
+    """
+    ranks = PROCRUSTES_RANK_GRID if rank_grid is None else tuple(rank_grid)
+    etas = PROCRUSTES_ETA_GRID if eta_grid is None else tuple(eta_grid)
+    require(bool(ranks) and bool(etas), "profile")
+    require(len(set(ranks)) == len(ranks) and len(set(etas)) == len(etas), "profile")
+    return tuple({"r": rank, "eta": eta, "variant": variant}
+                 for rank in ranks for eta in etas)
+
+
+def select_procrustes_map(fit, apply, fit_partition, validation_partition, *,
+                          rank_grid=None, eta_grid=None, variant="o",
+                          serving_grid=SERVING_VARIANTS, nu=None, torch_module=None):
+    """Fit the low-rank whitened Procrustes challenger for every (r, eta) grid
+    point on FIT; select the hyperparameters and the serving variant on
+    VALIDATION.
+
+    The final test partition is not an argument and can never enter fitting or
+    selection. The default rank axis is the frozen-method selection grid
+    (32, 64, 128, 256); r=16 stays a legal fit hyperparameter but is off the
+    default selection grid. A rank the FIT partition cannot support
+    (r > min(numerical_rank(A), numerical_rank(B), M - 1, D), measured by
+    rank_bound on FIT only) is skipped and recorded, never fitted with null
+    directions; a selection with no supportable rank refuses. Hyperparameters
+    are chosen by the raw r2_standard the frozen map earns on validation; the
+    serving variant is chosen by the served r2 the same artifact earns under
+    N0 or N1. Ties keep the earlier grid entry, so the selection is
+    deterministic. variant selects the challenger configuration: "o" is the
+    frozen spec method; "so" and "plain" are separately labelled comparators
+    and never the default.
+    """
+    torch = torch_module or _torch()
+    require(callable(fit) and callable(apply), "profile")
+    grid = _procrustes_grid(rank_grid, eta_grid, variant)
+    variants = tuple(serving_grid)
+    require(bool(variants) and set(variants) <= {"n0", "n1"}, "profile")
+    if "n1" in variants:
+        require(isinstance(nu, (int, float)) and not isinstance(nu, bool)
+                and math.isfinite(nu) and nu > 0.0, "profile")
+        nu = float(nu)
+    cap = rank_bound(fit_partition, torch_module=torch)
+    supported = tuple(hyperparams for hyperparams in grid if hyperparams["r"] <= cap)
+    require(bool(supported), "numerical")
+    skipped = tuple(dict.fromkeys(hyperparams["r"] for hyperparams in grid
+                                  if hyperparams["r"] > cap))
+    candidates = []
+    for hyperparams in supported:
+        artifact = fit(fit_partition, dict(hyperparams), torch_module=torch)
+        record = evaluate_map(apply, artifact, validation_partition, torch_module=torch)
+        candidates.append((hyperparams, artifact, record))
+    best_hyper, best_artifact, _ = max(candidates,
+                                       key=lambda entry: _raw_selection_score(entry[2]))
+    serving_candidates = []
+    for serving_variant in variants:
+        config = None if serving_variant == "n0" else {"kind": "n1"}
+        record = evaluate_map(apply, best_artifact, validation_partition,
+                              serving=config, nu=nu, torch_module=torch)
+        serving_candidates.append((serving_variant, config, record))
+
+    best_variant, best_config, best_record = max(
+        serving_candidates, key=lambda entry: _served_selection_score(entry[2]))
+    return {"schema": SELECTION_SCHEMA,
+            "hyperparams": dict(best_hyper), "serving": best_config,
+            "serving_variant": best_variant, "artifact": best_artifact,
+            "validation_record": best_record,
+            "rank_cap": cap, "skipped_ranks": skipped,
+            "candidates": [{"hyperparams": dict(hyperparams),
+                            "r2_standard": record["r2_standard"],
+                            "artifact_digest": record["artifact_digest"]}
+                           for hyperparams, _, record in candidates],
+            "serving_candidates": [{"variant": name,
+                                    "served_r2_standard": record["served_r2_standard"]}
+                                   for name, _, record in serving_candidates]}

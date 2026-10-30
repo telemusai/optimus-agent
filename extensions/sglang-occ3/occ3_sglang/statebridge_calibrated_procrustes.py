@@ -697,30 +697,66 @@ def residual_discard_ratio(artifact, hidden, *, torch_module=None):
     return residual / total
 
 
+def rank_bound(partition, *, torch_module=None):
+    """The largest r fit_map would accept for this partition.
+
+    min(numerical_rank(A), numerical_rank(B), M - 1, D) under the fit's own
+    relative tolerance (RANK_RELATIVE_TOLERANCE), measured on the centred FIT
+    rows exactly as fit_map measures it. A grid driver uses this to drop
+    unsupported ranks before fitting, so a rank the data cannot support is
+    skipped and recorded instead of completed with null directions; fit_map
+    keeps its own refusal as the backstop. Pure measurement: nothing is
+    fitted, cached or written, and the partition is validated by the same
+    contract check the fit uses.
+    """
+    torch = torch_module or _torch(partition.get("hidden") if hasattr(partition, "get")
+                                   else None)
+    (hidden, embeddings, _row_turn_ids, _turn_ids, _manifest_digest, rows, dim) = (
+        _partition_rows(partition))
+    with torch.no_grad():
+        h, e = hidden.float(), embeddings.float()
+        require(bool(torch.isfinite(h).all()) and bool(torch.isfinite(e).all()), "numerical")
+        mu_h, mu_e = h.mean(0, keepdim=True), e.mean(0, keepdim=True)
+        a, b = h - mu_h, e - mu_e
+        require(float(a.pow(2).sum()) > 0.0 and float(b.pow(2).sum()) > 0.0, "numerical")
+        try:
+            _, s_h, _ = torch.linalg.svd(a, full_matrices=False)
+            _, s_e, _ = torch.linalg.svd(b, full_matrices=False)
+        except RuntimeError:
+            raise LatentError("numerical") from None
+        rank_h = _numerical_rank(s_h, torch)
+        rank_e = _numerical_rank(s_e, torch)
+    return min(rank_h, rank_e, rows - 1, dim)
+
+
 def serving_transform(config, z_raw, *, nu=None, torch_module=None):
     """Apply the selected serving normalisation to raw aligned rows.
 
     config None is N0: the rows are returned unchanged. config {"kind": "n1"}
     renormalises every row to the fixed vocabulary norm statistic nu, which is
     measured from the frozen embedding matrix by the caller and never derived
-    from evaluation answers. Norms at or below NORM_FLOOR, and nonfinite norms,
-    are refused rather than fabricated into a carrier.
+    from evaluation answers. Nonfinite rows, and norms at or below NORM_FLOOR,
+    are refused for either variant rather than fabricated into a carrier: the
+    N0 path applies the same finite and norm-floor guards as the dual-ridge
+    method (statebridge_calibrated.serving_transform), so a zero or nonfinite
+    row is refused before it can reach the prefix, not only under N1.
     """
     torch = torch_module or _torch(z_raw)
     require(hasattr(z_raw, "ndim") and z_raw.ndim == 2, "profile")
-    if config is None:
-        return z_raw
-    require(type(config) is dict and set(config) == {"kind"} and config["kind"] == "n1",
-            "profile")
-    if getattr(nu, "ndim", None) == 0 and getattr(nu, "numel", lambda: None)() == 1:
-        nu = float(nu)
-    require(type(nu) in (int, float) and not isinstance(nu, bool) and math.isfinite(nu)
-            and nu > 0, "profile")
     with torch.no_grad():
         z = z_raw.float()
+        require(bool(torch.isfinite(z).all()), "numerical")
         norms = z.norm(dim=-1, keepdim=True)
         require(bool(torch.isfinite(norms).all()), "numerical")
         require(bool((norms > NORM_FLOOR).all()), "numerical")
+        if config is None:
+            return z_raw.contiguous()
+        require(type(config) is dict and set(config) == {"kind"}
+                and config["kind"] == "n1", "profile")
+        if getattr(nu, "ndim", None) == 0 and getattr(nu, "numel", lambda: None)() == 1:
+            nu = float(nu)
+        require(type(nu) in (int, float) and not isinstance(nu, bool) and math.isfinite(nu)
+                and nu > 0, "profile")
         served = z * (float(nu) / norms)
         require(bool(torch.isfinite(served).all()), "numerical")
     return served.to(dtype=z_raw.dtype).contiguous()
