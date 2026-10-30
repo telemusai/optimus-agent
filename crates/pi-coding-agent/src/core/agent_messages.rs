@@ -2253,6 +2253,8 @@ impl PreparedNativeHandoff {
     }
     pub fn authorization(&self) -> &AuthorizedNativeHandoff { &self.authorization }
     pub fn envelope(&self) -> &crate::core::occ::occ3::types::Occ3Envelope { &self.publication.envelope }
+    /// The underlying publication's id (read-only; corpus-turn evidence).
+    pub fn publication_id(&self) -> &str { &self.publication.publication_id }
     /// Durable/model-visible message contains control only. Never persist raw
     /// state handles, source receipts or source text in custom-message details.
     pub fn control_payload(&self) -> AgentSessionMessagePayload {

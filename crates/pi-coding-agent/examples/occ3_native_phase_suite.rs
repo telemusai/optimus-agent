@@ -43,6 +43,18 @@
 //! published under the run's output directory only - the frozen report
 //! fieldset is untouched, and every control-arm expectation is pre-registered
 //! here rather than improvised.
+//!
+//! `--corpus-turn MANIFEST` (P4 calibration-corpus collection,
+//! p4-corpus-design.md section 5) runs ONE source-only capture turn instead
+//! of the frozen contract: enroll the family's source session, arm the v2
+//! capture with the positive case's budget, run the pinned corpus templates
+//! with the manifest's pre-committed per-turn payload, and stop at the real
+//! occ3_handoff - the publication is admitted into an enrolled-but-never-
+//! prompted receiver session (the daemon's admit-only delivery semantics;
+//! no receiver inference runs). The verdict is structural only (capture,
+//! handoff, span, coverage). `--corpus-turn` with `--arm NATIVE` is the
+//! canary: the full positive case (receiver leg included) driven by the
+//! manifest payload.
 
 use indexmap::IndexMap;
 use pi_agent_core::agent::{Agent, AgentOptions, PromptInput};
@@ -52,9 +64,16 @@ use pi_agent_core::types::{
 use pi_ai::source_capture::{
     canonical_json_bytes, sha256, SourceCaptureProfile, SourceSpanArming, SOURCE_SPAN_POLICY_ENV,
 };
-use pi_ai::types::{ContentBlock as AiContentBlock, ImageOrTextContent, Message, Model, API_OPENAI_COMPLETIONS};
+use pi_ai::types::{
+    BoxFuture, ContentBlock as AiContentBlock, ImageOrTextContent, Message, Model,
+    API_OPENAI_COMPLETIONS,
+};
 use pi_coding_agent::core::agent_messages::{
-    AgentFamilyCatalogEntry, AgentSessionMessageEndpoint, AgentSessionMessageSendInput,
+    agent_family_relationship, create_agent_session_message_receipt, AgentFamilyCatalogEntry,
+    AgentFamilyRosterCurrent, AgentFamilyRosterEntry, AgentFamilyRosterResult,
+    AgentSessionMessageController, AgentSessionMessageEndpoint, AgentSessionMessageReceipt,
+    AgentSessionMessageSendInput, AuthorizedNativeHandoff, DELIVERY_STATUS_QUEUED,
+    FAMILY_STATUS_IDLE, PreparedNativeHandoff,
 };
 use pi_coding_agent::core::agent_session::occ3_state::{
     NativeSourceBudget, Occ3NativeSession, NATIVE_HANDOFF_TOOL,
@@ -123,6 +142,13 @@ const ARM_CONTROL_PATH_ENV: &str = "OCC3_P3_ARM_FILE";
 const ARM_CONTROL_DEFAULT_PATH: &str = "/tmp/occ3_p3_arm";
 /// The hook's MAX_CONTROL_BYTES: a larger control file selects no arm.
 const ARM_CONTROL_MAX_BYTES: usize = 64;
+/// P4 calibration-corpus collection (p4-corpus-design.md): the per-turn
+/// manifest schema, the per-turn evidence schema (a sibling of the arm
+/// evidence schema, section 2.2.5) and its bound.
+const CORPUS_TURN_MANIFEST_SCHEMA: &str = "optimus.occ3.p4-corpus-turn-manifest.v1";
+const CORPUS_TURN_EVIDENCE_SCHEMA: &str = "optimus.occ3.p4-corpus-turn.v1";
+const CORPUS_TURN_TRIAL_SCHEMA: &str = "optimus.occ3.p4-corpus-turn-trial.v1";
+const MAX_TURN_MANIFEST_BYTES: usize = 4096;
 
 fn now() -> u64 {
     SystemTime::now()
@@ -718,6 +744,11 @@ struct FixtureRecords {
     /// Never reset across a modeled restart: server-side handles stay
     /// globally unique like the real runtime's unguessable handle ids.
     capture_counter: u64,
+    /// Test-only decline injection: the capture-armed source request is
+    /// refused with the server's attachment-error shape, so the corpus-turn
+    /// fail-closed path (source_turn_error, nonzero exit) is exercised
+    /// offline exactly like a live reserve/admit/commit decline.
+    refuse_captures: bool,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -945,15 +976,24 @@ async fn send_router_error(socket: &mut tokio::net::TcpStream, status: u16, code
 
 fn extract_fact(messages: &Value) -> Option<String> {
     let text = messages.to_string();
-    let marker = "The private vault code is ";
-    let start = text.find(marker)? + marker.len();
-    let rest = &text[start..];
-    let end = rest.find('.')?;
-    let fact = &rest[..end];
-    if fact.is_empty() || fact.len() > 128 || !fact.starts_with("occ3-") {
-        return None;
+    // The corpus-turn user template states the payload with its own marker
+    // (p4-corpus-design.md 2.2.1); the vault-code sentence stays the arm
+    // trials' marker. The first sentence end bounds the value in both.
+    let mut fact = None;
+    for marker in ["The private vault code is ", "The private payload is: "] {
+        if let Some(start) = text.find(marker).map(|at| at + marker.len()) {
+            if let Some(end) = text[start..].find('.') {
+                let candidate = &text[start..start + end];
+                if !candidate.is_empty()
+                    && candidate.len() <= 128
+                    && candidate.starts_with("occ3-")
+                {
+                    fact = Some(candidate.to_string());
+                }
+            }
+        }
     }
-    Some(fact.to_string())
+    fact
 }
 
 async fn serve(
@@ -1123,6 +1163,17 @@ async fn serve(
                             "MAX goes through the existing model-specific conversion, or the documented receiver override matches"
                         );
                         if let Some(intent) = body.get("occ3_capture") {
+                            if {
+                                let records_guard = records.lock().unwrap();
+                                records_guard.refuse_captures
+                            } {
+                                // A declined capture (the collector's
+                                // reserve/admit/commit refusals arrive on the
+                                // armed request itself): the attachment-error
+                                // shape, so the client fails the source turn.
+                                send_attachment_error(&mut socket, 503, "capture_declined").await;
+                                return;
+                            }
                             // The live occ3-sglang server (chat_adapter handle_around)
                             // admits capture-armed source requests only with exactly
                             // one accept-encoding header whose value is identity;
@@ -2008,12 +2059,15 @@ struct PositiveArmPlan {
 }
 
 /// What one positive-path run observed, for both the frozen contract callers
-/// (case/observed/cleanup) and the arm-evidence projection.
+/// (case/observed/cleanup) and the arm-evidence projection. `source_audit`
+/// carries the capture identity (capture_id, turn_nonce) the P4 canary's
+/// corpus-turn block needs; the frozen callers ignore it.
 struct PositiveOutcome {
     case: Value,
     observed: Value,
     cleanup_ok: bool,
     arm_evidence: Value,
+    source_audit: Value,
 }
 
 /// Positive case: one real native handoff (root correction F4: the before
@@ -2202,7 +2256,7 @@ async fn run_positive_case(
         "receiver_request_audit": audit_summary,
     });
     if diagnostic_extras && !case_passed {
-        case["source_audit"] = source_audit;
+        case["source_audit"] = source_audit.clone();
         case["source_tool_errors"] = json!(source_tool_errors(&source_agent));
         case["receiver_tool_errors"] = json!(receiver_tool_errors(&receiver_agent));
         case["receiver_tool_calls"] = json!(receiver_tool_calls);
@@ -2239,6 +2293,7 @@ async fn run_positive_case(
         observed,
         cleanup_ok: cleanup.is_ok(),
         arm_evidence,
+        source_audit,
     })
 }
 
@@ -3978,30 +4033,63 @@ fn effective_arm_or_readback(arm: Arm, readback: &ArmControlReadback) -> Value {
     })
 }
 
+/// Publish one evidence JSON under the run's output directory with the
+/// arm-evidence conventions: canonical bytes, the 64 KiB bound and the
+/// no-replace, no-replay exclusive publication.
+fn write_journal_evidence(
+    journal: &Path,
+    name: &str,
+    evidence: &Value,
+    oversize_code: &str,
+) -> Result<PathBuf, String> {
+    let bytes = canonical_json_bytes(evidence).map_err(|_| fail())?;
+    if bytes.len() > MAX_ARM_EVIDENCE_BYTES {
+        return Err(oversize_code.into());
+    }
+    publish_exclusive(journal, name, &bytes)?;
+    Ok(journal.join(name))
+}
+
 /// Publish the per-arm evidence JSON under the run's output directory. The
 /// intended value and the receiver's raw answer appear ONLY here (local
 /// evidence file), never in the frozen report fieldset.
 fn write_arm_evidence(journal: &Path, evidence: &Value) -> Result<PathBuf, String> {
     let trial_id = evidence["trial_id"].as_str().ok_or_else(fail)?;
-    let name = format!("arm-evidence-{trial_id}.json");
-    let bytes = canonical_json_bytes(evidence).map_err(|_| fail())?;
-    if bytes.len() > MAX_ARM_EVIDENCE_BYTES {
-        return Err("arm_evidence_oversize".into());
-    }
-    publish_exclusive(journal, &name, &bytes)?;
-    Ok(journal.join(name))
+    write_journal_evidence(
+        journal,
+        &format!("arm-evidence-{trial_id}.json"),
+        evidence,
+        "arm_evidence_oversize",
+    )
+}
+
+/// Publish the per-turn corpus evidence JSON: the arm-evidence writer's
+/// conventions with the corpus-turn file name (the manifest turn id). The
+/// raw payload appears ONLY here (local evidence file).
+fn write_corpus_turn_evidence(journal: &Path, evidence: &Value) -> Result<PathBuf, String> {
+    let turn_id = evidence["turn_id"].as_str().ok_or_else(fail)?;
+    write_journal_evidence(
+        journal,
+        &format!("corpus-turn-evidence-{turn_id}.json"),
+        evidence,
+        "corpus_turn_evidence_oversize",
+    )
 }
 
 /// One experiment-arm trial: verify the staging the driver can see,
 /// pre-commit the private value, burn the one-shot phase claim, run the
 /// arm's case, ALWAYS publish the per-arm evidence JSON (a failed trial is
 /// recorded, never silently dropped), then apply the pre-registered
-/// verdict. The frozen report fieldset is untouched.
+/// verdict. The frozen report fieldset is untouched. `corpus` is set only
+/// by the `--corpus-turn` canary (arm NATIVE): the manifest payload is the
+/// pre-committed value and the evidence gains the corpus-turn identity
+/// block; plain arm trials are unchanged.
 async fn run_arm_phase(
     env: &PhaseEnv,
     challenge: &PhaseChallenge,
     descriptor_digest: &str,
     arm: Arm,
+    corpus: Option<&CorpusTurnManifest>,
 ) -> Result<Value, String> {
     let pins = ReportPins {
         binary_sha256: env.harness_binary_sha256.clone(),
@@ -4020,8 +4108,12 @@ async fn run_arm_phase(
     let started = Instant::now();
     // Pre-committed private values (the phase runners' F4 nonce discipline):
     // the intended value is the one the receiver should report; WRONG_SENDER
-    // adds the never-delivered other value.
-    let intended_value = format!("occ3-{}", uuid::Uuid::new_v4());
+    // adds the never-delivered other value. A corpus-turn canary pins the
+    // manifest's pre-committed payload instead of minting one.
+    let intended_value = match corpus {
+        Some(corpus) => corpus.payload.clone(),
+        None => format!("occ3-{}", uuid::Uuid::new_v4()),
+    };
     let other_value = format!("occ3-{}", uuid::Uuid::new_v4());
     let nonce_commitment = sha256(intended_value.as_bytes());
     if env.expected_ranks != challenge.expected_ranks {
@@ -4044,8 +4136,12 @@ async fn run_arm_phase(
     let connector = env.connector()?;
     // Fresh per-trial session ids: a live serving process binds each session
     // id to its first enrollment, and arm trials never reuse the frozen
-    // phase ids or each other's.
-    let source_id = format!("{}-source-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    // phase ids or each other's. A corpus-turn canary enrolls the manifest's
+    // family session id (the corpus family, spec 2.1).
+    let source_id = match corpus {
+        Some(corpus) => corpus.family_id.clone(),
+        None => format!("{}-source-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple()),
+    };
     let second_source_id =
         format!("{}-source-b-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
     let receiver_id =
@@ -4068,6 +4164,20 @@ async fn run_arm_phase(
             .map(|outcome| {
                 let mut evidence = outcome.arm_evidence;
                 evidence["structural_ok"] = json!(positive_structural_ok(&evidence));
+                if let Some(corpus) = corpus {
+                    // The canary's corpus identity: the manifest turn plus
+                    // the capture the positive case armed (spec 2.2.5); the
+                    // canary counts toward the 56 like any corpus turn.
+                    evidence["corpus_turn"] = json!({
+                        "turn_id": corpus.turn_id,
+                        "bucket": corpus.bucket,
+                        "family_id": corpus.family_id,
+                        "receiver_leg": corpus.receiver_leg,
+                        "payload_sha256": corpus.payload_sha256,
+                        "capture_id": outcome.source_audit["source"]["capture_id"],
+                        "turn_nonce": outcome.source_audit["source"]["turn_nonce"],
+                    });
+                }
                 evidence
             })
             .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
@@ -4195,6 +4305,8 @@ async fn run_arm_phase(
         "semantic_nonce_match",
         "receipt_span_block",
         "coverage",
+        // Absent for plain arm trials; the corpus-turn canary's identity.
+        "corpus_turn",
     ] {
         if let Some(value) = evidence["case"].get(key).cloned() {
             evidence[key] = value;
@@ -4243,12 +4355,10 @@ async fn run_arm_phase(
     Ok(summary)
 }
 
-/// One offline arm trial against the synthetic fixture: the arm case runs
-/// exactly like the live arm trial (claim burn, evidence publication,
-/// pre-registered verdicts) with `offline-synthetic-fixture` provenance and
-/// no live success claim.
-async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, String> {
-    let journal = match journal {
+/// The fresh-journal rule every offline trial shares: an existing non-empty
+/// directory refuses (no replay into a used journal).
+fn offline_trial_journal(journal: Option<PathBuf>, prefix: &str) -> Result<PathBuf, String> {
+    match journal {
         Some(dir) => {
             if dir.exists() {
                 let nonempty = std::fs::read_dir(&dir)
@@ -4260,19 +4370,36 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
             } else {
                 std::fs::create_dir_all(&dir).map_err(|_| fail())?;
             }
-            dir
+            Ok(dir)
         }
         None => {
             let dir = std::env::temp_dir()
-                .join(format!("occ3-arm-trial-{}", uuid::Uuid::new_v4().simple()));
+                .join(format!("{prefix}-{}", uuid::Uuid::new_v4().simple()));
             std::fs::create_dir_all(&dir).map_err(|_| fail())?;
-            dir
+            Ok(dir)
         }
-    };
+    }
+}
+
+/// Shared offline trial scaffolding: the challenge file in the fresh journal,
+/// one fixture server, the phase env and the effective descriptor digest.
+/// The caller aborts the server task once the trial settles.
+struct OfflineTrial {
+    env: PhaseEnv,
+    challenge: PhaseChallenge,
+    descriptor_digest: String,
+    server: tokio::task::JoinHandle<()>,
+}
+
+async fn offline_trial_context(
+    journal: PathBuf,
+    records: Arc<Mutex<FixtureRecords>>,
+    attempt_label: &str,
+) -> Result<OfflineTrial, String> {
     let (binary_sha256, manifest_sha256, _manifest) = compute_offline_pins()?;
     let identity = fixture_identity();
     let fingerprint = identity.fingerprint();
-    let attempt_id = format!("offline-arm-attempt-{}", uuid::Uuid::new_v4().simple());
+    let attempt_id = format!("offline-{attempt_label}-attempt-{}", uuid::Uuid::new_v4().simple());
     let candidate_id = sha256("offline-synthetic-candidate".as_bytes());
     let started_at = chrono::Utc::now().to_rfc3339_opts(chrono::SecondsFormat::Micros, true);
     let challenge = mint_offline_challenge(
@@ -4290,7 +4417,6 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
         )
         .map_err(|_| fail())?,
     )?;
-    let records = Arc::new(Mutex::new(FixtureRecords::default()));
     let expires = now() + 240;
     let epoch_state = Arc::new(Mutex::new(FixtureEpoch {
         runtime_epoch: "offline-runtime-epoch-before".into(),
@@ -4339,9 +4465,603 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
         &binary_sha256,
         &manifest_sha256,
     )?;
-    let result = run_arm_phase(&env, &challenge, &descriptor_digest, arm).await;
-    server.abort();
+    Ok(OfflineTrial {
+        env,
+        challenge,
+        descriptor_digest,
+        server,
+    })
+}
+
+/// One offline arm trial against the synthetic fixture: the arm case runs
+/// exactly like the live arm trial (claim burn, evidence publication,
+/// pre-registered verdicts) with `offline-synthetic-fixture` provenance and
+/// no live success claim.
+async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, String> {
+    let journal = offline_trial_journal(journal, "occ3-arm-trial")?;
+    let trial =
+        offline_trial_context(journal, Arc::new(Mutex::new(FixtureRecords::default())), "arm")
+            .await?;
+    let result =
+        run_arm_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, arm, None).await;
+    trial.server.abort();
     result
+}
+
+/// One offline corpus turn against the synthetic fixture: the source-only
+/// turn (or the `--arm NATIVE` canary) runs exactly like the live corpus
+/// turn (claim burn, evidence publication, structural verdict) with
+/// `offline-synthetic-fixture` provenance and no live success claim.
+async fn offline_corpus_turn(
+    manifest: &CorpusTurnManifest,
+    journal: Option<PathBuf>,
+    canary: bool,
+) -> Result<Value, String> {
+    let journal = offline_trial_journal(journal, "occ3-corpus-turn")?;
+    let trial = offline_trial_context(
+        journal,
+        Arc::new(Mutex::new(FixtureRecords::default())),
+        "corpus",
+    )
+    .await?;
+    let result = if canary {
+        run_arm_phase(
+            &trial.env,
+            &trial.challenge,
+            &trial.descriptor_digest,
+            Arm::Native,
+            Some(manifest),
+        )
+        .await
+    } else {
+        run_corpus_turn_phase(
+            &trial.env,
+            &trial.challenge,
+            &trial.descriptor_digest,
+            manifest,
+        )
+        .await
+    };
+    trial.server.abort();
+    result
+}
+
+// ---------------------------------------------------------------------------
+// P4 corpus-turn collection (p4-corpus-design.md): a source-only capture
+// turn per manifest, plus the NATIVE canary through the arm machinery.
+// ---------------------------------------------------------------------------
+
+/// The per-turn manifest (spec 5.2 step 6): the runner-pinned turn identity,
+/// the bucket label, the family (= source session) id, the pre-committed
+/// payload and its sha256, and the receiver-leg flag (canary C1 only).
+#[derive(Clone, Debug, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+struct CorpusTurnManifest {
+    schema: String,
+    turn_id: String,
+    bucket: String,
+    family_id: String,
+    payload: String,
+    payload_sha256: String,
+    receiver_leg: bool,
+}
+
+/// The suite nonce grammar (spec 2.2.2): `occ3-<uuid4>`.
+fn corpus_payload_grammar_ok(payload: &str) -> bool {
+    payload
+        .strip_prefix("occ3-")
+        .and_then(|rest| uuid::Uuid::parse_str(rest).ok())
+        .is_some_and(|id| id.get_version_num() == 4)
+}
+
+fn bounded_label(value: &str, max: usize) -> bool {
+    !value.is_empty()
+        && value.len() <= max
+        && value
+            .bytes()
+            .all(|b| b.is_ascii_alphanumeric() || b == b'-' || b == b'_')
+}
+
+/// Strict load + validation of the per-turn manifest: the same
+/// bound-before-allocation, strict-decode, depth-scan, deny-unknown-fields
+/// loader every other input document uses, then the pinned-shape checks.
+/// Refusals are fixed value-free codes (the descriptor discipline).
+fn load_corpus_turn_manifest(path: &Path) -> Result<CorpusTurnManifest, String> {
+    let manifest: CorpusTurnManifest = strict_load(path, MAX_TURN_MANIFEST_BYTES)?;
+    if manifest.schema != CORPUS_TURN_MANIFEST_SCHEMA {
+        return Err("corpus_turn_manifest_schema".into());
+    }
+    // The turn id names the evidence file: filesystem-safe bytes only.
+    if !bounded_label(&manifest.turn_id, 64) {
+        return Err("corpus_turn_manifest_turn_id".into());
+    }
+    if !bounded_label(&manifest.bucket, 32) {
+        return Err("corpus_turn_manifest_bucket".into());
+    }
+    // The family id is the source session id the driver enrolls.
+    if !bounded_label(&manifest.family_id, 128) {
+        return Err("corpus_turn_manifest_family_id".into());
+    }
+    if !corpus_payload_grammar_ok(&manifest.payload) {
+        return Err("corpus_turn_manifest_payload_grammar".into());
+    }
+    if manifest.payload_sha256 != sha256(manifest.payload.as_bytes()) {
+        return Err("corpus_turn_manifest_payload_sha256".into());
+    }
+    Ok(manifest)
+}
+
+/// Corpus turns run the shipped aligner only: no arm (the source-only turn)
+/// or the NATIVE canary (the full positive case, receiver leg included).
+/// The manifest's receiver-leg flag must agree with the selection.
+fn corpus_selection_check(arm: Option<Arm>, manifest: &CorpusTurnManifest) -> Result<(), String> {
+    match arm {
+        Some(Arm::Native) if manifest.receiver_leg => Ok(()),
+        Some(Arm::Native) => Err(
+            "corpus-turn manifest receiver_leg=false refuses the NATIVE canary arm; a source-only turn selects no arm"
+                .into(),
+        ),
+        Some(arm) => Err(format!(
+            "corpus turns require the shipped aligner: {} is not admitted with --corpus-turn (no arm, or NATIVE for the canary)",
+            arm.as_str()
+        )),
+        None if manifest.receiver_leg => Err(
+            "corpus-turn manifest receiver_leg=true requires the NATIVE canary arm (--arm NATIVE)"
+                .into(),
+        ),
+        None => Ok(()),
+    }
+}
+
+/// The pinned corpus source templates (spec 2.2.1): byte-stable across the
+/// run; only the payload slot is substituted per turn.
+const CORPUS_SOURCE_SYSTEM_PROMPT: &str = "Preserve the private payload in the native source turn. State the payload verbatim as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
+
+fn corpus_source_user_prompt(payload: &str) -> String {
+    format!("The private payload is: {payload}. Emit exactly \"{payload}\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no payload in arguments.")
+}
+
+/// The corpus-turn handoff controller: the daemon's admit-only delivery
+/// semantics for the source-only turn. `send_prepared_native_handoff`
+/// admits the publication into the enrolled receiver's inbox and
+/// acknowledges it as queued - the receiver is NEVER prompted, so no
+/// receiver inference runs (the daemon controller's contract: a queued or
+/// admitted delivery is a truthful transport acknowledgement with no
+/// completion marker; the isolated arm harness instead prompts and requires
+/// Consumed). The one-shot lease then expires or is retired at close.
+struct CorpusTurnController {
+    source_catalog: AgentFamilyCatalogEntry,
+    receiver_catalog: AgentFamilyCatalogEntry,
+    source_endpoint: AgentSessionMessageEndpoint,
+    receiver_endpoint: AgentSessionMessageEndpoint,
+    receiver_native: Arc<Occ3NativeSession>,
+    /// What the one admitted publication observed, for the per-turn
+    /// evidence (publication id, message id, acknowledged status).
+    publication: Arc<Mutex<Option<Value>>>,
+}
+
+impl AgentSessionMessageController for CorpusTurnController {
+    fn authorize_native_handoff(
+        &self,
+        relationship: String,
+        selector: String,
+    ) -> BoxFuture<Result<AuthorizedNativeHandoff, String>> {
+        let authorized = (|| {
+            let receiver = self
+                .receiver_endpoint
+                .session_name
+                .as_deref()
+                .is_some_and(|name| name == selector)
+                || self.receiver_endpoint.session_id == selector;
+            if !receiver {
+                return Err("Target not in corpus catalog".into());
+            }
+            AuthorizedNativeHandoff::from_catalog(
+                &self.source_catalog,
+                &self.receiver_catalog,
+                self.source_endpoint.clone(),
+                self.receiver_endpoint.clone(),
+                &relationship,
+            )
+        })();
+        Box::pin(async move { authorized })
+    }
+    fn send_prepared_native_handoff(
+        &self,
+        prepared: PreparedNativeHandoff,
+    ) -> BoxFuture<Result<AgentSessionMessageReceipt, String>> {
+        let receiver = self.receiver_native.clone();
+        let publication = self.publication.clone();
+        let source_id = self.source_catalog.id.clone();
+        let receiver_id = self.receiver_catalog.id.clone();
+        Box::pin(async move {
+            if prepared.authorization().source_session_id() != source_id
+                || prepared.authorization().target_session_id() != receiver_id
+            {
+                return Err("Corpus handoff session binding mismatch".into());
+            }
+            // Admit-only: the receiver's inbox holds the envelope, the
+            // receiver agent is never prompted (no inference).
+            if !receiver.admit(&prepared)? {
+                return Err("Corpus receiver duplicate; no replay".into());
+            }
+            let payload = prepared.control_payload();
+            let receipt = create_agent_session_message_receipt(
+                &payload,
+                &DELIVERY_STATUS_QUEUED.to_string(),
+                &chrono::Utc::now().to_rfc3339(),
+            );
+            *publication.lock().map_err(|_| "Corpus publication journal unavailable".to_string())? =
+                Some(json!({
+                    "publication_id": prepared.publication_id(),
+                    "message_id": payload.id,
+                    "receiver_session_id": receiver_id,
+                    "delivery_status": receipt.delivery_status,
+                }));
+            Ok(receipt)
+        })
+    }
+    fn roster(
+        &self,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentFamilyRosterResult, String>> + Send>>
+    {
+        let current = AgentFamilyRosterCurrent {
+            name: self.source_endpoint.session_name.clone().unwrap_or_default(),
+            id: self.source_catalog.id.clone(),
+            depth: self.source_catalog.depth,
+        };
+        let entries = vec![AgentFamilyRosterEntry {
+            relationship: agent_family_relationship(&self.source_catalog, &self.receiver_catalog)
+                .unwrap_or_default(),
+            name: self
+                .receiver_endpoint
+                .session_name
+                .clone()
+                .unwrap_or_else(|| self.receiver_catalog.id.clone()),
+            id: self.receiver_catalog.id.clone(),
+            depth: self.receiver_catalog.depth,
+            status: FAMILY_STATUS_IDLE.into(),
+            replied_since_task: None,
+        }];
+        Box::pin(async move { Ok(AgentFamilyRosterResult { current, entries }) })
+    }
+    fn await_pending_child_publication(
+        &self,
+        _selector: String,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<Option<String>, String>> + Send>>
+    {
+        Box::pin(async { Ok(None) })
+    }
+    fn send_agent_message(
+        &self,
+        _input: AgentSessionMessageSendInput,
+    ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<AgentSessionMessageReceipt, String>> + Send>>
+    {
+        Box::pin(async { Err("Corpus turns send no agent messages".into()) })
+    }
+}
+
+/// The corpus-turn source leg (spec 5.3): enroll the family's source session
+/// and an enrolled-but-never-prompted receiver session, arm the capture
+/// with the positive case's budget, run the pinned corpus templates with
+/// the manifest payload, and let the turn terminate on the real
+/// occ3_handoff - then STOP. No receiver inference, no publication beyond
+/// the handoff's own admit-only delivery, no semantic evaluation.
+async fn run_corpus_source_turn(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    manifest: &CorpusTurnManifest,
+) -> Result<Value, String> {
+    let source =
+        Occ3NativeSession::enroll(&manifest.family_id, &env.model, connector.clone()).await?;
+    let receiver_id = format!("corpus-turn-receiver-{}", uuid::Uuid::new_v4().simple());
+    let receiver =
+        Occ3NativeSession::enroll(&receiver_id, &env.model, connector.clone()).await?;
+    let source_user_prompt = corpus_source_user_prompt(&manifest.payload);
+    let mut source_options = agent_options(&env.model, env.key.clone(), CORPUS_SOURCE_SYSTEM_PROMPT);
+    if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
+        // Root diagnostic, mirrored from the positive case: dump the armed
+        // source-turn request payload exactly as serialized. No behavior
+        // change when unset.
+        source_options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
+            let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+            Box::pin(async move { None })
+        }));
+    }
+    let source_agent = Agent::new(source_options);
+    // The REAL occ3_handoff tool, driven by the corpus-turn controller
+    // (admit-only delivery; the receiver agent is never created).
+    let controller = Arc::new(CorpusTurnController {
+        source_catalog: AgentFamilyCatalogEntry {
+            id: manifest.family_id.clone(),
+            name: Some("source".into()),
+            depth: 0.,
+            ..Default::default()
+        },
+        receiver_catalog: AgentFamilyCatalogEntry {
+            id: receiver_id.clone(),
+            name: Some("receiver".into()),
+            depth: 1.,
+            parent_session_id: Some(manifest.family_id.clone()),
+            ..Default::default()
+        },
+        source_endpoint: AgentSessionMessageEndpoint {
+            active_session_id: manifest.family_id.clone(),
+            session_id: manifest.family_id.clone(),
+            session_name: Some("source".into()),
+            ..Default::default()
+        },
+        receiver_endpoint: AgentSessionMessageEndpoint {
+            active_session_id: receiver_id.clone(),
+            session_id: receiver_id.clone(),
+            session_name: Some("receiver".into()),
+            ..Default::default()
+        },
+        receiver_native: receiver.clone(),
+        publication: Arc::new(Mutex::new(None)),
+    });
+    let publication_slot = controller.publication.clone();
+    // The same installation the isolated family performs for a member:
+    // receiver resolver, source capture hooks, the handoff tool.
+    source_agent.set_resolve_inference_state(Some(source.receiver_resolver()));
+    source_agent.set_source_capture_hooks(Some(source.source_hooks()));
+    {
+        let mut state = source_agent.state();
+        let mut tools = state.tools.take().unwrap_or_default();
+        tools.push(source.handoff_tool(controller));
+        state.tools = Some(tools);
+        source_agent.set_state(state);
+    }
+    source.arm_source(NativeSourceBudget {
+        retained_count_limit: 128,
+        max_capture_bytes: env.max_capture_bytes,
+        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+        max_response_bytes: env.max_response_bytes,
+    })?;
+    let action = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        source_agent.prompt(PromptInput::Text {
+            input: source_user_prompt,
+            images: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    // Evidence extraction happens before cleanup.
+    let source_audit = source.audit();
+    let receiver_inbox = receiver.audit()["receiver"].clone();
+    let span_block = source.span_evidence();
+    let sender_content = assistant_text_content(&source_agent);
+    let value_in_sender_content = sender_content.contains(&manifest.payload);
+    let source_tool_calls = count_tool_calls(&source_agent);
+    let capture_state = source_audit["source"]["state"]
+        .as_str()
+        .map(str::to_string);
+    // Fail-closed naming: a turn whose capture did not reach Captured still
+    // records why - the prompt error, else the capture lease's own state
+    // (a declined/interrupted armed request surfaces as the lease state,
+    // e.g. Uncertain, with the request id in the same evidence).
+    let source_turn_error = action.as_ref().err().cloned().or_else(|| {
+        capture_state.as_deref().and_then(|state| {
+            (state != "Captured").then(|| format!("capture_not_captured_{state}"))
+        })
+    });
+    let source_state_ok = source_audit["source"]["state"] == json!("Captured")
+        && source_audit["source"]["tool_claimed"] == json!(true)
+        && source_audit["source"]["handoff_admitted"] == json!(true)
+        && source_audit["source"]["published_message"].is_array();
+    // The WRONG_SENDER retirement pattern: the capture is retired at close,
+    // the never-consumed receiver lease is dropped with the session.
+    let cleanup_ok = source.close().await.is_ok() && receiver.close().await.is_ok();
+    Ok(json!({
+        "observed": observed_from(env, &source_audit),
+        "capture_id": source_audit["source"]["capture_id"],
+        "turn_nonce": source_audit["source"]["turn_nonce"],
+        "source_request_id": source_audit["source"]["source_request_id"],
+        "capture_state": capture_state,
+        "tool_claimed": source_audit["source"]["tool_claimed"],
+        "handoff_admitted": source_audit["source"]["handoff_admitted"],
+        "published_message": source_audit["source"]["published_message"],
+        "source_state_ok": source_state_ok,
+        "source_tool_calls": source_tool_calls,
+        "receiver_inbox": receiver_inbox,
+        "receiver_publication": publication_slot.lock().unwrap().clone(),
+        "receiver_session": receiver_id,
+        "receipt_span_block": span_block,
+        "sender_final_content": sender_content,
+        "sender_final_content_contains_value": value_in_sender_content,
+        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "cleanup_ok": cleanup_ok,
+        "source_turn_error": source_turn_error,
+    }))
+}
+
+/// One P4 corpus turn: verify the staging the driver can see, burn the
+/// one-shot phase claim on the manifest's pre-committed payload sha256,
+/// run the source-only turn, ALWAYS publish the per-turn evidence JSON (a
+/// failed turn is recorded, never silently dropped), then apply the
+/// pre-registered STRUCTURAL verdict - no receiver inference, no semantic
+/// pass condition (the corpus row is collected server-side at capture
+/// commit, before/independent of any consume). The frozen report fieldset
+/// is untouched.
+async fn run_corpus_turn_phase(
+    env: &PhaseEnv,
+    challenge: &PhaseChallenge,
+    descriptor_digest: &str,
+    manifest: &CorpusTurnManifest,
+) -> Result<Value, String> {
+    let pins = ReportPins {
+        binary_sha256: env.harness_binary_sha256.clone(),
+        source_manifest_sha256: env.source_manifest_sha256.clone(),
+        identity_fingerprint: env.identity.fingerprint(),
+        profile_digest: env.profile_digest.clone(),
+        endpoint_origin: url::Url::parse(&env.endpoint)
+            .map_err(|_| fail())?
+            .origin()
+            .ascii_serialization(),
+    };
+    // Corpus turns require the shipped aligner: the NATIVE arm's staging
+    // check (a readable control file with a token refuses).
+    let readback = arm_control_readback();
+    arm_staging_check(Arm::Native, &readback)?;
+    if env.expected_ranks != challenge.expected_ranks {
+        return Err("challenge_ranks_mismatch".into());
+    }
+    let trial_id = format!("corpus-{}", uuid::Uuid::new_v4().simple());
+    let turn_started_at = now();
+    let started = Instant::now();
+    // Durable one-shot claim BEFORE any effect: the attempt is spent whether
+    // the turn passes or fails (one attempt per invocation, like the arms).
+    // The committed value is the manifest's pre-committed payload sha256.
+    write_phase_claim(
+        &env.journal,
+        &challenge.phase,
+        challenge,
+        &pins,
+        &manifest.payload_sha256,
+        &PreMintedIds {
+            publication_id: format!("publication-{}", uuid::Uuid::new_v4()),
+            message_id: format!("message-{}", uuid::Uuid::new_v4()),
+        },
+        descriptor_digest,
+    )?;
+    let connector = env.connector()?;
+    let case_result = run_corpus_source_turn(env, &connector, manifest).await;
+    let (mut case_evidence, turn_error) = match case_result {
+        Ok(evidence) => (evidence, None),
+        Err(error) => (json!({"trial_error": error.clone()}), Some(error)),
+    };
+    // Live-only tokenize cross-check (the arms' TOKEN_FULL discipline): the
+    // receipt-span verdict stays authoritative; offline records null.
+    if let Some(content) = case_evidence["sender_final_content"].as_str() {
+        match tokenize_message_count(env, content).await {
+            Some((count, route)) => {
+                case_evidence["coverage"]["tokenize_count"] = json!(count);
+                case_evidence["coverage"]["tokenize_route"] = json!(route);
+                case_evidence["coverage"]["tokenize_add_special_tokens"] = json!(false);
+                case_evidence["coverage"]["tokenize_count_matches_span_content_count"] = json!(
+                    case_evidence["receipt_span_block"]["span_content_count"].as_u64()
+                        == Some(count)
+                );
+            }
+            None => {
+                case_evidence["coverage"]["tokenize_count"] = Value::Null;
+                case_evidence["coverage"]["tokenize_unavailable"] = json!(true);
+            }
+        }
+    }
+    // The pre-registered structural verdict (spec section 4): the capture
+    // reached Captured through exactly one handoff binding with a complete
+    // span covering the payload; a tokenize mismatch also invalidates.
+    let source_turn_error = case_evidence["source_turn_error"]
+        .as_str()
+        .map(str::to_string)
+        .or_else(|| turn_error.clone());
+    let tokenize_mismatch =
+        case_evidence["coverage"]["tokenize_count_matches_span_content_count"] == json!(false);
+    let passed = turn_error.is_none()
+        && case_evidence["source_state_ok"] == json!(true)
+        && case_evidence["source_tool_calls"] == json!(1)
+        && case_evidence["receipt_span_block"].is_object()
+        && case_evidence["coverage"]["coverage_complete"] == json!(true)
+        && case_evidence["cleanup_ok"] == json!(true)
+        && !tokenize_mismatch;
+    let span_rows = case_evidence["receipt_span_block"]["accepted_span_end"]
+        .as_u64()
+        .zip(
+            case_evidence["receipt_span_block"]["accepted_span_start"]
+                .as_u64(),
+        )
+        .and_then(|(end, start)| end.checked_sub(start));
+    let mut evidence = json!({
+        "schema": CORPUS_TURN_EVIDENCE_SCHEMA,
+        "trial_id": trial_id,
+        "attempt_id": env.attempt_id,
+        "phase": challenge.phase,
+        "mode": if env.offline_records.is_some() {
+            "offline-synthetic-fixture"
+        } else {
+            "live-root-authorized"
+        },
+        "turn_id": manifest.turn_id,
+        "bucket": manifest.bucket,
+        "family_id": manifest.family_id,
+        "receiver_leg": manifest.receiver_leg,
+        "turn_started_at": turn_started_at,
+        "turn_completed_at": now(),
+        "timings": {
+            "turn_duration_millis": started.elapsed().as_millis() as u64,
+        },
+        "control_file": {
+            "path": readback.path,
+            "state": readback.state,
+            "sha256": readback.sha256,
+            "bytes": readback.bytes,
+            "hook_token": readback.hook_token,
+        },
+        "payload": manifest.payload,
+        "payload_sha256": manifest.payload_sha256,
+        "sessions": {
+            "source": manifest.family_id,
+            "receiver": case_evidence["receiver_session"],
+        },
+        "span_rows": span_rows,
+        "source_turn_error": source_turn_error,
+        "corpus_turn_passed": passed,
+    });
+    for key in [
+        "observed",
+        "capture_id",
+        "turn_nonce",
+        "source_request_id",
+        "capture_state",
+        "tool_claimed",
+        "handoff_admitted",
+        "published_message",
+        "source_state_ok",
+        "source_tool_calls",
+        "receiver_inbox",
+        "receiver_publication",
+        "receipt_span_block",
+        "sender_final_content",
+        "sender_final_content_contains_value",
+        "coverage",
+        "cleanup_ok",
+    ] {
+        if let Some(value) = case_evidence.get(key).cloned() {
+            evidence[key] = value;
+        }
+    }
+    let evidence_path = write_corpus_turn_evidence(&env.journal, &evidence)?;
+    let summary = json!({
+        "schema": CORPUS_TURN_TRIAL_SCHEMA,
+        "turn_id": manifest.turn_id,
+        "trial_id": trial_id,
+        "attempt_id": env.attempt_id,
+        "phase": challenge.phase,
+        "mode": evidence["mode"],
+        "receiver_leg": manifest.receiver_leg,
+        "corpus_turn_passed": passed,
+        "status": if passed { "passed" } else { "failed" },
+        "evidence_file": evidence_path
+            .file_name()
+            .map(|name| name.to_string_lossy().to_string()),
+        "capture_id": evidence["capture_id"],
+        "coverage_complete": evidence["coverage"]["coverage_complete"],
+    });
+    if let Some(error) = turn_error {
+        return Err(error);
+    }
+    if !passed {
+        return Err(format!(
+            "corpus turn {} failed (evidence: {}): {}",
+            manifest.turn_id,
+            evidence_path.display(),
+            case_evidence
+        ));
+    }
+    Ok(summary)
 }
 
 // ---------------------------------------------------------------------------
@@ -4804,7 +5524,11 @@ fn resolve_control_headers(
     Ok(Some(resolved))
 }
 
-async fn live_phase(path: &str, cli_arm: Option<Arm>) -> Result<Value, String> {
+async fn live_phase(
+    path: &str,
+    cli_arm: Option<Arm>,
+    corpus: Option<CorpusTurnManifest>,
+) -> Result<Value, String> {
     let descriptor_path = Path::new(path);
     let bytes = strict_read_bounded(descriptor_path, MAX_DESCRIPTOR_BYTES)?;
     let text = strict_decode(&bytes)?;
@@ -4921,12 +5645,24 @@ async fn live_phase(path: &str, cli_arm: Option<Arm>) -> Result<Value, String> {
         profile_digest: d.profile_digest.clone(),
     };
     let descriptor_digest = sha256(&bytes);
-    let report = match arm {
-        Some(arm) => run_arm_phase(&env, &challenge, &descriptor_digest, arm).await?,
-        None if d.phase == "before_restart" => {
+    // The corpus-turn selection is authoritative against the EFFECTIVE arm
+    // (the descriptor pin counts): source-only turns run no arm; the canary
+    // runs the NATIVE positive case with the manifest payload.
+    if let Some(corpus) = &corpus {
+        corpus_selection_check(arm, corpus)?;
+    }
+    let report = match (arm, corpus) {
+        (Some(arm), Some(corpus)) => {
+            run_arm_phase(&env, &challenge, &descriptor_digest, arm, Some(&corpus)).await?
+        }
+        (None, Some(corpus)) => {
+            run_corpus_turn_phase(&env, &challenge, &descriptor_digest, &corpus).await?
+        }
+        (Some(arm), None) => run_arm_phase(&env, &challenge, &descriptor_digest, arm, None).await?,
+        (None, None) if d.phase == "before_restart" => {
             run_before_phase(&env, &challenge, &descriptor_digest).await?
         }
-        None => run_after_phase(&env, &challenge, &descriptor_digest).await?,
+        (None, None) => run_after_phase(&env, &challenge, &descriptor_digest).await?,
     };
     Ok(report)
 }
@@ -4975,16 +5711,18 @@ async fn real_main() -> Result<(), i32> {
         eprintln!("Native phase-suite producer refused: {error}");
         return Err(1);
     }
-    // CLI: [--arm ARM] with exactly one of [--offline [DIR] | --live PATH].
-    // `--offline` keeps its historical optional positional directory; a
-    // following flag is never consumed as that directory.
+    // CLI: [--arm ARM] [--corpus-turn MANIFEST] with exactly one of
+    // [--offline [DIR] | --live PATH]. `--offline` keeps its historical
+    // optional positional directory; a following flag is never consumed as
+    // that directory.
     let mut offline: Option<Option<PathBuf>> = None;
     let mut live: Option<String> = None;
     let mut arm_flag: Option<String> = None;
+    let mut corpus_turn: Option<String> = None;
     let mut index = 0;
     let usage = || {
         eprintln!(
-            "Usage: occ3_native_phase_suite [--arm ARM] [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]"
+            "Usage: occ3_native_phase_suite [--arm ARM] [--corpus-turn TURN_MANIFEST_JSON] [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]"
         );
     };
     while index < args.len() {
@@ -4995,6 +5733,17 @@ async fn real_main() -> Result<(), i32> {
                     return Err(1);
                 };
                 if arm_flag.replace(value.clone()).is_some() {
+                    usage();
+                    return Err(1);
+                }
+                index += 2;
+            }
+            "--corpus-turn" => {
+                let Some(value) = args.get(index + 1) else {
+                    usage();
+                    return Err(1);
+                };
+                if corpus_turn.replace(value.clone()).is_some() {
                     usage();
                     return Err(1);
                 }
@@ -5043,12 +5792,50 @@ async fn real_main() -> Result<(), i32> {
             return Err(1);
         }
     };
-    let result = match (&offline, &live, arm) {
-        (None, None, None) if args.is_empty() => offline_selftest(None).await,
-        (None, None, Some(arm)) => offline_arm_trial(arm, None).await,
-        (Some(directory), None, None) => offline_selftest(directory.clone()).await,
-        (Some(directory), None, Some(arm)) => offline_arm_trial(arm, directory.clone()).await,
-        (None, Some(path), arm) => live_phase(path, arm).await,
+    // The per-turn manifest is strict-loaded and validated before any
+    // enrollment, claim or HTTP effect; the corpus-turn selection (no arm,
+    // or the NATIVE canary) refuses with the manifest's receiver-leg flag.
+    let corpus_manifest = match &corpus_turn {
+        None => None,
+        Some(path) => {
+            let manifest = load_corpus_turn_manifest(Path::new(path)).and_then(|manifest| {
+                corpus_selection_check(arm, &manifest)?;
+                Ok(manifest)
+            });
+            match manifest {
+                Ok(manifest) => Some(manifest),
+                Err(error) => {
+                    eprintln!("Native phase-suite producer refused: {error}");
+                    return Err(1);
+                }
+            }
+        }
+    };
+    let result = match (&offline, &live) {
+        (None, None) => {
+            if let Some(corpus) = &corpus_manifest {
+                let canary = arm == Some(Arm::Native);
+                offline_corpus_turn(corpus, None, canary).await
+            } else if args.is_empty() {
+                offline_selftest(None).await
+            } else if let Some(arm) = arm {
+                offline_arm_trial(arm, None).await
+            } else {
+                usage();
+                return Err(1);
+            }
+        }
+        (Some(directory), None) => {
+            if let Some(corpus) = &corpus_manifest {
+                let canary = arm == Some(Arm::Native);
+                offline_corpus_turn(corpus, directory.clone(), canary).await
+            } else if let Some(arm) = arm {
+                offline_arm_trial(arm, directory.clone()).await
+            } else {
+                offline_selftest(directory.clone()).await
+            }
+        }
+        (None, Some(path)) => live_phase(path, arm, corpus_manifest).await,
         _ => {
             usage();
             return Err(1);
@@ -6043,8 +6830,14 @@ mod gate_tests {
 
     #[cfg(windows)]
     fn find_arm_evidence(root: &Path, name: &str) -> Option<Value> {
-        // The offline arm trial journals under a fresh
-        // occ3-arm-trial-<uuid> directory in the temp root.
+        find_trial_evidence(root, name, "occ3-arm-trial-")
+    }
+
+    /// The offline trials journal under fresh
+    /// occ3-arm-trial-<uuid>/occ3-corpus-turn-<uuid> directories in the temp
+    /// root; find one evidence file by its exact name.
+    #[cfg(windows)]
+    fn find_trial_evidence(root: &Path, name: &str, prefix: &str) -> Option<Value> {
         let mut stack = vec![root.to_path_buf()];
         let mut visited = 0;
         while let Some(dir) = stack.pop() {
@@ -6061,7 +6854,7 @@ mod gate_tests {
                     if path
                         .file_name()
                         .and_then(|n| n.to_str())
-                        .is_some_and(|n| n.starts_with("occ3-arm-trial-"))
+                        .is_some_and(|n| n.starts_with(prefix))
                     {
                         let candidate = path.join(name);
                         if candidate.is_file() {
@@ -6074,5 +6867,406 @@ mod gate_tests {
             }
         }
         None
+    }
+
+    // ------------------------------------------------------------------
+    // P4 corpus-turn surface (source-only capture turns + the canary).
+    // ------------------------------------------------------------------
+
+    fn write_corpus_turn_manifest(
+        dir: &Path,
+        turn_id: &str,
+        bucket: &str,
+        family_id: &str,
+        payload: &str,
+        receiver_leg: bool,
+    ) -> PathBuf {
+        let path = dir.join(format!("turn-{turn_id}.json"));
+        let manifest = json!({
+            "schema": CORPUS_TURN_MANIFEST_SCHEMA,
+            "turn_id": turn_id,
+            "bucket": bucket,
+            "family_id": family_id,
+            "payload": payload,
+            "payload_sha256": sha256(payload.as_bytes()),
+            "receiver_leg": receiver_leg,
+        });
+        std::fs::write(&path, serde_json::to_string(&manifest).unwrap()).unwrap();
+        path
+    }
+
+    #[test]
+    fn corpus_turn_manifest_loader_accepts_the_pinned_shape_and_refuses_every_tamper() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d";
+        let path =
+            write_corpus_turn_manifest(&dir, "t01-bucket-a-fam-01", "A", "corpus-family-01", payload, false);
+        let manifest = load_corpus_turn_manifest(&path).unwrap();
+        assert_eq!(manifest.schema, CORPUS_TURN_MANIFEST_SCHEMA);
+        assert_eq!(manifest.turn_id, "t01-bucket-a-fam-01");
+        assert_eq!(manifest.bucket, "A");
+        assert_eq!(manifest.family_id, "corpus-family-01");
+        assert_eq!(manifest.payload, payload);
+        assert_eq!(manifest.payload_sha256, sha256(payload.as_bytes()));
+        assert!(!manifest.receiver_leg);
+        // Unknown fields refuse (the strict loader's deny-unknown-fields).
+        let tampered = json!({
+            "schema": CORPUS_TURN_MANIFEST_SCHEMA,
+            "turn_id": "t01-bucket-a-fam-01",
+            "bucket": "A",
+            "family_id": "corpus-family-01",
+            "payload": payload,
+            "payload_sha256": sha256(payload.as_bytes()),
+            "receiver_leg": false,
+            "extra": true,
+        });
+        let unknown_path = dir.join("turn-unknown-field.json");
+        std::fs::write(&unknown_path, serde_json::to_string(&tampered).unwrap()).unwrap();
+        assert!(load_corpus_turn_manifest(&unknown_path).is_err());
+        // Every pinned-shape violation refuses with its fixed code (an
+        // empty or whitespace value is invalid for every field).
+        for (name, error_code) in [
+            ("schema", "corpus_turn_manifest_schema"),
+            ("turn_id", "corpus_turn_manifest_turn_id"),
+            ("bucket", "corpus_turn_manifest_bucket"),
+            ("family_id", "corpus_turn_manifest_family_id"),
+            ("payload", "corpus_turn_manifest_payload_grammar"),
+            ("payload_sha256", "corpus_turn_manifest_payload_sha256"),
+        ] {
+            for value in ["", " "] {
+                let mut bad = json!({
+                    "schema": CORPUS_TURN_MANIFEST_SCHEMA,
+                    "turn_id": "t01-bucket-a-fam-01",
+                    "bucket": "A",
+                    "family_id": "corpus-family-01",
+                    "payload": payload,
+                    "payload_sha256": sha256(payload.as_bytes()),
+                    "receiver_leg": false,
+                });
+                bad[name] = json!(value);
+                let bad_path = dir.join(format!("turn-bad-{name}-{}.json", value.len()));
+                std::fs::write(&bad_path, serde_json::to_string(&bad).unwrap()).unwrap();
+                match load_corpus_turn_manifest(&bad_path) {
+                    Err(error) => assert_eq!(error, error_code, "{name}"),
+                    Ok(manifest) => panic!("{name} tamper accepted: {manifest:?}"),
+                }
+            }
+        }
+        // The nonce grammar: the payload must be a v4 uuid behind occ3-.
+        for bad_payload in [
+            "occ3-",
+            "occ3-not-a-uuid",
+            "0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d",
+            // A v1-layout uuid is not the suite nonce grammar.
+            "occ3-1f8f9f3a-6b3c-1c3e-9d2a-1e2f3a4b5c6d",
+        ] {
+            let bad_path = write_corpus_turn_manifest(
+                &dir,
+                "t01-bucket-a-fam-01",
+                "A",
+                "corpus-family-01",
+                bad_payload,
+                false,
+            );
+            assert_eq!(
+                load_corpus_turn_manifest(&bad_path).unwrap_err(),
+                "corpus_turn_manifest_payload_grammar",
+                "{bad_payload}"
+            );
+        }
+        // Path-unsafe turn ids refuse (the id names the evidence file); the
+        // file itself keeps a safe name, only the manifest content is bad.
+        for bad_turn in ["../escape", "with space", "t/01", "t01.json"] {
+            let manifest = json!({
+                "schema": CORPUS_TURN_MANIFEST_SCHEMA,
+                "turn_id": bad_turn,
+                "bucket": "A",
+                "family_id": "corpus-family-01",
+                "payload": payload,
+                "payload_sha256": sha256(payload.as_bytes()),
+                "receiver_leg": false,
+            });
+            let bad_path = dir.join("turn-path-unsafe.json");
+            std::fs::write(&bad_path, serde_json::to_string(&manifest).unwrap()).unwrap();
+            assert_eq!(
+                load_corpus_turn_manifest(&bad_path).unwrap_err(),
+                "corpus_turn_manifest_turn_id",
+                "{bad_turn}"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn corpus_turn_selection_admits_only_source_only_or_the_native_canary() {
+        let manifest = |receiver_leg| CorpusTurnManifest {
+            schema: CORPUS_TURN_MANIFEST_SCHEMA.into(),
+            turn_id: "t01-bucket-a-fam-01".into(),
+            bucket: "A".into(),
+            family_id: "corpus-family-01".into(),
+            payload: "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d".into(),
+            payload_sha256: sha256("occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d".as_bytes()),
+            receiver_leg,
+        };
+        // Source-only turn: no arm, receiver_leg=false.
+        assert!(corpus_selection_check(None, &manifest(false)).is_ok());
+        // Canary: the NATIVE arm with receiver_leg=true.
+        assert!(corpus_selection_check(Some(Arm::Native), &manifest(true)).is_ok());
+        // Any other arm refuses (corpus turns require the shipped aligner).
+        for arm in [
+            Arm::NoAttachment,
+            Arm::FullText,
+            Arm::TokenFull,
+            Arm::TokenSelected,
+            Arm::TokenNorm,
+            Arm::NullShape,
+            Arm::WrongSender,
+        ] {
+            let error = corpus_selection_check(Some(arm), &manifest(true)).unwrap_err();
+            assert!(error.contains("require the shipped aligner"), "{error}");
+        }
+        // The receiver-leg flag must agree with the selection.
+        let error = corpus_selection_check(Some(Arm::Native), &manifest(false)).unwrap_err();
+        assert!(error.contains("receiver_leg=false"), "{error}");
+        let error = corpus_selection_check(None, &manifest(true)).unwrap_err();
+        assert!(error.contains("receiver_leg=true"), "{error}");
+    }
+
+    #[cfg(windows)]
+    #[test]
+    fn corpus_turn_evidence_json_writes_canonically_and_refuses_replay() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-corpus-evidence-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let evidence = json!({
+            "schema": CORPUS_TURN_EVIDENCE_SCHEMA,
+            "turn_id": "t01-bucket-a-fam-01",
+            "trial_id": "corpus-fixed",
+            "payload": "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d",
+            "source_state_ok": true,
+            "coverage": {"coverage_complete": true},
+        });
+        let path = write_corpus_turn_evidence(&journal, &evidence).unwrap();
+        assert!(path.is_file());
+        assert!(path
+            .file_name()
+            .unwrap()
+            .to_string_lossy()
+            .contains("corpus-turn-evidence-t01-bucket-a-fam-01"));
+        // Canonical bytes: sorted keys, compact, exact readback.
+        let bytes = std::fs::read(&path).unwrap();
+        assert_eq!(bytes, canonical_json_bytes(&evidence).unwrap());
+        assert!(bytes.len() <= MAX_ARM_EVIDENCE_BYTES);
+        // One shot: the same turn id never rewrites its evidence.
+        let replay = write_corpus_turn_evidence(&journal, &evidence);
+        assert!(replay.is_err());
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// A source-only corpus turn passes offline: the capture commits, the
+    /// turn terminates on the real occ3_handoff, the publication is admitted
+    /// to an enrolled-but-never-prompted receiver, and the evidence carries
+    /// the structural verdict with no receiver fields.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corpus_turn_source_only_passes_offline() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        // A per-invocation turn id keeps the evidence name unique across
+        // test runs (the temp root is not cleaned between runs).
+        let turn_id = format!("t03-bucket-c-fam-03-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path =
+            write_corpus_turn_manifest(&dir, &turn_id, "C", "corpus-family-03", &payload, false);
+        let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        let summary = offline_corpus_turn(&manifest, None, false)
+            .await
+            .unwrap_or_else(|error| panic!("corpus turn failed: {error}"));
+        assert_eq!(summary["schema"], json!(CORPUS_TURN_TRIAL_SCHEMA));
+        assert_eq!(summary["turn_id"], json!(turn_id));
+        assert_eq!(summary["receiver_leg"], json!(false));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["corpus_turn_passed"], json!(true));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        assert!(
+            evidence_name.starts_with("corpus-turn-evidence-t03-bucket-c-fam-03"),
+            "{evidence_name}"
+        );
+        assert_eq!(evidence_name, format!("corpus-turn-evidence-{turn_id}.json"));
+        let evidence = find_trial_evidence(
+            &std::env::temp_dir(),
+            &evidence_name,
+            "occ3-corpus-turn-",
+        )
+        .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        assert_eq!(evidence["schema"], json!(CORPUS_TURN_EVIDENCE_SCHEMA));
+        assert_eq!(evidence["corpus_turn_passed"], json!(true));
+        assert_eq!(evidence["receiver_leg"], json!(false));
+        assert_eq!(evidence["bucket"], json!("C"));
+        assert_eq!(evidence["family_id"], json!("corpus-family-03"));
+        assert_eq!(evidence["payload"], json!(payload));
+        assert_eq!(evidence["payload_sha256"], json!(sha256(payload.as_bytes())));
+        // The structural verdict's inputs, per the existing source audit.
+        assert_eq!(evidence["capture_state"], json!("Captured"));
+        assert_eq!(evidence["tool_claimed"], json!(true));
+        assert_eq!(evidence["handoff_admitted"], json!(true));
+        assert!(evidence["published_message"].is_array());
+        assert_eq!(evidence["source_state_ok"], json!(true));
+        assert_eq!(evidence["source_tool_calls"], json!(1));
+        assert_eq!(evidence["source_turn_error"], json!(null));
+        // Capture identity + publication id (spec 2.2.5).
+        assert!(evidence["capture_id"].as_str().is_some_and(|v| v.starts_with("capture-")));
+        assert!(evidence["turn_nonce"].as_str().is_some_and(|v| !v.is_empty()));
+        assert!(evidence["receiver_publication"]["publication_id"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("publication-")));
+        assert_eq!(evidence["receiver_publication"]["delivery_status"], json!("queued"));
+        // Span block + coverage + the offline tokenize cross-check.
+        assert!(evidence["receipt_span_block"].is_object());
+        assert_eq!(evidence["receipt_span_block"]["span_message_truncated"], json!(false));
+        assert_eq!(
+            evidence["receipt_span_block"]["span_contains_final_content"],
+            json!(true)
+        );
+        assert_eq!(evidence["span_rows"], json!(8));
+        assert_eq!(evidence["coverage"]["coverage_complete"], json!(true));
+        assert_eq!(evidence["coverage"]["value_in_sender_content"], json!(true));
+        assert_eq!(evidence["coverage"]["tokenize_count"], json!(null));
+        assert_eq!(evidence["coverage"]["tokenize_unavailable"], json!(true));
+        // The receiver session was enrolled but never prompted: exactly one
+        // admitted inbox record, never delivered or consumed.
+        assert!(evidence["receiver_inbox"].as_array().is_some_and(|entries| {
+            entries.len() == 1 && entries[0]["status"] == json!("ADMITTED")
+        }));
+        assert_eq!(evidence["sessions"]["source"], json!("corpus-family-03"));
+        assert!(evidence["sessions"]["receiver"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("corpus-turn-receiver-")));
+        assert!(evidence["timings"]["turn_duration_millis"].as_u64().is_some_and(|v| v > 0));
+        assert!(evidence["turn_started_at"].as_u64().is_some());
+        assert!(evidence["turn_completed_at"].as_u64().is_some());
+        // No receiver answer fields exist on a source-only turn.
+        assert!(evidence.get("parsed_answer").is_none());
+        assert!(evidence.get("receiver_raw_answer").is_none());
+        assert!(evidence.get("semantic_nonce_match").is_none());
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A declined capture fails the corpus turn: the evidence records
+    /// source_turn_error, the verdict is false and the invocation is
+    /// nonzero (Err) - one attempt, no retry.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corpus_turn_capture_failure_records_source_turn_error_and_fails() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("t04-bucket-b-fam-04-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path =
+            write_corpus_turn_manifest(&dir, &turn_id, "B", "corpus-family-04", &payload, false);
+        let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-corpus-turn-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            refuse_captures: true,
+            ..Default::default()
+        }));
+        let trial = offline_trial_context(journal.clone(), records, "corpus")
+            .await
+            .unwrap();
+        let result = run_corpus_turn_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, &manifest)
+            .await;
+        trial.server.abort();
+        let error = result.expect_err("a declined capture must fail the corpus turn");
+        assert!(
+            error.contains("corpus turn t04-bucket-b-fam-04"),
+            "{error}"
+        );
+        let evidence = find_trial_evidence(
+            &std::env::temp_dir(),
+            &format!("corpus-turn-evidence-{turn_id}.json"),
+            "occ3-corpus-turn-",
+        )
+        .expect("the failed turn still published its evidence");
+        assert_eq!(evidence["corpus_turn_passed"], json!(false));
+        assert_eq!(evidence["source_state_ok"], json!(false));
+        assert!(
+            evidence["source_turn_error"]
+                .as_str()
+                .is_some_and(|why| !why.is_empty()),
+            "the evidence must name why the capture did not reach Captured: {evidence}"
+        );
+        assert!(evidence["coverage"]["coverage_complete"] != json!(true));
+        assert!(evidence["receiver_publication"].is_null());
+        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The canary (corpus-turn + arm NATIVE) is the full positive case: the
+    /// receiver leg runs and the arm evidence includes the receiver fields
+    /// plus the corpus-turn identity block.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corpus_turn_canary_arm_native_runs_the_receiver_offline() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let turn_id = format!("t00-canary-d-fam-00-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path =
+            write_corpus_turn_manifest(&dir, &turn_id, "D", "corpus-family-00", &payload, true);
+        let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        let summary = offline_corpus_turn(&manifest, None, true)
+            .await
+            .unwrap_or_else(|error| panic!("canary corpus turn failed: {error}"));
+        assert_eq!(summary["schema"], json!(ARM_TRIAL_SCHEMA));
+        assert_eq!(summary["requested_arm"], json!("NATIVE"));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["arm_case_passed"], json!(true));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        assert!(evidence_name.starts_with("arm-evidence-"), "{evidence_name}");
+        let evidence =
+            find_trial_evidence(&std::env::temp_dir(), &evidence_name, "occ3-corpus-turn-")
+                .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        assert_eq!(evidence["schema"], json!(ARM_EVIDENCE_SCHEMA));
+        assert_eq!(evidence["requested_arm"], json!("NATIVE"));
+        assert_eq!(evidence["arm_case_passed"], json!(true));
+        // The receiver leg ran: the arm evidence's receiver fields.
+        assert_eq!(evidence["semantic_nonce_match"], json!(true));
+        assert_eq!(evidence["parsed_answer"], json!(payload));
+        assert!(evidence["receiver_raw_answer"].is_string());
+        assert!(evidence["finish_reason"].is_string());
+        // The receiver leg ran and consumed the state: consumed_before_tools
+        // is exactly consumed && receiver_tool_calls == 0 && source_tool_calls
+        // == 1 (the positive case's definition); the three components are in
+        // the arm evidence's case block.
+        assert_eq!(evidence["case"]["consumed"], json!(true));
+        assert_eq!(evidence["case"]["receiver_tool_calls"], json!(0));
+        assert_eq!(evidence["case"]["source_tool_calls"], json!(1));
+        assert_eq!(
+            evidence["case"]["receiver_request_audit"]["request_count"],
+            json!(1)
+        );
+        // The manifest's pre-committed payload is the intended value.
+        assert_eq!(evidence["intended_value"], json!(payload));
+        assert_eq!(evidence["intended_value_sha256"], json!(sha256(payload.as_bytes())));
+        // The corpus identity block (the canary counts toward the 56).
+        assert_eq!(evidence["corpus_turn"]["turn_id"], json!(turn_id));
+        assert_eq!(evidence["corpus_turn"]["bucket"], json!("D"));
+        assert_eq!(evidence["corpus_turn"]["family_id"], json!("corpus-family-00"));
+        assert_eq!(evidence["corpus_turn"]["receiver_leg"], json!(true));
+        assert_eq!(evidence["corpus_turn"]["payload_sha256"], json!(sha256(payload.as_bytes())));
+        assert!(evidence["corpus_turn"]["capture_id"]
+            .as_str()
+            .is_some_and(|v| v.starts_with("capture-")));
+        assert!(evidence["corpus_turn"]["turn_nonce"].as_str().is_some_and(|v| !v.is_empty()));
+        // The canary enrolled the manifest's family session as its source.
+        assert_eq!(evidence["sessions"]["source"], json!("corpus-family-00"));
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }
