@@ -1249,7 +1249,8 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
     runtime.preflight("commit_lineage", validate, descriptor=descriptor)
     record = prepared["record"]
     if type(descriptor) is CaptureWorkerDescriptor:
-        stage, count, actual = prepared["stage"], prepared["count"], prepared["actual"]
+        stage, count, actual, positions = (prepared["stage"], prepared["count"],
+                                           prepared["actual"], prepared["positions"])
         def append_ring():
             _begin_gpu(runtime, record)
             if not record.retained:
