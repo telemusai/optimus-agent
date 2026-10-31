@@ -24,6 +24,7 @@ from .attachment_contract import (
     AttachmentError, AuthenticatedContext, BackendReadiness, CaptureIntent,
     CaptureWorkerDescriptor, ConsumeWorkerDescriptor, InferenceAttachment, MAX_RECEIPT_BYTES, RECEIPT_HEADER,
     SOURCE_RECEIPT_HEADER, SourceEnrollment, Reservation, SPAN_POLICIES_V2, TERMINAL_ACK_HEADER, TERMINAL_MODE,
+    DEFERRED_RECEIPT_HEADER, DEFERRED_RECEIPT_MODE, KEEPALIVE_REQUEST_HEADER, KEEPALIVE_REQUEST_MODE,
     canonical, digest, identifier, normalize_worker_descriptor, parse_opt_in, parse_terminal_mode,
 )
 from .span_policy import resolve_runtime_markers, wire_marker_entries
@@ -96,6 +97,27 @@ def _refusal_status(reason) -> str:
 # A disconnected client may never receive the JSON error; retain a bounded log.
 # Other AttachmentError outcomes stay unlogged here.
 _CUT_TURN = frozenset({("client_disconnected", 499), ("deadline_exceeded", 504)})
+
+#: One SSE comment frame. Comment-only lines are part of the SSE grammar and
+#: must be ignored by conformant parsers (including this adapter's own audit
+#: and the pi-ai openai-completions reader), so the frame keeps an otherwise
+#: idle armed-turn transport alive without touching the attested body bytes.
+_KEEPALIVE_FRAME = b": occ3-keepalive\n\n"
+
+
+class _AwaitResult:
+    """Mutable outcome box for the keepalive race helper.
+
+    An async generator cannot return a value to its consumer, so the raced
+    operation's outcome travels in this box: `stop` marks a normal iterator
+    EOF (StopAsyncIteration), `value` carries the awaited result.
+    """
+
+    __slots__ = ("stop", "value")
+
+    def __init__(self):
+        self.stop = False
+        self.value = None
 
 
 class NativeGenerateRequest(Protocol):
@@ -231,6 +253,10 @@ class BufferProfile:
     max_receipt_bytes: int = MAX_RECEIPT_BYTES
     aggregate_header_bytes: int = 3072
     ordinary_header_reserve: int = 768
+    #: SSE comment keepalive cadence for keepalive-mode armed streaming turns.
+    #: The interval is server-owned (the client only opts in with a version
+    #: token) so a request can never dictate the emission rate.
+    keepalive_seconds: float = 30
 
     def __post_init__(self):
         integer_fields = (self.max_buffer_bytes, self.max_active, self.total_working_bytes,
@@ -246,7 +272,7 @@ class BufferProfile:
             raise ValueError("invalid buffer profile")
         if any(not math.isfinite(x) or x <= 0 for x in (
             self.max_ttl_seconds, self.max_turn_seconds, self.cleanup_seconds,
-            self.disconnect_interval, self.deadline_margin_seconds,
+            self.disconnect_interval, self.deadline_margin_seconds, self.keepalive_seconds,
         )):
             raise ValueError("invalid buffer profile")
 
@@ -365,6 +391,13 @@ class _Context:
     # Receiver continuous-prefix placement resolved from the rendered prompt.
     prefix_offset: int = 0
     prefix_layout: str = "prepend"
+    # Keepalive streaming hand-off: the buffered armed-turn response is being
+    # returned as a StreamingResponse whose body generator owns the drain, the
+    # proof, the emission and the settle for this context.
+    stream_handed_off: bool = False
+    keepalive_stream: bool = False
+    stream_settled: bool = False
+    stream_watchdog_task: Any = None
 
 
 class ChatAttachmentAdapter:
@@ -473,6 +506,12 @@ class ChatAttachmentAdapter:
                     raise AttachmentError("unsupported_profile")
                 if getattr(request, "rid", None) is not None:
                     raise AttachmentError("unsupported_profile")
+            keepalive = self._keepalive_requested(raw_request)
+            if keepalive and not getattr(request, "stream", False):
+                # SSE comment keepalives are a streaming-shape extension; a
+                # non-streaming request cannot carry them, so the opt-in is a
+                # refusal instead of a silent downgrade to the buffered body.
+                raise AttachmentError("unsupported_profile", 409)
             if (not self._has_hook(serving._convert_to_internal_request, "convert_after")
                     or not self._has_hook(serving.tokenizer_manager.generate_request, "generate_around")):
                 raise AttachmentError("unsupported_attachment", 503)
@@ -509,6 +548,7 @@ class ChatAttachmentAdapter:
             ctx = _Context(attachment, None, raw_request, uuid.uuid4().hex, deadline, receipt)
             ctx.tm = serving.tokenizer_manager
             ctx.terminal_mode = terminal_mode
+            ctx.keepalive_stream = keepalive
             if terminal_mode is not None:
                 profile = self.terminal_profile
                 if len(self._terminal_attempts) >= profile.max_attempts:
@@ -549,7 +589,8 @@ class ChatAttachmentAdapter:
                     # charges are retained until the backend retire is
                     # positively confirmed; the legacy buffered path is
                     # unchanged.
-                    if not ctx.completed and not ctx.terminal_handed_off:
+                    if (not ctx.completed and not ctx.terminal_handed_off
+                            and not ctx.stream_handed_off):
                         if ctx.terminal_mode is None:
                             await self._bounded_cleanup(self._cleanup(ctx), ctx)
                         else:
@@ -557,14 +598,16 @@ class ChatAttachmentAdapter:
                 finally:
                     ctx.owner_finished = True
                     if ctx.terminal_mode is None:
-                        if not ctx.terminal_handed_off and not any(
-                                getattr(task, "_occ3_context", None) is ctx for task in self._quarantined):
+                        if (not ctx.terminal_handed_off and not ctx.stream_handed_off
+                                and not any(getattr(task, "_occ3_context", None) is ctx
+                                            for task in self._quarantined)):
                             self._release(ctx)
                     # Terminal charges are released ONLY by the tracked settle:
                     # known success, or a positively confirmed retire (immediate
                     # or quarantined-late). Unknown cleanup retains both charge
                     # domains and must refuse new work at the limits.
-                    if getattr(raw_request.state, _CONTEXT, None) is ctx and not ctx.terminal_handed_off:
+                    if (getattr(raw_request.state, _CONTEXT, None) is ctx
+                            and not ctx.terminal_handed_off and not ctx.stream_handed_off):
                         delattr(raw_request.state, _CONTEXT)
 
     async def _authorize_and_run(self, original, serving, request, raw_request, ctx):
@@ -860,6 +903,8 @@ class ChatAttachmentAdapter:
             if iterator is None:
                 raise AttachmentError("native_completion_failed")
             ctx.response_iterator = iterator
+            if ctx.keepalive_stream:
+                return await self._run_keepalive_stream(headers, ctx)
             chunks = []
             async for chunk in iterator:
                 if isinstance(chunk, str):
@@ -931,6 +976,335 @@ class ChatAttachmentAdapter:
         # The original delayed abort background is replaced by eager tracked cleanup.
         ctx.completed = True
         return result
+
+    @staticmethod
+    def _keepalive_requested(raw_request):
+        """Strict single-header opt-in for the keepalive streaming mode.
+
+        Absent: the ordinary buffered contract. Present: exactly one value
+        equal to the negotiated mode token; duplicates, blanks or unknown
+        values are refusals, never silent downgrades.
+        """
+        values = raw_request.headers.getlist(KEEPALIVE_REQUEST_HEADER)
+        if not values:
+            return False
+        if len(values) != 1 or values[0] != KEEPALIVE_REQUEST_MODE:
+            raise AttachmentError("unsupported_profile", 409)
+        return True
+
+    async def _run_keepalive_stream(self, headers, ctx):
+        """Buffered armed turn whose response starts before the drain.
+
+        The ordinary buffered contract cannot emit a byte before the
+        post-drain proof mints the receipt that must lead the response
+        headers, so a long native turn leaves the transport idle and
+        interproxies cut it (measured 2026-10-31, public origin: two capture
+        turns killed client-side at 426.9 s / 433.8 s while the server-side
+        captures committed). This mode keeps the attested-body contract but
+        reorders the wire: the response starts immediately, SSE comment
+        frames keep the connection warm while the inner stream drains and
+        the proof runs, and the receipt travels as the final private SSE
+        event ahead of the unchanged trailing [DONE] frame. Only requests
+        that opted in explicitly see this shape; every other client keeps
+        the byte-identical buffered contract.
+        """
+        out_headers = [(key, value) for key, value in headers
+                       if key.lower() not in (b"content-encoding", b"cache-control")]
+        if any(key.lower() in (RECEIPT_HEADER.encode(), SOURCE_RECEIPT_HEADER.encode(),
+                               DEFERRED_RECEIPT_HEADER.encode()) for key, _ in out_headers):
+            raise AttachmentError("invalid_evidence")
+        out_headers.extend([(b"content-encoding", b"identity"),
+                            (DEFERRED_RECEIPT_HEADER.encode(), DEFERRED_RECEIPT_MODE.encode("ascii")),
+                            (b"cache-control", b"no-store")])
+        native_header_bytes = sum(len(key) + len(value) + 4 for key, value in out_headers)
+        if native_header_bytes + self.profile.ordinary_header_reserve > self.profile.aggregate_header_bytes:
+            raise AttachmentError("buffer_limit", 413)
+        ctx.stream_handed_off = True  # The body generator now owns the settle.
+        # Bounded abandonment watchdog: if the response is never iterated to
+        # completion (client gone before the first byte, ASGI lifecycle gave
+        # up), the settle still runs at the disconnect cadence or the
+        # absolute deadline. Nothing relies on generator finalization.
+        try:
+            ctx.stream_watchdog_task = asyncio.create_task(self._keepalive_watchdog(ctx))
+        except RuntimeError:
+            ctx.stream_watchdog_task = None  # no running loop: nothing to watch
+        return StreamingResponse(
+            self._keepalive_body(ctx),
+            status_code=200,
+            headers={key.decode("latin-1"): value.decode("latin-1") for key, value in out_headers},
+            media_type="text/event-stream")
+
+    async def _keepalive_watchdog(self, ctx):
+        """Exactly-once settle driver for an abandoned keepalive stream.
+
+        The body generator settles itself on every exit path; this task only
+        covers the paths where that exit never happens (the response is
+        dropped without iteration or the consumer vanished mid-stream), so
+        charges and backend leases cannot outlive the context's deadline.
+        """
+        try:
+            while True:
+                if ctx.completed or ctx.stream_settled:
+                    return
+                if self.monotonic() >= ctx.deadline:
+                    await self._keepalive_settle(ctx)
+                    return
+                try:
+                    if await ctx.raw_request.is_disconnected():
+                        await self._keepalive_settle(ctx)
+                        return
+                except Exception:
+                    pass
+                await asyncio.sleep(self.profile.disconnect_interval)
+        except asyncio.CancelledError:
+            raise
+
+    async def _keepalive_settle(self, ctx):
+        """Idempotent post-handoff settle: buffered-path failure semantics.
+
+        Abort, retire and close with bounded waits exactly like the buffered
+        failure path, release the frontend charge when nothing is
+        quarantined, drop the request-state context attribute and stop the
+        watchdog. Success paths settle with nothing to clean (the native
+        iterator already reached its positive EOF and the proof is bound).
+        """
+        if ctx.stream_settled:
+            return
+        ctx.stream_settled = True
+        try:
+            if not ctx.completed:
+                ctx.cancel_requested = True
+                await self._bounded_cleanup(self._cleanup(ctx), ctx)
+            if not any(getattr(task, "_occ3_context", None) is ctx for task in self._quarantined):
+                self._release(ctx)
+            if getattr(ctx.raw_request.state, _CONTEXT, None) is ctx:
+                delattr(ctx.raw_request.state, _CONTEXT)
+        finally:
+            watchdog = ctx.stream_watchdog_task
+            if watchdog is not None and not watchdog.done() and asyncio.current_task() is not watchdog:
+                watchdog.cancel()
+
+    async def _keepalive_race(self, awaitable, ctx, next_keepalive, box):
+        """Await one operation while the response stays warm.
+
+        Races the operation against the absolute turn deadline, the client
+        disconnect (polled at the profile's disconnect interval, exactly like
+        the buffered path's _guard) and the keepalive cadence. Keepalive
+        frames are yielded only while the operation is still pending; the
+        outcome is delivered through `box` because an async generator cannot
+        return a value to `async for`.
+        """
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
+                remaining = ctx.deadline - self.monotonic()
+                if remaining <= 0:
+                    raise AttachmentError("deadline_exceeded", 504)
+                if await ctx.raw_request.is_disconnected():
+                    raise AttachmentError("client_disconnected", 499)
+                if asyncio.current_task().cancelling():
+                    raise asyncio.CancelledError
+                done, _ = await asyncio.wait(
+                    {task}, timeout=min(remaining, self.profile.disconnect_interval))
+                if done:
+                    if await ctx.raw_request.is_disconnected():
+                        raise AttachmentError("client_disconnected", 499)
+                    if asyncio.current_task().cancelling():
+                        raise asyncio.CancelledError
+                    if self.monotonic() >= ctx.deadline:
+                        raise AttachmentError("deadline_exceeded", 504)
+                    try:
+                        box.value = task.result()
+                    except StopAsyncIteration:
+                        box.stop = True
+                    return
+                now = self.monotonic()
+                if now >= next_keepalive[0]:
+                    next_keepalive[0] = now + self.profile.keepalive_seconds
+                    yield _KEEPALIVE_FRAME
+        except BaseException:
+            ctx.cancel_requested = True
+            raise
+        finally:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=self.profile.cleanup_seconds)
+                finally:
+                    if not task.done():
+                        self._quarantine(task, ctx)
+            elif not task.cancelled():
+                task.exception()  # Retrieve failure without exposing its message.
+
+    async def _close_race(self, race, ctx):
+        """Deterministically close one finished-or-suspended race generator.
+
+        The raced operation's task is owned by the race generator; without
+        this close a cancelled response could leave a pending native
+        __anext__ (and its generator chain) to asynchronous finalization.
+        The close itself is bounded by the cleanup grace and never raises.
+        """
+        try:
+            await asyncio.wait_for(race.aclose(), timeout=self.profile.cleanup_seconds)
+        except (asyncio.TimeoutError, asyncio.CancelledError, Exception):
+            pass
+
+    @staticmethod
+    def _split_trailing_done(body):
+        """Split the drained inner SSE body at its trailing [DONE] frame.
+
+        The keepalive response must deliver the private receipt event before
+        [DONE] (client SSE readers stop at the first [DONE] payload), so the
+        drained body is split at the boundary of its final frame, which the
+        native output audit already proved to be exactly the [DONE] frame.
+        The returned pieces concatenate byte-identically back to `body`.
+        """
+        offset = 0
+        last_frame_start = None
+        for match in re.finditer(rb"\r?\n\r?\n", body):
+            if body[offset:match.start()]:
+                last_frame_start = offset
+            offset = match.end()
+        if last_frame_start is None:
+            raise AttachmentError("native_completion_failed")
+        head, tail = body[:last_frame_start], body[last_frame_start:]
+        match = re.search(rb"\r?\n\r?\n", tail)
+        if (match is None or tail[:match.start()].rstrip(b"\r") != b"data: [DONE]"
+                or tail[match.end():].strip(b" \t\r\n")):
+            raise AttachmentError("native_completion_failed")
+        return head, tail
+
+    @staticmethod
+    def _stream_error_event(error):
+        """One bounded SSE error event for a post-start failure.
+
+        The HTTP status was already committed when the response started, so
+        the buffered path's status code travels in the fixed occ3 error body
+        shape instead: the bounded public code only, never payloads,
+        identifiers or handles.
+        """
+        return b"data: " + canonical({"error": {"message": error.code,
+                                                "type": "occ3_attachment_error",
+                                                "code": error.status}}) + b"\n\n"
+
+    async def _keepalive_body(self, ctx):
+        """Stream-lifetime body for one keepalive-mode armed turn.
+
+        Keepalive comment frames are emitted while the inner native stream
+        drains and while the post-drain proof runs; the attested inner body,
+        the private receipt event and the unchanged trailing [DONE] frame
+        follow only after the proof succeeds, so no unproven native byte
+        ever reaches the client. A post-start failure surfaces as one
+        bounded SSE error event and the finally settles the context exactly
+        like the buffered failure path (abort, retire, close, release).
+        """
+        source = type(ctx.attachment) is CaptureIntent
+        iterator = ctx.response_iterator
+        audit = NativeOutputAudit(ctx.reservation.max_output_bytes, source=source)
+        next_keepalive = [self.monotonic() + self.profile.keepalive_seconds]
+        try:
+            chunks = []
+            while True:
+                box = _AwaitResult()
+                race = self._keepalive_race(iterator.__anext__(), ctx, next_keepalive, box)
+                try:
+                    async for frame in race:
+                        yield frame
+                finally:
+                    await self._close_race(race, ctx)
+                if box.stop:
+                    break
+                chunk = box.value
+                if isinstance(chunk, str):
+                    chunk = chunk.encode("utf-8")
+                if not isinstance(chunk, bytes):
+                    raise AttachmentError("native_completion_failed")
+                audit.feed(chunk)
+                chunks.append(chunk)
+                if self._dump_stream_path is not None:
+                    # Root diagnostic: append every armed-turn chunk exactly
+                    # as the inner iterator yields it, before any audit or
+                    # buffering. No behavior change when the env var is unset.
+                    try:
+                        with open(self._dump_stream_path, "ab") as handle:
+                            handle.write(chunk)
+                    except OSError:
+                        pass
+            body = b"".join(chunks)
+            completion = audit.finish(ctx.native_rid)
+            if not ctx.exhausted:
+                box = _AwaitResult()
+                race = self._keepalive_race(ctx.outer.__anext__(), ctx, next_keepalive, box)
+                try:
+                    async for frame in race:
+                        yield frame
+                finally:
+                    await self._close_race(race, ctx)
+                if not box.stop:
+                    raise AttachmentError("native_completion_failed")
+            if not ctx.native_terminal or not ctx.exhausted:
+                raise AttachmentError("native_completion_failed")
+            if ctx.cancel_requested:
+                raise AttachmentError("client_disconnected", 499)
+            if source:
+                provenance = audit.source_provenance(ctx.attachment.span_policy)
+                box = _AwaitResult()
+                race = self._keepalive_race(
+                    self.backend.finish_source(ctx.enrollment, ctx.reservation, completion, provenance),
+                    ctx, next_keepalive, box)
+                try:
+                    async for frame in race:
+                        yield frame
+                finally:
+                    await self._close_race(race, ctx)
+                if box.stop:
+                    raise AttachmentError("native_completion_failed")
+                if ctx.cancel_requested:
+                    raise AttachmentError("client_disconnected", 499)
+                receipt = validate_source_evidence(ctx.attachment, ctx.enrollment, ctx.reservation,
+                                                  ctx.descriptor, completion, provenance, box.value)
+                if self.epoch() >= receipt.expires_at_epoch:
+                    raise AttachmentError("attachment_expired")
+                ctx.receipt = source_receipt_bytes(receipt, self.profile.max_receipt_bytes)
+            else:
+                box = _AwaitResult()
+                race = self._keepalive_race(
+                    self.backend.finish(ctx.reservation, completion), ctx, next_keepalive, box)
+                try:
+                    async for frame in race:
+                        yield frame
+                finally:
+                    await self._close_race(race, ctx)
+                if box.stop:
+                    raise AttachmentError("native_completion_failed")
+                if ctx.cancel_requested:
+                    raise AttachmentError("client_disconnected", 499)
+                validate_evidence(ctx.attachment, ctx.reservation, ctx.descriptor, completion, box.value)
+            head, done_frame = self._split_trailing_done(body)
+            yield head
+            yield terminal_event_bytes(terminal_envelope(
+                "source" if source else "receiver", ctx.native_rid, completion.native_rid,
+                completion.output_sha256, completion.output_bytes, json.loads(ctx.receipt)))
+            yield done_frame
+            ctx.completed = True
+            return
+        except asyncio.CancelledError:
+            raise
+        except AttachmentError as error:
+            # The response already started, so the bounded refusal that the
+            # buffered path would have answered with an HTTP status becomes
+            # one SSE error event before the stream ends.
+            yield self._stream_error_event(error)
+        except Exception as error:
+            # Unexpected failures fold into the same generic event; the
+            # bounded class name is recorded server-side only.
+            logger.error("occ3-bridge: native turn failed (inner=%s)",
+                         type(error).__name__)
+            yield self._stream_error_event(AttachmentError())
+        finally:
+            await self._keepalive_settle(ctx)
 
     def _terminal_admission(self, request, raw_request) -> bool:
         """Terminal-only admission checks. False means refusal before dispatch.

@@ -562,6 +562,18 @@ TERMINAL_MODE = "terminal-sse-v1"
 TERMINAL_MODE_FIELD = "occ3_receipt_mode"
 TERMINAL_ACK_HEADER = "x-optimus-occ3-mode"
 
+#: Buffered armed turns can opt into SSE comment keepalives: the response
+#: starts before the native stream is drained, `: occ3-keepalive` comment
+#: frames keep the transport from idling, and the receipt travels as the
+#: final SSE event instead of a response header (a header cannot be minted
+#: before the post-drain proof completes). Opt-in is a single strict request
+#: header; the response carries the matching marker so the client knows which
+#: wire contract the answer follows.
+KEEPALIVE_REQUEST_HEADER = "x-optimus-occ3-keepalive"
+KEEPALIVE_REQUEST_MODE = "keepalive-v1"
+DEFERRED_RECEIPT_HEADER = "x-optimus-occ3-deferred-receipt"
+DEFERRED_RECEIPT_MODE = "deferred-v1"
+
 
 def parse_terminal_mode(body: bytes) -> str | None:
     """Strict sibling-field negotiation for the terminal receipt mode.
