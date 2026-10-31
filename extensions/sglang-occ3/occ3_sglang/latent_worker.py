@@ -564,9 +564,11 @@ class WorkerRuntime:
         """Every rank agrees on request/error before a safe cancel can be typed."""
         value, error = None, ""
         request_binding = None if descriptor is None else digest(asdict(descriptor))
+        declined = None
         try:
             value = check()
         except Exception as exc:
+            declined = exc if isinstance(exc, LatentError) else None
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"phase": phase, "request": request_binding, "binding": value, "error": error})
         if any(item != outcomes[0] for item in outcomes):
@@ -576,6 +578,10 @@ class WorkerRuntime:
             if (error in ("expired", "retired") and not self.poisoned
                     and type(descriptor) in (CaptureWorkerDescriptor, ConsumeWorkerDescriptor)):
                 raise UniformRequestCancellation(error, descriptor.native_rid, descriptor.attempt_id)
+            # Live diagnosability (2026-10-30): re-raise the ORIGINAL decline so
+            # its bounded members (e.g. the span R-rule id) survive to the log.
+            if declined is not None and declined.code == error:
+                raise declined
             raise LatentError(error)
         return value
 

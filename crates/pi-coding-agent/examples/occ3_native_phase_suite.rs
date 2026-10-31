@@ -1793,7 +1793,25 @@ fn receiver_thinking_level() -> ThinkingLevel {
 /// agent_options for pure-consumer receivers: identical to agent_options except
 /// the env-overridable thinking level.
 fn receiver_agent_options(model: &Model, key: Arc<String>, system_prompt: &str) -> AgentOptions {
-    let mut options = agent_options(model, key, system_prompt);
+    // Live 2026-10-30 window icalib-p3final-20261030T235450Z: the GLM-5.3 chat
+    // template has no `developer` role branch, so a developer-role system
+    // prompt is silently dropped at render and the receiver never sees its
+    // contract. Force the `system` role for receiver requests only; the
+    // sender path is untouched and the on_payload audit still gates the wire.
+    let mut receiver_model = model.clone();
+    let existing = receiver_model.compat.take();
+    receiver_model.compat = Some(match existing {
+        Some(pi_ai::types::Compat::Completions(mut compat)) => {
+            compat.supports_developer_role = Some(false);
+            pi_ai::types::Compat::Completions(compat)
+        }
+        Some(other) => other,
+        None => pi_ai::types::Compat::Completions(pi_ai::types::OpenAICompletionsCompat {
+            supports_developer_role: Some(false),
+            ..Default::default()
+        }),
+    });
+    let mut options = agent_options(&receiver_model, key, system_prompt);
     if let Some(state) = options.initial_state.as_mut() {
         state.thinking_level = receiver_thinking_level();
     }
@@ -1862,9 +1880,21 @@ fn attach_receiver_audit(
             .get("max_tokens")
             .or_else(|| payload.get("max_completion_tokens"))
             .cloned();
+        // Live 2026-10-30 window icalib-p3final-20261030T235450Z: the GLM-5.3
+        // template drops `developer`-role messages at render, so the receiver
+        // contract must travel as role `system`. Recorded per request so the
+        // wire proof is in every receiver audit.
+        let system_role_present = payload
+            .get("messages")
+            .and_then(|m| m.as_array())
+            .and_then(|m| m.first())
+            .and_then(|m| m.get("role"))
+            .and_then(|r| r.as_str())
+            .is_some_and(|r| r == "system");
         let mut entry = json!({
             "source_facts_absent": absent,
             "max_tokens": max_tokens,
+            "system_role_present": system_role_present,
         });
         if require_no_occ3_keys {
             entry["occ3_keys_absent"] = json!(occ3_keys_absent);
@@ -2634,7 +2664,11 @@ async fn run_wrong_sender_case(
         Occ3NativeSession::enroll(source_b_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let source_system_prompt = "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
+    // Live 2026-10-30 window icalib-p3final-20261030T235450Z: unpinned wrong-sender
+    // source turns can end with no CONTENT run (R8 span decline). Both sources
+    // pin the final-content sentence so the span always contains the message;
+    // the WRONG_SENDER verdict still depends only on WHICH nonce arrives.
+    let source_system_prompt = "Preserve the private vault code in the native source turn. State the exact message as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
     let source_a_agent = Agent::new(agent_options(&env.model, env.key.clone(), source_system_prompt));
     let source_b_agent = Agent::new(agent_options(&env.model, env.key.clone(), source_system_prompt));
     let mut receiver_options = receiver_agent_options(&env.model, env.key.clone(), RECEIVER_SYSTEM_PROMPT);
@@ -2703,7 +2737,7 @@ async fn run_wrong_sender_case(
     let action_a = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_a_agent.prompt(PromptInput::Text {
-            input: format!("The private vault code is {other_nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
+            input: format!("The private vault code is {other_nonce}. Emit exactly \"The private vault code is {other_nonce}.\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
             images: Vec::new(),
         }),
     )
@@ -2728,7 +2762,7 @@ async fn run_wrong_sender_case(
     let action_b = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_b_agent.prompt(PromptInput::Text {
-            input: format!("The private vault code is {delivered_nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
+            input: format!("The private vault code is {delivered_nonce}. Emit exactly \"The private vault code is {delivered_nonce}.\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."),
             images: Vec::new(),
         }),
     )
@@ -4150,7 +4184,13 @@ async fn run_arm_phase(
     let case_result: Result<Value, String> = match arm {
         Arm::Native | Arm::TokenFull | Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
             let plan = PositiveArmPlan {
-                message_pinned: arm == Arm::TokenFull,
+                // Live 2026-10-30 window icalib-p3final-20261030T235450Z: unpinned
+                // positive-arm source turns can end with no CONTENT run
+                // (thinking straight to the tool call), which select_span_v2
+                // declines at R8; every positive arm plus the wrong-sender
+                // source turn pins the final-content sentence so the span
+                // always contains the message the arm measures.
+                message_pinned: true,
             };
             run_positive_case(
                 env,
@@ -5938,7 +5978,42 @@ mod gate_tests {
     /// fixture serves canned answers, so live compliance cannot be proven
     /// offline; this pin keeps the repaired prompt's required clauses from
     /// silently regressing.
-    #[test]
+    #[tokio::test]
+    async fn receiver_options_serialize_the_contract_as_the_system_role() {
+        // Live 2026-10-30 window icalib-p3final-20261030T235450Z: the deployed
+        // GLM-5.3 chat template has no `developer` role branch, so a
+        // developer-role system prompt is silently dropped at render and the
+        // receiver never sees its contract. The receiver model clone must pin
+        // supports_developer_role=false so convert_messages emits `system`.
+        let model = offline_model("http://127.0.0.1:9");
+        let options = receiver_agent_options(&model, Arc::new(FIXTURE_KEY.into()), RECEIVER_SYSTEM_PROMPT);
+        let pinned = options
+            .initial_state
+            .as_ref()
+            .and_then(|s| s.model.compat.as_ref());
+        assert!(
+            matches!(pinned, Some(pi_ai::types::Compat::Completions(c))
+                if c.supports_developer_role == Some(false)),
+            "receiver model must pin supports_developer_role=false"
+        );
+        // The audit observes the wire: a developer-role first message records
+        // system_role_present=false (the live defect), a system-role one true.
+        let captured: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        let mut opts = AgentOptions::default();
+        attach_receiver_audit(&mut opts, captured.clone(), vec![], false);
+        let hook = opts.on_payload.take().unwrap();
+        let defect = json!({"messages": [{"role": "developer", "content": RECEIVER_SYSTEM_PROMPT}], "max_tokens": 64});
+        let _ = hook(defect, &model).await;
+        assert_eq!(captured.lock().unwrap()[0]["system_role_present"], json!(false));
+        let mut fixed = AgentOptions::default();
+        let captured2: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+        attach_receiver_audit(&mut fixed, captured2.clone(), vec![], false);
+        let hook2 = fixed.on_payload.take().unwrap();
+        let repaired = json!({"messages": [{"role": "system", "content": RECEIVER_SYSTEM_PROMPT}], "max_tokens": 64});
+        let _ = hook2(repaired, &model).await;
+        assert_eq!(captured2.lock().unwrap()[0]["system_role_present"], json!(true));
+    }
+
     fn receiver_system_prompt_pins_the_data_quoting_contract() {
         for clause in [
             "authorized, operator-supervised experiment",
