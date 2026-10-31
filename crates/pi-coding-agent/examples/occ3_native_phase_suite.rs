@@ -168,7 +168,7 @@ const ARM_CONTROL_MAX_BYTES: usize = 64;
 /// P4 calibration-corpus collection (p4-corpus-design.md): the per-turn
 /// manifest schema, the per-turn evidence schema (a sibling of the arm
 /// evidence schema, section 2.2.5) and its bound.
-const CORPUS_TURN_MANIFEST_SCHEMA: &str = "optimus.occ3.p4-corpus-turn-manifest.v1";
+const CORPUS_TURN_MANIFEST_SCHEMA: &str = "optimus.occ3.p4-corpus-turn-manifest.v2";
 const CORPUS_TURN_EVIDENCE_SCHEMA: &str = "optimus.occ3.p4-corpus-turn.v1";
 const CORPUS_TURN_TRIAL_SCHEMA: &str = "optimus.occ3.p4-corpus-turn-trial.v1";
 const MAX_TURN_MANIFEST_BYTES: usize = 4096;
@@ -1019,15 +1019,34 @@ fn extract_fact(messages: &Value) -> Option<String> {
     let text = messages.to_string();
     // The corpus-turn user template states the payload with its own marker
     // (p4-corpus-design.md 2.2.1); the vault-code sentence stays the arm
-    // trials' marker. The first sentence end bounds the value in both.
+    // trials' marker. The serialized template is byte-stable, so the
+    // payload branch is bounded by its pinned terminator (". Emit exactly
+    // \") instead of the first period: a content payload (manifest v2)
+    // may contain periods. When the terminator is absent (an echoed sender
+    // message without the template phrase, e.g. the P7 full-text oracle's
+    // delivered text) the first period still bounds the value - the v1
+    // shape. The vault-code branch is unchanged: first period, 128-byte
+    // cap, the occ3- nonce prefix.
     let mut fact = None;
-    for marker in ["The private vault code is ", "The private payload is: "] {
+    for (marker, terminator, fallback, cap, nonce_prefix) in [
+        ("The private vault code is ", ".", None, 128usize, true),
+        (
+            "The private payload is: ",
+            ". Emit exactly \\\"",
+            Some('.'),
+            640,
+            false,
+        ),
+    ] {
         if let Some(start) = text.find(marker).map(|at| at + marker.len()) {
-            if let Some(end) = text[start..].find('.') {
-                let candidate = &text[start..start + end];
+            let len = text[start..]
+                .find(terminator)
+                .or_else(|| fallback.and_then(|term| text[start..].find(term)));
+            if let Some(len) = len {
+                let candidate = &text[start..start + len];
                 if !candidate.is_empty()
-                    && candidate.len() <= 128
-                    && candidate.starts_with("occ3-")
+                    && candidate.len() <= cap
+                    && (!nonce_prefix || candidate.starts_with("occ3-"))
                 {
                     fact = Some(candidate.to_string());
                 }
@@ -4692,16 +4711,40 @@ struct CorpusTurnManifest {
     bucket: String,
     family_id: String,
     payload: String,
+    /// Manifest v2 (content payloads): "nonce" (the v1 `occ3-<uuid4>`
+    /// grammar) or "content" (the turn's private content, which the sender
+    /// must emit as its complete final content). `default` keeps a
+    /// v1-shaped file DESERIALIZABLE so the schema check refuses it with
+    /// `corpus_turn_manifest_schema` (fail-closed both ways: one collection
+    /// epoch runs exactly ONE set); a v2 file missing the kind still
+    /// refuses, with the payload_kind code.
+    #[serde(default)]
+    payload_kind: String,
+    /// The coverage/leakage readback key: 4..=24 printable non-whitespace
+    /// bytes inside the payload (a nonce turn's marker is the uuid's first
+    /// 13 bytes).
+    #[serde(default)]
+    fact_marker: String,
     payload_sha256: String,
     receiver_leg: bool,
 }
 
-/// The suite nonce grammar (spec 2.2.2): `occ3-<uuid4>`.
-fn corpus_payload_grammar_ok(payload: &str) -> bool {
-    payload
-        .strip_prefix("occ3-")
-        .and_then(|rest| uuid::Uuid::parse_str(rest).ok())
-        .is_some_and(|id| id.get_version_num() == 4)
+/// The payload grammar is kind-aware (manifest v2, spec 2.2.2): a `nonce`
+/// payload stays `occ3-<uuid4>` exactly (the v1 rule); a `content` payload
+/// is 16..=640 printable-ASCII bytes with no double quote and no backslash
+/// (the emit-exactly quoting stays unambiguous, D3).
+fn corpus_payload_grammar_ok(kind: &str, payload: &str) -> bool {
+    match kind {
+        "nonce" => payload
+            .strip_prefix("occ3-")
+            .and_then(|rest| uuid::Uuid::parse_str(rest).ok())
+            .is_some_and(|id| id.get_version_num() == 4),
+        "content" => (16..=640).contains(&payload.len())
+            && payload.bytes().all(|b| (0x20..=0x7E).contains(&b))
+            && !payload.contains('"')
+            && !payload.contains('\\'),
+        _ => false,
+    }
 }
 
 fn bounded_label(value: &str, max: usize) -> bool {
@@ -4732,8 +4775,21 @@ fn load_corpus_turn_manifest(path: &Path) -> Result<CorpusTurnManifest, String> 
     if !bounded_label(&manifest.family_id, 128) {
         return Err("corpus_turn_manifest_family_id".into());
     }
-    if !corpus_payload_grammar_ok(&manifest.payload) {
+    // Manifest v2: the kind decides which grammar the payload must
+    // satisfy; an unknown kind refuses with its own code.
+    if manifest.payload_kind != "nonce" && manifest.payload_kind != "content" {
+        return Err("corpus_turn_manifest_payload_kind".into());
+    }
+    if !corpus_payload_grammar_ok(&manifest.payload_kind, &manifest.payload) {
         return Err("corpus_turn_manifest_payload_grammar".into());
+    }
+    // The fact marker: 4..=24 printable non-whitespace bytes that appear in
+    // the payload (the content turns' coverage/leakage readback key).
+    let fact_marker_ok = (4..=24).contains(&manifest.fact_marker.len())
+        && manifest.fact_marker.bytes().all(|b| b.is_ascii_graphic())
+        && manifest.payload.contains(&manifest.fact_marker);
+    if !fact_marker_ok {
+        return Err("corpus_turn_manifest_fact_marker".into());
     }
     if manifest.payload_sha256 != sha256(manifest.payload.as_bytes()) {
         return Err("corpus_turn_manifest_payload_sha256".into());
@@ -4984,6 +5040,10 @@ async fn run_corpus_source_turn(
     let span_block = source.span_evidence();
     let sender_content = assistant_text_content(&source_agent);
     let value_in_sender_content = sender_content.contains(&manifest.payload);
+    // The fact marker is the cheap coverage/leakage readback key (D5):
+    // inside the captured sender content for every kind (a nonce turn's
+    // marker rides inside its uuid).
+    let fact_marker_in_sender_content = sender_content.contains(&manifest.fact_marker);
     let source_tool_calls = count_tool_calls(&source_agent);
     let capture_state = source_audit["source"]["state"]
         .as_str()
@@ -5021,6 +5081,7 @@ async fn run_corpus_source_turn(
         "receipt_span_block": span_block,
         "sender_final_content": sender_content,
         "sender_final_content_contains_value": value_in_sender_content,
+        "fact_marker_in_sender_content": fact_marker_in_sender_content,
         "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
         "cleanup_ok": cleanup_ok,
         "source_turn_error": source_turn_error,
@@ -5176,6 +5237,7 @@ async fn run_corpus_turn_phase(
         "receipt_span_block",
         "sender_final_content",
         "sender_final_content_contains_value",
+        "fact_marker_in_sender_content",
         "coverage",
         "cleanup_ok",
     ] {
@@ -8973,6 +9035,8 @@ mod gate_tests {
         bucket: &str,
         family_id: &str,
         payload: &str,
+        payload_kind: &str,
+        fact_marker: &str,
         receiver_leg: bool,
     ) -> PathBuf {
         let path = dir.join(format!("turn-{turn_id}.json"));
@@ -8982,6 +9046,8 @@ mod gate_tests {
             "bucket": bucket,
             "family_id": family_id,
             "payload": payload,
+            "payload_kind": payload_kind,
+            "fact_marker": fact_marker,
             "payload_sha256": sha256(payload.as_bytes()),
             "receiver_leg": receiver_leg,
         });
@@ -8995,16 +9061,61 @@ mod gate_tests {
             .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let payload = "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d";
-        let path =
-            write_corpus_turn_manifest(&dir, "t01-bucket-a-fam-01", "A", "corpus-family-01", payload, false);
+        let fact_marker = "0f8f9f3a-6b3c";
+        let path = write_corpus_turn_manifest(
+            &dir,
+            "t01-bucket-a-fam-01",
+            "A",
+            "corpus-family-01",
+            payload,
+            "nonce",
+            fact_marker,
+            false,
+        );
         let manifest = load_corpus_turn_manifest(&path).unwrap();
         assert_eq!(manifest.schema, CORPUS_TURN_MANIFEST_SCHEMA);
         assert_eq!(manifest.turn_id, "t01-bucket-a-fam-01");
         assert_eq!(manifest.bucket, "A");
         assert_eq!(manifest.family_id, "corpus-family-01");
         assert_eq!(manifest.payload, payload);
+        assert_eq!(manifest.payload_kind, "nonce");
+        assert_eq!(manifest.fact_marker, fact_marker);
         assert_eq!(manifest.payload_sha256, sha256(payload.as_bytes()));
         assert!(!manifest.receiver_leg);
+        // A v2 content manifest loads (the canary C2 shape).
+        let content_payload = "The rooftop antenna inspection code is INDIGO-336 and the ratchet kit lives in the second cabinet.";
+        let content_path = write_corpus_turn_manifest(
+            &dir,
+            "t01-canary-a-fam-c2",
+            "A",
+            "corpus-family-c2",
+            content_payload,
+            "content",
+            "INDIGO-336",
+            false,
+        );
+        let content = load_corpus_turn_manifest(&content_path).unwrap();
+        assert_eq!(content.payload_kind, "content");
+        assert_eq!(content.payload, content_payload);
+        assert_eq!(content.fact_marker, "INDIGO-336");
+        // A v1-shaped manifest (the banked set) refuses with the schema
+        // code: fail-closed both ways, one collection epoch runs exactly
+        // ONE set (D2).
+        let v1_shape = json!({
+            "schema": "optimus.occ3.p4-corpus-turn-manifest.v1",
+            "turn_id": "t01-bucket-a-fam-01",
+            "bucket": "A",
+            "family_id": "corpus-family-01",
+            "payload": payload,
+            "payload_sha256": sha256(payload.as_bytes()),
+            "receiver_leg": false,
+        });
+        let v1_path = dir.join("turn-v1-shape.json");
+        std::fs::write(&v1_path, serde_json::to_string(&v1_shape).unwrap()).unwrap();
+        assert_eq!(
+            load_corpus_turn_manifest(&v1_path).unwrap_err(),
+            "corpus_turn_manifest_schema"
+        );
         // Unknown fields refuse (the strict loader's deny-unknown-fields).
         let tampered = json!({
             "schema": CORPUS_TURN_MANIFEST_SCHEMA,
@@ -9012,6 +9123,8 @@ mod gate_tests {
             "bucket": "A",
             "family_id": "corpus-family-01",
             "payload": payload,
+            "payload_kind": "nonce",
+            "fact_marker": fact_marker,
             "payload_sha256": sha256(payload.as_bytes()),
             "receiver_leg": false,
             "extra": true,
@@ -9027,6 +9140,8 @@ mod gate_tests {
             ("bucket", "corpus_turn_manifest_bucket"),
             ("family_id", "corpus_turn_manifest_family_id"),
             ("payload", "corpus_turn_manifest_payload_grammar"),
+            ("payload_kind", "corpus_turn_manifest_payload_kind"),
+            ("fact_marker", "corpus_turn_manifest_fact_marker"),
             ("payload_sha256", "corpus_turn_manifest_payload_sha256"),
         ] {
             for value in ["", " "] {
@@ -9036,6 +9151,8 @@ mod gate_tests {
                     "bucket": "A",
                     "family_id": "corpus-family-01",
                     "payload": payload,
+                    "payload_kind": "nonce",
+                    "fact_marker": fact_marker,
                     "payload_sha256": sha256(payload.as_bytes()),
                     "receiver_leg": false,
                 });
@@ -9048,7 +9165,8 @@ mod gate_tests {
                 }
             }
         }
-        // The nonce grammar: the payload must be a v4 uuid behind occ3-.
+        // The nonce grammar (kind=nonce): the payload must be a v4 uuid
+        // behind occ3-.
         for bad_payload in [
             "occ3-",
             "occ3-not-a-uuid",
@@ -9062,12 +9180,64 @@ mod gate_tests {
                 "A",
                 "corpus-family-01",
                 bad_payload,
+                "nonce",
+                fact_marker,
                 false,
             );
             assert_eq!(
                 load_corpus_turn_manifest(&bad_path).unwrap_err(),
                 "corpus_turn_manifest_payload_grammar",
                 "{bad_payload}"
+            );
+        }
+        // The content grammar (kind=content): 16..=640 printable-ASCII
+        // bytes, no double quote, no backslash, no non-ASCII byte.
+        let too_long_payload = "x".repeat(641);
+        for (bad_payload, why) in [
+            ("short payload", "too short"),
+            (too_long_payload.as_str(), "too long"),
+            ("a quoted \"payload\" of sixteen", "double quote"),
+            ("backslash \\ inside the content", "backslash"),
+            ("non-ascii caf\u{e9} payload bytes", "non-ascii byte"),
+        ] {
+            let bad_path = write_corpus_turn_manifest(
+                &dir,
+                "t01-canary-a-fam-c2",
+                "A",
+                "corpus-family-c2",
+                bad_payload,
+                "content",
+                "INDIGO-336",
+                false,
+            );
+            assert_eq!(
+                load_corpus_turn_manifest(&bad_path).unwrap_err(),
+                "corpus_turn_manifest_payload_grammar",
+                "{why}"
+            );
+        }
+        // The fact marker: 4..=24 printable non-whitespace bytes inside the
+        // payload.
+        for (bad_marker, why) in [
+            ("abc", "too short"),
+            ("a-25-byte-fact-marker-012", "too long"),
+            ("INDIGO 336", "whitespace"),
+            ("NOT-INTHE-PAYLOAD", "absent from the payload"),
+        ] {
+            let bad_path = write_corpus_turn_manifest(
+                &dir,
+                "t01-canary-a-fam-c2",
+                "A",
+                "corpus-family-c2",
+                content_payload,
+                "content",
+                bad_marker,
+                false,
+            );
+            assert_eq!(
+                load_corpus_turn_manifest(&bad_path).unwrap_err(),
+                "corpus_turn_manifest_fact_marker",
+                "{why}"
             );
         }
         // Path-unsafe turn ids refuse (the id names the evidence file); the
@@ -9079,6 +9249,8 @@ mod gate_tests {
                 "bucket": "A",
                 "family_id": "corpus-family-01",
                 "payload": payload,
+                "payload_kind": "nonce",
+                "fact_marker": fact_marker,
                 "payload_sha256": sha256(payload.as_bytes()),
                 "receiver_leg": false,
             });
@@ -9093,6 +9265,91 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The fixture's extract_fact is bounded by the pinned template
+    /// terminator for content payloads (a content payload may contain
+    /// periods, manifest v2) and keeps the vault-code branch unchanged
+    /// (first period, 128-byte cap, occ3- nonce prefix).
+    #[test]
+    fn extract_fact_bounds_the_content_payload_by_the_pinned_terminator() {
+        let payload = "The tide gate opens at the MARLIN-77 signal and the ferry departs every forty minutes. The night crew logs the seal.";
+        let messages = json!([
+            {"role": "system", "content": CORPUS_SOURCE_SYSTEM_PROMPT},
+            {"role": "user", "content": corpus_source_user_prompt(payload)},
+        ]);
+        assert_eq!(extract_fact(&messages).as_deref(), Some(payload));
+        // The vault-code branch (the arm trials and canary C1): the occ3-
+        // nonce bounded by its first period.
+        let nonce = "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d";
+        let vault = json!([
+            {"role": "user", "content": format!(
+                "The private vault code is {nonce}. Emit exactly \"The private vault code is {nonce}.\" as your complete final content before the handoff, with no other text."
+            )},
+        ]);
+        assert_eq!(extract_fact(&vault).as_deref(), Some(nonce));
+        // An echoed sender message without the template phrase keeps the
+        // v1 first-period bound (the P7 full-text oracle's delivered shape).
+        let echo = json!([
+            {"role": "user", "content": format!("The private payload is: {nonce}.")},
+        ]);
+        assert_eq!(extract_fact(&echo).as_deref(), Some(nonce));
+    }
+
+    /// The authored v2 manifest set (p4-turns-v2: 60 files, 51 content + 9
+    /// nonce) loads whole through the new path when its directory is
+    /// provided via OCC3_P4_TURNS_V2_DIR - an offline disk read only, no
+    /// network. Unset skips, so CI without the private set stays green.
+    #[test]
+    fn corpus_turn_v2_manifest_set_loads_when_provided() {
+        let Ok(root) = std::env::var("OCC3_P4_TURNS_V2_DIR") else {
+            return;
+        };
+        let mut paths = Vec::new();
+        let mut stack = vec![PathBuf::from(&root)];
+        while let Some(dir) = stack.pop() {
+            let Ok(entries) = std::fs::read_dir(&dir) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                if path.is_dir() {
+                    stack.push(path);
+                } else if path.extension().and_then(|e| e.to_str()) == Some("json") {
+                    paths.push(path);
+                }
+            }
+        }
+        paths.sort();
+        assert_eq!(paths.len(), 60, "the authored v2 set has 60 manifests");
+        let mut manifests = Vec::new();
+        for path in &paths {
+            let manifest = load_corpus_turn_manifest(path)
+                .unwrap_or_else(|error| panic!("{} refused: {error}", path.display()));
+            // The file name carries the turn id (canary: the id itself;
+            // main: <fit|val|test>-<turn_id>.json).
+            let stem = path.file_stem().and_then(|s| s.to_str()).unwrap_or_default();
+            assert!(stem.ends_with(&manifest.turn_id), "{}", path.display());
+            manifests.push(manifest);
+        }
+        let content_kind = manifests.iter().filter(|m| m.payload_kind == "content").count();
+        let nonce_kind = manifests.iter().filter(|m| m.payload_kind == "nonce").count();
+        assert_eq!(content_kind, 51);
+        assert_eq!(nonce_kind, 9);
+        // The authored uniqueness rule: every fact marker appears in
+        // exactly one payload of the whole set (the loader pins the
+        // per-file rules).
+        for manifest in &manifests {
+            let hits = manifests
+                .iter()
+                .filter(|other| other.payload.contains(&manifest.fact_marker))
+                .count();
+            assert_eq!(
+                hits, 1,
+                "marker {} of {}",
+                manifest.fact_marker, manifest.turn_id
+            );
+        }
+    }
+
     #[test]
     fn corpus_turn_selection_admits_only_source_only_or_the_native_canary() {
         let manifest = |receiver_leg| CorpusTurnManifest {
@@ -9101,6 +9358,8 @@ mod gate_tests {
             bucket: "A".into(),
             family_id: "corpus-family-01".into(),
             payload: "occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d".into(),
+            payload_kind: "nonce".into(),
+            fact_marker: "0f8f9f3a-6b3c".into(),
             payload_sha256: sha256("occ3-0f8f9f3a-6b3c-4c3e-9d2a-1e2f3a4b5c6d".as_bytes()),
             receiver_leg,
         };
@@ -9162,20 +9421,34 @@ mod gate_tests {
     /// A source-only corpus turn passes offline: the capture commits, the
     /// turn terminates on the real occ3_handoff, the publication is admitted
     /// to an enrolled-but-never-prompted receiver, and the evidence carries
-    /// the structural verdict with no receiver fields.
+    /// the structural verdict with no receiver fields. The manifest is the
+    /// v2 content kind (a bucket-B multi-fact passage with periods, so the
+    /// fixture's extract must be bounded by the template terminator, D4)
+    /// and the evidence records the fact-marker readback (D5).
     #[cfg(windows)]
     #[tokio::test]
     async fn corpus_turn_source_only_passes_offline() {
         let dir = std::env::temp_dir()
             .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
-        let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let payload = "The tide gate opens at the MARLIN-77 signal and the harbor ferry departs every forty minutes. The night crew logs the gate seal in the red binder by the wharf office.";
+        let fact_marker = "MARLIN-77";
         // A per-invocation turn id keeps the evidence name unique across
         // test runs (the temp root is not cleaned between runs).
-        let turn_id = format!("t03-bucket-c-fam-03-{}", uuid::Uuid::new_v4().simple());
-        let manifest_path =
-            write_corpus_turn_manifest(&dir, &turn_id, "C", "corpus-family-03", &payload, false);
+        let turn_id = format!("t24-bucket-b-fam-06-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path = write_corpus_turn_manifest(
+            &dir,
+            &turn_id,
+            "B",
+            "corpus-family-06",
+            payload,
+            "content",
+            fact_marker,
+            false,
+        );
         let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        assert_eq!(manifest.payload_kind, "content");
+        assert_eq!(manifest.fact_marker, fact_marker);
         let summary = offline_corpus_turn(&manifest, None, false)
             .await
             .unwrap_or_else(|error| panic!("corpus turn failed: {error}"));
@@ -9186,7 +9459,7 @@ mod gate_tests {
         assert_eq!(summary["corpus_turn_passed"], json!(true));
         let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
         assert!(
-            evidence_name.starts_with("corpus-turn-evidence-t03-bucket-c-fam-03"),
+            evidence_name.starts_with("corpus-turn-evidence-t24-bucket-b-fam-06"),
             "{evidence_name}"
         );
         assert_eq!(evidence_name, format!("corpus-turn-evidence-{turn_id}.json"));
@@ -9199,8 +9472,8 @@ mod gate_tests {
         assert_eq!(evidence["schema"], json!(CORPUS_TURN_EVIDENCE_SCHEMA));
         assert_eq!(evidence["corpus_turn_passed"], json!(true));
         assert_eq!(evidence["receiver_leg"], json!(false));
-        assert_eq!(evidence["bucket"], json!("C"));
-        assert_eq!(evidence["family_id"], json!("corpus-family-03"));
+        assert_eq!(evidence["bucket"], json!("B"));
+        assert_eq!(evidence["family_id"], json!("corpus-family-06"));
         assert_eq!(evidence["payload"], json!(payload));
         assert_eq!(evidence["payload_sha256"], json!(sha256(payload.as_bytes())));
         // The structural verdict's inputs, per the existing source audit.
@@ -9228,6 +9501,16 @@ mod gate_tests {
         assert_eq!(evidence["span_rows"], json!(8));
         assert_eq!(evidence["coverage"]["coverage_complete"], json!(true));
         assert_eq!(evidence["coverage"]["value_in_sender_content"], json!(true));
+        // The full content payload (periods included) and the fact marker
+        // are in the captured sender content (D4/D5).
+        assert_eq!(evidence["sender_final_content_contains_value"], json!(true));
+        assert_eq!(evidence["fact_marker_in_sender_content"], json!(true));
+        assert!(evidence["sender_final_content"]
+            .as_str()
+            .is_some_and(|content| content.contains(payload)));
+        assert!(evidence["sender_final_content"]
+            .as_str()
+            .is_some_and(|content| content.contains(fact_marker)));
         assert_eq!(evidence["coverage"]["tokenize_count"], json!(null));
         assert_eq!(evidence["coverage"]["tokenize_unavailable"], json!(true));
         // The receiver session was enrolled but never prompted: exactly one
@@ -9235,7 +9518,7 @@ mod gate_tests {
         assert!(evidence["receiver_inbox"].as_array().is_some_and(|entries| {
             entries.len() == 1 && entries[0]["status"] == json!("ADMITTED")
         }));
-        assert_eq!(evidence["sessions"]["source"], json!("corpus-family-03"));
+        assert_eq!(evidence["sessions"]["source"], json!("corpus-family-06"));
         assert!(evidence["sessions"]["receiver"]
             .as_str()
             .is_some_and(|v| v.starts_with("corpus-turn-receiver-")));
@@ -9249,6 +9532,49 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The D-shape nonce variant stays loadable and passing offline (the 8
+    /// bucket-D main turns and canary C1 keep the banked v1 nonce payloads
+    /// byte-identical under kind=nonce); its readback key is the occ3-
+    /// marker itself, with the fact marker riding inside the uuid.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corpus_turn_source_only_nonce_kind_passes_offline() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let fact_marker = payload[5..18].to_string();
+        let turn_id = format!("t52-bucket-d-fam-13-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path = write_corpus_turn_manifest(
+            &dir,
+            &turn_id,
+            "D",
+            "corpus-family-13",
+            &payload,
+            "nonce",
+            &fact_marker,
+            false,
+        );
+        let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        assert_eq!(manifest.payload_kind, "nonce");
+        assert_eq!(manifest.fact_marker, fact_marker);
+        let summary = offline_corpus_turn(&manifest, None, false)
+            .await
+            .unwrap_or_else(|error| panic!("nonce corpus turn failed: {error}"));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["corpus_turn_passed"], json!(true));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_trial_evidence(&std::env::temp_dir(), &evidence_name, "occ3-corpus-turn-")
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        assert_eq!(evidence["corpus_turn_passed"], json!(true));
+        assert_eq!(evidence["bucket"], json!("D"));
+        assert_eq!(evidence["payload"], json!(payload));
+        assert_eq!(evidence["payload_sha256"], json!(sha256(payload.as_bytes())));
+        assert_eq!(evidence["coverage"]["value_in_sender_content"], json!(true));
+        assert_eq!(evidence["fact_marker_in_sender_content"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A declined capture fails the corpus turn: the evidence records
     /// source_turn_error, the verdict is false and the invocation is
     /// nonzero (Err) - one attempt, no retry.
@@ -9259,9 +9585,18 @@ mod gate_tests {
             .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let fact_marker = payload[5..18].to_string();
         let turn_id = format!("t04-bucket-b-fam-04-{}", uuid::Uuid::new_v4().simple());
-        let manifest_path =
-            write_corpus_turn_manifest(&dir, &turn_id, "B", "corpus-family-04", &payload, false);
+        let manifest_path = write_corpus_turn_manifest(
+            &dir,
+            &turn_id,
+            "B",
+            "corpus-family-04",
+            &payload,
+            "nonce",
+            &fact_marker,
+            false,
+        );
         let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
         let journal = std::env::temp_dir()
             .join(format!("occ3-corpus-turn-{}", uuid::Uuid::new_v4().simple()));
@@ -9311,9 +9646,18 @@ mod gate_tests {
             .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
         std::fs::create_dir_all(&dir).unwrap();
         let payload = format!("occ3-{}", uuid::Uuid::new_v4());
+        let fact_marker = payload[5..18].to_string();
         let turn_id = format!("t00-canary-d-fam-00-{}", uuid::Uuid::new_v4().simple());
-        let manifest_path =
-            write_corpus_turn_manifest(&dir, &turn_id, "D", "corpus-family-00", &payload, true);
+        let manifest_path = write_corpus_turn_manifest(
+            &dir,
+            &turn_id,
+            "D",
+            "corpus-family-00",
+            &payload,
+            "nonce",
+            &fact_marker,
+            true,
+        );
         let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
         let summary = offline_corpus_turn(&manifest, None, true)
             .await
