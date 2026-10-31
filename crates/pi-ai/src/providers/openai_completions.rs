@@ -1748,6 +1748,9 @@ pub(crate) struct SseLineReader {
 	data: Vec<u8>,
 	has_data: bool,
 	saw_event: bool,
+	/// Set when a `: occ3-keepalive` comment line was decoded since the last
+	/// take; the transport loop forwards it as a `SsePayload::Keepalive`.
+	keepalive_seen: bool,
 }
 
 impl SseLineReader {
@@ -1757,7 +1760,13 @@ impl SseLineReader {
 			data: Vec::new(),
 			has_data: false,
 			saw_event: false,
+			keepalive_seen: false,
 		}
+	}
+
+	/// Consume the pending keepalive flag, if one was decoded.
+	pub(crate) fn take_keepalive(&mut self) -> bool {
+		std::mem::replace(&mut self.keepalive_seen, false)
 	}
 
 	/// Feed one network chunk. Each payload is passed to `on_payload` the moment
@@ -1806,6 +1815,13 @@ impl SseLineReader {
 			return self.flush();
 		}
 		if line[0] == b':' {
+			// The one comment shape the OCC-3 keepalive extension emits. Dropped
+			// from the SSE event stream exactly like any other comment, but
+			// recorded so the transport loop can surface it as a Keepalive
+			// payload for watchdog liveness.
+			if line == b": occ3-keepalive" {
+				self.keepalive_seen = true;
+			}
 			return None;
 		}
 		let (fieldname, value) = match line.iter().position(|&byte| byte == b':') {
@@ -1964,6 +1980,10 @@ enum SsePayload {
 	/// The raw payload plus its parsed `Value` when the reader already parsed it
 	/// for an attached observer; `None` means the consumer parses it.
 	Data { payload: String, parsed: Option<Value> },
+	/// The server's keepalive comment frame (`: occ3-keepalive`). It carries no
+	/// model bytes: surfacing it lets the stream event-gap watchdog observe
+	/// transport liveness during a long buffered receive phase.
+	Keepalive,
 	Done { exact: bool },
 }
 
@@ -2041,6 +2061,9 @@ async fn read_sse_data(
 			}
 		};
 		if !reader.push(&chunk, |payload| forward_sse_payload(payload, observer.as_ref(), &sender)) {
+			return;
+		}
+		if reader.take_keepalive() && !sender.send(Ok(SsePayload::Keepalive)).is_ok() {
 			return;
 		}
 	}
@@ -3305,10 +3328,19 @@ async fn run_stream_body(
 		if let Some(submission) = submission.as_ref() { submission.ensure_active()?; }
 		let (payload, parsed) = match payload? {
 			SsePayload::Data { payload, parsed } => (payload, parsed),
+			SsePayload::Keepalive => {
+				// Transport liveness only: no model bytes, no aggregation, no
+				// state changes. The event keeps a long buffered receive
+				// from tripping the stream event-gap watchdog.
+				stream.push(AssistantMessageEvent::Keepalive {
+					partial: partial_message(output, &state),
+				});
+				continue;
+			}
 			SsePayload::Done { exact } => {
 				if submission.is_some() && !exact {
 					return Err(StreamError::inference_uncertain().with_occ3_cause(OCC3_CAUSE_INCOMPLETE_STREAM));
-				}
+					}
 				done = true;
 				break;
 			}
@@ -3890,9 +3922,23 @@ mod provider_settlement_tests {
             }
             Ok(SsePayload::Data { payload, .. }) => panic!("unexpected data after the stall: {payload}"),
             Ok(SsePayload::Done { .. }) => panic!("unexpected [DONE] after the stall"),
+            Ok(SsePayload::Keepalive) => panic!("unexpected keepalive after the stall"),
         }
         reader.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_comment_frames_surface_as_keepalive_payloads() {
+        let (model, server) = local_sse(
+            ": occ3-keepalive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n: occ3-keepalive\n\ndata: [DONE]\n\n",
+            true,
+        ).await;
+        let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(keyed_options()));
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.stop_reason, "stop");
+        assert_eq!(output.content[0].as_text().unwrap().text, "ok");
+        join_server(server).await;
     }
 
     #[tokio::test]
@@ -6730,7 +6776,8 @@ mod partial_snapshot_tests {
 			| AssistantMessageEvent::ThinkingEnd { partial, .. }
 			| AssistantMessageEvent::ToolCallStart { partial, .. }
 			| AssistantMessageEvent::ToolCallDelta { partial, .. }
-			| AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+			| AssistantMessageEvent::ToolCallEnd { partial, .. }
+			| AssistantMessageEvent::Keepalive { partial } => Some(partial),
 			AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
 		}
 	}
