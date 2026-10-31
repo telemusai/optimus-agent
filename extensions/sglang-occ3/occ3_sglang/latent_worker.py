@@ -447,7 +447,18 @@ class WorkerRuntime:
         # Scalar identity of the frozen artifact, never tensor content. Empty for
         # the per-message method, which holds no artifact.
         self.calibration_digest = getattr(self.aligner, "artifact_digest", "")
-        self.registry = LatentRegistry(profile)
+        # Rank-agreed clocks: every gate whose verdict is compared across
+        # ranks reads these, refreshed from rank 0's payload slot by each
+        # gather() at zero extra collectives. A deadline/expiry boundary is
+        # then crossed by all ranks together or by none, so a turn killed at
+        # a boundary degrades to a uniform per-record decline instead of a
+        # rank-divergent gather that poisons the runtime (live evidence:
+        # 2026-10-31 P7 pilot - the 600 s event-gap kill straddled the
+        # expiry checks rank-to-rank and latched every later native turn).
+        self._agreed_epoch = time.time()
+        self._agreed_monotonic = time.monotonic()
+        self.registry = LatentRegistry(profile, epoch=lambda: self._agreed_epoch,
+                                      monotonic=lambda: self._agreed_monotonic)
         # The frozen artifact is resident on every rank for the life of the
         # runtime: charge its bytes into the rank-local live-bytes budget at
         # install so capture reservations cannot spend them twice, and expose
@@ -549,12 +560,20 @@ class WorkerRuntime:
 
     def gather(self, value):
         result = [None] * self.profile.expected_ranks
-        self.torch.distributed.all_gather_object(result, value, group=self.group.cpu_group)
-        return result
+        # Piggyback the local clocks: rank 0's read becomes the agreed
+        # clock for the NEXT gathered decision on every rank, at zero extra
+        # collectives. Same value on all ranks -> uniform boundary verdicts.
+        payload = {"v": value, "e": time.time(), "m": time.monotonic()}
+        self.torch.distributed.all_gather_object(result, payload, group=self.group.cpu_group)
+        if result and result[0] is not None:
+            self._agreed_epoch = result[0]["e"]
+            self._agreed_monotonic = result[0]["m"]
+        return [None if item is None else item["v"] for item in result]
 
     def consensus(self, value):
         values = self.gather(value)
         if not all(x == values[0] for x in values):
+            logger.error("occ3-bridge: runtime poisoned (site=consensus code=ranks)")
             self.poisoned = True
             raise LatentError("ranks")
         return value
@@ -572,6 +591,7 @@ class WorkerRuntime:
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"phase": phase, "request": request_binding, "binding": value, "error": error})
         if any(item != outcomes[0] for item in outcomes):
+            logger.error("occ3-bridge: runtime poisoned (site=preflight code=ranks phase=%s)", phase)
             self.poisoned = True
             raise LatentError("ranks")
         if error:
@@ -693,6 +713,11 @@ class WorkerRuntime:
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
                     _release_content_state(record)
+                # Fence before the retire snapshot: every recorded CUDA
+                # event is complete on every rank, so the snapshot's
+                # gpu_freed verdict is identical across ranks instead of
+                # racing per-rank event queries (a mismatch poisons).
+                self.fence()
                 result = self.registry.retire(handle=handle)
             else:
                 raise LatentError("invalid")
@@ -700,6 +725,7 @@ class WorkerRuntime:
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"error": error, "result": result})
         if any(item != outcomes[0] for item in outcomes):
+            logger.error("occ3-bridge: runtime poisoned (site=control code=ranks op=%s)", op)
             self.poisoned = True
             result, error = {}, "ranks"
         if error:
@@ -717,7 +743,10 @@ class WorkerRuntime:
         record = self.registry.source_for_attempt(descriptor.attempt_id)
         require(not record.revoked, "retired")
         if check_deadline:
-            require(descriptor.deadline > time.monotonic() and record.expires_at_epoch > time.time(), "expired")
+            # Agreed clocks (see gather): the deadline verdict is identical
+            # on every rank, never a rank-divergent straddle.
+            require(descriptor.deadline > self._agreed_monotonic
+                    and record.expires_at_epoch > self._agreed_epoch, "expired")
         expected = record.descriptor if type(descriptor) is CaptureWorkerDescriptor else record.consumer
         require(expected == descriptor, "identity")
         return record
@@ -1279,8 +1308,8 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
             return {"count": count, "end": output_end}
         try:
             runtime.preflight("commit_write", append_ring)
-        except Exception:
-            runtime.poisoned = True
+        except Exception as exc:
+            _poison_unless_uniform(runtime, exc, "commit_write")
             raise
         record.accepted_count += count
         stage.committed = True
@@ -1306,6 +1335,23 @@ def _cleanup_runtime(scheduler):
     return runtime
 
 
+def _poison_unless_uniform(runtime, exc, site):
+    """Poison only real cross-rank disagreement or engine faults.
+
+    A LatentError raised identically on every rank is a per-record decline
+    (expired, retired, identity, replay, quota, state): it must degrade to
+    a per-request outcome, never latch the runtime. Only ``ranks`` (a
+    genuine gather divergence, already set at the consensus sites) and
+    non-LatentError exceptions (engine faults) poison. One bounded log
+    line either way the latch is attributable offline.
+    """
+    uniform = isinstance(exc, LatentError) and exc.code != "ranks"
+    if not uniform:
+        logger.error("occ3-bridge: runtime poisoned (site=%s code=%s)",
+                     site, getattr(exc, "code", type(exc).__name__))
+        runtime.poisoned = True
+
+
 def fence_private_kv_release(scheduler, req):
     """Cleanup-only: no readiness/expiry gate may bypass a real KV stream fence."""
     runtime = _cleanup_runtime(scheduler)
@@ -1321,8 +1367,8 @@ def fence_private_kv_release(scheduler, req):
     try:
         runtime.preflight("private_kv_fence", fence_owned)
         prepared["record"].inflight = 0
-    except Exception:
-        runtime.poisoned = True
+    except Exception as exc:
+        _poison_unless_uniform(runtime, exc, "private_kv_fence")
         raise
 
 
@@ -1344,8 +1390,8 @@ def abort_request(scheduler, req, reason):
         runtime.preflight("abort_fence", fence_owned)
         prepared["record"].inflight = 0
         runtime.registry.retire(attempt_id=descriptor.attempt_id)
-    except Exception:
-        runtime.poisoned = True
+    except Exception as exc:
+        _poison_unless_uniform(runtime, exc, "abort_fence")
         raise
 
 

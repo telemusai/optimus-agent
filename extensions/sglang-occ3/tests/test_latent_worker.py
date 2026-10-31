@@ -728,6 +728,7 @@ def test_retire_control_refreshes_events_but_keeps_exact_idempotency_binding():
     r,_=registry(); record=ready(r); event=Event(); record.events.append(event)
     runtime=object.__new__(w.WorkerRuntime)
     runtime.profile=profile(); runtime.registry=r; runtime.commands={}; runtime.poisoned=False
+    runtime.streams={}
     runtime.gather=lambda value:[value]*8
     request=control_request("retire-op","retire",dict(source_handle="handle",source_session_id="source",principal_digest="a"*64))
     assert runtime.control(request)["result"]["gpu_freed"] is False
@@ -832,12 +833,16 @@ def test_actual_prepare_clock_crosses_between_verify_rounds_and_cleanup_is_exact
     now=[100.0]
     monkeypatch.setattr(w.time,"time",lambda:now[0])
     monkeypatch.setattr(w.time,"monotonic",lambda:now[0])
+    # Agreed clocks (rank 0's read at the last gather): the monkeypatched
+    # gather above bypasses the refresh, so advance them alongside `now`.
+    runtime._agreed_epoch=runtime._agreed_monotonic=now[0]
     monkeypatch.setattr(w,"_RUNTIME",runtime)
     scheduler=NS(occ3_runtime=runtime); request=req(capture())
     batch=NS(reqs=[request],forward_mode=NS(is_extend=lambda:False))
     w.prepare_batch(scheduler,batch)
     assert batch.occ3_context[0].output_start==0
     request.output_ids.append(17); now[0]=401.0
+    runtime._agreed_epoch=runtime._agreed_monotonic=401.0  # gathered from rank 0
     with pytest.raises(UniformRequestCancellation) as caught:
         w.prepare_batch(scheduler,batch)
     assert caught.value.native_rid==request.rid and not runtime.poisoned
@@ -866,8 +871,13 @@ def _worker_init_env(monkeypatch, *, radix_match, unified=False):
     def fake_all_gather(result, value, group=None):
         # Single-process stand-in for the 8-rank gather: replicate the local
         # value, branding per-rank layouts so the all-ranks identity check holds.
+        # gather() piggybacks the rank-0 clocks as {"v", "e", "m"}; unwrap
+        # that first so branding sees the real payload.
+        wrapped = isinstance(value, dict) and set(value) == {"v", "e", "m"}
+        inner = value["v"] if wrapped else value
         for i in range(len(result)):
-            result[i] = {**value, "rank": i} if isinstance(value, dict) and "rank" in value else value
+            slot = {**inner, "rank": i} if isinstance(inner, dict) and "rank" in inner else inner
+            result[i] = {"v": slot, "e": value["e"], "m": value["m"]} if wrapped else slot
 
     fake_torch = types.ModuleType("torch")
     fake_torch.distributed = NS(
