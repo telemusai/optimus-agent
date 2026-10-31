@@ -2639,6 +2639,38 @@ async fn run_full_text_case(
     Ok(evidence)
 }
 
+/// Name the WRONG_SENDER receiver outcome (the `source_turn_error`
+/// diagnosability pattern applied to the receiver leg). The arm's verdict
+/// is receiver-side P-vs-W only: the receiver must report the DELIVERED
+/// state's value and never the other source's. Live window
+/// icalib-p3r3-20261031T013930Z failed this arm with every structural
+/// field green: the receiver behaviorally refused the output contract
+/// (prose naming the experiment a credential-extraction attempt - neither
+/// value, not UNKNOWN). That class must be self-describing in the arm
+/// evidence so it can never be misread as a server-side acceptance
+/// question: the arm's one publication is the authorized parent's
+/// (source-B), and the wrong sender (source-A) never publishes at all.
+fn wrong_sender_receiver_outcome_class(
+    answer: &str,
+    delivered_nonce_match: bool,
+    other_nonce_match: bool,
+) -> &'static str {
+    if delivered_nonce_match {
+        "delivered_value"
+    } else if other_nonce_match {
+        "other_value"
+    } else if answer == UNKNOWN_ANSWER {
+        "unknown_answer"
+    } else if answer.trim().is_empty() {
+        "empty_answer"
+    } else {
+        // The output contract admits exactly the delivered vault code once
+        // state is attached; any other non-empty answer refused it (the
+        // live class is a behavioral refusal of the quoting contract).
+        "receiver_refusal"
+    }
+}
+
 /// WRONG_SENDER arm: the positive-case flow with a SECOND source session
 /// that emits its own independently generated value. Source-A captures its
 /// value but its handoff is the retained-control inert stub (never
@@ -2647,7 +2679,14 @@ async fn run_full_text_case(
 /// the DELIVERED state's value and not the other source's value. One-shot
 /// lease discipline: B's publication is consumed exactly once (one receiver
 /// prompt, one Consumed inbox record); A's unpublished capture is retired by
-/// family.close() through retire_native_source.
+/// family.close() through retire_native_source. The verdict is receiver-side
+/// P-vs-W only - the arm never expects the server to refuse anything: B is
+/// the receiver's authorized parent, and the only publication in the arm is
+/// B's (source-A, the wrong sender, is stubbed before its prompt and never
+/// attempts one). A live receiver that behaviorally refuses the output
+/// contract (neither value, not UNKNOWN) is named by
+/// `receiver_outcome_class` so the failure class is readable from the arm
+/// evidence alone.
 async fn run_wrong_sender_case(
     env: &PhaseEnv,
     connector: &Arc<SglangOcc3Connector>,
@@ -2775,6 +2814,8 @@ async fn run_wrong_sender_case(
     let answer_sha256 = sha256(answer.as_bytes());
     let delivered_nonce_match = answer == delivered_nonce;
     let other_nonce_match = answer == other_nonce;
+    let receiver_outcome_class =
+        wrong_sender_receiver_outcome_class(&answer, delivered_nonce_match, other_nonce_match);
     let receipts = family.receipts();
     let receiver_phase = receiver.audit()["receiver"].clone();
     let consumed_count = receiver_phase
@@ -2814,6 +2855,7 @@ async fn run_wrong_sender_case(
         "finish_reason": finish_reason,
         "delivered_nonce_match": delivered_nonce_match,
         "other_nonce_match": other_nonce_match,
+        "receiver_outcome_class": receiver_outcome_class,
         "delivered_value_sha256": sha256(delivered_nonce.as_bytes()),
         "other_value_sha256": sha256(other_nonce.as_bytes()),
         "delivered_source": "source-b",
@@ -4360,6 +4402,7 @@ async fn run_arm_phase(
             "other_value_sha256": sha256(other_value.as_bytes()),
             "delivered_value_match": evidence["case"]["delivered_nonce_match"].clone(),
             "other_value_match": evidence["case"]["other_nonce_match"].clone(),
+            "receiver_outcome_class": evidence["case"]["receiver_outcome_class"].clone(),
             "scoring": "the receiver must report the DELIVERED state's value and not the other source's value",
         });
     }
@@ -6014,6 +6057,7 @@ mod gate_tests {
         assert_eq!(captured2.lock().unwrap()[0]["system_role_present"], json!(true));
     }
 
+    #[test]
     fn receiver_system_prompt_pins_the_data_quoting_contract() {
         for clause in [
             "authorized, operator-supervised experiment",
@@ -6521,6 +6565,34 @@ mod gate_tests {
     }
 
     #[test]
+    fn wrong_sender_outcome_class_names_the_live_refusal_class() {
+        // The live p3r3 window failure: a behavioral refusal of the output
+        // contract - prose, neither value, not UNKNOWN (the refusal text
+        // from the window evidence, trimmed to its opening).
+        let refusal = "I'm not going to continue with this. This exchange is structured to extract a credential-looking secret.";
+        assert_eq!(
+            wrong_sender_receiver_outcome_class(refusal, false, false),
+            "receiver_refusal"
+        );
+        // The pass condition, the wrong-value leak, and the non-recovery
+        // classes.
+        assert_eq!(
+            wrong_sender_receiver_outcome_class("occ3-x", true, false),
+            "delivered_value"
+        );
+        assert_eq!(
+            wrong_sender_receiver_outcome_class("occ3-y", false, true),
+            "other_value"
+        );
+        assert_eq!(
+            wrong_sender_receiver_outcome_class("UNKNOWN", false, false),
+            "unknown_answer"
+        );
+        assert_eq!(wrong_sender_receiver_outcome_class("", false, false), "empty_answer");
+        assert_eq!(wrong_sender_receiver_outcome_class("   ", false, false), "empty_answer");
+    }
+
+    #[test]
     fn hook_token_mirror_matches_the_hook_parser_and_the_arm_map() {
         // Exactly the hook's _arm_token: one token, one optional newline.
         assert_eq!(hook_token_from_control_bytes(b"texact"), Some("texact"));
@@ -6897,6 +6969,14 @@ mod gate_tests {
                 assert_eq!(evidence["case"]["consumed_count"], json!(1));
                 assert_eq!(evidence["case"]["messages"], json!(1));
                 assert_eq!(evidence["case"]["a_captured_unpublished"], json!(true));
+                // The receiver outcome is named in the arm evidence (the
+                // offline fixture's receiver reports the delivered value), so
+                // a live behavioral refusal is self-describing and can never
+                // be misread as a server-side acceptance question.
+                assert_eq!(
+                    evidence["wrong_sender"]["receiver_outcome_class"],
+                    json!("delivered_value")
+                );
             }
         }
         // No frozen phase report was produced by an arm trial.
