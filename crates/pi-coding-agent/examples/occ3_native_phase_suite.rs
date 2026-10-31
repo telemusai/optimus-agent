@@ -4974,6 +4974,25 @@ impl AgentSessionMessageController for CorpusTurnController {
 /// the manifest payload, and let the turn terminate on the real
 /// occ3_handoff - then STOP. No receiver inference, no publication beyond
 /// the handoff's own admit-only delivery, no semantic evaluation.
+/// The corpus-turn pass rule (spec section 4, as amended 2026-10-31):
+/// the capture reached Captured through exactly one handoff binding whose
+/// retained window contains the payload and the complete final content.
+/// The tokenize cross-check and coverage_complete are recorded as data:
+/// tokenize(sender_final_content) equals span_content_count only when the
+/// model emitted exactly one content chunk, which is a sender-verbosity
+/// bet rather than a capture-integrity invariant (the live 061855Z window
+/// measured a captured, value-bearing, marker-bearing turn failing it);
+/// arm trials keep the stricter rule, where the pinned prompts make it a
+/// true invariant.
+fn corpus_turn_verdict_passed(case_evidence: &Value) -> bool {
+    case_evidence["source_state_ok"] == json!(true)
+        && case_evidence["source_tool_calls"] == json!(1)
+        && case_evidence["receipt_span_block"].is_object()
+        && case_evidence["coverage"]["value_in_sender_content"] == json!(true)
+        && case_evidence["coverage"]["span_contains_final_content"] == json!(true)
+        && case_evidence["cleanup_ok"] == json!(true)
+}
+
 async fn run_corpus_source_turn(
     env: &PhaseEnv,
     connector: &Arc<SglangOcc3Connector>,
@@ -5202,16 +5221,8 @@ async fn run_corpus_turn_phase(
         .as_str()
         .map(str::to_string)
         .or_else(|| turn_error.clone());
-    let tokenize_mismatch =
-        case_evidence["coverage"]["tokenize_count_matches_span_content_count"] == json!(false);
-    let passed = turn_error.is_none()
-        && case_evidence["source_state_ok"] == json!(true)
-        && case_evidence["source_tool_calls"] == json!(1)
-        && case_evidence["receipt_span_block"].is_object()
-        && case_evidence["coverage"]["value_in_sender_content"] == json!(true)
-        && case_evidence["coverage"]["span_contains_final_content"] == json!(true)
-        && case_evidence["cleanup_ok"] == json!(true)
-        && !tokenize_mismatch;
+    let passed =
+        turn_error.is_none() && corpus_turn_verdict_passed(&case_evidence);
     let span_rows = case_evidence["receipt_span_block"]["accepted_span_end"]
         .as_u64()
         .zip(
@@ -9572,6 +9583,42 @@ mod gate_tests {
     /// a thinking-bearing sender whose retained content-tail window is a
     /// strict subset of the accepted spans (span_message_truncated=true)
     /// still passes when the payload and the complete final content are
+    /// The 061855Z amendment: the tokenize cross-check is a sender-verbosity
+    /// proxy on corpus turns - tokenize(sender_final_content) equals
+    /// span_content_count only when the model emitted exactly one content
+    /// chunk. The live window measured a captured turn (value + marker +
+    /// final content all inside the window) failing the conjunct, so the
+    /// rule keeps the direct predicates and records the mismatch as data.
+    #[test]
+    fn corpus_verdict_passes_when_only_the_tokenize_proxy_mismatches() {
+        let case = json!({
+            "source_state_ok": true,
+            "source_tool_calls": 1,
+            "receipt_span_block": {"span_content_count": 40},
+            "cleanup_ok": true,
+            "coverage": {
+                "value_in_sender_content": true,
+                "span_contains_final_content": true,
+                "span_message_truncated": true,
+                "coverage_complete": false,
+                "tokenize_count": 25,
+                "tokenize_count_matches_span_content_count": false
+            }
+        });
+        assert!(corpus_turn_verdict_passed(&case));
+        // The direct predicates stay load-bearing: drop any one and the
+        // verdict fails.
+        let mut missing_value = case.clone();
+        missing_value["coverage"]["value_in_sender_content"] = json!(false);
+        assert!(!corpus_turn_verdict_passed(&missing_value));
+        let mut missing_final = case.clone();
+        missing_final["coverage"]["span_contains_final_content"] = json!(false);
+        assert!(!corpus_turn_verdict_passed(&missing_final));
+        let mut wrong_tool_calls = case.clone();
+        wrong_tool_calls["source_tool_calls"] = json!(2);
+        assert!(!corpus_turn_verdict_passed(&wrong_tool_calls));
+    }
+
     /// inside the window and the tokenize cross-check holds - the direct
     /// data-completeness predicates, not the retained==accepted proxy that
     /// is structurally unsatisfiable for corpus turns.
