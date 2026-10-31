@@ -273,3 +273,80 @@ async def test_keepalive_client_disconnect_settles(harness):
     assert harness.tm.aborts
     assert harness.backend.retires
     assert harness.tm.closed == 1
+
+@pytest.mark.asyncio
+async def test_keepalive_receive_window_frames_flow(harness):
+    """The receive window (slow first inner output) is covered by frames.
+
+    TM.first_gate models the receiver's native generation time-to-first-output:
+    the reserved-prefix prefill plus the first decode step. The pinned native
+    handler awaits that first frame inside handle_request, so before the
+    receive-phase extension the response could not even start. With the
+    extension the deferred-receipt response starts immediately and the body
+    races the native handler task with the keepalive cadence.
+    """
+    fast_profile(harness, 0.05)
+    gate = harness.tm.first_gate = asyncio.Event()
+    raw = keepalive_raw(canonical({"occ3": attachment().wire()}))
+    response = await harness.chat.handle_request(chat_request(), raw)
+    assert isinstance(response, StreamingResponse)
+    assert response.headers.get(DEFERRED_RECEIPT_HEADER) == DEFERRED_RECEIPT_MODE
+    events = []
+
+    async def send(event):
+        events.append((time.monotonic(), event))
+
+    task = asyncio.create_task(response(raw.scope, raw.receive, send))
+    await spin_until(lambda: sum(1 for _, event in events
+                                  if event["type"] == "http.response.body"
+                                  and event.get("body") == KEEPALIVE_FRAME) >= 3)
+    keepalive_times = [t for t, event in events
+                       if event["type"] == "http.response.body"
+                       and event.get("body") == KEEPALIVE_FRAME]
+    for earlier, later in zip(keepalive_times, keepalive_times[1:]):
+        assert later - earlier >= 0.045
+    # No native byte leaked while the first inner output was still pending.
+    assert not any(b"choices" in (event.get("body") or b"")
+                   for _, event in events if event["type"] == "http.response.body")
+    gate.set()
+    await task
+    body = b"".join(event.get("body", b"") for _, event in events
+                   if event["type"] == "http.response.body")
+    inner = b"".join(harness.chat.frames)
+    assert body.count(KEEPALIVE_FRAME) >= 3
+    envelope = parse_terminal_event(extract_receipt_event(body))
+    assert envelope["kind"] == "receiver"
+    assert envelope["body_sha256"] == hashlib.sha256(inner).hexdigest()
+    assert strip_comments_and_receipt(body) == inner
+    await spin_until(lambda: harness.adapter._active == 0)
+    assert not harness.tm.aborts
+    assert harness.tm.closed == 1
+    assert len(harness.backend.finishes) == 1
+
+
+@pytest.mark.asyncio
+async def test_keepalive_receive_window_disconnect_settles(harness):
+    """A client that vanishes inside the receive window still settles.
+
+    The body never gets past the receive race, so the settle path must cancel
+    the native handler task, abort the already-dispatched native request and
+    release the charge.
+    """
+    fast_profile(harness, 0.02)
+    harness.tm.first_gate = asyncio.Event()  # Never released.
+    raw, queue = raw_request(canonical({"occ3": attachment().wire()}))
+    raw.scope["headers"].append((KEEPALIVE_REQUEST_HEADER.encode(), KEEPALIVE_REQUEST_MODE.encode()))
+    response = await harness.chat.handle_request(chat_request(), raw)
+    events = []
+
+    async def send(event):
+        events.append(event)
+
+    task = asyncio.create_task(response(raw.scope, raw.receive, send))
+    await spin_until(lambda: sum(1 for e in events
+                                 if e.get("body") == KEEPALIVE_FRAME) >= 3)
+    queue.put_nowait({"type": "http.disconnect"})
+    await asyncio.wait_for(task, timeout=5)
+    await spin_until(lambda: harness.adapter._active == 0)
+    assert harness.tm.aborts
+    assert harness.backend.retires

@@ -398,6 +398,12 @@ class _Context:
     keepalive_stream: bool = False
     stream_settled: bool = False
     stream_watchdog_task: Any = None
+    # Receive-phase keepalive: the native handle_request task whose completion
+    # yields the inner response (headers plus body iterator) that the body
+    # generator then drains. Owned by the first _keepalive_race once the body
+    # starts; cancelled by the settle when the response is abandoned before
+    # any iteration.
+    receive_task: Any = None
 
 
 class ChatAttachmentAdapter:
@@ -871,6 +877,18 @@ class ChatAttachmentAdapter:
             raise AttachmentError() from None
 
     async def _run(self, original, serving, request, raw_request, ctx):
+        if (ctx.keepalive_stream and ctx.terminal_mode is None
+                and getattr(request, "stream", False)):
+            # Receive-phase keepalive. The pinned native handler kick-starts
+            # the first rendered frame inside handle_request (serving_chat
+            # _handle_streaming_request awaits generator.__anext__() before
+            # returning its StreamingResponse), so a turn whose first inner
+            # output is slow - the receiver's reserved-prefix prefill plus
+            # first decode - would otherwise hold the transport silent: no
+            # status line, no headers, no comment frames, for the whole
+            # receive window. Start the deferred-receipt response now; the
+            # body generator races the native handler itself.
+            return await self._run_keepalive_receive(original, serving, request, raw_request, ctx)
         response = await original(serving, request, raw_request)
         if ctx.cancel_requested:
             raise AttachmentError("client_disconnected", 499)
@@ -992,6 +1010,44 @@ class ChatAttachmentAdapter:
             raise AttachmentError("unsupported_profile", 409)
         return True
 
+    async def _run_keepalive_receive(self, original, serving, request, raw_request, ctx):
+        """Keepalive armed turn whose response starts before the native handler.
+
+        Same deferred-receipt contract as _run_keepalive_stream, but the
+        response starts before the inner request's first frame exists: the
+        receive window (native generation time-to-first-output) is raced by
+        the body generator against the keepalive cadence instead of delaying
+        the status line behind it. The inner response checks that _run makes
+        before its hand-off run inside the body; a refusal there surfaces as
+        the extension's bounded SSE error event, exactly like every other
+        post-start failure. The eager first frame the pinned handler consumed
+        is not lost: it is held inside the returned iterator, so the drain
+        yields it as the first data event of the stream.
+        """
+        out_headers = [(b"content-encoding", b"identity"),
+                       (DEFERRED_RECEIPT_HEADER.encode(), DEFERRED_RECEIPT_MODE.encode("ascii")),
+                       (b"cache-control", b"no-store")]
+        native_header_bytes = sum(len(key) + len(value) + 4 for key, value in out_headers)
+        if native_header_bytes + self.profile.ordinary_header_reserve > self.profile.aggregate_header_bytes:
+            raise AttachmentError("buffer_limit", 413)
+        ctx.stream_handed_off = True  # The body generator now owns the settle.
+        try:
+            # A task, not a bare coroutine: an abandoned response (never
+            # iterated) must be cancellable by the settle, and the race must
+            # own exactly one task for the native handler.
+            ctx.receive_task = asyncio.ensure_future(original(serving, request, raw_request))
+        except RuntimeError:
+            ctx.receive_task = None  # no running loop: nothing to receive
+        try:
+            ctx.stream_watchdog_task = asyncio.create_task(self._keepalive_watchdog(ctx))
+        except RuntimeError:
+            ctx.stream_watchdog_task = None  # no running loop: nothing to watch
+        return StreamingResponse(
+            self._keepalive_body(ctx),
+            status_code=200,
+            headers={key.decode("latin-1"): value.decode("latin-1") for key, value in out_headers},
+            media_type="text/event-stream")
+
     async def _run_keepalive_stream(self, headers, ctx):
         """Buffered armed turn whose response starts before the drain.
 
@@ -1074,6 +1130,18 @@ class ChatAttachmentAdapter:
         try:
             if not ctx.completed:
                 ctx.cancel_requested = True
+                receive = ctx.receive_task
+                if receive is not None and not receive.done():
+                    # Abandoned before any iteration: the body's race never
+                    # ran, so the settle cancels the native handler task
+                    # itself (bounded wait, quarantine on overrun), exactly
+                    # like the race's own finally would have.
+                    receive.cancel()
+                    try:
+                        await asyncio.wait({receive}, timeout=self.profile.cleanup_seconds)
+                    finally:
+                        if not receive.done():
+                            self._quarantine(receive, ctx)
                 await self._bounded_cleanup(self._cleanup(ctx), ctx)
             if not any(getattr(task, "_occ3_context", None) is ctx for task in self._quarantined):
                 self._release(ctx)
@@ -1201,10 +1269,59 @@ class ChatAttachmentAdapter:
         like the buffered failure path (abort, retire, close, release).
         """
         source = type(ctx.attachment) is CaptureIntent
-        iterator = ctx.response_iterator
-        audit = NativeOutputAudit(ctx.reservation.max_output_bytes, source=source)
         next_keepalive = [self.monotonic() + self.profile.keepalive_seconds]
         try:
+            if ctx.receive_task is not None:
+                # Receive phase: race the native handle_request (whose pinned
+                # body awaits the inner first frame) against the keepalive
+                # cadence, then run exactly the checks the buffered _run path
+                # makes before its hand-off. The reservation exists only
+                # after this await: _generate reserves inside the first native
+                # generator advance, which happens under the handler task.
+                box = _AwaitResult()
+                race = self._keepalive_race(ctx.receive_task, ctx, next_keepalive, box)
+                try:
+                    async for frame in race:
+                        yield frame
+                finally:
+                    await self._close_race(race, ctx)
+                response = box.value
+                if ctx.cancel_requested:
+                    raise AttachmentError("client_disconnected", 499)
+                if (ctx.reservation is None or ctx.generation_calls != 1
+                        or getattr(response, "status_code", 200) != 200):
+                    # The public code stays generic; the container log records
+                    # which condition fired so live refusals caused by adapter
+                    # or engine defects are diagnosable offline. No request
+                    # bytes, identifiers or backend handles are logged.
+                    logger.error(
+                        "occ3-bridge: native completion refused (attempt=%s cause=%s generation_calls=%s "
+                        "inner_status=%s inner_message=%r stream=%s)",
+                        ctx.attempt_id and "bound" or "none",
+                        "reservation_missing" if ctx.reservation is None else
+                        ("generation_calls" if ctx.generation_calls != 1 else "inner_error_response"),
+                        ctx.generation_calls, getattr(response, "status_code", 200),
+                        _inner_error_detail(response, 200),
+                        True,
+                    )
+                    raise AttachmentError("native_completion_failed")
+                headers = list(getattr(response, "raw_headers",
+                                       [(b"content-type", b"application/json")]))
+                if source:
+                    encodings = [value.strip().lower() for key, value in headers
+                                 if key.lower() == b"content-encoding"]
+                    if encodings not in ([], [b"identity"]):
+                        raise AttachmentError("unsupported_profile")
+                if any(key.lower() in (RECEIPT_HEADER.encode(), SOURCE_RECEIPT_HEADER.encode(),
+                                       DEFERRED_RECEIPT_HEADER.encode()) for key, _ in headers):
+                    raise AttachmentError("invalid_evidence")
+                iterator = getattr(response, "body_iterator", None)
+                if iterator is None:
+                    raise AttachmentError("native_completion_failed")
+                ctx.response_iterator = iterator
+            else:
+                iterator = ctx.response_iterator
+            audit = NativeOutputAudit(ctx.reservation.max_output_bytes, source=source)
             chunks = []
             while True:
                 box = _AwaitResult()
@@ -1304,7 +1421,20 @@ class ChatAttachmentAdapter:
                          type(error).__name__)
             yield self._stream_error_event(AttachmentError())
         finally:
-            await self._keepalive_settle(ctx)
+            # The settle must complete even when the transport framework
+            # cancels the body task: if the ASGI layer's own disconnect
+            # listener consumes the http.disconnect message before a poll
+            # does, the body's finally runs inside a cancelled scope and
+            # every unshielded await in it would die mid-cleanup (abort
+            # done, retire/close never run). The settle therefore runs in
+            # its own task, shielded from this generator's cancellation.
+            settle = asyncio.ensure_future(self._keepalive_settle(ctx))
+            try:
+                await asyncio.shield(settle)
+            except asyncio.CancelledError:
+                # The body is cancelled; the settle task keeps running to
+                # completion on its own. Never cancel it from here.
+                pass
 
     def _terminal_admission(self, request, raw_request) -> bool:
         """Terminal-only admission checks. False means refusal before dispatch.
