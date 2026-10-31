@@ -790,6 +790,12 @@ struct FixtureRecords {
     /// Test-only task-mode injection: the canned answer the synthetic
     /// receiver recovers from the delivered state (the oracle's answer).
     task_answer: Option<String>,
+    /// Test-only span injection: model a thinking-bearing sender whose
+    /// retained content-tail window is a strict subset of the accepted
+    /// spans (the live corpus shape: span_message_truncated=true with the
+    /// final content fully inside the window). The verdict rule test uses
+    /// this; the default false mirrors the simple offline fixture turn.
+    span_message_truncated: bool,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -1331,7 +1337,10 @@ async fn serve(
                                     "span_tool_arguments_count":0,"span_control_count":2,"span_unknown_count":0,
                                     "span_window_start_position":0,"span_window_end_position":10,"span_contiguous":true,
                                     "span_contains_final_content":true,"span_contains_tool_call":false,
-                                    "span_message_truncated":false});
+                                    "span_message_truncated":records
+                                        .lock()
+                                        .unwrap()
+                                        .span_message_truncated});
                                 for (key, value) in span.as_object().unwrap() {
                                     receipt[key.as_str()] = value.clone();
                                 }
@@ -4666,10 +4675,22 @@ async fn offline_corpus_turn(
     journal: Option<PathBuf>,
     canary: bool,
 ) -> Result<Value, String> {
+    offline_corpus_turn_with_records(manifest, journal, canary, FixtureRecords::default()).await
+}
+
+/// The records-injecting variant: verdict-rule tests model the live span
+/// shapes (e.g. a thinking-bearing sender whose content-tail window is a
+/// strict subset of the accepted spans) without touching the network.
+async fn offline_corpus_turn_with_records(
+    manifest: &CorpusTurnManifest,
+    journal: Option<PathBuf>,
+    canary: bool,
+    records: FixtureRecords,
+) -> Result<Value, String> {
     let journal = offline_trial_journal(journal, "occ3-corpus-turn")?;
     let trial = offline_trial_context(
         journal,
-        Arc::new(Mutex::new(FixtureRecords::default())),
+        Arc::new(Mutex::new(records)),
         "corpus",
     )
     .await?;
@@ -5162,9 +5183,21 @@ async fn run_corpus_turn_phase(
             }
         }
     }
-    // The pre-registered structural verdict (spec section 4): the capture
-    // reached Captured through exactly one handoff binding with a complete
-    // span covering the payload; a tokenize mismatch also invalidates.
+    // The pre-registered structural verdict (spec section 4), amended
+    // 2026-10-31 after the canary stop of window icalib-p4-20261031T045310Z:
+    // the capture reached Captured through exactly one handoff binding
+    // whose retained window contains the payload and the complete final
+    // content; a tokenize mismatch also invalidates. The original conjunct
+    // coverage_complete (span_message_truncated == false) is structurally
+    // unsatisfiable for thinking-bearing corpus turns: the content-tail
+    // retention window is by design a subset of all accepted spans, so
+    // retained_count < total_accepted whenever the sender reasons at all -
+    // the live canaries measured 23-84 thinking spans plus tool calls per
+    // turn with the payload and the final content fully inside the window
+    // (value_in_sender_content, span_contains_final_content, and the
+    // tokenize cross-check all true). The direct data-completeness
+    // predicates replace the proxy; coverage_complete stays recorded in
+    // the evidence as data. Arm trials keep the stricter rule.
     let source_turn_error = case_evidence["source_turn_error"]
         .as_str()
         .map(str::to_string)
@@ -5175,7 +5208,8 @@ async fn run_corpus_turn_phase(
         && case_evidence["source_state_ok"] == json!(true)
         && case_evidence["source_tool_calls"] == json!(1)
         && case_evidence["receipt_span_block"].is_object()
-        && case_evidence["coverage"]["coverage_complete"] == json!(true)
+        && case_evidence["coverage"]["value_in_sender_content"] == json!(true)
+        && case_evidence["coverage"]["span_contains_final_content"] == json!(true)
         && case_evidence["cleanup_ok"] == json!(true)
         && !tokenize_mismatch;
     let span_rows = case_evidence["receipt_span_block"]["accepted_span_end"]
@@ -9533,6 +9567,60 @@ mod gate_tests {
     }
 
     /// The D-shape nonce variant stays loadable and passing offline (the 8
+
+    /// The 2026-10-31 canary-stop amendment (window icalib-p4-20261031T045310Z):
+    /// a thinking-bearing sender whose retained content-tail window is a
+    /// strict subset of the accepted spans (span_message_truncated=true)
+    /// still passes when the payload and the complete final content are
+    /// inside the window and the tokenize cross-check holds - the direct
+    /// data-completeness predicates, not the retained==accepted proxy that
+    /// is structurally unsatisfiable for corpus turns.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn corpus_turn_passes_with_truncated_thinking_spans_when_content_is_complete() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-corpus-manifest-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let payload = "The night watch rotates the QUARTZ-221 key at every tide change and logs the handover in the blue ledger kept under the pier lamp.";
+        let fact_marker = "QUARTZ-221";
+        let turn_id = format!("t25-bucket-b-fam-06-{}", uuid::Uuid::new_v4().simple());
+        let manifest_path = write_corpus_turn_manifest(
+            &dir,
+            &turn_id,
+            "B",
+            "corpus-family-06",
+            payload,
+            "content",
+            fact_marker,
+            false,
+        );
+        let manifest = load_corpus_turn_manifest(&manifest_path).unwrap();
+        let summary = offline_corpus_turn_with_records(
+            &manifest,
+            None,
+            false,
+            FixtureRecords {
+                span_message_truncated: true,
+                ..Default::default()
+            },
+        )
+        .await
+        .unwrap_or_else(|error| panic!("corpus turn failed: {error}"));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["corpus_turn_passed"], json!(true), "{summary}");
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_trial_evidence(&std::env::temp_dir(), &evidence_name, "occ3-corpus-turn-")
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        // The truncation is recorded as data, and the direct predicates hold.
+        assert_eq!(evidence["coverage"]["span_message_truncated"], json!(true));
+        assert_eq!(evidence["coverage"]["coverage_complete"], json!(false));
+        assert_eq!(evidence["coverage"]["value_in_sender_content"], json!(true));
+        assert_eq!(
+            evidence["coverage"]["span_contains_final_content"],
+            json!(true)
+        );
+    }
+
     /// bucket-D main turns and canary C1 keep the banked v1 nonce payloads
     /// byte-identical under kind=nonce); its readback key is the occ3-
     /// marker itself, with the fact marker riding inside the uuid.
