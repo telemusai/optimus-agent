@@ -10,9 +10,16 @@ from typing import Any
 RECEIPT_HEADER = "x-optimus-occ3-receipt"
 MAX_RECEIPT_BYTES = 2048
 #: Capture-intent schemas. v2 exists only to admit the content_tail_v2 span
-#: policy family; every v1 wire keeps its exact meaning.
+#: policy family; every v1 wire keeps its exact meaning. v3 adds the
+#: retained-capture mode: a content-only no-tool turn that the orchestrator
+#: publishes without any tool call.
 CAPTURE_SCHEMA_V1 = "occ3.capture.v1"
 CAPTURE_SCHEMA_V2 = "occ3.capture.v2"
+CAPTURE_SCHEMA_V3 = "occ3.capture.v3"
+#: The only v3 capture mode: the turn is captured content-only (the no-tool
+#: span policy) and publication happens by orchestrator dispatch instead of
+#: the same-turn occ3_handoff tool call. Empty means the legacy protocol.
+CAPTURE_MODE_CONTENT_ONLY = "content_only_orchestrator_v1"
 #: Source receipt schemas. v2 keeps the 21 v1 fields and adds the bounded
 #: occ3.span.v1 block of SOURCE-SPAN-SELECTION.md section 6.2.
 SOURCE_SCHEMA_V1 = "occ3.source.v1"
@@ -168,6 +175,9 @@ class CaptureIntent:
     expires_at_epoch: int
     schema: str = "occ3.capture.v1"
     span_policy: str = "whole_completed_response_tail_v1"
+    #: Retained-capture mode. Empty means the legacy same-turn tool protocol;
+    #: only a v3 wire may carry it, and then only as the content-only mode.
+    capture_mode: str = ""
 
     def __post_init__(self):
         for name in ("capture_id", "source_session_id", "source_request_id", "turn_nonce",
@@ -180,7 +190,12 @@ class CaptureIntent:
             raise AttachmentError("invalid_attachment", 400)
         # Schema-gated span policy: the v1 default is unchanged, and the v2
         # family is admitted only under the v2 schema (doc section 6.1).
-        if self.schema == CAPTURE_SCHEMA_V1:
+        if self.schema == CAPTURE_SCHEMA_V3:
+            # The retained-capture mode admits exactly the no-tool policy: a
+            # content-only turn whose window holds no tool syntax at all.
+            admitted = (self.capture_mode == CAPTURE_MODE_CONTENT_ONLY
+                        and self.span_policy == "content_tail_no_tool_v2")
+        elif self.schema == CAPTURE_SCHEMA_V1:
             admitted = self.span_policy == SPAN_POLICY_V1
         elif self.schema == CAPTURE_SCHEMA_V2:
             admitted = self.span_policy in SPAN_POLICIES_V2
@@ -188,15 +203,30 @@ class CaptureIntent:
             admitted = False
         if not admitted:
             raise AttachmentError("unsupported_profile", 409)
+        if self.schema != CAPTURE_SCHEMA_V3 and self.capture_mode != "":
+            # v1/v2 keep their historical meaning: no capture mode exists there.
+            raise AttachmentError("unsupported_profile", 409)
 
     @classmethod
     def parse(cls, value):
-        if not isinstance(value, dict) or set(value) != set(cls.__dataclass_fields__):
+        if not isinstance(value, dict):
+            raise AttachmentError("invalid_attachment", 400)
+        fields = set(cls.__dataclass_fields__)
+        if value.get("schema") != CAPTURE_SCHEMA_V3:
+            # Only a v3 body may carry capture_mode; v1/v2 wires keep their
+            # exact historical field sets.
+            fields.discard("capture_mode")
+        if set(value) != fields:
             raise AttachmentError("invalid_attachment", 400)
         return cls(**value)
 
     def wire(self) -> dict:
-        return asdict(self)
+        value = asdict(self)
+        if self.schema != CAPTURE_SCHEMA_V3:
+            # The v1/v2 wire stays byte-identical to its historical shape:
+            # parse enforces the same schema gate on the way in.
+            return {name: value[name] for name in value if name != "capture_mode"}
+        return value
 
     @property
     def binding_digest(self) -> str:
@@ -532,6 +562,10 @@ class CaptureWorkerDescriptor:
     #: span policy; a bounded identifier for the v2 family. The marker ids
     #: themselves never travel here: they use the private custom_params channel.
     marker_profile: str = ""
+    #: Retained-capture mode mirrored from the source intent. Empty means the
+    #: legacy same-turn tool protocol; the only non-empty value is the v3
+    #: content-only mode, which requires the no-tool span policy.
+    capture_mode: str = ""
     schema: str = "occ3.sglang.worker.v1"
     operation: str = "capture"
 
@@ -556,6 +590,12 @@ class CaptureWorkerDescriptor:
                 raise AttachmentError("invalid_evidence")
         elif not 1 <= len(self.marker_profile) <= 64 or identifier(self.marker_profile) is None:
             raise AttachmentError("invalid_evidence")
+        if self.capture_mode != "":
+            # The v3 rules: the content-only mode rides only the no-tool
+            # span policy (mode agreement with the negotiated intent).
+            if (self.capture_mode != CAPTURE_MODE_CONTENT_ONLY
+                    or self.span_policy != "content_tail_no_tool_v2"):
+                raise AttachmentError("invalid_evidence")
 
 
 TERMINAL_MODE = "terminal-sse-v1"

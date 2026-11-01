@@ -354,6 +354,13 @@ class SessionEnrollment:
         uint(self.expires_at_epoch)
 
 
+#: How a publication was dispatched. The default keeps the legacy same-turn
+#: model tool protocol; orchestrator_v1 is the retained-capture mode where
+#: the orchestrator publishes a no-tool content turn.
+DISPATCH_MODEL_TOOL_V1 = "model_tool_v1"
+DISPATCH_ORCHESTRATOR_V1 = "orchestrator_v1"
+
+
 @dataclass(frozen=True, repr=False)
 class Publication:
     publication_id: str
@@ -365,17 +372,30 @@ class Publication:
     source_turn_nonce: str
     tool_call_id: str
     expires_at_epoch: int
+    dispatch_mode: str = DISPATCH_MODEL_TOOL_V1
 
     def __post_init__(self):
         sha(self.principal_digest)
+        require(self.dispatch_mode in (DISPATCH_MODEL_TOOL_V1, DISPATCH_ORCHESTRATOR_V1), "invalid")
         for k, v in asdict(self).items():
-            if k not in ("principal_digest", "expires_at_epoch"):
-                identifier(v)
+            if k in ("principal_digest", "expires_at_epoch"):
+                continue
+            if k == "tool_call_id" and self.dispatch_mode == DISPATCH_ORCHESTRATOR_V1:
+                # Orchestrator dispatch names no tool call: the field must be
+                # the empty string, and only in this mode.
+                require(type(v) is str and v == "", "invalid")
+                continue
+            identifier(v)
         uint(self.expires_at_epoch)
 
     @property
     def binding_digest(self):
-        return digest(asdict(self))
+        # Field-consistent with the schema the client used: the legacy digest
+        # is over the nine v1 fields; the v2 digest swaps tool_call_id for
+        # dispatch_mode. No mode is ever defaulted onto the other field set.
+        if self.dispatch_mode == DISPATCH_ORCHESTRATOR_V1:
+            return digest({k: v for k, v in asdict(self).items() if k != "tool_call_id"})
+        return digest({k: v for k, v in asdict(self).items() if k != "dispatch_mode"})
 
 
 def control_request(command_id, operation, payload):

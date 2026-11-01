@@ -39,6 +39,7 @@ fn lease(model: &Model) -> SourceCaptureLease {
                 .as_secs()
                 + 300,
             span_policy: SOURCE_SPAN_POLICY.into(),
+            capture_mode: String::new(),
         },
         SourceCaptureProfile {
             layer_index: 3,

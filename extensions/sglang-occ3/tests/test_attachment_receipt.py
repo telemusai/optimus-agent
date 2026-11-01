@@ -133,7 +133,8 @@ def test_v2_span_policies_are_schema_gated():
         # A v2 name is refused under the v1 schema.
         with pytest.raises(AttachmentError):
             CaptureIntent(*base, span_policy=policy)
-    # The v1 default is refused under the v2 schema, and so is an unknown schema.
+    # The v1 default is refused under the v2 schema, and so is an unknown
+    # schema. A v3 intent without its capture_mode is refused as well.
     with pytest.raises(AttachmentError):
         CaptureIntent(*base, schema="occ3.capture.v2")
     with pytest.raises(AttachmentError):

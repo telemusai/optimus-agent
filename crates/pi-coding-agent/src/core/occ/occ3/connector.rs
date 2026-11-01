@@ -69,9 +69,25 @@ pub struct NativePublicationRequest {
     pub receiver_session_id: String,
     pub message_id: String,
     pub publication_id: String,
-    pub tool_call_id: String,
-    pub tool_name: String,
-    pub tool_arguments: serde_json::Value,
+    pub dispatch: NativePublicationDispatch,
+}
+
+/// How a completed capture is dispatched to its authorised receiver. The
+/// legacy protocol binds publication to the model's own same-turn
+/// `occ3_handoff` tool call; the retained content-only mode is dispatched
+/// deterministically by the authenticated family controller instead.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum NativePublicationDispatch {
+    /// The captured turn carried exactly one `occ3_handoff` tool call: the
+    /// publication must be validated against that exact binding.
+    ModelTool {
+        tool_call_id: String,
+        tool_name: String,
+        tool_arguments: serde_json::Value,
+    },
+    /// Retained content-only capture: the turn carried zero tool bindings and
+    /// the authorised orchestrator (family controller) dispatches publication.
+    Orchestrator,
 }
 
 /// Only authenticated publication creates this process-local envelope authority.
@@ -117,6 +133,9 @@ pub trait Occ3Connector: Send + Sync {
     }
 
     /// Create metadata for the source's actual next native request, not a helper.
+    /// `arming` pins the capture negotiation: `None` resolves the legacy
+    /// environment default, `Some(SourceSpanArming::RETAINED_CONTENT_ONLY)`
+    /// negotiates the retained content-only mode.
     async fn prepare_source_capture(
         &self,
         _session_id: &str,
@@ -124,6 +143,7 @@ pub trait Occ3Connector: Send + Sync {
         _retained_count_limit: u32,
         _max_capture_bytes: u64,
         _limits: pi_ai::source_capture::SourceCaptureLimits,
+        _arming: Option<pi_ai::source_capture::SourceSpanArming>,
     ) -> Result<pi_ai::source_capture::SourceCaptureLease, Occ3Error> {
         Err(Occ3Error::NativeInferenceUnsupported {
             connector_id: self.connector_id().into(),

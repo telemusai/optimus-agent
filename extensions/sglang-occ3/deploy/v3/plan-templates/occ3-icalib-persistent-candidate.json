@@ -84,6 +84,7 @@
    "control": [
     "occ3.sessions.enroll.v1",
     "occ3.publish.v1",
+    "occ3.publish.v2",
     "occ3.publication.status.v1",
     "occ3.retire.v1"
    ],
