@@ -820,6 +820,12 @@ struct FixtureRecords {
     /// final content fully inside the window). The verdict rule test uses
     /// this; the default false mirrors the simple offline fixture turn.
     span_message_truncated: bool,
+    /// Server-side wire audit (defect 7.3): the `reasoning_effort` of every
+    /// capture-armed /v1/chat/completions body the fixture admitted, in
+    /// arrival order. The canary's ARM route threads OCC3_SOURCE_THINKING
+    /// through the source agent's on_payload hook, so the serialized armed
+    /// request body must carry exactly the pinned effort.
+    capture_reasoning_efforts: Vec<String>,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -1307,6 +1313,15 @@ async fn serve(
                             "MAX goes through the existing model-specific conversion, or the documented receiver override matches"
                         );
                         if let Some(intent) = body.get("occ3_capture") {
+                            // Server-side wire audit (defect 7.3): the armed
+                            // source request's serialized reasoning_effort,
+                            // exactly as the fixture received it.
+                            records.lock().unwrap().capture_reasoning_efforts.push(
+                                body["reasoning_effort"]
+                                    .as_str()
+                                    .unwrap_or("<absent>")
+                                    .to_string(),
+                            );
                             if {
                                 let records_guard = records.lock().unwrap();
                                 records_guard.refuse_captures
@@ -3022,7 +3037,11 @@ async fn run_positive_case(
             case["source_tool_calls"] = json!(source_tool_calls);
         }
     }
-    let coverage = span_coverage_verdict(span_block.as_ref(), value_in_sender_content);
+    let coverage = span_coverage_verdict(
+        span_block.as_ref(),
+        value_in_sender_content,
+        coverage_criterion(retained_mode),
+    );
     let arm_evidence = json!({
         "receiver_raw_answer": receiver_raw_answer,
         "parsed_answer": answer,
@@ -4665,23 +4684,75 @@ async fn run_after_phase(
 // Arm-trial coverage, evidence and the arm phase runner.
 // ---------------------------------------------------------------------------
 
+/// Which coverage criterion a receipt span is judged by. The 2026-11-01
+/// canary2 repair (window icalib-canary2-20261101T1615Z) split the single
+/// historical rule: the retained content-only arm measures VALUE coverage,
+/// because its tail window reports `span_message_truncated=true` for ANY
+/// turn longer than the window (902 accepted rows vs a 128-row window) -
+/// by design of the tail retention, not a capture defect.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoverageCriterion {
+    /// The historical TOKEN_FULL / TOKEN_SELECTED / legacy two-turn rule:
+    /// whole-turn coverage, fail-closed on the receipt's truncation flag.
+    Legacy,
+    /// The occ3.capture.v3 retained content-only rule: the value is fully
+    /// contained in the accepted content run (every value token position
+    /// inside span start..end), the span is the final content run, and
+    /// retention is full-width. The server's message_truncated is recorded
+    /// honestly as the tail-window fact and never gates the verdict.
+    RetainedContentOnly,
+}
+
+/// The criterion for a source lifecycle: the retained content-only mode
+/// judges value coverage; every other route keeps the legacy rule.
+fn coverage_criterion(retained_mode: bool) -> CoverageCriterion {
+    if retained_mode {
+        CoverageCriterion::RetainedContentOnly
+    } else {
+        CoverageCriterion::Legacy
+    }
+}
+
 /// Driver-side coverage verdict for TOKEN_FULL / TOKEN_SELECTED
-/// (arms-audit 4.5). Coverage==1 requires:
+/// (arms-audit 4.5). Two criteria share this projection (see
+/// `CoverageCriterion`); both require:
 /// - a v2 receipt span block (a v1 capture has NO span selection: the fields
 ///   needed for offline computation are recorded instead and the verdict is
 ///   null, `coverage_computed: "offline"`);
-/// - span_message_truncated == false (no content-head loss, no over-window
-///   turn: the receipt's truncation flag is the fail-closed signal);
 /// - span_contains_final_content == true (the selected run is the final
 ///   content run, which starts at the reasoning terminator);
-/// - the intended value present in the sender's own final CONTENT text: the
-///   span is that complete run, so the value's tokens are then inside the
-///   span. Thinking text is excluded by construction (the run starts after
-///   the terminator), so a value stated only in reasoning is NOT covered.
 /// - full-width retention: retained_count equals the aligned span width, so
 ///   no span row - in particular not the final content row - was dropped
 ///   (the canary's final-character loss class, 2026-11-01).
-fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) -> Value {
+///
+/// Legacy (TOKEN_FULL / TOKEN_SELECTED / two-turn arms) additionally
+/// requires span_message_truncated == false (no content-head loss, no
+/// over-window turn: the receipt's truncation flag is the fail-closed
+/// signal) and the intended value present in the sender's own final CONTENT
+/// text: the span is that complete run, so the value's tokens are then
+/// inside the span. Thinking text is excluded by construction (the run
+/// starts after the terminator), so a value stated only in reasoning is NOT
+/// covered.
+///
+/// RetainedContentOnly (occ3.capture.v3) judges VALUE coverage instead: the
+/// value is fully contained in the accepted content run - every value token
+/// position inside span start..end. That holds when (a) the value appears in
+/// the sender's own final CONTENT text (value_in_sender_content; the value's
+/// tokens live in the content run) and (b) the retained window is
+/// unit-stride (span_contiguous), which in the v3 construction proves the
+/// content run was NOT clipped by the tail window: the buffer pins the
+/// terminator rows and the content suffix, so the only position gap it can
+/// show is between them - exactly the eviction of content-run head rows. A
+/// clipped run means the value's leading tokens sit before
+/// accepted_span_start, outside the span. The server's message_truncated
+/// (accepted_total > window rows) is the tail-window fact of any
+/// thinking-bearing turn and is recorded honestly - `turn_truncated`,
+/// `turn_window_rows` - never as a coverage gate.
+fn span_coverage_verdict(
+    span: Option<&Value>,
+    value_in_sender_content: bool,
+    criterion: CoverageCriterion,
+) -> Value {
     let Some(span) = span else {
         return json!({
             "coverage_computed": "offline",
@@ -4692,32 +4763,86 @@ fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) ->
     };
     let truncated = span["span_message_truncated"].as_bool();
     let contains_final_content = span["span_contains_final_content"].as_bool();
+    let contiguous = span["span_contiguous"].as_bool();
     let retained_count = span["retained_count"].as_u64();
     let span_width = span["accepted_span_end"]
         .as_u64()
         .zip(span["accepted_span_start"].as_u64())
         .map(|(end, start)| end.saturating_sub(start));
     let retained_all = span_width.map_or(false, |width| retained_count == Some(width));
-    let span_complete = truncated == Some(false) && contains_final_content == Some(true) && retained_all;
-    let coverage_complete = span_complete && value_in_sender_content;
-    json!({
-        "coverage_computed": "receipt_span",
-        "coverage_complete": coverage_complete,
-        "value_in_sender_content": value_in_sender_content,
-        "span_message_truncated": truncated,
-        "span_contains_final_content": contains_final_content,
-        "span_retained_count": retained_count,
-        "span_accepted_width": span_width,
-        "span_content_count": span["span_content_count"],
-        "span_thinking_count": span["span_thinking_count"],
-        "span_tool_call_count": span["span_tool_call_count"],
-        "span_window_start_position": span["span_window_start_position"],
-        "span_window_end_position": span["span_window_end_position"],
-        "retained_count": span["retained_count"],
-        "accepted_span_start": span["accepted_span_start"],
-        "accepted_span_end": span["accepted_span_end"],
-        "accepted_sequence_digest": span["accepted_sequence_digest"],
-    })
+    // The retained window's row count: the six span_*_count fields are
+    // window-wide (the whole classified window, not the aligned span).
+    let window_rows = [
+        "span_thinking_count",
+        "span_content_count",
+        "span_tool_call_count",
+        "span_tool_arguments_count",
+        "span_control_count",
+        "span_unknown_count",
+    ]
+    .iter()
+    .filter_map(|field| span[field].as_u64())
+    .sum::<u64>();
+    match criterion {
+        CoverageCriterion::Legacy => {
+            let span_complete = truncated == Some(false)
+                && contains_final_content == Some(true)
+                && retained_all;
+            let coverage_complete = span_complete && value_in_sender_content;
+            json!({
+                "coverage_computed": "receipt_span",
+                "coverage_complete": coverage_complete,
+                "value_in_sender_content": value_in_sender_content,
+                "span_message_truncated": truncated,
+                "span_contains_final_content": contains_final_content,
+                "span_retained_count": retained_count,
+                "span_accepted_width": span_width,
+                "span_content_count": span["span_content_count"],
+                "span_thinking_count": span["span_thinking_count"],
+                "span_tool_call_count": span["span_tool_call_count"],
+                "span_window_start_position": span["span_window_start_position"],
+                "span_window_end_position": span["span_window_end_position"],
+                "retained_count": span["retained_count"],
+                "accepted_span_start": span["accepted_span_start"],
+                "accepted_span_end": span["accepted_span_end"],
+                "accepted_sequence_digest": span["accepted_sequence_digest"],
+            })
+        }
+        CoverageCriterion::RetainedContentOnly => {
+            // Every value token position inside span start..end: the value
+            // lives in the sender's content run AND that run was retained
+            // whole (a clipped run leaves the window non-contiguous).
+            let value_fully_in_span =
+                value_in_sender_content && contiguous == Some(true);
+            let coverage_complete = value_fully_in_span
+                && contains_final_content == Some(true)
+                && retained_all;
+            json!({
+                "coverage_computed": "receipt_span_retained_content_only",
+                "coverage_complete": coverage_complete,
+                "value_in_sender_content": value_in_sender_content,
+                "value_fully_in_span": value_fully_in_span,
+                // The tail-window fact, recorded honestly - never a gate:
+                // any turn longer than the window reports truncated.
+                "turn_truncated": truncated,
+                "turn_window_rows": window_rows,
+                "span_message_truncated": truncated,
+                "span_contains_final_content": contains_final_content,
+                "span_contiguous": contiguous,
+                "span_retained_count": retained_count,
+                "span_accepted_width": span_width,
+                "span_content_count": span["span_content_count"],
+                "span_thinking_count": span["span_thinking_count"],
+                "span_tool_call_count": span["span_tool_call_count"],
+                "span_window_start_position": span["span_window_start_position"],
+                "span_window_end_position": span["span_window_end_position"],
+                "retained_count": span["retained_count"],
+                "accepted_span_start": span["accepted_span_start"],
+                "accepted_span_end": span["accepted_span_end"],
+                "accepted_sequence_digest": span["accepted_sequence_digest"],
+            })
+        }
+    }
 }
 
 /// Live-only token-count cross-check for the TOKEN_FULL / TOKEN_SELECTED
@@ -5784,7 +5909,11 @@ async fn run_corpus_source_turn(
         "sender_final_content": sender_content,
         "sender_final_content_contains_value": value_in_sender_content,
         "fact_marker_in_sender_content": fact_marker_in_sender_content,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            CoverageCriterion::Legacy,
+        ),
         "cleanup_ok": cleanup_ok,
         "source_turn_error": source_turn_error,
     }))
@@ -6947,7 +7076,11 @@ async fn run_task_positive_case(
         "sender_final_content": sender_content,
         "sender_final_content_contains_message": value_in_sender_content,
         "receipt_span_block": span_block,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            coverage_criterion(retained_mode),
+        ),
         "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
         "receiver_publication": controller.publication.lock().unwrap().clone(),
         "delivered": delivered,
@@ -7365,7 +7498,11 @@ async fn run_task_wrong_sender_case(
         "b_state_ok": b_state_ok,
         "sender_final_content": sender_content,
         "receipt_span_block": span_block,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            CoverageCriterion::Legacy,
+        ),
         "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
         "receiver_publication": controller.publication.lock().unwrap().clone(),
         "delivered": delivered,
@@ -9737,43 +9874,234 @@ mod gate_tests {
             "accepted_span_end": 8,
             "accepted_sequence_digest": "d".repeat(64),
         });
-        let verdict = span_coverage_verdict(Some(&span), true);
+        let verdict = span_coverage_verdict(Some(&span), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_computed"], json!("receipt_span"));
         assert_eq!(verdict["coverage_complete"], json!(true));
         assert!(!token_full_invalid_coverage(&verdict));
         // The value outside the sender's content: coverage < 1 -> invalid.
-        let verdict = span_coverage_verdict(Some(&span), false);
+        let verdict = span_coverage_verdict(Some(&span), false, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert!(token_full_invalid_coverage(&verdict));
         // A truncated span (content-head loss or over-window turn): invalid.
         let mut truncated = span.clone();
         truncated["span_message_truncated"] = json!(true);
-        let verdict = span_coverage_verdict(Some(&truncated), true);
+        let verdict = span_coverage_verdict(Some(&truncated), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert_eq!(verdict["span_message_truncated"], json!(true));
         assert!(token_full_invalid_coverage(&verdict));
         // A span that is not the final content run: invalid.
         let mut no_final = span.clone();
         no_final["span_contains_final_content"] = json!(false);
-        let verdict = span_coverage_verdict(Some(&no_final), true);
+        let verdict = span_coverage_verdict(Some(&no_final), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert!(token_full_invalid_coverage(&verdict));
         // A retention narrower than the aligned span width: the final-row
         // exclusion class (canary 2026-11-01) - invalid, never a silent pass.
         let mut narrow = span.clone();
         narrow["retained_count"] = json!(7);
-        let verdict = span_coverage_verdict(Some(&narrow), true);
+        let verdict = span_coverage_verdict(Some(&narrow), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert_eq!(verdict["span_retained_count"], json!(7));
         assert_eq!(verdict["span_accepted_width"], json!(8));
         assert!(token_full_invalid_coverage(&verdict));
         // No span block at all (v1 capture): offline fields only, the null
         // verdict is invalid for TOKEN_FULL - never a silent pass.
-        let verdict = span_coverage_verdict(None, true);
+        let verdict = span_coverage_verdict(None, true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_computed"], json!("offline"));
         assert_eq!(verdict["coverage_complete"], json!(null));
         assert!(token_full_invalid_coverage(&verdict));
         assert_eq!(verdict["value_in_sender_content"], json!(true));
+    }
+
+    /// The live canary2 tail-window shape (2026-11-01, window
+    /// icalib-canary2-20261101T1615Z, executor-verified): 902 accepted
+    /// rows, a 128-row retained tail window (96 THINKING + 1 CONTROL
+    /// thinking_end + 31 CONTENT), span 871..902, retained_count == width
+    /// == 31, and the value fully inside the retained content tail.
+    fn retained_canary_tail_span() -> Value {
+        json!({
+            "span_schema": "occ3.span.v1",
+            "span_policy": "content_tail_no_tool_v2",
+            "span_reasoning_terminator": "thinking_end",
+            "span_thinking_count": 96,
+            "span_content_count": 31,
+            "span_tool_call_count": 0,
+            "span_tool_arguments_count": 0,
+            "span_control_count": 1,
+            "span_unknown_count": 0,
+            "span_window_start_position": 4431,
+            "span_window_end_position": 4559,
+            "span_contiguous": true,
+            "span_contains_final_content": true,
+            "span_contains_tool_call": false,
+            "span_message_truncated": true,
+            "accepted_span_start": 871,
+            "accepted_span_end": 902,
+            "retained_count": 31,
+            "accepted_sequence_digest": "d".repeat(64),
+        })
+    }
+
+    /// The 2026-11-01 canary2 repair: the retained content-only arm judges
+    /// VALUE coverage, not whole-turn coverage. The canary2 turn was longer
+    /// than the tail window (902 accepted rows vs 128 window rows), so the
+    /// server honestly reported span_message_truncated=true - and the
+    /// verdict's truncation gate turned every such legitimate capture into
+    /// coverage_complete=false even though the value lived entirely inside
+    /// the retained content tail (31 of 31 content rows retained, the value
+    /// inside them). The retained criterion must pass this capture.
+    #[test]
+    fn retained_value_coverage_passes_a_truncated_tail_window() {
+        let span = retained_canary_tail_span();
+        let verdict = span_coverage_verdict(
+            Some(&span),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(
+            verdict["coverage_computed"],
+            json!("receipt_span_retained_content_only")
+        );
+        assert_eq!(verdict["coverage_complete"], json!(true));
+        assert_eq!(verdict["value_fully_in_span"], json!(true));
+        assert_eq!(verdict["value_in_sender_content"], json!(true));
+        // The tail-window fact is recorded honestly, never a gate.
+        assert_eq!(verdict["turn_truncated"], json!(true));
+        assert_eq!(verdict["span_message_truncated"], json!(true));
+        assert_eq!(verdict["turn_window_rows"], json!(128));
+        assert_eq!(verdict["span_contiguous"], json!(true));
+        assert_eq!(verdict["span_retained_count"], json!(31));
+        assert_eq!(verdict["span_accepted_width"], json!(31));
+        // The very same span under the legacy criterion stays refusals:
+        // whole-turn coverage is a different, stricter question.
+        let legacy = span_coverage_verdict(Some(&span), true, CoverageCriterion::Legacy);
+        assert_eq!(legacy["coverage_computed"], json!("receipt_span"));
+        assert_eq!(legacy["coverage_complete"], json!(false));
+        assert_eq!(legacy["span_message_truncated"], json!(true));
+    }
+
+    /// Defect 7.3, ARM-route proof (canary2 follow-up, 2026-11-01): the
+    /// canary runs `run_positive_case --arm NATIVE --source-mode retained`,
+    /// and the source effort rewrite must reach the SERVER through the
+    /// source agent's on_payload hook: the serialized armed request body
+    /// carries exactly the pinned OCC3_SOURCE_THINKING level. The fixture
+    /// records the admitted armed body's `reasoning_effort` server-side;
+    /// the arm evidence's `source_request_audit` must agree (the same
+    /// fact measured on both ends of the wire). canary2 measured 3715
+    /// reasoning chars vs canary1's 1494 under the same env pin - this pin
+    /// separates the plumbing question (answerable offline: the rewrite IS
+    /// on the wire) from the live variance question (the model's own
+    /// reasoning length under a pinned effort).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_arm_route_threads_the_source_effort_rewrite_into_the_armed_request() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-arm-effort-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords::default()));
+        let trial = offline_trial_context(journal.clone(), records.clone(), "effort")
+            .await
+            .unwrap();
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        std::env::set_var("OCC3_SOURCE_THINKING", "low");
+        let outcome = run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("effort-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("effort-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await;
+        std::env::remove_var("OCC3_SOURCE_THINKING");
+        trial.server.abort();
+        let outcome = outcome.unwrap_or_else(|error| panic!("retained arm case failed: {error}"));
+        // Server side: exactly one capture-armed source request (the
+        // retained leg's single content turn), serialized with the pinned
+        // effort on the wire.
+        let efforts = records.lock().unwrap().capture_reasoning_efforts.clone();
+        assert_eq!(efforts, vec!["low".to_string()], "the armed source request body must carry the pinned effort");
+        // Client side: the audit saw the same request and the serialized
+        // body matched the requested effort (defect 7.3 assertion).
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["request_count"],
+            json!(1)
+        );
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["effort_requested"],
+            json!("low")
+        );
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["effort_on_wire_matches_request"],
+            json!(true)
+        );
+        // The turn itself completed and the retained value-coverage
+        // criterion (not the legacy truncation gate) judged the capture.
+        assert_eq!(outcome.arm_evidence["source_mode"], json!("retained"));
+        assert_eq!(
+            outcome.arm_evidence["coverage"]["coverage_computed"],
+            json!("receipt_span_retained_content_only")
+        );
+        assert_eq!(outcome.arm_evidence["coverage"]["coverage_complete"], json!(true));
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The retained criterion's negative space: the value NOT fully inside
+    /// the span fails coverage. A clipped content run (the tail window
+    /// evicted content-head rows: the pinned terminator rows are followed
+    /// by a position gap before the first retained content row, so the
+    /// window is not unit-stride) means the value's leading tokens sit
+    /// before accepted_span_start - outside the span even though the value
+    /// is present in the sender's own content. A value stated only in
+    /// reasoning, and a dropped span row, fail the same way.
+    #[test]
+    fn retained_value_coverage_fails_when_the_value_is_not_fully_inside_the_span() {
+        let span = retained_canary_tail_span();
+        // Clipped content run: value in the sender's content, but the
+        // retained window is not contiguous.
+        let mut clipped = span.clone();
+        clipped["span_contiguous"] = json!(false);
+        let verdict = span_coverage_verdict(
+            Some(&clipped),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["value_fully_in_span"], json!(false));
+        assert_eq!(verdict["value_in_sender_content"], json!(true));
+        assert_eq!(verdict["turn_truncated"], json!(true));
+        // The value stated only in reasoning (absent from the sender's own
+        // CONTENT text) is never covered, window or not.
+        let verdict = span_coverage_verdict(
+            Some(&span),
+            false,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["value_fully_in_span"], json!(false));
+        // A dropped span row (retention narrower than the aligned width)
+        // still fails closed under the retained criterion too.
+        let mut narrow = span.clone();
+        narrow["retained_count"] = json!(30);
+        let verdict = span_coverage_verdict(
+            Some(&narrow),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["span_retained_count"], json!(30));
+        assert_eq!(verdict["span_accepted_width"], json!(31));
+        // A span that is not the final content run fails both criteria.
+        let mut no_final = span.clone();
+        no_final["span_contains_final_content"] = json!(false);
+        let verdict = span_coverage_verdict(
+            Some(&no_final),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
     }
 
     #[cfg(windows)]
