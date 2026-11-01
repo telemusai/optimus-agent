@@ -138,9 +138,11 @@ const CEILING_TOKENS: f64 = 262144.0;
 /// capture to the last CONTENT run), so the turn is bounded: an unbounded
 /// thinking budget produced a 57k-token turn that died in an inner 400
 /// (`native_completion_failed`), and the other run ended on a bare tool call
-/// with no CONTENT run at all. Low effort plus an 8k output budget keeps the
-/// final text turn reachable and cheap.
-const SOURCE_MAX_NEW_TOKENS: f64 = 8192.0;
+/// with no CONTENT run at all. Low effort plus a bounded 32k output budget
+/// keeps the final text turn reachable: the model reasons for a few hundred
+/// tokens before it emits one sentence, so an 8k bound was consumed entirely
+/// by reasoning and left an empty content run.
+const SOURCE_MAX_NEW_TOKENS: f64 = 32768.0;
 const CONTEXT_WINDOW: f64 = 1048576.0;
 const CONTROL_HEADER: &str = "x-pomerium-authorization";
 const CONTROL_VALUE: &str = "synthetic-fixture-gateway-control-value";
@@ -1514,6 +1516,21 @@ impl PhaseEnv {
     }
 }
 
+/// Root ruling r12: true when the last assistant message stopped because the
+/// output budget ran out. Only that shape earns the single bounded retry.
+fn source_turn_hit_length(agent: &Agent) -> bool {
+    let state = agent.state();
+    state
+        .messages
+        .iter()
+        .rev()
+        .find_map(|m| match m {
+            AgentMessage::Message(Message::Assistant(a)) => Some(a.stop_reason.as_str() == "length"),
+            _ => None,
+        })
+        .unwrap_or(false)
+}
+
 /// Root ruling (p8i decline): an empty source turn must name WHY it was
 /// empty. This returns counts only - never any model text - so the refusal
 /// stays token-free while still telling content from reasoning from tools.
@@ -2279,6 +2296,9 @@ async fn run_positive_case(
     let source_text_prompt = format!(
         "The private vault code is {nonce}. Reply with exactly this sentence and nothing else: \"The private vault code is {nonce}.\""
     );
+    let source_text_retry_prompt = format!(
+        "Your previous reply had no visible text. Reply now with exactly this sentence and nothing else: \"The private vault code is {nonce}.\""
+    );
     let source_handoff_prompt = "Now publish that exact message through native state only: call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments, then stop.".to_string();
     // Option B (root ruling, p8h decline): the source leg no longer uses a single
     // mixed prompt. Turn 1 asks only for the final content, turn 2 asks only for
@@ -2336,22 +2356,36 @@ async fn run_positive_case(
     // captured span always carries a CONTENT run (span policy R8). Only after
     // that content turn does the family install the tool and the second turn ask
     // for the handoff alone.
-    let _ = tokio::time::timeout(
-        Duration::from_secs(env.deadline_seconds),
-        source_agent.prompt(PromptInput::Text {
-            input: source_text_prompt,
-            images: Vec::new(),
-        }),
-    )
-    .await
-    .map_err(|_| fail())?
-    .map_err(|_| fail());
-    if normalized_final_answer(&source_agent).is_empty() {
-        return Err(format!(
-            "source_turn_without_final_content({})",
-            describe_last_assistant(&source_agent)
+    // Root ruling r12: one bounded retry when a turn spent its whole budget on
+    // reasoning. The shape of an empty turn is printed on its own line, because
+    // the refusal text itself is sanitised down to a stable code.
+    let mut source_turns = 0u32;
+    loop {
+        source_turns += 1;
+        let prompt = if source_turns == 1 {
+            source_text_prompt.clone()
+        } else {
+            source_text_retry_prompt.clone()
+        };
+        let _ = tokio::time::timeout(
+            Duration::from_secs(env.deadline_seconds),
+            source_agent.prompt(PromptInput::Text {
+                input: prompt,
+                images: Vec::new(),
+            }),
         )
-        .into());
+        .await
+        .map_err(|_| fail())?
+        .map_err(|_| fail());
+        if !normalized_final_answer(&source_agent).is_empty() {
+            break;
+        }
+        let detail = describe_last_assistant(&source_agent);
+        eprintln!("occ3-source-turn-diag turn={source_turns} {detail}");
+        if source_turns == 1 && source_turn_hit_length(&source_agent) {
+            continue;
+        }
+        return Err(format!("source_turn_without_final_content({detail})").into());
     }
     family.install()?;
     let action = tokio::time::timeout(
