@@ -126,6 +126,12 @@ def _require(condition, code, detail=""):
 
 
 IGNORED_LOCAL_DIRS = ("__pycache__", ".pytest_cache")
+#: The calibration capture directory is host-backed: the only RW bind the
+#: serving container mounts is /data/neo-glm53, so the corpus must land under
+#: it (Option A of the capture-mount survey) or the collector's rows die with
+#: the container's overlay. The stage plan's CAPTURE_DIR value is pinned to
+#: this prefix together with the plan template and p8_live.py.
+CAPTURE_DIR_PREFIX = "/data/neo-glm53/occ3-calibration-capture/"
 
 
 def plugin_files():
@@ -245,7 +251,7 @@ def _verify(entries, plan, window):
                            "OCC3_MAX_TURN_SECONDS", "SGLANG_USE_PICKLE_IPC"],
              "plan_environment_additions_changed", ",".join(additions))
     corpus = plan["environment_additions"][0]["value"]
-    _require(corpus == "/data/occ3-bridge/icalib-corpus/" + window, "plan_corpus_dir_mismatch", corpus)
+    _require(corpus == CAPTURE_DIR_PREFIX + window, "plan_corpus_dir_mismatch", corpus)
     for entry in entries:
         if entry["source"] is None:
             _require(isinstance(entry["content"], bytes), "arm_control_missing")
