@@ -582,6 +582,28 @@ def test_refused_prepare_logs_fixed_code_and_selected_flag(loop_server, monkeypa
     assert "PRIVATE" not in message and "PRIVATE" not in caplog.text
 
 
+def test_refused_prepare_writes_bounded_diagnostic_file(loop_server, monkeypatch, caplog, tmp_path):
+    """A generic decline leaves a read-back record; the single log line stays clean."""
+    f = loop_server
+    path = tmp_path / "startup-diagnostic.json"
+    monkeypatch.setattr(install, "_DIAGNOSTIC_PATH", str(path))
+    def broken(selection):
+        raise RuntimeError("PRIVATE-GENERIC-DETAIL")
+    monkeypatch.setattr(install, "_verify_startup_artifacts", broken)
+    with caplog.at_level(logging.ERROR, logger="occ3_sglang.native_install"):
+        result = install.prepare_selected_native_server(f.server, f.app, f.tm)
+    assert result.code == "experimental_startup_refused"
+    assert "PRIVATE" not in caplog.text
+    record = json.loads(path.read_text(encoding="utf-8"))
+    assert record["schema"] == "occ3.startup.diagnostic.v1"
+    assert record["stage"] == "prepare" and record["selected"] is True
+    assert record["exception"] == "RuntimeError" and record["exception_code"] is None
+    assert [item["name"] for item in record["files"]] == [
+        "native_profile.json", "native_sources.json", "_native_profile_digest.py"]
+    assert "_verify_startup_artifacts" in record["traceback"]
+    assert len(record["traceback"]) <= 8192
+
+
 async def test_declined_install_logs_receipt_code(loop_server, monkeypatch, caplog):
     f = loop_server
     async def refuse(*args, **kwargs):
