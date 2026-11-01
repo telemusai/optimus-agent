@@ -6,7 +6,7 @@ use crate::core::agent_messages::{
     AGENT_MESSAGE_CUSTOM_TYPE,
 };
 use crate::core::occ::occ3::connector::{
-    NativePublicationRequest, NativeSessionEnrollment, Occ3Connector,
+    NativePublicationDispatch, NativePublicationRequest, NativeSessionEnrollment, Occ3Connector,
 };
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
@@ -19,6 +19,7 @@ use pi_agent_core::types::{
 use pi_ai::inference_attachment::InferenceStateTarget;
 use pi_ai::source_capture::{
     SourceCaptureLease, SourceCaptureLimits, SourceCaptureReceipt, SourceCaptureState,
+    SourceSpanArming,
 };
 use pi_ai::types::Model;
 use serde_json::{json, Value};
@@ -51,9 +52,14 @@ pub struct NativeSourceBudget {
 }
 struct SourceSlot {
     budget: Option<NativeSourceBudget>,
+    /// Retained content-only negotiation for the armed capture: the wire and
+    /// the completed-hook contract switch to the no-tool mode for this arm.
+    retained: bool,
     resolved: bool,
     lease: Option<SourceCaptureLease>,
     tool_claimed: bool,
+    /// One-shot orchestrator publication claim for the retained mode.
+    publication_claimed: bool,
     handoff_admitted: bool,
     published_message: Option<(String, String)>,
     negative_control_armed: bool,
@@ -156,9 +162,11 @@ impl Occ3NativeSession {
             inbox: Mutex::new(Occ3InferenceInbox::new(session_id.into()).map_err(|_| failure())?),
             source: Mutex::new(SourceSlot {
                 budget: None,
+                retained: false,
                 resolved: false,
                 lease: None,
                 tool_claimed: false,
+                publication_claimed: false,
                 handoff_admitted: false,
                 published_message: None,
                 negative_control_armed: false,
@@ -171,6 +179,19 @@ impl Occ3NativeSession {
         &self.enrollment.session_id
     }
     pub fn arm_source(&self, budget: NativeSourceBudget) -> Result<(), String> {
+        self.arm(budget, false)
+    }
+
+    /// Arm the next source request for retained content-only capture: the
+    /// captured turn must carry a real eligible content span with ZERO tool
+    /// bindings, and publication is dispatched later by the authorised
+    /// family controller through [`Self::publish_retained`] - never by a
+    /// same-turn tool call.
+    pub fn arm_source_retained(&self, budget: NativeSourceBudget) -> Result<(), String> {
+        self.arm(budget, true)
+    }
+
+    fn arm(&self, budget: NativeSourceBudget, retained: bool) -> Result<(), String> {
         self.check()?;
         if budget.deadline <= Instant::now()
             || budget.retained_count_limit == 0
@@ -182,6 +203,7 @@ impl Occ3NativeSession {
         if slot.resolved || slot.budget.is_some() || slot.lease.is_some() {
             return Err(failure());
         }
+        slot.retained = retained;
         slot.budget = Some(budget);
         Ok(())
     }
@@ -259,7 +281,7 @@ impl Occ3NativeSession {
                 Box::pin(async move {
                     this.check_model(&request.model)
                         .map_err(anyhow::Error::msg)?;
-                    let budget = {
+                    let (budget, retained) = {
                         let mut slot =
                             this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         let Some(budget) = slot.budget.take() else {
@@ -278,7 +300,7 @@ impl Occ3NativeSession {
                             return Ok(None);
                         };
                         slot.resolved = true;
-                        budget
+                        (budget, slot.retained)
                     };
                     let lease = this
                         .connector
@@ -291,6 +313,7 @@ impl Occ3NativeSession {
                                 deadline: budget.deadline,
                                 max_response_bytes: budget.max_response_bytes,
                             },
+                            retained.then_some(SourceSpanArming::RETAINED_CONTENT_ONLY),
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!(failure()))?;
@@ -312,11 +335,25 @@ impl Occ3NativeSession {
                     if completion.lease.state() != SourceCaptureState::Captured {
                         return Err(anyhow::anyhow!(format!("{} [occ3_completed_state_not_captured]", failure())));
                     }
-                    if bindings.len() != 1 {
-                        return Err(anyhow::anyhow!(format!("{} [occ3_completed_binding_count]", failure())));
-                    }
-                    if bindings[0].tool_name != NATIVE_HANDOFF_TOOL {
-                        return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_name]", failure())));
+                    if completion.lease.is_retained_content_only() {
+                        // Retained content-only mode: the captured turn must
+                        // be exactly a content turn. Any tool call forbids the
+                        // mode; the empty binding is the valid shape.
+                        if !bindings.is_empty() {
+                            return Err(anyhow::anyhow!(format!(
+                                "{} [occ3_completed_mode_tool_forbidden]",
+                                failure()
+                            )));
+                        }
+                    } else {
+                        // Legacy same-turn protocol: exactly one occ3_handoff
+                        // binding from this same captured turn.
+                        if bindings.len() != 1 {
+                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_binding_count]", failure())));
+                        }
+                        if bindings[0].tool_name != NATIVE_HANDOFF_TOOL {
+                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_name]", failure())));
+                        }
                     }
                     let slot = this
                         .source
@@ -674,7 +711,7 @@ impl Occ3NativeSession {
                     let expected_receiver_id=authorized.target_session_id().to_string();
                     let publication=this.connector.publish_native_source(NativePublicationRequest {source:source.clone(),
                         receiver_session_id:authorized.target_session_id().into(),message_id:authorized.message_id().into(),
-                        publication_id:format!("publication-{}",uuid::Uuid::new_v4()),tool_call_id:tool_id,tool_name:NATIVE_HANDOFF_TOOL.into(),tool_arguments:args}).await
+                        publication_id:format!("publication-{}",uuid::Uuid::new_v4()),dispatch:NativePublicationDispatch::ModelTool{tool_call_id:tool_id,tool_name:NATIVE_HANDOFF_TOOL.into(),tool_arguments:args}}).await
                         .map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_publish: {e}]", failure())))?;
                     this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_publish_lock]", failure())))?.published_message=Some((publication.envelope.message_id.clone(),publication.binding_digest.clone()));
                     this.check().map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_check_publish: {e}]", failure())))?;
@@ -695,6 +732,91 @@ impl Occ3NativeSession {
                 })
             }),
         }
+    }
+
+    /// Deterministic orchestrator publication of a retained content-only
+    /// capture. The recipient must already be requested and permitted by
+    /// the normal agent workflow: authorization goes through the same
+    /// authenticated family controller the handoff tool uses, and the
+    /// retained capture is published exactly once under its original
+    /// capture-turn lineage. There is no model tool dispatch in this mode.
+    pub async fn publish_retained(
+        self: &Arc<Self>,
+        controller: Arc<dyn AgentSessionMessageController>,
+        relationship: &str,
+        selector: &str,
+    ) -> Result<crate::core::agent_messages::AgentSessionMessageReceipt, String> {
+        self.check()?;
+        let source = {
+            let mut slot = self
+                .source
+                .lock()
+                .map_err(|_| format!("{} [occ3_publish_source_lock]", failure()))?;
+            let source = slot
+                .lease
+                .clone()
+                .ok_or_else(|| format!("{} [occ3_publish_lease_missing]", failure()))?;
+            if source.state() != SourceCaptureState::Captured {
+                return Err(format!("{} [occ3_publish_state_not_captured]", failure()));
+            }
+            if !source.is_retained_content_only() {
+                return Err(format!("{} [occ3_publish_mode_not_retained]", failure()));
+            }
+            if slot.tool_claimed {
+                return Err(format!("{} [occ3_publish_tool_claimed]", failure()));
+            }
+            if slot.publication_claimed {
+                return Err(format!("{} [occ3_publish_already_claimed]", failure()));
+            }
+            // One-shot claim BEFORE any await: concurrent callers cannot
+            // publish the same retained capture twice.
+            slot.publication_claimed = true;
+            source
+        };
+        let authorized = controller
+            .authorize_native_handoff(relationship.into(), selector.into())
+            .await
+            .map_err(|e| format!("{} [occ3_publish_authorize: {e}]", failure()))?;
+        if authorized.source_session_id() != self.session_id() {
+            return Err(format!("{} [occ3_publish_sender_mismatch]", failure()));
+        }
+        self.check()?;
+        let expected_message_id = authorized.message_id().to_string();
+        let expected_receiver_id = authorized.target_session_id().to_string();
+        let publication = self
+            .connector
+            .publish_native_source(NativePublicationRequest {
+                source: source.clone(),
+                receiver_session_id: authorized.target_session_id().into(),
+                message_id: authorized.message_id().into(),
+                publication_id: format!("publication-{}", uuid::Uuid::new_v4()),
+                dispatch: NativePublicationDispatch::Orchestrator,
+            })
+            .await
+            .map_err(|e| format!("{} [occ3_publish_publish: {e}]", failure()))?;
+        self.source
+            .lock()
+            .map_err(|_| format!("{} [occ3_publish_lock]", failure()))?
+            .published_message =
+            Some((publication.envelope.message_id.clone(), publication.binding_digest.clone()));
+        let prepared = PreparedNativeHandoff::new(authorized, publication)
+            .map_err(|e| format!("{} [occ3_publish_prepared: {e}]", failure()))?;
+        let receipt = controller
+            .send_prepared_native_handoff(prepared)
+            .await
+            .map_err(|e| format!("{} [occ3_publish_send: {e}]", failure()))?;
+        if receipt.id != expected_message_id
+            || receipt.target.session_id != expected_receiver_id
+            || !matches!(receipt.delivery_status.as_str(), "delivered" | "queued")
+        {
+            return Err(format!("{} [occ3_publish_receipt_mismatch]", failure()));
+        }
+        self.check()?;
+        self.source
+            .lock()
+            .map_err(|_| failure())?
+            .handoff_admitted = true;
+        Ok(receipt)
     }
 
     /// Span-coverage evidence for the experiment-arm trials (OCC-3 campaign
@@ -746,6 +868,7 @@ impl Occ3NativeSession {
             "runtime_generation":self.enrollment.runtime_generation,"model_fingerprint":self.enrollment.identity.fingerprint(),
             "source":slot.lease.as_ref().map(|lease|json!({
                 "capture_id":lease.intent().capture_id,"source_request_id":lease.intent().source_request_id,"turn_nonce":lease.intent().turn_nonce,
+                "capture_mode":lease.capture_mode(),
                 "intent_digest":lease.intent().digest().ok(),"state":format!("{:?}",lease.state()),
                 "receipt":receipt.as_ref().map(|r|json!({"native_rid":r.native_rid,"response_id":r.response_id,
                     "capture_commit_id":r.capture_commit_id,"handle_sha256":pi_ai::source_capture::sha256(r.source_handle.as_bytes()),
@@ -753,6 +876,7 @@ impl Occ3NativeSession {
                     "accepted_span_start":r.accepted_span_start,"accepted_span_end":r.accepted_span_end,"logical_prefix_bytes":r.byte_count,
                     "ready_ranks":r.ready_ranks,"expected_ranks":r.expected_ranks,"layout_digest":r.layout_digest})),
                 "tool_claimed":slot.tool_claimed,"handoff_admitted":slot.handoff_admitted,"published_message":slot.published_message,
+                "retained":slot.retained,"publication_claimed":slot.publication_claimed,
                 "negative_control_armed":slot.negative_control_armed,"negative_control_exported":slot.negative_control_exported,
             })),
             "receiver":self.inbox.lock().expect("native receiver state poisoned").audit()})
@@ -904,6 +1028,7 @@ mod tests {
             retained_count_limit: u32,
             max_capture_bytes: u64,
             limits: SourceCaptureLimits,
+            _arming: Option<SourceSpanArming>,
         ) -> Result<SourceCaptureLease, Occ3Error> {
             SourceCaptureLease::new(
                 target,
@@ -921,6 +1046,7 @@ mod tests {
                     max_capture_bytes,
                     expires_at_epoch: now() + 600,
                     span_policy: SOURCE_SPAN_POLICY.into(),
+                    capture_mode: String::new(),
                 },
                 self.profile.clone(),
                 limits,

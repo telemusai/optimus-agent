@@ -161,6 +161,7 @@ impl Occ3Connector for FixtureConnector {
         retained_count_limit: u32,
         max_capture_bytes: u64,
         limits: SourceCaptureLimits,
+        _arming: Option<pi_ai::source_capture::SourceSpanArming>,
     ) -> Result<SourceCaptureLease, Occ3Error> {
         SourceCaptureLease::new(
             target,
@@ -178,6 +179,7 @@ impl Occ3Connector for FixtureConnector {
                 max_capture_bytes,
                 expires_at_epoch: now() + 600,
                 span_policy: SOURCE_SPAN_POLICY.into(),
+                capture_mode: String::new(),
             },
             self.profile.clone(),
             limits,
@@ -686,12 +688,14 @@ impl NativeHandoffFixture {
                 receiver_session_id: authorized.target_session_id().to_string(),
                 message_id: authorized.message_id().to_string(),
                 publication_id: format!("gap2-publication-{}", uuid::Uuid::new_v4()),
-                tool_call_id: "call-gap2-fixture".to_string(),
-                tool_name: NATIVE_HANDOFF_TOOL.to_string(),
-                tool_arguments: serde_json::json!({
-                    "receiver_role": "child",
-                    "receiver_name": "gap2-child-fixture"
-                }),
+                dispatch: crate::core::occ::occ3::connector::NativePublicationDispatch::ModelTool {
+                    tool_call_id: "call-gap2-fixture".to_string(),
+                    tool_name: NATIVE_HANDOFF_TOOL.to_string(),
+                    tool_arguments: serde_json::json!({
+                        "receiver_role": "child",
+                        "receiver_name": "gap2-child-fixture"
+                    }),
+                },
             })
             .await
             .expect("fixture publication");

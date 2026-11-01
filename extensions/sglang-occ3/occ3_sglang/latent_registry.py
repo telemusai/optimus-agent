@@ -6,9 +6,11 @@ import time
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
-from .attachment_contract import CaptureWorkerDescriptor, ConsumeWorkerDescriptor, digest
-from .latent_types import (LatentError, Publication, RuntimeProfile, SessionEnrollment,
-                           require, sha)
+from .attachment_contract import (CAPTURE_MODE_CONTENT_ONLY, CaptureWorkerDescriptor,
+                                  ConsumeWorkerDescriptor, digest)
+from .latent_types import (DISPATCH_MODEL_TOOL_V1, DISPATCH_ORCHESTRATOR_V1, LatentError,
+                           Publication, RuntimeProfile, SessionEnrollment, require, sha)
+from .span_policy import POLICY_NO_TOOL
 
 
 @dataclass(repr=False)
@@ -131,8 +133,21 @@ class LatentRegistry:
             source = self.session(publication.principal_digest, publication.source_session_id)
             target = self.session(publication.principal_digest, publication.receiver_session_id)
             require(source.access_domain == target.access_domain, "identity")
-            require(publication.tool_call_id == record.output_binding["tool_call_id"]
-                    and record.output_binding["tool_name"] == "occ3_handoff", "identity")
+            if publication.dispatch_mode == DISPATCH_ORCHESTRATOR_V1:
+                # Retained capture: the turn ended with no tool call, so the
+                # bound output identity is the empty tool pair, and the record
+                # must come from a v3 content-only capture under the no-tool
+                # span policy (the descriptor mirrors the negotiated intent).
+                require(record.output_binding["tool_call_id"] == ""
+                        and record.output_binding["tool_name"] == ""
+                        and d.span_policy == POLICY_NO_TOOL
+                        and d.capture_mode == CAPTURE_MODE_CONTENT_ONLY, "identity")
+            elif publication.dispatch_mode == DISPATCH_MODEL_TOOL_V1:
+                require(publication.tool_call_id == record.output_binding["tool_call_id"]
+                        and record.output_binding["tool_name"] == "occ3_handoff", "identity")
+            else:
+                # Unknown dispatch modes are refused, never defaulted.
+                require(False, "invalid")
             require(self.epoch() < publication.expires_at_epoch <= min(record.expires_at_epoch, target.expires_at_epoch), "expired")
             record.publication, record.state = publication, "published"
             self.publications[publication.publication_id] = publication

@@ -126,6 +126,7 @@ impl Occ3Connector for FixtureConnector {
         retained_count_limit: u32,
         max_capture_bytes: u64,
         limits: SourceCaptureLimits,
+        _arming: Option<pi_ai::source_capture::SourceSpanArming>,
     ) -> Result<SourceCaptureLease, Occ3Error> {
         SourceCaptureLease::new(
             target,
@@ -143,6 +144,7 @@ impl Occ3Connector for FixtureConnector {
                 max_capture_bytes,
                 expires_at_epoch: now() + 600,
                 span_policy: SOURCE_SPAN_POLICY.into(),
+                capture_mode: String::new(),
             },
             self.profile.clone(),
             limits,

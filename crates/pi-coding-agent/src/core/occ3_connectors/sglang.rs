@@ -15,7 +15,10 @@ use serde_json::json;
 use serde_json::Value;
 use url::Url;
 
-use crate::core::occ::occ3::connector::{CaptureRequest, ConsumeRequest, Occ3Connector};
+use crate::core::occ::occ3::connector::{
+    CaptureRequest, ConsumeRequest, NativePublicationDispatch, Occ3Connector,
+};
+use pi_ai::source_capture::SourceSpanArming;
 use crate::core::occ::occ3::types::{
     Occ3ConnectorCapabilities, Occ3Error, Occ3HandleRef, Occ3Method, Occ3ModelIdentity,
     Occ3TransferMetrics,
@@ -773,6 +776,7 @@ impl Occ3Connector for SglangOcc3Connector {
         retained_count_limit: u32,
         max_capture_bytes: u64,
         limits: pi_ai::source_capture::SourceCaptureLimits,
+        arming: Option<SourceSpanArming>,
     ) -> Result<pi_ai::source_capture::SourceCaptureLease, Occ3Error> {
         use pi_ai::source_capture::*;
         let enrolled = self.enroll(session_id).await?;
@@ -783,12 +787,17 @@ impl Occ3Connector for SglangOcc3Connector {
         // v2 (content_tail_v2) is the default arming: only a v2 capture yields
         // the span selection the calibration collector records. An unknown
         // OCC3_SPAN_POLICY refuses here, before any enrollment side effect.
-        let arming = SourceSpanArming::from_env().map_err(|_| Occ3Error::TransferFailed {
-            reason: format!(
-                "invalid {SOURCE_SPAN_POLICY_ENV}: expected one of {}",
-                SourceSpanArming::admitted_names()
-            ),
-        })?;
+        // An explicit arming (the retained content-only mode) is pinned
+        // verbatim and never falls back to the environment.
+        let arming = match arming {
+            Some(explicit) => explicit,
+            None => SourceSpanArming::from_env().map_err(|_| Occ3Error::TransferFailed {
+                reason: format!(
+                    "invalid {SOURCE_SPAN_POLICY_ENV}: expected one of {}",
+                    SourceSpanArming::admitted_names()
+                ),
+            })?,
+        };
         SourceCaptureLease::new(
             target,
             SourceCaptureIntent {
@@ -805,6 +814,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 max_capture_bytes,
                 expires_at_epoch: enrolled.expires_at_epoch,
                 span_policy: arming.span_policy.into(),
+                capture_mode: arming.capture_mode.into(),
             },
             enrolled.source_profile,
             limits,
@@ -821,19 +831,32 @@ impl Occ3Connector for SglangOcc3Connector {
         let native = self.experiment()?;
         let intent = request.source.intent();
         let receipt = request.source.receipt().ok_or_else(native_invalid)?;
+        // Mode-scoped dispatch validation. The legacy protocol requires the
+        // captured turn's own exact occ3_handoff tool binding; the retained
+        // content-only mode requires zero tool bindings and the v3 intent
+        // that negotiated it. A capture can never cross the modes.
+        let dispatch_valid = match &request.dispatch {
+            NativePublicationDispatch::ModelTool {
+                tool_call_id,
+                tool_name,
+                tool_arguments,
+            } => {
+                tool_name == "occ3_handoff"
+                    && request.source.tool_bindings().len() == 1
+                    && request
+                        .source
+                        .validate_tool(tool_call_id, tool_name, tool_arguments)
+                        .is_ok()
+            }
+            NativePublicationDispatch::Orchestrator => {
+                intent.is_retained_content_only()
+                    && request.source.tool_bindings().is_empty()
+            }
+        };
         if !native_id(&request.message_id)
             || request.message_id.len() > 128
             || !native_id(&request.publication_id)
-            || request.tool_name != "occ3_handoff"
-            || request.source.tool_bindings().len() != 1
-            || request
-                .source
-                .validate_tool(
-                    &request.tool_call_id,
-                    &request.tool_name,
-                    &request.tool_arguments,
-                )
-                .is_err()
+            || !dispatch_valid
             || intent.model_fingerprint != native.permit.identity.fingerprint()
             || intent.runtime_id != native.permit.runtime_id
             || intent.runtime_generation != native.permit.runtime_generation
@@ -853,11 +876,24 @@ impl Occ3Connector for SglangOcc3Connector {
         {
             return Err(Occ3Error::Unauthorized);
         }
-        let body = serde_json::json!({"schema":"occ3.publish.v1","publication_id":request.publication_id,
-            "source_handle":receipt.source_handle,"source_session_id":source.session_id,
-            "receiver_session_id":receiver.session_id,"message_id":request.message_id,
-            "source_turn_nonce":intent.turn_nonce,"tool_call_id":request.tool_call_id,
-            "expires_at_epoch":receipt.expires_at_epoch});
+        let body = match &request.dispatch {
+            NativePublicationDispatch::ModelTool { tool_call_id, .. } => serde_json::json!({
+                "schema":"occ3.publish.v1","publication_id":request.publication_id,
+                "source_handle":receipt.source_handle,"source_session_id":source.session_id,
+                "receiver_session_id":receiver.session_id,"message_id":request.message_id,
+                "source_turn_nonce":intent.turn_nonce,"tool_call_id":tool_call_id,
+                "expires_at_epoch":receipt.expires_at_epoch}),
+            // The retained content-only publication carries no tool binding:
+            // dispatch_mode names the orchestrator authority (the family
+            // controller's authorized message) and the capture's negotiated
+            // mode travels with the turn nonce lineage.
+            NativePublicationDispatch::Orchestrator => serde_json::json!({
+                "schema":"occ3.publish.v2","publication_id":request.publication_id,
+                "source_handle":receipt.source_handle,"source_session_id":source.session_id,
+                "receiver_session_id":receiver.session_id,"message_id":request.message_id,
+                "source_turn_nonce":intent.turn_nonce,"dispatch_mode":"orchestrator_v1",
+                "expires_at_epoch":receipt.expires_at_epoch}),
+        };
         let mut binding = body.clone();
         binding
             .as_object_mut()

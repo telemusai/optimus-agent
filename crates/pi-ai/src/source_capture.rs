@@ -18,6 +18,17 @@ use crate::types::{AssistantMessage, ContentBlock};
 pub const SOURCE_CAPTURE_SCHEMA: &str = "occ3.capture.v1";
 /// Capture-intent schema that admits the content_tail_v2 span family.
 pub const SOURCE_CAPTURE_SCHEMA_V2: &str = "occ3.capture.v2";
+/// v3 admits exactly the retained content-only capture mode: a no-tool
+/// content turn whose publication is dispatched by the authorised
+/// orchestrator instead of a same-turn model tool call.
+pub const SOURCE_CAPTURE_SCHEMA_V3: &str = "occ3.capture.v3";
+/// Legacy (v1/v2) capture publication mode: the captured turn itself must
+/// carry exactly one `occ3_handoff` tool call binding.
+pub const SOURCE_CAPTURE_MODE_SAME_TURN_TOOL: &str = "same_turn_tool_v1";
+/// Retained capture mode: a real eligible content span with zero tool
+/// bindings; publication happens later through the authenticated family
+/// controller (orchestrator dispatch), never a forged tool binding.
+pub const SOURCE_CAPTURE_MODE_CONTENT_ONLY: &str = "content_only_orchestrator_v1";
 pub const SOURCE_RECEIPT_SCHEMA: &str = "occ3.source.v1";
 /// Source receipt that carries the 21 v1 fields plus the occ3.span.v1 block.
 pub const SOURCE_RECEIPT_SCHEMA_V2: &str = "occ3.source.v2";
@@ -69,17 +80,34 @@ pub const SOURCE_REPRESENTATION: &str = "final_layer_prenorm_predictor";
 pub struct SourceSpanArming {
     pub schema: &'static str,
     pub span_policy: &'static str,
+    /// Retained content-only capture negotiation. Empty means the legacy
+    /// same-turn tool mode; the wire stays byte-identical for v1/v2 arming.
+    pub capture_mode: &'static str,
 }
 
 impl SourceSpanArming {
     pub const DEFAULT: SourceSpanArming = SourceSpanArming {
         schema: SOURCE_CAPTURE_SCHEMA_V2,
         span_policy: SOURCE_SPAN_POLICY_V2_DEFAULT,
+        capture_mode: "",
     };
     pub const V1: SourceSpanArming = SourceSpanArming {
         schema: SOURCE_CAPTURE_SCHEMA,
         span_policy: SOURCE_SPAN_POLICY,
+        capture_mode: "",
     };
+    /// The retained content-only capture: a no-tool content turn under the
+    /// no-tool span policy, published later by orchestrator dispatch.
+    pub const RETAINED_CONTENT_ONLY: SourceSpanArming = SourceSpanArming {
+        schema: SOURCE_CAPTURE_SCHEMA_V3,
+        span_policy: "content_tail_no_tool_v2",
+        capture_mode: SOURCE_CAPTURE_MODE_CONTENT_ONLY,
+    };
+
+    /// Whether this arming negotiates the retained content-only mode.
+    pub fn is_retained_content_only(&self) -> bool {
+        self.capture_mode == SOURCE_CAPTURE_MODE_CONTENT_ONLY
+    }
 
     /// `None` or blank arms the v2 default; a known policy name arms the schema
     /// that admits it; anything else is `InvalidField("span_policy")`.
@@ -90,12 +118,16 @@ impl SourceSpanArming {
         if name == SOURCE_SPAN_POLICY {
             return Ok(Self::V1);
         }
+        if name == SOURCE_CAPTURE_MODE_CONTENT_ONLY {
+            return Ok(Self::RETAINED_CONTENT_ONLY);
+        }
         SOURCE_SPAN_POLICIES_V2
             .iter()
             .find(|policy| **policy == name)
             .map(|policy| Self {
                 schema: SOURCE_CAPTURE_SCHEMA_V2,
                 span_policy: policy,
+                capture_mode: "",
             })
             .ok_or(SourceCaptureError::InvalidField("span_policy"))
     }
@@ -135,6 +167,11 @@ pub struct SourceCaptureIntent {
     pub max_capture_bytes: u64,
     pub expires_at_epoch: u64,
     pub span_policy: String,
+    /// Retained content-only negotiation. Absent (never serialized) keeps the
+    /// legacy same-turn tool mode and leaves v1/v2 wire bytes identical; only a
+    /// v3 intent may carry it, pinned to `content_only_orchestrator_v1`.
+    #[serde(default, skip_serializing_if = "String::is_empty")]
+    pub capture_mode: String,
 }
 
 impl std::fmt::Debug for SourceCaptureIntent {
@@ -147,11 +184,20 @@ impl std::fmt::Debug for SourceCaptureIntent {
 impl SourceCaptureIntent {
     pub fn validate(&self, now: u64) -> Result<(), SourceCaptureError> {
         // Schema-gated span policy, mirroring the server's CaptureIntent: the
-        // v1 policy only under v1, the v2 family only under v2.
+        // v1 policy only under v1, the v2 family only under v2, and the
+        // retained content-only mode only under v3 pinned to the no-tool
+        // policy and its explicit capture mode.
         let admitted = match self.schema.as_str() {
-            SOURCE_CAPTURE_SCHEMA => self.span_policy == SOURCE_SPAN_POLICY,
+            SOURCE_CAPTURE_SCHEMA => {
+                self.span_policy == SOURCE_SPAN_POLICY && self.capture_mode.is_empty()
+            }
             SOURCE_CAPTURE_SCHEMA_V2 => {
                 SOURCE_SPAN_POLICIES_V2.contains(&self.span_policy.as_str())
+                    && self.capture_mode.is_empty()
+            }
+            SOURCE_CAPTURE_SCHEMA_V3 => {
+                self.span_policy == "content_tail_no_tool_v2"
+                    && self.capture_mode == SOURCE_CAPTURE_MODE_CONTENT_ONLY
             }
             _ => false,
         };
@@ -187,6 +233,20 @@ impl SourceCaptureIntent {
 
     pub fn digest(&self) -> Result<String, SourceCaptureError> {
         Ok(sha256(&self.canonical_bytes()?))
+    }
+
+    /// The negotiated publication mode. Empty means legacy same-turn tool.
+    pub fn capture_mode(&self) -> &str {
+        if self.capture_mode.is_empty() {
+            SOURCE_CAPTURE_MODE_SAME_TURN_TOOL
+        } else {
+            self.capture_mode.as_str()
+        }
+    }
+
+    /// Whether this intent negotiated the retained content-only mode.
+    pub fn is_retained_content_only(&self) -> bool {
+        self.capture_mode == SOURCE_CAPTURE_MODE_CONTENT_ONLY
     }
 }
 
@@ -646,6 +706,16 @@ impl SourceCaptureLease {
     pub fn retirement_receipt(&self) -> Option<SourceCaptureReceipt> {
         self.0.state.lock().receipt.clone()
     }
+    /// The negotiated capture/publication mode of this lease's intent.
+    pub fn capture_mode(&self) -> &str {
+        self.0.intent.capture_mode()
+    }
+
+    /// Whether this lease was armed for retained content-only capture.
+    pub fn is_retained_content_only(&self) -> bool {
+        self.0.intent.is_retained_content_only()
+    }
+
     pub fn tool_bindings(&self) -> Vec<SourceToolBinding> {
         let record = self.0.state.lock();
         if record.state == SourceCaptureState::Captured {
@@ -929,6 +999,9 @@ pub fn validate_receipt(
     let schema_matches = match (&receipt.span, intent.schema.as_str()) {
         (None, SOURCE_CAPTURE_SCHEMA) => receipt.schema == SOURCE_RECEIPT_SCHEMA,
         (Some(_), SOURCE_CAPTURE_SCHEMA_V2) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
+        // The retained content-only capture reuses the v2 receipt wire: the
+        // mode lives in the intent (and its digest), never the receipt.
+        (Some(_), SOURCE_CAPTURE_SCHEMA_V3) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
         _ => false,
     };
     if !schema_matches
@@ -1159,6 +1232,7 @@ mod span_arming_tests {
             max_capture_bytes: 1 << 20,
             expires_at_epoch: now() + 300,
             span_policy: arming.span_policy.into(),
+            capture_mode: arming.capture_mode.into(),
         }
     }
 
@@ -1253,6 +1327,53 @@ mod span_arming_tests {
             Err(SourceCaptureError::InvalidField("span_policy"))
         ));
         assert!(SourceSpanArming::admitted_names().contains("content_tail_no_tool_v2"));
+    }
+
+    #[test]
+    fn retained_content_only_arming_is_explicitly_negotiated() {
+        let retained = SourceSpanArming::RETAINED_CONTENT_ONLY;
+        assert!(retained.is_retained_content_only());
+        assert_eq!(retained.schema, "occ3.capture.v3");
+        assert_eq!(retained.span_policy, "content_tail_no_tool_v2");
+        assert_eq!(retained.capture_mode, SOURCE_CAPTURE_MODE_CONTENT_ONLY);
+        // The mode name also arms through the same resolver as the policies.
+        assert_eq!(
+            SourceSpanArming::resolve(Some(SOURCE_CAPTURE_MODE_CONTENT_ONLY)).unwrap(),
+            retained
+        );
+        // Legacy arming never carries the mode.
+        assert!(!SourceSpanArming::DEFAULT.is_retained_content_only());
+        assert!(!SourceSpanArming::V1.is_retained_content_only());
+        // A v3 intent validates only with the pinned policy and mode.
+        let mut v3 = intent(SourceSpanArming::RETAINED_CONTENT_ONLY);
+        assert!(v3.validate(now()).is_ok());
+        assert!(v3.is_retained_content_only());
+        assert_eq!(v3.capture_mode(), SOURCE_CAPTURE_MODE_CONTENT_ONLY);
+        v3.span_policy = "content_tail_v2".into();
+        assert!(matches!(
+            v3.validate(now()),
+            Err(SourceCaptureError::InvalidField("schema_or_scope"))
+        ));
+        v3.span_policy = "content_tail_no_tool_v2".into();
+        v3.capture_mode = "model_tool_v2".into();
+        assert!(matches!(
+            v3.validate(now()),
+            Err(SourceCaptureError::InvalidField("schema_or_scope"))
+        ));
+        // The mode never leaks onto a legacy v1/v2 intent wire.
+        let legacy = intent(SourceSpanArming::DEFAULT);
+        assert!(legacy.capture_mode.is_empty());
+        let wire = serde_json::to_value(&legacy).unwrap();
+        assert!(wire.get("capture_mode").is_none());
+        assert!(matches!(
+            legacy.validate(now()),
+            Err(SourceCaptureError::InvalidField("schema_or_scope"))
+                if {
+                    let mut crossed = legacy.clone();
+                    crossed.capture_mode = SOURCE_CAPTURE_MODE_CONTENT_ONLY.into();
+                    crossed.validate(now()).is_err()
+                }
+        ));
     }
 
     #[test]

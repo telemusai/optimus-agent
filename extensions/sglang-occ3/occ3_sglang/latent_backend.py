@@ -270,7 +270,8 @@ class LatentBackend:
             capture_id=intent.capture_id, source_session_id=intent.source_session_id,
             source_turn_nonce=intent.turn_nonce, runtime_generation=intent.runtime_generation,
             span_policy=intent.span_policy, max_prefix_tokens=intent.retained_count_limit,
-            max_capture_bytes=intent.max_capture_bytes, marker_profile=marker_profile)
+            max_capture_bytes=intent.max_capture_bytes, marker_profile=marker_profile,
+            capture_mode=intent.capture_mode)
         enrollment = SourceEnrollment(attempt_id, intent.binding_digest, native_rid,
             identity.principal_digest, uuid.uuid4().hex, int(uuid.uuid4().hex[:16], 16),
             intent.expires_at_epoch, intent.source_session_id, intent.runtime_id, intent.runtime_generation,

@@ -165,9 +165,17 @@ def create_router(backend, authority):
                     "model_fingerprint": enrollment.model_fingerprint, "expires_at_epoch": enrollment.expires_at_epoch,
                     "readiness": health}
             elif operation == "publish":
-                body = _fields(value, "occ3.publish.v1", ("publication_id", "source_handle", "source_session_id",
-                    "receiver_session_id", "message_id", "source_turn_nonce", "tool_call_id", "expires_at_epoch"))
-                publication = Publication(principal_digest=principal, **body)
+                if value.get("schema") == "occ3.publish.v2":
+                    # Retained capture: no tool call exists to name, so the v2
+                    # body carries dispatch_mode instead of tool_call_id and
+                    # the publication parses with the empty tool identity.
+                    body = _fields(value, "occ3.publish.v2", ("publication_id", "source_handle", "source_session_id",
+                        "receiver_session_id", "message_id", "source_turn_nonce", "dispatch_mode", "expires_at_epoch"))
+                    publication = Publication(principal_digest=principal, tool_call_id="", **body)
+                else:
+                    body = _fields(value, "occ3.publish.v1", ("publication_id", "source_handle", "source_session_id",
+                        "receiver_session_id", "message_id", "source_turn_nonce", "tool_call_id", "expires_at_epoch"))
+                    publication = Publication(principal_digest=principal, **body)
                 authority.check_session(principal, publication.source_session_id)
                 authority.check_session(principal, publication.receiver_session_id)
                 record = await backend.client.call("publish", asdict(publication),

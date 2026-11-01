@@ -853,6 +853,7 @@ class ChatAttachmentAdapter:
                         or descriptor.source_session_id != ctx.attachment.source_session_id
                         or descriptor.source_turn_nonce != ctx.attachment.turn_nonce
                         or descriptor.span_policy != ctx.attachment.span_policy
+                        or descriptor.capture_mode != ctx.attachment.capture_mode
                         or descriptor.max_prefix_tokens != ctx.attachment.retained_count_limit
                         or descriptor.max_capture_bytes != ctx.attachment.max_capture_bytes):
                     raise AttachmentError("invalid_evidence")

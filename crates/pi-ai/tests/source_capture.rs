@@ -32,6 +32,7 @@ fn intent() -> SourceCaptureIntent {
         max_capture_bytes: 4096,
         expires_at_epoch: epoch() + 300,
         span_policy: SOURCE_SPAN_POLICY.into(),
+        capture_mode: String::new(),
     }
 }
 fn profile() -> SourceCaptureProfile {
