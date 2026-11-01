@@ -13,6 +13,18 @@ use tokio_util::sync::CancellationToken;
 pub const INFERENCE_RECEIPT_HEADER: &str = "x-optimus-occ3-receipt";
 pub const MAX_INFERENCE_RECEIPT_BYTES: usize = 2048;
 
+/// Keepalive stream extension (opt-in). A client that cannot tolerate the
+/// fully-buffered armed-turn contract sets the request header below; a server
+/// that accepts the offer answers with the deferred-receipt marker and moves
+/// the receipt from the response headers into a terminal SSE event.
+pub const OCC3_KEEPALIVE_REQUEST_HEADER: &str = "x-optimus-occ3-keepalive";
+pub const OCC3_KEEPALIVE_REQUEST_MODE: &str = "keepalive-v1";
+pub const OCC3_DEFERRED_RECEIPT_HEADER: &str = "x-optimus-occ3-deferred-receipt";
+pub const OCC3_DEFERRED_RECEIPT_MODE: &str = "deferred-v1";
+/// Envelope schema of the terminal receipt event (`occ3.terminal.v1`).
+pub const OCC3_TERMINAL_SCHEMA: &str = "occ3.terminal.v1";
+pub const OCC3_TERMINAL_KIND_RECEIVER: &str = "receiver";
+
 /// Exact dispatch target. This is local metadata, never part of `occ3` on the wire.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct InferenceStateTarget {
@@ -233,6 +245,7 @@ impl InferenceStateLease {
         Ok(InferenceSubmission {
             lease: self.clone(),
             receipt_verified: false,
+            deferred: false,
         })
     }
 }
@@ -241,6 +254,9 @@ impl InferenceStateLease {
 pub(crate) struct InferenceSubmission {
     lease: InferenceStateLease,
     receipt_verified: bool,
+    /// The server accepted the keepalive offer: the receipt arrives as the
+    /// terminal `optimus.occ3.receipt` SSE event instead of response headers.
+    deferred: bool,
 }
 
 #[derive(Deserialize)]
@@ -275,6 +291,74 @@ impl InferenceSubmission {
         }
         let receipt: InferenceReceipt = serde_json::from_slice(value.as_bytes())
             .map_err(|_| InferenceAttachmentError::InvalidReceipt)?;
+        if receipt.attachment != *self.lease.attachment()
+            || !receipt.consumed
+            || receipt.fallback_used
+            || !receipt.injected_state
+        {
+            return Err(InferenceAttachmentError::ReceiptMismatch);
+        }
+        self.receipt_verified = true;
+        Ok(())
+    }
+
+    /// Keepalive offer handling at response headers. `Ok(false)` means the
+    /// server kept the buffered contract, so the caller must fall back to
+    /// `verify_receipt`; `Ok(true)` defers the receipt to the terminal event.
+    pub(crate) fn defer_receipt(
+        &mut self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<bool, InferenceAttachmentError> {
+        self.ensure_active()?;
+        let mut values = headers.get_all(OCC3_DEFERRED_RECEIPT_HEADER).iter();
+        match values.next() {
+            None => Ok(false),
+            Some(value) => {
+                if values.next().is_some() || value.as_bytes() != OCC3_DEFERRED_RECEIPT_MODE.as_bytes() {
+                    return Err(InferenceAttachmentError::InvalidReceipt);
+                }
+                self.deferred = true;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Whether this submission waits for the terminal receipt event.
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
+    /// Verify the receipt carried by the terminal SSE envelope. The invariants
+    /// are exactly `verify_receipt`'s; only the transport differs.
+    pub(crate) fn verify_receipt_value(
+        &mut self,
+        envelope: &serde_json::Value,
+    ) -> Result<(), InferenceAttachmentError> {
+        self.ensure_active()?;
+        if !self.deferred
+            || envelope.get("schema").and_then(serde_json::Value::as_str) != Some(OCC3_TERMINAL_SCHEMA)
+            || envelope.get("kind").and_then(serde_json::Value::as_str) != Some(OCC3_TERMINAL_KIND_RECEIVER)
+        {
+            return Err(InferenceAttachmentError::InvalidReceipt);
+        }
+        let receipt_value = envelope
+            .get("receipt")
+            .cloned()
+            .ok_or(InferenceAttachmentError::InvalidReceipt)?;
+        if serde_json::to_vec(&receipt_value).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
+            > MAX_INFERENCE_RECEIPT_BYTES
+        {
+            return Err(InferenceAttachmentError::InvalidReceipt);
+        }
+        let receipt: InferenceReceipt = serde_json::from_value(receipt_value)
+            .map_err(|_| InferenceAttachmentError::InvalidReceipt)?;
+        let response_id = envelope
+            .get("response_id")
+            .and_then(serde_json::Value::as_str)
+            .ok_or(InferenceAttachmentError::InvalidReceipt)?;
+        if response_id.is_empty() || response_id.len() > 256 {
+            return Err(InferenceAttachmentError::InvalidReceipt);
+        }
         if receipt.attachment != *self.lease.attachment()
             || !receipt.consumed
             || receipt.fallback_used
@@ -720,5 +804,100 @@ mod tests {
         assert!(restored.inference_state.is_none());
         assert!(!format!("{lease:?}").contains(&lease.attachment().state_handle));
         assert!(!format!("{:?}", lease.attachment()).contains(&lease.attachment().state_handle));
+    }
+
+    #[test]
+    fn deferred_receipt_transport_verifies_and_completes() {
+        let lease = InferenceStateLease::new(target(), attachment()).unwrap();
+        let mut submission = lease.submit().unwrap();
+        assert!(!submission.is_deferred());
+        // No marker: the server kept the buffered contract, so the caller
+        // falls back to `verify_receipt`.
+        assert!(!submission.defer_receipt(&reqwest::header::HeaderMap::new()).unwrap());
+        let mut marker = reqwest::header::HeaderMap::new();
+        marker.insert(
+            OCC3_DEFERRED_RECEIPT_HEADER,
+            OCC3_DEFERRED_RECEIPT_MODE.parse().unwrap(),
+        );
+        assert!(submission.defer_receipt(&marker).unwrap());
+        assert!(submission.is_deferred());
+        let envelope = json!({
+            "schema": OCC3_TERMINAL_SCHEMA,
+            "kind": OCC3_TERMINAL_KIND_RECEIVER,
+            "response_id": "resp-1",
+            "receipt": receipt(&attachment()),
+        });
+        submission.verify_receipt_value(&envelope).unwrap();
+        submission.complete().unwrap();
+    }
+
+    #[test]
+    fn deferred_receipt_rejects_wrong_kinds_schemas_and_unguarded_use() {
+        let lease = InferenceStateLease::new(target(), attachment()).unwrap();
+        let mut submission = lease.submit().unwrap();
+        let envelope = json!({
+            "schema": OCC3_TERMINAL_SCHEMA,
+            "kind": OCC3_TERMINAL_KIND_RECEIVER,
+            "response_id": "resp-1",
+            "receipt": receipt(&attachment()),
+        });
+        // Without the defer marker the envelope path is refused.
+        assert_eq!(
+            submission.verify_receipt_value(&envelope).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        let mut marker = reqwest::header::HeaderMap::new();
+        marker.insert(
+            OCC3_DEFERRED_RECEIPT_HEADER,
+            OCC3_DEFERRED_RECEIPT_MODE.parse().unwrap(),
+        );
+        assert!(submission.defer_receipt(&marker).unwrap());
+        // Wrong kind, wrong schema and an oversized response id are refused.
+        let mut wrong_kind = envelope.clone();
+        wrong_kind["kind"] = json!("source");
+        assert_eq!(
+            submission.verify_receipt_value(&wrong_kind).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        let mut wrong_schema = envelope.clone();
+        wrong_schema["schema"] = json!("occ3.other.v1");
+        assert_eq!(
+            submission.verify_receipt_value(&wrong_schema).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        let mut long_id = envelope.clone();
+        long_id["response_id"] = json!("a".repeat(257));
+        assert_eq!(
+            submission.verify_receipt_value(&long_id).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        // A receipt that did not consume the state is a mismatch.
+        let mut not_consumed = envelope.clone();
+        not_consumed["receipt"]["consumed"] = json!(false);
+        assert_eq!(
+            submission.verify_receipt_value(&not_consumed).unwrap_err(),
+            InferenceAttachmentError::ReceiptMismatch
+        );
+        // Duplicated or wrong-valued markers are refused.
+        let lease_two = InferenceStateLease::new(target(), attachment()).unwrap();
+        let mut submission_two = lease_two.submit().unwrap();
+        let mut duplicated = reqwest::header::HeaderMap::new();
+        duplicated.append(OCC3_DEFERRED_RECEIPT_HEADER, OCC3_DEFERRED_RECEIPT_MODE.parse().unwrap());
+        duplicated.append(OCC3_DEFERRED_RECEIPT_HEADER, OCC3_DEFERRED_RECEIPT_MODE.parse().unwrap());
+        assert_eq!(
+            submission_two.defer_receipt(&duplicated).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        let mut wrong_value = reqwest::header::HeaderMap::new();
+        wrong_value.insert(OCC3_DEFERRED_RECEIPT_HEADER, "deferred-v2".parse().unwrap());
+        assert_eq!(
+            submission_two.defer_receipt(&wrong_value).unwrap_err(),
+            InferenceAttachmentError::InvalidReceipt
+        );
+        // A stream that never delivers the envelope cannot complete.
+        assert_eq!(
+            submission_two.complete().unwrap_err(),
+            InferenceAttachmentError::MissingReceipt
+        );
     }
 }

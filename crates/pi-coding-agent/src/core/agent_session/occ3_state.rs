@@ -697,6 +697,44 @@ impl Occ3NativeSession {
         }
     }
 
+    /// Span-coverage evidence for the experiment-arm trials (OCC-3 campaign
+    /// section 5: TOKEN_FULL / TOKEN_SELECTED). Projects the captured
+    /// receipt's `occ3.span.v1` block plus the retained-window integers a
+    /// driver-side coverage assertion needs. Hash-only discipline is kept:
+    /// no raw handle leaves this session. `None` before a receipt lands or
+    /// when the capture ran under a v1 intent (no span selection exists).
+    pub fn span_evidence(&self) -> Option<Value> {
+        let slot = self.source.lock().ok()?;
+        let lease = slot.lease.as_ref()?;
+        let receipt = lease.retirement_receipt()?;
+        let span = receipt.span.as_ref()?;
+        Some(json!({
+            "span_schema": span.span_schema,
+            "span_policy": span.span_policy,
+            "span_marker_profile": span.span_marker_profile,
+            "span_marker_schema": span.span_marker_schema,
+            "span_reasoning_terminator": span.span_reasoning_terminator,
+            "span_turn_end_attested": span.span_turn_end_attested,
+            "span_thinking_count": span.span_thinking_count,
+            "span_content_count": span.span_content_count,
+            "span_tool_call_count": span.span_tool_call_count,
+            "span_tool_arguments_count": span.span_tool_arguments_count,
+            "span_control_count": span.span_control_count,
+            "span_unknown_count": span.span_unknown_count,
+            "span_window_start_position": span.span_window_start_position,
+            "span_window_end_position": span.span_window_end_position,
+            "span_contiguous": span.span_contiguous,
+            "span_contains_final_content": span.span_contains_final_content,
+            "span_contains_tool_call": span.span_contains_tool_call,
+            "span_message_truncated": span.span_message_truncated,
+            "accepted_span_start": receipt.accepted_span_start,
+            "accepted_span_end": receipt.accepted_span_end,
+            "retained_count": receipt.retained_count,
+            "accepted_sequence_digest": receipt.accepted_sequence_digest,
+            "output_sha256": receipt.output_sha256,
+        }))
+    }
+
     /// Evidence projection only. Opaque handles are hashed, never persisted.
     pub fn audit(&self) -> Value {
         let slot = self.source.lock().expect("native source state poisoned");

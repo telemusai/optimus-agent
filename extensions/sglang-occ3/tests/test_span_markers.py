@@ -20,7 +20,8 @@ from occ3_sglang.span_markers import (
     DEFAULT_PROFILE, MARKER_SCHEMA, PROFILES, REASONS, ROLES,
     THINKING_CLOSE, THINKING_OPEN,
     ArgumentDelimiters, ContentDelimiters, MarkerResolutionError, MarkerTable,
-    resolve_marker_ids, resolve_marker_table, resolve_stop_ids, vocabulary_bound,
+    resolve_marker_ids, resolve_marker_table, resolve_stop_ids,
+    resolve_turn_stop_ids, vocabulary_bound,
 )
 
 BYTE_BASE = 1000            # byte-fallback ids live above every added token

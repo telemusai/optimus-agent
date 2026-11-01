@@ -107,7 +107,7 @@ def test_receipt_descriptor_agrees_with_the_source_receipt_type():
         SourceCaptureReceipt.parse(dict(value, representation="frozen_dual_ridge"))
 
 
-def test_profile_validator_accepts_only_advertised_methods():
+def test_profile_validator_accepts_advertised_methods_and_refuses_unknown():
     from occ3_sglang import native_profile as profile
     from occ3_sglang.native_profile import ProfileError
     for method in profile.advertised_methods():
@@ -119,6 +119,34 @@ def test_profile_validator_accepts_only_advertised_methods():
         assert caught.value.code == "profile_invalid"
         with pytest.raises(ProfileError):
             profile.method_descriptor(method)
+
+
+def test_pinned_profiles_may_name_the_registered_procrustes_challengers():
+    """P5: the low-rank Procrustes challengers are pinnable by a runtime
+    profile (fit on FIT, select on VALIDATION, freeze, bind to a native
+    profile) while the packaged advertisement still ships the committed
+    two-method surface; nothing outside the registry ever validates."""
+    from occ3_sglang import native_profile as profile
+    from occ3_sglang import statebridge_calibrated_procrustes as procrustes
+    from occ3_sglang.native_profile import ProfileError
+    challengers = (profile.PROCRUSTES_METHOD, profile.PROCRUSTES_METHOD_SO,
+                   profile.PROCRUSTES_METHOD_PLAIN)
+    assert challengers == (procrustes.METHOD_ID, procrustes.METHOD_ID_SO,
+                           procrustes.METHOD_ID_PLAIN)
+    for method in challengers:
+        assert method in profile.registered_methods()
+        assert method not in profile.advertised_methods()
+        assert profile._validate_profile(_profile(method)) == _profile(method)
+        pinned = dict(_profile(method), calibration_path="C:/cal/artifact.occ3prd",
+                      calibration_digest="e" * 64)
+        assert profile._validate_profile(pinned)["method"] == method
+    # The per-message method still consumes no artifact, so a reference is
+    # refused for it exactly as before.
+    with pytest.raises(ProfileError) as caught:
+        profile._validate_profile(dict(
+            _profile(profile.PER_MESSAGE_METHOD),
+            calibration_path="C:/cal/artifact.occ3prd", calibration_digest="e" * 64))
+    assert caught.value.code == "profile_invalid"
 
 
 def test_pinned_profile_may_name_the_calibrated_method(tmp_path):

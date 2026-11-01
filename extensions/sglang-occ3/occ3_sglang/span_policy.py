@@ -75,6 +75,9 @@ marker text.
 """
 from __future__ import annotations
 
+import json
+import os
+import time
 from dataclasses import dataclass
 from typing import Dict, FrozenSet, Sequence, Tuple
 
@@ -123,14 +126,86 @@ _NON_TURN_END_ROLES = tuple(role for role in ROLES if role != "turn_end")
 class SpanPolicyError(SpanContractError):
     """A decline of the v2 family; ``code`` is "profile" or "lineage"."""
 
+    def __init__(self, code: str = "lineage", members=None):
+        # Live diagnosability (2026-10-30): carry the declining R-rule id in
+        # the bounded members field; the wire code stays exactly "lineage".
+        LatentError.__init__(self, code, members)
 
-def _decline(code: str = "lineage"):
-    raise SpanPolicyError(code)
+
+def _decline(code: str = "lineage", rule: str = ""):
+    # Live diagnosability (2026-10-30 window icalib-p3final-20261030T235450Z):
+    # every span decline surfaced as code=lineage, indistinguishable from
+    # commit-guard failures in the abort log. The rule id travels in the
+    # bounded members field (LatentError sanitises unknown codes to
+    # latent_failed, so the wire code stays exactly "lineage").
+    members = [rule] if rule else None
+    # Root ruling C (p8g, 2026-11-01): a decline now also leaves a bounded,
+    # token-free audit of the turn it refused, so the next window names the
+    # exact classification instead of inferring it from one code. Best effort:
+    # a diagnostic can never change the refusal it describes.
+    _write_span_audit(code, rule)
+    raise SpanPolicyError(code, members)
 
 
-def _require(condition: bool, code: str = "lineage") -> None:
+# --- Bounded span audit (root ruling C, window icalib-p8g, 2026-11-01) ------
+# The R8 decline in p8g surfaced as one line - code=lineage members=R8-content-
+# run-exists - and every question about it (which turn, which terminator, what
+# the classifier saw) had to be inferred. This sink records the last refused
+# selection next to the startup diagnostic, in the same shape: one small file,
+# best effort, token-free, never fatal.
+SPAN_AUDIT_PATH = "/tmp/occ3-bridge-span-audit.json"
+SPAN_AUDIT_SCHEMA = "occ3.span.audit.v1"
+MAX_SPAN_AUDIT_BYTES = 8192
+MAX_SPAN_AUDIT_RUNS = 16
+_SPAN_AUDIT: Dict[str, object] = {}
+
+
+def _audit_begin(**fields) -> None:
+    """Start a fresh audit record for one selection attempt."""
+    _SPAN_AUDIT.clear()
+    _SPAN_AUDIT["schema"] = SPAN_AUDIT_SCHEMA
+    _SPAN_AUDIT["started_at"] = time.time()
+    _SPAN_AUDIT.update(fields)
+
+
+def _audit_update(**fields) -> None:
+    if not _SPAN_AUDIT:
+        return
+    _SPAN_AUDIT.update(fields)
+
+
+def _run_record(run) -> Dict[str, object]:
+    """A run as counts and indices only; it can never reproduce a token."""
+    return {"kind": run.kind, "start_index": run.start_index,
+            "end_index": run.end_index, "contiguous": run.contiguous}
+
+
+def _write_span_audit(code: str, rule: str = "") -> None:
+    if not _SPAN_AUDIT:
+        return
+    try:
+        record: Dict[str, object] = dict(_SPAN_AUDIT)
+        record["code"] = code
+        record["rule"] = rule or None
+        runs = list(record.get("runs") or [])[:MAX_SPAN_AUDIT_RUNS]
+        record["runs"] = runs
+        while True:
+            payload = json.dumps(record, sort_keys=True, default=str).encode("utf-8")
+            if len(payload) <= MAX_SPAN_AUDIT_BYTES or not record["runs"]:
+                break
+            record["runs"] = record["runs"][:len(record["runs"]) // 2]
+        staging = SPAN_AUDIT_PATH + ".tmp"
+        with open(staging, "wb") as handle:
+            handle.write(payload[:MAX_SPAN_AUDIT_BYTES])
+        os.replace(staging, SPAN_AUDIT_PATH)
+    except Exception:
+        # A diagnostic never raises and never retries: the refusal is the signal.
+        return
+
+
+def _require(condition: bool, code: str = "lineage", rule: str = "") -> None:
     if not condition:
-        _decline(code)
+        _decline(code, rule)
 
 
 def _marker_tuple(value, role: str) -> Tuple[int, ...] | None:
@@ -252,6 +327,9 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     the turn.  ``reasoning_tokens`` is the scheduler's own boundary count when
     available (R11 cross-check).
     """
+    _audit_begin(policy=policy, accepted_total=accepted_total,
+                 position_base=position_base, window_rows=len(token_ids),
+                 reasoning_tokens=reasoning_tokens)
     # R0: attestation.
     if policy not in SPAN_POLICIES_V2:
         _decline("profile")
@@ -278,10 +356,10 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     window_start_index = window_start_position - position_base
     window_end_index = window_end_position - position_base
     _require(0 <= window_start_index, "lineage")
-    _require(window_end_index == accepted_total, "lineage")
+    _require(window_end_index == accepted_total, "lineage", "R2-window-end")
 
     # R3: turn end.
-    _require(token_ids[count - 1] in stop_ids, "lineage")
+    _require(token_ids[count - 1] in stop_ids, "lineage", "R3-turn-end")
 
     # R4/R6: the terminator and tool-call completeness need first occurrences.
     markers = marker_table.span_markers()
@@ -289,12 +367,19 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     thinking = _find(token_ids, count, by_role["thinking_end"])
     tool_start = _find(token_ids, count, by_role["tool_call_start"])
     tool_end = _find(token_ids, count, by_role["tool_call_end"])
-    _require(thinking is not None or tool_start is not None, "lineage")
-    _require(tool_start is None or tool_end is not None, "lineage")
+    _require(thinking is not None or tool_start is not None, "lineage", "R4-terminator-present")
+    _require(tool_start is None or tool_end is not None, "lineage", "R4-tool-complete")
     if thinking is not None and (tool_start is None or thinking.start < tool_start.start):
         terminator, terminator_kind = thinking, TERMINATOR_THINKING_END
     else:
         terminator, terminator_kind = tool_start, TERMINATOR_TOOL_CALL_START
+    _audit_update(terminator_kind=terminator_kind, terminator_start=terminator.start,
+                  terminator_end=terminator.end,
+                  thinking_end_start=None if thinking is None else thinking.start,
+                  tool_call_start=None if tool_start is None else tool_start.start,
+                  tool_call_end=None if tool_end is None else tool_end.start,
+                  window_start_index=window_start_index,
+                  window_end_index=window_end_index)
 
     # R5/R7: classification with the second reasoning terminator and the stop
     # set, so the R3 stop row bounds the content run even when it is a role
@@ -303,16 +388,20 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
                              reasoning_end_ids=by_role["tool_call_start"], stop_ids=stop_ids)
 
     # R12 (first half): a truncated run list cannot answer "the last content run".
-    _require(not audit.runs_truncated, "lineage")
+    _audit_update(runs_truncated=audit.runs_truncated,
+                  contains_tool_call=audit.contains_tool_call,
+                  runs=[_run_record(item) for item in audit.runs])
+    _require(not audit.runs_truncated, "lineage", "R12-runs-untruncated")
     run = audit.last_run(CONTENT)
+    _audit_update(last_content_run=None if run is None else _run_record(run))
     # R8: no content run exists; v2 declines, it never falls back.
-    _require(run is not None, "lineage")
+    _require(run is not None, "lineage", "R8-content-run-exists")
     # R7: the run is the region after the R5 boundary, before the first
     # tool-call-start, and stops at a marker row (tool-call-start or the
     # stop row) rather than at the window edge.
-    _require(run.start_index == terminator.end, "lineage")
-    _require(tool_start is None or run.end_index <= tool_start.start, "lineage")
-    _require(run.end_index < count, "lineage")
+    _require(run.start_index == terminator.end, "lineage", "R7-run-after-terminator")
+    _require(tool_start is None or run.end_index <= tool_start.start, "lineage", "R7-run-before-tool")
+    _require(run.end_index < count, "lineage", "R7-run-bounded")
 
     # R9: the no-tool policy refuses any tool syntax anywhere in the window.
     if policy == POLICY_NO_TOOL:
@@ -321,21 +410,21 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
                      "argument_key_end", "argument_value_start", "argument_value_end"):
             if _scan_all(token_ids, count, by_role[role]):
                 tool_syntax = True
-        _require(not tool_syntax, "lineage")
+        _require(not tool_syntax, "lineage", "R9-no-tool-syntax")
 
     # R10: no marker sequence may overlap the selected run at any offset.
     for role in ROLES:
         for start, end in _scan_all(token_ids, count, by_role[role]):
-            _require(start >= run.end_index or end <= run.start_index, "lineage")
+            _require(start >= run.end_index or end <= run.start_index, "lineage", "R10-no-overlap")
 
     # R11: two independent measurements of the reasoning boundary.
     if reasoning_tokens is not None and terminator_kind == TERMINATOR_THINKING_END:
         _require(type(reasoning_tokens) is int and reasoning_tokens >= 0, "lineage")
-        _require(reasoning_tokens == window_start_index + terminator.end, "lineage")
+        _require(reasoning_tokens == window_start_index + terminator.end, "lineage", "R11-boundary-agreement")
 
     # R12 (second half): an unattainable tail limit is refused, not clamped-to-nothing.
     requested = TAIL_LIMITS.get(policy)
-    _require(requested is None or requested <= count, "lineage")
+    _require(requested is None or requested <= count, "lineage", "R12-tail-attainable")
 
     start = run.start_index
     clamped = False
@@ -347,15 +436,18 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
 
     # R2 (window identity, second half): the aligned span is exactly as wide
     # as its rows - no gap inside the selection.
-    _require(positions[start] - position_base >= 0, "lineage")
+    _require(positions[start] - position_base >= 0, "lineage", "R2-start-base")
     _require((run.end_index - start)
-             == (positions[run.end_index - 1] + 1) - positions[start], "lineage")
+             == (positions[run.end_index - 1] + 1) - positions[start], "lineage", "R2-width-identity")
     # Receipt bounds: the aligned span fits the negotiated ring cap, and every
     # class count fits the v2 receipt block's u32 bound (128 per class).
-    _require(2 <= run.end_index - start <= 128, "lineage")
+    _require(2 <= run.end_index - start <= 128, "lineage", "R12-span-width")
     for value in audit.counts.values():
-        _require(value <= 128, "lineage")
+        _require(value <= 128, "lineage", "R12-class-count")
 
+    # A successful selection clears the record: the audit file always describes
+    # the last REFUSED turn, never a stale one.
+    _SPAN_AUDIT.clear()
     return SpanSelectionV2(
         policy=policy, terminator=terminator_kind,
         start_index=start, end_index=run.end_index,

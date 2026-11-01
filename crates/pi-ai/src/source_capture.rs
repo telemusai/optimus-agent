@@ -23,6 +23,22 @@ pub const SOURCE_RECEIPT_SCHEMA: &str = "occ3.source.v1";
 pub const SOURCE_RECEIPT_SCHEMA_V2: &str = "occ3.source.v2";
 pub const SOURCE_RECEIPT_HEADER: &str = "x-optimus-occ3-source";
 pub const MAX_SOURCE_RECEIPT_BYTES: usize = 2048;
+
+/// Keepalive stream extension (opt-in). Mirrors the inference-attachment names:
+/// the client offers `keepalive-v1`; a server that accepts answers with the
+/// deferred-receipt marker and moves the receipt into a terminal SSE event
+/// emitted before the unchanged trailing `[DONE]` frame.
+pub const OCC3_KEEPALIVE_REQUEST_HEADER: &str = "x-optimus-occ3-keepalive";
+pub const OCC3_KEEPALIVE_REQUEST_MODE: &str = "keepalive-v1";
+pub const OCC3_DEFERRED_RECEIPT_HEADER: &str = "x-optimus-occ3-deferred-receipt";
+pub const OCC3_DEFERRED_RECEIPT_MODE: &str = "deferred-v1";
+/// Envelope schema of the terminal receipt event.
+pub const OCC3_TERMINAL_SCHEMA: &str = "occ3.terminal.v1";
+pub const OCC3_TERMINAL_KIND_SOURCE: &str = "source";
+/// The SSE comment frame a keepalive server emits while the inner stream drains.
+pub const OCC3_KEEPALIVE_COMMENT: &str = ": occ3-keepalive";
+/// The event name of the terminal receipt event.
+pub const OCC3_RECEIPT_EVENT: &str = "event: optimus.occ3.receipt";
 /// The v1 span policy: the last N accepted rows, tool tail and stop row
 /// included. Admitted only under `occ3.capture.v1`. A v1 turn carries no span
 /// selection, so the calibration collector never records it.
@@ -705,6 +721,7 @@ impl SourceCaptureLease {
             lease: self.clone(),
             receipt: None,
             body_verified: false,
+            deferred: false,
         })
     }
 }
@@ -714,6 +731,9 @@ pub(crate) struct SourceSubmission {
     lease: SourceCaptureLease,
     receipt: Option<SourceCaptureReceipt>,
     body_verified: bool,
+    /// The server accepted the keepalive offer: the receipt arrives as the
+    /// terminal `optimus.occ3.receipt` SSE event instead of response headers.
+    deferred: bool,
 }
 impl SourceSubmission {
     pub(crate) fn ensure_active(&self) -> Result<(), SourceCaptureError> {
@@ -761,6 +781,76 @@ impl SourceSubmission {
             .map(|r| r.response_id.as_str())
             .ok_or(SourceCaptureError::InvalidReceipt)
     }
+    /// Keepalive offer handling at response headers. `Ok(false)` means the
+    /// server kept the buffered contract, so the caller must fall back to
+    /// `verify_header`; `Ok(true)` defers the receipt to the terminal event.
+    pub(crate) fn defer_header(
+        &mut self,
+        headers: &reqwest::header::HeaderMap,
+    ) -> Result<bool, SourceCaptureError> {
+        self.ensure_active()?;
+        if headers
+            .get_all(reqwest::header::CONTENT_ENCODING)
+            .iter()
+            .any(|v| v.as_bytes() != b"identity")
+        {
+            return Err(SourceCaptureError::InvalidReceipt);
+        }
+        let mut values = headers.get_all(OCC3_DEFERRED_RECEIPT_HEADER).iter();
+        match values.next() {
+            None => Ok(false),
+            Some(value) => {
+                if values.next().is_some() || value.as_bytes() != OCC3_DEFERRED_RECEIPT_MODE.as_bytes() {
+                    return Err(SourceCaptureError::InvalidReceipt);
+                }
+                self.deferred = true;
+                Ok(true)
+            }
+        }
+    }
+
+    /// Whether this submission waits for the terminal receipt event.
+    pub(crate) fn is_deferred(&self) -> bool {
+        self.deferred
+    }
+
+    /// Verify the receipt carried by the terminal SSE envelope. The invariants
+    /// are exactly `verify_header`'s; only the transport differs.
+    pub(crate) fn verify_deferred_receipt(
+        &mut self,
+        envelope: &serde_json::Value,
+    ) -> Result<(), SourceCaptureError> {
+        self.ensure_active()?;
+        if !self.deferred
+            || envelope.get("schema").and_then(serde_json::Value::as_str) != Some(OCC3_TERMINAL_SCHEMA)
+            || envelope.get("kind").and_then(serde_json::Value::as_str) != Some(OCC3_TERMINAL_KIND_SOURCE)
+        {
+            return Err(SourceCaptureError::InvalidReceipt);
+        }
+        let receipt_value = envelope
+            .get("receipt")
+            .cloned()
+            .ok_or(SourceCaptureError::InvalidReceipt)?;
+        if serde_json::to_vec(&receipt_value).map(|bytes| bytes.len()).unwrap_or(usize::MAX)
+            > MAX_SOURCE_RECEIPT_BYTES
+        {
+            return Err(SourceCaptureError::InvalidReceipt);
+        }
+        let receipt: SourceCaptureReceipt = serde_json::from_value(receipt_value)
+            .map_err(|_| SourceCaptureError::InvalidReceipt)?;
+        if envelope.get("response_id").and_then(serde_json::Value::as_str) != Some(receipt.response_id.as_str()) {
+            return Err(SourceCaptureError::InvalidReceipt);
+        }
+        validate_receipt(
+            &receipt,
+            self.lease.intent(),
+            self.lease.profile(),
+            epoch_now()?,
+        )?;
+        self.receipt = Some(receipt);
+        Ok(())
+    }
+
     pub(crate) fn verify_body(&mut self, bytes: &[u8]) -> Result<(), SourceCaptureError> {
         self.ensure_active()?;
         if bytes.len() > self.lease.limits().max_response_bytes {

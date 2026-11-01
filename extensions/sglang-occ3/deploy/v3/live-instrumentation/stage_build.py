@@ -68,15 +68,30 @@ CHUNK_CHARS = 6000
 MAX_PY_BYTES = 2 * 1024 * 1024
 MAX_FILE_BYTES = 64 * 1024 * 1024
 
-ARM_ORDER = ("N-none", "F-text", "T-exact", "T-norm", "N-shape")
-ARM_TOKENS = {"T-exact": b"texact\n", "T-norm": b"tnorm\n", "N-shape": b"nshape\n",
-              "N-none": b"", "F-text": b""}
+# The corrected 8-arm experiment surface (campaign section 5). Four hook arms
+# carry the unchanged wire tokens; the four client-side arms (NATIVE,
+# NO_ATTACHMENT, FULL_TEXT, WRONG_SENDER) run with the control file ABSENT -
+# the hook selects no arm and the driver's --arm flag (OCC3_ARM env; the flag
+# wins) owns the case. TOKEN_FULL and TOKEN_SELECTED share the texact token:
+# the difference is the driver-side coverage==1 assertion, not the hook.
+ARM_ORDER = ("NO_ATTACHMENT", "FULL_TEXT", "TOKEN_FULL", "TOKEN_SELECTED",
+             "TOKEN_NORM", "NULL_SHAPE", "NATIVE", "WRONG_SENDER")
+ARM_TOKENS = {"TOKEN_FULL": b"texact\n", "TOKEN_SELECTED": b"texact\n",
+              "TOKEN_NORM": b"tnorm\n", "NULL_SHAPE": b"nshape\n"}
+ARM_ABSENT_CONTROL = tuple(arm for arm in ARM_ORDER if arm not in ARM_TOKENS)
 ARM_OPERATOR_STEP = {
-    "N-none": "remove the control file before the turn",
-    "F-text": "control file absent",
-    "T-exact": "write arms/control-T-exact.txt into the control path",
-    "T-norm": "write arms/control-T-norm.txt into the control path",
-    "N-shape": "write arms/control-N-shape.txt into the control path, remove it after the turn",
+    "NO_ATTACHMENT": "verify the control path is absent, run the client with --arm NO_ATTACHMENT",
+    "FULL_TEXT": "verify the control path is absent, run the client with --arm FULL_TEXT",
+    "TOKEN_FULL": "write arms/control-TOKEN_FULL.txt (texact) into the control path, "
+                  "run with --arm TOKEN_FULL",
+    "TOKEN_SELECTED": "write arms/control-TOKEN_SELECTED.txt (texact) into the control path, "
+                      "run with --arm TOKEN_SELECTED",
+    "TOKEN_NORM": "write arms/control-TOKEN_NORM.txt (tnorm) into the control path, "
+                  "run with --arm TOKEN_NORM",
+    "NULL_SHAPE": "write arms/control-NULL_SHAPE.txt (nshape) into the control path, "
+                  "run with --arm NULL_SHAPE, remove it after the turn",
+    "NATIVE": "verify the control path is absent, run with --arm NATIVE",
+    "WRONG_SENDER": "verify the control path is absent, run with --arm WRONG_SENDER",
 }
 
 
@@ -186,8 +201,9 @@ def staged_entries(window, plan_path):
     entries.append(_entry("instrumentation", INST_DIR / "zz_occ3_p3_arms.pth",
                           live_root + "/extras/site-packages/zz_occ3_p3_arms.pth"))
     for arm in ARM_ORDER:
-        entries.append(_entry("arm-control", None, live_root + "/arms/control-" + arm + ".txt",
-                              ARM_TOKENS[arm]))
+        if arm in ARM_TOKENS:
+            entries.append(_entry("arm-control", None, live_root + "/arms/control-" + arm + ".txt",
+                                  ARM_TOKENS[arm]))
     return entries
 
 
@@ -202,6 +218,7 @@ def _arm_order_document(window, hook_digests):
         "arm_order": list(ARM_ORDER),
         "tokens": {arm: token.decode("ascii").strip() or None
                    for arm, token in ARM_TOKENS.items()},
+        "absent_control_arms": list(ARM_ABSENT_CONTROL),
         "operator_step": dict(ARM_OPERATOR_STEP),
         "one_attempt_per_arm": True,
         "log_line": "occ3_p3_arm=<token|none> file_sha256=<hex|none> mtime_ns=<int>",

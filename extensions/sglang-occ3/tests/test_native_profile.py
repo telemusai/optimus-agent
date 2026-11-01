@@ -320,12 +320,55 @@ class RegisteredMethodTests(ErrorAssertions, unittest.TestCase):
         self.error_code("profile_invalid", lambda:
                         profile.validate_method_binding(binding, message))
 
-    def test_a_pinned_profile_still_names_only_advertised_methods(self):
+    def test_a_pinned_profile_names_advertised_or_registered_challenger_methods(self):
+        """P5: the registered low-rank Procrustes challengers are pinnable by a
+        runtime profile (fit on FIT, select on VALIDATION, bind to a native
+        profile) even though the packaged advertisement still ships only the
+        per-message and dual-ridge identities; an unknown id still refuses."""
         self.assertTrue(static_profile()["method"] == profile.PER_MESSAGE_METHOD
                         or static_profile()["method"] in profile.advertised_methods())
-        challenger = static_profile()
-        challenger["method"] = profile.PROCRUSTES_METHOD
-        self.error_code("profile_invalid", lambda: profile._validate_profile(challenger))
+        for challenger in (profile.PROCRUSTES_METHOD, profile.PROCRUSTES_METHOD_SO,
+                           profile.PROCRUSTES_METHOD_PLAIN):
+            pinned = static_profile()
+            pinned["method"] = challenger
+            self.assertEqual(profile._validate_profile(pinned), pinned)
+            self.assertNotIn(challenger, profile.advertised_methods())
+        for unknown in ("statebridge.glm53.final-prenorm-predictor"
+                        ".calibrated-lowrank-procrustes.v2",
+                        "statebridge.glm53.final-prenorm-predictor.unknown.v1"):
+            pinned = static_profile()
+            pinned["method"] = unknown
+            self.error_code("profile_invalid", lambda: profile._validate_profile(pinned))
+
+    def test_a_challenger_profile_validates_its_own_binding_class(self):
+        from occ3_sglang.statebridge_calibrated_procrustes import ProcrustesBinding
+        pinned = static_profile()
+        pinned["method"] = profile.PROCRUSTES_METHOD
+        binding = ProcrustesBinding(
+            method_id=profile.PROCRUSTES_METHOD, variant="o", r=64, eta=0.01, a0=0.0,
+            rotation_defect=1e-6, rotation_determinant=-1.0, hidden_dim=6144, rows=512,
+            layer_index=77, model_fingerprint=pinned["model_fingerprint"],
+            checkpoint_revision="rev-1", tokenizer_fingerprint="sha256:" + "b" * 64,
+            embedding_id="glm53-tp8-vocab",
+            capture_method_id="glm53.final-prenorm.capture.v1",
+            capture_span_policy="whole_completed_response_tail_v1",
+            predictor_position_offset=-1, precision="float32",
+            fit_manifest_digest="d" * 64, corpus_digest="c" * 64, rank_hidden=64,
+            rank_embedding=64, participation_hidden=2.0, participation_embedding=2.0,
+            whitening_gain_hidden=1.0, whitening_gain_embedding=1.0)
+        descriptor = profile.validate_method_binding(binding, pinned)
+        self.assertEqual(descriptor["method_id"], profile.PROCRUSTES_METHOD)
+        self.assertEqual(descriptor["artifact_module"],
+                         "occ3_sglang.statebridge_calibrated_procrustes")
+        # The identity of the pinned method still rules the binding: a wrong
+        # hidden dim, layer or model fingerprint is refused exactly as before.
+        for changes in ({"hidden_dim": 512}, {"layer_index": 78},
+                         {"model_fingerprint": "other-value-1"}):
+            broken = static_profile()
+            broken["method"] = profile.PROCRUSTES_METHOD
+            broken.update(changes)
+            self.error_code("profile_invalid",
+                            lambda: profile.validate_method_binding(binding, broken))
 
 
 class ParentTokenTests(ErrorAssertions, unittest.TestCase):

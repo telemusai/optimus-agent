@@ -153,6 +153,75 @@ def _decline_detail(error):
     return "exception_" + name if name.isidentifier() else "exception_unknown"
 
 
+_DIAGNOSTIC_PATH = "/tmp/occ3-bridge-startup-diagnostic.json"
+_DIAGNOSTIC_FILES = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
+
+
+def _describe_packaging_file(path):
+    """Path, digest and stat of one packaging file the loaders would read."""
+    import hashlib
+    import os
+    name = os.path.basename(str(path))
+    try:
+        with open(path, "rb") as handle:
+            raw = handle.read(1 << 20)
+        info = os.stat(path)
+    except Exception:
+        return {"name": name, "readable": False}
+    return {"name": name, "readable": True, "sha256": hashlib.sha256(raw).hexdigest(),
+            "bytes": info.st_size, "mode": oct(info.st_mode & 0o7777),
+            "uid": info.st_uid, "gid": info.st_gid, "nlink": info.st_nlink}
+
+
+def _startup_diagnostic(error, selection, stage):
+    """Bounded, secret-free description of a declined startup step.
+
+    Permanent diagnostic: the receipt taxonomy deliberately carries no exception
+    text, so every generic decline used to look identical. This record names the
+    exception class, its fixed code when it has one, the process identity, the
+    exact packaging files the loader resolves next to this module (digest, mode,
+    owner, link count) and a bounded traceback. It never enters an HTTP payload
+    and never carries request data, credentials or model content.
+    """
+    import os
+    import traceback
+    from pathlib import Path
+    package = Path(__file__).absolute().parent
+    return {"schema": "occ3.startup.diagnostic.v1", "stage": stage,
+            "selected": selection is not None, "exception": type(error).__name__,
+            "exception_code": getattr(error, "code", None),
+            "euid": getattr(os, "geteuid", lambda: None)(), "cwd": os.getcwd(),
+            "package": str(package),
+            "files": [_describe_packaging_file(package / name) for name in _DIAGNOSTIC_FILES],
+            "traceback": traceback.format_exc()[-8192:]}
+
+
+def _diagnostic_line(record):
+    """One bounded log line; enough to explain a decline without the file."""
+    files = " ".join("%s:%s:%s:%s:%s" % (item["name"], (item.get("sha256") or "-")[:12],
+                                        item.get("mode"), item.get("uid"), item.get("gid"))
+                     for item in record["files"])
+    return ("stage=%s selected=%s exception=%s code=%s euid=%s cwd=%s package=%s files=[%s]"
+            % (record["stage"], record["selected"], record["exception"],
+               record["exception_code"], record["euid"], record["cwd"],
+               record["package"], files))[:1024]
+
+
+def _record_startup_diagnostic(record):
+    """Best-effort bounded file so a post-mortem needs no log scraping."""
+    import json
+    import os
+    try:
+        temporary = "%s.%d.tmp" % (_DIAGNOSTIC_PATH, os.getpid())
+        with open(temporary, "w", encoding="utf-8") as handle:
+            json.dump(record, handle, sort_keys=True, indent=1)
+        os.chmod(temporary, 0o644)
+        os.replace(temporary, _DIAGNOSTIC_PATH)
+        return _DIAGNOSTIC_PATH
+    except Exception:
+        return None
+
+
 def _existing_auth(app, tm):
     args = getattr(tm, "server_args", None)
     key = getattr(args, "api_key", None)
@@ -1207,6 +1276,13 @@ def prepare_selected_native_server(server, app, tokenizer_manager):
                                      attempt=attempt)
         logger.error("occ3-bridge: native startup decline (attempt=%s stage=prepare code=%s selected=%s)",
                      attempt, error.code, selection is not None)
+        # Fixed-code decline: no traceback needed, but the packaging facts must
+        # stay observable so a selection/mode decline is never ambiguous. The
+        # record goes to the diagnostic file only: the log keeps exactly one
+        # bounded decline line and never carries exception text.
+        record = _startup_diagnostic(error, selection, "prepare")
+        record["traceback"] = ""
+        _record_startup_diagnostic(record)
         return receipt
     except Exception as error:
         receipt = StartupReceipt(selection is not None, False, "experimental_startup_refused")
@@ -1216,6 +1292,11 @@ def prepare_selected_native_server(server, app, tokenizer_manager):
         logger.error("occ3-bridge: native startup decline (attempt=%s stage=prepare code=experimental_startup_refused "
                      "selected=%s detail=%s)", attempt, selection is not None,
                      _decline_detail(error))
+        # Unclassified decline: the receipt keeps no exception text and the log
+        # keeps its single bounded line, so the bounded diagnostic (exception
+        # class and code, process identity, packaging digests, traceback) goes to
+        # the fixed file and is read back by the operator/controller tooling.
+        _record_startup_diagnostic(_startup_diagnostic(error, selection, "prepare"))
         return receipt
 
     owner = _StartupOwner(app, tokenizer_manager, original)

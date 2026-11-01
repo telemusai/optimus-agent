@@ -1647,6 +1647,11 @@ async fn stream_assistant_response_inner(
                     .await?;
                 }
             }
+            AssistantMessageEvent::Keepalive { .. } => {
+                // Transport liveness only: `last_event_at` was already reset
+                // when the event arrived, which is the entire purpose of the
+                // keepalive extension. No aggregation, no message state.
+            }
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => {
                 let mut final_message = get_terminal_message(&event);
                 match maybe_abortable(

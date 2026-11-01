@@ -1053,6 +1053,14 @@ pub enum AssistantMessageEvent {
         reason: String,
         error: AssistantMessage,
     },
+    /// Transport keepalive from the OCC-3 stream extension (`: occ3-keepalive`
+    /// SSE comment frame). Carries no model bytes and mutates no message
+    /// state: its only consumer effect is resetting stream liveness timers
+    /// (the event-gap watchdog) during a long buffered receive phase.
+    #[serde(rename = "keepalive")]
+    Keepalive {
+        partial: AssistantMessage,
+    },
 }
 
 impl AssistantMessageEvent {
@@ -1070,6 +1078,7 @@ impl AssistantMessageEvent {
             AssistantMessageEvent::ToolCallEnd { .. } => "toolcall_end",
             AssistantMessageEvent::Done { .. } => "done",
             AssistantMessageEvent::Error { .. } => "error",
+            AssistantMessageEvent::Keepalive { .. } => "keepalive",
         }
     }
 
@@ -1085,7 +1094,8 @@ impl AssistantMessageEvent {
             | AssistantMessageEvent::ThinkingEnd { partial, .. }
             | AssistantMessageEvent::ToolCallStart { partial, .. }
             | AssistantMessageEvent::ToolCallDelta { partial, .. }
-            | AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+            | AssistantMessageEvent::ToolCallEnd { partial, .. }
+            | AssistantMessageEvent::Keepalive { partial } => Some(partial),
             AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
         }
     }

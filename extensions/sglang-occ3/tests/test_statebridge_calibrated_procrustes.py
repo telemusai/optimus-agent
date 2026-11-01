@@ -556,6 +556,69 @@ def test_serving_transform_variants():
         assert caught.value.code == "profile"
 
 
+def test_serving_transform_n0_applies_the_dual_ridge_guards():
+    """N0 keeps the finite and norm-floor guards the dual-ridge method has: a
+    zero or nonfinite row is refused before it can reach the prefix, not only
+    under N1."""
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.statebridge_calibrated_procrustes import serving_transform
+    gen = _generator(1102)
+    z_raw = torch.randn(12, 64, generator=gen)
+    served = serving_transform(None, z_raw)
+    assert served is z_raw and torch.equal(served, z_raw)
+    zero = z_raw.clone()
+    zero[3] = 0.0
+    with pytest.raises(LatentError) as caught:
+        serving_transform(None, zero)
+    assert caught.value.code == "numerical"
+    for row, column in ((5, 1), (2, 9), (0, 0)):
+        nonfinite = z_raw.clone()
+        nonfinite[row, column] = float("inf") if column else float("nan")
+        with pytest.raises(LatentError) as caught:
+            serving_transform(None, nonfinite)
+        assert caught.value.code == "numerical"
+    # A non-contiguous input returns a contiguous copy, exactly like the
+    # dual-ridge N0 path.
+    strided = z_raw.t().contiguous().t()
+    assert not strided.is_contiguous()
+    guarded = serving_transform(None, strided)
+    assert guarded.is_contiguous() and torch.equal(guarded, strided)
+
+
+def test_rank_bound_is_the_fit_refusal_boundary():
+    """rank_bound is min(numerical_rank(A), numerical_rank(B), M - 1, D): every
+    r at or below it fits, every r above it is refused without null
+    directions, and the bound never exceeds the shape limits."""
+    from occ3_sglang.latent_types import LatentError
+    from occ3_sglang.statebridge_calibrated_procrustes import fit_map, rank_bound
+    exact = _SharedFactor(rows=128, dim=64, rank=16, seed=100)
+    partition = exact.partition(seed=1103)
+    bound = rank_bound(partition)
+    assert bound == 16
+    assert bound <= min(partition["hidden"].shape[0] - 1, partition["hidden"].shape[1])
+    for r in (16,):
+        assert fit_map(partition, {"r": r, "eta": 0.01}).r == r
+    for r in (32, 64):
+        with pytest.raises(LatentError) as caught:
+            fit_map(partition, {"r": r, "eta": 0.01})
+        assert caught.value.code == "numerical"
+    noisy = _SharedFactor(rows=128, dim=64, rank=16, seed=100, noise=0.5)
+    noisy_partition = noisy.partition(seed=1201)
+    noisy_bound = rank_bound(noisy_partition)
+    assert noisy_bound > 16
+    artifact = fit_map(noisy_partition, {"r": 16, "eta": 0.01}, provenance=_provenance())
+    assert noisy_bound == min(artifact.binding.rank_hidden,
+                              artifact.binding.rank_embedding,
+                              noisy_partition["hidden"].shape[0] - 1,
+                              noisy_partition["hidden"].shape[1])
+    # A pure measurement: repeating it changes nothing, and a malformed
+    # partition is refused by the same contract check the fit uses.
+    assert rank_bound(noisy_partition) == noisy_bound
+    with pytest.raises(LatentError) as caught:
+        rank_bound(dict(partition, extra=1))
+    assert caught.value.code == "profile"
+
+
 def test_numerical_rank_is_recorded_separately_from_the_requested_rank():
     from occ3_sglang.statebridge_calibrated_procrustes import describe, fit_map
     exact = fit_map(_SharedFactor(rows=128, dim=64, rank=16, seed=100).partition(),

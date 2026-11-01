@@ -12,7 +12,11 @@ Truthfulness rules (normative, see the phase-split design):
   ids the installed registry advertises (build capability), which is not a
   readiness or live-proof claim.
 - ``code``/``stage``/``attempt`` are fixed-taxonomy values or null; exception
-  text, paths, principals and secrets never enter a payload or log line.
+  text, paths, principals and secrets never enter a payload or log line. A
+  bounded, secret-free startup diagnostic (exception class and fixed code,
+  process identity, packaging file digests and stats, truncated traceback) is
+  written to /tmp/occ3-bridge-startup-diagnostic.json so a generic decline stays
+  explainable; it never carries request data, credentials or model content.
 - The identity route never fabricates the incarnation tuple: before
   NATIVE_READY it answers 503 ``not_ready``; afterwards it delegates to the
   extracted runtime handler against the installed backend only.

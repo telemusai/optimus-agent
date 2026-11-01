@@ -304,3 +304,75 @@ def test_only_accepted_verify_rows_enter_the_retained_ring(monkeypatch):
         if rejected in accepted:
             continue
         assert not any(torch.equal(written_hidden[i], hidden[rejected]) for i in range(len(accepted)))
+
+
+def test_v2_armed_commit_feeds_content_state_positions(monkeypatch):
+    """Regression (2026-10-30 live window 095217Z): the v2 commit path called
+    state.feed(..., positions) with positions never unpacked from prepared, so
+    every v2-armed capture commit raised NameError inside preflight
+    (commit_write), poisoned the runtime (persistent latent_failed on
+    identity) and aborted the first armed turn server-side with 503
+    occ3_commit_failed. The v1 path (no content state) never executed the
+    feed line, which is why every earlier commit test passed.
+
+    This test commits a v2-armed capture with a content state present and
+    asserts: no exception, no poison, the ring advances, the stage commits,
+    and the state received (tokens, hidden, positions) with positions equal
+    to the lineage-validated tensor.
+    """
+    torch = pytest.importorskip("torch", reason="Actual CPU Torch is required; no tensor stub")
+    from occ3_sglang.attachment_contract import CaptureWorkerDescriptor
+
+    width, ring_size, accepted = 6, 8, [3, 1, 5]
+    prompt = [11, 12, 13]
+    descriptor = CaptureWorkerDescriptor(
+        attempt_id="capture", reservation_id="reserve-capture", native_rid="rid",
+        principal_digest="a" * 64, runtime_epoch="epoch", model_fingerprint="model-hash",
+        method_id=profile().method, deadline=900.0, capture_id="c" * 64,
+        source_session_id="source", source_turn_nonce="nonce", runtime_generation=9,
+        span_policy="content_tail_v2", marker_profile="glm45_glm47_xml_kv.v1",
+        max_prefix_tokens=ring_size, max_capture_bytes=1 << 20)
+    hidden_dim = profile().hidden_dim
+    hidden = (torch.arange(1, width + 1, dtype=torch.float32)[:, None] * 1e6
+              + torch.arange(hidden_dim, dtype=torch.float32)[None, :])
+    positions = torch.tensor([50, 3, 51, 2, 52, 4], dtype=torch.int64)
+    predict = torch.tensor([70, 73, 71, 90, 72, 95], dtype=torch.int64)
+    accept_index = torch.tensor([[3, 1, 5, -1, -1, -1]], dtype=torch.int64)
+    accept_lens = torch.tensor([len(accepted)], dtype=torch.int32)
+    context = (RequestSlice(descriptor, 0, width, ring_size, 0, True),)
+    record = NS(events=[], live_refs=[], inflight=0, accepted_count=0, retained=[])
+
+    fed = []
+
+    class RecordingContentState:
+        def feed(self, tokens, hidden_rows, positions_arg):
+            fed.append((tokens.clone(), hidden_rows.clone(), positions_arg.clone()))
+
+    record.occ3_content_state = RecordingContentState()
+    stream = NS(wait_event=lambda event: None)
+    runtime = NS(torch=CpuTorch(torch, stream), device="cpu", profile=profile(), poisoned=False,
+                 resolve=lambda value, **kwargs: record, gather=lambda value: [value] * 8,
+                 event=lambda: NS(query=lambda: True))
+    runtime.preflight = types.MethodType(worker.WorkerRuntime.preflight, runtime)
+    runtime.reap_live = types.MethodType(worker.WorkerRuntime.reap_live, runtime)
+    monkeypatch.setattr(worker, "_RUNTIME", runtime)
+    events = runtime.event()
+    logits = NS(occ3_capture_rows=worker.CaptureRows(context, hidden, positions, "verify", events, 7))
+    forward_batch = NS(occ3_context=context, occ3_force_eager=True, batch_size=1)
+    stage = worker.stage_verify(forward_batch, logits, predict, accept_lens, accept_index, positions)
+    assert stage is not None and stage.counts.tolist() == [len(accepted)]
+    request = NS(rid="rid", occ3_worker_descriptor=descriptor, retraction_count=0,
+                 origin_input_ids=prompt, output_ids=[int(predict[i]) for i in accepted])
+    worker.commit_result(NS(occ3_runtime=runtime), request, NS(occ3_capture_stage=stage),
+                         0, 0, len(accepted), terminal=False, forward_iter=7)
+    # The regression assertions: no NameError, no poison, ring advanced, and
+    # the content state was fed exactly once with the lineage positions.
+    assert runtime.poisoned is False
+    assert record.accepted_count == len(accepted) and stage.committed
+    assert len(fed) == 1
+    fed_tokens, fed_hidden, fed_positions = fed[0]
+    assert torch.equal(fed_tokens, predict[accepted])
+    assert torch.equal(fed_hidden, hidden[accepted])
+    expected_positions = torch.arange(len(prompt) + 0 - 1,
+                                      len(prompt) + len(accepted) - 1, dtype=torch.int64)
+    assert torch.equal(fed_positions, expected_positions)

@@ -1,0 +1,230 @@
+{
+ "schema": "occ3.icalib.p3-arm-schedule.v1",
+ "status": "DRAFT - OFFLINE - NOT RUN",
+ "window": "<WIN>",
+ "source_of_truth": {
+  "arm_order": "extensions/sglang-occ3/deploy/v3/live-instrumentation/stage_build.py ARM_ORDER",
+  "control_tokens": "stage_build.py ARM_TOKENS (hook parser: occ3_p3_arms_hook.py _arm_token)",
+  "plan": "occ3-icalib-briefs/live-first-control-plan.md sections 2.4, 2.5, 4.3",
+  "protocol": "reports/occ3-independent-calibration/SEMANTIC-PROTOCOL.md section 3"
+ },
+ "arm_order": [
+  "N-none",
+  "F-text",
+  "T-exact",
+  "T-norm",
+  "N-shape"
+ ],
+ "one_attempt_per_arm": true,
+ "interleave": "all five arms share one window, one serving process and one turn sequence; no restart separates arms (live-first-control-plan.md 2.4); each attached arm interleaves its own capture -> publish -> attach cycle; the order below is fixed by plan 4.3 and may not be rotated or changed after arm 1 has run (1.4)",
+ "control_path": "/tmp/occ3_p3_arm",
+ "control_path_env": "OCC3_P3_ARM_FILE",
+ "tokens": {
+  "T-exact": "texact",
+  "T-norm": "tnorm",
+  "N-shape": "nshape",
+  "N-none": null,
+  "F-text": null
+ },
+ "control_files": {
+  "T-exact": "arms/control-T-exact.txt",
+  "T-norm": "arms/control-T-norm.txt",
+  "N-shape": "arms/control-N-shape.txt",
+  "N-none": "arms/control-N-none.txt",
+  "F-text": "arms/control-F-text.txt"
+ },
+ "operator_step": {
+  "N-none": "remove the control file before the turn; the control path must hold NO file",
+  "F-text": "control file absent; nothing is written to the control path",
+  "T-exact": "write arms/control-T-exact.txt (bytes 'texact\\n') to the control path",
+  "T-norm": "write arms/control-T-norm.txt (bytes 'tnorm\\n') to the control path",
+  "N-shape": "write arms/control-N-shape.txt (bytes 'nshape\\n') to the control path, remove the file after the turn"
+ },
+ "turn_id_grammar": {
+  "pattern": "p3-<WIN>-t<NNNN>",
+  "example": "p3-icalib-20261107T041500Z-t0003",
+  "seq": "4-digit zero-padded, allocated strictly in execution order",
+  "constraint": "must match [A-Za-z0-9._:/-]{1,256} (attachment_contract.py:31 identifier; calibration_corpus.py _IDENTIFIER)"
+ },
+ "sessions": {
+  "source": "p3-<WIN>-src",
+  "receiver": "p3-<WIN>-rcv",
+  "access_domain": "p3-<WIN>",
+  "note": "one source session for all three captures (family_id of every P3 corpus row would be the source session; latent_worker.py:389 capture.submit passes source_session_id as family)"
+ },
+ "turns": [
+  {
+   "seq": 1,
+   "turn_id": "p3-<WIN>-t0001",
+   "arm": "N-none",
+   "role": "plain-receiver",
+   "kind": "chat",
+   "occ3_keys": false,
+   "control_file_state": "absent",
+   "wire_ids": {},
+   "operator_step_before": "remove the control file"
+  },
+  {
+   "seq": 2,
+   "turn_id": "p3-<WIN>-t0002",
+   "arm": "F-text",
+   "role": "plain-receiver",
+   "kind": "chat",
+   "occ3_keys": false,
+   "control_file_state": "absent",
+   "wire_ids": {},
+   "operator_step_before": "control file absent (no change)"
+  },
+  {
+   "seq": 3,
+   "turn_id": "p3-<WIN>-t0003",
+   "arm": "T-exact",
+   "role": "source-capture",
+   "kind": "chat+occ3_capture",
+   "occ3_keys": "occ3_capture",
+   "control_file_state": "texact\\n",
+   "wire_ids": {
+    "capture_id": "p3-<WIN>-t0003",
+    "source_request_id": "p3-<WIN>-req-t0003",
+    "turn_nonce": "p3-<WIN>-nonce-t0003"
+   },
+   "operator_step_before": "write control-T-exact.txt to the control path"
+  },
+  {
+   "seq": 4,
+   "turn_id": "p3-<WIN>-t0004",
+   "arm": "T-exact",
+   "role": "receiver-attach",
+   "kind": "chat+occ3",
+   "occ3_keys": "occ3 + occ3_receipt_mode",
+   "control_file_state": "texact\\n",
+   "wire_ids": {
+    "request_id": "p3-<WIN>-req-t0004",
+    "message_id": "p3-<WIN>-msg-t0004",
+    "publication_id": "p3-<WIN>-pub-t0003",
+    "tool_call_id": "<id of the single occ3_handoff call in turn t0003>"
+   },
+   "operator_step_before": null
+  },
+  {
+   "seq": 5,
+   "turn_id": "p3-<WIN>-t0005",
+   "arm": "T-norm",
+   "role": "source-capture",
+   "kind": "chat+occ3_capture",
+   "occ3_keys": "occ3_capture",
+   "control_file_state": "tnorm\\n",
+   "wire_ids": {
+    "capture_id": "p3-<WIN>-t0005",
+    "source_request_id": "p3-<WIN>-req-t0005",
+    "turn_nonce": "p3-<WIN>-nonce-t0005"
+   },
+   "operator_step_before": "write control-T-norm.txt to the control path"
+  },
+  {
+   "seq": 6,
+   "turn_id": "p3-<WIN>-t0006",
+   "arm": "T-norm",
+   "role": "receiver-attach",
+   "kind": "chat+occ3",
+   "occ3_keys": "occ3 + occ3_receipt_mode",
+   "control_file_state": "tnorm\\n",
+   "wire_ids": {
+    "request_id": "p3-<WIN>-req-t0006",
+    "message_id": "p3-<WIN>-msg-t0006",
+    "publication_id": "p3-<WIN>-pub-t0005",
+    "tool_call_id": "<id of the single occ3_handoff call in turn t0005>"
+   },
+   "operator_step_before": null
+  },
+  {
+   "seq": 7,
+   "turn_id": "p3-<WIN>-t0007",
+   "arm": "N-shape",
+   "role": "source-capture",
+   "kind": "chat+occ3_capture",
+   "occ3_keys": "occ3_capture",
+   "control_file_state": "nshape\\n",
+   "wire_ids": {
+    "capture_id": "p3-<WIN>-t0007",
+    "source_request_id": "p3-<WIN>-req-t0007",
+    "turn_nonce": "p3-<WIN>-nonce-t0007"
+   },
+   "operator_step_before": "write control-N-shape.txt to the control path"
+  },
+  {
+   "seq": 8,
+   "turn_id": "p3-<WIN>-t0008",
+   "arm": "N-shape",
+   "role": "receiver-attach",
+   "kind": "chat+occ3",
+   "occ3_keys": "occ3 + occ3_receipt_mode",
+   "control_file_state": "nshape\\n",
+   "wire_ids": {
+    "request_id": "p3-<WIN>-req-t0008",
+    "message_id": "p3-<WIN>-msg-t0008",
+    "publication_id": "p3-<WIN>-pub-t0007",
+    "tool_call_id": "<id of the single occ3_handoff call in turn t0007>"
+   },
+   "operator_step_before": "remove the control file after the turn"
+  }
+ ],
+ "turn_id_ranges": [
+  {
+   "arm": "N-none",
+   "roles": [
+    "plain-receiver"
+   ],
+   "first": "p3-<WIN>-t0001",
+   "last": "p3-<WIN>-t0001"
+  },
+  {
+   "arm": "F-text",
+   "roles": [
+    "plain-receiver"
+   ],
+   "first": "p3-<WIN>-t0002",
+   "last": "p3-<WIN>-t0002"
+  },
+  {
+   "arm": "T-exact",
+   "roles": [
+    "source-capture",
+    "receiver-attach"
+   ],
+   "first": "p3-<WIN>-t0003",
+   "last": "p3-<WIN>-t0004"
+  },
+  {
+   "arm": "T-norm",
+   "roles": [
+    "source-capture",
+    "receiver-attach"
+   ],
+   "first": "p3-<WIN>-t0005",
+   "last": "p3-<WIN>-t0006"
+  },
+  {
+   "arm": "N-shape",
+   "roles": [
+    "source-capture",
+    "receiver-attach"
+   ],
+   "first": "p3-<WIN>-t0007",
+   "last": "p3-<WIN>-t0008"
+  }
+ ],
+ "determinism": "source decode temperature 0 + seed 1234; the three source captures must carry the same accepted_sequence_digest (plan 2.5); a mismatch stops the phase as a framing-equality failure",
+ "repeat_rule": "a repeated arm is a new declared window with a new id and re-runs all five arms in the same order (plan 4.3); turn ids never repeat because the window id is part of every id",
+ "fit_exclusion": {
+  "reserved_prefixes": [
+   "p3-"
+  ],
+  "template": "fit-exclusion.template.json",
+  "format_doc": "FIT-EXCLUSION-FORMAT.md"
+ },
+ "evidence": {
+  "turns_jsonl": "turns.jsonl",
+  "note": "driver appends one record per submitted turn (arm, turn_id, wire ids, request sha256, status, finish_reason, answer class, receipt summary, control-file readings, timings)"
+ }
+}

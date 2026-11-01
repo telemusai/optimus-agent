@@ -21,9 +21,14 @@ use crate::cache_pricing::{get_anthropic_cache_write_cost, has_standard_anthropi
 use crate::env_api_keys::{get_env_api_key, get_prime_team_id};
 use crate::inference_attachment::{
 	InferenceAttachmentError, InferenceStateLease, InferenceStateLeaseState, InferenceSubmission, INFERENCE_RECEIPT_HEADER,
+	OCC3_DEFERRED_RECEIPT_HEADER as INFERENCE_DEFERRED_HEADER, OCC3_KEEPALIVE_REQUEST_HEADER, OCC3_KEEPALIVE_REQUEST_MODE,
+	OCC3_TERMINAL_SCHEMA,
 };
 use crate::models::{calculate_cost, clamp_thinking_level, CostOverrides};
-use crate::source_capture::{SourceCaptureError, SourceCaptureLease, SourceCaptureState, SourceSubmission, SOURCE_RECEIPT_HEADER};
+use crate::source_capture::{
+	SourceCaptureError, SourceCaptureLease, SourceCaptureState, SourceSubmission, SOURCE_RECEIPT_HEADER,
+	OCC3_KEEPALIVE_COMMENT, OCC3_RECEIPT_EVENT,
+};
 use crate::providers::cloudflare::{is_cloudflare_provider, resolve_cloudflare_base_url};
 use crate::providers::github_copilot_headers::{build_copilot_dynamic_headers, has_copilot_vision_input, CopilotDynamicHeaderParams};
 use crate::providers::opencode_headers::with_opencode_headers;
@@ -1388,6 +1393,21 @@ const OCC3_CAUSE_HTTP_NON_SUCCESS: &str = "http_non_success";
 const OCC3_CAUSE_RECEIPT_INVALID: &str = "receipt_invalid";
 const OCC3_CAUSE_SSE_IDLE: &str = "sse_idle";
 const OCC3_CAUSE_INCOMPLETE_STREAM: &str = "incomplete_stream";
+/// Environment opt-in for the keepalive stream extension on armed turns. The
+/// buffered armed-turn contract stays the default: fully buffered server-side,
+/// receipt in the response headers. Setting this makes the client offer
+/// `x-optimus-occ3-keepalive: keepalive-v1` on guarded requests so a server
+/// that accepts can emit SSE comment keepalives while the inner stream drains,
+/// defeating intermediary idle timeouts on the public origin.
+const ENV_OCC3_KEEPALIVE_STREAM: &str = "OCC3_KEEPALIVE_STREAM";
+
+fn occ3_keepalive_stream_enabled() -> bool {
+	match std::env::var(ENV_OCC3_KEEPALIVE_STREAM) {
+		Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"),
+		Err(_) => false,
+	}
+}
+
 const OCC3_CAUSES: [&str; 8] = [
 	OCC3_CAUSE_UNKNOWN,
 	OCC3_CAUSE_SEND_TRANSPORT_ERROR,
@@ -1728,6 +1748,9 @@ pub(crate) struct SseLineReader {
 	data: Vec<u8>,
 	has_data: bool,
 	saw_event: bool,
+	/// Set when a `: occ3-keepalive` comment line was decoded since the last
+	/// take; the transport loop forwards it as a `SsePayload::Keepalive`.
+	keepalive_seen: bool,
 }
 
 impl SseLineReader {
@@ -1737,7 +1760,13 @@ impl SseLineReader {
 			data: Vec::new(),
 			has_data: false,
 			saw_event: false,
+			keepalive_seen: false,
 		}
+	}
+
+	/// Consume the pending keepalive flag, if one was decoded.
+	pub(crate) fn take_keepalive(&mut self) -> bool {
+		std::mem::replace(&mut self.keepalive_seen, false)
 	}
 
 	/// Feed one network chunk. Each payload is passed to `on_payload` the moment
@@ -1786,6 +1815,13 @@ impl SseLineReader {
 			return self.flush();
 		}
 		if line[0] == b':' {
+			// The one comment shape the OCC-3 keepalive extension emits. Dropped
+			// from the SSE event stream exactly like any other comment, but
+			// recorded so the transport loop can surface it as a Keepalive
+			// payload for watchdog liveness.
+			if line == b": occ3-keepalive" {
+				self.keepalive_seen = true;
+			}
 			return None;
 		}
 		let (fieldname, value) = match line.iter().position(|&byte| byte == b':') {
@@ -1944,6 +1980,10 @@ enum SsePayload {
 	/// The raw payload plus its parsed `Value` when the reader already parsed it
 	/// for an attached observer; `None` means the consumer parses it.
 	Data { payload: String, parsed: Option<Value> },
+	/// The server's keepalive comment frame (`: occ3-keepalive`). It carries no
+	/// model bytes: surfacing it lets the stream event-gap watchdog observe
+	/// transport liveness during a long buffered receive phase.
+	Keepalive,
 	Done { exact: bool },
 }
 
@@ -2023,6 +2063,9 @@ async fn read_sse_data(
 		if !reader.push(&chunk, |payload| forward_sse_payload(payload, observer.as_ref(), &sender)) {
 			return;
 		}
+		if reader.take_keepalive() && !sender.send(Ok(SsePayload::Keepalive)).is_ok() {
+			return;
+		}
 	}
 
 	if let Some(payload) = reader.finish() {
@@ -2032,6 +2075,83 @@ async fn read_sse_data(
 	}
 }
 
+
+/// Strip the keepalive transport framing from a deferred-receipt source body.
+///
+/// The server contract: `: occ3-keepalive` comment frames while the inner
+/// stream drains, then the inner body, then the terminal
+/// `event: optimus.occ3.receipt` event, then the unchanged trailing `[DONE]`
+/// frame. Removing the comment frames and the receipt event reconstructs the
+/// exact native body bytes, which `verify_body` hashes. Any deviation from the
+/// frame shapes the extension itself emits is `InvalidCompletion`: the inner
+/// body is audit-guaranteed to contain only `data:` lines.
+fn strip_occ3_keepalive_transport(bytes: &[u8]) -> Result<(Vec<u8>, String), SourceCaptureError> {
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut envelope: Option<String> = None;
+    let mut offset = 0;
+    while offset < bytes.len() {
+        let end = offset
+            + bytes[offset..]
+                .iter()
+                .position(|&byte| byte == b'\n')
+                .unwrap_or(bytes.len() - offset);
+        let line = &bytes[offset..end];
+        let terminated = end < bytes.len();
+        if line.first() == Some(&b':') {
+            // One keepalive comment frame: exactly the keepalive comment line
+            // plus the empty terminating line, as the server emits it.
+            if line != OCC3_KEEPALIVE_COMMENT.as_bytes()
+                || !terminated
+                || bytes.get(end + 1) != Some(&b'\n')
+            {
+                return Err(SourceCaptureError::InvalidCompletion);
+            }
+            offset = end + 2;
+            continue;
+        }
+        if line == OCC3_RECEIPT_EVENT.as_bytes() {
+            if !terminated {
+                return Err(SourceCaptureError::InvalidCompletion);
+            }
+            let mut data: Vec<Vec<u8>> = Vec::new();
+            let mut cursor = end + 1;
+            loop {
+                if cursor >= bytes.len() {
+                    return Err(SourceCaptureError::InvalidCompletion);
+                }
+                let data_end = cursor
+                    + bytes[cursor..]
+                        .iter()
+                        .position(|&byte| byte == b'\n')
+                        .unwrap_or(bytes.len() - cursor);
+                let data_line = &bytes[cursor..data_end];
+                if data_line.is_empty() {
+                    cursor = data_end + 1;
+                    break;
+                }
+                let Some(value) = data_line.strip_prefix(b"data:") else {
+                    return Err(SourceCaptureError::InvalidCompletion);
+                };
+                let value = value.strip_prefix(b" ").unwrap_or(value);
+                data.push(value.to_vec());
+                cursor = data_end + 1;
+            }
+            if data.len() != 1 || envelope.is_some() {
+                return Err(SourceCaptureError::InvalidCompletion);
+            }
+            envelope = Some(String::from_utf8(data.remove(0)).map_err(|_| SourceCaptureError::InvalidCompletion)?);
+            offset = cursor;
+            continue;
+        }
+        out.extend_from_slice(line);
+        if terminated {
+            out.push(b'\n');
+        }
+        offset = end + 1;
+    }
+    let envelope = envelope.ok_or(SourceCaptureError::InvalidCompletion)?;
+    Ok((out, envelope))
+}
 
 /// Source capture alone drains the finite, server-buffered body to clean EOF.
 /// Hash the exact identity bytes before SSE normalization; never reserialize JSON.
@@ -2048,13 +2168,29 @@ async fn buffer_source_sse(
         }
         bytes.extend_from_slice(&chunk);
     }
-    submission.verify_body(&bytes)?;
     if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_SSE") {
         // Root diagnostic: dump the raw armed-turn response bytes exactly as
-        // received, before any SSE parsing. No behavior change when unset.
+        // received, before any SSE parsing or keepalive stripping. No behavior
+        // change when unset.
         let _ = std::fs::write(&path, &bytes);
     }
-    let raw = std::str::from_utf8(&bytes).map_err(|_| SourceCaptureError::InvalidCompletion)?;
+    // A deferred-receipt body carries keepalive comment frames and the
+    // terminal receipt event; both are transport framing, never attested body
+    // bytes, so the receipt verifies from the envelope and the hash covers
+    // only the reconstructed native bytes.
+    let inner: Vec<u8> = if submission.is_deferred() {
+        let (stripped, envelope) = strip_occ3_keepalive_transport(&bytes)?;
+        let envelope: Value = serde_json::from_str(&envelope)
+            .map_err(|_| SourceCaptureError::InvalidCompletion)?;
+        submission
+            .verify_deferred_receipt(&envelope)
+            .map_err(StreamError::from)?;
+        stripped
+    } else {
+        bytes
+    };
+    submission.verify_body(&inner)?;
+    let raw = std::str::from_utf8(&inner).map_err(|_| SourceCaptureError::InvalidCompletion)?;
     let response_id = submission.expected_response_id()?;
     let mut payloads = Vec::new();
     let mut data: Vec<&str> = Vec::new();
@@ -2208,6 +2344,9 @@ async fn post_chat_completions(
 	// `RequestBuilder::timeout` (a TOTAL deadline) because that aborts a long-lived stream.
 	let header_timeout = resolve_header_timeout(timeout_ms);
 
+	// One offer for both guarded shapes: only a request the client cannot let
+	// silently stall (armed inference or source capture) carries the opt-in.
+	let keepalive = occ3_keepalive_stream_enabled();
 	let mut submission = if let Some((lease, model)) = inference {
 		lease.validate_target(&model.provider, &model.id, &client.base_url)?;
 		if body.get("model").and_then(Value::as_str) != Some(model.id.as_str())
@@ -2217,9 +2356,15 @@ async fn post_chat_completions(
 		{
 			return Err(InferenceAttachmentError::InvalidPayload.into());
 		}
-		let request = builder.build().map_err(|_| InferenceAttachmentError::InvalidPayload)?;
+		let mut request = builder.build().map_err(|_| InferenceAttachmentError::InvalidPayload)?;
 		if request.headers().contains_key(reqwest::header::HOST) {
 			return Err(InferenceAttachmentError::TargetMismatch("authority").into());
+		}
+		if keepalive {
+			request.headers_mut().insert(
+				OCC3_KEEPALIVE_REQUEST_HEADER,
+				reqwest::header::HeaderValue::from_static(OCC3_KEEPALIVE_REQUEST_MODE),
+			);
 		}
 		builder = reqwest::RequestBuilder::from_parts(http_client.clone(), request);
 		if is_cancelled(signal) { return Err(abort_error()); }
@@ -2239,6 +2384,12 @@ async fn post_chat_completions(
 			return Err(SourceCaptureError::InvalidPayload.into());
 		}
 		request.headers_mut().insert(reqwest::header::ACCEPT_ENCODING, reqwest::header::HeaderValue::from_static("identity"));
+		if keepalive {
+			request.headers_mut().insert(
+				OCC3_KEEPALIVE_REQUEST_HEADER,
+				reqwest::header::HeaderValue::from_static(OCC3_KEEPALIVE_REQUEST_MODE),
+			);
+		}
 		builder = reqwest::RequestBuilder::from_parts(http_client, request);
 		if is_cancelled(signal) { return Err(abort_error()); }
 		Some(lease.submit()?)
@@ -2286,17 +2437,31 @@ async fn post_chat_completions(
 		if !response.status().is_success() {
 			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
 		}
-		submission
-			.verify_receipt(response.headers())
-			.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		// A server that did not take the keepalive offer kept the buffered
+		// contract, so the receipt stays in the response headers.
+		let deferred = keepalive
+			&& submission
+				.defer_receipt(response.headers())
+				.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		if !deferred {
+			submission
+				.verify_receipt(response.headers())
+				.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		}
 	}
 	if let Some(submission) = source_submission.as_mut() {
 		if !response.status().is_success() {
 			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
 		}
-		submission
-			.verify_header(response.headers())
-			.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		let deferred = keepalive
+			&& submission
+				.defer_header(response.headers())
+				.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		if !deferred {
+			submission
+				.verify_header(response.headers())
+				.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+		}
 	}
 	if status >= 400 {
 		let headers_record = crate::utils::headers::header_map_to_record(response.headers());
@@ -2405,6 +2570,31 @@ pub(crate) fn parse_typed_chunk(payload: &str) -> Option<TypedChunk<'_>> {
 /// (duplicate keys, exotic field shapes, observer-parsed chunks) and all
 /// `reasoning_details` handling (arbitrary-key maps stay a DOM).
 #[allow(clippy::too_many_arguments)]
+/// Parse the terminal `optimus.occ3.receipt` envelope from a data payload.
+///
+/// The cheap prefix is exact: the server serializes the envelope as canonical
+/// JSON (`separators=(",", ":")`, sorted keys), so it starts with
+/// `{"body_sha256":` and no ordinary chat chunk can collide. A payload with
+/// the prefix but without the terminal schema is a hard receipt failure, never
+/// a silently ignored chunk.
+fn parse_occ3_terminal_envelope(
+	payload: &str,
+	parsed: Option<&Value>,
+) -> Result<Option<Value>, InferenceAttachmentError> {
+	if !payload.starts_with("{\"body_sha256\":") {
+		return Ok(None);
+	}
+	let value = match parsed {
+		Some(value) => value.clone(),
+		None => serde_json::from_str(payload).map_err(|_| InferenceAttachmentError::InvalidReceipt)?,
+	};
+	if value.get("schema").and_then(Value::as_str) == Some(OCC3_TERMINAL_SCHEMA) {
+		Ok(Some(value))
+	} else {
+		Err(InferenceAttachmentError::InvalidReceipt)
+	}
+}
+
 fn handle_value_chunk(
 	chunk: Value,
 	model: &Model,
@@ -3080,7 +3270,7 @@ async fn run_stream_body(
 			"occ3_capture".into(), serde_json::to_value(lease.intent()).map_err(|_| SourceCaptureError::InvalidPayload)?,
 		);
 	}
-	let (response, submission, mut source_submission) = post_chat_completions(
+	let (response, mut submission, mut source_submission) = post_chat_completions(
 		&client, &params, signal.as_ref(), timeout_ms, budget.as_ref().map(|receipt| (model, receipt)), observer,
 		inference.map(|lease| (lease, model)), source.map(|lease| (lease, model)),
 	).await?;
@@ -3097,6 +3287,7 @@ async fn run_stream_body(
 		};
 		response_record.headers.swap_remove(INFERENCE_RECEIPT_HEADER);
 		response_record.headers.swap_remove(SOURCE_RECEIPT_HEADER);
+		response_record.headers.swap_remove(INFERENCE_DEFERRED_HEADER);
 		response_record.headers.insert("x-optimus-transport".into(), "sse".into());
 		on_response(response_record, model).await;
 	}
@@ -3111,6 +3302,7 @@ async fn run_stream_body(
 	let mut response_headers = crate::utils::headers::header_map_to_record(&headers);
 	response_headers.swap_remove(INFERENCE_RECEIPT_HEADER);
 	response_headers.swap_remove(SOURCE_RECEIPT_HEADER);
+	response_headers.swap_remove(INFERENCE_DEFERRED_HEADER);
 
 	let (sender, mut receiver) = tokio::sync::mpsc::unbounded_channel::<Result<SsePayload, StreamError>>();
 	let observer = options_ref.and_then(|options| options.stream.on_stream_observation.clone());
@@ -3129,18 +3321,54 @@ async fn run_stream_body(
 	}
 	let mut finished = false;
 	let mut done = false;
+	// Set once the deferred terminal receipt event has been verified. A stream
+	// that ends (or errors) before it never reaches `complete()`.
+	let mut deferred_receipt_seen = false;
 	while let Some(payload) = receiver.recv().await {
 		if let Some(submission) = submission.as_ref() { submission.ensure_active()?; }
 		let (payload, parsed) = match payload? {
 			SsePayload::Data { payload, parsed } => (payload, parsed),
+			SsePayload::Keepalive => {
+				// Transport liveness only: no model bytes, no aggregation, no
+				// state changes. The event keeps a long buffered receive
+				// from tripping the stream event-gap watchdog.
+				stream.push(AssistantMessageEvent::Keepalive {
+					partial: partial_message(output, &state),
+				});
+				continue;
+			}
 			SsePayload::Done { exact } => {
 				if submission.is_some() && !exact {
 					return Err(StreamError::inference_uncertain().with_occ3_cause(OCC3_CAUSE_INCOMPLETE_STREAM));
-				}
+					}
 				done = true;
 				break;
 			}
 		};
+		if let Some(submission) = submission.as_mut() {
+			if submission.is_deferred() {
+				if let Some(envelope) = parse_occ3_terminal_envelope(&payload, parsed.as_ref())
+					.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?
+				{
+					submission
+						.verify_receipt_value(&envelope)
+						.map_err(|error| StreamError::from(error).with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID))?;
+					// The receipt binds the attested body to the completion id
+					// the native runtime stamped on the chunks just streamed.
+					let response_id = envelope
+						.get("response_id")
+						.and_then(Value::as_str)
+						.unwrap_or_default()
+						.to_string();
+					if output.response_id.as_deref() != Some(response_id.as_str()) {
+						return Err(StreamError::from(InferenceAttachmentError::ReceiptMismatch)
+							.with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID));
+					}
+					deferred_receipt_seen = true;
+					continue;
+				}
+			}
+		}
 		// Fast path: borrowed typed parse of the payload the reader owns.
 		// Observer-attached streams arrive with the parsed Value already (the
 		// reader parsed it once for the observer) and keep the Value path.
@@ -3196,6 +3424,12 @@ async fn run_stream_body(
 	}
 	if (submission.is_some() || source_submission.is_some()) && (!finished || !done) {
 		return Err(StreamError::inference_uncertain().with_occ3_cause(OCC3_CAUSE_INCOMPLETE_STREAM));
+	}
+	if let Some(submission) = submission.as_ref() {
+		if submission.is_deferred() && !deferred_receipt_seen {
+			return Err(StreamError::from(InferenceAttachmentError::MissingReceipt)
+				.with_occ3_cause(OCC3_CAUSE_RECEIPT_INVALID));
+		}
 	}
 	if !finished && !done {
 		return Err(StreamError::dropped());
@@ -3688,9 +3922,23 @@ mod provider_settlement_tests {
             }
             Ok(SsePayload::Data { payload, .. }) => panic!("unexpected data after the stall: {payload}"),
             Ok(SsePayload::Done { .. }) => panic!("unexpected [DONE] after the stall"),
+            Ok(SsePayload::Keepalive) => panic!("unexpected keepalive after the stall"),
         }
         reader.await.unwrap();
         tokio::time::timeout(Duration::from_secs(5), server).await.unwrap().unwrap();
+    }
+
+    #[tokio::test]
+    async fn keepalive_comment_frames_surface_as_keepalive_payloads() {
+        let (model, server) = local_sse(
+            ": occ3-keepalive\n\ndata: {\"choices\":[{\"delta\":{\"content\":\"ok\"}}]}\n\n: occ3-keepalive\n\ndata: [DONE]\n\n",
+            true,
+        ).await;
+        let stream = stream_openai_completions(&model, &context(vec![user_text("fixture")]), Some(keyed_options()));
+        let output = tokio::time::timeout(Duration::from_secs(5), stream.result()).await.unwrap();
+        assert_eq!(output.stop_reason, "stop");
+        assert_eq!(output.content[0].as_text().unwrap().text, "ok");
+        join_server(server).await;
     }
 
     #[tokio::test]
@@ -6097,6 +6345,94 @@ mod message_tests {
 		assert_eq!(seen, vec!["a".to_string(), "[DONE]".to_string()]);
 	}
 
+	// ------------------------------------------------------------------
+	// OCC3 keepalive stream extension: deferred-receipt transport framing
+	// ------------------------------------------------------------------
+
+	#[test]
+	fn keepalive_transport_strips_to_the_exact_native_bytes() {
+		let first = "data: {\"id\":\"r-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n";
+		let last = "data: {\"id\":\"r-1\",\"choices\":[{\"index\":0,\"delta\":{},\"finish_reason\":\"stop\"}]}\n\n";
+		let done = "data: [DONE]\n\n";
+		let inner = format!("{first}{last}{done}");
+		let envelope = "{\"body_sha256\":\"abc\",\"kind\":\"source\",\"native_rid\":\"r-1\",\"receipt\":{},\"response_id\":\"r-1\",\"schema\":\"occ3.terminal.v1\"}";
+		let wire = format!(
+			": occ3-keepalive\n\n{first}: occ3-keepalive\n\n{last}event: optimus.occ3.receipt\ndata: {envelope}\n\n{done}"
+		);
+		let (stripped, extracted) = strip_occ3_keepalive_transport(wire.as_bytes()).unwrap();
+		assert_eq!(stripped, inner.as_bytes());
+		assert_eq!(extracted, envelope);
+	}
+
+	#[test]
+	fn keepalive_transport_refuses_foreign_and_malformed_framing() {
+		// A comment that is not the keepalive comment.
+		assert!(strip_occ3_keepalive_transport(b": other\n\ndata: [DONE]\n\n").is_err());
+		// A keepalive comment without the terminating blank line.
+		assert!(strip_occ3_keepalive_transport(b": occ3-keepalive\ndata: [DONE]\n\n").is_err());
+		// Two receipt events.
+		let wire = "event: optimus.occ3.receipt\ndata: {}\n\nevent: optimus.occ3.receipt\ndata: {}\n\n";
+		assert!(strip_occ3_keepalive_transport(wire.as_bytes()).is_err());
+		// A receipt event with no data line.
+		assert!(strip_occ3_keepalive_transport(b"event: optimus.occ3.receipt\n\n").is_err());
+		// A receipt event with two data lines.
+		let wire = "event: optimus.occ3.receipt\ndata: a\ndata: b\n\n";
+		assert!(strip_occ3_keepalive_transport(wire.as_bytes()).is_err());
+		// A body with no receipt event at all.
+		assert!(strip_occ3_keepalive_transport(b"data: [DONE]\n\n").is_err());
+	}
+
+	#[test]
+	fn keepalive_wire_through_the_line_reader_yields_only_inner_payloads() {
+		// The reader must ignore the keepalive comments and frame the receipt
+		// event as an ordinary data payload, so the consumer sees exactly the
+		// inner chunks, the envelope and the unchanged [DONE].
+		let wire = ": occ3-keepalive\n\n\
+data: {\"id\":\"r-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}\n\n\
+: occ3-keepalive\n\n\
+event: optimus.occ3.receipt\ndata: {\"body_sha256\":\"abc\",\"schema\":\"occ3.terminal.v1\"}\n\n\
+data: [DONE]\n\n";
+		let mut reader = SseLineReader::new();
+		let mut payloads = Vec::new();
+		assert!(reader.push(wire.as_bytes(), |payload| {
+			payloads.push(payload);
+			true
+		}));
+		if let Some(tail) = reader.finish() {
+			payloads.push(tail);
+		}
+		assert_eq!(
+			payloads,
+			vec![
+				"{\"id\":\"r-1\",\"choices\":[{\"index\":0,\"delta\":{\"content\":\"a\"}}]}".to_string(),
+				"{\"body_sha256\":\"abc\",\"schema\":\"occ3.terminal.v1\"}".to_string(),
+				"[DONE]".to_string(),
+			]
+		);
+	}
+
+	#[test]
+	fn terminal_envelope_parser_accepts_only_the_canonical_prefix_and_schema() {
+		assert!(parse_occ3_terminal_envelope("data payload", None).unwrap().is_none());
+		assert!(parse_occ3_terminal_envelope("{\"id\":\"r-1\",\"choices\":[]}", None).unwrap().is_none());
+		let envelope = "{\"body_sha256\":\"abc\",\"schema\":\"occ3.terminal.v1\"}";
+		let parsed = parse_occ3_terminal_envelope(envelope, None).unwrap().unwrap();
+		assert_eq!(parsed["schema"], "occ3.terminal.v1");
+		assert_eq!(
+			parse_occ3_terminal_envelope("{\"body_sha256\":\"abc\",\"schema\":\"occ3.other.v1\"}", None)
+				.unwrap_err(),
+			InferenceAttachmentError::InvalidReceipt
+		);
+		assert_eq!(
+			parse_occ3_terminal_envelope("{\"body_sha256\":not json", None).unwrap_err(),
+			InferenceAttachmentError::InvalidReceipt
+		);
+		// The pre-parsed observer value is reused, not reparsed.
+		let value: Value = serde_json::from_str(envelope).unwrap();
+		let parsed = parse_occ3_terminal_envelope(envelope, Some(&value)).unwrap().unwrap();
+		assert_eq!(parsed, value);
+	}
+
 	#[test]
 	fn find_double_newline_handles_lf_and_crlf() {
 		assert_eq!(find_double_newline_index(b"a\n\nb"), Some(3));
@@ -6440,7 +6776,8 @@ mod partial_snapshot_tests {
 			| AssistantMessageEvent::ThinkingEnd { partial, .. }
 			| AssistantMessageEvent::ToolCallStart { partial, .. }
 			| AssistantMessageEvent::ToolCallDelta { partial, .. }
-			| AssistantMessageEvent::ToolCallEnd { partial, .. } => Some(partial),
+			| AssistantMessageEvent::ToolCallEnd { partial, .. }
+			| AssistantMessageEvent::Keepalive { partial } => Some(partial),
 			AssistantMessageEvent::Done { .. } | AssistantMessageEvent::Error { .. } => None,
 		}
 	}

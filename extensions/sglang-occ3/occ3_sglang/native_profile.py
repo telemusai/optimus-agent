@@ -136,6 +136,14 @@ _CHALLENGER_METHODS = {entry["method_id"]: MappingProxyType(entry) for entry in 
 )}
 _REGISTERED = MappingProxyType({**_METHODS, **_CHALLENGER_METHODS})
 _REGISTERED_IDS = tuple(_REGISTERED)
+# The pinnable surface: advertised methods plus the registered low-rank
+# Procrustes challengers (campaign section 12: fit on FIT, select on
+# VALIDATION, freeze the artifact, bind it to a native profile). A challenger
+# is dispatchable and pinnable at runtime but not yet packaged: merging it
+# into the advertised table above belongs to the deployment wave, which owns
+# native_package's static parse of _METHODS. Anything outside this table is
+# refused; there is never a silent substitution.
+_PINNABLE_METHODS = MappingProxyType({**_METHODS, **_CHALLENGER_METHODS})
 
 
 def _validate_method(descriptor):
@@ -408,9 +416,12 @@ def _validate_profile(value):
     for name in ("model_fingerprint", "model_id", "method"):
         item = value[name]
         _require(type(item) is str and _IDENTIFIER.fullmatch(item) is not None)
-    # A pinned profile may only name an advertised method; an unknown or a
-    # silently substituted representation is refused before any runtime use.
-    _require(value["method"] in _METHODS)
+    # A pinned profile may only name an advertised method or one of the
+    # registered low-rank Procrustes challengers (P5 frozen-method
+    # fit/select/serve); an unknown or a silently substituted representation is
+    # refused before any runtime use. The challengers are pinnable but not yet
+    # packaged: the advertised table stays the deployment surface.
+    _require(value["method"] in _PINNABLE_METHODS)
     for name in _PROFILE_FIELDS - {"model_fingerprint", "model_id", "method", "anchor_alpha"}:
         _require(_uint(value[name], minimum=0 if name == "layer_index" else 1))
     _require(type(value["anchor_alpha"]) in (int, float)
