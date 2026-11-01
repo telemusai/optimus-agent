@@ -232,7 +232,11 @@ async def build_native_enrollment_fixture():
         else: changed[field]="fixture-boot-epoch-restarted" if field=="runtime_id" else 8
         response_negatives.append(dict(name=field,response=changed,native_must_reject=True))
     from occ3_sglang.attachment_contract import CaptureIntent, SourceCaptureReceipt
-    unchanged=dict(intent_schema="occ3.capture.v1",intent_fields=list(CaptureIntent.__dataclass_fields__),
+    # The v1 wire contract is unchanged: exactly the 13 historical fields.
+    # The class additionally carries the v3-only capture_mode, which a v1/v2
+    # wire may not carry (parse and wire() enforce the same schema gate).
+    unchanged=dict(intent_schema="occ3.capture.v1",
+        intent_fields=[name for name in CaptureIntent.__dataclass_fields__ if name != "capture_mode"],
         receipt_schema="occ3.source.v1",receipt_fields=list(SourceCaptureReceipt.__dataclass_fields__),
         receiver_wire_changed=False)
     return dict(schema="occ3.offline.native-enrollment-fixture.v1",fixture_kind="metadata-only-simulated-ranks-and-transport",

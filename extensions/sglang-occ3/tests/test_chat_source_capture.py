@@ -80,7 +80,7 @@ class SourceFixtureBackend(FixtureBackend):
             enrollment.native_rid, enrollment.principal_digest, a.runtime_id, a.model_fingerprint,
             a.method, self.prepares[-1][1].deadline_monotonic, a.capture_id, a.source_session_id,
             a.turn_nonce, a.runtime_generation, a.span_policy, a.retained_count_limit, a.max_capture_bytes,
-            "" if a.span_policy not in SPAN_POLICIES_V2 else "glm45_glm47_xml_kv.v1")
+            "" if a.span_policy not in SPAN_POLICIES_V2 else "glm45_glm47_xml_kv.v1", a.capture_mode)
         native.occ3_worker_descriptor = (self.mutate_source_descriptor(descriptor)
                                         if self.mutate_source_descriptor else descriptor)
 
