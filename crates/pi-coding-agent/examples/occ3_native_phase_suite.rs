@@ -73,7 +73,8 @@
 //! span-policy variants).
 //!
 //! `--source-mode retained` (default `legacy`) selects the retained
-//! content-only source lifecycle for the positive case: the source arms
+//! content-only source lifecycle for the positive case and the task
+//! mode's P leg: the source arms
 //! `arm_source_retained` BEFORE its single content request, the handoff
 //! tool is not installed on that turn, and the completed capture (zero
 //! tool bindings, span policy content_tail_no_tool_v2, capture_mode
@@ -6523,6 +6524,14 @@ fn p7_ladder_verdict(
 /// corpus-turn template's shape).
 const TASK_SOURCE_SYSTEM_PROMPT: &str = "Preserve the task's private content in the native source turn. State the pinned message verbatim as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
 
+/// The retained content-only task source system prompt: the captured turn
+/// asks ONLY for the pinned message, with the handoff tool NOT installed on
+/// that turn, so the armed span is a pure content run under
+/// content_tail_no_tool_v2 and the completed hook's zero-tool-binding
+/// contract holds by construction (the RETAINED_SOURCE_SYSTEM_PROMPT shape
+/// with the task grammar's pinned message).
+const TASK_RETAINED_SOURCE_SYSTEM_PROMPT: &str = "Preserve the task's private content in the native source turn. State the pinned message verbatim as your complete final content and stop. Do not call any tools.";
+
 /// The task-mode receiver system prompt: the landed repaired receiver
 /// contract (the c6d6b197f class-A fix: authorized-experiment framing,
 /// role separation, quoting the sender's content as DATA, the output
@@ -6720,6 +6729,13 @@ impl AgentSessionMessageController for TaskController {
 /// as its complete final content), the real capture commits, the
 /// publication delivers through the authenticated admission, and the
 /// receiver answers the task's receiver_question from the attached state.
+/// The source lifecycle follows `source_mode` exactly like the positive
+/// case: legacy keeps the same-turn occ3_handoff binding; retained arms
+/// `arm_source_retained` BEFORE the single content request, installs NO
+/// handoff tool for that turn, and publishes the completed capture after
+/// the turn through `publish_retained` (occ3.publish.v2, dispatch_mode
+/// orchestrator_v1) - no model tool dispatch anywhere. The receiver leg,
+/// the scripted verifier and the L1 exact-match scoring are unchanged.
 /// Evidence extraction happens before cleanup; the ladder and verdict are
 /// computed by the phase runner.
 async fn run_task_positive_case(
@@ -6728,12 +6744,22 @@ async fn run_task_positive_case(
     source_id: &str,
     receiver_id: &str,
     task: &P7Task,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     let arm_started = Instant::now();
+    let retained_mode = source_mode == SourceMode::Retained;
     let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let mut source_options = agent_options(&env.model, env.key.clone(), TASK_SOURCE_SYSTEM_PROMPT);
+    // The retained content-only turn swaps in its own source system prompt
+    // (its turn asks for the pinned message alone, no handoff tool
+    // installed); the legacy task turn keeps the historical prompt bytes.
+    let source_system_prompt = if retained_mode {
+        TASK_RETAINED_SOURCE_SYSTEM_PROMPT
+    } else {
+        TASK_SOURCE_SYSTEM_PROMPT
+    };
+    let mut source_options = agent_options(&env.model, env.key.clone(), source_system_prompt);
     if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
         // Root diagnostic, mirrored from the positive case: dump the armed
         // source-turn request payload exactly as serialized. No behavior
@@ -6790,9 +6816,15 @@ async fn run_task_positive_case(
     // The same installation the isolated family performs per member:
     // resolver, capture hooks, the handoff tool on the source side; the
     // receiver is a pure consumer (resolver set, handoff tool stripped).
+    // The retained content-only turn forbids tool bindings: the handoff
+    // tool is NOT installed on the source agent, and the completed capture
+    // is published after the turn through the authenticated task
+    // controller (publish_retained).
     source_agent.set_resolve_inference_state(Some(source.receiver_resolver()));
     source_agent.set_source_capture_hooks(Some(source.source_hooks()));
-    {
+    if retained_mode {
+        strip_handoff_tool(&source_agent);
+    } else {
         let mut state = source_agent.state();
         let mut tools = state.tools.take().unwrap_or_default();
         tools.push(source.handoff_tool(controller.clone()));
@@ -6802,12 +6834,25 @@ async fn run_task_positive_case(
     receiver_agent.set_resolve_inference_state(Some(receiver.receiver_resolver()));
     receiver_agent.set_source_capture_hooks(Some(receiver.source_hooks()));
     strip_handoff_tool(&receiver_agent);
-    source.arm_source(NativeSourceBudget {
-        retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
-        max_capture_bytes: env.max_capture_bytes,
-        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
-        max_response_bytes: env.max_response_bytes,
-    })?;
+    if retained_mode {
+        // RETAINED SOURCE LEG: arm BEFORE the single content request; the
+        // captured turn must be a no-tool content turn (occ3.capture.v3,
+        // capture_mode content_only_orchestrator_v1, span policy
+        // content_tail_no_tool_v2), one shot - no retry.
+        source.arm_source_retained(NativeSourceBudget {
+            retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+    } else {
+        source.arm_source(NativeSourceBudget {
+            retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+    }
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
@@ -6818,6 +6863,23 @@ async fn run_task_positive_case(
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail());
+    // The retained publication runs AFTER the content turn completes, through
+    // the authenticated task controller for the source session, targeting the
+    // receiver - no model tool dispatch anywhere in this mode (the
+    // run_positive_case retained-leg pattern). The turn's own error, if any,
+    // is reported unchanged; a publish failure names its stage.
+    let action = if retained_mode {
+        match action {
+            Err(error) => Err(error),
+            Ok(()) => source
+                .publish_retained(controller.clone(), "child", "receiver")
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("task_retained_publish_error({error})")),
+        }
+    } else {
+        action
+    };
     let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
     // Evidence extraction happens before cleanup.
     let answer = normalized_final_answer(&receiver_agent);
@@ -6840,10 +6902,25 @@ async fn run_task_positive_case(
         .as_array()
         .map(|entries| entries.iter().any(|e| e["lease_state"] == json!("Consumed")))
         .unwrap_or(false);
-    let source_state_ok = source_audit["source"]["state"] == json!("Captured")
-        && source_audit["source"]["tool_claimed"] == json!(true)
-        && source_audit["source"]["handoff_admitted"] == json!(true)
-        && source_audit["source"]["published_message"].is_array();
+    // The retained mode's task source contract: a Captured content-only lease
+    // that was NEVER tool-claimed, published exactly once through the
+    // orchestrator (publication_claimed) under the retained capture mode -
+    // the run_positive_case retained contract. The legacy mode keeps its
+    // historical contract: exactly one same-turn tool claim.
+    let source_state_ok = if retained_mode {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(false)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+            && source_audit["source"]["publication_claimed"] == json!(true)
+            && source_audit["source"]["retained"] == json!(true)
+            && source_audit["source"]["capture_mode"] == json!("content_only_orchestrator_v1")
+    } else {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(true)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+    };
     let source_turn_error = action.as_ref().err().cloned().or_else(|| {
         source_audit["source"]["state"].as_str().and_then(|state| {
             (state != "Captured").then(|| format!("capture_not_captured_{state}"))
@@ -7324,6 +7401,7 @@ async fn run_task_phase(
     task: &P7Task,
     task_file_sha256: &str,
     arm: Option<Arm>,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     let pins = ReportPins {
         binary_sha256: env.harness_binary_sha256.clone(),
@@ -7380,7 +7458,7 @@ async fn run_task_phase(
     let receiver_id = format!("task-{suffix}-receiver-{}", uuid::Uuid::new_v4().simple());
     let case_result: Result<Value, String> = match leg {
         TaskLeg::Positive => {
-            run_task_positive_case(env, &connector, &source_id, &receiver_id, task)
+            run_task_positive_case(env, &connector, &source_id, &receiver_id, task, source_mode)
                 .await
                 .map_err(|error| format!("task {} P-leg case failed: {error}", task.id))
         }
@@ -7455,13 +7533,20 @@ async fn run_task_phase(
     // requests, or a source_turn_error) on the native legs; the
     // client-side legs carry their own structural verdict. Tool calls and
     // extra requests are contract violations (L5), not plumbing failures.
+    // The retained P leg's source turn is toolless by construction (zero
+    // source tool calls); the legacy P leg and the W leg (source-B's real
+    // handoff) make exactly one.
+    let expected_source_tool_calls = match leg {
+        TaskLeg::Positive if source_mode == SourceMode::Retained => 0,
+        _ => 1,
+    };
     let structural_ok = if native_leg {
         trial_error.is_none()
             && source_turn_error.is_none()
             && delivered
             && consumed
             && source_state_ok
-            && source_tool_calls == 1
+            && source_tool_calls == expected_source_tool_calls
             && request_count > 0
     } else {
         trial_error.is_none() && case_evidence["structural_ok"] == json!(true)
@@ -7480,7 +7565,7 @@ async fn run_task_phase(
                 Some("source_state_not_ok".to_string())
             } else if request_count == 0 {
                 Some("zero_receiver_requests".to_string())
-            } else if source_tool_calls != 1 {
+            } else if source_tool_calls != expected_source_tool_calls {
                 Some("source_tool_calls".to_string())
             } else {
                 Some("pipeline".to_string())
@@ -7599,6 +7684,11 @@ async fn run_task_phase(
         "est_receiver_question_tokens": task.est_receiver_question_tokens,
         "requested_suite": "task-run",
         "arm": arm.map(|arm| arm.as_str()).unwrap_or("P"),
+        "source_mode": if source_mode == SourceMode::Retained {
+            "retained"
+        } else {
+            "legacy"
+        },
         "arm_crosswalk": "NATIVE~P, WRONG_SENDER~W, NULL_SHAPE~N, NO_ATTACHMENT~N0, TOKEN_SELECTED~T, FULL_TEXT~F; TOKEN_FULL/TOKEN_NORM are P span-policy variants (spec section 8.6)",
         "trial_id": trial_id,
         "attempt_id": env.attempt_id,
@@ -7727,12 +7817,14 @@ async fn offline_task_trial(
     task_file_sha256: &str,
     journal: Option<PathBuf>,
     arm: Option<Arm>,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     offline_task_trial_with_records(
         task,
         task_file_sha256,
         journal,
         arm,
+        source_mode,
         Arc::new(Mutex::new(FixtureRecords::default())),
     )
     .await
@@ -7747,12 +7839,21 @@ async fn offline_task_trial_with_records(
     task_file_sha256: &str,
     journal: Option<PathBuf>,
     arm: Option<Arm>,
+    source_mode: SourceMode,
     records: Arc<Mutex<FixtureRecords>>,
 ) -> Result<Value, String> {
     let journal = offline_trial_journal(journal, "occ3-task-trial")?;
     let trial = offline_trial_context(journal, records, "task").await?;
-    let result =
-        run_task_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, task, task_file_sha256, arm).await;
+    let result = run_task_phase(
+        &trial.env,
+        &trial.challenge,
+        &trial.descriptor_digest,
+        task,
+        task_file_sha256,
+        arm,
+        source_mode,
+    )
+    .await;
     trial.server.abort();
     result
 }
@@ -8467,6 +8568,7 @@ async fn live_phase(
             &loaded.task,
             &loaded.file_sha256,
             arm,
+            SourceMode::current(),
         )
         .await?
     } else {
@@ -8725,7 +8827,7 @@ async fn real_main() -> Result<(), i32> {
                 let canary = arm == Some(Arm::Native);
                 offline_corpus_turn(corpus, None, canary).await
             } else if let Some(loaded) = &loaded_task {
-                offline_task_trial(&loaded.task, &loaded.file_sha256, None, arm).await
+                offline_task_trial(&loaded.task, &loaded.file_sha256, None, arm, source_mode).await
             } else if args.is_empty() {
                 offline_selftest(None).await
             } else if let Some(arm) = arm {
@@ -8740,8 +8842,14 @@ async fn real_main() -> Result<(), i32> {
                 let canary = arm == Some(Arm::Native);
                 offline_corpus_turn(corpus, directory.clone(), canary).await
             } else if let Some(loaded) = &loaded_task {
-                offline_task_trial(&loaded.task, &loaded.file_sha256, directory.clone(), arm)
-                    .await
+                offline_task_trial(
+                    &loaded.task,
+                    &loaded.file_sha256,
+                    directory.clone(),
+                    arm,
+                    source_mode,
+                )
+                .await
             } else if let Some(arm) = arm {
                 offline_arm_trial(arm, directory.clone()).await
             } else {
@@ -11070,6 +11178,7 @@ mod gate_tests {
             &loaded.file_sha256,
             None,
             None,
+            SourceMode::Legacy,
             records,
         )
         .await
@@ -11137,6 +11246,92 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The retained task P leg (--source-mode retained): the task turn must
+    /// run the content-only lifecycle, not the legacy tool leg - the
+    /// handoff tool is never installed (zero source tool calls), the
+    /// capture rides one occ3.capture.v3 intent (capture_mode
+    /// content_only_orchestrator_v1, span policy content_tail_no_tool_v2),
+    /// the publication is an occ3.publish.v2 orchestrator dispatch, and the
+    /// receiver leg, the ladder and the one-shot evidence are unchanged
+    /// (L1 exact recovery).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn p7_task_retained_leg_runs_the_content_only_lifecycle_offline() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-p7-task-files-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_json = p7_scripted_task();
+        let path = write_p7_task_file(&dir, &task_json);
+        let loaded = load_p7_task(&path).unwrap();
+        let sender_msg = loaded.task.sender_msg.clone();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            task_source_content: Some(sender_msg.clone()),
+            task_answer: Some(sender_msg.clone()),
+            ..Default::default()
+        }));
+        let summary = offline_task_trial_with_records(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            None,
+            SourceMode::Retained,
+            records.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("retained task P leg failed: {error}"));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["ladder_level"], json!("L1"));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence =
+            find_trial_evidence(&std::env::temp_dir(), &evidence_name, "occ3-task-trial-")
+                .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        // The retained lifecycle contract: no tool binding on the source
+        // turn, the retained audit shape, structural validity at ZERO
+        // source tool calls.
+        assert_eq!(evidence["source_mode"], json!("retained"), "{evidence}");
+        assert_eq!(evidence["source_tool_calls"], json!(0), "{evidence}");
+        assert_eq!(evidence["source_state_ok"], json!(true), "{evidence}");
+        assert_eq!(evidence["structural_ok"], json!(true), "{evidence}");
+        // The server-side lifecycle: one occ3.capture.v3 intent under the
+        // content-only capture mode and one occ3.publish.v2 orchestrator
+        // publication (never a v1/v2 tool-bound publication).
+        {
+            let records = records.lock().unwrap();
+            let capture = records.captures.last().expect("one retained capture");
+            assert_eq!(capture.intent["schema"], json!("occ3.capture.v3"));
+            assert_eq!(
+                capture.intent["capture_mode"],
+                json!("content_only_orchestrator_v1")
+            );
+            assert_eq!(
+                capture.intent["span_policy"],
+                json!("content_tail_no_tool_v2")
+            );
+            let publication = records
+                .published
+                .last()
+                .expect("one orchestrator publication");
+            assert_eq!(publication["schema"], json!("occ3.publish.v2"));
+            assert_eq!(publication["dispatch_mode"], json!("orchestrator_v1"));
+        }
+        // The receiver leg and the scoring are unchanged.
+        assert_eq!(evidence["delivered"], json!(true));
+        assert_eq!(evidence["consumed"], json!(true));
+        assert_eq!(evidence["receiver_tool_calls"], json!(0));
+        assert_eq!(
+            evidence["receiver_request_audit"]["request_count"],
+            json!(1)
+        );
+        assert_eq!(evidence["ladder"]["level"], json!("L1"));
+        assert_eq!(evidence["verifier_results"]["exact_match"], json!(true));
+        assert_eq!(
+            evidence["case"]["sender_final_content_contains_message"],
+            json!(true)
+        );
+        assert_eq!(evidence["coverage"]["coverage_complete"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A refusal answer scores L5 on a structurally valid trial: the
     /// evidence records the contract violation, the verdict fails the task
     /// turn and the invocation is nonzero (Err) - one attempt, no retry.
@@ -11158,9 +11353,15 @@ mod gate_tests {
             ),
             ..Default::default()
         }));
-        let result =
-            offline_task_trial_with_records(&loaded.task, &loaded.file_sha256, None, None, records)
-                .await;
+        let result = offline_task_trial_with_records(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            None,
+            SourceMode::Legacy,
+            records,
+        )
+        .await;
         let error = result.expect_err("the refusal verdict must fail the task turn");
         assert!(error.contains(&task_id), "{error}");
         let evidence = find_trial_evidence(
@@ -11205,6 +11406,7 @@ mod gate_tests {
             &loaded.file_sha256,
             None,
             None,
+            SourceMode::Legacy,
             records,
         )
         .await
@@ -11243,9 +11445,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_four_way_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::NoAttachment))
-            .await
-            .unwrap_or_else(|error| panic!("task N0 leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::NoAttachment),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task N0 leg failed: {error}"));
         assert_eq!(summary["arm"], json!("NO_ATTACHMENT"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         assert_eq!(summary["ladder_level"], json!("L6"));
@@ -11273,9 +11481,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_four_way_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::WrongSender))
-            .await
-            .unwrap_or_else(|error| panic!("task W leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::WrongSender),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task W leg failed: {error}"));
         assert_eq!(summary["arm"], json!("WRONG_SENDER"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         // The wrong sender's delivered value: wrong content (L4), the
@@ -11312,9 +11526,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_marker_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::FullText))
-            .await
-            .unwrap_or_else(|error| panic!("task F leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::FullText),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task F leg failed: {error}"));
         assert_eq!(summary["arm"], json!("FULL_TEXT"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         assert_eq!(summary["ladder_level"], json!("L2"));
