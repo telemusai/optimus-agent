@@ -4678,6 +4678,9 @@ async fn run_after_phase(
 ///   span is that complete run, so the value's tokens are then inside the
 ///   span. Thinking text is excluded by construction (the run starts after
 ///   the terminator), so a value stated only in reasoning is NOT covered.
+/// - full-width retention: retained_count equals the aligned span width, so
+///   no span row - in particular not the final content row - was dropped
+///   (the canary's final-character loss class, 2026-11-01).
 fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) -> Value {
     let Some(span) = span else {
         return json!({
@@ -4689,7 +4692,13 @@ fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) ->
     };
     let truncated = span["span_message_truncated"].as_bool();
     let contains_final_content = span["span_contains_final_content"].as_bool();
-    let span_complete = truncated == Some(false) && contains_final_content == Some(true);
+    let retained_count = span["retained_count"].as_u64();
+    let span_width = span["accepted_span_end"]
+        .as_u64()
+        .zip(span["accepted_span_start"].as_u64())
+        .map(|(end, start)| end.saturating_sub(start));
+    let retained_all = span_width.map_or(false, |width| retained_count == Some(width));
+    let span_complete = truncated == Some(false) && contains_final_content == Some(true) && retained_all;
     let coverage_complete = span_complete && value_in_sender_content;
     json!({
         "coverage_computed": "receipt_span",
@@ -4697,6 +4706,8 @@ fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) ->
         "value_in_sender_content": value_in_sender_content,
         "span_message_truncated": truncated,
         "span_contains_final_content": contains_final_content,
+        "span_retained_count": retained_count,
+        "span_accepted_width": span_width,
         "span_content_count": span["span_content_count"],
         "span_thinking_count": span["span_thinking_count"],
         "span_tool_call_count": span["span_tool_call_count"],
@@ -9746,6 +9757,15 @@ mod gate_tests {
         no_final["span_contains_final_content"] = json!(false);
         let verdict = span_coverage_verdict(Some(&no_final), true);
         assert_eq!(verdict["coverage_complete"], json!(false));
+        assert!(token_full_invalid_coverage(&verdict));
+        // A retention narrower than the aligned span width: the final-row
+        // exclusion class (canary 2026-11-01) - invalid, never a silent pass.
+        let mut narrow = span.clone();
+        narrow["retained_count"] = json!(7);
+        let verdict = span_coverage_verdict(Some(&narrow), true);
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["span_retained_count"], json!(7));
+        assert_eq!(verdict["span_accepted_width"], json!(8));
         assert!(token_full_invalid_coverage(&verdict));
         // No span block at all (v1 capture): offline fields only, the null
         // verdict is invalid for TOKEN_FULL - never a silent pass.

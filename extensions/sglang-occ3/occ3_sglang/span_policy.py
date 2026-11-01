@@ -318,7 +318,8 @@ class SpanSelectionV2:
 
 def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, position_base: int,
                    accepted_total: int, policy: str, marker_table: MarkerTable,
-                   stop_ids: FrozenSet[int], reasoning_tokens: int | None = None) -> SpanSelectionV2:
+                   stop_ids: FrozenSet[int], reasoning_tokens: int | None = None,
+                   retained_content_only: bool = False) -> SpanSelectionV2:
     """Select the v2 span over one retained window, or decline (R0-R13).
 
     ``token_ids``/``positions`` are the retained window rows in position
@@ -385,7 +386,8 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     # set, so the R3 stop row bounds the content run even when it is a role
     # token (GLM ends a turn on <|user|>/<|observation|>, not the eos marker).
     audit = classify_accepted(token_ids, positions, markers, accepted_total=accepted_total,
-                             reasoning_end_ids=by_role["tool_call_start"], stop_ids=stop_ids)
+                             reasoning_end_ids=by_role["tool_call_start"], stop_ids=stop_ids,
+                             retained_content_only=retained_content_only)
 
     # R12 (first half): a truncated run list cannot answer "the last content run".
     _audit_update(runs_truncated=audit.runs_truncated,
@@ -401,7 +403,13 @@ def select_span_v2(token_ids: Sequence[int], positions: Sequence[int], *, positi
     # stop row) rather than at the window edge.
     _require(run.start_index == terminator.end, "lineage", "R7-run-after-terminator")
     _require(tool_start is None or run.end_index <= tool_start.start, "lineage", "R7-run-before-tool")
-    _require(run.end_index < count, "lineage", "R7-run-bounded")
+    # R7 (v3 retained content-only): the window edge IS the turn's finish
+    # boundary (R2) and its last row is the stop row (R3), so the content run
+    # may end exactly there - the stop row is content, not a terminator.
+    if retained_content_only:
+        _require(run.end_index <= count, "lineage", "R7-run-bounded")
+    else:
+        _require(run.end_index < count, "lineage", "R7-run-bounded")
 
     # R9: the no-tool policy refuses any tool syntax anywhere in the window.
     if policy == POLICY_NO_TOOL:
