@@ -41,7 +41,7 @@ REPORT_SCHEMA = "optimus.occ3.native-phase-suite.v1"
 CHALLENGE_SCHEMA = "optimus.occ3.validator-phase-challenge.v1"
 PIN_SCHEMA = "occ3.admission.pin.v1"
 ADMISSION_SCHEMA = "optimus.occ3.native-admission.v1"
-CONTROL_SCHEMAS = ("occ3.sessions.enroll.v1", "occ3.publish.v1",
+CONTROL_SCHEMAS = ("occ3.sessions.enroll.v1", "occ3.publish.v1", "occ3.publish.v2",
                    "occ3.publication.status.v1", "occ3.retire.v1")
 ALLOWED_HARNESS_PLATFORMS = {"windows-x86_64"}
 ALLOWED_HEADER_NAMES = {"x-pomerium-authorization"}

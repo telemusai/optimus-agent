@@ -279,6 +279,28 @@ def test_admission_refuses_each_invalid_input(tmp_path, mutate, code):
     assert result["ok"] is False and result["code"] == code
 
 
+def test_admission_requires_the_publish_v2_control_interface(tmp_path):
+    """The Rust client sends occ3.publish.v2 bodies for orchestrator-dispatch
+    publications, so the pinned control interface must declare it: a pin
+    carrying the five-schema tuple (publish.v2 immediately after publish.v1)
+    is admitted, and the pre-publish.v2 four-tuple is refused by name."""
+    journal = make_journal(tmp_path, native_plan())
+    state = journal.read()
+    admitted = copy.deepcopy(state["plan"])
+    admitted["native_validator"]["interface_versions"]["control"] = [
+        "occ3.sessions.enroll.v1", "occ3.publish.v1", "occ3.publish.v2",
+        "occ3.publication.status.v1", "occ3.retire.v1"]
+    assert NativeHandoffValidator(admitted, journal,
+                                  state).pre_mutation_admission()["ok"] is True
+    stale = copy.deepcopy(state["plan"])
+    stale["native_validator"]["interface_versions"]["control"] = [
+        name for name in stale["native_validator"]["interface_versions"]["control"]
+        if name != "occ3.publish.v2"]
+    refused = NativeHandoffValidator(stale, journal, state).pre_mutation_admission()
+    assert refused["ok"] is False
+    assert refused["code"] == "control_schema_version_unknown"
+
+
 def test_admission_never_resolves_or_leaks_references(tmp_path):
     journal = make_journal(tmp_path, native_plan())
     result = make_validator(journal).pre_mutation_admission()

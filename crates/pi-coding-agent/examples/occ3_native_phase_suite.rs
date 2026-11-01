@@ -71,6 +71,20 @@
 //! NATIVE~P, WRONG_SENDER~W, NULL_SHAPE~N, NO_ATTACHMENT~N0,
 //! TOKEN_SELECTED~T, FULL_TEXT~F; TOKEN_FULL/TOKEN_NORM are P
 //! span-policy variants).
+//!
+//! `--source-mode retained` (default `legacy`) selects the retained
+//! content-only source lifecycle for the positive case: the source arms
+//! `arm_source_retained` BEFORE its single content request, the handoff
+//! tool is not installed on that turn, and the completed capture (zero
+//! tool bindings, span policy content_tail_no_tool_v2, capture_mode
+//! content_only_orchestrator_v1) is published afterwards through the
+//! authenticated family controller (`publish_retained`, occ3.publish.v2
+//! with dispatch_mode orchestrator_v1). The receiver leg is unchanged.
+//! The default keeps the legacy two-turn leg byte-identical, and the
+//! offline selftest additionally runs one retained leg end-to-end.
+//! `OCC3_SOURCE_THINKING` (low|high|max, validated at startup like
+//! OCC3_RECEIVER_THINKING) rewrites `reasoning_effort` on the source
+//! wire; unset keeps source requests byte-identical.
 
 // The per-task evidence `json!` literal (one object with the full
 // pre-registered field set) needs more macro-expansion recursion than the
@@ -881,6 +895,25 @@ fn sse_source_turn(id: &str, tool_call_id: &str, content: Option<&str>) -> Strin
     body
 }
 
+/// The retained content-only armed source turn (occ3.capture.v3,
+/// capture_mode content_only_orchestrator_v1): reasoning, the message text
+/// as CONTENT, finish `stop` and ZERO tool calls - exactly the no-tool shape
+/// the content_tail_no_tool_v2 span policy captures and the completed hook
+/// accepts in the retained mode.
+fn sse_source_turn_retained(id: &str, content: &str) -> String {
+    let chunks = vec![
+        json!({"id":id,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"retained native reasoning"},"finish_reason":null}]}),
+        json!({"id":id,"choices":[{"index":0,"delta":{"content":content},"finish_reason":null}]}),
+        json!({"id":id,"choices":[{"index":0,"delta":{},"finish_reason":"stop"}]}),
+    ];
+    let mut body = chunks
+        .into_iter()
+        .map(|v| format!("data: {v}\n\n"))
+        .collect::<String>();
+    body.push_str("data: [DONE]\n\n");
+    body
+}
+
 fn sse(id: &str, tool_call_id: &str, content: Option<&str>) -> String {
     let mut chunks = vec![json!({"id":id,"choices":[{"index":0,"delta":{"role":"assistant","reasoning_content":"retained native reasoning"},"finish_reason":null}]})];
     match content {
@@ -1109,11 +1142,21 @@ async fn serve(
                         send(&mut socket, "200 OK", reply.to_string(), vec![]).await;
                     }
                     "/occ3/v1/native/publish" => {
-                        let fields = ["schema","publication_id","source_handle","source_session_id","receiver_session_id","message_id","source_turn_nonce","tool_call_id","expires_at_epoch"];
+                        let v1_fields = ["schema","publication_id","source_handle","source_session_id","receiver_session_id","message_id","source_turn_nonce","tool_call_id","expires_at_epoch"];
+                        // occ3.publish.v2 (the retained content-only
+                        // publication): no tool_call_id; dispatch_mode names
+                        // the orchestrator authority instead of a same-turn
+                        // model tool binding.
+                        let v2_fields = ["schema","publication_id","source_handle","source_session_id","receiver_session_id","message_id","source_turn_nonce","dispatch_mode","expires_at_epoch"];
                         let object = body.as_object();
-                        let valid = object.is_some_and(|o| o.len() == fields.len()
-                            && fields.iter().all(|f| o.contains_key(*f)));
-                        if !valid || body["schema"] != "occ3.publish.v1" {
+                        let v1 = object.is_some_and(|o| o.len() == v1_fields.len()
+                            && v1_fields.iter().all(|f| o.contains_key(*f)))
+                            && body["schema"] == json!("occ3.publish.v1");
+                        let v2 = object.is_some_and(|o| o.len() == v2_fields.len()
+                            && v2_fields.iter().all(|f| o.contains_key(*f)))
+                            && body["schema"] == json!("occ3.publish.v2")
+                            && body["dispatch_mode"] == json!("orchestrator_v1");
+                        if !v1 && !v2 {
                             send_router_error(&mut socket, 400, "invalid").await;
                             return;
                         }
@@ -1147,7 +1190,15 @@ async fn serve(
                                             PublishVerdict::Expired
                                         } else if capture.session != source_session
                                             || capture.intent["turn_nonce"] != body["source_turn_nonce"]
-                                            || capture.tool_call_id != body["tool_call_id"].as_str().unwrap_or_default()
+                                            // Mode-scoped binding, mirroring the connector's
+                                            // dispatch validation: a v1 publication requires the
+                                            // captured turn's own exact occ3_handoff tool binding
+                                            // (legacy captures only); a v2 publication requires
+                                            // the retained content-only capture and carries no
+                                            // tool binding at all.
+                                            || (v1 && (capture.tool_call_id != body["tool_call_id"].as_str().unwrap_or_default()
+                                                || capture.intent["capture_mode"] == json!("content_only_orchestrator_v1")))
+                                            || (v2 && capture.intent["capture_mode"] != json!("content_only_orchestrator_v1"))
                                         {
                                             PublishVerdict::State
                                         } else {
@@ -1168,6 +1219,10 @@ async fn serve(
                                 send_router_error(&mut socket, 409, "expired").await;
                             }
                             PublishVerdict::Published { capture, expiry_epoch } => {
+                                // The binding digest is computed the same way for
+                                // v1 and v2 publications: canonical body minus
+                                // schema plus principal_digest (the connector's
+                                // own computation, mirrored here).
                                 let mut binding = body.clone();
                                 binding.as_object_mut().unwrap().remove("schema");
                                 binding["principal_digest"] = json!(PRINCIPAL_DIGEST);
@@ -1293,14 +1348,25 @@ async fn serve(
                                 let records_guard = records.lock().unwrap();
                                 records_guard.task_source_content.clone()
                             };
-                            let mut output = sse_source_turn(
-                                &rid,
-                                &tool_call_id,
-                                task_source_content
-                                    .clone()
-                                    .or_else(|| extract_fact(&body["messages"]))
-                                    .as_deref(),
-                            );
+                            // occ3.capture.v3 (capture_mode
+                            // content_only_orchestrator_v1) arms the retained
+                            // content-only lifecycle: the armed turn is a
+                            // no-tool content turn (finish stop), so the fixture
+                            // serves the content-only shape instead of the
+                            // legacy reasoning+content+tool-call shape.
+                            let retained_intent = intent["capture_mode"]
+                                == json!("content_only_orchestrator_v1");
+                            let armed_content = task_source_content
+                                .clone()
+                                .or_else(|| extract_fact(&body["messages"]));
+                            let mut output = if retained_intent {
+                                sse_source_turn_retained(
+                                    &rid,
+                                    armed_content.as_deref().unwrap_or(""),
+                                )
+                            } else {
+                                sse_source_turn(&rid, &tool_call_id, armed_content.as_deref())
+                            };
                             if let Ok(replay) = std::env::var("OCC3_REPLAY_SSE_FILE") {
                                 // Root diagnostic: serve a captured live armed-turn
                                 // SSE body instead of the synthetic one, with the
@@ -1346,11 +1412,16 @@ async fn serve(
                                 "representation":"final_layer_prenorm_predictor","layer_index":LAYER_INDEX,"hidden_dim":HIDDEN_DIM,"dtype":"bfloat16","layout_digest":LAYOUT_DIGEST,
                                 "ready_ranks":EXPECTED_RANKS,"expected_ranks":EXPECTED_RANKS,"accepted_sequence_digest":ACCEPTED_SEQUENCE_DIGEST,
                                 "output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":byte_count});
-                            if intent["schema"] == json!("occ3.capture.v2") {
+                            if intent["schema"] == json!("occ3.capture.v2")
+                                || intent["schema"] == json!("occ3.capture.v3")
+                            {
                                 // Mirror the live occ3.source.v2 wire (attachment_contract
                                 // SourceCaptureReceipt): the 21 v1 fields plus the bounded
-                                // occ3.span.v1 block, flat. A v2 intent answered with a bare
-                                // v1 receipt is refused by the client, exactly like live.
+                                // occ3.span.v1 block, flat. A v2 or v3 intent answered with
+                                // a bare v1 receipt is refused by the client, exactly like
+                                // live; the retained content-only capture (v3) reuses the v2
+                                // receipt wire - the mode lives in the intent, never the
+                                // receipt.
                                 receipt["schema"] = json!("occ3.source.v2");
                                 let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
                                     "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
@@ -1516,52 +1587,223 @@ impl PhaseEnv {
     }
 }
 
-/// Root ruling r12: true when the last assistant message stopped because the
-/// output budget ran out. Only that shape earns the single bounded retry.
-fn source_turn_hit_length(agent: &Agent) -> bool {
-    let state = agent.state();
-    state
+/// Defect 7.1 (discarded request errors): the typed outcome of ONE bounded
+/// source-turn request. The former
+/// `let _ = timeout(...).map_err(|_| fail())?.map_err(|_| fail())` discarded
+/// the inner provider Result entirely, so a refused or failed source turn
+/// surfaced only as a downstream empty-answer refusal.
+enum SourceTurnOutcome {
+    /// The request completed; the turn's own shape is judged separately.
+    Succeeded,
+    /// The per-request deadline elapsed before completion.
+    Deadline,
+    /// The provider/agent request failed; the tag is sanitized (the stop
+    /// signal, the error chain's type names and the occ3 client-side
+    /// refusal codes - never provider text, which can quote private content).
+    Provider(String),
+}
+
+impl SourceTurnOutcome {
+    /// The named stage failure for this outcome, or `None` on success.
+    fn failure(&self, stage: &str) -> Option<String> {
+        match self {
+            SourceTurnOutcome::Succeeded => None,
+            SourceTurnOutcome::Deadline => Some(format!("{stage}_deadline")),
+            SourceTurnOutcome::Provider(tag) => Some(format!("{stage}_provider_error({tag})")),
+        }
+    }
+
+    fn as_str(&self) -> &'static str {
+        match self {
+            SourceTurnOutcome::Succeeded => "succeeded",
+            SourceTurnOutcome::Deadline => "deadline",
+            SourceTurnOutcome::Provider(_) => "provider_error",
+        }
+    }
+}
+
+/// One bounded source-turn request with a typed stage outcome (defect 7.1).
+async fn bounded_source_prompt(
+    agent: &Arc<Agent>,
+    prompt: String,
+    deadline_seconds: u64,
+) -> SourceTurnOutcome {
+    match tokio::time::timeout(
+        Duration::from_secs(deadline_seconds),
+        agent.prompt(PromptInput::Text {
+            input: prompt,
+            images: Vec::new(),
+        }),
+    )
+    .await
+    {
+        Err(_) => SourceTurnOutcome::Deadline,
+        Ok(Err(error)) => {
+            SourceTurnOutcome::Provider(sanitized_request_error_tag(agent, &error))
+        }
+        Ok(Ok(())) => SourceTurnOutcome::Succeeded,
+    }
+}
+
+/// Sanitized, content-free identity of a failed source request (defect 7.1):
+/// the agent's own stop signal, the root error's TYPE name and the occ3
+/// client-side refusal codes. Never the provider's Display text, which can
+/// quote private content; the tag is hard-bounded to a code-like length.
+fn sanitized_request_error_tag(agent: &Agent, error: &anyhow::Error) -> String {
+    let stop_reason = agent
+        .state()
         .messages
         .iter()
         .rev()
         .find_map(|m| match m {
-            AgentMessage::Message(Message::Assistant(a)) => Some(a.stop_reason.as_str() == "length"),
+            AgentMessage::Message(Message::Assistant(a)) => Some(a.stop_reason.clone()),
             _ => None,
         })
-        .unwrap_or(false)
+        .filter(|reason| !reason.is_empty())
+        .unwrap_or_else(|| "absent".to_string());
+    let root_type = std::any::type_name_of_val(error.root_cause());
+    // The occ3 client-side hooks embed their refusal codes in brackets
+    // (`... [occ3_completed_mode_tool_forbidden]`); admitting only an
+    // `occ3_` identifier directly preceded by `[` keeps the scan on code
+    // tokens and off any private text the provider may have echoed.
+    let mut occ3_codes: Vec<String> = Vec::new();
+    let text = format!("{error:#}");
+    let mut rest = text.as_str();
+    while let Some(at) = rest.find("occ3_") {
+        let tag: String = rest[at..]
+            .chars()
+            .take_while(|c| c.is_ascii_lowercase() || c.is_ascii_digit() || *c == '_')
+            .collect();
+        let tag_len = tag.len().max(1);
+        if rest[..at].ends_with('[') && !tag.is_empty() && !occ3_codes.contains(&tag) {
+            occ3_codes.push(tag);
+        }
+        rest = &rest[at + tag_len..];
+    }
+    let mut tag = format!("stop={stop_reason};error_type={root_type}");
+    if !occ3_codes.is_empty() {
+        tag.push_str(";occ3_codes=");
+        tag.push_str(&occ3_codes.join("+"));
+    }
+    tag.chars().take(192).collect()
 }
 
-/// Root ruling (p8i decline): an empty source turn must name WHY it was
-/// empty. This returns counts only - never any model text - so the refusal
-/// stays token-free while still telling content from reasoning from tools.
-fn describe_last_assistant(agent: &Agent) -> String {
+/// Defect 7.2 (stale final answer): the assistant-message position BEFORE a
+/// source request. Only assistant messages appended AFTER the baseline count
+/// as that request's own output; `normalized_final_answer` scans back across
+/// ALL turns, so an empty armed turn was masked by an earlier turn's
+/// content.
+#[derive(Clone, Copy)]
+struct SourceTurnBaseline {
+    message_position: usize,
+}
+
+fn source_turn_baseline(agent: &Agent) -> SourceTurnBaseline {
+    SourceTurnBaseline {
+        message_position: agent.state().messages.len(),
+    }
+}
+
+/// Fresh-content accounting for one completed source request: counts and
+/// lengths over ONLY the assistant messages appended after the baseline.
+/// Never copies text out; the sole hash covers the concatenated fresh text
+/// under the pinned normalization trim rule.
+struct FreshSourceTurn {
+    assistant_count: usize,
+    content_chars: usize,
+    reasoning_blocks: usize,
+    reasoning_chars: usize,
+    tool_calls: usize,
+    stop_reason: Option<String>,
+    content_sha256: Option<String>,
+}
+
+impl FreshSourceTurn {
+    /// Fresh visible text exists (the pinned normalization trim rule).
+    fn has_content(&self) -> bool {
+        self.content_sha256.is_some()
+    }
+
+    /// Root ruling (p8i decline, defect 7.2): an empty source turn must name
+    /// WHY it was empty. Counts only - never any model text - so the refusal
+    /// stays token-free while still telling content from reasoning from tools.
+    fn describe(&self) -> String {
+        format!(
+            "fresh_assistant={};content_chars={};reasoning_blocks={};reasoning_chars={};tool_calls={};stop={:?}",
+            self.assistant_count,
+            self.content_chars,
+            self.reasoning_blocks,
+            self.reasoning_chars,
+            self.tool_calls,
+            self.stop_reason
+        )
+    }
+}
+
+fn fresh_source_turn(agent: &Agent, baseline: SourceTurnBaseline) -> FreshSourceTurn {
     let state = agent.state();
-    let last = state.messages.iter().rev().find_map(|m| match m {
-        AgentMessage::Message(Message::Assistant(a)) => Some(a),
-        _ => None,
-    });
-    let Some(message) = last else {
-        return "assistant_messages=0".to_string();
+    let mut fresh = FreshSourceTurn {
+        assistant_count: 0,
+        content_chars: 0,
+        reasoning_blocks: 0,
+        reasoning_chars: 0,
+        tool_calls: 0,
+        stop_reason: None,
+        content_sha256: None,
     };
-    let mut text = 0usize;
-    let mut reasoning = 0usize;
-    let mut tool = 0usize;
-    let mut chars = 0usize;
-    for block in message.content.iter() {
-        match block {
-            AiContentBlock::Text(t) => {
-                text += 1;
-                chars += t.text.chars().count();
+    let mut content = String::new();
+    for message in state.messages.iter().skip(baseline.message_position) {
+        let AgentMessage::Message(Message::Assistant(a)) = message else {
+            continue;
+        };
+        fresh.assistant_count += 1;
+        fresh.stop_reason = Some(a.stop_reason.clone());
+        for block in a.content.iter() {
+            match block {
+                AiContentBlock::Text(t) => {
+                    fresh.content_chars += t.text.chars().count();
+                    content.push_str(&t.text);
+                }
+                AiContentBlock::Thinking(t) => {
+                    fresh.reasoning_blocks += 1;
+                    fresh.reasoning_chars += t.thinking.chars().count();
+                }
+                AiContentBlock::ToolCall(_) => fresh.tool_calls += 1,
             }
-            AiContentBlock::Thinking(_) => reasoning += 1,
-            AiContentBlock::ToolCall(_) => tool += 1,
-            _ => {}
         }
     }
-    format!(
-        "parts=text:{text},reasoning:{reasoning},tool:{tool};chars={chars};stop={:?}",
-        message.stop_reason
-    )
+    let trimmed = content
+        .trim_matches(|c: char| matches!(c, ' ' | '\t' | '\r' | '\n'))
+        .to_string();
+    if !trimmed.is_empty() {
+        fresh.content_sha256 = Some(sha256(trimmed.as_bytes()));
+    }
+    fresh
+}
+
+/// One source request's evidence entry (defect 7.2): request identity plus
+/// fresh-turn accounting - lengths and hashes only, never private content.
+fn source_request_evidence(
+    stage: &str,
+    ordinal: u32,
+    prompt_sha256: &str,
+    outcome: &SourceTurnOutcome,
+    fresh: &FreshSourceTurn,
+) -> Value {
+    json!({
+        "stage": stage,
+        "ordinal": ordinal,
+        "prompt_sha256": prompt_sha256,
+        "outcome": outcome.as_str(),
+        "error_tag": outcome.failure(stage),
+        "fresh_assistant_count": fresh.assistant_count,
+        "fresh_content_chars": fresh.content_chars,
+        "fresh_reasoning_blocks": fresh.reasoning_blocks,
+        "fresh_reasoning_chars": fresh.reasoning_chars,
+        "fresh_tool_calls": fresh.tool_calls,
+        "fresh_stop_reason": fresh.stop_reason,
+        "fresh_content_sha256": fresh.content_sha256,
+    })
 }
 
 /// The pinned normalization rule: text content blocks in order from the FINAL
@@ -1729,6 +1971,19 @@ fn validate_receiver_thinking_env() -> Result<(), String> {
     }
 }
 
+/// Defect 7.3 (source wire effort): refuse an OCC3_SOURCE_THINKING value the
+/// GLM-5.3 chat template would silently render as Max, before any
+/// enrollment. Unset stays byte-identical (the template default).
+fn validate_source_thinking_env() -> Result<(), String> {
+    match std::env::var("OCC3_SOURCE_THINKING") {
+        Err(_) => Ok(()),
+        Ok(value) if GLM53_WIRE_EFFORTS.contains(&value.as_str()) => Ok(()),
+        Ok(value) => Err(format!(
+            "OCC3_SOURCE_THINKING={value:?} is not a GLM-5.3 chat-template effort level: the template honours only low and high and renders anything else (off, none, minimal, medium, xhigh) as Max. Use low|high|max or unset it."
+        )),
+    }
+}
+
 /// Refuse an OCC3_SPAN_POLICY the connector would refuse at capture time,
 /// before any enrollment side effect.
 fn validate_span_policy_env() -> Result<(), String> {
@@ -1740,6 +1995,45 @@ fn validate_span_policy_env() -> Result<(), String> {
             SourceSpanArming::DEFAULT.span_policy
         )
     })
+}
+
+// ---------------------------------------------------------------------------
+// Source lifecycle mode (retained content-only vs legacy two-turn).
+// ---------------------------------------------------------------------------
+
+/// The positive case's source-leg lifecycle. `Legacy` is the frozen two-turn
+/// protocol (unarmed content turn, then the armed same-turn occ3_handoff
+/// turn); `Retained` is the retained content-only lifecycle: ONE armed
+/// no-tool content turn (occ3.capture.v3, span policy
+/// content_tail_no_tool_v2, capture_mode content_only_orchestrator_v1)
+/// published afterwards through the authenticated family controller
+/// (occ3.publish.v2, dispatch_mode orchestrator_v1). The default stays
+/// Legacy so the frozen contract runs and their pins are unchanged.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum SourceMode {
+    Legacy,
+    Retained,
+}
+
+static SOURCE_MODE: std::sync::OnceLock<SourceMode> = std::sync::OnceLock::new();
+
+impl SourceMode {
+    fn parse(flag: Option<&str>) -> Result<SourceMode, String> {
+        match flag {
+            None => Ok(SourceMode::Legacy),
+            Some("legacy") => Ok(SourceMode::Legacy),
+            Some("retained") => Ok(SourceMode::Retained),
+            Some(other) => Err(format!(
+                "{other:?} is not an admitted source mode; expected legacy|retained"
+            )),
+        }
+    }
+
+    /// The `--source-mode` selection; unset (tests, library callers) is the
+    /// legacy default.
+    fn current() -> SourceMode {
+        *SOURCE_MODE.get().unwrap_or(&SourceMode::Legacy)
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1992,6 +2286,89 @@ fn receiver_wire_effort() -> Option<String> {
     std::env::var("OCC3_RECEIVER_THINKING")
         .ok()
         .filter(|level| GLM53_WIRE_EFFORTS.contains(&level.as_str()))
+}
+
+/// Wire-level source effort override (defect 7.3): the source-side twin of
+/// `receiver_wire_effort`. `Some(level)` rewrites the body field to one of
+/// the template's own levels, `None` leaves the body untouched. Env-gated so
+/// unset runs stay byte-identical; any other value was refused at startup
+/// (validate_source_thinking_env), so nothing here can send a value the
+/// template would render as Max behind the operator's back.
+fn source_wire_effort() -> Option<String> {
+    std::env::var("OCC3_SOURCE_THINKING")
+        .ok()
+        .filter(|level| GLM53_WIRE_EFFORTS.contains(&level.as_str()))
+}
+
+/// Defect 7.3 (source wire effort): the source-side on_payload hook, composed
+/// like `attach_receiver_audit`. When OCC3_SOURCE_THINKING is set the body's
+/// `reasoning_effort` is rewritten and the mutated payload RETURNED
+/// (on_payload replaces the provider-built params only when `Some` is
+/// returned; returning `None` would silently discard the rewrite and put the
+/// default back on the wire). The OCC3_DUMP_SOURCE_PAYLOAD dump writes AFTER
+/// the mutation, and the audit records whether the serialized body carried
+/// the applied effort. With both envs unset no hook is installed at all, so
+/// requests stay byte-identical.
+fn attach_source_payload_hook(options: &mut AgentOptions, audit: Arc<Mutex<Vec<Value>>>) {
+    let dump_path = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD").ok();
+    if dump_path.is_none() && std::env::var_os("OCC3_SOURCE_THINKING").is_none() {
+        return;
+    }
+    options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
+        // For provider dgx-glm53 the openai-completions client builds
+        // `reasoning_effort` from provider options only, so
+        // `initial_state.thinking_level` never reaches the body; rewriting
+        // the body here is the only place that is actually serialized.
+        let effort = source_wire_effort();
+        let mut payload = payload;
+        if let Some(level) = effort.clone() {
+            if let Some(object) = payload.as_object_mut() {
+                // The GLM-5.3 template honours exactly `low`/`high` and
+                // renders every other value, an absent key included, as Max;
+                // the level here is already one of GLM53_WIRE_EFFORTS.
+                object.insert("reasoning_effort".to_string(), Value::String(level));
+            }
+        }
+        // Dump AFTER mutation: the file shows exactly the body the provider
+        // receives when Some(payload) is returned below.
+        if let Some(path) = &dump_path {
+            let _ = std::fs::write(path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
+        }
+        // Audit assertion (defect 7.3): the serialized body carries the
+        // applied effort. reasoning_effort re-read from the mutated payload
+        // is what goes on the wire when Some is returned below.
+        let effort_on_wire = payload
+            .get("reasoning_effort")
+            .and_then(Value::as_str)
+            .map(str::to_string);
+        audit.lock().unwrap().push(json!({
+            "effort_requested": effort.clone(),
+            "effort_on_wire": effort_on_wire,
+        }));
+        Box::pin(async move {
+            if effort.is_some() {
+                Some(payload)
+            } else {
+                None
+            }
+        })
+    }))
+}
+
+/// Source-request audit summary for the arm evidence: how many source
+/// requests the hook saw, and - the defect 7.3 assertion - that whenever an
+/// effort was requested, the serialized body carried exactly that value.
+fn source_request_audit_summary(audit: &[Value]) -> Value {
+    json!({
+        "request_count": audit.len(),
+        "effort_requested": audit.first().and_then(|a| a["effort_requested"].as_str()).map(str::to_string),
+        "effort_on_wire_matches_request": audit.iter().all(|a| {
+            match a["effort_requested"].as_str() {
+                None => true,
+                Some(level) => a["effort_on_wire"].as_str() == Some(level),
+            }
+        }),
+    })
 }
 
 /// Receiver-side request audit through the existing on_payload hook:
@@ -2253,6 +2630,13 @@ struct PositiveArmPlan {
     message_pinned: bool,
 }
 
+/// The retained content-only source system prompt: the captured turn asks
+/// ONLY for the private sentence, with the handoff tool NOT installed on
+/// that turn, so the armed span is a pure content run under
+/// content_tail_no_tool_v2 and the completed hook's zero-tool-binding
+/// contract holds by construction.
+const RETAINED_SOURCE_SYSTEM_PROMPT: &str = "Preserve the private vault code in the native source turn. State the exact message as your complete final content and stop. Do not call any tools.";
+
 /// What one positive-path run observed, for both the frozen contract callers
 /// (case/observed/cleanup) and the arm-evidence projection. `source_audit`
 /// carries the capture identity (capture_id, turn_nonce) the P4 canary's
@@ -2278,15 +2662,22 @@ async fn run_positive_case(
     receiver_id: &str,
     nonce: &str,
     plan: Option<&PositiveArmPlan>,
+    source_mode: SourceMode,
 ) -> Result<PositiveOutcome, String> {
     let arm_started = Instant::now();
+    let retained_mode = source_mode == SourceMode::Retained;
     let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
     // TOKEN_FULL's pre-registered source prompts; every other run keeps the
-    // historical prompt bytes exactly.
+    // historical prompt bytes exactly. The retained mode swaps in its own
+    // source system prompt (its turn asks for the sentence alone, no handoff
+    // tool installed), so the legacy prompt bytes stay untouched in legacy
+    // mode.
     let message_pinned = plan.is_some_and(|plan| plan.message_pinned);
-    let source_system_prompt = if message_pinned {
+    let source_system_prompt = if retained_mode {
+        RETAINED_SOURCE_SYSTEM_PROMPT
+    } else if message_pinned {
         "Preserve the private vault code in the native source turn. State the exact message as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
     } else {
         "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff tool returns, reply with ONE short plain-text confirmation that repeats the code (for example \"Recorded: <code>\") and call no further tools - the turn must end on that text, never on a tool call."
@@ -2313,14 +2704,13 @@ async fn run_positive_case(
     if let Some(state) = source_options.initial_state.as_mut() {
         state.thinking_level = ThinkingLevel::Low;
     }
-    if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
-        // Root diagnostic: dump the armed source-turn request payload exactly
-        // as serialized to the provider. No behavior change when unset.
-        source_options.on_payload = Some(Arc::new(move |payload: Value, _model: &Model| {
-            let _ = std::fs::write(&path, serde_json::to_vec_pretty(&payload).unwrap_or_default());
-            Box::pin(async move { None })
-        }));
-    }
+    // Defect 7.3 (source wire effort): the composed source on_payload hook -
+    // the OCC3_DUMP_SOURCE_PAYLOAD dump (written after mutation) plus the
+    // OCC3_SOURCE_THINKING reasoning_effort rewrite with Some(payload)
+    // returned, mirroring attach_receiver_audit's composition. With both
+    // envs unset no hook is installed, so requests stay byte-identical.
+    let source_request_audit: Arc<Mutex<Vec<Value>>> = Arc::new(Mutex::new(Vec::new()));
+    attach_source_payload_hook(&mut source_options, source_request_audit.clone());
     let source_agent = Agent::new(source_options);
     let mut receiver_options = receiver_agent_options(
         &env.model,
@@ -2347,72 +2737,159 @@ async fn run_positive_case(
     // can call the installed source-side tool and refuse instead of
     // answering from the attached state.
     strip_handoff_tool(&receiver_agent);
-    // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
-    // the handoff tool NOT yet installed, so it cannot end on a tool call and the
-    // captured span always carries a CONTENT run (span policy R8). Only after
-    // that content turn does the family install the tool and the second turn ask
-    // for the handoff alone.
-    // Root ruling r12: one bounded retry when a turn spent its whole budget on
-    // reasoning. The shape of an empty turn is printed on its own line, because
-    // the refusal text itself is sanitised down to a stable code.
-    let mut source_turns = 0u32;
-    loop {
-        source_turns += 1;
-        let prompt = if source_turns == 1 {
-            source_text_prompt.clone()
-        } else {
-            source_text_retry_prompt.clone()
-        };
-        let _ = tokio::time::timeout(
-            Duration::from_secs(env.deadline_seconds),
-            source_agent.prompt(PromptInput::Text {
-                input: prompt,
-                images: Vec::new(),
-            }),
+    // Defect 7.2: per-request evidence - request identity plus fresh-turn
+    // accounting (lengths and hashes only, never private content).
+    let mut source_requests: Vec<Value> = Vec::new();
+    // The publication action's typed result: legacy = the armed handoff
+    // turn's request outcome; retained = the publish_retained call.
+    let action: Result<(), String>;
+    if retained_mode {
+        // RETAINED SOURCE LEG (task 1): the capture rides the SINGLE content
+        // turn. The family hooks (source capture + receiver resolver) are
+        // installed first, then the handoff tool is stripped from both agents
+        // for this turn (the mode forbids tool bindings), the retained
+        // capture is armed BEFORE the request, and the turn asks ONLY for
+        // the private sentence. One shot: the resolve hook takes the budget,
+        // so there is no retry - an empty turn fails by name below.
+        family.install()?;
+        strip_handoff_tool(&receiver_agent);
+        strip_handoff_tool(&source_agent);
+        source.arm_source_retained(NativeSourceBudget {
+            retained_count_limit: 128,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+        let baseline = source_turn_baseline(&source_agent);
+        let prompt_sha256 = sha256(source_text_prompt.as_bytes());
+        let outcome = bounded_source_prompt(
+            &source_agent,
+            source_text_prompt.clone(),
+            env.deadline_seconds,
         )
-        .await
-        .map_err(|_| fail())?
-        .map_err(|_| fail());
-        if !normalized_final_answer(&source_agent).is_empty() {
-            break;
+        .await;
+        let fresh = fresh_source_turn(&source_agent, baseline);
+        source_requests.push(source_request_evidence(
+            "source_turn",
+            1,
+            &prompt_sha256,
+            &outcome,
+            &fresh,
+        ));
+        if let Some(error) = outcome.failure("source_turn") {
+            return Err(error.into());
         }
-        let detail = describe_last_assistant(&source_agent);
-        eprintln!("occ3-source-turn-diag turn={source_turns} {detail}");
-        if source_turns == 1 && source_turn_hit_length(&source_agent) {
-            continue;
+        if !fresh.has_content() {
+            return Err(
+                format!("source_turn_without_final_content({})", fresh.describe()).into(),
+            );
         }
-        return Err(format!("source_turn_without_final_content({detail})").into());
-    }
-    // Root ruling r13: turn 1 stays UNARMED. A plain model turn emits the
-    // sentence with no capture attached, so the bridge cannot serve that turn
-    // with native state (the r12 window burned ~90 s of reasoning inside an
-    // attached turn and ended with no CONTENT run). The arm is taken only now,
-    // for the handoff turn that actually publishes.
-    source.arm_source(NativeSourceBudget {
-        retained_count_limit: 128,
-        max_capture_bytes: env.max_capture_bytes,
-        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
-        max_response_bytes: env.max_response_bytes,
-    })?;
-    family.install()?;
-    let action = tokio::time::timeout(
-        Duration::from_secs(env.deadline_seconds),
-        source_agent.prompt(PromptInput::Text {
-            input: source_handoff_prompt,
-            images: Vec::new(),
-        }),
-    )
-    .await
-    .map_err(|_| fail())?
-    .map_err(|_| fail());
-    // Root ruling A (d): a source turn that ends on a tool call has no CONTENT
-    // run, so the span policy declines it (R8) only after the whole turn is
-    // spent. Refuse here, by name, before the publication leg begins.
-    // Root ruling A (d), live-only: in offline fixtures the synthetic source turn
-    // ends on the handoff tool call by contract, so the guard would refuse the
-    // very fixtures the offline selftest pins. Guard the live path only.
-    if env.offline_records.is_none() && normalized_final_answer(&source_agent).is_empty() {
-        return Err("source_turn_without_final_content".into());
+        // Retained publication: through the authenticated family controller
+        // for the source session, targeting the receiver - no model tool
+        // dispatch anywhere in this mode.
+        let controller = family
+            .controller(source_id)
+            .map_err(|error| format!("retained_controller_unavailable({error})"))?;
+        action = source
+            .publish_retained(controller, "child", "receiver")
+            .await
+            .map(|_| ())
+            .map_err(|error| format!("source_retained_publish_error({error})"));
+    } else {
+        // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
+        // the handoff tool NOT yet installed, so it cannot end on a tool call and the
+        // captured span always carries a CONTENT run (span policy R8). Only after
+        // that content turn does the family install the tool and the second turn ask
+        // for the handoff alone.
+        // Root ruling r12: one bounded retry when a turn spent its whole budget on
+        // reasoning. The shape of an empty turn is printed on its own line, because
+        // the refusal text itself is sanitised down to a stable code.
+        // Defect 7.1: every request failure is a named stage outcome, never a
+        // discarded provider Result. Defect 7.2: only assistant messages
+        // appended after each request's baseline count as that turn's output,
+        // so an empty retry turn can no longer be masked by turn 1's sentence.
+        let mut source_turns = 0u32;
+        loop {
+            source_turns += 1;
+            let prompt = if source_turns == 1 {
+                source_text_prompt.clone()
+            } else {
+                source_text_retry_prompt.clone()
+            };
+            let prompt_sha256 = sha256(prompt.as_bytes());
+            let baseline = source_turn_baseline(&source_agent);
+            let outcome =
+                bounded_source_prompt(&source_agent, prompt, env.deadline_seconds).await;
+            let fresh = fresh_source_turn(&source_agent, baseline);
+            source_requests.push(source_request_evidence(
+                "source_turn",
+                source_turns,
+                &prompt_sha256,
+                &outcome,
+                &fresh,
+            ));
+            if let Some(error) = outcome.failure("source_turn") {
+                return Err(error.into());
+            }
+            if fresh.has_content() {
+                break;
+            }
+            let detail = fresh.describe();
+            eprintln!("occ3-source-turn-diag turn={source_turns} {detail}");
+            if source_turns == 1 && fresh.stop_reason.as_deref() == Some("length") {
+                continue;
+            }
+            return Err(format!("source_turn_without_final_content({detail})").into());
+        }
+        // Root ruling r13: turn 1 stays UNARMED. A plain model turn emits the
+        // sentence with no capture attached, so the bridge cannot serve that turn
+        // with native state (the r12 window burned ~90 s of reasoning inside an
+        // attached turn and ended with no CONTENT run). The arm is taken only now,
+        // for the handoff turn that actually publishes.
+        source.arm_source(NativeSourceBudget {
+            retained_count_limit: 128,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+        family.install()?;
+        let baseline = source_turn_baseline(&source_agent);
+        let prompt_sha256 = sha256(source_handoff_prompt.as_bytes());
+        let outcome = bounded_source_prompt(
+            &source_agent,
+            source_handoff_prompt.clone(),
+            env.deadline_seconds,
+        )
+        .await;
+        let fresh = fresh_source_turn(&source_agent, baseline);
+        source_requests.push(source_request_evidence(
+            "source_handoff",
+            1,
+            &prompt_sha256,
+            &outcome,
+            &fresh,
+        ));
+        // Defect 7.1: carry the armed handoff turn's error tag instead of
+        // flattening it into a generic fail; the case verdict records it.
+        action = match outcome.failure("source_handoff") {
+            Some(error) => Err(error),
+            None => Ok(()),
+        };
+        // Root ruling A (d): a source turn that ends on a tool call has no CONTENT
+        // run, so the span policy declines it (R8) only after the whole turn is
+        // spent. Refuse here, by name, before the publication leg begins.
+        // Root ruling A (d), live-only: in offline fixtures the synthetic source turn
+        // ends on the handoff tool call by contract, so the guard would refuse the
+        // very fixtures the offline selftest pins. Guard the live path only.
+        // Defect 7.2: the guard reads ONLY this request's fresh content, so an
+        // empty armed turn can no longer be masked by turn 1's sentence.
+        if env.offline_records.is_none() && !fresh.has_content() {
+            return Err(format!(
+                "source_turn_without_final_content({})",
+                fresh.describe()
+            )
+            .into());
+        }
     }
     let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
     // Evidence extraction happens before cleanup.
@@ -2476,10 +2953,28 @@ async fn run_positive_case(
     let delivered = message
         .as_ref()
         .is_some_and(|r| r.delivery_status == "delivered");
-    let source_state_ok = source_audit["source"]["state"] == json!("Captured")
-        && source_audit["source"]["tool_claimed"] == json!(true)
-        && source_audit["source"]["handoff_admitted"] == json!(true)
-        && source_audit["source"]["published_message"].is_array();
+    // The retained mode's source contract: a Captured content-only lease that
+    // was NEVER tool-claimed, published exactly once through the orchestrator
+    // (publication_claimed) under the retained capture mode. The legacy mode
+    // keeps its historical contract: exactly one same-turn tool claim.
+    let source_state_ok = if retained_mode {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(false)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+            && source_audit["source"]["publication_claimed"] == json!(true)
+            && source_audit["source"]["retained"] == json!(true)
+            && source_audit["source"]["capture_mode"] == json!("content_only_orchestrator_v1")
+    } else {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(true)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+    };
+    // The retained content turn makes ZERO tool calls by construction; the
+    // legacy handoff turn makes exactly one. The receiver-side consumed
+    // receipt requirements are identical in both modes.
+    let expected_source_tool_calls = if retained_mode { 0 } else { 1 };
     let case_passed = action.is_ok()
         && semantic_nonce_match
         && final_message_is_pure_text(&receiver_agent)
@@ -2487,7 +2982,7 @@ async fn run_positive_case(
         && receipts.len() == 1
         && consumed
         && receiver_tool_calls == 0
-        && source_tool_calls == 1
+        && source_tool_calls == expected_source_tool_calls
         && source_state_ok
         && audit_summary["source_facts_absent"] == json!(true)
         && audit_summary["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
@@ -2511,15 +3006,20 @@ async fn run_positive_case(
         "answer_sha256": answer_sha256,
         "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
         "lease_state": receiver_phase.as_array().and_then(|e| e.first()).and_then(|e| e["lease_state"].as_str()).map(str::to_string),
-        "consumed_before_tools": consumed && receiver_tool_calls == 0 && source_tool_calls == 1,
+        "consumed_before_tools": consumed && receiver_tool_calls == 0 && source_tool_calls == expected_source_tool_calls,
         "receiver_request_audit": audit_summary,
     });
-    if diagnostic_extras && !case_passed {
-        case["source_audit"] = source_audit.clone();
-        case["source_tool_errors"] = json!(source_tool_errors(&source_agent));
-        case["receiver_tool_errors"] = json!(receiver_tool_errors(&receiver_agent));
-        case["receiver_tool_calls"] = json!(receiver_tool_calls);
-        case["source_tool_calls"] = json!(source_tool_calls);
+    if diagnostic_extras {
+        // Defect 7.2 evidence (env-gated so the default report keeps its
+        // exact fieldset): request identity plus fresh-turn accounting.
+        case["source_requests"] = json!(source_requests.clone());
+        if !case_passed {
+            case["source_audit"] = source_audit.clone();
+            case["source_tool_errors"] = json!(source_tool_errors(&source_agent));
+            case["receiver_tool_errors"] = json!(receiver_tool_errors(&receiver_agent));
+            case["receiver_tool_calls"] = json!(receiver_tool_calls);
+            case["source_tool_calls"] = json!(source_tool_calls);
+        }
     }
     let coverage = span_coverage_verdict(span_block.as_ref(), value_in_sender_content);
     let arm_evidence = json!({
@@ -2546,6 +3046,12 @@ async fn run_positive_case(
         // surface only as empty fields; name the refused-turn error so the
         // next live failure is readable from arm evidence alone.
         "source_turn_error": action.as_ref().err().cloned(),
+        // The source lifecycle that ran (task 1) and its per-request
+        // evidence (defect 7.2) + wire-effort audit (defect 7.3): lengths
+        // and hashes only, never private content.
+        "source_mode": if retained_mode { "retained" } else { "legacy" },
+        "source_requests": source_requests,
+        "source_request_audit": source_request_audit_summary(&source_request_audit.lock().unwrap().clone()),
     });
     Ok(PositiveOutcome {
         case,
@@ -3958,6 +4464,7 @@ async fn run_before_phase(
         &diagnostic_receiver_session(),
         &nonce,
         None,
+        SourceMode::current(),
     )
     .await?;
     if positive_outcome.case["case_passed"] != json!(true) {
@@ -4116,6 +4623,7 @@ async fn run_after_phase(
         &diagnostic_receiver_session(),
         &nonce,
         None,
+        SourceMode::current(),
     )
     .await?;
     if positive_outcome.case["case_passed"] != json!(true) {
@@ -4268,11 +4776,18 @@ fn token_full_invalid_coverage(coverage: &Value) -> bool {
 /// the value (that semantic outcome is the experiment's datum, recorded in
 /// the evidence either way).
 fn positive_structural_ok(evidence: &Value) -> bool {
+    // The retained source mode's turn is toolless by construction (zero
+    // source tool calls); the legacy two-turn leg makes exactly one.
+    let expected_source_tool_calls = if evidence["source_mode"] == json!("retained") {
+        0
+    } else {
+        1
+    };
     evidence["delivered"] == json!(true)
         && evidence["consumed"] == json!(true)
         && evidence["source_state_ok"] == json!(true)
         && evidence["receiver_tool_calls"] == json!(0)
-        && evidence["source_tool_calls"] == json!(1)
+        && evidence["source_tool_calls"] == json!(expected_source_tool_calls)
         && evidence["receiver_request_audit"]["source_facts_absent"] == json!(true)
         && evidence["receiver_request_audit"]["occ3_keys_absent"] != json!(false)
         && evidence["receiver_request_audit"]["max_tokens"] == json!(DEFAULT_MAX_TOKENS as u64)
@@ -4470,6 +4985,7 @@ async fn run_arm_phase(
                 &receiver_id,
                 &intended_value,
                 Some(&plan),
+                SourceMode::current(),
             )
             .await
             .map(|outcome| {
@@ -7330,6 +7846,107 @@ fn effective_descriptor_digest(
     ))
 }
 
+/// The offline selftest's retained content-only leg (task 5): one full
+/// positive case in `SourceMode::Retained` against the restarted fixture -
+/// `arm_source_retained` BEFORE the single no-tool content request, then
+/// `publish_retained` through the authenticated family controller - with
+/// the retained lifecycle's audit shape cross-checked against the
+/// harness-owned fixture records. Lengths and hashes only; no private
+/// content in the summary.
+async fn run_retained_selftest_leg(env: &PhaseEnv) -> Result<Value, String> {
+    let connector = env.connector()?;
+    let source_id = format!("retained-source-{}", uuid::Uuid::new_v4().simple());
+    let receiver_id = format!("retained-receiver-{}", uuid::Uuid::new_v4().simple());
+    let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+    let outcome = run_positive_case(
+        env,
+        &connector,
+        &source_id,
+        &receiver_id,
+        &nonce,
+        None,
+        SourceMode::Retained,
+    )
+    .await?;
+    if outcome.case["case_passed"] != json!(true) {
+        return Err(format!("retained source leg failed: {}", outcome.case));
+    }
+    // The retained capture must retire cleanly through the same close path
+    // (family.close -> retire_native_source), like the legacy publication.
+    if !outcome.cleanup_ok {
+        return Err("retained source leg cleanup failed".into());
+    }
+    let source = &outcome.source_audit["source"];
+    if source["capture_mode"] != json!("content_only_orchestrator_v1")
+        || source["retained"] != json!(true)
+        || source["tool_claimed"] != json!(false)
+        || source["publication_claimed"] != json!(true)
+    {
+        return Err(format!(
+            "retained source leg audit mismatch: {}",
+            outcome.source_audit
+        ));
+    }
+    // Fixture cross-checks under the harness-owned records: exactly one v3
+    // retained capture and exactly one occ3.publish.v2 publication, bound to
+    // this leg's sessions, dispatched by the orchestrator with no tool
+    // binding anywhere.
+    if let Some(records) = &env.offline_records {
+        // Scoped to THIS leg's source session: a `--source-mode retained`
+        // run also drives the frozen-phase positive cases through the
+        // retained lifecycle against the same fixture.
+        let records = records.lock().unwrap();
+        let retained_captures: Vec<&CapturedRecord> = records
+            .captures
+            .iter()
+            .filter(|c| {
+                c.session == source_id && c.intent["schema"] == json!("occ3.capture.v3")
+            })
+            .collect();
+        if retained_captures.len() != 1
+            || retained_captures[0].intent["capture_mode"] != json!("content_only_orchestrator_v1")
+            || retained_captures[0].intent["span_policy"] != json!("content_tail_no_tool_v2")
+        {
+            return Err(format!(
+                "retained capture shape mismatch: {} captures",
+                retained_captures.len()
+            ));
+        }
+        let retained_publications: Vec<&Value> = records
+            .published
+            .iter()
+            .filter(|p| {
+                p["schema"] == json!("occ3.publish.v2")
+                    && p["source_session_id"] == json!(source_id)
+            })
+            .collect();
+        if retained_publications.len() != 1 {
+            return Err(format!(
+                "retained publication count mismatch: {}",
+                retained_publications.len()
+            ));
+        }
+        let publication = retained_publications[0];
+        if publication["dispatch_mode"] != json!("orchestrator_v1")
+            || publication.get("tool_call_id").is_some()
+            || publication["receiver_session_id"] != json!(receiver_id)
+        {
+            return Err("retained publication shape mismatch".into());
+        }
+    }
+    Ok(json!({
+        "case_passed": true,
+        "source_mode": "retained",
+        "capture_schema": "occ3.capture.v3",
+        "capture_mode": "content_only_orchestrator_v1",
+        "span_policy": "content_tail_no_tool_v2",
+        "publication_schema": "occ3.publish.v2",
+        "dispatch_mode": "orchestrator_v1",
+        "tool_call_id_absent": true,
+        "answer_sha256": outcome.case["answer_sha256"],
+    }))
+}
+
 /// Full two-phase offline selftest against the local synthetic backend. The
 /// "restart" is modeled by a second fixture instance with a fresh runtime
 /// epoch and an ADVANCED generation (retained-counter restart profile).
@@ -7490,10 +8107,17 @@ async fn offline_selftest(journal: Option<PathBuf>) -> Result<Value, String> {
         &binary_sha256,
         &manifest_sha256,
     )?;
-    let after_report =
+    let after_result =
         run_after_phase(&env_after, &challenge_after, &descriptor_digest_after).await;
+    // The retained content-only lifecycle leg (task 5) runs end-to-end
+    // against the same restarted fixture - arm_source_retained, one no-tool
+    // content turn, publish_retained through the family controller, the
+    // receiver consumed - before the fixture server is aborted. The frozen
+    // two-phase reports above stay byte-compatible in legacy mode.
+    let retained_source_leg = run_retained_selftest_leg(&env_after).await;
     server_before.abort();
-    let after_report = after_report?;
+    let after_report = after_result?;
+    let retained_source_leg = retained_source_leg?;
     // Strict readback verification of the published final reports.
     let pins_before = ReportPins {
         binary_sha256: binary_sha256.clone(),
@@ -7559,6 +8183,7 @@ async fn offline_selftest(journal: Option<PathBuf>) -> Result<Value, String> {
         },
         "restart_profile": "controlled_same_container_stop_start_retained_counter_offline_model",
         "generation_advanced": true,
+        "retained_source_leg": retained_source_leg,
         "harness": {
             "binary_sha256": binary_sha256,
             "source_manifest_sha256": manifest_sha256,
@@ -7902,9 +8527,13 @@ fn main() {
 async fn real_main() -> Result<(), i32> {
     let args: Vec<String> = std::env::args().skip(1).collect();
     // Operator knobs are checked before any enrollment or HTTP effect: a value
-    // that would silently run the receiver at Max effort, or arm a span policy
-    // the connector refuses, ends the run here with the admitted set.
-    if let Err(error) = validate_receiver_thinking_env().and_then(|_| validate_span_policy_env()) {
+    // that would silently run the receiver at Max effort, silently run the
+    // source at Max effort, or arm a span policy the connector refuses, ends
+    // the run here with the admitted set.
+    if let Err(error) = validate_receiver_thinking_env()
+        .and_then(|_| validate_source_thinking_env())
+        .and_then(|_| validate_span_policy_env())
+    {
         eprintln!("Native phase-suite producer refused: {error}");
         return Err(1);
     }
@@ -7918,10 +8547,11 @@ async fn real_main() -> Result<(), i32> {
     let mut corpus_turn: Option<String> = None;
     let mut task_flag: Option<String> = None;
     let mut suite_flag: Option<String> = None;
+    let mut source_mode_flag: Option<String> = None;
     let mut index = 0;
     let usage = || {
         eprintln!(
-            "Usage: occ3_native_phase_suite [--arm ARM] [--corpus-turn TURN_MANIFEST_JSON] [--task TASK_JSON] [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]"
+            "Usage: occ3_native_phase_suite [--arm ARM] [--source-mode legacy|retained] [--corpus-turn TURN_MANIFEST_JSON] [--task TASK_JSON] [--offline [DIR] | --live PRIVATE_DESCRIPTOR_PATH]"
         );
     };
     while index < args.len() {
@@ -7970,6 +8600,17 @@ async fn real_main() -> Result<(), i32> {
                 }
                 index += 2;
             }
+            "--source-mode" => {
+                let Some(value) = args.get(index + 1) else {
+                    usage();
+                    return Err(1);
+                };
+                if source_mode_flag.replace(value.clone()).is_some() {
+                    usage();
+                    return Err(1);
+                }
+                index += 2;
+            }
             "--offline" => {
                 if offline.is_some() || live.is_some() {
                     usage();
@@ -8013,6 +8654,17 @@ async fn real_main() -> Result<(), i32> {
             return Err(1);
         }
     };
+    // The source-lifecycle mode is selected with the same startup refusal
+    // discipline; unset is the legacy two-turn leg, so existing pins are
+    // unchanged.
+    let source_mode = match SourceMode::parse(source_mode_flag.as_deref()) {
+        Ok(mode) => mode,
+        Err(error) => {
+            eprintln!("Native phase-suite producer refused: {error}");
+            return Err(1);
+        }
+    };
+    let _ = SOURCE_MODE.set(source_mode);
     // The per-turn manifest is strict-loaded and validated before any
     // enrollment, claim or HTTP effect; the corpus-turn selection (no arm,
     // or the NATIVE canary) refuses with the manifest's receiver-leg flag.
