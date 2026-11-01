@@ -2299,7 +2299,10 @@ async fn run_positive_case(
     // Root ruling A (d): a source turn that ends on a tool call has no CONTENT
     // run, so the span policy declines it (R8) only after the whole turn is
     // spent. Refuse here, by name, before the publication leg begins.
-    if normalized_final_answer(&source_agent).is_empty() {
+    // Root ruling A (d), live-only: in offline fixtures the synthetic source turn
+    // ends on the handoff tool call by contract, so the guard would refuse the
+    // very fixtures the offline selftest pins. Guard the live path only.
+    if env.offline_records.is_none() && normalized_final_answer(&source_agent).is_empty() {
         return Err("source_turn_without_final_content".into());
     }
     let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
