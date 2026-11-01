@@ -6,6 +6,8 @@ never fall back to last_accepted (R13).
 """
 from __future__ import annotations
 
+import json
+
 import pytest
 
 from occ3_sglang.attachment_contract import MARKER_SCHEMA_V1, SOURCE_SCHEMA_V2, SPAN_SCHEMA_V1
@@ -317,3 +319,33 @@ def test_glm53_tool_call_turn_ends_on_the_observation_role_token():
              stop_ids=GLM53_STOP)
     # The eos-only stop set still declines at R3: <|observation|> is not eos.
     declines(turn, code="lineage", marker_table=glm53_table(), stop_ids=frozenset((GLM53_EOS,)))
+
+def test_r8_decline_leaves_a_bounded_token_free_span_audit(monkeypatch, tmp_path):
+    """Root ruling C: a refusal names the turn it refused, and nothing else.
+
+    The file is bounded, atomic and token-free: kinds, indices and flags only.
+    """
+    target = tmp_path / "span-audit.json"
+    monkeypatch.setattr("occ3_sglang.span_policy.SPAN_AUDIT_PATH", str(target))
+    declines(([1, THINK, TC_START, 4, TC_END, EOS], [9, 10, 11, 12, 13, 14], 9, 6),
+             code="lineage")
+    record = json.loads(target.read_text(encoding="utf-8"))
+    assert record["schema"] == "occ3.span.audit.v1"
+    assert record["code"] == "lineage"
+    assert record["rule"] == "R8-content-run-exists"
+    assert record["accepted_total"] == 6 and record["window_rows"] == 6
+    # The terminator here is the thinking close (it precedes the tool markers);
+    # the refusal is still R8 because nothing CONTENT follows it.
+    assert record["terminator_kind"] in ("thinking_end", "tool_call_start")
+    assert record["tool_call_start"] is not None
+    assert record["last_content_run"] is None
+    assert all(set(run) == {"kind", "start_index", "end_index", "contiguous"}
+               for run in record["runs"])
+    assert target.stat().st_size <= 8192
+    # A token id can never appear: every recorded number is an index/count.
+    assert "token_ids" not in record and "positions" not in record
+    # A successful selection clears the in-memory record, so a stale decline is
+    # never cited; the last written file stays as the record of that refusal.
+    selects(([THINK, 1, 2, EOS], [9, 10, 11, 12], 9, 4))
+    import occ3_sglang.span_policy as span_policy
+    assert span_policy._SPAN_AUDIT == {}

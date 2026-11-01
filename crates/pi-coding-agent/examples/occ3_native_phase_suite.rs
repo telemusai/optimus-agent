@@ -134,6 +134,13 @@ const MAX_DESCRIPTOR_BYTES: usize = 65536;
 const MAX_JSON_DEPTH: usize = 32;
 const DEFAULT_MAX_TOKENS: f64 = 131072.0;
 const CEILING_TOKENS: f64 = 262144.0;
+/// The live source turn must end on real content (span policy R8 binds the
+/// capture to the last CONTENT run), so the turn is bounded: an unbounded
+/// thinking budget produced a 57k-token turn that died in an inner 400
+/// (`native_completion_failed`), and the other run ended on a bare tool call
+/// with no CONTENT run at all. Low effort plus an 8k output budget keeps the
+/// final text turn reachable and cheap.
+const SOURCE_MAX_NEW_TOKENS: f64 = 8192.0;
 const CONTEXT_WINDOW: f64 = 1048576.0;
 const CONTROL_HEADER: &str = "x-pomerium-authorization";
 const CONTROL_VALUE: &str = "synthetic-fixture-gateway-control-value";
@@ -2219,16 +2226,25 @@ async fn run_positive_case(
     let source_system_prompt = if message_pinned {
         "Preserve the private vault code in the native source turn. State the exact message as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
     } else {
-        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop."
+        "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff tool returns, reply with ONE short plain-text confirmation that repeats the code (for example \"Recorded: <code>\") and call no further tools - the turn must end on that text, never on a tool call."
     };
     let source_user_prompt = if message_pinned {
         format!(
             "The private vault code is {nonce}. Emit exactly \"The private vault code is {nonce}.\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."
         )
     } else {
-        format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments.")
+        format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments. After the handoff returns, end your turn with ONE plain-text line that repeats the code; do not call any tool after the handoff.")
     };
-    let mut source_options = agent_options(&env.model, env.key.clone(), source_system_prompt);
+    // Root ruling A (p8g declines): the live source turn is BOUNDED. Same code
+    // path, but the model copy carries a low thinking effort and an 8k output
+    // budget so the turn cannot wander into an unbounded reasoning trace.
+    let mut source_model = env.model.clone();
+    source_model.max_tokens = SOURCE_MAX_NEW_TOKENS;
+    source_model.default_max_tokens = Some(SOURCE_MAX_NEW_TOKENS);
+    let mut source_options = agent_options(&source_model, env.key.clone(), source_system_prompt);
+    if let Some(state) = source_options.initial_state.as_mut() {
+        state.thinking_level = ThinkingLevel::Low;
+    }
     if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
         // Root diagnostic: dump the armed source-turn request payload exactly
         // as serialized to the provider. No behavior change when unset.
@@ -2280,6 +2296,12 @@ async fn run_positive_case(
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail());
+    // Root ruling A (d): a source turn that ends on a tool call has no CONTENT
+    // run, so the span policy declines it (R8) only after the whole turn is
+    // spent. Refuse here, by name, before the publication leg begins.
+    if normalized_final_answer(&source_agent).is_empty() {
+        return Err("source_turn_without_final_content".into());
+    }
     let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
     // Evidence extraction happens before cleanup.
     let answer = normalized_final_answer(&receiver_agent);
