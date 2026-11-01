@@ -1514,6 +1514,39 @@ impl PhaseEnv {
     }
 }
 
+/// Root ruling (p8i decline): an empty source turn must name WHY it was
+/// empty. This returns counts only - never any model text - so the refusal
+/// stays token-free while still telling content from reasoning from tools.
+fn describe_last_assistant(agent: &Agent) -> String {
+    let state = agent.state();
+    let last = state.messages.iter().rev().find_map(|m| match m {
+        AgentMessage::Message(Message::Assistant(a)) => Some(a),
+        _ => None,
+    });
+    let Some(message) = last else {
+        return "assistant_messages=0".to_string();
+    };
+    let mut text = 0usize;
+    let mut reasoning = 0usize;
+    let mut tool = 0usize;
+    let mut chars = 0usize;
+    for block in message.content.iter() {
+        match block {
+            AiContentBlock::Text(t) => {
+                text += 1;
+                chars += t.text.chars().count();
+            }
+            AiContentBlock::Thinking(_) => reasoning += 1,
+            AiContentBlock::ToolCall(_) => tool += 1,
+            _ => {}
+        }
+    }
+    format!(
+        "parts=text:{text},reasoning:{reasoning},tool:{tool};chars={chars};stop={:?}",
+        message.stop_reason
+    )
+}
+
 /// The pinned normalization rule: text content blocks in order from the FINAL
 /// completed receiver assistant message only, concatenated with no separators,
 /// trimmed of leading/trailing ASCII space/tab/CR/LF only. No Unicode
@@ -2314,7 +2347,11 @@ async fn run_positive_case(
     .map_err(|_| fail())?
     .map_err(|_| fail());
     if normalized_final_answer(&source_agent).is_empty() {
-        return Err("source_turn_without_final_content".into());
+        return Err(format!(
+            "source_turn_without_final_content({})",
+            describe_last_assistant(&source_agent)
+        )
+        .into());
     }
     family.install()?;
     let action = tokio::time::timeout(

@@ -76,6 +76,34 @@ def _inner_error_detail(response, limit):
 # this bounded shape is ever logged; any other abort payload stays unlogged.
 _REFUSAL_CODE = re.compile(r"occ3_[a-z][a-z_]{0,62}\Z")
 
+_ABORT_DETAIL_LIMIT = 512
+
+
+def _refusal_detail(reason) -> str:
+    """Bounded, content-free description of an unclassified abort payload.
+
+    Only the structural keys and the short scalar values of the finish_reason
+    dict are rendered; long strings are truncated and any other value is
+    reduced to its type name. Model text can never reach this string because
+    the scheduler's abort payload carries status metadata only.
+    """
+    if not isinstance(reason, dict):
+        return f"type={type(reason).__name__}"
+    parts = []
+    for name in sorted(reason, key=str):
+        value = reason[name]
+        if isinstance(value, str):
+            rendered = value[:64]
+        elif isinstance(value, (int, float, bool)) or value is None:
+            rendered = str(value)
+        else:
+            rendered = f"<{type(value).__name__}>"
+        parts.append(f"{name}={rendered}")
+        if sum(len(p) for p in parts) > _ABORT_DETAIL_LIMIT:
+            break
+    return ";".join(parts)[:_ABORT_DETAIL_LIMIT]
+
+
 
 def _refusal_code(reason) -> str:
     if not isinstance(reason, dict):
@@ -859,8 +887,13 @@ class ChatAttachmentAdapter:
                         # is a fixed occ3 refusal code. The public code stays generic;
                         # the bounded code is recorded server-side so live refusals are
                         # diagnosable offline. Other abort payloads are never logged.
-                        logger.error("occ3-bridge: native turn aborted (refusal=%s status=%s)",
-                                     _refusal_code(reason), _refusal_status(reason))
+                        code = _refusal_code(reason)
+                        logger.error(
+                            "occ3-bridge: native turn aborted (refusal=%s status=%s detail=%s)",
+                            code,
+                            _refusal_status(reason),
+                            _refusal_detail(reason) if code == "unclassified" else "",
+                        )
                         raise AttachmentError("native_completion_failed")
                     ctx.native_terminal = True
                 yield output
