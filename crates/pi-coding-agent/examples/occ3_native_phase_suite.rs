@@ -2241,16 +2241,16 @@ async fn run_positive_case(
     } else {
         "Preserve the private vault code in the native source turn. Call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff tool returns, reply with ONE short plain-text confirmation that repeats the code (for example \"Recorded: <code>\") and call no further tools - the turn must end on that text, never on a tool call."
     };
-    let source_user_prompt = if message_pinned {
-        format!(
-            "The private vault code is {nonce}. Emit exactly \"The private vault code is {nonce}.\" as your complete final content before the handoff, with no other text. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments."
-        )
-    } else {
-        format!("The private vault code is {nonce}. Communicate it only through native state to the child agent named receiver, using occ3_handoff with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments. After the handoff returns, end your turn with ONE plain-text line that repeats the code; do not call any tool after the handoff.")
-    };
-    // Root ruling A (p8g declines): the live source turn is BOUNDED. Same code
-    // path, but the model copy carries a low thinking effort and an 8k output
-    // budget so the turn cannot wander into an unbounded reasoning trace.
+    // Option B splits the leg: turn 1 (no tool installed) asks only for the
+    // final content, turn 2 asks only for the handoff that publishes it.
+    let source_text_prompt = format!(
+        "The private vault code is {nonce}. Reply with exactly this sentence and nothing else: \"The private vault code is {nonce}.\""
+    );
+    let source_handoff_prompt = "Now publish that exact message through native state only: call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments, then stop.".to_string();
+    // Option B (root ruling, p8h decline): the source leg no longer uses a single
+    // mixed prompt. Turn 1 asks only for the final content, turn 2 asks only for
+    // the handoff, so the captured span always carries a CONTENT run (span policy
+    // R8) instead of depending on the model obeying "text first, then the tool".
     let mut source_model = env.model.clone();
     source_model.max_tokens = SOURCE_MAX_NEW_TOKENS;
     source_model.default_max_tokens = Some(SOURCE_MAX_NEW_TOKENS);
@@ -2288,7 +2288,6 @@ async fn run_positive_case(
         source_native: source.clone(),
         receiver_native: receiver.clone(),
     })?;
-    family.install()?;
     // The receiver is a pure consumer: without this, a live receiver model
     // can call the installed source-side tool and refuse instead of
     // answering from the attached state.
@@ -2299,10 +2298,29 @@ async fn run_positive_case(
         deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
         max_response_bytes: env.max_response_bytes,
     })?;
+    // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
+    // the handoff tool NOT yet installed, so it cannot end on a tool call and the
+    // captured span always carries a CONTENT run (span policy R8). Only after
+    // that content turn does the family install the tool and the second turn ask
+    // for the handoff alone.
+    let _ = tokio::time::timeout(
+        Duration::from_secs(env.deadline_seconds),
+        source_agent.prompt(PromptInput::Text {
+            input: source_text_prompt,
+            images: Vec::new(),
+        }),
+    )
+    .await
+    .map_err(|_| fail())?
+    .map_err(|_| fail());
+    if normalized_final_answer(&source_agent).is_empty() {
+        return Err("source_turn_without_final_content".into());
+    }
+    family.install()?;
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
-            input: source_user_prompt,
+            input: source_handoff_prompt,
             images: Vec::new(),
         }),
     )
