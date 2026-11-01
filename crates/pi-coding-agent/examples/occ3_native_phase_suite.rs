@@ -2299,7 +2299,9 @@ async fn run_positive_case(
     let source_text_retry_prompt = format!(
         "Your previous reply had no visible text. Reply now with exactly this sentence and nothing else: \"The private vault code is {nonce}.\""
     );
-    let source_handoff_prompt = "Now publish that exact message through native state only: call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments, then stop.".to_string();
+    let source_handoff_prompt = format!(
+        "Repeat the sentence exactly: \"The private vault code is {nonce}.\" Write it as visible text first. Only after that sentence, call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\" and no code in arguments, then stop."
+    );
     // Option B (root ruling, p8h decline): the source leg no longer uses a single
     // mixed prompt. Turn 1 asks only for the final content, turn 2 asks only for
     // the handoff, so the captured span always carries a CONTENT run (span policy
@@ -2345,12 +2347,6 @@ async fn run_positive_case(
     // can call the installed source-side tool and refuse instead of
     // answering from the attached state.
     strip_handoff_tool(&receiver_agent);
-    source.arm_source(NativeSourceBudget {
-        retained_count_limit: 128,
-        max_capture_bytes: env.max_capture_bytes,
-        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
-        max_response_bytes: env.max_response_bytes,
-    })?;
     // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
     // the handoff tool NOT yet installed, so it cannot end on a tool call and the
     // captured span always carries a CONTENT run (span policy R8). Only after
@@ -2387,6 +2383,17 @@ async fn run_positive_case(
         }
         return Err(format!("source_turn_without_final_content({detail})").into());
     }
+    // Root ruling r13: turn 1 stays UNARMED. A plain model turn emits the
+    // sentence with no capture attached, so the bridge cannot serve that turn
+    // with native state (the r12 window burned ~90 s of reasoning inside an
+    // attached turn and ended with no CONTENT run). The arm is taken only now,
+    // for the handoff turn that actually publishes.
+    source.arm_source(NativeSourceBudget {
+        retained_count_limit: 128,
+        max_capture_bytes: env.max_capture_bytes,
+        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+        max_response_bytes: env.max_response_bytes,
+    })?;
     family.install()?;
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
