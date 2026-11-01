@@ -1217,10 +1217,19 @@ async fn serve(
                         }
                     }
                     "/v1/chat/completions" => {
-                        assert_eq!(
-                            body.get("max_tokens").or_else(|| body.get("max_completion_tokens")),
-                            Some(&json!(DEFAULT_MAX_TOKENS as u64)),
-                            "real native default is preserved"
+                        // Root ruling A (r9 selftest catch): the live source agent now
+                        // runs on a bounded model copy (SOURCE_MAX_NEW_TOKENS), so
+                        // its completion bodies carry the reduced budget. The
+                        // receiver keeps the full DEFAULT_MAX_TOKENS ceiling. The
+                        // fixture accepts both and still fails on any other value.
+                        let got_tokens = body
+                            .get("max_tokens")
+                            .or_else(|| body.get("max_completion_tokens"))
+                            .and_then(|v| v.as_u64());
+                        assert!(
+                            got_tokens == Some(DEFAULT_MAX_TOKENS as u64)
+                                || got_tokens == Some(SOURCE_MAX_NEW_TOKENS as u64),
+                            "real native default is preserved (source budget allowed)"
                         );
                         // The suite requests MAX through the model-specific conversion;
                         // the documented receiver budget override
