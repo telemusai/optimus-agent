@@ -1239,8 +1239,12 @@ async fn serve(
                         let receiver_override = std::env::var("OCC3_RECEIVER_THINKING")
                             .ok()
                             .filter(|v| GLM53_WIRE_EFFORTS.contains(&v.as_str()));
+                        // Root ruling A (r9 selftest catch): the live source agent
+                        // runs ThinkingLevel::Low (bounded reasoning, commit
+                        // 21d96c27b), so its bodies carry reasoning_effort="low".
+                        // The receiver still converts to the historical set.
                         assert!(
-                            body.get("reasoning_effort").and_then(Value::as_str).is_some_and(|v| matches!(v, "high" | "xhigh" | "max")
+                            body.get("reasoning_effort").and_then(Value::as_str).is_some_and(|v| matches!(v, "low" | "high" | "xhigh" | "max")
                                 || receiver_override.as_deref() == Some(v)),
                             "MAX goes through the existing model-specific conversion, or the documented receiver override matches"
                         );
