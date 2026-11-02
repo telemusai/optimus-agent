@@ -6,7 +6,10 @@
 //! allocation. The tests pin the `core::dgx_auth` contract: export/import
 //! round trips, validation rejections, force semantics, atomic failure
 //! behavior, redaction, registry visibility of the three DGX models, the
-//! optional credential-refresh command, and expiry classification.
+//! optional credential-refresh command, expiry classification, and the
+//! portability contract for command-backed credentials (export resolves
+//! them to inline values, import rejects files that still reference helper
+//! commands).
 //!
 //! Two tests are requirement-literal rather than mechanism-aware on purpose:
 //! - `bundled_dgx_models_list_in_a_fresh_agent_dir` asserts the bundled DGX
@@ -53,6 +56,12 @@ const SECRET_GLM53_KEY_ALT: &str = "TEST-SECRET-NEVER-REAL-GLM53-KEY-ALT-5";
 const SECRET_JWT_ALT: &str = "TEST-SECRET-NEVER-REAL-POMERIUM-JWT-ALT-6";
 const SECRET_SOURCE_RELAY_KEY: &str = "TEST-SECRET-NEVER-REAL-SOURCE-RELAY-7";
 const SECRET_FRESH_RELAY_KEY: &str = "TEST-SECRET-NEVER-REAL-FRESH-RELAY-8";
+// Inline values produced by fake `!`-prefixed credential helpers: the export
+// side must write exactly these into the auth file, and no error or report
+// may ever name them.
+const SECRET_RESOLVED_KEY: &str = "TEST-SECRET-NEVER-REAL-RESOLVED-KEY-9";
+const SECRET_RESOLVED_JWT: &str = "TEST-SECRET-NEVER-REAL-RESOLVED-JWT-10";
+const SECRET_RESOLVED_MODEL_HEADER: &str = "TEST-SECRET-NEVER-REAL-RESOLVED-MODEL-HDR-11";
 
 /// Every synthetic credential used anywhere in this suite.
 const SECRETS: &[&str] = &[
@@ -64,6 +73,9 @@ const SECRETS: &[&str] = &[
     SECRET_JWT_ALT,
     SECRET_SOURCE_RELAY_KEY,
     SECRET_FRESH_RELAY_KEY,
+    SECRET_RESOLVED_KEY,
+    SECRET_RESOLVED_JWT,
+    SECRET_RESOLVED_MODEL_HEADER,
 ];
 
 /// The agent-dir environment is process-global, so tests that point it at a
@@ -513,6 +525,170 @@ fn export_selects_the_requested_providers_only() {
 }
 
 #[test]
+fn export_resolves_command_backed_credentials_to_inline_values() {
+    let directory = tempfile::tempdir().unwrap();
+    let models = directory.path().join("models.json");
+    let auth_path = directory.path().join("auth.json");
+
+    // The sharer's live credentials are helper commands, not literals: the
+    // gateway key, the shared session header, and a model-level header. The
+    // commands stay quote-free because the resolver spawns them through the
+    // configured shell or the `cmd /C` fallback, where inner quotes do not
+    // survive.
+    let mut glm53 = glm53_block(
+        &format!("!echo {SECRET_RESOLVED_KEY}"),
+        &format!("!echo {SECRET_RESOLVED_JWT}"),
+    );
+    glm53.models.as_mut().unwrap()[0].headers = Some(IndexMap::from([(
+        "X-DGX-Model-Header".to_string(),
+        format!("!echo {SECRET_RESOLVED_MODEL_HEADER}"),
+    )]));
+    // k3 keeps an inline key: it must pass through untouched. Both providers
+    // share one session-header command, so the resolved headers still
+    // compare equal and a shared gateway can be exported.
+    let k3 = k3_block(SECRET_K3_KEY, &format!("!echo {SECRET_RESOLVED_JWT}"));
+    write_models_config(
+        &models,
+        vec![("dgx-glm53", glm53), ("dgx-k3", k3)],
+    );
+
+    let exported = export_dgx_auth(&models, &auth_path, None).unwrap();
+
+    // The command references became inline values...
+    assert_eq!(
+        exported.providers["dgx-glm53"].api_key.as_deref(),
+        Some(SECRET_RESOLVED_KEY)
+    );
+    assert_eq!(
+        exported.providers["dgx-glm53"].headers,
+        Some(pom_headers(SECRET_RESOLVED_JWT))
+    );
+    assert_eq!(
+        exported.providers["dgx-glm53"].models.as_ref().unwrap()[0]
+            .headers
+            .as_ref()
+            .and_then(|headers| headers.get("X-DGX-Model-Header").map(String::as_str)),
+        Some(SECRET_RESOLVED_MODEL_HEADER)
+    );
+    // ...the gateway mirrors the resolved session header...
+    assert_eq!(exported.gateway.headers, pom_headers(SECRET_RESOLVED_JWT));
+    // ...and inline credentials pass through unchanged.
+    assert_eq!(
+        exported.providers["dgx-k3"].api_key.as_deref(),
+        Some(SECRET_K3_KEY)
+    );
+
+    // The written file is self-contained: the resolved values are inline and
+    // no command reference survives.
+    let raw = fs::read_to_string(&auth_path).unwrap();
+    assert!(raw.contains(SECRET_RESOLVED_KEY));
+    assert!(raw.contains(SECRET_RESOLVED_JWT));
+    assert!(
+        !raw.contains("!echo"),
+        "command references must not survive into the auth file: {raw}"
+    );
+    assert!(validate_dgx_auth(&exported).is_ok());
+
+    // The resolved file imports on a machine without the helper commands.
+    let fresh_models = directory.path().join("fresh-models.json");
+    write_models_config(
+        &fresh_models,
+        vec![(
+            "fresh-relay",
+            relay_block("Fresh Relay", SECRET_FRESH_RELAY_KEY),
+        )],
+    );
+    let report = import_dgx_auth(&auth_path, &fresh_models, false).unwrap();
+    assert_eq!(report.imported, vec!["dgx-glm53", "dgx-k3"]);
+    assert_no_secrets(&format!("{report:?}"));
+    let merged = read_models_config(&fresh_models);
+    assert_eq!(
+        merged.providers["dgx-glm53"].api_key.as_deref(),
+        Some(SECRET_RESOLVED_KEY)
+    );
+    assert_eq!(
+        merged.providers["dgx-k3"].api_key.as_deref(),
+        Some(SECRET_K3_KEY)
+    );
+    assert_eq!(
+        merged.providers["dgx-glm53"].headers,
+        Some(pom_headers(SECRET_RESOLVED_JWT))
+    );
+}
+
+#[test]
+fn export_fails_when_a_command_backed_credential_does_not_resolve() {
+    let directory = tempfile::tempdir().unwrap();
+    let models = directory.path().join("models.json");
+    let auth_path = directory.path().join("auth.json");
+
+    // `exit 3` is a builtin of every shell the resolver spawns (the
+    // configured shell, `cmd /C`, `sh -c`): the helper runs, exits nonzero,
+    // and prints nothing.
+    write_models_config(
+        &models,
+        vec![("dgx-glm53", glm53_block("!exit 3", SECRET_JWT))],
+    );
+    let error = export_dgx_auth(&models, &auth_path, None).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("dgx-glm53"),
+        "the refusal must name the provider id: {message}"
+    );
+    assert!(
+        message.contains("apiKey"),
+        "the refusal must name the field kind: {message}"
+    );
+    assert!(
+        !message.contains("exit 3"),
+        "the command text must not leak: {message}"
+    );
+    assert_no_secrets(&message);
+    assert_no_secrets(&format!("{error:?}"));
+    assert!(
+        !auth_path.exists(),
+        "no file may be written when a credential does not resolve"
+    );
+
+    // A helper that exits 0 but prints nothing is equally unresolvable.
+    write_models_config(
+        &models,
+        vec![("dgx-glm53", glm53_block("!exit 0", SECRET_JWT))],
+    );
+    let message = export_dgx_auth(&models, &auth_path, None)
+        .unwrap_err()
+        .to_string();
+    assert!(
+        message.contains("dgx-glm53"),
+        "empty helper output must fail the export too: {message}"
+    );
+    assert!(!auth_path.exists());
+
+    // The same refusal covers command-backed header values, naming the
+    // header field instead of the apiKey.
+    write_models_config(
+        &models,
+        vec![("dgx-glm53", glm53_block(SECRET_GLM53_KEY, "!exit 4"))],
+    );
+    let error = export_dgx_auth(&models, &auth_path, None).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("dgx-glm53"),
+        "the refusal must name the provider id: {message}"
+    );
+    assert!(
+        message.contains("header"),
+        "the refusal must name the field kind: {message}"
+    );
+    assert!(
+        !message.contains("exit 4"),
+        "the command text must not leak: {message}"
+    );
+    assert_no_secrets(&message);
+    assert!(!auth_path.exists());
+}
+
+#[test]
 fn validation_rejects_wrong_format_id() {
     let mut file = sample_auth_file();
     file.format = "optimus-dgx-auth/2".to_string();
@@ -728,6 +904,54 @@ fn import_skips_providers_with_identical_credentials() {
             .and_then(|models| models.first())
             .and_then(|model| model.name.as_deref()),
         Some("Kimi K3 - locally edited")
+    );
+}
+
+#[test]
+fn import_rejects_auth_files_that_still_reference_commands() {
+    let directory = tempfile::tempdir().unwrap();
+    let models = directory.path().join("models.json");
+    write_models_config(
+        &models,
+        vec![(
+            "fresh-relay",
+            relay_block("Fresh Relay", SECRET_FRESH_RELAY_KEY),
+        )],
+    );
+    let before = fs::read(&models).unwrap();
+
+    // A hand-built file: the glm53 apiKey and the k3 session header are
+    // still command references, so the file is not portable. deepseek41 keeps
+    // inline credentials and must not be named.
+    let mut file = sample_auth_file();
+    file.providers["dgx-glm53"].api_key = Some(format!("!echo {SECRET_RESOLVED_KEY}"));
+    file.providers["dgx-k3"].headers = Some(pom_headers(&format!(
+        "!echo {SECRET_RESOLVED_JWT}"
+    )));
+    let auth_path = directory.path().join("auth.json");
+    write_auth_file(&auth_path, &file);
+
+    let error = import_dgx_auth(&auth_path, &models, false).unwrap_err();
+    let message = error.to_string();
+    assert!(
+        message.contains("dgx-glm53") && message.contains("dgx-k3"),
+        "the rejection must name the offending provider ids: {message}"
+    );
+    assert!(
+        !message.contains("dgx-deepseek41"),
+        "providers with inline credentials must not be named: {message}"
+    );
+    assert_no_secrets(&message);
+    assert_no_secrets(&format!("{error:?}"));
+
+    // The rejection is structural, so --force does not bypass it, and
+    // models.json stays byte-identical either way.
+    let error = import_dgx_auth(&auth_path, &models, true).unwrap_err();
+    assert_no_secrets(&error.to_string());
+    assert_eq!(
+        fs::read(&models).unwrap(),
+        before,
+        "models.json must stay byte-identical"
     );
 }
 
