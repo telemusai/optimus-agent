@@ -5,7 +5,11 @@
 //! Pomerium headers, model definitions) into an `optimus-dgx-auth/1` JSON
 //! file. `import_dgx_auth` merges those providers into another user's
 //! models.json, so the recipient gets working DGX models until the gateway
-//! session expires. Secret values never appear in errors, reports, or
+//! session expires. models.json credentials may be command-backed
+//! (`"!"`-prefixed values that run a helper command on the exporting
+//! machine); export resolves those to their inline output so the file is
+//! self-contained, and import rejects files that still carry command
+//! references. Secret values never appear in errors, reports, or
 //! messages; only provider ids, presence flags, and JSON positions are
 //! reported.
 
@@ -21,6 +25,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::core::model_registry::{ModelsConfig, ProviderConfig, strip_json_comments};
+use crate::core::resolve_config_value::resolve_config_value_uncached;
 use crate::utils::atomic_file::{
     WriteFileAtomicOptions, realpath_if_present_sync, write_file_atomic_sync,
 };
@@ -74,7 +79,11 @@ pub struct ImportReport {
 
 /// Snapshot the `dgx-*` providers of `models_json_path` into a shareable auth
 /// file at `out_path`. `provider_ids` restricts the export to a subset; `None`
-/// exports every `dgx-*` provider. Returns the file that was written.
+/// exports every `dgx-*` provider. Command-backed credentials
+/// (`"!"`-prefixed apiKey/header values that run a helper command on this
+/// machine) are resolved to their inline output first, so the file is
+/// self-contained; a value that does not resolve fails the export before any
+/// file is written. Returns the file that was written.
 pub fn export_dgx_auth(
     models_json_path: &Path,
     out_path: &Path,
@@ -86,6 +95,10 @@ pub fn export_dgx_auth(
     let content = read_file_content(models_json_path, "models.json")?;
     let config: ModelsConfig = parse_json_or_empty("models.json", &content)?;
     let selected = select_dgx_providers(&config, provider_ids)?;
+    // Command-backed credentials must not travel as references to helper
+    // commands on this machine. Resolving before the gateway is built also
+    // inlines the gateway headers, which come from the first provider.
+    let selected = resolve_command_backed_credentials(&selected)?;
     let gateway = shared_gateway(&selected)?;
 
     let file = DgxAuthFile {
@@ -135,6 +148,20 @@ pub fn import_dgx_auth(
         bail!(
             "A DGX auth file may only declare \"dgx-\" providers; it also declares: {}",
             non_dgx.join(", ")
+        );
+    }
+    // Export resolves command-backed credentials to their inline output, so a
+    // surviving `"!"`-prefixed value means a hand-built or downgraded file.
+    // Importing it would embed the sharer's helper commands in the
+    // recipient's models.json, and every request would then fail to resolve
+    // them. Only the offending provider ids are reported.
+    let command_backed = command_backed_provider_ids(&file);
+    if !command_backed.is_empty() {
+        bail!(
+            "The DGX auth file is not portable: providers {} still carry command references \
+             (\"!\"-prefixed apiKey or header values) instead of inline credentials. \
+             Re-export the file on the machine where those commands resolve",
+            command_backed.join(", ")
         );
     }
 
@@ -475,6 +502,93 @@ fn format_available(available: &[&str]) -> String {
     }
 }
 
+/// Resolve the command-backed credentials of the selected providers into
+/// inline values. models.json blocks may carry `"!"`-prefixed apiKey/header
+/// values that run a credential helper on the machine where models.json
+/// lives (`core::resolve_config_value`); copying those verbatim into the
+/// auth file would export this machine's helper paths, and every recipient
+/// request would then fail to resolve them. Inline values pass through
+/// unchanged, and the gateway headers are taken from the first provider's
+/// resolved headers, so they are covered too. Unresolvable values are
+/// collected and fail the export before any file is written; the errors name
+/// only provider ids and field kinds, never the commands or their output
+/// (both may be secrets).
+fn resolve_command_backed_credentials(
+    selected: &[(String, ProviderConfig)],
+) -> anyhow::Result<Vec<(String, ProviderConfig)>> {
+    let mut resolved: Vec<(String, ProviderConfig)> = Vec::with_capacity(selected.len());
+    let mut unresolvable: Vec<String> = Vec::new();
+    for (id, provider) in selected {
+        let mut provider = provider.clone();
+        if let Some(api_key) = provider.api_key.as_deref() {
+            match resolve_command_backed_value(api_key) {
+                Some(value) => provider.api_key = Some(value),
+                None => unresolvable.push(format!("apiKey for provider {id}")),
+            }
+        }
+        if let Some(headers) = provider.headers.as_mut() {
+            unresolvable.extend(resolve_command_backed_headers(headers).into_iter().map(
+                |name| format!("header \"{name}\" for provider {id}"),
+            ));
+        }
+        for model in provider.models.iter_mut().flatten() {
+            if let Some(headers) = model.headers.as_mut() {
+                unresolvable.extend(resolve_command_backed_headers(headers).into_iter().map(
+                    |name| {
+                        format!("model header \"{name}\" for model {} of provider {id}", model.id)
+                    },
+                ));
+            }
+        }
+        for (model_id, model_override) in provider.model_overrides.iter_mut().flatten() {
+            if let Some(headers) = model_override.headers.as_mut() {
+                unresolvable.extend(resolve_command_backed_headers(headers).into_iter().map(
+                    |name| {
+                        format!(
+                            "model override header \"{name}\" for model {model_id} of provider {id}"
+                        )
+                    },
+                ));
+            }
+        }
+        resolved.push((id.clone(), provider));
+    }
+    if !unresolvable.is_empty() {
+        bail!(
+            "Failed to resolve command-backed {}; cannot build a portable auth file",
+            unresolvable.join(", ")
+        );
+    }
+    Ok(resolved)
+}
+
+/// Resolve one credential value for the auth file: `"!"`-prefixed values run
+/// their helper command through the shared resolver, anything else passes
+/// through verbatim. Uncached on purpose: an export is a one-shot snapshot
+/// taken after an optional credential refresh, so a helper must be
+/// re-executed rather than served from a per-request cache. `None` means the
+/// helper failed, timed out, or printed nothing.
+fn resolve_command_backed_value(value: &str) -> Option<String> {
+    if is_command_reference(value) {
+        resolve_config_value_uncached(value)
+    } else {
+        Some(value.to_string())
+    }
+}
+
+/// Resolve every `"!"`-prefixed header value in place, returning the names
+/// of the headers whose helper produced no value.
+fn resolve_command_backed_headers(headers: &mut IndexMap<String, String>) -> Vec<String> {
+    let mut unresolvable: Vec<String> = Vec::new();
+    for (name, value) in headers.iter_mut() {
+        match resolve_command_backed_value(value.as_str()) {
+            Some(resolved) => *value = resolved,
+            None => unresolvable.push(name.clone()),
+        }
+    }
+    unresolvable
+}
+
 /// The exported gateway must be shared: every selected provider has to carry
 /// the same baseUrl and headers, or the file could not re-apply one gateway.
 fn shared_gateway(selected: &[(String, ProviderConfig)]) -> anyhow::Result<DgxGateway> {
@@ -578,6 +692,54 @@ fn credentials_match(existing: &Value, effective: &ProviderConfig) -> bool {
         _ => false,
     };
     key_matches && headers_match
+}
+
+/// Whether the value is a command reference: `"!"`-prefixed config values
+/// execute a helper command instead of being used literally
+/// (`core::resolve_config_value`).
+fn is_command_reference(value: &str) -> bool {
+    value.starts_with('!')
+}
+
+/// Whether any header value in the map is a command reference.
+fn headers_reference_commands(headers: Option<&IndexMap<String, String>>) -> bool {
+    headers.is_some_and(|headers| headers.values().any(|value| is_command_reference(value)))
+}
+
+/// Whether any credential of the provider is still a command reference: the
+/// apiKey, the provider headers, or any model-level or model-override header
+/// value.
+fn provider_references_commands(provider: &ProviderConfig) -> bool {
+    provider.api_key.as_deref().is_some_and(is_command_reference)
+        || headers_reference_commands(provider.headers.as_ref())
+        || provider.models.as_ref().is_some_and(|models| {
+            models
+                .iter()
+                .any(|model| headers_reference_commands(model.headers.as_ref()))
+        })
+        || provider.model_overrides.as_ref().is_some_and(|overrides| {
+            overrides
+                .values()
+                .any(|model_override| headers_reference_commands(model_override.headers.as_ref()))
+        })
+}
+
+/// Provider ids whose imported credentials would still be command references.
+/// The gateway headers are applied to every provider on import, so a
+/// command-backed gateway value flags every provider in the file.
+fn command_backed_provider_ids(file: &DgxAuthFile) -> Vec<&str> {
+    let gateway_references_commands = file
+        .gateway
+        .headers
+        .values()
+        .any(|value| is_command_reference(value));
+    file.providers
+        .iter()
+        .filter(|(_, provider)| {
+            gateway_references_commands || provider_references_commands(provider)
+        })
+        .map(|(id, _)| id.as_str())
+        .collect()
 }
 
 /// The models.json root an import merges into: the parsed file when present,
