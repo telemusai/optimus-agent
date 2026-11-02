@@ -436,3 +436,19 @@ def test_stop_set_defers_to_an_observed_message_end_marker():
 def test_stop_set_must_be_a_set():
     with pytest.raises(SpanContractError):
         classify([1, THINK, 5, STOP_ROLE], stop_ids=[STOP_ROLE])
+
+
+def test_retained_content_only_keeps_the_final_stop_row_as_content():
+    # v3 retained content-only: the turn's last row is a stop-set role token
+    # whose spelling begins with the value's final character, so it is
+    # CONTENT, not the terminator.  The eos marker still closes the message.
+    audit = classify([1, THINK, 5, 6, STOP_ROLE],
+                     stop_ids=frozenset((MSG_END, STOP_ROLE)), retained_content_only=True)
+    assert audit.counts[CONTENT] == 3 and audit.counts[CONTROL_MARKERS] == 1
+    assert audit.last_run(CONTENT).end_index == 5
+    # The observed marker still wins over the retained-mode classification.
+    marked = classify([1, THINK, 5, MSG_END], stop_ids=frozenset((MSG_END, STOP_ROLE)),
+                       retained_content_only=True)
+    assert marked.counts[CONTROL_MARKERS] == 2 and marked.counts[CONTENT] == 1
+    assert marked.last_run(CONTENT).end_index == 3
+

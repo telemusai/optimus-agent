@@ -1036,10 +1036,20 @@ pub fn validate_receipt(
         .checked_mul(u64::from(receipt.hidden_dim))
         .and_then(|v| v.checked_mul(element))
         .ok_or(SourceCaptureError::InvalidReceipt)?;
+    // The retained content-only capture reuses the v2 receipt wire, so its
+    // stricter retention identity lives here: every aligned span row of a v3
+    // capture is retained (the final content row is never dropped for a stop
+    // row - the canary's final-character loss). The legacy v1/v2 arms keep
+    // the historical upper bound.
+    let retained_fits = if intent.is_retained_content_only() {
+        u64::from(receipt.retained_count) == width
+    } else {
+        u64::from(receipt.retained_count) <= width
+    };
     if width == 0
         || receipt.retained_count == 0
         || receipt.retained_count > intent.retained_count_limit
-        || u64::from(receipt.retained_count) > width
+        || !retained_fits
         || logical_bytes == 0
         || receipt.byte_count != logical_bytes
         || receipt.byte_count > intent.max_capture_bytes
@@ -1360,19 +1370,21 @@ mod span_arming_tests {
             v3.validate(now()),
             Err(SourceCaptureError::InvalidField("schema_or_scope"))
         ));
-        // The mode never leaks onto a legacy v1/v2 intent wire.
+        // The mode never leaks onto a legacy v1/v2 intent wire: the legacy
+        // intent validates clean, and crossing the mode onto it is refused.
+        // (The old shape demanded the legacy intent itself be refused, which
+        // contradicted intent_admits_only_schema_matched_policies once the
+        // v2 default became content_tail_v2.)
         let legacy = intent(SourceSpanArming::DEFAULT);
         assert!(legacy.capture_mode.is_empty());
         let wire = serde_json::to_value(&legacy).unwrap();
         assert!(wire.get("capture_mode").is_none());
+        assert!(legacy.validate(now()).is_ok());
+        let mut crossed = legacy.clone();
+        crossed.capture_mode = SOURCE_CAPTURE_MODE_CONTENT_ONLY.into();
         assert!(matches!(
-            legacy.validate(now()),
+            crossed.validate(now()),
             Err(SourceCaptureError::InvalidField("schema_or_scope"))
-                if {
-                    let mut crossed = legacy.clone();
-                    crossed.capture_mode = SOURCE_CAPTURE_MODE_CONTENT_ONLY.into();
-                    crossed.validate(now()).is_err()
-                }
         ));
     }
 
@@ -1486,5 +1498,35 @@ mod span_arming_tests {
         wire["span_contains_tool_call"] = serde_json::json!(true);
         let receipt = parse(&wire).unwrap();
         assert!(validate_receipt(&receipt, &no_tool_intent, &profile(), now()).is_err());
+    }
+
+    #[test]
+    fn retained_content_only_receipt_requires_full_width_retention() {
+        // Live canary icalib-canary-20261101T1330Z: the value's final character
+        // lived in the turn's LAST row - a stop-set role token the legacy
+        // last-row stop heuristic classified as the terminator, so the aligned
+        // span covered 33 of the 34 content rows and the receiver reproduced
+        // the 40-char value missing exactly its final character. The v3
+        // retained content-only arm now requires every aligned span row to be
+        // retained; the legacy v1/v2 arms keep the historical upper bound.
+        let v3 = intent(SourceSpanArming::RETAINED_CONTENT_ONLY);
+        let receipt = parse(&v2_wire(&v3)).unwrap();
+        assert!(validate_receipt(&receipt, &v3, &profile(), now()).is_ok());
+        // A retention narrower than the aligned span width is refused.
+        let mut narrow = v2_wire(&v3);
+        narrow["retained_count"] = serde_json::json!(7);
+        narrow["byte_count"] = serde_json::json!(7u64 * 6144 * 2);
+        let receipt = parse(&narrow).unwrap();
+        assert!(matches!(
+            validate_receipt(&receipt, &v3, &profile(), now()),
+            Err(SourceCaptureError::InvalidReceipt)
+        ));
+        // The legacy v2 arm keeps the upper-bound semantics.
+        let v2 = intent(SourceSpanArming::DEFAULT);
+        let mut legacy = v2_wire(&v2);
+        legacy["retained_count"] = serde_json::json!(7);
+        legacy["byte_count"] = serde_json::json!(7u64 * 6144 * 2);
+        let receipt = parse(&legacy).unwrap();
+        assert!(validate_receipt(&receipt, &v2, &profile(), now()).is_ok());
     }
 }

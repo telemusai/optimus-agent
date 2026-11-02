@@ -1,7 +1,8 @@
-# OCC-3 PR #215 — Usage (offline verification)
+# OCC-3 PR #215 — Usage (offline verification + live canary driver)
 
 Worktree `C:/Users/openclawuser/optimus-occ3-icalib-20261028`, branch
-`fix/occ3-glm53-full-message-recovery`. All commands below are offline.
+`fix/occ3-glm53-full-message-recovery`. Offline commands first; the measured live
+driver usage that the canary windows actually exercised follows.
 
 Build discipline: one warm target dir (`CARGO_TARGET_DIR=target-occ3compl`), cargo runs
 serial only. Do not create new target dirs.
@@ -38,12 +39,48 @@ From `extensions/sglang-occ3`:
 - Full suite: `python -m pytest tests/ -q` (1986 passed, 449 skipped, 2 xfailed)
 - Focused (179 passed, 2 skipped):
   `python -m pytest tests/test_retained_lifecycle.py tests/test_v3_native_validator.py -q`
+- Calibration pool (evening, 16 tests): `python -m pytest tests/test_calibration_pool.py -q`
 
 ## Workspace checks
 
 - `git diff --check`
 - `bash scripts/check.sh` (295 python tests, 12 skipped)
 - `cargo check --locked --workspace --all-targets`
+
+## Live canary driver (as measured in the canary-1/2/3 windows)
+
+- Arm selection: `--arm NAME` (flag wins) or `OCC3_ARM=NAME`; unset runs the frozen
+  contract phase; unknown names are refused at startup before any enrollment or HTTP
+  effect. Admitted set (in order): `NO_ATTACHMENT | FULL_TEXT | TOKEN_FULL |
+  TOKEN_SELECTED | TOKEN_NORM | NULL_SHAPE | NATIVE | WRONG_SENDER`.
+- `NATIVE` is the shipped positive case: the control file must be proven ABSENT
+  (the driver records the readback; hook line `occ3_p3_arm=none ...`).
+- Hook arms (`TOKEN_FULL`, `TOKEN_SELECTED` -> control token `texact`; `TOKEN_NORM`
+  -> `tnorm`; `NULL_SHAPE` -> `nshape`) need the P3 arms hook installed in the
+  serving container and a control file at `/tmp/occ3_p3_arm` containing the token.
+  `OCC3_P3_ARM_FILE` overrides the control path. The driver only reads the control
+  file back; the authoritative effective-arm signal is the server log line
+  `occ3_p3_arm=<token|none> file_sha256=... mtime_ns=...`.
+- The hook bundle (occ3_p3_arms_hook.py + zz_occ3_p3_arms.pth) is staged by
+  `stage_build.py` and must be carried in the transfer tarball and docker-cp'd into
+  the STOPPED candidate container before the swap; run the pre-swap guard
+  (throwaway `docker run --rm --network none` import test) first — it was PASS for
+  the canary-3 image cff9b321….
+- Canaries are fired only in a quiet window (trailing load line re-derived from
+  docker logs and recorded with the arm), through a single executor, never in
+  parallel with other live work; on arm-A failure the stop rule blocks controls B-E.
+
+## Supplemental collection runner (s9; measured this evening)
+
+- One family per turn: server enrollment is one-shot per (principal, family) with
+  exact payload equality, so each turn needs its own family id.
+- Capture dir is host-backed (Option A): `/data/neo-glm53/occ3-calibration-capture/<window>`
+  (the serving container's only RW bind); pre-create it with the ownership the
+  offline fit will need (root-in-container writes land root-owned).
+- Turns are paced on health/GPU gates with 240 s / 420 s caps under contention;
+  aborted-at-cap turns and minted spares are recorded in the runner log + turns.jsonl.
+- If the Pomerium origin expires mid-window, use the documented loopback tunnel
+  (turn endpoint `http://127.0.0.1:<port>/v1`).
 
 ## Environment variables
 
@@ -59,11 +96,12 @@ From `extensions/sglang-occ3`:
   `content_tail_last64_v2`, `content_tail_last32_v2`. Unknown names are refused, not
   defaulted. The v1 pin is the documented workaround for the pre-existing
   `receipt_invalid` fixture issue (see REGRESSION-RESULTS.md).
+- `OCC3_ARM` — env arm selector besides `--arm`; see the live driver section.
 
 ## User configuration — NOT yet live (pending live validation)
 
 The following is planned but NOT configured and NOT validated live. Do not enable in a
-real user setup before the live canary, P8 chain and pilot re-runs pass:
+real user setup before the canary-4 refit, controls B-E, P8 chain and pilot re-runs pass:
 
 - User `models.json` occ3 block plus the existing experimental OCC-3 settings
   (`occ3Enabled` / `occ3Experimental`) for the specific compatible GLM-5.3 endpoint.

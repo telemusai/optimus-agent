@@ -320,6 +320,43 @@ def test_glm53_tool_call_turn_ends_on_the_observation_role_token():
     # The eos-only stop set still declines at R3: <|observation|> is not eos.
     declines(turn, code="lineage", marker_table=glm53_table(), stop_ids=frozenset((GLM53_EOS,)))
 
+def test_v3_retained_capture_keeps_the_final_stop_row_as_content():
+    """Red before the retained-capture fix (canary icalib-canary-20261101T1330Z).
+
+    The value's final character lives inside the turn's LAST row: a stop-set
+    role token (154827) whose spelling begins with that character.  The legacy
+    last-row stop heuristic classified that row CONTROL, the content run ended
+    one row early, and the receiver reproduced the 40-char value missing
+    exactly its last character (span 356..389, retained 33 of 34 rows).  A
+    retained content-only (v3) selection must keep the stop row in the
+    content run; a legacy v2 selection keeps the historical terminator
+    semantics, and the eos marker still closes the message in both modes.
+    """
+    think_end = GLM53_THINK + 1
+    turn = window([think_end, 2001, 2002, GLM53_USER], base=640)
+    selection = selects(turn, policy=POLICY_NO_TOOL, marker_table=glm53_table(),
+                        stop_ids=GLM53_STOP, retained_content_only=True)
+    assert (selection.start_index, selection.end_index) == (1, 4)
+    assert (selection.accepted_span_start, selection.accepted_span_end) == (1, 4)
+    assert selection.retained_rows == 3
+    block = selection.span_block(glm53_table())
+    assert block["span_content_count"] == 3 and block["span_control_count"] == 1
+    assert block["span_turn_end_attested"] is True
+    assert block["span_contains_final_content"] is True
+    # The eos marker itself still closes the message in the retained mode.
+    marker_turn = window([think_end, 2001, 2002, GLM53_EOS], base=640)
+    marker_sel = selects(marker_turn, policy=POLICY_NO_TOOL, marker_table=glm53_table(),
+                         stop_ids=GLM53_STOP, retained_content_only=True)
+    assert (marker_sel.start_index, marker_sel.end_index) == (1, 3)
+    assert marker_sel.span_block(glm53_table())["span_control_count"] == 2
+    # Legacy v2 keeps the historical semantics: the role token is CONTROL.
+    legacy = selects(turn, policy=POLICY_NO_TOOL, marker_table=glm53_table(),
+                     stop_ids=GLM53_STOP)
+    assert (legacy.start_index, legacy.end_index) == (1, 3)
+    assert legacy.span_block(glm53_table())["span_content_count"] == 2
+
+
+
 def test_r8_decline_leaves_a_bounded_token_free_span_audit(monkeypatch, tmp_path):
     """Root ruling C: a refusal names the turn it refused, and nothing else.
 

@@ -15,8 +15,9 @@ from array import array
 from dataclasses import asdict, dataclass
 from typing import Any
 
-from .attachment_contract import (CaptureWorkerDescriptor, ConsumeWorkerDescriptor,
-                                    MAX_CAPTURE_BYTES, SPAN_POLICY_V1, SPAN_POLICIES_V2, digest)
+from .attachment_contract import (CAPTURE_MODE_CONTENT_ONLY, CaptureWorkerDescriptor,
+                                    ConsumeWorkerDescriptor, MAX_CAPTURE_BYTES, SPAN_POLICY_V1,
+                                    SPAN_POLICIES_V2, digest)
 from .span_policy import marker_table_from_wire, select_span_v2
 from .latent_registry import LatentRegistry
 from .latent_types import (LatentError, UniformRequestCancellation, Publication, RequestSlice, RuntimeProfile, require_members,
@@ -80,10 +81,14 @@ class _ContentState:
 
     __slots__ = ("table", "stop_ids", "capacity", "content_capacity", "hidden", "tokens",
                  "positions", "window", "head_len", "tool_len", "head_count", "tool_count",
-                 "content_count", "overrun", "phase", "pending", "released")
+                 "content_count", "overrun", "phase", "pending", "released",
+                 "retained_content_only")
 
-    def __init__(self, table, stop_ids, capacity):
+    def __init__(self, table, stop_ids, capacity, retained_content_only=False):
         self.table, self.stop_ids, self.capacity = table, stop_ids, capacity
+        # v3 capture mode: the turn's final stop-set row can carry content,
+        # so it is retained in the content segment instead of being dropped.
+        self.retained_content_only = bool(retained_content_only)
         self.head_len, self.tool_len = len(table.thinking_end_ids), len(table.tool_call_start_ids)
         # Marker rows are pinned in their own segments, so the profile declines
         # a marker set that would leave no content slot at all.
@@ -160,7 +165,8 @@ class _ContentState:
             self.positions = positions.new_empty(self.capacity)
         for index in range(int(tokens.shape[0])):
             token, position = int(tokens[index]), int(positions[index])
-            if self.phase == "content" and token not in self.stop_ids:
+            if self.phase == "content" and (token not in self.stop_ids
+                                            or self.retained_content_only):
                 kind = "content"
             elif token in self.stop_ids:
                 kind = "stop"
@@ -249,7 +255,9 @@ def _prepare_v2_window(runtime, record, req, prepared):
                               accepted_total=record.accepted_count,
                               policy=descriptor.span_policy, marker_table=table,
                               stop_ids=stop_ids,
-                              reasoning_tokens=getattr(req, "reasoning_tokens", None))
+                              reasoning_tokens=getattr(req, "reasoning_tokens", None),
+                              retained_content_only=(
+                                  descriptor.capture_mode == CAPTURE_MODE_CONTENT_ONLY))
     n = selection.retained_rows
     require(workspace_bound(n, runtime.profile.hidden_dim, runtime.profile.expected_ranks,
                             runtime.profile.tile_rows, runtime.profile.anchor_alpha)
@@ -937,7 +945,9 @@ def admit_request(scheduler, req, value):
             # Capacity decline ("profile") fires here, inside the preflight, so a
             # marker set that would leave no content slot never enters a turn.
             content_state = _ContentState(span_markers[0], span_markers[1],
-                                          descriptor.max_prefix_tokens)
+                                          descriptor.max_prefix_tokens,
+                                          retained_content_only=(
+                                              descriptor.capture_mode == CAPTURE_MODE_CONTENT_ONLY))
         if type(descriptor) is ConsumeWorkerDescriptor:
             count = descriptor.expected_prefix_tokens
             at = descriptor.prefix_offset

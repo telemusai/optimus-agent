@@ -12,8 +12,9 @@ from dataclasses import asdict, dataclass
 from .attachment_contract import (
     AttachmentError, InferenceAttachment, MAX_RECEIPT_BYTES, Reservation,
     SourceCaptureReceipt, SourceEnrollment, bounded_identifier, canonical, digest,
-    identifier, sha256_hex, strict_json, uint, MARKER_SCHEMA_V1, SOURCE_SCHEMA_V1,
-    SOURCE_SCHEMA_V2, SPAN_POLICY_V1, SPAN_POLICIES_V2, SPAN_SCHEMA_V1, SPAN_TERMINATORS,
+    identifier, sha256_hex, strict_json, uint, CAPTURE_MODE_CONTENT_ONLY, MARKER_SCHEMA_V1,
+    SOURCE_SCHEMA_V1, SOURCE_SCHEMA_V2, SPAN_POLICY_V1, SPAN_POLICIES_V2, SPAN_SCHEMA_V1,
+    SPAN_TERMINATORS,
 )
 
 VALID_FINISH_REASONS = frozenset({"stop", "length", "tool_calls", "function_call"})
@@ -586,6 +587,13 @@ def validate_source_evidence(intent, enrollment, reservation, descriptor, comple
             or commit.dtype != enrollment.dtype or commit.layout_digest != enrollment.layout_digest
             or commit.expires_at_epoch != enrollment.expires_at_epoch
             or commit.byte_count > intent.max_capture_bytes):
+        raise AttachmentError("invalid_evidence")
+    # The v3 retained content-only arm: every aligned span row is retained
+    # (the final content row is never dropped for a stop row), so a narrower
+    # retention is refused, never silently accepted.  Legacy v1/v2 arms keep
+    # the historical upper bound checked in SourceCaptureReceipt.
+    if (getattr(intent, "capture_mode", "") == CAPTURE_MODE_CONTENT_ONLY
+            and commit.retained_count != commit.accepted_span_end - commit.accepted_span_start):
         raise AttachmentError("invalid_evidence")
     # Schema-gated receipt: a v2 intent requires the bounded span block and the
     # v2 source schema; a v1 intent refuses any block (doc section 6.2).

@@ -487,7 +487,8 @@ def _run_of(kind: str, start: int, end: int, positions) -> SpanRun:
 def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
                       markers: SpanMarkers, *, accepted_total: int | None = None,
                       reasoning_end_ids: Sequence[int] | None = None,
-                      stop_ids: frozenset | None = None) -> SpanAudit:
+                      stop_ids: frozenset | None = None,
+                      retained_content_only: bool = False) -> SpanAudit:
     """Classify a retained accepted window without a tokenizer.
 
     ``token_ids`` and ``positions`` are parallel sequences for the retained rows,
@@ -514,12 +515,22 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     would.  Only the last row qualifies, because generation stops at the first
     stop id, so an earlier stop id can never be a legitimate row.
 
+    ``retained_content_only`` is the v3 capture mode: the retained span must
+    cover the complete content run INCLUDING its final token, and a trailing
+    exclusion is legal only for stop/terminator rows, never content.  A GLM
+    role token's spelling begins with an ordinary character, so the row that
+    carries the value's final character can BE the stop row; in this mode the
+    last-row stop-id heuristic does not fire, the row stays CONTENT, and the
+    observed message-end marker (the eos spelling) still closes the message.
+
     Raises :class:`SpanContractError` (``code == "lineage"``) on inconsistent
     input, contradictory markers or a bounded-resource breach.  Never guesses.
     """
     if type(markers) is not SpanMarkers:
         raise SpanContractError("lineage")
     if stop_ids is not None and not isinstance(stop_ids, (set, frozenset)):
+        raise SpanContractError("lineage")
+    if type(retained_content_only) is not bool:
         raise SpanContractError("lineage")
     count = _size(token_ids)
     if _size(positions) != count:
@@ -548,7 +559,8 @@ def classify_accepted(token_ids: Sequence[int], positions: Sequence[int],
     # message like the marker; marker_occurrences keeps counting the marker.
     terminal = message
     if (message is None and stop_ids is not None
-            and token_ids[count - 1] in stop_ids):
+            and token_ids[count - 1] in stop_ids
+            and not retained_content_only):
         terminal = _MarkerHit(count - 1, count, 1)
     _boundary_checks(thinking, begin, finish, terminal, alternate)
 

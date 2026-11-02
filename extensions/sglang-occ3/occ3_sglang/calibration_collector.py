@@ -48,8 +48,9 @@ from pathlib import Path
 from .calibration_corpus import (M_ROW_BUDGETS, MIN_TURN_ROWS,
                                  PARTITION_DIGEST_DOMAIN, SPLIT_SCHEMA, TurnBlock,
                                  _byte_order, _canonical, _identifier, _matrix_digest,
-                                 split_manifest, turn_order_key)
+                                 _partition, split_manifest, turn_order_key)
 from .latent_types import HEX, LatentError, bounded_payload, require
+from .span_policy import POLICY_NO_TOOL
 from .statebridge_calibrated import (MAX_CORPUS_TURNS, PARTITION_FIELDS,
                                      PREDICTOR_POSITION_OFFSET, corpus_digest)
 
@@ -68,6 +69,12 @@ DEFAULT_FIT_TURNS = 32
 DEFAULT_VALIDATION_TURNS = 8
 DEFAULT_TEST_TURNS = 16
 PARTITION_NAMES = ("fit", "validation", "test")
+#: The retained v3 capture policy (span_policy.POLICY_NO_TOOL) is the
+#: only span whose collected rows carry a content-count alignment invariant:
+#: the selected span IS the content run, so its row count must equal the
+#: receipt's span_content_count. Any other count is a misaligned capture
+#: (a tokenize-aligned off-by-one included) and is refused fail-closed.
+RETAINED_CONTENT_ONLY_POLICY = POLICY_NO_TOOL
 BUDGET_KEYS = frozenset({"rows", "turns", "rows_per_turn", "digest"})
 TURN_ENTRY_KEYS = frozenset({"turn_id", "family_id", "rows", "partition",
                              "span_policy", "span_metadata"})
@@ -216,6 +223,15 @@ class CaptureRecord:
             require(bool((vector >= 0).all()), "profile")
         positions = self.absolute_positions
         require(rows < 2 or bool((positions[1:] > positions[:-1]).all()), "profile")
+        if self.span_policy == RETAINED_CONTENT_ONLY_POLICY:
+            # Row alignment is by SPAN content rows, never by a tokenize count:
+            # the retained content-only span is exactly the content run, so a
+            # hidden matrix wider or narrower than span_content_count is a
+            # misaligned capture (off-by-one included) and is refused.
+            content_count = self.span_metadata.get("span_content_count")
+            require(type(content_count) is int and not isinstance(content_count, bool)
+                    and 0 <= content_count <= 2 ** 31, "profile")
+            require(rows == content_count, "profile")
 
 
 def _embedding_rows(token_ids, embedding_lookup, dim, torch, *, on_refusal=None):
@@ -391,6 +407,84 @@ class Collector:
         split = split_manifest(blocks, fit_turns=fit_turns,
                                validation_turns=validation_turns,
                                test_turns=test_turns, torch_module=torch)
+        return self._freeze(dirpath, split, split["targets"],
+                            include_embeddings, budget_values,
+                            budget_per_turn_cap, torch)
+
+    def write_partitions(self, dirpath, partitions, *, targets=None,
+                         include_embeddings=True, budgets=M_ROW_BUDGETS,
+                         budget_per_turn_cap=DEFAULT_BUDGET_PER_TURN_CAP,
+                         torch_module=None):
+        """Freeze the corpus under an explicit whole-turn partition assignment.
+
+        The pooling entry point: the split is NOT recomputed. ``partitions``
+        maps each partition name to the sequence of turn ids it must hold;
+        every added turn must be assigned exactly once, no partition may stay
+        empty and every family must stay within one partition, so the pooled
+        manifest keeps the whole-family invariant. Turn order inside a
+        partition is the deterministic digest order, exactly what a freshly
+        split manifest would produce, so the result depends only on the
+        assignment and the records. ``targets`` records the split targets in
+        the manifest; the default records the actual per-partition turn
+        counts, the only non-misleading value for an assignment that was not
+        produced by target-driven greedy splitting.
+        """
+        torch = torch_module or _torch()
+        require(isinstance(partitions, Mapping) and set(partitions)
+                == set(PARTITION_NAMES), "profile")
+        require(type(include_embeddings) is bool, "profile")
+        budget_values = _validate_budgets(budgets)
+        require(_uint(budget_per_turn_cap, 1, 2 ** 31), "profile")
+        require(self._records, "profile")
+        for entry in self._records.values():
+            require(entry["embeddings"] is not None, "profile")
+        assigned = {}
+        for name in PARTITION_NAMES:
+            ids = partitions[name]
+            require(isinstance(ids, (list, tuple)) and bool(ids), "profile")
+            for turn_id in ids:
+                require(_identifier(turn_id) and turn_id in self._records,
+                        "identity")
+                require(turn_id not in assigned, "identity")
+                assigned[turn_id] = name
+        require(set(assigned) == set(self._records), "identity")
+        if targets is None:
+            target_values = {name: len(partitions[name])
+                             for name in PARTITION_NAMES}
+        else:
+            require(isinstance(targets, Mapping) and set(targets)
+                    == set(PARTITION_NAMES), "profile")
+            target_values = {}
+            for name in PARTITION_NAMES:
+                require(_uint(targets[name], 1, MAX_CORPUS_TURNS), "profile")
+                target_values[name] = int(targets[name])
+        families = {}
+        for turn_id, name in assigned.items():
+            families.setdefault(self._records[turn_id]["family_id"],
+                                set()).add(name)
+        for members in families.values():
+            require(len(members) == 1, "identity")
+        split = {}
+        for name in PARTITION_NAMES:
+            blocks = [TurnBlock(turn_id=turn_id,
+                                hidden=self._records[turn_id]["hidden"],
+                                embeddings=self._records[turn_id]["embeddings"],
+                                family=self._records[turn_id]["family_id"])
+                      for turn_id in sorted(partitions[name], key=turn_order_key)]
+            split[name] = _partition(name, blocks, torch)
+        return self._freeze(dirpath, split, target_values,
+                            include_embeddings, budget_values,
+                            budget_per_turn_cap, torch)
+
+    def _freeze(self, dirpath, split, targets, include_embeddings, budget_values,
+                budget_per_turn_cap, torch):
+        """Write one verified corpus: tensor files first, manifest.json last.
+
+        ``split`` holds the three already-materialized partitions (the shape
+        calibration_corpus._partition returns); ``targets`` the split targets
+        to record. The split digest is recomputed from the written partition
+        digests, so the manifest chain stays verified end to end.
+        """
         root = Path(dirpath)
         root.mkdir(parents=True, exist_ok=True)
         files = []
@@ -410,14 +504,19 @@ class Collector:
                           "rows": entry["rows"], "partition": assignment[turn_id],
                           "span_policy": entry["span_policy"],
                           "span_metadata": entry["span_metadata"]})
+        counts = {name: len(partitions[name]["turn_ids"])
+                  for name in PARTITION_NAMES}
+        split_digest = _split_digest(targets, counts,
+                                    {name: partitions[name]["manifest_digest"]
+                                     for name in PARTITION_NAMES})
         manifest = {"schema": CORPUS_SCHEMA, "byte_order": _byte_order(),
                     "precision": PRECISION,
                     "predictor_position_offset": PREDICTOR_POSITION_OFFSET,
                     "provenance": dict(self._provenance),
                     "split": {"schema": SPLIT_SCHEMA,
-                              "targets": dict(split["targets"]),
-                              "turns": dict(split["turns"]),
-                              "manifest_digest": split["manifest_digest"]},
+                              "targets": dict(targets),
+                              "turns": dict(counts),
+                              "manifest_digest": split_digest},
                     "turns": turns, "partitions": partitions}
         manifest["corpus_manifest_digest"] = hashlib.sha256(
             _canonical(manifest)).hexdigest()
@@ -428,7 +527,7 @@ class Collector:
         return {"schema": CORPUS_SCHEMA, "dirpath": str(dirpath),
                 "corpus_manifest_digest": manifest["corpus_manifest_digest"],
                 "embeddings_included": include_embeddings,
-                "turns": dict(split["turns"]),
+                "turns": dict(counts),
                 "rows": {name: partitions[name]["rows"]
                          for name in PARTITION_NAMES},
                 "budgets": {key: {"rows": value["rows"], "turns": value["turns"]}
@@ -637,6 +736,74 @@ def load(dirpath, *, embedding_lookup=None, torch_module=None):
             "validation": partitions["validation"], "test": partitions["test"],
             "turns": dict(split["turns"]), "targets": dict(split["targets"]),
             "manifest_digest": split["manifest_digest"]}
+
+
+def load_turns(dirpath, *, embedding_lookup=None, torch_module=None):
+    """Per-turn views of one written corpus, in the manifest's digest order.
+
+    The pooling input contract: every digest chain load() verifies is
+    verified here too, then each turn is re-expressed as the record shape the
+    collector accepts (hidden rows, the token ids they predict, their
+    absolute positions and the reference rows), together with the partition
+    the source corpus assigned it. A corpus written without embedding files
+    rebuilds its reference rows through ``embedding_lookup`` exactly like
+    load(); a turn reconstructed this way re-enters the pipeline only by
+    passing CaptureRecord's own validation, so the pooled corpus can never
+    be looser than a freshly collected one.
+    """
+    torch = torch_module or _torch()
+    manifest = read_manifest(dirpath)
+    partitions = load(dirpath, embedding_lookup=embedding_lookup,
+                      torch_module=torch)
+    root = Path(dirpath)
+    vectors = {}
+    for name in PARTITION_NAMES:
+        entry = manifest["partitions"][name]
+        block = {}
+        for key in ("token_ids", "absolute_positions"):
+            vector = _load_tensor(root / entry[key]["file"],
+                                  entry[key]["sha256"], torch)
+            require(vector.ndim == 1 and vector.dtype == torch.int64, "profile")
+            require(_int_vector_digest(vector, torch, key)
+                    == entry[key]["content_digest"], "identity")
+            block[key] = vector
+        vectors[name] = block
+    offsets, cursor = {}, {}
+    for name in PARTITION_NAMES:
+        entry = manifest["partitions"][name]
+        position = 0
+        starts = {}
+        for turn_id, count in zip(entry["turn_ids"], entry["row_counts"]):
+            starts[turn_id] = position
+            position += int(count)
+        offsets[name] = starts
+        cursor[name] = position
+    for name in PARTITION_NAMES:
+        entry = manifest["partitions"][name]
+        require(int(entry["rows"]) == cursor[name]
+                and int(partitions[name]["hidden"].shape[0]) == cursor[name],
+                "identity")
+        for key in ("token_ids", "absolute_positions"):
+            require(int(vectors[name][key].shape[0]) == cursor[name],
+                    "identity")
+    turns = []
+    for entry in manifest["turns"]:
+        name = entry["partition"]
+        turn_id = entry["turn_id"]
+        start = offsets[name][turn_id]
+        end = start + int(entry["rows"])
+        partition = partitions[name]
+        turns.append({"turn_id": turn_id, "family_id": entry["family_id"],
+                      "span_policy": entry["span_policy"],
+                      "span_metadata": entry["span_metadata"],
+                      "partition": name, "rows": int(entry["rows"]),
+                      "hidden": partition["hidden"][start:end].contiguous(),
+                      "token_ids": vectors[name]["token_ids"][start:end].contiguous(),
+                      "absolute_positions":
+                          vectors[name]["absolute_positions"][start:end].contiguous(),
+                      "embeddings": partition["embeddings"][start:end].contiguous()})
+    require(bool(turns), "profile")
+    return turns
 
 
 def _load_tensor(path, expected_sha256, torch):

@@ -73,7 +73,8 @@
 //! span-policy variants).
 //!
 //! `--source-mode retained` (default `legacy`) selects the retained
-//! content-only source lifecycle for the positive case: the source arms
+//! content-only source lifecycle for the positive case and the task
+//! mode's P leg: the source arms
 //! `arm_source_retained` BEFORE its single content request, the handoff
 //! tool is not installed on that turn, and the completed capture (zero
 //! tool bindings, span policy content_tail_no_tool_v2, capture_mode
@@ -819,6 +820,12 @@ struct FixtureRecords {
     /// final content fully inside the window). The verdict rule test uses
     /// this; the default false mirrors the simple offline fixture turn.
     span_message_truncated: bool,
+    /// Server-side wire audit (defect 7.3): the `reasoning_effort` of every
+    /// capture-armed /v1/chat/completions body the fixture admitted, in
+    /// arrival order. The canary's ARM route threads OCC3_SOURCE_THINKING
+    /// through the source agent's on_payload hook, so the serialized armed
+    /// request body must carry exactly the pinned effort.
+    capture_reasoning_efforts: Vec<String>,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -1306,6 +1313,15 @@ async fn serve(
                             "MAX goes through the existing model-specific conversion, or the documented receiver override matches"
                         );
                         if let Some(intent) = body.get("occ3_capture") {
+                            // Server-side wire audit (defect 7.3): the armed
+                            // source request's serialized reasoning_effort,
+                            // exactly as the fixture received it.
+                            records.lock().unwrap().capture_reasoning_efforts.push(
+                                body["reasoning_effort"]
+                                    .as_str()
+                                    .unwrap_or("<absent>")
+                                    .to_string(),
+                            );
                             if {
                                 let records_guard = records.lock().unwrap();
                                 records_guard.refuse_captures
@@ -3021,7 +3037,11 @@ async fn run_positive_case(
             case["source_tool_calls"] = json!(source_tool_calls);
         }
     }
-    let coverage = span_coverage_verdict(span_block.as_ref(), value_in_sender_content);
+    let coverage = span_coverage_verdict(
+        span_block.as_ref(),
+        value_in_sender_content,
+        coverage_criterion(retained_mode),
+    );
     let arm_evidence = json!({
         "receiver_raw_answer": receiver_raw_answer,
         "parsed_answer": answer,
@@ -4664,20 +4684,75 @@ async fn run_after_phase(
 // Arm-trial coverage, evidence and the arm phase runner.
 // ---------------------------------------------------------------------------
 
+/// Which coverage criterion a receipt span is judged by. The 2026-11-01
+/// canary2 repair (window icalib-canary2-20261101T1615Z) split the single
+/// historical rule: the retained content-only arm measures VALUE coverage,
+/// because its tail window reports `span_message_truncated=true` for ANY
+/// turn longer than the window (902 accepted rows vs a 128-row window) -
+/// by design of the tail retention, not a capture defect.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+enum CoverageCriterion {
+    /// The historical TOKEN_FULL / TOKEN_SELECTED / legacy two-turn rule:
+    /// whole-turn coverage, fail-closed on the receipt's truncation flag.
+    Legacy,
+    /// The occ3.capture.v3 retained content-only rule: the value is fully
+    /// contained in the accepted content run (every value token position
+    /// inside span start..end), the span is the final content run, and
+    /// retention is full-width. The server's message_truncated is recorded
+    /// honestly as the tail-window fact and never gates the verdict.
+    RetainedContentOnly,
+}
+
+/// The criterion for a source lifecycle: the retained content-only mode
+/// judges value coverage; every other route keeps the legacy rule.
+fn coverage_criterion(retained_mode: bool) -> CoverageCriterion {
+    if retained_mode {
+        CoverageCriterion::RetainedContentOnly
+    } else {
+        CoverageCriterion::Legacy
+    }
+}
+
 /// Driver-side coverage verdict for TOKEN_FULL / TOKEN_SELECTED
-/// (arms-audit 4.5). Coverage==1 requires:
+/// (arms-audit 4.5). Two criteria share this projection (see
+/// `CoverageCriterion`); both require:
 /// - a v2 receipt span block (a v1 capture has NO span selection: the fields
 ///   needed for offline computation are recorded instead and the verdict is
 ///   null, `coverage_computed: "offline"`);
-/// - span_message_truncated == false (no content-head loss, no over-window
-///   turn: the receipt's truncation flag is the fail-closed signal);
 /// - span_contains_final_content == true (the selected run is the final
 ///   content run, which starts at the reasoning terminator);
-/// - the intended value present in the sender's own final CONTENT text: the
-///   span is that complete run, so the value's tokens are then inside the
-///   span. Thinking text is excluded by construction (the run starts after
-///   the terminator), so a value stated only in reasoning is NOT covered.
-fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) -> Value {
+/// - full-width retention: retained_count equals the aligned span width, so
+///   no span row - in particular not the final content row - was dropped
+///   (the canary's final-character loss class, 2026-11-01).
+///
+/// Legacy (TOKEN_FULL / TOKEN_SELECTED / two-turn arms) additionally
+/// requires span_message_truncated == false (no content-head loss, no
+/// over-window turn: the receipt's truncation flag is the fail-closed
+/// signal) and the intended value present in the sender's own final CONTENT
+/// text: the span is that complete run, so the value's tokens are then
+/// inside the span. Thinking text is excluded by construction (the run
+/// starts after the terminator), so a value stated only in reasoning is NOT
+/// covered.
+///
+/// RetainedContentOnly (occ3.capture.v3) judges VALUE coverage instead: the
+/// value is fully contained in the accepted content run - every value token
+/// position inside span start..end. That holds when (a) the value appears in
+/// the sender's own final CONTENT text (value_in_sender_content; the value's
+/// tokens live in the content run) and (b) the retained window is
+/// unit-stride (span_contiguous), which in the v3 construction proves the
+/// content run was NOT clipped by the tail window: the buffer pins the
+/// terminator rows and the content suffix, so the only position gap it can
+/// show is between them - exactly the eviction of content-run head rows. A
+/// clipped run means the value's leading tokens sit before
+/// accepted_span_start, outside the span. The server's message_truncated
+/// (accepted_total > window rows) is the tail-window fact of any
+/// thinking-bearing turn and is recorded honestly - `turn_truncated`,
+/// `turn_window_rows` - never as a coverage gate.
+fn span_coverage_verdict(
+    span: Option<&Value>,
+    value_in_sender_content: bool,
+    criterion: CoverageCriterion,
+) -> Value {
     let Some(span) = span else {
         return json!({
             "coverage_computed": "offline",
@@ -4688,24 +4763,86 @@ fn span_coverage_verdict(span: Option<&Value>, value_in_sender_content: bool) ->
     };
     let truncated = span["span_message_truncated"].as_bool();
     let contains_final_content = span["span_contains_final_content"].as_bool();
-    let span_complete = truncated == Some(false) && contains_final_content == Some(true);
-    let coverage_complete = span_complete && value_in_sender_content;
-    json!({
-        "coverage_computed": "receipt_span",
-        "coverage_complete": coverage_complete,
-        "value_in_sender_content": value_in_sender_content,
-        "span_message_truncated": truncated,
-        "span_contains_final_content": contains_final_content,
-        "span_content_count": span["span_content_count"],
-        "span_thinking_count": span["span_thinking_count"],
-        "span_tool_call_count": span["span_tool_call_count"],
-        "span_window_start_position": span["span_window_start_position"],
-        "span_window_end_position": span["span_window_end_position"],
-        "retained_count": span["retained_count"],
-        "accepted_span_start": span["accepted_span_start"],
-        "accepted_span_end": span["accepted_span_end"],
-        "accepted_sequence_digest": span["accepted_sequence_digest"],
-    })
+    let contiguous = span["span_contiguous"].as_bool();
+    let retained_count = span["retained_count"].as_u64();
+    let span_width = span["accepted_span_end"]
+        .as_u64()
+        .zip(span["accepted_span_start"].as_u64())
+        .map(|(end, start)| end.saturating_sub(start));
+    let retained_all = span_width.map_or(false, |width| retained_count == Some(width));
+    // The retained window's row count: the six span_*_count fields are
+    // window-wide (the whole classified window, not the aligned span).
+    let window_rows = [
+        "span_thinking_count",
+        "span_content_count",
+        "span_tool_call_count",
+        "span_tool_arguments_count",
+        "span_control_count",
+        "span_unknown_count",
+    ]
+    .iter()
+    .filter_map(|field| span[field].as_u64())
+    .sum::<u64>();
+    match criterion {
+        CoverageCriterion::Legacy => {
+            let span_complete = truncated == Some(false)
+                && contains_final_content == Some(true)
+                && retained_all;
+            let coverage_complete = span_complete && value_in_sender_content;
+            json!({
+                "coverage_computed": "receipt_span",
+                "coverage_complete": coverage_complete,
+                "value_in_sender_content": value_in_sender_content,
+                "span_message_truncated": truncated,
+                "span_contains_final_content": contains_final_content,
+                "span_retained_count": retained_count,
+                "span_accepted_width": span_width,
+                "span_content_count": span["span_content_count"],
+                "span_thinking_count": span["span_thinking_count"],
+                "span_tool_call_count": span["span_tool_call_count"],
+                "span_window_start_position": span["span_window_start_position"],
+                "span_window_end_position": span["span_window_end_position"],
+                "retained_count": span["retained_count"],
+                "accepted_span_start": span["accepted_span_start"],
+                "accepted_span_end": span["accepted_span_end"],
+                "accepted_sequence_digest": span["accepted_sequence_digest"],
+            })
+        }
+        CoverageCriterion::RetainedContentOnly => {
+            // Every value token position inside span start..end: the value
+            // lives in the sender's content run AND that run was retained
+            // whole (a clipped run leaves the window non-contiguous).
+            let value_fully_in_span =
+                value_in_sender_content && contiguous == Some(true);
+            let coverage_complete = value_fully_in_span
+                && contains_final_content == Some(true)
+                && retained_all;
+            json!({
+                "coverage_computed": "receipt_span_retained_content_only",
+                "coverage_complete": coverage_complete,
+                "value_in_sender_content": value_in_sender_content,
+                "value_fully_in_span": value_fully_in_span,
+                // The tail-window fact, recorded honestly - never a gate:
+                // any turn longer than the window reports truncated.
+                "turn_truncated": truncated,
+                "turn_window_rows": window_rows,
+                "span_message_truncated": truncated,
+                "span_contains_final_content": contains_final_content,
+                "span_contiguous": contiguous,
+                "span_retained_count": retained_count,
+                "span_accepted_width": span_width,
+                "span_content_count": span["span_content_count"],
+                "span_thinking_count": span["span_thinking_count"],
+                "span_tool_call_count": span["span_tool_call_count"],
+                "span_window_start_position": span["span_window_start_position"],
+                "span_window_end_position": span["span_window_end_position"],
+                "retained_count": span["retained_count"],
+                "accepted_span_start": span["accepted_span_start"],
+                "accepted_span_end": span["accepted_span_end"],
+                "accepted_sequence_digest": span["accepted_sequence_digest"],
+            })
+        }
+    }
 }
 
 /// Live-only token-count cross-check for the TOKEN_FULL / TOKEN_SELECTED
@@ -5772,7 +5909,11 @@ async fn run_corpus_source_turn(
         "sender_final_content": sender_content,
         "sender_final_content_contains_value": value_in_sender_content,
         "fact_marker_in_sender_content": fact_marker_in_sender_content,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            CoverageCriterion::Legacy,
+        ),
         "cleanup_ok": cleanup_ok,
         "source_turn_error": source_turn_error,
     }))
@@ -6523,6 +6664,14 @@ fn p7_ladder_verdict(
 /// corpus-turn template's shape).
 const TASK_SOURCE_SYSTEM_PROMPT: &str = "Preserve the task's private content in the native source turn. State the pinned message verbatim as your complete final content, then call occ3_handoff exactly once with receiver_role \"child\" and receiver_name \"receiver\"; include only receiver_role and receiver_name arguments. After the handoff stop.";
 
+/// The retained content-only task source system prompt: the captured turn
+/// asks ONLY for the pinned message, with the handoff tool NOT installed on
+/// that turn, so the armed span is a pure content run under
+/// content_tail_no_tool_v2 and the completed hook's zero-tool-binding
+/// contract holds by construction (the RETAINED_SOURCE_SYSTEM_PROMPT shape
+/// with the task grammar's pinned message).
+const TASK_RETAINED_SOURCE_SYSTEM_PROMPT: &str = "Preserve the task's private content in the native source turn. State the pinned message verbatim as your complete final content and stop. Do not call any tools.";
+
 /// The task-mode receiver system prompt: the landed repaired receiver
 /// contract (the c6d6b197f class-A fix: authorized-experiment framing,
 /// role separation, quoting the sender's content as DATA, the output
@@ -6720,6 +6869,13 @@ impl AgentSessionMessageController for TaskController {
 /// as its complete final content), the real capture commits, the
 /// publication delivers through the authenticated admission, and the
 /// receiver answers the task's receiver_question from the attached state.
+/// The source lifecycle follows `source_mode` exactly like the positive
+/// case: legacy keeps the same-turn occ3_handoff binding; retained arms
+/// `arm_source_retained` BEFORE the single content request, installs NO
+/// handoff tool for that turn, and publishes the completed capture after
+/// the turn through `publish_retained` (occ3.publish.v2, dispatch_mode
+/// orchestrator_v1) - no model tool dispatch anywhere. The receiver leg,
+/// the scripted verifier and the L1 exact-match scoring are unchanged.
 /// Evidence extraction happens before cleanup; the ladder and verdict are
 /// computed by the phase runner.
 async fn run_task_positive_case(
@@ -6728,12 +6884,22 @@ async fn run_task_positive_case(
     source_id: &str,
     receiver_id: &str,
     task: &P7Task,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     let arm_started = Instant::now();
+    let retained_mode = source_mode == SourceMode::Retained;
     let source = Occ3NativeSession::enroll(source_id, &env.model, connector.clone()).await?;
     let receiver =
         Occ3NativeSession::enroll(receiver_id, &env.model, connector.clone()).await?;
-    let mut source_options = agent_options(&env.model, env.key.clone(), TASK_SOURCE_SYSTEM_PROMPT);
+    // The retained content-only turn swaps in its own source system prompt
+    // (its turn asks for the pinned message alone, no handoff tool
+    // installed); the legacy task turn keeps the historical prompt bytes.
+    let source_system_prompt = if retained_mode {
+        TASK_RETAINED_SOURCE_SYSTEM_PROMPT
+    } else {
+        TASK_SOURCE_SYSTEM_PROMPT
+    };
+    let mut source_options = agent_options(&env.model, env.key.clone(), source_system_prompt);
     if let Ok(path) = std::env::var("OCC3_DUMP_SOURCE_PAYLOAD") {
         // Root diagnostic, mirrored from the positive case: dump the armed
         // source-turn request payload exactly as serialized. No behavior
@@ -6790,9 +6956,15 @@ async fn run_task_positive_case(
     // The same installation the isolated family performs per member:
     // resolver, capture hooks, the handoff tool on the source side; the
     // receiver is a pure consumer (resolver set, handoff tool stripped).
+    // The retained content-only turn forbids tool bindings: the handoff
+    // tool is NOT installed on the source agent, and the completed capture
+    // is published after the turn through the authenticated task
+    // controller (publish_retained).
     source_agent.set_resolve_inference_state(Some(source.receiver_resolver()));
     source_agent.set_source_capture_hooks(Some(source.source_hooks()));
-    {
+    if retained_mode {
+        strip_handoff_tool(&source_agent);
+    } else {
         let mut state = source_agent.state();
         let mut tools = state.tools.take().unwrap_or_default();
         tools.push(source.handoff_tool(controller.clone()));
@@ -6802,12 +6974,25 @@ async fn run_task_positive_case(
     receiver_agent.set_resolve_inference_state(Some(receiver.receiver_resolver()));
     receiver_agent.set_source_capture_hooks(Some(receiver.source_hooks()));
     strip_handoff_tool(&receiver_agent);
-    source.arm_source(NativeSourceBudget {
-        retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
-        max_capture_bytes: env.max_capture_bytes,
-        deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
-        max_response_bytes: env.max_response_bytes,
-    })?;
+    if retained_mode {
+        // RETAINED SOURCE LEG: arm BEFORE the single content request; the
+        // captured turn must be a no-tool content turn (occ3.capture.v3,
+        // capture_mode content_only_orchestrator_v1, span policy
+        // content_tail_no_tool_v2), one shot - no retry.
+        source.arm_source_retained(NativeSourceBudget {
+            retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+    } else {
+        source.arm_source(NativeSourceBudget {
+            retained_count_limit: P7_SPAN_CAP_TOKENS as u32,
+            max_capture_bytes: env.max_capture_bytes,
+            deadline: Instant::now() + Duration::from_secs(env.deadline_seconds),
+            max_response_bytes: env.max_response_bytes,
+        })?;
+    }
     let action = tokio::time::timeout(
         Duration::from_secs(env.deadline_seconds),
         source_agent.prompt(PromptInput::Text {
@@ -6818,6 +7003,23 @@ async fn run_task_positive_case(
     .await
     .map_err(|_| fail())?
     .map_err(|_| fail());
+    // The retained publication runs AFTER the content turn completes, through
+    // the authenticated task controller for the source session, targeting the
+    // receiver - no model tool dispatch anywhere in this mode (the
+    // run_positive_case retained-leg pattern). The turn's own error, if any,
+    // is reported unchanged; a publish failure names its stage.
+    let action = if retained_mode {
+        match action {
+            Err(error) => Err(error),
+            Ok(()) => source
+                .publish_retained(controller.clone(), "child", "receiver")
+                .await
+                .map(|_| ())
+                .map_err(|error| format!("task_retained_publish_error({error})")),
+        }
+    } else {
+        action
+    };
     let capture_turn_millis = arm_started.elapsed().as_millis() as u64;
     // Evidence extraction happens before cleanup.
     let answer = normalized_final_answer(&receiver_agent);
@@ -6840,10 +7042,25 @@ async fn run_task_positive_case(
         .as_array()
         .map(|entries| entries.iter().any(|e| e["lease_state"] == json!("Consumed")))
         .unwrap_or(false);
-    let source_state_ok = source_audit["source"]["state"] == json!("Captured")
-        && source_audit["source"]["tool_claimed"] == json!(true)
-        && source_audit["source"]["handoff_admitted"] == json!(true)
-        && source_audit["source"]["published_message"].is_array();
+    // The retained mode's task source contract: a Captured content-only lease
+    // that was NEVER tool-claimed, published exactly once through the
+    // orchestrator (publication_claimed) under the retained capture mode -
+    // the run_positive_case retained contract. The legacy mode keeps its
+    // historical contract: exactly one same-turn tool claim.
+    let source_state_ok = if retained_mode {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(false)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+            && source_audit["source"]["publication_claimed"] == json!(true)
+            && source_audit["source"]["retained"] == json!(true)
+            && source_audit["source"]["capture_mode"] == json!("content_only_orchestrator_v1")
+    } else {
+        source_audit["source"]["state"] == json!("Captured")
+            && source_audit["source"]["tool_claimed"] == json!(true)
+            && source_audit["source"]["handoff_admitted"] == json!(true)
+            && source_audit["source"]["published_message"].is_array()
+    };
     let source_turn_error = action.as_ref().err().cloned().or_else(|| {
         source_audit["source"]["state"].as_str().and_then(|state| {
             (state != "Captured").then(|| format!("capture_not_captured_{state}"))
@@ -6859,7 +7076,11 @@ async fn run_task_positive_case(
         "sender_final_content": sender_content,
         "sender_final_content_contains_message": value_in_sender_content,
         "receipt_span_block": span_block,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            coverage_criterion(retained_mode),
+        ),
         "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
         "receiver_publication": controller.publication.lock().unwrap().clone(),
         "delivered": delivered,
@@ -7277,7 +7498,11 @@ async fn run_task_wrong_sender_case(
         "b_state_ok": b_state_ok,
         "sender_final_content": sender_content,
         "receipt_span_block": span_block,
-        "coverage": span_coverage_verdict(span_block.as_ref(), value_in_sender_content),
+        "coverage": span_coverage_verdict(
+            span_block.as_ref(),
+            value_in_sender_content,
+            CoverageCriterion::Legacy,
+        ),
         "message_status": message.as_ref().map(|r| r.delivery_status.clone()),
         "receiver_publication": controller.publication.lock().unwrap().clone(),
         "delivered": delivered,
@@ -7324,6 +7549,7 @@ async fn run_task_phase(
     task: &P7Task,
     task_file_sha256: &str,
     arm: Option<Arm>,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     let pins = ReportPins {
         binary_sha256: env.harness_binary_sha256.clone(),
@@ -7380,7 +7606,7 @@ async fn run_task_phase(
     let receiver_id = format!("task-{suffix}-receiver-{}", uuid::Uuid::new_v4().simple());
     let case_result: Result<Value, String> = match leg {
         TaskLeg::Positive => {
-            run_task_positive_case(env, &connector, &source_id, &receiver_id, task)
+            run_task_positive_case(env, &connector, &source_id, &receiver_id, task, source_mode)
                 .await
                 .map_err(|error| format!("task {} P-leg case failed: {error}", task.id))
         }
@@ -7455,13 +7681,20 @@ async fn run_task_phase(
     // requests, or a source_turn_error) on the native legs; the
     // client-side legs carry their own structural verdict. Tool calls and
     // extra requests are contract violations (L5), not plumbing failures.
+    // The retained P leg's source turn is toolless by construction (zero
+    // source tool calls); the legacy P leg and the W leg (source-B's real
+    // handoff) make exactly one.
+    let expected_source_tool_calls = match leg {
+        TaskLeg::Positive if source_mode == SourceMode::Retained => 0,
+        _ => 1,
+    };
     let structural_ok = if native_leg {
         trial_error.is_none()
             && source_turn_error.is_none()
             && delivered
             && consumed
             && source_state_ok
-            && source_tool_calls == 1
+            && source_tool_calls == expected_source_tool_calls
             && request_count > 0
     } else {
         trial_error.is_none() && case_evidence["structural_ok"] == json!(true)
@@ -7480,7 +7713,7 @@ async fn run_task_phase(
                 Some("source_state_not_ok".to_string())
             } else if request_count == 0 {
                 Some("zero_receiver_requests".to_string())
-            } else if source_tool_calls != 1 {
+            } else if source_tool_calls != expected_source_tool_calls {
                 Some("source_tool_calls".to_string())
             } else {
                 Some("pipeline".to_string())
@@ -7599,6 +7832,11 @@ async fn run_task_phase(
         "est_receiver_question_tokens": task.est_receiver_question_tokens,
         "requested_suite": "task-run",
         "arm": arm.map(|arm| arm.as_str()).unwrap_or("P"),
+        "source_mode": if source_mode == SourceMode::Retained {
+            "retained"
+        } else {
+            "legacy"
+        },
         "arm_crosswalk": "NATIVE~P, WRONG_SENDER~W, NULL_SHAPE~N, NO_ATTACHMENT~N0, TOKEN_SELECTED~T, FULL_TEXT~F; TOKEN_FULL/TOKEN_NORM are P span-policy variants (spec section 8.6)",
         "trial_id": trial_id,
         "attempt_id": env.attempt_id,
@@ -7727,12 +7965,14 @@ async fn offline_task_trial(
     task_file_sha256: &str,
     journal: Option<PathBuf>,
     arm: Option<Arm>,
+    source_mode: SourceMode,
 ) -> Result<Value, String> {
     offline_task_trial_with_records(
         task,
         task_file_sha256,
         journal,
         arm,
+        source_mode,
         Arc::new(Mutex::new(FixtureRecords::default())),
     )
     .await
@@ -7747,12 +7987,21 @@ async fn offline_task_trial_with_records(
     task_file_sha256: &str,
     journal: Option<PathBuf>,
     arm: Option<Arm>,
+    source_mode: SourceMode,
     records: Arc<Mutex<FixtureRecords>>,
 ) -> Result<Value, String> {
     let journal = offline_trial_journal(journal, "occ3-task-trial")?;
     let trial = offline_trial_context(journal, records, "task").await?;
-    let result =
-        run_task_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, task, task_file_sha256, arm).await;
+    let result = run_task_phase(
+        &trial.env,
+        &trial.challenge,
+        &trial.descriptor_digest,
+        task,
+        task_file_sha256,
+        arm,
+        source_mode,
+    )
+    .await;
     trial.server.abort();
     result
 }
@@ -8467,6 +8716,7 @@ async fn live_phase(
             &loaded.task,
             &loaded.file_sha256,
             arm,
+            SourceMode::current(),
         )
         .await?
     } else {
@@ -8725,7 +8975,7 @@ async fn real_main() -> Result<(), i32> {
                 let canary = arm == Some(Arm::Native);
                 offline_corpus_turn(corpus, None, canary).await
             } else if let Some(loaded) = &loaded_task {
-                offline_task_trial(&loaded.task, &loaded.file_sha256, None, arm).await
+                offline_task_trial(&loaded.task, &loaded.file_sha256, None, arm, source_mode).await
             } else if args.is_empty() {
                 offline_selftest(None).await
             } else if let Some(arm) = arm {
@@ -8740,8 +8990,14 @@ async fn real_main() -> Result<(), i32> {
                 let canary = arm == Some(Arm::Native);
                 offline_corpus_turn(corpus, directory.clone(), canary).await
             } else if let Some(loaded) = &loaded_task {
-                offline_task_trial(&loaded.task, &loaded.file_sha256, directory.clone(), arm)
-                    .await
+                offline_task_trial(
+                    &loaded.task,
+                    &loaded.file_sha256,
+                    directory.clone(),
+                    arm,
+                    source_mode,
+                )
+                .await
             } else if let Some(arm) = arm {
                 offline_arm_trial(arm, directory.clone()).await
             } else {
@@ -9618,34 +9874,234 @@ mod gate_tests {
             "accepted_span_end": 8,
             "accepted_sequence_digest": "d".repeat(64),
         });
-        let verdict = span_coverage_verdict(Some(&span), true);
+        let verdict = span_coverage_verdict(Some(&span), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_computed"], json!("receipt_span"));
         assert_eq!(verdict["coverage_complete"], json!(true));
         assert!(!token_full_invalid_coverage(&verdict));
         // The value outside the sender's content: coverage < 1 -> invalid.
-        let verdict = span_coverage_verdict(Some(&span), false);
+        let verdict = span_coverage_verdict(Some(&span), false, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert!(token_full_invalid_coverage(&verdict));
         // A truncated span (content-head loss or over-window turn): invalid.
         let mut truncated = span.clone();
         truncated["span_message_truncated"] = json!(true);
-        let verdict = span_coverage_verdict(Some(&truncated), true);
+        let verdict = span_coverage_verdict(Some(&truncated), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
         assert_eq!(verdict["span_message_truncated"], json!(true));
         assert!(token_full_invalid_coverage(&verdict));
         // A span that is not the final content run: invalid.
         let mut no_final = span.clone();
         no_final["span_contains_final_content"] = json!(false);
-        let verdict = span_coverage_verdict(Some(&no_final), true);
+        let verdict = span_coverage_verdict(Some(&no_final), true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_complete"], json!(false));
+        assert!(token_full_invalid_coverage(&verdict));
+        // A retention narrower than the aligned span width: the final-row
+        // exclusion class (canary 2026-11-01) - invalid, never a silent pass.
+        let mut narrow = span.clone();
+        narrow["retained_count"] = json!(7);
+        let verdict = span_coverage_verdict(Some(&narrow), true, CoverageCriterion::Legacy);
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["span_retained_count"], json!(7));
+        assert_eq!(verdict["span_accepted_width"], json!(8));
         assert!(token_full_invalid_coverage(&verdict));
         // No span block at all (v1 capture): offline fields only, the null
         // verdict is invalid for TOKEN_FULL - never a silent pass.
-        let verdict = span_coverage_verdict(None, true);
+        let verdict = span_coverage_verdict(None, true, CoverageCriterion::Legacy);
         assert_eq!(verdict["coverage_computed"], json!("offline"));
         assert_eq!(verdict["coverage_complete"], json!(null));
         assert!(token_full_invalid_coverage(&verdict));
         assert_eq!(verdict["value_in_sender_content"], json!(true));
+    }
+
+    /// The live canary2 tail-window shape (2026-11-01, window
+    /// icalib-canary2-20261101T1615Z, executor-verified): 902 accepted
+    /// rows, a 128-row retained tail window (96 THINKING + 1 CONTROL
+    /// thinking_end + 31 CONTENT), span 871..902, retained_count == width
+    /// == 31, and the value fully inside the retained content tail.
+    fn retained_canary_tail_span() -> Value {
+        json!({
+            "span_schema": "occ3.span.v1",
+            "span_policy": "content_tail_no_tool_v2",
+            "span_reasoning_terminator": "thinking_end",
+            "span_thinking_count": 96,
+            "span_content_count": 31,
+            "span_tool_call_count": 0,
+            "span_tool_arguments_count": 0,
+            "span_control_count": 1,
+            "span_unknown_count": 0,
+            "span_window_start_position": 4431,
+            "span_window_end_position": 4559,
+            "span_contiguous": true,
+            "span_contains_final_content": true,
+            "span_contains_tool_call": false,
+            "span_message_truncated": true,
+            "accepted_span_start": 871,
+            "accepted_span_end": 902,
+            "retained_count": 31,
+            "accepted_sequence_digest": "d".repeat(64),
+        })
+    }
+
+    /// The 2026-11-01 canary2 repair: the retained content-only arm judges
+    /// VALUE coverage, not whole-turn coverage. The canary2 turn was longer
+    /// than the tail window (902 accepted rows vs 128 window rows), so the
+    /// server honestly reported span_message_truncated=true - and the
+    /// verdict's truncation gate turned every such legitimate capture into
+    /// coverage_complete=false even though the value lived entirely inside
+    /// the retained content tail (31 of 31 content rows retained, the value
+    /// inside them). The retained criterion must pass this capture.
+    #[test]
+    fn retained_value_coverage_passes_a_truncated_tail_window() {
+        let span = retained_canary_tail_span();
+        let verdict = span_coverage_verdict(
+            Some(&span),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(
+            verdict["coverage_computed"],
+            json!("receipt_span_retained_content_only")
+        );
+        assert_eq!(verdict["coverage_complete"], json!(true));
+        assert_eq!(verdict["value_fully_in_span"], json!(true));
+        assert_eq!(verdict["value_in_sender_content"], json!(true));
+        // The tail-window fact is recorded honestly, never a gate.
+        assert_eq!(verdict["turn_truncated"], json!(true));
+        assert_eq!(verdict["span_message_truncated"], json!(true));
+        assert_eq!(verdict["turn_window_rows"], json!(128));
+        assert_eq!(verdict["span_contiguous"], json!(true));
+        assert_eq!(verdict["span_retained_count"], json!(31));
+        assert_eq!(verdict["span_accepted_width"], json!(31));
+        // The very same span under the legacy criterion stays refusals:
+        // whole-turn coverage is a different, stricter question.
+        let legacy = span_coverage_verdict(Some(&span), true, CoverageCriterion::Legacy);
+        assert_eq!(legacy["coverage_computed"], json!("receipt_span"));
+        assert_eq!(legacy["coverage_complete"], json!(false));
+        assert_eq!(legacy["span_message_truncated"], json!(true));
+    }
+
+    /// Defect 7.3, ARM-route proof (canary2 follow-up, 2026-11-01): the
+    /// canary runs `run_positive_case --arm NATIVE --source-mode retained`,
+    /// and the source effort rewrite must reach the SERVER through the
+    /// source agent's on_payload hook: the serialized armed request body
+    /// carries exactly the pinned OCC3_SOURCE_THINKING level. The fixture
+    /// records the admitted armed body's `reasoning_effort` server-side;
+    /// the arm evidence's `source_request_audit` must agree (the same
+    /// fact measured on both ends of the wire). canary2 measured 3715
+    /// reasoning chars vs canary1's 1494 under the same env pin - this pin
+    /// separates the plumbing question (answerable offline: the rewrite IS
+    /// on the wire) from the live variance question (the model's own
+    /// reasoning length under a pinned effort).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_arm_route_threads_the_source_effort_rewrite_into_the_armed_request() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-arm-effort-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords::default()));
+        let trial = offline_trial_context(journal.clone(), records.clone(), "effort")
+            .await
+            .unwrap();
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        std::env::set_var("OCC3_SOURCE_THINKING", "low");
+        let outcome = run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("effort-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("effort-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await;
+        std::env::remove_var("OCC3_SOURCE_THINKING");
+        trial.server.abort();
+        let outcome = outcome.unwrap_or_else(|error| panic!("retained arm case failed: {error}"));
+        // Server side: exactly one capture-armed source request (the
+        // retained leg's single content turn), serialized with the pinned
+        // effort on the wire.
+        let efforts = records.lock().unwrap().capture_reasoning_efforts.clone();
+        assert_eq!(efforts, vec!["low".to_string()], "the armed source request body must carry the pinned effort");
+        // Client side: the audit saw the same request and the serialized
+        // body matched the requested effort (defect 7.3 assertion).
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["request_count"],
+            json!(1)
+        );
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["effort_requested"],
+            json!("low")
+        );
+        assert_eq!(
+            outcome.arm_evidence["source_request_audit"]["effort_on_wire_matches_request"],
+            json!(true)
+        );
+        // The turn itself completed and the retained value-coverage
+        // criterion (not the legacy truncation gate) judged the capture.
+        assert_eq!(outcome.arm_evidence["source_mode"], json!("retained"));
+        assert_eq!(
+            outcome.arm_evidence["coverage"]["coverage_computed"],
+            json!("receipt_span_retained_content_only")
+        );
+        assert_eq!(outcome.arm_evidence["coverage"]["coverage_complete"], json!(true));
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// The retained criterion's negative space: the value NOT fully inside
+    /// the span fails coverage. A clipped content run (the tail window
+    /// evicted content-head rows: the pinned terminator rows are followed
+    /// by a position gap before the first retained content row, so the
+    /// window is not unit-stride) means the value's leading tokens sit
+    /// before accepted_span_start - outside the span even though the value
+    /// is present in the sender's own content. A value stated only in
+    /// reasoning, and a dropped span row, fail the same way.
+    #[test]
+    fn retained_value_coverage_fails_when_the_value_is_not_fully_inside_the_span() {
+        let span = retained_canary_tail_span();
+        // Clipped content run: value in the sender's content, but the
+        // retained window is not contiguous.
+        let mut clipped = span.clone();
+        clipped["span_contiguous"] = json!(false);
+        let verdict = span_coverage_verdict(
+            Some(&clipped),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["value_fully_in_span"], json!(false));
+        assert_eq!(verdict["value_in_sender_content"], json!(true));
+        assert_eq!(verdict["turn_truncated"], json!(true));
+        // The value stated only in reasoning (absent from the sender's own
+        // CONTENT text) is never covered, window or not.
+        let verdict = span_coverage_verdict(
+            Some(&span),
+            false,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["value_fully_in_span"], json!(false));
+        // A dropped span row (retention narrower than the aligned width)
+        // still fails closed under the retained criterion too.
+        let mut narrow = span.clone();
+        narrow["retained_count"] = json!(30);
+        let verdict = span_coverage_verdict(
+            Some(&narrow),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
+        assert_eq!(verdict["span_retained_count"], json!(30));
+        assert_eq!(verdict["span_accepted_width"], json!(31));
+        // A span that is not the final content run fails both criteria.
+        let mut no_final = span.clone();
+        no_final["span_contains_final_content"] = json!(false);
+        let verdict = span_coverage_verdict(
+            Some(&no_final),
+            true,
+            CoverageCriterion::RetainedContentOnly,
+        );
+        assert_eq!(verdict["coverage_complete"], json!(false));
     }
 
     #[cfg(windows)]
@@ -11070,6 +11526,7 @@ mod gate_tests {
             &loaded.file_sha256,
             None,
             None,
+            SourceMode::Legacy,
             records,
         )
         .await
@@ -11137,6 +11594,92 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    /// The retained task P leg (--source-mode retained): the task turn must
+    /// run the content-only lifecycle, not the legacy tool leg - the
+    /// handoff tool is never installed (zero source tool calls), the
+    /// capture rides one occ3.capture.v3 intent (capture_mode
+    /// content_only_orchestrator_v1, span policy content_tail_no_tool_v2),
+    /// the publication is an occ3.publish.v2 orchestrator dispatch, and the
+    /// receiver leg, the ladder and the one-shot evidence are unchanged
+    /// (L1 exact recovery).
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn p7_task_retained_leg_runs_the_content_only_lifecycle_offline() {
+        let dir = std::env::temp_dir()
+            .join(format!("occ3-p7-task-files-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let task_json = p7_scripted_task();
+        let path = write_p7_task_file(&dir, &task_json);
+        let loaded = load_p7_task(&path).unwrap();
+        let sender_msg = loaded.task.sender_msg.clone();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            task_source_content: Some(sender_msg.clone()),
+            task_answer: Some(sender_msg.clone()),
+            ..Default::default()
+        }));
+        let summary = offline_task_trial_with_records(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            None,
+            SourceMode::Retained,
+            records.clone(),
+        )
+        .await
+        .unwrap_or_else(|error| panic!("retained task P leg failed: {error}"));
+        assert_eq!(summary["status"], json!("passed"), "{summary}");
+        assert_eq!(summary["ladder_level"], json!("L1"));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence =
+            find_trial_evidence(&std::env::temp_dir(), &evidence_name, "occ3-task-trial-")
+                .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        // The retained lifecycle contract: no tool binding on the source
+        // turn, the retained audit shape, structural validity at ZERO
+        // source tool calls.
+        assert_eq!(evidence["source_mode"], json!("retained"), "{evidence}");
+        assert_eq!(evidence["source_tool_calls"], json!(0), "{evidence}");
+        assert_eq!(evidence["source_state_ok"], json!(true), "{evidence}");
+        assert_eq!(evidence["structural_ok"], json!(true), "{evidence}");
+        // The server-side lifecycle: one occ3.capture.v3 intent under the
+        // content-only capture mode and one occ3.publish.v2 orchestrator
+        // publication (never a v1/v2 tool-bound publication).
+        {
+            let records = records.lock().unwrap();
+            let capture = records.captures.last().expect("one retained capture");
+            assert_eq!(capture.intent["schema"], json!("occ3.capture.v3"));
+            assert_eq!(
+                capture.intent["capture_mode"],
+                json!("content_only_orchestrator_v1")
+            );
+            assert_eq!(
+                capture.intent["span_policy"],
+                json!("content_tail_no_tool_v2")
+            );
+            let publication = records
+                .published
+                .last()
+                .expect("one orchestrator publication");
+            assert_eq!(publication["schema"], json!("occ3.publish.v2"));
+            assert_eq!(publication["dispatch_mode"], json!("orchestrator_v1"));
+        }
+        // The receiver leg and the scoring are unchanged.
+        assert_eq!(evidence["delivered"], json!(true));
+        assert_eq!(evidence["consumed"], json!(true));
+        assert_eq!(evidence["receiver_tool_calls"], json!(0));
+        assert_eq!(
+            evidence["receiver_request_audit"]["request_count"],
+            json!(1)
+        );
+        assert_eq!(evidence["ladder"]["level"], json!("L1"));
+        assert_eq!(evidence["verifier_results"]["exact_match"], json!(true));
+        assert_eq!(
+            evidence["case"]["sender_final_content_contains_message"],
+            json!(true)
+        );
+        assert_eq!(evidence["coverage"]["coverage_complete"], json!(true));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A refusal answer scores L5 on a structurally valid trial: the
     /// evidence records the contract violation, the verdict fails the task
     /// turn and the invocation is nonzero (Err) - one attempt, no retry.
@@ -11158,9 +11701,15 @@ mod gate_tests {
             ),
             ..Default::default()
         }));
-        let result =
-            offline_task_trial_with_records(&loaded.task, &loaded.file_sha256, None, None, records)
-                .await;
+        let result = offline_task_trial_with_records(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            None,
+            SourceMode::Legacy,
+            records,
+        )
+        .await;
         let error = result.expect_err("the refusal verdict must fail the task turn");
         assert!(error.contains(&task_id), "{error}");
         let evidence = find_trial_evidence(
@@ -11205,6 +11754,7 @@ mod gate_tests {
             &loaded.file_sha256,
             None,
             None,
+            SourceMode::Legacy,
             records,
         )
         .await
@@ -11243,9 +11793,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_four_way_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::NoAttachment))
-            .await
-            .unwrap_or_else(|error| panic!("task N0 leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::NoAttachment),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task N0 leg failed: {error}"));
         assert_eq!(summary["arm"], json!("NO_ATTACHMENT"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         assert_eq!(summary["ladder_level"], json!("L6"));
@@ -11273,9 +11829,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_four_way_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::WrongSender))
-            .await
-            .unwrap_or_else(|error| panic!("task W leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::WrongSender),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task W leg failed: {error}"));
         assert_eq!(summary["arm"], json!("WRONG_SENDER"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         // The wrong sender's delivered value: wrong content (L4), the
@@ -11312,9 +11874,15 @@ mod gate_tests {
         std::fs::create_dir_all(&dir).unwrap();
         let path = write_p7_task_file(&dir, &p7_marker_task());
         let loaded = load_p7_task(&path).unwrap();
-        let summary = offline_task_trial(&loaded.task, &loaded.file_sha256, None, Some(Arm::FullText))
-            .await
-            .unwrap_or_else(|error| panic!("task F leg failed: {error}"));
+        let summary = offline_task_trial(
+            &loaded.task,
+            &loaded.file_sha256,
+            None,
+            Some(Arm::FullText),
+            SourceMode::Legacy,
+        )
+        .await
+        .unwrap_or_else(|error| panic!("task F leg failed: {error}"));
         assert_eq!(summary["arm"], json!("FULL_TEXT"));
         assert_eq!(summary["status"], json!("passed"), "{summary}");
         assert_eq!(summary["ladder_level"], json!("L2"));
