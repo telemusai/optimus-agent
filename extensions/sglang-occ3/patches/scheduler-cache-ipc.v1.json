@@ -109,7 +109,7 @@
     {
       "path": "managers/scheduler.py",
       "before_sha256": "b61df5b750adc748a99ceb381b8494c199fb3f704d793da5a0217bd6bbb606c4",
-      "after_sha256": "81db4aeec399af2ab4395e1ff5540ff99de8a6fc455bf58030c020074b484259",
+      "after_sha256": "83c7c1e77e55159ecee89020a3ee2264d9ad4847154ae5811dabc9ac881fda0a",
       "replacements": [
         {
           "before": "    OpenSessionReqInput,\n",
@@ -129,7 +129,7 @@
         },
         {
           "before": "            req.tokenizer = self.tokenizer\n\n            if radix_native_session:",
-          "after": "            req.tokenizer = self.tokenizer\n            if occ3_descriptor is not None:\n                from occ3_sglang.latent_worker import admit_request\n\n                req.occ3_scheduler = self\n                try:\n                    admit_request(self, req, occ3_descriptor)\n                except Exception:\n                    self._occ3_reject_received(recv_req, \"occ3_admission_failed\")\n                    return\n                req.occ3_queue_deadline = min(occ3_descriptor.deadline, time.monotonic() + 5.0)\n\n            if radix_native_session:"
+          "after": "            req.tokenizer = self.tokenizer\n            if occ3_descriptor is not None:\n                from occ3_sglang.latent_worker import admit_request\n\n                req.occ3_scheduler = self\n                try:\n                    admit_request(self, req, occ3_descriptor)\n                except Exception:\n                    self._occ3_reject_received(recv_req, \"occ3_admission_failed\")\n                    return\n                req.occ3_queue_deadline = min(occ3_descriptor.deadline, time.monotonic() + 30.0)\n\n            if radix_native_session:"
         },
         {
           "before": "    def init_req_max_new_tokens(self, req):\n        input_len = len(req.origin_input_ids)",
