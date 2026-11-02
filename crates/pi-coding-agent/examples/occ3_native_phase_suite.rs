@@ -5506,9 +5506,21 @@ async fn run_arm_phase(
                     } else {
                         Value::Null
                     };
-                    evidence["value_distance"] =
-                        json!(value_edit_distance(&intended_value, &parsed_answer));
+                    let distance = value_edit_distance(&intended_value, &parsed_answer);
+                    evidence["value_distance"] = json!(distance);
                     evidence["attempts_used"] = json!(1);
+                    // The same per-attempt record the ladder publishes, so the
+                    // strict pin and corpus canaries carry one-send diagnostics.
+                    evidence["attempts"] = json!([{
+                        "attempt": 1,
+                        "source_session": source_id.clone(),
+                        "receiver_session": receiver_id.clone(),
+                        "value_distance": distance,
+                        "answer_sha256": evidence["answer_sha256"].clone(),
+                        "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
+                        "structural_ok": evidence["structural_ok"].clone(),
+                        "source_turn_error": evidence["source_turn_error"].clone(),
+                    }]);
                     evidence["retry_policy"] = json!({
                         "schema": "optimus.occ3.arm-retry-policy.v1",
                         "tolerance": tolerance_policy.tolerance,
@@ -5568,7 +5580,37 @@ async fn run_arm_phase(
     };
     let (mut case_evidence, trial_error) = match case_result {
         Ok(evidence) => (evidence, None),
-        Err(error) => (json!({"trial_error": error.clone()}), Some(error)),
+        Err(error) => {
+            // A single-send NATIVE total failure publishes the same fieldset the
+            // ladder publishes on total failure (TOLERANCE-RETRY.md).
+            let mut evidence = json!({"trial_error": error.clone()});
+            if arm == Arm::Native {
+                evidence["arm_accepted"] = json!(false);
+                evidence["accept_reason"] = Value::Null;
+                evidence["value_distance"] = Value::Null;
+                evidence["attempts_used"] = json!(1);
+                evidence["attempts"] = json!([{
+                    "attempt": 1,
+                    "source_session": source_id.clone(),
+                    "receiver_session": receiver_id.clone(),
+                    "trial_error": error.clone(),
+                }]);
+                evidence["retry_policy"] = json!({
+                    "schema": "optimus.occ3.arm-retry-policy.v1",
+                    "tolerance": tolerance_policy.tolerance,
+                    "max_attempts": tolerance_policy.max_attempts,
+                    "enabled": false,
+                    "claim_scope": "arm",
+                    "scope": if corpus.is_some() {
+                        "corpus-canary-precommitted-identity"
+                    } else {
+                        "strict-pin-single-send"
+                    },
+                });
+                evidence["strict_value_recovery"] = json!(false);
+            }
+            (evidence, Some(error))
+        }
     };
     // Live-only token-count cross-check for the token arms; the receipt-span
     // verdict stays authoritative.
@@ -5875,6 +5917,9 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
 /// The records-injecting variant: the tolerance ladder's offline
 /// regressions model the live canary defect shapes (a receiver that decodes
 /// the value one or more characters short) without touching the network.
+// Used only by the windows-only ladder fixture test; the unconditional
+// allow keeps non-test builds (and Linux test builds) warning-free.
+#[allow(dead_code)]
 async fn offline_arm_trial_with_records(
     arm: Arm,
     records: FixtureRecords,
@@ -10817,6 +10862,27 @@ mod gate_tests {
         std::env::remove_var("OCC3_ARM_TOLERANCE");
         let error = strict.expect_err("the strict pin must refuse a one-character error");
         assert!(error.contains("arm trial failed"), "{error}");
+        // Red-first for the single-send fieldset: the strict pin's evidence
+        // carries the same attempts array the ladder publishes.
+        let path = error
+            .split("(evidence: ")
+            .nth(1)
+            .and_then(|rest| rest.split("): ").next())
+            .unwrap_or_else(|| panic!("no evidence path in {error}"));
+        let strict_evidence: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        let attempts = strict_evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1, "{strict_evidence}");
+        assert_eq!(attempts[0]["value_distance"], json!(1));
+        assert_eq!(
+            strict_evidence["retry_policy"]["enabled"],
+            json!(false),
+            "{strict_evidence}"
+        );
+        assert_eq!(strict_evidence["arm_accepted"], json!(false));
+        assert_eq!(strict_evidence["strict_value_recovery"], json!(false));
     }
 
     #[cfg(windows)]
