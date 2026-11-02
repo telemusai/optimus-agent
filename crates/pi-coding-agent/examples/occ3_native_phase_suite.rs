@@ -814,6 +814,12 @@ struct FixtureRecords {
     /// Test-only task-mode injection: the canned answer the synthetic
     /// receiver recovers from the delivered state (the oracle's answer).
     task_answer: Option<String>,
+    /// Test-only live-defect injection: the synthetic receiver's recovered
+    /// answer drops this many trailing characters of the captured fact -
+    /// canary-1's measured shape (2026-11-01), one deletion at the value
+    /// boundary. The tolerance ladder's offline regressions use it; the
+    /// default 0 mirrors an exact decode.
+    receiver_answer_drop_chars: usize,
     /// Test-only span injection: model a thinking-bearing sender whose
     /// retained content-tail window is a strict subset of the accepted
     /// spans (the live corpus shape: span_message_truncated=true with the
@@ -1493,17 +1499,30 @@ async fn serve(
                             assert_eq!(attachment["runtime_id"], epoch);
                             assert_eq!(attachment["runtime_generation"], json!(generation));
                             let receipt = json!({"attachment":attachment,"consumed":true,"injected_state":true,"fallback_used":false});
-                            let task_answer = {
+                            let (task_answer, drop_chars) = {
                                 let records_guard = records.lock().unwrap();
-                                records_guard.task_answer.clone()
+                                (
+                                    records_guard.task_answer.clone(),
+                                    records_guard.receiver_answer_drop_chars,
+                                )
+                            };
+                            let recovered = task_answer
+                                .as_deref()
+                                .or(capture.fact.as_deref())
+                                .unwrap_or("UNKNOWN");
+                            let recovered = if drop_chars > 0 {
+                                let total = recovered.chars().count();
+                                recovered
+                                    .chars()
+                                    .take(total.saturating_sub(drop_chars))
+                                    .collect::<String>()
+                            } else {
+                                recovered.to_string()
                             };
                             let output = sse(
                                 &rid(&handle),
                                 "unused",
-                                Some(task_answer
-                                    .as_deref()
-                                    .or(capture.fact.as_deref())
-                                    .unwrap_or("UNKNOWN")),
+                                Some(recovered.as_str()),
                             );
                             send_sse(&mut socket, output, vec![("x-optimus-occ3-receipt", receipt.to_string())]).await;
                             return;
@@ -2011,6 +2030,12 @@ fn validate_span_policy_env() -> Result<(), String> {
             SourceSpanArming::DEFAULT.span_policy
         )
     })
+}
+
+/// Refuse an OCC3 arm-tolerance knob pair the ladder would refuse at
+/// verdict time, before any enrollment or send side effect.
+fn validate_arm_tolerance_env() -> Result<(), String> {
+    ArmTolerancePolicy::current().map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -5033,6 +5058,316 @@ fn write_corpus_turn_evidence(journal: &Path, evidence: &Value) -> Result<PathBu
     )
 }
 
+// ---------------------------------------------------------------------------
+// NATIVE-arm bounded send-with-tolerance ladder (2026-11-02 decision): the
+// arm accepts a recovered value whose character edit distance from the
+// intended value is at most OCC3_ARM_TOLERANCE (default 1), re-sends the
+// message with a FRESH capture at most OCC3_ARM_MAX_ATTEMPTS times (default
+// 3, ceiling 3: the message is sent no more than three times), and after
+// the final send accepts the best structurally valid transmission (lowest
+// distance, earliest attempt wins ties) instead of failing the arm.
+// Tolerance 0 restores the historical strict single-send verdict exactly;
+// pre-registered strict-L1 windows pin it. The ladder applies only to the
+// plain NATIVE arm with a minted value: corpus canaries keep their
+// pre-committed single-turn identity, and the token/control arms keep their
+// own pre-registered verdicts.
+// ---------------------------------------------------------------------------
+
+const ARM_TOLERANCE_ENV: &str = "OCC3_ARM_TOLERANCE";
+const ARM_MAX_ATTEMPTS_ENV: &str = "OCC3_ARM_MAX_ATTEMPTS";
+const DEFAULT_ARM_TOLERANCE: usize = 1;
+const DEFAULT_ARM_MAX_ATTEMPTS: usize = 3;
+/// The small-error ceiling: this policy tolerates character-level noise,
+/// not a different message.
+const ARM_TOLERANCE_CEILING: usize = 4;
+/// The decision bounds sends at three; the ceiling keeps the knob honest.
+const ARM_MAX_ATTEMPTS_CEILING: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArmTolerancePolicy {
+    /// Maximum accepted character edit distance between the intended
+    /// value and the recovered answer. 0 is the historical strict verdict.
+    tolerance: usize,
+    /// Total sends the arm may spend on one message (1 = single-send).
+    max_attempts: usize,
+}
+
+impl ArmTolerancePolicy {
+    /// Parse the operator knobs; unset keeps the defaults, and malformed or
+    /// out-of-bound values are refused (never silently coerced).
+    fn parse(tolerance: Option<&str>, max_attempts: Option<&str>) -> Result<Self, String> {
+        let tolerance = match tolerance {
+            None => DEFAULT_ARM_TOLERANCE,
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                format!("{ARM_TOLERANCE_ENV}={raw:?} is not a non-negative integer")
+            })?,
+        };
+        if tolerance > ARM_TOLERANCE_CEILING {
+            return Err(format!(
+                "{ARM_TOLERANCE_ENV}={tolerance} exceeds the small-error ceiling {ARM_TOLERANCE_CEILING}; this policy tolerates character-level noise, not a different message"
+            ));
+        }
+        let max_attempts = match max_attempts {
+            None => DEFAULT_ARM_MAX_ATTEMPTS,
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                format!("{ARM_MAX_ATTEMPTS_ENV}={raw:?} is not a non-negative integer")
+            })?,
+        };
+        if max_attempts == 0 {
+            return Err(format!(
+                "{ARM_MAX_ATTEMPTS_ENV}=0 must allow at least one send"
+            ));
+        }
+        if max_attempts > ARM_MAX_ATTEMPTS_CEILING {
+            return Err(format!(
+                "{ARM_MAX_ATTEMPTS_ENV}={max_attempts} exceeds the ceiling {ARM_MAX_ATTEMPTS_CEILING} (the decision bounds sends at three)"
+            ));
+        }
+        Ok(Self {
+            tolerance,
+            max_attempts,
+        })
+    }
+
+    fn current() -> Result<Self, String> {
+        Self::parse(
+            std::env::var(ARM_TOLERANCE_ENV).ok().as_deref(),
+            std::env::var(ARM_MAX_ATTEMPTS_ENV).ok().as_deref(),
+        )
+    }
+
+    fn enabled(&self) -> bool {
+        self.tolerance > 0
+    }
+}
+
+/// Character-level Levenshtein distance over Unicode scalar values. The
+/// measured live failure modes were single-character deletions and
+/// mid-string substitutions inside fully retained rows, so edit distance
+/// (not a prefix or hash comparison) is the honest error metric.
+fn value_edit_distance(expected: &str, observed: &str) -> usize {
+    let expected: Vec<char> = expected.chars().collect();
+    let observed: Vec<char> = observed.chars().collect();
+    if expected.is_empty() {
+        return observed.len();
+    }
+    if observed.is_empty() {
+        return expected.len();
+    }
+    let mut previous: Vec<usize> = (0..=observed.len()).collect();
+    let mut current = vec![0usize; observed.len() + 1];
+    for (row, expected_char) in expected.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, observed_char) in observed.iter().enumerate() {
+            let substitute = previous[column] + usize::from(expected_char != observed_char);
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(substitute);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[observed.len()]
+}
+
+/// Why an attempt was accepted: exact match, within the tolerated
+/// character distance, or the best-effort fallback after the final send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmAcceptReason {
+    Exact,
+    WithinTolerance,
+    BestEffortFallback,
+}
+
+impl ArmAcceptReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::WithinTolerance => "within_tolerance",
+            Self::BestEffortFallback => "best_effort_fallback",
+        }
+    }
+}
+
+/// One send's selection input: the attempt index (1-based) and the
+/// recovered value's edit distance from the intended value. `None` marks a
+/// send with no valid transmission (request error or a structurally
+/// invalid arm), which can never be selected as accepted.
+#[derive(Clone, Copy, Debug)]
+struct AttemptSelection {
+    index: usize,
+    distance: Option<usize>,
+}
+
+/// The bounded-ladder decision, pure so the accept order is pinned by
+/// tests without a fixture server: the first structurally valid send
+/// within tolerance is accepted (exact or tolerated); when every send
+/// misses and the policy is tolerant, the best transmitted value is
+/// accepted after the final attempt (lowest distance, earliest attempt
+/// wins ties); strict tolerance 0 never accepts an out-of-tolerance value,
+/// and nothing transmitted means nothing to accept.
+fn select_accepted_attempt(
+    attempts: &[AttemptSelection],
+    tolerance: usize,
+) -> Option<(usize, ArmAcceptReason)> {
+    for attempt in attempts {
+        if let Some(distance) = attempt.distance {
+            if distance <= tolerance {
+                let reason = if distance == 0 {
+                    ArmAcceptReason::Exact
+                } else {
+                    ArmAcceptReason::WithinTolerance
+                };
+                return Some((attempt.index, reason));
+            }
+        }
+    }
+    if tolerance == 0 {
+        // Strict mode: out-of-tolerance answers are never accepted, not
+        // even as the best-effort fallback.
+        return None;
+    }
+    let best = attempts
+        .iter()
+        .filter_map(|attempt| attempt.distance.map(|distance| (distance, attempt.index)))
+        .min()?;
+    Some((best.1, ArmAcceptReason::BestEffortFallback))
+}
+
+/// The NATIVE arm's bounded send-with-tolerance ladder: each attempt is
+/// one full positive case with FRESH session ids (a live serving process
+/// binds a session id to its first enrollment, so every re-send needs its
+/// own); the first structurally valid transmission within tolerance is
+/// accepted; after the final send the best transmitted value is accepted
+/// rather than failing the arm. Never returns Err for a failed send: every
+/// attempt and the selection are carried in the returned evidence, so a
+/// total failure still publishes per-attempt diagnostics.
+async fn run_native_arm_tolerance_ladder(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    arm: Arm,
+    intended_value: &str,
+    plan: &PositiveArmPlan,
+    policy: ArmTolerancePolicy,
+) -> Value {
+    let mut attempts: Vec<Value> = Vec::new();
+    let mut selections: Vec<AttemptSelection> = Vec::new();
+    let mut transmitted: Vec<(usize, Value)> = Vec::new();
+    let mut last_error: Option<String> = None;
+    for index in 1..=policy.max_attempts {
+        // Fresh ids per send: the serving process binds each session id to
+        // its first enrollment, so a re-send never reuses one.
+        let source_id = format!(
+            "{}-source-{}-a{index}",
+            arm.trial_suffix(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let receiver_id = format!(
+            "{}-receiver-{}-a{index}",
+            arm.trial_suffix(),
+            uuid::Uuid::new_v4().simple()
+        );
+        match run_positive_case(
+            env,
+            connector,
+            &source_id,
+            &receiver_id,
+            intended_value,
+            Some(plan),
+            SourceMode::current(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let mut evidence = outcome.arm_evidence;
+                let structural_ok = positive_structural_ok(&evidence);
+                evidence["structural_ok"] = json!(structural_ok);
+                let parsed_answer = evidence["parsed_answer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let distance = value_edit_distance(intended_value, &parsed_answer);
+                attempts.push(json!({
+                    "attempt": index,
+                    "source_session": source_id,
+                    "receiver_session": receiver_id,
+                    "value_distance": distance,
+                    "answer_sha256": evidence["answer_sha256"].clone(),
+                    "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
+                    "structural_ok": structural_ok,
+                    "source_turn_error": evidence["source_turn_error"].clone(),
+                }));
+                if structural_ok {
+                    selections.push(AttemptSelection {
+                        index,
+                        distance: Some(distance),
+                    });
+                    transmitted.push((index, evidence));
+                } else {
+                    selections.push(AttemptSelection { index, distance: None });
+                }
+            }
+            Err(error) => {
+                last_error = Some(error.clone());
+                attempts.push(json!({
+                    "attempt": index,
+                    "source_session": source_id,
+                    "receiver_session": receiver_id,
+                    "trial_error": error,
+                }));
+                selections.push(AttemptSelection { index, distance: None });
+            }
+        }
+        // Stop sending once a transmission is within tolerance; the final
+        // selection below stays the single source of truth for ordering.
+        if selections
+            .last()
+            .is_some_and(|selection| selection.distance.is_some_and(|d| d <= policy.tolerance))
+        {
+            break;
+        }
+    }
+    let attempts_used = selections.len();
+    let retry_policy = json!({
+        "schema": "optimus.occ3.arm-retry-policy.v1",
+        "tolerance": policy.tolerance,
+        "max_attempts": policy.max_attempts,
+        "enabled": policy.enabled(),
+        "claim_scope": "arm",
+        "scope": "native-arm-fresh-canary",
+    });
+    match select_accepted_attempt(&selections, policy.tolerance) {
+        Some((index, reason)) => {
+            let mut evidence = transmitted
+                .iter()
+                .find(|(attempt_index, _)| *attempt_index == index)
+                .map(|(_, evidence)| evidence.clone())
+                .expect("the accepted attempt carried a valid transmission");
+            evidence["arm_accepted"] = json!(true);
+            evidence["accept_reason"] = json!(reason.as_str());
+            evidence["value_distance"] = json!(value_edit_distance(
+                intended_value,
+                evidence["parsed_answer"].as_str().unwrap_or_default()
+            ));
+            evidence["attempts_used"] = json!(attempts_used);
+            evidence["attempts"] = json!(attempts);
+            evidence["retry_policy"] = retry_policy;
+            evidence["strict_value_recovery"] = evidence["semantic_nonce_match"].clone();
+            evidence
+        }
+        None => json!({
+            "trial_error": last_error
+                .unwrap_or_else(|| "no_valid_transmission".to_string()),
+            "arm_accepted": json!(false),
+            "accept_reason": Value::Null,
+            "value_distance": Value::Null,
+            "attempts_used": json!(attempts_used),
+            "attempts": attempts,
+            "retry_policy": retry_policy,
+            "strict_value_recovery": json!(false),
+        }),
+    }
+}
+
 /// One experiment-arm trial: verify the staging the driver can see,
 /// pre-commit the private value, burn the one-shot phase claim, run the
 /// arm's case, ALWAYS publish the per-arm evidence JSON (a failed trial is
@@ -5103,8 +5438,34 @@ async fn run_arm_phase(
         format!("{}-source-b-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
     let receiver_id =
         format!("{}-receiver-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    // The bounded send-with-tolerance ladder resolves its operator knobs
+    // before any send: a malformed value refuses the arm here rather than
+    // mid-ladder after a partial spend.
+    let tolerance_policy = ArmTolerancePolicy::current()?;
     // Run the arm's case; a structural/protocol error still yields evidence.
-    let case_result: Result<Value, String> = match arm {
+    // The plain NATIVE arm with a minted value runs the tolerance ladder
+    // (fresh re-sends, first within-tolerance acceptance, best-effort
+    // after the final send); every other arm keeps its pre-registered
+    // single-shot verdict.
+    let tolerance_ladder_applies =
+        arm == Arm::Native && corpus.is_none() && tolerance_policy.enabled();
+    let case_result: Result<Value, String> = if tolerance_ladder_applies {
+        let plan = PositiveArmPlan {
+            // The same final-content pin as the single-shot positive arms:
+            // the span must contain the message the arm measures.
+            message_pinned: true,
+        };
+        Ok(run_native_arm_tolerance_ladder(
+            env,
+            &connector,
+            arm,
+            &intended_value,
+            &plan,
+            tolerance_policy,
+        )
+        .await)
+    } else {
+        match arm {
         Arm::Native | Arm::TokenFull | Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
             let plan = PositiveArmPlan {
                 // Live 2026-10-30 window icalib-p3final-20261030T235450Z: unpinned
@@ -5128,6 +5489,40 @@ async fn run_arm_phase(
             .map(|outcome| {
                 let mut evidence = outcome.arm_evidence;
                 evidence["structural_ok"] = json!(positive_structural_ok(&evidence));
+                if arm == Arm::Native {
+                    // Single-send NATIVE metadata (strict pin or corpus
+                    // canary): the same fieldset the ladder publishes, with
+                    // the ladder disabled and its reason recorded. The
+                    // strict verdict stays arm_accepted ==
+                    // semantic_nonce_match.
+                    let parsed_answer = evidence["parsed_answer"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let strict = evidence["semantic_nonce_match"] == json!(true);
+                    evidence["arm_accepted"] = json!(strict);
+                    evidence["accept_reason"] = if strict {
+                        json!("exact")
+                    } else {
+                        Value::Null
+                    };
+                    evidence["value_distance"] =
+                        json!(value_edit_distance(&intended_value, &parsed_answer));
+                    evidence["attempts_used"] = json!(1);
+                    evidence["retry_policy"] = json!({
+                        "schema": "optimus.occ3.arm-retry-policy.v1",
+                        "tolerance": tolerance_policy.tolerance,
+                        "max_attempts": tolerance_policy.max_attempts,
+                        "enabled": false,
+                        "claim_scope": "arm",
+                        "scope": if corpus.is_some() {
+                            "corpus-canary-precommitted-identity"
+                        } else {
+                            "strict-pin-single-send"
+                        },
+                    });
+                    evidence["strict_value_recovery"] = json!(strict);
+                }
                 if let Some(corpus) = corpus {
                     // The canary's corpus identity: the manifest turn plus
                     // the capture the positive case armed (spec 2.2.5); the
@@ -5169,6 +5564,7 @@ async fn run_arm_phase(
             .await
             .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
         }
+        }
     };
     let (mut case_evidence, trial_error) = match case_result {
         Ok(evidence) => (evidence, None),
@@ -5202,7 +5598,13 @@ async fn run_arm_phase(
     // oracle); WRONG_SENDER must report the delivered value and not the
     // other.
     let case_passed = match arm {
-        Arm::Native => case_evidence["semantic_nonce_match"] == json!(true)
+        // The bounded send-with-tolerance ladder (2026-11-02): the arm
+        // passes on a structurally valid transmission whose value distance
+        // is within policy - exact, tolerated, or the best-effort fallback
+        // after the final send. Strict windows pin OCC3_ARM_TOLERANCE=0,
+        // which keeps arm_accepted == semantic_nonce_match (the historical
+        // exact single-send verdict).
+        Arm::Native => case_evidence["arm_accepted"] == json!(true)
             && case_evidence["structural_ok"] == json!(true),
         Arm::TokenFull => {
             // Mark, never silently pass: the trial is invalid as TOKEN_FULL
@@ -5271,6 +5673,15 @@ async fn run_arm_phase(
         "coverage",
         // Absent for plain arm trials; the corpus-turn canary's identity.
         "corpus_turn",
+        // The NATIVE arm's bounded send-with-tolerance fields (absent for
+        // the token/control arms, which keep single-shot verdicts).
+        "arm_accepted",
+        "accept_reason",
+        "value_distance",
+        "attempts_used",
+        "attempts",
+        "retry_policy",
+        "strict_value_recovery",
     ] {
         if let Some(value) = evidence["case"].get(key).cloned() {
             evidence[key] = value;
@@ -5305,6 +5716,14 @@ async fn run_arm_phase(
         "answer_sha256": evidence["answer_sha256"].clone(),
         "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
         "coverage_complete": evidence["coverage"]["coverage_complete"].clone(),
+        // The NATIVE arm's tolerance verdict surface: any strict-L1 gate
+        // reads strict_value_recovery (or pins OCC3_ARM_TOLERANCE=0) rather
+        // than trusting arm_case_passed alone.
+        "strict_value_recovery": evidence["strict_value_recovery"].clone(),
+        "arm_accepted": evidence["arm_accepted"].clone(),
+        "accept_reason": evidence["accept_reason"].clone(),
+        "value_distance": evidence["value_distance"].clone(),
+        "attempts_used": evidence["attempts_used"].clone(),
     });
     if let Some(error) = trial_error {
         return Err(error);
@@ -5447,6 +5866,22 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
     let trial =
         offline_trial_context(journal, Arc::new(Mutex::new(FixtureRecords::default())), "arm")
             .await?;
+    let result =
+        run_arm_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, arm, None).await;
+    trial.server.abort();
+    result
+}
+
+/// The records-injecting variant: the tolerance ladder's offline
+/// regressions model the live canary defect shapes (a receiver that decodes
+/// the value one or more characters short) without touching the network.
+async fn offline_arm_trial_with_records(
+    arm: Arm,
+    records: FixtureRecords,
+) -> Result<Value, String> {
+    let journal = offline_trial_journal(None, "occ3-arm-trial")?;
+    let trial =
+        offline_trial_context(journal, Arc::new(Mutex::new(records)), "arm").await?;
     let result =
         run_arm_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, arm, None).await;
     trial.server.abort();
@@ -8783,6 +9218,7 @@ async fn real_main() -> Result<(), i32> {
     if let Err(error) = validate_receiver_thinking_env()
         .and_then(|_| validate_source_thinking_env())
         .and_then(|_| validate_span_policy_env())
+        .and_then(|_| validate_arm_tolerance_env())
     {
         eprintln!("Native phase-suite producer refused: {error}");
         return Err(1);
@@ -9605,6 +10041,168 @@ mod gate_tests {
         server.abort();
     }
     // ------------------------------------------------------------------
+    // NATIVE-arm bounded send-with-tolerance ladder (2026-11-02 decision).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn value_edit_distance_counts_substitutions_deletions_and_insertions() {
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd1234"), 0);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd123X"), 1);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd123"), 1);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd12345"), 1);
+        // A transposition is a substitution pair under Levenshtein.
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd2134"), 2);
+        assert_eq!(value_edit_distance("occ3-abcd1234", ""), 13);
+        assert_eq!(value_edit_distance("", "occ3-abcd1234"), 13);
+        // Unicode scalar values count as single characters.
+        assert_eq!(value_edit_distance("occ3-\u{00e9}x", "occ3-ex"), 1);
+        assert_eq!(value_edit_distance("\u{00e9}\u{00e9}", "\u{00e9}"), 1);
+    }
+
+    #[test]
+    fn arm_tolerance_policy_parses_defaults_bounds_and_refuses_garbage() {
+        assert_eq!(
+            ArmTolerancePolicy::parse(None, None).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 1,
+                max_attempts: 3
+            }
+        );
+        assert_eq!(
+            ArmTolerancePolicy::parse(Some("0"), None).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 0,
+                max_attempts: 3
+            }
+        );
+        assert_eq!(
+            ArmTolerancePolicy::parse(Some("2"), Some("2")).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 2,
+                max_attempts: 2
+            }
+        );
+        // The small-error ceiling.
+        assert!(ArmTolerancePolicy::parse(Some("5"), None).is_err());
+        assert!(ArmTolerancePolicy::parse(Some("-1"), None).is_err());
+        assert!(ArmTolerancePolicy::parse(Some("one"), None).is_err());
+        // "No more than three times" is enforced by the ceiling.
+        assert!(ArmTolerancePolicy::parse(None, Some("0")).is_err());
+        assert!(ArmTolerancePolicy::parse(None, Some("4")).is_err());
+        assert!(ArmTolerancePolicy::parse(None, Some("many")).is_err());
+    }
+
+    #[test]
+    fn tolerance_ladder_accepts_the_first_send_within_tolerance() {
+        let attempts = [
+            AttemptSelection {
+                index: 1,
+                distance: Some(2),
+            },
+            AttemptSelection {
+                index: 2,
+                distance: None,
+            },
+            AttemptSelection {
+                index: 3,
+                distance: Some(1),
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&attempts, 1),
+            Some((3, ArmAcceptReason::WithinTolerance))
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 2,
+                    distance: Some(0),
+                }],
+                1
+            ),
+            Some((2, ArmAcceptReason::Exact))
+        );
+    }
+
+    #[test]
+    fn tolerance_ladder_best_effort_picks_lowest_distance_earliest_attempt() {
+        let attempts = [
+            AttemptSelection {
+                index: 1,
+                distance: Some(2),
+            },
+            AttemptSelection {
+                index: 2,
+                distance: Some(4),
+            },
+            AttemptSelection {
+                index: 3,
+                distance: Some(2),
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&attempts, 1),
+            Some((1, ArmAcceptReason::BestEffortFallback))
+        );
+        // Errored or structurally invalid sends are never selected.
+        let errored = [
+            AttemptSelection {
+                index: 1,
+                distance: None,
+            },
+            AttemptSelection {
+                index: 2,
+                distance: Some(9),
+            },
+            AttemptSelection {
+                index: 3,
+                distance: None,
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&errored, 1),
+            Some((2, ArmAcceptReason::BestEffortFallback))
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: None,
+                }],
+                1
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tolerance_zero_keeps_the_strict_verdict() {
+        // Strict mode never accepts an out-of-tolerance answer, not even as
+        // the best-effort fallback: pinning OCC3_ARM_TOLERANCE=0 restores
+        // the historical exact single-send verdict.
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: Some(1),
+                }],
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: Some(0),
+                }],
+                0
+            ),
+            Some((1, ArmAcceptReason::Exact))
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Experiment-arm surface (campaign section 5).
     // ------------------------------------------------------------------
 
@@ -10144,6 +10742,81 @@ mod gate_tests {
     #[tokio::test]
     async fn native_arm_trial_passes_offline() {
         arm_trial_assertions(Arm::Native, offline_arm_trial(Arm::Native, None).await).await;
+    }
+
+    /// Red-first (2026-11-02): on HEAD a one-character deletion in the
+    /// recovered value fails the NATIVE arm strictly - canary-1's measured
+    /// shape, 40 of 41 characters. The three tolerance scenarios run in
+    /// one test so the OCC3_ARM_TOLERANCE env pin is never observable to a
+    /// concurrently running trial: (1) the default tolerant policy accepts
+    /// a one-character error on the first send without re-sending, records
+    /// the strict verdict separately, and the arm passes; (2) a
+    /// two-character error is re-sent up to the three-send bound and then
+    /// accepted best-effort; (3) the strict pin refuses the same
+    /// one-character error exactly like HEAD.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_arm_tolerance_ladder_accepts_bounded_error() {
+        // (1) One character short: accepted within tolerance, one send.
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 1,
+            ..Default::default()
+        };
+        let summary = offline_arm_trial_with_records(Arm::Native, records)
+            .await
+            .expect("tolerant arm trial failed");
+        assert_eq!(summary["arm_case_passed"], json!(true), "{summary}");
+        assert_eq!(summary["accept_reason"], json!("within_tolerance"));
+        assert_eq!(summary["attempts_used"], json!(1));
+        assert_eq!(summary["value_distance"], json!(1));
+        // The strict verdict stays measurable, not silently replaced.
+        assert_eq!(summary["strict_value_recovery"], json!(false));
+        assert_eq!(summary["semantic_nonce_match"], json!(false));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_arm_evidence(&std::env::temp_dir(), &evidence_name)
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        let attempts = evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1, "{evidence}");
+        assert_eq!(attempts[0]["value_distance"], json!(1));
+        assert_eq!(
+            evidence["retry_policy"]["enabled"],
+            json!(true),
+            "{evidence}"
+        );
+
+        // (2) Two characters short: three sends, then best-effort accept.
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 2,
+            ..Default::default()
+        };
+        let summary = offline_arm_trial_with_records(Arm::Native, records)
+            .await
+            .expect("best-effort arm trial failed");
+        assert_eq!(summary["arm_case_passed"], json!(true), "{summary}");
+        assert_eq!(summary["accept_reason"], json!("best_effort_fallback"));
+        assert_eq!(summary["attempts_used"], json!(3));
+        assert_eq!(summary["value_distance"], json!(2));
+        assert_eq!(summary["strict_value_recovery"], json!(false));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_arm_evidence(&std::env::temp_dir(), &evidence_name)
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        let attempts = evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 3, "{evidence}");
+        for attempt in attempts {
+            assert_eq!(attempt["value_distance"], json!(2));
+        }
+
+        // (3) Strict pin: the same one-character error refuses the arm,
+        // exactly like the historical single-send verdict.
+        std::env::set_var("OCC3_ARM_TOLERANCE", "0");
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 1,
+            ..Default::default()
+        };
+        let strict = offline_arm_trial_with_records(Arm::Native, records).await;
+        std::env::remove_var("OCC3_ARM_TOLERANCE");
+        let error = strict.expect_err("the strict pin must refuse a one-character error");
+        assert!(error.contains("arm trial failed"), "{error}");
     }
 
     #[cfg(windows)]
