@@ -54,8 +54,15 @@ import sys
 POOL_SCHEMA = "optimus.occ3.calibration-pool.v1"
 PARTITION_NAMES = ("fit", "validation", "test")
 #: Provenance fields that must agree across every pooled corpus.
-SHARED_PROVENANCE_KEYS = ("method_id", "hidden_dim", "layer_index",
+#: method_id is deliberately absent: a supplemental corpus collected under
+#: a different latent method is the distribution shift pooling exists to
+#: cover, so its id is unioned into POOLED_METHOD_IDS instead of refusing.
+SHARED_PROVENANCE_KEYS = ("hidden_dim", "layer_index",
                            "marker_profile_max_len")
+#: Manifest field recording every pooled input's method_id, sorted and
+#: comma-joined, present only when the ids actually differ (byte-identity
+#: for agreeing corpora; the value cap is the manifest provenance quota).
+POOLED_METHOD_IDS = "pooled_method_ids"
 #: Provenance fields allowed to differ (the artifact a corpus was collected
 #: under); distinct values are recorded, comma-joined in sorted order.
 MERGED_PROVENANCE_KEYS = ("artifact_digest",)
@@ -133,6 +140,18 @@ def _merge_provenance(corpora):
         _require(all(value == values[0] for value in values), "identity",
                  "provenance field %s differs across corpora" % key)
         merged[key] = values[0]
+    # method_id keeps the FIRST corpus's value (the legacy corpus is first)
+    # so any consumer reading it as one string stays fed; when a pooled
+    # corpus was collected under a different latent method, the union is
+    # recorded instead of refusing - nothing is silently dropped.
+    method_ids = [corpus["provenance"].get("method_id") for corpus in corpora]
+    method_ids = [value for value in method_ids if value is not None]
+    _require(method_ids, "identity", "missing provenance field method_id")
+    merged["method_id"] = method_ids[0]
+    if len(set(method_ids)) > 1:
+        union = ",".join(sorted(set(method_ids)))
+        _require(len(union) <= 256, "quota", "too many pooled method ids")
+        merged[POOLED_METHOD_IDS] = union
     for key in MERGED_PROVENANCE_KEYS:
         values = sorted({corpus["provenance"][key] for corpus in corpora
                          if corpus["provenance"].get(key) is not None})

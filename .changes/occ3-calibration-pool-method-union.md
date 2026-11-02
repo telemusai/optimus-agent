@@ -1,0 +1,1 @@
+- Changed: calibration_pool now pools corpora collected under different latent method ids: the merged provenance keeps the first corpus's method_id and records every input method id in pooled_method_ids (sorted, comma-joined) instead of refusing the pool; corpora with agreeing method ids pool to byte-identical output as before, and every other provenance mismatch still refuses.
