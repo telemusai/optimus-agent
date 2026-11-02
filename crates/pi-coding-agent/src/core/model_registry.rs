@@ -29,6 +29,12 @@ use crate::core::prime_inference_models::{
 };
 use crate::core::provider_display_names::built_in_provider_display_names;
 
+/// Built-in DGX model catalog. Declared through `#[path]` here (the
+/// `auth_storage.rs` -> `claude_code_auth.rs` pattern) because `core/mod.rs`
+/// is owned by the dgx-auth work; the file is `core/dgx_models.rs`.
+#[path = "dgx_models.rs"]
+pub mod dgx_models;
+
 // ---------------------------------------------------------------------------
 // pi-ai boundary: models.ts `getProviders()` / `getModels(provider)`
 // ---------------------------------------------------------------------------
@@ -1739,10 +1745,15 @@ impl ModelRegistry {
         model_overrides: &IndexMap<String, IndexMap<String, ModelOverride>>,
         live_prime_inference_models: Option<Vec<Model>>,
     ) -> Vec<Model> {
-        let bundled_models: Vec<Model> = get_providers()
+        let mut bundled_models: Vec<Model> = get_providers()
             .iter()
             .flat_map(|provider| get_models(provider))
             .collect();
+        // The DGX gateway models ship credential-less; models.json entries
+        // (a DGX Auth File import) override them by provider+id below.
+        bundled_models.extend(dgx_models::build_dgx_models(&|provider| {
+            self.has_configured_provider_request_auth(provider)
+        }));
         merge_prime_inference_models(&bundled_models, live_prime_inference_models.as_deref())
             .into_iter()
             .map(|model| {
@@ -2085,7 +2096,10 @@ impl ModelRegistry {
                 {
                     return false;
                 }
-                self.has_configured_auth(model)
+                // The bundled DGX models ship credential-less and stay listed
+                // (with their needs-credentials name marker) so `model list`
+                // surfaces them on a fresh install.
+                self.has_configured_auth(model) || dgx_models::is_dgx_provider(&model.provider)
             })
             .cloned()
             .collect();
@@ -2980,6 +2994,20 @@ impl ModelRegistry {
 
         if let Err(error) = self.auth_storage.validate_claude_code_endpoint(model) {
             return ResolvedRequestAuth { error: Some(error), ..Default::default() };
+        }
+
+        // The bundled DGX models ship without an endpoint or credentials.
+        // Without models.json request auth (a DGX Auth File import) they fail
+        // fast with the import hint instead of an empty-endpoint error.
+        if dgx_models::is_dgx_provider(&model.provider)
+            && !self.has_configured_provider_request_auth(&model.provider)
+        {
+            return ResolvedRequestAuth {
+                ok: false,
+                api_key: None,
+                headers: None,
+                error: Some(dgx_models::dgx_credentials_required_message(&model.provider)),
+            };
         }
 
         let auth_storage_auth = match self
@@ -4317,16 +4345,83 @@ mod tests {
         assert!(all.iter().any(|model| model.provider == "anthropic"));
 
         let available = registry.refresh_available_models().await;
-        // No auth in the in-memory storage and no ambient credentials, so nothing
-        // is available (TS model-registry.test.ts:1198-1200).
-        assert!(available.is_empty());
+        // No auth in the in-memory storage and no ambient credentials, so only
+        // the bundled credential-less DGX models are available
+        // (TS model-registry.test.ts:1198-1200 plus the shipped DGX catalog).
+        let available_ids: Vec<String> = available
+            .iter()
+            .map(|model| format!("{}/{}", model.provider, model.id))
+            .collect();
+        assert_eq!(
+            available_ids,
+            vec![
+                "dgx-glm53/glm-5.3".to_string(),
+                "dgx-k3/kimi-k3".to_string(),
+                "dgx-deepseek41/deepseek-v4.1-flash-1017".to_string(),
+            ]
+        );
         assert!(!registry.has_configured_auth(&all[0]));
 
         let snapshot = registry.refresh_model_catalog().await;
-        assert!(snapshot.configured_providers.is_empty());
+        assert_eq!(
+            snapshot.configured_providers,
+            vec![
+                "dgx-glm53".to_string(),
+                "dgx-k3".to_string(),
+                "dgx-deepseek41".to_string(),
+            ]
+        );
         assert!(!snapshot.models.is_empty());
         assert!(!registry.can_use_model(&all[0], false).await);
         assert!(registry.can_use_model(&all[0], true).await);
+    }
+
+    #[tokio::test]
+    async fn bundled_dgx_models_need_credentials_until_models_json_overrides_them() {
+        // Fresh profile: the bundled DGX models list with the marker and no
+        // endpoint, and using one fails with the import hint.
+        let mut registry = ModelRegistry::in_memory(in_memory_auth());
+        for (provider, id) in [
+            ("dgx-glm53", "glm-5.3"),
+            ("dgx-k3", "kimi-k3"),
+            ("dgx-deepseek41", "deepseek-v4.1-flash-1017"),
+        ] {
+            let model = registry.find(provider, id).unwrap();
+            assert!(model.name.contains(dgx_models::DGX_CREDENTIALS_MARKER));
+            assert!(model.base_url.is_empty());
+        }
+        let available = registry.get_available();
+        assert!(available
+            .iter()
+            .any(|model| model.provider == "dgx-glm53" && model.id == "glm-5.3"));
+
+        let model = registry.find("dgx-glm53", "glm-5.3").unwrap();
+        let auth = registry.get_api_key_and_headers(&model).await;
+        assert!(!auth.ok);
+        let error = auth.error.unwrap();
+        assert!(error.contains("dgx-auth import"), "{error}");
+        assert!(error.contains("dgx-glm53"), "{error}");
+
+        // A models.json dgx provider (the auth-file import result) overrides
+        // the built-in by id and resolves request auth normally.
+        let dir = tempfile::tempdir().unwrap();
+        let mut registry = registry_with_config(
+            dir.path(),
+            r#"{"providers": {"dgx-glm53": {"api": "openai-completions", "baseUrl": "https://dgx.test/v1",
+                "apiKey": "TEST-SECRET-NEVER-REAL-KEY",
+                "models": [{"id": "glm-5.3", "name": "GLM-5.3 - DGX MTP", "reasoning": true,
+                    "input": ["text"], "contextWindow": 1048576, "maxTokens": 262144}]}}}"#,
+        );
+        let model = registry.find("dgx-glm53", "glm-5.3").unwrap();
+        assert_eq!(model.base_url, "https://dgx.test/v1");
+        assert!(!model.name.contains(dgx_models::DGX_CREDENTIALS_MARKER));
+        let auth = registry.get_api_key_and_headers(&model).await;
+        assert!(auth.ok);
+        assert_eq!(auth.api_key.as_deref(), Some("TEST-SECRET-NEVER-REAL-KEY"));
+
+        // The other bundled DGX models are unaffected by the single import.
+        let kimi = registry.find("dgx-k3", "kimi-k3").unwrap();
+        assert!(kimi.name.contains(dgx_models::DGX_CREDENTIALS_MARKER));
     }
 
     #[test]

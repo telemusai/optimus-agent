@@ -7,7 +7,7 @@ use std::sync::OnceLock;
 pub fn built_in_provider_display_names() -> &'static IndexMap<String, String> {
     static NAMES: OnceLock<IndexMap<String, String>> = OnceLock::new();
     NAMES.get_or_init(|| {
-        let pairs: [(&str, &str); 32] = [
+        let pairs: [(&str, &str); 35] = [
             ("anthropic", "Anthropic"),
             ("amazon-bedrock", "Amazon Bedrock"),
             ("azure-openai-responses", "Azure OpenAI Responses"),
@@ -15,6 +15,9 @@ pub fn built_in_provider_display_names() -> &'static IndexMap<String, String> {
             ("cloudflare-ai-gateway", "Cloudflare AI Gateway"),
             ("cloudflare-workers-ai", "Cloudflare Workers AI"),
             ("deepseek", "DeepSeek"),
+            ("dgx-deepseek41", "DGX DeepSeek 4.1"),
+            ("dgx-glm53", "DGX GLM 5.3"),
+            ("dgx-k3", "DGX K3"),
             ("fireworks", "Fireworks"),
             ("google", "Google Gemini"),
             ("google-vertex", "Google Vertex AI"),
@@ -64,6 +67,14 @@ mod tests {
         assert_eq!(
             names.get("xiaomi-token-plan-sgp").map(String::as_str),
             Some("Xiaomi MiMo Token Plan (Singapore)")
+        );
+        // The bundled DGX gateway providers match the names a DGX Auth File
+        // import writes into models.json.
+        assert_eq!(names.get("dgx-glm53").map(String::as_str), Some("DGX GLM 5.3"));
+        assert_eq!(names.get("dgx-k3").map(String::as_str), Some("DGX K3"));
+        assert_eq!(
+            names.get("dgx-deepseek41").map(String::as_str),
+            Some("DGX DeepSeek 4.1")
         );
     }
 }

@@ -105,6 +105,36 @@ pub const COMMAND_SPECS: &[CommandSpec] = &[
     spec(&["mcp", "list"], "mcp list", "List user MCP servers"),
     spec(&["mcp", "get"], "mcp get <name>", "Show a user MCP server"),
     spec(&["mcp", "remove"], "mcp remove <name>", "Remove a user MCP server"),
+    spec(&["dgx-auth"], "dgx-auth <export|import|status>", "Manage DGX gateway credentials"),
+    CommandSpec {
+        path: &["dgx-auth", "export"],
+        usage: "dgx-auth export [--out <path>] [--providers <ids>] [--no-refresh]",
+        summary: "Export DGX providers and gateway credentials to an auth file",
+        description: Some(
+            "Credentials are refreshed first via OPTIMUS_DGX_AUTH_REFRESH_CMD when it is configured. The auth file is self-contained and holds live gateway credentials. Share it only with trusted users; it stops working when the gateway session expires.",
+        ),
+        options: Some(&[
+            "--out <path>       Write to a specific path (default: dgx-auth-YYYYMMDD-HHMMSS.json in the current directory)",
+            "--providers <ids>  Comma-separated provider ids to export (default: every dgx provider)",
+            "--no-refresh       Export the current credentials without running OPTIMUS_DGX_AUTH_REFRESH_CMD",
+        ]),
+        examples: None,
+    },
+    CommandSpec {
+        path: &["dgx-auth", "import"],
+        usage: "dgx-auth import <file> [--force]",
+        summary: "Import DGX providers from an auth file",
+        description: Some(
+            "Providers whose existing credentials differ are refused unless --force is passed.",
+        ),
+        options: Some(&["--force  Replace providers whose credentials differ"]),
+        examples: None,
+    },
+    spec(
+        &["dgx-auth", "status"],
+        "dgx-auth status",
+        "Show DGX provider credentials and gateway expiry",
+    ),
     CommandSpec {
         path: &["package"],
         usage: "package <install|remove|list|update>",
@@ -420,6 +450,15 @@ mod tests {
             .collect();
         assert_eq!(children, vec!["install", "remove", "list", "update"]);
         assert!(get_child_command_specs(&["mcp"]).len() == 4);
+    }
+
+    #[test]
+    fn dgx_auth_group_registers_the_parent_and_all_subcommands() {
+        assert!(get_command_spec(&["dgx-auth"]).is_some());
+        let children: Vec<&str> =
+            get_child_command_specs(&["dgx-auth"]).iter().map(|spec| spec.path[1]).collect();
+        assert_eq!(children, vec!["export", "import", "status"]);
+        assert!(public_command_names().contains("dgx-auth"));
     }
 
     #[test]

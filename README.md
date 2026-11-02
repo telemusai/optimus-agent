@@ -254,6 +254,39 @@ Optimus includes a native **Kiro** provider with 20 catalog entries, including O
 
 Select `kiro/claude-sonnet-5` in `/model`, or use `optimus-agent --provider kiro --model claude-sonnet-5`. Native tool round trips with Opus 5.5, Sonnet 5 and Haiku 4.5 have been validated using an existing CLI login. The service region defaults to `us-east-1`; configure `providers.kiro.region` in `models.json` to change it. See [Kiro setup, model discovery and limitations](resources/agent/docs/providers.md#kiro).
 
+### DGX Auth Files
+
+The bundled **DGX models** — `dgx-glm53` (GLM-5.3), `dgx-k3` (Kimi K3), and `dgx-deepseek41` (DeepSeek V4.1 Flash) — are served through an authenticated DGX gateway. They ship in every install with **zero credentials**: no API key, no gateway session header, no private endpoint. Public model metadata alone cannot serve a request.
+
+A **DGX Auth File** activates them. It is a self-contained credential bundle — the gateway `baseUrl`, the `X-Pomerium-Authorization` session header, per-provider API keys, and the model definitions — in one JSON file with format id `optimus-dgx-auth/1`. A user with live DGX credentials exports the file and shares it; the recipient imports it, and the DGX models become usable.
+
+```bash
+# Machine with live DGX credentials (the sharer)
+optimus-agent dgx-auth export                      # refreshes credentials, writes dgx-auth-YYYYMMDD-HHMMSS.json
+optimus-agent dgx-auth export --out team.json      # choose a destination
+optimus-agent dgx-auth export --providers dgx-k3   # export a subset of providers
+optimus-agent dgx-auth export --no-refresh         # skip the pre-export credential refresh
+
+# Recipient
+optimus-agent dgx-auth import team.json
+optimus-agent dgx-auth status                       # credential presence per DGX provider
+```
+
+By default, `export` refreshes the gateway credentials **before** reading them, so every exported file carries a freshly-minted session with its full lifetime ahead of it. The refresh runs the command configured in the `OPTIMUS_DGX_AUTH_REFRESH_CMD` environment variable — for example, a local Pomerium login script that opens the browser. That command must exit `0` after updating `models.json`; its stdout and stderr are never captured. Pass `--no-refresh` to skip it and export the credentials as they stand; `export` warns when the credentials are already expired at export time.
+
+`import` merges the bundled DGX providers into `<agent-dir>/models.json`. An absent provider is inserted; a provider with identical credentials is skipped as unchanged; a provider with different credentials is refused unless `--force` is passed. Command output lists provider IDs, never key or header values. `status` shows credential presence per DGX provider, such as `apiKey: set` and `X-Pomerium-Authorization: set`.
+
+**Access expires with the gateway session.** The file works only while the sharer's gateway login stays valid — at most about 48 hours. The default refresh starts each exported file from a freshly-minted session; with `--no-refresh`, the file keeps only whatever lifetime the current session has left. After expiry, requests fail authentication; the recipient needs a freshly exported file, which the sharer produces by running `export` again (the default refresh renews the login first). The file's `expiresAt` timestamp is a best-effort decode of the session header and may be absent; treat it as a hint, not a guarantee.
+
+**The file is the credential.** It grants access to the sharer's DGX allocation until the gateway credentials expire.
+
+- There is no revocation before expiry; anyone holding the file can use it for its full lifetime.
+- Treat it like a password and share it only through a channel you trust with one.
+- Never commit it to git, attach it to issues or pull requests, or paste it into chats.
+- Delete the file when it is no longer needed.
+
+This repository itself ships zero credentials. Bundled model registrations are public metadata only; every secret arrives through an auth file a user imports.
+
 ### Efficiency you can measure
 
 The performance work targets both the host runtime and the conversation it manages:

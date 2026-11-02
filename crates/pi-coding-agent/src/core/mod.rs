@@ -15,6 +15,7 @@ pub mod context_health_calibration;
 pub mod context_tree;
 pub mod cron_jobs;
 pub mod defaults;
+pub mod dgx_auth;
 pub mod diagnostics;
 pub mod event_bus;
 pub mod event_log;

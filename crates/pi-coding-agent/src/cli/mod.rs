@@ -8,6 +8,7 @@ pub mod daemon_ps;
 pub mod daemon_ps_format;
 pub mod daemon_stop_confirm;
 pub mod daemon_update_restart;
+pub mod dgx_auth_command;
 pub mod file_processor;
 pub mod initial_message;
 pub mod list_models;

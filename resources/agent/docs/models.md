@@ -12,6 +12,7 @@ Add custom providers and models (Ollama, vLLM, LM Studio, proxies) via `~/.prime
 - [Staged Azure Astra native compaction](#staged-azure-astra-native-compaction)
 - [Overriding Built-in Providers](#overriding-built-in-providers)
 - [Per-model Overrides](#per-model-overrides)
+- [DGX Models and Auth Files](#dgx-models-and-auth-files)
 - [Anthropic Messages Compatibility](#anthropic-messages-compatibility)
 - [OpenAI Compatibility](#openai-compatibility)
 
@@ -346,6 +347,61 @@ Behavior notes:
 - Unknown model IDs are ignored.
 - You can combine provider-level `baseUrl`/`headers` with `modelOverrides`.
 - If `models` is also defined for a provider, custom models are merged after built-in overrides. A custom model with the same `id` replaces the overridden built-in model entry.
+
+## DGX Models and Auth Files
+
+The three DGX providers — `dgx-glm53` (GLM-5.3), `dgx-k3` (Kimi K3), and `dgx-deepseek41` (DeepSeek V4.1 Flash) — ship with every install as credential-free registrations: public model metadata only, with no `apiKey`, no `X-Pomerium-Authorization` header, and no gateway endpoint. They cannot serve requests until credentials are present.
+
+The supported way to add those credentials is a **DGX auth file**, exported on a machine that already has working DGX credentials:
+
+```bash
+optimus-agent dgx-auth export                                   # refreshes credentials first
+optimus-agent dgx-auth export --out team.json                    # choose a destination
+optimus-agent dgx-auth export --providers dgx-k3,dgx-deepseek41 # a subset of providers
+optimus-agent dgx-auth export --no-refresh                       # skip the pre-export credential refresh
+```
+
+By default, `export` refreshes the gateway credentials before reading them, so every exported file carries a freshly-minted session with its full lifetime ahead of it. The refresh runs the command configured in the `OPTIMUS_DGX_AUTH_REFRESH_CMD` environment variable — for example, a local Pomerium login script that opens the browser. That command must exit `0` after updating `models.json`; its stdout and stderr are never captured. Pass `--no-refresh` to skip it, and expect a warning when the credentials are already expired at export time.
+
+The file bundles the gateway `baseUrl`, the `X-Pomerium-Authorization` session header, per-provider API keys, and the provider and model definitions under format id `optimus-dgx-auth/1`. Abbreviated example with placeholder values:
+
+```json
+{
+  "format": "optimus-dgx-auth/1",
+  "createdAt": "2026-11-02T12:00:00Z",
+  "expiresAt": "2026-11-03T18:22:00Z",
+  "gateway": {
+    "baseUrl": "https://dgx-gateway.example.invalid/v1",
+    "headers": { "X-Pomerium-Authorization": "<session JWT>" }
+  },
+  "providers": {
+    "dgx-k3": {
+      "name": "DGX K3",
+      "baseUrl": "https://dgx-gateway.example.invalid/v1",
+      "api": "openai-completions",
+      "apiKey": "<gateway API key>",
+      "headers": { "X-Pomerium-Authorization": "<session JWT>" },
+      "models": [
+        { "id": "kimi-k3", "name": "Kimi K3 - DGX MAX", "reasoning": true }
+      ]
+    }
+  }
+}
+```
+
+Import merges the bundled providers into `<agent-dir>/models.json` (normally `~/.config/optimus-rust/models.json` with the installed launcher), applying the gateway `baseUrl` and gateway headers:
+
+```bash
+optimus-agent dgx-auth import team.json         # merge into models.json
+optimus-agent dgx-auth import team.json --force # also replace providers whose credentials differ
+optimus-agent dgx-auth status                    # credential presence per DGX provider
+```
+
+- Absent providers are inserted; identical existing credentials are skipped as unchanged; different credentials are refused unless `--force` is passed. The merge writes atomically, so a failed import does not corrupt the existing `models.json`.
+- `import` and `status` report provider IDs and credential presence (`apiKey: set`, `X-Pomerium-Authorization: set`), never the values.
+- Access is bounded by the sharer's gateway session — at most about 48 hours; the default refresh starts from a freshly-minted session, while `--no-refresh` keeps only the lifetime the current session has left. After expiry, requests fail authentication; the sharer exports a fresh file. `expiresAt` is a best-effort decode of the session header and may be missing.
+
+**Security:** the auth file is the credential. It grants access to the sharer's DGX allocation until the gateway credentials expire, and it cannot be revoked before that. Treat it like a password: transfer it only over a trusted channel, never commit it to git, and delete it when it is no longer needed. See [DGX Auth Files](../../../README.md#dgx-auth-files).
 
 ## Anthropic Messages Compatibility
 
