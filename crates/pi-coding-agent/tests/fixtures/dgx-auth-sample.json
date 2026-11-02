@@ -1,0 +1,98 @@
+{
+  "format": "optimus-dgx-auth/1",
+  "createdAt": "2026-11-02T00:00:00Z",
+  "expiresAt": "2026-11-03T12:00:00Z",
+  "gateway": {
+    "baseUrl": "https://dgx.test/v1",
+    "headers": {
+      "X-Pomerium-Authorization": "TEST-SECRET-NEVER-REAL-POMERIUM-JWT-4"
+    }
+  },
+  "providers": {
+    "dgx-glm53": {
+      "name": "DGX GLM 5.3",
+      "baseUrl": "https://dgx.test/v1",
+      "apiKey": "TEST-SECRET-NEVER-REAL-GLM53-KEY-1",
+      "api": "openai-completions",
+      "headers": {
+        "X-Pomerium-Authorization": "TEST-SECRET-NEVER-REAL-POMERIUM-JWT-4"
+      },
+      "compat": {
+        "supportsStore": false,
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": false,
+        "maxTokensField": "max_tokens",
+        "supportsStrictMode": false,
+        "supportsLongCacheRetention": false,
+        "sglangTokenBudget": true,
+        "thinkingFormat": "openai",
+        "requiresThinkingAsText": false,
+        "requiresReasoningContentOnAssistantMessages": true
+      },
+      "models": [
+        {
+          "id": "glm-5.3",
+          "name": "GLM-5.3 - DGX MTP",
+          "reasoning": true,
+          "input": [
+            "text"
+          ],
+          "contextWindow": 1048576,
+          "maxTokens": 262144
+        }
+      ]
+    },
+    "dgx-k3": {
+      "name": "DGX K3",
+      "baseUrl": "https://dgx.test/v1",
+      "apiKey": "TEST-SECRET-NEVER-REAL-K3-KEY-2",
+      "api": "openai-completions",
+      "headers": {
+        "X-Pomerium-Authorization": "TEST-SECRET-NEVER-REAL-POMERIUM-JWT-4"
+      },
+      "compat": {
+        "supportsStore": false,
+        "supportsDeveloperRole": false,
+        "supportsReasoningEffort": true,
+        "maxTokensField": "max_tokens",
+        "supportsStrictMode": false,
+        "supportsLongCacheRetention": false
+      },
+      "models": [
+        {
+          "id": "kimi-k3",
+          "name": "Kimi K3 - DGX MAX",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 1048576,
+          "maxTokens": 262144
+        }
+      ]
+    },
+    "dgx-deepseek41": {
+      "name": "DGX DeepSeek 4.1",
+      "baseUrl": "https://dgx.test/v1",
+      "apiKey": "TEST-SECRET-NEVER-REAL-DEEPSEEK-KEY-3",
+      "api": "openai-completions",
+      "headers": {
+        "X-Pomerium-Authorization": "TEST-SECRET-NEVER-REAL-POMERIUM-JWT-4"
+      },
+      "models": [
+        {
+          "id": "deepseek-v4.1-flash-1017",
+          "name": "DeepSeek V4.1 Flash 1017 - DGX",
+          "reasoning": true,
+          "input": [
+            "text",
+            "image"
+          ],
+          "contextWindow": 1048576,
+          "maxTokens": 262144
+        }
+      ]
+    }
+  }
+}

@@ -18,6 +18,7 @@ use crate::cli::command_registry::{
 use crate::cli::daemon_command::{handle_daemon_command, DaemonCommandIo};
 use crate::cli::daemon_ps::{run_ps, run_reap, run_shutdown_all, DaemonPsIo};
 use crate::cli::daemon_update_restart::DAEMON_UPDATE_RESTART_COORDINATOR_FLAG;
+use crate::cli::dgx_auth_command::{run_dgx_auth_command, DgxAuthCommandIo};
 use crate::config::{APP_COMMAND as APP_NAME, SELF_UPDATE_INTERACTIVE_CHILD_ENV};
 use crate::core::auth_storage::AuthStorage;
 use crate::core::mcp::mcp_command::{run_mcp_management_command, McpCredentialStore};
@@ -178,6 +179,7 @@ async fn run_public_command(
         "shutdown" => run_shutdown(&args[1..], io).await,
         "package" => run_package(&args[1..], io).await,
         "mcp" => run_mcp(&args[1..], io).await,
+        "dgx-auth" => run_dgx_auth(&args[1..], io),
         "update" => {
             let rest = &args[1..];
             let has_legacy_self_target =
@@ -450,6 +452,15 @@ impl McpCredentialStore for OwnedMcpCredentialStore {
     fn remove_verified(&mut self, provider: &str) -> Result<(), String> {
         self.auth_storage.remove_verified(provider)
     }
+}
+
+/// `runDgxAuth(args)`: the dgx-auth command group is synchronous (the core
+/// auth-file API is sync), so failures propagate through the same `Err` arm
+/// the TypeScript `catch` covers for a rejected MCP promise.
+fn run_dgx_auth(args: &[String], io: &PublicCommandIo<'_>) -> Result<PublicCommandResult, String> {
+    let dgx_io = dgx_auth_command_io(io);
+    run_dgx_auth_command(args, &dgx_io)?;
+    Ok(HANDLED)
 }
 
 /// `runPackage(args)`.
@@ -736,6 +747,11 @@ fn daemon_command_io<'a>(io: &PublicCommandIo<'a>) -> DaemonCommandIo<'a> {
     }
 }
 
+/// The dgx-auth command IO surface, derived from this module's seam.
+fn dgx_auth_command_io<'a>(io: &PublicCommandIo<'a>) -> DgxAuthCommandIo<'a> {
+    DgxAuthCommandIo { log: io.log, cwd: io.cwd.clone() }
+}
+
 /// The `daemon-ps.ts` IO surface, derived from this module's seam.
 fn daemon_ps_io<'a>(io: &PublicCommandIo<'a>) -> DaemonPsIo<'a> {
     DaemonPsIo {
@@ -984,6 +1000,39 @@ mod tests {
         let (harness, result) = run(&["schedule", "cancell", "job-1"]);
         assert!(result.handled);
         assert!(harness.errors().iter().any(|line| line.contains("schedule cancel")));
+    }
+
+    #[test]
+    fn routes_dgx_auth_failures_through_the_public_error_path() {
+        let (harness, result) = run(&["dgx-auth", "nonsense"]);
+        assert!(result.handled);
+        assert_eq!(harness.exit_code(), Some(1));
+        assert!(
+            harness
+                .errors()
+                .iter()
+                .any(|line| line.contains("Usage: dgx-auth <export|import|status>."))
+        );
+    }
+
+    #[test]
+    fn serves_dgx_auth_help_from_the_registry_specs() {
+        let (harness, result) = run(&["help", "dgx-auth"]);
+        assert!(result.handled);
+        let printed = harness.logged().join("\n");
+        assert!(printed.contains("Usage:\n  optimus-agent dgx-auth <export|import|status>"), "{printed}");
+        assert!(printed.contains("export"), "{printed}");
+
+        let (harness, result) = run(&["dgx-auth", "export", "--help"]);
+        assert!(result.handled);
+        let printed = harness.logged().join("\n");
+        assert!(
+            printed.contains(
+                "Usage:\n  optimus-agent dgx-auth export [--out <path>] [--providers <ids>] [--no-refresh]"
+            ),
+            "{printed}"
+        );
+        assert!(printed.contains("--no-refresh"), "{printed}");
     }
 
     #[test]
