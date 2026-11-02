@@ -1,11 +1,13 @@
 # OCC-3 PR #215 — Regression Results (offline)
 
-Gate run of 2026-11-01 (gate-runner, serial execution, single warm target dir
+Gate run of 2026-11-01 13:00Z (gate-runner, serial execution, single warm target dir
 `target-occ3compl`). Branch `fix/occ3-glm53-full-message-recovery` at `c4d310929`
 (commits `7cccaae4d..c4d310929` after base `91bfde04f`). "Pinned" means
 `OCC3_SPAN_POLICY=whole_completed_response_tail_v1`; "unpinned" means the env unset.
+Evening additions after the live campaign (span fix 77d57c64c, coverage criterion
+109ab15db, supplemental tooling 0f7be46d7) are recorded in the last section.
 
-## Gate table
+## Gate table (13:00Z)
 
 | # | Gate | Result |
 |---|------|--------|
@@ -39,7 +41,7 @@ Command: `cargo test --locked -p pi-coding-agent --test occ3_retained_lifecycle
 
 Unpinned 4/11 (7 failures, all `occ3Cause=receipt_invalid`); pinned 11/11.
 
-## New-test inventory (this PR)
+## New-test inventory (this PR through the 13:00Z milestone)
 
 - Rust `crates/pi-coding-agent/tests/occ3_retained_lifecycle.rs` — 7 tests:
   content-only accept; tool output refused (tombstone); unarmed-then-armed claim
@@ -50,6 +52,25 @@ Unpinned 4/11 (7 failures, all `occ3Cause=receipt_invalid`); pinned 11/11.
   consistency (both schemas), e2e content-only v3 turn through the real chat adapter.
 - Python `test_v3_native_validator.py::test_admission_requires_the_publish_v2_control_interface`
   — 5-tuple admitted, 4-tuple refused `control_schema_version_unknown`.
+
+## Evening additions (offline, after the live canary windows)
+
+- Span fix 77d57c64c (canary-1 C-invariant) and coverage-criterion fix 109ab15db
+  (canary-2 C-invariant) were each landed red-first (root's campaign record): the
+  failing behavior was reproduced as a test before the fix.
+- Supplemental-calibration tooling (0f7be46d7) red-first evidence, measured on the
+  scratch torch-2.15 venv (calib-design evidence, window icalib-canary3-20261101T1745Z):
+  - New test file `tests/test_calibration_pool.py` against pristine `git archive HEAD`:
+    14 failed / 2 passed (the two passing are the positive controls, green on both
+    sides by design).
+  - Full suite, pristine baseline: 1 failed (`test_statebridge_calibrated_procrustes.py::
+    test_reflection_fixture_keeps_the_det_negative_optimum`, the known
+    venv/torch-build-dependent fixture), 2251 passed, 361 skipped, 2 xfailed,
+    77 subtests passed, 174.32 s.
+  - Full suite, edited tree (post-fix): same single known failure, 2267 passed
+    (+16 = exactly the new pool tests), 361 skipped, 2 xfailed, 187.12 s.
+  - `Collector.write()` proved byte-identical pre/post refactor (A/B harness, pinned
+    by `test_write_partitions_matches_split_manifest_digest`).
 
 ## Known issue: unpinned receipt_invalid failures (pre-existing, NOT from PR #215)
 

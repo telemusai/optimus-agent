@@ -115,3 +115,30 @@ occ3.publication.status.v1, occ3.retire.v1); a 4-tuple is refused with
 - The legacy mode's security proof (tool-bound admission) is untouched; the new mode
   substitutes controller authentication plus the empty-binding check for the tool
   binding, and adds the no-tool span policy as a second, independent guard.
+
+## Live validation state (measured, 2026-11-01 evening; digests in LIVE-RESULTS.md)
+
+The retained lifecycle ran live in three controlled-swap windows (canary-1 1330Z,
+canary-2 1615Z, canary-3 1745Z). Measured per arm-A evidence:
+
+- The structural chain held end-to-end every time: arm BEFORE the content request,
+  zero tool bindings in the captured turn (`source_tool_calls=0`,
+  `span_tool_call_count=0`), one-shot claim burned pre-effect, single v2 publication
+  (`POST /occ3/v1/native/publish 200`), receiver admission, real receiver request
+  (`request_count=1`, `receiver_tool_calls=0`, `source_facts_absent=true`,
+  `occ3_keys_absent=true`), `message_status=delivered`, `consumed=true`,
+  `lease_state=Consumed`, then retire (`POST /occ3/v1/native/retire 200`).
+- The failure never occurred in the structural chain; it sat at invariant G
+  (exact-value recovery) in every window, and at invariant C (coverage) until the two
+  red-first fixes (77d57c64c span/turn-end classification, 109ab15db tail-window
+  coverage criterion) landed. After 109ab15db, canary-3 measured `coverage_complete
+  = true`, `value_fully_in_span=true`, `retained_count == span_accepted_width` (35/35).
+- The TOKEN_FULL exact-embedding arm (canary-3 window, control token `texact`,
+  readback-confirmed) recovered a fresh private value exactly in 84.9 s: the
+  publish -> receiver-admission -> consumption path delivers exact information when
+  the calibrated map is bypassed. The map, not the lifecycle, is the remaining defect.
+- Receiver answers, when wrong, were mutated strings (39/41 and 40/41 chars) with
+  mid-string edits inside retained rows — not missing spans — consistent with a
+  distribution-shifted calibrated map rather than a capture or publication failure.
+- Canary-4 (pooled refit + re-run) is PENDING; the design above is unchanged by the
+  measured results.

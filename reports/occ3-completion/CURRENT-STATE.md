@@ -1,33 +1,44 @@
 # OCC-3 PR #215 — Current State
 
-Milestone update, 2026-11-01. Branch `fix/occ3-glm53-full-message-recovery`, worktree
-`C:/Users/openclawuser/optimus-occ3-icalib-20261028`, base main-merge `91bfde04f`.
-All offline milestones are implemented and gated green. The live DGX chain is NOT-RUN.
-This is a milestone update, not the final completion report.
+Milestone update, 2026-11-01 (evening). Branch `fix/occ3-glm53-full-message-recovery`,
+worktree `C:/Users/openclawuser/optimus-occ3-icalib-20261028`. All offline milestones
+are implemented and gated green; the live campaign has now run three controlled-swap
+canary windows plus one exact-embedding diagnostic (measured values in
+LIVE-RESULTS.md). Exact-value recovery is NOT yet achieved, so the campaign remains
+open. This is a milestone update, not the final completion report.
 
 ## Implemented
 
 - `occ3.capture.v3` retained content-only capture: `capture_mode=content_only_orchestrator_v1`,
   span policy `content_tail_no_tool_v2`.
 - Publication through the authenticated family controller via `occ3.publish.v2`,
-  `dispatch_mode=orchestrator_v1`. Zero tool bindings required in the captured turn;
-  any tool call in that turn fails the mode.
+  `dispatch_mode=orchestrator_v1`. Zero tool bindings required in the captured turn.
 - Single-turn retained workflow (replaces the old r13 two-turn unarmed/armed workflow):
   arm BEFORE the content request, handoff tool not installed for that turn,
   deterministic orchestrator publication after.
 - Legacy same-turn tool protocol unchanged and byte-identical on the wire.
 - Mode isolation: retained and legacy modes cannot cross in either direction.
+- Live fixes from the campaign (each verified red-first): 77d57c64c span/turn-end
+  classification so the stop row stays a content row (canary-1 invariant C);
+  109ab15db coverage criterion for tail windows so a complete content run inside a
+  128-row retention window passes (canary-2 invariant C).
+- Supplemental-calibration tooling 0f7be46d7: host-backed Option A capture dir
+  wiring, one-family-per-turn corpus design, offline pool tool
+  (`deploy/v3/calibration_pool.py`) with 16 new tests (see REGRESSION-RESULTS.md).
 
-## Commit chain (verified read-only, `git log --oneline -5`)
+## Commit chain (root-recorded; branch range 62fa6f414..0f7be46d7, 11 commits)
 
-| Commit | Subject | Size |
-|--------|---------|------|
-| `7cccaae4d` | retained content-only capture mode with orchestrator publication (lifecycle contract) | 16 files, +466/-64 |
-| `40a79907f` | red-first retained-lifecycle regression suites | 5 files, +1519/-3 |
-| `b731a0736` | phase-suite retained source leg and harness repairs (7.1/7.2/7.3, validator 5-tuple, changelog) | 6 files, +823/-142 |
-| `c4d310929` | stage-3 native profile input for the calibrated candidate | 1 file, +1 |
+| Commit | Subject |
+|--------|---------|
+| `77d57c64c` | span fix: turn-end stop row classified as content; fail-closed retained==width rule (canary-1 C-invariant, red-first) |
+| `109ab15db` | coverage criterion fix for tail windows (canary-2 C-invariant, red-first) |
+| `0f7be46d7` | supplemental-calibration tooling (Option A capture dir, one-family-per-turn corpus, offline pool tool + tests) |
+| (range total) | 11 commits also covering the retained lifecycle contract and the retained task-route; r17 client sha256 1525df15… |
 
-## Gates (gate-runner, this session, all green)
+The earlier documented chain 7cccaae4d..c4d310929 (13:00Z milestone) sits on the same
+branch; the range above is the current campaign record.
+
+## Gates (gate-runner, 13:00Z session, all green)
 
 | Gate | Result |
 |------|--------|
@@ -42,23 +53,41 @@ This is a milestone update, not the final completion report.
 | `test_retained_lifecycle.py` + `test_v3_native_validator.py` | 179 passed, 2 skipped |
 | phase-suite selftest | retained mode exit 0; legacy mode exit 0 (byte-compat) |
 
-## New tests
+Evening additions (offline, measured): calibration-pool red-first evidence and the
+full-suite runs are recorded in REGRESSION-RESULTS.md.
 
-- Rust `occ3_retained_lifecycle`: 7 tests.
-- Python `test_retained_lifecycle.py`: 35 tests.
-- Validator: `test_admission_requires_the_publish_v2_control_interface` (5-tuple
-  admitted, 4-tuple refused `control_schema_version_unknown`).
+## Live campaign state (measured; details and digests in LIVE-RESULTS.md)
 
-## Remaining (NOT-RUN)
+- Three controlled swaps, all with identity efef608a / artifact 59d60f83 (72799976 B)
+  / TP8 unchanged: canary-1 (1330Z, candidate 60fc24ad), canary-2 (1615Z, 33572fd0),
+  canary-3 (1745Z, 9110a771, image cff9b321…).
+- Canary-1: arm A FAIL at C — span truncation (33/34 content rows; parsed answer
+  40/41 chars); fixed red-first in 77d57c64c.
+- Canary-2: arm A FAIL at C — coverage criterion wrong for tail windows (31/31
+  retained but gated by span_message_truncated; receiver answer 39/41 chars);
+  fixed red-first in 109ab15db. Controls B-E not fired (stop rule).
+- Canary-3: coverage PROVEN (value_fully_in_span, retained 35 == width 35); arm A
+  zero recovery; TOKEN_FULL exact-embedding diagnostic PASSED EXACT (fresh value,
+  84.9 s) — injection chain sound, calibrated map distribution-shifted.
+- s9 supplemental calibration STARTED (window icalib-sup-20261101T2003Z):
+  one-family-per-turn correction, host-backed Option A corpus, paced 420 s caps
+  under GPU contention, Pomerium expiry worked around via the documented loopback
+  tunnel. All four written reopen conditions met.
 
-- Live DGX canary: two independent sessions, fresh private value, full-span capture
-  through `publish_retained` to a receiver Consumed receipt. NOT-RUN.
+## Remaining (NOT-RUN / PENDING)
+
+- Canary-4: pooled refit of the calibrated map, then re-run. PENDING.
+- Canary controls B-E (different value, wrong-sender, matched-shape null,
+  no-attachment). NOT fired.
 - P8 proof chain in retained mode. NOT-RUN.
-- Five pending pilot cases (f2-03, f3-01, f3-02, f4-01, f4-02). NOT RE-RUN.
+- Five pending pilot cases (f2-03, f3-01, f3-02, f4-01, f4-02) + one coherent
+  16-case set. NOT RE-RUN.
 - 64-task battery. NOT-RUN.
-- Normal-runtime activation (user models.json occ3 block + occ3Enabled/occ3Experimental).
-  NOT configured.
+- Normal-runtime activation (S17: user models.json occ3 block +
+  occ3Enabled/occ3Experimental). NOT configured.
+- S18. NOT-RUN.
 - OCC3 light: verified only via offline fixtures; live verification NOT-RUN.
 - Benchmarks. NOT measured.
-- DGX: healthy on the calibrated candidate (neo-glm53, image d983f301, identity
-  efef608a, 8/8 ranks), untouched this session.
+- Known-issue follow-ups: serving API key rotation (exposed once in a docker-logs
+  dump; post-campaign), stale validate_descriptors.py (METHOD_ID constant + v1
+  manifest shape), PR #213 receipt fixtures (21 unpinned failures).
