@@ -1,0 +1,1 @@
+- Fixed: the single-send NATIVE arm path (strict pin and corpus canaries) now publishes the per-attempt `attempts` array and the full `retry_policy` fieldset the tolerance ladder publishes, so a strict-L1 gate reads one-send diagnostics from the evidence; a total single-send failure publishes the array as well, per the TOLERANCE-RETRY.md evidence contract.
