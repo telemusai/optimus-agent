@@ -42,6 +42,18 @@ def static_profile():
             "method": "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1"}
 
 
+def declared_identity():
+    return {"model_id": "offline-model", "architecture": "FixtureForCausalLM",
+            "checkpoint_revision": "0" * 40,
+            "weight_fingerprint": "metadata-manifest-sha256:" + "1" * 64,
+            "tokenizer_fingerprint": "sha256:" + "2" * 64,
+            "chat_template_fingerprint": "sha256:" + "3" * 64,
+            "quantisation": "fp8", "tensor_geometry": "layers78:hidden6144",
+            "kv_layout": "declared-launch:tp8:kv-fp8_e4m3",
+            "latent_method": "kv-radix-channel-v1",
+            "runtime": "sglang:0.5.21:" + "4" * 40}
+
+
 def source_attestation():
     return {"schema": "optimus.occ3.native-sources.v1",
             "source_revision": "e00930c5489053f26d86b179cee0d087f846acbb",
@@ -156,6 +168,46 @@ class PackagedArtifactTests(ErrorAssertions, unittest.TestCase):
                 self.store("native_profile.json", raw, "PROFILE_SHA256")
                 with self.assertRaises(profile.ProfileError):
                     profile.load_pinned_profile()
+
+    def test_declared_identity_block_loads_and_is_returned(self):
+        value = static_profile()
+        value[profile.DECLARED_IDENTITY] = declared_identity()
+        self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+        loaded = profile.load_pinned_profile()
+        self.assertEqual(loaded[profile.DECLARED_IDENTITY], declared_identity())
+
+    def test_declared_identity_block_is_strictly_validated(self):
+        block = declared_identity()
+        cases = []
+        for name in profile._DECLARED_IDENTITY_FIELDS:
+            cases.append(("missing:" + name,
+                          {key: value for key, value in block.items() if key != name}))
+            cases.append(("empty:" + name, {**block, name: ""}))
+            cases.append(("oversize:" + name, {**block, name: "x" * 513}))
+            cases.append(("wrong-type:" + name, {**block, name: 7}))
+        cases.append(("extra-field", {**block, "extra": "field"}))
+        for label, declared in cases:
+            with self.subTest(case=label):
+                value = static_profile()
+                value[profile.DECLARED_IDENTITY] = declared
+                self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+                self.error_code("profile_invalid", profile.load_pinned_profile)
+
+    def test_declared_identity_block_must_be_the_full_fieldset(self):
+        # Present-but-wrong blocks are refused; only genuine absence is valid.
+        for wrong in ("string-block", [declared_identity()], 7, None):
+            with self.subTest(block=wrong):
+                value = static_profile()
+                value[profile.DECLARED_IDENTITY] = wrong
+                self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+                self.error_code("profile_invalid", profile.load_pinned_profile)
+
+    def test_profile_without_declared_identity_block_stays_valid(self):
+        # An older pinned file without the block still loads; the route, not
+        # the loader, owns the fail-closed decision.
+        self.store("native_profile.json", encoded(static_profile()), "PROFILE_SHA256")
+        loaded = profile.load_pinned_profile()
+        self.assertNotIn(profile.DECLARED_IDENTITY, loaded)
 
     def test_profile_is_exact_flat_typed_shape(self):
         changes = [{key: "forbidden"} for key in

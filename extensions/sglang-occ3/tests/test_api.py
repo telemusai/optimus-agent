@@ -2,12 +2,44 @@
 
 from __future__ import annotations
 
+import hashlib
+import json
+import sys
+import types
+from pathlib import Path
+
 import pytest
 from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from occ3_sglang import api, plugin
+from occ3_sglang.identity import IDENTITY_FIELDS
 from occ3_sglang.registry import registry
+
+PROFILE_INPUT = (
+    Path(__file__).resolve().parents[1]
+    / "deploy/native-build-inputs/native-profile-input.json"
+)
+
+
+def install_pinned_profile(monkeypatch, tmp_path, payload):
+    """Install a packaged native_profile.json plus its baked digest module.
+
+    The same seam the disposable image owns: the profile JSON lives next to
+    native_profile.py and _native_profile_digest pins its sha256.
+    """
+    from occ3_sglang import native_profile
+
+    directory = tmp_path / "occ3_sglang"
+    directory.mkdir()
+    raw = json.dumps(payload, sort_keys=True, separators=(",", ":")).encode()
+    (directory / "native_profile.json").write_bytes(raw)
+    baked = types.ModuleType("occ3_sglang._native_profile_digest")
+    baked.PROFILE_SHA256 = hashlib.sha256(raw).hexdigest()
+    monkeypatch.setattr(native_profile, "__file__",
+                        str(directory / "native_profile.py"))
+    monkeypatch.setitem(sys.modules, "occ3_sglang._native_profile_digest", baked)
+    return payload
 
 
 @pytest.fixture
@@ -74,13 +106,36 @@ def test_status_payload_is_a_fixed_key_superset_with_dormant_state(client):
         "rollback_completed"))
 
 
-def test_identity_route_exposes_contract_fields(client):
+def test_identity_route_serves_the_pinned_declared_fields(client, monkeypatch, tmp_path):
+    payload = install_pinned_profile(
+        monkeypatch, tmp_path, json.loads(PROFILE_INPUT.read_text(encoding="utf-8")))
     r = client.get("/occ3/v1/identity")
     assert r.status_code == 200
     body = r.json()
-    assert body["fields"]["architecture"] == "GlmMoeDsaForCausalLM"
-    assert len(body["field_order"]) == 11
-    assert body["fingerprint"].count("|") == 10
+    declared = payload["declared_identity"]
+    assert body["schema"] == "optimus.occ3.identity.v1"
+    assert body["field_order"] == list(IDENTITY_FIELDS)
+    assert body["fields"] == declared  # exactly the declared eleven, byte-exact
+    assert body["fields"]["checkpoint_revision"] == declared["checkpoint_revision"]
+    assert body["fields"]["chat_template_fingerprint"] == declared["chat_template_fingerprint"]
+    assert body["fields"]["checkpoint_revision"]
+    assert body["fields"]["chat_template_fingerprint"]
+    assert body["fingerprint"] == "|".join(declared[name] for name in IDENTITY_FIELDS)
+
+
+def test_identity_route_fails_closed_without_an_installed_profile(client):
+    r = client.get("/occ3/v1/identity")
+    assert r.status_code == 503
+    assert "fields" not in r.json()
+
+
+def test_identity_route_fails_closed_when_the_block_is_absent(client, monkeypatch, tmp_path):
+    payload = json.loads(PROFILE_INPUT.read_text(encoding="utf-8"))
+    payload.pop("declared_identity")
+    install_pinned_profile(monkeypatch, tmp_path, payload)
+    r = client.get("/occ3/v1/identity")
+    assert r.status_code == 503
+    assert "fields" not in r.json()
 
 
 def test_capabilities_advertisement_shape(client):
