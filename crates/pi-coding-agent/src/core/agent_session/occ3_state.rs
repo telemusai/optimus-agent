@@ -27,6 +27,12 @@ use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 pub const NATIVE_HANDOFF_TOOL: &str = "occ3_handoff";
+
+/// Failed armed captures tolerated before the native path deactivates for
+/// the session (recovery, not a brick). Each failure consumes one retry;
+/// the model re-arms explicitly by calling the handoff tool again between
+/// attempts, so capture stays one-shot per attempt and is never replayed.
+pub const MAX_NATIVE_CAPTURE_RETRIES: u32 = 3;
 fn now() -> u64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -54,6 +60,12 @@ struct SourceSlot {
     budget: Option<NativeSourceBudget>,
     /// Target fixed by the first, capture-arming tool call in normal sessions.
     armed_receiver: Option<String>,
+    /// Failed capture attempts observed through the tombstone path. Each
+    /// failed armed capture counts exactly once (the first resolve after the
+    /// failure); the slot resets for one re-arm per attempt until this
+    /// exceeds MAX_NATIVE_CAPTURE_RETRIES, after which the native path
+    /// deactivates for recovery and later turns run the ordinary path.
+    failed_attempts: u32,
     /// Retained content-only negotiation for the armed capture: the wire and
     /// the completed-hook contract switch to the no-tool mode for this arm.
     retained: bool,
@@ -112,6 +124,12 @@ pub struct Occ3NativeSession {
     source: Mutex<SourceSlot>,
     chat_preferences: std::sync::OnceLock<Option<String>>,
     closed: std::sync::atomic::AtomicBool,
+    /// Host-side recovery callback run exactly once when this session's
+    /// native path is terminally deactivated (retry budget exhausted, or
+    /// invalidate from teardown). The host clears its agent hooks and
+    /// removes the handoff tool so later turns take the ordinary
+    /// inference path instead of failing on a closed native session.
+    tombstone_cleanup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
     /// Unsubscribe for the delivery-marker restamp listener installed by
     /// [`Self::install_delivery_restamp`]; dropped by [`Self::invalidate`].
     restamp_unsubscribe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -175,9 +193,11 @@ impl Occ3NativeSession {
                 published_message: None,
                 negative_control_armed: false,
                 negative_control_exported: false,
+                failed_attempts: 0,
             }),
             closed: std::sync::atomic::AtomicBool::new(false),
             chat_preferences: std::sync::OnceLock::new(),
+            tombstone_cleanup: Mutex::new(None),
         }))
     }
     pub fn session_id(&self) -> &str {
@@ -344,28 +364,57 @@ impl Occ3NativeSession {
                 Box::pin(async move {
                     this.check_model(&request.model)
                         .map_err(anyhow::Error::msg)?;
+                    let mut tombstone = false;
                     let (budget, retained) = {
                         let mut slot =
                             this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
-                        let Some(budget) = slot.budget.take() else {
-                            // Only a completed source + definitively admitted
-                            // handoff may enter its normal tool continuation.
-                            // Missing budget after a failure is a tombstone,
-                            // never permission to retry without capture.
-                            if slot.resolved
-                                && (!slot.handoff_admitted
-                                    || !slot.lease.as_ref().is_some_and(|lease| {
-                                        lease.state() == SourceCaptureState::Captured
-                                    }))
-                            {
-                                return Err(anyhow::anyhow!(failure()));
+                        match slot.budget.take() {
+                            Some(budget) => {
+                                this.check_native_allowed().map_err(anyhow::Error::msg)?;
+                                slot.resolved = true;
+                                (Some(budget), slot.retained)
                             }
-                            return Ok(None);
-                        };
-                        this.check_native_allowed().map_err(anyhow::Error::msg)?;
-                        slot.resolved = true;
-                        (budget, slot.retained)
+                            None => {
+                                // Only a completed source + definitively admitted
+                                // handoff may enter its normal tool continuation.
+                                // Missing budget after a failure is a tombstone,
+                                // never permission to retry without capture.
+                                tombstone = slot.resolved
+                                    && (!slot.handoff_admitted
+                                        || !slot.lease.as_ref().is_some_and(|lease| {
+                                            lease.state() == SourceCaptureState::Captured
+                                        }));
+                                (None, slot.retained)
+                            }
+                        }
                     };
+                    if tombstone {
+                        // A failed armed capture must not brick the session:
+                        // count the failure, reset the slot so the model can
+                        // re-arm explicitly (the handoff tool re-arms and
+                        // returns capture_armed again), and let THIS turn run
+                        // uncaptured. Capture itself stays one-shot and is
+                        // never replayed silently. After MAX_NATIVE_CAPTURE_RETRIES
+                        // the native path deactivates for the session (the
+                        // registered cleanup clears the host hooks and removes
+                        // the handoff tool) and later turns take the ordinary
+                        // inference path.
+                        let exhausted = {
+                            let mut slot =
+                                this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
+                            slot.failed_attempts = slot.failed_attempts.saturating_add(1);
+                            let exhausted = slot.failed_attempts > MAX_NATIVE_CAPTURE_RETRIES;
+                            slot.resolved = false;
+                            slot.lease = None;
+                            slot.budget = None;
+                            exhausted
+                        };
+                        if exhausted {
+                            this.deactivate();
+                        }
+                        return Ok(None);
+                    }
+                    let Some(budget) = budget else { return Ok(None); };
                     let lease = this
                         .connector
                         .prepare_source_capture(
@@ -752,7 +801,7 @@ impl Occ3NativeSession {
         let this = self.clone();
         AgentTool {
             name:NATIVE_HANDOFF_TOOL.into(),label:"Experimental native state handoff".into(),
-            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff.".into(),
+            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
             parameters:json!({"type":"object","additionalProperties":false,"properties":{"receiver_role":{"type":"string","enum":["parent","sibling","child"]},"receiver_name":{"type":"string"}},"required":["receiver_role","receiver_name"]}),
             prepare_arguments:None,execution_mode:None,
             execute:Arc::new(move |tool_id,args,signal,_update| {
@@ -768,9 +817,22 @@ impl Occ3NativeSession {
                     if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(format!("{} [occ3_tool_sender_mismatch]", failure()))); }
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { return Err(anyhow::anyhow!(failure())); }
                     if this.arm_handoff_if_needed(authorized.target_session_id()).map_err(anyhow::Error::msg)? {
-                        return Ok(AgentToolResult::new(vec![ContentBlock::text(
-                            "Native source capture armed; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments."
-                        )], json!({"status":"capture_armed","delivery_completed":false})));
+                        let attempts = this.failed_capture_attempts();
+                        let retry_note = if attempts > 0 {
+                            format!(
+                                " (retry attempt {} of {} after {} failed capture{})",
+                                attempts,
+                                MAX_NATIVE_CAPTURE_RETRIES,
+                                attempts,
+                                if attempts == 1 { "" } else { "s" }
+                            )
+                        } else {
+                            String::new()
+                        };
+                        return Ok(AgentToolResult::new(vec![ContentBlock::text(format!(
+                            "Native source capture armed{retry_note}; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments. If the captured turn fails again the capture is retried automatically up to {} times before native handoffs are disabled for this session; ordinary messages always keep working.",
+                            MAX_NATIVE_CAPTURE_RETRIES
+                        ))], json!({"status":"capture_armed","delivery_completed":false,"capture_attempts_failed":attempts})));
                     }
                     let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
                         let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_source_lease_missing]", failure())))?;
@@ -976,6 +1038,63 @@ impl Occ3NativeSession {
                 unsubscribe();
             }
         }
+        self.run_tombstone_cleanup();
+    }
+    /// Runs the host-side recovery callback exactly once. Called on every
+    /// terminal deactivation path so the host's native hooks and handoff
+    /// tool never outlive the native session they were installed for.
+    fn run_tombstone_cleanup(&self) {
+        let cleanup = self
+            .tombstone_cleanup
+            .lock()
+            .ok()
+            .and_then(|mut slot| slot.take());
+        if let Some(cleanup) = cleanup {
+            cleanup();
+        }
+    }
+    /// Recoverable deactivation for a terminally failed source capture
+    /// (retry budget exhausted). Unlike [`Self::invalidate`] it does not
+    /// drop the process-wide ready cache: the connector handshake stays
+    /// valid for other sessions and later re-activation. It marks this
+    /// session closed, cancels any residual lease, and runs the registered
+    /// tombstone cleanup so the host clears its native hooks and removes
+    /// the handoff tool. Subsequent turns of the host session then take
+    /// the ordinary inference path instead of failing forever.
+    pub fn deactivate(&self) {
+        self.closed
+            .store(true, std::sync::atomic::Ordering::Release);
+        if let Ok(mut inbox) = self.inbox.lock() {
+            inbox.invalidate_all();
+        }
+        if let Ok(mut source) = self.source.lock() {
+            source.budget = None;
+            if let Some(lease) = &source.lease {
+                lease.cancel();
+            }
+        }
+        if let Ok(mut guard) = self.restamp_unsubscribe.lock() {
+            if let Some(unsubscribe) = guard.take() {
+                unsubscribe();
+            }
+        }
+        self.run_tombstone_cleanup();
+    }
+    /// Registers the host-side recovery callback run exactly once when this
+    /// session's native path is terminally deactivated. The host uses it to
+    /// clear its agent hooks and remove the handoff tool.
+    pub fn set_tombstone_cleanup(&self, cleanup: Box<dyn Fn() + Send + Sync>) {
+        if let Ok(mut slot) = self.tombstone_cleanup.lock() {
+            *slot = Some(cleanup);
+        }
+    }
+    /// Failed armed captures observed so far. Exposed for the handoff
+    /// tool's retry notice and host diagnostics.
+    pub fn failed_capture_attempts(&self) -> u32 {
+        self.source
+            .lock()
+            .map(|slot| slot.failed_attempts)
+            .unwrap_or(0)
     }
     /// Revocation stays in memory; best-effort runtime cleanup is awaited by the
     /// isolated controller. It never restarts the model or changes settings.
@@ -1245,6 +1364,84 @@ mod tests {
                 assert_eq!(budget.retained_count_limit, 64);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn failed_capture_resets_for_retry_and_reports_attempts() {
+        let session = enrolled().await;
+        // Arm, then simulate the armed turn's failure: the resolve hook
+        // took the budget and resolved the slot, but no admitted capture
+        // survived (stalled stream -> cancelled lease).
+        assert!(session.arm_source(budget()).is_ok());
+        {
+            let mut slot = session.source.lock().unwrap();
+            let spent = slot.budget.take();
+            assert!(spent.is_some());
+            slot.resolved = true;
+        }
+        let hooks = session.source_hooks();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: Vec::new(),
+            signal: None,
+        };
+        // First tombstone: counted as failure 1, slot resets for a re-arm,
+        // and the turn is allowed to run uncaptured instead of failing.
+        let resolved = (hooks.resolve)(request()).await;
+        assert!(resolved.is_ok(), "retry must not fail the turn");
+        assert!(resolved.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(!slot.resolved, "slot resets for the next arm");
+            assert!(slot.lease.is_none());
+            assert!(slot.budget.is_none());
+        }
+        // The model can explicitly re-arm through the handoff tool.
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let result = (tool.execute)("retry-call".into(), json!({"receiver_role":"child","receiver_name":"receiver"}), None, None).await;
+        assert!(result.is_ok());
+        let result = result.unwrap();
+        assert_eq!(result.details["status"], "capture_armed");
+        assert_eq!(result.details["capture_attempts_failed"], 1);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("retry attempt 1 of"), "retry note surfaced: {text}");
+    }
+
+    #[tokio::test]
+    async fn failed_captures_deactivate_the_native_path_after_the_retry_budget() {
+        let session = enrolled().await;
+        let hooks = session.source_hooks();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: Vec::new(),
+            signal: None,
+        };
+        for expected_attempts in 1..=(MAX_NATIVE_CAPTURE_RETRIES + 1) {
+            // Simulate each armed turn failing after resolve took the budget.
+            assert!(session.arm_source(budget()).is_ok());
+            {
+                let mut slot = session.source.lock().unwrap();
+                assert!(slot.budget.take().is_some());
+                slot.resolved = true;
+            }
+            let resolved = (hooks.resolve)(request()).await;
+            assert!(resolved.is_ok(), "no retry step may fail the turn");
+            assert!(resolved.unwrap().is_none());
+            assert_eq!(session.failed_capture_attempts(), expected_attempts);
+        }
+        // Budget exhausted: the session deactivated for recovery. Even the
+        // direct arm path refuses the closed session.
+        assert!(session.arm_source(budget()).is_err());
     }
 
     #[tokio::test]
