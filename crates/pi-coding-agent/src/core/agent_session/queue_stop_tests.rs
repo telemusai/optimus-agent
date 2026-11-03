@@ -948,3 +948,112 @@ async fn queue_metrics_record_actual_delivery_once_without_prompt_content() {
     drop(events);
     session.dispose_async(Some(false)).await;
 }
+
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn ordinary_busy_submission_queues_as_follow_up_in_order() {
+    let session = fixture().await;
+    let entered = CancellationToken::new();
+    let release = CancellationToken::new();
+    let tool_calls = Arc::new(AtomicUsize::new(0));
+    install_tool(&session, entered.clone(), release.clone(), tool_calls.clone());
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    install_provider(&session, contexts.clone(), 1);
+    let owner = session.clone();
+    let initial = tokio::spawn(async move { owner.prompt("initial work", None).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.cancelled())
+        .await
+        .unwrap();
+
+    // Ordinary submissions with no streaming behavior while the session is
+    // streaming must queue as in-order follow-ups, not reject the caller.
+    for text in ["first queued", "second queued", "third queued"] {
+        session
+            .prompt_until_accepted(text, None)
+            .await
+            .unwrap_or_else(|error| panic!("ordinary busy submission {text} was rejected: {error}"));
+    }
+    let snapshot = session.get_session_action_snapshot();
+    assert!(snapshot.steering.is_empty(), "ordinary submissions must not steer");
+    assert_eq!(
+        snapshot.follow_ups,
+        ["first queued", "second queued", "third queued"],
+        "ordinary submissions must wait in order"
+    );
+
+    // Cancellation of one queued follow-up before it starts: it must never
+    // reach the model, and the queue keeps its order around the hole.
+    session.cancel_session_actions(
+        &|action| matches!(&action.payload, QueuedActionPayload::Turn(turn) if turn.base.text == "second queued"),
+        "test cancellation of one queued follow-up",
+        None,
+    );
+
+    release.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(8), initial)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    tokio::time::timeout(std::time::Duration::from_secs(15), session.wait_for_idle())
+        .await
+        .unwrap()
+        .unwrap();
+
+    let seen = contexts.lock().unwrap();
+    // 2 contexts for the initial turn (tool call + completion), then exactly 2
+    // surviving follow-up turns.
+    assert_eq!(
+        seen.len(),
+        2 + 2,
+        "expected 2 executed follow-ups, saw {} contexts",
+        seen.len()
+    );
+    assert!(
+        !seen.iter().any(|context| has_text(context, "second queued")),
+        "the cancelled queued submission must never reach the model"
+    );
+    // Each executed follow-up sees the prior queued submission in its history.
+    let third = seen.iter().position(|c| has_text(c, "third queued")).unwrap();
+    assert!(has_text(&seen[third], "first queued"));
+    let first = seen.iter().position(|c| has_text(c, "first queued")).unwrap();
+    assert!(first < third, "follow-ups must execute in order");
+    drop(seen);
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn internal_busy_submission_without_behavior_still_rejects() {
+    let session = fixture().await;
+    let entered = CancellationToken::new();
+    let release = CancellationToken::new();
+    install_tool(&session, entered.clone(), release.clone(), Arc::new(AtomicUsize::new(0)));
+    let contexts = Arc::new(Mutex::new(Vec::new()));
+    install_provider(&session, contexts.clone(), 1);
+    let owner = session.clone();
+    let initial = tokio::spawn(async move { owner.prompt("initial work", None).await });
+    tokio::time::timeout(std::time::Duration::from_secs(5), entered.cancelled())
+        .await
+        .unwrap();
+    let error = session
+        .prompt_until_accepted(
+            "internal probe",
+            Some(PromptOptions {
+                internal_prompt: Some(true),
+                ..Default::default()
+            }),
+        )
+        .await
+        .unwrap_err();
+    assert!(
+        error.contains("Specify streamingBehavior"),
+        "internal busy prompt without behavior must keep the explicit error, saw: {error}"
+    );
+    release.cancel();
+    tokio::time::timeout(std::time::Duration::from_secs(8), initial)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap();
+    session.dispose_async(Some(false)).await;
+}

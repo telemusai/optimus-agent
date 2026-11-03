@@ -330,7 +330,9 @@ fn mutation_payload(mutation: &Mutation) -> Value {
     match mutation {
         Mutation::Move(direction) => json!({"type": "move", "direction": direction}),
         Mutation::Edit(text, follow_up) if !text.trim().is_empty() => {
-            let mut value = json!({"type": "replace", "text": text.trim(), "lane": if *follow_up { "followUp" } else { "steering" }});
+            // Lane choice mirrors submit semantics: Enter re-files the
+            // edited item as an in-order follow-up, the follow-up key steers.
+            let mut value = json!({"type": "replace", "text": text.trim(), "lane": if *follow_up { "steering" } else { "followUp" }});
             // Missing images preserves attachments that this client cannot resolve.
             if crate::modes::interactive::image_markers::image_marker_ids(text).is_empty() {
                 value["images"] = json!([]);
@@ -1362,7 +1364,7 @@ mod tests {
 
         assert_eq!(
             harness.connection.mutations()[0].3,
-            json!({"type": "replace", "text": "f1 edited", "lane": "steering", "images": []})
+            json!({"type": "replace", "text": "f1 edited", "lane": "followUp", "images": []})
         );
         assert_eq!(harness.editor_text(), "typed draft");
         assert!(!harness.is_browsing());
@@ -1482,12 +1484,12 @@ mod tests {
     fn a_replace_sends_resolvable_images_and_omits_unresolvable_ones() {
         assert_eq!(
             mutation_payload(&Mutation::Edit("[image #7] look".into(), false)),
-            json!({"type": "replace", "text": "[image #7] look", "lane": "steering"})
+            json!({"type": "replace", "text": "[image #7] look", "lane": "followUp"})
         );
         // No marker at all means the queue's own images are cleared.
         assert_eq!(
             mutation_payload(&Mutation::Edit("plain".into(), false)),
-            json!({"type": "replace", "text": "plain", "lane": "steering", "images": []})
+            json!({"type": "replace", "text": "plain", "lane": "followUp", "images": []})
         );
     }
 
@@ -1525,7 +1527,7 @@ mod tests {
         );
         assert_eq!(
             mutation_payload(&Mutation::Edit(" updated ".into(), true)),
-            json!({"type":"replace","text":"updated","lane":"followUp","images":[]})
+            json!({"type":"replace","text":"updated","lane":"steering","images":[]})
         );
         assert!(
             mutation_payload(&Mutation::Edit("[image #1] inspect".into(), false))

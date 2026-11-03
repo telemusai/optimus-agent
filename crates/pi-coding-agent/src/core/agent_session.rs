@@ -10217,7 +10217,17 @@ impl AgentSession {
                 let queue_for_busy = options.queue_if_busy == Some(true)
                     && self.is_busy_for_session_input("preflight");
                 let visible_queued = queue_for_streaming || queue_for_busy;
-                if visible_queued && options.streaming_behavior.is_none() {
+                // Ordinary user submissions while the session is busy now queue
+                // as follow-ups (executed in order against updated history)
+                // instead of rejecting the caller. Internal machine traffic
+                // must stay explicit: an internal prompt with no streaming
+                // behavior still fails loudly so silent queueing cannot change
+                // automated flows. Explicit "steer" keeps its preemption
+                // semantics untouched.
+                if visible_queued
+                    && options.streaming_behavior.is_none()
+                    && (is_internal_prompt || options.custom_message.is_some())
+                {
                     if let Some(fence) = commit_fence.as_ref() {
                         fence.release();
                     }
