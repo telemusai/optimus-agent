@@ -979,6 +979,13 @@ TS8_RUNTIME_EPOCH = "c2847f3de4fc43d1897644eda8dc81a9"
 TS8_RUNTIME_GENERATION = 1
 
 
+def test_static_input_pin_matches_the_reviewed_input_file():
+    """The pin exists to catch unintended input changes; keep it honest."""
+    root = Path(nv.__file__).resolve().parents[2]
+    raw = (root / "deploy/native-build-inputs/native-profile-input.json").read_bytes()
+    assert hashlib.sha256(raw).hexdigest() == nv.PIN_STATIC_INPUT_SHA256
+
+
 def test_ts8_incarnation_reproduces_byte_exact_wire_digest():
     observed = {"runtime_epoch": TS8_RUNTIME_EPOCH,
                 "runtime_generation": TS8_RUNTIME_GENERATION}

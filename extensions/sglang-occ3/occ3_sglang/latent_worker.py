@@ -1443,6 +1443,11 @@ def load_runtime_profile():
     # A pinned profile may omit the frozen-artifact reference: the per-message
     # method names none, so the runtime profile takes its empty default.
     optional = {"calibration_path", "calibration_digest"}
+    # The declared-launch identity block (native_profile.DECLARED_IDENTITY) is
+    # route-served deployment metadata, never worker state: it is dropped
+    # before the RuntimeProfile fieldset is checked or constructed.
+    static = {name: value for name, value in static.items()
+              if name != "declared_identity"}
     require(type(static) is dict and expected - optional <= set(static) <= expected, "profile")
     return RuntimeProfile(**static, runtime_epoch=incarnation["runtime_epoch"],
                           runtime_generation=incarnation["runtime_generation"])

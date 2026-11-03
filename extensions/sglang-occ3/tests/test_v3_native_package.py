@@ -724,6 +724,74 @@ def test_profile_identifier_outside_shared_contract_refused_without_write(fixtur
     fixture.no_writes()
 
 
+def _declared_block():
+    return {
+        "model_id": "fixture-model", "architecture": "FixtureForCausalLM",
+        "checkpoint_revision": "0" * 40,
+        "weight_fingerprint": "metadata-manifest-sha256:" + "1" * 64,
+        "tokenizer_fingerprint": "sha256:" + "2" * 64,
+        "chat_template_fingerprint": "sha256:" + "3" * 64,
+        "quantisation": "fp8", "tensor_geometry": "layers78:hidden6144",
+        "kv_layout": "declared-launch:tp8:kv-fp8_e4m3",
+        "latent_method": "kv-radix-channel-v1",
+        "runtime": "sglang:0.5.21:" + "4" * 40}
+
+
+def test_profile_declared_identity_block_passes_validation_unchanged():
+    # The pure validation seam (the same check prepare applies to the input
+    # file) accepts the block and the canonical form carries it verbatim.
+    value = {"model_fingerprint": "fixture-fingerprint-not-production",
+             "model_id": "fixture-model",
+             "expected_ranks": 8, "hidden_dim": 6144, "layer_index": 77,
+             "max_prefix_tokens": 128, "max_live_bytes": 256 * 1024**2,
+             "workspace_bytes": 128 * 1024**2, "max_records": 256, "max_active": 1,
+             "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
+             "method": package.METHOD,
+             "declared_identity": _declared_block()}
+    canonical = package._profile(value)
+    assert json.loads(canonical)["declared_identity"] == _declared_block()
+
+
+def test_real_per_message_input_file_passes_profile_validation():
+    # The shipped input must stay packageable at the same seam.
+    root = Path(package.__file__).resolve().parents[2]
+    raw = (root / "deploy/native-build-inputs/native-profile-input.json").read_bytes()
+    value = package._json(raw)
+    assert json.loads(package._profile(value))["declared_identity"]["model_id"] == "glm-5.3"
+
+
+@pytest.mark.parametrize("mutation", [
+    "missing-field", "empty-field", "oversize-field", "wrong-type-field",
+    "extra-field", "explicit-null", "not-a-dict",
+])
+def test_profile_declared_identity_block_refused(mutation):
+    value = {"model_fingerprint": "fixture-fingerprint-not-production",
+             "model_id": "fixture-model",
+             "expected_ranks": 8, "hidden_dim": 6144, "layer_index": 77,
+             "max_prefix_tokens": 128, "max_live_bytes": 256 * 1024**2,
+             "workspace_bytes": 128 * 1024**2, "max_records": 256, "max_active": 1,
+             "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
+             "method": package.METHOD}
+    block = _declared_block()
+    if mutation == "missing-field":
+        block.pop("latent_method")
+    elif mutation == "empty-field":
+        block["quantisation"] = ""
+    elif mutation == "oversize-field":
+        block["runtime"] = "x" * 513
+    elif mutation == "wrong-type-field":
+        block["model_id"] = 7
+    elif mutation == "extra-field":
+        block["extra"] = "field"
+    elif mutation == "explicit-null":
+        block = None
+    else:
+        block = "string-block"
+    value["declared_identity"] = block
+    with pytest.raises(package.PackageError, match="invalid_profile_fields"):
+        package._profile(value)
+
+
 def test_merged_manifest_respects_same_byte_bound_as_normal_source_patch_prepare(fixture, monkeypatch):
     for path, manifest in zip(fixture.manifest_paths, fixture.manifests):
         path.write_bytes(package._canonical(manifest))
