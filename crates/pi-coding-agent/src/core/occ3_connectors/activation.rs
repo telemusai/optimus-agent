@@ -1097,6 +1097,44 @@ mod tests {
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_accepts_a_server_that_honestly_degrades_informational_fields() {
+        let _cache_guard = reset_ready_cache().await;
+        // The deployed extension degrades two informational provenance
+        // fields to "" (a checkpoint served from a local path carries no
+        // hub revision; a chat template kept outside tokenizer_config.json
+        // yields no in-config digest). A server that still binds its
+        // attested fingerprint over exactly that degraded identity must
+        // activate end to end: the empty fields are honest, not absent.
+        let degraded = Occ3ModelIdentity {
+            checkpoint_revision: String::new(),
+            chat_template_fingerprint: String::new(),
+            ..fixture_identity("glm-5.3", METHOD_A)
+        };
+        let fixture = serve_activation_fixture(degraded.clone(), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let ready = verify(&request, Duration::from_secs(5))
+            .await
+            .expect("honest empty informational fields must not decline activation");
+        assert_eq!(ready.method_id, METHOD_A);
+        assert_eq!(ready.capabilities.model_identity.model_id, "glm-5.3");
+        assert_eq!(ready.capabilities.model_identity.checkpoint_revision, "");
+        assert_eq!(
+            ready.capabilities.model_identity.chat_template_fingerprint,
+            ""
+        );
+        // The binding check still ran: the attested fingerprint is the
+        // digest of exactly the degraded identity the server served.
+        assert_eq!(
+            ready.capabilities.model_identity.fingerprint(),
+            {
+                let mut bound = degraded;
+                bound.latent_method = METHOD_A.into();
+                bound.fingerprint()
+            }
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
     async fn verify_declines_a_declared_method_the_verified_runtime_does_not_serve() {
         let _cache_guard = reset_ready_cache().await;
         let fixture =
