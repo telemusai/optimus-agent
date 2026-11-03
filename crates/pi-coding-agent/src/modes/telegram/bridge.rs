@@ -711,13 +711,16 @@ impl TelegramBridge {
                 .await
                 .map_err(TelegramBridgeError::Message)?,
             None => {
+                // Ordinary chat traffic queues in order against updated
+                // history instead of interrupting the running turn; explicit
+                // steering stays available through the command surface.
                 self.connection
                     .prompt(
                         text,
                         Some(AgentConnectionPromptOptions {
                             source: Some("interactive".to_string()),
                             queue_if_busy: Some(true),
-                            streaming_behavior: Some("steer".to_string()),
+                            streaming_behavior: Some("followUp".to_string()),
                             ..Default::default()
                         }),
                     )
