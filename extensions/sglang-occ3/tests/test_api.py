@@ -106,6 +106,32 @@ def test_status_payload_is_a_fixed_key_superset_with_dormant_state(client):
         "rollback_completed"))
 
 
+def test_status_and_capabilities_serve_the_pinned_declared_fingerprint(
+        client, monkeypatch, tmp_path):
+    # Diagnostic routes must not contradict the identity route: when the
+    # installed profile pins a declared-launch identity, both advertise
+    # exactly its pipe-joined fingerprint instead of the runtime-derived
+    # one the live 2026-11-03 status response still showed.
+    payload = install_pinned_profile(
+        monkeypatch, tmp_path, json.loads(PROFILE_INPUT.read_text(encoding="utf-8")))
+    declared = payload["declared_identity"]
+    expected = "|".join(declared[name] for name in IDENTITY_FIELDS)
+    for path in ("/occ3/v1/status", "/occ3/v1/capabilities"):
+        r = client.get(path)
+        assert r.status_code == 200
+        assert r.json()["model_fingerprint"] == expected
+
+
+def test_status_keeps_the_runtime_fingerprint_without_a_pinned_profile(client):
+    # No pinned profile (pre-install / DECLINED / older profile): status
+    # still answers with the runtime-derived fingerprint. The controller
+    # gate reads status exactly in those states, so a fail-closed 503 here
+    # would break the DECLINED-aware deployment gate.
+    r = client.get("/occ3/v1/status")
+    assert r.status_code == 200
+    assert r.json()["model_fingerprint"]
+
+
 def test_identity_route_serves_the_pinned_declared_fields(client, monkeypatch, tmp_path):
     payload = install_pinned_profile(
         monkeypatch, tmp_path, json.loads(PROFILE_INPUT.read_text(encoding="utf-8")))
