@@ -88,7 +88,7 @@ PIN_FIELDS = ("schema", "phase", "attempt_id", "static_input_sha256", "runtime_e
 # registry-default per-message method pins the reviewed file
 # deploy/native-build-inputs/native-profile-input.json; every other registered
 # method re-pins the per-method static input digest its plan declared.
-PIN_STATIC_INPUT_SHA256 = "6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a"
+PIN_STATIC_INPUT_SHA256 = "613698c4abf7ac20ba8e15dacdbcca8391c6deb379d168ba513a1f7a94d648a6"
 REPORT_COMMON_FIELDS = ("schema", "phase", "attempt_id", "candidate_id",
                          "candidate_started_at", "validator_challenge", "harness", "binding",
                          "observed", "suite_nonce_sha256", "cases", "logical_cleanup_confirmed",

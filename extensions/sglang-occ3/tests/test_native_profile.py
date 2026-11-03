@@ -176,6 +176,22 @@ class PackagedArtifactTests(ErrorAssertions, unittest.TestCase):
         loaded = profile.load_pinned_profile()
         self.assertEqual(loaded[profile.DECLARED_IDENTITY], declared_identity())
 
+    def test_declared_identity_block_with_calibrated_reference_loads(self):
+        # The calibrated deployment input carries the block alongside the
+        # frozen-artifact reference; both optional fields coexist. The
+        # double-slash fixture path is absolute under both ntpath and
+        # posixpath, so the check runs on every host; the production input's
+        # single-slash form is absolute in the Linux build stage.
+        value = static_profile()
+        value["method"] = profile.CALIBRATED_METHOD
+        value["calibration_path"] = "//occ3/calibration/synthetic-frozen-artifact.bin"
+        value["calibration_digest"] = "5" * 64
+        value[profile.DECLARED_IDENTITY] = declared_identity()
+        self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+        loaded = profile.load_pinned_profile()
+        self.assertEqual(loaded[profile.DECLARED_IDENTITY], declared_identity())
+        self.assertEqual(loaded["method"], profile.CALIBRATED_METHOD)
+
     def test_declared_identity_block_is_strictly_validated(self):
         block = declared_identity()
         cases = []

@@ -34,8 +34,20 @@ PROFILE_FIELDS = frozenset({
     "max_prefix_tokens", "max_live_bytes", "workspace_bytes", "max_records",
     "max_active", "max_ttl_seconds", "anchor_alpha", "tile_rows", "method",
 })
+# The declared-launch identity block (the eleven optimus.occ3.identity.v1
+# fields pinned at deploy time) is optional here exactly as it is in the
+# runtime validator (occ3_sglang/native_profile.py): an older pinned input
+# without the block stays valid. The fieldset is a literal in both places;
+# tests pin the two definitions together.
+DECLARED_IDENTITY = "declared_identity"
+_DECLARED_IDENTITY_FIELDS = frozenset({
+    "model_id", "architecture", "checkpoint_revision", "weight_fingerprint",
+    "tokenizer_fingerprint", "chat_template_fingerprint", "quantisation",
+    "tensor_geometry", "kv_layout", "latent_method", "runtime",
+})
 # Frozen-artifact reference: optional, because the per-message method names none.
-OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest"})
+OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
+                                     DECLARED_IDENTITY})
 OUTPUT_NAMES = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 MAX_PROFILE_BYTES = 16384
 MAX_SOURCES_BYTES = 65536
@@ -434,6 +446,16 @@ def _source(raw, relative, *, attested_sg):
 
 def _profile(value):
     _keys(value, PROFILE_FIELDS, "invalid_profile_fields", OPTIONAL_PROFILE_FIELDS)
+    if DECLARED_IDENTITY in value:
+        # Mirrors occ3_sglang.native_profile._validate_profile: the declared
+        # block, when present, is exactly the eleven non-empty bounded
+        # strings; an explicit null is refused, never treated as absent.
+        declared = value[DECLARED_IDENTITY]
+        _need(type(declared) is dict and set(declared) == _DECLARED_IDENTITY_FIELDS,
+              "invalid_profile_fields")
+        for name in _DECLARED_IDENTITY_FIELDS:
+            _need(type(declared[name]) is str and 0 < len(declared[name]) <= 512,
+                  "invalid_profile_fields")
     path_value = value.get("calibration_path", "")
     digest_value = value.get("calibration_digest", "")
     _need(type(path_value) is str and type(digest_value) is str
