@@ -1,4 +1,7 @@
 //! Transport-only clients. Request credentials and affinity never enter this pool.
+//! Pooling keys include a fingerprint of every frozen-matcher input reqwest's
+//! default client reads: the proxy/TLS environment plus, on Windows, the
+//! registry values hyper-util's system matcher consults.
 use std::collections::VecDeque;
 use std::net::{IpAddr, Ipv4Addr, Ipv6Addr};
 use std::sync::{Mutex, OnceLock};
@@ -22,6 +25,59 @@ const TLS_ENV: [&str; 4] = ["SSL_CERT_FILE", "SSL_CERT_DIR", "OPENSSL_CONF", "OP
 /// per-handshake platforms may pool TLS-bearing reuse.
 const PER_HANDSHAKE_TRUST: bool = cfg!(any(windows, target_os = "macos"));
 
+/// What this process can observe about the OS proxy store that reqwest's
+/// default matcher consults beyond the environment (hyper-util
+/// `client-proxy-system`): the registry on Windows, the SystemConfiguration
+/// store on macOS. The store feeds every pooled client's frozen matcher, so
+/// reuse needs a fingerprint of its consultable values or a fresh client.
+#[derive(Clone, PartialEq, Eq, Debug)]
+enum OsProxyStore {
+    /// The default matcher consults no OS store (Linux): env is everything.
+    /// Only tests construct it on Windows/macOS, where an OS store is real.
+    #[cfg_attr(any(windows, target_os = "macos"), allow(dead_code))]
+    None,
+    /// The store exists but its values are not observable here (macOS
+    /// SystemConfiguration; a Windows registry key that failed to open).
+    Unobserved,
+    /// The Windows registry store, carrying exactly the values hyper-util
+    /// `win::with_system` reads, presence included.
+    Windows(WindowsProxySettings),
+}
+
+/// The registry values under HKCU `Software\Microsoft\Windows\
+/// CurrentVersion\Internet Settings` that hyper-util 0.1.20 `win::with_system`
+/// consults: `ProxyEnable` gates the whole contribution, `ProxyServer` fills
+/// empty env http/https slots, `ProxyOverride` fills an empty env NO_PROXY
+/// slot after its `;`-join and `*.`-strip transform.
+#[derive(Clone, PartialEq, Eq, Debug, Default)]
+struct WindowsProxySettings {
+    enable: u32,
+    server: Option<String>,
+    r#override: Option<String>,
+}
+
+/// Read the store hyper-util would read, without writing anything. An
+/// unopenable key is `Unobserved` (a fresh client could still read it later,
+/// so the store is not provably empty), not `None`.
+#[cfg(windows)]
+fn observe_os_proxy() -> OsProxyStore {
+    let Ok(settings) = windows_registry::CURRENT_USER
+        .open("Software\\Microsoft\\Windows\\CurrentVersion\\Internet Settings")
+    else {
+        return OsProxyStore::Unobserved;
+    };
+    OsProxyStore::Windows(WindowsProxySettings {
+        enable: settings.get_u32("ProxyEnable").unwrap_or(0),
+        server: settings.get_string("ProxyServer").ok(),
+        r#override: settings.get_string("ProxyOverride").ok(),
+    })
+}
+
+#[cfg(not(windows))]
+fn observe_os_proxy() -> OsProxyStore {
+    if cfg!(target_os = "macos") { OsProxyStore::Unobserved } else { OsProxyStore::None }
+}
+
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub(super) enum RedirectPolicy { Generation, Count }
 
@@ -37,10 +93,12 @@ struct Entry { key: Key, created: Instant, client: reqwest::Client }
 #[derive(Default)]
 struct Pool { entries: VecDeque<Entry> }
 
+#[derive(Debug)]
 struct Environment { digest: [u8; 32], fallback: Option<&'static str>, no_proxy: Option<String> }
 
 // `no_proxy` is a decision input for loopback coverage, not an identity field:
-// its value is already hashed into `digest`, so equality stays rotation-sensitive.
+// its value is the env string or the registry override, both hashed into
+// `digest`, so equality stays rotation-sensitive.
 impl PartialEq for Environment {
     fn eq(&self, other: &Self) -> bool {
         self.digest == other.digest && self.fallback == other.fallback
@@ -48,7 +106,9 @@ impl PartialEq for Environment {
 }
 impl Eq for Environment {}
 
-fn environment_from(read: impl Fn(&str) -> Option<std::ffi::OsString>) -> Environment {
+fn environment_from(
+    read: impl Fn(&str) -> Option<std::ffi::OsString>, os: &OsProxyStore,
+) -> Environment {
     static SALT: OnceLock<[u8; 32]> = OnceLock::new();
     let mut hash = Sha256::new();
     hash.update(SALT.get_or_init(rand::random));
@@ -64,12 +124,43 @@ fn environment_from(read: impl Fn(&str) -> Option<std::ffi::OsString>) -> Enviro
             None => hash.update([0]),
         }
     }
+    // The registry store feeds the same frozen matcher. Hash exactly what
+    // hyper-util `win::with_system` consults: ProxyEnable always (its early
+    // return), then ProxyServer/ProxyOverride only while enabled (the only
+    // state in which they can fill a matcher slot).
+    if let OsProxyStore::Windows(settings) = os {
+        hash.update(b"windows:ProxyEnable");
+        hash.update(settings.enable.to_le_bytes());
+        if settings.enable != 0 {
+            for (name, value) in [
+                ("windows:ProxyServer", &settings.server),
+                ("windows:ProxyOverride", &settings.r#override),
+            ] {
+                hash.update(name);
+                match value {
+                    Some(value) => {
+                        let bytes = value.as_bytes();
+                        hash.update([1]);
+                        hash.update((bytes.len() as u64).to_le_bytes());
+                        hash.update(bytes);
+                    }
+                    None => hash.update([0]),
+                }
+            }
+        }
+    }
     let nonempty = |upper, lower| read(upper).and_then(|v| v.into_string().ok())
         .or_else(|| read(lower).and_then(|v| v.into_string().ok()))
         .map(|v| !v.is_empty()).unwrap_or(false);
-    // reqwest's default system matcher can fill empty HTTP/HTTPS/NO_PROXY
-    // from Windows/macOS settings. Do not freeze unobservable mutable policy.
-    let os_proxy_unobserved = cfg!(any(windows, target_os = "macos"))
+    // reqwest's default system matcher can fill empty HTTP/HTTPS/NO_PROXY from
+    // the OS store. The store is either fingerprinted above (Windows registry)
+    // or provably unable to contribute: CGI mode empties the whole matcher, and
+    // a fully covering environment leaves no empty slot to fill.
+    let store_unobserved = match os {
+        OsProxyStore::Unobserved => true,
+        OsProxyStore::None | OsProxyStore::Windows(_) => false,
+    };
+    let os_proxy_unobserved = store_unobserved
         && read("REQUEST_METHOD").is_none()
         && !(nonempty("HTTP_PROXY", "http_proxy") && nonempty("HTTPS_PROXY", "https_proxy")
             && nonempty("NO_PROXY", "no_proxy"));
@@ -78,14 +169,45 @@ fn environment_from(read: impl Fn(&str) -> Option<std::ffi::OsString>) -> Enviro
     let tls_files = TLS_ENV.iter().any(|name| read(name).is_some());
     let first = |upper, lower| read(upper).and_then(|v| v.into_string().ok())
         .or_else(|| read(lower).and_then(|v| v.into_string().ok()));
+    // hyper-util fills an empty env NO_PROXY slot from the registry override
+    // while ProxyEnable is set, after its `;`-join and `*.`-strip transform
+    // (`win::with_system`); replicate the gate and the transform exactly so
+    // coverage decisions track the frozen matcher.
+    let no_proxy = first("NO_PROXY", "no_proxy").filter(|value| !value.is_empty()).or_else(|| {
+        match os {
+            OsProxyStore::Windows(settings) if settings.enable != 0 => settings.r#override.as_ref()
+                .map(|value| {
+                    value.split(';').map(str::trim).collect::<Vec<&str>>().join(",")
+                        .replace("*.", "")
+                }),
+            _ => None,
+        }
+    });
+    // The registry server fills only empty env http/https slots while enabled;
+    // ALL_PROXY fills only what is still empty at build time.
+    let http_slot = first("HTTP_PROXY", "http_proxy").filter(|value| !value.is_empty());
+    let https_slot = first("HTTPS_PROXY", "https_proxy").filter(|value| !value.is_empty());
+    let all_slot = first("ALL_PROXY", "all_proxy").filter(|value| !value.is_empty());
+    let registry_server = match os {
+        OsProxyStore::Windows(settings) if settings.enable != 0 => settings.server.clone(),
+        _ => None,
+    };
+    let registry_fills_http = http_slot.is_none();
+    let registry_fills_https = https_slot.is_none();
+    let http_proxy = http_slot
+        .or_else(|| registry_server.clone().filter(|_| registry_fills_http))
+        .or(all_slot.clone());
+    let https_proxy = https_slot
+        .or_else(|| registry_server.filter(|_| registry_fills_https))
+        .or(all_slot);
     // A domain wildcard does not bypass numeric IP hosts in hyper-util. Do not
     // infer TLS bypass from NO_PROXY; an HTTPS proxy always uses fresh policy.
     let proxy_may_use_tls = read("REQUEST_METHOD").is_none()
-        && [first("HTTP_PROXY", "http_proxy"), first("ALL_PROXY", "all_proxy")]
-            .into_iter().flatten().any(|value| value.to_ascii_lowercase().starts_with("https://"));
+        && [http_proxy, https_proxy].into_iter().flatten()
+            .any(|value| value.to_ascii_lowercase().starts_with("https://"));
     Environment {
         digest: hash.finalize().into(),
-        no_proxy: first("NO_PROXY", "no_proxy"),
+        no_proxy,
         fallback: if tls_files { Some("fresh_tls_policy") }
             else if os_proxy_unobserved { Some("fresh_system_proxy_policy") }
             else if proxy_may_use_tls { Some("fresh_proxy_tls_policy") } else { None },
@@ -281,6 +403,12 @@ fn poolable(
         (RedirectPolicy::Generation, Some("http")) if loopback => {
             PER_HANDSHAKE_TRUST && fully_observed && covered
         }
+        // Redirect-following generation over TLS: the environment digest now
+        // pins every frozen-matcher input (env vars plus, on Windows, the
+        // registry values hyper-util consults), and per-handshake trust keeps
+        // schannel/security-framework trust roots current, so a pooled client
+        // observes exactly the policy a fresh build would.
+        (RedirectPolicy::Generation, Some("https")) => PER_HANDSHAKE_TRUST && fully_observed,
         _ => false,
     }
 }
@@ -289,6 +417,9 @@ fn poolable(
 fn phases(redirect: RedirectPolicy, scheme: Option<&str>, loopback: bool) -> (&'static str, &'static str) {
     match (redirect, scheme, loopback) {
         (RedirectPolicy::Count, Some("https"), _) => ("http_client_reused_https", "http_client_created_https"),
+        (RedirectPolicy::Generation, Some("https"), _) => {
+            ("http_client_reused_generation_https", "http_client_created_generation_https")
+        }
         (RedirectPolicy::Generation, Some("http"), true) => {
             ("http_client_reused_generation_loopback", "http_client_created_generation_loopback")
         }
@@ -302,8 +433,16 @@ fn fresh_phase(
     redirect: RedirectPolicy, scheme: Option<&str>, origin_known: bool,
     fallback: Option<&'static str>,
 ) -> &'static str {
-    if redirect == RedirectPolicy::Generation { "fresh_generation_policy" }
-    else if scheme == Some("https") { "fresh_tls_policy" }
+    if redirect == RedirectPolicy::Generation {
+        match fallback {
+            Some("fresh_tls_policy") => "fresh_generation_tls_policy",
+            Some("fresh_system_proxy_policy") => "fresh_generation_system_proxy_policy",
+            Some("fresh_proxy_tls_policy") => "fresh_generation_proxy_tls_policy",
+            // Fully observed but still fresh: no per-handshake-trust platform,
+            // or an origin that never pooled.
+            _ => "fresh_generation_policy",
+        }
+    } else if scheme == Some("https") { "fresh_tls_policy" }
     else if !origin_known { "fresh_unknown_policy" }
     else { fallback.unwrap_or("fresh_unknown_policy") }
 }
@@ -314,11 +453,12 @@ pub(super) struct Lease {
 }
 
 pub(super) fn acquire(base_url: &str, redirect: RedirectPolicy) -> Result<Lease, reqwest::Error> {
-    acquire_from(&|name| std::env::var_os(name), base_url, redirect)
+    acquire_with(&|name| std::env::var_os(name), &observe_os_proxy, base_url, redirect)
 }
 
-fn acquire_from(
+fn acquire_with(
     read: &dyn Fn(&str) -> Option<std::ffi::OsString>,
+    os_read: &dyn Fn() -> OsProxyStore,
     base_url: &str,
     redirect: RedirectPolicy,
 ) -> Result<Lease, reqwest::Error> {
@@ -327,7 +467,7 @@ fn acquire_from(
     let scheme = url.as_ref().map(|url| url.scheme());
     let host = url.as_ref().and_then(|url| url.host_str());
     let runtime = tokio::runtime::Handle::try_current().ok().map(|handle| handle.id());
-    let policy = environment_from(read);
+    let policy = environment_from(read, &os_read());
     let origin = url.as_ref()
         .filter(|url| matches!(url.scheme(), "http" | "https") && url.host_str().is_some())
         .map(|url| Sha256::digest(url.origin().ascii_serialization().as_bytes()).into());
@@ -345,13 +485,13 @@ fn acquire_from(
     let key = Key { runtime: runtime.unwrap(), origin: origin.unwrap(), environment: policy.digest, redirect };
     let pool = POOL.get_or_init(|| Mutex::new(Pool::default()));
     if let Some(client) = pool.lock().unwrap_or_else(|p| p.into_inner()).take(&key, Instant::now()) {
-        if environment_from(read) == policy { return Ok(Lease { client, phase: reused }); }
+        if environment_from(read, &os_read()) == policy { return Ok(Lease { client, phase: reused }); }
         return Ok(Lease { client: build(redirect)?, phase: "fresh_changed_policy" });
     }
     // Client construction is outside the pool lock. Cloned handles keep active
     // requests alive across eviction; only idle ownership is bounded here.
     let client = build(redirect)?;
-    if environment_from(read) != policy { return Ok(Lease { client, phase: "fresh_changed_policy" }); }
+    if environment_from(read, &os_read()) != policy { return Ok(Lease { client, phase: "fresh_changed_policy" }); }
     let client = pool.lock().unwrap_or_else(|p| p.into_inner()).insert(key, client, Instant::now());
     Ok(Lease { client, phase: created })
 }
@@ -393,35 +533,79 @@ mod tests {
     #[test]
     fn environment_rotation_is_not_stored_as_plaintext_and_tls_files_fall_back() {
         let mut values = std::collections::BTreeMap::<&str, std::ffi::OsString>::new();
-        let initial = environment_from(|name| values.get(name).cloned());
+        let initial = environment_from(|name| values.get(name).cloned(), &OsProxyStore::None);
         assert_eq!(initial.no_proxy, None);
         values.insert("HTTP_PROXY", "http://fixture-user:fixture-secret@127.0.0.1:1".into());
         values.insert("HTTPS_PROXY", "http://fixture-user:fixture-secret@127.0.0.1:1".into());
         values.insert("NO_PROXY", "*".into());
-        let first = environment_from(|name| values.get(name).cloned());
+        let first = environment_from(|name| values.get(name).cloned(), &OsProxyStore::None);
         assert!(first.digest != initial.digest);
         assert!(first.fallback.is_none());
         assert_eq!(first.no_proxy.as_deref(), Some("*"));
         values.insert("HTTP_PROXY", "http://rotated-user:rotated-secret@127.0.0.1:1".into());
-        assert!(environment_from(|name| values.get(name).cloned()).digest != first.digest);
+        assert!(environment_from(|name| values.get(name).cloned(), &OsProxyStore::None).digest != first.digest);
         values.insert("NO_PROXY", "127.0.0.1".into());
-        let rotated = environment_from(|name| values.get(name).cloned());
+        let rotated = environment_from(|name| values.get(name).cloned(), &OsProxyStore::None);
         assert!(rotated.digest != first.digest, "a NO_PROXY rotation must change the digest");
         assert_eq!(rotated.no_proxy.as_deref(), Some("127.0.0.1"));
         values.insert("SSL_CERT_FILE", "nonexistent-fixture.pem".into());
-        assert_eq!(environment_from(|name| values.get(name).cloned()).fallback, Some("fresh_tls_policy"));
+        assert_eq!(environment_from(|name| values.get(name).cloned(), &OsProxyStore::None).fallback, Some("fresh_tls_policy"));
         values.remove("SSL_CERT_FILE");
         values.remove("HTTP_PROXY");
-        if cfg!(any(windows, target_os = "macos")) {
-            assert_eq!(environment_from(|name| values.get(name).cloned()).fallback, Some("fresh_system_proxy_policy"));
-        }
+        // An unobservable OS store (macOS SystemConfiguration, or a Windows
+        // registry key that failed to open) keeps the fresh fallback.
+        assert_eq!(
+            environment_from(|name| values.get(name).cloned(), &OsProxyStore::Unobserved).fallback,
+            Some("fresh_system_proxy_policy")
+        );
         values.insert("HTTP_PROXY", "https://fixture-proxy.invalid".into());
         values.insert("NO_PROXY", "127.0.0.1".into());
-        assert_eq!(environment_from(|name| values.get(name).cloned()).fallback, Some("fresh_proxy_tls_policy"));
+        assert_eq!(environment_from(|name| values.get(name).cloned(), &OsProxyStore::None).fallback, Some("fresh_proxy_tls_policy"));
         values.insert("NO_PROXY", "*".into());
-        assert_eq!(environment_from(|name| values.get(name).cloned()).fallback, Some("fresh_proxy_tls_policy"), "domain wildcard cannot prove TLS bypass for IP hosts");
+        assert_eq!(environment_from(|name| values.get(name).cloned(), &OsProxyStore::None).fallback, Some("fresh_proxy_tls_policy"), "domain wildcard cannot prove TLS bypass for IP hosts");
         values.insert("REQUEST_METHOD", "POST".into());
-        assert!(environment_from(|name| values.get(name).cloned()).fallback.is_none());
+        assert!(environment_from(|name| values.get(name).cloned(), &OsProxyStore::Unobserved).fallback.is_none());
+    }
+
+    #[test]
+    fn windows_store_rotation_changes_the_digest_only_while_enabled() {
+        let read = reader(&[]);
+        let base = WindowsProxySettings {
+            enable: 1, server: Some("http://a.invalid:1".into()), r#override: Some("localhost".into()),
+        };
+        let baseline = environment_from(&read, &OsProxyStore::Windows(base.clone()));
+        // Any consultable rotation while enabled changes the digest.
+        for rotated in [
+            WindowsProxySettings { enable: 1, server: Some("http://b.invalid:2".into()), r#override: Some("localhost".into()) },
+            WindowsProxySettings { enable: 1, server: Some("http://a.invalid:1".into()), r#override: Some("127.0.0.1".into()) },
+            WindowsProxySettings { enable: 1, server: None, r#override: Some("localhost".into()) },
+            WindowsProxySettings { enable: 1, server: Some("http://a.invalid:1".into()), r#override: None },
+            WindowsProxySettings { enable: 0, server: Some("http://a.invalid:1".into()), r#override: Some("localhost".into()) },
+        ] {
+            assert!(
+                environment_from(&read, &OsProxyStore::Windows(rotated)).digest != baseline.digest,
+                "rotation must invalidate the frozen-matcher fingerprint"
+            );
+        }
+        // While disabled, server/override cannot fill any matcher slot, so
+        // rotating them leaves the digest unchanged: exactly the values
+        // hyper-util would consult.
+        let disabled = WindowsProxySettings::default();
+        let disabled_digest = environment_from(&read, &OsProxyStore::Windows(disabled.clone())).digest;
+        for ignored in [
+            WindowsProxySettings { enable: 0, server: Some("http://b.invalid:2".into()), r#override: None },
+            WindowsProxySettings { enable: 0, server: None, r#override: Some("127.0.0.1".into()) },
+        ] {
+            assert_eq!(environment_from(&read, &OsProxyStore::Windows(ignored)).digest, disabled_digest);
+        }
+        // Store presence itself never leaks into the digest, only its values.
+        assert_eq!(
+            environment_from(&read, &OsProxyStore::Unobserved).digest,
+            environment_from(&read, &OsProxyStore::None).digest
+        );
+        // Presence of the store is not plaintext either: equal observations
+        // are equal environments.
+        assert_eq!(environment_from(&read, &OsProxyStore::Windows(base)), baseline);
     }
 
     #[test]
@@ -572,59 +756,188 @@ mod tests {
             ("HTTPS_PROXY", "http://fixture.invalid:8080"),
             ("NO_PROXY", "127.0.0.1,localhost,::1"),
         ]);
+        let no_store = || OsProxyStore::None;
         // Fully observed env, plain-http non-loopback: existing base phases.
-        assert_eq!(acquire_from(&observed, "http://10.0.0.1:59001/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created");
-        assert_eq!(acquire_from(&observed, "http://10.0.0.1:59001/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused");
+        assert_eq!(acquire_with(&observed, &no_store, "http://10.0.0.1:59001/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created");
+        assert_eq!(acquire_with(&observed, &no_store, "http://10.0.0.1:59001/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused");
         // Loopback detection: the three covered hosts pool, remote hosts do not.
-        assert_eq!(acquire_from(&observed, "http://127.0.0.1:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
-        assert_eq!(acquire_from(&observed, "http://127.0.0.1:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
-        assert_eq!(acquire_from(&observed, "http://localhost:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
-        assert_eq!(acquire_from(&observed, "http://[::1]:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&observed, &no_store, "http://127.0.0.1:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&observed, &no_store, "http://127.0.0.1:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        assert_eq!(acquire_with(&observed, &no_store, "http://localhost:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&observed, &no_store, "http://[::1]:59002/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
         // https://127.0.0.1 is the https branch, not loopback.
-        let https_loopback = acquire_from(&observed, "https://127.0.0.1:59003/v1", RedirectPolicy::Count).unwrap().phase;
+        let https_loopback = acquire_with(&observed, &no_store, "https://127.0.0.1:59003/v1", RedirectPolicy::Count).unwrap().phase;
         if PER_HANDSHAKE_TRUST {
             assert_eq!(https_loopback, "http_client_created_https");
         } else {
             assert_eq!(https_loopback, "fresh_tls_policy");
         }
         // Generation: pooled only for covered loopback with fully observed env.
-        let generation = acquire_from(&observed, "http://127.0.0.1:59004/v1", RedirectPolicy::Generation).unwrap();
+        let generation = acquire_with(&observed, &no_store, "http://127.0.0.1:59004/v1", RedirectPolicy::Generation).unwrap();
         if PER_HANDSHAKE_TRUST {
             assert_eq!(generation.phase, "http_client_created_generation_loopback");
-            assert_eq!(acquire_from(&observed, "http://127.0.0.1:59004/v1", RedirectPolicy::Generation).unwrap().phase, "http_client_reused_generation_loopback");
+            assert_eq!(acquire_with(&observed, &no_store, "http://127.0.0.1:59004/v1", RedirectPolicy::Generation).unwrap().phase, "http_client_reused_generation_loopback");
         } else {
             assert_eq!(generation.phase, "fresh_generation_policy");
         }
-        assert_eq!(acquire_from(&observed, "http://10.0.0.1:59005/v1", RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
+        assert_eq!(acquire_with(&observed, &no_store, "http://10.0.0.1:59005/v1", RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
         // https Count: per-handshake-trust platforms pool, OpenSSL platforms stay fresh.
-        let https = acquire_from(&observed, "https://fixture.invalid:59006/v1", RedirectPolicy::Count).unwrap().phase;
+        let https = acquire_with(&observed, &no_store, "https://fixture.invalid:59006/v1", RedirectPolicy::Count).unwrap().phase;
         if PER_HANDSHAKE_TRUST {
             assert_eq!(https, "http_client_created_https");
-            assert_eq!(acquire_from(&observed, "https://fixture.invalid:59006/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_https");
+            assert_eq!(acquire_with(&observed, &no_store, "https://fixture.invalid:59006/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_https");
         } else {
             assert_eq!(https, "fresh_tls_policy");
+        }
+        // https Generation: the fully observed environment plus per-handshake
+        // trust now pools the redirect-following TLS generation client too.
+        let generation_https = acquire_with(&observed, &no_store, "https://fixture.invalid:59006/v1", RedirectPolicy::Generation).unwrap();
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(generation_https.phase, "http_client_created_generation_https");
+            assert_eq!(acquire_with(&observed, &no_store, "https://fixture.invalid:59006/v1", RedirectPolicy::Generation).unwrap().phase, "http_client_reused_generation_https");
+        } else {
+            assert_eq!(generation_https.phase, "fresh_generation_policy");
         }
         // Only NO_PROXY set: the unobserved Windows/macOS system matcher is
         // provably bypassed for a covered loopback host, so Count still pools.
         let no_proxy_only = reader(&[("NO_PROXY", "127.0.0.1,localhost,::1")]);
-        assert_eq!(acquire_from(&no_proxy_only, "http://localhost:59007/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
-        assert_eq!(acquire_from(&no_proxy_only, "http://localhost:59007/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        assert_eq!(acquire_with(&no_proxy_only, &no_store, "http://localhost:59007/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&no_proxy_only, &no_store, "http://localhost:59007/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
         // Generation with an unobserved system matcher stays fresh.
-        assert_eq!(acquire_from(&no_proxy_only, "http://localhost:59008/v1", RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
-        // An uncovered loopback host keeps the fresh fallbacks.
+        assert_eq!(acquire_with(&no_proxy_only, &|| OsProxyStore::Unobserved, "http://localhost:59008/v1", RedirectPolicy::Generation).unwrap().phase, "fresh_generation_system_proxy_policy");
+        // An uncovered loopback host keeps the fresh fallbacks when the store
+        // is unobservable, and pools when the store is fingerprinted.
         let uncovered = reader(&[("NO_PROXY", "10.0.0.1")]);
-        let phase = acquire_from(&uncovered, "http://127.0.0.1:59009/v1", RedirectPolicy::Count).unwrap().phase;
-        if cfg!(any(windows, target_os = "macos")) {
-            assert_eq!(phase, "fresh_system_proxy_policy");
-        } else {
-            assert_eq!(phase, "http_client_created_loopback");
-        }
+        assert_eq!(
+            acquire_with(&uncovered, &|| OsProxyStore::Unobserved, "http://127.0.0.1:59009/v1", RedirectPolicy::Count).unwrap().phase,
+            "fresh_system_proxy_policy"
+        );
+        assert_eq!(
+            acquire_with(&uncovered, &no_store, "http://127.0.0.1:59009/v1", RedirectPolicy::Count).unwrap().phase,
+            "http_client_created_loopback"
+        );
         // The TLS-env guard is never overridden by coverage.
         let tls_env = reader(&[("NO_PROXY", "127.0.0.1"), ("SSL_CERT_FILE", "fixture.pem")]);
-        assert_eq!(acquire_from(&tls_env, "http://127.0.0.1:59010/v1", RedirectPolicy::Count).unwrap().phase, "fresh_tls_policy");
+        assert_eq!(acquire_with(&tls_env, &no_store, "http://127.0.0.1:59010/v1", RedirectPolicy::Count).unwrap().phase, "fresh_tls_policy");
         // An https:// proxy is bypassed for a covered loopback host.
         let https_proxy = reader(&[("HTTP_PROXY", "https://fixture.invalid"), ("NO_PROXY", "127.0.0.1")]);
-        assert_eq!(acquire_from(&https_proxy, "http://127.0.0.1:59011/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&https_proxy, &no_store, "http://127.0.0.1:59011/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+    }
+
+    #[tokio::test]
+    async fn windows_registry_store_pools_and_invalidates_https_generation() {
+        let partial = reader(&[("NO_PROXY", "127.0.0.1,localhost,::1")]);
+        let url = "https://dgx-fixture.invalid:59020/v1";
+        let disabled = || OsProxyStore::Windows(WindowsProxySettings::default());
+        // A readable registry with ProxyEnable=0 is fully observed: https
+        // generation pools without any env proxy variables at all.
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(acquire_with(&partial, &disabled, url, RedirectPolicy::Generation).unwrap().phase, "http_client_created_generation_https");
+            assert_eq!(acquire_with(&partial, &disabled, url, RedirectPolicy::Generation).unwrap().phase, "http_client_reused_generation_https");
+        } else {
+            assert_eq!(acquire_with(&partial, &disabled, url, RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
+        }
+        // Enabling the store rotates the fingerprint: the disabled-store client
+        // is not handed out; returning to it reuses its own earlier client.
+        let enabled = || OsProxyStore::Windows(WindowsProxySettings {
+            enable: 1, server: Some("http://proxy-fixture.invalid:8080".into()), r#override: None,
+        });
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(acquire_with(&partial, &enabled, url, RedirectPolicy::Generation).unwrap().phase, "http_client_created_generation_https");
+            assert_eq!(acquire_with(&partial, &disabled, url, RedirectPolicy::Generation).unwrap().phase, "http_client_reused_generation_https");
+        }
+        // An https:// registry proxy keeps TLS-bearing generation fresh.
+        let https_proxy = || OsProxyStore::Windows(WindowsProxySettings {
+            enable: 1, server: Some("https://proxy-fixture.invalid:8443".into()), r#override: None,
+        });
+        assert_eq!(acquire_with(&partial, &https_proxy, url, RedirectPolicy::Generation).unwrap().phase, "fresh_generation_proxy_tls_policy");
+        // An unobservable store with a partially covering env stays fresh.
+        let unobserved = || OsProxyStore::Unobserved;
+        assert_eq!(acquire_with(&partial, &unobserved, url, RedirectPolicy::Generation).unwrap().phase, "fresh_generation_system_proxy_policy");
+        // A fully covering env leaves no empty slot for the store to fill, so
+        // even an unobservable store (macOS shape) pools.
+        let observed = reader(&[
+            ("HTTP_PROXY", "http://fixture.invalid:8080"),
+            ("HTTPS_PROXY", "http://fixture.invalid:8080"),
+            ("NO_PROXY", "127.0.0.1,localhost,::1"),
+        ]);
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(acquire_with(&observed, &unobserved, url, RedirectPolicy::Generation).unwrap().phase, "http_client_created_generation_https");
+        } else {
+            assert_eq!(acquire_with(&observed, &unobserved, url, RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
+        }
+        // CGI mode empties the matcher entirely: the store is not consulted.
+        let cgi = reader(&[("NO_PROXY", "127.0.0.1"), ("REQUEST_METHOD", "POST")]);
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(acquire_with(&cgi, &unobserved, url, RedirectPolicy::Generation).unwrap().phase, "http_client_created_generation_https");
+        } else {
+            assert_eq!(acquire_with(&cgi, &unobserved, url, RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
+        }
+    }
+
+    #[tokio::test]
+    async fn registry_override_extends_loopback_coverage() {
+        // No env NO_PROXY: the effective coverage comes from the registry
+        // override while ProxyEnable is set, after hyper-util's `;`-join and
+        // `*.`-strip transform (`win::with_system`).
+        let empty = reader(&[]);
+        let covered = || OsProxyStore::Windows(WindowsProxySettings {
+            enable: 1,
+            server: Some("http://proxy-fixture.invalid:8080".into()),
+            r#override: Some("127.0.0.1;localhost".into()),
+        });
+        let policy = environment_from(&empty, &covered());
+        assert_eq!(policy.no_proxy.as_deref(), Some("127.0.0.1,localhost"));
+        assert_eq!(policy.fallback, None);
+        assert_eq!(acquire_with(&empty, &covered, "http://127.0.0.1:59021/v1", RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&empty, &covered, "http://127.0.0.1:59021/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        if PER_HANDSHAKE_TRUST {
+            assert_eq!(acquire_with(&empty, &covered, "http://localhost:59022/v1", RedirectPolicy::Generation).unwrap().phase, "http_client_created_generation_loopback");
+        } else {
+            assert_eq!(acquire_with(&empty, &covered, "http://localhost:59022/v1", RedirectPolicy::Generation).unwrap().phase, "fresh_generation_policy");
+        }
+        // Windows' `<local>` convention is NOT a hyper-util bypass, and `*.`
+        // entries are stripped to their bare domain form.
+        let local = OsProxyStore::Windows(WindowsProxySettings {
+            enable: 1,
+            server: Some("http://proxy-fixture.invalid:8080".into()),
+            r#override: Some("<local>;*.intranet".into()),
+        });
+        let policy = environment_from(&empty, &local);
+        assert_eq!(policy.no_proxy.as_deref(), Some("<local>,intranet"));
+        assert!(!no_proxy_covers("127.0.0.1", policy.no_proxy.as_deref().unwrap()));
+        assert!(no_proxy_covers("host.intranet", policy.no_proxy.as_deref().unwrap()));
+        // A disabled store contributes no override even when the value exists.
+        let disabled = OsProxyStore::Windows(WindowsProxySettings {
+            enable: 0,
+            server: Some("http://proxy-fixture.invalid:8080".into()),
+            r#override: Some("127.0.0.1".into()),
+        });
+        assert_eq!(environment_from(&empty, &disabled).no_proxy, None);
+        // Env NO_PROXY wins over the registry override.
+        let env_wins = reader(&[("NO_PROXY", "10.0.0.1")]);
+        assert_eq!(environment_from(&env_wins, &covered()).no_proxy.as_deref(), Some("10.0.0.1"));
+    }
+
+    /// The production observer reads the real HKCU Internet Settings key. Two
+    /// consecutive observations must agree, and whatever the machine store
+    /// says, a fully covering environment keeps the fallback clear.
+    #[cfg(windows)]
+    #[test]
+    fn live_registry_observation_is_stable() {
+        let first = observe_os_proxy();
+        let second = observe_os_proxy();
+        assert_eq!(first, second);
+        let read = reader(&[
+            ("HTTP_PROXY", "http://fixture.invalid:8080"),
+            ("HTTPS_PROXY", "http://fixture.invalid:8080"),
+            ("NO_PROXY", "127.0.0.1,localhost,::1"),
+        ]);
+        assert_eq!(environment_from(&read, &first).fallback, None);
+        assert_eq!(
+            environment_from(&read, &first).digest,
+            environment_from(&read, &second).digest
+        );
     }
 
     #[tokio::test]
@@ -640,12 +953,13 @@ mod tests {
             ("NO_PROXY", "localhost,::1"),
         ]);
         let url = "http://127.0.0.1:59012/v1";
-        assert_eq!(acquire_from(&before, url, RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        let no_store = || OsProxyStore::None;
+        assert_eq!(acquire_with(&before, &no_store, url, RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
         // The rotated digest is part of the key: the old client is not handed out.
-        assert_eq!(acquire_from(&after, url, RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
-        assert_eq!(acquire_from(&after, url, RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        assert_eq!(acquire_with(&after, &no_store, url, RedirectPolicy::Count).unwrap().phase, "http_client_created_loopback");
+        assert_eq!(acquire_with(&after, &no_store, url, RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
         // Returning to the earlier environment legitimately reuses its client.
-        assert_eq!(acquire_from(&before, url, RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        assert_eq!(acquire_with(&before, &no_store, url, RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
     }
 
     #[tokio::test]
@@ -663,7 +977,7 @@ mod tests {
         for _ in 0..32 {
             let read = read.clone();
             tasks.push(tokio::spawn(async move {
-                acquire_from(&*read, "http://127.0.0.1:59013/v1", RedirectPolicy::Count).unwrap().phase
+                acquire_with(&*read, &|| OsProxyStore::None, "http://127.0.0.1:59013/v1", RedirectPolicy::Count).unwrap().phase
             }));
         }
         let mut phases = Vec::new();
@@ -671,7 +985,7 @@ mod tests {
         assert!(phases.iter().all(|phase| matches!(*phase, "http_client_created_loopback" | "http_client_reused_loopback")));
         assert!(phases.contains(&"http_client_created_loopback"));
         assert!(phases.contains(&"http_client_reused_loopback"));
-        assert_eq!(acquire_from(&*read, "http://127.0.0.1:59013/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
+        assert_eq!(acquire_with(&*read, &|| OsProxyStore::None, "http://127.0.0.1:59013/v1", RedirectPolicy::Count).unwrap().phase, "http_client_reused_loopback");
     }
 
     // -----------------------------------------------------------------------
@@ -753,7 +1067,7 @@ mod tests {
                 for _ in 0..quota {
                     let started = Instant::now();
                     if pooled {
-                        let lease = acquire_from(&*read, &url, RedirectPolicy::Count).unwrap();
+                        let lease = acquire_with(&*read, &|| OsProxyStore::None, &url, RedirectPolicy::Count).unwrap();
                         let response = lease.client.get(&url).timeout(Duration::from_secs(10)).send().await.unwrap();
                         assert_eq!(response.status(), reqwest::StatusCode::OK);
                         assert_eq!(response.text().await.unwrap(), "ok");
@@ -806,11 +1120,11 @@ mod tests {
         let build_cost = latency_summary(build_samples);
         // (a') Pool-hit acquisition cost (digest + lock + take), same loop.
         let url = "http://127.0.0.1:59014/v1";
-        acquire_from(&read, url, RedirectPolicy::Count).unwrap();
+        acquire_with(&read, &|| OsProxyStore::None, url, RedirectPolicy::Count).unwrap();
         let mut acquire_samples = Vec::new();
         for _ in 0..1000 {
             let started = Instant::now();
-            let lease = acquire_from(&read, url, RedirectPolicy::Count).unwrap();
+            let lease = acquire_with(&read, &|| OsProxyStore::None, url, RedirectPolicy::Count).unwrap();
             acquire_samples.push(started.elapsed().as_nanos());
             std::hint::black_box(&lease);
         }
