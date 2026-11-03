@@ -1,0 +1,1 @@
+- Fixed new sessions timing out after 30 seconds on macOS when the default runtime directory made daemon worker socket paths longer than the Unix socket limit: the launcher now falls back to `/tmp/optimus-rust-<uid>/<release>` when the default path is too long.
