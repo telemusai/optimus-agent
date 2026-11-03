@@ -318,5 +318,54 @@ class NativeReleaseTests(unittest.TestCase):
             release.verify_build_provenance(bundle, self.binary)
 
 
+@unittest.skipIf(os.name == 'nt', 'POSIX launcher only')
+class LauncherRuntimeDirTests(unittest.TestCase):
+    """The launcher must keep daemon worker socket paths below the macOS 103-byte limit."""
+
+    WORKER_SOCKET_SUFFIX = f'/prime-agent-{os.getuid() if os.name != "nt" else 0}/worker-{"0" * 12}-{"0" * 12}.sock'
+
+    def setUp(self):
+        scratch = tempfile.TemporaryDirectory(prefix='optimus-launcher-test-')
+        self.addCleanup(scratch.cleanup)
+        self.root = Path(scratch.name)
+        self.release_name = f'launcher-test-{os.getpid()}'
+        install = self.root / 'root/releases' / self.release_name
+        (install / 'bin').mkdir(parents=True)
+        (install / 'COMMIT').write_text('abcdef0\n')
+        binary = install / 'bin/optimus-rust'
+        binary.write_text('#!/bin/sh\nprintf %s "$TMPDIR"\n')
+        binary.chmod(0o755)
+        (self.root / 'root/current').symlink_to(Path('releases') / self.release_name)
+        (self.root / 'config').mkdir()
+
+    def run_launcher(self, **overrides):
+        env = {key: value for key, value in os.environ.items()
+               if key not in ('XDG_RUNTIME_DIR', 'OPTIMUS_RUST_TMPDIR')}
+        env.update(OPTIMUS_RUST_ROOT=str(self.root / 'root'),
+                   PRIME_AGENT_CODING_AGENT_DIR=str(self.root / 'config'), **overrides)
+        result = subprocess.run(['sh', str(ROOT / 'scripts/optimus-agent')], env=env,
+                                capture_output=True, text=True, check=True)
+        runtime_dir = result.stdout
+        if runtime_dir.startswith('/tmp/optimus-rust-'):
+            self.addCleanup(os.rmdir, runtime_dir)
+        return runtime_dir
+
+    def test_long_default_runtime_dir_should_fall_back_to_short_private_dir(self):
+        runtime_dir = self.run_launcher(HOME=str(self.root / ('h' * 60)))
+        self.assertEqual(runtime_dir, f'/tmp/optimus-rust-{os.getuid()}/{self.release_name}')
+        self.assertLessEqual(len(runtime_dir + self.WORKER_SOCKET_SUFFIX), 103)
+
+    def test_short_default_runtime_dir_should_be_kept(self):
+        short = Path(tempfile.mkdtemp(prefix='oxr', dir='/tmp'))
+        self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(short)], check=False))
+        runtime_dir = self.run_launcher(XDG_RUNTIME_DIR=str(short))
+        self.assertEqual(runtime_dir, f'{short}/optimus-rust/{self.release_name}')
+
+    def test_explicit_override_should_be_used_unchanged(self):
+        override = self.root / ('o' * 80)
+        runtime_dir = self.run_launcher(OPTIMUS_RUST_TMPDIR=str(override))
+        self.assertEqual(runtime_dir, str(override))
+
+
 if __name__ == '__main__':
     unittest.main()
