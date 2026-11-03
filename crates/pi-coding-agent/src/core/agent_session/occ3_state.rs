@@ -52,6 +52,8 @@ pub struct NativeSourceBudget {
 }
 struct SourceSlot {
     budget: Option<NativeSourceBudget>,
+    /// Target fixed by the first, capture-arming tool call in normal sessions.
+    armed_receiver: Option<String>,
     /// Retained content-only negotiation for the armed capture: the wire and
     /// the completed-hook contract switch to the no-tool mode for this arm.
     retained: bool,
@@ -108,6 +110,7 @@ pub struct Occ3NativeSession {
     registry: Occ3ConnectorRegistry,
     inbox: Mutex<Occ3InferenceInbox>,
     source: Mutex<SourceSlot>,
+    chat_preferences: std::sync::OnceLock<Option<String>>,
     closed: std::sync::atomic::AtomicBool,
     /// Unsubscribe for the delivery-marker restamp listener installed by
     /// [`Self::install_delivery_restamp`]; dropped by [`Self::invalidate`].
@@ -162,6 +165,7 @@ impl Occ3NativeSession {
             inbox: Mutex::new(Occ3InferenceInbox::new(session_id.into()).map_err(|_| failure())?),
             source: Mutex::new(SourceSlot {
                 budget: None,
+                armed_receiver: None,
                 retained: false,
                 resolved: false,
                 lease: None,
@@ -173,10 +177,58 @@ impl Occ3NativeSession {
                 negative_control_exported: false,
             }),
             closed: std::sync::atomic::AtomicBool::new(false),
+            chat_preferences: std::sync::OnceLock::new(),
         }))
     }
     pub fn session_id(&self) -> &str {
         &self.enrollment.session_id
+    }
+
+    pub(crate) fn bind_chat_preferences(&self, session_file: Option<String>) -> Result<(), String> {
+        self.chat_preferences.set(session_file).map_err(|_| failure())
+    }
+
+    /// Normal sessions have no pre-armed validation harness. The first authorized
+    /// handoff call arms exactly the next response; it publishes nothing.
+    fn arm_handoff_if_needed(&self, receiver: &str) -> Result<bool, String> {
+        self.check()?;
+        self.check_native_allowed()?;
+        let mut slot = self.source.lock().map_err(|_| failure())?;
+        if slot.armed_receiver.as_deref().is_some_and(|id| id != receiver) {
+            return Err("Native handoff receiver changed after capture was armed".into());
+        }
+        if slot.lease.is_some() {
+            return Ok(false);
+        }
+        if slot.resolved || slot.budget.is_some() {
+            return Err(failure());
+        }
+        let caps = self.registry.capabilities(self.connector.connector_id()).ok_or_else(failure)?;
+        let bytes_per_element = match self.enrollment.source_profile.dtype.as_str() {
+            "bfloat16" | "float16" => 2u64,
+            "float32" => 4,
+            _ => return Err(failure()),
+        };
+        let bytes_per_row = u64::from(self.enrollment.source_profile.hidden_dim)
+            .checked_mul(bytes_per_element).filter(|n| *n > 0).ok_or_else(failure)?;
+        // This budget covers staged buffers on every tensor-parallel rank,
+        // not just the final retained rows. GLM's 128-row v2 capture needs
+        // about 75 MiB across eight ranks; a logical-row-only cap is refused
+        // before inference. Stay within both the verified and local limits.
+        let max_capture_bytes = caps.max_state_bytes.min(128 * 1024 * 1024);
+        let retained_count_limit = (max_capture_bytes / bytes_per_row).min(128) as u32;
+        let seconds = self.enrollment.expires_at_epoch.saturating_sub(now()).min(600);
+        if retained_count_limit == 0 || seconds == 0 {
+            return Err(failure());
+        }
+        slot.budget = Some(NativeSourceBudget {
+            retained_count_limit,
+            max_capture_bytes,
+            deadline: Instant::now() + std::time::Duration::from_secs(seconds),
+            max_response_bytes: 8 * 1024 * 1024,
+        });
+        slot.armed_receiver = Some(receiver.to_string());
+        Ok(true)
     }
     pub fn arm_source(&self, budget: NativeSourceBudget) -> Result<(), String> {
         self.arm(budget, false)
@@ -255,6 +307,17 @@ impl Occ3NativeSession {
             retention_reason: NEGATIVE_CONTROL_RETENTION_REASON,
         })
     }
+    fn check_native_allowed(&self) -> Result<(), String> {
+        if let Some(Some(file)) = self.chat_preferences.get() {
+            let preference = crate::core::occ::session_settings::resolve(file)?;
+            // With no chat override the already-verified global opt-in applies.
+            // Explicit chat/ancestor preferences are read on each native action.
+            if preference.source_session_id.is_some() && !preference.occ3_enabled {
+                return Err("OCC-3 is disabled for this chat; use /occ 3 on with a supported model".into());
+            }
+        }
+        Ok(())
+    }
     fn check(&self) -> Result<(), String> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire)
             || self.enrollment.expires_at_epoch <= now()
@@ -299,6 +362,7 @@ impl Occ3NativeSession {
                             }
                             return Ok(None);
                         };
+                        this.check_native_allowed().map_err(anyhow::Error::msg)?;
                         slot.resolved = true;
                         (budget, slot.retained)
                     };
@@ -407,6 +471,7 @@ impl Occ3NativeSession {
                 let Some(envelope) = envelope else {
                     return Ok(None);
                 };
+                this.check_native_allowed().map_err(anyhow::Error::msg)?;
                 this.check().map_err(anyhow::Error::msg)?;
                 if !this.registry.supports(
                     this.connector.connector_id(),
@@ -440,6 +505,7 @@ impl Occ3NativeSession {
     /// false for duplicate/tombstone; it must not schedule another receiver run.
     pub fn admit(&self, prepared: &PreparedNativeHandoff) -> Result<bool, String> {
         self.check()?;
+        self.check_native_allowed()?;
         let e = prepared.envelope();
         if e.receiver_session_id != self.session_id()
             || e.model_fingerprint != self.enrollment.identity.fingerprint()
@@ -686,25 +752,30 @@ impl Occ3NativeSession {
         let this = self.clone();
         AgentTool {
             name:NATIVE_HANDOFF_TOOL.into(),label:"Experimental native state handoff".into(),
-            description:"Transfer the captured source state to one authorized family agent. Do not include source facts in arguments.".into(),
+            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff.".into(),
             parameters:json!({"type":"object","additionalProperties":false,"properties":{"receiver_role":{"type":"string","enum":["parent","sibling","child"]},"receiver_name":{"type":"string"}},"required":["receiver_role","receiver_name"]}),
             prepare_arguments:None,execution_mode:None,
             execute:Arc::new(move |tool_id,args,signal,_update| {
                 let this=this.clone(); let controller=controller.clone(); Box::pin(async move {
                     this.check().map_err(anyhow::Error::msg)?;
+                    this.check_native_allowed().map_err(anyhow::Error::msg)?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { return Err(anyhow::anyhow!(failure())); }
                     let object=args.as_object().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_args_not_object]", failure())))?;
                     if object.len()!=2 { return Err(anyhow::anyhow!(format!("{} [occ3_tool_args_len]", failure()))); }
                     let role=object.get("receiver_role").and_then(Value::as_str).ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_role_missing]", failure())))?;
                     let name=object.get("receiver_name").and_then(Value::as_str).filter(|v|!v.is_empty()&&v.len()<=128).ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_name_missing]", failure())))?;
+                    let authorized=controller.authorize_native_handoff(role.into(),name.into()).await.map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_authorize: {e}]", failure())))?;
+                    if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(format!("{} [occ3_tool_sender_mismatch]", failure()))); }
+                    if signal.as_ref().is_some_and(|s|s.is_cancelled()) { return Err(anyhow::anyhow!(failure())); }
+                    if this.arm_handoff_if_needed(authorized.target_session_id()).map_err(anyhow::Error::msg)? {
+                        return Ok(AgentToolResult::new(vec![ContentBlock::text(
+                            "Native source capture armed; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments."
+                        )], json!({"status":"capture_armed","delivery_completed":false})));
+                    }
                     let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
                         let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_source_lease_missing]", failure())))?;
                         source.validate_tool(&tool_id,NATIVE_HANDOFF_TOOL,&args).map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_validate_tool: {e}]", failure())))?;
                         if slot.tool_claimed {return Err(anyhow::anyhow!(format!("{} [occ3_tool_already_claimed]", failure())));} slot.tool_claimed=true; source};
-                    // Family authorization precedes publication and creates the
-                    // real transport ID only after actual source completion.
-                    let authorized=controller.authorize_native_handoff(role.into(),name.into()).await.map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_authorize: {e}]", failure())))?;
-                    if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(format!("{} [occ3_tool_sender_mismatch]", failure()))); }
                     this.check().map_err(anyhow::Error::msg)?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(failure())); }
                     let expected_message_id=authorized.message_id().to_string();
@@ -747,6 +818,7 @@ impl Occ3NativeSession {
         selector: &str,
     ) -> Result<crate::core::agent_messages::AgentSessionMessageReceipt, String> {
         self.check()?;
+        self.check_native_allowed()?;
         let source = {
             let mut slot = self
                 .source
@@ -1121,6 +1193,98 @@ mod tests {
         )
         .await
         .expect("fixture enrollment")
+    }
+
+    struct ArmingController(bool);
+    impl AgentSessionMessageController for ArmingController {
+        fn authorize_native_handoff(&self, role: String, name: String)
+            -> pi_ai::types::BoxFuture<Result<AuthorizedNativeHandoff, String>> {
+            let allowed = self.0;
+            Box::pin(async move {
+                if !allowed || role != "child" || name != "receiver" {
+                    return Err("Native receiver permit not installed".into());
+                }
+                AuthorizedNativeHandoff::from_catalog(
+                    &AgentFamilyCatalogEntry { id: "unit-session".into(), depth: 0., ..Default::default() },
+                    &AgentFamilyCatalogEntry { id: "receiver".into(), depth: 1., parent_session_id: Some("unit-session".into()), ..Default::default() },
+                    AgentSessionMessageEndpoint { session_id: "unit-session".into(), active_session_id: "unit-session".into(), ..Default::default() },
+                    AgentSessionMessageEndpoint { session_id: "receiver".into(), active_session_id: "receiver".into(), ..Default::default() },
+                    &role,
+                )
+            })
+        }
+        fn roster(&self) -> pi_ai::types::BoxFuture<Result<crate::core::agent_messages::AgentFamilyRosterResult, String>> {
+            Box::pin(async { Err("unused".into()) })
+        }
+        fn await_pending_child_publication(&self, _: String) -> pi_ai::types::BoxFuture<Result<Option<String>, String>> {
+            Box::pin(async { Ok(None) })
+        }
+        fn send_agent_message(&self, _: crate::core::agent_messages::AgentSessionMessageSendInput)
+            -> pi_ai::types::BoxFuture<Result<crate::core::agent_messages::AgentSessionMessageReceipt, String>> {
+            Box::pin(async { Err("ordinary messages must not be used".into()) })
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_handoff_arms_once_only_after_receiver_authorization() {
+        for allowed in [false, true] {
+            let session = enrolled().await;
+            let tool = session.handoff_tool(Arc::new(ArmingController(allowed)));
+            let result = (tool.execute)("prepare-call".into(), json!({"receiver_role":"child","receiver_name":"receiver"}), None, None).await;
+            assert_eq!(result.is_ok(), allowed);
+            if let Ok(result) = result {
+                assert_eq!(result.details["status"], "capture_armed");
+                assert_eq!(result.details["delivery_completed"], false);
+            }
+            let slot = session.source.lock().unwrap();
+            assert_eq!(slot.budget.is_some(), allowed);
+            assert!(slot.lease.is_none());
+            assert!(!slot.handoff_admitted);
+            if let Some(budget) = &slot.budget {
+                assert_eq!(budget.max_capture_bytes, 1024);
+                assert_eq!(budget.retained_count_limit, 64);
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn normal_handoff_capture_cannot_change_receiver_or_rearm() {
+        let session = enrolled().await;
+        assert!(session.arm_handoff_if_needed("receiver").unwrap());
+        assert!(session.arm_handoff_if_needed("receiver").is_err());
+        assert!(session.arm_handoff_if_needed("other").is_err());
+        resolve_capture(&session).await;
+        assert!(!session.arm_handoff_if_needed("receiver").unwrap());
+        assert!(session.arm_handoff_if_needed("other").is_err());
+        session.invalidate();
+        assert!(session.arm_handoff_if_needed("receiver").is_err());
+    }
+
+    #[tokio::test]
+    async fn native_actions_respect_dynamic_chat_and_parent_preferences() {
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir(&sessions).unwrap();
+        let parent = sessions.join("parent.jsonl");
+        let child = sessions.join("child.jsonl");
+        std::fs::write(&parent, "{\"type\":\"session\",\"rlmDepth\":0}\n").unwrap();
+        std::fs::write(&child, format!("{}\n", json!({"type":"session","rlmDepth":1,"parentSession":parent}))).unwrap();
+        let session = enrolled().await;
+        session.bind_chat_preferences(Some(child.to_string_lossy().into_owned())).unwrap();
+        assert!(session.check_native_allowed().is_ok());
+        let parent = parent.to_str().unwrap();
+        crate::core::occ::session_settings::save_occ3(parent, true, false).unwrap();
+        assert!(session.check_native_allowed().unwrap_err().contains("disabled for this chat"));
+        assert!(session.check().is_ok(), "ordinary inference must remain available");
+        let request = || InferenceStateRequest {
+            model: fixture_model(), context: Default::default(), messages: Vec::new(), signal: None,
+        };
+        assert!((session.source_hooks().resolve)(request()).await.unwrap().is_none());
+        assert!((session.receiver_resolver())(request()).await.unwrap().is_none());
+        crate::core::occ::session_settings::save_occ3(parent, true, true).unwrap();
+        assert!(session.check_native_allowed().is_ok());
+        std::fs::write(crate::core::occ::session_settings::preference_path(parent), "invalid").unwrap();
+        assert!(session.check_native_allowed().is_err());
     }
 
     /// Drives the real resolve hook once so the slot holds a Prepared lease.

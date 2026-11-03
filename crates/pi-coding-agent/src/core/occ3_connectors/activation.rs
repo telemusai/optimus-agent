@@ -33,7 +33,9 @@ use pi_ai::types::{Model, Occ3Validation};
 
 /// Upper bound on the readiness handshake so activation can never stall a
 /// session start. A timeout is a decline, not an error path.
-pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// Four sequential gateway operations (identity, runtime, enrollment and
+// discovery) can exceed five seconds even while each operation is healthy.
+pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Why OCC-3 is not active for this session. Every variant is a clean
 /// decline: the session keeps its ordinary text/OCC-1/OCC-2 behaviour.
@@ -861,6 +863,7 @@ pub async fn enroll(
         ready.connector.clone(),
     )
     .await?;
+    state.bind_chat_preferences(session.session_file())?;
     session.install_experimental_native_occ3(state, controller)
 }
 
