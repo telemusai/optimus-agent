@@ -53,29 +53,40 @@ fn bounded_id(value: &str, max: usize) -> bool {
 }
 
 pub(crate) fn complete_identity(identity: &Occ3ModelIdentity) -> bool {
-    [
-        &identity.model_id,
-        &identity.architecture,
-        &identity.checkpoint_revision,
-        &identity.weight_fingerprint,
-        &identity.tokenizer_fingerprint,
-        &identity.chat_template_fingerprint,
-        &identity.quantisation,
-        &identity.tensor_geometry,
-        &identity.kv_layout,
-        &identity.latent_method,
-        &identity.runtime,
-    ]
-    .into_iter()
-    .all(|value| {
+    // Informational provenance fields may be honestly empty: the sglang
+    // extension degrades an unknown checkpoint provenance and a chat
+    // template kept outside tokenizer_config.json to "" (occ3_sglang/
+    // identity.py). Every other identity field still requires a
+    // non-empty, bounded, non-placeholder attested value.
+    let bounded = |value: &str| {
         value.len() <= 4096
             && !value.chars().any(char::is_control)
             && !matches!(
                 value.trim().to_ascii_lowercase().as_str(),
                 "unknown" | "unverified" | "none"
             )
-            && !value.trim().is_empty()
-    })
+    };
+    let informational = [
+        &identity.checkpoint_revision,
+        &identity.chat_template_fingerprint,
+    ];
+    let hard = [
+        &identity.model_id,
+        &identity.architecture,
+        &identity.weight_fingerprint,
+        &identity.tokenizer_fingerprint,
+        &identity.quantisation,
+        &identity.tensor_geometry,
+        &identity.kv_layout,
+        &identity.latent_method,
+        &identity.runtime,
+    ];
+    informational
+        .into_iter()
+        .all(|value| bounded(value))
+        && hard
+            .into_iter()
+            .all(|value| bounded(value) && !value.trim().is_empty())
 }
 
 fn validate_envelope(envelope: &Occ3Envelope, now_epoch: u64) -> Result<(), Occ3Error> {
@@ -415,4 +426,99 @@ pub fn permits_text_fallback(status: Occ3DeliveryStatus) -> bool {
         status,
         Occ3DeliveryStatus::Prepared | Occ3DeliveryStatus::Captured
     )
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn identity() -> crate::core::occ::occ3::types::Occ3ModelIdentity {
+        crate::core::occ::occ3::types::Occ3ModelIdentity {
+            model_id: "glm-5.3".into(),
+            architecture: "GlmMoeDsaForCausalLM".into(),
+            checkpoint_revision: "aca966e4".into(),
+            weight_fingerprint: "18ad686accf22269".into(),
+            tokenizer_fingerprint: "98b1271574f41abf".into(),
+            chat_template_fingerprint: "3740abce".into(),
+            quantisation: "fp8".into(),
+            tensor_geometry: "hidden_size=6144".into(),
+            kv_layout: "tp_size=8".into(),
+            latent_method: "kv-radix-channel-v1".into(),
+            runtime: "sglang/0.5.21".into(),
+        }
+    }
+
+    #[test]
+    fn complete_identity_accepts_honestly_degraded_informational_fields() {
+        // The sglang extension degrades checkpoint_revision and
+        // chat_template_fingerprint to "" when the provenance is unknown
+        // (local checkpoint path without a hub revision; chat template kept
+        // outside tokenizer_config.json). A complete identity may carry
+        // exactly those two fields empty.
+        let mut degraded = identity();
+        degraded.checkpoint_revision = String::new();
+        degraded.chat_template_fingerprint = String::new();
+        assert!(complete_identity(&degraded));
+    }
+
+    #[test]
+    fn complete_identity_still_refuses_degraded_hard_fields() {
+        let base = identity();
+        for mutate in [
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.model_id.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.architecture.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.weight_fingerprint.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.tokenizer_fingerprint.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.quantisation.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.tensor_geometry.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.kv_layout.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.latent_method.clear()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.runtime.clear()
+            },
+        ] {
+            let mut broken = base.clone();
+            mutate(&mut broken);
+            assert!(!complete_identity(&broken));
+        }
+    }
+
+    #[test]
+    fn complete_identity_never_accepts_placeholders() {
+        let base = identity();
+        for mutate in [
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.checkpoint_revision = "unknown".into()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.chat_template_fingerprint = "unverified".into()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.checkpoint_revision = "none".into()
+            },
+            |identity: &mut crate::core::occ::occ3::types::Occ3ModelIdentity| {
+                identity.chat_template_fingerprint = "none".into()
+            },
+        ] {
+            let mut broken = base.clone();
+            mutate(&mut broken);
+            assert!(!complete_identity(&broken));
+        }
+    }
 }

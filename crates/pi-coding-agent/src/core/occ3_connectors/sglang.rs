@@ -722,13 +722,37 @@ fn parse_identity(fields: &Value) -> Result<Occ3ModelIdentity, Occ3Error> {
                 reason: format!("identity field missing: {name}"),
             })
     };
+    // Informational provenance fields: the sglang extension degrades an
+    // unknown checkpoint provenance (a local model path carries no hub
+    // revision) and a chat template kept outside tokenizer_config.json to
+    // an honest empty string (occ3_sglang/identity.py). An empty value is
+    // accepted; an absent field, an oversized value, control characters or
+    // placeholder text is still rejected, so a degraded server can never
+    // smuggle an unverifiable claim as a value.
+    let informational_field = |name: &str| -> Result<String, Occ3Error> {
+        fields
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| {
+                value.len() <= 4096
+                    && !value.chars().any(char::is_control)
+                    && !matches!(
+                        value.trim().to_ascii_lowercase().as_str(),
+                        "unknown" | "unverified"
+                    )
+            })
+            .map(str::to_string)
+            .ok_or_else(|| Occ3Error::TransferFailed {
+                reason: format!("identity field missing: {name}"),
+            })
+    };
     Ok(Occ3ModelIdentity {
         model_id: str_field("model_id")?,
         architecture: str_field("architecture")?,
-        checkpoint_revision: str_field("checkpoint_revision")?,
+        checkpoint_revision: informational_field("checkpoint_revision")?,
         weight_fingerprint: str_field("weight_fingerprint")?,
         tokenizer_fingerprint: str_field("tokenizer_fingerprint")?,
-        chat_template_fingerprint: str_field("chat_template_fingerprint")?,
+        chat_template_fingerprint: informational_field("chat_template_fingerprint")?,
         quantisation: str_field("quantisation")?,
         tensor_geometry: str_field("tensor_geometry")?,
         kv_layout: str_field("kv_layout")?,
@@ -1325,6 +1349,53 @@ mod tests {
             parse_identity(&changed).unwrap().fingerprint()
         );
         assert!(parse_identity(&json!({})).is_err());
+    }
+
+    #[test]
+    fn identity_informational_fields_may_degrade_to_empty() {
+        // The deployed extension's identity contract (occ3_sglang/identity.py)
+        // degrades unknown provenance components to empty strings: a
+        // checkpoint served from a local path has no hub revision, and a
+        // runtime that keeps its chat template outside tokenizer_config.json
+        // has no in-config template digest. Those two fields are
+        // informational, so an honestly degraded identity must still parse.
+        let fields = json!({
+            "model_id": "glm-5.3",
+            "architecture": "GlmMoeDsaForCausalLM",
+            "checkpoint_revision": "",
+            "weight_fingerprint": "18ad686accf22269",
+            "tokenizer_fingerprint": "98b1271574f41abf",
+            "chat_template_fingerprint": "",
+            "quantisation": "fp8",
+            "tensor_geometry": "hidden_size=6144;num_hidden_layers=78",
+            "kv_layout": "page_size=;kv_cache_dtype=fp8_e4m3;tp_size=8",
+            "latent_method": "kv-radix-channel-v1",
+            "runtime": "sglang/0.5.21",
+        });
+        let identity = parse_identity(&fields).unwrap();
+        assert_eq!(identity.checkpoint_revision, "");
+        assert_eq!(identity.chat_template_fingerprint, "");
+        // The fingerprint still covers the degraded fields, so two servers
+        // that degrade the same way still compare equal.
+        assert!(identity.fingerprint().starts_with("sha256:"));
+        // Hard identity fields still refuse empty values.
+        let mut missing = fields.clone();
+        missing["weight_fingerprint"] = json!("");
+        assert!(parse_identity(&missing).is_err());
+        let mut missing = fields.clone();
+        missing["model_id"] = json!("");
+        assert!(parse_identity(&missing).is_err());
+        // Placeholder values never pass, even where empty is honest.
+        let mut placeholder = fields.clone();
+        placeholder["checkpoint_revision"] = json!("unknown");
+        assert!(parse_identity(&placeholder).is_err());
+        let mut placeholder = fields.clone();
+        placeholder["chat_template_fingerprint"] = json!("unverified");
+        assert!(parse_identity(&placeholder).is_err());
+        // An absent informational field is still a protocol violation.
+        let mut absent = fields.clone();
+        absent.as_object_mut().unwrap().remove("checkpoint_revision");
+        assert!(parse_identity(&absent).is_err());
     }
 
     #[test]
