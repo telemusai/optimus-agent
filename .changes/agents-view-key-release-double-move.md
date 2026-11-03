@@ -1,0 +1,1 @@
+- Fixed arrow keys in the agents view moving the selection two rows on terminals with the Kitty keyboard protocol (for example iTerm2, Kitty, Ghostty and WezTerm): key-release events are no longer handled as a second key press.
