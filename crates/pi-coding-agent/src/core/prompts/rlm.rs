@@ -188,6 +188,11 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
             "For structured task and result communication with other agents, encode agent_message bodies as OCC-1 compact structured English (see the agent-message skill; codec preinstalled as rlm.occ1). Plain English remains fine for conversational replies.".to_string(),
         );
     }
+    if has_agent_message || active_tools.iter().any(|tool| tool == "subagent" || tool == "occ3_handoff") {
+        parts.push(
+            "OCC-3 hive mind: coordinate compatible agents as a team with a shared objective and distinct responsibilities. Exchange focused native context between authorized family members, then reconcile their results; each agent still has its own session, memory and permissions. Never assume automatic shared memory, broadcast access, or identical conclusions. Use OCC-3 for eligible native handoffs only when the runtime exposes the occ3_handoff tool and both sender and receiver subagents use explicitly OCC-3-configured models with matching verified model/runtime identity. For example, a configured DGX MTP (OCC-3) model is distinct from the ordinary DGX MTP model; a shared display name or model id does not establish support. Discover the configured OCC-3 entry using available model discovery (rlm.find_models in IPython) and pass its exact provider/model selector explicitly when creating both subagents through rlm or the native subagent tool, according to the current execution mode (for example dgx-glm53-occ3/glm-5.3 only when listed). Do not select by bare model id, which can resolve to the ordinary provider. Keep compatible subagents on that same configured OCC-3 model. Use its configured inference and OCC-3 endpoints with the existing provider credentials; do not substitute remembered SSH tunnels, known-hosts entries, or gateway routes. Report failure of the configured endpoint instead of inventing an alternate route. Call occ3_handoff as a native tool with only receiver_role and receiver_name, following its schema. If the first call returns capture_armed, no transfer occurred: emit concise source facts as assistant content in the next response and call occ3_handoff once for the same receiver, with no other tools in that response. After admission, do not repeat it. Never invent OCC/3 envelopes, handles, or source facts in its arguments. If the tool or a compatible receiver is unavailable, use ordinary agent messaging with valid OCC-1 bodies and let the runtime select OCC-2 where eligible. agent_message.send does not itself perform native OCC-3 transfer. A queued/admitted handoff is not completed native use; inspect receipts and do not replay an uncertain handoff blindly. A completed-use receipt proves native consumption, not semantic accuracy: verify transferred critical facts before acting on them.".to_string(),
+        );
+    }
     if has_agent_observe && has_ipython {
         parts.push(
             "Agent observation is restricted to your parent, siblings, and direct children; roots are siblings, and deeper inspection relays through the intermediate child.".to_string(),
@@ -367,6 +372,31 @@ mod tests {
         assert!(prompt.contains("Discover its CLI usage with `<skill> --help`."));
         assert!(!prompt.contains("Installed Python skill modules (pre-imported)"));
         assert!(!prompt.contains("await rlm('sub-task')"));
+    }
+
+    #[test]
+    fn communication_guidance_limits_occ3_to_supported_pairs_in_all_modes() {
+        for mode in ["ipython", "node", "clang", "bash"] {
+            for depth in [0, 1] {
+                let options = RlmPromptOptions {
+                    depth: Some(depth),
+                    installed_skills: Some(vec!["agent_message".into()]),
+                    active_tools: Some(vec![mode.into(), "subagent".into()]),
+                    ..base()
+                };
+                let prompt = build_rlm_prompt(&options);
+                assert!(prompt.contains("both sender and receiver subagents use explicitly OCC-3-configured models"));
+                assert!(prompt.contains("matching verified model/runtime identity"));
+                assert!(prompt.contains("OCC-3 hive mind"));
+                assert!(prompt.contains("each agent still has its own session"));
+                assert!(prompt.contains("exact provider/model selector"));
+                assert!(prompt.contains("capture_armed"));
+                assert!(prompt.contains("only when the runtime exposes the occ3_handoff tool"));
+                assert!(prompt.contains("use ordinary agent messaging with valid OCC-1 bodies"));
+                assert!(prompt.contains("agent_message.send does not itself perform native OCC-3 transfer"));
+            }
+        }
+        assert!(!build_rlm_prompt(&base()).contains("Call occ3_handoff"));
     }
 
     #[test]

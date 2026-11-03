@@ -26,7 +26,7 @@ use crate::core::occ::occ3::types::{
 
 pub const CONNECTOR_ID: &str = "sglang-occ3";
 
-const HEALTH_TIMEOUT: Duration = Duration::from_secs(5);
+const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const OP_TIMEOUT: Duration = Duration::from_secs(90);
 
 /// Construction parameters (from a model's `occ3` block + environment).

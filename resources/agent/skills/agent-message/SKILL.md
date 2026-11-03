@@ -115,10 +115,56 @@ The receiving model gets validated symbolic text with a reusable codebook; inval
 symbolic text uses the validated OCC-1 fallback when available. The durable
 record retains both encodings. This mode does not promise lower total token use.
 
-The subagent bar flashes neon blue for delivered messages: TXT (plain text),
-OCC1 (structured English), or OCC2 (validated symbolic encoding). Pulses last
-1.4 seconds and do not indicate model generation or queued sends. OCC-3 remains
-research-only; there is no latent indicator or runtime toggle.
+## Experimental OCC-3 native handoffs
+
+Use OCC-3 where the runtime makes it available, only between compatible
+OCC-3-supported subagents. Both models must have an enabled `occ3` block in
+`models.json` and pass the live handshake with matching exact model/runtime
+identity. A configured **DGX MTP (OCC-3)** entry is distinct from an ordinary
+DGX MTP entry: a shared display name, provider URL, or model id is not proof of
+support. Keep both subagents on the same configured OCC-3 model for these
+handoffs; use ordinary messaging for unsupported or mixed pairs.
+
+Discover the configured entry with `await rlm.find_models("DGX MTP (OCC-3)")`
+and pass the returned exact `selector` as `model=` when creating both subagents
+with `rlm(...)`. For this configured provider the selector may be
+`dgx-glm53-occ3/glm-5.3`; use it only if listed. A bare `glm-5.3` can select the
+ordinary provider and lose OCC-3 support. Both agents must still enroll and
+pass the native identity checks.
+
+Use the selected model's configured inference and OCC-3 endpoints and existing
+provider credentials. Do not replace them with remembered SSH tunnels,
+known-hosts entries, or gateway routes. An unavailable configured endpoint is
+a connectivity failure to report, not permission to invent an alternate route.
+
+The user can select the OCC-3 preference in `/occ`, inspect `/occ status`, or
+use `/occ 3 on` and `/occ 3 off`. The explicit chat preference gates native actions dynamically, including
+inherited subagent actions. Without an override, an installed connector follows
+the global opt-in. A chat preference does not install a missing connector. Native activation separately requires the existing
+`agentCommunication.occ3Enabled` and `occ3Experimental` settings, compatible
+model configuration, and a successful live connector handshake. Do not change
+global settings or invent configuration to make a model eligible.
+
+When the runtime exposes **`occ3_handoff`**, use that native tool for an eligible
+handoff of captured source state to an authorized parent, sibling, or child.
+The first call on an unarmed session returns `capture_armed`: no message has
+been sent. In the next response, emit the concise source facts as assistant
+content and call `occ3_handoff` once for that same receiver; include no other
+tool calls in that response. This arms bounded source capture before publication.
+Follow its schema: supply only `receiver_role` and `receiver_name`. Do not put
+source facts in those arguments, fabricate handles, write `OCC/3` envelopes,
+or invoke the native tool as a Python `agent_message` function.
+`agent_message.send` remains the ordinary text/OCC-1/OCC-2 path; it does not
+automatically become a native OCC-3 transfer. If native handoff is unavailable,
+continue through that ordinary path. If a handoff has already been admitted or
+its result is uncertain, inspect the outcome before retrying or sending a
+duplicate text handoff.
+
+The subagent bar flashes for delivered TXT (plain text), OCC1 (structured
+English), or OCC2 (validated symbolic encoding). OCC3 requires a completed
+native-use receipt. A configured preference, exposed tool, successful
+handshake, or queued/admitted handoff does not prove completed use or semantic
+accuracy. OCC-3 remains experimental.
 
 ## Safety
 

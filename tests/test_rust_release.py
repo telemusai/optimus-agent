@@ -328,7 +328,8 @@ class LauncherRuntimeDirTests(unittest.TestCase):
         scratch = tempfile.TemporaryDirectory(prefix='optimus-launcher-test-')
         self.addCleanup(scratch.cleanup)
         self.root = Path(scratch.name)
-        self.release_name = f'launcher-test-{os.getpid()}'
+        # Keep the short-path fixture short even with six-digit host PIDs.
+        self.release_name = f'lt-{os.getpid()}'
         install = self.root / 'root/releases' / self.release_name
         (install / 'bin').mkdir(parents=True)
         (install / 'COMMIT').write_text('abcdef0\n')
@@ -358,6 +359,7 @@ class LauncherRuntimeDirTests(unittest.TestCase):
     def test_short_default_runtime_dir_should_be_kept(self):
         short = Path(tempfile.mkdtemp(prefix='oxr', dir='/tmp'))
         self.addCleanup(lambda: subprocess.run(['rm', '-rf', str(short)], check=False))
+        self.assertLessEqual(len(f'{short}/optimus-rust/{self.release_name}' + self.WORKER_SOCKET_SUFFIX), 103)
         runtime_dir = self.run_launcher(XDG_RUNTIME_DIR=str(short))
         self.assertEqual(runtime_dir, f'{short}/optimus-rust/{self.release_name}')
 

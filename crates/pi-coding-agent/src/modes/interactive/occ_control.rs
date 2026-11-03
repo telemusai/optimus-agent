@@ -1,8 +1,8 @@
 //! Chat-local OCC controls. The host that owns the session persists them:
 //! daemons expose the capability-gated `occ_get_preferences` /
 //! `occ_set_preferences` commands (schema revision 41), so a client never
-//! writes storage the daemon may not read. Workers read session artifacts at
-//! each send either way.
+//! writes OCC-2 storage the daemon may not read. OCC-3 retains its existing
+//! chat-local preference; native activation is configured separately.
 
 use super::*;
 
@@ -33,7 +33,7 @@ fn status(enabled: bool) -> String {
 
 fn status_occ3(enabled: bool, occ3_enabled: bool) -> String {
     format!(
-        "Agent communication (this chat)\n\nOCC-1: ON (fallback)\nOCC-2: {} (adaptive symbolic encoding; default ON)\nOCC-3: {} (latent, same-exact-model only; requires a live connector handshake)\n\n/occ 2 on enables OCC-2; /occ 2 off returns to OCC-1; /occ 3 on enables OCC-3 (falls back automatically when the receiver, model or connector is ineligible).\nSaved for this chat and inherited by its subagents unless they have an override. Other chats are unchanged. Applies to subsequent structured messages. Plain-text messages remain TXT.\nNeon-blue TXT / OCC1 / OCC2 indicators flash on delivered messages.",
+        "Agent communication (this chat)\n\nOCC-1: ON (fallback)\nOCC-2: {} (adaptive symbolic encoding; default ON)\nOCC-3: {} (chat preference; same-exact-model native handoffs)\n\n/occ 2 on enables OCC-2; /occ 2 off returns to OCC-1; /occ 3 on saves the OCC-3 preference; /occ 3 off blocks native handoffs for this chat.\nNative OCC-3 still requires agentCommunication.occ3Enabled and occ3Experimental, a configured model endpoint, and a successful live connector handshake. An explicit chat preference gates native actions dynamically; it does not install a missing connector. Without a chat override, an installed native connector follows the existing global opt-in. Agents use occ3_handoff only when the runtime exposes it; ordinary messages retain their OCC-2/OCC-1/TXT path.\nSaved for this chat and inherited by its subagents unless they have an override. Other chats are unchanged.\nTXT / OCC1 / OCC2 indicators reflect delivered messages; OCC3 requires a completed native-use receipt, not just enablement or a queued handoff.",
         if enabled { "ON" } else { "OFF" },
         if occ3_enabled { "ON" } else { "OFF" }
     )
@@ -97,11 +97,10 @@ fn enabled_of(payload: &serde_json::Value) -> Result<bool, String> {
         .ok_or_else(|| "Daemon returned an invalid OCC-2 preference".to_string())
 }
 
-/// The status panel from a host preference payload, with provenance when the
-/// host reports the value was inherited from an ancestor chat (daemon truth,
-/// not a client-local read).
-fn status_of(payload: &serde_json::Value) -> Result<String, String> {
-    let mut panel = status(enabled_of(payload)?);
+/// Host-authoritative OCC-2 status and provenance, alongside the existing
+/// chat-local OCC-3 preference.
+fn status_of(payload: &serde_json::Value, occ3_enabled: bool) -> Result<String, String> {
+    let mut panel = status_occ3(enabled_of(payload)?, occ3_enabled);
     if payload.get("inherited").and_then(serde_json::Value::as_bool).unwrap_or(false) {
         if let Some(source) = payload.get("sourceSessionId").and_then(serde_json::Value::as_str) {
             panel.push_str(&format!(
@@ -122,7 +121,7 @@ async fn write_preference(
             let value = connection.set_occ_preferences(enabled).await?;
             // The daemon-authoritative echo, rendered with any provenance it
             // reports; an invalid echo is an error, never a success panel.
-            Ok(CommandOutput::Status(status_of(&value)?))
+            Ok(CommandOutput::Status(status_of(&value, false)?))
         }
         Route::LegacyLocal => {
             let state = connection.get_state().await?;
@@ -140,6 +139,50 @@ async fn write_preference(
     }
 }
 
+const MENU_CHOICES: [&str; 4] = [
+    "OCC-1 only",
+    "Enable OCC-2 (default)",
+    "Enable OCC-3 preference (experimental)",
+    "Disable OCC-3 preference",
+];
+const OCC3_UNAVAILABLE: &str = "OCC-3 unavailable for this model";
+const OCC3_MODEL_REQUIRED: &str = "OCC-3 requires a model with an enabled, supported occ3 configuration in models.json. Select an OCC-3 model, such as your DGX MTP (OCC-3) entry. Both sender and receiver subagents must use compatible OCC-3 models and pass the live exact-model/runtime handshake; a matching model name alone is insufficient. Unsupported pairs use ordinary OCC-2/OCC-1/TXT communication.";
+
+fn model_supports_occ3(model: Option<&pi_ai::types::Model>) -> bool {
+    use crate::core::occ3_connectors::activation::{configured_connector, Occ3ActivationRequest};
+    // Configuration eligibility only; the daemon still owns live activation.
+    model.is_some_and(|model| {
+        configured_connector(&Occ3ActivationRequest::new(model, true, true)).is_ok()
+    })
+}
+
+fn menu_choice(value: &str) -> Result<Choice, String> {
+    if value == OCC3_UNAVAILABLE {
+        return Ok(Choice::SetOcc3(true));
+    }
+    match MENU_CHOICES.iter().position(|choice| *choice == value) {
+        Some(0) => Ok(Choice::Set(false)),
+        Some(1) => Ok(Choice::Set(true)),
+        Some(2) => Ok(Choice::SetOcc3(true)),
+        Some(3) => Ok(Choice::SetOcc3(false)),
+        _ => Err("Unknown OCC selection".into()),
+    }
+}
+
+async fn read_occ3_preference(connection: &Arc<dyn wire::AgentConnection>) -> Result<(bool, bool), String> {
+    // Match the existing chat-local OCC-3 write path; the OCC-2 daemon
+    // preference payload does not include OCC-3.
+    let state = connection.get_state().await?;
+    let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
+    let preference = crate::core::occ::session_settings::resolve(session_file)?;
+    let enabled = if preference.source_session_id.is_some() {
+        preference.occ3_enabled
+    } else {
+        state.active_tool_names.iter().any(|name| name == "occ3_handoff")
+    };
+    Ok((enabled, model_supports_occ3(state.model.as_ref())))
+}
+
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
     send: &mpsc::Sender<HostEvent>,
@@ -155,11 +198,42 @@ pub(super) async fn run(
     }
     let payload = read_preference(connection, &route).await?;
     let enabled = enabled_of(&payload)?;
-    // OCC-3 writes are chat-local for v1: the daemon preference command
-    // set is unchanged (capability-gated), so the toggle persists via
-    // the session artifact the worker reads at send time.
+    let choice = match choice {
+        Choice::Status => {
+            let (occ3_enabled, supported) = read_occ3_preference(connection).await?;
+            let mut panel = status_of(&payload, occ3_enabled)?;
+            panel.push_str(if supported {
+                "\nSelected model: OCC-3 configured. The receiver must also be OCC-3 configured with matching verified model/runtime identity."
+            } else {
+                "\nSelected model: OCC-3 unavailable. Use an explicitly configured OCC-3 model for both subagents."
+            });
+            return Ok(CommandOutput::Panel(panel));
+        }
+        Choice::Menu => {
+            let (occ3_enabled, supported) = read_occ3_preference(connection).await?;
+            let title = format!(
+                "OCC-1 ON · OCC-2 {} · OCC-3 {} (preference)",
+                if enabled { "ON" } else { "OFF" },
+                if occ3_enabled { "ON" } else { "OFF" },
+            );
+            let mut choices = MENU_CHOICES;
+            if !supported {
+                choices[2] = OCC3_UNAVAILABLE;
+            }
+            match select(send, &title, &choices).await {
+                Some(value) => menu_choice(&value)?,
+                None => return Ok(CommandOutput::Nothing),
+            }
+        }
+        choice => choice,
+    };
+    // OCC-3 keeps its existing chat-local storage path. This does not
+    // change the daemon protocol or install a native connector.
     if let Choice::SetOcc3(value) = choice {
         let state = connection.get_state().await?;
+        if value && !model_supports_occ3(state.model.as_ref()) {
+            return Ok(CommandOutput::Warning(OCC3_MODEL_REQUIRED.into()));
+        }
         let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
         let resolution = crate::core::occ::session_settings::resolve(session_file)?;
         crate::core::occ::session_settings::save_occ3(
@@ -169,19 +243,10 @@ pub(super) async fn run(
         )?;
         return Ok(CommandOutput::Status(status_occ3(enabled, value)));
     }
-    let requested = match choice {
-        Choice::Status => return Ok(CommandOutput::Panel(status_of(&payload)?)),
-        Choice::Set(value) => value,
-        Choice::SetOcc3(_) => unreachable!("handled above"),
-        Choice::Menu => {
-            let title = format!("OCC-1 ON · OCC-2 {}", if enabled { "ON" } else { "OFF" });
-            match select(send, &title, &["OCC-1 only", "Enable OCC-2 (default)"]).await {
-                Some(choice) => choice == "Enable OCC-2 (default)",
-                None => return Ok(CommandOutput::Nothing),
-            }
-        }
-    };
-    write_preference(connection, &route, requested).await
+    match choice {
+        Choice::Set(value) => write_preference(connection, &route, value).await,
+        _ => unreachable!("menu, status and OCC-3 handled above"),
+    }
 }
 
 #[cfg(test)]
@@ -226,16 +291,63 @@ mod tests {
     fn occ_status_renders_host_truth_with_provenance() {
         // A chat's own preference: no provenance line.
         let own = serde_json::json!({"occ2Enabled": true, "inherited": false, "sourceSessionId": "chat-1"});
-        let panel = status_of(&own).unwrap();
+        let panel = status_of(&own, true).unwrap();
         assert!(panel.contains("OCC-2: ON"));
+        assert!(panel.contains("OCC-3: ON"));
+        assert!(panel.contains("An explicit chat preference gates native actions dynamically"));
         assert!(!panel.contains("Inherited from chat"));
         // A subagent chat: the daemon reports the ancestor as the source.
         let inherited = serde_json::json!({"occ2Enabled": true, "inherited": true, "sourceSessionId": "parent-7"});
-        let panel = status_of(&inherited).unwrap();
+        let panel = status_of(&inherited, false).unwrap();
         assert!(panel.contains("OCC-2: ON"));
+        assert!(panel.contains("OCC-3: OFF"));
         assert!(panel.contains("Inherited from chat parent-7"));
         // A host response without the toggle is an error, never a silent value.
-        assert!(status_of(&serde_json::json!({})).is_err());
+        assert!(status_of(&serde_json::json!({}), false).is_err());
+    }
+
+    #[test]
+    fn occ_menu_exposes_both_occ3_actions_without_changing_occ2_selection() {
+        assert_eq!(menu_choice(MENU_CHOICES[0]).unwrap(), Choice::Set(false));
+        assert_eq!(menu_choice(MENU_CHOICES[1]).unwrap(), Choice::Set(true));
+        assert_eq!(menu_choice(MENU_CHOICES[2]).unwrap(), Choice::SetOcc3(true));
+        assert_eq!(menu_choice(MENU_CHOICES[3]).unwrap(), Choice::SetOcc3(false));
+        assert!(menu_choice("unknown").is_err());
+    }
+
+    #[test]
+    fn occ3_menu_requires_explicit_supported_model_configuration() {
+        use pi_ai::types::{Model, Occ3Capability, Occ3Validation, OCC3_API_VERSION_V1, OCC3_PROTOCOL_V1};
+
+        assert!(!model_supports_occ3(None));
+        let mut model = Model {
+            id: "glm-5.3".into(),
+            name: "GLM-5.3 - DGX MTP (OCC-3)".into(),
+            ..Default::default()
+        };
+        // Even the expected display name cannot opt an ordinary model in.
+        assert!(!model_supports_occ3(Some(&model)));
+        model.occ3 = Some(Occ3Capability {
+            protocol: OCC3_PROTOCOL_V1.into(),
+            api_version: OCC3_API_VERSION_V1.into(),
+            connector: "sglang".into(),
+            endpoint: "http://127.0.0.1:30001".into(),
+            same_model_only: true,
+            enabled: true,
+            validation: Occ3Validation::LiveVerified,
+            fallback: Vec::new(),
+            method: None,
+            artifact_digest: None,
+        });
+        assert!(model_supports_occ3(Some(&model)));
+        model.occ3.as_mut().unwrap().enabled = false;
+        assert!(!model_supports_occ3(Some(&model)));
+        model.occ3.as_mut().unwrap().enabled = true;
+        model.occ3.as_mut().unwrap().same_model_only = false;
+        assert!(!model_supports_occ3(Some(&model)));
+        model.occ3.as_mut().unwrap().same_model_only = true;
+        model.occ3.as_mut().unwrap().connector = "unsupported".into();
+        assert!(!model_supports_occ3(Some(&model)));
     }
 
     #[test]
