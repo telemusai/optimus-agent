@@ -1203,6 +1203,17 @@ async fn finalize_source_capture(
         message.stop_reason = pi_ai::types::STOP_REASON_ERROR.into();
         message.error_message = Some(format!(
             "Native source capture/provenance did not complete; handoff and replay are forbidden. [{reason}]"));
+        // The failure must be readable, not diagnostics-only: a stalled or
+        // aborted capture turn otherwise renders as an empty message, and the
+        // model cannot see that it may retry by calling the handoff tool
+        // again (the client retries armed captures up to its budget).
+        if !message.content.iter().any(|block| {
+            matches!(block, pi_ai::types::ContentBlock::Text(text) if !text.text.is_empty())
+        }) {
+            message.content = vec![pi_ai::types::ContentBlock::Text(
+                pi_ai::types::TextContent::new(message.error_message.clone().unwrap_or_default()),
+            )];
+        }
         let failure = pi_ai::utils::stream_failure::StreamFailureError::new(
             &format!("Native source capture/provenance did not complete; automatic replay is disabled. [{reason}]"),
             pi_ai::utils::stream_failure::StreamFailureInfo {

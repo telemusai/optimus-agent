@@ -42,8 +42,9 @@ pub(super) fn expire_notices(
     now: Instant,
 ) {
     let notice_expired = mode.borrow_mut().expire_error_notices(now);
+    let status_expired = mode.borrow_mut().expire_transient_status_notices(now);
     let request_expired = transcript.borrow_mut().request_errors.expire(now);
-    if notice_expired || request_expired {
+    if notice_expired || status_expired || request_expired {
         ui.borrow_mut().request_render();
     }
 }

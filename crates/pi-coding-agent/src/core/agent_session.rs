@@ -342,6 +342,13 @@ pub trait AgentHandle: Send + Sync {
     fn set_native_state_hooks(&self, _receiver: pi_agent_core::types::ResolveInferenceState,
         _source: pi_agent_core::types::SourceCaptureHooks) -> bool { false }
 
+    /// Clear the process-local experimental native callbacks installed by
+    /// [`Self::set_native_state_hooks`]. Used by OCC-3 terminal recovery so a
+    /// failed native path degrades to the ordinary inference path instead of
+    /// failing every subsequent turn. Returns false when the handle never
+    /// supported installation.
+    fn clear_native_state_hooks(&self) -> bool { false }
+
     /// Snapshot the live callbacks copied by TypeScript's standalone side agent.
     fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> {
         None
@@ -3352,6 +3359,19 @@ impl AgentSession {
         // the receiver's record so the activity projection never
         // misreports it as text.
         state.install_delivery_restamp(Arc::clone(&self.agent))?;
+        // Terminal recovery: when the native path deactivates (retry budget
+        // exhausted or session teardown), clear the agent hooks and remove
+        // the handoff tool so later turns take the ordinary inference path
+        // instead of failing on a closed native session.
+        let agent = self.agent.clone();
+        state.set_tombstone_cleanup(Box::new(move || {
+            agent.clear_native_state_hooks();
+            agent.update_state(Box::new(|live| {
+                if let Some(tools) = live.tools.as_mut() {
+                    tools.retain(|tool| tool.name != occ3_state::NATIVE_HANDOFF_TOOL);
+                }
+            }));
+        }));
         *installed=Some(state); Ok(())
     }
     pub fn experimental_native_occ3(&self) -> Option<Arc<occ3_state::Occ3NativeSession>> {

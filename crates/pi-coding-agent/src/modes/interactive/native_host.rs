@@ -927,6 +927,9 @@ enum InputAction {
     SessionResume,
 }
 enum HostEvent {
+    /// A short-lived confirmation line (e.g. an OCC toggle acknowledgement)
+    /// that renders in the chat and auto-hides after a few seconds.
+    TransientStatus(String),
     MenuTiming(Instant),
     Extension(native_extension_bridge::Event),
     Shutdown,
@@ -2964,6 +2967,9 @@ async fn run_terminal(
                     );
                 }
                 HostEvent::Status(status) => mode.borrow_mut().show_status(&status, "dim"),
+                HostEvent::TransientStatus(status) => {
+                    mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+                }
                 HostEvent::ClipboardNotice(message) => {
                     transcript.borrow_mut().clipboard_notice.show(message, Instant::now());
                 }
@@ -3867,6 +3873,9 @@ fn should_record_prompt_history(text: &str) -> bool {
 enum CommandOutput {
     Nothing,
     Status(String),
+    /// A confirmation that should disappear after a few moments instead of
+    /// staying in the transcript (OCC toggle acknowledgements).
+    TransientStatus(String),
     ClipboardNotice(String),
     Warning(String),
     EchoLocal(String),
@@ -3915,6 +3924,9 @@ impl CommandOutput {
             CommandOutput::Status(status) => {
                 mode.borrow_mut().show_status(&status, "dim");
             }
+            CommandOutput::TransientStatus(status) => {
+                mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+            }
             CommandOutput::ClipboardNotice(message) => {
                 let _ = send.send(HostEvent::ClipboardNotice(message));
             }
@@ -3954,6 +3966,7 @@ impl CommandOutput {
         match self {
             CommandOutput::Nothing => Vec::new(),
             CommandOutput::Status(status) => vec![HostEvent::Status(status)],
+            CommandOutput::TransientStatus(status) => vec![HostEvent::TransientStatus(status)],
             CommandOutput::ClipboardNotice(message) => vec![HostEvent::ClipboardNotice(message)],
             CommandOutput::Warning(warning) => vec![HostEvent::Warning(warning)],
             CommandOutput::EchoLocal(text) => vec![HostEvent::EchoLocal(text)],

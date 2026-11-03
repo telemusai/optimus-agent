@@ -121,7 +121,7 @@ async fn write_preference(
             let value = connection.set_occ_preferences(enabled).await?;
             // The daemon-authoritative echo, rendered with any provenance it
             // reports; an invalid echo is an error, never a success panel.
-            Ok(CommandOutput::Status(status_of(&value, false)?))
+            Ok(CommandOutput::TransientStatus(status_of(&value, false)?))
         }
         Route::LegacyLocal => {
             let state = connection.get_state().await?;
@@ -241,7 +241,7 @@ pub(super) async fn run(
             resolution.occ2_enabled,
             value,
         )?;
-        return Ok(CommandOutput::Status(status_occ3(enabled, value)));
+        return Ok(CommandOutput::TransientStatus(status_occ3(enabled, value)));
     }
     match choice {
         Choice::Set(value) => write_preference(connection, &route, value).await,
