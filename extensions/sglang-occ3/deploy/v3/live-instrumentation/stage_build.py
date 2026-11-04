@@ -51,12 +51,12 @@ BUILD_UTILITIES = ("__init__.py", "artifact_preflight.py", "source_patch.py",
 CONTROLLER_MODULES = ("controller.py", "docker_api.py", "docker_config.py", "lifecycle.py",
                       "live_validation.py", "native_validator.py", "rehearsal.py",
                       "rehearsal_ingress.py", "service_checks.py", "supervisor.py")
-PATCHES = ("capture-eager-mtp.v1.json", "native-startup.v1.json", "scheduler-cache-ipc.v1.json")
+PATCHES = ("capture-eager-mtp.v1.json", "native-startup.v2.json", "scheduler-cache-ipc.v1.json")
 BUILD_INPUTS = ("source-baseline-expanded.json", "native-profile-input.json")
 HOOK_FILES = ("occ3_p3_arms_hook.py", "zz_occ3_p3_arms.pth")
 
 # Hard pins from live-build-sequence.md section 3. A mismatch is a refusal, never a warning.
-PROFILE_SHA256 = "6e676f1c6fc795ba412c4327168b51c8ef6f65056664638c4954eec58e75348a"
+PROFILE_SHA256 = "613698c4abf7ac20ba8e15dacdbcca8391c6deb379d168ba513a1f7a94d648a6"
 BASELINE_SHA256 = "509345ec366fe775e29412b057f68a0019b8a6829c98d303229f5ebf5387f8bc"
 PLUGIN_FILE_COUNT = 35
 GENERATED_OUTPUTS = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")

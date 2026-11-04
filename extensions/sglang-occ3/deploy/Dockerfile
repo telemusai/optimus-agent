@@ -45,7 +45,7 @@ COPY pyproject.toml README.md* ./
 # Only these deploy/v3 files are staged; nothing else from deploy/ is used.
 COPY deploy/v3/artifact_preflight.py deploy/v3/__init__.py deploy/v3/source_patch.py deploy/v3/native_package.py deploy/v3/native_image_build.py ./deploy/v3/
 # Exactly the three reviewed source manifests, by name, from patches/.
-COPY patches/capture-eager-mtp.v1.json patches/native-startup.v1.json patches/scheduler-cache-ipc.v1.json ./native-build-inputs/
+COPY patches/capture-eager-mtp.v1.json patches/native-startup.v2.json patches/scheduler-cache-ipc.v1.json ./native-build-inputs/
 # Root-staged packaging inputs: the root operator stages these two files
 # into deploy/native-build-inputs/ before the build. Their absence fails
 # the build; there are no fallback inputs and no generated baselines.

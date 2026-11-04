@@ -2885,6 +2885,36 @@ impl AgentConnection for DaemonAgentConnection {
             Ok(data)
         })
     }
+    fn supports_occ_queue_resolution(&self) -> bool {
+        self.client.supports_server_capability("agent_communication_queue_control")
+    }
+
+    fn resolve_occ_queue_entry(&self, queue_id: &str, reemit: bool) -> BoxFuture<Result<Value, String>> {
+        let this = self.clone();
+        let queue_id = queue_id.to_string();
+        Box::pin(async move {
+            if !this.client.supports_server_capability("agent_communication_queue_control") {
+                return Err("The attached daemon does not support OCC-3 queue resolution".to_string());
+            }
+            // The entry must be resolved on the chat that owns it: a
+            // session switch between the user's confirmation and the send
+            // must never resolve a different chat's queue.
+            let active_session_id = this.active_session_id();
+            let command = command_body(
+                "occ_resolve_queue_entry",
+                vec![
+                    ("activeSessionId", Value::String(active_session_id.clone())),
+                    ("queueId", Value::String(queue_id.clone())),
+                    ("reemit", Value::Bool(reemit)),
+                ],
+            );
+            let data = this.request_data(command, None).await?;
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while resolving the queue entry".to_string());
+            }
+            Ok(data)
+        })
+    }
     fn supports_execution_mode(&self) -> bool {
         self.client.supports_server_capability("execution_mode")
     }

@@ -707,6 +707,7 @@ impl NativeHandoffFixture {
             model: fixture_model(),
             context: Default::default(),
             messages: Vec::new(),
+            newly_supplied_messages: Vec::new(),
             signal: None,
         })
         .await
@@ -1433,4 +1434,113 @@ fn receipt_is_latent_completion(fixture: &NativeHandoffFixture, message_id: &str
         delivery.id == message_id
             && delivery.kind == crate::core::occ::activity::CommunicationKind::Latent
     })
+}
+
+/// REGRESSION (controller-level, daemon parent delivery): the
+/// production DaemonAgentMessageController parent notification verifies
+/// the CALLER's identity (the controller's current session must BE the
+/// named child), verifies the RELATIONSHIP (the target must be the
+/// child's recorded catalog parent, never a caller-supplied name),
+/// durably accepts exactly one record, and dedups by noticeId over the
+/// full history (beyond any window).
+#[tokio::test]
+async fn parent_queue_notification_verifies_identity_relationship_and_dedups() {
+    let fixture = NativeHandoffFixture::new().await;
+    let child_session_id = fixture.child.session.session_id().to_string();
+    let parent_session_id = fixture.parent.session.session_id().to_string();
+    let stranger_session_id = fixture.stranger.session.session_id().to_string();
+    let details = serde_json::json!({
+        "noticeId": "occ3n_wiring_dedup_1",
+        "queueId": "occ3q_wiring",
+        "receiver": "child:worker",
+        "state": "expired",
+        "reason": "ttl_expired",
+        "attempts": 1,
+        "position": 1,
+        "timestamp": 4242,
+    });
+
+    // (1) Caller identity: the STRANGER's controller claiming the child's
+    // identity is refused.
+    let stranger_controller = fixture.stranger.controller.clone().expect("controller");
+    let error = stranger_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, details.clone())
+        .await
+        .expect_err("identity mismatch refused");
+    assert!(error.contains("identity mismatch"), "got: {error}");
+
+    // (2) Relationship: the child's own controller naming a NON-parent
+    // target (the stranger) is refused.
+    let child_controller = fixture.child.controller.clone().expect("controller");
+    let error = child_controller
+        .notify_parent_queue_notice(&child_session_id, &stranger_session_id, details.clone())
+        .await
+        .expect_err("non-parent target refused");
+    assert!(error.contains("not the recorded parent"), "got: {error}");
+
+    // (3) Correct delivery: child -> its recorded parent, durably
+    // accepted (rollback variant), exactly one record.
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, details.clone())
+        .await
+        .expect("delivery accepted");
+
+    let count_child_notices = |notice_id: &str| -> usize {
+        fixture
+            .parent
+            .session
+            .session_manager
+            .lock()
+            .expect("parent manager")
+            .get_entries()
+            .iter()
+            .filter(|entry| {
+                entry.get("customType").and_then(serde_json::Value::as_str)
+                    == Some(
+                        crate::core::agent_session::occ3_sender_queue
+                            ::OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE,
+                    )
+                    && entry
+                        .get("details")
+                        .and_then(|details| details.get("noticeId"))
+                        .and_then(serde_json::Value::as_str)
+                        == Some(notice_id)
+            })
+            .count()
+    };
+    assert_eq!(count_child_notices("occ3n_wiring_dedup_1"), 1);
+
+    // (4) Full-history dedup: flood the parent transcript past any
+    // window bound, then redeliver the SAME noticeId - still one record.
+    {
+        let mut manager = fixture.parent.session.session_manager.lock().expect("manager");
+        for index in 0..300 {
+            let _ = manager.append_custom_message_entry(
+                "wiring_filler",
+                &crate::core::session_manager::CustomMessageEntryContent::Text(format!(
+                    "filler {index}"
+                )),
+                false,
+                None,
+            );
+        }
+    }
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, details.clone())
+        .await
+        .expect("duplicate accepted as no-op");
+    assert_eq!(
+        count_child_notices("occ3n_wiring_dedup_1"),
+        1,
+        "replay beyond any window dedups by noticeId"
+    );
+
+    // (5) A DISTINCT noticeId delivers a second record (no over-dedup).
+    let mut other = details.clone();
+    other["noticeId"] = serde_json::Value::String("occ3n_wiring_dedup_2".into());
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, other)
+        .await
+        .expect("distinct notice accepted");
+    assert_eq!(count_child_notices("occ3n_wiring_dedup_2"), 1);
 }

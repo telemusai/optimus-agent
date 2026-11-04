@@ -961,6 +961,35 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
         self.session().system_prompt()
     }
 
+    fn session_resolve_occ_queue_entry(&self, queue_id: &str, reemit: bool) -> Result<Value, String> {
+        // Same process: the session itself owns the native OCC-3 queue, so
+        // the resolve executes directly against it. The resolve API
+        // refuses any non-uncertain state, and the journaling goes through
+        // the same notice drain the session's own listener uses, so the
+        // transcript records and the roster projection observe the
+        // resolution within one drain cycle.
+        let native = self
+            .session()
+            .experimental_native_occ3()
+            .ok_or_else(|| "This chat has no active OCC-3 native session".to_string())?;
+        let notice = native
+            .sender_queue_resolve_uncertain(queue_id, reemit)
+            .map_err(|error| format!("Queue resolution refused: {error}"))?;
+        // The wrapper journals the outcome into the durable outbox
+        // atomically with the resolution itself (one lock, one persist).
+        Ok(match &notice {
+            Some(notice) => serde_json::json!({
+                "queueId": notice.queue_id,
+                "messageId": notice.message_id.clone().unwrap_or_default(),
+                "state": notice.state,
+                "reason": notice.reason.clone().unwrap_or_else(|| {
+                    if reemit { "manual_reemit".to_string() } else { "manual_cancel".to_string() }
+                }),
+            }),
+            None => serde_json::json!({ "queueId": queue_id, "state": "unchanged" }),
+        })
+    }
+
     fn session_tool_definition(&self, name: &str) -> Option<ConnectionToolDefinition> {
         self.session()
             .get_tool_definition(name)

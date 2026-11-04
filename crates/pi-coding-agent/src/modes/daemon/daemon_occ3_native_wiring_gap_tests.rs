@@ -676,6 +676,7 @@ impl NativeHandoffFixture {
             model: fixture_model(),
             context: Default::default(),
             messages: Vec::new(),
+            newly_supplied_messages: Vec::new(),
             signal: None,
         })
         .await

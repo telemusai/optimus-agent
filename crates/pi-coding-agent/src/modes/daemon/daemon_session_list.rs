@@ -487,12 +487,23 @@ pub fn summary_for_active_session(
         worker_state: None,
         worker_pid: None,
         extra: {
-            let mut extra = HashMap::from([(
-                "communicationActivity".into(),
-                serde_json::to_value(crate::core::occ::activity::from_admitted_messages(
-                    &session.messages, &session.session_id, &state.event_generation,
-                )).expect("communication metadata serializes"),
-            )]);
+            let mut extra = HashMap::from([
+                (
+                    "communicationActivity".into(),
+                    serde_json::to_value(crate::core::occ::activity::from_admitted_messages(
+                        &session.messages, &session.session_id, &state.event_generation,
+                    )).expect("communication metadata serializes"),
+                ),
+                // Schema-45 optional queue metadata: advisory UI visibility of
+                // the sender's OCC-3 queue notices. Clients that do not
+                // advertise the capability strip the field (roster_subscription).
+                (
+                    "communicationQueue".into(),
+                    serde_json::to_value(crate::core::occ::queue::from_queue_notices(
+                        &session.messages, &session.session_id, &state.event_generation,
+                    )).expect("queue metadata serializes"),
+                ),
+            ]);
             if let Some(snapshot) = crate::core::performance_monitor::throughput::snapshot(&session.session_id) {
                 if let Ok(value) = serde_json::to_value(snapshot) {
                     extra.insert("streamingThroughput".into(), value);
@@ -960,6 +971,56 @@ mod tests {
         let serialized = final_row.to_string();
         assert!(!serialized.contains("OCC/2"));
         assert!(!serialized.contains("#FALLBACK-OCC1"));
+    }
+
+    #[test]
+    fn queue_metadata_survives_roster_and_view_projection_content_free() {
+        use pi_agent_core::types::{AgentMessage, CustomAgentMessage, CustomMessageContent};
+        let notice = AgentMessage::Custom(CustomAgentMessage::Custom {
+            custom_type: "occ3_queue_notice".to_string(),
+            content: CustomMessageContent::Text("queue notice".to_string()),
+            display: false,
+            details: Some(serde_json::json!({
+                "sessionId": "sender",
+                "queueId": "occ3q_1",
+                "messageId": "m1",
+                "position": 1,
+                "receiver": "child:receiver-a",
+                "state": "pending",
+                "attempts": 0,
+                "reason": "internal-only",
+                "body": "private handoff body",
+            })),
+            timestamp: 1000,
+        });
+        let mut runtime = super::super::active_session_state::AgentSessionRuntime::default();
+        runtime.session.session_id = "sender".into();
+        runtime.session.messages.push(notice);
+        let state = Arc::new(StdMutex::new(ActiveSessionState::new("active-sender", runtime)));
+        let summary = summary_for_active_session(&state, None, false, false, false);
+        let wire = serde_json::to_value(summary.roster_view()).unwrap();
+        let view: crate::modes::agents_view::agents_view_state::SessionSummary =
+            serde_json::from_value(wire.clone()).unwrap();
+        let final_row = serde_json::to_value(view).unwrap();
+        assert_eq!(final_row["communicationQueue"], wire["communicationQueue"]);
+        assert_eq!(
+            final_row["communicationQueue"]["entries"][0]["queueId"], "occ3q_1");
+        assert_eq!(final_row["communicationQueue"]["entries"][0]["state"], "pending");
+        // The full pending count and the display-bound remainder both ride
+        // the wire, so the badge never undercounts a larger queue.
+        assert_eq!(final_row["communicationQueue"]["pendingTotal"], 1);
+        assert_eq!(final_row["communicationQueue"]["omitted"], 0);
+        assert!(final_row["communicationQueue"]["entries"][0].get("reason").is_none());
+        assert!(final_row["communicationQueue"]["entries"][0].get("body").is_none());
+        let serialized = final_row.to_string();
+        assert!(!serialized.contains("private handoff body"));
+        // A session without notices projects an empty queue, not a missing field.
+        let mut bare = super::super::active_session_state::AgentSessionRuntime::default();
+        bare.session.session_id = "bare".into();
+        let bare_state = Arc::new(StdMutex::new(ActiveSessionState::new("active-bare", bare)));
+        let bare_summary = summary_for_active_session(&bare_state, None, false, false, false);
+        let bare_wire = serde_json::to_value(bare_summary.roster_view()).unwrap();
+        assert_eq!(bare_wire["communicationQueue"]["entries"].as_array().map(Vec::len), Some(0));
     }
 
     #[test]

@@ -931,6 +931,22 @@ def admit_request(scheduler, req, value):
         require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile")
         require(getattr(req, "positional_embed_overrides", None) is None, "profile")
         require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
+        # Busy-batch admission bound: an armed turn runs as an isolated
+        # cohort, so ordinary inflight work must drain before its prefill.
+        # Parking in the ordinary queue would hold the one-shot native
+        # attempt behind unrelated decode traffic until the queue bound
+        # aborts it; declining here is rank-uniform, mutates nothing and
+        # leaves the sender free to retry with a fresh attempt. An empty
+        # batch (no inflight rows, no chunked prefill) admits immediately.
+        collect = getattr(scheduler, "collect_inflight_reqs", None)
+        inflight = list(collect()) if callable(collect) else []
+        chunked = getattr(scheduler, "chunked_req", None)
+        if chunked is not None:
+            inflight.append(chunked)
+        active = [held for held in inflight
+                  if not (callable(getattr(held, "finished", None))
+                          and held.finished())]
+        require(not active, "quota")
         original = req.origin_input_ids
         new_ids = original
         span_markers, content_state = None, None
@@ -1443,6 +1459,11 @@ def load_runtime_profile():
     # A pinned profile may omit the frozen-artifact reference: the per-message
     # method names none, so the runtime profile takes its empty default.
     optional = {"calibration_path", "calibration_digest"}
+    # The declared-launch identity block (native_profile.DECLARED_IDENTITY) is
+    # route-served deployment metadata, never worker state: it is dropped
+    # before the RuntimeProfile fieldset is checked or constructed.
+    static = {name: value for name, value in static.items()
+              if name != "declared_identity"}
     require(type(static) is dict and expected - optional <= set(static) <= expected, "profile")
     return RuntimeProfile(**static, runtime_epoch=incarnation["runtime_epoch"],
                           runtime_generation=incarnation["runtime_generation"])

@@ -39,7 +39,7 @@ PROFILE = {"model_fingerprint": "fixture-fingerprint-not-production", "model_id"
            "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
            "method": package.METHOD}
 MANIFEST_TARGETS = {"capture-eager-mtp.v1.json": "a.py",
-                    "native-startup.v1.json": "http_server.py",
+                    "native-startup.v2.json": "http_server.py",
                     "scheduler-cache-ipc.v1.json": "sub/b.py"}
 
 
@@ -239,14 +239,14 @@ def test_staged_inputs_directory_is_exact_and_closed(fixture, monkeypatch):
     with pytest.raises(nib.BuildError, match="staged_input_unexpected"):
         nib.build_layer(fixture.arguments())
     (fixture.staged / "sub").rmdir()
-    (fixture.staged / "native-startup.v1.json").unlink()
+    (fixture.staged / "native-startup.v2.json").unlink()
     with pytest.raises(nib.BuildError, match="staged_input_missing"):
         nib.build_layer(fixture.arguments())
-    (fixture.staged / "native-startup.v1.json").mkdir()
+    (fixture.staged / "native-startup.v2.json").mkdir()
     with pytest.raises(nib.BuildError, match="staged_input_unsupported"):
         nib.build_layer(fixture.arguments())
-    (fixture.staged / "native-startup.v1.json").rmdir()
-    (fixture.staged / "native-startup.v1.json").write_bytes(b"[]")
+    (fixture.staged / "native-startup.v2.json").rmdir()
+    (fixture.staged / "native-startup.v2.json").write_bytes(b"[]")
     with pytest.raises(package.PackageError):
         nib.build_layer(fixture.arguments())
 
@@ -407,10 +407,10 @@ def test_oversized_spec_is_refused_before_any_child_process():
 
 
 def test_driver_constants_pin_the_finite_interface():
-    assert nib.MANIFEST_NAMES == ("capture-eager-mtp.v1.json", "native-startup.v1.json",
+    assert nib.MANIFEST_NAMES == ("capture-eager-mtp.v1.json", "native-startup.v2.json",
                                   "scheduler-cache-ipc.v1.json")
     assert nib.STAGED_NAMES == ("capture-eager-mtp.v1.json", "native-profile-input.json",
-                                "native-startup.v1.json", "scheduler-cache-ipc.v1.json",
+                                "native-startup.v2.json", "scheduler-cache-ipc.v1.json",
                                 "source-baseline-expanded.json")
     assert nib.PIP_INSTALL_FLAGS == ("--no-index", "--no-deps", "--no-cache-dir",
                                      "--no-build-isolation", "--no-compile",
@@ -832,7 +832,7 @@ def test_dockerfile_copy_set_is_bounded_to_staged_inputs():
                "deploy/v3/artifact_preflight.py", "deploy/v3/__init__.py",
                "deploy/v3/source_patch.py", "deploy/v3/native_package.py",
                "deploy/v3/native_image_build.py",
-               "patches/capture-eager-mtp.v1.json", "patches/native-startup.v1.json",
+               "patches/capture-eager-mtp.v1.json", "patches/native-startup.v2.json",
                "patches/scheduler-cache-ipc.v1.json",
                "deploy/native-build-inputs/source-baseline-expanded.json",
                "deploy/native-build-inputs/native-profile-input.json"}

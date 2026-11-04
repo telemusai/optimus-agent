@@ -21,7 +21,7 @@ use tokio::time::timeout;
 use crate::agent::{Agent, AgentOptions, PromptInput};
 use crate::types::{
     AgentMessage, AgentState, AgentTool, AgentToolResult, CustomAgentMessage, CustomMessageContent,
-    InferenceStateRequest, ResolveInferenceState, StreamFn,
+    InferenceStateRequest, ResolveInferenceState, SourceCaptureHooks, StreamFn,
 };
 
 fn model(base_url: &str) -> Model {
@@ -553,4 +553,258 @@ async fn native_inference_state_ignored_by_stream_cannot_execute_tools() {
         .unwrap()
         .contains("was not consumed"));
     assert_eq!(state.state(), InferenceStateLeaseState::Cancelled);
+}
+
+
+// ---------------------------------------------------------------------------
+// newly_supplied_messages provenance (fresh-input snapshot contract)
+// ---------------------------------------------------------------------------
+
+/// Stable text form of a fresh-input snapshot entry, so assertions compare
+/// plain strings regardless of the message lane.
+fn fresh_texts(request: &InferenceStateRequest) -> Vec<String> {
+    request
+        .newly_supplied_messages
+        .iter()
+        .map(|message| match message {
+            AgentMessage::Message(Message::User(user)) => match &user.content {
+                UserContent::Text(text) => format!("user:{}", text),
+                _ => "user:other".to_string(),
+            },
+            AgentMessage::Message(message) => format!("role:{}", message.role()),
+            AgentMessage::Custom(custom) => format!("custom:{}", custom.role()),
+        })
+        .collect()
+}
+
+/// Records every fresh-input snapshot the inference-state resolver observed,
+/// one entry per resolver invocation.
+#[derive(Default)]
+struct FreshnessLog {
+    fresh: Mutex<Vec<Vec<String>>>,
+}
+
+/// An offline stream fn: every request returns one plain assistant message
+/// (no tool calls, no HTTP).
+fn offline_stream(calls: Arc<AtomicUsize>) -> StreamFn {
+    Arc::new(move |model, _, _| {
+        calls.fetch_add(1, Ordering::SeqCst);
+        let mut message = AssistantMessage::new(model.api, model.provider, model.id, 1);
+        message
+            .content
+            .push(ContentBlock::Text(TextContent::new("offline")));
+        message.stop_reason = "stop".into();
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEvent::Done {
+            reason: message.stop_reason.clone(),
+            message,
+        });
+        stream.end(None);
+        Box::pin(async move { stream })
+    })
+}
+
+/// An offline stream fn whose FIRST request returns one tool call (executed
+/// by `fixture_tool`) and whose later requests return a plain completion, so
+/// exactly one tool continuation request follows.
+fn tool_then_plain_stream(calls: Arc<AtomicUsize>) -> StreamFn {
+    Arc::new(move |model, _, _| {
+        let index = calls.fetch_add(1, Ordering::SeqCst);
+        let mut message = AssistantMessage::new(model.api, model.provider, model.id, 1);
+        if index == 0 {
+            message.content.push(ContentBlock::ToolCall(ToolCall::new(
+                "ignored-state-tool",
+                "fixture_tool",
+                serde_json::Map::new(),
+            )));
+            message.stop_reason = "toolUse".into();
+        } else {
+            message
+                .content
+                .push(ContentBlock::Text(TextContent::new("ordinary fixture")));
+            message.stop_reason = "stop".into();
+        }
+        let stream = AssistantMessageEventStream::new();
+        stream.push(AssistantMessageEvent::Done {
+            reason: message.stop_reason.clone(),
+            message,
+        });
+        stream.end(None);
+        Box::pin(async move { stream })
+    })
+}
+
+fn recording_resolver(log: &Arc<FreshnessLog>) -> ResolveInferenceState {
+    let log = log.clone();
+    Arc::new(move |request: InferenceStateRequest| {
+        log.fresh
+            .lock()
+            .unwrap()
+            .push(fresh_texts(&request));
+        Box::pin(async move { Ok(None) })
+    })
+}
+
+/// The fresh-input snapshot carries exactly the run's initial prompt lane:
+/// user text and custom host messages in supply order, and nothing else.
+#[tokio::test]
+async fn fresh_input_snapshot_is_exactly_the_initial_prompts() {
+    let model = model("http://offline");
+    let log = Arc::new(FreshnessLog::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut options = base_options(model, offline_stream(calls.clone()));
+    options.resolve_inference_state = Some(recording_resolver(&log));
+    let agent = Agent::new(options);
+    agent
+        .prompt(PromptInput::Messages(vec![
+            user("history-free first prompt"),
+            admitted_message(),
+        ]))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    // One resolver invocation for the single request, and the snapshot holds
+    // EXACTLY the two supplied prompts (user text and the custom agent
+    // message), in supply order.
+    assert_eq!(
+        log.fresh.lock().unwrap().clone(),
+        vec![vec![
+            "user:history-free first prompt".to_string(),
+            "custom:custom".to_string(),
+        ]]
+    );
+}
+
+/// A tool continuation supplies no new input: the continuation request's
+/// snapshot is empty even though its request context carries the full
+/// history, the assistant output and the tool result.
+#[tokio::test]
+async fn tool_continuation_carries_empty_fresh_input() {
+    let model = model("http://offline");
+    let log = Arc::new(FreshnessLog::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let tools = Arc::new(AtomicUsize::new(0));
+    let mut options = base_options(model, tool_then_plain_stream(calls.clone()));
+    options.initial_state.as_mut().unwrap().tools = Some(vec![fixture_tool(tools.clone())]);
+    options.resolve_inference_state = Some(recording_resolver(&log));
+    let agent = Agent::new(options);
+    agent
+        .prompt(PromptInput::Messages(vec![user("turn one")]))
+        .await
+        .unwrap();
+    assert_eq!(tools.load(Ordering::SeqCst), 1);
+    assert_eq!(calls.load(Ordering::SeqCst), 2);
+    // Two resolver invocations (the request with the prompt, then the tool
+    // continuation request): the second snapshot is empty.
+    let fresh = log.fresh.lock().unwrap().clone();
+    assert_eq!(fresh.len(), 2);
+    assert_eq!(fresh[0], vec!["user:turn one".to_string()]);
+    assert_eq!(fresh[1], Vec::<String>::new());
+}
+
+/// Steering and follow-up drains are fresh input for the request they feed.
+/// The prompt lane leads each run's snapshot; a steering batch drained at the
+/// run's start lands after it in the SAME snapshot, and a follow-up batch is
+/// consumed inside the same run as its own request lane.
+#[tokio::test]
+async fn steering_and_follow_up_drains_are_fresh_input() {
+    let model = model("http://offline");
+    let log = Arc::new(FreshnessLog::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut options = base_options(model, offline_stream(calls.clone()));
+    options.resolve_inference_state = Some(recording_resolver(&log));
+    let agent = Agent::new(options);
+    agent
+        .prompt(PromptInput::Messages(vec![user("initial")]))
+        .await
+        .unwrap();
+    // Steering queued between runs drains at the next run's start: one
+    // request whose snapshot is the prompt lane plus the steering batch.
+    agent.steer(vec![user("steered input"), admitted_message()]);
+    agent
+        .prompt(PromptInput::Messages(vec![user("second run")]))
+        .await
+        .unwrap();
+    // A follow-up enqueued before the run is drained after the run's own
+    // request would otherwise stop, feeding one further request whose
+    // snapshot is exactly the follow-up lane.
+    agent.follow_up(vec![user("follow up input")]);
+    agent
+        .prompt(PromptInput::Messages(vec![user("third run")]))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 4);
+    let fresh = log.fresh.lock().unwrap().clone();
+    assert_eq!(fresh.len(), 4);
+    assert_eq!(fresh[0], vec!["user:initial".to_string()]);
+    // Prompt lane leads; the steering drain extends the same snapshot.
+    assert_eq!(
+        fresh[1],
+        vec![
+            "user:second run".to_string(),
+            "user:steered input".to_string(),
+            "custom:custom".to_string(),
+        ]
+    );
+    // The follow-up becomes the fresh lane of its own request.
+    assert_eq!(fresh[2], vec!["user:third run".to_string()]);
+    assert_eq!(fresh[3], vec!["user:follow up input".to_string()]);
+}
+
+/// A continuation run (`continue_`) supplies no new input: its request's
+/// snapshot is empty even though the context carries real history.
+#[tokio::test]
+async fn run_continue_carries_empty_fresh_input() {
+    let model = model("http://offline");
+    let log = Arc::new(FreshnessLog::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut options = base_options(model, offline_stream(calls.clone()));
+    options.initial_state.as_mut().unwrap().messages = vec![user("seeded history")];
+    options.resolve_inference_state = Some(recording_resolver(&log));
+    let agent = Agent::new(options);
+    agent
+        .continue_()
+        .await
+        .map_err(|error| error.message)
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let fresh = log.fresh.lock().unwrap().clone();
+    assert_eq!(fresh.len(), 1);
+    assert_eq!(fresh[0], Vec::<String>::new());
+}
+
+/// When BOTH the inference-state resolver and the source-capture resolve are
+/// configured on the same request, both constructions observe the SAME
+/// fresh-input snapshot (the take-once snapshot is cloned for both; the
+/// second consumer is never starved by the first).
+#[tokio::test]
+async fn both_hooks_share_the_same_fresh_input_snapshot() {
+    let model = model("http://offline");
+    let log = Arc::new(FreshnessLog::default());
+    let calls = Arc::new(AtomicUsize::new(0));
+    let mut options = base_options(model, offline_stream(calls.clone()));
+    options.resolve_inference_state = Some(recording_resolver(&log));
+    let agent = Agent::new(options);
+    let capture_observed = Arc::new(Mutex::new(Vec::<Vec<String>>::new()));
+    let capture_sink = capture_observed.clone();
+    agent.set_source_capture_hooks(Some(SourceCaptureHooks {
+        resolve: Arc::new(move |request: InferenceStateRequest| {
+            capture_sink.lock().unwrap().push(fresh_texts(&request));
+            // The PR235 source-side recovery contract is preserved: no lease
+            // armed, nothing captured, the turn runs uncaptured.
+            Box::pin(async move { Ok(None) })
+        }),
+        completed: Arc::new(|_completion| Box::pin(async move { Ok(()) })),
+    }));
+    agent
+        .prompt(PromptInput::Messages(vec![user("shared snapshot probe")]))
+        .await
+        .unwrap();
+    assert_eq!(calls.load(Ordering::SeqCst), 1);
+    let resolver_seen = log.fresh.lock().unwrap().clone();
+    let capture_seen = capture_observed.lock().unwrap().clone();
+    // Two hook constructions for the one request: both saw the identical
+    // snapshot (and in particular the second was not starved to empty).
+    assert_eq!(resolver_seen, vec![vec!["user:shared snapshot probe".to_string()]]);
+    assert_eq!(capture_seen, resolver_seen);
 }

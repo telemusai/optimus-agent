@@ -714,7 +714,7 @@ pub struct DaemonHistoryRange {
 }
 
 /// `DAEMON_COMMAND_TYPES` (ported verbatim from daemon-mode.ts).
-pub const DAEMON_COMMAND_TYPES: [&str; 105] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 106] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -822,6 +822,9 @@ pub const DAEMON_COMMAND_TYPES: [&str; 105] = [
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_get_preferences",
     "occ_set_preferences",
+    // Manual OCC-3 queue resolution (schema revision 46): optional and
+    // capability-gated; an old daemon answers "Unknown daemon command".
+    "occ_resolve_queue_entry",
     "extension_ui_response",
     "prepare_update_restart",
     "retry_worker",
@@ -5905,6 +5908,58 @@ impl AgentDaemon {
                 Ok(Some(DaemonResponse::success(
                     id,
                     "occ_set_preferences",
+                    Some(value),
+                )))
+            }
+            // Manual resolution (schema 46): cancel or explicitly confirmed
+            // re-emit of ONE uncertain entry on the attached session's own
+            // native OCC-3 queue. The session owns the queue; the daemon
+            // only forwards the already-validated intent. The resolve API
+            // itself refuses any non-uncertain state, so a replayed or
+            // mis-targeted command mutates nothing. The response is
+            // content-free: ids and state only, never the dispatch token.
+            "occ_resolve_queue_entry" => {
+                let queue_id = body
+                    .get("queueId")
+                    .and_then(Value::as_str)
+                    .filter(|value| !value.is_empty())
+                    .ok_or_else(|| "queueId must be a non-empty string".to_string())?;
+                let reemit = body
+                    .get("reemit")
+                    .and_then(Value::as_bool)
+                    .ok_or_else(|| "reemit must be a boolean".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let agent_session = self
+                    .session_of(&state)
+                    .agent_session()
+                    .ok_or_else(|| "This daemon session does not expose an agent session".to_string())?;
+                let native = agent_session
+                    .experimental_native_occ3()
+                    .ok_or_else(|| "This chat has no active OCC-3 native session".to_string())?;
+                let notice = native
+                    .sender_queue_resolve_uncertain(queue_id, reemit)
+                    .map_err(|error| format!("Queue resolution refused: {error}"))?;
+                // The wrapper journals the outcome into the durable outbox
+                // atomically with the resolution itself (one lock, one
+                // persist), so the transcript records, the /occ table and
+                // the roster projection observe the resolution within one
+                // drain cycle (turn end or the 30s idle sweep). The full
+                // notice (dispatch token included) stays in-process: the
+                // wire response below never carries it.
+                let value = match &notice {
+                    Some(notice) => serde_json::json!({
+                        "queueId": notice.queue_id,
+                        "messageId": notice.message_id.clone().unwrap_or_default(),
+                        "state": notice.state,
+                        "reason": notice.reason.clone().unwrap_or_else(|| {
+                            if reemit { "manual_reemit".to_string() } else { "manual_cancel".to_string() }
+                        }),
+                    }),
+                    None => serde_json::json!({ "queueId": queue_id, "state": "unchanged" }),
+                };
+                Ok(Some(DaemonResponse::success(
+                    id,
+                    "occ_resolve_queue_entry",
                     Some(value),
                 )))
             }
@@ -17066,6 +17121,119 @@ impl AgentSessionMessageController for DaemonAgentMessageController {
                 &speaker,
                 true,
             )
+        })
+    }
+
+    /// OCC-3 sender-queue parent notification: durably records one
+    /// child queue notice in the PARENT session's transcript. The
+    /// parent target resolves through the daemon's own session registry
+    /// (`get_bound_session_state`) from the spawn-relationship id the
+    /// sender host passed - never a model-supplied name - and a live,
+    /// non-closing session must exist for the delivery to be accepted.
+    /// The record carries the content-free notice details plus
+    /// `childSessionId`; its stable `noticeId` makes a replay (crash
+    /// between this durable accept and the sender's local outbox ack)
+    /// an idempotent no-op.
+    fn notify_parent_queue_notice(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        details: serde_json::Value,
+    ) -> pi_ai::types::BoxFuture<Result<(), String>> {
+        let daemon = self.daemon.clone();
+        let child_session_id = child_session_id.to_string();
+        let parent_session_id = parent_session_id.to_string();
+        // Caller authentication resolves OUTSIDE the boxed future:
+        // require_current_state is sync and returns an owned Arc, so the
+        // receiver borrow never enters the 'static future. A failure is
+        // still surfaced as an asynchronous Err (same external contract
+        // as before the hoist).
+        let current = match self.require_current_state() {
+            Ok(current) => current,
+            Err(error) => return Box::pin(async move { Err(error) }),
+        };
+        Box::pin(async move {
+            use crate::core::agent_session::occ3_sender_queue::OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE;
+            use crate::core::session_manager::CustomMessageEntryContent;
+            let notice_id = details
+                .get("noticeId")
+                .and_then(serde_json::Value::as_str)
+                .ok_or("Parent queue notification missing noticeId")?
+                .to_string();
+            // Caller authentication: the notifying session must BE the
+            // controller's current session (the registry-resolved handle,
+            // never a caller-supplied id).
+            let child = daemon
+                .session_of(&current)
+                .agent_session()
+                .ok_or("Notifying session unavailable")?;
+            if child.session_id() != child_session_id {
+                return Err("Parent queue notification caller identity mismatch".into());
+            }
+            // Relationship authentication: the parent must be the
+            // child's RECORDED parent (catalog family entry, from the
+            // daemon-owned runtime metadata), never a caller-supplied
+            // name. Fail closed when no relationship is recorded.
+            let child_entry = daemon.agent_family_entry(&current);
+            if child_entry.parent_session_id.as_deref() != Some(parent_session_id.as_str()) {
+                return Err("Parent queue notification target is not the recorded parent".into());
+            }
+            let parent_state = daemon.get_bound_session_state(&parent_session_id)?;
+            let parent = daemon
+                .session_of(&parent_state)
+                .agent_session()
+                .ok_or("Parent agent session unavailable")?;
+            let mut details = details;
+            details["childSessionId"] = serde_json::Value::String(child_session_id.clone());
+            let state = details.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+            let queue_id = details.get("queueId").and_then(serde_json::Value::as_str).unwrap_or("");
+            let reason = details.get("reason").and_then(serde_json::Value::as_str);
+            let line = match reason {
+                Some(reason) => format!("OCC-3 child queue notice: {state} handoff {queue_id} from child session {child_session_id} ({reason})."),
+                None => format!("OCC-3 child queue notice: {state} handoff {queue_id} from child session {child_session_id}."),
+            };
+            let content = CustomMessageEntryContent::Text(line.clone());
+            // The session-manager guard is scoped: dedup + durable
+            // append complete and the guard DROPS before the async
+            // follow-up below, keeping the future `Send`.
+            {
+                let mut manager = parent
+                    .session_manager
+                    .lock()
+                    .map_err(|_| "Parent session manager poisoned".to_string())?;
+                // Replay dedup over the FULL history (no window): if the
+                // parent already accepted this noticeId, the duplicate
+                // delivery is a no-op (never a second record).
+                if manager.has_custom_message_notice(OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE, &notice_id)
+                {
+                    return Ok(());
+                }
+                manager
+                    .append_custom_message_entry_with_rollback(
+                        OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE,
+                        &content,
+                        true,
+                        Some(details.clone()),
+                    )
+                    .map_err(|error| format!("Parent queue notification not durably accepted: {error}"))?;
+            }
+            // Live steering for an active parent: the same record as a
+            // follow-up prompt, so a busy parent learns of the final
+            // state without waiting for its next turn. Prompt failure
+            // never un-acks: the durable record above already replays
+            // into the parent's context at the next turn boundary.
+            let custom = crate::core::messages::CustomMessage {
+                role: "user".into(),
+                custom_type: OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE.into(),
+                content: pi_agent_core::types::CustomMessageContent::Text(line.clone()),
+                display: true,
+                details: Some(details),
+                timestamp: crate::core::agent_session::now_ms() as i64,
+            };
+            let _ = parent
+                .queue_agent_message_prompt(&line, "followUp", Some(custom))
+                .await;
+            Ok(())
         })
     }
 }

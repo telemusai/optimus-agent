@@ -116,6 +116,39 @@ impl ActivityState {
         self.until.iter().flatten().copied().filter(|deadline| *deadline > now).min()
     }
 
+    /// The advisory queue badge from the same roster rows: pending OCC-3
+    /// queue entries of the observed family. Never a pulse: completed-use
+    /// deliveries remain the only pulse trigger, and a queued notice lights
+    /// no TXT/OCC slot. The roster subscription already strips
+    /// `communicationQueue` when the daemon does not advertise the (separate)
+    /// queue capability, so field presence is the gate — the badge stays
+    /// independent of the activity capability.
+    pub(super) fn queue_badge(&self, rows: &[SessionSummary]) -> String {
+        let mut pending = 0usize;
+        for row in rows.iter().filter(|row| !row.session_id.is_empty()) {
+            let Some(queue) = row.extra.get("communicationQueue") else { continue };
+            // The projection's full pending count survives the display
+            // bound; counting the bounded entries is only the fallback for
+            // hand-shaped rows that carry no pendingTotal.
+            if let Some(total) = queue.get("pendingTotal").and_then(serde_json::Value::as_u64) {
+                pending = pending.saturating_add(total.min(usize::MAX as u64) as usize);
+                continue;
+            }
+            let Some(entries) = queue.get("entries").and_then(|value| value.as_array()) else { continue };
+            for entry in entries {
+                let Some(state) = entry.get("state").and_then(serde_json::Value::as_str) else { continue };
+                if !crate::core::occ::queue::is_terminal_state(state) {
+                    pending = pending.saturating_add(1);
+                }
+            }
+        }
+        if pending == 0 {
+            String::new()
+        } else {
+            format!("\u{1f4e9}QUEUED {pending}")
+        }
+    }
+
     pub(super) fn indicators(&self, now: Instant) -> String {
         ["TXT", "OCC1", "OCC2", "OCC3"].iter().enumerate().map(|(index, label)| {
             let active = self.until[index].is_some_and(|until| now < until);
@@ -266,6 +299,47 @@ mod tests {
         state.observe(&[row("child", true, json!([]))], &parent(), now);
         assert!(state.observe(&[row("child", true, json!([message("one", "parent", kind)]))], &parent(), now));
         strip_ansi(&state.indicators(now))
+    }
+
+    #[test]
+    fn queue_badge_counts_pending_entries_without_pulsing() {
+        let now = Instant::now();
+        let mut state = ActivityState::default();
+        let mut rows = vec![
+            row("parent", false, json!([])),
+            row("child", true, json!([])),
+        ];
+        state.observe(&rows, &parent(), now);
+        // No queue field: no badge.
+        assert_eq!(state.queue_badge(&rows), "");
+        rows[1].extra.insert("communicationQueue".into(), json!({
+            "generation":"g",
+            "entries":[
+                {"queueId":"q1","state":"pending"},
+                {"queueId":"q2","state":"armed"},
+                {"queueId":"q3","state":"fallback"},
+                {"queueId":"q4","state":"failed"},
+                {"queueId":"q5","state":"admitted"},
+                {"queueId":"q6","state":"future-unknown"}
+            ]
+        }));
+        // Pending + armed + admitted + unknown = 4; terminal states
+        // (fallback/failed, and the corrected completed/expired) excluded.
+        rows[1].extra.get_mut("communicationQueue").unwrap()["entries"].as_array_mut().unwrap()
+            .push(json!({"queueId":"q7","state":"completed"}));
+        rows[1].extra.get_mut("communicationQueue").unwrap()["entries"].as_array_mut().unwrap()
+            .push(json!({"queueId":"q8","state":"expired"}));
+        assert_eq!(state.queue_badge(&rows), "\u{1f4e9}QUEUED 4");
+        // pendingTotal is authoritative when present: it survives the
+        // display bound, so larger configured queues are not undercounted.
+        rows[1].extra.get_mut("communicationQueue").unwrap()["pendingTotal"] = json!(11);
+        assert_eq!(state.queue_badge(&rows), "\u{1f4e9}QUEUED 11");
+        // The badge never lights any pulse slot.
+        assert_eq!(strip_ansi(&state.indicators(now)), IDLE);
+        assert_eq!(state.next_deadline(now), None);
+        // A queue field with no entries array and no pendingTotal is ignored.
+        rows[1].extra.insert("communicationQueue".into(), json!({"generation":"g"}));
+        assert_eq!(state.queue_badge(&rows), "");
     }
 
     #[test]

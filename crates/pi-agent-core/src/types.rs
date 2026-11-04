@@ -45,6 +45,20 @@ pub struct InferenceStateRequest {
     pub model: Model,
     pub context: pi_ai::types::Context,
     pub messages: Vec<AgentMessage>,
+    /// Agent messages NEWLY SUPPLIED since the previous resolver invocation
+    /// of this run: the run's initial prompt lane, plus the host-owned
+    /// steering and follow-up lanes drained since the last provider request.
+    /// Assistant output, tool results and pre-run history are never fresh,
+    /// and a continuation without new input carries an empty set. The field
+    /// is one shared take-once snapshot per provider request: when both the
+    /// inference-state resolver and the source-capture resolve run on the
+    /// same request they observe the identical clone, and the pool is empty
+    /// for the next request even when a hook refused.
+    ///
+    /// Internal Rust source-compat note: this field is NOT serialized onto
+    /// any wire or transcript; every constructor in this workspace must
+    /// now supply it (`Vec::new()` where no new input exists).
+    pub newly_supplied_messages: Vec<AgentMessage>,
     pub signal: Option<tokio_util::sync::CancellationToken>,
 }
 

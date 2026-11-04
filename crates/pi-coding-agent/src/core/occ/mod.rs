@@ -270,6 +270,7 @@
 
 pub mod activity;
 pub mod consolidation;
+pub mod queue;
 pub mod contract;
 pub mod delta;
 pub mod dialect;

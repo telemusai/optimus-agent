@@ -33,7 +33,9 @@ use pi_ai::types::{Model, Occ3Validation};
 
 /// Upper bound on the readiness handshake so activation can never stall a
 /// session start. A timeout is a decline, not an error path.
-pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(5);
+// Four sequential gateway operations (identity, runtime, enrollment and
+// discovery) can exceed five seconds even while each operation is healthy.
+pub const ACTIVATION_HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(45);
 
 /// Why OCC-3 is not active for this session. Every variant is a clean
 /// decline: the session keeps its ordinary text/OCC-1/OCC-2 behaviour.
@@ -539,6 +541,52 @@ pub fn invalidate_ready_cache() {
     }
 }
 
+
+/// Process-wide capture-concurrency limiter for native OCC-3 source
+/// handoffs. The permit covers the WHOLE armed capture lifetime: it is
+/// acquired before `arm_handoff_if_needed` arms the slot and released when
+/// the capture reaches a terminal outcome (completed handoff, capture
+/// failure, cancel or deactivation). Callers must not hold queue or slot
+/// mutexes while awaiting the permit.
+///
+/// Default 1 concurrent armed capture per process. `OCC3_CAPTURE_CONCURRENCY`
+/// clamps the value into 1..=8; the ceiling exists so one process cannot
+/// promise a serving runtime more concurrent armed turns than its protocol
+/// tolerates, and the floor keeps captures serialized by default.
+fn capture_concurrency_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(env_capture_concurrency())))
+}
+
+fn env_capture_concurrency() -> usize {
+    std::env::var("OCC3_CAPTURE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(1)
+}
+
+/// Acquire one armed-capture permit for the process. Hold the returned
+/// guard across the armed capture lifetime only; never across other awaits
+/// the capture does not own.
+pub async fn acquire_capture_permit() -> tokio::sync::OwnedSemaphorePermit {
+    // `acquire_owned` takes the `Arc` by value; the static lends a reference.
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .acquire_owned()
+        .await
+        .expect("capture permit semaphore closed")
+}
+
+/// Non-blocking permit take for sync arming paths (orchestrator retained
+/// captures, tests). `None` when every permit is held: the caller must
+/// refuse the concurrent capture, never queue it.
+pub fn try_capture_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .try_acquire_owned()
+        .ok()
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Offline loopback control plane for activation tests: the three
@@ -861,6 +909,7 @@ pub async fn enroll(
         ready.connector.clone(),
     )
     .await?;
+    state.bind_chat_preferences(session.session_file())?;
     session.install_experimental_native_occ3(state, controller)
 }
 
@@ -1093,6 +1142,44 @@ mod tests {
         assert!(
             served >= 4,
             "identity + runtime identity + probe enrollment + discovery handshake ({served})"
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn activation_accepts_a_server_that_honestly_degrades_informational_fields() {
+        let _cache_guard = reset_ready_cache().await;
+        // The deployed extension degrades two informational provenance
+        // fields to "" (a checkpoint served from a local path carries no
+        // hub revision; a chat template kept outside tokenizer_config.json
+        // yields no in-config digest). A server that still binds its
+        // attested fingerprint over exactly that degraded identity must
+        // activate end to end: the empty fields are honest, not absent.
+        let degraded = Occ3ModelIdentity {
+            checkpoint_revision: String::new(),
+            chat_template_fingerprint: String::new(),
+            ..fixture_identity("glm-5.3", METHOD_A)
+        };
+        let fixture = serve_activation_fixture(degraded.clone(), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let ready = verify(&request, Duration::from_secs(5))
+            .await
+            .expect("honest empty informational fields must not decline activation");
+        assert_eq!(ready.method_id, METHOD_A);
+        assert_eq!(ready.capabilities.model_identity.model_id, "glm-5.3");
+        assert_eq!(ready.capabilities.model_identity.checkpoint_revision, "");
+        assert_eq!(
+            ready.capabilities.model_identity.chat_template_fingerprint,
+            ""
+        );
+        // The binding check still ran: the attested fingerprint is the
+        // digest of exactly the degraded identity the server served.
+        assert_eq!(
+            ready.capabilities.model_identity.fingerprint(),
+            {
+                let mut bound = degraded;
+                bound.latent_method = METHOD_A.into();
+                bound.fingerprint()
+            }
         );
     }
 

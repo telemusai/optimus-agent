@@ -63,6 +63,13 @@ pub trait InProcessRuntimeHost: Send + Sync {
     fn session_system_prompt(&self) -> String;
     fn session_tool_definition(&self, name: &str) -> Option<crate::modes::agent_connection::tool_definition::ToolDefinition>;
     fn session_append_label_change(&self, entry_id: &str, label: Option<&str>);
+    /// Resolves one uncertain entry on the session's own native OCC-3
+    /// queue (same process, so the session itself executes it). Returns
+    /// the content-free post-state. Default: this host has no native
+    /// OCC-3 surface.
+    fn session_resolve_occ_queue_entry(&self, _queue_id: &str, _reemit: bool) -> Result<Value, String> {
+        Err("This chat has no active OCC-3 native session".to_string())
+    }
     fn session_prompt(&self, message: &str, options: Value) -> BoxFuture<Result<(), String>>;
     fn session_prompt_and_wait(&self, message: &str, options: Value) -> BoxFuture<Result<(), String>>;
     fn session_steer(&self, message: &str, images: Option<Vec<ImageContent>>) -> BoxFuture<Result<(), String>>;
@@ -400,6 +407,15 @@ impl AgentConnection for InProcessAgentConnection {
                 .as_deref()
                 .ok_or("This chat has no saved session identity")?;
             crate::core::occ::session_settings::set_preferences(session_file, occ2_enabled)
+        })
+    }
+    fn supports_occ_queue_resolution(&self) -> bool { true }
+    fn resolve_occ_queue_entry(&self, queue_id: &str, reemit: bool) -> BoxFuture<Result<Value, String>> {
+        let runtime_host = self.runtime_host.clone();
+        let queue_id = queue_id.to_string();
+        Box::pin(async move {
+            let value = runtime_host.session_resolve_occ_queue_entry(&queue_id, reemit)?;
+            Ok(value)
         })
     }
     fn supports_execution_mode(&self) -> bool { true }

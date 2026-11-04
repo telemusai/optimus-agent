@@ -2330,6 +2330,29 @@ pub trait AgentSessionMessageController: Send + Sync {
         let _ = (target, message);
         Box::pin(async { Occ3SendPolicy::disabled() })
     }
+
+    /// OCC-3 sender-queue parent notification: one durable queue-level
+    /// event (expiry, refusal, fallback aggregate, uncertain resolution)
+    /// the HOST delivers to the parent session of a native-OCC-3 child.
+    /// Both session ids come from the authenticated spawn relationship
+    /// (`semantic_parent_session_id`), never a model-provided name. The
+    /// payload is the content-free notice details: queueId, state,
+    /// attempts, reason, noticeId - never a dispatch token, capture
+    /// handle or receipt. `Ok` means durably accepted (e.g. written to
+    /// the parent's transcript); the sender removes the outbox record
+    /// only then. The default REFUSES: a controller without a real
+    /// parent surface must never acknowledge - the notice stays pending
+    /// in the durable outbox (bounded, overflow-flagged, never dropped)
+    /// until a real implementation accepts it.
+    fn notify_parent_queue_notice(
+        &self,
+        child_session_id: &str,
+        parent_session_id: &str,
+        details: serde_json::Value,
+    ) -> pi_ai::types::BoxFuture<Result<(), String>> {
+        let _ = (child_session_id, parent_session_id, details);
+        Box::pin(async { Err("Parent queue notification is not installed".into()) })
+    }
 }
 
 /// `createAgentMessageHostHandlers(controller)`.

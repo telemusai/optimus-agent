@@ -48,7 +48,9 @@ TERMINAL = {"COMPLETE", "RESTORED", "NOOP", "RESTORE_FAILED", "PREFLIGHT_FAILED"
 REHEARSAL_LABEL = "occ3.v3.rehearsal"
 IMMUTABLE = {"attempt_id", "original_id", "original_image_id", "candidate_image_id",
              "original_name", "preserved_name", "candidate_name", "failed_name",
-             "plan", "created_at", "schema"}
+             "plan", "created_at", "schema",
+             "calibration_source", "calibration_destination", "calibration_basename",
+             "calibration_source_identity"}
 DEFAULTS = {"startup_timeout_s": 1200, "deployment_timeout_s": 3600,
             "rollback_timeout_s": 900, "proof_timeout_s": 300,
             "controller_timeout_s": 45, "supervisor_lease_s": 5,
@@ -200,11 +202,15 @@ def validate_plan(plan):
         if isinstance(value, bool) or not isinstance(value, (int, float)) or not math.isfinite(value) or value <= 0:
             raise Failure("invalid deadline option")
     validate_persistence(plan)
-    from .docker_config import environment_addition_entries
+    from .docker_config import environment_addition_entries, calibrated_capability
     try:
         environment_addition_entries(plan.setdefault("environment_additions", []))
     except ValueError:
         raise Failure("invalid environment additions") from None
+    try:
+        calibrated_capability(plan)
+    except ValueError:
+        raise Failure("invalid calibrated artifact capability") from None
     return plan
 
 
@@ -240,6 +246,52 @@ def timeout_policy(plan):
     record.update({"candidate_persistence_policy": plan["persistence_policy"],
                    "research_stage_deadlines": dict(RESEARCH_STAGE_DEADLINES)})
     return record
+
+
+def calibrated_binding_from_state(state):
+    """The journaled calibrated binding, or None for plans without the capability.
+
+    A nonempty capability without its set-once journaled derived evidence is an
+    inconsistent attempt (crash between journal creation and the verified
+    prepare): refuse rather than re-derive from an unverified source.
+    """
+    if state["plan"].get("calibrated_artifact") is None:
+        return None
+    fields = ("calibration_source", "calibration_destination", "calibration_basename")
+    if any(state.get(name) is None for name in fields):
+        raise Failure("calibrated capability missing journaled binding")
+    return {"source": state["calibration_source"],
+            "destination": state["calibration_destination"],
+            "basename": state["calibration_basename"]}
+
+
+def verify_calibrated_source(state):
+    """Full re-verification of profile pin and artifact bytes before mutation.
+
+    Runs on the Docker host immediately before the first production mutation:
+    the staged profile is re-read and digest-pinned, the artifact is re-read
+    with the full fd-read verification, and the file identity must still match
+    the one journaled at prepare. Docker re-resolves the source path at mount
+    time, so this narrows (never eliminates) the path race; the in-container
+    runtime digest check remains the standing content gate.
+    """
+    from .docker_config import (calibrated_capability, verify_calibrated_artifact,
+                                verify_calibrated_profile)
+    capability = calibrated_capability(state["plan"])
+    if capability is None:
+        return None
+    binding = calibrated_binding_from_state(state)
+    try:
+        verified = verify_calibrated_profile(capability)
+        if verified["calibration_path"] != binding["destination"]:
+            raise Failure("calibrated profile path changed after prepare")
+        identity = verify_calibrated_artifact(binding["source"], capability["sha256"],
+                                              capability["size"])
+    except ValueError as error:
+        raise Failure(str(error)) from None
+    if list(identity) != list(state.get("calibration_source_identity") or ()):
+        raise Failure("calibrated source identity changed after prepare")
+    return binding
 
 
 def preserved_configuration_digest(original):
@@ -341,7 +393,7 @@ class Journal:
                 raise Failure("attempt directory must be private and owned")
 
     @classmethod
-    def create(cls, directory, plan, original):
+    def create(cls, directory, plan, original, *, calibrated=None):
         directory = Path(directory)
         # Existing directories, even empty ones, are stale attempts, not resumable deployments.
         directory.mkdir(mode=0o700, parents=False, exist_ok=False)
@@ -350,7 +402,7 @@ class Journal:
         prefix = ("occ3-v3-rehearsal-" + plan["rehearsal_owner"] if plan["mode"] == "rehearsal"
                   else "occ3-v3-" + plan["attempt_id"])
         private_json(directory / "original.json", original, exclusive=True)
-        private_json(directory / "journal.json", {
+        state = {
             "schema": 1, "attempt_id": plan["attempt_id"], "plan": plan,
             "original_id": container_id(original["Id"]),
             "original_image_id": image_id(original["Image"]),
@@ -360,7 +412,16 @@ class Journal:
             "created_at": time.time(), "phase": "PREFLIGHT", "sequence": 0,
             "authorization_consumed": False, "mutation_intent": False,
             "restart_count": 0, "gates": {}, "history": [],
-        }, exclusive=True)
+        }
+        if calibrated is not None:
+            # Immutable attempt evidence seeded atomically with the journal:
+            # the derived calibrated binding and the verified source identity
+            # exist from creation, so no later update can change or omit them.
+            state.update(calibration_source=calibrated["source"],
+                        calibration_destination=calibrated["destination"],
+                        calibration_basename=calibrated["basename"],
+                        calibration_source_identity=list(calibrated["identity"]))
+        private_json(directory / "journal.json", state, exclusive=True)
         return journal
 
     def read(self):
@@ -1159,8 +1220,9 @@ def reconcile_candidate_create(api, journal, error=None):
             raise Failure("candidate create intent identity differs")
         if rejected:
             raise Failure("rejected create cannot adopt the occupant of the requested name")
+        binding = calibrated_binding_from_state(state)
         request = build_create_request(original, state["candidate_image_id"], record["name"],
-                                       state["plan"].get("environment_additions"))
+                                       state["plan"].get("environment_additions"), binding)
         if _request_digest(request) != record["request_sha256"]:
             raise Failure("candidate create intent request differs")
         document = api.inspect(record.get("container_id") or record["name"])
@@ -1170,7 +1232,7 @@ def reconcile_candidate_create(api, journal, error=None):
                 document.get("State", {}).get("Running")):
             raise Failure("candidate create reconciliation is not exact and stopped")
         assert_candidate_parity(original, document, state["candidate_image_id"],
-                                state["plan"].get("environment_additions"))
+                                state["plan"].get("environment_additions"), binding)
         record.update(container_id=identity, reconciliation="verified_cleanup_only", cleanup_admissible=True,
                       actual_configuration_sha256=_actual_configuration_digest(document))
     except Exception as reconcile_error:
@@ -1181,7 +1243,9 @@ def reconcile_candidate_create(api, journal, error=None):
 
 
 def prepare(api, plan, directory, *, probe=artifact_probe):
-    from .docker_config import assert_candidate_parity, build_create_request, extract_api_key
+    from .docker_config import (assert_candidate_parity, build_create_request, extract_api_key,
+                                calibrated_capability, derive_calibrated_binding,
+                                verify_calibrated_artifact, verify_calibrated_profile)
     plan = validate_plan(plan)
     original = checked_inspect(api, plan["original_id"], plan["original_image_id"])
     if not is_running(original):
@@ -1193,11 +1257,26 @@ def prepare(api, plan, directory, *, probe=artifact_probe):
         verify_receipt(reference)
         assert_inspect_schema(original, read_json(reference["path"]))
     extract_api_key(original)
+    capability = calibrated_capability(plan)
+    binding = artifact_identity = None
+    if capability is not None:
+        # Verified staged profile first; its calibration_path is the sole
+        # authority for the artifact filename (never a digest). The artifact
+        # bytes are verified on this Docker host before anything is created.
+        verified = verify_calibrated_profile(capability)
+        binding = derive_calibrated_binding(verified, original)
+        artifact_identity = verify_calibrated_artifact(binding["source"], capability["sha256"],
+                                                       capability["size"])
     preserved = preserved_original_record(plan, original)
     deadlines = timeout_policy(plan)
     if api.inspect_image(plan["candidate_image_id"]).get("Id") != plan["candidate_image_id"]:
         raise Failure("candidate image identity mismatch")
-    journal = Journal.create(directory, plan, original)
+    journal = Journal.create(directory, plan, original,
+                              calibrated=(None if binding is None else
+                                          {"source": binding["source"],
+                                           "destination": binding["destination"],
+                                           "basename": binding["basename"],
+                                           "identity": artifact_identity}))
     journal.update(docker_api_version=getattr(api, "version", "offline-test-adapter"),
                    preserved_original=preserved, timeout_policy=deadlines)
     try:
@@ -1217,7 +1296,7 @@ def prepare(api, plan, directory, *, probe=artifact_probe):
         resource_nonce = secrets.token_hex(16)
         create_name = candidate_create_name(state["candidate_name"], resource_nonce)
         body = build_create_request(original, state["candidate_image_id"], create_name,
-                                    state["plan"].get("environment_additions"))
+                                    state["plan"].get("environment_additions"), binding)
         journal.intent("create_candidate")
         create_record = {"schema": 1, "attempt_id": state["attempt_id"], "resource_nonce": resource_nonce,
                          "name": create_name, "final_name": state["candidate_name"],
@@ -1236,7 +1315,7 @@ def prepare(api, plan, directory, *, probe=artifact_probe):
         if is_running(candidate) or candidate.get("State", {}).get("Status") != "created":
             raise Failure("candidate was not created stopped")
         evidence = assert_candidate_parity(original, candidate, state["candidate_image_id"],
-                                           state["plan"].get("environment_additions"))
+                                           state["plan"].get("environment_additions"), binding)
         private_json(journal.directory / "candidate-inspect.json", candidate, exclusive=True)
         create_record.update(phase="VERIFIED_STOPPED_OWN")
         private_json(journal.directory / "candidate-create-intent.json", create_record)

@@ -25,6 +25,8 @@
 mod agent_handle;
 #[path = "agent_session/occ3_state.rs"]
 pub mod occ3_state;
+#[path = "agent_session/occ3_sender_queue.rs"]
+pub mod occ3_sender_queue;
 mod execution_mode;
 #[path = "agent_session/git_state.rs"]
 mod git_state;
@@ -341,6 +343,13 @@ pub trait AgentHandle: Send + Sync {
     /// Process-local experimental callbacks. Older/test handles refuse installation.
     fn set_native_state_hooks(&self, _receiver: pi_agent_core::types::ResolveInferenceState,
         _source: pi_agent_core::types::SourceCaptureHooks) -> bool { false }
+
+    /// Clear the process-local experimental native callbacks installed by
+    /// [`Self::set_native_state_hooks`]. Used by OCC-3 terminal recovery so a
+    /// failed native path degrades to the ordinary inference path instead of
+    /// failing every subsequent turn. Returns false when the handle never
+    /// supported installation.
+    fn clear_native_state_hooks(&self) -> bool { false }
 
     /// Snapshot the live callbacks copied by TypeScript's standalone side agent.
     fn side_question_options(&self) -> Option<pi_agent_core::agent::AgentOptions> {
@@ -2634,6 +2643,10 @@ mod dispatch_delivery_tests;
 mod queue_stop_tests;
 
 #[cfg(test)]
+#[path = "agent_session/occ3_sender_queue_tests.rs"]
+mod occ3_sender_queue_tests;
+
+#[cfg(test)]
 #[path = "agent_session/transport_retry_tests.rs"]
 mod transport_retry_tests;
 
@@ -2765,6 +2778,12 @@ pub struct AgentSession {
     /// `this` as a weak handle, mirroring the TypeScript instance identity. Some
     /// `&self` methods must hand the session to helpers that spawn tasks.
     session_self: OnceLock<Weak<AgentSession>>,
+    /// The authenticated parent session id, captured from the runtime
+    /// spawn relationship (`AgentSessionConfig::semantic_parent_session_id`)
+    /// and never from model-provided names. Host-side parent
+    /// notifications (OCC-3 sender queue) resolve their target through
+    /// this field only.
+    semantic_parent_session_id: Option<String>,
     cwd: String,
     agent_dir: Option<String>,
     include_goals: bool,
@@ -3149,6 +3168,7 @@ impl AgentSession {
             acp_mcp_tools: Mutex::new(Vec::new()),
             base_tool_definitions: Mutex::new(BTreeMap::new()),
             session_self: OnceLock::new(),
+            semantic_parent_session_id: config.semantic_parent_session_id.clone(),
             cwd: config.cwd.clone(),
             agent_dir: config.agent_dir.clone(),
             include_goals: config.include_goals.unwrap_or(true),
@@ -3332,6 +3352,14 @@ impl AgentSession {
         self.session_self.get().and_then(|weak| weak.upgrade())
     }
 
+    /// The authenticated parent session id from the runtime spawn
+    /// relationship, when this session is a child. Host-side parent
+    /// notifications resolve their target exclusively through this -
+    /// never a model-supplied name.
+    fn semantic_parent_session_id(&self) -> Option<&str> {
+        self.semantic_parent_session_id.as_deref()
+    }
+
 
     /// Explicit isolated controller installation only. Does not set persistent
     /// OCC3 preferences or change model/provider configuration.
@@ -3345,18 +3373,390 @@ impl AgentSession {
         let mut tools=self.agent.state().tools.unwrap_or_default();
         if tools.iter().any(|t|t.name==occ3_state::NATIVE_HANDOFF_TOOL) {return Err("Native tool name conflict".into());}
         if !self.agent.set_native_state_hooks(state.receiver_resolver(),state.source_hooks()) {return Err("Native callbacks unsupported".into());}
-        tools.push(state.handoff_tool(controller));
+        tools.push(state.handoff_tool(controller.clone()));
         self.agent.update_state(Box::new(move |live|live.tools=Some(tools)));
         // A queued control body lands in the transcript only after this
         // point; the restamp listener keeps its delivery marker in step with
         // the receiver's record so the activity projection never
         // misreports it as text.
         state.install_delivery_restamp(Arc::clone(&self.agent))?;
+        // Sender queue: load the persisted artifact (a blocked load keeps the
+        // file untouched and surfaces one blocked notice), then subscribe the
+        // notice drain + advance prompt on this session's own event stream.
+        if let Some(session_file) = state.bound_session_file() {
+            // The loader records the aggregate and expiry notices into the
+            // durable outbox atomically with the load itself; the drain
+            // (listener/timer) delivers them from there.
+            let _ = state.load_sender_queue(Some(&session_file));
+        }
+        // The listener hands the session `Arc` to spawned work (weakly, via
+        // the timer) and subscribes on the agent's own event stream, so it
+        // needs the session as an `Arc`, exactly like the agent-event
+        // listener in `new`. `session_self` is set by `AgentSession::new`
+        // for every production and fixture caller; fail loudly, never
+        // silently skip installing the queue listener.
+        let session_arc = self
+            .session_arc()
+            .ok_or_else(|| "installing native OCC-3 requires a live session Arc".to_string())?;
+        Self::install_sender_queue_listener(&session_arc, &state, controller)?;
+        // Terminal recovery: when the native path deactivates (retry budget
+        // exhausted or session teardown), clear the agent hooks and remove
+        // the handoff tool so later turns take the ordinary inference path
+        // instead of failing on a closed native session.
+        let agent = self.agent.clone();
+        state.set_tombstone_cleanup(Box::new(move || {
+            agent.clear_native_state_hooks();
+            agent.update_state(Box::new(|live| {
+                if let Some(tools) = live.tools.as_mut() {
+                    tools.retain(|tool| tool.name != occ3_state::NATIVE_HANDOFF_TOOL);
+                }
+            }));
+        }));
         *installed=Some(state); Ok(())
     }
     pub fn experimental_native_occ3(&self) -> Option<Arc<occ3_state::Occ3NativeSession>> {
         self.native_occ3.lock().ok().and_then(|s|s.clone())
     }
+
+/// Sender-queue listener installed with the native OCC-3 session. Runs on the
+/// session's own event stream exactly like the delivery-marker restamp: at
+/// turn and agent end it drains journaled queue notices into durable
+/// `occ3_queue_notice` transcript records (content-free) and, when the queue
+/// advanced to a new pending head, queues exactly one fresh-source advance
+/// prompt as an in-order follow-up. No notice ever rewrites another record;
+/// no raw handle or receipt is ever emitted.
+fn install_sender_queue_listener(
+    session: &Arc<AgentSession>,
+    state: &Arc<occ3_state::Occ3NativeSession>,
+    controller: Arc<dyn crate::core::agent_messages::AgentSessionMessageController>,
+) -> Result<(), String> {
+    // Owned clones: the closure takes its own, the originals stay for the
+    // unsubscribe registration and the timer below.
+    let state = std::sync::Arc::clone(state);
+    let session = std::sync::Arc::clone(session);
+    let listener_state = std::sync::Arc::clone(&state);
+    let listener_session = std::sync::Arc::clone(&session);
+    let listener_controller = std::sync::Arc::clone(&controller);
+    let last_prompted_head = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    // Receiver borrows the outer `session` clone (identical `Arc`), so the
+    // move closure below keeps `listener_session` for itself - same shape
+    // as the agent-event listener installed in `AgentSession::new`.
+    let unsubscribe = session.agent.subscribe(Arc::new(move |event, _signal| {
+        let last_prompted_head = last_prompted_head.clone();
+        let state = listener_state.clone();
+        let session = listener_session.clone();
+        let controller = listener_controller.clone();
+        Box::pin(async move {
+            match event {
+                // The fallback re-emission prompt landed in context: this
+                // turn is the entry's dedicated fallback turn. Record it
+                // (queueId is public; the token stays private).
+                pi_agent_core::types::AgentEvent::MessageEnd { message } => {
+                    let AgentMessage::Custom(CustomAgentMessage::Custom {
+                        custom_type,
+                        details,
+                        ..
+                    }) = message
+                    else {
+                        return;
+                    };
+                    if custom_type != occ3_sender_queue::OCC3_FALLBACK_PROMPT_CUSTOM_TYPE {
+                        return;
+                    }
+                    let Some(queue_id) = details
+                        .as_ref()
+                        .and_then(|details| details.get("queueId"))
+                        .and_then(Value::as_str)
+                    else {
+                        return;
+                    };
+                    // Host-issued one-shot gate: the turn is armed ONLY
+                    // when THIS host queued the fallback prompt for this
+                    // entry (issue outstanding, entry still
+                    // fallback_pending). A spoofed, stale or replayed
+                    // `occ3_fallback_prompt` message arms nothing.
+                    if state.note_fallback_prompt_message(queue_id) {
+                        state.begin_fallback_turn(queue_id);
+                    }
+                    return;
+                }
+                pi_agent_core::types::AgentEvent::TurnEnd { .. }
+                | pi_agent_core::types::AgentEvent::AgentEnd { .. } => {
+                    // The fallback turn (if any) ends here: no later send
+                    // in another turn may carry the token.
+                    state.end_fallback_turn();
+                }
+                _ => return,
+            }
+            let last_prompted_head = last_prompted_head;
+            let notices = state.take_pending_queue_notices();
+            // The loops below consume the vecs; capture emptiness first for
+            // the trailing snapshot-notice gate.
+            let had_notices = !notices.is_empty();
+            for record in notices {
+                Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
+            }
+            // Live TTL enforcement at every turn/agent end: expired pending
+            // and fallback_pending entries become terminal `expired` with a
+            // sender-visible notice, without waiting for a restart.
+            // The sweep wrapper journals every expired notice into the
+            // durable outbox atomically with the queue rewrite.
+            let _ = state.sender_queue_sweep_expired();
+            // Drain again: the sweep may have journaled new notices.
+            let sweep_notices = state.take_pending_queue_notices();
+            let had_sweep_notices = !sweep_notices.is_empty();
+            for record in sweep_notices {
+                Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
+            }
+            // Same-process retry: any record whose transcript write or
+            // parent notification failed (or was skipped) is re-selected
+            // from the durable outbox for the NEXT drain cycle - the next
+            // turn/agent end or the 30s idle timer. No restart needed.
+            state.requeue_unacked_queue_notices();
+            if had_notices || had_sweep_notices {
+                // One snapshot-form notice after the individual records: the
+                // full current queue in one record, so a bounded transcript
+                // scan always finds an authoritative base (the individual
+                // notices alone can fall out of a bounded scan).
+                if let Ok(details) = state.sender_queue_snapshot_details() {
+                    let custom = CustomMessage {
+                        role: "user".into(),
+                        custom_type: occ3_sender_queue::OCC3_QUEUE_NOTICE_CUSTOM_TYPE.into(),
+                        content: CustomMessageContent::Text(
+                            "OCC-3 sender queue snapshot.".into(),
+                        ),
+                        display: true,
+                        details: Some(details),
+                        timestamp: crate::core::agent_session::now_ms() as i64,
+                    };
+                    let mut manager = session.session_manager.lock().unwrap();
+                    let appended = manager.append_custom_message_entry(
+                        &custom.custom_type,
+                        &custom_message_entry_content(&custom.content),
+                        custom.display,
+                        custom.details.clone(),
+                    );
+                    if appended.and_then(|_| manager.flush_now()).is_err() {
+                        // Persistence failure must not lose the live notice.
+                    }
+                }
+            }
+            // Advance prompt: exactly once per pending head. The closure
+            // remembers the last prompted queue id, so a head the model left
+            // pending is not re-prompted every turn (the retry re-prompt
+            // comes from the capture-failure notice, not the timer).
+            if let Ok((entries, blocked)) = state.sender_queue_snapshot() {
+                if blocked.is_none() {
+                    if let Some(head) = entries.first() {
+                        // The fallback re-emission prompt is a DEDICATED
+                        // custom message carrying the queueId (public) - the
+                        // dispatch token stays private in the native
+                        // session's memory and never rides the prompt, the
+                        // transcript or the notices.
+                        let prompt = match head.state {
+                            occ3_sender_queue::Occ3SenderQueueState::Pending => Some(
+                                occ3_sender_queue::advance_prompt(
+                                    entries.len(),
+                                    &head.receiver_selector(),
+                                ),
+                            ),
+                            occ3_sender_queue::Occ3SenderQueueState::FallbackPending => Some(
+                                occ3_sender_queue::fallback_prompt(&head.receiver_selector()),
+                            ),
+                            _ => None,
+                        };
+                        if let Some(prompt) = prompt {
+                            if last_prompted_head
+                                .lock()
+                                .map(|last| last.as_deref() != Some(head.queue_id.as_str()))
+                                .unwrap_or(false)
+                            {
+                                let fallback_head =
+                                    head.state == occ3_sender_queue::Occ3SenderQueueState::FallbackPending;
+                                let custom = if fallback_head {
+                                    Some(CustomMessage {
+                                        role: "user".into(),
+                                        custom_type:
+                                            occ3_sender_queue::OCC3_FALLBACK_PROMPT_CUSTOM_TYPE.into(),
+                                        content: CustomMessageContent::Text(prompt.clone()),
+                                        display: true,
+                                        details: Some(serde_json::json!({
+                                            "queueId": head.queue_id,
+                                        })),
+                                        timestamp: crate::core::agent_session::now_ms() as i64,
+                                    })
+                                } else {
+                                    None
+                                };
+                                let _ = session
+                                    .queue_agent_message_prompt(&prompt, "followUp", custom)
+                                    .await;
+                                if fallback_head {
+                                    // The host issued this fallback
+                                    // re-emission prompt: record the issue
+                                    // its MessageEnd must consume.
+                                    state.issue_fallback_prompt(&head.queue_id);
+                                }
+                                if let Ok(mut last) = last_prompted_head.lock() {
+                                    *last = Some(head.queue_id.clone());
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        })
+    }));
+    state.set_queue_listener_unsubscribe(Box::from(unsubscribe));
+    // Bounded host scheduling for idle expiry: an application scheduler
+    // timer (not an agent polling loop) sweeps TTL expiry and drains
+    // journaled notices while the session sits idle, so expiry never waits
+    // for a restart or the next turn. Weak references: the task exits when
+    // either the native session or the agent session is gone.
+    {
+        // The timer holds only Weak targets: it self-terminates when either
+        // side drops, so the listener unsubscribe above remains the single
+        // teardown hook for event-driven drains.
+        let state = std::sync::Arc::downgrade(&state);
+        let session = std::sync::Arc::downgrade(&session);
+        let controller = std::sync::Arc::downgrade(&controller);
+        let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller);
+    }
+    Ok(())
+}
+
+/// Delivers one durable queue-notice record to both targets, in order:
+/// the sender-transcript record (appended and flushed; acknowledged only
+/// after the durable write succeeds) and then the parent notification
+/// (target resolved exclusively from the authenticated
+/// `semantic_parent_session_id` relationship; acknowledged only after the
+/// trusted controller accepts). The live follow-up prompt follows the
+/// transcript write. A failed transcript write or a refused/failed
+/// parent delivery leaves the record pending in the durable outbox: the
+/// next drain retries it, and the bounded outbox keeps it visible
+/// (overflow is flagged, never silently dropped).
+async fn deliver_queue_notice_record(
+    session: &Arc<AgentSession>,
+    state: &Arc<occ3_state::Occ3NativeSession>,
+    controller: &Arc<dyn crate::core::agent_messages::AgentSessionMessageController>,
+    record: occ3_sender_queue::Occ3DurableQueueNotice,
+) {
+    if !record.transcript_done {
+        // F3 wording: a terminal fallback acknowledges ordinary
+        // transport acceptance only - the recorded status says which
+        // (delivered vs queued) and NEVER claims consumption proof.
+        // F3: uncertain entries state their explicit resolution
+        // semantics - manual resolution only, never an automatic
+        // retry or duplicate.
+        let custom = CustomMessage {
+            role: "user".into(),
+            custom_type: occ3_sender_queue::OCC3_QUEUE_NOTICE_CUSTOM_TYPE.into(),
+            content: CustomMessageContent::Text(record.transcript_line()),
+            display: true,
+            details: Some(record.details()),
+            timestamp: crate::core::agent_session::now_ms() as i64,
+        };
+        // Durable record first, then the live-context follow-up lane:
+        // a notice must survive restart even when the turn ends here.
+        let appended = {
+            let mut manager = session.session_manager.lock().unwrap();
+            manager
+                .append_custom_message_entry(
+                    &custom.custom_type,
+                    &custom_message_entry_content(&custom.content),
+                    custom.display,
+                    custom.details.clone(),
+                )
+                .and_then(|_| manager.flush_now())
+                .is_ok()
+        };
+        if !appended {
+            // Persistence failed: the record stays pending in the
+            // durable outbox and the next drain retries the write.
+            return;
+        }
+        state.sender_queue_notice_ack_transcript(&record.notice_id);
+        let _ = session
+            .queue_agent_message_prompt(&AgentSession::custom_text(&custom), "followUp", Some(custom))
+            .await;
+    }
+    if !record.parent_done {
+        match session.semantic_parent_session_id() {
+            Some(parent_session_id) => {
+                if controller
+                    .notify_parent_queue_notice(
+                        &session.session_id(),
+                        parent_session_id,
+                        record.details(),
+                    )
+                    .await
+                    .is_ok()
+                {
+                    state.sender_queue_notice_ack_parent(&record.notice_id);
+                }
+                // A refused or failed parent delivery stays pending in
+                // the durable outbox: retried on the next drain, bounded
+                // and overflow-flagged, never silently dropped.
+            }
+            None => {
+                // No parent surface exists for this session (a root
+                // session): the sender transcript record is the durable
+                // report, so the parent leg is complete by definition.
+                state.sender_queue_notice_ack_parent(&record.notice_id);
+            }
+        }
+    }
+}
+
+/// Spawns the bounded TTL sweep timer for one installed native session.
+/// Returns the task abort handle. The task exits by itself when either
+/// weak target dies; no agent turn or polling loop is involved.
+fn unsubscribe_timer_sweep(
+    state: std::sync::Weak<occ3_state::Occ3NativeSession>,
+    session: std::sync::Weak<AgentSession>,
+    controller: std::sync::Weak<dyn crate::core::agent_messages::AgentSessionMessageController>,
+) -> tokio::task::AbortHandle {
+    tokio::spawn(async move {
+        // Bounded cadence: twice per minimum TTL window, hard-capped at a
+        // 60s floor so a short TTL still gets swept and a long TTL does
+        // not spin.
+        let cadence = std::time::Duration::from_secs(30);
+        let mut ticker = tokio::time::interval(cadence);
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let Some(state) = state.upgrade() else { break };
+            let Some(session) = session.upgrade() else { break };
+            let Some(controller) = controller.upgrade() else { break };
+            // The sweep wrapper journals every expired notice into the
+            // durable outbox atomically with the queue rewrite.
+            let _ = state.sender_queue_sweep_expired();
+            let notices = state.take_pending_queue_notices();
+            for record in notices {
+                Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
+            }
+            // Same-process retry: unacked records re-enter the worklist
+            // for the next 30s tick; the outbox is the source of truth.
+            state.requeue_unacked_queue_notices();
+        }
+    })
+    .abort_handle()
+}
+
+/// Renders a custom notice message as its live-context text.
+fn custom_text(message: &CustomMessage) -> String {
+    match &message.content {
+        CustomMessageContent::Text(text) => text.clone(),
+        CustomMessageContent::Blocks(blocks) => blocks
+            .iter()
+            .filter_map(|block| match block {
+                pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<Vec<_>>()
+            .join("\n"),
+    }
+}
 
     /// Refreshes MCP provider registrations without rebuilding the session runtime.
     pub fn refresh_mcp_providers(&self) {
@@ -5719,6 +6119,43 @@ impl AgentSession {
                 serde_json::from_value::<AgentSessionMessageReceipt>(value)
                     .map_err(|error| error.to_string())
             });
+            // Sender-queue fallback acknowledgment (production close): when
+            // this session has a native OCC-3 queue with a fallback_pending
+            // entry for this target, the ordinary send's honest receipt
+            // decides the entry's fate - `delivered`|`queued` acknowledges
+            // (terminal `fallback`), anything else reports honestly and keeps
+            // the entry. No captured-state reuse; the payload itself is
+            // untouched model-authored OCC-1 text.
+            if let Some(native) = session.experimental_native_occ3() {
+                // F2 correlation, turn-scoped: ONLY the ordinary send made
+                // during the ACTIVE fallback re-emission turn for the
+                // matching receiver can carry the entry's dispatch token.
+                // An unrelated message to the same receiver in any other
+                // turn obtains no token and acknowledges nothing.
+                let token = native.active_fallback_token_for(&target);
+                let (receipt_status, receipt_message_id) = match outcome.as_ref() {
+                    Ok(receipt) => (
+                        Some(receipt.delivery_status.clone()),
+                        Some(receipt.id.clone()),
+                    ),
+                    Err(_) => (None, None),
+                };
+                // The wrapper journals every notice into the durable
+                // outbox atomically with the queue transition. A persist
+                // failure returns Err here: the send receipt itself stays
+                // truthful, and the record remains in the worklist and the
+                // durable outbox, so the drain/requeue cycle retries the
+                // persist in this same process. Never a silent success
+                // over unsaved queue state.
+                if let Err(_unsaved) = native.sender_queue_note_ordinary_send(
+                    token.as_deref(),
+                    receipt_status.as_deref(),
+                    receipt_message_id.as_deref(),
+                ) {
+                    // The unacked record is re-selected by the next drain
+                    // cycle (requeue_unacked_queue_notices).
+                }
+            }
             if addressed_parent {
                 session.settle_rlm_parent_delivery(&previous, &outcome, &target, &message, true);
             }
@@ -10197,7 +10634,17 @@ impl AgentSession {
                 let queue_for_busy = options.queue_if_busy == Some(true)
                     && self.is_busy_for_session_input("preflight");
                 let visible_queued = queue_for_streaming || queue_for_busy;
-                if visible_queued && options.streaming_behavior.is_none() {
+                // Ordinary user submissions while the session is busy now queue
+                // as follow-ups (executed in order against updated history)
+                // instead of rejecting the caller. Internal machine traffic
+                // must stay explicit: an internal prompt with no streaming
+                // behavior still fails loudly so silent queueing cannot change
+                // automated flows. Explicit "steer" keeps its preemption
+                // semantics untouched.
+                if visible_queued
+                    && options.streaming_behavior.is_none()
+                    && (is_internal_prompt || options.custom_message.is_some())
+                {
                     if let Some(fence) = commit_fence.as_ref() {
                         fence.release();
                     }

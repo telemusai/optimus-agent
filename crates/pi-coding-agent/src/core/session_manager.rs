@@ -4860,6 +4860,22 @@ impl SessionManager {
         self.by_id.get(id).cloned()
     }
 
+    /// True when a custom_message entry of this type carrying this
+    /// `noticeId` (in its details) already exists. Full-history scan with
+    /// no window and no clones: delivery dedup must be exact, not
+    /// probabilistic. Read-only.
+    pub fn has_custom_message_notice(&self, custom_type: &str, notice_id: &str) -> bool {
+        self.by_id.values().any(|entry| {
+            entry_type(entry) == "custom_message"
+                && entry.get("customType").and_then(Value::as_str) == Some(custom_type)
+                && entry
+                    .get("details")
+                    .and_then(|details| details.get("noticeId"))
+                    .and_then(Value::as_str)
+                    == Some(notice_id)
+        })
+    }
+
     pub fn get_children(&self, parent_id: &str) -> Vec<SessionEntry> {
         let mut children: Vec<SessionEntry> = Vec::new();
         for entry in self.by_id.values() {

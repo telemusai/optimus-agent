@@ -1362,6 +1362,26 @@ pub trait AgentConnection: Send + Sync {
         let _ = occ2_enabled;
         Box::pin(async { Err("set_occ_preferences is not supported by this connection".to_string()) })
     }
+    /// Whether the execution host can resolve entries on this chat's own
+    /// native OCC-3 queue (`agent_communication_queue_control`, schema
+    /// revision 46). When true, /occ offers the manual resolution commands
+    /// for uncertain entries; when false, the UI degrades to guidance
+    /// text instead of sending an unsupported command.
+    fn supports_occ_queue_resolution(&self) -> bool { false }
+    /// Resolves one uncertain entry on this chat's own native OCC-3 queue.
+    /// `reemit=false` cancels the handoff (terminal `failed`, never
+    /// re-sent); `reemit=true` re-arms the ordinary OCC-1 re-emission and
+    /// MUST only be called after the user explicitly acknowledged the
+    /// duplicate-delivery risk. Returns the content-free post-state
+    /// (`queueId`, `messageId`, `state`, `reason`).
+    fn resolve_occ_queue_entry(
+        &self,
+        queue_id: &str,
+        reemit: bool,
+    ) -> pi_ai::types::BoxFuture<Result<Value, String>> {
+        let _ = (queue_id, reemit);
+        Box::pin(async { Err("resolve_occ_queue_entry is not supported by this connection".to_string()) })
+    }
     fn supports_execution_mode(&self) -> bool { false }
     fn supports_node_execution_mode(&self) -> bool { false }
     fn supports_clang_execution_mode(&self) -> bool { false }
