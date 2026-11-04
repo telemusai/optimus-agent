@@ -477,6 +477,27 @@ def test_profile_loader_uses_no_client_fields(monkeypatch):
         w.load_runtime_profile()
 
 
+def test_profile_loader_drops_the_declared_identity_block(monkeypatch):
+    # The declared-launch identity is route-served metadata: it never enters
+    # the RuntimeProfile fieldset the worker binds.
+    import types
+    from dataclasses import asdict
+    module=types.ModuleType("occ3_sglang.native_profile")
+    static=asdict(profile()); static.pop("runtime_epoch"); static.pop("runtime_generation")
+    static["declared_identity"]={name:"declared-"+name for name in (
+        "model_id","architecture","checkpoint_revision","weight_fingerprint",
+        "tokenizer_fingerprint","chat_template_fingerprint","quantisation",
+        "tensor_geometry","kv_layout","latent_method","runtime")}
+    module.load_pinned_profile=lambda:static
+    module.get_runtime_incarnation=lambda:dict(runtime_epoch="fresh",runtime_generation=99,
+        incarnation_digest="a"*64,profile_sha256="b"*64,source_attestation_sha256="c"*64)
+    monkeypatch.setitem(sys.modules,"occ3_sglang.native_profile",module)
+    actual=w.load_runtime_profile()
+    assert actual.runtime_epoch == "fresh" and actual.runtime_generation == 99
+    assert not hasattr(actual,"declared_identity")
+    assert actual.model_id == static["model_id"]
+
+
 def test_all_rank_preflight_rejects_partial_admission_before_mutation():
     runtime=object.__new__(w.WorkerRuntime); runtime.poisoned=False
     runtime.gather=lambda own:[own,{"phase":"admit","binding":None,"error":"expired"}]

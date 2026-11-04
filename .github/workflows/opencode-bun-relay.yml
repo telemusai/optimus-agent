@@ -1,0 +1,33 @@
+name: OpenCode Bun relay
+
+on:
+  pull_request:
+    paths:
+      - 'scripts/opencode-bun-relay*'
+      - 'scripts/install-opencode-bun-relay.py'
+      - 'tests/test_opencode_bun_relay_install.py'
+      - '.github/workflows/opencode-bun-relay.yml'
+  push:
+    branches: [main]
+    paths:
+      - 'scripts/opencode-bun-relay*'
+      - 'scripts/install-opencode-bun-relay.py'
+      - 'tests/test_opencode_bun_relay_install.py'
+      - '.github/workflows/opencode-bun-relay.yml'
+
+permissions:
+  contents: read
+
+jobs:
+  relay:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0
+        with:
+          persist-credentials: false
+      - uses: oven-sh/setup-bun@0c5077e51419868618aeaa5fe8019c62421857d6
+        with:
+          bun-version: 1.4.4
+      - run: bun test scripts/opencode-bun-relay.test.mjs
+      - run: python3 -m unittest discover -s tests -p test_opencode_bun_relay_install.py

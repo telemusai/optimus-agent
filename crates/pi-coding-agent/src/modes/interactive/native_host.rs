@@ -927,6 +927,9 @@ enum InputAction {
     SessionResume,
 }
 enum HostEvent {
+    /// A short-lived confirmation line (e.g. an OCC toggle acknowledgement)
+    /// that renders in the chat and auto-hides after a few seconds.
+    TransientStatus(String),
     MenuTiming(Instant),
     Extension(native_extension_bridge::Event),
     Shutdown,
@@ -2194,7 +2197,7 @@ async fn run_terminal(
                         // the ephemeral `?` guide (interactive-mode.ts:4931-4936).
                         mode.borrow_mut().handle_hotkeys_command();
                     } else if text.trim() == "/help" {
-                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Alt+Enter queues follow-up; Ctrl+O expands tools.", "dim");
+                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter queues a follow-up while busy; Alt+Enter steers the running turn; Ctrl+O expands tools.", "dim");
                     } else {
                         if submission_is_prompt(&text) { ui.borrow_mut().scroll_to_bottom(); }
                         submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
@@ -2964,6 +2967,9 @@ async fn run_terminal(
                     );
                 }
                 HostEvent::Status(status) => mode.borrow_mut().show_status(&status, "dim"),
+                HostEvent::TransientStatus(status) => {
+                    mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+                }
                 HostEvent::ClipboardNotice(message) => {
                     transcript.borrow_mut().clipboard_notice.show(message, Instant::now());
                 }
@@ -3698,12 +3704,16 @@ async fn prompt_model(
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
 ) -> Result<(), String> {
+    // Ordinary submissions queue as in-order follow-ups while the agent is
+    // busy; the follow-up key opts into steering the running turn instead.
+    // The core session applies the same followUp default to behavior-less
+    // ordinary prompts, so every caller stays consistent.
     connection
         .prompt(
             line,
             Some(wire::AgentConnectionPromptOptions {
                 images,
-                streaming_behavior: Some(if follow_up { "followUp" } else { "steer" }.into()),
+                streaming_behavior: Some(if follow_up { "steer" } else { "followUp" }.into()),
                 ..Default::default()
             }),
         )
@@ -3867,6 +3877,9 @@ fn should_record_prompt_history(text: &str) -> bool {
 enum CommandOutput {
     Nothing,
     Status(String),
+    /// A confirmation that should disappear after a few moments instead of
+    /// staying in the transcript (OCC toggle acknowledgements).
+    TransientStatus(String),
     ClipboardNotice(String),
     Warning(String),
     EchoLocal(String),
@@ -3915,6 +3928,9 @@ impl CommandOutput {
             CommandOutput::Status(status) => {
                 mode.borrow_mut().show_status(&status, "dim");
             }
+            CommandOutput::TransientStatus(status) => {
+                mode.borrow_mut().show_transient_status(&status, "dim", Instant::now());
+            }
             CommandOutput::ClipboardNotice(message) => {
                 let _ = send.send(HostEvent::ClipboardNotice(message));
             }
@@ -3954,6 +3970,7 @@ impl CommandOutput {
         match self {
             CommandOutput::Nothing => Vec::new(),
             CommandOutput::Status(status) => vec![HostEvent::Status(status)],
+            CommandOutput::TransientStatus(status) => vec![HostEvent::TransientStatus(status)],
             CommandOutput::ClipboardNotice(message) => vec![HostEvent::ClipboardNotice(message)],
             CommandOutput::Warning(warning) => vec![HostEvent::Warning(warning)],
             CommandOutput::EchoLocal(text) => vec![HostEvent::EchoLocal(text)],
@@ -6020,7 +6037,7 @@ fn apply_event_legacy_for_speed(
         let (reply, wait) = tokio::sync::oneshot::channel();
         fake.prompt_replies.lock().unwrap().push_back(wait);
         let (send, receive) = mpsc::channel();
-        submit_from_editor(&connection, &send, "private submitted prompt".into(), true, &mut metrics, &h.transcript);
+        submit_from_editor(&connection, &send, "private submitted prompt".into(), false, &mut metrics, &h.transcript);
         assert_eq!(metrics.pending_count(), 1);
         assert!(fake.calls().is_empty(), "the receipt/ID must exist before the task runs");
         let initial = h.paint().join("\n");
@@ -6031,6 +6048,7 @@ fn apply_event_legacy_for_speed(
         h.editor.borrow_mut().handle_input("\x1b[D");
         let cursor = h.editor.borrow().editor().get_cursor();
         tokio::task::yield_now().await;
+        // The ordinary submit path queues as a follow-up; the follow-up key now steers.
         assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "followUp", "None"]);
         assert!(receive.try_recv().is_err(), "held reply must not claim completion");
         reply.send(Err("synthetic host rejection".into())).unwrap();
@@ -6966,8 +6984,8 @@ fn apply_event_legacy_for_speed(
                 .unwrap_or_else(|| panic!("{text} must reach connection.prompt, got {recorded:?}"));
             assert_eq!(prompt.1[0], text.trim(), "{text} must be prompted verbatim");
             assert_eq!(
-                prompt.1[1], "steer",
-                "{text} must keep the default steer queue mode"
+                prompt.1[1], "followUp",
+                "{text} must keep the default in-order follow-up queue mode"
             );
             assert!(
                 result.is_ok(),
@@ -7478,7 +7496,7 @@ fn apply_event_legacy_for_speed(
             assert_eq!(result.is_ok(), supported);
             let calls = recorder.calls();
             if supported {
-                assert!(calls.iter().any(|(name, args)| name == "prompt" && args[0] == "/mode toggle" && args[1] == "followUp"));
+                assert!(calls.iter().any(|(name, args)| name == "prompt" && args[0] == "/mode toggle" && args[1] == "steer"));
             } else {
                 assert!(calls.is_empty());
                 assert!(result.unwrap_err().contains("restart the daemon"));
@@ -8371,7 +8389,7 @@ fn apply_event_legacy_for_speed(
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let prompt = recorder.only_call("prompt");
         assert_eq!(prompt[0], "/model", "the prompt must reach the model verbatim");
-        assert_eq!(prompt[1], "steer");
+        assert_eq!(prompt[1], "followUp");
         assert!(
             editor.borrow().editor().get_history().iter().any(|entry| entry == "/model"),
             "the prompt must be recorded in history: {:?}",

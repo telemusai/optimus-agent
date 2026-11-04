@@ -292,7 +292,9 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
         KeybindingDefinition {
             default_keys: vec![String::from("alt+enter")],
             default_keys_is_single: true,
-            description: Some("Queue follow-up message".to_string()),
+            description: Some(
+                "Steer the running turn; Enter queues a follow-up".to_string(),
+            ),
             default_key_scope: None,
         },
     );

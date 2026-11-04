@@ -42,6 +42,14 @@ fn deliver(row: &mut SessionSummary, id: &str, from: &str) {
         "id":id, "sourceSessionId":from, "kind":"text", "timestamp":chrono::Utc::now().timestamp_millis(),
     }]);
 }
+/// A completed native OCC-3 handoff reports a `latent` delivery: it must
+/// pulse the OCC3 indicator and flash the sender->receiver edge in the
+/// top-right agents graph exactly like an ordinary message link.
+fn deliver_latent(row: &mut SessionSummary, id: &str, from: &str) {
+    row.extra.get_mut("communicationActivity").unwrap()["deliveries"] = json!([{
+        "id":id, "sourceSessionId":from, "kind":"latent", "timestamp":chrono::Utc::now().timestamp_millis(),
+    }]);
+}
 
 #[test]
 fn graph_uses_nested_roster_links_and_live_work_without_cross_session_nodes() {
@@ -81,6 +89,36 @@ fn graph_uses_nested_roster_links_and_live_work_without_cross_session_nodes() {
             .collect::<Vec<_>>(),
         ["foreign", "foreign-child"]
     );
+}
+
+#[test]
+fn graph_flashes_the_edge_and_occ3_indicator_for_a_completed_native_handoff() {
+    let now = Instant::now();
+    let mut graph = Graph::default();
+    let mut rows = vec![
+        row("root", None, false),
+        row("a", Some("root"), false),
+        row("b", Some("root"), false),
+    ];
+    graph.observe(&rows, &parent("root"), false, now);
+    assert_eq!(graph.activity.live_links(now).count(), 0);
+    // A completed native OCC-3 handoff from sibling `a` to sibling `b`
+    // reports one latent delivery on the receiver's roster row.
+    deliver_latent(&mut rows[2], "occ3-a-to-b", "a");
+    graph.observe(&rows, &parent("root"), false, now);
+    let links = graph
+        .activity
+        .live_links(now)
+        .map(|(from, to, _)| (from, to))
+        .collect::<Vec<_>>();
+    assert_eq!(links, [("a", "b")]);
+    assert_eq!(
+        strip_ansi(&graph.activity.indicators(now)),
+        "○ TXT  ○ OCC1  ○ OCC2  ● OCC3"
+    );
+    // The link expires with the pulse window like every other message edge.
+    graph.observe(&rows, &parent("root"), false, now + PULSE);
+    assert_eq!(graph.activity.live_links(now + PULSE).count(), 0);
 }
 
 #[test]

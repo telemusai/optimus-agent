@@ -454,6 +454,91 @@ def test_pool_refuses_v3_row_misalignment_in_a_written_corpus(tmp_path):
     assert failure.value.code == "record_refused"
 
 
+def test_pool_records_the_method_union_when_method_ids_differ(tmp_path):
+    """(iii-d) Corpora collected under different latent method ids pool.
+
+    The differing method_id is the distribution shift pooling exists to
+    cover, so it is recorded instead of refused: the pooled provenance
+    keeps the legacy corpus's method_id (the first input) and carries every
+    input method id in a sorted, comma-joined union field.
+    """
+    tool = _pool_tool()
+    legacy_method = ("statebridge.glm53.final-prenorm-predictor."
+                     "continuous-prefix.v1")
+    supplemental_method = ("statebridge.glm53.final-prenorm-predictor."
+                           "calibrated-dual-ridge.v1")
+
+    def _method_provenance(method_id):
+        return {"method_id": method_id, "artifact_digest": "none",
+                "hidden_dim": str(DIM), "layer_index": "77",
+                "marker_profile_max_len": "64"}
+
+    legacy = _families(3, 2, policy=LEGACY_POLICY, start=0)
+    legacy_dir = tmp_path / "legacy"
+    _write_corpus(legacy, legacy_dir,
+                  provenance=_method_provenance(legacy_method))
+    supplemental = _families(3, 2, policy=RETAINED_POLICY, start=100)
+    supplemental_dir = tmp_path / "supplemental"
+    _write_corpus(supplemental, supplemental_dir,
+                  provenance=_method_provenance(supplemental_method))
+    out = tmp_path / "pooled"
+    summary = tool.pool(str(legacy_dir), [str(supplemental_dir)], str(out))
+
+    from occ3_sglang.calibration_collector import load, read_manifest
+    provenance = read_manifest(out)["provenance"]
+    assert provenance["method_id"] == legacy_method
+    assert provenance["pooled_method_ids"] == ",".join(sorted(
+        (legacy_method, supplemental_method)))
+    # the pooled corpus still verifies and loads through the fit contract
+    partitions = load(out)
+    assert partitions["turns"] == {"fit": 4, "validation": 4, "test": 4}
+    assert len(summary["pooled_from"]) == 2
+
+
+def test_pool_provenance_is_unchanged_when_method_ids_agree(tmp_path):
+    """Agreeing method ids pool to the byte-identical provenance.
+
+    The union field appears ONLY when a method id actually differs, so a
+    pool of corpora collected under one method keeps the exact provenance
+    (and therefore the exact manifest bytes) the tool wrote before.
+    """
+    tool = _pool_tool()
+    legacy = _families(3, 2, policy=LEGACY_POLICY, start=0)
+    legacy_dir = tmp_path / "legacy"
+    _write_corpus(legacy, legacy_dir)
+    supplemental = _families(3, 2, policy=RETAINED_POLICY, start=100)
+    supplemental_dir = tmp_path / "supplemental"
+    _write_corpus(supplemental, supplemental_dir)
+    out = tmp_path / "pooled"
+    tool.pool(str(legacy_dir), [str(supplemental_dir)], str(out))
+    from occ3_sglang.calibration_collector import read_manifest
+    provenance = read_manifest(out)["provenance"]
+    assert set(provenance) == {"method_id", "artifact_digest", "hidden_dim",
+                               "layer_index", "marker_profile_max_len",
+                               "pooled_from", "pool_schema"}
+
+
+def test_pool_still_refuses_other_provenance_mismatches(tmp_path):
+    """Only method_id unions; every other shared provenance field still
+    refuses exactly as before."""
+    tool = _pool_tool()
+    legacy = _families(3, 2, policy=LEGACY_POLICY, start=0)
+    legacy_dir = tmp_path / "legacy"
+    _write_corpus(legacy, legacy_dir)
+    supplemental = _families(3, 2, policy=RETAINED_POLICY, start=100)
+    supplemental_dir = tmp_path / "supplemental"
+    _write_corpus(supplemental, supplemental_dir, provenance={
+        "method_id": "statebridge.glm53.final-prenorm-predictor."
+                     "continuous-prefix.v1",
+        "artifact_digest": "none", "hidden_dim": str(DIM + 1),
+        "layer_index": "77", "marker_profile_max_len": "64"})
+    with pytest.raises(tool.PoolError) as failure:
+        tool.pool(str(legacy_dir), [str(supplemental_dir)],
+                  str(tmp_path / "out"))
+    assert failure.value.code == "identity"
+    assert "hidden_dim" in failure.value.detail
+
+
 def test_pool_cli_writes_summary(tmp_path, capsys):
     tool = _pool_tool()
     legacy = _families(3, 2, policy=LEGACY_POLICY, start=0)

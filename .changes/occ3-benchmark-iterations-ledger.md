@@ -1,0 +1,1 @@
+- Added: a Phase 3 benchmark iteration ledger (reports/occ3-completion/BENCHMARK-ITERATIONS.md) recording the measured baseline and the s9 pooled-refit iteration with its same-split cross-score, tolerance-ladder state, bench-harness offline baseline, and the gates for the next iterations.

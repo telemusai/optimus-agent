@@ -1,0 +1,1 @@
+- Added: contributor documentation for the fork-based upstream PR workflow, including the REST API PR path and the workflow-scope push rejection remedy (rebase onto a fork-known base so the push carries no workflow-file changes).
