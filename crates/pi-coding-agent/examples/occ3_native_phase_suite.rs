@@ -814,6 +814,12 @@ struct FixtureRecords {
     /// Test-only task-mode injection: the canned answer the synthetic
     /// receiver recovers from the delivered state (the oracle's answer).
     task_answer: Option<String>,
+    /// Test-only live-defect injection: the synthetic receiver's recovered
+    /// answer drops this many trailing characters of the captured fact -
+    /// canary-1's measured shape (2026-11-01), one deletion at the value
+    /// boundary. The tolerance ladder's offline regressions use it; the
+    /// default 0 mirrors an exact decode.
+    receiver_answer_drop_chars: usize,
     /// Test-only span injection: model a thinking-bearing sender whose
     /// retained content-tail window is a strict subset of the accepted
     /// spans (the live corpus shape: span_message_truncated=true with the
@@ -826,6 +832,48 @@ struct FixtureRecords {
     /// through the source agent's on_payload hook, so the serialized armed
     /// request body must carry exactly the pinned effort.
     capture_reasoning_efforts: Vec<String>,
+    /// Test-only hang injection (retained-timeout regressions): the
+    /// receiver-turn route (a /v1/chat/completions body carrying the occ3
+    /// attachment key) is accepted and recorded but never answered until
+    /// the owning test's bounded cleanup releases it; the client's wrapped
+    /// publication deadline fires first in the passing shape.
+    /// Discriminating on the occ3 key keeps the capture-armed source
+    /// route (occ3_capture) fast. Compiled out of production builds.
+    #[cfg(test)]
+    hang_receiver_turns: bool,
+    /// Test-only hang injection: the publication route is accepted and
+    /// recorded but never answered until the same cleanup, so the client
+    /// keeps its one-shot claim and nothing is ever admitted (no inbox
+    /// record, no bound lease). Compiled out of production builds.
+    #[cfg(test)]
+    hang_publish_route: bool,
+    /// Which hang injections actually fired, in arrival order - the
+    /// fixture-side record that a hung route was reached and held (the
+    /// requests log names the route; this names the hang). Compiled out
+    /// of production builds.
+    #[cfg(test)]
+    hang_events: Vec<String>,
+    /// Test-only latched cancellation for the hang-injected routes: the
+    /// held connection tasks park on this token (locks released before
+    /// the await) until the owning test's bounded cleanup cancels it -
+    /// never an artificial sleep. Compiled out of production builds.
+    #[cfg(test)]
+    hang_cancel: tokio_util::sync::CancellationToken,
+    /// Test-only latched route-arrival signal: cancelled after the hang
+    /// event is recorded and BEFORE the route parks, so a test can
+    /// deterministically observe that the handler actually reached the
+    /// park point before it triggers the failure path (a socket EOF
+    /// after an abort alone proves nothing about the handler). Compiled
+    /// out of production builds.
+    #[cfg(test)]
+    hang_arrival: tokio_util::sync::CancellationToken,
+    /// Test-only connection tracking: every per-connection task handle the
+    /// fixture spawned, so the hang tests own their cleanup and join it
+    /// under one aggregate bound instead of relying on runtime teardown.
+    /// Compiled out of production builds; production connections always
+    /// answer and terminate on their own.
+    #[cfg(test)]
+    connection_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -1111,6 +1159,40 @@ fn extract_fact(messages: &Value) -> Option<String> {
     fact
 }
 
+/// Test-only hang gate for the hang-injected routes: records the event
+/// and parks the connection task on the latched cancellation token until
+/// the owning test's bounded cleanup cancels it - never an artificial
+/// sleep, and the fixture Mutex is released before the await. Returns
+/// true when the route was held (the caller then returns without
+/// answering). Compiled out of production builds together with the hang
+/// fields.
+#[cfg(test)]
+async fn hold_route_until_cancelled(
+    records: &Arc<Mutex<FixtureRecords>>,
+    event: &str,
+) -> bool {
+    let cancel = {
+        let mut guard = records.lock().unwrap();
+        let hold = match event {
+            "publish_route" => guard.hang_publish_route,
+            "receiver_turn" => guard.hang_receiver_turns,
+            _ => false,
+        };
+        if !hold {
+            return false;
+        }
+        guard.hang_events.push(event.to_string());
+        // Route-arrival latch: set under the same lock, after the event
+        // is recorded and before the park, so the awaiting test observes
+        // the handler's actual arrival at the park point (never a lock
+        // held across the await - the token is latched).
+        guard.hang_arrival.cancel();
+        guard.hang_cancel.clone()
+    };
+    cancel.cancelled().await;
+    true
+}
+
 async fn serve(
     epoch_state: Arc<Mutex<FixtureEpoch>>,
     records: Arc<Mutex<FixtureRecords>>,
@@ -1120,6 +1202,8 @@ async fn serve(
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
+            #[cfg(test)]
+            let tracker = records.clone();
             let records = records.clone();
             let (epoch, generation, expiry, profile_digest) = {
                 let state = epoch_state.lock().unwrap();
@@ -1130,7 +1214,7 @@ async fn serve(
                     state.profile_digest.clone(),
                 )
             };
-            tokio::spawn(async move {
+            let connection = tokio::spawn(async move {
                 let (path, body, control, accept_encodings) = read_request(&mut socket).await;
                 {
                     let mut records = records.lock().unwrap();
@@ -1149,6 +1233,12 @@ async fn serve(
                         send(&mut socket, "200 OK", reply.to_string(), vec![]).await;
                     }
                     "/occ3/v1/native/publish" => {
+                        #[cfg(test)]
+                        {
+                            if hold_route_until_cancelled(&records, "publish_route").await {
+                                return;
+                            }
+                        }
                         let v1_fields = ["schema","publication_id","source_handle","source_session_id","receiver_session_id","message_id","source_turn_nonce","tool_call_id","expires_at_epoch"];
                         // occ3.publish.v2 (the retained content-only
                         // publication): no tool_call_id; dispatch_mode names
@@ -1466,6 +1556,12 @@ async fn serve(
                             return;
                         }
                         if let Some(attachment) = body.get("occ3") {
+                            #[cfg(test)]
+                            {
+                                if hold_route_until_cancelled(&records, "receiver_turn").await {
+                                    return;
+                                }
+                            }
                             let handle = attachment["state_handle"].as_str().unwrap_or_default().to_string();
                             let capture = {
                                 let records_guard = records.lock().unwrap();
@@ -1493,17 +1589,30 @@ async fn serve(
                             assert_eq!(attachment["runtime_id"], epoch);
                             assert_eq!(attachment["runtime_generation"], json!(generation));
                             let receipt = json!({"attachment":attachment,"consumed":true,"injected_state":true,"fallback_used":false});
-                            let task_answer = {
+                            let (task_answer, drop_chars) = {
                                 let records_guard = records.lock().unwrap();
-                                records_guard.task_answer.clone()
+                                (
+                                    records_guard.task_answer.clone(),
+                                    records_guard.receiver_answer_drop_chars,
+                                )
+                            };
+                            let recovered = task_answer
+                                .as_deref()
+                                .or(capture.fact.as_deref())
+                                .unwrap_or("UNKNOWN");
+                            let recovered = if drop_chars > 0 {
+                                let total = recovered.chars().count();
+                                recovered
+                                    .chars()
+                                    .take(total.saturating_sub(drop_chars))
+                                    .collect::<String>()
+                            } else {
+                                recovered.to_string()
                             };
                             let output = sse(
                                 &rid(&handle),
                                 "unused",
-                                Some(task_answer
-                                    .as_deref()
-                                    .or(capture.fact.as_deref())
-                                    .unwrap_or("UNKNOWN")),
+                                Some(recovered.as_str()),
                             );
                             send_sse(&mut socket, output, vec![("x-optimus-occ3-receipt", receipt.to_string())]).await;
                             return;
@@ -1524,6 +1633,17 @@ async fn serve(
                     _ => panic!("Unexpected fixture route: {path}"),
                 }
             });
+            // Test-only connection tracking: the handle is registered so
+            // the hang tests own their cleanup and join it; production
+            // builds keep the historical fire-and-forget spawn exactly.
+            #[cfg(test)]
+            {
+                tracker.lock().unwrap().connection_tasks.push(connection);
+            }
+            #[cfg(not(test))]
+            {
+                drop(connection);
+            }
         }
     });
     (endpoint, task)
@@ -2011,6 +2131,12 @@ fn validate_span_policy_env() -> Result<(), String> {
             SourceSpanArming::DEFAULT.span_policy
         )
     })
+}
+
+/// Refuse an OCC3 arm-tolerance knob pair the ladder would refuse at
+/// verdict time, before any enrollment or send side effect.
+fn validate_arm_tolerance_env() -> Result<(), String> {
+    ArmTolerancePolicy::current().map(|_| ())
 }
 
 // ---------------------------------------------------------------------------
@@ -2806,11 +2932,36 @@ async fn run_positive_case(
         let controller = family
             .controller(source_id)
             .map_err(|error| format!("retained_controller_unavailable({error})"))?;
-        action = source
-            .publish_retained(controller, "child", "receiver")
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("source_retained_publish_error({error})"));
+        // The publication leg is bounded by the same case deadline that
+        // bounds the source turn and the no-state receiver leg (the
+        // run_no_state_case idiom): the isolated controller's receiver
+        // prompt has no internal envelope, so without this bound a wedged
+        // publish or receiver leg would hold the phase until the harness
+        // kills it. On expiry the elapsed deadline becomes the terminal
+        // action error; the flow still reaches family.close() below (no
+        // early return sits between this assignment and the cleanup), and
+        // the one-shot publication claim taken before the first await in
+        // publish_retained is NOT released, so nothing can retry the
+        // publication.
+        action = match tokio::time::timeout(
+            Duration::from_secs(env.deadline_seconds),
+            source.publish_retained(controller, "child", "receiver"),
+        )
+        .await
+        {
+            Ok(result) => result
+                .map(|_| ())
+                .map_err(|error| format!("source_retained_publish_error({error})")),
+            Err(_elapsed) => {
+                // Fixed sanitized tag only (the source-turn diag pattern):
+                // the deadline constant, never wire text or credentials.
+                eprintln!(
+                    "occ3-retained-publish-diag retained_publish_timeout deadline_seconds={}",
+                    env.deadline_seconds
+                );
+                Err("retained_publish_timeout".to_string())
+            }
+        };
     } else {
         // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
         // the handoff tool NOT yet installed, so it cannot end on a tool call and the
@@ -5033,6 +5184,316 @@ fn write_corpus_turn_evidence(journal: &Path, evidence: &Value) -> Result<PathBu
     )
 }
 
+// ---------------------------------------------------------------------------
+// NATIVE-arm bounded send-with-tolerance ladder (2026-11-02 decision): the
+// arm accepts a recovered value whose character edit distance from the
+// intended value is at most OCC3_ARM_TOLERANCE (default 1), re-sends the
+// message with a FRESH capture at most OCC3_ARM_MAX_ATTEMPTS times (default
+// 3, ceiling 3: the message is sent no more than three times), and after
+// the final send accepts the best structurally valid transmission (lowest
+// distance, earliest attempt wins ties) instead of failing the arm.
+// Tolerance 0 restores the historical strict single-send verdict exactly;
+// pre-registered strict-L1 windows pin it. The ladder applies only to the
+// plain NATIVE arm with a minted value: corpus canaries keep their
+// pre-committed single-turn identity, and the token/control arms keep their
+// own pre-registered verdicts.
+// ---------------------------------------------------------------------------
+
+const ARM_TOLERANCE_ENV: &str = "OCC3_ARM_TOLERANCE";
+const ARM_MAX_ATTEMPTS_ENV: &str = "OCC3_ARM_MAX_ATTEMPTS";
+const DEFAULT_ARM_TOLERANCE: usize = 1;
+const DEFAULT_ARM_MAX_ATTEMPTS: usize = 3;
+/// The small-error ceiling: this policy tolerates character-level noise,
+/// not a different message.
+const ARM_TOLERANCE_CEILING: usize = 4;
+/// The decision bounds sends at three; the ceiling keeps the knob honest.
+const ARM_MAX_ATTEMPTS_CEILING: usize = 3;
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct ArmTolerancePolicy {
+    /// Maximum accepted character edit distance between the intended
+    /// value and the recovered answer. 0 is the historical strict verdict.
+    tolerance: usize,
+    /// Total sends the arm may spend on one message (1 = single-send).
+    max_attempts: usize,
+}
+
+impl ArmTolerancePolicy {
+    /// Parse the operator knobs; unset keeps the defaults, and malformed or
+    /// out-of-bound values are refused (never silently coerced).
+    fn parse(tolerance: Option<&str>, max_attempts: Option<&str>) -> Result<Self, String> {
+        let tolerance = match tolerance {
+            None => DEFAULT_ARM_TOLERANCE,
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                format!("{ARM_TOLERANCE_ENV}={raw:?} is not a non-negative integer")
+            })?,
+        };
+        if tolerance > ARM_TOLERANCE_CEILING {
+            return Err(format!(
+                "{ARM_TOLERANCE_ENV}={tolerance} exceeds the small-error ceiling {ARM_TOLERANCE_CEILING}; this policy tolerates character-level noise, not a different message"
+            ));
+        }
+        let max_attempts = match max_attempts {
+            None => DEFAULT_ARM_MAX_ATTEMPTS,
+            Some(raw) => raw.parse::<usize>().map_err(|_| {
+                format!("{ARM_MAX_ATTEMPTS_ENV}={raw:?} is not a non-negative integer")
+            })?,
+        };
+        if max_attempts == 0 {
+            return Err(format!(
+                "{ARM_MAX_ATTEMPTS_ENV}=0 must allow at least one send"
+            ));
+        }
+        if max_attempts > ARM_MAX_ATTEMPTS_CEILING {
+            return Err(format!(
+                "{ARM_MAX_ATTEMPTS_ENV}={max_attempts} exceeds the ceiling {ARM_MAX_ATTEMPTS_CEILING} (the decision bounds sends at three)"
+            ));
+        }
+        Ok(Self {
+            tolerance,
+            max_attempts,
+        })
+    }
+
+    fn current() -> Result<Self, String> {
+        Self::parse(
+            std::env::var(ARM_TOLERANCE_ENV).ok().as_deref(),
+            std::env::var(ARM_MAX_ATTEMPTS_ENV).ok().as_deref(),
+        )
+    }
+
+    fn enabled(&self) -> bool {
+        self.tolerance > 0
+    }
+}
+
+/// Character-level Levenshtein distance over Unicode scalar values. The
+/// measured live failure modes were single-character deletions and
+/// mid-string substitutions inside fully retained rows, so edit distance
+/// (not a prefix or hash comparison) is the honest error metric.
+fn value_edit_distance(expected: &str, observed: &str) -> usize {
+    let expected: Vec<char> = expected.chars().collect();
+    let observed: Vec<char> = observed.chars().collect();
+    if expected.is_empty() {
+        return observed.len();
+    }
+    if observed.is_empty() {
+        return expected.len();
+    }
+    let mut previous: Vec<usize> = (0..=observed.len()).collect();
+    let mut current = vec![0usize; observed.len() + 1];
+    for (row, expected_char) in expected.iter().enumerate() {
+        current[0] = row + 1;
+        for (column, observed_char) in observed.iter().enumerate() {
+            let substitute = previous[column] + usize::from(expected_char != observed_char);
+            current[column + 1] = (previous[column + 1] + 1)
+                .min(current[column] + 1)
+                .min(substitute);
+        }
+        std::mem::swap(&mut previous, &mut current);
+    }
+    previous[observed.len()]
+}
+
+/// Why an attempt was accepted: exact match, within the tolerated
+/// character distance, or the best-effort fallback after the final send.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ArmAcceptReason {
+    Exact,
+    WithinTolerance,
+    BestEffortFallback,
+}
+
+impl ArmAcceptReason {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::Exact => "exact",
+            Self::WithinTolerance => "within_tolerance",
+            Self::BestEffortFallback => "best_effort_fallback",
+        }
+    }
+}
+
+/// One send's selection input: the attempt index (1-based) and the
+/// recovered value's edit distance from the intended value. `None` marks a
+/// send with no valid transmission (request error or a structurally
+/// invalid arm), which can never be selected as accepted.
+#[derive(Clone, Copy, Debug)]
+struct AttemptSelection {
+    index: usize,
+    distance: Option<usize>,
+}
+
+/// The bounded-ladder decision, pure so the accept order is pinned by
+/// tests without a fixture server: the first structurally valid send
+/// within tolerance is accepted (exact or tolerated); when every send
+/// misses and the policy is tolerant, the best transmitted value is
+/// accepted after the final attempt (lowest distance, earliest attempt
+/// wins ties); strict tolerance 0 never accepts an out-of-tolerance value,
+/// and nothing transmitted means nothing to accept.
+fn select_accepted_attempt(
+    attempts: &[AttemptSelection],
+    tolerance: usize,
+) -> Option<(usize, ArmAcceptReason)> {
+    for attempt in attempts {
+        if let Some(distance) = attempt.distance {
+            if distance <= tolerance {
+                let reason = if distance == 0 {
+                    ArmAcceptReason::Exact
+                } else {
+                    ArmAcceptReason::WithinTolerance
+                };
+                return Some((attempt.index, reason));
+            }
+        }
+    }
+    if tolerance == 0 {
+        // Strict mode: out-of-tolerance answers are never accepted, not
+        // even as the best-effort fallback.
+        return None;
+    }
+    let best = attempts
+        .iter()
+        .filter_map(|attempt| attempt.distance.map(|distance| (distance, attempt.index)))
+        .min()?;
+    Some((best.1, ArmAcceptReason::BestEffortFallback))
+}
+
+/// The NATIVE arm's bounded send-with-tolerance ladder: each attempt is
+/// one full positive case with FRESH session ids (a live serving process
+/// binds a session id to its first enrollment, so every re-send needs its
+/// own); the first structurally valid transmission within tolerance is
+/// accepted; after the final send the best transmitted value is accepted
+/// rather than failing the arm. Never returns Err for a failed send: every
+/// attempt and the selection are carried in the returned evidence, so a
+/// total failure still publishes per-attempt diagnostics.
+async fn run_native_arm_tolerance_ladder(
+    env: &PhaseEnv,
+    connector: &Arc<SglangOcc3Connector>,
+    arm: Arm,
+    intended_value: &str,
+    plan: &PositiveArmPlan,
+    policy: ArmTolerancePolicy,
+) -> Value {
+    let mut attempts: Vec<Value> = Vec::new();
+    let mut selections: Vec<AttemptSelection> = Vec::new();
+    let mut transmitted: Vec<(usize, Value)> = Vec::new();
+    let mut last_error: Option<String> = None;
+    for index in 1..=policy.max_attempts {
+        // Fresh ids per send: the serving process binds each session id to
+        // its first enrollment, so a re-send never reuses one.
+        let source_id = format!(
+            "{}-source-{}-a{index}",
+            arm.trial_suffix(),
+            uuid::Uuid::new_v4().simple()
+        );
+        let receiver_id = format!(
+            "{}-receiver-{}-a{index}",
+            arm.trial_suffix(),
+            uuid::Uuid::new_v4().simple()
+        );
+        match run_positive_case(
+            env,
+            connector,
+            &source_id,
+            &receiver_id,
+            intended_value,
+            Some(plan),
+            SourceMode::current(),
+        )
+        .await
+        {
+            Ok(outcome) => {
+                let mut evidence = outcome.arm_evidence;
+                let structural_ok = positive_structural_ok(&evidence);
+                evidence["structural_ok"] = json!(structural_ok);
+                let parsed_answer = evidence["parsed_answer"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                let distance = value_edit_distance(intended_value, &parsed_answer);
+                attempts.push(json!({
+                    "attempt": index,
+                    "source_session": source_id,
+                    "receiver_session": receiver_id,
+                    "value_distance": distance,
+                    "answer_sha256": evidence["answer_sha256"].clone(),
+                    "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
+                    "structural_ok": structural_ok,
+                    "source_turn_error": evidence["source_turn_error"].clone(),
+                }));
+                if structural_ok {
+                    selections.push(AttemptSelection {
+                        index,
+                        distance: Some(distance),
+                    });
+                    transmitted.push((index, evidence));
+                } else {
+                    selections.push(AttemptSelection { index, distance: None });
+                }
+            }
+            Err(error) => {
+                last_error = Some(error.clone());
+                attempts.push(json!({
+                    "attempt": index,
+                    "source_session": source_id,
+                    "receiver_session": receiver_id,
+                    "trial_error": error,
+                }));
+                selections.push(AttemptSelection { index, distance: None });
+            }
+        }
+        // Stop sending once a transmission is within tolerance; the final
+        // selection below stays the single source of truth for ordering.
+        if selections
+            .last()
+            .is_some_and(|selection| selection.distance.is_some_and(|d| d <= policy.tolerance))
+        {
+            break;
+        }
+    }
+    let attempts_used = selections.len();
+    let retry_policy = json!({
+        "schema": "optimus.occ3.arm-retry-policy.v1",
+        "tolerance": policy.tolerance,
+        "max_attempts": policy.max_attempts,
+        "enabled": policy.enabled(),
+        "claim_scope": "arm",
+        "scope": "native-arm-fresh-canary",
+    });
+    match select_accepted_attempt(&selections, policy.tolerance) {
+        Some((index, reason)) => {
+            let mut evidence = transmitted
+                .iter()
+                .find(|(attempt_index, _)| *attempt_index == index)
+                .map(|(_, evidence)| evidence.clone())
+                .expect("the accepted attempt carried a valid transmission");
+            evidence["arm_accepted"] = json!(true);
+            evidence["accept_reason"] = json!(reason.as_str());
+            evidence["value_distance"] = json!(value_edit_distance(
+                intended_value,
+                evidence["parsed_answer"].as_str().unwrap_or_default()
+            ));
+            evidence["attempts_used"] = json!(attempts_used);
+            evidence["attempts"] = json!(attempts);
+            evidence["retry_policy"] = retry_policy;
+            evidence["strict_value_recovery"] = evidence["semantic_nonce_match"].clone();
+            evidence
+        }
+        None => json!({
+            "trial_error": last_error
+                .unwrap_or_else(|| "no_valid_transmission".to_string()),
+            "arm_accepted": json!(false),
+            "accept_reason": Value::Null,
+            "value_distance": Value::Null,
+            "attempts_used": json!(attempts_used),
+            "attempts": attempts,
+            "retry_policy": retry_policy,
+            "strict_value_recovery": json!(false),
+        }),
+    }
+}
+
 /// One experiment-arm trial: verify the staging the driver can see,
 /// pre-commit the private value, burn the one-shot phase claim, run the
 /// arm's case, ALWAYS publish the per-arm evidence JSON (a failed trial is
@@ -5103,8 +5564,34 @@ async fn run_arm_phase(
         format!("{}-source-b-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
     let receiver_id =
         format!("{}-receiver-{}", arm.trial_suffix(), uuid::Uuid::new_v4().simple());
+    // The bounded send-with-tolerance ladder resolves its operator knobs
+    // before any send: a malformed value refuses the arm here rather than
+    // mid-ladder after a partial spend.
+    let tolerance_policy = ArmTolerancePolicy::current()?;
     // Run the arm's case; a structural/protocol error still yields evidence.
-    let case_result: Result<Value, String> = match arm {
+    // The plain NATIVE arm with a minted value runs the tolerance ladder
+    // (fresh re-sends, first within-tolerance acceptance, best-effort
+    // after the final send); every other arm keeps its pre-registered
+    // single-shot verdict.
+    let tolerance_ladder_applies =
+        arm == Arm::Native && corpus.is_none() && tolerance_policy.enabled();
+    let case_result: Result<Value, String> = if tolerance_ladder_applies {
+        let plan = PositiveArmPlan {
+            // The same final-content pin as the single-shot positive arms:
+            // the span must contain the message the arm measures.
+            message_pinned: true,
+        };
+        Ok(run_native_arm_tolerance_ladder(
+            env,
+            &connector,
+            arm,
+            &intended_value,
+            &plan,
+            tolerance_policy,
+        )
+        .await)
+    } else {
+        match arm {
         Arm::Native | Arm::TokenFull | Arm::TokenSelected | Arm::TokenNorm | Arm::NullShape => {
             let plan = PositiveArmPlan {
                 // Live 2026-10-30 window icalib-p3final-20261030T235450Z: unpinned
@@ -5128,6 +5615,52 @@ async fn run_arm_phase(
             .map(|outcome| {
                 let mut evidence = outcome.arm_evidence;
                 evidence["structural_ok"] = json!(positive_structural_ok(&evidence));
+                if arm == Arm::Native {
+                    // Single-send NATIVE metadata (strict pin or corpus
+                    // canary): the same fieldset the ladder publishes, with
+                    // the ladder disabled and its reason recorded. The
+                    // strict verdict stays arm_accepted ==
+                    // semantic_nonce_match.
+                    let parsed_answer = evidence["parsed_answer"]
+                        .as_str()
+                        .unwrap_or_default()
+                        .to_string();
+                    let strict = evidence["semantic_nonce_match"] == json!(true);
+                    evidence["arm_accepted"] = json!(strict);
+                    evidence["accept_reason"] = if strict {
+                        json!("exact")
+                    } else {
+                        Value::Null
+                    };
+                    let distance = value_edit_distance(&intended_value, &parsed_answer);
+                    evidence["value_distance"] = json!(distance);
+                    evidence["attempts_used"] = json!(1);
+                    // The same per-attempt record the ladder publishes, so the
+                    // strict pin and corpus canaries carry one-send diagnostics.
+                    evidence["attempts"] = json!([{
+                        "attempt": 1,
+                        "source_session": source_id.clone(),
+                        "receiver_session": receiver_id.clone(),
+                        "value_distance": distance,
+                        "answer_sha256": evidence["answer_sha256"].clone(),
+                        "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
+                        "structural_ok": evidence["structural_ok"].clone(),
+                        "source_turn_error": evidence["source_turn_error"].clone(),
+                    }]);
+                    evidence["retry_policy"] = json!({
+                        "schema": "optimus.occ3.arm-retry-policy.v1",
+                        "tolerance": tolerance_policy.tolerance,
+                        "max_attempts": tolerance_policy.max_attempts,
+                        "enabled": false,
+                        "claim_scope": "arm",
+                        "scope": if corpus.is_some() {
+                            "corpus-canary-precommitted-identity"
+                        } else {
+                            "strict-pin-single-send"
+                        },
+                    });
+                    evidence["strict_value_recovery"] = json!(strict);
+                }
                 if let Some(corpus) = corpus {
                     // The canary's corpus identity: the manifest turn plus
                     // the capture the positive case armed (spec 2.2.5); the
@@ -5169,10 +5702,41 @@ async fn run_arm_phase(
             .await
             .map_err(|error| format!("{} arm case failed: {error}", arm.as_str()))
         }
+        }
     };
     let (mut case_evidence, trial_error) = match case_result {
         Ok(evidence) => (evidence, None),
-        Err(error) => (json!({"trial_error": error.clone()}), Some(error)),
+        Err(error) => {
+            // A single-send NATIVE total failure publishes the same fieldset the
+            // ladder publishes on total failure (TOLERANCE-RETRY.md).
+            let mut evidence = json!({"trial_error": error.clone()});
+            if arm == Arm::Native {
+                evidence["arm_accepted"] = json!(false);
+                evidence["accept_reason"] = Value::Null;
+                evidence["value_distance"] = Value::Null;
+                evidence["attempts_used"] = json!(1);
+                evidence["attempts"] = json!([{
+                    "attempt": 1,
+                    "source_session": source_id.clone(),
+                    "receiver_session": receiver_id.clone(),
+                    "trial_error": error.clone(),
+                }]);
+                evidence["retry_policy"] = json!({
+                    "schema": "optimus.occ3.arm-retry-policy.v1",
+                    "tolerance": tolerance_policy.tolerance,
+                    "max_attempts": tolerance_policy.max_attempts,
+                    "enabled": false,
+                    "claim_scope": "arm",
+                    "scope": if corpus.is_some() {
+                        "corpus-canary-precommitted-identity"
+                    } else {
+                        "strict-pin-single-send"
+                    },
+                });
+                evidence["strict_value_recovery"] = json!(false);
+            }
+            (evidence, Some(error))
+        }
     };
     // Live-only token-count cross-check for the token arms; the receipt-span
     // verdict stays authoritative.
@@ -5202,7 +5766,13 @@ async fn run_arm_phase(
     // oracle); WRONG_SENDER must report the delivered value and not the
     // other.
     let case_passed = match arm {
-        Arm::Native => case_evidence["semantic_nonce_match"] == json!(true)
+        // The bounded send-with-tolerance ladder (2026-11-02): the arm
+        // passes on a structurally valid transmission whose value distance
+        // is within policy - exact, tolerated, or the best-effort fallback
+        // after the final send. Strict windows pin OCC3_ARM_TOLERANCE=0,
+        // which keeps arm_accepted == semantic_nonce_match (the historical
+        // exact single-send verdict).
+        Arm::Native => case_evidence["arm_accepted"] == json!(true)
             && case_evidence["structural_ok"] == json!(true),
         Arm::TokenFull => {
             // Mark, never silently pass: the trial is invalid as TOKEN_FULL
@@ -5271,6 +5841,15 @@ async fn run_arm_phase(
         "coverage",
         // Absent for plain arm trials; the corpus-turn canary's identity.
         "corpus_turn",
+        // The NATIVE arm's bounded send-with-tolerance fields (absent for
+        // the token/control arms, which keep single-shot verdicts).
+        "arm_accepted",
+        "accept_reason",
+        "value_distance",
+        "attempts_used",
+        "attempts",
+        "retry_policy",
+        "strict_value_recovery",
     ] {
         if let Some(value) = evidence["case"].get(key).cloned() {
             evidence[key] = value;
@@ -5305,6 +5884,14 @@ async fn run_arm_phase(
         "answer_sha256": evidence["answer_sha256"].clone(),
         "semantic_nonce_match": evidence["semantic_nonce_match"].clone(),
         "coverage_complete": evidence["coverage"]["coverage_complete"].clone(),
+        // The NATIVE arm's tolerance verdict surface: any strict-L1 gate
+        // reads strict_value_recovery (or pins OCC3_ARM_TOLERANCE=0) rather
+        // than trusting arm_case_passed alone.
+        "strict_value_recovery": evidence["strict_value_recovery"].clone(),
+        "arm_accepted": evidence["arm_accepted"].clone(),
+        "accept_reason": evidence["accept_reason"].clone(),
+        "value_distance": evidence["value_distance"].clone(),
+        "attempts_used": evidence["attempts_used"].clone(),
     });
     if let Some(error) = trial_error {
         return Err(error);
@@ -5361,6 +5948,18 @@ async fn offline_trial_context(
     records: Arc<Mutex<FixtureRecords>>,
     attempt_label: &str,
 ) -> Result<OfflineTrial, String> {
+    offline_trial_context_with_deadline(journal, records, attempt_label, 20).await
+}
+
+/// The deadline-parameterized variant: the retained-timeout regressions
+/// drive the real run_positive_case path against a short wrapped deadline,
+/// so the fixture must not impose the selftest's 20-second default.
+async fn offline_trial_context_with_deadline(
+    journal: PathBuf,
+    records: Arc<Mutex<FixtureRecords>>,
+    attempt_label: &str,
+    deadline_seconds: u64,
+) -> Result<OfflineTrial, String> {
     let (binary_sha256, manifest_sha256, _manifest) = compute_offline_pins()?;
     let identity = fixture_identity();
     let fingerprint = identity.fingerprint();
@@ -5404,7 +6003,7 @@ async fn offline_trial_context(
         runtime_epoch: "offline-runtime-epoch-before".into(),
         runtime_generation: 41,
         expires_at_epoch: expires,
-        deadline_seconds: 20,
+        deadline_seconds,
         max_capture_bytes: 1048576,
         max_response_bytes: replay_max_response_bytes(),
         harness_binary_sha256: binary_sha256.clone(),
@@ -5447,6 +6046,25 @@ async fn offline_arm_trial(arm: Arm, journal: Option<PathBuf>) -> Result<Value, 
     let trial =
         offline_trial_context(journal, Arc::new(Mutex::new(FixtureRecords::default())), "arm")
             .await?;
+    let result =
+        run_arm_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, arm, None).await;
+    trial.server.abort();
+    result
+}
+
+/// The records-injecting variant: the tolerance ladder's offline
+/// regressions model the live canary defect shapes (a receiver that decodes
+/// the value one or more characters short) without touching the network.
+// Used only by the windows-only ladder fixture test; the unconditional
+// allow keeps non-test builds (and Linux test builds) warning-free.
+#[allow(dead_code)]
+async fn offline_arm_trial_with_records(
+    arm: Arm,
+    records: FixtureRecords,
+) -> Result<Value, String> {
+    let journal = offline_trial_journal(None, "occ3-arm-trial")?;
+    let trial =
+        offline_trial_context(journal, Arc::new(Mutex::new(records)), "arm").await?;
     let result =
         run_arm_phase(&trial.env, &trial.challenge, &trial.descriptor_digest, arm, None).await;
     trial.server.abort();
@@ -8783,6 +9401,7 @@ async fn real_main() -> Result<(), i32> {
     if let Err(error) = validate_receiver_thinking_env()
         .and_then(|_| validate_source_thinking_env())
         .and_then(|_| validate_span_policy_env())
+        .and_then(|_| validate_arm_tolerance_env())
     {
         eprintln!("Native phase-suite producer refused: {error}");
         return Err(1);
@@ -9605,6 +10224,168 @@ mod gate_tests {
         server.abort();
     }
     // ------------------------------------------------------------------
+    // NATIVE-arm bounded send-with-tolerance ladder (2026-11-02 decision).
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn value_edit_distance_counts_substitutions_deletions_and_insertions() {
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd1234"), 0);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd123X"), 1);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd123"), 1);
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd12345"), 1);
+        // A transposition is a substitution pair under Levenshtein.
+        assert_eq!(value_edit_distance("occ3-abcd1234", "occ3-abcd2134"), 2);
+        assert_eq!(value_edit_distance("occ3-abcd1234", ""), 13);
+        assert_eq!(value_edit_distance("", "occ3-abcd1234"), 13);
+        // Unicode scalar values count as single characters.
+        assert_eq!(value_edit_distance("occ3-\u{00e9}x", "occ3-ex"), 1);
+        assert_eq!(value_edit_distance("\u{00e9}\u{00e9}", "\u{00e9}"), 1);
+    }
+
+    #[test]
+    fn arm_tolerance_policy_parses_defaults_bounds_and_refuses_garbage() {
+        assert_eq!(
+            ArmTolerancePolicy::parse(None, None).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 1,
+                max_attempts: 3
+            }
+        );
+        assert_eq!(
+            ArmTolerancePolicy::parse(Some("0"), None).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 0,
+                max_attempts: 3
+            }
+        );
+        assert_eq!(
+            ArmTolerancePolicy::parse(Some("2"), Some("2")).unwrap(),
+            ArmTolerancePolicy {
+                tolerance: 2,
+                max_attempts: 2
+            }
+        );
+        // The small-error ceiling.
+        assert!(ArmTolerancePolicy::parse(Some("5"), None).is_err());
+        assert!(ArmTolerancePolicy::parse(Some("-1"), None).is_err());
+        assert!(ArmTolerancePolicy::parse(Some("one"), None).is_err());
+        // "No more than three times" is enforced by the ceiling.
+        assert!(ArmTolerancePolicy::parse(None, Some("0")).is_err());
+        assert!(ArmTolerancePolicy::parse(None, Some("4")).is_err());
+        assert!(ArmTolerancePolicy::parse(None, Some("many")).is_err());
+    }
+
+    #[test]
+    fn tolerance_ladder_accepts_the_first_send_within_tolerance() {
+        let attempts = [
+            AttemptSelection {
+                index: 1,
+                distance: Some(2),
+            },
+            AttemptSelection {
+                index: 2,
+                distance: None,
+            },
+            AttemptSelection {
+                index: 3,
+                distance: Some(1),
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&attempts, 1),
+            Some((3, ArmAcceptReason::WithinTolerance))
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 2,
+                    distance: Some(0),
+                }],
+                1
+            ),
+            Some((2, ArmAcceptReason::Exact))
+        );
+    }
+
+    #[test]
+    fn tolerance_ladder_best_effort_picks_lowest_distance_earliest_attempt() {
+        let attempts = [
+            AttemptSelection {
+                index: 1,
+                distance: Some(2),
+            },
+            AttemptSelection {
+                index: 2,
+                distance: Some(4),
+            },
+            AttemptSelection {
+                index: 3,
+                distance: Some(2),
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&attempts, 1),
+            Some((1, ArmAcceptReason::BestEffortFallback))
+        );
+        // Errored or structurally invalid sends are never selected.
+        let errored = [
+            AttemptSelection {
+                index: 1,
+                distance: None,
+            },
+            AttemptSelection {
+                index: 2,
+                distance: Some(9),
+            },
+            AttemptSelection {
+                index: 3,
+                distance: None,
+            },
+        ];
+        assert_eq!(
+            select_accepted_attempt(&errored, 1),
+            Some((2, ArmAcceptReason::BestEffortFallback))
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: None,
+                }],
+                1
+            ),
+            None
+        );
+    }
+
+    #[test]
+    fn tolerance_zero_keeps_the_strict_verdict() {
+        // Strict mode never accepts an out-of-tolerance answer, not even as
+        // the best-effort fallback: pinning OCC3_ARM_TOLERANCE=0 restores
+        // the historical exact single-send verdict.
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: Some(1),
+                }],
+                0
+            ),
+            None
+        );
+        assert_eq!(
+            select_accepted_attempt(
+                &[AttemptSelection {
+                    index: 1,
+                    distance: Some(0),
+                }],
+                0
+            ),
+            Some((1, ArmAcceptReason::Exact))
+        );
+    }
+
+    // ------------------------------------------------------------------
     // Experiment-arm surface (campaign section 5).
     // ------------------------------------------------------------------
 
@@ -10048,6 +10829,400 @@ mod gate_tests {
         let _ = std::fs::remove_dir_all(&journal);
     }
 
+    /// Failure backstop for `finish_hang_trial`: when a teardown step
+    /// panics or the aggregate deadline is exceeded, the guard cancels the
+    /// hang token and aborts the accept task plus every still-registered
+    /// connection. Sync operations only - Drop never awaits. The accept
+    /// task lives in a SHARED ownership slot: Drop aborts the occupant
+    /// through the slot WITHOUT taking it (abort takes the handle by
+    /// reference), and the normal teardown or the unwind test's observer
+    /// takes it exactly once and awaits its actual termination.
+    struct HangTrialCleanupGuard {
+        records: Arc<Mutex<FixtureRecords>>,
+        server: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        armed: bool,
+    }
+
+    impl Drop for HangTrialCleanupGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Some(server) = self.server.lock().unwrap().as_ref() {
+                server.abort();
+            }
+            let mut records = self.records.lock().unwrap();
+            records.hang_cancel.cancel();
+            for connection in records.connection_tasks.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    /// Bounded test-owned teardown for the hang-injected fixture, in the
+    /// gate-required order: (a) cancel the hang token first - the held
+    /// routes return and drop their sockets; (b) abort the accept task
+    /// and AWAIT its termination before the registry drain, so no late
+    /// connection can slip past the drain; (c) drain the registry, then
+    /// abort and join every tracked connection. Everything runs under
+    /// ONE aggregate five-second cleanup deadline (not a fresh bound per
+    /// handle); the happy-path joins are the measured cleanup proof.
+    /// CONSUMES the caller's armed guard (single ownership from
+    /// construction to disarm): the guard's Drop is the backstop on any
+    /// panic between its construction and the disarm. Locks are released
+    /// before every await.
+    async fn finish_hang_trial(mut guard: HangTrialCleanupGuard) {
+        const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+        let joined = tokio::time::timeout(CLEANUP_BOUND, async {
+            // (a) explicit release signal first.
+            guard.records.lock().unwrap().hang_cancel.cancel();
+            // (b) stop the accept/spawn loop and await its termination
+            // BEFORE the registry drain: the shared slot is taken exactly
+            // once, here (the test observer takes it only on the Drop
+            // path, never alongside this).
+            let server = guard
+                .server
+                .lock()
+                .unwrap()
+                .take()
+                .expect("accept-task handle");
+            server.abort();
+            let joined = server.await;
+            assert!(
+                joined.is_ok() || joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+                "accept task failed during teardown"
+            );
+            // (c) registry drain (accept task already terminated), then
+            // abort and join every tracked connection.
+            let connections: Vec<_> = guard
+                .records
+                .lock()
+                .unwrap()
+                .connection_tasks
+                .drain(..)
+                .collect();
+            for connection in &connections {
+                connection.abort();
+            }
+            for connection in connections {
+                let joined = connection.await;
+                assert!(
+                    joined.is_ok()
+                        || joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+                    "connection task failed during teardown"
+                );
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "fixture teardown exceeded the aggregate cleanup bound"
+        );
+        guard.armed = false;
+    }
+
+    /// Retained publication timeout, post-submission variant: the
+    /// receiver-turn route (the occ3 attachment key discriminates it from
+    /// the capture-armed source route) is accepted and recorded but never
+    /// answered, after the publication was accepted and the wire
+    /// submission set the lease to Submitted. The wrapped deadline fires:
+    /// the action error is the sanitized timeout tag, the case fails,
+    /// family.close() still runs and records cleanup, no receipt exists,
+    /// nothing retried, and the dropped wire submission leaves the bound
+    /// lease Uncertain (the library-pinned drop transition), observable in
+    /// the receiver inbox audit.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_publish_timeout_reaches_close_and_marks_lease_uncertain() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-retained-timeout-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_receiver_turns: true,
+            ..Default::default()
+        }));
+        let trial = offline_trial_context_with_deadline(
+            journal.clone(),
+            records.clone(),
+            "retained-timeout",
+            3,
+        )
+        .await
+        .unwrap();
+        // The armed guard owns the accept task from here - BEFORE the
+        // connector unwrap and the case run below can panic - so its
+        // Drop is the backstop for the whole run, not only the teardown.
+        // The handle rides the shared slot: Drop aborts through it, the
+        // teardown below takes it exactly once.
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: Arc::new(Mutex::new(Some(trial.server))),
+            armed: true,
+        };
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        let outcome = match run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("timeout-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("timeout-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_hang_trial(guard).await;
+                panic!("retained timeout case errored: {error}");
+            }
+        };
+        // Bounded test-owned teardown runs on BOTH paths BEFORE any
+        // assertion: every assertion input below is owned data (the
+        // PositiveOutcome values and the fixture records).
+        finish_hang_trial(guard).await;
+        // The retained arm ran and the terminal action error is the
+        // sanitized timeout tag (fixed constant, no wire text).
+        assert_eq!(outcome.arm_evidence["source_mode"], json!("retained"));
+        assert_eq!(
+            outcome.arm_evidence["source_turn_error"].as_str(),
+            Some("retained_publish_timeout")
+        );
+        // The case fails, and cleanup still ran through family.close().
+        assert_eq!(outcome.case["case_passed"], json!(false));
+        assert!(outcome.cleanup_ok);
+        // No success receipt exists: nothing was delivered or consumed.
+        assert!(outcome.arm_evidence["message_status"].is_null());
+        assert_eq!(outcome.arm_evidence["delivered"], json!(false));
+        assert_eq!(outcome.arm_evidence["consumed"], json!(false));
+        // Post-submission: the admission exists and its bound lease reads
+        // Uncertain after the dropped wire submission.
+        assert_eq!(outcome.case["lease_state"], json!("Uncertain"));
+        // One-shot, no retry: exactly one publication POST and exactly one
+        // receiver-turn request, both recorded and held (never answered),
+        // and nothing after the deadline.
+        {
+            let guard = records.lock().unwrap();
+            let publish_posts = guard
+                .requests
+                .iter()
+                .filter(|(path, _)| path == "/occ3/v1/native/publish")
+                .count();
+            let receiver_turns = guard
+                .requests
+                .iter()
+                .filter(|(path, body)| {
+                    path == "/v1/chat/completions" && body.get("occ3").is_some()
+                })
+                .count();
+            assert_eq!(publish_posts, 1);
+            assert_eq!(receiver_turns, 1);
+            assert_eq!(guard.hang_events, vec!["receiver_turn".to_string()]);
+        }
+        // Semantic timing only: the wrap elapsed its full deadline. The
+        // timeout tag and the joined bounded cleanup are the real
+        // evidence; no upper bound substitutes for them.
+        let total_millis = outcome.arm_evidence["total_millis"].as_u64().unwrap();
+        assert!(total_millis >= 3000, "wrap must elapse the deadline");
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Retained publication timeout, pre-bind variant: the publication
+    /// route itself is accepted and recorded but never answered, so
+    /// nothing is admitted - no inbox record, no bound lease - while the
+    /// wrapped deadline still fails the case with the sanitized tag and
+    /// cleanup runs. The one-shot claim stays taken: exactly one publish
+    /// POST and no receiver turn ever happens.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_publish_timeout_before_binding_leaves_no_lease() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-retained-timeout-prebind-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_publish_route: true,
+            ..Default::default()
+        }));
+        let trial = offline_trial_context_with_deadline(
+            journal.clone(),
+            records.clone(),
+            "retained-timeout-prebind",
+            3,
+        )
+        .await
+        .unwrap();
+        // The armed guard owns the accept task from here - BEFORE the
+        // connector unwrap and the case run below can panic - so its
+        // Drop is the backstop for the whole run, not only the teardown.
+        // The handle rides the shared slot: Drop aborts through it, the
+        // teardown below takes it exactly once.
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: Arc::new(Mutex::new(Some(trial.server))),
+            armed: true,
+        };
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        let outcome = match run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("prebind-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("prebind-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_hang_trial(guard).await;
+                panic!("pre-bind timeout case errored: {error}");
+            }
+        };
+        // Bounded test-owned teardown on both paths, before assertions.
+        finish_hang_trial(guard).await;
+        assert_eq!(
+            outcome.arm_evidence["source_turn_error"].as_str(),
+            Some("retained_publish_timeout")
+        );
+        assert_eq!(outcome.case["case_passed"], json!(false));
+        assert!(outcome.cleanup_ok);
+        // Pre-bind: nothing was admitted, so the receiver inbox audit has
+        // no record and no lease state to report.
+        assert_eq!(outcome.case["lease_state"], json!(null));
+        assert!(outcome.arm_evidence["message_status"].is_null());
+        {
+            let guard = records.lock().unwrap();
+            let publish_posts = guard
+                .requests
+                .iter()
+                .filter(|(path, _)| path == "/occ3/v1/native/publish")
+                .count();
+            let receiver_turns = guard
+                .requests
+                .iter()
+                .filter(|(path, body)| {
+                    path == "/v1/chat/completions" && body.get("occ3").is_some()
+                })
+                .count();
+            assert_eq!(publish_posts, 1);
+            assert_eq!(receiver_turns, 0);
+            assert_eq!(guard.hang_events, vec!["publish_route".to_string()]);
+        }
+        // Semantic timing only: the wrap elapsed its full deadline. The
+        // timeout tag and the joined bounded cleanup are the real
+        // evidence; no upper bound substitutes for them.
+        let total_millis = outcome.arm_evidence["total_millis"].as_u64().unwrap();
+        assert!(total_millis >= 3000, "wrap must elapse the deadline");
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Unwind-path regression: the armed guard's Drop ALONE - with no
+    /// finish_hang_trial - releases the fixture. A test panic anywhere
+    /// between guard construction and the normal teardown must still
+    /// cancel the hang token and issue the abort requests to the parked
+    /// connection and the accept task. Drop is synchronous, so JOINS are
+    /// never claimed here; the proven observables are the token flipping
+    /// cancelled, the parked socket closing promptly, and the listener
+    /// dying with the aborted accept task.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hang_cleanup_guard_drop_releases_the_fixture_without_finish() {
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_publish_route: true,
+            ..Default::default()
+        }));
+        let epoch_state = Arc::new(Mutex::new(FixtureEpoch {
+            runtime_epoch: "guard-drop-epoch".into(),
+            runtime_generation: 1,
+            expires_at_epoch: now() + 240,
+            profile_digest: OFFLINE_PROFILE_DIGEST_BEFORE.into(),
+        }));
+        let (endpoint, server) = serve(epoch_state, records.clone()).await;
+        // The slot is retained by the TEST before the guard exists: after
+        // the Drop, the test takes the handle and observes the accept
+        // task's actual termination (the join is test-owned evidence;
+        // Drop itself stays synchronous and only aborts).
+        let server_slot = Arc::new(Mutex::new(Some(server)));
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: server_slot.clone(),
+            armed: true,
+        };
+        // One raw publish request parks its connection task on the token
+        // (the route arm hangs before any validation, so a minimal JSON
+        // body suffices; read_request only requires the bearer fixture
+        // key and a matching content-length). The raw socket needs the
+        // endpoint's AUTHORITY, not its URL: serve returns
+        // http://127.0.0.1:PORT, and a URL string would be split at the
+        // last colon and DNS-resolved as a hostname (the 11001 class).
+        // "127.0.0.1:PORT" parses directly as a SocketAddr - the same
+        // in-file precedent as the accept-encoding gate test.
+        let authority = endpoint.trim_start_matches("http://");
+        let mut socket = tokio::net::TcpStream::connect(authority).await.unwrap();
+        let body = "{}".to_string();
+        let request = format!(
+            "POST /occ3/v1/native/publish HTTP/1.1\r\nhost: {authority}\r\nauthorization: bearer {FIXTURE_KEY}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        // Deterministic route ARRIVAL first: await the latched arrival
+        // signal (set after the hang event is recorded, before the
+        // park) so the abort provably lands on a parked handler - a
+        // socket EOF after an abort alone would prove nothing about the
+        // handler having reached the route. The token is cloned before
+        // the await, so no lock is ever held across it.
+        let arrival = records.lock().unwrap().hang_arrival.clone();
+        let arrived = tokio::time::timeout(Duration::from_secs(5), arrival.cancelled()).await;
+        assert!(
+            arrived.is_ok(),
+            "the hung route must signal arrival within the bound"
+        );
+        // Drop is now the ONLY cleanup - exactly the failure path.
+        drop(guard);
+        // The token is cancelled (Drop set it synchronously).
+        assert!(
+            records.lock().unwrap().hang_cancel.is_cancelled(),
+            "guard Drop must cancel the hang token"
+        );
+        // Accept-task termination observed BY THE TEST: take the
+        // retained handle exactly once and await its actual completion
+        // under a bounded wait. Drop requested the abort without taking
+        // the handle; this join is the separate, test-owned evidence
+        // (never a join claimed from Drop itself).
+        let server = server_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("retained accept-task handle");
+        let terminated = tokio::time::timeout(Duration::from_secs(5), server).await;
+        assert!(
+            terminated.is_ok(),
+            "the aborted accept task must terminate within the bound"
+        );
+        // The parked connection was aborted: its socket closes promptly
+        // (the task owned it; the abort drops it). Bounded read AFTER the
+        // accept task's termination is observed.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0u8; 256];
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "parked socket must close within the bound");
+        // The route was reached and parked exactly once.
+        assert_eq!(
+            records.lock().unwrap().hang_events,
+            vec!["publish_route".to_string()]
+        );
+    }
+
     /// The retained criterion's negative space: the value NOT fully inside
     /// the span fails coverage. A clipped content run (the tail window
     /// evicted content-head rows: the pinned terminator rows are followed
@@ -10144,6 +11319,102 @@ mod gate_tests {
     #[tokio::test]
     async fn native_arm_trial_passes_offline() {
         arm_trial_assertions(Arm::Native, offline_arm_trial(Arm::Native, None).await).await;
+    }
+
+    /// Red-first (2026-11-02): on HEAD a one-character deletion in the
+    /// recovered value fails the NATIVE arm strictly - canary-1's measured
+    /// shape, 40 of 41 characters. The three tolerance scenarios run in
+    /// one test so the OCC3_ARM_TOLERANCE env pin is never observable to a
+    /// concurrently running trial: (1) the default tolerant policy accepts
+    /// a one-character error on the first send without re-sending, records
+    /// the strict verdict separately, and the arm passes; (2) a
+    /// two-character error is re-sent up to the three-send bound and then
+    /// accepted best-effort; (3) the strict pin refuses the same
+    /// one-character error exactly like HEAD.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn native_arm_tolerance_ladder_accepts_bounded_error() {
+        // (1) One character short: accepted within tolerance, one send.
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 1,
+            ..Default::default()
+        };
+        let summary = offline_arm_trial_with_records(Arm::Native, records)
+            .await
+            .expect("tolerant arm trial failed");
+        assert_eq!(summary["arm_case_passed"], json!(true), "{summary}");
+        assert_eq!(summary["accept_reason"], json!("within_tolerance"));
+        assert_eq!(summary["attempts_used"], json!(1));
+        assert_eq!(summary["value_distance"], json!(1));
+        // The strict verdict stays measurable, not silently replaced.
+        assert_eq!(summary["strict_value_recovery"], json!(false));
+        assert_eq!(summary["semantic_nonce_match"], json!(false));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_arm_evidence(&std::env::temp_dir(), &evidence_name)
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        let attempts = evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1, "{evidence}");
+        assert_eq!(attempts[0]["value_distance"], json!(1));
+        assert_eq!(
+            evidence["retry_policy"]["enabled"],
+            json!(true),
+            "{evidence}"
+        );
+
+        // (2) Two characters short: three sends, then best-effort accept.
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 2,
+            ..Default::default()
+        };
+        let summary = offline_arm_trial_with_records(Arm::Native, records)
+            .await
+            .expect("best-effort arm trial failed");
+        assert_eq!(summary["arm_case_passed"], json!(true), "{summary}");
+        assert_eq!(summary["accept_reason"], json!("best_effort_fallback"));
+        assert_eq!(summary["attempts_used"], json!(3));
+        assert_eq!(summary["value_distance"], json!(2));
+        assert_eq!(summary["strict_value_recovery"], json!(false));
+        let evidence_name = summary["evidence_file"].as_str().unwrap().to_string();
+        let evidence = find_arm_evidence(&std::env::temp_dir(), &evidence_name)
+            .unwrap_or_else(|| panic!("evidence {evidence_name} not found"));
+        let attempts = evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 3, "{evidence}");
+        for attempt in attempts {
+            assert_eq!(attempt["value_distance"], json!(2));
+        }
+
+        // (3) Strict pin: the same one-character error refuses the arm,
+        // exactly like the historical single-send verdict.
+        std::env::set_var("OCC3_ARM_TOLERANCE", "0");
+        let records = FixtureRecords {
+            receiver_answer_drop_chars: 1,
+            ..Default::default()
+        };
+        let strict = offline_arm_trial_with_records(Arm::Native, records).await;
+        std::env::remove_var("OCC3_ARM_TOLERANCE");
+        let error = strict.expect_err("the strict pin must refuse a one-character error");
+        assert!(error.contains("arm trial failed"), "{error}");
+        // Red-first for the single-send fieldset: the strict pin's evidence
+        // carries the same attempts array the ladder publishes.
+        let path = error
+            .split("(evidence: ")
+            .nth(1)
+            .and_then(|rest| rest.split("): ").next())
+            .unwrap_or_else(|| panic!("no evidence path in {error}"));
+        let strict_evidence: serde_json::Value = serde_json::from_str(
+            &std::fs::read_to_string(path).unwrap_or_else(|e| panic!("read {path}: {e}")),
+        )
+        .unwrap_or_else(|e| panic!("parse {path}: {e}"));
+        let attempts = strict_evidence["attempts"].as_array().unwrap();
+        assert_eq!(attempts.len(), 1, "{strict_evidence}");
+        assert_eq!(attempts[0]["value_distance"], json!(1));
+        assert_eq!(
+            strict_evidence["retry_policy"]["enabled"],
+            json!(false),
+            "{strict_evidence}"
+        );
+        assert_eq!(strict_evidence["arm_accepted"], json!(false));
+        assert_eq!(strict_evidence["strict_value_recovery"], json!(false));
     }
 
     #[cfg(windows)]
