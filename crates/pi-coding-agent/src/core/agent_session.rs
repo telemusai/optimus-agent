@@ -3578,7 +3578,9 @@ fn install_sender_queue_listener(
                                 ))
                             }
                             occ3_sender_queue::Occ3SenderQueueState::Pending
-                                if head.busy_retries > 0 =>
+                                if head.busy_retries > 0
+                                    && head.reason.as_deref()
+                                        == Some(occ3_sender_queue::OCC3_RECEIVER_BUSY_RETRY_REASON) =>
                             {
                                 Some(occ3_sender_queue::receiver_busy_prompt(
                                     &head.receiver_selector(),

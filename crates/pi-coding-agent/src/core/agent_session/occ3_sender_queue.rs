@@ -217,6 +217,9 @@ pub const OCC3_RECEIVER_BUSY_MAX_RETRIES: u32 = 3;
 /// Queue reason of a pending head whose armed SOURCE capture the server
 /// refused as busy before admission (nothing captured, nothing published).
 pub const OCC3_SOURCE_BUSY_RETRY_REASON: &str = "source_busy_retry";
+/// Queue reason of a pending head whose admitted capture the receiver
+/// refused as busy before use.
+pub const OCC3_RECEIVER_BUSY_RETRY_REASON: &str = "receiver_busy_retry";
 /// Upper bound on any busy re-capture wait the handoff tool honours, in
 /// seconds. Matches the bounded server `Retry-After` the client accepts.
 pub const OCC3_BUSY_BACKOFF_MAX_SECS: u64 = 30;
@@ -804,7 +807,7 @@ impl Occ3SenderQueue {
         // to pending; it must not outlive the fresh arm.
         if matches!(
             head.reason.as_deref(),
-            Some(OCC3_SOURCE_BUSY_RETRY_REASON) | Some("receiver_busy_retry")
+            Some(OCC3_SOURCE_BUSY_RETRY_REASON) | Some(OCC3_RECEIVER_BUSY_RETRY_REASON)
         ) {
             head.reason = None;
         }
@@ -952,7 +955,7 @@ impl Occ3SenderQueue {
         let entry = &mut self.entries[index];
         entry.busy_retries = entry.busy_retries.saturating_add(1);
         entry.state = Occ3SenderQueueState::Pending;
-        entry.reason = Some("receiver_busy_retry".into());
+        entry.reason = Some(OCC3_RECEIVER_BUSY_RETRY_REASON.into());
         entry.retry_not_before_epoch =
             Some(now_epoch.saturating_add(receiver_busy_backoff_secs(entry.busy_retries)));
         self.notice_at(index, now_epoch, None).into_iter().collect()

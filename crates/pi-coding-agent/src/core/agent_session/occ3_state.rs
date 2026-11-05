@@ -1173,7 +1173,7 @@ impl Occ3NativeSession {
         let this = self.clone();
         AgentTool {
             name:NATIVE_HANDOFF_TOOL.into(),label:"Experimental native state handoff".into(),
-            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. If the server or receiver is busy, nothing is captured or used; call this tool again to re-arm a fresh capture after a short wait (up to 3 busy retries, not counted as failures), then emit the facts again; after that the handoff falls back to ordinary messaging. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
+            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. If the server or receiver is busy, nothing is delivered or used; call this tool again to re-arm a fresh capture after a short wait (up to 3 busy retries, not counted as failures), then emit the facts again; after that the handoff falls back to ordinary messaging. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
             parameters:json!({"type":"object","additionalProperties":false,"properties":{"receiver_role":{"type":"string","enum":["parent","sibling","child"]},"receiver_name":{"type":"string"}},"required":["receiver_role","receiver_name"]}),
             prepare_arguments:None,execution_mode:None,
             execute:Arc::new(move |tool_id,args,signal,_update| {
@@ -1300,11 +1300,22 @@ impl Occ3NativeSession {
                     };
                     // Busy re-arm context for the truthful tool text: read
                     // before mark_armed clears the busy reason.
+                    // Keyed on the reason, not on busy_retries alone: an
+                    // ordinary failure after a busy re-arm clears the reason
+                    // but keeps the count, and must not read as busy.
                     let busy_rearm = this.queue.lock().ok().and_then(|queue| {
+                        use super::occ3_sender_queue::{
+                            Occ3SenderQueueState, OCC3_RECEIVER_BUSY_RETRY_REASON, OCC3_SOURCE_BUSY_RETRY_REASON,
+                        };
                         queue.head().and_then(|head| {
-                            (head.state == super::occ3_sender_queue::Occ3SenderQueueState::Pending
-                                && head.busy_retries > 0)
-                                .then(|| (head.busy_retries, head.reason.as_deref() == Some(super::occ3_sender_queue::OCC3_SOURCE_BUSY_RETRY_REASON)))
+                            if head.state != Occ3SenderQueueState::Pending || head.busy_retries == 0 {
+                                return None;
+                            }
+                            match head.reason.as_deref() {
+                                Some(OCC3_SOURCE_BUSY_RETRY_REASON) => Some((head.busy_retries, true)),
+                                Some(OCC3_RECEIVER_BUSY_RETRY_REASON) => Some((head.busy_retries, false)),
+                                _ => None,
+                            }
                         })
                     });
                     if this.arm_handoff_if_needed(authorized.target_session_id(), capture_permit).map_err(anyhow::Error::msg)? {
@@ -1319,6 +1330,10 @@ impl Occ3NativeSession {
                             )
                             .ok()
                             .flatten();
+                        // "busy retries do not count as failures" below holds
+                        // on every path reachable from this tool: a busy
+                        // refusal is counted as a failure only when no queue
+                        // head was armed, and the tool always arms the head.
                         let busy_note = match busy_rearm {
                             Some((retry, true)) => format!(
                                 " (busy retry {retry} of {}: the server was busy and captured nothing; the backoff wait has elapsed, so emit the facts again)",
@@ -1814,7 +1829,11 @@ impl Occ3NativeSession {
             return Ok(false);
         };
         self.journal_notices_locked(&mut queue, Some(notice));
-        self.persist_sender_queue(&queue)?;
+        // The in-memory transition already happened, so the refusal is
+        // absorbed even if persisting fails; reporting false here would
+        // also spend the capture-failure budget for the same refusal.
+        // A later queue write persists the same state.
+        let _ = self.persist_sender_queue(&queue);
         Ok(true)
     }
 
@@ -2915,6 +2934,46 @@ mod tests {
         }));
         assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
         assert_eq!(session.failed_capture_attempts(), 1);
+    }
+
+    /// Busy, re-arm, then an ordinary failure, then re-arm: the text is
+    /// the ordinary retry text and names no busy cause (review MAJOR-1).
+    #[tokio::test]
+    async fn ordinary_failure_after_a_busy_rearm_is_not_reported_as_busy() {
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        armed_capture_outcome(&session, Some(None)).await;
+        session.queue.lock().unwrap().clear_head_backoff_for_test();
+        // Re-arm (directly, avoiding the process-wide permit), then fail.
+        session.prepare_receiver_busy_recapture("child", "receiver", None).await.unwrap();
+        session.source.lock().unwrap().budget = None;
+        armed_capture_outcome(&session, None).await;
+        assert_eq!(session.failed_capture_attempts(), 1);
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].busy_retries, 1);
+        assert_eq!(entries[0].reason, None);
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let result = (tool.execute)(
+            "rearm".into(),
+            json!({"receiver_role":"child","receiver_name":"receiver"}),
+            None,
+            None,
+        )
+        .await
+        .expect("re-arm");
+        assert_eq!(result.details["status"], "capture_armed");
+        assert_eq!(result.details["busy_retries"], 0);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(!text.contains("busy retry"), "{text}");
+        assert!(!text.contains("was busy"), "{text}");
+        assert!(text.contains("retry attempt 1 of"), "{text}");
     }
 
     /// The tool re-arm after a source busy refusal reports the busy retry

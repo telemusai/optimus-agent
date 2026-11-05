@@ -1492,18 +1492,28 @@ pub fn parse_occ3_busy_retry_after(headers: &reqwest::header::HeaderMap) -> Opti
 /// Upper bound on the error body read to classify a 503.
 const OCC3_BUSY_BODY_LIMIT: usize = 4096;
 
+/// Upper bound on reading a refusal body before classifying it.
+const OCC3_BUSY_BODY_READ_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(2);
+
 /// Reads at most [`OCC3_BUSY_BODY_LIMIT`] bytes of an error body and returns
 /// its bounded error code (`error.message`, falling back to `error.code`).
 /// Only a short identifier-shaped token is returned; any other text yields
 /// `None`, so no free-form body text can leave this function.
+///
+/// The read is bounded in time as well ([`OCC3_BUSY_BODY_READ_TIMEOUT`]): a
+/// refusal body that stalls yields `None`, so the caller keeps the existing
+/// uncertain path instead of holding the turn until the lease deadline.
 async fn read_bounded_error_code(response: &mut reqwest::Response) -> Option<String> {
 	let mut body = Vec::new();
-	while body.len() < OCC3_BUSY_BODY_LIMIT {
-		match response.chunk().await {
-			Ok(Some(chunk)) => body.extend_from_slice(&chunk),
-			_ => break,
+	let read = async {
+		while body.len() < OCC3_BUSY_BODY_LIMIT {
+			match response.chunk().await {
+				Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+				_ => break,
+			}
 		}
-	}
+	};
+	tokio::time::timeout(OCC3_BUSY_BODY_READ_TIMEOUT, read).await.ok()?;
 	body.truncate(OCC3_BUSY_BODY_LIMIT);
 	let value: Value = serde_json::from_slice(&body).ok()?;
 	let error = value.get("error")?;

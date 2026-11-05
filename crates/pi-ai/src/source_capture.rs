@@ -766,7 +766,11 @@ impl SourceCaptureLease {
     /// sent) lease as `Cancelled` with a busy refusal record, the same end
     /// state a real pre-admission busy refusal produces. `Prepared ->
     /// Cancelled` is already a public transition ([`Self::cancel`]), so this
-    /// cannot turn a submitted or uncertain lease into proven non-use.
+    /// cannot turn a submitted or uncertain lease into proven non-use. The
+    /// only effect a non-test caller could get is to have its own unsent
+    /// capture counted as a busy retry instead of a capture failure, which
+    /// is still bounded by the queue busy budget. Kept public (not behind a
+    /// cargo feature) so test builds share the workspace's pi-ai artifact.
     #[doc(hidden)]
     pub fn cancel_unsent_as_busy(&self, refusal: SourceBusyRefusal) -> bool {
         let mut record = self.0.state.lock();

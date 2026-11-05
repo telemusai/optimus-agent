@@ -99,6 +99,9 @@ enum Reply {
     HoldEof,
     /// Pre-event refusal: status line, body and extra header lines. No receipt.
     Refusal(&'static str, String, &'static str),
+    /// Busy 503 whose body never finishes: headers plus a partial body, then
+    /// the connection is held open.
+    StalledRefusal,
 }
 struct Fixture {
     model: Model,
@@ -159,6 +162,13 @@ impl Fixture {
                 capture.lock().unwrap().push((head, payload.clone()));
                 notify.notify_one();
                 if matches!(reply, Reply::Disconnect) {
+                    continue;
+                }
+                if matches!(reply, Reply::StalledRefusal) {
+                    let partial = "{\"error\":{\"message\":\"scheduler_bu";
+                    let wire = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n{partial}");
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
                     continue;
                 }
                 if let Reply::Refusal(status, body, extra) = &reply {
@@ -825,4 +835,22 @@ async fn source_unrecognised_refusals_stay_uncertain() {
         assert_eq!(details["providerErrorType"], "occ3_inference_uncertain", "{status}");
         assert_eq!(details["occ3Cause"], "http_non_success", "{status}");
     }
+}
+
+/// A busy 503 whose body stalls is not classified: the bounded read gives
+/// up quickly and the existing uncertain path applies, without waiting for
+/// the lease deadline.
+#[tokio::test]
+async fn source_stalled_refusal_body_stays_uncertain_and_returns_quickly() {
+    let fixture = Fixture::new(Reply::StalledRefusal).await;
+    let lease = fixture.lease();
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), collect(&stream))
+        .await
+        .expect("bounded body read");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert_uncertain(&events, &lease);
+    assert!(lease.busy_refusal().is_none());
+    assert_eq!(fixture.count(), 1);
 }
