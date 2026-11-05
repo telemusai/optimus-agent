@@ -220,6 +220,8 @@ pub const OCC3_SOURCE_BUSY_RETRY_REASON: &str = "source_busy_retry";
 /// Queue reason of a pending head whose admitted capture the receiver
 /// refused as busy before use.
 pub const OCC3_RECEIVER_BUSY_RETRY_REASON: &str = "receiver_busy_retry";
+/// Fallback reason after the busy budget ran out on source busy refusals.
+pub const OCC3_SOURCE_BUSY_EXHAUSTED_REASON: &str = "source_busy_exhausted";
 /// Upper bound on any busy re-capture wait the handoff tool honours, in
 /// seconds. Matches the bounded server `Retry-After` the client accepts.
 pub const OCC3_BUSY_BACKOFF_MAX_SECS: u64 = 30;
@@ -983,7 +985,7 @@ impl Occ3SenderQueue {
         }
         if head.busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
             let queue_id = head.queue_id.clone();
-            return self.mark_fallback(Some(&queue_id), "source_busy_exhausted", now_epoch);
+            return self.mark_fallback(Some(&queue_id), OCC3_SOURCE_BUSY_EXHAUSTED_REASON, now_epoch);
         }
         let head = self.entries.front_mut()?;
         head.busy_retries = head.busy_retries.saturating_add(1);
@@ -1026,7 +1028,11 @@ impl Occ3SenderQueue {
         let entry = &mut self.entries[index];
         entry.state = Occ3SenderQueueState::FallbackPending;
         entry.reason = Some(bounded_reason(reason));
-        entry.attempts = entry.attempts.saturating_add(1);
+        // A source busy exhaustion is not a capture failure: nothing was
+        // captured, so the attempt counter (capture failures) is unchanged.
+        if reason != OCC3_SOURCE_BUSY_EXHAUSTED_REASON {
+            entry.attempts = entry.attempts.saturating_add(1);
+        }
         entry.fallback_dispatch_token = Some(new_dispatch_token());
         let token = entry.fallback_dispatch_token.clone();
         let position = (index + 1) as u32;
@@ -1425,6 +1431,30 @@ Do not reuse or replay any earlier capture."
     )
 }
 
+/// The host's head prompt for the current queue head, or `None` when the
+/// head needs no prompt (armed or in flight). Pure: the listener applies
+/// the one-shot dedup with [`head_prompt_key`]. A busy prompt is chosen
+/// only when the head's reason names that busy cause; an ordinary failure
+/// after a busy re-arm keeps the count but clears the reason, so it gets
+/// the ordinary advance prompt.
+pub fn head_prompt(head: &Occ3SenderQueueEntry, queue_len: usize) -> Option<String> {
+    match head.state {
+        Occ3SenderQueueState::Pending
+            if head.busy_retries > 0 && head.reason.as_deref() == Some(OCC3_SOURCE_BUSY_RETRY_REASON) =>
+        {
+            Some(source_busy_prompt(&head.receiver_selector(), head.busy_retries))
+        }
+        Occ3SenderQueueState::Pending
+            if head.busy_retries > 0 && head.reason.as_deref() == Some(OCC3_RECEIVER_BUSY_RETRY_REASON) =>
+        {
+            Some(receiver_busy_prompt(&head.receiver_selector(), head.busy_retries))
+        }
+        Occ3SenderQueueState::Pending => Some(advance_prompt(queue_len, &head.receiver_selector())),
+        Occ3SenderQueueState::FallbackPending => Some(fallback_prompt(&head.receiver_selector())),
+        _ => None,
+    }
+}
+
 /// Dedup key for the host's one-shot head prompt: a receiver-busy retry or a
 /// later fallback is a new prompting occasion for the same queue entry.
 pub fn head_prompt_key(entry: &Occ3SenderQueueEntry) -> String {
@@ -1597,6 +1627,42 @@ mod tests {
         assert_eq!(head.state, Occ3SenderQueueState::Pending);
         assert_eq!(head.busy_retries, 1);
         assert_eq!(head.reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+    }
+
+    #[test]
+    fn head_prompt_selects_by_state_and_busy_reason() {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        // Fresh pending head: advance prompt.
+        assert!(head_prompt(&head(&queue), 1).unwrap().contains("sender queue advanced"));
+        // Armed: no prompt.
+        queue.mark_armed(None, None, 100).unwrap();
+        assert!(head_prompt(&head(&queue), 1).is_none());
+        // Source busy: source busy prompt.
+        queue.record_source_busy(None, 100, 100).unwrap();
+        let prompt = head_prompt(&head(&queue), 1).unwrap();
+        assert!(prompt.contains("server was busy and captured nothing"), "{prompt}");
+        assert!(!prompt.contains("receiver child:receiver was busy"), "{prompt}");
+        // Ordinary failure after a busy re-arm: count kept, reason cleared,
+        // so the ordinary advance prompt (no busy wording).
+        queue.mark_armed(None, None, 110).unwrap();
+        queue.capture_failed(false, "capture_failed", 110);
+        let entry = head(&queue);
+        assert_eq!(entry.busy_retries, 1);
+        let prompt = head_prompt(&entry, 1).unwrap();
+        assert!(prompt.contains("sender queue advanced"), "{prompt}");
+        assert!(!prompt.contains("busy"), "{prompt}");
+        // Receiver busy reason: receiver busy prompt.
+        let mut receiver_busy = entry.clone();
+        receiver_busy.reason = Some(OCC3_RECEIVER_BUSY_RETRY_REASON.into());
+        assert!(head_prompt(&receiver_busy, 1).unwrap().contains("did not use the native handoff"));
+        // Fallback pending: fallback prompt, never a native re-capture.
+        let mut fallback = entry;
+        fallback.state = Occ3SenderQueueState::FallbackPending;
+        let prompt = head_prompt(&fallback, 1).unwrap();
+        assert!(prompt.contains("fell back to ordinary messaging"));
+        assert!(!prompt.contains("occ3_handoff"));
     }
 
     #[test]

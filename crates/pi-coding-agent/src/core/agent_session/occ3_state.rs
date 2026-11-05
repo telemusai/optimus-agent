@@ -585,25 +585,8 @@ impl Occ3NativeSession {
                         // one retry from its separate busy budget; with no
                         // armed head the outcome counts as an ordinary
                         // failure so it stays bounded.
-                        let busy = {
-                            let slot =
-                                this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
-                            slot.lease.as_ref().and_then(|lease| {
-                                (lease.state() == SourceCaptureState::Cancelled)
-                                    .then(|| lease.busy_refusal())
-                                    .flatten()
-                            })
-                        };
-                        if let Some(refusal) = busy {
-                            if this.sender_queue_source_busy(refusal).unwrap_or(false) {
-                                let mut slot =
-                                    this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
-                                slot.resolved = false;
-                                slot.lease = None;
-                                slot.budget = None;
-                                slot.capture_permit = None;
-                                return Ok(None);
-                            }
+                        if this.absorb_source_busy_refusal() {
+                            return Ok(None);
                         }
                         let exhausted = {
                             let mut slot =
@@ -1070,6 +1053,42 @@ impl Occ3NativeSession {
         *guard = Some(Box::from(unsubscribe));
         Ok(())
     }
+    /// The fallback short-circuit for a repeated `occ3_handoff` call. Returns
+    /// a result only when the queue head is `fallback_pending` for exactly
+    /// this receiver. Read-only: no arm, no enqueue, no notice. The host's
+    /// fallback prompt (sent after this run) carries the one-shot dispatch
+    /// gate for the ordinary delivery.
+    fn fallback_pending_result(&self, role: &str, name: &str) -> Option<AgentToolResult> {
+        let queue = self.queue.lock().ok()?;
+        let head = queue.head()?;
+        if head.receiver_role != role
+            || head.receiver_name != name
+            || head.state != super::occ3_sender_queue::Occ3SenderQueueState::FallbackPending
+        {
+            return None;
+        }
+        let cause = match head.reason.as_deref() {
+            Some(super::occ3_sender_queue::OCC3_SOURCE_BUSY_EXHAUSTED_REASON) => format!(
+                " after {} busy retries (the server was busy and captured nothing)",
+                head.busy_retries
+            ),
+            Some("receiver_busy_exhausted") => format!(
+                " after {} busy retries (the receiver was busy and did not use the capture)",
+                head.busy_retries
+            ),
+            _ => String::new(),
+        };
+        let queue_id = head.queue_id.clone();
+        Some(AgentToolResult::new(
+            vec![ContentBlock::text(format!(
+                "Native handoff to {role}:{name} fell back to ordinary messaging{cause}; nothing was armed or queued. \
+Deliver the facts once as an ordinary agent_message to that receiver when the fallback prompt arrives. \
+Do not call occ3_handoff again for these facts."
+            ))],
+            json!({"status":"fallback_pending","delivery_completed":false,"queue_id":queue_id,"busy_retries":head.busy_retries}),
+        ))
+    }
+
     /// The "already delivered" short-circuit for a repeated `occ3_handoff`
     /// call. Returns a result only when the slot holds an admitted handoff
     /// AND the queue head is the admitted/published entry for exactly this
@@ -1200,6 +1219,15 @@ impl Occ3NativeSession {
                     // capture before using it. Retire that spent capture so a
                     // FRESH arm is legal, then honour the bounded backoff.
                     this.prepare_receiver_busy_recapture(role, name, signal.as_ref()).await.map_err(anyhow::Error::msg)?;
+                    // A same-receiver call while the head is falling back to
+                    // ordinary messaging (for example the session retry
+                    // re-ran a context that ended in capture_armed just as
+                    // the busy budget ran out) must not queue a second
+                    // native handoff of the same facts. Report the fallback
+                    // truthfully; nothing is armed or enqueued.
+                    if let Some(result) = this.fallback_pending_result(role, name) {
+                        return Ok(result);
+                    }
                     let queue_head = {
                         let queue = this.queue.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         queue.head().map(|head| {
@@ -1835,6 +1863,43 @@ impl Occ3NativeSession {
         // A later queue write persists the same state.
         let _ = self.persist_sender_queue(&queue);
         Ok(true)
+    }
+
+    /// Absorbs a pre-admission source busy refusal left in the slot: the
+    /// slot is resolved, not admitted, and its lease is `Cancelled` with a
+    /// busy refusal record (set only by pi-ai on a recognised 503 busy
+    /// code). The armed queue head takes one busy retry (or falls back once
+    /// the busy budget is spent) and the slot resets for a fresh arm; the
+    /// refused lease was never published, so it is dropped, never retired
+    /// or replayed. Returns false (and changes nothing) when the slot holds
+    /// no such refusal or no queue head is armed; the resolve hook then
+    /// counts an ordinary capture failure. Called from the resolve hook's
+    /// tombstone path and, eagerly, at AgentEnd so the outcome is recorded
+    /// even when no automatic provider retry follows.
+    pub(crate) fn absorb_source_busy_refusal(&self) -> bool {
+        let Ok(slot) = self.source.lock() else {
+            return false;
+        };
+        if !slot.resolved || slot.handoff_admitted {
+            return false;
+        }
+        let Some(refusal) = slot.lease.as_ref().and_then(|lease| {
+            (lease.state() == SourceCaptureState::Cancelled).then(|| lease.busy_refusal()).flatten()
+        }) else {
+            return false;
+        };
+        drop(slot);
+        if !self.sender_queue_source_busy(refusal).unwrap_or(false) {
+            return false;
+        }
+        let Ok(mut slot) = self.source.lock() else {
+            return true;
+        };
+        slot.resolved = false;
+        slot.lease = None;
+        slot.budget = None;
+        slot.capture_permit = None;
+        true
     }
 
     /// A capture failure for the armed head. `terminal` marks the native
@@ -2916,8 +2981,108 @@ mod tests {
         let (entries, _) = session.sender_queue_snapshot().unwrap();
         assert_eq!(entries[0].state, Occ3SenderQueueState::FallbackPending);
         assert_eq!(entries[0].reason.as_deref(), Some("source_busy_exhausted"));
+        assert_eq!(entries[0].attempts, 0, "busy exhaustion is not a capture failure");
         assert_eq!(session.failed_capture_attempts(), 0);
         assert!(session.check().is_ok(), "busy never deactivates the native path");
+        // The session retry re-runs a context ending in capture_armed, so the
+        // model calls occ3_handoff again for the same receiver. That call
+        // must not enqueue a duplicate (review round 3 MAJOR-1).
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let result = (tool.execute)(
+            "after-exhaustion".into(),
+            json!({"receiver_role":"child","receiver_name":"receiver"}),
+            None,
+            None,
+        )
+        .await
+        .expect("truthful non-error result");
+        assert_eq!(result.details["status"], "fallback_pending");
+        assert_eq!(result.details["busy_retries"], OCC3_RECEIVER_BUSY_MAX_RETRIES);
+        let text = result
+            .content
+            .iter()
+            .filter_map(|block| match block {
+                pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
+                _ => None,
+            })
+            .collect::<String>();
+        assert!(text.contains("fell back to ordinary messaging after 3 busy retries"), "{text}");
+        assert!(text.contains("agent_message"), "{text}");
+        assert!(text.contains("Do not call occ3_handoff again"), "{text}");
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries.len(), 1, "no duplicate entry for the same receiver");
+        assert_eq!(entries[0].state, Occ3SenderQueueState::FallbackPending);
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.budget.is_none() && slot.lease.is_none(), "nothing armed");
+        }
+        // The head prompt is the fallback prompt, never a native re-capture.
+        let prompt = super::super::occ3_sender_queue::head_prompt(&entries[0], entries.len()).unwrap();
+        assert!(prompt.contains("fell back to ordinary messaging"), "{prompt}");
+        assert!(!prompt.contains("call occ3_handoff"), "{prompt}");
+        // After the token-gated ack pops the head the queue is empty, so no
+        // advance prompt asks for a native handoff of the same facts.
+        let token = session.queue.lock().unwrap().head().unwrap().fallback_dispatch_token.clone();
+        let queue_id = entries[0].queue_id.clone();
+        assert!(session
+            .queue
+            .lock()
+            .unwrap()
+            .acknowledge_fallback(&queue_id, token.as_deref(), now())
+            .is_some());
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert!(entries.is_empty());
+    }
+
+    /// When no automatic provider retry follows a source busy refusal, the
+    /// AgentEnd hook records it so the head prompt still goes out; a later
+    /// request then runs normally without counting a failure. Also pins
+    /// Retry-After flowing from the lease record into the queue backoff.
+    #[tokio::test]
+    async fn source_busy_is_recorded_at_agent_end_without_a_provider_retry() {
+        use super::super::occ3_sender_queue::{Occ3SenderQueueState, OCC3_SOURCE_BUSY_RETRY_REASON};
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        assert!(session.arm_handoff_if_needed("receiver", None).expect("arm"));
+        session.sender_queue_mark_armed(None, Some("receiver")).unwrap();
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("fresh lease");
+        let refused_at = now();
+        assert!(lease.cancel_unsent_as_busy(pi_ai::source_capture::SourceBusyRefusal {
+            refused_at_epoch: refused_at,
+            retry_after_secs: Some(7),
+        }));
+        // No second resolve: the run simply ends (retry disabled or vetoed).
+        assert!(session.absorb_source_busy_refusal());
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);
+        assert_eq!(entries[0].reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+        assert_eq!(entries[0].busy_retries, 1);
+        assert_eq!(entries[0].retry_not_before_epoch, Some(refused_at + 7), "Retry-After reaches the queue");
+        let prompt = super::super::occ3_sender_queue::head_prompt(&entries[0], entries.len()).unwrap();
+        assert!(prompt.contains("busy retry 1 of 3"), "{prompt}");
+        // Idempotent: the slot was reset, so a second call changes nothing.
+        assert!(!session.absorb_source_busy_refusal());
+        assert_eq!(session.sender_queue_snapshot().unwrap().0[0].busy_retries, 1);
+        // A later (user-prompted) request runs uncaptured; no failure counted.
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 0);
+    }
+
+    /// The AgentEnd hook leaves ordinary failures to the resolve hook.
+    #[tokio::test]
+    async fn agent_end_absorb_ignores_ordinary_failures() {
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        assert!(session.arm_handoff_if_needed("receiver", None).expect("arm"));
+        session.sender_queue_mark_armed(None, Some("receiver")).unwrap();
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("fresh lease");
+        lease.cancel();
+        assert!(!session.absorb_source_busy_refusal());
+        assert!(session.source.lock().unwrap().lease.is_some(), "slot untouched");
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
     }
 
     /// With no armed queue head a busy refusal counts as an ordinary

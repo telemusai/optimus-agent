@@ -3480,11 +3480,21 @@ fn install_sender_queue_listener(
                     }
                     return;
                 }
-                pi_agent_core::types::AgentEvent::TurnEnd { .. }
-                | pi_agent_core::types::AgentEvent::AgentEnd { .. } => {
+                pi_agent_core::types::AgentEvent::TurnEnd { .. } => {
                     // The fallback turn (if any) ends here: no later send
                     // in another turn may carry the token.
                     state.end_fallback_turn();
+                }
+                pi_agent_core::types::AgentEvent::AgentEnd { .. } => {
+                    state.end_fallback_turn();
+                    // A source busy refusal is otherwise recorded only when
+                    // the next request resolves. Record it at the end of the
+                    // run so the head prompt below goes out even when no
+                    // automatic provider retry follows (retry disabled,
+                    // vetoed or cancelled). If a retry does follow, its
+                    // request finds a reset slot and runs uncaptured, the
+                    // same outcome as the resolve-hook path.
+                    state.absorb_source_busy_refusal();
                 }
                 _ => return,
             }
@@ -3553,51 +3563,13 @@ fn install_sender_queue_listener(
                         // dispatch token stays private in the native
                         // session's memory and never rides the prompt, the
                         // transcript or the notices.
-                        let prompt = match head.state {
-                            occ3_sender_queue::Occ3SenderQueueState::Pending
-                                if head.busy_retries > 0
-                                    && head.reason.as_deref()
-                                        == Some(occ3_sender_queue::OCC3_SOURCE_BUSY_RETRY_REASON) =>
-                            {
-                                // Delivered as a followUp after the current
-                                // run. The prompt is chosen from the queue
-                                // snapshot at drain time, not from the busy
-                                // notice: if the model already re-armed, the
-                                // head is armed (or later) and no busy prompt
-                                // is sent. If one is sent and the model calls
-                                // occ3_handoff, that is the single re-arm.
-                                // Each tool result starts a new request that
-                                // resolves the armed budget, so only two
-                                // handoff calls in ONE response can hit the
-                                // existing double-arm refusal, which spends
-                                // neither budget. Busy retries are counted
-                                // only at a refusal, never per call.
-                                Some(occ3_sender_queue::source_busy_prompt(
-                                    &head.receiver_selector(),
-                                    head.busy_retries,
-                                ))
-                            }
-                            occ3_sender_queue::Occ3SenderQueueState::Pending
-                                if head.busy_retries > 0
-                                    && head.reason.as_deref()
-                                        == Some(occ3_sender_queue::OCC3_RECEIVER_BUSY_RETRY_REASON) =>
-                            {
-                                Some(occ3_sender_queue::receiver_busy_prompt(
-                                    &head.receiver_selector(),
-                                    head.busy_retries,
-                                ))
-                            }
-                            occ3_sender_queue::Occ3SenderQueueState::Pending => Some(
-                                occ3_sender_queue::advance_prompt(
-                                    entries.len(),
-                                    &head.receiver_selector(),
-                                ),
-                            ),
-                            occ3_sender_queue::Occ3SenderQueueState::FallbackPending => Some(
-                                occ3_sender_queue::fallback_prompt(&head.receiver_selector()),
-                            ),
-                            _ => None,
-                        };
+                        // Selection lives in `occ3_sender_queue::head_prompt`
+                        // (unit-tested). Prompts are delivered as followUps
+                        // after the current run and chosen from the queue
+                        // at drain time: a head the model already re-armed
+                        // is Armed and gets no prompt. Busy retries are
+                        // counted only at a refusal, never per call.
+                        let prompt = occ3_sender_queue::head_prompt(head, entries.len());
                         if let Some(prompt) = prompt {
                             let prompt_key = occ3_sender_queue::head_prompt_key(head);
                             if last_prompted_head
