@@ -884,6 +884,27 @@ mod tests {
     }
 
     #[test]
+    fn occ3_source_busy_failure_is_retryable_and_honours_retry_after() {
+        // Shape recorded by pi-ai for a pre-event 503 busy refusal of an
+        // armed source capture: kind overloaded, bounded retryAfterMs.
+        let mut busy = error_message(Some("overloaded"));
+        if let Some(details) = busy.diagnostics.as_mut().and_then(|d| d[0].details.as_mut()) {
+            details.insert("providerErrorType".into(), json!("occ3_source_busy"));
+            details.insert("status".into(), json!(503));
+            details.insert("retryAfterMs".into(), json!(5000.0));
+        }
+        assert!(!cannot_replay_provider_failure(&busy));
+        assert!(!is_permanent_provider_failure_kind(provider_stream_failure_kind(&busy).as_deref(), 0.0));
+        assert_eq!(provider_stream_failure_retry_after_ms(&busy), Some(5000.0));
+        let policy = default_provider_retry_policy();
+        assert_eq!(
+            provider_retry_delay(1.0, Some(5000.0), &policy, &options(0.0)),
+            ProviderRetryDelay::Wait { delay_ms: 5000.0 },
+            "Retry-After is the floor of the session retry delay"
+        );
+    }
+
+    #[test]
     fn occ3_receiver_busy_failure_is_retryable_and_replay_safe() {
         // Shape recorded by pi-ai for a pre-event 503 scheduler_busy on an
         // attached receiver turn: kind overloaded, no content.

@@ -828,7 +828,10 @@ async fn pre_event_receiver_busy_is_retryable_non_use_without_resend() {
 /// uncertain, no-replay contract.
 #[tokio::test]
 async fn attached_503_with_unknown_code_stays_uncertain() {
-    let fixture = Fixture::new(Reply::Busy("native_completion_failed")).await;
+  // `admission_timeout` is busy only for a SOURCE capture: on the receiver
+  // path the attempt fence may be charged, so attachment non-use is unproven.
+  for code in ["native_completion_failed", "admission_timeout"] {
+    let fixture = Fixture::new(Reply::Busy(code)).await;
     let lease = lease(&fixture.model);
     let stream = stream_openai_completions(
         &fixture.model, &context(), Some(options(Some(lease.clone()))),
@@ -839,4 +842,5 @@ async fn attached_503_with_unknown_code_stays_uncertain() {
     assert_eq!(lease.state(), InferenceStateLeaseState::Uncertain);
     assert!(!lease.refused_busy(), "an unknown 503 is not a busy refusal");
     assert_eq!(fixture.count(), 1);
+  }
 }

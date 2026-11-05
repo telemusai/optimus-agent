@@ -214,6 +214,13 @@ fn is_zero_u32(value: &u32) -> bool {
 /// back to ordinary OCC-1 re-emission.
 pub const OCC3_RECEIVER_BUSY_MAX_RETRIES: u32 = 3;
 
+/// Queue reason of a pending head whose armed SOURCE capture the server
+/// refused as busy before admission (nothing captured, nothing published).
+pub const OCC3_SOURCE_BUSY_RETRY_REASON: &str = "source_busy_retry";
+/// Upper bound on any busy re-capture wait the handoff tool honours, in
+/// seconds. Matches the bounded server `Retry-After` the client accepts.
+pub const OCC3_BUSY_BACKOFF_MAX_SECS: u64 = 30;
+
 /// Backoff before receiver-busy re-capture `retry` (1-based): 2s, 4s, 8s.
 /// Matches the session provider retry policy's base delays.
 pub fn receiver_busy_backoff_secs(retry: u32) -> u64 {
@@ -771,6 +778,14 @@ impl Occ3SenderQueue {
         self.entries.front()
     }
 
+    /// Test-only: drop the head's busy backoff so a test can skip the wait.
+    #[cfg(test)]
+    pub(crate) fn clear_head_backoff_for_test(&mut self) {
+        if let Some(head) = self.entries.front_mut() {
+            head.retry_not_before_epoch = None;
+        }
+    }
+
     /// Marks the head as armed and records the daemon-minted message id plus
     /// the AUTHENTICATED receiver session id from the authorization.
     pub fn mark_armed(
@@ -785,6 +800,14 @@ impl Occ3SenderQueue {
         }
         head.state = Occ3SenderQueueState::Armed;
         head.retry_not_before_epoch = None;
+        // A busy-retry reason describes the refusal that returned the entry
+        // to pending; it must not outlive the fresh arm.
+        if matches!(
+            head.reason.as_deref(),
+            Some(OCC3_SOURCE_BUSY_RETRY_REASON) | Some("receiver_busy_retry")
+        ) {
+            head.reason = None;
+        }
         head.receiver_session_id = receiver_session_id.map(str::to_string);
         if let Some(id) = message_id {
             let id = id.to_string();
@@ -933,6 +956,42 @@ impl Occ3SenderQueue {
         entry.retry_not_before_epoch =
             Some(now_epoch.saturating_add(receiver_busy_backoff_secs(entry.busy_retries)));
         self.notice_at(index, now_epoch, None).into_iter().collect()
+    }
+
+    /// The server refused the armed head's SOURCE capture as busy before
+    /// admission: nothing was captured or published, so this is not a
+    /// capture failure and never touches `attempts` or the session's
+    /// capture-failure budget. It shares the per-entry busy budget
+    /// ([`OCC3_RECEIVER_BUSY_MAX_RETRIES`]) with receiver-busy refusals.
+    /// Within it the head returns to `pending` with a backoff anchored at
+    /// the refusal time (`retry_after_secs` when the server sent a valid one,
+    /// else 2s/4s/8s); after it the entry falls back to OCC-1 re-emission.
+    /// Returns `None` when there is no armed head (the caller then counts an
+    /// ordinary capture failure so the attempt stays bounded).
+    pub fn record_source_busy(
+        &mut self,
+        retry_after_secs: Option<u64>,
+        refused_at_epoch: u64,
+        now_epoch: u64,
+    ) -> Option<Occ3QueueNotice> {
+        let head = self.entries.front()?;
+        if head.state != Occ3SenderQueueState::Armed {
+            return None;
+        }
+        if head.busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            let queue_id = head.queue_id.clone();
+            return self.mark_fallback(Some(&queue_id), "source_busy_exhausted", now_epoch);
+        }
+        let head = self.entries.front_mut()?;
+        head.busy_retries = head.busy_retries.saturating_add(1);
+        head.state = Occ3SenderQueueState::Pending;
+        head.reason = Some(OCC3_SOURCE_BUSY_RETRY_REASON.into());
+        let wait = retry_after_secs
+            .filter(|seconds| (1..=OCC3_BUSY_BACKOFF_MAX_SECS).contains(seconds))
+            .unwrap_or_else(|| receiver_busy_backoff_secs(head.busy_retries));
+        let anchor = if refused_at_epoch == 0 { now_epoch } else { refused_at_epoch.min(now_epoch) };
+        head.retry_not_before_epoch = Some(anchor.saturating_add(wait));
+        self.notice_at(0, now_epoch, None)
     }
 
     /// Demotes the head or a matched entry to fallback_pending (ordinary
@@ -1350,6 +1409,19 @@ source facts again as assistant content and call occ3_handoff once more. Do not 
     )
 }
 
+/// The re-capture prompt for a pending head whose source capture the
+/// server refused as busy. Nothing was captured, so the facts must be
+/// emitted again into a fresh capture. Busy retries are counted only at a
+/// refusal, never per handoff call.
+pub fn source_busy_prompt(receiver: &str, retry: u32) -> String {
+    format!(
+        "OCC-3 native handoff to {receiver} was not delivered: the server was busy and captured nothing (busy retry {retry} of {OCC3_RECEIVER_BUSY_MAX_RETRIES}). \
+If occ3_handoff has not already returned capture_armed since then, call it with receiver_role and receiver_name for that receiver; it waits out the \
+short backoff and arms a fresh capture. Then emit the concise source facts again as assistant content and call occ3_handoff once more. \
+Do not reuse or replay any earlier capture."
+    )
+}
+
 /// Dedup key for the host's one-shot head prompt: a receiver-busy retry or a
 /// later fallback is a new prompting occasion for the same queue entry.
 pub fn head_prompt_key(entry: &Occ3SenderQueueEntry) -> String {
@@ -1466,6 +1538,73 @@ mod tests {
 
     /// Older artifacts without the busy fields still load; the fields
     /// round-trip, and an out-of-bound busy count blocks the load.
+    #[test]
+    fn source_busy_backs_off_then_falls_back_without_touching_attempts() {
+        let mut queue = queue();
+        let now = 1_000;
+        queue.enqueue("child", "receiver", now).unwrap();
+        for retry in 1..=OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            queue.mark_armed(None, Some("receiver"), now).unwrap();
+            let notice = queue.record_source_busy(None, now, now).expect("armed head");
+            assert_eq!(notice.state, "pending");
+            assert_eq!(notice.reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+            let head = queue.head().unwrap();
+            assert_eq!(head.busy_retries, retry);
+            assert_eq!(head.attempts, 0, "busy is not a capture failure");
+            assert_eq!(head.retry_not_before_epoch, Some(now + receiver_busy_backoff_secs(retry)));
+        }
+        queue.mark_armed(None, Some("receiver"), now).unwrap();
+        let notice = queue.record_source_busy(None, now, now).unwrap();
+        assert_eq!(notice.state, "fallback_pending");
+        assert_eq!(notice.reason.as_deref(), Some("source_busy_exhausted"));
+        // Not armed: nothing to absorb.
+        assert!(queue.record_source_busy(None, now, now).is_none());
+    }
+
+    #[test]
+    fn source_busy_honours_bounded_retry_after_anchored_at_the_refusal() {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(Some(5), 100, 103).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(105));
+        queue.mark_armed(None, None, 110).unwrap();
+        assert_eq!(queue.head().unwrap().reason, None);
+        // Out-of-bound Retry-After falls back to the 2/4/8 s schedule.
+        queue.record_source_busy(Some(31), 110, 110).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(114));
+        // A refusal clock ahead of now is clamped to now.
+        queue.mark_armed(None, None, 120).unwrap();
+        queue.record_source_busy(None, 500, 120).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(128));
+    }
+
+    #[test]
+    fn source_busy_entry_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", now_epoch()).unwrap();
+        queue.mark_armed(None, None, now_epoch()).unwrap();
+        queue.record_source_busy(None, now_epoch(), now_epoch()).unwrap();
+        queue.persist(&path).unwrap();
+        let (loaded, outcome) = Occ3SenderQueue::load(&path, 3600);
+        assert!(matches!(outcome, Occ3SenderQueueLoad::Loaded(..)));
+        let head = loaded.head().unwrap();
+        assert_eq!(head.state, Occ3SenderQueueState::Pending);
+        assert_eq!(head.busy_retries, 1);
+        assert_eq!(head.reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+    }
+
+    #[test]
+    fn source_busy_prompt_is_truthful() {
+        let prompt = source_busy_prompt("sibling:r", 2);
+        assert!(prompt.contains("busy retry 2 of 3"));
+        assert!(prompt.contains("captured nothing"));
+        assert!(prompt.contains("emit the concise source facts again"));
+        assert!(prompt.contains("Do not reuse or replay"));
+    }
+
     #[test]
     fn busy_fields_are_backward_compatible_and_bounded() {
         let dir = tempfile::tempdir().unwrap();

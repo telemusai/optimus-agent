@@ -573,6 +573,38 @@ impl Occ3NativeSession {
                         // registered cleanup clears the host hooks and removes
                         // the handoff tool) and later turns take the ordinary
                         // inference path.
+                        //
+                        // A pre-admission busy refusal is NOT a capture
+                        // failure. The decision keys only on the lease's own
+                        // refusal record (Cancelled + busy_refusal, set by
+                        // pi-ai on a recognised 503 busy code), never on the
+                        // queue head's reason text. The refused lease has no
+                        // receipt and was never published, so the slot reset
+                        // below just drops it (already cancelled); it is never
+                        // retired or replayed. The armed queue head then takes
+                        // one retry from its separate busy budget; with no
+                        // armed head the outcome counts as an ordinary
+                        // failure so it stays bounded.
+                        let busy = {
+                            let slot =
+                                this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
+                            slot.lease.as_ref().and_then(|lease| {
+                                (lease.state() == SourceCaptureState::Cancelled)
+                                    .then(|| lease.busy_refusal())
+                                    .flatten()
+                            })
+                        };
+                        if let Some(refusal) = busy {
+                            if this.sender_queue_source_busy(refusal).unwrap_or(false) {
+                                let mut slot =
+                                    this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
+                                slot.resolved = false;
+                                slot.lease = None;
+                                slot.budget = None;
+                                slot.capture_permit = None;
+                                return Ok(None);
+                            }
+                        }
                         let exhausted = {
                             let mut slot =
                                 this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
@@ -1076,7 +1108,19 @@ impl Occ3NativeSession {
     /// published and then refused unused, so it is retired (never resent)
     /// and the slot is reset for a fresh arm. Then waits out the remaining
     /// backoff, at most [`receiver_busy_backoff_secs`] of the last retry.
-    async fn prepare_receiver_busy_recapture(self: &Arc<Self>, role: &str, name: &str) -> Result<(), String> {
+    ///
+    /// Also serves source-busy re-arms (head reason `source_busy_retry`):
+    /// nothing was admitted then, so there is no spent capture to retire.
+    /// The wait is capped at [`OCC3_BUSY_BACKOFF_MAX_SECS`] and stops with a
+    /// failure when `signal` is cancelled, so no arm follows a cancel. It
+    /// runs BEFORE the capture permit is acquired, so no permit is held
+    /// while waiting.
+    async fn prepare_receiver_busy_recapture(
+        self: &Arc<Self>,
+        role: &str,
+        name: &str,
+        signal: Option<&tokio_util::sync::CancellationToken>,
+    ) -> Result<(), String> {
         let not_before = {
             let queue = self.queue.lock().map_err(|_| failure())?;
             let Some(head) = queue.head() else { return Ok(()) };
@@ -1104,12 +1148,19 @@ impl Occ3NativeSession {
             self.complete_handoff_slot().await?;
         }
         if let Some(not_before) = not_before {
-            let cap = super::occ3_sender_queue::receiver_busy_backoff_secs(
-                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES,
-            );
+            let cap = super::occ3_sender_queue::OCC3_BUSY_BACKOFF_MAX_SECS;
             let wait = not_before.saturating_sub(now()).min(cap);
             if wait > 0 {
-                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+                let sleep = tokio::time::sleep(std::time::Duration::from_secs(wait));
+                match signal {
+                    Some(signal) => {
+                        tokio::select! {
+                            _ = sleep => {}
+                            _ = signal.cancelled() => return Err(failure()),
+                        }
+                    }
+                    None => sleep.await,
+                }
             }
         }
         Ok(())
@@ -1122,7 +1173,7 @@ impl Occ3NativeSession {
         let this = self.clone();
         AgentTool {
             name:NATIVE_HANDOFF_TOOL.into(),label:"Experimental native state handoff".into(),
-            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
+            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. If the server or receiver is busy, nothing is captured or used; call this tool again to re-arm a fresh capture after a short wait (up to 3 busy retries, not counted as failures), then emit the facts again; after that the handoff falls back to ordinary messaging. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
             parameters:json!({"type":"object","additionalProperties":false,"properties":{"receiver_role":{"type":"string","enum":["parent","sibling","child"]},"receiver_name":{"type":"string"}},"required":["receiver_role","receiver_name"]}),
             prepare_arguments:None,execution_mode:None,
             execute:Arc::new(move |tool_id,args,signal,_update| {
@@ -1148,7 +1199,7 @@ impl Occ3NativeSession {
                     // `pending` after the receiver refused the published
                     // capture before using it. Retire that spent capture so a
                     // FRESH arm is legal, then honour the bounded backoff.
-                    this.prepare_receiver_busy_recapture(role, name).await.map_err(anyhow::Error::msg)?;
+                    this.prepare_receiver_busy_recapture(role, name, signal.as_ref()).await.map_err(anyhow::Error::msg)?;
                     let queue_head = {
                         let queue = this.queue.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         queue.head().map(|head| {
@@ -1247,6 +1298,15 @@ impl Occ3NativeSession {
                     } else {
                         Some(crate::core::occ3_connectors::activation::acquire_capture_permit().await)
                     };
+                    // Busy re-arm context for the truthful tool text: read
+                    // before mark_armed clears the busy reason.
+                    let busy_rearm = this.queue.lock().ok().and_then(|queue| {
+                        queue.head().and_then(|head| {
+                            (head.state == super::occ3_sender_queue::Occ3SenderQueueState::Pending
+                                && head.busy_retries > 0)
+                                .then(|| (head.busy_retries, head.reason.as_deref() == Some(super::occ3_sender_queue::OCC3_SOURCE_BUSY_RETRY_REASON)))
+                        })
+                    });
                     if this.arm_handoff_if_needed(authorized.target_session_id(), capture_permit).map_err(anyhow::Error::msg)? {
                         let attempts = this.failed_capture_attempts();
                         // Queue journal: the head entry (if any) is armed.
@@ -1259,6 +1319,17 @@ impl Occ3NativeSession {
                             )
                             .ok()
                             .flatten();
+                        let busy_note = match busy_rearm {
+                            Some((retry, true)) => format!(
+                                " (busy retry {retry} of {}: the server was busy and captured nothing; the backoff wait has elapsed, so emit the facts again)",
+                                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES
+                            ),
+                            Some((retry, false)) => format!(
+                                " (busy retry {retry} of {}: the receiver was busy and did not use the earlier capture; the backoff wait has elapsed, so emit the facts again)",
+                                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES
+                            ),
+                            None => String::new(),
+                        };
                         let retry_note = if attempts > 0 {
                             format!(
                                 " (retry attempt {} of {} after {} failed capture{})",
@@ -1271,9 +1342,10 @@ impl Occ3NativeSession {
                             String::new()
                         };
                         return Ok(AgentToolResult::new(vec![ContentBlock::text(format!(
-                            "Native source capture armed{retry_note}; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments. If the captured turn fails again the capture is retried automatically up to {} times before native handoffs are disabled for this session; ordinary messages always keep working.",
+                            "Native source capture armed{busy_note}{retry_note}; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments. If the server is busy, call this tool again to re-arm after a short wait (up to {} busy retries, which do not count as failures); after that the handoff falls back to ordinary messaging. If the captured turn fails for another reason you can re-arm up to {} times before native handoffs are disabled for this session; ordinary messages always keep working.",
+                            super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES,
                             MAX_NATIVE_CAPTURE_RETRIES
-                        ))], json!({"status":"capture_armed","delivery_completed":false,"capture_attempts_failed":attempts})));
+                        ))], json!({"status":"capture_armed","delivery_completed":false,"capture_attempts_failed":attempts,"busy_retries":busy_rearm.map(|(retry, _)| retry).unwrap_or(0)})));
                     }
                     let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
                         let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_source_lease_missing]", failure())))?;
@@ -1724,6 +1796,26 @@ impl Occ3NativeSession {
             self.persist_sender_queue(&queue)?;
         }
         Ok(notices)
+    }
+
+    /// A pre-admission busy refusal of the armed head's source capture.
+    /// Returns `true` when an armed head absorbed it (busy retry scheduled
+    /// or busy budget exhausted to OCC-1 fallback); `false` when there was
+    /// no armed head, so the caller counts an ordinary capture failure.
+    /// Never touches the `failed_attempts` capture-failure budget.
+    pub(crate) fn sender_queue_source_busy(
+        &self,
+        refusal: pi_ai::source_capture::SourceBusyRefusal,
+    ) -> Result<bool, String> {
+        let mut queue = self.queue.lock().map_err(|_| failure())?;
+        let Some(notice) =
+            queue.record_source_busy(refusal.retry_after_secs, refusal.refused_at_epoch, now())
+        else {
+            return Ok(false);
+        };
+        self.journal_notices_locked(&mut queue, Some(notice));
+        self.persist_sender_queue(&queue)?;
+        Ok(true)
     }
 
     /// A capture failure for the armed head. `terminal` marks the native
@@ -2697,6 +2789,168 @@ mod tests {
         assert!(session.arm_source(budget()).is_err());
     }
 
+    fn hook_request() -> InferenceStateRequest {
+        InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: Vec::new(),
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        }
+    }
+
+    /// Drive one armed head through a real resolve (fresh lease), then end
+    /// that capture either as a pre-admission busy refusal or as an ordinary
+    /// failure (the agent loop's request guard cancels the lease), and run
+    /// the next resolve, which is the tombstone decision.
+    async fn armed_capture_outcome(session: &Arc<Occ3NativeSession>, busy: Option<Option<u64>>) {
+        assert!(session.arm_handoff_if_needed("receiver", None).expect("arm"));
+        session.sender_queue_mark_armed(None, Some("receiver")).expect("queue armed");
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("fresh lease");
+        match busy {
+            Some(retry_after_secs) => assert!(lease.cancel_unsent_as_busy(
+                pi_ai::source_capture::SourceBusyRefusal { refused_at_epoch: now(), retry_after_secs }
+            )),
+            None => {
+                lease.cancel();
+            }
+        }
+        let next = (hooks.resolve)(hook_request()).await;
+        assert!(next.is_ok(), "no outcome may fail the turn");
+        assert!(next.unwrap().is_none(), "the retried turn runs uncaptured");
+        let slot = session.source.lock().unwrap();
+        assert!(slot.lease.is_none() && slot.budget.is_none() && !slot.resolved);
+    }
+
+    /// A source busy refusal keeps the capture-failure budget, schedules a
+    /// bounded busy retry, and the next handoff call waits out the backoff
+    /// and arms a FRESH capture. A later ordinary failure still counts.
+    #[tokio::test]
+    async fn source_busy_refusal_rearms_without_spending_the_failure_budget() {
+        use super::super::occ3_sender_queue::{Occ3SenderQueueState, OCC3_SOURCE_BUSY_RETRY_REASON};
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        armed_capture_outcome(&session, Some(Some(1))).await;
+        assert_eq!(session.failed_capture_attempts(), 0, "busy is not a capture failure");
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);
+        assert_eq!(entries[0].busy_retries, 1);
+        assert_eq!(entries[0].attempts, 0);
+        assert_eq!(entries[0].reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+        assert!(entries[0].retry_not_before_epoch.is_some());
+        // Cancellation during the backoff fails the call; nothing is armed.
+        let cancelled = tokio_util::sync::CancellationToken::new();
+        cancelled.cancel();
+        assert!(session
+            .prepare_receiver_busy_recapture("child", "receiver", Some(&cancelled))
+            .await
+            .is_err());
+        assert!(session.source.lock().unwrap().budget.is_none(), "no arm after a cancel");
+        // The tool's prepare + arm steps, called directly so the test does
+        // not wait on the process-wide capture permit.
+        let started = std::time::Instant::now();
+        session
+            .prepare_receiver_busy_recapture("child", "receiver", None)
+            .await
+            .expect("busy re-arm preparation");
+        assert!(session.arm_handoff_if_needed("receiver", None).expect("fresh arm"));
+        session.sender_queue_mark_armed(None, Some("receiver")).unwrap();
+        // Retry-After 1 anchored at the refusal: at most ~1 s of wait.
+        assert!(started.elapsed() < std::time::Duration::from_secs(3));
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.budget.is_some() && slot.lease.is_none(), "fresh budget, nothing reused");
+        }
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Armed);
+        assert_eq!(entries[0].reason, None, "the busy reason does not outlive the re-arm");
+        assert_eq!(entries[0].retry_not_before_epoch, None);
+        // The fresh capture now fails for an ordinary reason: the failure
+        // budget counts it and the busy count is unchanged.
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("lease");
+        lease.cancel();
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].busy_retries, 1);
+        assert_eq!(entries[0].attempts, 1);
+    }
+
+    /// After the busy budget the head falls back to ordinary OCC-1
+    /// re-emission; the native path stays active and no failure is spent.
+    #[tokio::test]
+    async fn source_busy_exhausts_to_fallback_and_keeps_native_active() {
+        use super::super::occ3_sender_queue::{Occ3SenderQueueState, OCC3_RECEIVER_BUSY_MAX_RETRIES};
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        for retry in 1..=OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            armed_capture_outcome(&session, Some(None)).await;
+            let (entries, _) = session.sender_queue_snapshot().unwrap();
+            assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);
+            assert_eq!(entries[0].busy_retries, retry);
+            // Skip the real backoff: it is covered above and in the queue tests.
+            session.queue.lock().unwrap().clear_head_backoff_for_test();
+        }
+        armed_capture_outcome(&session, Some(None)).await;
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].state, Occ3SenderQueueState::FallbackPending);
+        assert_eq!(entries[0].reason.as_deref(), Some("source_busy_exhausted"));
+        assert_eq!(session.failed_capture_attempts(), 0);
+        assert!(session.check().is_ok(), "busy never deactivates the native path");
+    }
+
+    /// With no armed queue head a busy refusal counts as an ordinary
+    /// capture failure, so the attempt stays bounded.
+    #[tokio::test]
+    async fn source_busy_without_an_armed_head_counts_as_a_failure() {
+        let session = enrolled().await;
+        assert!(session.arm_source(budget()).is_ok());
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("lease");
+        assert!(lease.cancel_unsent_as_busy(pi_ai::source_capture::SourceBusyRefusal {
+            refused_at_epoch: now(),
+            retry_after_secs: None,
+        }));
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
+    }
+
+    /// The tool re-arm after a source busy refusal reports the busy retry
+    /// truthfully. A second call in the same uncaptured window keeps the
+    /// existing double-arm refusal and spends neither budget.
+    #[tokio::test]
+    async fn busy_rearm_text_is_truthful_and_a_double_arm_spends_nothing() {
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        armed_capture_outcome(&session, Some(None)).await;
+        session.queue.lock().unwrap().clear_head_backoff_for_test();
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let args = json!({"receiver_role":"child","receiver_name":"receiver"});
+        let first = (tool.execute)("rearm".into(), args.clone(), None, None).await.expect("re-arm");
+        assert_eq!(first.details["status"], "capture_armed");
+        assert_eq!(first.details["busy_retries"], 1);
+        let text = |result: &AgentToolResult| {
+            result
+                .content
+                .iter()
+                .filter_map(|block| match block {
+                    pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
+                    _ => None,
+                })
+                .collect::<String>()
+        };
+        assert!(text(&first).contains("busy retry 1 of 3"), "{}", text(&first));
+        assert!(!text(&first).contains("failed capture"), "{}", text(&first));
+        // A second call before any request resolved the fresh capture keeps
+        // the existing double-arm refusal: it spends neither budget.
+        assert!((tool.execute)("dup".into(), args, None, None).await.is_err());
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].busy_retries, 1, "no extra busy retry");
+        assert_eq!(session.failed_capture_attempts(), 0);
+    }
+
     #[tokio::test]
     async fn normal_handoff_capture_cannot_change_receiver_or_rearm() {
         let session = enrolled().await;
@@ -2987,7 +3241,7 @@ mod tests {
         // capture permit, which parallel tests can hold.
         let started = std::time::Instant::now();
         session
-            .prepare_receiver_busy_recapture("child", "receiver")
+            .prepare_receiver_busy_recapture("child", "receiver", None)
             .await
             .expect("busy re-capture preparation");
         assert!(

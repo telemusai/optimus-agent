@@ -1448,8 +1448,47 @@ impl From<SourceCaptureError> for StreamError {
 /// `_ADMISSION_REFUSALS`): another request is decoding, nothing was
 /// generated and the attachment was not used.
 const OCC3_RECEIVER_BUSY_CODES: [&str; 3] = ["scheduler_busy", "admission_capacity", "occ3_busy_batch"];
+/// Source-capture busy codes: the receiver set plus `admission_timeout`.
+/// An armed source capture is never published before its stream completes,
+/// so any pre-event admission refusal, including the control-plane
+/// `admission_timeout`, proves that nothing was captured. The receiver set
+/// deliberately omits `admission_timeout`: there the attempt fence may
+/// already have been charged, so non-use of the attachment is not proven.
+const OCC3_SOURCE_BUSY_CODES: [&str; 4] = ["scheduler_busy", "admission_capacity", "occ3_busy_batch", "admission_timeout"];
 /// Public error code of the retryable receiver-busy failure.
 const OCC3_RECEIVER_BUSY: &str = "occ3_receiver_busy";
+/// Public error code of the retryable source-capture-busy failure.
+const OCC3_SOURCE_BUSY: &str = "occ3_source_busy";
+/// Upper bound on an honoured `Retry-After` for a busy refusal, in seconds.
+pub const OCC3_BUSY_RETRY_AFTER_MAX_SECS: u64 = 30;
+
+/// Whether a bounded 503 error code is an admission-busy refusal for the
+/// given request shape (`source` = armed source capture, else attached
+/// receiver). One classifier for both paths.
+fn is_occ3_busy_code(code: &str, source: bool) -> bool {
+	if source {
+		OCC3_SOURCE_BUSY_CODES.contains(&code)
+	} else {
+		OCC3_RECEIVER_BUSY_CODES.contains(&code)
+	}
+}
+
+/// Parses a busy refusal's `Retry-After` header: one header, plain ASCII
+/// delta-seconds in `1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS`. Anything else
+/// (missing, repeated, HTTP-date, zero, too large, garbage) is ignored.
+pub fn parse_occ3_busy_retry_after(headers: &reqwest::header::HeaderMap) -> Option<u64> {
+	let mut values = headers.get_all(reqwest::header::RETRY_AFTER).iter();
+	let value = values.next()?;
+	if values.next().is_some() {
+		return None;
+	}
+	let text = value.to_str().ok()?.trim();
+	if text.is_empty() || text.len() > 2 || !text.bytes().all(|byte| byte.is_ascii_digit()) {
+		return None;
+	}
+	let seconds: u64 = text.parse().ok()?;
+	(1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(&seconds).then_some(seconds)
+}
 /// Upper bound on the error body read to classify a 503.
 const OCC3_BUSY_BODY_LIMIT: usize = 4096;
 
@@ -1477,6 +1516,29 @@ async fn read_bounded_error_code(response: &mut reqwest::Response) -> Option<Str
 }
 
 fn record_completions_failure(model: &Model, output: &mut AssistantMessage, error: &StreamError) {
+	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_SOURCE_BUSY) {
+		// Retryable overload with proven non-use of the capture. The session
+		// retry policy re-runs the turn (uncaptured); the native session
+		// re-arms a fresh capture on its own busy budget.
+		let retry_after_ms = error
+			.value
+			.get("retryAfterSecs")
+			.and_then(Value::as_u64)
+			.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds))
+			.map(|seconds| (seconds * 1000) as f64);
+		let failure = crate::utils::stream_failure::StreamFailureError::new(
+			error.message.clone(),
+			crate::utils::stream_failure::StreamFailureInfo {
+				kind: crate::utils::stream_failure::KIND_OVERLOADED.into(),
+				provider_error_type: Some(OCC3_SOURCE_BUSY.into()),
+				status: Some(503),
+				retry_after_ms,
+				..Default::default()
+			},
+		);
+		record_stream_failure(model, output, &ThrownStreamError::Failure(&failure));
+		return;
+	}
 	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_RECEIVER_BUSY) {
 		// Retryable overload: the session retry policy re-runs the turn
 		// without the (now cancelled) attachment. No Retry-After is
@@ -1573,6 +1635,17 @@ impl StreamError {
 	fn occ3_receiver_busy() -> Self {
 		let message = "OCC-3 receiver busy before admission; the turn continues without the native attachment.".to_string();
 		Self { value: json!({"name":"Error", "message":message, "code":OCC3_RECEIVER_BUSY}), message }
+	}
+
+	/// The server refused the armed source capture as busy before any stream
+	/// event. Retryable; the capture lease is already closed as non-use.
+	fn occ3_source_busy(retry_after_secs: Option<u64>) -> Self {
+		let message = "OCC-3 source capture refused: the server was busy before admission; nothing was captured and the handoff was not delivered.".to_string();
+		let mut value = json!({"name":"Error", "message":message, "code":OCC3_SOURCE_BUSY});
+		if let Some(seconds) = retry_after_secs {
+			value["retryAfterSecs"] = json!(seconds);
+		}
+		Self { value, message }
 	}
 
 	fn inference_uncertain() -> Self {
@@ -2497,11 +2570,35 @@ async fn post_chat_completions(
 		// the attachment, never a resend of this request.
 		let mut response = response;
 		if let Some(code) = read_bounded_error_code(&mut response).await {
-			if OCC3_RECEIVER_BUSY_CODES.contains(&code.as_str()) {
+			if is_occ3_busy_code(&code, false) {
 				if let Some(submission) = submission.take() {
 					submission.refuse_before_admission();
 				}
 				return Err(StreamError::occ3_receiver_busy());
+			}
+		}
+		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
+	}
+	if source_submission.is_some() && status == 503 {
+		// Admission unavailability for an armed source capture: the server
+		// refused before generating anything, so nothing was captured. Close
+		// the lease as proven non-use and surface a distinct retryable error.
+		// The sender re-arms a FRESH capture later; this request and its
+		// lease are never resent. Unknown codes keep the uncertain contract.
+		// `admission_timeout` may follow server-side enroll/reserve/prepare
+		// for this capture_id, but no publication can follow a refused
+		// capture and the next arm mints a new capture_id, so non-use holds.
+		// Known gap: with the keepalive offer accepted, the server sends 200
+		// headers first and a busy refusal arrives as an SSE error event;
+		// that shape is not classified here and keeps the uncertain path.
+		let retry_after = parse_occ3_busy_retry_after(response.headers());
+		let mut response = response;
+		if let Some(code) = read_bounded_error_code(&mut response).await {
+			if is_occ3_busy_code(&code, true) {
+				if let Some(source_submission) = source_submission.take() {
+					source_submission.refuse_before_admission(retry_after);
+				}
+				return Err(StreamError::occ3_source_busy(retry_after));
 			}
 		}
 		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));

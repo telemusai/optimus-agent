@@ -3555,6 +3555,29 @@ fn install_sender_queue_listener(
                         // transcript or the notices.
                         let prompt = match head.state {
                             occ3_sender_queue::Occ3SenderQueueState::Pending
+                                if head.busy_retries > 0
+                                    && head.reason.as_deref()
+                                        == Some(occ3_sender_queue::OCC3_SOURCE_BUSY_RETRY_REASON) =>
+                            {
+                                // Delivered as a followUp after the current
+                                // run. The prompt is chosen from the queue
+                                // snapshot at drain time, not from the busy
+                                // notice: if the model already re-armed, the
+                                // head is armed (or later) and no busy prompt
+                                // is sent. If one is sent and the model calls
+                                // occ3_handoff, that is the single re-arm.
+                                // Each tool result starts a new request that
+                                // resolves the armed budget, so only two
+                                // handoff calls in ONE response can hit the
+                                // existing double-arm refusal, which spends
+                                // neither budget. Busy retries are counted
+                                // only at a refusal, never per call.
+                                Some(occ3_sender_queue::source_busy_prompt(
+                                    &head.receiver_selector(),
+                                    head.busy_retries,
+                                ))
+                            }
+                            occ3_sender_queue::Occ3SenderQueueState::Pending
                                 if head.busy_retries > 0 =>
                             {
                                 Some(occ3_sender_queue::receiver_busy_prompt(
