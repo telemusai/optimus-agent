@@ -214,6 +214,18 @@ fn is_zero_u32(value: &u32) -> bool {
 /// back to ordinary OCC-1 re-emission.
 pub const OCC3_RECEIVER_BUSY_MAX_RETRIES: u32 = 3;
 
+/// Queue reason of a pending head whose armed SOURCE capture the server
+/// refused as busy before admission (nothing captured, nothing published).
+pub const OCC3_SOURCE_BUSY_RETRY_REASON: &str = "source_busy_retry";
+/// Queue reason of a pending head whose admitted capture the receiver
+/// refused as busy before use.
+pub const OCC3_RECEIVER_BUSY_RETRY_REASON: &str = "receiver_busy_retry";
+/// Fallback reason after the busy budget ran out on source busy refusals.
+pub const OCC3_SOURCE_BUSY_EXHAUSTED_REASON: &str = "source_busy_exhausted";
+/// Upper bound on any busy re-capture wait the handoff tool honours, in
+/// seconds. Matches the bounded server `Retry-After` the client accepts.
+pub const OCC3_BUSY_BACKOFF_MAX_SECS: u64 = 30;
+
 /// Backoff before receiver-busy re-capture `retry` (1-based): 2s, 4s, 8s.
 /// Matches the session provider retry policy's base delays.
 pub fn receiver_busy_backoff_secs(retry: u32) -> u64 {
@@ -771,6 +783,14 @@ impl Occ3SenderQueue {
         self.entries.front()
     }
 
+    /// Test-only: drop the head's busy backoff so a test can skip the wait.
+    #[cfg(test)]
+    pub(crate) fn clear_head_backoff_for_test(&mut self) {
+        if let Some(head) = self.entries.front_mut() {
+            head.retry_not_before_epoch = None;
+        }
+    }
+
     /// Marks the head as armed and records the daemon-minted message id plus
     /// the AUTHENTICATED receiver session id from the authorization.
     pub fn mark_armed(
@@ -785,6 +805,14 @@ impl Occ3SenderQueue {
         }
         head.state = Occ3SenderQueueState::Armed;
         head.retry_not_before_epoch = None;
+        // A busy-retry reason describes the refusal that returned the entry
+        // to pending; it must not outlive the fresh arm.
+        if matches!(
+            head.reason.as_deref(),
+            Some(OCC3_SOURCE_BUSY_RETRY_REASON) | Some(OCC3_RECEIVER_BUSY_RETRY_REASON)
+        ) {
+            head.reason = None;
+        }
         head.receiver_session_id = receiver_session_id.map(str::to_string);
         if let Some(id) = message_id {
             let id = id.to_string();
@@ -929,10 +957,46 @@ impl Occ3SenderQueue {
         let entry = &mut self.entries[index];
         entry.busy_retries = entry.busy_retries.saturating_add(1);
         entry.state = Occ3SenderQueueState::Pending;
-        entry.reason = Some("receiver_busy_retry".into());
+        entry.reason = Some(OCC3_RECEIVER_BUSY_RETRY_REASON.into());
         entry.retry_not_before_epoch =
             Some(now_epoch.saturating_add(receiver_busy_backoff_secs(entry.busy_retries)));
         self.notice_at(index, now_epoch, None).into_iter().collect()
+    }
+
+    /// The server refused the armed head's SOURCE capture as busy before
+    /// admission: nothing was captured or published, so this is not a
+    /// capture failure and never touches `attempts` or the session's
+    /// capture-failure budget. It shares the per-entry busy budget
+    /// ([`OCC3_RECEIVER_BUSY_MAX_RETRIES`]) with receiver-busy refusals.
+    /// Within it the head returns to `pending` with a backoff anchored at
+    /// the refusal time (`retry_after_secs` when the server sent a valid one,
+    /// else 2s/4s/8s); after it the entry falls back to OCC-1 re-emission.
+    /// Returns `None` when there is no armed head (the caller then counts an
+    /// ordinary capture failure so the attempt stays bounded).
+    pub fn record_source_busy(
+        &mut self,
+        retry_after_secs: Option<u64>,
+        refused_at_epoch: u64,
+        now_epoch: u64,
+    ) -> Option<Occ3QueueNotice> {
+        let head = self.entries.front()?;
+        if head.state != Occ3SenderQueueState::Armed {
+            return None;
+        }
+        if head.busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            let queue_id = head.queue_id.clone();
+            return self.mark_fallback(Some(&queue_id), OCC3_SOURCE_BUSY_EXHAUSTED_REASON, now_epoch);
+        }
+        let head = self.entries.front_mut()?;
+        head.busy_retries = head.busy_retries.saturating_add(1);
+        head.state = Occ3SenderQueueState::Pending;
+        head.reason = Some(OCC3_SOURCE_BUSY_RETRY_REASON.into());
+        let wait = retry_after_secs
+            .filter(|seconds| (1..=OCC3_BUSY_BACKOFF_MAX_SECS).contains(seconds))
+            .unwrap_or_else(|| receiver_busy_backoff_secs(head.busy_retries));
+        let anchor = if refused_at_epoch == 0 { now_epoch } else { refused_at_epoch.min(now_epoch) };
+        head.retry_not_before_epoch = Some(anchor.saturating_add(wait));
+        self.notice_at(0, now_epoch, None)
     }
 
     /// Demotes the head or a matched entry to fallback_pending (ordinary
@@ -964,7 +1028,11 @@ impl Occ3SenderQueue {
         let entry = &mut self.entries[index];
         entry.state = Occ3SenderQueueState::FallbackPending;
         entry.reason = Some(bounded_reason(reason));
-        entry.attempts = entry.attempts.saturating_add(1);
+        // A source busy exhaustion is not a capture failure: nothing was
+        // captured, so the attempt counter (capture failures) is unchanged.
+        if reason != OCC3_SOURCE_BUSY_EXHAUSTED_REASON {
+            entry.attempts = entry.attempts.saturating_add(1);
+        }
         entry.fallback_dispatch_token = Some(new_dispatch_token());
         let token = entry.fallback_dispatch_token.clone();
         let position = (index + 1) as u32;
@@ -1350,10 +1418,105 @@ source facts again as assistant content and call occ3_handoff once more. Do not 
     )
 }
 
+/// The re-capture prompt for a pending head whose source capture the
+/// server refused as busy. Nothing was captured, so the facts must be
+/// emitted again into a fresh capture. Busy retries are counted only at a
+/// refusal, never per handoff call.
+pub fn source_busy_prompt(receiver: &str, retry: u32) -> String {
+    format!(
+        "OCC-3 native handoff to {receiver} was not delivered: the server was busy and captured nothing (busy retry {retry} of {OCC3_RECEIVER_BUSY_MAX_RETRIES}). \
+If occ3_handoff has not already returned capture_armed since then, call it with receiver_role and receiver_name for that receiver; it waits out the \
+short backoff and arms a fresh capture. Then emit the concise source facts again as assistant content and call occ3_handoff once more. \
+Do not reuse or replay any earlier capture."
+    )
+}
+
+/// The host's head prompt for the current queue head, or `None` when the
+/// head needs no prompt (armed or in flight). Pure: the listener applies
+/// the one-shot dedup with [`head_prompt_key`]. A busy prompt is chosen
+/// only when the head's reason names that busy cause; an ordinary failure
+/// after a busy re-arm keeps the count but clears the reason, so it gets
+/// the ordinary advance prompt.
+pub fn head_prompt(head: &Occ3SenderQueueEntry, queue_len: usize) -> Option<String> {
+    match head.state {
+        Occ3SenderQueueState::Pending
+            if head.busy_retries > 0 && head.reason.as_deref() == Some(OCC3_SOURCE_BUSY_RETRY_REASON) =>
+        {
+            Some(source_busy_prompt(&head.receiver_selector(), head.busy_retries))
+        }
+        Occ3SenderQueueState::Pending
+            if head.busy_retries > 0 && head.reason.as_deref() == Some(OCC3_RECEIVER_BUSY_RETRY_REASON) =>
+        {
+            Some(receiver_busy_prompt(&head.receiver_selector(), head.busy_retries))
+        }
+        Occ3SenderQueueState::Pending => Some(advance_prompt(queue_len, &head.receiver_selector())),
+        Occ3SenderQueueState::FallbackPending => Some(fallback_prompt(&head.receiver_selector())),
+        _ => None,
+    }
+}
+
+/// Outcome of [`HeadPromptGate::decide`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadPromptDecision {
+    /// Send this prompt now (the gate has recorded it as sent).
+    Send(String),
+    /// A provider retry of the run is still pending: decide again once it
+    /// settles, against the queue state at that time.
+    Defer,
+    /// Nothing to send (no prompt for this state, or already sent).
+    Skip,
+}
+
+/// One-shot gate for the host's head prompt. A source busy head is the one
+/// case with two possible drivers: the provider auto-retry of the refused
+/// run and the host follow-up prompt. While a retry is pending the gate
+/// defers, so the follow-up goes out only if the head still needs it after
+/// the retry settled (or immediately when no retry was scheduled). Every
+/// other head prompt keeps its existing behaviour.
+#[derive(Debug, Default)]
+pub struct HeadPromptGate {
+    last_sent: Option<String>,
+}
+
+impl HeadPromptGate {
+    pub fn decide(
+        &mut self,
+        head: &Occ3SenderQueueEntry,
+        queue_len: usize,
+        retry_pending: bool,
+    ) -> HeadPromptDecision {
+        let Some(prompt) = head_prompt(head, queue_len) else {
+            return HeadPromptDecision::Skip;
+        };
+        let key = head_prompt_key(head);
+        if self.last_sent.as_deref() == Some(key.as_str()) {
+            return HeadPromptDecision::Skip;
+        }
+        if retry_pending
+            && head.state == Occ3SenderQueueState::Pending
+            && head.reason.as_deref() == Some(OCC3_SOURCE_BUSY_RETRY_REASON)
+        {
+            return HeadPromptDecision::Defer;
+        }
+        self.last_sent = Some(key);
+        HeadPromptDecision::Send(prompt)
+    }
+}
+
 /// Dedup key for the host's one-shot head prompt: a receiver-busy retry or a
 /// later fallback is a new prompting occasion for the same queue entry.
 pub fn head_prompt_key(entry: &Occ3SenderQueueEntry) -> String {
-    format!("{}#{}#{}", entry.queue_id, entry.state.as_str(), entry.busy_retries)
+    // The reason separates prompting occasions that share a state and busy
+    // count, for example a source busy retry and a later ordinary capture
+    // failure of the re-armed capture (both pending with busy_retries 1).
+    // Keys live only in the listener's memory, so nothing persisted changes.
+    format!(
+        "{}#{}#{}#{}",
+        entry.queue_id,
+        entry.state.as_str(),
+        entry.busy_retries,
+        entry.reason.as_deref().unwrap_or("")
+    )
 }
 
 /// The advance prompt the model receives when the queue advances to a new
@@ -1466,6 +1629,171 @@ mod tests {
 
     /// Older artifacts without the busy fields still load; the fields
     /// round-trip, and an out-of-bound busy count blocks the load.
+    #[test]
+    fn source_busy_backs_off_then_falls_back_without_touching_attempts() {
+        let mut queue = queue();
+        let now = 1_000;
+        queue.enqueue("child", "receiver", now).unwrap();
+        for retry in 1..=OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            queue.mark_armed(None, Some("receiver"), now).unwrap();
+            let notice = queue.record_source_busy(None, now, now).expect("armed head");
+            assert_eq!(notice.state, "pending");
+            assert_eq!(notice.reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+            let head = queue.head().unwrap();
+            assert_eq!(head.busy_retries, retry);
+            assert_eq!(head.attempts, 0, "busy is not a capture failure");
+            assert_eq!(head.retry_not_before_epoch, Some(now + receiver_busy_backoff_secs(retry)));
+        }
+        queue.mark_armed(None, Some("receiver"), now).unwrap();
+        let notice = queue.record_source_busy(None, now, now).unwrap();
+        assert_eq!(notice.state, "fallback_pending");
+        assert_eq!(notice.reason.as_deref(), Some("source_busy_exhausted"));
+        // Not armed: nothing to absorb.
+        assert!(queue.record_source_busy(None, now, now).is_none());
+    }
+
+    #[test]
+    fn source_busy_honours_bounded_retry_after_anchored_at_the_refusal() {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(Some(5), 100, 103).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(105));
+        queue.mark_armed(None, None, 110).unwrap();
+        assert_eq!(queue.head().unwrap().reason, None);
+        // Out-of-bound Retry-After falls back to the 2/4/8 s schedule.
+        queue.record_source_busy(Some(31), 110, 110).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(114));
+        // A refusal clock ahead of now is clamped to now.
+        queue.mark_armed(None, None, 120).unwrap();
+        queue.record_source_busy(None, 500, 120).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, Some(128));
+    }
+
+    #[test]
+    fn source_busy_entry_persists_and_reloads() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("queue.json");
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", now_epoch()).unwrap();
+        queue.mark_armed(None, None, now_epoch()).unwrap();
+        queue.record_source_busy(None, now_epoch(), now_epoch()).unwrap();
+        queue.persist(&path).unwrap();
+        let (loaded, outcome) = Occ3SenderQueue::load(&path, 3600);
+        assert!(matches!(outcome, Occ3SenderQueueLoad::Loaded(..)));
+        let head = loaded.head().unwrap();
+        assert_eq!(head.state, Occ3SenderQueueState::Pending);
+        assert_eq!(head.busy_retries, 1);
+        assert_eq!(head.reason.as_deref(), Some(OCC3_SOURCE_BUSY_RETRY_REASON));
+    }
+
+    #[test]
+    fn head_prompt_selects_by_state_and_busy_reason() {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        // Fresh pending head: advance prompt.
+        assert!(head_prompt(&head(&queue), 1).unwrap().contains("sender queue advanced"));
+        // Armed: no prompt.
+        queue.mark_armed(None, None, 100).unwrap();
+        assert!(head_prompt(&head(&queue), 1).is_none());
+        // Source busy: source busy prompt.
+        queue.record_source_busy(None, 100, 100).unwrap();
+        let prompt = head_prompt(&head(&queue), 1).unwrap();
+        assert!(prompt.contains("server was busy and captured nothing"), "{prompt}");
+        assert!(!prompt.contains("receiver child:receiver was busy"), "{prompt}");
+        // Ordinary failure after a busy re-arm: count kept, reason cleared,
+        // so the ordinary advance prompt (no busy wording).
+        queue.mark_armed(None, None, 110).unwrap();
+        queue.capture_failed(false, "capture_failed", 110);
+        let entry = head(&queue);
+        assert_eq!(entry.busy_retries, 1);
+        let prompt = head_prompt(&entry, 1).unwrap();
+        assert!(prompt.contains("sender queue advanced"), "{prompt}");
+        assert!(!prompt.contains("busy"), "{prompt}");
+        // Receiver busy reason: receiver busy prompt.
+        let mut receiver_busy = entry.clone();
+        receiver_busy.reason = Some(OCC3_RECEIVER_BUSY_RETRY_REASON.into());
+        assert!(head_prompt(&receiver_busy, 1).unwrap().contains("did not use the native handoff"));
+        // Fallback pending: fallback prompt, never a native re-capture.
+        let mut fallback = entry;
+        fallback.state = Occ3SenderQueueState::FallbackPending;
+        let prompt = head_prompt(&fallback, 1).unwrap();
+        assert!(prompt.contains("fell back to ordinary messaging"));
+        assert!(!prompt.contains("occ3_handoff"));
+    }
+
+    #[test]
+    fn head_prompt_gate_has_one_driver_for_source_busy() {
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        // Retry scheduled: defer; the retried turn re-arms, so after the
+        // retry settles nothing is sent (no stale follow-up).
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(None, 100, 100).unwrap();
+        let mut gate = HeadPromptGate::default();
+        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        queue.mark_armed(None, None, 105).unwrap();
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // No retry: exactly one follow-up.
+        let mut queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        let HeadPromptDecision::Send(prompt) = gate.decide(&head(&queue), 1, false) else {
+            panic!("one follow-up");
+        };
+        assert!(prompt.contains("busy retry 1 of 3"));
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // Retry scheduled but the retried turn did not re-arm: once the
+        // retry settles, exactly one follow-up.
+        let mut gate = HeadPromptGate::default();
+        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // Other heads are never deferred: a fallback prompt goes out even
+        // while a retry is pending.
+        queue.mark_armed(None, None, 110).unwrap();
+        queue.record_source_busy(None, 110, 110).unwrap();
+        queue.mark_armed(None, None, 120).unwrap();
+        queue.record_source_busy(None, 120, 120).unwrap();
+        queue.mark_armed(None, None, 130).unwrap();
+        queue.record_source_busy(None, 130, 130).unwrap();
+        assert_eq!(head(&queue).state, Occ3SenderQueueState::FallbackPending);
+        let mut gate = HeadPromptGate::default();
+        assert!(matches!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Send(_)));
+    }
+
+    #[test]
+    fn ordinary_failure_after_a_busy_rearm_gets_its_advance_prompt() {
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        let mut queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
+        queue.mark_armed(None, None, 105).unwrap();
+        queue.capture_failed(false, "capture_failed", 106);
+        let HeadPromptDecision::Send(prompt) = gate.decide(&head(&queue), 1, false) else {
+            panic!("the ordinary failure is a new prompting occasion");
+        };
+        assert!(prompt.contains("sender queue advanced"), "{prompt}");
+    }
+
+    fn queue_with_busy_head() -> Occ3SenderQueue {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(None, 100, 100).unwrap();
+        queue
+    }
+
+    #[test]
+    fn source_busy_prompt_is_truthful() {
+        let prompt = source_busy_prompt("sibling:r", 2);
+        assert!(prompt.contains("busy retry 2 of 3"));
+        assert!(prompt.contains("captured nothing"));
+        assert!(prompt.contains("emit the concise source facts again"));
+        assert!(prompt.contains("Do not reuse or replay"));
+    }
+
     #[test]
     fn busy_fields_are_backward_compatible_and_bounded() {
         let dir = tempfile::tempdir().unwrap();

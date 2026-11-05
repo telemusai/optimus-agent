@@ -630,6 +630,18 @@ struct SourceRecord {
     state: SourceCaptureState,
     receipt: Option<SourceCaptureReceipt>,
     tools: Vec<SourceToolBinding>,
+    busy_refusal: Option<SourceBusyRefusal>,
+}
+
+/// A pre-event busy refusal of an armed source capture: the server refused
+/// admission before generating anything, so nothing was captured. Recorded on
+/// the (now `Cancelled`) lease for the session's busy re-arm budget.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct SourceBusyRefusal {
+    /// Epoch second of the refusal.
+    pub refused_at_epoch: u64,
+    /// Bounded server `Retry-After` in seconds, when it was a valid value.
+    pub retry_after_secs: Option<u64>,
 }
 
 #[derive(Clone)]
@@ -675,6 +687,7 @@ impl SourceCaptureLease {
                 state: SourceCaptureState::Prepared,
                 receipt: None,
                 tools: Vec::new(),
+                busy_refusal: None,
             }),
             cancellation: CancellationToken::new(),
         })))
@@ -693,6 +706,14 @@ impl SourceCaptureLease {
     }
     pub fn state(&self) -> SourceCaptureState {
         self.0.state.lock().state
+    }
+    /// The recorded pre-event busy refusal, if the server refused this
+    /// capture as busy before admission (the lease is then `Cancelled`).
+    pub fn busy_refusal(&self) -> Option<SourceBusyRefusal> {
+        let record = self.0.state.lock();
+        (record.state == SourceCaptureState::Cancelled)
+            .then_some(record.busy_refusal)
+            .flatten()
     }
     /// Available only after the exact native response and parser completed.
     pub fn receipt(&self) -> Option<SourceCaptureReceipt> {
@@ -740,6 +761,26 @@ impl SourceCaptureLease {
             return Err(SourceCaptureError::InvalidToolBinding);
         }
         Ok(expected)
+    }
+    /// Test seam for downstream crates: closes a still-`Prepared` (never
+    /// sent) lease as `Cancelled` with a busy refusal record, the same end
+    /// state a real pre-admission busy refusal produces. `Prepared ->
+    /// Cancelled` is already a public transition ([`Self::cancel`]), so this
+    /// cannot turn a submitted or uncertain lease into proven non-use. The
+    /// only effect a non-test caller could get is to have its own unsent
+    /// capture counted as a busy retry instead of a capture failure, which
+    /// is still bounded by the queue busy budget. Kept public (not behind a
+    /// cargo feature) so test builds share the workspace's pi-ai artifact.
+    #[doc(hidden)]
+    pub fn cancel_unsent_as_busy(&self, refusal: SourceBusyRefusal) -> bool {
+        let mut record = self.0.state.lock();
+        if record.state != SourceCaptureState::Prepared {
+            return false;
+        }
+        record.state = SourceCaptureState::Cancelled;
+        record.busy_refusal = Some(refusal);
+        self.0.cancellation.cancel();
+        true
     }
     /// Revokes local authority; callers separately retire the runtime resource.
     pub fn cancel(&self) -> SourceCaptureState {
@@ -976,6 +1017,23 @@ impl SourceSubmission {
         record.tools = tools;
         record.state = SourceCaptureState::Captured;
         Ok(())
+    }
+}
+impl SourceSubmission {
+    /// The server refused the armed capture as busy BEFORE any stream event:
+    /// nothing was generated or captured. That is proven non-use, so the
+    /// lease closes as `Cancelled` (never `Uncertain`, never reusable). The
+    /// cancellation token is left for the request guard, as on the receiver
+    /// path, so the provider's biased select keeps this bounded refusal.
+    pub(crate) fn refuse_before_admission(self, retry_after_secs: Option<u64>) {
+        let mut record = self.lease.0.state.lock();
+        if record.state == SourceCaptureState::Submitted {
+            record.state = SourceCaptureState::Cancelled;
+            record.busy_refusal = Some(SourceBusyRefusal {
+                refused_at_epoch: epoch_now().unwrap_or(0),
+                retry_after_secs,
+            });
+        }
     }
 }
 impl Drop for SourceSubmission {

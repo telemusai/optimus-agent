@@ -97,6 +97,11 @@ enum Reply {
     Disconnect,
     Status,
     HoldEof,
+    /// Pre-event refusal: status line, body and extra header lines. No receipt.
+    Refusal(&'static str, String, &'static str),
+    /// Busy 503 whose body never finishes: headers plus a partial body, then
+    /// the connection is held open.
+    StalledRefusal,
 }
 struct Fixture {
     model: Model,
@@ -157,6 +162,18 @@ impl Fixture {
                 capture.lock().unwrap().push((head, payload.clone()));
                 notify.notify_one();
                 if matches!(reply, Reply::Disconnect) {
+                    continue;
+                }
+                if matches!(reply, Reply::StalledRefusal) {
+                    let partial = "{\"error\":{\"message\":\"scheduler_bu";
+                    let wire = format!("HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: 4000\r\n\r\n{partial}");
+                    let _ = socket.write_all(wire.as_bytes()).await;
+                    tokio::time::sleep(std::time::Duration::from_secs(30)).await;
+                    continue;
+                }
+                if let Reply::Refusal(status, body, extra) = &reply {
+                    let wire = format!("HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}", body.len());
+                    let _ = socket.write_all(wire.as_bytes()).await;
                     continue;
                 }
                 let output = match &reply {
@@ -694,4 +711,146 @@ fn shared_python_source_v1_fixture_matches_exact_canonical_bytes_hashes_and_nega
         fixture["duplicate_receipt_json"].as_str().unwrap()
     )
     .is_err());
+}
+
+fn busy_body(code: &str) -> String {
+    format!("{{\"error\":{{\"message\":\"{code}\",\"type\":\"occ3_attachment_error\",\"code\":503}}}}")
+}
+fn failure_details(events: &[AssistantMessageEvent]) -> serde_json::Map<String, Value> {
+    let AssistantMessageEvent::Error { error, .. } = events.last().expect("terminal event") else {
+        panic!("expected failure")
+    };
+    error
+        .diagnostics
+        .as_ref()
+        .unwrap()
+        .iter()
+        .find(|d| d.type_ == "provider_stream_failure")
+        .unwrap()
+        .details
+        .clone()
+        .unwrap()
+}
+
+/// A pre-event 503 with a recognised admission-busy code on an armed SOURCE
+/// capture is a distinct retryable non-use outcome: the lease closes as
+/// `Cancelled` with a busy refusal record, never `Uncertain`, and nothing is
+/// resent or replayable.
+#[tokio::test]
+async fn source_pre_event_busy_is_retryable_non_use_without_resend() {
+    for code in ["scheduler_busy", "admission_capacity", "admission_timeout", "occ3_busy_batch"] {
+        let fixture = Fixture::new(Reply::Refusal(
+            "503 Service Unavailable",
+            busy_body(code),
+            "Retry-After: 5\r\n",
+        ))
+        .await;
+        let lease = fixture.lease();
+        let stream =
+            stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let events = collect(&stream).await;
+        assert_eq!(events.len(), 1, "{code}: no partial output");
+        let details = failure_details(&events);
+        assert_eq!(details["providerErrorType"], "occ3_source_busy", "{code}");
+        assert_eq!(details["kind"], "overloaded", "{code}: retryable, not request_interrupted");
+        assert_eq!(details["status"], 503);
+        assert_eq!(details["retryAfterMs"], 5000.0, "{code}");
+        assert!(details.get("occ3Cause").is_none());
+        assert_eq!(lease.state(), SourceCaptureState::Cancelled, "{code}: proven non-use");
+        let refusal = lease.busy_refusal().expect("busy refusal recorded");
+        assert_eq!(refusal.retry_after_secs, Some(5));
+        assert!(refusal.refused_at_epoch > 0);
+        assert!(lease.receipt().is_none());
+        let wire = serde_json::to_string(&events).unwrap();
+        assert!(wire.contains("not delivered"), "{code}: truthful message");
+        assert_eq!(fixture.count(), 1, "{code}: no automatic resend");
+        let replay =
+            stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let _ = collect(&replay).await;
+        assert_eq!(fixture.count(), 1, "{code}: the closed lease cannot be replayed");
+        assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    }
+}
+
+/// Retry-After is honoured only as one plain delta-seconds value in 1..=30.
+#[tokio::test]
+async fn source_busy_retry_after_is_bounded() {
+    for (extra, expected) in [
+        ("Retry-After: 1\r\n", Some(1u64)),
+        ("Retry-After: 30\r\n", Some(30)),
+        ("", None),
+        ("Retry-After: 0\r\n", None),
+        ("Retry-After: 31\r\n", None),
+        ("Retry-After: -1\r\n", None),
+        ("Retry-After: abc\r\n", None),
+        ("Retry-After: 2.5\r\n", None),
+        ("Retry-After: 99999999999999999999999\r\n", None),
+        ("Retry-After: Wed, 21 Oct 2015 07:28:00 GMT\r\n", None),
+        ("Retry-After: 5\r\nRetry-After: 6\r\n", None),
+    ] {
+        let fixture =
+            Fixture::new(Reply::Refusal("503 Service Unavailable", busy_body("scheduler_busy"), extra))
+                .await;
+        let lease = fixture.lease();
+        let stream =
+            stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let details = failure_details(&collect(&stream).await);
+        assert_eq!(details["providerErrorType"], "occ3_source_busy", "{extra:?}");
+        assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, expected, "{extra:?}");
+        assert_eq!(
+            details.get("retryAfterMs").and_then(Value::as_f64),
+            expected.map(|s| (s * 1000) as f64),
+            "{extra:?}"
+        );
+    }
+}
+
+/// Unknown 503 codes, oversized or non-JSON bodies, and busy bodies on any
+/// other status keep the existing uncertain, no-replay source contract.
+#[tokio::test]
+async fn source_unrecognised_refusals_stay_uncertain() {
+    let oversized = format!(
+        "{{\"error\":{{\"message\":\"scheduler_busy\",\"pad\":\"{}\"}}}}",
+        "x".repeat(5000)
+    );
+    let cases: Vec<(&'static str, String)> = vec![
+        ("503 Service Unavailable", busy_body("native_completion_failed")),
+        ("503 Service Unavailable", busy_body("unclassified")),
+        ("503 Service Unavailable", "scheduler_busy".into()),
+        ("503 Service Unavailable", oversized),
+        ("502 Bad Gateway", busy_body("scheduler_busy")),
+        ("504 Gateway Timeout", busy_body("admission_timeout")),
+        ("429 Too Many Requests", busy_body("scheduler_busy")),
+    ];
+    for (status, body) in cases {
+        let fixture = Fixture::new(Reply::Refusal(status, body, "Retry-After: 5\r\n")).await;
+        let lease = fixture.lease();
+        let stream =
+            stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let events = collect(&stream).await;
+        assert_uncertain(&events, &lease);
+        assert!(lease.busy_refusal().is_none(), "{status}");
+        assert_eq!(fixture.count(), 1);
+        let details = failure_details(&events);
+        assert_eq!(details["providerErrorType"], "occ3_inference_uncertain", "{status}");
+        assert_eq!(details["occ3Cause"], "http_non_success", "{status}");
+    }
+}
+
+/// A busy 503 whose body stalls is not classified: the bounded read gives
+/// up quickly and the existing uncertain path applies, without waiting for
+/// the lease deadline.
+#[tokio::test]
+async fn source_stalled_refusal_body_stays_uncertain_and_returns_quickly() {
+    let fixture = Fixture::new(Reply::StalledRefusal).await;
+    let lease = fixture.lease();
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = tokio::time::timeout(std::time::Duration::from_secs(10), collect(&stream))
+        .await
+        .expect("bounded body read");
+    assert!(started.elapsed() < std::time::Duration::from_secs(8));
+    assert_uncertain(&events, &lease);
+    assert!(lease.busy_refusal().is_none());
+    assert_eq!(fixture.count(), 1);
 }
