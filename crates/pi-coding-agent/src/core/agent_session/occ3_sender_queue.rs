@@ -1455,10 +1455,68 @@ pub fn head_prompt(head: &Occ3SenderQueueEntry, queue_len: usize) -> Option<Stri
     }
 }
 
+/// Outcome of [`HeadPromptGate::decide`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HeadPromptDecision {
+    /// Send this prompt now (the gate has recorded it as sent).
+    Send(String),
+    /// A provider retry of the run is still pending: decide again once it
+    /// settles, against the queue state at that time.
+    Defer,
+    /// Nothing to send (no prompt for this state, or already sent).
+    Skip,
+}
+
+/// One-shot gate for the host's head prompt. A source busy head is the one
+/// case with two possible drivers: the provider auto-retry of the refused
+/// run and the host follow-up prompt. While a retry is pending the gate
+/// defers, so the follow-up goes out only if the head still needs it after
+/// the retry settled (or immediately when no retry was scheduled). Every
+/// other head prompt keeps its existing behaviour.
+#[derive(Debug, Default)]
+pub struct HeadPromptGate {
+    last_sent: Option<String>,
+}
+
+impl HeadPromptGate {
+    pub fn decide(
+        &mut self,
+        head: &Occ3SenderQueueEntry,
+        queue_len: usize,
+        retry_pending: bool,
+    ) -> HeadPromptDecision {
+        let Some(prompt) = head_prompt(head, queue_len) else {
+            return HeadPromptDecision::Skip;
+        };
+        let key = head_prompt_key(head);
+        if self.last_sent.as_deref() == Some(key.as_str()) {
+            return HeadPromptDecision::Skip;
+        }
+        if retry_pending
+            && head.state == Occ3SenderQueueState::Pending
+            && head.reason.as_deref() == Some(OCC3_SOURCE_BUSY_RETRY_REASON)
+        {
+            return HeadPromptDecision::Defer;
+        }
+        self.last_sent = Some(key);
+        HeadPromptDecision::Send(prompt)
+    }
+}
+
 /// Dedup key for the host's one-shot head prompt: a receiver-busy retry or a
 /// later fallback is a new prompting occasion for the same queue entry.
 pub fn head_prompt_key(entry: &Occ3SenderQueueEntry) -> String {
-    format!("{}#{}#{}", entry.queue_id, entry.state.as_str(), entry.busy_retries)
+    // The reason separates prompting occasions that share a state and busy
+    // count, for example a source busy retry and a later ordinary capture
+    // failure of the re-armed capture (both pending with busy_retries 1).
+    // Keys live only in the listener's memory, so nothing persisted changes.
+    format!(
+        "{}#{}#{}#{}",
+        entry.queue_id,
+        entry.state.as_str(),
+        entry.busy_retries,
+        entry.reason.as_deref().unwrap_or("")
+    )
 }
 
 /// The advance prompt the model receives when the queue advances to a new
@@ -1663,6 +1721,68 @@ mod tests {
         let prompt = head_prompt(&fallback, 1).unwrap();
         assert!(prompt.contains("fell back to ordinary messaging"));
         assert!(!prompt.contains("occ3_handoff"));
+    }
+
+    #[test]
+    fn head_prompt_gate_has_one_driver_for_source_busy() {
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        // Retry scheduled: defer; the retried turn re-arms, so after the
+        // retry settles nothing is sent (no stale follow-up).
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(None, 100, 100).unwrap();
+        let mut gate = HeadPromptGate::default();
+        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        queue.mark_armed(None, None, 105).unwrap();
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // No retry: exactly one follow-up.
+        let mut queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        let HeadPromptDecision::Send(prompt) = gate.decide(&head(&queue), 1, false) else {
+            panic!("one follow-up");
+        };
+        assert!(prompt.contains("busy retry 1 of 3"));
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // Retry scheduled but the retried turn did not re-arm: once the
+        // retry settles, exactly one follow-up.
+        let mut gate = HeadPromptGate::default();
+        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+        // Other heads are never deferred: a fallback prompt goes out even
+        // while a retry is pending.
+        queue.mark_armed(None, None, 110).unwrap();
+        queue.record_source_busy(None, 110, 110).unwrap();
+        queue.mark_armed(None, None, 120).unwrap();
+        queue.record_source_busy(None, 120, 120).unwrap();
+        queue.mark_armed(None, None, 130).unwrap();
+        queue.record_source_busy(None, 130, 130).unwrap();
+        assert_eq!(head(&queue).state, Occ3SenderQueueState::FallbackPending);
+        let mut gate = HeadPromptGate::default();
+        assert!(matches!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Send(_)));
+    }
+
+    #[test]
+    fn ordinary_failure_after_a_busy_rearm_gets_its_advance_prompt() {
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        let mut queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
+        queue.mark_armed(None, None, 105).unwrap();
+        queue.capture_failed(false, "capture_failed", 106);
+        let HeadPromptDecision::Send(prompt) = gate.decide(&head(&queue), 1, false) else {
+            panic!("the ordinary failure is a new prompting occasion");
+        };
+        assert!(prompt.contains("sender queue advanced"), "{prompt}");
+    }
+
+    fn queue_with_busy_head() -> Occ3SenderQueue {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(None, None, 100).unwrap();
+        queue.record_source_busy(None, 100, 100).unwrap();
+        queue
     }
 
     #[test]

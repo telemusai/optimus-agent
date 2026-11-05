@@ -593,10 +593,7 @@ impl Occ3NativeSession {
                                 this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                             slot.failed_attempts = slot.failed_attempts.saturating_add(1);
                             let exhausted = slot.failed_attempts > MAX_NATIVE_CAPTURE_RETRIES;
-                            slot.resolved = false;
-                            slot.lease = None;
-                            slot.budget = None;
-                            slot.capture_permit = None;
+                            Self::reset_slot_for_fresh_arm(&mut slot);
                             exhausted
                         };
                         if exhausted {
@@ -1079,13 +1076,27 @@ impl Occ3NativeSession {
             _ => String::new(),
         };
         let queue_id = head.queue_id.clone();
+        // Exactly one OCC-1 request per entry: only the host's fallback
+        // turn carries the dispatch token that completes the entry, so an
+        // agent_message sent at any other time would leave the entry
+        // pending and the fallback prompt would ask a second time. Outside
+        // that turn the model is told to wait; inside it, to send now.
+        let in_fallback_turn = self
+            .active_fallback_turn
+            .lock()
+            .ok()
+            .is_some_and(|active| active.as_deref() == Some(queue_id.as_str()));
+        let instruction = if in_fallback_turn {
+            "Send the facts now, once, as an ordinary agent_message to that receiver."
+        } else {
+            "Do not send the facts now. A separate fallback prompt will ask you to send them once as an ordinary agent_message to that receiver; send them only then."
+        };
         Some(AgentToolResult::new(
             vec![ContentBlock::text(format!(
-                "Native handoff to {role}:{name} fell back to ordinary messaging{cause}; nothing was armed or queued. \
-Deliver the facts once as an ordinary agent_message to that receiver when the fallback prompt arrives. \
+                "Native handoff to {role}:{name} fell back to ordinary messaging{cause}; nothing was armed or queued. {instruction} \
 Do not call occ3_handoff again for these facts."
             ))],
-            json!({"status":"fallback_pending","delivery_completed":false,"queue_id":queue_id,"busy_retries":head.busy_retries}),
+            json!({"status":"fallback_pending","delivery_completed":false,"queue_id":queue_id,"busy_retries":head.busy_retries,"send_now":in_fallback_turn}),
         ))
     }
 
@@ -1877,7 +1888,11 @@ Do not call occ3_handoff again for these facts."
     /// tombstone path and, eagerly, at AgentEnd so the outcome is recorded
     /// even when no automatic provider retry follows.
     pub(crate) fn absorb_source_busy_refusal(&self) -> bool {
-        let Ok(slot) = self.source.lock() else {
+        // Check and reset under ONE slot lock so a concurrent resolve cannot
+        // see the refused lease after the queue absorbed it and count the
+        // same refusal as a capture failure. Lock order is source -> queue,
+        // the same order the audit snapshot uses.
+        let Ok(mut slot) = self.source.lock() else {
             return false;
         };
         if !slot.resolved || slot.handoff_admitted {
@@ -1888,18 +1903,41 @@ Do not call occ3_handoff again for these facts."
         }) else {
             return false;
         };
-        drop(slot);
         if !self.sender_queue_source_busy(refusal).unwrap_or(false) {
             return false;
         }
-        let Ok(mut slot) = self.source.lock() else {
-            return true;
-        };
+        Self::reset_slot_for_fresh_arm(&mut slot);
+        true
+    }
+
+    /// Slot reset after a completed (admitted, retired) handoff. Also
+    /// releases the receiver binding: before this, a queued handoff to a
+    /// different receiver in the same session was refused with "receiver
+    /// changed after capture was armed" (pre-existing). The binding stays
+    /// while a budget is still armed, because that budget belongs to the
+    /// bound receiver.
+    fn reset_slot_after_completed_handoff(slot: &mut SourceSlot) {
+        slot.resolved = false;
+        slot.lease = None;
+        slot.tool_claimed = false;
+        slot.publication_claimed = false;
+        slot.handoff_admitted = false;
+        slot.published_message = None;
+        slot.capture_permit = None;
+        if slot.budget.is_none() {
+            slot.armed_receiver = None;
+        }
+    }
+
+    /// Resets the capture slot after a capture ended without delivery
+    /// (busy refusal or ordinary failure) so the next arm is fresh. Clears
+    /// the receiver binding too: no lease or budget remains for it.
+    fn reset_slot_for_fresh_arm(slot: &mut SourceSlot) {
         slot.resolved = false;
         slot.lease = None;
         slot.budget = None;
         slot.capture_permit = None;
-        true
+        slot.armed_receiver = None;
     }
 
     /// A capture failure for the armed head. `terminal` marks the native
@@ -2448,13 +2486,7 @@ Do not call occ3_handoff again for these facts."
             lease.cancel();
         }
         let mut slot = self.source.lock().map_err(|_| failure())?;
-        slot.resolved = false;
-        slot.lease = None;
-        slot.tool_claimed = false;
-        slot.publication_claimed = false;
-        slot.handoff_admitted = false;
-        slot.published_message = None;
-        slot.capture_permit = None;
+        Self::reset_slot_after_completed_handoff(&mut slot);
         Ok(())
     }
 
@@ -3007,8 +3039,27 @@ mod tests {
             })
             .collect::<String>();
         assert!(text.contains("fell back to ordinary messaging after 3 busy retries"), "{text}");
-        assert!(text.contains("agent_message"), "{text}");
+        assert!(text.contains("Do not send the facts now"), "{text}");
+        assert!(text.contains("fallback prompt will ask you"), "{text}");
         assert!(text.contains("Do not call occ3_handoff again"), "{text}");
+        assert_eq!(result.details["send_now"], false);
+        // Inside the host's fallback turn the same call says send now, and
+        // that turn is the only one whose send carries the dispatch token.
+        let queue_id = session.sender_queue_snapshot().unwrap().0[0].queue_id.clone();
+        session.begin_fallback_turn(&queue_id);
+        let inside = (tool.execute)(
+            "in-fallback-turn".into(),
+            json!({"receiver_role":"child","receiver_name":"receiver"}),
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        assert_eq!(inside.details["send_now"], true);
+        assert!(session.active_fallback_token_for("child:receiver").is_some());
+        session.end_fallback_turn();
+        // Outside that turn no send can complete the entry.
+        assert!(session.active_fallback_token_for("child:receiver").is_none());
         let (entries, _) = session.sender_queue_snapshot().unwrap();
         assert_eq!(entries.len(), 1, "no duplicate entry for the same receiver");
         assert_eq!(entries[0].state, Occ3SenderQueueState::FallbackPending);
@@ -3173,6 +3224,47 @@ mod tests {
         let (entries, _) = session.sender_queue_snapshot().unwrap();
         assert_eq!(entries[0].busy_retries, 1, "no extra busy retry");
         assert_eq!(session.failed_capture_attempts(), 0);
+    }
+
+    /// Pre-existing bug: after a completed handoff to A, a queued handoff
+    /// to B in the same session must be able to arm. While A's capture is
+    /// armed, B is still refused.
+    #[tokio::test]
+    async fn completed_handoff_releases_the_receiver_binding() {
+        let session = enrolled().await;
+        assert!(session.arm_handoff_if_needed("receiver-a", None).unwrap());
+        assert!(session.arm_handoff_if_needed("receiver-b", None).is_err(), "A armed: B refused");
+        resolve_capture(&session).await;
+        assert!(session.arm_handoff_if_needed("receiver-b", None).is_err(), "A capturing: B refused");
+        {
+            // The state complete_handoff_slot resets after retiring A's
+            // admitted Captured lease (a Captured lease cannot be built
+            // without a real receipt, so the reset helper is driven directly).
+            let mut slot = session.source.lock().unwrap();
+            slot.handoff_admitted = true;
+            Occ3NativeSession::reset_slot_after_completed_handoff(&mut slot);
+            assert!(slot.armed_receiver.is_none());
+        }
+        assert!(session.arm_handoff_if_needed("receiver-b", None).expect("B arms after A completed"));
+        assert!(session.arm_handoff_if_needed("receiver-a", None).is_err(), "B armed: A refused");
+        // A live budget keeps its binding through the completed-handoff reset.
+        let mut slot = session.source.lock().unwrap();
+        Occ3NativeSession::reset_slot_after_completed_handoff(&mut slot);
+        assert_eq!(slot.armed_receiver.as_deref(), Some("receiver-b"));
+    }
+
+    /// A busy refusal or ordinary failure frees the binding too, so the
+    /// next queue head (another receiver) can arm.
+    #[tokio::test]
+    async fn failed_or_busy_capture_releases_the_receiver_binding() {
+        let session = enrolled().await;
+        armed_capture_outcome(&session, None).await;
+        assert!(session.source.lock().unwrap().armed_receiver.is_none());
+        assert!(session.arm_handoff_if_needed("other", None).expect("other arms"));
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        armed_capture_outcome(&session, Some(None)).await;
+        assert!(session.source.lock().unwrap().armed_receiver.is_none());
     }
 
     #[tokio::test]

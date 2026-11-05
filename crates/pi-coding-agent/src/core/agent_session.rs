@@ -3437,12 +3437,13 @@ fn install_sender_queue_listener(
     let listener_state = std::sync::Arc::clone(&state);
     let listener_session = std::sync::Arc::clone(&session);
     let listener_controller = std::sync::Arc::clone(&controller);
-    let last_prompted_head = std::sync::Arc::new(std::sync::Mutex::new(None::<String>));
+    let head_prompt_gate =
+        std::sync::Arc::new(std::sync::Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
     // Receiver borrows the outer `session` clone (identical `Arc`), so the
     // move closure below keeps `listener_session` for itself - same shape
     // as the agent-event listener installed in `AgentSession::new`.
     let unsubscribe = session.agent.subscribe(Arc::new(move |event, _signal| {
-        let last_prompted_head = last_prompted_head.clone();
+        let head_prompt_gate = head_prompt_gate.clone();
         let state = listener_state.clone();
         let session = listener_session.clone();
         let controller = listener_controller.clone();
@@ -3498,7 +3499,6 @@ fn install_sender_queue_listener(
                 }
                 _ => return,
             }
-            let last_prompted_head = last_prompted_head;
             let notices = state.take_pending_queue_notices();
             // The loops below consume the vecs; capture emptiness first for
             // the trailing snapshot-notice gate.
@@ -3551,66 +3551,11 @@ fn install_sender_queue_listener(
                     }
                 }
             }
-            // Advance prompt: exactly once per pending head. The closure
-            // remembers the last prompted queue id, so a head the model left
-            // pending is not re-prompted every turn (the retry re-prompt
-            // comes from the capture-failure notice, not the timer).
-            if let Ok((entries, blocked)) = state.sender_queue_snapshot() {
-                if blocked.is_none() {
-                    if let Some(head) = entries.first() {
-                        // The fallback re-emission prompt is a DEDICATED
-                        // custom message carrying the queueId (public) - the
-                        // dispatch token stays private in the native
-                        // session's memory and never rides the prompt, the
-                        // transcript or the notices.
-                        // Selection lives in `occ3_sender_queue::head_prompt`
-                        // (unit-tested). Prompts are delivered as followUps
-                        // after the current run and chosen from the queue
-                        // at drain time: a head the model already re-armed
-                        // is Armed and gets no prompt. Busy retries are
-                        // counted only at a refusal, never per call.
-                        let prompt = occ3_sender_queue::head_prompt(head, entries.len());
-                        if let Some(prompt) = prompt {
-                            let prompt_key = occ3_sender_queue::head_prompt_key(head);
-                            if last_prompted_head
-                                .lock()
-                                .map(|last| last.as_deref() != Some(prompt_key.as_str()))
-                                .unwrap_or(false)
-                            {
-                                let fallback_head =
-                                    head.state == occ3_sender_queue::Occ3SenderQueueState::FallbackPending;
-                                let custom = if fallback_head {
-                                    Some(CustomMessage {
-                                        role: "user".into(),
-                                        custom_type:
-                                            occ3_sender_queue::OCC3_FALLBACK_PROMPT_CUSTOM_TYPE.into(),
-                                        content: CustomMessageContent::Text(prompt.clone()),
-                                        display: true,
-                                        details: Some(serde_json::json!({
-                                            "queueId": head.queue_id,
-                                        })),
-                                        timestamp: crate::core::agent_session::now_ms() as i64,
-                                    })
-                                } else {
-                                    None
-                                };
-                                let _ = session
-                                    .queue_agent_message_prompt(&prompt, "followUp", custom)
-                                    .await;
-                                if fallback_head {
-                                    // The host issued this fallback
-                                    // re-emission prompt: record the issue
-                                    // its MessageEnd must consume.
-                                    state.issue_fallback_prompt(&head.queue_id);
-                                }
-                                if let Ok(mut last) = last_prompted_head.lock() {
-                                    *last = Some(prompt_key);
-                                }
-                            }
-                        }
-                    }
-                }
-            }
+            // Head prompt: exactly once per prompting occasion (see
+            // `HeadPromptGate`). A source busy head is deferred while a
+            // provider retry of this run is pending, so only one driver
+            // re-arms it.
+            Self::drive_occ3_head_prompt(session.clone(), state.clone(), head_prompt_gate.clone()).await;
         })
     }));
     state.set_queue_listener_unsubscribe(Box::from(unsubscribe));
@@ -3629,6 +3574,86 @@ fn install_sender_queue_listener(
         let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller);
     }
     Ok(())
+}
+
+/// Sends the host's head prompt for the current queue head at most once
+/// per prompting occasion. When the gate defers (a source busy head while
+/// a provider retry of the refused run is pending), a detached task waits
+/// for the retry to settle and decides again against the queue state at
+/// that time: if the retried turn re-armed or delivered, nothing is sent;
+/// if no retry ran (disabled, vetoed, cancelled, exhausted) or it did not
+/// re-arm, exactly one follow-up goes out. The task holds only weak
+/// references and never blocks the agent run.
+fn drive_occ3_head_prompt(
+    session: Arc<AgentSession>,
+    state: Arc<occ3_state::Occ3NativeSession>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> {
+    Box::pin(async move {
+    let (session, state, gate) = (&session, &state, &gate);
+    let Ok((entries, blocked)) = state.sender_queue_snapshot() else {
+        return;
+    };
+    if blocked.is_some() {
+        return;
+    }
+    let Some(head) = entries.first() else {
+        return;
+    };
+    let decision = match gate.lock() {
+        Ok(mut gate) => gate.decide(head, entries.len(), session.is_retrying()),
+        Err(_) => return,
+    };
+    match decision {
+        occ3_sender_queue::HeadPromptDecision::Skip => {}
+        occ3_sender_queue::HeadPromptDecision::Defer => {
+            let session = Arc::downgrade(session);
+            let state = Arc::downgrade(state);
+            let gate = Arc::clone(gate);
+            tokio::spawn(async move {
+                loop {
+                    let Some(live) = session.upgrade() else { return };
+                    if !live.is_retrying() {
+                        break;
+                    }
+                    live.wait_for_retry().await;
+                }
+                let (Some(session), Some(state)) = (session.upgrade(), state.upgrade()) else {
+                    return;
+                };
+                Self::drive_occ3_head_prompt(session, state, gate).await;
+            });
+        }
+        occ3_sender_queue::HeadPromptDecision::Send(prompt) => {
+            let fallback_head =
+                head.state == occ3_sender_queue::Occ3SenderQueueState::FallbackPending;
+            let custom = if fallback_head {
+                Some(CustomMessage {
+                    role: "user".into(),
+                    custom_type:
+                        occ3_sender_queue::OCC3_FALLBACK_PROMPT_CUSTOM_TYPE.into(),
+                    content: CustomMessageContent::Text(prompt.clone()),
+                    display: true,
+                    details: Some(serde_json::json!({
+                        "queueId": head.queue_id,
+                    })),
+                    timestamp: crate::core::agent_session::now_ms() as i64,
+                })
+            } else {
+                None
+            };
+            let _ = session
+                .queue_agent_message_prompt(&prompt, "followUp", custom)
+                .await;
+            if fallback_head {
+                // The host issued this fallback
+                // re-emission prompt: record the issue
+                // its MessageEnd must consume.
+                state.issue_fallback_prompt(&head.queue_id);
+            }
+        }
+    }
+    })
 }
 
 /// Delivers one durable queue-notice record to both targets, in order:
