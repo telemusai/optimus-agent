@@ -1026,6 +1026,10 @@ def admit_request(scheduler, req, value):
                 new_ids = original[:at] + array(original.typecode, holes) + original[at:]
             else:
                 new_ids = list(original[:at]) + holes + list(original[at:])
+            # Pre-use capacity floor: a consume that cannot get a request slot
+            # or KV for its rewritten prompt would park until the queue bound
+            # and end in a dispatched, non-releasable admission_timeout.
+            require(_consume_capacity_available(scheduler, len(new_ids)), "quota")
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
@@ -1057,6 +1061,33 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+
+
+def _consume_capacity_available(scheduler, prompt_tokens):
+    """Conservative pre-use check that a consume prefill can be scheduled now.
+
+    Reads scheduler state that is identical on every rank (request slots,
+    KV allocator and radix evictable sizes, queue length), and runs inside
+    the admit preflight, so the verdict is gathered and rank-uniform. It is a
+    floor, not the PrefillAdder's exact budget: a False verdict is a busy
+    decline the sender may retry. A scheduler without these hooks (offline
+    fixtures) is treated as having capacity.
+    """
+    running = getattr(scheduler, "running_batch", None)
+    slots = getattr(scheduler, "get_num_allocatable_reqs", None)
+    if callable(slots) and running is not None:
+        queued = len(getattr(scheduler, "waiting_queue", ()) or ())
+        if slots(len(running.reqs), running_batch=running) - queued <= 0:
+            return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    tree = getattr(scheduler, "tree_cache", None)
+    available = getattr(allocator, "available_size", None)
+    evictable = getattr(tree, "evictable_size", None)
+    if callable(available) and callable(evictable):
+        page = max(int(getattr(scheduler, "page_size", 1) or 1), 1)
+        if available() + evictable() < prompt_tokens + page:
+            return False
+    return True
 
 
 def release_consume_cohort(scheduler, req):

@@ -467,6 +467,7 @@ class _Context:
     # pre-admission busy refusal (None otherwise).
     fence: str | None = None
     busy_refusal: str | None = None
+    registry_busy: bool = False
     exhausted: bool = False
     native_terminal: bool = False
     completed: bool = False
@@ -796,6 +797,7 @@ class ChatAttachmentAdapter:
                 if (error.code, error.status) == ("scheduler_busy", 503):
                     # The registry declined "busy" before any mutation
                     # (latent_backend.enroll_source); nothing was dispatched.
+                    ctx.registry_busy = True
                     ctx.busy_refusal = "scheduler_busy"
                 raise
             if ctx.cancel_requested:
@@ -917,11 +919,10 @@ class ChatAttachmentAdapter:
             # fired while the request may already be admitted, so its use is
             # uncertain and the fence stays.
             return
-        registry_busy = (ctx.busy_refusal == "scheduler_busy" and ctx.enrollment is None
-                         and type(ctx.attachment) is CaptureIntent and not ctx.dispatched)
-        if not registry_busy:
+        if not (ctx.registry_busy and not ctx.dispatched):
             # Re-prove non-use on the worker. Only the registry's own "busy"
-            # decline at capture enroll needs no proof: it creates no record.
+            # decline (capture enroll or consume reserve) needs no proof: it
+            # is raised before the registry creates or mutates any state.
             release = getattr(self.backend, "release_unused_attempt", None)
             if not callable(release):
                 return
@@ -938,7 +939,29 @@ class ChatAttachmentAdapter:
                 # The consume lease is back to published: a retire now would
                 # revoke the source state, so cleanup skips it.
                 ctx.retired = ctx.retire_confirmed = True
+            elif not await self._retire_before_unfence(ctx):
+                return
         self._unfence(ctx)
+
+    async def _retire_before_unfence(self, ctx):
+        """Retire the never-admitted capture record before the fence drops.
+
+        Otherwise an immediate resend can meet the still-reserved record and
+        the registry busy decline. Only a positive retire unfences; any other
+        outcome keeps the fence and leaves the retry to the normal cleanup.
+        """
+        task = asyncio.ensure_future(
+            self.backend.retire(ctx.attempt_id, ctx.native_rid, ctx.dispatched))
+        try:
+            await asyncio.wait({task}, timeout=self.profile.cleanup_seconds)
+        finally:
+            if not task.done():
+                task.cancel()
+                self._quarantine(task, ctx)
+        if not task.done() or task.cancelled() or task.exception() is not None:
+            return False  # cleanup still retires: ctx.retired stays False
+        ctx.retired = ctx.retire_confirmed = True
+        return True
 
     async def _generate(self, original, tm, obj, request, ctx):
         try:
@@ -992,10 +1015,20 @@ class ChatAttachmentAdapter:
                                        if k != "occ3_worker_descriptor"})
             view = NativeRequestView(obj, budget, digest(sampling), bool(obj.stream),
                                      ctx.deadline, prefix_offset=ctx.prefix_offset)
-            reservation = (await self._bounded_admission(
-                    self.backend.prepare_source(ctx.enrollment, view), ctx) if source else
-                await self._bounded_admission(
-                    self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view), ctx))
+            if source:
+                reservation = await self._bounded_admission(
+                    self.backend.prepare_source(ctx.enrollment, view), ctx)
+            else:
+                try:
+                    reservation = await self._bounded_admission(
+                        self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view), ctx)
+                except AttachmentError as error:
+                    if (error.code, error.status) == ("scheduler_busy", 503):
+                        # The registry declined "busy" before taking the
+                        # nonce, attempt or lease (latent_backend.reserve).
+                        ctx.registry_busy = True
+                        ctx.busy_refusal = "scheduler_busy"
+                    raise
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             if (type(reservation) is not Reservation

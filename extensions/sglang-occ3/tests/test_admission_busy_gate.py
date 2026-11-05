@@ -624,3 +624,40 @@ async def test_keepalive_no_native_event_emits_bounded_admission_error(harness):
     # Cut at the admission bound, far below the 60 s turn deadline.
     assert elapsed < 5.0
     await _spin_until(lambda: harness.adapter._active == 0)
+
+
+# ------------------------------------- Fable review 3: no parked consume
+def _capacity_scheduler(runtime, *, slots=4, waiting=0, free_kv=10_000, evictable=0, page=1):
+    running = NS(reqs=[active("a"), active("b")])
+    sched = scheduler(runtime, inflight=running.reqs)
+    sched.running_batch = running
+    sched.waiting_queue = [object()] * waiting
+    sched.get_num_allocatable_reqs = lambda bs, running_batch=None: slots
+    sched.token_to_kv_pool_allocator = NS(available_size=lambda: free_kv)
+    sched.tree_cache = NS(evictable_size=lambda: evictable)
+    sched.page_size = page
+    return sched
+
+
+@pytest.mark.parametrize("kw", [dict(slots=0), dict(slots=2, waiting=2),
+                                dict(free_kv=8, evictable=2)])
+def test_consume_declines_busy_when_its_prefill_cannot_be_scheduled(monkeypatch, kw):
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    descriptor = consume(native_rid="rid")   # 3 prompt + 8 prefix tokens
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(_capacity_scheduler(runtime, **kw), request, descriptor)
+    assert caught.value.code == "quota"     # scheduler folds to occ3_busy_batch
+    assert list(request.origin_input_ids) == [1, 2, 3]
+    assert record.admitted_consume is False and record.state == "leased"
+
+
+def test_consume_admits_when_slot_and_kv_cover_its_rewritten_prompt(monkeypatch):
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    descriptor = consume(native_rid="rid")
+    # 11 prompt tokens + one page: exactly enough with radix-evictable pages.
+    w.admit_request(_capacity_scheduler(runtime, slots=1, free_kv=6, evictable=6), request, descriptor)
+    assert record.admitted_consume

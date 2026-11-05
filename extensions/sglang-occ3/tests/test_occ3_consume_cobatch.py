@@ -35,9 +35,11 @@ class Row:
         self.finished_reason = self.to_finish = None
         self.inflight_middle_chunks = 0
         self.kv = NS(holds_kv=False)
+        self.occ3_abort_done = False
         self.occ3_worker_descriptor = descriptor("consume") if attached else None
     def finished(self):
-        return self.done
+        # Native Req.finished(): a set finish reason is finished.
+        return self.done or self.finished_reason is not None
 
 
 def consume_row(rid="consume", *, eager=False, **kw):
@@ -55,14 +57,21 @@ class Batch:
 
 
 class TestConsumeCoBatch(PinnedCase):
-    def settle(self, batch, *, chunked=None, mode_extend=False, finish=()):
+    def settle(self, batch, *, chunked=None, mode_extend=False, finish=(), release_ok=True):
         calls = []
         worker = types.ModuleType("occ3_sglang.latent_worker")
-        worker.abort_request = lambda s, r, reason: calls.append(("abort", r.rid, reason))
+        def abort(s, r, reason):
+            if getattr(r, "occ3_abort_done", False):
+                return
+            calls.append(("abort", r.rid, reason))
+            r.occ3_abort_done = True
+        worker.abort_request = abort
         worker.commit_result = lambda s, r, result, index, start, end, **kw: calls.append(
             ("commit", r.rid, index, start, end, kw["terminal"]))
         def release(s, r):
             calls.append(("release", r.rid))
+            if not release_ok:
+                return False   # record retired/expired before injection completed
             r.occ3_force_eager = False
             return True
         worker.release_consume_cohort = release
@@ -217,12 +226,6 @@ class TestConsumeCoBatch(PinnedCase):
         fn(state, NS(abort_all=False, rid="consume-rid", abort_message=None))
         self.assertEqual(aborted, [("consume-rid", "cancelled")])
 
-    def test_deadline_sweep_covers_a_decoding_consume(self):
-        node = self.sources.node(SCHED, "_poll_timeout_aborts", "Scheduler")
-        import ast
-        text = ast.unparse(node)
-        self.assertIn("occ3_attached", text)
-
     def test_retraction_aborts_the_attached_row_and_keeps_ordinary_rows_retractable(self):
         abort_calls = []
         worker = types.ModuleType("occ3_sglang.latent_worker")
@@ -243,19 +246,6 @@ class TestConsumeCoBatch(PinnedCase):
         with self.assertRaisesRegex(RuntimeError, "retraction_unsupported"):
             reset(consume)
 
-    def test_retraction_order_pops_ordinary_rows_before_the_attached_row(self):
-        node = self.sources.node(BATCH, "retract_decode", "ScheduleBatch")
-        import ast
-        text = ast.unparse(node)
-        self.assertIn("occ3_attached", text)
-        rows = [Row("a"), consume_row(), Row("c")]
-        order = [0, 1, 2]
-        reordered = [i for i in order if getattr(rows[i], "occ3_attached", False)] + [
-            i for i in order if not getattr(rows[i], "occ3_attached", False)]
-        self.assertEqual(reordered.pop(), 2)
-        self.assertEqual(reordered.pop(), 0)
-        self.assertEqual(reordered, [1])
-
     def test_preemption_stays_available_beside_an_attached_row(self):
         node = self.sources.node(POLICY, "preempt_to_schedule", "PrefillAdder")
         import ast
@@ -274,3 +264,108 @@ class TestConsumeCoBatch(PinnedCase):
         ordinary = Row("o", out=[1] * 10)
         ordinary.sampling_params = NS(max_new_tokens=10000)
         self.assertEqual(fn(NS(new_token_ratio=0.5), ordinary), 2048)
+
+    # ------------------------------------------------- Fable review, blocking 1
+    def test_refused_cohort_release_aborts_the_consume_and_leaves_no_eager_row(self):
+        req = consume_row(eager=True)
+        req.kv.holds_kv = True
+        _, calls = self.settle(Batch([req]), mode_extend=True, release_ok=False)
+        self.assertEqual(calls, [("release", "consume"), ("abort", "consume", "commit_failed"),
+                                 ("free", "consume")])
+        self.assertEqual(req.finished_reason.message, "occ3_commit_failed")
+        self.assertFalse(req.occ3_force_eager)
+        # The settled batch merges into a running batch of ordinary rows.
+        req.done = True
+        last = NS(reqs=[req], occ3_force_eager=True, occ3_context=("ctx",))
+        merge = self.sources.function(BATCH, "merge_batch", "ScheduleBatch")
+        running = NS(reqs=[Row("a"), Row("b")], occ3_force_eager=False, occ3_context=None)
+        try:
+            merge(running, last)
+        except RuntimeError as error:
+            self.assertNotIn("mixed_cohort", str(error))
+        except Exception:
+            pass  # past the occ3 guard the stub cannot run native merge code
+        self.assertFalse(last.occ3_force_eager)
+
+    def test_defensive_sweep_aborts_any_eager_consume_left_after_an_extend_settle(self):
+        # start None (no accepted pair this step), but no longer the chunked row.
+        req = consume_row(eager=True)
+        req.inflight_middle_chunks = 1
+        req.kv.holds_kv = True
+        _, calls = self.settle(Batch([req]), chunked=None, mode_extend=True)
+        self.assertEqual(calls, [("abort", "consume", "commit_failed"), ("free", "consume")])
+        self.assertFalse(req.occ3_force_eager)
+        self.assertEqual(req.finished_reason.message, "occ3_commit_failed")
+
+    def test_defensive_sweep_keeps_the_scheduler_chunked_consume(self):
+        req = consume_row(eager=True)
+        req.inflight_middle_chunks = 1
+        _, calls = self.settle(Batch([req]), chunked=req, mode_extend=True)
+        self.assertEqual(calls, [])
+        self.assertTrue(req.occ3_force_eager)
+
+    # ----------------------------------------------- Fable review, should fix 2
+    def test_overshoot_tick_keeps_the_first_abort_reason(self):
+        rows = [Row("a"), consume_row(), Row("c")]
+        rows[1].occ3_abort_done = True
+        rows[1].finished_reason = Abort("occ3_admission_timeout")
+        rows[1].finished_len = 3
+        rows[1].kv.holds_kv = True
+        _, calls = self.settle(Batch(rows))
+        self.assertEqual(calls, [])
+        self.assertEqual(rows[1].finished_reason.message, "occ3_admission_timeout")
+        self.assertEqual(rows[1].finished_len, 3)
+
+    # ------------------------------------- behaviour, replacing source-text pins
+
+    # ------------------------------------- behaviour, replacing source-text pins
+    def test_deadline_sweep_aborts_a_decoding_consume_past_its_deadline(self):
+        off = NS(get=lambda: 0)
+        sweep = self.sources.function(SCHED, "_poll_timeout_aborts", "Scheduler",
+                                      AbortReq=lambda **kw: NS(**kw), List=list,
+                                      time=NS(monotonic=lambda: 50.0, perf_counter=lambda: 50.0),
+                                      envs=NS(SGLANG_REQ_WAITING_TIMEOUT=off,
+                                              SGLANG_REQ_RUNNING_TIMEOUT=off))
+        def row(rid, deadline, *, attached=True, eager=False):
+            req = Row(rid, attached=attached, eager=eager, private=attached)
+            req.occ3_worker_descriptor = NS(deadline=deadline)
+            req.occ3_queue_deadline = None
+            return req
+        late, live, ordinary = row("late", 10.0), row("live", 90.0), Row("plain")
+        queued = row("queued", 90.0, eager=True)
+        queued.occ3_queue_deadline = 40.0  # queue bound applies to queued rows only
+        state = NS(waiting_queue=[queued], grammar_manager=NS(grammar_queue=[]),
+                   collect_inflight_reqs=lambda: {late, live, ordinary}, chunked_req=None)
+        aborts = sweep(state)
+        self.assertEqual(sorted((a.rid, a.abort_message) for a in aborts),
+                         [("late", "occ3_admission_timeout"), ("queued", "occ3_admission_timeout")])
+
+    def test_retraction_pops_ordinary_rows_and_never_the_attached_row(self):
+        retract = self.sources.function(
+            BATCH, "retract_decode", "ScheduleBatch", FINISH_ABORT=Abort,
+            HTTPStatus=NS(INTERNAL_SERVER_ERROR=500, SERVICE_UNAVAILABLE=503),
+            beam_retraction_order=lambda order, reqs: order,
+            get_disagg=lambda: NS(disaggregation_decode_retraction_backup="none"),
+            logger=NS(warning=lambda *a, **k: None), List=list, Tuple=tuple, Req=Row)
+        # Native order would pop the attached row first (it is last).
+        rows = [Row("a"), Row("c"), Row("d"), consume_row()]
+        for req in rows:
+            req.beam_group = None
+        released, kept = [], []
+        budget = {"fits_after": 2}  # memory fits once two ordinary rows are gone
+        batch = NS(reqs=rows)
+        batch._get_decode_retraction_order = lambda reqs: [0, 1, 2, 3]
+        batch.check_decode_mem = lambda selected_indices=None: len(released) >= budget["fits_after"]
+        batch.release_req = lambda idx, remaining, offload_kv=True: released.append(rows[idx].rid) or True
+        batch.filter_batch = lambda keep_indices: kept.extend(rows[i].rid for i in keep_indices)
+        try:
+            retract(batch)
+        except Exception as error:
+            if not released:
+                raise  # failed before the loop: the stub no longer matches
+            self.assertIsInstance(error, (AttributeError, NameError, TypeError), error)
+        self.assertEqual(released, ["d", "c"])
+        self.assertNotIn("consume", released)
+        if kept:
+            self.assertIn("consume", kept)
+

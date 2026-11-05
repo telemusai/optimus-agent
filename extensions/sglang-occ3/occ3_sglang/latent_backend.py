@@ -233,8 +233,16 @@ class LatentBackend:
         reservation = self._reservation(descriptor, attachment.binding_digest, native)
         self.attempts[attempt_id] = {"descriptor": descriptor, "reservation": reservation,
                                      "principal": identity.principal_digest}
-        await self.client.call("reserve_consume", {"descriptor": asdict(descriptor)},
-                               command_id="reserve-" + descriptor.reservation_id)
+        try:
+            await self.client.call("reserve_consume", {"descriptor": asdict(descriptor)},
+                                   command_id="reserve-" + descriptor.reservation_id)
+        except LatentError as error:
+            if error.code != "busy":
+                raise
+            # Proven non-use, same contract as enroll_source: the registry
+            # declines "busy" before taking the nonce, attempt or lease.
+            self.attempts[attempt_id]["retired"] = True
+            raise AttachmentError("scheduler_busy", 503) from None
         return reservation
 
     def bind(self, reservation, native):

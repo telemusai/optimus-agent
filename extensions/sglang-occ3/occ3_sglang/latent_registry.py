@@ -213,8 +213,11 @@ class LatentRegistry:
                     and descriptor.attempt_id not in self.tombstone_attempts, "replay")
             nonce_key = digest([descriptor.principal_digest, descriptor.receiver_session_id, descriptor.consume_nonce])
             require(nonce_key not in self.used_nonces, "replay")
-            require(sum(r.state in ("reserved", "capturing", "leased", "injected") and not r.revoked
-                        for r in self.records.values()) < self.profile.max_active, "quota")
+            # Same single active slot as reserve_capture: the same distinct
+            # "busy" decline, raised before any mutation (no nonce, attempt or
+            # lease), so the frontend can prove non-use.
+            require(sum(r.state in _ACTIVE_STATES and not r.revoked
+                        for r in self.records.values()) < self.profile.max_active, "busy")
             self.used_nonces[nonce_key] = descriptor.reservation_id
             self._nonce_expiry[nonce_key] = pub.expires_at_epoch
             self.attempts[descriptor.attempt_id] = record.handle

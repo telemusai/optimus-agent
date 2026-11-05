@@ -325,3 +325,190 @@ def test_release_unused_lease_checks_the_principal():
     with pytest.raises(LatentError, match="identity"):
         r.release_unused_lease(descriptor.attempt_id, "b" * 64)
     assert record.state == "leased"
+
+
+# ------------------------------------------ Fable review: backend and worker
+class _StubClient:
+    def __init__(self, replies):
+        self.replies, self.calls = replies, []
+
+    async def call(self, operation, payload, command_id=None):
+        self.calls.append((operation, payload, command_id))
+        reply = self.replies[operation]
+        if isinstance(reply, Exception):
+            raise reply
+        return reply
+
+
+def _backend_with(descriptor, replies):
+    from occ3_sglang import latent_backend as lb
+    backend = object.__new__(lb.LatentBackend)
+    backend.client = _StubClient(replies)
+    backend.attempts = {descriptor.attempt_id: {"descriptor": descriptor, "principal": "a" * 64}}
+    return backend
+
+
+@pytest.mark.asyncio
+async def test_backend_release_unused_attempt_consume_branch():
+    descriptor = consume()
+    backend = _backend_with(descriptor, {"release_lease": {"state": "published"}})
+    assert await backend.release_unused_attempt(descriptor.attempt_id, descriptor.native_rid) == "released"
+    assert backend.client.calls == [("release_lease",
+                                     {"attempt_id": descriptor.attempt_id, "principal_digest": "a" * 64},
+                                     "release-" + descriptor.reservation_id)]
+    assert backend.attempts[descriptor.attempt_id]["retired"]
+    # Once released, the frontend never releases or proves the attempt again.
+    with pytest.raises(LatentError, match="state"):
+        await backend.release_unused_attempt(descriptor.attempt_id, descriptor.native_rid)
+
+
+@pytest.mark.asyncio
+async def test_backend_release_unused_attempt_consume_refusal_propagates():
+    descriptor = consume()
+    backend = _backend_with(descriptor, {"release_lease": LatentError("state")})
+    with pytest.raises(LatentError, match="state"):
+        await backend.release_unused_attempt(descriptor.attempt_id, descriptor.native_rid)
+    assert not backend.attempts[descriptor.attempt_id].get("retired")
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("record,ok", [({"state": "reserved", "revoked": False}, True),
+                                       ({"state": "capturing", "revoked": False}, False),
+                                       ({"state": "reserved", "revoked": True}, False)])
+async def test_backend_release_unused_attempt_capture_branch(record, ok):
+    from test_latent_types import capture
+    descriptor = capture()
+    backend = _backend_with(descriptor, {"status": record})
+    if ok:
+        assert await backend.release_unused_attempt(descriptor.attempt_id, descriptor.native_rid) == "unadmitted"
+    else:
+        with pytest.raises(LatentError, match="state"):
+            await backend.release_unused_attempt(descriptor.attempt_id, descriptor.native_rid)
+    assert [c[0] for c in backend.client.calls] == ["status"]
+    assert not backend.attempts[descriptor.attempt_id].get("retired")   # caller retires
+
+
+@pytest.mark.asyncio
+async def test_backend_release_unused_attempt_checks_the_native_rid():
+    descriptor = consume()
+    backend = _backend_with(descriptor, {"release_lease": {}})
+    with pytest.raises(LatentError, match="identity"):
+        await backend.release_unused_attempt(descriptor.attempt_id, "other-rid")
+    assert not backend.client.calls
+
+
+def _worker_runtime(r):
+    from occ3_sglang import latent_worker as w
+    from test_latent_types import profile
+    runtime = object.__new__(w.WorkerRuntime)
+    runtime.profile = profile(); runtime.registry = r; runtime.commands = {}
+    runtime.poisoned = False; runtime.streams = {}; runtime.calibration_capture = None
+    runtime._agreed_epoch = 100.0
+    runtime.gather = lambda value: [value] * 8
+    runtime.consensus = lambda value: value
+    runtime.fence = lambda: None
+    return runtime
+
+
+def test_worker_control_release_lease_returns_the_lease_on_every_rank():
+    from occ3_sglang.latent_types import control_request
+    r, record, descriptor = _leased()
+    runtime = _worker_runtime(r)
+    reply = runtime.control(control_request("release-1", "release_lease", {
+        "attempt_id": descriptor.attempt_id, "principal_digest": descriptor.principal_digest}))
+    assert reply["ok"], reply
+    assert record.state == "published" and record.consumer is None
+    # A replayed command id returns the journaled reply, never a second release.
+    again = runtime.control(control_request("release-1", "release_lease", {
+        "attempt_id": descriptor.attempt_id, "principal_digest": descriptor.principal_digest}))
+    assert again == reply
+
+
+@pytest.mark.parametrize("payload", [{"attempt_id": "consume"},
+                                     {"attempt_id": "consume", "principal_digest": "a" * 64, "x": 1}])
+def test_worker_control_release_lease_requires_the_exact_payload(payload):
+    from occ3_sglang.latent_types import control_request
+    r, record, _ = _leased()
+    reply = _worker_runtime(r).control(control_request("release-2", "release_lease", payload))
+    assert not reply["ok"] and record.state == "leased"
+
+
+def test_worker_control_release_lease_refuses_an_admitted_lease():
+    from occ3_sglang.latent_types import control_request
+    r, record, descriptor = _leased()
+    record.admitted_consume = True
+    reply = _worker_runtime(r).control(control_request("release-3", "release_lease", {
+        "attempt_id": descriptor.attempt_id, "principal_digest": descriptor.principal_digest}))
+    assert not reply["ok"] and record.state == "leased" and record.consumer == descriptor
+
+
+# --------------------------------------- Fable review 4: consume busy decline
+def test_consume_behind_an_active_capture_declines_busy_without_mutation():
+    r, _ = registry()
+    ready(r)
+    r.publish(publication())
+    from test_latent_types import capture
+    r.reserve_capture(capture(attempt_id="other", reservation_id="other-res", capture_id="other-cap"),
+                      "other-handle", 1, 400, 128 * 1024 * 1024, 4096)
+    before = (dict(r.used_nonces), dict(r.attempts), r.records["handle"].state)
+    with pytest.raises(LatentError) as caught:
+        r.reserve_consume(consume())
+    assert caught.value.code == "busy"
+    assert (dict(r.used_nonces), dict(r.attempts), r.records["handle"].state) == before
+
+
+@pytest.mark.asyncio
+async def test_consume_registry_busy_then_identical_resend_is_admitted(harness):
+    h = harness
+    _reusable_consume(h)
+    reserve = h.backend.reserve
+    state = {"busy": True}
+    async def busy(a, *args):
+        if state.pop("busy", False):
+            h.backend.reserves.append((a,) + args)
+            raise AttachmentError("scheduler_busy", 503)
+        return await reserve(a, *args)
+    h.backend.reserve = busy
+    proof = h.backend.release_unused_attempt = _Proof()
+    a = attachment()
+    first = await consume_call(h, a)
+    assert first.status_code == 503 and first.headers["retry-after"] == "5"
+    assert json.loads(first.body)["error"]["message"] == "scheduler_busy"
+    assert not proof.calls and not h.tm.calls    # registry decline is the proof
+    second = await consume_call(h, a)
+    assert second.status_code == 200
+
+
+# --------------------------------------- Fable review 5: unfence after retire
+@pytest.mark.asyncio
+async def test_capture_busy_batch_unfences_only_after_the_record_is_retired(source_harness):
+    h = source_harness
+    proof = h.backend.release_unused_attempt = _Proof("unadmitted")
+    order = []
+    retire = h.backend.retire
+    async def tracked(*args):
+        order.append(("retire", bool(h.adapter._attempts)))
+        return await retire(*args)
+    h.backend.retire = tracked
+    _aborting(h, ["occ3_busy_batch"])
+    first, _, _ = await source_call(h)
+    assert first.status_code == 503 and len(proof.calls) == 1
+    assert order == [("retire", True)]          # fenced while retiring, retired once
+    assert not h.adapter._attempts
+
+
+@pytest.mark.asyncio
+async def test_capture_busy_batch_keeps_the_fence_when_the_retire_fails(source_harness):
+    h = source_harness
+    h.backend.release_unused_attempt = _Proof("unadmitted")
+    calls = []
+    async def failing(*args):
+        calls.append(args)
+        raise LatentError("state")
+    h.backend.retire = failing
+    _aborting(h, ["occ3_busy_batch"])
+    first, _, _ = await source_call(h)
+    assert first.status_code == 503
+    assert len(calls) == 2                      # early retire, then the cleanup retry
+    second, _, _ = await source_call(h)
+    assert second.status_code == 409 and b"replay_forbidden" in second.body
