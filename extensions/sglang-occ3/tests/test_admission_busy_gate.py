@@ -1,7 +1,9 @@
-"""Admission busy-batch gate: an armed turn admits only against an empty batch.
+"""Admission busy-batch gate: a capture admits only against an empty batch.
 
-An armed turn runs as an isolated cohort, so ordinary inflight work must
-drain before its prefill. Parking the one-shot native attempt in the
+A capture turn runs as an isolated cohort for its whole decode, so ordinary
+inflight work must drain before its prefill. A consume admits while ordinary
+rows decode (its prefill is a one-request extend batch, then it decodes in
+the shared batch); it declines only behind another eager row. Parking the one-shot native attempt in the
 ordinary queue would hold it behind unrelated decode traffic until the
 queue bound aborts it, so admission against a busy batch declines fast,
 explicitly and rank-uniformly instead: the scheduler wrapper folds the
@@ -90,15 +92,43 @@ def test_busy_running_batch_declines_before_any_mutation(monkeypatch):
     assert record.admitted_capture is False and record.state == "reserved"
 
 
-def test_busy_consume_declines_without_punching_prefix_holes(monkeypatch):
+def test_consume_admits_while_two_ordinary_requests_decode(monkeypatch):
+    # A consume prefill runs as its own one-request extend batch and then
+    # decodes in the shared batch, so ordinary decode traffic never blocks it.
     record = consume_record()
     runtime = bind(monkeypatch, runtime_for(record))
     request = req()
+    descriptor = consume(native_rid="rid")
+    w.admit_request(scheduler(runtime, inflight=[active("a"), active("b")]), request, descriptor)
+    assert record.admitted_consume
+    assert request.occ3_attached and request.occ3_force_eager and request.occ3_private_prefix
+    assert len(request.origin_input_ids) == 3 + descriptor.expected_prefix_tokens
+
+
+def test_consume_declines_without_punching_prefix_holes_behind_an_eager_row(monkeypatch):
+    # An eager row (a capture turn, or another consume's injected prefill)
+    # drains new prefills; the consume declines busy, pre-use, unmutated.
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    eager = NS(rid="capture", finished=lambda: False, occ3_force_eager=True)
     with pytest.raises(LatentError) as caught:
-        w.admit_request(scheduler(runtime, inflight=[active()]), request, consume(native_rid="rid"))
+        w.admit_request(scheduler(runtime, inflight=[active(), eager]), request, consume(native_rid="rid"))
     assert caught.value.code == "quota"
     assert list(request.origin_input_ids) == [1, 2, 3]
+    assert request.occ3_worker_descriptor is None and getattr(request, "occ3_attached", None) is None
     assert record.admitted_consume is False and record.state == "leased"
+
+
+def test_capture_still_declines_while_others_decode(monkeypatch):
+    record = capture_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(scheduler(runtime, inflight=[active("a"), active("b")]), request, capture())
+    assert caught.value.code == "quota"
+    assert request.occ3_worker_descriptor is None
+    assert record.admitted_capture is False and record.state == "reserved"
 
 
 def test_chunked_prefill_counts_as_busy(monkeypatch):
@@ -594,3 +624,48 @@ async def test_keepalive_no_native_event_emits_bounded_admission_error(harness):
     # Cut at the admission bound, far below the 60 s turn deadline.
     assert elapsed < 5.0
     await _spin_until(lambda: harness.adapter._active == 0)
+
+
+# ------------------------------------- Fable review 3: no parked consume
+def _capacity_scheduler(runtime, *, slots=4, waiting=0, free_kv=10_000, evictable=0, page=1):
+    running = NS(reqs=[active("a"), active("b")])
+    sched = scheduler(runtime, inflight=running.reqs)
+    sched.running_batch = running
+    sched.waiting_queue = [object()] * waiting
+    sched.get_num_allocatable_reqs = lambda bs, running_batch=None: slots
+    sched.token_to_kv_pool_allocator = NS(available_size=lambda: free_kv)
+    sched.tree_cache = NS(evictable_size=lambda: evictable)
+    sched.page_size = page
+    return sched
+
+
+@pytest.mark.parametrize("kw", [dict(slots=0), dict(free_kv=8, evictable=2)])
+def test_consume_declines_busy_when_its_prefill_cannot_be_scheduled(monkeypatch, kw):
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    descriptor = consume(native_rid="rid")   # 3 prompt + 8 prefix tokens
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(_capacity_scheduler(runtime, **kw), request, descriptor)
+    assert caught.value.code == "quota"     # scheduler folds to occ3_busy_batch
+    assert list(request.origin_input_ids) == [1, 2, 3]
+    assert record.admitted_consume is False and record.state == "leased"
+
+
+def test_consume_admits_when_slot_and_kv_cover_its_rewritten_prompt(monkeypatch):
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    descriptor = consume(native_rid="rid")
+    # 11 prompt tokens + one page: exactly enough with radix-evictable pages.
+    w.admit_request(_capacity_scheduler(runtime, slots=1, free_kv=6, evictable=6), request, descriptor)
+    assert record.admitted_consume
+
+
+def test_consume_admits_with_one_free_slot_behind_a_long_waiting_queue(monkeypatch):
+    # _occ3_prefill_selection runs the pending consume ahead of the waiting
+    # queue, so queued ordinary requests never make it busy.
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    w.admit_request(_capacity_scheduler(runtime, slots=1, waiting=64), req(), consume(native_rid="rid"))
+    assert record.admitted_consume

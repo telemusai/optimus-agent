@@ -103,6 +103,12 @@ _ADMISSION_REFUSALS = {
     "occ3_admission_timeout": ("admission_timeout", 503),
 }
 
+#: Scheduler refusals raised before admission (receive-time armed cap and the
+#: admit-time busy-batch decline): the request never entered the scheduler,
+#: so its replay fence may be released. admission_timeout is NOT here: it
+#: aborts an admitted request.
+_PRE_ADMISSION_BUSY = frozenset({"occ3_busy_batch", "occ3_busy"})
+
 #: Public codes in the admission-unavailability family (Retry-After and the
 #: admission-window header attach to these).
 _ADMISSION_PUBLIC_CODES = frozenset({"scheduler_busy", "admission_capacity",
@@ -457,6 +463,11 @@ class _Context:
     generation_calls: int = 0
     dispatched: bool = False
     attempted: bool = False
+    # Replay-fence entry this context added, and the public code of a proven
+    # pre-admission busy refusal (None otherwise).
+    fence: str | None = None
+    busy_refusal: str | None = None
+    registry_busy: bool = False
     exhausted: bool = False
     native_terminal: bool = False
     completed: bool = False
@@ -527,7 +538,9 @@ class ChatAttachmentAdapter:
         self.profile = profile or BufferProfile()
         self.monotonic, self.epoch = monotonic, epoch
         self._active = 0
-        self._attempts: dict[str, float] = {}
+        # Replay fence: fence digest -> (expiry epoch, owning attempt id). The
+        # owner id lets a context remove only the entry it added itself.
+        self._attempts: dict[str, tuple[float, str]] = {}
         self._quarantined: set[asyncio.Task] = set()
         # Root diagnostic: when set, every armed-turn response chunk is
         # appended to this path before audit/buffering. Never set in
@@ -570,7 +583,12 @@ class ChatAttachmentAdapter:
         profile = self.profile
         if (self._active >= profile.max_active
                 or (self._active + 1) * profile.max_buffer_bytes * 4 > profile.total_working_bytes):
-            raise AttachmentError("quota_exceeded", 429)
+            # Proven non-use: raised before the attempt fence, any backend
+            # call or native dispatch (ctx.attempted is still False), so the
+            # refusal is the retryable busy contract (503 scheduler_busy with
+            # Retry-After), not a counted failure. The other quota_exceeded
+            # sites (fence table, terminal limits) are unchanged.
+            raise AttachmentError("scheduler_busy", 503)
         self._active += 1
         ctx.charged = True
 
@@ -691,6 +709,8 @@ class ChatAttachmentAdapter:
             return await self._guard(
                 self._authorize_and_run(original, serving, request, raw_request, ctx), ctx)
         except AttachmentError as error:
+            if ctx is not None:
+                await self._release_busy_fence(ctx, error)
             if ctx is not None and (error.code, error.status) in _CUT_TURN:
                 # Bounded cut-turn record: fixed code, status and whether native
                 # work was already dispatched. No handle, body or prompt text.
@@ -769,9 +789,17 @@ class ChatAttachmentAdapter:
         if source:
             ctx.native_rid = uuid.uuid4().hex
             self._fence(ctx)
-            enrollment = await self._bounded_admission(
-                self.backend.enroll_source(
-                    ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline), ctx)
+            try:
+                enrollment = await self._bounded_admission(
+                    self.backend.enroll_source(
+                        ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline), ctx)
+            except AttachmentError as error:
+                if (error.code, error.status) == ("scheduler_busy", 503):
+                    # The registry declined "busy" before any mutation
+                    # (latent_backend.enroll_source); nothing was dispatched.
+                    ctx.registry_busy = True
+                    ctx.busy_refusal = "scheduler_busy"
+                raise
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             validate_source_enrollment(ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, enrollment)
@@ -838,7 +866,7 @@ class ChatAttachmentAdapter:
 
     def _fence(self, ctx):
         now = self.epoch()
-        self._attempts = {key: expiry for key, expiry in self._attempts.items() if expiry > now}
+        self._attempts = {key: entry for key, entry in self._attempts.items() if entry[0] > now}
         a = ctx.attachment
         if type(a) is CaptureIntent:
             identity = ["capture", ctx.identity.principal_digest, a.source_session_id, a.capture_id]
@@ -849,8 +877,91 @@ class ChatAttachmentAdapter:
             raise AttachmentError("replay_forbidden")
         if len(self._attempts) >= self.profile.max_attempts:
             raise AttachmentError("quota_exceeded", 429)
-        self._attempts[fence] = a.expires_at_epoch
+        self._attempts[fence] = (a.expires_at_epoch, ctx.attempt_id)
+        ctx.fence = fence
         ctx.attempted = True  # Before any backend await, including uncertain admission.
+
+    def _unfence(self, ctx):
+        """Drop this context's own fence entry; never another context's.
+
+        Same event loop as _fence (no await between check and delete), so a
+        concurrent duplicate either still sees the entry or adds its own.
+        """
+        fence = ctx.fence
+        entry = self._attempts.get(fence) if fence is not None else None
+        if entry is not None and entry[1] == ctx.attempt_id:
+            del self._attempts[fence]
+        ctx.fence = None
+
+    async def _release_busy_fence(self, ctx, error):
+        """Free the replay fence after a proven pre-dispatch busy refusal.
+
+        Proof: the scheduler or the registry declined this attempt before
+        admission (ctx.busy_refusal names that decline and matches the public
+        error), and no native output was observed. Nothing ran, so no attempt
+        was committed, no private KV exists and no receipt can exist. Every
+        other ending keeps the fence: a resend of the same request then gets
+        replay_forbidden. A consume also returns its lease and nonce to the
+        published state first, and a capture proves its record was never
+        admitted; when that is not positively confirmed the fence stays and
+        the normal cleanup retires. Keepalive streams (refusal delivered as
+        an SSE error event after hand-off) keep the fence.
+        """
+        if error.status != 503 or ctx.native_started or ctx.fence is None \
+                or ctx.stream_handed_off or ctx.terminal_handed_off:
+            return
+        if ctx.busy_refusal is not None and ctx.busy_refusal == error.code:
+            pass  # A proven pre-admission busy decline (scheduler or registry).
+        elif error.code == "admission_timeout" and not ctx.dispatched:
+            pass  # A control-plane timeout before dispatch: worker proof below.
+        else:
+            # Includes admission_timeout AFTER dispatch: the first-event bound
+            # fired while the request may already be admitted, so its use is
+            # uncertain and the fence stays.
+            return
+        if not (ctx.registry_busy and not ctx.dispatched):
+            # Re-prove non-use on the worker. Only the registry's own "busy"
+            # decline (capture enroll or consume reserve) needs no proof: it
+            # is raised before the registry creates or mutates any state.
+            release = getattr(self.backend, "release_unused_attempt", None)
+            if not callable(release):
+                return
+            task = asyncio.ensure_future(release(ctx.attempt_id, ctx.native_rid))
+            try:
+                await asyncio.wait({task}, timeout=self.profile.cleanup_seconds)
+            finally:
+                if not task.done():
+                    task.cancel()
+                    self._quarantine(task, ctx)
+            if not task.done() or task.cancelled() or task.exception() is not None:
+                return
+            if task.result() == "released":
+                # The consume lease is back to published: a retire now would
+                # revoke the source state, so cleanup skips it.
+                ctx.retired = ctx.retire_confirmed = True
+            elif not await self._retire_before_unfence(ctx):
+                return
+        self._unfence(ctx)
+
+    async def _retire_before_unfence(self, ctx):
+        """Retire the never-admitted capture record before the fence drops.
+
+        Otherwise an immediate resend can meet the still-reserved record and
+        the registry busy decline. Only a positive retire unfences; any other
+        outcome keeps the fence and leaves the retry to the normal cleanup.
+        """
+        task = asyncio.ensure_future(
+            self.backend.retire(ctx.attempt_id, ctx.native_rid, ctx.dispatched))
+        try:
+            await asyncio.wait({task}, timeout=self.profile.cleanup_seconds)
+        finally:
+            if not task.done():
+                task.cancel()
+                self._quarantine(task, ctx)
+        if not task.done() or task.cancelled() or task.exception() is not None:
+            return False  # cleanup still retires: ctx.retired stays False
+        ctx.retired = ctx.retire_confirmed = True
+        return True
 
     async def _generate(self, original, tm, obj, request, ctx):
         try:
@@ -904,10 +1015,20 @@ class ChatAttachmentAdapter:
                                        if k != "occ3_worker_descriptor"})
             view = NativeRequestView(obj, budget, digest(sampling), bool(obj.stream),
                                      ctx.deadline, prefix_offset=ctx.prefix_offset)
-            reservation = (await self._bounded_admission(
-                    self.backend.prepare_source(ctx.enrollment, view), ctx) if source else
-                await self._bounded_admission(
-                    self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view), ctx))
+            if source:
+                reservation = await self._bounded_admission(
+                    self.backend.prepare_source(ctx.enrollment, view), ctx)
+            else:
+                try:
+                    reservation = await self._bounded_admission(
+                        self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view), ctx)
+                except AttachmentError as error:
+                    if (error.code, error.status) == ("scheduler_busy", 503):
+                        # The registry declined "busy" before taking the
+                        # nonce, attempt or lease (latent_backend.reserve).
+                        ctx.registry_busy = True
+                        ctx.busy_refusal = "scheduler_busy"
+                    raise
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             if (type(reservation) is not Reservation
@@ -1022,6 +1143,8 @@ class ChatAttachmentAdapter:
                             # deadline abort of admitted generation and keeps
                             # the generic completion failure below.
                             public, status = _ADMISSION_REFUSALS[code]
+                            if code in _PRE_ADMISSION_BUSY:
+                                ctx.busy_refusal = public
                             raise AttachmentError(public, status)
                         raise AttachmentError("native_completion_failed")
                     ctx.native_terminal = True

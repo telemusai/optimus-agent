@@ -25,7 +25,7 @@ class LatentError(RuntimeError):
     def __init__(self, code="latent_failed", members=None):
         allowed = {"latent_failed", "unavailable", "profile", "identity", "expired",
                    "quota", "replay", "state", "lineage", "ranks", "invalid",
-                   "not_ready", "retired", "numerical", "cancelled"}
+                   "not_ready", "retired", "numerical", "cancelled", "busy"}
         self.code = code if code in allowed else "latent_failed"
         # Bounded sanitised names of the profile members that tripped; a live
         # decline names every failing check in one attempt instead of one.
@@ -401,7 +401,8 @@ class Publication:
 def control_request(command_id, operation, payload):
     identifier(command_id)
     require(operation in {"health", "enroll_session", "reserve_capture", "reserve_consume",
-                          "publish", "publication_status", "status", "retire", "bind_output"})
+                          "publish", "publication_status", "status", "retire", "bind_output",
+                          "release_lease"})
     bounded_payload(payload)
     return {"schema": "occ3.control.v1", "command_id": command_id,
             "operation": operation, "payload": payload}

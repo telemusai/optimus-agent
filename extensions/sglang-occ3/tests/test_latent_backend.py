@@ -324,3 +324,24 @@ async def test_v1_enroll_refuses_when_calibration_collection_is_armed(monkeypatc
     monkeypatch.delenv("OCC3_CALIBRATION_CAPTURE_DIR")
     enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
     assert enrollment.attempt_id=="attempt"
+
+
+@pytest.mark.asyncio
+async def test_receiver_registry_busy_is_scheduler_busy_503_and_retires_the_attempt():
+    """Fable review 4: the consume busy decline uses the capture busy contract."""
+    from occ3_sglang.attachment_contract import AttachmentError
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    identity=AuthenticatedContext(identity.principal_digest,"receiver",p.model_id,p.model_fingerprint,p.runtime_epoch,9,identity.deadline_monotonic)
+    attachment=InferenceAttachment(1,"nonce","message","connector","receiver",p.model_fingerprint,p.runtime_epoch,9,"handle",expiry,p.method)
+    client.record=dict(source_handle="handle",state_generation=7,expires_at_epoch=expiry,state="published",revoked=False,
+        source=dict(capture_commit_id="commit",expected_ranks=8,retained_count=8,hidden_dim=6144,dtype="bfloat16",layout_digest="b"*64),terminal={})
+    call=client.call
+    async def busy(op,payload,command_id=None):
+        if op=="reserve_consume": raise LatentError("busy")
+        return await call(op,payload,command_id)
+    client.call=busy
+    native=NS(rid="native-rid",input_ids=[1],sampling_params={"max_new_tokens":100},stream=True)
+    with pytest.raises(AttachmentError) as caught:
+        await backend.reserve(attachment,identity,"consume",NativeRequestView(native,100,"s",True,identity.deadline_monotonic))
+    assert (caught.value.code,caught.value.status)==("scheduler_busy",503)
+    assert backend.attempts["consume"]["retired"]

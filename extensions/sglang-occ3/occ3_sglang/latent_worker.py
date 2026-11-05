@@ -661,6 +661,7 @@ class WorkerRuntime:
         command_id, op, payload = command["command_id"], command["operation"], command["payload"]
         fingerprint = digest(command)
         self.consensus(fingerprint)
+        _prune_commands(self)
         old = self.commands.get(command_id)
         if old is not None:
             require(old[0] == fingerprint, "replay")
@@ -711,6 +712,12 @@ class WorkerRuntime:
                 record = self.registry.source_for_attempt(payload["attempt_id"])
                 require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                 result = self.registry.bind_output(payload["attempt_id"], payload["binding"])
+            elif op == "release_lease":
+                # Busy-declined consume only: the registry proves the lease was
+                # never admitted (no injection, no inflight work) before it
+                # returns the nonce and the lease to the published state.
+                require(set(payload) == {"attempt_id", "principal_digest"})
+                result = self.registry.release_unused_lease(payload["attempt_id"], payload["principal_digest"])
             elif op == "retire":
                 require(set(payload) in ({"attempt_id", "principal_digest"},
                                         {"source_handle", "source_session_id", "principal_digest"}))
@@ -721,6 +728,12 @@ class WorkerRuntime:
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
                     _release_content_state(record)
+                elif handle is not None and self.registry.tombstone(handle) is not None:
+                    # Pruned terminal record: same owner checks as a live one.
+                    tomb = self.registry.tombstone(handle)
+                    require(tomb[2] == payload["principal_digest"], "identity")
+                    if "source_session_id" in payload:
+                        require(tomb[3] == payload["source_session_id"], "identity")
                 # Fence before the retire snapshot: every recorded CUDA
                 # event is complete on every rank, so the snapshot's
                 # gpu_freed verdict is identical across ranks instead of
@@ -743,8 +756,11 @@ class WorkerRuntime:
         validate_control_payload(reply, result=True)
         # Status/health must observe fresh journal/event state, not stale successful snapshots.
         if op not in ("health", "status", "publication_status"):
-            self.commands[command_id] = (fingerprint, reply)
+            stamp = getattr(self, "_agreed_epoch", None)
+            self.commands[command_id] = ((fingerprint, reply) if stamp is None
+                                         else (fingerprint, reply, stamp))
         return reply
+
 
     def resolve(self, descriptor, *, check_deadline=False):
         require(not self.poisoned, "unavailable")
@@ -872,6 +888,32 @@ def _runtime(scheduler=None):
     return runtime
 
 
+#: Seconds a non-read control reply stays in the idempotency cache. Bounds
+#: the max_records * 16 command table so a long-lived process does not refuse
+#: every control call with "quota" after a few thousand turns.
+COMMAND_CACHE_SECONDS = 600
+
+
+def _prune_commands(runtime):
+    """Drop idempotency entries older than COMMAND_CACHE_SECONDS.
+
+    Every cached operation is also idempotent or replay-refused at the
+    registry (attempt/handle/publication tombstones, expiry checks), so
+    an aged-out command id that is replayed is re-validated, never
+    re-executed against live state. Uses the rank-agreed clock, so every
+    rank drops the same entries. Entries without a timestamp are legacy
+    two-tuples and are kept.
+    """
+    agreed = getattr(runtime, "_agreed_epoch", None)
+    if agreed is None:
+        return
+    cutoff = agreed - COMMAND_CACHE_SECONDS
+    stale = [key for key, entry in runtime.commands.items()
+             if len(entry) > 2 and entry[2] <= cutoff]
+    for key in stale:
+        del runtime.commands[key]
+
+
 def handle_control(scheduler, payload):
     return _runtime(scheduler).control(payload)
 
@@ -897,9 +939,12 @@ def batch_context(reqs, extend_lens=None, prefix_lens=None, final_chunks=None):
 
 
 def prepare_batch(scheduler, batch):
-    if not any(getattr(req, "occ3_worker_descriptor", None) is not None for req in batch.reqs):
+    # Keyed on the eager cohort flag, not the descriptor: a post-injection
+    # consume keeps its descriptor (attached) but is an ordinary shared row.
+    if not any(getattr(req, "occ3_force_eager", False) for req in batch.reqs):
         batch.occ3_context, batch.occ3_force_eager = None, False
         return
+    require(len(batch.reqs) == 1, "profile")
     runtime = _runtime(scheduler)
     prepared = {}
     def validate():
@@ -931,13 +976,18 @@ def admit_request(scheduler, req, value):
         require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile")
         require(getattr(req, "positional_embed_overrides", None) is None, "profile")
         require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
-        # Busy-batch admission bound: an armed turn runs as an isolated
-        # cohort, so ordinary inflight work must drain before its prefill.
-        # Parking in the ordinary queue would hold the one-shot native
-        # attempt behind unrelated decode traffic until the queue bound
-        # aborts it; declining here is rank-uniform, mutates nothing and
-        # leaves the sender free to retry with a fresh attempt. An empty
-        # batch (no inflight rows, no chunked prefill) admits immediately.
+        # Busy-batch admission bound, capture only: a capture turn runs as an
+        # isolated eager cohort for its whole decode (its rows end at the stop
+        # row), so ordinary inflight work must drain first. Parking it would
+        # hold the one-shot attempt behind unrelated decode traffic until the
+        # queue bound aborts it; declining here is rank-uniform, mutates
+        # nothing and leaves the sender free to retry. A consume is admitted
+        # while others decode: its prefill runs as its own one-request extend
+        # batch and it decodes in the shared batch afterwards.
+        # A consume still declines (busy, pre-use) while an eager row is
+        # inflight (a capture turn or another consume's injected prefill):
+        # that cohort drains new prefills, so parking would end in the queue
+        # bound's non-busy admission_timeout instead of a retryable busy.
         collect = getattr(scheduler, "collect_inflight_reqs", None)
         inflight = list(collect()) if callable(collect) else []
         chunked = getattr(scheduler, "chunked_req", None)
@@ -946,7 +996,10 @@ def admit_request(scheduler, req, value):
         active = [held for held in inflight
                   if not (callable(getattr(held, "finished", None))
                           and held.finished())]
-        require(not active, "quota")
+        if type(descriptor) is CaptureWorkerDescriptor:
+            require(not active, "quota")
+        else:
+            require(not any(getattr(held, "occ3_force_eager", False) for held in active), "quota")
         original = req.origin_input_ids
         new_ids = original
         span_markers, content_state = None, None
@@ -973,6 +1026,10 @@ def admit_request(scheduler, req, value):
                 new_ids = original[:at] + array(original.typecode, holes) + original[at:]
             else:
                 new_ids = list(original[:at]) + holes + list(original[at:])
+            # Pre-use capacity floor: a consume that cannot get a request slot
+            # or KV for its rewritten prompt would park until the queue bound
+            # and end in a dispatched, non-releasable admission_timeout.
+            require(_consume_capacity_available(scheduler, len(new_ids)), "quota")
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
@@ -987,6 +1044,7 @@ def admit_request(scheduler, req, value):
     runtime.preflight("admit", validate)
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
+    req.occ3_attached = True
     if type(descriptor) is ConsumeWorkerDescriptor:
         _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
@@ -1003,6 +1061,57 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+
+
+def _consume_capacity_available(scheduler, prompt_tokens):
+    """Conservative pre-use check that a consume prefill can be scheduled now.
+
+    Reads scheduler state that is identical on every rank (request slots,
+    KV allocator and radix evictable sizes), and runs inside
+    the admit preflight, so the verdict is gathered and rank-uniform. It is a
+    floor, not the PrefillAdder's exact budget: a False verdict is a busy
+    decline the sender may retry. A scheduler without these hooks (offline
+    fixtures) is treated as having capacity.
+    """
+    running = getattr(scheduler, "running_batch", None)
+    slots = getattr(scheduler, "get_num_allocatable_reqs", None)
+    if callable(slots) and running is not None:
+        # No waiting-queue term: _occ3_prefill_selection schedules the pending
+        # consume ahead of the waiting queue, so only a free slot matters.
+        if slots(len(running.reqs), running_batch=running) <= 0:
+            return False
+    allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
+    tree = getattr(scheduler, "tree_cache", None)
+    available = getattr(allocator, "available_size", None)
+    evictable = getattr(tree, "evictable_size", None)
+    if callable(available) and callable(evictable):
+        page = max(int(getattr(scheduler, "page_size", 1) or 1), 1)
+        if available() + evictable() < prompt_tokens + page:
+            return False
+    return True
+
+
+def release_consume_cohort(scheduler, req):
+    """Leave the eager cohort after a consume's final injected prefill.
+
+    Called from result settle on every rank with the same request state. The
+    row stays attached (abort, retraction, terminal journal, private KV), but
+    clears occ3_force_eager so it merges into the ordinary running batch and
+    decodes with CUDA graphs. The batch flag is recomputed by filter_batch /
+    merge_batch before the next schedule. No GPU work and no gather: injection
+    is complete, and the terminal receipt reads only integers and tokens.
+    Returns False (row stays eager, safe) unless injection is complete.
+    """
+    descriptor = getattr(req, "occ3_worker_descriptor", None)
+    if type(descriptor) is not ConsumeWorkerDescriptor or not getattr(req, "occ3_force_eager", False):
+        return False
+    runtime = _runtime(scheduler)
+    record = runtime.registry.source_for_attempt(descriptor.attempt_id)
+    if (record.consumer != descriptor or record.state != "injected"
+            or len(record.injected_positions) != descriptor.expected_prefix_tokens):
+        return False
+    req.occ3_force_eager = False
+    return True
 
 
 def _flag_sparse_topk(runtime, prompt_rows):
@@ -1059,8 +1168,10 @@ def capture_prenorm(forward_batch, hidden_states):
             mode = "prefill"
         else:
             raise LatentError("profile")
-        copied = hidden_states.index_select(0, rows).clone()
-        positions = forward_batch.positions.index_select(0, rows).clone()
+        # index_select always allocates a fresh tensor (never a view), so an
+        # extra clone() would only add a second device copy per forward.
+        copied = hidden_states.index_select(0, rows)
+        positions = forward_batch.positions.index_select(0, rows)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (copied, positions)))
@@ -1119,9 +1230,11 @@ def stage_verify(forward_batch, logits_output, predict, accept_lens, accept_inde
         require(bool((((accept_index >= 0) & (accept_index < rows.hidden.shape[0])) | ~valid).all()), "lineage")
         require(bool(((count > 0) & (count <= accept_index.shape[1])).all()), "lineage")
         indices = torch.where(valid, accept_index, torch.zeros_like(accept_index)).reshape(-1).long()
-        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim).clone()
-        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
-        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
+        # index_select allocates a fresh contiguous tensor; reshape of it is a
+        # view of that private buffer, so no clone() is needed.
+        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim)
+        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1)
+        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (rows, hidden, tokens, selected_positions)))
@@ -1400,7 +1513,9 @@ def fence_private_kv_release(scheduler, req):
 
 def abort_request(scheduler, req, reason):
     descriptor = getattr(req, "occ3_worker_descriptor", None)
-    if descriptor is None:
+    if descriptor is None or getattr(req, "occ3_abort_done", False):
+        # Latched: an overlap overshoot tick re-presents an already aborted
+        # row; its record is retired and fenced, so no second gather.
         return
     runtime = _cleanup_runtime(scheduler)
     prepared = {}
@@ -1416,6 +1531,7 @@ def abort_request(scheduler, req, reason):
         runtime.preflight("abort_fence", fence_owned)
         prepared["record"].inflight = 0
         runtime.registry.retire(attempt_id=descriptor.attempt_id)
+        req.occ3_abort_done = True
     except Exception as exc:
         _poison_unless_uniform(runtime, exc, "abort_fence")
         raise

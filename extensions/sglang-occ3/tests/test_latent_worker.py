@@ -858,7 +858,7 @@ def test_actual_prepare_clock_crosses_between_verify_rounds_and_cleanup_is_exact
     # gather above bypasses the refresh, so advance them alongside `now`.
     runtime._agreed_epoch=runtime._agreed_monotonic=now[0]
     monkeypatch.setattr(w,"_RUNTIME",runtime)
-    scheduler=NS(occ3_runtime=runtime); request=req(capture())
+    scheduler=NS(occ3_runtime=runtime); request=req(capture()); request.occ3_force_eager=True  # as admitted
     batch=NS(reqs=[request],forward_mode=NS(is_extend=lambda:False))
     w.prepare_batch(scheduler,batch)
     assert batch.occ3_context[0].output_start==0
@@ -1211,3 +1211,53 @@ def test_consume_admission_flags_prompts_beyond_the_sparse_indexer_topk(monkeypa
     assert w._flag_sparse_topk(NS(sparse_index_topk=11), 11) is False
     assert w._flag_sparse_topk(NS(), 10**6) is False
     assert w._flag_sparse_topk(NS(sparse_index_topk=2048, rank=1), 2049) is True
+
+
+def test_release_consume_cohort_requires_complete_injection(monkeypatch):
+    from test_latent_registry import consume as consume_descriptor
+    descriptor = consume_descriptor(native_rid="rid")
+    record = NS(consumer=descriptor, state="leased", injected_positions=set())
+    runtime = NS(registry=NS(source_for_attempt=lambda attempt: record), poisoned=False)
+    monkeypatch.setattr(w, "_RUNTIME", runtime)
+    request = req(descriptor); request.occ3_force_eager = True; request.occ3_attached = True
+    scheduler = NS(occ3_runtime=runtime)
+    assert w.release_consume_cohort(scheduler, request) is False and request.occ3_force_eager
+    record.state = "injected"; record.injected_positions = set(range(descriptor.expected_prefix_tokens - 1))
+    assert w.release_consume_cohort(scheduler, request) is False and request.occ3_force_eager
+    record.injected_positions = set(range(descriptor.expected_prefix_tokens))
+    assert w.release_consume_cohort(scheduler, request) is True
+    assert request.occ3_force_eager is False and request.occ3_attached is True
+    assert request.occ3_worker_descriptor is descriptor
+
+
+def test_prepare_batch_ignores_attached_rows_outside_the_eager_cohort(monkeypatch):
+    from test_latent_registry import consume as consume_descriptor
+    shared = req(consume_descriptor(native_rid="rid")); shared.occ3_force_eager = False
+    batch = NS(reqs=[req(), shared, req()], occ3_context=("stale",), occ3_force_eager=True,
+               forward_mode=NS(is_extend=lambda: False))
+    w.prepare_batch(NS(), batch)  # no runtime touched: no hook, no gather
+    assert batch.occ3_context is None and batch.occ3_force_eager is False
+
+
+def test_prepare_batch_refuses_an_eager_row_in_a_shared_batch(monkeypatch):
+    runtime = NS(poisoned=False)
+    monkeypatch.setattr(w, "_RUNTIME", runtime)
+    eager = req(capture()); eager.occ3_force_eager = True
+    with pytest.raises(LatentError):
+        w.prepare_batch(NS(occ3_runtime=runtime), NS(reqs=[req(), eager], forward_mode=NS(is_extend=lambda: False)))
+
+
+def test_abort_request_is_latched_after_retire(monkeypatch):
+    from test_latent_registry import consume as consume_descriptor
+    descriptor = consume_descriptor(native_rid="rid")
+    calls = []
+    record = NS(consumer=descriptor, descriptor=None, inflight=1, occ3_content_state=None)
+    runtime = NS(registry=NS(source_for_attempt=lambda attempt: record,
+                             retire=lambda **kw: calls.append("retire")),
+                 preflight=lambda phase, check: calls.append(phase) or check(),
+                 fence=lambda: calls.append("fence"))
+    monkeypatch.setattr(w, "_RUNTIME", runtime)
+    request = req(descriptor)
+    w.abort_request(NS(occ3_runtime=runtime), request, "cancelled")
+    w.abort_request(NS(occ3_runtime=runtime), request, "cancelled")  # overshoot tick
+    assert calls == ["abort_fence", "fence", "retire"]
