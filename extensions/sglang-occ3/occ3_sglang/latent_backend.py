@@ -41,6 +41,11 @@ _SOURCE_COMMIT_FIELDS = ("capture_commit_id", "accepted_span_start", "accepted_s
                           "byte_count")
 
 
+#: Seconds past an attempt's native deadline before its frontend state is
+#: pruned. Covers a quarantined retire (control timeout <= 120 s).
+ATTEMPT_PRUNE_GRACE_SECONDS = 150
+
+
 class ControlClient:
     def __init__(self, tokenizer_manager, *, timeout_seconds=30, max_pending=64):
         require(0 < timeout_seconds <= 120 and 0 < max_pending <= 256)
@@ -170,7 +175,26 @@ class LatentBackend:
         self.authority.check_session(identity.principal_digest, session)
 
     def _slot(self, attempt):
+        self._prune()
         require(attempt not in self.attempts and len(self.attempts) < self.profile.max_records, "replay")
+
+    def _prune(self):
+        """Drop per-turn frontend state that no caller can use any more.
+
+        An entry is dropped once its retire was acknowledged, or once its
+        native deadline (monotonic) is more than ATTEMPT_PRUNE_GRACE_SECONDS
+        in the past: every reserve/bind/finish/retire for an attempt runs
+        inside its own turn, and a quarantined retire is bounded by the
+        control timeout. Attempt ids are fresh per request, and worker-side
+        replay protection lives in the registry, so pruning never reopens a
+        replay. Without this, max_records (256) armed turns per process
+        exhausted the table and every later turn was refused.
+        """
+        cutoff = time.monotonic() - ATTEMPT_PRUNE_GRACE_SECONDS
+        stale = [key for key, state in self.attempts.items()
+                 if state.get("retired") or state["descriptor"].deadline <= cutoff]
+        for key in stale:
+            del self.attempts[key]
 
     def _reservation(self, descriptor, binding, native):
         require(native.request.rid == descriptor.native_rid and native.max_new_tokens > 0, "identity")
@@ -280,9 +304,21 @@ class LatentBackend:
         # Store before await so cancellation cleanup can find uncertain enrollment.
         self.attempts[attempt_id] = {"descriptor": descriptor, "enrollment": enrollment,
                                     "principal": identity.principal_digest}
-        await self.client.call("reserve_capture", {"descriptor": asdict(descriptor),
-            "source_handle": enrollment.source_handle, "state_generation": enrollment.state_generation,
-            "expires_at_epoch": enrollment.expires_at_epoch}, command_id="reserve-" + descriptor.reservation_id)
+        try:
+            await self.client.call("reserve_capture", {"descriptor": asdict(descriptor),
+                "source_handle": enrollment.source_handle, "state_generation": enrollment.state_generation,
+                "expires_at_epoch": enrollment.expires_at_epoch}, command_id="reserve-" + descriptor.reservation_id)
+        except LatentError as error:
+            if error.code != "busy":
+                raise
+            # Proven non-use: the registry declines "busy" before creating
+            # any record, attempt or byte charge, on every rank (a rank
+            # mismatch would have come back as "ranks"). Nothing was
+            # dispatched and no receipt can exist, so this is the same
+            # retryable contract as the scheduler busy-batch refusal. The
+            # local entry is marked retired so it is pruned.
+            self.attempts[attempt_id]["retired"] = True
+            raise AttachmentError("scheduler_busy", 503) from None
         return enrollment
 
     async def prepare_source(self, enrollment, native):

@@ -570,7 +570,12 @@ class ChatAttachmentAdapter:
         profile = self.profile
         if (self._active >= profile.max_active
                 or (self._active + 1) * profile.max_buffer_bytes * 4 > profile.total_working_bytes):
-            raise AttachmentError("quota_exceeded", 429)
+            # Proven non-use: raised before the attempt fence, any backend
+            # call or native dispatch (ctx.attempted is still False), so the
+            # refusal is the retryable busy contract (503 scheduler_busy with
+            # Retry-After), not a counted failure. The other quota_exceeded
+            # sites (fence table, terminal limits) are unchanged.
+            raise AttachmentError("scheduler_busy", 503)
         self._active += 1
         ctx.charged = True
 

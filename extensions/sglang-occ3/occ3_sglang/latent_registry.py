@@ -41,6 +41,9 @@ class StateRecord:
     admitted_capture: bool = False
     admitted_consume: bool = False
     inflight: int = 0
+    # Agreed-epoch time the record became terminal (retired/expired); the
+    # prune grace is measured from here.
+    terminal_at: float | None = None
 
     def snapshot(self):
         return {"source_handle": self.handle, "state_generation": self.state_generation,
@@ -49,11 +52,33 @@ class StateRecord:
                 "source": dict(self.source_metadata), "terminal": dict(self.terminal_metadata)}
 
 
+#: Seconds a terminal, GPU-freed record stays fully resident (status,
+#: publication_status and idempotent retire replies) before it is pruned to a
+#: tombstone. Not a profile field: the profile binding digest is unchanged.
+PRUNE_GRACE_SECONDS = 60
+
+#: Terminal record states that may be pruned once revoked and GPU-freed.
+_PRUNABLE_STATES = ("retired", "expired")
+
+#: Live states that hold the single active OCC-3 slot (profile.max_active).
+_ACTIVE_STATES = ("reserved", "capturing", "leased", "injected")
+
+
 class LatentRegistry:
-    def __init__(self, profile: RuntimeProfile, *, epoch=time.time, monotonic=time.monotonic):
+    def __init__(self, profile: RuntimeProfile, *, epoch=time.time, monotonic=time.monotonic,
+                 prune_grace_seconds=PRUNE_GRACE_SECONDS):
         self.profile, self.epoch, self.monotonic = profile, epoch, monotonic
+        require(0 <= prune_grace_seconds <= 3600, "profile")
+        self.prune_grace_seconds = prune_grace_seconds
         self.records: dict[str, StateRecord] = {}
         self.attempts: dict[str, str] = {}
+        # Replay tombstones for pruned records: attempt id / handle ->
+        # (expiry epoch, final state). Kept until the record's own expiry,
+        # after which every replay is refused by the expiry checks anyway.
+        self.tombstone_attempts: dict[str, tuple[float, str]] = {}
+        self.tombstone_handles: dict[str, tuple[float, str]] = {}
+        self.tombstone_publications: dict[str, tuple[float, str]] = {}
+        self._nonce_expiry: dict[str, float] = {}
         self.sessions: dict[tuple[str, str], SessionEnrollment] = {}
         self.publications: dict[str, Publication] = {}
         self.used_nonces: dict[str, str] = {}
@@ -66,6 +91,7 @@ class LatentRegistry:
                           enrollment.model_fingerprint)
             self._expiry(enrollment.expires_at_epoch)
             key = (enrollment.principal_digest, enrollment.session_id)
+            self._prune()
             old = self.sessions.get(key)
             require(old is None or old == enrollment, "identity")
             require(old is not None or len(self.sessions) < self.profile.max_records, "quota")
@@ -97,10 +123,18 @@ class LatentRegistry:
                 record = self.records[existing]
                 require(record.handle == handle and record.descriptor == descriptor and not record.revoked, "replay")
                 return record
+            require(descriptor.attempt_id not in self.tombstone_attempts
+                    and handle not in self.tombstone_handles, "replay")
+            self._prune()
             require(handle not in self.records and len(self.records) < self.profile.max_records, "quota")
+            require(len(self.tombstone_attempts) < self.profile.max_records * 16, "quota")
+            # Another OCC-3 turn holds the single active slot: a distinct
+            # "busy" decline, raised before ANY mutation (no record, attempt
+            # or byte charge), so the frontend can prove non-use and return
+            # the retryable busy contract instead of a generic failure.
+            require(sum(not r.revoked and r.state in _ACTIVE_STATES
+                        for r in self.records.values()) < self.profile.max_active, "busy")
             require(self.charged_bytes + reserved_bytes <= self.profile.max_live_bytes, "quota")
-            require(sum(not r.revoked and r.state in ("reserved", "capturing", "leased", "injected")
-                        for r in self.records.values()) < self.profile.max_active, "quota")
             record = StateRecord(handle, generation, descriptor, expiry, budget, reserved_bytes)
             self.records[handle] = record
             self.attempts[descriptor.attempt_id] = handle
@@ -121,6 +155,7 @@ class LatentRegistry:
 
     def publish(self, publication: Publication):
         with self.lock:
+            require(publication.publication_id not in self.tombstone_publications, "replay")
             old = self.publications.get(publication.publication_id)
             if old is not None:
                 require(old == publication, "replay")
@@ -174,12 +209,14 @@ class LatentRegistry:
             if record.consumer is not None:
                 require(record.consumer == descriptor, "replay")
                 return record
-            require(record.state == "published" and descriptor.attempt_id not in self.attempts, "replay")
+            require(record.state == "published" and descriptor.attempt_id not in self.attempts
+                    and descriptor.attempt_id not in self.tombstone_attempts, "replay")
             nonce_key = digest([descriptor.principal_digest, descriptor.receiver_session_id, descriptor.consume_nonce])
             require(nonce_key not in self.used_nonces, "replay")
             require(sum(r.state in ("reserved", "capturing", "leased", "injected") and not r.revoked
                         for r in self.records.values()) < self.profile.max_active, "quota")
             self.used_nonces[nonce_key] = descriptor.reservation_id
+            self._nonce_expiry[nonce_key] = pub.expires_at_epoch
             self.attempts[descriptor.attempt_id] = record.handle
             record.consumer, record.state = descriptor, "leased"
             return record
@@ -204,9 +241,18 @@ class LatentRegistry:
             if handle is None:
                 handle = self.attempts.get(attempt_id)
             if handle not in self.records:
+                tomb = (self.tombstone_handles.get(handle) if handle is not None
+                        else self.tombstone_attempts.get(attempt_id))
+                if tomb is not None:
+                    # Pruned terminal record: the idempotent retire answer
+                    # keeps its final state instead of turning "absent".
+                    return {"source_handle": handle, "state": tomb[1], "revoked": True,
+                            "gpu_freed": True}
                 return {"state": "absent", "revoked": True, "gpu_freed": True}
             record = self.records[handle]
             record.revoked, record.state = True, "retired"
+            if record.terminal_at is None:
+                record.terminal_at = self.epoch()
             self.reap()
             return record.snapshot()
 
@@ -216,6 +262,8 @@ class LatentRegistry:
             for record in self.records.values():
                 if record.expires_at_epoch <= self.epoch():
                     record.revoked, record.state = True, "expired"
+                    if record.terminal_at is None:
+                        record.terminal_at = self.epoch()
                 if (record.revoked and not record.gpu_freed and record.inflight == 0
                         and all(e.query() for e in record.events)):
                     record.prefix = None
@@ -225,3 +273,49 @@ class LatentRegistry:
                     record.retained_tokens.clear()
                     record.gpu_freed = True
                     self.charged_bytes -= record.reserved_bytes
+
+    def tombstone(self, handle):
+        """Final (expiry, state, principal, session) of a pruned record, else None."""
+        return self.tombstone_handles.get(handle)
+
+    def _prune(self):
+        """Bound process-lifetime growth without weakening replay protection.
+
+        A record is dropped only when it is revoked, GPU-freed, in a terminal
+        state (retired/expired), has no inflight work and has been terminal
+        for at least prune_grace_seconds. Its attempt ids and handle become
+        tombstones that keep refusing replays until the record's own expiry;
+        after that every replay is refused by the expiry checks anyway, so
+        the tombstone is dropped too. Live records (reserved, capturing,
+        ready, published, leased, injected, terminal) are never touched.
+        Expired sessions and consume nonces are dropped the same way. All
+        times come from the registry clock (rank-agreed in the worker), so
+        every rank prunes the same entries.
+        """
+        with self.lock:
+            now = self.epoch()
+            prunable = [handle for handle, r in self.records.items()
+                        if r.revoked and r.gpu_freed and r.inflight == 0
+                        and r.state in _PRUNABLE_STATES and r.terminal_at is not None
+                        and r.terminal_at + self.prune_grace_seconds <= now]
+            for handle in prunable:
+                record = self.records.pop(handle)
+                d = record.descriptor
+                tomb = (record.expires_at_epoch, record.state, d.principal_digest, d.source_session_id)
+                self.tombstone_handles[handle] = tomb
+                for attempt, owner in list(self.attempts.items()):
+                    if owner == handle:
+                        del self.attempts[attempt]
+                        self.tombstone_attempts[attempt] = tomb
+                for publication_id, pub in list(self.publications.items()):
+                    if pub.source_handle == handle:
+                        del self.publications[publication_id]
+                        self.tombstone_publications[publication_id] = (pub.expires_at_epoch, record.state)
+            for table in (self.tombstone_handles, self.tombstone_attempts, self.tombstone_publications):
+                for key in [k for k, v in table.items() if v[0] <= now]:
+                    del table[key]
+            for key in [k for k, expiry in self._nonce_expiry.items() if expiry <= now]:
+                del self._nonce_expiry[key]
+                self.used_nonces.pop(key, None)
+            for key in [k for k, s in self.sessions.items() if s.expires_at_epoch <= now]:
+                del self.sessions[key]

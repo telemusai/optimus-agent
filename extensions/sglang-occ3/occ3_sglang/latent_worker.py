@@ -661,6 +661,7 @@ class WorkerRuntime:
         command_id, op, payload = command["command_id"], command["operation"], command["payload"]
         fingerprint = digest(command)
         self.consensus(fingerprint)
+        _prune_commands(self)
         old = self.commands.get(command_id)
         if old is not None:
             require(old[0] == fingerprint, "replay")
@@ -721,6 +722,12 @@ class WorkerRuntime:
                     if "source_session_id" in payload:
                         require(record.descriptor.source_session_id == payload["source_session_id"], "identity")
                     _release_content_state(record)
+                elif handle is not None and self.registry.tombstone(handle) is not None:
+                    # Pruned terminal record: same owner checks as a live one.
+                    tomb = self.registry.tombstone(handle)
+                    require(tomb[2] == payload["principal_digest"], "identity")
+                    if "source_session_id" in payload:
+                        require(tomb[3] == payload["source_session_id"], "identity")
                 # Fence before the retire snapshot: every recorded CUDA
                 # event is complete on every rank, so the snapshot's
                 # gpu_freed verdict is identical across ranks instead of
@@ -743,8 +750,11 @@ class WorkerRuntime:
         validate_control_payload(reply, result=True)
         # Status/health must observe fresh journal/event state, not stale successful snapshots.
         if op not in ("health", "status", "publication_status"):
-            self.commands[command_id] = (fingerprint, reply)
+            stamp = getattr(self, "_agreed_epoch", None)
+            self.commands[command_id] = ((fingerprint, reply) if stamp is None
+                                         else (fingerprint, reply, stamp))
         return reply
+
 
     def resolve(self, descriptor, *, check_deadline=False):
         require(not self.poisoned, "unavailable")
@@ -870,6 +880,32 @@ def _runtime(scheduler=None):
     runtime = getattr(scheduler, "occ3_runtime", None) if scheduler is not None else _RUNTIME
     require(runtime is not None and runtime is _RUNTIME and not runtime.poisoned, "unavailable")
     return runtime
+
+
+#: Seconds a non-read control reply stays in the idempotency cache. Bounds
+#: the max_records * 16 command table so a long-lived process does not refuse
+#: every control call with "quota" after a few thousand turns.
+COMMAND_CACHE_SECONDS = 600
+
+
+def _prune_commands(runtime):
+    """Drop idempotency entries older than COMMAND_CACHE_SECONDS.
+
+    Every cached operation is also idempotent or replay-refused at the
+    registry (attempt/handle/publication tombstones, expiry checks), so
+    an aged-out command id that is replayed is re-validated, never
+    re-executed against live state. Uses the rank-agreed clock, so every
+    rank drops the same entries. Entries without a timestamp are legacy
+    two-tuples and are kept.
+    """
+    agreed = getattr(runtime, "_agreed_epoch", None)
+    if agreed is None:
+        return
+    cutoff = agreed - COMMAND_CACHE_SECONDS
+    stale = [key for key, entry in runtime.commands.items()
+             if len(entry) > 2 and entry[2] <= cutoff]
+    for key in stale:
+        del runtime.commands[key]
 
 
 def handle_control(scheduler, payload):
@@ -1059,8 +1095,10 @@ def capture_prenorm(forward_batch, hidden_states):
             mode = "prefill"
         else:
             raise LatentError("profile")
-        copied = hidden_states.index_select(0, rows).clone()
-        positions = forward_batch.positions.index_select(0, rows).clone()
+        # index_select always allocates a fresh tensor (never a view), so an
+        # extra clone() would only add a second device copy per forward.
+        copied = hidden_states.index_select(0, rows)
+        positions = forward_batch.positions.index_select(0, rows)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (copied, positions)))
@@ -1119,9 +1157,11 @@ def stage_verify(forward_batch, logits_output, predict, accept_lens, accept_inde
         require(bool((((accept_index >= 0) & (accept_index < rows.hidden.shape[0])) | ~valid).all()), "lineage")
         require(bool(((count > 0) & (count <= accept_index.shape[1])).all()), "lineage")
         indices = torch.where(valid, accept_index, torch.zeros_like(accept_index)).reshape(-1).long()
-        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim).clone()
-        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
-        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1).clone()
+        # index_select allocates a fresh contiguous tensor; reshape of it is a
+        # view of that private buffer, so no clone() is needed.
+        hidden = rows.hidden.index_select(0, indices).reshape(1, -1, runtime.profile.hidden_dim)
+        tokens = predict.reshape(-1).index_select(0, indices).reshape(1, -1)
+        selected_positions = positions.reshape(-1).index_select(0, indices).reshape(1, -1)
         event = runtime.event()
         record.events.append(event)
         record.live_refs.append((event, (rows, hidden, tokens, selected_positions)))

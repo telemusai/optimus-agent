@@ -25,7 +25,7 @@ class LatentError(RuntimeError):
     def __init__(self, code="latent_failed", members=None):
         allowed = {"latent_failed", "unavailable", "profile", "identity", "expired",
                    "quota", "replay", "state", "lineage", "ranks", "invalid",
-                   "not_ready", "retired", "numerical", "cancelled"}
+                   "not_ready", "retired", "numerical", "cancelled", "busy"}
         self.code = code if code in allowed else "latent_failed"
         # Bounded sanitised names of the profile members that tripped; a live
         # decline names every failing check in one attempt instead of one.

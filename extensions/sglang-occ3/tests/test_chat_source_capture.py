@@ -601,7 +601,8 @@ async def test_source_uncertain_enrollment_holds_quota_until_settled(source_harn
     assert response.status_code == 499 and h.adapter._active == 1 and h.adapter._quarantined
     assert not h.tm.calls and len(h.backend.retires) == 1
     other, _, _ = await source_call(h, intent(capture_id="other"))
-    assert other.status_code == 429 and len(h.backend.enrollments) == 1
+    assert other.status_code == 503 and len(h.backend.enrollments) == 1
+    assert b"scheduler_busy" in other.body
     release.set()
     await spin_until(lambda: h.adapter._active == 0)
     assert not h.tm.calls
