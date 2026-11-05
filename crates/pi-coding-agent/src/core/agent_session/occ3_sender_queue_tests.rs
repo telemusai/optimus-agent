@@ -238,6 +238,31 @@ async fn enrolled_session() -> Arc<Occ3NativeSession> {
     .expect("queue fixture enrollment")
 }
 
+/// Writes one queue artifact for a test-owned session file.
+///
+/// The derived artifact path walks to `dirname(dirname(session_file))` +
+/// `session-artifacts/<basename>`; tests therefore nest the session file
+/// one level inside their tempdir so the artifact root is test-private
+/// (a shared root made the whole module order-dependent: every persist
+/// and manual write landed on one global file). The parent directories
+/// do not exist on the first write, and a path-shape regression would
+/// silently reintroduce cross-test sharing, so both are handled - and
+/// guarded - here once for every test that stages an artifact by hand.
+fn write_queue_artifact(session_file: &str, artifact: &serde_json::Value) {
+    let path = crate::core::agent_session::occ3_sender_queue::sender_queue_path(session_file);
+    let root = std::path::Path::new(session_file)
+        .parent()
+        .and_then(|parent| parent.parent())
+        .expect("the test session file must sit one level inside its tempdir");
+    assert!(
+        path.starts_with(root),
+        "queue artifact {path:?} escapes its test directory {root:?}"
+    );
+    std::fs::create_dir_all(path.parent().expect("artifact parent"))
+        .expect("create the test artifact parent");
+    std::fs::write(&path, artifact.to_string()).expect("write the test queue artifact");
+}
+
 /// The queued (pending) head owns the next arm: a different-receiver
 /// call while the head waits QUEUES BEHIND it (F4) - it never arms and
 /// never touches the capture permit; the head keeps its arm right.
@@ -283,17 +308,17 @@ async fn unknown_schema_blocks_and_preserves_artifact() {
     let contents = br#"{"schema":"optimus.occ3-sender-queue.v999","entries":[]}"#;
     std::fs::write(&path, contents).unwrap();
     session
-        .bind_chat_preferences(Some(dir.path().join("session.jsonl").to_string_lossy().into_owned()))
+        .bind_chat_preferences(Some(dir.path().join("nested/session.jsonl").to_string_lossy().into_owned()))
         .expect("bind preferences");
     // session.jsonl does not exist; the artifact path derives from its
     // basename, so point the loader at the artifact we wrote.
     let artifact = crate::core::agent_session::occ3_sender_queue::sender_queue_path(
-        &dir.path().join("session.jsonl").to_string_lossy(),
+        &dir.path().join("nested/session.jsonl").to_string_lossy(),
     );
     std::fs::create_dir_all(artifact.parent().unwrap()).unwrap();
     std::fs::write(&artifact, contents).unwrap();
     let blocked_notice = session
-        .load_sender_queue(Some(&dir.path().join("session.jsonl").to_string_lossy()))
+        .load_sender_queue(Some(&dir.path().join("nested/session.jsonl").to_string_lossy()))
         .expect("load returns a notice, not an error");
     assert!(blocked_notice.is_some(), "blocked load surfaces a notice");
     assert_eq!(std::fs::read(&artifact).unwrap(), contents.to_vec(), "file preserved");
@@ -311,7 +336,7 @@ async fn unknown_schema_blocks_and_preserves_artifact() {
 async fn restart_armed_entry_fresh_arms_within_budget() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     session.sender_queue_enqueue("child", "pre-publication").expect("enqueue");
     session.sender_queue_mark_armed(Some("agentmsg_armed"), None).expect("mark armed");
@@ -337,7 +362,7 @@ async fn restart_armed_entry_fresh_arms_within_budget() {
 async fn restart_admitted_entry_becomes_uncertain() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     session.sender_queue_enqueue("child", "admitted-one").expect("enqueue");
     session.sender_queue_mark_armed(None, None).expect("armed");
@@ -381,7 +406,7 @@ async fn restart_admitted_entry_becomes_uncertain() {
 async fn restart_expired_pending_surfaces_durable_expired_notice() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // One pending entry whose TTL lapsed long before the restart.
     let artifact = serde_json::json!({
@@ -396,11 +421,7 @@ async fn restart_expired_pending_surfaces_durable_expired_notice() {
             "attempts": 0,
         }],
     });
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        artifact.to_string(),
-    )
-    .unwrap();
+    write_queue_artifact(&session_file, &artifact);
     // No fallback aggregate (nothing survived the restart), but the expiry
     // IS journaled for the durable drain.
     let aggregate = session.load_sender_queue(Some(&session_file)).expect("load");
@@ -431,7 +452,7 @@ async fn restart_expired_pending_surfaces_durable_expired_notice() {
 async fn sweep_expired_notice_is_durable_before_any_drain() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // One pending entry that is already expired.
     let now = crate::core::agent_session::occ3_sender_queue::now_epoch();
@@ -447,11 +468,7 @@ async fn sweep_expired_notice_is_durable_before_any_drain() {
             "attempts": 0,
         }],
     });
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        artifact.to_string(),
-    )
-    .unwrap();
+    write_queue_artifact(&session_file, &artifact);
     // LOAD is itself the restart expiry surface: the loader drops the
     // expired pending entry and journals its terminal `expired` notice
     // into the loaded queue's durable outbox + drain journal BEFORE the
@@ -498,7 +515,7 @@ async fn sweep_expired_notice_is_durable_before_any_drain() {
 async fn live_sweep_expiry_journal_survives_a_crash_before_drain() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // One UNEXPIRED pending entry: the load keeps it as live work.
     let now = crate::core::agent_session::occ3_sender_queue::now_epoch();
@@ -514,11 +531,7 @@ async fn live_sweep_expiry_journal_survives_a_crash_before_drain() {
             "attempts": 0,
         }],
     });
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        artifact.to_string(),
-    )
-    .unwrap();
+    write_queue_artifact(&session_file, &artifact);
     session.load_sender_queue(Some(&session_file)).expect("load");
     // Nothing expires at load time: no notices yet.
     assert!(
@@ -562,7 +575,7 @@ async fn live_sweep_expiry_journal_survives_a_crash_before_drain() {
 async fn load_expiry_notices_survive_subsequent_persists() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     let now = crate::core::agent_session::occ3_sender_queue::now_epoch();
     let artifact = serde_json::json!({
@@ -577,11 +590,7 @@ async fn load_expiry_notices_survive_subsequent_persists() {
             "attempts": 0,
         }],
     });
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        artifact.to_string(),
-    )
-    .unwrap();
+    write_queue_artifact(&session_file, &artifact);
     session.load_sender_queue(Some(&session_file)).expect("load");
     let expiry_notices = session.take_pending_queue_notices();
     assert_eq!(expiry_notices.len(), 1);
@@ -615,7 +624,7 @@ async fn load_expiry_notices_survive_subsequent_persists() {
 async fn failed_parent_leg_is_retried_in_the_same_process() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     session.sender_queue_enqueue("child", "retry-target").expect("enqueue");
     session.sender_queue_mark_armed(None, None).expect("armed");
@@ -669,7 +678,7 @@ async fn persist_failure_surfaces_and_keeps_the_record_retryable() {
     // create_dir_all fails, so the atomic persist fails deterministically.
     let blocker = dir.path().join("blocker");
     std::fs::write(&blocker, b"not a directory").unwrap();
-    let session_file = blocker.join("sub").join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = blocker.join("sub").join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // The enqueue transition applies in memory, journals the notice, and
     // the persist FAILS -> Err surfaced (never a silent success).
@@ -706,7 +715,7 @@ async fn persist_failure_surfaces_and_keeps_the_record_retryable() {
 async fn transitions_record_outbox_entries_exactly_once() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // Enqueue -> armed -> terminal capture failure: three transitions.
     session.sender_queue_enqueue("child", "once-only").expect("enqueue");
@@ -743,7 +752,7 @@ async fn transitions_record_outbox_entries_exactly_once() {
 async fn durable_outbox_survives_restart_and_dedups_by_notice_id() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // Three transitions journal three records atomically; the fallback
     // demotion (terminal capture failure) is the subject of this test.
@@ -850,7 +859,7 @@ async fn durable_outbox_survives_restart_and_dedups_by_notice_id() {
 async fn undelivered_parent_leg_stays_pending_bounded_and_visible() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // Refusals journal durable records naturally: fill the queue, then
     // keep attempting enqueues past the outbox cap.
@@ -888,7 +897,7 @@ async fn undelivered_parent_leg_stays_pending_bounded_and_visible() {
 async fn refused_enqueue_journals_a_queue_level_notice() {
     let session = enrolled_session().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     // Fill the queue to its effective ceiling: the next enqueue is refused.
     let mut enqueued = 0usize;
@@ -920,11 +929,10 @@ async fn refused_enqueue_journals_a_queue_level_notice() {
     assert_eq!(details["queueId"], "");
     // Blocked path: an unknown-schema artifact blocks the queue; the next
     // enqueue is refused queue_blocked with the same record shape.
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        serde_json::json!({"schema": "optimus.occ3-sender-queue.v99", "entries": []}).to_string(),
-    )
-    .unwrap();
+    write_queue_artifact(
+        &session_file,
+        &serde_json::json!({"schema": "optimus.occ3-sender-queue.v99", "entries": []}),
+    );
     session.load_sender_queue(Some(&session_file)).expect("reload");
     assert_eq!(
         session.sender_queue_enqueue("child", "blocked").unwrap_err(),
@@ -1474,12 +1482,8 @@ async fn fallback_ack_correlation_is_token_gated() {
         ],
     });
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
-    std::fs::write(
-        crate::core::agent_session::occ3_sender_queue::sender_queue_path(&session_file),
-        artifact.to_string(),
-    )
-    .unwrap();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
+    write_queue_artifact(&session_file, &artifact);
     let session = enrolled_session().await;
     session.bind_chat_preferences(Some(session_file.clone())).expect("bind");
     session.load_sender_queue(Some(&session_file)).expect("load");
@@ -1743,7 +1747,7 @@ async fn sending_session_fixture() -> (Arc<AgentSession>, Arc<Occ3NativeSession>
 async fn production_send_hook_correlates_only_the_fallback_turn() {
     let (session, native) = sending_session_fixture().await;
     let dir = tempfile::tempdir().unwrap();
-    let session_file = dir.path().join("session.jsonl").to_string_lossy().into_owned();
+    let session_file = dir.path().join("nested/session.jsonl").to_string_lossy().into_owned();
     native
         .bind_chat_preferences(Some(session_file.clone()))
         .expect("bind");

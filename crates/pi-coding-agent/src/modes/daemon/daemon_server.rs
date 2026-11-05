@@ -241,7 +241,10 @@ mod tests {
         tokio::io::AsyncBufReadExt::read_line(&mut lines, &mut line).await.unwrap();
         let hello: Value = serde_json::from_str(&line).unwrap();
         assert_eq!(hello["type"], "daemon_hello");
-        assert_eq!(hello["schemaRevision"], 44);
+        assert_eq!(
+            hello["schemaRevision"],
+            crate::modes::daemon::daemon_protocol::DAEMON_SCHEMA_REVISION
+        );
         let capabilities = hello["serverCapabilities"].as_array().unwrap();
         assert!(capabilities.iter().any(|capability| capability == "streaming_throughput"));
         assert!(!capabilities.iter().any(|capability| capability == "generation_throughput"));
