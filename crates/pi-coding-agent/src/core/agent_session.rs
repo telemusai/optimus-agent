@@ -3576,6 +3576,36 @@ fn install_sender_queue_listener(
     Ok(())
 }
 
+/// Waiter for a deferred head prompt. Holds the session only weakly: each
+/// round upgrades, takes the owned retry wait (`retry_settled_future`,
+/// which owns no session reference) and drops the session before awaiting,
+/// so a dropped session is never kept alive and the task exits at the next
+/// upgrade without sending. Once no retry is pending it clears its gate
+/// mark and decides again against the queue state at that time.
+async fn await_retry_then_drive_occ3_head_prompt(
+    session: std::sync::Weak<AgentSession>,
+    state: std::sync::Weak<occ3_state::Occ3NativeSession>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
+    key: String,
+) -> bool {
+    loop {
+        let settled = {
+            let Some(live) = session.upgrade() else { return false };
+            live.retry_settled_future()
+        };
+        let Some(settled) = settled else { break };
+        settled.await;
+    }
+    let (Some(session), Some(state)) = (session.upgrade(), state.upgrade()) else {
+        return false;
+    };
+    if let Ok(mut gate) = gate.lock() {
+        gate.settle_deferred(&key);
+    }
+    Self::drive_occ3_head_prompt(session, state, gate).await;
+    true
+}
+
 /// Sends the host's head prompt for the current queue head at most once
 /// per prompting occasion. When the gate defers (a source busy head while
 /// a provider retry of the refused run is pending), a detached task waits
@@ -3606,23 +3636,13 @@ fn drive_occ3_head_prompt(
     };
     match decision {
         occ3_sender_queue::HeadPromptDecision::Skip => {}
-        occ3_sender_queue::HeadPromptDecision::Defer => {
-            let session = Arc::downgrade(session);
-            let state = Arc::downgrade(state);
-            let gate = Arc::clone(gate);
-            tokio::spawn(async move {
-                loop {
-                    let Some(live) = session.upgrade() else { return };
-                    if !live.is_retrying() {
-                        break;
-                    }
-                    live.wait_for_retry().await;
-                }
-                let (Some(session), Some(state)) = (session.upgrade(), state.upgrade()) else {
-                    return;
-                };
-                Self::drive_occ3_head_prompt(session, state, gate).await;
-            });
+        occ3_sender_queue::HeadPromptDecision::Defer(key) => {
+            tokio::spawn(Self::await_retry_then_drive_occ3_head_prompt(
+                Arc::downgrade(session),
+                Arc::downgrade(state),
+                Arc::clone(gate),
+                key,
+            ));
         }
         occ3_sender_queue::HeadPromptDecision::Send(prompt) => {
             let fallback_head =
@@ -20679,6 +20699,35 @@ mod post_compaction_continuation_tests {
             .lock()
             .unwrap()
             .clone()
+    }
+
+    /// The deferred head-prompt waiter holds the session only weakly while a
+    /// retry is pending, and exits without deciding once the session is gone.
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn deferred_head_prompt_waiter_does_not_keep_the_session_alive() {
+        let session = test_session(ScriptedAgent::new(vec![]));
+        let retry = AgentMessageDeferred::new();
+        *session.retry_promise.lock().unwrap() = Some(retry.clone());
+        let baseline = Arc::strong_count(&session);
+        let gate = Arc::new(std::sync::Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+        let waiter = tokio::spawn(AgentSession::await_retry_then_drive_occ3_head_prompt(
+            Arc::downgrade(&session),
+            std::sync::Weak::new(),
+            gate,
+            "occasion".into(),
+        ));
+        tokio::time::sleep(std::time::Duration::from_millis(50)).await;
+        assert!(!waiter.is_finished(), "the waiter waits for the retry");
+        assert_eq!(Arc::strong_count(&session), baseline, "no strong hold across the await");
+        let weak = Arc::downgrade(&session);
+        drop(session);
+        retry.resolve();
+        let decided = tokio::time::timeout(std::time::Duration::from_secs(5), waiter)
+            .await
+            .expect("the waiter exits")
+            .expect("no panic");
+        assert!(!decided, "a dropped session sends nothing");
+        assert_eq!(weak.strong_count(), 0, "the waiter let the session be freed");
     }
 
     #[tokio::test]

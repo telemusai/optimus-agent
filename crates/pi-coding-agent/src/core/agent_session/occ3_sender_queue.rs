@@ -1460,10 +1460,13 @@ pub fn head_prompt(head: &Occ3SenderQueueEntry, queue_len: usize) -> Option<Stri
 pub enum HeadPromptDecision {
     /// Send this prompt now (the gate has recorded it as sent).
     Send(String),
-    /// A provider retry of the run is still pending: decide again once it
-    /// settles, against the queue state at that time.
-    Defer,
-    /// Nothing to send (no prompt for this state, or already sent).
+    /// A provider retry of the run is still pending: the caller starts ONE
+    /// waiter for this prompting occasion (the key), which calls
+    /// [`HeadPromptGate::settle_deferred`] with it and decides again once
+    /// the retry settles, against the queue state at that time.
+    Defer(String),
+    /// Nothing to send (no prompt for this state, already sent, or a waiter
+    /// for this occasion is already running).
     Skip,
 }
 
@@ -1476,6 +1479,9 @@ pub enum HeadPromptDecision {
 #[derive(Debug, Default)]
 pub struct HeadPromptGate {
     last_sent: Option<String>,
+    /// Key of the occasion whose waiter is running. Repeated queue events
+    /// for the same occasion during one retry then start no extra waiter.
+    deferred: Option<String>,
 }
 
 impl HeadPromptGate {
@@ -1496,10 +1502,25 @@ impl HeadPromptGate {
             && head.state == Occ3SenderQueueState::Pending
             && head.reason.as_deref() == Some(OCC3_SOURCE_BUSY_RETRY_REASON)
         {
-            return HeadPromptDecision::Defer;
+            if self.deferred.as_deref() == Some(key.as_str()) {
+                return HeadPromptDecision::Skip;
+            }
+            // A new occasion replaces the mark; the older waiter still
+            // decides once (and is deduplicated by `last_sent`).
+            self.deferred = Some(key.clone());
+            return HeadPromptDecision::Defer(key);
         }
         self.last_sent = Some(key);
         HeadPromptDecision::Send(prompt)
+    }
+
+    /// Called by a waiter right before it decides again. Clears the mark
+    /// only when it is still this waiter's occasion, so a newer occasion's
+    /// waiter keeps its own mark and no prompt is lost.
+    pub fn settle_deferred(&mut self, key: &str) {
+        if self.deferred.as_deref() == Some(key) {
+            self.deferred = None;
+        }
     }
 }
 
@@ -1733,7 +1754,7 @@ mod tests {
         queue.mark_armed(None, None, 100).unwrap();
         queue.record_source_busy(None, 100, 100).unwrap();
         let mut gate = HeadPromptGate::default();
-        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        assert!(matches!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer(_)));
         queue.mark_armed(None, None, 105).unwrap();
         assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
         // No retry: exactly one follow-up.
@@ -1747,7 +1768,7 @@ mod tests {
         // Retry scheduled but the retried turn did not re-arm: once the
         // retry settles, exactly one follow-up.
         let mut gate = HeadPromptGate::default();
-        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer);
+        assert!(matches!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Defer(_)));
         assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
         assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
         // Other heads are never deferred: a fallback prompt goes out even
@@ -1761,6 +1782,46 @@ mod tests {
         assert_eq!(head(&queue).state, Occ3SenderQueueState::FallbackPending);
         let mut gate = HeadPromptGate::default();
         assert!(matches!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Send(_)));
+    }
+
+    /// One waiter per prompting occasion: repeated queue events during one
+    /// pending retry defer once, then skip; after settle exactly one send.
+    /// A newer occasion while the older waiter runs still gets its own.
+    #[test]
+    fn head_prompt_gate_defers_once_per_occasion() {
+        let head = |queue: &Occ3SenderQueue| queue.head().unwrap().clone();
+        let queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        let HeadPromptDecision::Defer(key) = gate.decide(&head(&queue), 1, true) else {
+            panic!("first event during the retry defers");
+        };
+        for _ in 0..5 {
+            assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Skip);
+        }
+        gate.settle_deferred(&key);
+        assert!(matches!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Send(_)));
+        assert_eq!(gate.decide(&head(&queue), 1, false), HeadPromptDecision::Skip);
+
+        // Key changes while the first waiter runs: the new occasion gets its
+        // own waiter, and the old waiter's settle does not clear its mark.
+        let mut queue = queue_with_busy_head();
+        let mut gate = HeadPromptGate::default();
+        let HeadPromptDecision::Defer(old_key) = gate.decide(&head(&queue), 1, true) else {
+            panic!("defer");
+        };
+        queue.mark_armed(None, None, 105).unwrap();
+        queue.record_source_busy(None, 105, 105).unwrap();
+        let HeadPromptDecision::Defer(new_key) = gate.decide(&head(&queue), 1, true) else {
+            panic!("a new occasion defers with its own waiter");
+        };
+        assert_ne!(old_key, new_key);
+        gate.settle_deferred(&old_key);
+        assert_eq!(gate.decide(&head(&queue), 1, true), HeadPromptDecision::Skip, "new mark kept");
+        gate.settle_deferred(&new_key);
+        let HeadPromptDecision::Send(prompt) = gate.decide(&head(&queue), 1, false) else {
+            panic!("the new occasion is not dropped");
+        };
+        assert!(prompt.contains("busy retry 2 of 3"), "{prompt}");
     }
 
     #[test]

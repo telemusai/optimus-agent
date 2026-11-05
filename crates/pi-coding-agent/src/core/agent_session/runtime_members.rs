@@ -3769,12 +3769,23 @@ impl AgentSession {
     /// All observers await the same deferred; only the retry owner clears its slot.
     /// A waiter never consumes pending state or resurrects a settled generation.
     pub(super) async fn wait_for_retry(&self) {
-        let promise = { self.retry_promise.lock().unwrap().clone() };
-        let Some(promise) = promise else {
-            return;
-        };
-        let _ = promise.wait().await;
-        self.agent.wait_for_idle().await;
+        if let Some(settled) = self.retry_settled_future() {
+            settled.await;
+        }
+    }
+
+    /// The `wait_for_retry` wait as an owned future, or `None` when no
+    /// retry is pending. It owns only the cloned retry deferred and the
+    /// agent handle, never the session, so a detached waiter can drop its
+    /// session reference before awaiting and the session can be freed
+    /// while the wait is still in progress.
+    pub(super) fn retry_settled_future(&self) -> Option<BoxFuture<()>> {
+        let promise = self.retry_promise.lock().unwrap().clone()?;
+        let agent = Arc::clone(&self.agent);
+        Some(Box::pin(async move {
+            let _ = promise.wait().await;
+            agent.wait_for_idle().await;
+        }))
     }
 
     /// `get isRetrying()`.
