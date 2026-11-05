@@ -933,9 +933,12 @@ def batch_context(reqs, extend_lens=None, prefix_lens=None, final_chunks=None):
 
 
 def prepare_batch(scheduler, batch):
-    if not any(getattr(req, "occ3_worker_descriptor", None) is not None for req in batch.reqs):
+    # Keyed on the eager cohort flag, not the descriptor: a post-injection
+    # consume keeps its descriptor (attached) but is an ordinary shared row.
+    if not any(getattr(req, "occ3_force_eager", False) for req in batch.reqs):
         batch.occ3_context, batch.occ3_force_eager = None, False
         return
+    require(len(batch.reqs) == 1, "profile")
     runtime = _runtime(scheduler)
     prepared = {}
     def validate():
@@ -967,13 +970,18 @@ def admit_request(scheduler, req, value):
         require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile")
         require(getattr(req, "positional_embed_overrides", None) is None, "profile")
         require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
-        # Busy-batch admission bound: an armed turn runs as an isolated
-        # cohort, so ordinary inflight work must drain before its prefill.
-        # Parking in the ordinary queue would hold the one-shot native
-        # attempt behind unrelated decode traffic until the queue bound
-        # aborts it; declining here is rank-uniform, mutates nothing and
-        # leaves the sender free to retry with a fresh attempt. An empty
-        # batch (no inflight rows, no chunked prefill) admits immediately.
+        # Busy-batch admission bound, capture only: a capture turn runs as an
+        # isolated eager cohort for its whole decode (its rows end at the stop
+        # row), so ordinary inflight work must drain first. Parking it would
+        # hold the one-shot attempt behind unrelated decode traffic until the
+        # queue bound aborts it; declining here is rank-uniform, mutates
+        # nothing and leaves the sender free to retry. A consume is admitted
+        # while others decode: its prefill runs as its own one-request extend
+        # batch and it decodes in the shared batch afterwards.
+        # A consume still declines (busy, pre-use) while an eager row is
+        # inflight (a capture turn or another consume's injected prefill):
+        # that cohort drains new prefills, so parking would end in the queue
+        # bound's non-busy admission_timeout instead of a retryable busy.
         collect = getattr(scheduler, "collect_inflight_reqs", None)
         inflight = list(collect()) if callable(collect) else []
         chunked = getattr(scheduler, "chunked_req", None)
@@ -982,7 +990,10 @@ def admit_request(scheduler, req, value):
         active = [held for held in inflight
                   if not (callable(getattr(held, "finished", None))
                           and held.finished())]
-        require(not active, "quota")
+        if type(descriptor) is CaptureWorkerDescriptor:
+            require(not active, "quota")
+        else:
+            require(not any(getattr(held, "occ3_force_eager", False) for held in active), "quota")
         original = req.origin_input_ids
         new_ids = original
         span_markers, content_state = None, None
@@ -1023,6 +1034,7 @@ def admit_request(scheduler, req, value):
     runtime.preflight("admit", validate)
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
+    req.occ3_attached = True
     if type(descriptor) is ConsumeWorkerDescriptor:
         _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
@@ -1039,6 +1051,29 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+
+
+def release_consume_cohort(scheduler, req):
+    """Leave the eager cohort after a consume's final injected prefill.
+
+    Called from result settle on every rank with the same request state. The
+    row stays attached (abort, retraction, terminal journal, private KV), but
+    clears occ3_force_eager so it merges into the ordinary running batch and
+    decodes with CUDA graphs. The batch flag is recomputed by filter_batch /
+    merge_batch before the next schedule. No GPU work and no gather: injection
+    is complete, and the terminal receipt reads only integers and tokens.
+    Returns False (row stays eager, safe) unless injection is complete.
+    """
+    descriptor = getattr(req, "occ3_worker_descriptor", None)
+    if type(descriptor) is not ConsumeWorkerDescriptor or not getattr(req, "occ3_force_eager", False):
+        return False
+    runtime = _runtime(scheduler)
+    record = runtime.registry.source_for_attempt(descriptor.attempt_id)
+    if (record.consumer != descriptor or record.state != "injected"
+            or len(record.injected_positions) != descriptor.expected_prefix_tokens):
+        return False
+    req.occ3_force_eager = False
+    return True
 
 
 def _flag_sparse_topk(runtime, prompt_rows):
@@ -1440,7 +1475,9 @@ def fence_private_kv_release(scheduler, req):
 
 def abort_request(scheduler, req, reason):
     descriptor = getattr(req, "occ3_worker_descriptor", None)
-    if descriptor is None:
+    if descriptor is None or getattr(req, "occ3_abort_done", False):
+        # Latched: an overlap overshoot tick re-presents an already aborted
+        # row; its record is retired and fenced, so no second gather.
         return
     runtime = _cleanup_runtime(scheduler)
     prepared = {}
@@ -1456,6 +1493,7 @@ def abort_request(scheduler, req, reason):
         runtime.preflight("abort_fence", fence_owned)
         prepared["record"].inflight = 0
         runtime.registry.retire(attempt_id=descriptor.attempt_id)
+        req.occ3_abort_done = True
     except Exception as exc:
         _poison_unless_uniform(runtime, exc, "abort_fence")
         raise

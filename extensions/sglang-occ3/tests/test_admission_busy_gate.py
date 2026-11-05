@@ -1,7 +1,9 @@
-"""Admission busy-batch gate: an armed turn admits only against an empty batch.
+"""Admission busy-batch gate: a capture admits only against an empty batch.
 
-An armed turn runs as an isolated cohort, so ordinary inflight work must
-drain before its prefill. Parking the one-shot native attempt in the
+A capture turn runs as an isolated cohort for its whole decode, so ordinary
+inflight work must drain before its prefill. A consume admits while ordinary
+rows decode (its prefill is a one-request extend batch, then it decodes in
+the shared batch); it declines only behind another eager row. Parking the one-shot native attempt in the
 ordinary queue would hold it behind unrelated decode traffic until the
 queue bound aborts it, so admission against a busy batch declines fast,
 explicitly and rank-uniformly instead: the scheduler wrapper folds the
@@ -90,15 +92,43 @@ def test_busy_running_batch_declines_before_any_mutation(monkeypatch):
     assert record.admitted_capture is False and record.state == "reserved"
 
 
-def test_busy_consume_declines_without_punching_prefix_holes(monkeypatch):
+def test_consume_admits_while_two_ordinary_requests_decode(monkeypatch):
+    # A consume prefill runs as its own one-request extend batch and then
+    # decodes in the shared batch, so ordinary decode traffic never blocks it.
     record = consume_record()
     runtime = bind(monkeypatch, runtime_for(record))
     request = req()
+    descriptor = consume(native_rid="rid")
+    w.admit_request(scheduler(runtime, inflight=[active("a"), active("b")]), request, descriptor)
+    assert record.admitted_consume
+    assert request.occ3_attached and request.occ3_force_eager and request.occ3_private_prefix
+    assert len(request.origin_input_ids) == 3 + descriptor.expected_prefix_tokens
+
+
+def test_consume_declines_without_punching_prefix_holes_behind_an_eager_row(monkeypatch):
+    # An eager row (a capture turn, or another consume's injected prefill)
+    # drains new prefills; the consume declines busy, pre-use, unmutated.
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    eager = NS(rid="capture", finished=lambda: False, occ3_force_eager=True)
     with pytest.raises(LatentError) as caught:
-        w.admit_request(scheduler(runtime, inflight=[active()]), request, consume(native_rid="rid"))
+        w.admit_request(scheduler(runtime, inflight=[active(), eager]), request, consume(native_rid="rid"))
     assert caught.value.code == "quota"
     assert list(request.origin_input_ids) == [1, 2, 3]
+    assert request.occ3_worker_descriptor is None and getattr(request, "occ3_attached", None) is None
     assert record.admitted_consume is False and record.state == "leased"
+
+
+def test_capture_still_declines_while_others_decode(monkeypatch):
+    record = capture_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    request = req()
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(scheduler(runtime, inflight=[active("a"), active("b")]), request, capture())
+    assert caught.value.code == "quota"
+    assert request.occ3_worker_descriptor is None
+    assert record.admitted_capture is False and record.state == "reserved"
 
 
 def test_chunked_prefill_counts_as_busy(monkeypatch):
