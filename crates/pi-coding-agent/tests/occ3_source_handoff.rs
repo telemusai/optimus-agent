@@ -46,6 +46,11 @@ pub struct FixtureMode {
     /// Control plane replies 401 to publish and the one same-key status query:
     /// the attempt fails closed with no refresh, replay or regeneration.
     pub unauthorized_publish: bool,
+    /// Every enroll reply is delayed; proves the publish-time enrolls overlap.
+    pub slow_enroll: bool,
+    /// The receiver enroll fails once a source capture was served (the
+    /// publish-time refresh), so the parallel enroll error must stop publish.
+    pub fail_receiver_publish_enroll: bool,
 }
 #[derive(Default)]
 struct FixtureRecords {
@@ -58,6 +63,8 @@ struct FixtureRecords {
     // In-memory only: the observed control header value per request, in order.
     // Never copied into the report or any evidence file.
     control_header_seen: Vec<(String, Option<String>)>,
+    // (path, session_id, arrival, reply) per control request, in arrival order.
+    timeline: Vec<(String, String, Instant, Option<Instant>)>,
 }
 pub struct FixtureResult {
     pub report: Value,
@@ -71,6 +78,7 @@ pub struct FixtureResult {
     /// here, not from the volatile agent error field, which a later
     /// successful turn may legitimately clear.
     pub source_transcript: String,
+    pub timeline: Vec<(String, String, Instant, Option<Instant>)>,
 }
 fn identity() -> Occ3ModelIdentity {
     Occ3ModelIdentity {
@@ -205,6 +213,30 @@ async fn serve(
                     socket.write_all(response.as_bytes()).await.unwrap();
                     socket.shutdown().await.unwrap();
                     return;
+                }
+                let slot = {
+                    let mut records = records.lock().unwrap();
+                    let session = body.get("session_id").and_then(Value::as_str).unwrap_or("").to_string();
+                    records.timeline.push((path.clone(), session, Instant::now(), None));
+                    records.timeline.len() - 1
+                };
+                if path == "/occ3/v1/native/sessions/enroll" {
+                    if mode.slow_enroll {
+                        tokio::time::sleep(Duration::from_millis(300)).await;
+                    }
+                    let captured = records.lock().unwrap().source_intent.is_some();
+                    if mode.fail_receiver_publish_enroll && captured && body["session_id"] == "receiver-session" {
+                        let body = json!({"detail": "unavailable"}).to_string();
+                        let response = format!(
+                            "HTTP/1.1 503 Service Unavailable\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{}",
+                            body.len(),
+                            body
+                        );
+                        socket.write_all(response.as_bytes()).await.unwrap();
+                        socket.shutdown().await.unwrap();
+                        return;
+                    }
+                    records.lock().unwrap().timeline[slot].3 = Some(Instant::now());
                 }
                 let mut headers = Vec::new();
                 let result=match path.as_str() {
@@ -486,6 +518,7 @@ pub async fn run_offline_fixture(mode: FixtureMode) -> Result<FixtureResult, Str
     let requests = records.lock().unwrap().requests.clone();
     let source_receipt = records.lock().unwrap().source_receipt.clone();
     let control_header_seen = records.lock().unwrap().control_header_seen.clone();
+    let timeline = records.lock().unwrap().timeline.clone();
     let report = json!({"mode":"offline-synthetic-native-controller","source_requests":requests.iter().filter(|(_,v)|v.get("occ3_capture").is_some()).count(),
         "receiver_requests":requests.iter().filter(|(_,v)|v.get("occ3").is_some()).count(),"total_model_requests":requests.iter().filter(|(p,_)|p=="/v1/chat/completions").count(),"admitted_messages":receipts.len(),"receiver_source_facts_absent":true,
         "source_phase":source_phase,"receiver_phase":receiver_phase,"queue_fixture_only":mode.queue_receiver,
@@ -497,6 +530,7 @@ pub async fn run_offline_fixture(mode: FixtureMode) -> Result<FixtureResult, Str
         sender_error,
         control_header_seen,
         source_transcript,
+        timeline,
     })
 }
 #[tokio::test]
@@ -1024,4 +1058,55 @@ async fn queued_admission_allows_source_continuation_but_is_not_receiver_consump
     );
     assert_eq!(consumed.report["receiver_requests"], 1);
     assert_eq!(consumed.report["admitted_messages"], 1);
+}
+
+/// The publish-time membership refresh enrolls source and receiver
+/// concurrently, and both complete before the first publication side effect.
+#[tokio::test]
+async fn publish_enrolls_run_concurrently_and_finish_before_publish() {
+    let result = run_offline_fixture(FixtureMode {
+        slow_enroll: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.report["admitted_messages"], 1);
+    let publish = result
+        .timeline
+        .iter()
+        .position(|(path, ..)| path.ends_with("/publish"))
+        .expect("one publish");
+    let enrolls: Vec<_> = result.timeline[..publish]
+        .iter()
+        .filter(|(path, ..)| path.ends_with("/sessions/enroll"))
+        .collect();
+    let (source, receiver) = (
+        enrolls.iter().rev().find(|(_, s, ..)| s == "source-session").unwrap(),
+        enrolls.iter().rev().find(|(_, s, ..)| s == "receiver-session").unwrap(),
+    );
+    let publish_at = result.timeline[publish].2;
+    assert!(source.3.unwrap() <= publish_at && receiver.3.unwrap() <= publish_at);
+    // Overlap: each started before the other replied (300 ms reply delay).
+    assert!(source.2 < receiver.3.unwrap() && receiver.2 < source.3.unwrap());
+}
+
+/// A failed receiver refresh during the parallel enroll stops the handoff
+/// before any publication request.
+#[tokio::test]
+async fn failed_parallel_publish_enroll_never_publishes() {
+    let result = run_offline_fixture(FixtureMode {
+        fail_receiver_publish_enroll: true,
+        ..Default::default()
+    })
+    .await
+    .unwrap();
+    assert_eq!(result.report["admitted_messages"], 0);
+    assert_eq!(result.report["receiver_requests"], 0);
+    assert!(!result.requests.iter().any(|(p, _)| p.ends_with("/publish")));
+    assert!(result
+        .timeline
+        .iter()
+        .any(|(path, session, _, reply)| path.ends_with("/sessions/enroll")
+            && session == "receiver-session"
+            && reply.is_none()));
 }

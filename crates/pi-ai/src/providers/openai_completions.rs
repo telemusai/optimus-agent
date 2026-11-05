@@ -1461,6 +1461,17 @@ const OCC3_RECEIVER_BUSY: &str = "occ3_receiver_busy";
 const OCC3_SOURCE_BUSY: &str = "occ3_source_busy";
 /// Upper bound on an honoured `Retry-After` for a busy refusal, in seconds.
 pub const OCC3_BUSY_RETRY_AFTER_MAX_SECS: u64 = 30;
+/// Same-request resends of an armed source capture after a pre-admission
+/// busy 503, before the lease closes as a busy refusal.
+const OCC3_SOURCE_BUSY_RESENDS: u32 = 2;
+/// Resend delay when a busy refusal carries no usable `Retry-After`.
+const OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS: u64 = 5;
+/// Time a resent source capture may still need after its delay to be
+/// admitted and send its first event. Matches the server's published
+/// worst-case pre-first-event bound (`x-optimus-occ3-admission-window`,
+/// 7 s control + 8 s first event). A resend is attempted only if the delay
+/// plus this headroom fits the lease, so it never expires in flight.
+const OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS: u64 = 15;
 
 /// Whether a bounded 503 error code is an admission-busy refusal for the
 /// given request shape (`source` = armed source capture, else attached
@@ -2509,6 +2520,7 @@ async fn post_chat_completions(
 		if is_cancelled(signal) { return Err(abort_error()); }
 		Some(lease.submit()?)
 	} else { None };
+	let mut source_template: Option<reqwest::Request> = None;
 	let mut source_submission = if let Some((lease, model)) = source {
 		lease.validate_target(&model.provider, &model.id, &client.base_url)?;
 		if body.get("model").and_then(Value::as_str) != Some(model.id.as_str())
@@ -2529,7 +2541,9 @@ async fn post_chat_completions(
 				reqwest::header::HeaderValue::from_static(OCC3_KEEPALIVE_REQUEST_MODE),
 			);
 		}
-		builder = reqwest::RequestBuilder::from_parts(http_client, request);
+		// The identical request, kept for a busy pre-admission resend.
+		source_template = Some(request.try_clone().ok_or(SourceCaptureError::InvalidPayload)?);
+		builder = reqwest::RequestBuilder::from_parts(http_client.clone(), request);
 		if is_cancelled(signal) { return Err(abort_error()); }
 		Some(lease.submit()?)
 	} else { None };
@@ -2537,37 +2551,133 @@ async fn post_chat_completions(
 	// Only a guarded native request carries the bounded phase; an ordinary call
 	// keeps its exact thrown value and log.
 	let native = inference.is_some() || source.is_some();
-	let request = builder.send();
-	let response = match signal {
-		Some(signal) => {
-			tokio::select! {
-				result = tokio::time::timeout(header_timeout, request) => result,
-				_ = signal.cancelled() => return Err(abort_error()),
+	// Same-request resend of an armed SOURCE capture after a pre-admission
+	// busy refusal (see `SourceSubmission::resend_window_allows`). Only the source path ever
+	// loops; every other request sends exactly once.
+	let mut first_attempt = Some(builder);
+	let mut source_resends: u32 = 0;
+	let mut last_busy_retry_after: Option<u64> = None;
+	let response = loop {
+		let attempt = match first_attempt.take() {
+			Some(builder) => builder,
+			None => {
+				let template = source_template.as_ref().and_then(reqwest::Request::try_clone)
+					.ok_or_else(|| StreamError::from(SourceCaptureError::InvalidPayload))?;
+				reqwest::RequestBuilder::from_parts(http_client.clone(), template)
+			}
+		};
+		let request = attempt.send();
+		let response = match signal {
+			Some(signal) => {
+				tokio::select! {
+					result = tokio::time::timeout(header_timeout, request) => result,
+					_ = signal.cancelled() => return Err(abort_error()),
+				}
+			}
+			None => tokio::time::timeout(header_timeout, request).await,
+		};
+		let response = match response {
+			Ok(Ok(response)) => response,
+			Ok(Err(error)) => {
+				if is_cancelled(signal) {
+					return Err(abort_error());
+				}
+				if error.is_timeout() {
+					return Err(StreamError::new("Request timed out.")
+						.with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
+				}
+				// The transport message may embed the request URL, so only the phase survives.
+				return Err(StreamError::new(format!("Connection error: {error}"))
+					.with_occ3_cause_if(native, OCC3_CAUSE_SEND_TRANSPORT_ERROR));
+			}
+			// `APIConnectionTimeoutError`: `Request timed out.`
+			Err(_elapsed) => {
+				if is_cancelled(signal) {
+					return Err(abort_error());
+				}
+				return Err(StreamError::new("Request timed out.").with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
+			}
+		};
+		let status = response.status().as_u16();
+		let resend = source_resends > 0;
+		if source_submission.is_none() || !(status == 503 || (resend && status == 409)) {
+			break response;
+		}
+		// Admission unavailability for an armed source capture: the server
+		// refused before generating anything, so nothing was captured.
+		// `admission_timeout` may follow server-side enroll/reserve/prepare
+		// for this capture_id, but no publication can follow a refused
+		// capture, so non-use holds. Up to OCC3_SOURCE_BUSY_RESENDS times the
+		// IDENTICAL request is resent after Retry-After (the server releases
+		// its replay fence only for this pre-dispatch busy refusal); the
+		// lease stays Submitted meanwhile. After the last refusal the lease
+		// closes as proven non-use with a busy record and the sender re-arms
+		// a FRESH capture on its own busy budget. Unknown codes keep the
+		// uncertain contract.
+		// Known gap: with the keepalive offer accepted, the server sends 200
+		// headers first and a busy refusal arrives as an SSE error event;
+		// that shape is not classified here, never resent, and keeps the
+		// uncertain path.
+		let retry_after = parse_occ3_busy_retry_after(response.headers());
+		let mut response = response;
+		let code = read_bounded_error_code(&mut response).await;
+		let code = code.as_deref();
+		let busy = status == 503 && code.is_some_and(|code| is_occ3_busy_code(code, true));
+		// A 409 replay_forbidden on a resend means the server kept the fence
+		// (no fence release). The FIRST refusal was already proven pre-use,
+		// so this closes exactly like that busy refusal, never as uncertain.
+		let fence_kept = resend && status == 409 && code == Some("replay_forbidden");
+		if !busy && !fence_kept {
+			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
+		}
+		let retry_after = if busy { retry_after } else { retry_after.or(last_busy_retry_after) };
+		if busy && source_resends < OCC3_SOURCE_BUSY_RESENDS {
+			let delay = std::time::Duration::from_secs(retry_after.unwrap_or(OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS));
+			let headroom = std::time::Duration::from_secs(OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS);
+			let allowed = source_submission
+				.as_ref()
+				.is_some_and(|submission| submission.resend_window_allows(delay, headroom));
+			if allowed {
+				last_busy_retry_after = retry_after;
+				source_resends += 1;
+				drop(response);
+				// The sleep honours cancellation. Nothing is in flight during
+				// the sleep and the last refusal was a proven pre-use busy
+				// refusal, so a cancel here closes the lease as that busy
+				// refusal (Cancelled with a busy record), never Uncertain.
+				// The outer stream guard may also drop this body mid-sleep on
+				// the signal or the deadline; the resend-wait mark makes that
+				// drop close the same way. An explicit `lease.cancel()` revokes
+				// authority first and keeps its own conservative Uncertain.
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(Some(retry_after));
+				}
+				let cancelled = match signal {
+					Some(signal) => tokio::select! {
+						_ = tokio::time::sleep(delay) => false,
+						_ = signal.cancelled() => true,
+					},
+					None => {
+						tokio::time::sleep(delay).await;
+						false
+					}
+				};
+				if cancelled || is_cancelled(signal) {
+					if let Some(source_submission) = source_submission.take() {
+						source_submission.refuse_before_admission(retry_after);
+					}
+					return Err(abort_error());
+				}
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(None);
+				}
+				continue;
 			}
 		}
-		None => tokio::time::timeout(header_timeout, request).await,
-	};
-	let response = match response {
-		Ok(Ok(response)) => response,
-		Ok(Err(error)) => {
-			if is_cancelled(signal) {
-				return Err(abort_error());
-			}
-			if error.is_timeout() {
-				return Err(StreamError::new("Request timed out.")
-					.with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
-			}
-			// The transport message may embed the request URL, so only the phase survives.
-			return Err(StreamError::new(format!("Connection error: {error}"))
-				.with_occ3_cause_if(native, OCC3_CAUSE_SEND_TRANSPORT_ERROR));
+		if let Some(source_submission) = source_submission.take() {
+			source_submission.refuse_before_admission(retry_after);
 		}
-		// `APIConnectionTimeoutError`: `Request timed out.`
-		Err(_elapsed) => {
-			if is_cancelled(signal) {
-				return Err(abort_error());
-			}
-			return Err(StreamError::new("Request timed out.").with_occ3_cause_if(native, OCC3_CAUSE_HEADER_TIMEOUT));
-		}
+		return Err(StreamError::occ3_source_busy(retry_after));
 	};
 
 	observe_local_phase(observer, "generation_headers_complete");
@@ -2585,30 +2695,6 @@ async fn post_chat_completions(
 					submission.refuse_before_admission();
 				}
 				return Err(StreamError::occ3_receiver_busy());
-			}
-		}
-		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
-	}
-	if source_submission.is_some() && status == 503 {
-		// Admission unavailability for an armed source capture: the server
-		// refused before generating anything, so nothing was captured. Close
-		// the lease as proven non-use and surface a distinct retryable error.
-		// The sender re-arms a FRESH capture later; this request and its
-		// lease are never resent. Unknown codes keep the uncertain contract.
-		// `admission_timeout` may follow server-side enroll/reserve/prepare
-		// for this capture_id, but no publication can follow a refused
-		// capture and the next arm mints a new capture_id, so non-use holds.
-		// Known gap: with the keepalive offer accepted, the server sends 200
-		// headers first and a busy refusal arrives as an SSE error event;
-		// that shape is not classified here and keeps the uncertain path.
-		let retry_after = parse_occ3_busy_retry_after(response.headers());
-		let mut response = response;
-		if let Some(code) = read_bounded_error_code(&mut response).await {
-			if is_occ3_busy_code(&code, true) {
-				if let Some(source_submission) = source_submission.take() {
-					source_submission.refuse_before_admission(retry_after);
-				}
-				return Err(StreamError::occ3_source_busy(retry_after));
 			}
 		}
 		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
