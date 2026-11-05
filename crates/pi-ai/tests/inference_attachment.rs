@@ -814,6 +814,7 @@ async fn pre_event_receiver_busy_is_retryable_non_use_without_resend() {
         assert_eq!(details["status"], 503);
         assert!(details.get("occ3Cause").is_none());
         assert_eq!(lease.state(), InferenceStateLeaseState::Cancelled, "{code}: proven non-use");
+        assert!(lease.refused_busy(), "{code}: the lease records the busy refusal");
         assert_eq!(fixture.count(), 1, "{code}: no automatic resend");
         let replay = stream_openai_completions(
             &fixture.model, &context(), Some(options(Some(lease.clone()))),
@@ -836,5 +837,6 @@ async fn attached_503_with_unknown_code_stays_uncertain() {
     assert_no_replay_diagnostic(error(&output));
     assert_occ3_cause(error(&output), "http_non_success", Some(503));
     assert_eq!(lease.state(), InferenceStateLeaseState::Uncertain);
+    assert!(!lease.refused_busy(), "an unknown 503 is not a busy refusal");
     assert_eq!(fixture.count(), 1);
 }

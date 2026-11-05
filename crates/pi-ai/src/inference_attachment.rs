@@ -107,6 +107,11 @@ struct LeaseInner {
     attachment: InferenceAttachment,
     state: Mutex<InferenceStateLeaseState>,
     cancellation: CancellationToken,
+    /// Set once when the receiver refused this attached request as
+    /// admission unavailability before any stream event (proven non-use).
+    /// Lets the receiver-side dispatcher tell a busy refusal apart from any
+    /// other `Cancelled` outcome without parsing error text.
+    refused_busy: std::sync::atomic::AtomicBool,
 }
 
 /// A capability issued by a connector for one actual inference request.
@@ -164,6 +169,7 @@ impl InferenceStateLease {
             attachment,
             state: Mutex::new(InferenceStateLeaseState::Prepared),
             cancellation: CancellationToken::new(),
+            refused_busy: std::sync::atomic::AtomicBool::new(false),
         })))
     }
 
@@ -177,6 +183,14 @@ impl InferenceStateLease {
 
     pub fn state(&self) -> InferenceStateLeaseState {
         *self.0.state.lock()
+    }
+
+    /// Whether the receiver refused this lease's request as busy (admission
+    /// unavailability) before any stream event. Only true together with the
+    /// `Cancelled` state: the attachment was proven unused.
+    pub fn refused_busy(&self) -> bool {
+        self.0.refused_busy.load(std::sync::atomic::Ordering::Acquire)
+            && self.state() == InferenceStateLeaseState::Cancelled
     }
 
     /// Close this lease without rearming it. Cancellation after submission is uncertain.
@@ -382,6 +396,10 @@ impl InferenceSubmission {
             // `cancel()`: firing it here would race the provider's biased
             // select and turn this bounded refusal into `NotPrepared`.
             *state = InferenceStateLeaseState::Cancelled;
+            self.lease
+                .0
+                .refused_busy
+                .store(true, std::sync::atomic::Ordering::Release);
         }
     }
 

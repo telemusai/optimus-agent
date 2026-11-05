@@ -193,6 +193,31 @@ pub struct Occ3SenderQueueEntry {
     /// a display name cannot close the entry.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub receiver_session_id: Option<String>,
+    /// Receiver-busy re-captures already scheduled for this entry. Each one
+    /// follows a pre-event busy refusal (proven non-use of the published
+    /// capture). Bounded by [`OCC3_RECEIVER_BUSY_MAX_RETRIES`]; separate from
+    /// `attempts` and from the source-capture retry budget, because a busy
+    /// receiver is not a capture failure. Absent on older artifacts -> 0.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub busy_retries: u32,
+    /// Earliest epoch second at which the next busy re-capture may arm (the
+    /// backoff). Set only on a `pending` entry returned by a busy refusal.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub retry_not_before_epoch: Option<u64>,
+}
+
+fn is_zero_u32(value: &u32) -> bool {
+    *value == 0
+}
+
+/// Maximum receiver-busy re-captures per queue entry before the entry falls
+/// back to ordinary OCC-1 re-emission.
+pub const OCC3_RECEIVER_BUSY_MAX_RETRIES: u32 = 3;
+
+/// Backoff before receiver-busy re-capture `retry` (1-based): 2s, 4s, 8s.
+/// Matches the session provider retry policy's base delays.
+pub fn receiver_busy_backoff_secs(retry: u32) -> u64 {
+    2u64.saturating_pow(retry.clamp(1, OCC3_RECEIVER_BUSY_MAX_RETRIES))
 }
 
 impl Occ3SenderQueueEntry {
@@ -577,6 +602,7 @@ impl Occ3SenderQueue {
                         || entry.receiver_name.is_empty()
                         || entry.receiver_name.len() > 128
                         || entry.attempts > 64
+                        || entry.busy_retries > OCC3_RECEIVER_BUSY_MAX_RETRIES
                         || entry.message_ids.len() > 8
                 }) {
                     queue.blocked = Some(Occ3SenderQueueBlocked::Unreadable {
@@ -733,6 +759,8 @@ impl Occ3SenderQueue {
             reason: None,
             fallback_dispatch_token: None,
             receiver_session_id: None,
+            busy_retries: 0,
+            retry_not_before_epoch: None,
         });
         let position = self.entries.len() as u32;
         self.notice_at((position - 1) as usize, now_epoch, None)
@@ -756,6 +784,7 @@ impl Occ3SenderQueue {
             return None;
         }
         head.state = Occ3SenderQueueState::Armed;
+        head.retry_not_before_epoch = None;
         head.receiver_session_id = receiver_session_id.map(str::to_string);
         if let Some(id) = message_id {
             let id = id.to_string();
@@ -871,6 +900,39 @@ impl Occ3SenderQueue {
                 refusal: None,
             }]
         }
+    }
+
+    /// The receiver refused this sender's attached request as busy before
+    /// any stream event: the published capture was proven unused, but it is
+    /// spent (one publication per capture), so it is never resent. Within
+    /// [`OCC3_RECEIVER_BUSY_MAX_RETRIES`] the in-flight entry returns to
+    /// `pending` with a backoff, and the model is prompted for a FRESH
+    /// capture. After that the entry falls back to ordinary OCC-1
+    /// re-emission exactly like any other proven non-use outcome.
+    pub fn record_receiver_busy(
+        &mut self,
+        message_id: &str,
+        now_epoch: u64,
+    ) -> Vec<Occ3QueueNotice> {
+        let Some(index) = self.entries.iter().position(|entry| {
+            entry.message_id.as_deref() == Some(message_id) && entry.state.is_in_flight()
+        }) else {
+            return Vec::new();
+        };
+        if self.entries[index].busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            let queue_id = self.entries[index].queue_id.clone();
+            return self
+                .mark_fallback(Some(&queue_id), "receiver_busy_exhausted", now_epoch)
+                .into_iter()
+                .collect();
+        }
+        let entry = &mut self.entries[index];
+        entry.busy_retries = entry.busy_retries.saturating_add(1);
+        entry.state = Occ3SenderQueueState::Pending;
+        entry.reason = Some("receiver_busy_retry".into());
+        entry.retry_not_before_epoch =
+            Some(now_epoch.saturating_add(receiver_busy_backoff_secs(entry.busy_retries)));
+        self.notice_at(index, now_epoch, None).into_iter().collect()
     }
 
     /// Demotes the head or a matched entry to fallback_pending (ordinary
@@ -1277,6 +1339,23 @@ pub fn fallback_prompt(receiver: &str) -> String {
     )
 }
 
+/// The re-capture prompt for a pending head the receiver refused as busy.
+/// The earlier capture was proven unused but is spent; the model emits the
+/// facts again for a fresh capture.
+pub fn receiver_busy_prompt(receiver: &str, retry: u32) -> String {
+    format!(
+        "OCC-3 receiver {receiver} was busy and did not use the native handoff (busy retry {retry} of {OCC3_RECEIVER_BUSY_MAX_RETRIES}). \
+Call occ3_handoff with receiver_role and receiver_name for that receiver to arm a fresh capture, then emit the concise \
+source facts again as assistant content and call occ3_handoff once more. Do not reuse or replay any earlier capture."
+    )
+}
+
+/// Dedup key for the host's one-shot head prompt: a receiver-busy retry or a
+/// later fallback is a new prompting occasion for the same queue entry.
+pub fn head_prompt_key(entry: &Occ3SenderQueueEntry) -> String {
+    format!("{}#{}#{}", entry.queue_id, entry.state.as_str(), entry.busy_retries)
+}
+
 /// The advance prompt the model receives when the queue advances to a new
 /// head, when a capture failed and the native path is still available, or
 /// when a blocked/empty restart needs a fresh start. Explicitly instructs a
@@ -1332,6 +1411,80 @@ mod tests {
             .unwrap();
         assert_eq!(notice.state, "fallback");
         assert!(queue.is_empty());
+    }
+
+    /// A receiver-busy refusal returns the in-flight entry to `pending`
+    /// with a 2s/4s/8s backoff for a fresh capture, keeps it at the head,
+    /// prompts once per retry, and falls back to OCC-1 after the budget.
+    #[test]
+    fn receiver_busy_recaptures_with_backoff_then_falls_back() {
+        let mut queue = queue();
+        let head = queue.enqueue("child", "busy", 100).unwrap();
+        queue.enqueue("child", "behind", 100).unwrap();
+        let mut now = 100;
+        let mut keys = std::collections::HashSet::new();
+        for retry in 1..=OCC3_RECEIVER_BUSY_MAX_RETRIES {
+            let message_id = format!("agentmsg_{retry}");
+            queue.mark_armed(Some(&message_id), None, now).unwrap();
+            queue
+                .mark_progressed(Occ3SenderQueueState::Admitted, &message_id, now)
+                .unwrap();
+            let notices = queue.record_receiver_busy(&message_id, now);
+            assert_eq!(notices.len(), 1);
+            assert_eq!(notices[0].state, "pending", "retry {retry}");
+            assert_eq!(notices[0].reason.as_deref(), Some("receiver_busy_retry"));
+            assert!(notices[0].dispatch_token.is_none(), "no OCC-1 fallback yet");
+            let entry = queue.head().unwrap();
+            assert_eq!(entry.queue_id, head.queue_id, "busy entry keeps the head");
+            assert_eq!(entry.busy_retries, retry);
+            assert_eq!(entry.attempts, 0, "busy is not a capture failure");
+            assert_eq!(
+                entry.retry_not_before_epoch,
+                Some(now + receiver_busy_backoff_secs(retry))
+            );
+            assert!(keys.insert(head_prompt_key(entry)), "each retry prompts once");
+            now += 10;
+        }
+        assert_eq!(
+            (1..=3).map(receiver_busy_backoff_secs).collect::<Vec<_>>(),
+            vec![2, 4, 8]
+        );
+        queue.mark_armed(Some("agentmsg_last"), None, now).unwrap();
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, None, "arm clears the backoff");
+        queue
+            .mark_progressed(Occ3SenderQueueState::Admitted, "agentmsg_last", now)
+            .unwrap();
+        let notices = queue.record_receiver_busy("agentmsg_last", now);
+        assert_eq!(notices[0].state, "fallback_pending");
+        assert_eq!(notices[0].reason.as_deref(), Some("receiver_busy_exhausted"));
+        assert!(notices[0].dispatch_token.is_some());
+        assert!(keys.insert(head_prompt_key(queue.head().unwrap())), "fallback prompts too");
+        // Unknown or non-in-flight ids change nothing.
+        assert!(queue.record_receiver_busy("agentmsg_unknown", now).is_empty());
+        assert!(queue.record_receiver_busy("agentmsg_last", now).is_empty());
+    }
+
+    /// Older artifacts without the busy fields still load; the fields
+    /// round-trip, and an out-of-bound busy count blocks the load.
+    #[test]
+    fn busy_fields_are_backward_compatible_and_bounded() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("occ3-sender-queue.json");
+        let legacy = json!({"schema": OCC3_SENDER_QUEUE_SCHEMA, "entries": [{
+            "queueId": "occ3q_legacy", "receiverRole": "child", "receiverName": "r",
+            "enqueuedAtEpoch": 1, "expiresAtEpoch": u64::MAX / 2,
+            "state": "pending", "attempts": 0
+        }]});
+        std::fs::write(&path, legacy.to_string()).unwrap();
+        let (queue, load) = Occ3SenderQueue::load(&path, OCC3_SENDER_QUEUE_TTL_SECS);
+        assert!(matches!(load, Occ3SenderQueueLoad::Loaded(..)));
+        assert_eq!(queue.head().unwrap().busy_retries, 0);
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, None);
+        let mut over = legacy.clone();
+        over["entries"][0]["busyRetries"] = json!(OCC3_RECEIVER_BUSY_MAX_RETRIES + 1);
+        std::fs::write(&path, over.to_string()).unwrap();
+        let (_, load) = Occ3SenderQueue::load(&path, OCC3_SENDER_QUEUE_TTL_SECS);
+        assert!(matches!(load, Occ3SenderQueueLoad::Blocked(..)));
     }
 
     #[test]
