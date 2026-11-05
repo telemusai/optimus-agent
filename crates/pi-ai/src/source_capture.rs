@@ -833,6 +833,7 @@ impl SourceCaptureLease {
             receipt: None,
             body_verified: false,
             deferred: false,
+            resend_wait: None,
         })
     }
 }
@@ -845,6 +846,13 @@ pub(crate) struct SourceSubmission {
     /// The server accepted the keepalive offer: the receipt arrives as the
     /// terminal `optimus.occ3.receipt` SSE event instead of response headers.
     deferred: bool,
+    /// Set only while waiting out `Retry-After` before a same-request resend:
+    /// the last response was a proven pre-use busy refusal and nothing is in
+    /// flight. Holds that refusal's Retry-After. If the submission is dropped
+    /// in this window (the outer stream guard cancels the body on a signal,
+    /// lease cancel or deadline), it closes as that busy refusal, not
+    /// `Uncertain`.
+    resend_wait: Option<Option<u64>>,
 }
 impl SourceSubmission {
     pub(crate) fn ensure_active(&self) -> Result<(), SourceCaptureError> {
@@ -1022,20 +1030,27 @@ impl SourceSubmission {
 impl SourceSubmission {
     /// Whether an identical resend after `delay` still fits this lease: the
     /// submission is still `Submitted` and both the local deadline and the
-    /// intent expiry lie strictly after the delay. Called only after a
-    /// classified pre-admission busy refusal, before any stream event.
-    pub(crate) fn resend_window_allows(&self, delay: std::time::Duration) -> bool {
+    /// intent expiry lie strictly after the delay PLUS `headroom`, the time
+    /// the resent request may need to be admitted and produce its first
+    /// event. Without that headroom a resend started just before the
+    /// deadline would expire in flight as `Uncertain`, although refusing at
+    /// once is proven non-use. Called only after a classified pre-admission
+    /// busy refusal, before any stream event.
+    pub(crate) fn resend_window_allows(&self, delay: std::time::Duration, headroom: std::time::Duration) -> bool {
         if self.lease.state() != SourceCaptureState::Submitted {
             return false;
         }
-        let Some(resume) = Instant::now().checked_add(delay) else {
+        let Some(needed) = delay.checked_add(headroom) else {
+            return false;
+        };
+        let Some(resume) = Instant::now().checked_add(needed) else {
             return false;
         };
         let Ok(now) = epoch_now() else {
             return false;
         };
         resume < self.lease.limits().deadline
-            && now.saturating_add(delay.as_secs()) < self.lease.intent().expires_at_epoch
+            && now.saturating_add(needed.as_secs()) < self.lease.intent().expires_at_epoch
     }
     /// The server refused the armed capture as busy BEFORE any stream event:
     /// nothing was generated or captured. That is proven non-use, so the
@@ -1053,11 +1068,29 @@ impl SourceSubmission {
         }
     }
 }
+impl SourceSubmission {
+    /// Enter (`Some(retry_after)`) or leave (`None`) the Retry-After wait
+    /// before a same-request resend. See `resend_wait`.
+    pub(crate) fn set_resend_wait(&mut self, retry_after_secs: Option<Option<u64>>) {
+        self.resend_wait = retry_after_secs;
+    }
+}
 impl Drop for SourceSubmission {
     fn drop(&mut self) {
         let mut record = self.lease.0.state.lock();
         if record.state == SourceCaptureState::Submitted {
-            record.state = SourceCaptureState::Uncertain;
+            match self.resend_wait {
+                // Dropped while waiting to resend: nothing is in flight and the
+                // last refusal was proven pre-use, so close as that refusal.
+                Some(retry_after_secs) => {
+                    record.state = SourceCaptureState::Cancelled;
+                    record.busy_refusal = Some(SourceBusyRefusal {
+                        refused_at_epoch: epoch_now().unwrap_or(0),
+                        retry_after_secs,
+                    });
+                }
+                None => record.state = SourceCaptureState::Uncertain,
+            }
         }
     }
 }

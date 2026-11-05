@@ -1466,6 +1466,12 @@ pub const OCC3_BUSY_RETRY_AFTER_MAX_SECS: u64 = 30;
 const OCC3_SOURCE_BUSY_RESENDS: u32 = 2;
 /// Resend delay when a busy refusal carries no usable `Retry-After`.
 const OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS: u64 = 5;
+/// Time a resent source capture may still need after its delay to be
+/// admitted and send its first event. Matches the server's published
+/// worst-case pre-first-event bound (`x-optimus-occ3-admission-window`,
+/// 7 s control + 8 s first event). A resend is attempted only if the delay
+/// plus this headroom fits the lease, so it never expires in flight.
+const OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS: u64 = 15;
 
 /// Whether a bounded 503 error code is an admission-busy refusal for the
 /// given request shape (`source` = armed source capture, else attached
@@ -2546,7 +2552,7 @@ async fn post_chat_completions(
 	// keeps its exact thrown value and log.
 	let native = inference.is_some() || source.is_some();
 	// Same-request resend of an armed SOURCE capture after a pre-admission
-	// busy refusal (see `source_busy_resend_delay`). Only the source path ever
+	// busy refusal (see `SourceSubmission::resend_window_allows`). Only the source path ever
 	// loops; every other request sends exactly once.
 	let mut first_attempt = Some(builder);
 	let mut source_resends: u32 = 0;
@@ -2627,23 +2633,42 @@ async fn post_chat_completions(
 		let retry_after = if busy { retry_after } else { retry_after.or(last_busy_retry_after) };
 		if busy && source_resends < OCC3_SOURCE_BUSY_RESENDS {
 			let delay = std::time::Duration::from_secs(retry_after.unwrap_or(OCC3_SOURCE_BUSY_DEFAULT_DELAY_SECS));
-			let allowed = source_submission.as_ref().is_some_and(|submission| submission.resend_window_allows(delay));
+			let headroom = std::time::Duration::from_secs(OCC3_SOURCE_BUSY_RESEND_HEADROOM_SECS);
+			let allowed = source_submission
+				.as_ref()
+				.is_some_and(|submission| submission.resend_window_allows(delay, headroom));
 			if allowed {
 				last_busy_retry_after = retry_after;
 				source_resends += 1;
 				drop(response);
-				// The sleep honours cancellation. A cancel here drops the
-				// still-Submitted submission, which the outer stream guard
-				// records as Uncertain (the conservative abort contract).
-				match signal {
-					Some(signal) => tokio::select! {
-						_ = tokio::time::sleep(delay) => {}
-						_ = signal.cancelled() => return Err(abort_error()),
-					},
-					None => tokio::time::sleep(delay).await,
+				// The sleep honours cancellation. Nothing is in flight during
+				// the sleep and the last refusal was a proven pre-use busy
+				// refusal, so a cancel here closes the lease as that busy
+				// refusal (Cancelled with a busy record), never Uncertain.
+				// The outer stream guard may also drop this body mid-sleep
+				// (signal, lease cancel, deadline); the resend-wait mark makes
+				// that drop close the same way.
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(Some(retry_after));
 				}
-				if is_cancelled(signal) {
+				let cancelled = match signal {
+					Some(signal) => tokio::select! {
+						_ = tokio::time::sleep(delay) => false,
+						_ = signal.cancelled() => true,
+					},
+					None => {
+						tokio::time::sleep(delay).await;
+						false
+					}
+				};
+				if cancelled || is_cancelled(signal) {
+					if let Some(source_submission) = source_submission.take() {
+						source_submission.refuse_before_admission(retry_after);
+					}
 					return Err(abort_error());
+				}
+				if let Some(submission) = source_submission.as_mut() {
+					submission.set_resend_wait(None);
 				}
 				continue;
 			}

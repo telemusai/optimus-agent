@@ -250,7 +250,8 @@ impl Fixture {
         self.requests.lock().unwrap().len()
     }
     fn lease(&self) -> SourceCaptureLease {
-        self.lease_with(Duration::from_secs(8))
+        // Long enough for one resend: delay + the 15 s admission headroom.
+        self.lease_with(Duration::from_secs(30))
     }
     fn lease_with(&self, budget: Duration) -> SourceCaptureLease {
         SourceCaptureLease::new(
@@ -803,8 +804,9 @@ async fn source_busy_retry_after_is_bounded() {
         let fixture =
             Fixture::new(Reply::Refusal("503 Service Unavailable", busy_body("scheduler_busy"), extra))
                 .await;
-        // Shorter than any honoured delay: the refusal closes without a resend.
-        let lease = fixture.lease_with(Duration::from_millis(900));
+        // Shorter than any delay plus the 15 s resend headroom: the refusal
+        // closes without a resend.
+        let lease = fixture.lease_with(Duration::from_secs(10));
         let stream =
             stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
         let details = failure_details(&collect(&stream).await);
@@ -991,9 +993,40 @@ async fn source_busy_cancel_during_resend_sleep_stops_without_resend() {
     assert!(started.elapsed() < Duration::from_secs(4), "cancel interrupts the sleep");
     assert_eq!(fixture.count(), 1, "no resend after cancel");
     assert!(lease.receipt().is_none());
-    assert!(lease.busy_refusal().is_none());
-    assert_ne!(lease.state(), SourceCaptureState::Captured);
+    // Nothing was in flight and the refusal was proven pre-use: the lease
+    // closes as that busy refusal, never Uncertain.
+    assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    assert_eq!(lease.busy_refusal().expect("busy refusal").retry_after_secs, Some(5));
     assert!(matches!(events.last(), Some(AssistantMessageEvent::Error { .. })));
+}
+
+/// A resend is attempted only when the delay PLUS the admission headroom
+/// fits the lease, so it can never expire in flight as Uncertain.
+#[tokio::test]
+async fn source_busy_resend_requires_admission_headroom() {
+    let fixture = Fixture::new(Reply::Script(vec![busy("scheduler_busy", "Retry-After: 1\r\n"), Reply::Good])).await;
+    // 1 s delay fits a 10 s lease, but 1 s + 15 s headroom does not.
+    let lease = fixture.lease_with(Duration::from_secs(10));
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert_eq!(fixture.count(), 1, "no resend without headroom");
+    assert_eq!(failure_details(&events)["providerErrorType"], "occ3_source_busy");
+    assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, Some(1));
+}
+
+/// A busy refusal without a usable Retry-After resends after the 5 s default.
+#[tokio::test]
+async fn source_busy_without_retry_after_uses_default_delay() {
+    let fixture = Fixture::new(Reply::Script(vec![busy("scheduler_busy", ""), Reply::Good])).await;
+    let lease = fixture.lease();
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert!(started.elapsed() >= Duration::from_secs(5), "default delay honoured");
+    assert!(matches!(events.last(), Some(AssistantMessageEvent::Done { .. })), "{events:?}");
+    assert_eq!(fixture.count(), 2);
+    assert_eq!(lease.state(), SourceCaptureState::Captured);
 }
 
 /// A resend whose delay would cross the lease deadline is not attempted:
@@ -1006,12 +1039,14 @@ async fn source_busy_resend_respects_lease_deadline() {
         Reply::Good,
     ]))
     .await;
-    let lease = fixture.lease_with(Duration::from_secs(3));
+    // First resend: 1 s + 15 s headroom fits 18 s. Second, at ~1 s:
+    // 3 s + 15 s crosses it.
+    let lease = fixture.lease_with(Duration::from_secs(18));
     let started = std::time::Instant::now();
     let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
     let events = collect(&stream).await;
     assert!(started.elapsed() < Duration::from_secs(3));
-    assert_eq!(fixture.count(), 2, "second delay crosses the deadline");
+    assert_eq!(fixture.count(), 2, "second delay plus headroom crosses the deadline");
     assert_eq!(failure_details(&events)["providerErrorType"], "occ3_source_busy");
     assert_eq!(lease.state(), SourceCaptureState::Cancelled);
     assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, Some(3));
