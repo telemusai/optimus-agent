@@ -1023,6 +1023,20 @@ impl Occ3SenderQueue {
         Some(notice)
     }
 
+    /// Silent retirement for a deleted owner session (an RLM child that was
+    /// removed). Drops every entry and every undelivered outbox record and
+    /// clears the overflow flag. It emits NO notice: the owner is gone, so
+    /// nothing may report on its behalf. Returns the number of entries and
+    /// outbox records removed.
+    pub fn retire_all_silently(&mut self) -> (usize, usize) {
+        let entries = self.entries.len();
+        let records = self.outbox.len();
+        self.entries.clear();
+        self.outbox.clear();
+        self.outbox_overflow = false;
+        (entries, records)
+    }
+
     /// Pops the head after its terminal notice has been emitted.
     pub fn pop_terminal_head(&mut self) -> Option<Occ3SenderQueueEntry> {
         let terminal = self.entries.front()?.state.is_terminal();
@@ -1195,6 +1209,30 @@ pub fn queue_refusal_notice(refused: &'static str, timestamp: u64) -> Occ3QueueN
         dispatch_token: None,
         refusal: Some(refused.into()),
     }
+}
+
+/// Notice states that may raise a LIVE follow-up prompt in the parent.
+/// Intermediate states (pending, armed, published, fallback_pending,
+/// uncertain, refused) are still recorded durably in the parent
+/// transcript, but they do not wake the parent: only an outcome the
+/// parent can act on does.
+pub fn parent_notice_prompts_live(state: &str) -> bool {
+    matches!(
+        state,
+        "admitted" | "delivered" | "completed" | "fallback" | "failed" | "expired" | "cancelled"
+    )
+}
+
+/// Coalescing key for the parent's live follow-up prompt of one child
+/// queue entry. A newer notice for the same entry replaces a still-queued
+/// older prompt; the child prefix lets deletion drop all of them.
+pub fn parent_notice_queue_key(child_session_id: &str, queue_id: &str) -> String {
+    format!("{}{queue_id}", parent_notice_queue_key_prefix(child_session_id))
+}
+
+/// Prefix shared by every parent notice prompt of one child session.
+pub fn parent_notice_queue_key_prefix(child_session_id: &str) -> String {
+    format!("occ3-child-notice:{child_session_id}:")
 }
 
 pub fn now_epoch() -> u64 {
@@ -1671,6 +1709,34 @@ mod tests {
         assert!(queue.enqueue("child", "a", 100).is_some());
         assert!(queue.enqueue("child", "b", 100).is_some());
         assert!(queue.enqueue("child", "c", 100).is_none(), "ceiling 2 enforced");
+    }
+
+    #[test]
+    fn retire_all_silently_drops_entries_and_undelivered_notices() {
+        let mut queue = queue();
+        let first = queue.enqueue("child", "a", 100).unwrap();
+        queue.outbox_record(&first);
+        let second = queue.enqueue("child", "b", 100).unwrap();
+        queue.outbox_record(&second);
+        assert_eq!(queue.outbox_pending().len(), 2);
+        assert_eq!(queue.retire_all_silently(), (2, 2));
+        assert!(queue.is_empty());
+        assert!(queue.outbox_pending().is_empty(), "no notice survives deletion");
+        assert!(!queue.outbox_overflow());
+    }
+
+    #[test]
+    fn only_terminal_notice_states_prompt_the_parent_live() {
+        for state in ["admitted", "delivered", "completed", "fallback", "failed", "expired", "cancelled"] {
+            assert!(parent_notice_prompts_live(state), "{state} prompts");
+        }
+        for state in ["pending", "armed", "published", "fallback_pending", "uncertain", "refused", "unknown"] {
+            assert!(!parent_notice_prompts_live(state), "{state} stays durable-only");
+        }
+        assert_eq!(
+            parent_notice_queue_key("child-1", "occ3q_x"),
+            format!("{}occ3q_x", parent_notice_queue_key_prefix("child-1"))
+        );
     }
 
     #[test]

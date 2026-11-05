@@ -13752,6 +13752,68 @@ fn custom_text(message: &CustomMessage) -> String {
         }
     }
 
+    /// Queues an agent-message follow-up prompt under a coalescing key:
+    /// any still-queued (not yet started) follow-up with the same key is
+    /// removed first, so only the newest prompt for that key remains.
+    pub async fn queue_keyed_agent_message_follow_up(
+        self: &Arc<Self>,
+        text: &str,
+        queue_key: &str,
+        custom_message: Option<CustomMessage>,
+    ) -> bool {
+        self.remove_queued_follow_up(queue_key);
+        let agent_message_id = custom_message.as_ref().and_then(|message| {
+            message
+                .details
+                .as_ref()
+                .and_then(|details| details.get("id"))
+                .and_then(Value::as_str)
+                .map(|value| value.to_string())
+        });
+        self.queue_prepared_prompt(
+            SESSION_INPUT_SCHEDULE_FOLLOW_UP,
+            text,
+            None,
+            Some(PreparedTurnActionOptions {
+                agent_message_id,
+                queue_key: Some(queue_key.to_string()),
+                custom_message,
+                ..Default::default()
+            }),
+        )
+        .await
+    }
+
+    /// Removes every still-queued follow-up whose coalescing key starts
+    /// with `prefix`. Returns whether anything was removed.
+    pub fn remove_queued_follow_ups_with_prefix(&self, prefix: &str) -> bool {
+        let mut store = self.action_store.lock().unwrap();
+        let ids: HashSet<String> = store
+            .queued_actions(Some(DeliveryPolicy::WhenRunIdle))
+            .into_iter()
+            .filter(|action| {
+                action
+                    .queue_key
+                    .as_deref()
+                    .is_some_and(|key| key.starts_with(prefix))
+            })
+            .map(|action| action.id)
+            .collect();
+        if ids.is_empty() {
+            return false;
+        }
+        let removed = store.remove(
+            &|action: &QueuedSessionAction| ids.contains(&action.id),
+            None,
+        );
+        if removed.is_err() {
+            return false;
+        }
+        drop(store);
+        self.emit_queue_update();
+        true
+    }
+
     /// `removeQueuedFollowUp(queueKey)`.
     pub fn remove_queued_follow_up(&self, queue_key: &str) -> bool {
         let mut store = self.action_store.lock().unwrap();

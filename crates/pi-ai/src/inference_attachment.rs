@@ -370,6 +370,21 @@ impl InferenceSubmission {
         Ok(())
     }
 
+    /// The receiver refused the attached request as admission
+    /// unavailability BEFORE any stream event (nothing was generated and
+    /// the attachment was not injected). That is proven non-use: the lease
+    /// closes as `Cancelled`, never `Uncertain` and never reusable. The
+    /// caller continues without the attachment; it never resends it.
+    pub(crate) fn refuse_before_admission(self) {
+        let mut state = self.lease.0.state.lock();
+        if *state == InferenceStateLeaseState::Submitted {
+            // The cancellation token is left for the request guard's
+            // `cancel()`: firing it here would race the provider's biased
+            // select and turn this bounded refusal into `NotPrepared`.
+            *state = InferenceStateLeaseState::Cancelled;
+        }
+    }
+
     /// Only a successful terminal stream plus its exact receipt consumes the lease.
     pub(crate) fn complete(self) -> Result<(), InferenceAttachmentError> {
         if !self.receipt_verified {

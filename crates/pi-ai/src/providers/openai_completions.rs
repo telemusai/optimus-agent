@@ -1443,7 +1443,56 @@ impl From<SourceCaptureError> for StreamError {
 	}
 }
 
+/// Admission-unavailability refusal codes the OCC-3 receiver adapter returns
+/// as a pre-event 503 (`extensions/sglang-occ3/occ3_sglang/chat_adapter.py`
+/// `_ADMISSION_REFUSALS`): another request is decoding, nothing was
+/// generated and the attachment was not used.
+const OCC3_RECEIVER_BUSY_CODES: [&str; 3] = ["scheduler_busy", "admission_capacity", "occ3_busy_batch"];
+/// Public error code of the retryable receiver-busy failure.
+const OCC3_RECEIVER_BUSY: &str = "occ3_receiver_busy";
+/// Upper bound on the error body read to classify a 503.
+const OCC3_BUSY_BODY_LIMIT: usize = 4096;
+
+/// Reads at most [`OCC3_BUSY_BODY_LIMIT`] bytes of an error body and returns
+/// its bounded error code (`error.message`, falling back to `error.code`).
+/// Only a short identifier-shaped token is returned; any other text yields
+/// `None`, so no free-form body text can leave this function.
+async fn read_bounded_error_code(response: &mut reqwest::Response) -> Option<String> {
+	let mut body = Vec::new();
+	while body.len() < OCC3_BUSY_BODY_LIMIT {
+		match response.chunk().await {
+			Ok(Some(chunk)) => body.extend_from_slice(&chunk),
+			_ => break,
+		}
+	}
+	body.truncate(OCC3_BUSY_BODY_LIMIT);
+	let value: Value = serde_json::from_slice(&body).ok()?;
+	let error = value.get("error")?;
+	let code = error
+		.get("message")
+		.and_then(Value::as_str)
+		.or_else(|| error.get("code").and_then(Value::as_str))?;
+	(code.len() <= 64 && code.bytes().all(|byte| byte.is_ascii_lowercase() || byte.is_ascii_digit() || byte == b'_'))
+		.then(|| code.to_string())
+}
+
 fn record_completions_failure(model: &Model, output: &mut AssistantMessage, error: &StreamError) {
+	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_RECEIVER_BUSY) {
+		// Retryable overload: the session retry policy re-runs the turn
+		// without the (now cancelled) attachment. No Retry-After is
+		// forwarded, so the configured 2s/4s/8s backoff applies.
+		let failure = crate::utils::stream_failure::StreamFailureError::new(
+			error.message.clone(),
+			crate::utils::stream_failure::StreamFailureInfo {
+				kind: crate::utils::stream_failure::KIND_OVERLOADED.into(),
+				provider_error_type: Some(OCC3_RECEIVER_BUSY.into()),
+				status: Some(503),
+				..Default::default()
+			},
+		);
+		record_stream_failure(model, output, &ThrownStreamError::Failure(&failure));
+		return;
+	}
 	if error.value.get("code").and_then(Value::as_str) == Some("occ3_inference_uncertain") {
 		// The public shape stays exact; only the allowlisted cause and a valid
 		// HTTP status survive the collapse.
@@ -1519,6 +1568,13 @@ fn allowlisted_occ3_cause(cause: &str) -> &'static str {
 }
 
 impl StreamError {
+	/// The receiver was busy (admission unavailability) before any stream
+	/// event. Retryable; the attachment lease is already closed as non-use.
+	fn occ3_receiver_busy() -> Self {
+		let message = "OCC-3 receiver busy before admission; the turn continues without the native attachment.".to_string();
+		Self { value: json!({"name":"Error", "message":message, "code":OCC3_RECEIVER_BUSY}), message }
+	}
+
 	fn inference_uncertain() -> Self {
 		let message = "Inference state request did not complete; automatic replay is disabled.".to_string();
 		Self { value: json!({"name":"Error", "message":message, "code":"occ3_inference_uncertain"}), message }
@@ -2433,6 +2489,23 @@ async fn post_chat_completions(
 
 	observe_local_phase(observer, "generation_headers_complete");
 	let status = response.status().as_u16();
+	if submission.is_some() && status == 503 {
+		// Admission unavailability (another request is decoding): the
+		// server refused before generating anything, so the attachment was
+		// never used. Close the lease as proven non-use and surface a
+		// distinct retryable error; the retry is an ordinary turn without
+		// the attachment, never a resend of this request.
+		let mut response = response;
+		if let Some(code) = read_bounded_error_code(&mut response).await {
+			if OCC3_RECEIVER_BUSY_CODES.contains(&code.as_str()) {
+				if let Some(submission) = submission.take() {
+					submission.refuse_before_admission();
+				}
+				return Err(StreamError::occ3_receiver_busy());
+			}
+		}
+		return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));
+	}
 	if let Some(submission) = submission.as_mut() {
 		if !response.status().is_success() {
 			return Err(StreamError::inference_uncertain().with_occ3_status(OCC3_CAUSE_HTTP_NON_SUCCESS, Some(status)));

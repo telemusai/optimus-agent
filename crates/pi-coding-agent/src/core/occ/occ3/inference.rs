@@ -754,6 +754,49 @@ mod tests {
         assert!(inbox.poll_consumed().is_empty());
     }
 
+    /// Fix 1 (receiver busy): a bound lease closed as proven non-use
+    /// (`Cancelled`, the provider's pre-event busy refusal) resolves to
+    /// `Failed`. The next claim skips it, so the session's retry runs as an
+    /// ordinary turn without the attachment, and the terminal poll reports
+    /// it exactly once so the sender falls back to ordinary OCC-1 delivery.
+    #[test]
+    fn busy_refused_lease_lets_the_retry_run_ordinary_and_reports_failed_once() {
+        let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
+        assert!(inbox.admit(unit_envelope("m1", "s1"), "m1", "s1", 1).unwrap());
+        assert!(inbox.claim(&["m1".to_string()], &[], 1).unwrap().is_some());
+        let lease = pi_ai::inference_attachment::InferenceStateLease::new(
+            pi_ai::inference_attachment::InferenceStateTarget {
+                provider: "fixture".into(),
+                model_id: "fixture-model".into(),
+                base_url: "http://127.0.0.1:1/v1".into(),
+            },
+            pi_ai::inference_attachment::InferenceAttachment {
+                protocol_version: 1,
+                request_id: "consume-1".into(),
+                message_id: "m1".into(),
+                connector_id: "connector-1".into(),
+                receiver_session_id: "receiver".into(),
+                model_fingerprint: "fp-1".into(),
+                runtime_id: "runtime-1".into(),
+                runtime_generation: 1,
+                state_handle: "handle-m1".into(),
+                expires_at_epoch: u64::MAX / 2,
+                method: "kv-radix-channel-v1".into(),
+            },
+        )
+        .unwrap();
+        lease.cancel();
+        inbox.records.get_mut("m1").unwrap().bound_lease = Some(lease);
+        // The retry turn: no attachment, no uncertain refusal.
+        assert!(inbox.claim(&["m1".to_string()], &["m1".to_string()], 1).unwrap().is_none());
+        assert_eq!(
+            inbox.poll_terminal_failures(),
+            vec![("m1".to_string(), "s1".to_string(), Occ3DeliveryStatus::Failed)]
+        );
+        assert!(inbox.poll_terminal_failures().is_empty(), "reported exactly once");
+        assert!(inbox.poll_consumed().is_empty());
+    }
+
     /// Reversed context order cannot reorder the queue: the earliest pending
     /// admission by ARRIVAL is the only claimable record, even when its id
     /// sorts after a later admission's id (arrival order, not id order).

@@ -999,6 +999,38 @@ impl Occ3NativeSession {
         *guard = Some(Box::from(unsubscribe));
         Ok(())
     }
+    /// The "already delivered" short-circuit for a repeated `occ3_handoff`
+    /// call. Returns a result only when the slot holds an admitted handoff
+    /// AND the queue head is the admitted/published entry for exactly this
+    /// receiver. Read-only: no re-arm, no lease validation, no notice.
+    fn already_admitted_result(&self, role: &str, name: &str) -> Option<AgentToolResult> {
+        let admitted = self.source.lock().ok().is_some_and(|slot| slot.handoff_admitted);
+        if !admitted {
+            return None;
+        }
+        let queue = self.queue.lock().ok()?;
+        let head = queue.head()?;
+        if head.receiver_role != role
+            || head.receiver_name != name
+            || !matches!(
+                head.state,
+                super::occ3_sender_queue::Occ3SenderQueueState::Admitted
+                    | super::occ3_sender_queue::Occ3SenderQueueState::Published
+            )
+        {
+            return None;
+        }
+        let message_id = head.message_id.clone();
+        let queue_id = head.queue_id.clone();
+        Some(AgentToolResult::new(
+            vec![ContentBlock::text(format!(
+                "Native handoff for {role}:{name} was already admitted{}; nothing was sent again. Do not repeat this handoff.",
+                message_id.as_deref().map(|id| format!(" ({id})")).unwrap_or_default()
+            ))],
+            json!({"status":"already_delivered","delivery_completed":true,"queue_id":queue_id,"message_id":message_id}),
+        ))
+    }
+
     pub fn handoff_tool(
         self: &Arc<Self>,
         controller: Arc<dyn AgentSessionMessageController>,
@@ -1021,6 +1053,13 @@ impl Occ3NativeSession {
                     let authorized=controller.authorize_native_handoff(role.into(),name.into()).await.map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_authorize: {e}]", failure())))?;
                     if authorized.source_session_id()!=this.session_id() { return Err(anyhow::anyhow!(format!("{} [occ3_tool_sender_mismatch]", failure()))); }
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { return Err(anyhow::anyhow!(failure())); }
+                    // An admitted handoff is terminal for this call path: a
+                    // repeat for the same receiver must neither re-arm nor
+                    // re-validate the completed capture against a newer
+                    // response (that comparison can only fail provenance).
+                    if let Some(result) = this.already_admitted_result(role, name) {
+                        return Ok(result);
+                    }
                     let queue_head = {
                         let queue = this.queue.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         queue.head().map(|head| {
@@ -1919,6 +1958,26 @@ impl Occ3NativeSession {
         // durable outbox and the next cycle re-selects them here again.
     }
 
+    /// Silently retires this sender's whole queue when its owner session
+    /// is deleted: no entry stays live, no outbox record or worklist item
+    /// survives, so no later drain (turn end or idle timer) can notify
+    /// the parent about a session that no longer exists. Persists the
+    /// emptied queue so a restart replays nothing either.
+    pub fn retire_sender_queue_silently(&self) -> (usize, usize) {
+        let removed = match self.queue.lock() {
+            Ok(mut queue) => {
+                let removed = queue.retire_all_silently();
+                let _ = self.persist_sender_queue(&queue);
+                removed
+            }
+            Err(_) => (0, 0),
+        };
+        if let Ok(mut pending) = self.pending_queue_notices.lock() {
+            pending.clear();
+        }
+        removed
+    }
+
     /// Acknowledges the sender-transcript delivery of one durable notice
     /// (the custom message was appended and flushed). Persists the outbox
     /// state; the record is removed once the parent delivery is also
@@ -2413,6 +2472,43 @@ mod tests {
                 assert_eq!(budget.retained_count_limit, 64);
             }
         }
+    }
+
+    #[tokio::test]
+    async fn repeated_handoff_after_admission_reports_already_delivered() {
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        session
+            .sender_queue_mark_armed(Some("agentmsg_admitted"), Some("receiver"))
+            .unwrap();
+        session
+            .sender_queue_mark_progressed(
+                super::super::occ3_sender_queue::Occ3SenderQueueState::Admitted,
+                "agentmsg_admitted",
+            )
+            .unwrap();
+        session.source.lock().unwrap().handoff_admitted = true;
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let result = (tool.execute)(
+            "repeat-call".into(),
+            json!({"receiver_role":"child","receiver_name":"receiver"}),
+            None,
+            None,
+        )
+        .await
+        .expect("an admitted entry answers a repeat without error");
+        assert_eq!(result.details["status"], "already_delivered");
+        assert_eq!(result.details["message_id"], "agentmsg_admitted");
+        let slot = session.source.lock().unwrap();
+        assert!(slot.budget.is_none(), "no re-arm after admission");
+        assert!(slot.handoff_admitted);
+        drop(slot);
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries.len(), 1, "no new queue entry for the repeat");
+        assert_eq!(
+            entries[0].state,
+            super::super::occ3_sender_queue::Occ3SenderQueueState::Admitted
+        );
     }
 
     #[tokio::test]
