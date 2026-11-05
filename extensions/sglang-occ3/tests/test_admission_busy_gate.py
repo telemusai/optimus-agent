@@ -639,8 +639,7 @@ def _capacity_scheduler(runtime, *, slots=4, waiting=0, free_kv=10_000, evictabl
     return sched
 
 
-@pytest.mark.parametrize("kw", [dict(slots=0), dict(slots=2, waiting=2),
-                                dict(free_kv=8, evictable=2)])
+@pytest.mark.parametrize("kw", [dict(slots=0), dict(free_kv=8, evictable=2)])
 def test_consume_declines_busy_when_its_prefill_cannot_be_scheduled(monkeypatch, kw):
     record = consume_record()
     runtime = bind(monkeypatch, runtime_for(record))
@@ -660,4 +659,13 @@ def test_consume_admits_when_slot_and_kv_cover_its_rewritten_prompt(monkeypatch)
     descriptor = consume(native_rid="rid")
     # 11 prompt tokens + one page: exactly enough with radix-evictable pages.
     w.admit_request(_capacity_scheduler(runtime, slots=1, free_kv=6, evictable=6), request, descriptor)
+    assert record.admitted_consume
+
+
+def test_consume_admits_with_one_free_slot_behind_a_long_waiting_queue(monkeypatch):
+    # _occ3_prefill_selection runs the pending consume ahead of the waiting
+    # queue, so queued ordinary requests never make it busy.
+    record = consume_record()
+    runtime = bind(monkeypatch, runtime_for(record))
+    w.admit_request(_capacity_scheduler(runtime, slots=1, waiting=64), req(), consume(native_rid="rid"))
     assert record.admitted_consume

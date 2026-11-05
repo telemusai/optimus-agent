@@ -1067,7 +1067,7 @@ def _consume_capacity_available(scheduler, prompt_tokens):
     """Conservative pre-use check that a consume prefill can be scheduled now.
 
     Reads scheduler state that is identical on every rank (request slots,
-    KV allocator and radix evictable sizes, queue length), and runs inside
+    KV allocator and radix evictable sizes), and runs inside
     the admit preflight, so the verdict is gathered and rank-uniform. It is a
     floor, not the PrefillAdder's exact budget: a False verdict is a busy
     decline the sender may retry. A scheduler without these hooks (offline
@@ -1076,8 +1076,9 @@ def _consume_capacity_available(scheduler, prompt_tokens):
     running = getattr(scheduler, "running_batch", None)
     slots = getattr(scheduler, "get_num_allocatable_reqs", None)
     if callable(slots) and running is not None:
-        queued = len(getattr(scheduler, "waiting_queue", ()) or ())
-        if slots(len(running.reqs), running_batch=running) - queued <= 0:
+        # No waiting-queue term: _occ3_prefill_selection schedules the pending
+        # consume ahead of the waiting queue, so only a free slot matters.
+        if slots(len(running.reqs), running_batch=running) <= 0:
             return False
     allocator = getattr(scheduler, "token_to_kv_pool_allocator", None)
     tree = getattr(scheduler, "tree_cache", None)
