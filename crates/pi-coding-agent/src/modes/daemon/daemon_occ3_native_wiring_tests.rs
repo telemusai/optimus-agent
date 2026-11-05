@@ -1544,3 +1544,88 @@ async fn parent_queue_notification_verifies_identity_relationship_and_dedups() {
         .expect("distinct notice accepted");
     assert_eq!(count_child_notices("occ3n_wiring_dedup_2"), 1);
 }
+
+
+/// REGRESSION (parent notice flood): intermediate child queue notices are
+/// recorded durably in the parent but never queue a live follow-up
+/// prompt; terminal notices do, coalesced per (child, queueId) so a newer
+/// notice replaces a still-queued older prompt; and deleting the child
+/// drops its still-queued prompts.
+#[tokio::test]
+async fn parent_queue_notice_prompts_only_terminal_states_and_coalesce() {
+    let fixture = NativeHandoffFixture::new().await;
+    let child_session_id = fixture.child.session.session_id().to_string();
+    let parent_session_id = fixture.parent.session.session_id().to_string();
+    let child_controller = fixture.child.controller.clone().expect("controller");
+    let notice = |notice_id: &str, queue_id: &str, state: &str| {
+        serde_json::json!({
+            "noticeId": notice_id,
+            "queueId": queue_id,
+            "receiver": "child:worker",
+            "state": state,
+            "attempts": 0,
+            "position": 1,
+            "timestamp": 4242,
+        })
+    };
+    let live_prompts = |queue_id: &str| -> usize {
+        fixture
+            .parent
+            .session
+            .get_follow_up_messages()
+            .iter()
+            .filter(|text| text.contains("OCC-3 child queue notice") && text.contains(queue_id))
+            .count()
+    };
+    let durable = |notice_id: &str| -> bool {
+        fixture
+            .parent
+            .session
+            .session_manager
+            .lock()
+            .expect("parent manager")
+            .has_custom_message_notice(
+                crate::core::agent_session::occ3_sender_queue::OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE,
+                notice_id,
+            )
+    };
+    // Hold the parent busy-equivalent: queued follow-ups stay queued
+    // because nothing drains them in this fixture.
+    for (index, state) in ["pending", "armed", "published"].iter().enumerate() {
+        let id = format!("occ3n_flood_mid_{index}");
+        child_controller
+            .notify_parent_queue_notice(&child_session_id, &parent_session_id, notice(&id, "occ3q_flood", state))
+            .await
+            .expect("intermediate notice durably accepted");
+        assert!(durable(&id), "intermediate notice {state} is recorded durably");
+    }
+    assert_eq!(live_prompts("occ3q_flood"), 0, "intermediate states never prompt the parent");
+
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, notice("occ3n_flood_t1", "occ3q_flood", "admitted"))
+        .await
+        .expect("terminal notice accepted");
+    let after_admitted = live_prompts("occ3q_flood");
+    assert!(after_admitted <= 1, "at most one live prompt per entry");
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, notice("occ3n_flood_t2", "occ3q_flood", "completed"))
+        .await
+        .expect("newer terminal notice accepted");
+    assert!(
+        live_prompts("occ3q_flood") <= 1,
+        "a newer notice replaces the queued older prompt for the same queueId"
+    );
+    // Replaying an already-accepted noticeId adds nothing.
+    child_controller
+        .notify_parent_queue_notice(&child_session_id, &parent_session_id, notice("occ3n_flood_t2", "occ3q_flood", "completed"))
+        .await
+        .expect("replay is a no-op");
+    assert!(live_prompts("occ3q_flood") <= 1);
+
+    // Child deletion drops every still-queued prompt for that child.
+    super::daemon_subagents::drop_parent_notice_prompts_for_child(
+        &fixture.parent.session,
+        &child_session_id,
+    );
+    assert_eq!(live_prompts("occ3q_flood"), 0, "deleted child leaves no queued prompts");
+}

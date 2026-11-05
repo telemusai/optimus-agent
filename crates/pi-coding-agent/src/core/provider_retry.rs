@@ -884,6 +884,31 @@ mod tests {
     }
 
     #[test]
+    fn occ3_receiver_busy_failure_is_retryable_and_replay_safe() {
+        // Shape recorded by pi-ai for a pre-event 503 scheduler_busy on an
+        // attached receiver turn: kind overloaded, no content.
+        let mut busy = error_message(Some("overloaded"));
+        if let Some(details) = busy.diagnostics.as_mut().and_then(|d| d[0].details.as_mut()) {
+            details.insert("providerErrorType".into(), json!("occ3_receiver_busy"));
+            details.insert("status".into(), json!(503));
+        }
+        assert!(!cannot_replay_provider_failure(&busy));
+        for retries in [0.0, 1.0, 2.0] {
+            assert!(!is_permanent_provider_failure_kind(
+                provider_stream_failure_kind(&busy).as_deref(),
+                retries
+            ));
+        }
+        let policy = default_provider_retry_policy();
+        for (attempt, expected) in [(1.0, 2000.0), (2.0, 4000.0), (3.0, 8000.0)] {
+            assert_eq!(
+                provider_retry_delay(attempt, None, &policy, &options(0.5)),
+                ProviderRetryDelay::Wait { delay_ms: expected }
+            );
+        }
+    }
+
+    #[test]
     fn stream_failure_details_are_read_from_provider_diagnostics() {
         let message = error_message(Some("rate_limit"));
         assert_eq!(provider_stream_failure_kind(&message).as_deref(), Some("rate_limit"));

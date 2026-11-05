@@ -17217,11 +17217,24 @@ impl AgentSessionMessageController for DaemonAgentMessageController {
                     )
                     .map_err(|error| format!("Parent queue notification not durably accepted: {error}"))?;
             }
-            // Live steering for an active parent: the same record as a
-            // follow-up prompt, so a busy parent learns of the final
-            // state without waiting for its next turn. Prompt failure
-            // never un-acks: the durable record above already replays
-            // into the parent's context at the next turn boundary.
+            // Live steering for an active parent, terminal states only: a
+            // busy parent learns of the outcome without waiting for its
+            // next turn. Intermediate states stay durable-only, so they
+            // cannot flood the parent with follow-up turns. The prompt is
+            // coalesced per (child, queueId): a newer notice replaces an
+            // older prompt that has not started yet. Prompt failure never
+            // un-acks: the durable record above already replays into the
+            // parent's context at the next turn boundary.
+            use crate::core::agent_session::occ3_sender_queue::{
+                parent_notice_prompts_live, parent_notice_queue_key,
+            };
+            let queue_key = parent_notice_queue_key(&child_session_id, queue_id);
+            if !parent_notice_prompts_live(state) {
+                // An older terminal-or-not prompt for this entry is stale
+                // once a newer notice exists.
+                parent.remove_queued_follow_up(&queue_key);
+                return Ok(());
+            }
             let custom = crate::core::messages::CustomMessage {
                 role: "user".into(),
                 custom_type: OCC3_CHILD_QUEUE_NOTICE_CUSTOM_TYPE.into(),
@@ -17231,7 +17244,7 @@ impl AgentSessionMessageController for DaemonAgentMessageController {
                 timestamp: crate::core::agent_session::now_ms() as i64,
             };
             let _ = parent
-                .queue_agent_message_prompt(&line, "followUp", Some(custom))
+                .queue_keyed_agent_message_follow_up(&line, &queue_key, Some(custom))
                 .await;
             Ok(())
         })

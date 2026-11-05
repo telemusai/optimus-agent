@@ -265,6 +265,15 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
                 // Retention won before cleanup admission; no release await or deletion may start.
                 return Ok(());
             }
+            if cancelled {
+                retire_occ3_sender_queue(&runtime.session);
+                if let Some(parent_session) = daemon.session_of(&parent).agent_session() {
+                    drop_parent_notice_prompts_for_child(
+                        &parent_session,
+                        &runtime.session.session_id(),
+                    );
+                }
+            }
             let deletion = if cancelled {
                 daemon
                     .record_rlm_subagent_deletion(
@@ -354,6 +363,20 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
             daemon
                 .record_rlm_subagent_deletion(&parent, &child_id, RlmLedgerDeleteReason::User)
                 .await?;
+            // A deleted child must not keep reporting its OCC-3 sender
+            // queue to the parent: retire every entry silently before the
+            // session closes so no later drain emits a notice for it.
+            for child in state
+                .as_ref()
+                .and_then(|entry| entry.session.agent_session())
+                .into_iter()
+                .chain(session.iter().cloned())
+            {
+                retire_occ3_sender_queue(&child);
+                if let Some(parent_session) = daemon.session_of(&parent).agent_session() {
+                    drop_parent_notice_prompts_for_child(&parent_session, &child.session_id());
+                }
+            }
             let stale = session
                 .as_ref()
                 .filter(|session| {
@@ -408,6 +431,21 @@ impl SubagentRuntimeHost for DaemonSubagentHost {
                 .await
         })
     }
+}
+
+/// Silently retires a deleted RLM child's OCC-3 sender queue (no notices).
+/// A no-op when the child never installed a native OCC-3 session.
+pub(crate) fn retire_occ3_sender_queue(child: &Arc<AgentSession>) {
+    if let Some(native) = child.experimental_native_occ3() {
+        native.retire_sender_queue_silently();
+    }
+}
+
+/// Drops the parent's still-queued live notice prompts for a deleted
+/// child: the child no longer exists, so those prompts are stale.
+pub(crate) fn drop_parent_notice_prompts_for_child(parent: &Arc<AgentSession>, child_session_id: &str) {
+    use crate::core::agent_session::occ3_sender_queue::parent_notice_queue_key_prefix;
+    parent.remove_queued_follow_ups_with_prefix(&parent_notice_queue_key_prefix(child_session_id));
 }
 
 impl AgentDaemon {
