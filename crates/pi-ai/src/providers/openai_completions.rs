@@ -2645,9 +2645,10 @@ async fn post_chat_completions(
 				// the sleep and the last refusal was a proven pre-use busy
 				// refusal, so a cancel here closes the lease as that busy
 				// refusal (Cancelled with a busy record), never Uncertain.
-				// The outer stream guard may also drop this body mid-sleep
-				// (signal, lease cancel, deadline); the resend-wait mark makes
-				// that drop close the same way.
+				// The outer stream guard may also drop this body mid-sleep on
+				// the signal or the deadline; the resend-wait mark makes that
+				// drop close the same way. An explicit `lease.cancel()` revokes
+				// authority first and keeps its own conservative Uncertain.
 				if let Some(submission) = source_submission.as_mut() {
 					submission.set_resend_wait(Some(retry_after));
 				}

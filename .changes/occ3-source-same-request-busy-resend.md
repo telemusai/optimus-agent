@@ -30,8 +30,9 @@ run in parallel.
   replay fence (servers before the matching fence-release change). The first
   refusal was proven pre-use, so this closes as that busy refusal, not as
   uncertain.
-- A cancel during the `Retry-After` sleep also closes as the busy refusal,
-  because nothing is in flight.
+- A cancel signal or the lease deadline during the `Retry-After` sleep also
+  closes as the busy refusal, because nothing is in flight. An explicit lease
+  cancel (`lease.cancel()`) keeps its conservative `Uncertain`.
 - No retry on `429`, on any other `409` or `503`, on a first-attempt `409`,
   or after any stream byte. The receiver (consume) path is unchanged.
 - Known gap: with the keepalive stream opt-in, a busy refusal arrives as an

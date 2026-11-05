@@ -849,9 +849,9 @@ pub(crate) struct SourceSubmission {
     /// Set only while waiting out `Retry-After` before a same-request resend:
     /// the last response was a proven pre-use busy refusal and nothing is in
     /// flight. Holds that refusal's Retry-After. If the submission is dropped
-    /// in this window (the outer stream guard cancels the body on a signal,
-    /// lease cancel or deadline), it closes as that busy refusal, not
-    /// `Uncertain`.
+    /// in this window (the outer stream guard cancels the body on the signal
+    /// or the deadline), it closes as that busy refusal, not `Uncertain`. An
+    /// explicit `lease.cancel()` keeps its own conservative `Uncertain`.
     resend_wait: Option<Option<u64>>,
 }
 impl SourceSubmission {
