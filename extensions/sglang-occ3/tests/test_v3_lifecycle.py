@@ -1530,6 +1530,20 @@ def test_artifact_probe_durable_intent_precedes_create_and_id_precedes_start(tmp
     assert ("start", CANDIDATE) in api.events
 
 
+def test_artifact_probe_path_accepts_valueless_enable_http2(tmp_path):
+    # Production prepare's normal probe path, offline: the original launch
+    # carries the transport-only valueless flag end to end.
+    api = ArtifactProbeDocker()
+    api.docs[ORIGINAL]["Config"]["Cmd"].append("--enable-http2")
+    journal = probe_prepared(tmp_path, api)
+    state = journal.read()
+    assert state["phase"] == "PREPARED" and state["probe_id"] == CANDIDATE
+    assert state["probe_parity"]["result"] == "PASS"
+    assert state["probe_parity"]["isolated_stdlib_command_exact"] is True
+    assert (journal.directory / "artifact-proof.json").exists()
+    assert ("start", CANDIDATE) in api.events and ("remove", CANDIDATE) in api.events
+
+
 def test_lost_artifact_probe_create_reply_records_cleanup_identity_without_removal(tmp_path):
     api = ArtifactProbeDocker()
     real_create = api.create

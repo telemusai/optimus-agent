@@ -13,7 +13,7 @@ from fastapi import FastAPI
 from fastapi.testclient import TestClient
 
 from occ3_sglang import api, plugin
-from occ3_sglang.identity import IDENTITY_FIELDS
+from occ3_sglang.identity import IDENTITY_FIELDS, compute_identity, fingerprint
 from occ3_sglang.registry import registry
 
 PROFILE_INPUT = (
@@ -130,6 +130,40 @@ def test_status_keeps_the_runtime_fingerprint_without_a_pinned_profile(client):
     r = client.get("/occ3/v1/status")
     assert r.status_code == 200
     assert r.json()["model_fingerprint"]
+
+
+def test_status_serves_the_declared_fingerprint_without_runtime_state(
+        client, stub_http_server, monkeypatch, tmp_path):
+    # Identity degradation: with a pinned declared block the diagnostic
+    # routes answer from the packaged profile alone and never touch the
+    # runtime tokenizer manager, so a missing _global_state cannot take
+    # status down. The runtime-derived fallback would 503 there
+    # ("server not ready"); the pinned path must not.
+    payload = install_pinned_profile(
+        monkeypatch, tmp_path, json.loads(PROFILE_INPUT.read_text(encoding="utf-8")))
+    declared = payload["declared_identity"]
+    expected = "|".join(declared[name] for name in IDENTITY_FIELDS)
+    stub_http_server._global_state = None
+    for path in ("/occ3/v1/status", "/occ3/v1/capabilities"):
+        r = client.get(path)
+        assert r.status_code == 200
+        assert r.json()["model_fingerprint"] == expected
+
+
+def test_invalid_pinned_profile_keeps_status_open_and_identity_closed(
+        client, stub_tm, monkeypatch, tmp_path):
+    # A loadable profile whose declared block is malformed is refused by
+    # the validator: the identity route fails closed while the diagnostic
+    # routes keep answering 200 with the runtime-derived fingerprint.
+    payload = json.loads(PROFILE_INPUT.read_text(encoding="utf-8"))
+    payload["declared_identity"].pop("runtime")
+    install_pinned_profile(monkeypatch, tmp_path, payload)
+    expected = fingerprint(compute_identity(stub_tm))
+    for path in ("/occ3/v1/status", "/occ3/v1/capabilities"):
+        r = client.get(path)
+        assert r.status_code == 200
+        assert r.json()["model_fingerprint"] == expected
+    assert client.get("/occ3/v1/identity").status_code == 503
 
 
 def test_identity_route_serves_the_pinned_declared_fields(client, monkeypatch, tmp_path):

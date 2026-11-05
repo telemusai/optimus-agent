@@ -228,6 +228,9 @@ pub struct SessionSummary {
     /// Preserve streaming-only throughput; legacy request-inclusive metadata is ignored.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub streaming_throughput: Option<Value>,
+    /// Optional schema-45 advisory queue metadata; unknown versions must not break the roster.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub communication_queue: Option<Value>,
 }
 
 impl SessionSummary {
@@ -2221,6 +2224,30 @@ mod tests {
         let back: SessionSummary = serde_json::from_value(value).unwrap();
         assert_eq!(back.session_id, "s-1");
         assert_eq!(back.active_session_id, None);
+    }
+
+    #[test]
+    fn session_summary_preserves_communication_queue_and_ignores_unknown_versions() {
+        let mut row = serde_json::json!({
+            "id":"p", "sessionId":"p", "lifecycle":"live", "activity":"idle", "isSessionActive":false,
+            "cwd":"/tmp", "isStreaming":false, "isCompacting":false, "attachedClients":0, "messageCount":0,
+            "communicationQueue": {
+                "generation":"g", "version": 99,
+                "pendingTotal": 2, "omitted": 1,
+                "entries":[{"queueId":"q1","messageId":"m1","position":1,
+                             "receiver":"sibling/a","state":"pending","attempts":0,"timestamp":1000}]
+            }
+        });
+        let parsed: SessionSummary = serde_json::from_value(row.clone()).unwrap();
+        assert_eq!(parsed.communication_queue.as_ref().unwrap()["entries"][0]["queueId"], "q1");
+        assert_eq!(parsed.communication_queue.as_ref().unwrap()["pendingTotal"], 2);
+        assert_eq!(parsed.communication_queue.as_ref().unwrap()["omitted"], 1);
+        // Round-trip keeps the field; legacy rows without it still parse.
+        let serialized = serde_json::to_value(&parsed).unwrap();
+        assert!(serialized["communicationQueue"].is_object());
+        row.as_object_mut().unwrap().remove("communicationQueue");
+        let legacy: SessionSummary = serde_json::from_value(row).unwrap();
+        assert!(legacy.communication_queue.is_none());
     }
 
     #[test]

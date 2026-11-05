@@ -48,6 +48,8 @@ class AttachmentError(ValueError):
             "deadline_exceeded", "buffer_limit", "quota_exceeded", "replay_forbidden",
             "invalid_evidence", "native_completion_failed", "client_disconnected",
             "attachment_failed", "capture_transport_unnegotiated", "cleanup_pending",
+            "scheduler_busy", "admission_timeout", "admission_capacity",
+            "client_cancelled",
         }
         self.code = code if code in allowed else "attachment_failed"
         self.status = status if status in (400, 401, 409, 413, 429, 499, 503, 504) else 409

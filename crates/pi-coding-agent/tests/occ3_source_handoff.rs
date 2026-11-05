@@ -65,6 +65,12 @@ pub struct FixtureResult {
     pub source_receipt: Option<Value>,
     pub sender_error: Option<String>,
     pub control_header_seen: Vec<(String, Option<String>)>,
+    /// The sender agent's serialized transcript (messages only, never the
+    /// report or any evidence file). Stable recorded evidence: the first
+    /// turn's failure and the ordinary recovery turn are asserted from
+    /// here, not from the volatile agent error field, which a later
+    /// successful turn may legitimately clear.
+    pub source_transcript: String,
 }
 fn identity() -> Occ3ModelIdentity {
     Occ3ModelIdentity {
@@ -226,8 +232,27 @@ async fn serve(
                     if let Some(intent)=body.get("occ3_capture") {
                         records.lock().unwrap().source_intent=Some(intent.clone());
                         let output=sse("native-source-rid",true,mode.multiple_tools);
-                        let receipt=json!({"schema":"occ3.source.v1","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                        // The default arming is occ3.capture.v2, so the
+                        // intent is answered on the v2 wire with the
+                        // occ3.span.v1 block: the reasoning region, the
+                        // thinking_end terminator marker row and the
+                        // role-token stop row (both CONTROL), the single
+                        // occ3_handoff tool-call row and its argument rows.
+                        // The turn emits no content delta, so the window
+                        // carries no CONTENT row.
+                        let mut receipt=json!({"schema":"occ3.source.v2","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
                             "accepted_span_start":0,"accepted_span_end":8,"retained_count":8,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":if mode.bad_source_hash{"0".repeat(64)}else{sha256(output.as_bytes())},"expires_at_epoch":intent["expires_at_epoch"],"byte_count":128});
+                        let span=json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
+                            "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
+                            "span_reasoning_terminator":"thinking_end","span_turn_end_attested":true,
+                            "span_thinking_count":2,"span_content_count":0,"span_tool_call_count":1,
+                            "span_tool_arguments_count":3,"span_control_count":2,"span_unknown_count":0,
+                            "span_window_start_position":0,"span_window_end_position":8,
+                            "span_contiguous":true,"span_contains_final_content":true,
+                            "span_contains_tool_call":true,"span_message_truncated":false});
+                        for (key,value) in span.as_object().unwrap() {
+                            receipt[key.clone()]=value.clone();
+                        }
                         records.lock().unwrap().source_receipt=Some(receipt.clone());
                         headers.push(("x-optimus-occ3-source",receipt.to_string()));send(&mut socket,output,headers).await;return;
                     }
@@ -449,6 +474,7 @@ pub async fn run_offline_fixture(mode: FixtureMode) -> Result<FixtureResult, Str
     }
     let receipts = family.receipts();
     let sender_error = source_agent.state().error_message;
+    let source_transcript = serde_json::to_string(&source_agent.state().messages).unwrap();
     let receiver_context = serde_json::to_string(&receiver_agent.state().messages).unwrap();
     assert!(!receiver_context.contains(FACT));
     assert!(!receiver_context.contains("private-source-handle"));
@@ -470,6 +496,7 @@ pub async fn run_offline_fixture(mode: FixtureMode) -> Result<FixtureResult, Str
         source_receipt,
         sender_error,
         control_header_seen,
+        source_transcript,
     })
 }
 #[tokio::test]
@@ -624,8 +651,98 @@ async fn close_and_shutdown_reuse_retirement_key_even_after_unknown_reply() {
     }
 }
 
+/// The transcript's messages with their serialized roles (`"user"`,
+/// `"assistant"`, `"toolResult"`; pi-ai types.rs ROLE_* constants). The role
+/// field is the documented shape of every serialized AgentMessage; an entry
+/// without one fails loudly instead of silently skipping, so a transcript
+/// shape change can never fake a passing assertion.
+fn transcript_roles(transcript: &str) -> Vec<(String, Value)> {
+    let messages: Vec<Value> =
+        serde_json::from_str(transcript).expect("serialized agent messages");
+    messages
+        .into_iter()
+        .enumerate()
+        .map(|(index, message)| {
+            let role = message
+                .get("role")
+                .and_then(Value::as_str)
+                .map(str::to_string)
+                .unwrap_or_else(|| {
+                    panic!("transcript entry {index} lacks the documented role field: {message}")
+                });
+            (role, message)
+        })
+        .collect()
+}
+
+/// Index of the explicit retry prompt: the user turn carrying the fixture's
+/// fixed retry text (`run_offline_fixture` issues it verbatim).
+fn explicit_retry_index(roles: &[(String, Value)]) -> Option<usize> {
+    roles.iter().position(|(role, message)| {
+        role == "user" && message.to_string().contains("Retry the same failed source turn")
+    })
+}
+
+/// Index of the first assistant message whose recorded diagnostics carry an
+/// occ3 provider failure code in the structured `details` field (a provider
+/// diagnostic, not transcript text): the capture-level failure evidence.
+fn assistant_occ3_failure_index(roles: &[(String, Value)]) -> Option<usize> {
+    roles.iter().position(|(role, message)| {
+        role == "assistant"
+            && message["diagnostics"].as_array().is_some_and(|diagnostics| {
+                diagnostics.iter().any(|diagnostic| {
+                    diagnostic["details"]["providerErrorType"]
+                        .as_str()
+                        .is_some_and(|code| code.starts_with("occ3_"))
+                })
+            })
+    })
+}
+
+/// Index of the first error tool result (`"isError": true`) whose text
+/// content carries the failure-mode bracket code: the refused handoff
+/// call's recorded outcome.
+fn tool_error_code_index(roles: &[(String, Value)], code: &str) -> Option<usize> {
+    roles.iter().position(|(role, message)| {
+        role == "toolResult"
+            && message["isError"].as_bool() == Some(true)
+            && message["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block["type"] == "text"
+                        && block["text"].as_str().is_some_and(|text| text.contains(code))
+                })
+            })
+    })
+}
+
+/// Index of the LAST ordinary assistant completion. The captured turn emits
+/// no content delta (fixture sse for a capture is tool-only), so every
+/// occurrence of the completion text is an ordinary uncaptured turn's
+/// output - never the captured turn's.
+fn ordinary_completion_index(roles: &[(String, Value)]) -> Option<usize> {
+    roles.iter().rposition(|(role, message)| {
+        role == "assistant"
+            && message["content"].as_array().is_some_and(|blocks| {
+                blocks.iter().any(|block| {
+                    block["type"] == "text"
+                        && block["text"]
+                            .as_str()
+                            .is_some_and(|text| text.contains("synthetic fixture completion"))
+                })
+            })
+    })
+}
+
+/// PR235 contract (upstream #235): a failed armed capture or publication
+/// tombstones the slot and counts the failure; an explicitly requested
+/// LATER turn then runs ORDINARY and uncaptured instead of bricking the
+/// session (the pre-#235 behavior this test used to pin). What stays
+/// forbidden - and is asserted per failure mode below - is any automatic
+/// REPLAY of the failed attempt: the capture intent never repeats, no
+/// second publish or same-key status query follows the failed one, and
+/// nothing ever reaches the receiver.
 #[tokio::test]
-async fn failed_source_capture_or_publication_never_becomes_normal_source_retry() {
+async fn failed_source_capture_or_publication_recovers_as_explicit_ordinary_turn_and_never_replays() {
     for mode in [
         FixtureMode {
             bad_source_hash: true,
@@ -653,15 +770,111 @@ async fn failed_source_capture_or_publication_never_becomes_normal_source_retry(
             ..Default::default()
         },
     ] {
+        // Two distinct ordinary-recovery shapes, derived from the failure
+        // point (FixtureMode is Clone, not Copy - read the flags before the
+        // fixture consumes the mode):
+        // - Capture-level failures (bad hash / ambiguous tools) abort the
+        //   turn terminally: no tool runs, the loop answers the streamed
+        //   calls and stops (agent_loop terminal-failure branch). Exactly
+        //   TWO model requests: the capture request plus the explicit
+        //   retry turn. No publish, no status query.
+        // - Tool-path failures (unrelated target / absent or refused
+        //   publish) leave the tool error on the SAME turn, and the loop's
+        //   ordinary same-turn continuation follows (one more uncaptured
+        //   request - ordinary continuation, NOT native replay), then the
+        //   explicit retry turn adds its own. Exactly THREE model requests.
+        //   Publish-failure modes carry exactly one publish and the one
+        //   same-key status query of the failed attempt; an unrelated
+        //   target is refused before any publish.
+        let capture_level_failure = mode.bad_source_hash || mode.multiple_tools;
+        let unrelated_target = mode.unrelated;
+        let (want_total, want_publishes, want_statuses): (u64, usize, usize) =
+            if capture_level_failure {
+                (2, 0, 0)
+            } else if unrelated_target {
+                (3, 0, 0)
+            } else {
+                (3, 1, 1)
+            };
         let result = run_offline_fixture(mode).await.unwrap();
+        let roles = transcript_roles(&result.source_transcript);
+        // The failed attempt is durably recorded BEFORE the explicit retry
+        // prompt exists: capture-level failures record an assistant
+        // provider-failure diagnostic; tool-path failures record the refused
+        // handoff call's error tool result (isError with the bracket code).
+        // These are recorded events, not loose transcript substrings.
+        let retry_index = explicit_retry_index(&roles)
+            .expect("the fixture issues the explicit retry prompt");
+        let failure_index = assistant_occ3_failure_index(&roles)
+            .or_else(|| {
+                let code = if unrelated_target {
+                    "[occ3_tool_authorize"
+                } else {
+                    "[occ3_tool_publish"
+                };
+                tool_error_code_index(&roles, code)
+            })
+            .expect("the first turn's failure is durably recorded on the transcript");
+        assert!(
+            failure_index < retry_index,
+            "the failed attempt predates the explicit retry prompt (indexes {failure_index} < {retry_index})"
+        );
+        // Exactly one capture-intent request EVER, and it is the first
+        // model request: every later request - the same-turn ordinary
+        // continuation after a failed tool call and the explicit retry
+        // turn - runs uncaptured. The tombstone never re-arms the capture.
+        let capture_positions: Vec<usize> = result
+            .requests
+            .iter()
+            .filter(|(path, _)| path == "/v1/chat/completions")
+            .enumerate()
+            .filter(|(_, (_, body))| body.get("occ3_capture").is_some())
+            .map(|(index, _)| index)
+            .collect();
         assert_eq!(
-            result.report["total_model_requests"], 1,
-            "no normal post-failure continuation or retry"
+            capture_positions,
+            vec![0usize],
+            "only the first model request carries the capture intent; every later request is ordinary and uncaptured"
         );
         assert_eq!(result.report["source_requests"], 1);
+        // The explicitly requested retry turn completed ordinarily AFTER
+        // the retry prompt: the captured turn emits no content delta, so
+        // the last recorded completion can only be an ordinary turn's.
+        let completion_index = ordinary_completion_index(&roles)
+            .expect("an ordinary uncaptured completion is recorded");
+        assert!(
+            retry_index < completion_index,
+            "the explicit retry turn completed ordinarily (indexes {retry_index} < {completion_index})"
+        );
+        // The exact per-mode bound: no unbounded ordinary retries. The
+        // fixture's plain response carries no tools and no capture, so the
+        // loop cannot continue past the retry turn's completion.
+        assert_eq!(
+            result.report["total_model_requests"], want_total,
+            "exactly the capture request plus the derived ordinary turns"
+        );
+        // No receiver-side consumption of anything.
         assert_eq!(result.report["receiver_requests"], 0);
         assert_eq!(result.report["admitted_messages"], 0);
-        assert!(result.sender_error.is_some());
+        // No publish or status query beyond the failed attempt itself: the
+        // same-key status query of a lost/refused publish fires exactly once
+        // (the connector's publication recovery), and nothing follows the
+        // failure.
+        let publishes = result
+            .requests
+            .iter()
+            .filter(|(p, _)| p.ends_with("/publish"))
+            .count();
+        let statuses = result
+            .requests
+            .iter()
+            .filter(|(p, _)| p.ends_with("/publication/status"))
+            .count();
+        assert_eq!(publishes, want_publishes, "publish count is exactly the failed attempt's");
+        assert_eq!(
+            statuses, want_statuses,
+            "status queries are exactly the same-key query of the failed publish"
+        );
     }
 }
 
@@ -723,8 +936,48 @@ async fn mid_attempt_401_is_failed_not_negative_proof_and_never_replays() {
     assert_eq!(result.report["admitted_messages"], 0);
     assert_eq!(result.report["receiver_requests"], 0);
     assert_eq!(result.report["source_requests"], 1);
-    assert_eq!(result.report["total_model_requests"], 1);
-    assert!(result.sender_error.is_some());
+    // The 401 attempt fails closed INSIDE the first turn; the agent loop's
+    // ordinary continuation after the failed tool call is one more
+    // UNCAPPED model request (PR235 recovery, in-turn). That continuation
+    // is not a replay: the capture intent never repeats, no second publish
+    // or status query follows, and nothing reaches the receiver.
+    assert_eq!(
+        result.report["total_model_requests"], 2,
+        "the capture turn plus exactly one ordinary uncaptured continuation"
+    );
+    let capture_positions: Vec<usize> = result
+        .requests
+        .iter()
+        .filter(|(path, _)| path == "/v1/chat/completions")
+        .enumerate()
+        .filter(|(_, (_, body))| body.get("occ3_capture").is_some())
+        .map(|(index, _)| index)
+        .collect();
+    assert_eq!(
+        capture_positions,
+        vec![0usize],
+        "only the first model request carries the capture intent"
+    );
+    // No explicit retry prompt exists in this mode (retry_source_request
+    // is false): the second request is the SAME-TURN ordinary continuation
+    // after the failed tool call, not an explicit retry turn and not a
+    // native replay.
+    let roles = transcript_roles(&result.source_transcript);
+    assert!(
+        explicit_retry_index(&roles).is_none(),
+        "this mode issues no retry prompt; the extra request is the same-turn continuation"
+    );
+    // The 401 failure is durably recorded as the failed handoff call's
+    // error tool result (isError with the bracket code), and the ordinary
+    // same-turn continuation completes after it.
+    let failure_index = tool_error_code_index(&roles, "[occ3_tool_publish")
+        .expect("the failed publish is the recorded error tool result");
+    let completion_index = ordinary_completion_index(&roles)
+        .expect("the ordinary same-turn continuation completed");
+    assert!(
+        failure_index < completion_index,
+        "the same-turn continuation completed after the failed publish (indexes {failure_index} < {completion_index})"
+    );
     // The gateway header value never leaks into the report.
     assert!(!result.report.to_string().contains(CONTROL_VALUE));
     // The refused control requests still carried the resolved header.

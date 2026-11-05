@@ -12,6 +12,15 @@ enum Choice {
     Status,
     Set(bool),
     SetOcc3(bool),
+    /// `/occ queue`: the same queue view the status panel carries.
+    Queue,
+    /// `/occ queue cancel <queueId>`: manual resolution of one uncertain
+    /// entry as terminal `failed` (manual_cancel). Never re-sends.
+    QueueCancel(String),
+    /// `/occ queue reemit <queueId>`: manual re-emit of one uncertain entry
+    /// through ordinary OCC-1 delivery. Requires the explicit duplicate
+    /// risk confirmation before the send.
+    QueueReemit(String),
 }
 
 fn parse(args: &str) -> Result<Choice, String> {
@@ -19,11 +28,14 @@ fn parse(args: &str) -> Result<Choice, String> {
     match words.as_slice() {
         [] => Ok(Choice::Menu),
         ["status"] => Ok(Choice::Status),
+        ["queue"] => Ok(Choice::Queue),
+        ["queue", "cancel", queue_id] => Ok(Choice::QueueCancel(queue_id.to_string())),
+        ["queue", "reemit", queue_id] => Ok(Choice::QueueReemit(queue_id.to_string())),
         ["1"] | ["occ1"] | ["off"] | ["2", "off"] | ["occ2", "off"] => Ok(Choice::Set(false)),
         ["2"] | ["occ2"] | ["on"] | ["2", "on"] | ["occ2", "on"] => Ok(Choice::Set(true)),
         ["3", "on"] | ["occ3", "on"] => Ok(Choice::SetOcc3(true)),
         ["3", "off"] | ["occ3", "off"] | ["3"] | ["occ3"] => Ok(Choice::SetOcc3(false)),
-        _ => Err("Usage: /occ [status|1|2 on|2 off|3 on|3 off]. OCC-1 remains enabled as the fallback; OCC-2 is enabled by default; OCC-3 requires a live connector handshake.".into()),
+        _ => Err("Usage: /occ [status|queue|1|2 on|2 off|3 on|3 off|queue cancel <id>|queue reemit <id>]. OCC-1 remains enabled as the fallback; OCC-2 is enabled by default; OCC-3 requires a live connector handshake. queue cancel/reemit resolve one uncertain native handoff; reemit states the duplicate risk before sending.".into()),
     }
 }
 
@@ -97,10 +109,101 @@ fn enabled_of(payload: &serde_json::Value) -> Result<bool, String> {
         .ok_or_else(|| "Daemon returned an invalid OCC-2 preference".to_string())
 }
 
+/// One bounded queue-table row: position, receiver, state, attempt count
+/// and both stable ids. The handoff message id stays an explicit
+/// placeholder until the daemon mints it; it is never fabricated.
+fn queue_table_row(entry: &crate::core::occ::queue::CommunicationQueueEntry) -> String {
+    let mut row = format!(
+        "  {}. {} \u{00b7} {} \u{00b7} attempts {} \u{00b7} queue {} \u{00b7} msg {}",
+        entry.position,
+        entry.receiver,
+        crate::core::occ::queue::display_state(&entry.state),
+        entry.attempts,
+        entry.queue_id,
+        if entry.message_id.is_empty() { "\u{2014}" } else { entry.message_id.as_str() }
+    );
+    // The fallback transport verdict, stated honestly: a queued ordinary
+    // delivery is an acknowledgment, not acceptance.
+    if let Some(ordinary_delivery) = entry.ordinary_delivery.as_deref() {
+        row.push_str(&format!(" \u{00b7} ordinary delivery {ordinary_delivery}"));
+    }
+    // The manual resolution that drained an uncertain entry, when the
+    // notice names one (whitelisted upstream; anything else is absent).
+    if let Some(reason) = entry.reason.as_deref() {
+        let label = match reason {
+            "manual_reemit" => "manual re-emit",
+            "manual_cancel" => "manual cancel",
+            other => other,
+        };
+        row.push_str(&format!(" \u{00b7} {label}"));
+    }
+    row
+}
+
 /// Host-authoritative OCC-2 status and provenance, alongside the existing
-/// chat-local OCC-3 preference.
-fn status_of(payload: &serde_json::Value, occ3_enabled: bool) -> Result<String, String> {
+/// chat-local OCC-3 preference. `queue` is this chat's own native handoff
+/// queue, projected from its notices; the family-wide count lives in the
+/// subagents bar badge.
+fn status_of(
+    payload: &serde_json::Value,
+    occ3_enabled: bool,
+    queue: Option<&crate::core::occ::queue::CommunicationQueueSnapshot>,
+) -> Result<String, String> {
     let mut panel = status_occ3(enabled_of(payload)?, occ3_enabled);
+    if let Some(queue) = queue {
+        // The whole-queue blocked state first: a queue whose persisted
+        // artifact could not be loaded safely refuses new handoffs, and the
+        // user must see that before any entry detail.
+        if let Some(reason) = queue.blocked.as_deref() {
+            panel.push_str(&format!(
+                "\nNative handoff queue BLOCKED ({reason}): the persisted queue file could not be read safely. New handoffs are refused until the model starts a fresh queue; the file is left untouched for manual or future-build recovery."
+            ));
+        }
+        // The newest enqueue refusal, when it is still the newest event:
+        // a handoff was refused (full or blocked), stated without claiming
+        // it still holds beyond what the record proves.
+        if let Some(refused) = &queue.refused {
+            panel.push_str(&format!(
+                "\nEnqueue refused ({}): a native handoff was not queued. The banner clears once later activity proves admission resumed.",
+                refused.reason
+            ));
+        }
+        // The durable notice outbox hit its bound: some queue notices are
+        // undeliverable until it drains. Visible fail state, never silent.
+        if queue.notice_overflow {
+            panel.push_str(
+                "\nNotice outbox overflow: the durable queue-notice outbox is full, so some state notices cannot be delivered until it drains. The queue state itself is unaffected.",
+            );
+        }
+        if !queue.entries.is_empty() {
+            panel.push_str(&format!(
+                "\nNative handoff queue: {} pending (shown in the subagents bar as QUEUED; queued handoffs carry no pulse until the receiver proves completed use).",
+                queue.pending_total
+            ));
+            for entry in &queue.entries {
+                panel.push('\n');
+                panel.push_str(&queue_table_row(entry));
+            }
+            if queue.omitted > 0 {
+                panel.push_str(&format!("\n  +{} more queued", queue.omitted));
+            }
+        }
+        // Actionable guidance where the user looks: uncertain entries
+        // resolve ONLY through explicit manual resolution, so the panel
+        // names the commands instead of leaving a dead queue unexplained.
+        let uncertain: Vec<&crate::core::occ::queue::CommunicationQueueEntry> = queue
+            .entries
+            .iter()
+            .filter(|entry| entry.state == "uncertain" || entry.state == "reconciling" || entry.state == "blocked")
+            .collect();
+        if !uncertain.is_empty() {
+            panel.push_str(&format!(
+                "\n{} uncertain entr{} awaiting explicit resolution: /occ queue reemit <id> re-sends via ordinary OCC-1 delivery (the receiver may have already consumed it - duplicates are possible) or /occ queue cancel <id> abandons it (never re-sent). No automatic retry or duplicate will occur.",
+                uncertain.len(),
+                if uncertain.len() == 1 { "y is" } else { "ies are" }
+            ));
+        }
+    }
     if payload.get("inherited").and_then(serde_json::Value::as_bool).unwrap_or(false) {
         if let Some(source) = payload.get("sourceSessionId").and_then(serde_json::Value::as_str) {
             panel.push_str(&format!(
@@ -121,7 +224,7 @@ async fn write_preference(
             let value = connection.set_occ_preferences(enabled).await?;
             // The daemon-authoritative echo, rendered with any provenance it
             // reports; an invalid echo is an error, never a success panel.
-            Ok(CommandOutput::TransientStatus(status_of(&value, false)?))
+            Ok(CommandOutput::TransientStatus(status_of(&value, false, None)?))
         }
         Route::LegacyLocal => {
             let state = connection.get_state().await?;
@@ -183,12 +286,123 @@ async fn read_occ3_preference(connection: &Arc<dyn wire::AgentConnection>) -> Re
     Ok((enabled, model_supports_occ3(state.model.as_ref())))
 }
 
+/// This chat's queue entry with the given id, from the notice projection.
+/// Best effort (the bounded display list): a miss does NOT prove the entry
+/// is gone; the daemon's resolve API stays authoritative.
+async fn queue_entry_of(
+    connection: &Arc<dyn wire::AgentConnection>,
+    queue_id: &str,
+) -> Option<crate::core::occ::queue::CommunicationQueueEntry> {
+    let messages = connection.get_messages().await.ok()?;
+    if messages.is_empty() {
+        return None;
+    }
+    crate::core::occ::queue::from_queue_notices(&messages, "", "")
+        .entries
+        .into_iter()
+        .find(|entry| entry.queue_id == queue_id)
+}
+
+/// Renders the daemon's content-free resolve echo as the user-facing line.
+fn resolution_summary(value: &serde_json::Value, queue_id: &str, reemit: bool, receiver: &str) -> String {
+    let for_receiver = if receiver.is_empty() {
+        String::new()
+    } else {
+        format!(" for {receiver}")
+    };
+    let state = value.get("state").and_then(serde_json::Value::as_str).unwrap_or("unknown");
+    match (state, reemit) {
+        ("failed", _) => format!(
+            "Cancelled handoff {queue_id}{for_receiver}: marked failed (manual cancel). Nothing was re-sent."
+        ),
+        ("fallback_pending", true) => format!(
+            "Re-emit armed for handoff {queue_id}{for_receiver}: the ordinary OCC-1 re-emission is pending and the model will be prompted for fresh source facts. The receiver may have already consumed the original handoff, so a duplicate delivery is possible."
+        ),
+        ("unchanged", _) => format!("No change for handoff {queue_id}: the entry had already resolved."),
+        (state, _) => format!("Handoff {queue_id}{for_receiver} is now {state}."),
+    }
+}
+
+/// One manual resolution of an uncertain queue entry. `reemit=false`
+/// cancels (terminal `failed`, never re-sent); `reemit=true` re-arms the
+/// ordinary OCC-1 re-emission and REQUIRES the explicit duplicate-risk
+/// acknowledgment. The confirmation is a dialog the user must actively
+/// choose; a dismissed dialog resolves nothing.
+async fn queue_resolution(
+    connection: &Arc<dyn wire::AgentConnection>,
+    send: &mpsc::Sender<HostEvent>,
+    queue_id: &str,
+    reemit: bool,
+) -> Result<CommandOutput, String> {
+    if !connection.supports_occ_queue_resolution() {
+        return Ok(CommandOutput::Warning(
+            "This session host does not support OCC-3 queue resolution (agent_communication_queue_control, schema revision 46). Update the daemon; until then, uncertain entries stay visible and unresolved - no automatic retry or duplicate will occur.".into(),
+        ));
+    }
+    // The dialog states what it can prove from the projection; the
+    // daemon's resolve API remains the authority on the entry's state.
+    let entry = queue_entry_of(connection, queue_id).await;
+    if let Some(entry) = &entry {
+        if !matches!(entry.state.as_str(), "uncertain" | "reconciling" | "blocked") {
+            return Ok(CommandOutput::Warning(format!(
+                "Handoff {} is {} (not uncertain); only uncertain entries resolve manually. No change was made.",
+                queue_id,
+                crate::core::occ::queue::display_state(&entry.state)
+            )));
+        }
+    }
+    let receiver = entry.as_ref().map(|entry| entry.receiver.as_str()).unwrap_or("");
+    let unknown_entry = entry.is_none().then(|| " The entry is not in the bounded queue view; the daemon will verify it.").unwrap_or("");
+    let (title, decline, proceed) = if reemit {
+        (
+            format!(
+                "Re-emit handoff {queue_id}{for_receiver} via ordinary OCC-1 delivery? The receiver may have already consumed it; re-emitting can duplicate the handoff.{unknown_entry}",
+                for_receiver = if receiver.is_empty() { String::new() } else { format!(" to {receiver}") },
+            ),
+            "Don't re-emit",
+            "Re-emit anyway",
+        )
+    } else {
+        (
+            format!(
+                "Cancel handoff {queue_id}{for_receiver}? It will be marked failed (manual cancel) and never re-sent.{unknown_entry}",
+                for_receiver = if receiver.is_empty() { String::new() } else { format!(" to {receiver}") },
+            ),
+            "Keep it",
+            "Cancel handoff",
+        )
+    };
+    let Some(choice) = select(send, &title, &[decline, proceed]).await else {
+        return Ok(CommandOutput::Nothing);
+    };
+    if choice != proceed {
+        return Ok(CommandOutput::Nothing);
+    }
+    match connection.resolve_occ_queue_entry(queue_id, reemit).await {
+        Ok(value) => Ok(CommandOutput::TransientStatus(resolution_summary(&value, queue_id, reemit, receiver))),
+        Err(error) => Ok(CommandOutput::Warning(format!("Queue resolution refused: {error}"))),
+    }
+}
+
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
     send: &mpsc::Sender<HostEvent>,
     args: &str,
 ) -> Result<CommandOutput, String> {
     let choice = parse(args)?;
+    // Manual queue resolution is gated on its own connection capability,
+    // not on the OCC-2 preference route: resolve before any preference
+    // read. `/occ queue` itself is the status panel's queue view.
+    let choice = match choice {
+        Choice::QueueCancel(queue_id) => {
+            return queue_resolution(connection, send, &queue_id, false).await;
+        }
+        Choice::QueueReemit(queue_id) => {
+            return queue_resolution(connection, send, &queue_id, true).await;
+        }
+        Choice::Queue => Choice::Status,
+        other => other,
+    };
     let route = route(
         connection.supports_occ_session_preferences(),
         connection.supports_occ2_communication(),
@@ -201,7 +415,21 @@ pub(super) async fn run(
     let choice = match choice {
         Choice::Status => {
             let (occ3_enabled, supported) = read_occ3_preference(connection).await?;
-            let mut panel = status_of(&payload, occ3_enabled)?;
+            // This chat's own native handoff queue, projected from its
+            // notices; a failed read renders the panel without the queue
+            // section instead of failing the status command. The state read
+            // awaits before the closure so no async block hides inside
+            // and_then (E0728).
+            let session_id = connection.get_state().await.ok()
+                .and_then(|state| (!state.session_id.is_empty()).then_some(state.session_id))
+                .unwrap_or_default();
+            let queue = match connection.get_messages().await {
+                Ok(messages) if !messages.is_empty() => Some(
+                    crate::core::occ::queue::from_queue_notices(&messages, &session_id, ""),
+                ),
+                _ => None,
+            };
+            let mut panel = status_of(&payload, occ3_enabled, queue.as_ref())?;
             panel.push_str(if supported {
                 "\nSelected model: OCC-3 configured. The receiver must also be OCC-3 configured with matching verified model/runtime identity."
             } else {
@@ -275,6 +503,111 @@ mod tests {
     }
 
     #[test]
+    fn occ_control_accepts_queue_grammar_and_rejects_broken_forms() {
+        assert_eq!(parse("queue").unwrap(), Choice::Queue);
+        assert_eq!(
+            parse("queue cancel occ3q_1").unwrap(),
+            Choice::QueueCancel("occ3q_1".into())
+        );
+        assert_eq!(
+            parse("queue reemit occ3q_2").unwrap(),
+            Choice::QueueReemit("occ3q_2".into())
+        );
+        // Missing or extra words never resolve anything.
+        for args in ["queue cancel", "queue reemit", "queue cancel a b", "queue maybe x", "queue x cancel"] {
+            assert!(parse(args).is_err(), "args {args:?} must not parse");
+        }
+    }
+
+    #[test]
+    fn queue_resolution_summary_renders_each_post_state_honestly() {
+        let cancelled = serde_json::json!({"queueId": "occ3q_1", "state": "failed", "reason": "manual_cancel"});
+        let text = resolution_summary(&cancelled, "occ3q_1", false, "child:receiver-a");
+        assert!(text.contains("Cancelled handoff occ3q_1 for child:receiver-a"));
+        assert!(text.contains("Nothing was re-sent."));
+        // The re-emit summary states the duplicate risk explicitly.
+        let armed = serde_json::json!({"queueId": "occ3q_2", "state": "fallback_pending", "reason": "manual_reemit"});
+        let text = resolution_summary(&armed, "occ3q_2", true, "sibling:worker-b");
+        assert!(text.contains("Re-emit armed for handoff occ3q_2 for sibling:worker-b"));
+        assert!(text.contains("duplicate delivery is possible"));
+        // An already-resolved entry reports no change, never a fake success.
+        let unchanged = serde_json::json!({"queueId": "occ3q_3", "state": "unchanged"});
+        let text = resolution_summary(&unchanged, "occ3q_3", false, "");
+        assert!(text.contains("No change for handoff occ3q_3"));
+        assert!(!text.contains("Cancelled"));
+        // An unknown receiver stays absent, never fabricated.
+        let text = resolution_summary(&cancelled, "occ3q_1", false, "");
+        assert!(!text.contains(" for "));
+    }
+
+    #[test]
+    fn queue_status_names_the_manual_resolution_commands_for_uncertain_entries() {
+        let own = serde_json::json!({"occ2Enabled": true, "inherited": false, "sourceSessionId": "chat-1"});
+        let queue = crate::core::occ::queue::CommunicationQueueSnapshot {
+            generation: "g".into(),
+            pending_total: 1,
+            omitted: 0,
+            entries: vec![crate::core::occ::queue::CommunicationQueueEntry {
+                queue_id: "occ3q_unc".into(),
+                message_id: String::new(),
+                position: 1,
+                receiver: "child:receiver-a".into(),
+                state: "uncertain".into(),
+                attempts: 1,
+                timestamp: 1000,
+                ordinary_delivery: None,
+                reason: None,
+            }],
+            blocked: None,
+            refused: None,
+            notice_overflow: false,
+        };
+        let panel = status_of(&own, true, Some(&queue)).unwrap();
+        assert!(panel.contains("uncertain (pending receipt)"));
+        assert!(panel.contains("1 uncertain entry is awaiting explicit resolution"));
+        assert!(panel.contains("/occ queue reemit <id>"));
+        assert!(panel.contains("/occ queue cancel <id>"));
+        assert!(panel.contains("No automatic retry or duplicate will occur."));
+    }
+
+    #[test]
+    fn queue_status_surfaces_blocked_and_refused_banners_before_the_entries() {
+        let own = serde_json::json!({"occ2Enabled": true, "inherited": false, "sourceSessionId": "chat-1"});
+        let queue = crate::core::occ::queue::CommunicationQueueSnapshot {
+            generation: "g".into(),
+            pending_total: 0,
+            omitted: 0,
+            entries: Vec::new(),
+            blocked: Some("unsupported_schema".into()),
+            refused: Some(crate::core::occ::queue::CommunicationQueueRefusal {
+                reason: "queue_full".into(),
+                timestamp: 1500,
+            }),
+            notice_overflow: false,
+        };
+        let panel = status_of(&own, true, Some(&queue)).unwrap();
+        assert!(panel.contains("Native handoff queue BLOCKED (unsupported_schema)"));
+        assert!(panel.contains("New handoffs are refused until the model starts a fresh queue"));
+        assert!(panel.contains("Enqueue refused (queue_full)"));
+        // No entry rows, no queue count line, no uncertain guidance.
+        assert!(!panel.contains("Native handoff queue: 0 pending"));
+        assert!(!panel.contains("uncertain"));
+
+        // The outbox overflow banner rides the same projection.
+        let overflow = crate::core::occ::queue::CommunicationQueueSnapshot {
+            notice_overflow: true,
+            ..queue.clone()
+        };
+        let panel = status_of(&own, true, Some(&overflow)).unwrap();
+        assert!(panel.contains("Notice outbox overflow"));
+        let recovered = crate::core::occ::queue::CommunicationQueueSnapshot {
+            notice_overflow: false,
+            ..overflow
+        };
+        assert!(!status_of(&own, true, Some(&recovered)).unwrap().contains("Notice outbox overflow"));
+    }
+
+    #[test]
     fn legacy_daemon_keeps_its_default_until_an_explicit_preference() {
         use crate::core::occ::session_settings::Resolution;
         assert!(!legacy_enabled(&Resolution::default()));
@@ -291,19 +624,74 @@ mod tests {
     fn occ_status_renders_host_truth_with_provenance() {
         // A chat's own preference: no provenance line.
         let own = serde_json::json!({"occ2Enabled": true, "inherited": false, "sourceSessionId": "chat-1"});
-        let panel = status_of(&own, true).unwrap();
+        let queue = crate::core::occ::queue::CommunicationQueueSnapshot {
+            generation: "g".into(),
+            pending_total: 2,
+            omitted: 1,
+            entries: vec![
+                crate::core::occ::queue::CommunicationQueueEntry {
+                    queue_id: "occ3q_1".into(),
+                    message_id: String::new(),
+                    position: 1,
+                    receiver: "child:receiver-a".into(),
+                    state: "armed".into(),
+                    attempts: 1,
+                    timestamp: 1000,
+                    ordinary_delivery: None,
+                    reason: None,
+                },
+                crate::core::occ::queue::CommunicationQueueEntry {
+                    queue_id: "occ3q_2".into(),
+                    message_id: "m-2".into(),
+                    position: 2,
+                    receiver: "sibling:worker-b".into(),
+                    state: "fallback_pending".into(),
+                    attempts: 0,
+                    timestamp: 2000,
+                    ordinary_delivery: Some("queued".into()),
+                    reason: Some("manual_reemit".into()),
+                },
+            ],
+            blocked: None,
+            refused: None,
+            notice_overflow: false,
+        };
+        let panel = status_of(&own, true, Some(&queue)).unwrap();
         assert!(panel.contains("OCC-2: ON"));
         assert!(panel.contains("OCC-3: ON"));
         assert!(panel.contains("An explicit chat preference gates native actions dynamically"));
         assert!(!panel.contains("Inherited from chat"));
+        // Count line uses the full pending total, not the bounded list.
+        assert!(panel.contains("Native handoff queue: 2 pending"));
+        // Per-entry rows: position, receiver, state (sender's UI labels,
+        // corrected: admitted is an honest transport acknowledgment, never
+        // consumed; unfinished re-emission renders "fallback (pending)"),
+        // attempts, both ids.
+        assert!(panel.contains("1. child:receiver-a"));
+        assert!(panel.contains("armed"));
+        assert!(panel.contains("attempts 1"));
+        assert!(panel.contains("queue occ3q_1"));
+        // Unminted message id stays an explicit placeholder, never fabricated.
+        assert!(panel.contains("msg \u{2014}"));
+        assert!(panel.contains("2. sibling:worker-b"));
+        assert!(panel.contains("fallback (pending)"));
+        assert!(panel.contains("msg m-2"));
+        // The fallback row states its ordinary-delivery verdict honestly,
+        // plus the manual resolution that drained its uncertain entry.
+        assert!(panel.contains("ordinary delivery queued"));
+        assert!(panel.contains("manual re-emit"));
+        // The display bound is explicit, never silent.
+        assert!(panel.contains("+1 more queued"));
+        // The count badge line still appears with the queue table.
+        assert!(panel.contains("QUEUED"));
         // A subagent chat: the daemon reports the ancestor as the source.
         let inherited = serde_json::json!({"occ2Enabled": true, "inherited": true, "sourceSessionId": "parent-7"});
-        let panel = status_of(&inherited, false).unwrap();
+        let panel = status_of(&inherited, false, None).unwrap();
         assert!(panel.contains("OCC-2: ON"));
         assert!(panel.contains("OCC-3: OFF"));
         assert!(panel.contains("Inherited from chat parent-7"));
         // A host response without the toggle is an error, never a silent value.
-        assert!(status_of(&serde_json::json!({}), false).is_err());
+        assert!(status_of(&serde_json::json!({}), false, None).is_err());
     }
 
     #[test]

@@ -41,6 +41,23 @@ source attestation, GPU memory checks, original container preservation and the
 manual rollback all stay in place. The policy never disables a check; it only
 decides what happens to a candidate that already passed them.
 
+Retention additionally requires the complete native validation chain: all
+seven `REQUIRED_GATES` (the readiness gate, `native_initial`, `live_before`,
+the single validation restart, `live_after`, `service_final` and `native_final`)
+present and ok in the journal. A missing, failed or still-pending proof link
+cannot authorize retention under either policy: an experimental proof deadline
+or a closed maintenance window restores the original instead. Service
+readiness alone is insufficient. The supervisor's independent acceptance gate
+applies the same requirement on its own reading of the journal before
+accepting a durable `PERSISTED_CANDIDATE` state, so a forged or partial
+persistence record is restored too. `rollback_on_success` always restores,
+including after full success.
+
+The native proof chain depends on the external proof producers and their
+transport being ready before the live gates can pass. An absent producer is
+simply a missing proof link: the attempt restores. No claim is made here that
+the producers or their transport are complete or deployed.
+
 ## Timeouts are separate fields with separate reactions
 
 | Plan field | Meaning | Reaction when it elapses |
@@ -50,8 +67,8 @@ decides what happens to a candidate that already passed them.
 | `deployment_timeout_s` | controller deployment deadline | rollback until the readiness gate passed |
 | `source_capture_timeout_s` | native source capture deadline | recorded in `stage_deadlines`, never fatal |
 | `receiver_inference_timeout_s` | receiver inference deadline | recorded in `stage_deadlines`, never fatal |
-| `proof_timeout_s` | experimental proof deadline for one external native proof | rollback under `rollback_on_success`, persistence under `persist_candidate_on_success` |
-| `maintenance_window_s` | operator maintenance window | persistence under `persist_candidate_on_success` |
+| `proof_timeout_s` | experimental proof deadline for one external native proof | restoration under either policy while the proof chain is incomplete; a complete chain never waits on this deadline |
+| `maintenance_window_s` | operator maintenance window | retention under `persist_candidate_on_success` only after the complete native proof chain; otherwise restoration |
 | `persistence_policy` | candidate persistence policy | decides the commit action |
 
 The named deadlines are recorded once in the journal as `timeout_policy`, so the
@@ -93,10 +110,10 @@ The journal records, in its existing JSON format:
 - `preserved_original`: written by `prepare` before any mutation.
 - `timeout_policy`, `stage_deadlines`, `experiment_signals`.
 
-Phases: `CANDIDATE_PERSISTED` is the persist-mode commit point (readiness
-verified, research deadlines elapsed); `COMPLETE` is the verified commit after
-the full protocol; `RESTORED`, `NOOP`, `RESTORE_FAILED` and `PREFLIGHT_FAILED`
-are unchanged.
+Phases: `CANDIDATE_PERSISTED` is the persist-mode commit point (readiness, the
+complete native proof chain and the persistence gate verified); `COMPLETE` is
+the verified commit after the full protocol; `RESTORED`, `NOOP`,
+`RESTORE_FAILED` and `PREFLIGHT_FAILED` are unchanged.
 
 ## Operator recovery
 

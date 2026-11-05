@@ -361,17 +361,33 @@ async def test_source_native_refusal_logs_inner_error_detail(source_harness, cap
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("message", [
-    "occ3_unsupported_profile", "occ3_admission_failed", "occ3_full_budget_unavailable",
-    "occ3_busy", "occ3_invalid_native_request", "occ3_cancelled",
-    "occ3_retraction_unsupported", "occ3_commit_failed",
+@pytest.mark.parametrize("message,status,public", [
+    ("occ3_unsupported_profile", 409, "native_completion_failed"),
+    ("occ3_admission_failed", 409, "native_completion_failed"),
+    ("occ3_full_budget_unavailable", 409, "native_completion_failed"),
+    ("occ3_invalid_native_request", 409, "native_completion_failed"),
+    ("occ3_retraction_unsupported", 409, "native_completion_failed"),
+    ("occ3_commit_failed", 409, "native_completion_failed"),
+    ("occ3_cancelled", 409, "client_cancelled"),
+    ("occ3_busy", 503, "admission_capacity"),
+    ("occ3_busy_batch", 503, "scheduler_busy"),
+    ("occ3_admission_timeout", 503, "admission_timeout"),
 ])
-async def test_source_scheduler_abort_folds_to_observed_409_and_names_code(source_harness, caplog, message):
+async def test_source_scheduler_abort_folds_to_bounded_public_shape_and_names_code(
+        source_harness, caplog, message, status, public):
     """Live TS11 regression, red-first: the scheduler refuses armed turns
     before prefill by aborting the request; the ordinary stream then delivers
     exactly one abort output, which folds through the pinned first-chunk
-    ValueError catch into the observed generic 409. The refusal code must be
-    recorded server-side: it is the only place the abort code survives."""
+    ValueError catch into a flattened inner error. The refusal code must be
+    recorded server-side: it is the only place the abort code survives.
+
+    Intentional pin update (admission busy-gate campaign): admission
+    unavailability - busy batch, armed-cap saturation, admission timeout -
+    now restores its own distinct retryable 503 with Retry-After instead of
+    the historical generic 409, and a genuine user cancellation keeps the 409
+    under its own bounded code. Every other refusal keeps the generic
+    completion failure, so the compatibility change is exactly these
+    bounded reason codes on the public wire."""
     h = source_harness
 
     async def aborted_generate(tm, obj, request=None):
@@ -385,16 +401,28 @@ async def test_source_scheduler_abort_folds_to_observed_409_and_names_code(sourc
     type(h.tm).generate_request = h.wrap(aborted_generate, h.adapter.generate_around, h.HookType.AROUND)
     with caplog.at_level(logging.ERROR, logger="occ3_sglang.chat_adapter"):
         response, _, _ = await source_call(h)
-    assert response.status_code == 409
-    assert json.loads(response.body) == {"error": {"message": "native_completion_failed",
-                                                   "type": "occ3_attachment_error", "code": 409}}
+    assert response.status_code == status
+    assert json.loads(response.body) == {"error": {"message": public,
+                                                   "type": "occ3_attachment_error", "code": status}}
     aborted = [r.getMessage() for r in caplog.records if "native turn aborted" in r.getMessage()]
     assert aborted, "expected the scheduler refusal code in the server-side diagnostic"
     assert f"refusal={message}" in aborted[0] and "status=503" in aborted[0]
-    # The public body stays generic; the PR #200 post-check line still names the fold seam.
+    # The public body stays generic; only the bounded code travels.
     assert message.encode() not in response.body
-    refused = [r.getMessage() for r in caplog.records if "native completion refused" in r.getMessage()]
-    assert refused and "inner_error_response" in refused[0]
+    if status == 503:
+        # Admission unavailability publishes advisory retry timing and the
+        # accurate end-to-end admission maximum: control bound (7.0) +
+        # first-event bound (8.0); the manifest's 5 s scheduler window sits
+        # inside the first-event bound.
+        assert response.headers.get("retry-after") == "5"
+        assert response.headers.get("x-optimus-occ3-admission-window") == "15.0"
+    else:
+        assert "retry-after" not in response.headers
+        if public == "native_completion_failed":
+            # The PR #200 post-check line still names the fold seam.
+            refused = [r.getMessage() for r in caplog.records
+                       if "native completion refused" in r.getMessage()]
+            assert refused and "inner_error_response" in refused[0]
 
 
 @pytest.mark.asyncio

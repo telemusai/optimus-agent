@@ -88,8 +88,16 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 44 replaces optional generationThroughput with streamingThroughput.
 // The streaming_throughput capability gates post-first-delta streamingMs metadata;
 // legacy generation_throughput is parse-only and is never treated as streaming.
-pub const DAEMON_SCHEMA_REVISION: u32 = 44;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-44-streaming-throughput";
+// Revision 45 adds optional, capability-gated communicationQueue roster metadata:
+// an advisory, content-free view of the sender's OCC-3 queue notices. Existing
+// roster commands/events and startup remain compatible (the activity pattern).
+// Revision 46 adds the optional, capability-gated occ_resolve_queue_entry
+// command: manual resolution (cancel or explicitly confirmed re-emit) of one
+// uncertain entry on the attached session's own OCC-3 queue. Purely additive:
+// daemons without the capability keep answering every pre-46 command, and
+// clients gate the new command on the capability before sending.
+pub const DAEMON_SCHEMA_REVISION: u32 = 46;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-46-communication-queue-control";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -189,6 +197,16 @@ pub enum DaemonServerCapability {
     GenerationThroughput,
     /// Optional own-session output tokens and post-first-delta streaming time on roster rows.
     StreamingThroughput,
+    /// Optional advisory queue metadata on roster rows (schema 45): a
+    /// content-free view of the sender's OCC-3 queue notices. Pure
+    /// visibility; never a startup or command requirement.
+    AgentCommunicationQueue,
+    /// Optional manual OCC-3 queue resolution (schema 46): the daemon
+    /// executes `occ_resolve_queue_entry` (cancel or explicitly confirmed
+    /// re-emit of one uncertain entry) on the attached session's own
+    /// native OCC-3 queue. Read-only clients never need it; the roster
+    /// visibility above stays available without it.
+    AgentCommunicationQueueControl,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -239,7 +257,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 32] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 34] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -272,6 +290,8 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 32] = [
     DaemonServerCapability::AgentCommunicationActivity,
     DaemonServerCapability::OccSessionPreferences,
     DaemonServerCapability::StreamingThroughput,
+    DaemonServerCapability::AgentCommunicationQueue,
+    DaemonServerCapability::AgentCommunicationQueueControl,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2217,6 +2237,17 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "occ_get_preferences" | "occ_set_preferences" => {
             DaemonCommandCompatibility::capability(Capability::OccSessionPreferences)
         }
+        // Manual OCC-3 queue resolution (revision 46): cancel or explicitly
+        // confirmed re-emit of one uncertain entry on the attached session's
+        // own queue. BOTH gates enforce the send: the revision (a pre-46
+        // daemon, even one that happens to know the command, refuses) and
+        // the capability (a 46-era daemon that did not advertise the
+        // control capability never receives it). This matches the roster
+        // visibility split: agent_communication_queue (45, read-only) can
+        // never authorize this mutation.
+        "occ_resolve_queue_entry" => {
+            DaemonCommandCompatibility::gated(46, Capability::AgentCommunicationQueueControl)
+        }
         // Revisions 31/37 usage and memory feature metadata are optional; older workers still provide valid status.
         "jev_get_status" => {
             DaemonCommandCompatibility::capability(Capability::JevControl)
@@ -2273,7 +2304,7 @@ pub fn daemon_command_plane(command: &str) -> Option<&'static str> {
         | "set_rlm_max_depth" | "get_session_context" | "get_session_tree" | "get_user_messages_for_forking"
         | "get_last_assistant_text" | "get_system_prompt" | "get_tool_definition" | "set_session_entry_label"
         | "extension_ui_response" | "jev_get_settings" | "jev_set_session_mode" | "jev_get_status"
-        | "occ_get_preferences" | "occ_set_preferences" => {
+        | "occ_get_preferences" | "occ_set_preferences" | "occ_resolve_queue_entry" => {
             Some("session")
         }
         _ => None,
@@ -3132,7 +3163,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-streaming-throughput"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-communication-queue-control"));
     }
 
     #[test]
@@ -3232,6 +3263,225 @@ mod tests {
         assert!(legacy.generation_throughput.is_none());
         let current: SessionSummary = serde_json::from_value(wire).unwrap();
         assert_eq!(current.extra["streamingThroughput"]["streamingMs"], 1000);
+    }
+
+    #[test]
+    fn communication_queue_keeps_new_client_old_daemon_startup_compatible() {
+        // The pre-45 daemon: no queue capability, no communicationQueue rows.
+        let old_hello = serde_json::json!({
+            "type":"daemon_hello", "socketPath":"old-daemon", "clientId":"client",
+            "protocol":daemon_protocol_info(), "schemaRevision":44,
+            "serverCapabilities":["agent_roster", "streaming_throughput"]
+        });
+        let parsed: DaemonOutbound = serde_json::from_value(old_hello.clone()).unwrap();
+        let DaemonOutbound::DaemonHello { server_capabilities, .. } = parsed else { panic!("hello expected") };
+        assert!(!server_capabilities.contains(&DaemonServerCapability::AgentCommunicationQueue));
+        let older: DaemonCompatibilityHello = serde_json::from_value(old_hello).unwrap();
+        let queue = DaemonCommandCompatibility::gated(45, DaemonServerCapability::AgentCommunicationQueue);
+        assert!(!meets_daemon_command_compatibility(&older, &queue));
+        for command in ["create", "attach", "reattach", "list", "get_state", "roster_subscribe"] {
+            assert!(meets_daemon_command_compatibility(&older, &daemon_command_compatibility(command)));
+        }
+        for event in ["daemon_hello", "response", "session_attached", "session_resynced", "roster_update"] {
+            assert!(meets_daemon_command_compatibility(&older, &daemon_outbound_compatibility(event)));
+        }
+        // A pre-45 row shape parses without the queue field.
+        let old_shape = serde_json::json!({"id":"p", "sessionId":"p", "lifecycle":"live", "activity":"idle",
+            "isSessionActive":true, "cwd":"/tmp", "isStreaming":false, "isCompacting":false,
+            "attachedClients":1, "messageCount":1});
+        let old: SessionSummary = serde_json::from_value(old_shape).unwrap();
+        assert!(!old.extra.contains_key("communicationQueue"));
+    }
+
+    #[test]
+    fn communication_queue_keeps_old_client_new_daemon_compatible() {
+        assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::AgentCommunicationQueue));
+        let supervisor = super::super::daemon_supervisor::supervisor_server_capabilities();
+        assert!(supervisor.iter().any(|capability| capability == "agent_communication_queue"));
+        let current = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(), schema_revision: Some(DAEMON_SCHEMA_REVISION),
+            server_capabilities: Some(DAEMON_DEFAULT_SERVER_CAPABILITIES.into_iter().chain([DaemonServerCapability::AgentRoster]).collect()),
+        };
+        assert!(meets_daemon_command_compatibility(&current,
+            &DaemonCommandCompatibility::gated(45, DaemonServerCapability::AgentCommunicationQueue)));
+        for command in ["create", "attach", "reattach", "list", "get_state", "roster_subscribe"] {
+            assert!(meets_daemon_command_compatibility(&current, &daemon_command_compatibility(command)));
+        }
+        for event in ["daemon_hello", "response", "session_attached", "session_resynced", "roster_update"] {
+            assert!(meets_daemon_command_compatibility(&current, &daemon_outbound_compatibility(event)));
+        }
+        // The queue field round-trips through the roster view, and a legacy
+        // reader that models the full pre-45 field set still parses the
+        // row. Distinctive values prove each old field survives the
+        // round-trip unchanged beside the new queue field.
+        let mut summary = SessionSummary {
+            id: "p".into(),
+            session_id: "p".into(),
+            lifecycle: "live".into(),
+            activity: "streaming".into(),
+            is_session_active: true,
+            cwd: "/tmp/legacy".into(),
+            is_streaming: true,
+            is_compacting: false,
+            attached_clients: 2,
+            message_count: 7,
+            ..Default::default()
+        };
+        summary.extra.insert("communicationQueue".into(), serde_json::json!({
+            "generation":"g", "entries":[{ "queueId":"q1", "messageId":"m1", "position":1,
+            "receiver":"sibling/receiver-a", "state":"pending", "attempts":0, "timestamp":1000 }]
+        }));
+        let wire = serde_json::to_value(summary.roster_view()).unwrap();
+        assert!(wire["communicationQueue"]["entries"][0]["queueId"] == "q1");
+        // An OLD client deserializing the NEW daemon's row: the reader
+        // models the actual pre-45 field set, so the unknown
+        // communicationQueue field must be tolerated by actual
+        // deserialization, not merely by the current reader's round-trip.
+        // Every modeled field is asserted, not just parsed.
+        #[derive(Deserialize)]
+        #[serde(rename_all = "camelCase")]
+        struct LegacyRow {
+            id: String,
+            session_id: String,
+            lifecycle: String,
+            activity: String,
+            is_session_active: bool,
+            cwd: String,
+            is_streaming: bool,
+            is_compacting: bool,
+            attached_clients: i64,
+            message_count: i64,
+        }
+        let legacy: LegacyRow = serde_json::from_value(wire).unwrap();
+        assert_eq!(legacy.id, "p");
+        assert_eq!(legacy.session_id, "p");
+        assert_eq!(legacy.lifecycle, "live");
+        assert_eq!(legacy.activity, "streaming");
+        assert!(legacy.is_session_active);
+        assert_eq!(legacy.cwd, "/tmp/legacy");
+        assert!(legacy.is_streaming);
+        assert!(!legacy.is_compacting);
+        assert_eq!(legacy.attached_clients, 2);
+        assert_eq!(legacy.message_count, 7);
+    }
+
+    #[test]
+    fn communication_queue_does_not_raise_legacy_roster_or_startup_requirements() {
+        assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::AgentCommunicationQueue));
+        let older = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(), schema_revision: Some(44),
+            server_capabilities: Some(vec![DaemonServerCapability::AgentRoster]),
+        };
+        assert!(meets_daemon_command_compatibility(&older, &daemon_command_compatibility("roster_subscribe")));
+        assert!(meets_daemon_command_compatibility(&older, &daemon_outbound_compatibility("roster_update")));
+        assert_eq!(daemon_command_compatibility("attach"), DaemonCommandCompatibility::legacy());
+        assert_eq!(daemon_command_compatibility("list"), DaemonCommandCompatibility::legacy());
+    }
+
+    #[test]
+    fn queue_control_resolution_keeps_both_sides_compatible() {
+        // The new command is gated on BOTH the schema revision and the
+        // capability: a pre-46 daemon (revision 45 with the full 45-era
+        // capability set) must refuse it, and a 46-era daemon that did not
+        // advertise the control capability never receives it, while every
+        // pre-46 command keeps working for a current client, and a current
+        // daemon keeps serving a 45-era peer.
+        assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::AgentCommunicationQueueControl));
+        assert_eq!(
+            daemon_command_compatibility("occ_resolve_queue_entry"),
+            DaemonCommandCompatibility::gated(46, DaemonServerCapability::AgentCommunicationQueueControl)
+        );
+        assert_eq!(daemon_command_plane("occ_resolve_queue_entry"), Some("session"));
+        assert!(!READ_ONLY_DAEMON_COMMANDS.contains(&"occ_resolve_queue_entry"));
+        assert!(is_daemon_mutating_command("occ_resolve_queue_entry"));
+        // A roster-capable pre-46 peer: the supervisor-shaped worker
+        // list (defaults plus agent_roster, exactly what a real 45-era
+        // worker advertises via supervisor_server_capabilities), minus
+        // the schema-46 control capability a pre-46 daemon never has.
+        let pre46 = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(),
+            schema_revision: Some(45),
+            server_capabilities: Some(
+                DAEMON_DEFAULT_SERVER_CAPABILITIES
+                    .into_iter()
+                    .chain([DaemonServerCapability::AgentRoster])
+                    .filter(|capability| *capability != DaemonServerCapability::AgentCommunicationQueueControl)
+                    .collect(),
+            ),
+        };
+        assert!(!pre46
+            .server_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.contains(&DaemonServerCapability::AgentCommunicationQueueControl)));
+        assert!(!meets_daemon_command_compatibility(
+            &pre46,
+            &daemon_command_compatibility("occ_resolve_queue_entry")
+        ));
+        // The revision gate is INDEPENDENT of the capability gate: even a
+        // peer that advertises the control capability at revision 45 must
+        // be refused (a 45-era daemon cannot honor the schema-46 command
+        // contract). This covers the half the pre-46 fixture alone cannot:
+        // capability present, revision stale.
+        let stale_revision_with_control = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(),
+            schema_revision: Some(45),
+            server_capabilities: Some(vec![
+                DaemonServerCapability::AgentCommunicationQueueControl,
+                DaemonServerCapability::AgentCommunicationQueue,
+                DaemonServerCapability::AgentRoster,
+            ]),
+        };
+        assert!(stale_revision_with_control
+            .server_capabilities
+            .as_ref()
+            .is_some_and(|capabilities| capabilities.contains(&DaemonServerCapability::AgentCommunicationQueueControl)));
+        assert!(!meets_daemon_command_compatibility(
+            &stale_revision_with_control,
+            &daemon_command_compatibility("occ_resolve_queue_entry")
+        ));
+        // The current peer uses the same roster-capable worker shape
+        // (defaults plus agent_roster) at revision 46: it advertises the
+        // control capability and serves every pre-46 command.
+        let current = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(),
+            schema_revision: Some(DAEMON_SCHEMA_REVISION),
+            server_capabilities: Some(
+                DAEMON_DEFAULT_SERVER_CAPABILITIES
+                    .into_iter()
+                    .chain([DaemonServerCapability::AgentRoster])
+                    .collect(),
+            ),
+        };
+        assert!(meets_daemon_command_compatibility(
+            &current,
+            &daemon_command_compatibility("occ_resolve_queue_entry")
+        ));
+        // The 45-era capability set does NOT include the control
+        // capability: the roster visibility alone must never authorize a
+        // mutation.
+        let visibility_only = DaemonCompatibilityHello {
+            protocol: daemon_protocol_info(),
+            schema_revision: Some(45),
+            server_capabilities: Some(vec![
+                DaemonServerCapability::AgentCommunicationQueue,
+                DaemonServerCapability::AgentRoster,
+            ]),
+        };
+        assert!(!meets_daemon_command_compatibility(
+            &visibility_only,
+            &daemon_command_compatibility("occ_resolve_queue_entry")
+        ));
+        // Every pre-46 command keeps working against the current daemon,
+        // and a pre-46 peer stays compatible for startup and roster.
+        for command in ["create", "attach", "reattach", "list", "get_state", "roster_subscribe",
+            "occ_get_preferences", "occ_set_preferences"] {
+            assert!(meets_daemon_command_compatibility(&pre46, &daemon_command_compatibility(command)), "command {command}");
+            assert!(meets_daemon_command_compatibility(&current, &daemon_command_compatibility(command)), "command {command}");
+        }
+        for event in ["daemon_hello", "response", "session_attached", "session_resynced", "roster_update"] {
+            assert!(meets_daemon_command_compatibility(&pre46, &daemon_outbound_compatibility(event)));
+            assert!(meets_daemon_command_compatibility(&current, &daemon_outbound_compatibility(event)));
+        }
     }
 
     #[test]

@@ -202,6 +202,7 @@ async fn run_attempt(
     };
     stream_assistant_response(
         &mut AgentContext::default(),
+        &mut Vec::new(),
         &config,
         Some(&signal),
         &emit,

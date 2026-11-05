@@ -168,8 +168,27 @@ async fn serve(method: &'static str) -> (String, Arc<Mutex<FixtureRecords>>, tok
                         if let Some(intent) = body.get("occ3_capture") {
                             records.lock().unwrap().source_intent = Some(intent.clone());
                             let output = sse("native-source-rid", true);
-                            let receipt = json!({"schema":"occ3.source.v1","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
-                                "accepted_span_start":0,"accepted_span_end":8,"retained_count":8,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":128});
+                            // The default arming is occ3.capture.v2, so the intent is
+                            // answered on the v2 wire with the occ3.span.v1 block. This
+                            // fixture's captured turn emits no reasoning_content and no
+                            // content delta - only the occ3_handoff tool call - so the
+                            // window models the turn it actually emitted: the role-token
+                            // row and the stop row (both CONTROL), the single tool-call
+                            // row and its argument rows, no THINKING row, no CONTENT row
+                            // and the "none" reasoning terminator.
+                            let mut receipt = json!({"schema":"occ3.source.v2","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                                "accepted_span_start":0,"accepted_span_end":6,"retained_count":6,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":96});
+                            let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
+                                "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
+                                "span_reasoning_terminator":"none","span_turn_end_attested":true,
+                                "span_thinking_count":0,"span_content_count":0,"span_tool_call_count":1,
+                                "span_tool_arguments_count":3,"span_control_count":2,"span_unknown_count":0,
+                                "span_window_start_position":0,"span_window_end_position":6,
+                                "span_contiguous":true,"span_contains_final_content":true,
+                                "span_contains_tool_call":true,"span_message_truncated":false});
+                            for (key, value) in span.as_object().unwrap() {
+                                receipt[key.clone()] = value.clone();
+                            }
                             headers.push(("x-optimus-occ3-source", receipt.to_string()));
                             send(&mut socket, output, headers).await;
                             return;
@@ -412,7 +431,7 @@ async fn bind_lease_declines_a_same_family_method_id_swap() {
         .admit(envelope.clone(), &envelope.message_id, SOURCE, now())
         .unwrap());
     assert!(inbox
-        .claim(&[envelope.message_id.clone()], now())
+        .claim(&[envelope.message_id.clone()], &[], now())
         .unwrap()
         .is_some());
     // The attachment carries the full method id of identity A.

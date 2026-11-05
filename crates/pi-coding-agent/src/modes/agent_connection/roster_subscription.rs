@@ -45,6 +45,12 @@ impl RosterSubscription {
         })
     }
 
+    fn queue_supported(&self) -> bool {
+        self.transport.lock().unwrap().as_ref().is_some_and(|transport| {
+            queue_supported(transport.is_connected(), transport.hello().as_ref())
+        })
+    }
+
     async fn refresh(&self) {
         let epoch = self.observation_epoch.load(Ordering::SeqCst);
         let mut rows: Vec<Value> = self
@@ -172,6 +178,7 @@ impl AgentConnectionRosterStore for RosterSubscription {
             project_activity(&mut rows, false, self.observation_epoch.load(Ordering::SeqCst));
         }
         project_throughput(&mut rows, self.throughput_supported());
+        project_queue(&mut rows, self.queue_supported());
         rows
     }
     fn dispose(&self) -> BoxFuture<()> {
@@ -209,6 +216,21 @@ fn throughput_supported(connected: bool, hello: Option<&crate::modes::agents_vie
         && hello.server_capabilities.iter().any(|capability| capability == "streaming_throughput"))
 }
 
+// Schema-45 queue metadata is advisory: same negotiation discipline as the
+// activity field, and the row stays valid without it.
+fn queue_supported(connected: bool, hello: Option<&crate::modes::agents_view::roster_store::DaemonHello>) -> bool {
+    connected && hello.is_some_and(|hello| hello.schema_revision.is_some_and(|revision| revision >= 45)
+        && hello.server_capabilities.iter().any(|capability| capability == "agent_communication_queue"))
+}
+
+fn project_queue(rows: &mut [Value], supported: bool) {
+    for row in rows {
+        if let Some(object) = row.as_object_mut() {
+            if !supported { object.remove("communicationQueue"); }
+        }
+    }
+}
+
 fn project_throughput(rows: &mut [Value], supported: bool) {
     for row in rows {
         if let Some(row) = row.as_object_mut() {
@@ -223,6 +245,35 @@ fn project_throughput(rows: &mut [Value], supported: bool) {
 mod tests {
     use super::*;
     use crate::modes::agents_view::roster_store::DaemonHello;
+
+    #[test]
+    fn communication_queue_requires_negotiation_and_degrades_on_disconnect() {
+        let mut hello = DaemonHello { schema_revision: Some(45), server_capabilities: vec!["agent_communication_queue".into()], ..Default::default() };
+        assert!(queue_supported(true, Some(&hello)));
+        assert!(!queue_supported(false, Some(&hello)));
+        hello.schema_revision = Some(44);
+        assert!(!queue_supported(true, Some(&hello)));
+        hello.schema_revision = None;
+        assert!(!queue_supported(true, Some(&hello)));
+        hello.schema_revision = Some(45);
+        hello.server_capabilities.clear();
+        assert!(!queue_supported(true, Some(&hello)));
+        assert!(!queue_supported(true, None));
+        let mut rows = vec![serde_json::json!({
+            "sessionId":"p",
+            "communicationQueue":{"generation":"g","entries":[{"queueId":"q1"}]},
+            "communicationActivity":{"deliveries":[]},
+        })];
+        // Projection is a destructive filter: the supported pass must be
+        // asserted on the intact row BEFORE the unsupported pass strips
+        // the field (a re-projection can never restore it).
+        project_queue(&mut rows, true);
+        assert!(rows[0].get("communicationQueue").is_some());
+        project_queue(&mut rows, false);
+        assert!(rows[0].get("communicationQueue").is_none());
+        // The activity field keeps its own, independent gate.
+        assert!(rows[0].get("communicationActivity").is_some());
+    }
 
     #[test]
     fn streaming_throughput_requires_negotiation_and_degrades_on_disconnect() {

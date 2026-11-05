@@ -1099,6 +1099,7 @@ class StartupReceipt:
 
 _STARTUP_ATTR = "_occ3_native_startup_receipt"
 _SERVER_ATTR = "_occ3_native_startup_owner"
+_APP_OWNER_ATTR = "_occ3_native_startup_app_owner"
 
 
 def _read_startup_literal():
@@ -1259,6 +1260,11 @@ def prepare_selected_native_server(server, app, tokenizer_manager):
         # Phase split: the control plane registers before any owner check or
         # GPU-side validation, so declines stay observable over HTTP.
         register_control_plane(app, tokenizer_manager)
+        app_owner = getattr(app, _APP_OWNER_ATTR, None)
+        if app_owner is not None and app_owner is not getattr(server, _SERVER_ATTR, None):
+            # One preparation per app/tokenizer pair: a second entry point, or
+            # a second server object, must never wrap a second serve method.
+            raise InstallationError("startup_owner_mismatch")
         existing = getattr(server, _SERVER_ATTR, None)
         if existing is not None:
             if (type(existing) is _StartupOwner and existing.app is app
@@ -1345,6 +1351,204 @@ def prepare_selected_native_server(server, app, tokenizer_manager):
         if getattr(server, _SERVER_ATTR, None) is owner:
             delattr(server, _SERVER_ATTR)
         raise InstallationError("startup_wrapper_unavailable") from None
+    setattr(app, _APP_OWNER_ATTR, owner)
+    receipt = StartupReceipt(True, True, "experimental_startup_prepared")
+    setattr(app, _STARTUP_ATTR, receipt.evidence())
+    startup_state.record_prepare("experimental_startup_prepared", selected=True,
+                                 attempt=attempt)
+    return receipt
+
+
+# Measured installed Granian 2.8.4 granian/server/embed.py sha256 (raw fd-read
+# bytes; running-container read 2026-11-04T13:12Z). Build prediction, not
+# candidate identity: the rebuilt candidate must measure the same bytes.
+_GRANIAN_EMBED_SHA256 = "abd0b8b8cb752a0916115b3b7dd7ae6a0345ce629afb1faf2550b94adb7c001f"
+
+
+def _verify_native_server_granian(server, app, tm):
+    """Check the one embedded Granian server; never replace a global class method."""
+    import hashlib
+    import os
+    import stat
+    import sys
+    from pathlib import Path
+
+    try:
+        import granian.server.embed
+    except ImportError:
+        raise InstallationError("unsupported_native_startup") from None
+    server_class = granian.server.embed.Server
+    args = getattr(tm, "server_args", None)
+    if (type(server) is not server_class
+            or getattr(args, "tokenizer_worker_num", None) != 1
+            or getattr(args, "enable_http2", False) is not True
+            or getattr(args, "enable_ssl_refresh", False)
+            or getattr(app, "is_single_tokenizer_mode", False) is not True
+            or getattr(app, "server_args", None) is not args
+            or app.middleware_stack is not None
+            # Unverified whether AbstractServer.__init__ ever sets .config; the
+            # refusal is kept (never weakened) pending a measured common.py.
+            or hasattr(server, "config")
+            or "serve" in vars(server) or "stop" in vars(server)):
+        raise InstallationError("unsupported_native_startup")
+    module = sys.modules.get("granian.server.embed")
+    file = Path(getattr(module, "__file__", "")).absolute()
+    if any(path.is_symlink() for path in (file, *file.parents)):
+        raise InstallationError("startup_server_provenance")
+    fd = None
+    try:
+        fd = os.open(file, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0) | getattr(os, "O_BINARY", 0))
+        before = os.fstat(fd)
+        if not stat.S_ISREG(before.st_mode) or before.st_nlink != 1 or before.st_size > 262144:
+            raise InstallationError("startup_server_provenance")
+        with os.fdopen(fd, "rb") as stream:
+            fd = None
+            raw = stream.read(262145)
+            after = os.fstat(stream.fileno())
+        if ((before.st_dev, before.st_ino, before.st_size, before.st_mtime_ns)
+                != (after.st_dev, after.st_ino, after.st_size, after.st_mtime_ns)):
+            raise InstallationError("startup_server_provenance")
+        # Pinned expected bytes: measured installed Granian 2.8.4 embed.py
+        # (running-container read, 2026-11-04). The digest is over the exact
+        # fd-read raw bytes, before any decoding. A different installed build
+        # fails closed here; there is no version-only acceptance and no
+        # dynamic fallback. The rebuilt candidate must measure the same bytes
+        # before deployment; a mismatch is a stop-and-re-review event.
+        if hashlib.sha256(raw).hexdigest() != _GRANIAN_EMBED_SHA256:
+            raise InstallationError("startup_server_provenance")
+        source = raw.decode("utf-8")
+        for name in ("serve", "stop"):
+            function = getattr(server_class, name, None)
+            if (getattr(function, "__module__", None) != "granian.server.embed"
+                    or getattr(function, "__qualname__", None) != "Server." + name
+                    or getattr(server, name).__self__ is not server
+                    or getattr(server, name).__func__ is not function):
+                raise InstallationError("startup_server_provenance")
+            _verify_function_provenance(function, {str(file.resolve()): source})
+        if not inspect.iscoroutinefunction(server_class.serve):
+            raise InstallationError("startup_server_provenance")
+    except InstallationError:
+        raise
+    except Exception:
+        raise InstallationError("startup_server_provenance") from None
+    finally:
+        if fd is not None:
+            os.close(fd)
+    return server.serve
+
+
+def prepare_selected_native_granian_server(server, app, tokenizer_manager):
+    """Build-selected, embedded-Granian-only preparation, before native serve.
+
+    The wrapper is awaited by the patched uvloop.run(serve()) site on its
+    original event loop. It does not create a loop or change Granian options,
+    worker counts or stop hooks. Absent or false fixed build selection does
+    not load profiles, backends or controls.
+    """
+    from . import startup_state
+    attempt = uuid.uuid4().hex[:8]
+    selection = None
+    try:
+        selection = _read_startup_literal()
+        if selection is None:
+            receipt = StartupReceipt(False, False, "experimental_startup_not_selected")
+            setattr(app, _STARTUP_ATTR, receipt.evidence())
+            startup_state.record_prepare("experimental_startup_not_selected",
+                                         selected=False, attempt=attempt)
+            logger.info("occ3-bridge: native startup decline (attempt=%s stage=prepare "
+                        "code=experimental_startup_not_selected selected=false)", attempt)
+            return receipt
+        # Phase split: the control plane registers before any owner check or
+        # GPU-side validation, so declines stay observable over HTTP.
+        register_control_plane(app, tokenizer_manager)
+        app_owner = getattr(app, _APP_OWNER_ATTR, None)
+        if app_owner is not None and app_owner is not getattr(server, _SERVER_ATTR, None):
+            # One preparation per app/tokenizer pair: a second entry point, or
+            # a second server object, must never wrap a second serve method.
+            raise InstallationError("startup_owner_mismatch")
+        existing = getattr(server, _SERVER_ATTR, None)
+        if existing is not None:
+            if (type(existing) is _StartupOwner and existing.app is app
+                    and existing.tm is tokenizer_manager
+                    and getattr(server, "serve", None) is existing.wrapped_serve):
+                return StartupReceipt(True, True, "experimental_startup_prepared")
+            raise InstallationError("startup_owner_mismatch")
+        _verify_startup_artifacts(selection)
+        original = _verify_native_server_granian(server, app, tokenizer_manager)
+    except InstallationError as error:
+        # Nothing was dispatched or patched in this synchronous preparation.
+        receipt = StartupReceipt(selection is not None, False, error.code)
+        setattr(app, _STARTUP_ATTR, receipt.evidence())
+        startup_state.record_prepare(error.code, selected=selection is not None,
+                                     attempt=attempt)
+        logger.error("occ3-bridge: native startup decline (attempt=%s stage=prepare code=%s selected=%s)",
+                     attempt, error.code, selection is not None)
+        # Fixed-code decline: no traceback needed, but the packaging facts must
+        # stay observable so a selection/mode decline is never ambiguous. The
+        # record goes to the diagnostic file only: the log keeps exactly one
+        # bounded decline line and never carries exception text.
+        record = _startup_diagnostic(error, selection, "prepare")
+        record["traceback"] = ""
+        _record_startup_diagnostic(record)
+        return receipt
+    except Exception as error:
+        receipt = StartupReceipt(selection is not None, False, "experimental_startup_refused")
+        setattr(app, _STARTUP_ATTR, receipt.evidence())
+        startup_state.record_prepare("experimental_startup_refused",
+                                     selected=selection is not None, attempt=attempt)
+        logger.error("occ3-bridge: native startup decline (attempt=%s stage=prepare code=experimental_startup_refused "
+                     "selected=%s detail=%s)", attempt, selection is not None,
+                     _decline_detail(error))
+        _record_startup_diagnostic(_startup_diagnostic(error, selection, "prepare"))
+        return receipt
+
+    owner = _StartupOwner(app, tokenizer_manager, original)
+    async def selected_serve(*args, **kwargs):
+        if (owner.started or getattr(server, _SERVER_ATTR, None) is not owner
+                or getattr(server, "serve", None) is not owner.wrapped_serve):
+            raise InstallationError("startup_owner_mismatch")
+        owner.started = True
+        try:
+            result = await install_native_runtime(app, tokenizer_manager, experimental_opt_in=True)
+        except BaseException as error:
+            # Cancellation/unknown exceptions never turn an unverified partial
+            # transaction into an ordinary serving candidate.
+            setattr(app, _STARTUP_ATTR, {"code": "native_startup_aborted", "supported": False,
+                                        "live_proof": False, "gate8_pass": False})
+            # A raise-path code always supersedes the recorded decline code.
+            startup_state.record_superseded("native_startup_aborted",
+                                            attempt=uuid.uuid4().hex[:8])
+            if isinstance(error, asyncio.CancelledError):
+                raise
+            raise InstallationError("native_startup_aborted") from None
+        if type(result) is not InstallationReceipt:
+            raise InstallationError("native_startup_cleanup_unconfirmed")
+        setattr(app, _STARTUP_ATTR, result.evidence())
+        if not result.installed:
+            logger.error("occ3-bridge: native startup decline (attempt=%s stage=install code=%s)",
+                         uuid.uuid4().hex[:8], result.code)
+        if (result.code in {"installation_cleanup_unconfirmed", "factory_cleanup_unconfirmed",
+                            "installation_busy", "installation_owner_mismatch", "hook_target_occupied",
+                            "control_client_occupied", "installation_ownership_changed"}
+                or (not result.installed and (getattr(app, _INSTALLED_ATTR, None) is not None
+                    or getattr(tokenizer_manager, "_occ3_control_client", None) is not None
+                    or _cleanup_tasks))):
+            startup_state.record_superseded("native_startup_cleanup_unconfirmed",
+                                            attempt=uuid.uuid4().hex[:8])
+            raise InstallationError("native_startup_cleanup_unconfirmed")
+        # A declined installation reaches here only after verified owned rollback
+        # and control settlement. No success/capability claim follows a refusal.
+        return await owner.original_serve(*args, **kwargs)
+
+    owner.wrapped_serve = selected_serve
+    setattr(server, _SERVER_ATTR, owner)
+    try:
+        setattr(server, "serve", selected_serve)
+    except BaseException:
+        if getattr(server, _SERVER_ATTR, None) is owner:
+            delattr(server, _SERVER_ATTR)
+        raise InstallationError("startup_wrapper_unavailable") from None
+    setattr(app, _APP_OWNER_ATTR, owner)
     receipt = StartupReceipt(True, True, "experimental_startup_prepared")
     setattr(app, _STARTUP_ATTR, receipt.evidence())
     startup_state.record_prepare("experimental_startup_prepared", selected=True,

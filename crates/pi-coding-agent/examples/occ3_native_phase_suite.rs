@@ -832,6 +832,48 @@ struct FixtureRecords {
     /// through the source agent's on_payload hook, so the serialized armed
     /// request body must carry exactly the pinned effort.
     capture_reasoning_efforts: Vec<String>,
+    /// Test-only hang injection (retained-timeout regressions): the
+    /// receiver-turn route (a /v1/chat/completions body carrying the occ3
+    /// attachment key) is accepted and recorded but never answered until
+    /// the owning test's bounded cleanup releases it; the client's wrapped
+    /// publication deadline fires first in the passing shape.
+    /// Discriminating on the occ3 key keeps the capture-armed source
+    /// route (occ3_capture) fast. Compiled out of production builds.
+    #[cfg(test)]
+    hang_receiver_turns: bool,
+    /// Test-only hang injection: the publication route is accepted and
+    /// recorded but never answered until the same cleanup, so the client
+    /// keeps its one-shot claim and nothing is ever admitted (no inbox
+    /// record, no bound lease). Compiled out of production builds.
+    #[cfg(test)]
+    hang_publish_route: bool,
+    /// Which hang injections actually fired, in arrival order - the
+    /// fixture-side record that a hung route was reached and held (the
+    /// requests log names the route; this names the hang). Compiled out
+    /// of production builds.
+    #[cfg(test)]
+    hang_events: Vec<String>,
+    /// Test-only latched cancellation for the hang-injected routes: the
+    /// held connection tasks park on this token (locks released before
+    /// the await) until the owning test's bounded cleanup cancels it -
+    /// never an artificial sleep. Compiled out of production builds.
+    #[cfg(test)]
+    hang_cancel: tokio_util::sync::CancellationToken,
+    /// Test-only latched route-arrival signal: cancelled after the hang
+    /// event is recorded and BEFORE the route parks, so a test can
+    /// deterministically observe that the handler actually reached the
+    /// park point before it triggers the failure path (a socket EOF
+    /// after an abort alone proves nothing about the handler). Compiled
+    /// out of production builds.
+    #[cfg(test)]
+    hang_arrival: tokio_util::sync::CancellationToken,
+    /// Test-only connection tracking: every per-connection task handle the
+    /// fixture spawned, so the hang tests own their cleanup and join it
+    /// under one aggregate bound instead of relying on runtime teardown.
+    /// Compiled out of production builds; production connections always
+    /// answer and terminate on their own.
+    #[cfg(test)]
+    connection_tasks: Vec<tokio::task::JoinHandle<()>>,
 }
 
 /// Mutable per-epoch server identity: one fixture instance is one runtime
@@ -1117,6 +1159,40 @@ fn extract_fact(messages: &Value) -> Option<String> {
     fact
 }
 
+/// Test-only hang gate for the hang-injected routes: records the event
+/// and parks the connection task on the latched cancellation token until
+/// the owning test's bounded cleanup cancels it - never an artificial
+/// sleep, and the fixture Mutex is released before the await. Returns
+/// true when the route was held (the caller then returns without
+/// answering). Compiled out of production builds together with the hang
+/// fields.
+#[cfg(test)]
+async fn hold_route_until_cancelled(
+    records: &Arc<Mutex<FixtureRecords>>,
+    event: &str,
+) -> bool {
+    let cancel = {
+        let mut guard = records.lock().unwrap();
+        let hold = match event {
+            "publish_route" => guard.hang_publish_route,
+            "receiver_turn" => guard.hang_receiver_turns,
+            _ => false,
+        };
+        if !hold {
+            return false;
+        }
+        guard.hang_events.push(event.to_string());
+        // Route-arrival latch: set under the same lock, after the event
+        // is recorded and before the park, so the awaiting test observes
+        // the handler's actual arrival at the park point (never a lock
+        // held across the await - the token is latched).
+        guard.hang_arrival.cancel();
+        guard.hang_cancel.clone()
+    };
+    cancel.cancelled().await;
+    true
+}
+
 async fn serve(
     epoch_state: Arc<Mutex<FixtureEpoch>>,
     records: Arc<Mutex<FixtureRecords>>,
@@ -1126,6 +1202,8 @@ async fn serve(
     let task = tokio::spawn(async move {
         loop {
             let (mut socket, _) = listener.accept().await.unwrap();
+            #[cfg(test)]
+            let tracker = records.clone();
             let records = records.clone();
             let (epoch, generation, expiry, profile_digest) = {
                 let state = epoch_state.lock().unwrap();
@@ -1136,7 +1214,7 @@ async fn serve(
                     state.profile_digest.clone(),
                 )
             };
-            tokio::spawn(async move {
+            let connection = tokio::spawn(async move {
                 let (path, body, control, accept_encodings) = read_request(&mut socket).await;
                 {
                     let mut records = records.lock().unwrap();
@@ -1155,6 +1233,12 @@ async fn serve(
                         send(&mut socket, "200 OK", reply.to_string(), vec![]).await;
                     }
                     "/occ3/v1/native/publish" => {
+                        #[cfg(test)]
+                        {
+                            if hold_route_until_cancelled(&records, "publish_route").await {
+                                return;
+                            }
+                        }
                         let v1_fields = ["schema","publication_id","source_handle","source_session_id","receiver_session_id","message_id","source_turn_nonce","tool_call_id","expires_at_epoch"];
                         // occ3.publish.v2 (the retained content-only
                         // publication): no tool_call_id; dispatch_mode names
@@ -1472,6 +1556,12 @@ async fn serve(
                             return;
                         }
                         if let Some(attachment) = body.get("occ3") {
+                            #[cfg(test)]
+                            {
+                                if hold_route_until_cancelled(&records, "receiver_turn").await {
+                                    return;
+                                }
+                            }
                             let handle = attachment["state_handle"].as_str().unwrap_or_default().to_string();
                             let capture = {
                                 let records_guard = records.lock().unwrap();
@@ -1543,6 +1633,17 @@ async fn serve(
                     _ => panic!("Unexpected fixture route: {path}"),
                 }
             });
+            // Test-only connection tracking: the handle is registered so
+            // the hang tests own their cleanup and join it; production
+            // builds keep the historical fire-and-forget spawn exactly.
+            #[cfg(test)]
+            {
+                tracker.lock().unwrap().connection_tasks.push(connection);
+            }
+            #[cfg(not(test))]
+            {
+                drop(connection);
+            }
         }
     });
     (endpoint, task)
@@ -2831,11 +2932,36 @@ async fn run_positive_case(
         let controller = family
             .controller(source_id)
             .map_err(|error| format!("retained_controller_unavailable({error})"))?;
-        action = source
-            .publish_retained(controller, "child", "receiver")
-            .await
-            .map(|_| ())
-            .map_err(|error| format!("source_retained_publish_error({error})"));
+        // The publication leg is bounded by the same case deadline that
+        // bounds the source turn and the no-state receiver leg (the
+        // run_no_state_case idiom): the isolated controller's receiver
+        // prompt has no internal envelope, so without this bound a wedged
+        // publish or receiver leg would hold the phase until the harness
+        // kills it. On expiry the elapsed deadline becomes the terminal
+        // action error; the flow still reaches family.close() below (no
+        // early return sits between this assignment and the cleanup), and
+        // the one-shot publication claim taken before the first await in
+        // publish_retained is NOT released, so nothing can retry the
+        // publication.
+        action = match tokio::time::timeout(
+            Duration::from_secs(env.deadline_seconds),
+            source.publish_retained(controller, "child", "receiver"),
+        )
+        .await
+        {
+            Ok(result) => result
+                .map(|_| ())
+                .map_err(|error| format!("source_retained_publish_error({error})")),
+            Err(_elapsed) => {
+                // Fixed sanitized tag only (the source-turn diag pattern):
+                // the deadline constant, never wire text or credentials.
+                eprintln!(
+                    "occ3-retained-publish-diag retained_publish_timeout deadline_seconds={}",
+                    env.deadline_seconds
+                );
+                Err("retained_publish_timeout".to_string())
+            }
+        };
     } else {
         // Root ruling A (d), option B: the source leg is TWO turns. Turn 1 runs with
         // the handoff tool NOT yet installed, so it cannot end on a tool call and the
@@ -5822,6 +5948,18 @@ async fn offline_trial_context(
     records: Arc<Mutex<FixtureRecords>>,
     attempt_label: &str,
 ) -> Result<OfflineTrial, String> {
+    offline_trial_context_with_deadline(journal, records, attempt_label, 20).await
+}
+
+/// The deadline-parameterized variant: the retained-timeout regressions
+/// drive the real run_positive_case path against a short wrapped deadline,
+/// so the fixture must not impose the selftest's 20-second default.
+async fn offline_trial_context_with_deadline(
+    journal: PathBuf,
+    records: Arc<Mutex<FixtureRecords>>,
+    attempt_label: &str,
+    deadline_seconds: u64,
+) -> Result<OfflineTrial, String> {
     let (binary_sha256, manifest_sha256, _manifest) = compute_offline_pins()?;
     let identity = fixture_identity();
     let fingerprint = identity.fingerprint();
@@ -5865,7 +6003,7 @@ async fn offline_trial_context(
         runtime_epoch: "offline-runtime-epoch-before".into(),
         runtime_generation: 41,
         expires_at_epoch: expires,
-        deadline_seconds: 20,
+        deadline_seconds,
         max_capture_bytes: 1048576,
         max_response_bytes: replay_max_response_bytes(),
         harness_binary_sha256: binary_sha256.clone(),
@@ -10689,6 +10827,400 @@ mod gate_tests {
         );
         assert_eq!(outcome.arm_evidence["coverage"]["coverage_complete"], json!(true));
         let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Failure backstop for `finish_hang_trial`: when a teardown step
+    /// panics or the aggregate deadline is exceeded, the guard cancels the
+    /// hang token and aborts the accept task plus every still-registered
+    /// connection. Sync operations only - Drop never awaits. The accept
+    /// task lives in a SHARED ownership slot: Drop aborts the occupant
+    /// through the slot WITHOUT taking it (abort takes the handle by
+    /// reference), and the normal teardown or the unwind test's observer
+    /// takes it exactly once and awaits its actual termination.
+    struct HangTrialCleanupGuard {
+        records: Arc<Mutex<FixtureRecords>>,
+        server: Arc<Mutex<Option<tokio::task::JoinHandle<()>>>>,
+        armed: bool,
+    }
+
+    impl Drop for HangTrialCleanupGuard {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            if let Some(server) = self.server.lock().unwrap().as_ref() {
+                server.abort();
+            }
+            let mut records = self.records.lock().unwrap();
+            records.hang_cancel.cancel();
+            for connection in records.connection_tasks.drain(..) {
+                connection.abort();
+            }
+        }
+    }
+
+    /// Bounded test-owned teardown for the hang-injected fixture, in the
+    /// gate-required order: (a) cancel the hang token first - the held
+    /// routes return and drop their sockets; (b) abort the accept task
+    /// and AWAIT its termination before the registry drain, so no late
+    /// connection can slip past the drain; (c) drain the registry, then
+    /// abort and join every tracked connection. Everything runs under
+    /// ONE aggregate five-second cleanup deadline (not a fresh bound per
+    /// handle); the happy-path joins are the measured cleanup proof.
+    /// CONSUMES the caller's armed guard (single ownership from
+    /// construction to disarm): the guard's Drop is the backstop on any
+    /// panic between its construction and the disarm. Locks are released
+    /// before every await.
+    async fn finish_hang_trial(mut guard: HangTrialCleanupGuard) {
+        const CLEANUP_BOUND: Duration = Duration::from_secs(5);
+        let joined = tokio::time::timeout(CLEANUP_BOUND, async {
+            // (a) explicit release signal first.
+            guard.records.lock().unwrap().hang_cancel.cancel();
+            // (b) stop the accept/spawn loop and await its termination
+            // BEFORE the registry drain: the shared slot is taken exactly
+            // once, here (the test observer takes it only on the Drop
+            // path, never alongside this).
+            let server = guard
+                .server
+                .lock()
+                .unwrap()
+                .take()
+                .expect("accept-task handle");
+            server.abort();
+            let joined = server.await;
+            assert!(
+                joined.is_ok() || joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+                "accept task failed during teardown"
+            );
+            // (c) registry drain (accept task already terminated), then
+            // abort and join every tracked connection.
+            let connections: Vec<_> = guard
+                .records
+                .lock()
+                .unwrap()
+                .connection_tasks
+                .drain(..)
+                .collect();
+            for connection in &connections {
+                connection.abort();
+            }
+            for connection in connections {
+                let joined = connection.await;
+                assert!(
+                    joined.is_ok()
+                        || joined.as_ref().err().is_some_and(|e| e.is_cancelled()),
+                    "connection task failed during teardown"
+                );
+            }
+        })
+        .await;
+        assert!(
+            joined.is_ok(),
+            "fixture teardown exceeded the aggregate cleanup bound"
+        );
+        guard.armed = false;
+    }
+
+    /// Retained publication timeout, post-submission variant: the
+    /// receiver-turn route (the occ3 attachment key discriminates it from
+    /// the capture-armed source route) is accepted and recorded but never
+    /// answered, after the publication was accepted and the wire
+    /// submission set the lease to Submitted. The wrapped deadline fires:
+    /// the action error is the sanitized timeout tag, the case fails,
+    /// family.close() still runs and records cleanup, no receipt exists,
+    /// nothing retried, and the dropped wire submission leaves the bound
+    /// lease Uncertain (the library-pinned drop transition), observable in
+    /// the receiver inbox audit.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_publish_timeout_reaches_close_and_marks_lease_uncertain() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-retained-timeout-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_receiver_turns: true,
+            ..Default::default()
+        }));
+        let trial = offline_trial_context_with_deadline(
+            journal.clone(),
+            records.clone(),
+            "retained-timeout",
+            3,
+        )
+        .await
+        .unwrap();
+        // The armed guard owns the accept task from here - BEFORE the
+        // connector unwrap and the case run below can panic - so its
+        // Drop is the backstop for the whole run, not only the teardown.
+        // The handle rides the shared slot: Drop aborts through it, the
+        // teardown below takes it exactly once.
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: Arc::new(Mutex::new(Some(trial.server))),
+            armed: true,
+        };
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        let outcome = match run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("timeout-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("timeout-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_hang_trial(guard).await;
+                panic!("retained timeout case errored: {error}");
+            }
+        };
+        // Bounded test-owned teardown runs on BOTH paths BEFORE any
+        // assertion: every assertion input below is owned data (the
+        // PositiveOutcome values and the fixture records).
+        finish_hang_trial(guard).await;
+        // The retained arm ran and the terminal action error is the
+        // sanitized timeout tag (fixed constant, no wire text).
+        assert_eq!(outcome.arm_evidence["source_mode"], json!("retained"));
+        assert_eq!(
+            outcome.arm_evidence["source_turn_error"].as_str(),
+            Some("retained_publish_timeout")
+        );
+        // The case fails, and cleanup still ran through family.close().
+        assert_eq!(outcome.case["case_passed"], json!(false));
+        assert!(outcome.cleanup_ok);
+        // No success receipt exists: nothing was delivered or consumed.
+        assert!(outcome.arm_evidence["message_status"].is_null());
+        assert_eq!(outcome.arm_evidence["delivered"], json!(false));
+        assert_eq!(outcome.arm_evidence["consumed"], json!(false));
+        // Post-submission: the admission exists and its bound lease reads
+        // Uncertain after the dropped wire submission.
+        assert_eq!(outcome.case["lease_state"], json!("Uncertain"));
+        // One-shot, no retry: exactly one publication POST and exactly one
+        // receiver-turn request, both recorded and held (never answered),
+        // and nothing after the deadline.
+        {
+            let guard = records.lock().unwrap();
+            let publish_posts = guard
+                .requests
+                .iter()
+                .filter(|(path, _)| path == "/occ3/v1/native/publish")
+                .count();
+            let receiver_turns = guard
+                .requests
+                .iter()
+                .filter(|(path, body)| {
+                    path == "/v1/chat/completions" && body.get("occ3").is_some()
+                })
+                .count();
+            assert_eq!(publish_posts, 1);
+            assert_eq!(receiver_turns, 1);
+            assert_eq!(guard.hang_events, vec!["receiver_turn".to_string()]);
+        }
+        // Semantic timing only: the wrap elapsed its full deadline. The
+        // timeout tag and the joined bounded cleanup are the real
+        // evidence; no upper bound substitutes for them.
+        let total_millis = outcome.arm_evidence["total_millis"].as_u64().unwrap();
+        assert!(total_millis >= 3000, "wrap must elapse the deadline");
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Retained publication timeout, pre-bind variant: the publication
+    /// route itself is accepted and recorded but never answered, so
+    /// nothing is admitted - no inbox record, no bound lease - while the
+    /// wrapped deadline still fails the case with the sanitized tag and
+    /// cleanup runs. The one-shot claim stays taken: exactly one publish
+    /// POST and no receiver turn ever happens.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn retained_publish_timeout_before_binding_leaves_no_lease() {
+        let journal = std::env::temp_dir()
+            .join(format!("occ3-retained-timeout-prebind-{}", uuid::Uuid::new_v4().simple()));
+        std::fs::create_dir_all(&journal).unwrap();
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_publish_route: true,
+            ..Default::default()
+        }));
+        let trial = offline_trial_context_with_deadline(
+            journal.clone(),
+            records.clone(),
+            "retained-timeout-prebind",
+            3,
+        )
+        .await
+        .unwrap();
+        // The armed guard owns the accept task from here - BEFORE the
+        // connector unwrap and the case run below can panic - so its
+        // Drop is the backstop for the whole run, not only the teardown.
+        // The handle rides the shared slot: Drop aborts through it, the
+        // teardown below takes it exactly once.
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: Arc::new(Mutex::new(Some(trial.server))),
+            armed: true,
+        };
+        let connector = trial.env.connector().unwrap();
+        let nonce = format!("occ3-{}", uuid::Uuid::new_v4());
+        let outcome = match run_positive_case(
+            &trial.env,
+            &connector,
+            &format!("prebind-source-{}", uuid::Uuid::new_v4().simple()),
+            &format!("prebind-receiver-{}", uuid::Uuid::new_v4().simple()),
+            &nonce,
+            None,
+            SourceMode::Retained,
+        )
+        .await
+        {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                finish_hang_trial(guard).await;
+                panic!("pre-bind timeout case errored: {error}");
+            }
+        };
+        // Bounded test-owned teardown on both paths, before assertions.
+        finish_hang_trial(guard).await;
+        assert_eq!(
+            outcome.arm_evidence["source_turn_error"].as_str(),
+            Some("retained_publish_timeout")
+        );
+        assert_eq!(outcome.case["case_passed"], json!(false));
+        assert!(outcome.cleanup_ok);
+        // Pre-bind: nothing was admitted, so the receiver inbox audit has
+        // no record and no lease state to report.
+        assert_eq!(outcome.case["lease_state"], json!(null));
+        assert!(outcome.arm_evidence["message_status"].is_null());
+        {
+            let guard = records.lock().unwrap();
+            let publish_posts = guard
+                .requests
+                .iter()
+                .filter(|(path, _)| path == "/occ3/v1/native/publish")
+                .count();
+            let receiver_turns = guard
+                .requests
+                .iter()
+                .filter(|(path, body)| {
+                    path == "/v1/chat/completions" && body.get("occ3").is_some()
+                })
+                .count();
+            assert_eq!(publish_posts, 1);
+            assert_eq!(receiver_turns, 0);
+            assert_eq!(guard.hang_events, vec!["publish_route".to_string()]);
+        }
+        // Semantic timing only: the wrap elapsed its full deadline. The
+        // timeout tag and the joined bounded cleanup are the real
+        // evidence; no upper bound substitutes for them.
+        let total_millis = outcome.arm_evidence["total_millis"].as_u64().unwrap();
+        assert!(total_millis >= 3000, "wrap must elapse the deadline");
+        let _ = std::fs::remove_dir_all(&journal);
+    }
+
+    /// Unwind-path regression: the armed guard's Drop ALONE - with no
+    /// finish_hang_trial - releases the fixture. A test panic anywhere
+    /// between guard construction and the normal teardown must still
+    /// cancel the hang token and issue the abort requests to the parked
+    /// connection and the accept task. Drop is synchronous, so JOINS are
+    /// never claimed here; the proven observables are the token flipping
+    /// cancelled, the parked socket closing promptly, and the listener
+    /// dying with the aborted accept task.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn hang_cleanup_guard_drop_releases_the_fixture_without_finish() {
+        let records = Arc::new(Mutex::new(FixtureRecords {
+            hang_publish_route: true,
+            ..Default::default()
+        }));
+        let epoch_state = Arc::new(Mutex::new(FixtureEpoch {
+            runtime_epoch: "guard-drop-epoch".into(),
+            runtime_generation: 1,
+            expires_at_epoch: now() + 240,
+            profile_digest: OFFLINE_PROFILE_DIGEST_BEFORE.into(),
+        }));
+        let (endpoint, server) = serve(epoch_state, records.clone()).await;
+        // The slot is retained by the TEST before the guard exists: after
+        // the Drop, the test takes the handle and observes the accept
+        // task's actual termination (the join is test-owned evidence;
+        // Drop itself stays synchronous and only aborts).
+        let server_slot = Arc::new(Mutex::new(Some(server)));
+        let guard = HangTrialCleanupGuard {
+            records: records.clone(),
+            server: server_slot.clone(),
+            armed: true,
+        };
+        // One raw publish request parks its connection task on the token
+        // (the route arm hangs before any validation, so a minimal JSON
+        // body suffices; read_request only requires the bearer fixture
+        // key and a matching content-length). The raw socket needs the
+        // endpoint's AUTHORITY, not its URL: serve returns
+        // http://127.0.0.1:PORT, and a URL string would be split at the
+        // last colon and DNS-resolved as a hostname (the 11001 class).
+        // "127.0.0.1:PORT" parses directly as a SocketAddr - the same
+        // in-file precedent as the accept-encoding gate test.
+        let authority = endpoint.trim_start_matches("http://");
+        let mut socket = tokio::net::TcpStream::connect(authority).await.unwrap();
+        let body = "{}".to_string();
+        let request = format!(
+            "POST /occ3/v1/native/publish HTTP/1.1\r\nhost: {authority}\r\nauthorization: bearer {FIXTURE_KEY}\r\ncontent-type: application/json\r\ncontent-length: {}\r\nconnection: close\r\n\r\n{body}",
+            body.len()
+        );
+        socket.write_all(request.as_bytes()).await.unwrap();
+        // Deterministic route ARRIVAL first: await the latched arrival
+        // signal (set after the hang event is recorded, before the
+        // park) so the abort provably lands on a parked handler - a
+        // socket EOF after an abort alone would prove nothing about the
+        // handler having reached the route. The token is cloned before
+        // the await, so no lock is ever held across it.
+        let arrival = records.lock().unwrap().hang_arrival.clone();
+        let arrived = tokio::time::timeout(Duration::from_secs(5), arrival.cancelled()).await;
+        assert!(
+            arrived.is_ok(),
+            "the hung route must signal arrival within the bound"
+        );
+        // Drop is now the ONLY cleanup - exactly the failure path.
+        drop(guard);
+        // The token is cancelled (Drop set it synchronously).
+        assert!(
+            records.lock().unwrap().hang_cancel.is_cancelled(),
+            "guard Drop must cancel the hang token"
+        );
+        // Accept-task termination observed BY THE TEST: take the
+        // retained handle exactly once and await its actual completion
+        // under a bounded wait. Drop requested the abort without taking
+        // the handle; this join is the separate, test-owned evidence
+        // (never a join claimed from Drop itself).
+        let server = server_slot
+            .lock()
+            .unwrap()
+            .take()
+            .expect("retained accept-task handle");
+        let terminated = tokio::time::timeout(Duration::from_secs(5), server).await;
+        assert!(
+            terminated.is_ok(),
+            "the aborted accept task must terminate within the bound"
+        );
+        // The parked connection was aborted: its socket closes promptly
+        // (the task owned it; the abort drops it). Bounded read AFTER the
+        // accept task's termination is observed.
+        let closed = tokio::time::timeout(Duration::from_secs(2), async {
+            let mut buffer = [0u8; 256];
+            loop {
+                match socket.read(&mut buffer).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => continue,
+                }
+            }
+        })
+        .await;
+        assert!(closed.is_ok(), "parked socket must close within the bound");
+        // The route was reached and parked exactly once.
+        assert_eq!(
+            records.lock().unwrap().hang_events,
+            vec!["publish_route".to_string()]
+        );
     }
 
     /// The retained criterion's negative space: the value NOT fully inside

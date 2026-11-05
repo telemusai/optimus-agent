@@ -51,7 +51,7 @@ BUILD_UTILITIES = ("__init__.py", "artifact_preflight.py", "source_patch.py",
 CONTROLLER_MODULES = ("controller.py", "docker_api.py", "docker_config.py", "lifecycle.py",
                       "live_validation.py", "native_validator.py", "rehearsal.py",
                       "rehearsal_ingress.py", "service_checks.py", "supervisor.py")
-PATCHES = ("capture-eager-mtp.v1.json", "native-startup.v1.json", "scheduler-cache-ipc.v1.json")
+PATCHES = ("capture-eager-mtp.v1.json", "native-startup.v2.json", "scheduler-cache-ipc.v1.json")
 BUILD_INPUTS = ("source-baseline-expanded.json", "native-profile-input.json")
 HOOK_FILES = ("occ3_p3_arms_hook.py", "zz_occ3_p3_arms.pth")
 

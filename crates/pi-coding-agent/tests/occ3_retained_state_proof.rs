@@ -93,6 +93,9 @@ fn identity() -> Occ3ModelIdentity {
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 enum ReceiptMode {
     Exact,
+    /// The source fixture answers the default v2 arming with the stale bare
+    /// `occ3.source.v1` wire (no span block): the pre-fix live shape.
+    StaleV1,
     WrongHandle,
     WrongRequest,
     WrongMessage,
@@ -110,6 +113,7 @@ impl ReceiptMode {
     fn name(self) -> &'static str {
         match self {
             ReceiptMode::Exact => "exact",
+            ReceiptMode::StaleV1 => "stale_v1",
             ReceiptMode::WrongHandle => "wrong_handle",
             ReceiptMode::WrongRequest => "wrong_request",
             ReceiptMode::WrongMessage => "wrong_message",
@@ -318,7 +322,9 @@ async fn serve(
                                 .short_receipt_expiry
                                 .map(|secs| now() + secs)
                                 .unwrap_or_else(|| intent["expires_at_epoch"].as_u64().unwrap());
-                            let receipt = json!({"schema":"occ3.source.v1","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),
+                            let stale_v1 = mode.receipt == ReceiptMode::StaleV1;
+                            let mut receipt = json!({"schema":if stale_v1 {"occ3.source.v1"} else {"occ3.source.v2"},
+                                "intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),
                                 "source_handle":RAW_SOURCE_HANDLE,"native_rid":"retained-source-rid","response_id":"retained-source-rid",
                                 "capture_commit_id":"retained-proof-capture-commit",
                                 "accepted_span_start":0,"accepted_span_end":8,"retained_count":8,"predictor_position_offset":-1,
@@ -326,6 +332,33 @@ async fn serve(
                                 "layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,
                                 "accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),
                                 "expires_at_epoch":expires,"byte_count":128});
+                            // The default arming is occ3.capture.v2, so the
+                            // intent is answered on the v2 wire with the
+                            // occ3.span.v1 block. The counts model this
+                            // fixture's 8-row window the way the pi-ai
+                            // canonical v2 wire and the lifecycle fixture do:
+                            // the reasoning region, the thinking_end
+                            // terminator marker row and the role-token stop
+                            // row (both CONTROL), the single occ3_handoff
+                            // tool-call row and its argument rows. The
+                            // captured turn emits no content delta, so the
+                            // window carries no CONTENT row.
+                            let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
+                                "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
+                                "span_reasoning_terminator":"thinking_end","span_turn_end_attested":true,
+                                "span_thinking_count":2,"span_content_count":0,"span_tool_call_count":1,
+                                "span_tool_arguments_count":3,"span_control_count":2,"span_unknown_count":0,
+                                "span_window_start_position":0,"span_window_end_position":8,
+                                "span_contiguous":true,"span_contains_final_content":true,
+                                "span_contains_tool_call":true,"span_message_truncated":false});
+                            if !stale_v1 {
+                                for (key, value) in span.as_object().unwrap() {
+                                    receipt[key.clone()] = value.clone();
+                                }
+                            }
+                            // StaleV1 answers the default v2 arming with the
+                            // pre-fix live shape: the bare occ3.source.v1 wire
+                            // with no span block. The client must refuse it.
                             let headers = vec![("x-optimus-occ3-source", receipt.to_string())];
                             send(&mut socket, output, headers).await;
                             return;
@@ -373,6 +406,10 @@ async fn serve(
                                 ReceiptMode::FallbackUsed => fallback = true,
                                 ReceiptMode::NotInjected => injected = false,
                                 ReceiptMode::Exact | ReceiptMode::Duplicate | ReceiptMode::Missing => {}
+                                // StaleV1 only shapes the source receipt; a
+                                // receiver attachment is never reached in that
+                                // scenario (the source turn fails first).
+                                ReceiptMode::StaleV1 => {}
                             }
                             let receipt = json!({"attachment":receipt_attachment,"consumed":consumed,
                                 "fallback_used":fallback,"injected_state":injected});
@@ -1261,6 +1298,68 @@ async fn retained_receipt_binding_is_enforced_field_by_field_on_the_real_request
     }
 }
 
+/// The stale-fixture regression this campaign's baseline hit live: the default
+/// `arm_source` arming is `occ3.capture.v2` + `content_tail_v2`, so the bare
+/// span-less `occ3.source.v1` wire a pre-fix server answered is refused by the
+/// pi-ai verifier. The source turn fails closed and nothing is published,
+/// queued or consumed: the refusal is never a silent fallback to text.
+#[tokio::test]
+async fn stale_v1_source_receipt_is_refused_under_default_v2_arming() {
+    let pf = build_family(FamilyConfig {
+        mode: FixtureMode {
+            receipt: ReceiptMode::StaleV1,
+            short_receipt_expiry: None,
+        },
+        source_tool: SourceTool::QueueController,
+        ..Default::default()
+    })
+    .await;
+    pf.source
+        .arm_source(NativeSourceBudget {
+            retained_count_limit: 128,
+            max_capture_bytes: 1048576,
+            deadline: Instant::now() + Duration::from_secs(30),
+            max_response_bytes: 65536,
+        })
+        .expect("arm source");
+    pf.source_agent
+        .prompt(PromptInput::Text {
+            input: "Retained-source fixture prompt. Call occ3_handoff to child receiver. Arguments contain only role and name.".into(),
+            images: Vec::new(),
+        })
+        .await
+        .expect("source prompt returns");
+    assert!(
+        pf.source_agent.state().error_message.is_some(),
+        "a span-less occ3.source.v1 receipt under v2 arming is refused"
+    );
+    assert!(
+        !pf
+            .requests()
+            .iter()
+            .any(|(path, _)| path.ends_with("/publish")),
+        "no publication attempt happened"
+    );
+    assert!(
+        pf.state.records.lock().unwrap().published_request.is_none(),
+        "nothing was published"
+    );
+    assert!(
+        pf.queued_delivery.lock().unwrap().is_none(),
+        "no handoff delivery was queued for the receiver"
+    );
+    assert!(
+        pf.state.records.lock().unwrap().receiver_receipts.is_empty(),
+        "the receiver was never prompted"
+    );
+    let audit = pf.receiver.audit();
+    assert!(
+        audit["receiver"].as_array().is_none_or(|rows| rows.is_empty()),
+        "receiver inbox stayed empty"
+    );
+    cleanup(&pf).await;
+}
+
 // ---------------------------------------------------------------------------
 // Family 2: NO-STATE control
 // ---------------------------------------------------------------------------
@@ -1387,6 +1486,35 @@ async fn retained_stale_expired_handle_refuses_consumption_fail_closed() {
         pf.chat_bodies().len(),
         2,
         "only the source capture and continuation ran"
+    );
+    // An unrelated fresh user turn recovers: BOTH expired delivery records
+    // stay in the retained history, none is freshly supplied, so the turn
+    // proceeds as an ordinary chat request with no attachment and no error.
+    pf.receiver_agent
+        .prompt(PromptInput::Text {
+            input: "Unrelated follow-up after the expired delivery.".into(),
+            images: Vec::new(),
+        })
+        .await
+        .expect("the unrelated turn must complete");
+    assert!(
+        pf.receiver_agent.state().error_message.is_none(),
+        "history-only expired records never fail a later turn"
+    );
+    assert_eq!(
+        pf.occ3_bodies().len(),
+        0,
+        "no provider request ever carried the stale handle"
+    );
+    assert_eq!(
+        pf.chat_bodies().len(),
+        3,
+        "the unrelated turn ran as an ordinary chat request"
+    );
+    assert_eq!(
+        pf.receiver.audit()["receiver"][0]["status"],
+        json!("EXPIRED"),
+        "the expired record is preserved terminal"
     );
     cleanup(&pf).await;
 }
@@ -1631,7 +1759,13 @@ async fn retained_record_keeps_raw_handle_and_full_receipt_in_memory_only() {
     assert_eq!(record.raw_source_handle, RAW_SOURCE_HANDLE);
     let receipt = &record.receipt;
     assert_eq!(receipt.source_handle, RAW_SOURCE_HANDLE);
-    assert_eq!(receipt.schema, "occ3.source.v1");
+    assert_eq!(receipt.schema, "occ3.source.v2");
+    let span = receipt.span.as_ref().expect("v2 receipt carries the span block");
+    assert_eq!(span.span_policy, record.intent.span_policy);
+    assert_eq!(span.span_reasoning_terminator, "thinking_end");
+    assert_eq!(span.span_tool_call_count, 1);
+    assert_eq!(span.span_control_count, 2);
+    assert!(span.span_contains_tool_call && span.span_contains_final_content);
     assert_eq!(receipt.native_rid, "retained-source-rid");
     assert_eq!(receipt.response_id, "retained-source-rid");
     assert_eq!(receipt.capture_commit_id, "retained-proof-capture-commit");

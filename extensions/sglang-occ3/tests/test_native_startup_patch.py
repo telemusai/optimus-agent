@@ -26,7 +26,7 @@ from occ3_sglang import native_install as install
 from test_native_install import KEY, pinned_auth
 
 BEFORE = "1fbb46671e86d0ebf23046efa09e8e03d251754e681ba03b818dbb7a75c79c55"
-AFTER = "76d4f909410a2e587b6e7c3981531982ce630fd57079253f6dd7ed1b12167cc6"
+AFTER = "07838ebd49c9bbfa09369ffc55f001a089699769b0b6df22b96e7ba05863f57c"
 GLM_BEFORE = "61a62420d07e3986ae36d0f6fa44b9232f4c331ebd8fc3b32ba0889523bdfb0e"
 GLM_AFTER = "e09a129d5872c532ccdc085585cfd8fac336c73d13d09fa8c2304a79500be271"
 EXT = Path(__file__).resolve().parents[1]
@@ -41,7 +41,7 @@ def source_root():
 
 
 def test_exact_startup_patch_prepares_without_mutating_original_source():
-    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v1.json")
+    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v2.json")
     target = source_root() / "entrypoints/http_server.py"
     before = target.read_bytes()
     # Supplied checkout files have LF content; no normalization or fuzzy patch.
@@ -72,6 +72,38 @@ def test_exact_startup_patch_prepares_without_mutating_original_source():
     next_call = containing[0].value
     assert isinstance(next_call.func, ast.Attribute) and next_call.func.attr == "run"
     assert isinstance(next_call.func.value, ast.Name) and next_call.func.value.id == "server"
+    # The Granian branch carries its own additive bootstrap: exactly one call
+    # inside _run_granian_server's single-tokenizer sub-branch, directly
+    # before uvloop.run(serve()), with the same three in-scope arguments.
+    granian = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "_run_granian_server")
+    granian_calls = [n for n in ast.walk(granian) if isinstance(n, ast.Call)
+                     and isinstance(n.func, ast.Name)
+                     and n.func.id == "prepare_selected_native_granian_server"]
+    assert len(granian_calls) == 1
+    assert [n.id for n in granian_calls[0].args] == ["server", "app", "tokenizer_manager"]
+    granian_containing = []
+    for n in ast.walk(granian):
+        for _, value in ast.iter_fields(n):
+            if isinstance(value, list):
+                for i, item in enumerate(value):
+                    if isinstance(item, ast.Expr) and item.value is granian_calls[0]:
+                        granian_containing.append(value[i + 1])
+    assert len(granian_containing) == 1
+    run_call = granian_containing[0].value
+    assert isinstance(run_call.func, ast.Attribute) and run_call.func.attr == "run"
+    assert isinstance(run_call.func.value, ast.Name) and run_call.func.value.id == "uvloop"
+    assert (isinstance(run_call.args[0], ast.Call)
+            and isinstance(run_call.args[0].func, ast.Name)
+            and run_call.args[0].func.id == "serve")
+    # The two flavors never cross: no uvicorn-flavor call inside the Granian
+    # helper and no Granian-flavor call inside the uvicorn setup helper.
+    assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "prepare_selected_native_server"
+                   for n in ast.walk(granian))
+    assert not any(isinstance(n, ast.Call) and isinstance(n.func, ast.Name)
+                   and n.func.id == "prepare_selected_native_granian_server"
+                   for n in ast.walk(setup))
     # Parser overlay: strict flag default False, one except-clause guard, no other drift.
     glm = next(f for f in plan.files if f.relative == "function_call/glm47_moe_detector.py")
     assert hashlib.sha256(glm.original).hexdigest() == GLM_BEFORE
@@ -85,6 +117,66 @@ def test_exact_startup_patch_prepares_without_mutating_original_source():
     assert base_text.count("return StreamingParseResult(normal_text=current_text)") == 1
 
 
+def test_granian_http2_branch_bootstraps_through_granian_entry_point_only():
+    # The 2026-11-03 live incident proved an --enable-http2 boot takes
+    # _run_granian_server and never reaches the uvicorn default branch, so the
+    # v1 bootstrap call never ran. The v2 manifest adds an additive call inside
+    # _run_granian_server. Contract: the http2 branch references exactly the
+    # granian entry point -- never the uvicorn-flavor call, never a direct
+    # install_native/occ3 import beyond that one reviewed call.
+    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v2.json")
+    plan = source_patch.prepare(source_root(), manifest)
+    patched = plan.files[0].patched.decode("utf-8")
+    tree = ast.parse(patched)
+    setup = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                 and n.name == "_setup_and_run_http_server")
+
+    def branch_of(node):
+        for child in ast.iter_child_nodes(node):
+            if isinstance(child, ast.If):
+                yield child
+            yield from branch_of(child)
+
+    granian_branch = None
+    for check in branch_of(setup):
+        test = check.test
+        if (isinstance(test, ast.Attribute) and test.attr == "enable_http2"):
+            granian_branch = check
+            break
+    assert granian_branch is not None, "enable_http2 branch not found in patched source"
+    # .body only: the elif/else chain (orelse) legitimately contains the
+    # default uvicorn branch with its own bootstrap call.
+    body_names = set()
+    for node in granian_branch.body:
+        body_names |= {n.id for n in ast.walk(node) if isinstance(n, ast.Name)}
+        body_names |= {n.attr for n in ast.walk(node) if isinstance(n, ast.Attribute)}
+    assert "_run_granian_server" in body_names
+    assert "prepare_selected_native_server" not in body_names
+    assert not any(name.startswith("occ3") for name in body_names)
+    # The uvicorn bootstrap call stays exactly once, in the default branch.
+    calls = [n for n in ast.walk(setup) if isinstance(n, ast.Call)
+             and isinstance(n.func, ast.Name)
+             and n.func.id == "prepare_selected_native_server"]
+    assert len(calls) == 1
+    # The granian entry point exists module-wide exactly once, inside
+    # _run_granian_server, and the branch never bypasses it.
+    granian = next(n for n in tree.body if isinstance(n, ast.FunctionDef)
+                   and n.name == "_run_granian_server")
+    module_calls = [n for n in ast.walk(tree) if isinstance(n, ast.Call)
+                    and isinstance(n.func, ast.Name)
+                    and n.func.id == "prepare_selected_native_granian_server"]
+    assert len(module_calls) == 1
+    assert module_calls[0] in [c for c in ast.walk(granian) if c is module_calls[0]]
+    granian_names = {n.id for n in ast.walk(granian) if isinstance(n, ast.Name)}
+    granian_names |= {n.attr for n in ast.walk(granian) if isinstance(n, ast.Attribute)}
+    assert "install_native_runtime" not in granian_names
+    # No other occ3 reference exists in the whole patched file.
+    assert patched.count("occ3_sglang") == 2  # one import per entry point
+    imports = [n for n in ast.walk(tree) if isinstance(n, ast.ImportFrom)
+               and n.module == "occ3_sglang.native_install"]
+    assert len(imports) == 2
+
+
 def _install_glm47_chain():
     """Install the prepared patched detector + real snapshot deps into sys.modules.
 
@@ -92,7 +184,7 @@ def _install_glm47_chain():
     imports a real SGLang runtime or touches a real checkout.
     """
     import sys, types as t
-    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v1.json")
+    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v2.json")
     root = source_root()
     target = root / "function_call" / "glm47_moe_detector.py"
     assert hashlib.sha256(target.read_bytes()).hexdigest() == GLM_BEFORE
@@ -274,7 +366,7 @@ def test_overlay_concurrent_ordinary_request_unaffected():
 
 @pytest.mark.parametrize("fault", ["hash", "anchor", "afterhash"])
 def test_patch_rejects_wrong_original_or_fuzzy_or_unpinned_result(tmp_path, fault):
-    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v1.json")
+    manifest = source_patch.load_manifest(EXT / "patches/native-startup.v2.json")
     data = (source_root() / "entrypoints/http_server.py").read_bytes()
     dest = tmp_path / "entrypoints/http_server.py"
     dest.parent.mkdir()
@@ -680,3 +772,322 @@ def test_prepare_call_order_is_pinned_by_ast():
     assert names.index("register_control_plane") > names.index("_read_startup_literal")
     assert "<return>" in names[:names.index("register_control_plane")]  # not-selected early return
     assert names.index("register_control_plane") < names.index("getattr")  # existing-owner check
+
+
+def _granian_module(monkeypatch, tmp_path, *, tamper=None):
+    """Install a synthetic granian.server.embed module shaped like the pinned
+    SGLang 0.5.21 import contract (``from granian.server.embed import Server``).
+
+    The module body is written to a real file as explicit UTF-8 bytes (no
+    platform newline translation) so the fd-read provenance checks operate on
+    the exact written bytes on every platform; single-link file metadata is
+    modeled through
+    os.fstat exactly like the uvicorn tests do on Windows. The pinned expected
+    digest is overridden EXPLICITLY and test-only to this synthetic file's
+    actual digest; the production constant is pinned separately by
+    test_granian_embed_digest_default_is_the_measured_running_value.
+    """
+    package = tmp_path / "granian" / "server"
+    package.mkdir(parents=True)
+    source = (
+        "class Server:\n"
+        "    def __init__(self, target, **kwargs):\n"
+        "        self.target = target\n"
+        "        self.kwargs = kwargs\n"
+        "    async def serve(self):\n"
+        "        raise AssertionError(\"never started in these tests\")\n"
+        "    def stop(self):\n"
+        "        return None\n"
+    )
+    if tamper is not None:
+        source = source + tamper
+    embed = package / "embed.py"
+    embed.write_bytes(source.encode("utf-8"))
+    module = types.ModuleType("granian")
+    server_mod = types.ModuleType("granian.server")
+    embed_mod = types.ModuleType("granian.server.embed")
+    embed_mod.__file__ = str(embed)
+    exec(compile(source, str(embed), "exec", dont_inherit=True), embed_mod.__dict__)
+    server_mod.embed = embed_mod
+    module.server = server_mod
+    import sys as _sys
+    monkeypatch.setitem(_sys.modules, "granian", module)
+    monkeypatch.setitem(_sys.modules, "granian.server", server_mod)
+    monkeypatch.setitem(_sys.modules, "granian.server.embed", embed_mod)
+    real_fstat = os.fstat
+    def single_link(fd):
+        result = real_fstat(fd)
+        fields = {name: getattr(result, name) for name in
+            ("st_mode", "st_size", "st_dev", "st_ino", "st_mtime_ns")}
+        return NS(**fields, st_nlink=1)
+    monkeypatch.setattr(os, "fstat", single_link)
+    monkeypatch.setattr(install, "_GRANIAN_EMBED_SHA256",
+                        hashlib.sha256(embed.read_bytes()).hexdigest())
+    return embed_mod, embed
+
+
+def granian_server_fixture(tmp_path, monkeypatch, *, http2=True, workers=1, tamper=None):
+    """Embedded-Granian-shaped server + single-tokenizer app contract."""
+    embed_mod, embed = _granian_module(monkeypatch, tmp_path, tamper=tamper)
+    app = FastAPI()
+    args = NS(tokenizer_worker_num=workers, enable_http2=http2, enable_ssl_refresh=False)
+    app.server_args = args
+    app.is_single_tokenizer_mode = True
+    tm = NS(server_args=args)
+    server = embed_mod.Server("app-target", workers=workers)
+    return server, app, tm, embed
+
+
+def test_granian_verifier_accepts_only_the_embedded_single_tokenizer_http2_shape(tmp_path, monkeypatch):
+    server, app, tm, embed = granian_server_fixture(tmp_path, monkeypatch)
+    original = install._verify_native_server_granian(server, app, tm)
+    assert original.__self__ is server and original.__func__ is type(server).serve
+    assert "serve" not in vars(server) and "stop" not in vars(server)
+
+
+@pytest.mark.parametrize("fault", ["wrong-class", "http2-false", "multi-worker",
+                                   "ssl-refresh", "not-single-tokenizer",
+                                   "instance-serve", "instance-stop", "config-attr",
+                                   "wrong-app", "stack"])
+def test_granian_verifier_refuses_unsupported_shapes(tmp_path, monkeypatch, fault):
+    server, app, tm, embed = granian_server_fixture(tmp_path, monkeypatch)
+    if fault == "wrong-class":
+        server = type("Other", (), {"serve": type(server).serve, "stop": type(server).stop})()
+    elif fault == "http2-false":
+        tm.server_args.enable_http2 = False
+    elif fault == "multi-worker":
+        tm.server_args.tokenizer_worker_num = 2
+    elif fault == "ssl-refresh":
+        tm.server_args.enable_ssl_refresh = True
+    elif fault == "not-single-tokenizer":
+        app.is_single_tokenizer_mode = False
+    elif fault == "instance-serve":
+        server.serve = lambda: None
+    elif fault == "instance-stop":
+        server.stop = lambda: None
+    elif fault == "config-attr":
+        server.config = object()
+    elif fault == "wrong-app":
+        app.server_args = NS(tokenizer_worker_num=1, enable_http2=True, enable_ssl_refresh=False)
+    else:
+        app.middleware_stack = object()
+    with pytest.raises(install.InstallationError, match="unsupported_native_startup"):
+        install._verify_native_server_granian(server, app, tm)
+
+
+@pytest.mark.parametrize("fault", ["symlink", "hardlink", "foreign-serve", "sync-serve",
+                                   "non-module"])
+def test_granian_verifier_refuses_provenance_faults(tmp_path, monkeypatch, fault):
+    server, app, tm, embed = granian_server_fixture(tmp_path, monkeypatch)
+    if fault == "symlink":
+        original = Path.is_symlink
+        monkeypatch.setattr(Path, "is_symlink",
+                            lambda p: str(p) == str(embed) or original(p))
+    elif fault == "hardlink":
+        real_fstat = os.fstat
+        def two_links(fd):
+            result = real_fstat(fd)
+            fields = {name: getattr(result, name) for name in
+                ("st_mode", "st_size", "st_dev", "st_ino", "st_mtime_ns")}
+            return NS(**fields, st_nlink=2)
+        monkeypatch.setattr(os, "fstat", two_links)
+    elif fault == "foreign-serve":
+        async def imposter(self):
+            return None
+        type(server).serve = imposter
+    elif fault == "sync-serve":
+        type(server).serve = lambda self: None
+    else:
+        import sys as _sys
+        monkeypatch.setitem(_sys.modules, "granian.server.embed",
+                            types.ModuleType("granian.server.embed"))
+    with pytest.raises(install.InstallationError):
+        install._verify_native_server_granian(server, app, tm)
+
+
+def test_granian_embed_digest_default_is_the_measured_running_value():
+    """The production pin is the measured running-container Granian 2.8.4
+    embed.py sha256 (raw fd-read bytes); tests never change this default."""
+    assert install._GRANIAN_EMBED_SHA256 == (
+        "abd0b8b8cb752a0916115b3b7dd7ae6a0345ce629afb1faf2550b94adb7c001f")
+
+
+def test_granian_verifier_refuses_source_digest_mismatch(tmp_path, monkeypatch):
+    """A byte-level digest mismatch fails closed even when the loaded methods'
+    bytecode still matches the file (digest check is independent of, and runs
+    before, the function-provenance comparison)."""
+    server, app, tm, embed = granian_server_fixture(
+        tmp_path, monkeypatch, tamper="# unrelated byte drift\n")
+    # _granian_module already overrode the pin to the TAMPERED file's digest;
+    # restore the production-style expectation of the ORIGINAL content by
+    # re-pinning to the untampered digest so only the file/pin pair disagrees.
+    # The tamper is an exact trailing byte suffix of the written file: require
+    # it once and only at the end, then strip by suffix so the removal is real
+    # and never an accidental replacement of unrelated bytes.
+    suffix = b"# unrelated byte drift\n"
+    tampered = embed.read_bytes()
+    assert tampered.count(suffix) == 1 and tampered.endswith(suffix)
+    untampered = tampered.removesuffix(suffix)
+    assert untampered != tampered  # tripwire: expectation must truly differ
+    monkeypatch.setattr(install, "_GRANIAN_EMBED_SHA256",
+                        hashlib.sha256(untampered).hexdigest())
+    with pytest.raises(install.InstallationError, match="startup_server_provenance"):
+        install._verify_native_server_granian(server, app, tm)
+
+
+@pytest.fixture
+def granian_loop_server(monkeypatch, pinned_auth, tmp_path):
+    """Granian-shaped loop fixture mirroring loop_server: real class methods,
+    synthetic embed module, monkeypatched verifier/installer seams."""
+    from occ3_sglang import startup_state
+
+    embed_mod, embed = _granian_module(monkeypatch, tmp_path)
+    app = FastAPI()
+    tm = NS(server_args=NS(api_key=KEY, tokenizer_worker_num=1,
+                           enable_http2=True, enable_ssl_refresh=False))
+    app.server_args = tm.server_args
+    app.is_single_tokenizer_mode = True
+    pinned_auth.add_api_key_middleware(app, api_key=KEY, admin_api_key=None)
+    events = []
+
+    class Server:
+        async def serve(self):
+            events.append(("serve", asyncio.get_running_loop()))
+            assert app.middleware_stack is None
+            app.middleware_stack = "native-serve-built-stack"
+            return "native-granian-result"
+        def stop(self):
+            events.append(("stop",))
+    server = Server()
+    monkeypatch.setattr(install, "_read_startup_literal",
+                        lambda: {"EXPERIMENTAL_STARTUP": True})
+    monkeypatch.setattr(install, "_verify_startup_artifacts",
+                        lambda selection: events.append(("artifacts",)))
+    monkeypatch.setattr(install, "_verify_native_server_granian",
+                        lambda candidate, a, t: candidate.serve)
+    module_file = Path(startup_state.__file__).resolve()
+    monkeypatch.setattr(install, "_verify_control_plane_sources",
+                        lambda: {str(module_file): module_file.read_text(encoding="utf-8")})
+    async def factory(a, t, **kwargs):
+        assert a is app and t is tm and kwargs == {"experimental_opt_in": True}
+        assert app.middleware_stack is None
+        events.append(("install", asyncio.get_running_loop()))
+        return install.InstallationReceipt(True, "installed_experimental_not_live_validated")
+    monkeypatch.setattr(install, "install_native_runtime", factory)
+    return NS(app=app, tm=tm, server=server, events=events, factory=factory,
+              startup_state=startup_state, embed=embed, embed_mod=embed_mod)
+
+
+async def test_granian_wrapper_awaits_install_on_native_loop_before_serve(granian_loop_server):
+    f = granian_loop_server
+    original_type_serve = type(f.server).serve
+    original_type_stop = type(f.server).stop
+    receipt = install.prepare_selected_native_granian_server(f.server, f.app, f.tm)
+    assert receipt.prepared and not receipt.evidence()["live_proof"]
+    assert [event[0] for event in f.events] == ["artifacts"]
+    assert type(f.server).serve is original_type_serve
+    assert type(f.server).stop is original_type_stop  # stop-hook target untouched
+    result = await f.server.serve()
+    assert result == "native-granian-result"
+    assert [event[0] for event in f.events] == ["artifacts", "install", "serve"]
+    assert f.events[1][1] is f.events[2][1] is asyncio.get_running_loop()
+    assert not getattr(f.app, install._STARTUP_ATTR)["gate8_pass"]
+
+
+def test_granian_absent_selection_is_inert(granian_loop_server, monkeypatch):
+    f = granian_loop_server
+    monkeypatch.setattr(install, "_read_startup_literal", lambda: None)
+    original = f.server.serve
+    receipt = install.prepare_selected_native_granian_server(f.server, f.app, f.tm)
+    assert not receipt.selected and f.events == [] and f.server.serve == original
+    assert "serve" not in vars(f.server)
+    assert getattr(f.app, install._APP_OWNER_ATTR, None) is None
+
+
+async def test_granian_duplicate_prepare_idempotent_but_run_is_one_shot(granian_loop_server):
+    f = granian_loop_server
+    install.prepare_selected_native_granian_server(f.server, f.app, f.tm)
+    wrapper = f.server.serve
+    assert install.prepare_selected_native_granian_server(f.server, f.app, f.tm).prepared
+    assert f.server.serve is wrapper and len(f.events) == 1
+    await wrapper()
+    with pytest.raises(install.InstallationError, match="startup_owner_mismatch"):
+        await wrapper()
+
+
+@pytest.mark.parametrize("order", ["granian-then-uvicorn", "uvicorn-then-granian"])
+async def test_cross_entry_point_double_prepare_refuses_startup_owner_mismatch(
+        monkeypatch, pinned_auth, tmp_path, order):
+    """One app/tokenizer pair, two entry points: the second preparation,
+    in either order, is refused without wrapping a second serve method."""
+    from occ3_sglang import startup_state
+
+    embed_mod, embed = _granian_module(monkeypatch, tmp_path)
+    app = FastAPI()
+    tm = NS(server_args=NS(api_key=KEY, tokenizer_worker_num=1,
+                           enable_http2=True, enable_ssl_refresh=False))
+    app.server_args = tm.server_args
+    app.is_single_tokenizer_mode = True
+    pinned_auth.add_api_key_middleware(app, api_key=KEY, admin_api_key=None)
+    module_file = Path(startup_state.__file__).resolve()
+    monkeypatch.setattr(install, "_read_startup_literal",
+                        lambda: {"EXPERIMENTAL_STARTUP": True})
+    monkeypatch.setattr(install, "_verify_startup_artifacts", lambda selection: None)
+    monkeypatch.setattr(install, "_verify_control_plane_sources",
+                        lambda: {str(module_file): module_file.read_text(encoding="utf-8")})
+    monkeypatch.setattr(install, "_verify_native_server", lambda s, a, t: s.serve)
+    monkeypatch.setattr(install, "_verify_native_server_granian", lambda s, a, t: s.serve)
+
+    class GranianServer:
+        async def serve(self):
+            return "granian"
+        def stop(self):
+            return None
+    class UvicornServer:
+        should_exit = False
+        async def serve(self):
+            return "uvicorn"
+
+    async def factory(a, t, **kwargs):
+        return install.InstallationReceipt(True, "installed_experimental_not_live_validated")
+    monkeypatch.setattr(install, "install_native_runtime", factory)
+
+    granian = GranianServer()
+    uvicorn = UvicornServer()
+    if order == "granian-then-uvicorn":
+        first = install.prepare_selected_native_granian_server(granian, app, tm)
+        assert first.prepared
+        second = install.prepare_selected_native_server(uvicorn, app, tm)
+    else:
+        first = install.prepare_selected_native_server(uvicorn, app, tm)
+        assert first.prepared
+        second = install.prepare_selected_native_granian_server(granian, app, tm)
+    assert not second.prepared and second.code == "startup_owner_mismatch"
+    # The second entry point never installed its wrapper or recorded ownership.
+    assert "serve" not in vars(uvicorn if order == "granian-then-uvicorn" else granian)
+    assert getattr(app, install._APP_OWNER_ATTR) is getattr(
+        granian if order == "granian-then-uvicorn" else uvicorn, install._SERVER_ATTR, None)
+
+
+def test_granian_prepare_call_order_is_pinned_by_ast():
+    """Source structure: the granian entry point mirrors the uvicorn ordering:
+    selection read, registration, owner checks, artifacts, verifier."""
+    tree = ast.parse(Path(install.__file__).read_text(encoding="utf-8"))
+    function = next(node for node in ast.walk(tree)
+                    if isinstance(node, ast.FunctionDef)
+                    and node.name == "prepare_selected_native_granian_server")
+    statements = [node for node in function.body if not isinstance(node, (ast.Import, ast.ImportFrom, ast.Assign))]
+    body = next(node for node in statements if isinstance(node, ast.Try)).body
+    names = []
+    for node in body:
+        for call in ast.walk(node):
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Name):
+                names.append(call.func.id)
+            if isinstance(call, ast.Call) and isinstance(call.func, ast.Attribute):
+                names.append(call.func.attr)
+        if any(isinstance(nested, ast.Return) for nested in ast.walk(node)):
+            names.append("<return>")
+    assert names.index("register_control_plane") > names.index("_read_startup_literal")
+    assert "<return>" in names[:names.index("register_control_plane")]
+    assert names.index("register_control_plane") < names.index("getattr")
+    assert names.index("_verify_startup_artifacts") < names.index("_verify_native_server_granian")

@@ -541,6 +541,52 @@ pub fn invalidate_ready_cache() {
     }
 }
 
+
+/// Process-wide capture-concurrency limiter for native OCC-3 source
+/// handoffs. The permit covers the WHOLE armed capture lifetime: it is
+/// acquired before `arm_handoff_if_needed` arms the slot and released when
+/// the capture reaches a terminal outcome (completed handoff, capture
+/// failure, cancel or deactivation). Callers must not hold queue or slot
+/// mutexes while awaiting the permit.
+///
+/// Default 1 concurrent armed capture per process. `OCC3_CAPTURE_CONCURRENCY`
+/// clamps the value into 1..=8; the ceiling exists so one process cannot
+/// promise a serving runtime more concurrent armed turns than its protocol
+/// tolerates, and the floor keeps captures serialized by default.
+fn capture_concurrency_permits() -> &'static std::sync::Arc<tokio::sync::Semaphore> {
+    static PERMITS: std::sync::OnceLock<std::sync::Arc<tokio::sync::Semaphore>> =
+        std::sync::OnceLock::new();
+    PERMITS.get_or_init(|| std::sync::Arc::new(tokio::sync::Semaphore::new(env_capture_concurrency())))
+}
+
+fn env_capture_concurrency() -> usize {
+    std::env::var("OCC3_CAPTURE_CONCURRENCY")
+        .ok()
+        .and_then(|value| value.parse::<usize>().ok())
+        .map(|value| value.clamp(1, 8))
+        .unwrap_or(1)
+}
+
+/// Acquire one armed-capture permit for the process. Hold the returned
+/// guard across the armed capture lifetime only; never across other awaits
+/// the capture does not own.
+pub async fn acquire_capture_permit() -> tokio::sync::OwnedSemaphorePermit {
+    // `acquire_owned` takes the `Arc` by value; the static lends a reference.
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .acquire_owned()
+        .await
+        .expect("capture permit semaphore closed")
+}
+
+/// Non-blocking permit take for sync arming paths (orchestrator retained
+/// captures, tests). `None` when every permit is held: the caller must
+/// refuse the concurrent capture, never queue it.
+pub fn try_capture_permit() -> Option<tokio::sync::OwnedSemaphorePermit> {
+    std::sync::Arc::clone(capture_concurrency_permits())
+        .try_acquire_owned()
+        .ok()
+}
+
 #[cfg(test)]
 pub(crate) mod test_support {
     //! Offline loopback control plane for activation tests: the three

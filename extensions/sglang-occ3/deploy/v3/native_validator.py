@@ -47,6 +47,12 @@ ALLOWED_HARNESS_PLATFORMS = {"windows-x86_64"}
 ALLOWED_HEADER_NAMES = {"x-pomerium-authorization"}
 FORBIDDEN_HEADER_NAMES = {"authorization", "host", "proxy-authorization",
                           "content-type", "accept-encoding"}
+# The ONE admitted non-HTTPS origin: the exact local SSH tunnel fronting the
+# serving container's own API-key auth layer, which carries no proxy
+# authorization headers. Only this byte-exact string is admitted; every other
+# HTTP origin (any host, port, path, query, userinfo, fragment, slash or case
+# variant) stays refused by the HTTPS rule, and report equality stays exact.
+ADMITTED_LOOPBACK_ORIGIN = "http://127.0.0.1:30101"
 OBSERVED_LAYOUT_FIELDS = ("runtime_epoch", "runtime_generation", "tp_layout_digest",
                           "hidden_dim", "layer_index", "dtype", "expected_ranks", "ready_ranks")
 IDENTITY_FIELDS = ("model_id", "architecture", "checkpoint_revision", "weight_fingerprint",
@@ -305,6 +311,8 @@ def _string(value, code, *, limit=256, allow_empty=False):
 
 def _origin(value, code):
     _require(isinstance(value, str), code)
+    if value == ADMITTED_LOOPBACK_ORIGIN:
+        return value
     parsed = urlsplit(value)
     _require(parsed.scheme == "https" and parsed.hostname
              and not parsed.username and not parsed.password
@@ -486,7 +494,8 @@ class NativeHandoffValidator:
         self._check_budget(block["budget_resource_receipt"], block["max_budget"])
         self._check_layout_strategy(block["layout_strategy"])
         self._check_endpoint(block["endpoint"])
-        self._check_credential_references(block["credential_references"])
+        self._check_credential_references(block["credential_references"],
+                                         block["endpoint"]["origin"])
         self._check_control_spec(block["control_spec"])
         return block
 
@@ -605,11 +614,16 @@ class NativeHandoffValidator:
         _require(value["control_root"] == "/occ3/v1/native/", "control_root_invalid")
         value["origin"] = origin
 
-    def _check_credential_references(self, value):
+    def _check_credential_references(self, value, origin):
         value = _exact_fields(value, ("api_key", "headers"), "credential_references_invalid")
         _reference(value["api_key"], "api_key_reference_invalid")
         headers = value["headers"]
-        _require(isinstance(headers, dict) and headers, "credential_headers_invalid")
+        _require(isinstance(headers, dict), "credential_headers_invalid")
+        if origin != ADMITTED_LOOPBACK_ORIGIN:
+            # Only the exact admitted loopback origin may pin an empty header
+            # set (the tunnel carries no proxy authorization); every HTTPS
+            # admission still requires at least one permitted header.
+            _require(headers, "credential_headers_invalid")
         for name, reference in headers.items():
             _require(isinstance(name, str) and name.lower() in ALLOWED_HEADER_NAMES
                      and name.lower() not in FORBIDDEN_HEADER_NAMES, "header_name_not_allowed")

@@ -37,7 +37,7 @@ else:
     from . import native_package, source_patch
 
 SCHEMA = "optimus.occ3.native-image-build.v1"
-MANIFEST_NAMES = ("capture-eager-mtp.v1.json", "native-startup.v1.json",
+MANIFEST_NAMES = ("capture-eager-mtp.v1.json", "native-startup.v2.json",
                   "scheduler-cache-ipc.v1.json")
 INPUT_NAMES = ("source-baseline-expanded.json", "native-profile-input.json")
 STAGED_NAMES = tuple(sorted(MANIFEST_NAMES + INPUT_NAMES))

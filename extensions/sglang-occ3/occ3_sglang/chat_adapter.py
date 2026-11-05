@@ -76,29 +76,75 @@ def _inner_error_detail(response, limit):
 # this bounded shape is ever logged; any other abort payload stays unlogged.
 _REFUSAL_CODE = re.compile(r"occ3_[a-z][a-z_]{0,62}\Z")
 
+#: The published admission maximum is the END-TO-END pre-first-event bound:
+#: control-plane bound plus dispatch-relative first-event bound (see
+#: BufferProfile.admission_control_seconds and admission_first_event_seconds;
+#: the scheduler's own 5 s armed window sits inside the first-event bound).
+#: Deliberately distinct from the Retry-After advice below. The fail-closed
+#: settle can add at most BufferProfile.cleanup_seconds before the client
+#: sees the bounded 503.
+
+#: Advisory retry timing, in seconds, attached as Retry-After on the
+#: admission-unavailability 503 family. Advice only: it tells a sender how
+#: long to wait before a fresh attempt, and is NOT a publication of the
+#: admission maximum above.
+ADMISSION_BUSY_RETRY_AFTER_SECONDS = 5
+
+#: Response header that publishes the admission maximum (above) alongside the
+#: advisory Retry-After on admission-unavailability refusals.
+ADMISSION_WINDOW_HEADER = "x-optimus-occ3-admission-window"
+
+#: Scheduler refusal codes that are admission unavailability, mapped to their
+#: distinct public (code, status) shapes. These are retryable with a fresh
+#: attempt: nothing was generated when they fire as the first stream output.
+_ADMISSION_REFUSALS = {
+    "occ3_busy_batch": ("scheduler_busy", 503),
+    "occ3_busy": ("admission_capacity", 503),
+    "occ3_admission_timeout": ("admission_timeout", 503),
+}
+
+#: Public codes in the admission-unavailability family (Retry-After and the
+#: admission-window header attach to these).
+_ADMISSION_PUBLIC_CODES = frozenset({"scheduler_busy", "admission_capacity",
+                                     "admission_timeout"})
+
+#: Fixed public codes restored from the flattened inner 400. The pinned
+#: serving_chat first-chunk seam catches a raised AttachmentError (a
+#: ValueError) and flattens it into an inner error response whose message is
+#: exactly the fixed code; exact-token matches restore the public shape.
+_INNER_ERROR_RESTORE = {
+    "scheduler_busy": 503,
+    "admission_capacity": 503,
+    "admission_timeout": 503,
+    "client_cancelled": 409,
+}
+
 _ABORT_DETAIL_LIMIT = 512
 
 
 def _refusal_detail(reason) -> str:
     """Bounded, content-free description of an unclassified abort payload.
 
-    Only the structural keys and the short scalar values of the finish_reason
-    dict are rendered; long strings are truncated and any other value is
-    reduced to its type name. Model text can never reach this string because
-    the scheduler's abort payload carries status metadata only.
+    Only structural key names and non-string scalar values of the
+    finish_reason dict are rendered. String values reduce to their type
+    name, and only keys matching the bounded structural pattern survive:
+    both the message field and the key names of an ordinary abort payload
+    can carry arbitrary model-adjacent text, so no uncontrolled string
+    ever reaches this line.
     """
     if not isinstance(reason, dict):
         return f"type={type(reason).__name__}"
     parts = []
     for name in sorted(reason, key=str):
         value = reason[name]
+        key = name if (isinstance(name, str) and _STRUCTURAL_KEY.fullmatch(name)) else "<key>"
         if isinstance(value, str):
-            rendered = value[:64]
+            rendered = "<str>"
         elif isinstance(value, (int, float, bool)) or value is None:
             rendered = str(value)
         else:
             rendered = f"<{type(value).__name__}>"
-        parts.append(f"{name}={rendered}")
+        parts.append(f"{key}={rendered}")
         if sum(len(p) for p in parts) > _ABORT_DETAIL_LIMIT:
             break
     return ";".join(parts)[:_ABORT_DETAIL_LIMIT]
@@ -125,6 +171,9 @@ def _refusal_status(reason) -> str:
 # A disconnected client may never receive the JSON error; retain a bounded log.
 # Other AttachmentError outcomes stay unlogged here.
 _CUT_TURN = frozenset({("client_disconnected", 499), ("deadline_exceeded", 504)})
+
+#: Bounded structural key pattern for the unclassified-abort diagnostic.
+_STRUCTURAL_KEY = re.compile(r"[a-z][a-z0-9_]{0,31}\Z")
 
 #: One SSE comment frame. Comment-only lines are part of the SSE grammar and
 #: must be ignored by conformant parsers (including this adapter's own audit
@@ -285,6 +334,24 @@ class BufferProfile:
     #: The interval is server-owned (the client only opts in with a version
     #: token) so a request can never dictate the emission rate.
     keepalive_seconds: float = 30
+    #: Pre-dispatch control-plane bound (readiness refresh, enroll,
+    #: reserve/prepare_source): ONE request-scoped absolute deadline shared
+    #: by ALL of those calls together, covering the backend control round
+    #: trips that reach the same scheduler ranks and the worker-runtime
+    #: all-rank preflight. Never applied to generation: an admitted turn
+    #: keeps its own turn deadline.
+    admission_control_seconds: float = 7.0
+    #: Dispatch-relative first-event bound: after the native request is
+    #: submitted, the first native event (any output, including a scheduler
+    #: abort) must arrive within this window or admission is declared
+    #: unavailable. Covers the patched scheduler's 5 s armed admission
+    #: window plus the sweep tick, tokenizer and stream plumbing margin.
+    #: Never applied after the first event: generation keeps the turn
+    #: deadline. Worst-case pre-first-event wall clock is therefore
+    #: admission_control_seconds + admission_first_event_seconds (plus at
+    #: most cleanup_seconds of fail-closed settle before the client sees
+    #: the bounded 503).
+    admission_first_event_seconds: float = 8.0
 
     def __post_init__(self):
         integer_fields = (self.max_buffer_bytes, self.max_active, self.total_working_bytes,
@@ -301,6 +368,7 @@ class BufferProfile:
         if any(not math.isfinite(x) or x <= 0 for x in (
             self.max_ttl_seconds, self.max_turn_seconds, self.cleanup_seconds,
             self.disconnect_interval, self.deadline_margin_seconds, self.keepalive_seconds,
+            self.admission_control_seconds, self.admission_first_event_seconds,
         )):
             raise ValueError("invalid buffer profile")
 
@@ -432,6 +500,16 @@ class _Context:
     # starts; cancelled by the settle when the response is abandoned before
     # any iteration.
     receive_task: Any = None
+    # Admission accounting: ONE request-scoped absolute deadline shared by
+    # every pre-dispatch control await (authorize, readiness refresh, enroll,
+    # reserve/prepare), so consecutive slow control calls compound no further
+    # than the single bound; and the absolute first-native-event deadline set
+    # at dispatch. native_started latches when the first native output has
+    # actually arrived - the only admission evidence the adapter accepts
+    # (never reserve/prepare success: the request may still sit unqueued).
+    admission_control_deadline: float = 0.0
+    first_event_deadline: float = 0.0
+    native_started: bool = False
 
 
 class ChatAttachmentAdapter:
@@ -501,11 +579,23 @@ class ChatAttachmentAdapter:
             self._active -= 1
             ctx.charged = False
 
-    @staticmethod
-    def _error(error):
+    def _error(self, error):
+        headers = {"cache-control": "no-store"}
+        if error.status == 503 and error.code in _ADMISSION_PUBLIC_CODES:
+            # Advisory retry timing, plus the published admission maximum.
+            # The two are deliberately distinct values with distinct
+            # meanings: Retry-After advises when a fresh attempt is sensible;
+            # the window header states the accurate end-to-end bound within
+            # which a request either produces its first native event or is
+            # refused as admission unavailability (control bound + first-event
+            # bound; fail-closed settle can add at most cleanup_seconds).
+            headers["retry-after"] = str(ADMISSION_BUSY_RETRY_AFTER_SECONDS)
+            headers[ADMISSION_WINDOW_HEADER] = str(
+                self.profile.admission_control_seconds
+                + self.profile.admission_first_event_seconds)
         return JSONResponse({"error": {"message": error.code,
                             "type": "occ3_attachment_error", "code": error.status}},
-                            status_code=error.status, headers={"cache-control": "no-store"})
+                            status_code=error.status, headers=headers)
 
     async def handle_around(self, original, serving, request, raw_request):
         try:
@@ -592,6 +682,11 @@ class ChatAttachmentAdapter:
                 self._terminal_active += 1
                 ctx.terminal_active_charged = True
             self._charge(ctx)
+            # One request-scoped admission control deadline: authorize,
+            # readiness refresh, enroll and reserve/prepare ALL draw on this
+            # single absolute bound, so the pre-dispatch control phase can
+            # never compound per-call bounds.
+            ctx.admission_control_deadline = clock + self.profile.admission_control_seconds
             setattr(raw_request.state, _CONTEXT, ctx)
             return await self._guard(
                 self._authorize_and_run(original, serving, request, raw_request, ctx), ctx)
@@ -662,7 +757,9 @@ class ChatAttachmentAdapter:
         if type(readiness) is not BackendReadiness or not (
                 readiness.source_ready if source else readiness.receiver_ready):
             # Refresh expired health only after authenticating this request.
-            await self.backend.refresh_readiness()
+            # Bounded by the same request-scoped admission control deadline
+            # as every other pre-dispatch control call.
+            await self._bounded_admission(self.backend.refresh_readiness(), ctx)
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             readiness = self.backend.readiness()
@@ -672,8 +769,9 @@ class ChatAttachmentAdapter:
         if source:
             ctx.native_rid = uuid.uuid4().hex
             self._fence(ctx)
-            enrollment = await self.backend.enroll_source(
-                ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline)
+            enrollment = await self._bounded_admission(
+                self.backend.enroll_source(
+                    ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, ctx.deadline), ctx)
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             validate_source_enrollment(ctx.attachment, identity, ctx.attempt_id, ctx.native_rid, enrollment)
@@ -806,8 +904,10 @@ class ChatAttachmentAdapter:
                                        if k != "occ3_worker_descriptor"})
             view = NativeRequestView(obj, budget, digest(sampling), bool(obj.stream),
                                      ctx.deadline, prefix_offset=ctx.prefix_offset)
-            reservation = (await self.backend.prepare_source(ctx.enrollment, view) if source else
-                           await self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view))
+            reservation = (await self._bounded_admission(
+                    self.backend.prepare_source(ctx.enrollment, view), ctx) if source else
+                await self._bounded_admission(
+                    self.backend.reserve(ctx.attachment, ctx.identity, ctx.attempt_id, view), ctx))
             if ctx.cancel_requested:
                 raise AttachmentError("client_disconnected", 499)
             if (type(reservation) is not Reservation
@@ -872,6 +972,17 @@ class ChatAttachmentAdapter:
                 raise AttachmentError("attachment_expired")
             ctx.dispatched = True  # Conservative: original may send before first yield.
             ctx.inner = original(tm, obj, request)
+            # Dispatch moment: the first __anext__ submits to the scheduler.
+            # The first native event (any output, including an abort) must
+            # arrive within the profile's first-event bound - dispatch
+            # relative, because the patched scheduler's armed admission
+            # window starts at submission. Until that event, admission is
+            # NOT inferred from reserve/prepare success: the guard and the
+            # keepalive race cap their waits by this absolute deadline and
+            # fail closed with the retryable admission_timeout instead of
+            # holding a silent stream to the turn deadline.
+            ctx.first_event_deadline = self.monotonic() + self.profile.admission_first_event_seconds
+            emitted = False  # No native output has flowed yet.
             async for output in ctx.inner:
                 if obj.rid != ctx.native_rid or not isinstance(output, dict):
                     raise AttachmentError("native_completion_failed")
@@ -895,9 +1006,31 @@ class ChatAttachmentAdapter:
                             _refusal_status(reason),
                             _refusal_detail(reason) if code == "unclassified" else "",
                         )
+                        if code == "occ3_cancelled":
+                            # A genuine user/client abort of this request.
+                            # Distinct bounded code; the historical 409
+                            # status is preserved.
+                            raise AttachmentError("client_cancelled", 409)
+                        if code in _ADMISSION_REFUSALS and not emitted:
+                            # Admission unavailability reaching the stream as
+                            # the first and only output: nothing was
+                            # generated, so the bounded retryable shape is
+                            # honest - a distinct 503 with Retry-After for
+                            # the buffered contract, the same fixed code in
+                            # the keepalive SSE error event. Once content has
+                            # flowed, the same scheduler code is a mid-turn
+                            # deadline abort of admitted generation and keeps
+                            # the generic completion failure below.
+                            public, status = _ADMISSION_REFUSALS[code]
+                            raise AttachmentError(public, status)
                         raise AttachmentError("native_completion_failed")
                     ctx.native_terminal = True
+                # First native output observed: admission evidence. From
+                # here the admission bound no longer applies; generation
+                # keeps its own turn deadline.
+                ctx.native_started = True
                 yield output
+                emitted = True
             ctx.exhausted = True
         except asyncio.CancelledError:
             raise
@@ -926,6 +1059,16 @@ class ChatAttachmentAdapter:
         response = await original(serving, request, raw_request)
         if ctx.cancel_requested:
             raise AttachmentError("client_disconnected", 499)
+        inner_code = _inner_error_detail(response, 64)
+        if (getattr(response, "status_code", 200) == 400
+                and inner_code in _INNER_ERROR_RESTORE):
+            # An admission-shape refusal was raised inside the native stream
+            # and flattened by the pinned first-chunk ValueError seam into
+            # this inner 400, whose bounded message is exactly the fixed
+            # public code. Restore the public shape (distinct retryable 503
+            # for admission unavailability, 409 for a user cancellation)
+            # instead of the generic completion failure.
+            raise AttachmentError(inner_code, _INNER_ERROR_RESTORE[inner_code])
         if ctx.reservation is None or ctx.generation_calls != 1 or getattr(response, "status_code", 200) != 200:
             # The public code stays generic; the container log records which
             # condition fired so live refusals are diagnosable offline. No
@@ -1201,7 +1344,17 @@ class ChatAttachmentAdapter:
             while True:
                 if asyncio.current_task().cancelling():
                     raise asyncio.CancelledError
-                remaining = ctx.deadline - self.monotonic()
+                now = self.monotonic()
+                remaining = ctx.deadline - now
+                if not ctx.native_started and ctx.first_event_deadline:
+                    # Same first-event contract as _guard: with no native
+                    # event yet, the wait is capped by the admission
+                    # first-event bound, and its expiry is the structured
+                    # retryable admission_timeout event - not keepalive
+                    # frames until the turn deadline.
+                    if now >= ctx.first_event_deadline:
+                        raise AttachmentError("admission_timeout", 503)
+                    remaining = min(remaining, ctx.first_event_deadline - now)
                 if remaining <= 0:
                     raise AttachmentError("deadline_exceeded", 504)
                 if await ctx.raw_request.is_disconnected():
@@ -1287,9 +1440,14 @@ class ChatAttachmentAdapter:
         shape instead: the bounded public code only, never payloads,
         identifiers or handles.
         """
-        return b"data: " + canonical({"error": {"message": error.code,
-                                                "type": "occ3_attachment_error",
-                                                "code": error.status}}) + b"\n\n"
+        payload = {"error": {"message": error.code,
+                             "type": "occ3_attachment_error",
+                             "code": error.status}}
+        if error.status == 503 and error.code in _ADMISSION_PUBLIC_CODES:
+            # Post-start admission unavailability carries the same advisory
+            # retry timing in the structured event (headers are committed).
+            payload["error"]["retryAfterSeconds"] = ADMISSION_BUSY_RETRY_AFTER_SECONDS
+        return b"data: " + canonical(payload) + b"\n\n"
 
     async def _keepalive_body(self, ctx):
         """Stream-lifetime body for one keepalive-mode armed turn.
@@ -1322,6 +1480,18 @@ class ChatAttachmentAdapter:
                 response = box.value
                 if ctx.cancel_requested:
                     raise AttachmentError("client_disconnected", 499)
+                inner_code = _inner_error_detail(response, 64)
+                if (getattr(response, "status_code", 200) == 400
+                        and inner_code in _INNER_ERROR_RESTORE):
+                    # Same restore as the buffered _run post-check: an
+                    # admission-shape refusal (or a user cancellation) was
+                    # raised inside the native stream and flattened by the
+                    # pinned first-chunk ValueError seam into this inner
+                    # 400, whose bounded message is exactly the fixed public
+                    # code. Post-start admission unavailability ends the
+                    # committed stream with one structured retryable error
+                    # event instead of the generic completion failure.
+                    raise AttachmentError(inner_code, _INNER_ERROR_RESTORE[inner_code])
                 if (ctx.reservation is None or ctx.generation_calls != 1
                         or getattr(response, "status_code", 200) != 200):
                     # The public code stays generic; the container log records
@@ -2135,6 +2305,44 @@ class ChatAttachmentAdapter:
                 raise AttachmentError("client_disconnected", 499)
             validate_evidence(ctx.attachment, ctx.reservation, ctx.descriptor, completion, evidence)
 
+    async def _bounded_admission(self, awaitable, ctx):
+        """Race one pre-dispatch control await against the admission bound.
+
+        The backend control calls (readiness refresh, enroll, reserve,
+        prepare) reach the same scheduler ranks and the worker-runtime
+        all-rank preflight. Each call draws on ONE request-scoped absolute
+        deadline (ctx.admission_control_deadline, set once when the attempt
+        is charged), so consecutive slow control calls compound no further
+        than that single bound. A control plane that cannot answer within it
+        is admission unavailability, not generation time: fail closed now
+        with the bounded retryable 503 instead of waiting for the turn
+        deadline. The attempt fence was charged before the await, so a retry
+        needs a fresh attempt and no captured state is reused (same
+        uncertainty semantics as a cancelled backend await).
+        """
+        deadline = (ctx.admission_control_deadline
+                    or self.monotonic() + self.profile.admission_control_seconds)
+        task = asyncio.ensure_future(awaitable)
+        try:
+            while True:
+                remaining = deadline - self.monotonic()
+                if remaining <= 0:
+                    raise AttachmentError("admission_timeout", 503)
+                if ctx.cancel_requested:
+                    raise AttachmentError("client_disconnected", 499)
+                done, _ = await asyncio.wait({task}, timeout=min(remaining, self.profile.disconnect_interval))
+                if done:
+                    return task.result()
+        except BaseException:
+            if not task.done():
+                task.cancel()
+                try:
+                    await asyncio.wait({task}, timeout=self.profile.cleanup_seconds)
+                finally:
+                    if not task.done():
+                        self._quarantine(task, ctx)
+            raise
+
     async def _guard(self, operation, ctx):
         task = asyncio.create_task(operation)
         try:
@@ -2143,7 +2351,16 @@ class ChatAttachmentAdapter:
                 # scope. Recheck task cancellation if that scope swallowed it.
                 if asyncio.current_task().cancelling():
                     raise asyncio.CancelledError
-                remaining = ctx.deadline - self.monotonic()
+                now = self.monotonic()
+                remaining = ctx.deadline - now
+                if not ctx.native_started and ctx.first_event_deadline:
+                    # No native event yet: admission is not proven, so the
+                    # wait is capped by the first-event bound, not the turn
+                    # deadline. Failing closed here is the bounded retryable
+                    # admission_timeout - never a silent zero-event stream.
+                    if now >= ctx.first_event_deadline:
+                        raise AttachmentError("admission_timeout", 503)
+                    remaining = min(remaining, ctx.first_event_deadline - now)
                 if remaining <= 0:
                     raise AttachmentError("deadline_exceeded", 504)
                 if await ctx.raw_request.is_disconnected():

@@ -771,6 +771,9 @@ pub fn run_agent_loop(
 ) -> BoxFuture<'static, anyhow::Result<Vec<AgentMessage>>> {
     Box::pin(async move {
         let mut new_messages: Vec<AgentMessage> = prompts.clone();
+        // The fresh-input provenance pool starts as this run's prompt lane:
+        // exactly the messages newly supplied by the caller of this run.
+        let mut newly_supplied: Vec<AgentMessage> = prompts.clone();
         // The context param is owned and unread after this point, so moving its
         // fields avoids a full deep copy of the message history per run; the
         // resulting context value is identical to the previous clone.
@@ -803,7 +806,16 @@ pub fn run_agent_loop(
             .await?;
         }
 
-        run_loop(&mut current_context, &mut new_messages, &config, signal, &emit, stream_fn).await?;
+        run_loop(
+            &mut current_context,
+            &mut new_messages,
+            &mut newly_supplied,
+            &config,
+            signal,
+            &emit,
+            stream_fn,
+        )
+        .await?;
         Ok(new_messages)
     })
 }
@@ -830,6 +842,11 @@ pub fn run_agent_loop_continue(
         }
 
         let mut new_messages: Vec<AgentMessage> = Vec::new();
+        // The fresh-input provenance pool starts EMPTY on the continue path:
+        // a continuation supplies no new input, so its provider requests
+        // carry no newly-supplied messages (tool results and history are
+        // never fresh).
+        let mut newly_supplied: Vec<AgentMessage> = Vec::new();
         // Owned context: move the fields instead of deep-cloning the history
         // (the value is identical; only the copies differ).
         let mut current_context = AgentContext {
@@ -841,7 +858,16 @@ pub fn run_agent_loop_continue(
         emit_event(&emit, AgentEvent::AgentStart).await?;
         emit_event(&emit, AgentEvent::TurnStart).await?;
 
-        run_loop(&mut current_context, &mut new_messages, &config, signal, &emit, stream_fn).await?;
+        run_loop(
+            &mut current_context,
+            &mut new_messages,
+            &mut newly_supplied,
+            &config,
+            signal,
+            &emit,
+            stream_fn,
+        )
+        .await?;
         Ok(new_messages)
     })
 }
@@ -860,9 +886,11 @@ async fn emit_agent_end(emit: &AgentEventSink, new_messages: &[AgentMessage]) ->
     .await
 }
 
+#[allow(clippy::too_many_arguments)]
 async fn run_loop(
     current_context: &mut AgentContext,
     new_messages: &mut Vec<AgentMessage>,
+    newly_supplied: &mut Vec<AgentMessage>,
     config: &AgentLoopConfig,
     signal: Option<CancellationToken>,
     emit: &AgentEventSink,
@@ -903,7 +931,13 @@ async fn run_loop(
             }
 
             if !pending_messages.is_empty() {
-                for message in std::mem::take(&mut pending_messages) {
+                // Host-supplied input lanes (steering/follow-up drains):
+                // the drained messages are newly supplied for the NEXT
+                // provider request's fresh-input snapshot. Tool results and
+                // assistant output never pass through here.
+                let drained = std::mem::take(&mut pending_messages);
+                newly_supplied.extend(drained.iter().cloned());
+                for message in drained {
                     emit_event(
                         emit,
                         AgentEvent::MessageStart {
@@ -941,6 +975,7 @@ async fn run_loop(
 
             let message = stream_assistant_response(
                 current_context,
+                newly_supplied,
                 config,
                 signal.as_ref(),
                 emit,
@@ -2586,6 +2621,7 @@ fn close_stream(signal: Option<&CancellationToken>) {
 #[allow(clippy::too_many_arguments)]
 async fn stream_assistant_response(
     context: &mut AgentContext,
+    newly_supplied: &mut Vec<AgentMessage>,
     config: &AgentLoopConfig,
     signal: Option<&CancellationToken>,
     emit: &AgentEventSink,
@@ -2675,6 +2711,15 @@ async fn stream_assistant_response(
 
     let inference_messages = (config.resolve_inference_state.is_some() || config.source_capture.is_some())
         .then(|| messages.clone());
+    // ONE shared take-once fresh-input snapshot per provider request: both
+    // hook constructions below observe the SAME snapshot (the resolver
+    // constructor clones it; the source-capture constructor consumes the
+    // original), and the pool is empty for the next request even when a
+    // hook refused - the take precedes any resolve call. A request with no
+    // configured state hooks leaves the pool untouched.
+    let newly_supplied_snapshot =
+        (config.resolve_inference_state.is_some() || config.source_capture.is_some())
+            .then(|| std::mem::take(newly_supplied));
     let convert = config.convert_to_llm.clone();
     let llm_messages = maybe_abortable(
         async move {
@@ -2734,6 +2779,7 @@ async fn stream_assistant_response(
             model: config.model.clone(),
             context: llm_context.clone(),
             messages: inference_messages.clone().unwrap_or_default(),
+            newly_supplied_messages: newly_supplied_snapshot.clone().unwrap_or_default(),
             signal: provider_config.stream.signal.clone(),
         };
         inference_state_guard = maybe_abortable(
@@ -2759,7 +2805,9 @@ async fn stream_assistant_response(
         let resolve = hooks.resolve.clone();
         let request = InferenceStateRequest {
             model: config.model.clone(), context: llm_context.clone(),
-            messages: inference_messages.unwrap_or_default(), signal: provider_config.stream.signal.clone(),
+            messages: inference_messages.unwrap_or_default(),
+            newly_supplied_messages: newly_supplied_snapshot.unwrap_or_default(),
+            signal: provider_config.stream.signal.clone(),
         };
         source_guard = maybe_abortable(async move {
             resolve(request).await.map(|lease| SourceCaptureRequestGuard { lease, transferred: false })

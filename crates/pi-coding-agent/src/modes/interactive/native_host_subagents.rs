@@ -265,8 +265,14 @@ impl Bar {
             compaction_cycles: mode.connection_state.as_ref().map(|state| state.compaction_count).unwrap_or(0.0),
             is_compacting: mode.is_agent_compacting(),
         };
+        // The advisory queue badge is composed after the pulse indicators:
+        // truncated away first when the line narrows, never displacing the
+        // delivered-message pulses or the health/TPS segments.
+        let queue_badge = self.communication.queue_badge(&rows);
         self.line.set_communication_status(Some(context_health_indicator::status_line(
-            &self.communication.indicators(now), &self.throughput.indicator(), &input,
+            &format!("{}{}", self.communication.indicators(now),
+                if queue_badge.is_empty() { String::new() } else { format!("  {queue_badge}") }),
+            &self.throughput.indicator(), &input,
             width.saturating_sub(2),
         )));
     }

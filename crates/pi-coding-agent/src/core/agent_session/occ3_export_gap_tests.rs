@@ -228,6 +228,7 @@ async fn resolve_capture(session: &Arc<Occ3NativeSession>) {
         model: fixture_model(),
         context: Default::default(),
         messages: Vec::new(),
+        newly_supplied_messages: Vec::new(),
         signal: None,
     })
     .await

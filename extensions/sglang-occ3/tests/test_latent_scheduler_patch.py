@@ -110,7 +110,11 @@ class TestScheduler(PinnedCase):
             req.occ3_queue_deadline = 80 if req is waiting else 150
         state = NS(waiting_queue=[waiting, fresh], grammar_manager=NS(grammar_queue=[]), chunked_req=None,
                    collect_inflight_reqs=lambda: [active, active])
-        self.assertEqual([x.rid for x in fn(state)], ["waiting", "active"])
+        result = fn(state)
+        self.assertEqual([x.rid for x in result], ["waiting", "active"])
+        # The sweep carries its own bounded refusal reason so the abort path
+        # can distinguish admission timeout from a user cancellation.
+        self.assertTrue(all(x.abort_message == "occ3_admission_timeout" for x in result))
 
     def test_exact_abort_identity_and_no_normal_prefix_change(self):
         fn = self.sources.function("managers/scheduler.py", "_occ3_abort_matches", "Scheduler")
@@ -180,6 +184,100 @@ class TestScheduler(PinnedCase):
                    _occ3_reject_received=lambda r, code=None: calls.append("refusal"))
         with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
         self.assertEqual(calls, ["all-rank-admission", "refusal"])
+
+    def test_busy_admission_decline_keeps_its_own_retryable_code(self):
+        import ast as _ast
+        worker = types.ModuleType("occ3_sglang.latent_worker")
+        codes = []
+
+        class QuotaDecline(RuntimeError):
+            code = "quota"
+
+        def busy(*args):
+            raise QuotaDecline("rank-uniform busy decline")
+
+        def incomplete(*args):
+            raise RuntimeError("other admission failure")
+
+        fn = self.sources.function("managers/scheduler.py", "handle_generate_request", "Scheduler",
+            get_disagg=lambda: NS(disaggregation_bootstrap_port=1234),
+            BeamCoordinator=NS(request_beam_width=lambda req: 1), Req=lambda *a, **kw: NS(), array=array)
+        node = self.sources.node("managers/scheduler.py", "handle_generate_request", "Scheduler")
+        names = {n.attr for n in _ast.walk(node) if isinstance(n, _ast.Attribute)
+                 and isinstance(n.value, _ast.Name) and n.value.id == "recv_req"}
+
+        def state_with():
+            req = NS(**{name: None for name in names})
+            req.occ3_worker_descriptor = descriptor(); req.rid = "native-rid"
+            return NS(_occ3_validate_received=lambda r: descriptor(), enable_session_radix_cache=False,
+                     metrics_reporter=NS(enable_metrics=False), tokenizer=object(),
+                     model_config=NS(hf_eos_token_id=[2], vocab_size=100),
+                     disaggregation_mode="none", dllm_config=None,
+                     _occ3_reject_received=lambda r, code=None: codes.append(code)), req
+
+        worker.admit_request = busy
+        state, req = state_with()
+        with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
+        worker.admit_request = incomplete
+        state, req = state_with()
+        with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
+        # The busy decline keeps its own bounded code so the adapter can fold
+        # it into the retryable 503; every other admission failure keeps the
+        # generic completion-failure code.
+        self.assertEqual(codes, ["occ3_busy_batch", "occ3_admission_failed"])
+        # The published armed admission window is part of the pinned patch:
+        # admission declines immediately against a busy batch and an admitted
+        # request may wait at most this long before the queue-bound sweep.
+        self.assertIn("min(occ3_descriptor.deadline, time.monotonic() + 5.0)",
+                      self.sources.text["managers/scheduler.py"])
+
+    def test_abort_reason_threads_the_sweep_code_and_keeps_user_cancels(self):
+        matches = self.sources.function("managers/scheduler.py", "_occ3_abort_matches", "Scheduler")
+        reasons = []
+        fn = self.sources.function("managers/scheduler.py", "_occ3_abort_attached", "Scheduler")
+        armed, armed2, armed3 = Row("armed", True), Row("armed2", True), Row("armed3", True)
+        sweep = NS(abort_all=False, rid="armed", abort_message="occ3_admission_timeout")
+        user = NS(abort_all=False, rid="armed2", abort_message=None)
+        malformed = NS(abort_all=False, rid="armed3", abort_message="occ3_BAD REASON!")
+        state = NS(waiting_queue=[armed, armed2, armed3], grammar_manager=NS(grammar_queue=[]),
+                   collect_inflight_reqs=lambda: [], chunked_req=None,
+                   _occ3_abort_matches=lambda req, recv: matches(req, recv),
+                   _occ3_abort_one=lambda req, reason: reasons.append((req.rid, reason)))
+        fn(state, sweep)
+        fn(state, user)
+        fn(state, malformed)
+        # The sweep's bounded reason threads through; user and malformed
+        # aborts keep the cancelled reason.
+        self.assertEqual(reasons, [("armed", "admission_timeout"),
+                                   ("armed2", "cancelled"), ("armed3", "cancelled")])
+        self.assertEqual(state.waiting_queue, [])
+
+    def test_armed_cap_saturation_keeps_its_own_code(self):
+        import ast as _ast
+        worker = types.ModuleType("occ3_sglang.latent_worker")
+        worker.admit_request = lambda *args: None
+        codes = []
+        fn = self.sources.function("managers/scheduler.py", "handle_generate_request", "Scheduler",
+            get_disagg=lambda: NS(disaggregation_bootstrap_port=1234),
+            BeamCoordinator=NS(request_beam_width=lambda req: 1), Req=lambda *a, **kw: NS(), array=array)
+        node = self.sources.node("managers/scheduler.py", "handle_generate_request", "Scheduler")
+        names = {n.attr for n in _ast.walk(node) if isinstance(n, _ast.Attribute)
+                 and isinstance(n.value, _ast.Name) and n.value.id == "recv_req"}
+        req = NS(**{name: None for name in names})
+        req.occ3_worker_descriptor = descriptor(); req.rid = "native-rid"
+
+        def saturated(recv):
+            raise ValueError("occ3_busy")
+
+        state = NS(_occ3_validate_received=saturated, enable_session_radix_cache=False,
+                   metrics_reporter=NS(enable_metrics=False), tokenizer=object(),
+                   model_config=NS(hf_eos_token_id=[2], vocab_size=100),
+                   disaggregation_mode="none", dllm_config=None,
+                   _occ3_reject_received=lambda r, code=None: codes.append(code))
+        with patch.dict("sys.modules", {worker.__name__: worker}): fn(state, req)
+        # Armed-cap saturation is admission unavailability with its own
+        # bounded code, distinct from the generic profile refusal.
+        self.assertEqual(codes, ["occ3_busy"])
 
     def test_context_flag_copy_and_mixed_merge_guard(self):
         path = "managers/schedule_batch.py"
