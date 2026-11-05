@@ -221,6 +221,38 @@ class LatentRegistry:
             record.consumer, record.state = descriptor, "leased"
             return record
 
+    def release_unused_lease(self, attempt_id, principal_digest):
+        """Undo a consume lease the scheduler declined before admission.
+
+        The worker's own state is the proof of non-use: the lease must still
+        be "leased", never admitted, with no injected row, no inflight work
+        and no revocation. Under that proof the nonce and the lease return
+        exactly to the published state, so a fresh attempt for the same
+        attachment can lease again. The declined attempt id is tombstoned so
+        it can never be reused. Every rank runs this from the same control
+        command, so every rank makes the same decision.
+        """
+        with self.lock:
+            handle = self.attempts.get(attempt_id)
+            require(handle in self.records, "state")
+            record = self.records[handle]
+            consumer = record.consumer
+            require(consumer is not None and consumer.attempt_id == attempt_id
+                    and consumer.principal_digest == principal_digest, "identity")
+            require(record.state == "leased" and not record.admitted_consume and not record.revoked
+                    and record.inflight == 0 and not record.injected_positions
+                    and record.injection_commit_id is None, "state")
+            pub = record.publication
+            nonce_key = digest([consumer.principal_digest, consumer.receiver_session_id, consumer.consume_nonce])
+            require(self.used_nonces.get(nonce_key) == consumer.reservation_id, "state")
+            del self.used_nonces[nonce_key]
+            self._nonce_expiry.pop(nonce_key, None)
+            del self.attempts[attempt_id]
+            self.tombstone_attempts[attempt_id] = (pub.expires_at_epoch, "retired",
+                                                   consumer.principal_digest, consumer.receiver_session_id)
+            record.consumer, record.state = None, "published"
+            return record.snapshot()
+
     def bind_output(self, attempt_id, binding):
         with self.lock:
             record = self.source_for_attempt(attempt_id)

@@ -366,6 +366,28 @@ class LatentBackend:
         return SourceCaptureEvidence(enrollment, reservation.reservation_id, commit,
             completion.output_sha256, completion.native_rid, provenance.binding_digest, True, True, 0)
 
+    async def release_unused_attempt(self, attempt_id, native_rid):
+        """Worker-side proof that a busy-declined attempt never ran.
+
+        Consume: the worker returns the lease and its nonce to the published
+        state (registry.release_unused_lease re-proves non-admission first).
+        Capture: the record must still be "reserved" (admission flips it to
+        "capturing"); the caller's normal retire then revokes it. Any other
+        state raises, and the caller keeps its replay fence.
+        """
+        state = self.attempts.get(attempt_id)
+        require(state is not None and not state.get("retired"), "state")
+        descriptor = state["descriptor"]
+        require(descriptor.native_rid == native_rid, "identity")
+        if type(descriptor) is ConsumeWorkerDescriptor:
+            await self.client.call("release_lease", {"attempt_id": attempt_id, "principal_digest": state["principal"]},
+                                   command_id="release-" + descriptor.reservation_id)
+            state["retired"] = True
+            return "released"
+        record = await self.client.call("status", {"attempt_id": attempt_id, "principal_digest": state["principal"]})
+        require(record["state"] == "reserved" and not record["revoked"], "state")
+        return "unadmitted"
+
     async def retire(self, attempt_id, native_rid, dispatched):
         state = self.attempts.get(attempt_id)
         if state is None:

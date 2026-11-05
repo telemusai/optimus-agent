@@ -712,6 +712,12 @@ class WorkerRuntime:
                 record = self.registry.source_for_attempt(payload["attempt_id"])
                 require(record.descriptor.principal_digest == payload["principal_digest"], "identity")
                 result = self.registry.bind_output(payload["attempt_id"], payload["binding"])
+            elif op == "release_lease":
+                # Busy-declined consume only: the registry proves the lease was
+                # never admitted (no injection, no inflight work) before it
+                # returns the nonce and the lease to the published state.
+                require(set(payload) == {"attempt_id", "principal_digest"})
+                result = self.registry.release_unused_lease(payload["attempt_id"], payload["principal_digest"])
             elif op == "retire":
                 require(set(payload) in ({"attempt_id", "principal_digest"},
                                         {"source_handle", "source_session_id", "principal_digest"}))
