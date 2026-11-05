@@ -3554,6 +3554,14 @@ fn install_sender_queue_listener(
                         // session's memory and never rides the prompt, the
                         // transcript or the notices.
                         let prompt = match head.state {
+                            occ3_sender_queue::Occ3SenderQueueState::Pending
+                                if head.busy_retries > 0 =>
+                            {
+                                Some(occ3_sender_queue::receiver_busy_prompt(
+                                    &head.receiver_selector(),
+                                    head.busy_retries,
+                                ))
+                            }
                             occ3_sender_queue::Occ3SenderQueueState::Pending => Some(
                                 occ3_sender_queue::advance_prompt(
                                     entries.len(),
@@ -3566,9 +3574,10 @@ fn install_sender_queue_listener(
                             _ => None,
                         };
                         if let Some(prompt) = prompt {
+                            let prompt_key = occ3_sender_queue::head_prompt_key(head);
                             if last_prompted_head
                                 .lock()
-                                .map(|last| last.as_deref() != Some(head.queue_id.as_str()))
+                                .map(|last| last.as_deref() != Some(prompt_key.as_str()))
                                 .unwrap_or(false)
                             {
                                 let fallback_head =
@@ -3598,7 +3607,7 @@ fn install_sender_queue_listener(
                                     state.issue_fallback_prompt(&head.queue_id);
                                 }
                                 if let Ok(mut last) = last_prompted_head.lock() {
-                                    *last = Some(head.queue_id.clone());
+                                    *last = Some(prompt_key);
                                 }
                             }
                         }

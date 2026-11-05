@@ -133,6 +133,34 @@ pub(crate) fn route_delivery_event_to_sender(
         }
     }
 }
+/// Routes one receiver-busy refusal to the sender's queue by sender session
+/// id. The receiver refused the attached request before any stream event,
+/// so the published capture was proven unused. The sender re-captures with
+/// backoff (bounded) instead of falling straight back to OCC-1. No-op when
+/// the sender is gone or has no matching in-flight entry.
+pub(crate) fn route_receiver_busy_to_sender(sender_session_id: &str, message_id: &str) {
+    let senders = {
+        let Ok(registry) = sender_session_registry().lock() else {
+            return;
+        };
+        registry
+            .get(sender_session_id)
+            .map(|weak_list| {
+                weak_list
+                    .iter()
+                    .filter_map(std::sync::Weak::upgrade)
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default()
+    };
+    for sender in senders {
+        if let Ok(notices) = sender.sender_queue_record_receiver_busy(message_id) {
+            if !notices.is_empty() {
+                return;
+            }
+        }
+    }
+}
 #[derive(Clone)]
 pub struct NativeSourceBudget {
     pub retained_count_limit: u32,
@@ -968,12 +996,23 @@ impl Occ3NativeSession {
                                 }
                                 let terminal = inbox.poll_terminal_failures();
                                 for (message_id, sender_session_id, _status) in terminal {
-                                    route_delivery_event_to_sender(
-                                        &sender_session_id,
-                                        &message_id,
-                                        false,
-                                        None,
-                                    );
+                                    // A pre-event busy refusal proved the
+                                    // capture unused: ask the sender for a
+                                    // fresh capture (bounded backoff). Any
+                                    // other non-use outcome falls back.
+                                    if inbox.refused_busy(&message_id) {
+                                        route_receiver_busy_to_sender(
+                                            &sender_session_id,
+                                            &message_id,
+                                        );
+                                    } else {
+                                        route_delivery_event_to_sender(
+                                            &sender_session_id,
+                                            &message_id,
+                                            false,
+                                            None,
+                                        );
+                                    }
                                 }
                             }
                             let ids = receiver.admitted_message_ids();
@@ -1031,6 +1070,51 @@ impl Occ3NativeSession {
         ))
     }
 
+    /// Readies a receiver-busy re-capture for the pending head addressed by
+    /// this call. No-op unless the head is `pending` for exactly this
+    /// receiver with a scheduled busy retry. The previous capture was
+    /// published and then refused unused, so it is retired (never resent)
+    /// and the slot is reset for a fresh arm. Then waits out the remaining
+    /// backoff, at most [`receiver_busy_backoff_secs`] of the last retry.
+    async fn prepare_receiver_busy_recapture(self: &Arc<Self>, role: &str, name: &str) -> Result<(), String> {
+        let not_before = {
+            let queue = self.queue.lock().map_err(|_| failure())?;
+            let Some(head) = queue.head() else { return Ok(()) };
+            if head.receiver_role != role
+                || head.receiver_name != name
+                || head.state != super::occ3_sender_queue::Occ3SenderQueueState::Pending
+                || head.busy_retries == 0
+            {
+                return Ok(());
+            }
+            head.retry_not_before_epoch
+        };
+        let spent_capture = self
+            .source
+            .lock()
+            .map(|slot| {
+                slot.handoff_admitted
+                    && slot
+                        .lease
+                        .as_ref()
+                        .is_some_and(|lease| lease.state() == SourceCaptureState::Captured)
+            })
+            .unwrap_or(false);
+        if spent_capture {
+            self.complete_handoff_slot().await?;
+        }
+        if let Some(not_before) = not_before {
+            let cap = super::occ3_sender_queue::receiver_busy_backoff_secs(
+                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES,
+            );
+            let wait = not_before.saturating_sub(now()).min(cap);
+            if wait > 0 {
+                tokio::time::sleep(std::time::Duration::from_secs(wait)).await;
+            }
+        }
+        Ok(())
+    }
+
     pub fn handoff_tool(
         self: &Arc<Self>,
         controller: Arc<dyn AgentSessionMessageController>,
@@ -1060,6 +1144,11 @@ impl Occ3NativeSession {
                     if let Some(result) = this.already_admitted_result(role, name) {
                         return Ok(result);
                     }
+                    // Receiver-busy re-capture: the head went back to
+                    // `pending` after the receiver refused the published
+                    // capture before using it. Retire that spent capture so a
+                    // FRESH arm is legal, then honour the bounded backoff.
+                    this.prepare_receiver_busy_recapture(role, name).await.map_err(anyhow::Error::msg)?;
                     let queue_head = {
                         let queue = this.queue.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         queue.head().map(|head| {
@@ -1613,6 +1702,23 @@ impl Occ3NativeSession {
         self.check()?;
         let mut queue = self.queue.lock().map_err(|_| failure())?;
         let notices = queue.record_delivery_event(message_id, consumed, receipt_sha256, now());
+        self.journal_notices_locked(&mut queue, notices.clone());
+        if !notices.is_empty() {
+            self.persist_sender_queue(&queue)?;
+        }
+        Ok(notices)
+    }
+
+    /// Receiver-busy refusal for one of this sender's in-flight messages:
+    /// the entry returns to `pending` with a backoff for a fresh capture, or
+    /// falls back to OCC-1 once the busy retry budget is spent.
+    pub(crate) fn sender_queue_record_receiver_busy(
+        &self,
+        message_id: &str,
+    ) -> Result<Vec<Occ3QueueNotice>, String> {
+        self.check()?;
+        let mut queue = self.queue.lock().map_err(|_| failure())?;
+        let notices = queue.record_receiver_busy(message_id, now());
         self.journal_notices_locked(&mut queue, notices.clone());
         if !notices.is_empty() {
             self.persist_sender_queue(&queue)?;
@@ -2854,6 +2960,81 @@ mod tests {
         assert!(!failed.is_completed_native_latent());
         // An unknown message id has no marker at all.
         assert!(session.delivery_marker("no-such-message").is_err());
+    }
+
+    /// A receiver-busy refusal returns the head to `pending`, and the next
+    /// handoff call for that receiver waits out the backoff and arms a FRESH
+    /// capture (new budget, no lease reused) instead of falling back.
+    #[tokio::test]
+    async fn receiver_busy_refusal_rearms_a_fresh_capture_after_backoff() {
+        use super::super::occ3_sender_queue::Occ3SenderQueueState;
+        let session = enrolled().await;
+        session.sender_queue_enqueue("child", "receiver").unwrap();
+        session
+            .sender_queue_mark_armed(Some("agentmsg_busy"), Some("receiver"))
+            .unwrap();
+        session
+            .sender_queue_mark_progressed(Occ3SenderQueueState::Admitted, "agentmsg_busy")
+            .unwrap();
+        let notices = session.sender_queue_record_receiver_busy("agentmsg_busy").unwrap();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].state, "pending");
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].busy_retries, 1);
+        assert!(entries[0].retry_not_before_epoch.is_some());
+        // The tool runs these two steps after authorization. They are
+        // called directly so the test does not wait on the process-wide
+        // capture permit, which parallel tests can hold.
+        let started = std::time::Instant::now();
+        session
+            .prepare_receiver_busy_recapture("child", "receiver")
+            .await
+            .expect("busy re-capture preparation");
+        assert!(
+            session.arm_handoff_if_needed("receiver", None).expect("fresh arm"),
+            "a busy-refused head re-arms"
+        );
+        session.sender_queue_mark_armed(None, Some("receiver")).expect("queue armed");
+        assert!(
+            started.elapsed() >= std::time::Duration::from_millis(900),
+            "the re-arm honours the backoff"
+        );
+        let slot = session.source.lock().unwrap();
+        assert!(slot.budget.is_some(), "fresh budget armed");
+        assert!(slot.lease.is_none(), "no earlier capture reused");
+        assert!(!slot.handoff_admitted);
+        drop(slot);
+        let (entries, _) = session.sender_queue_snapshot().unwrap();
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Armed);
+        assert_eq!(entries[0].retry_not_before_epoch, None);
+        assert_eq!(entries[0].busy_retries, 1, "the retry count persists");
+        assert_eq!(session.failed_capture_attempts(), 0, "busy never spends the capture budget");
+    }
+
+    /// The receiver-side dispatcher routes a busy refusal to the sender's
+    /// queue by sender session id; an unknown message id changes nothing.
+    #[tokio::test]
+    async fn receiver_busy_routes_to_the_sender_queue() {
+        use super::super::occ3_sender_queue::Occ3SenderQueueState;
+        let sender = enrolled().await;
+        sender.sender_queue_enqueue("child", "receiver").unwrap();
+        sender
+            .sender_queue_mark_armed(Some("agentmsg_route_busy"), Some("receiver"))
+            .unwrap();
+        sender
+            .sender_queue_mark_progressed(Occ3SenderQueueState::Admitted, "agentmsg_route_busy")
+            .unwrap();
+        let _setup = sender.take_pending_queue_notices();
+        route_receiver_busy_to_sender("unit-session", "agentmsg_unknown");
+        assert!(sender.take_pending_queue_notices().is_empty());
+        route_receiver_busy_to_sender("unit-session", "agentmsg_route_busy");
+        let notices = sender.take_pending_queue_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].state, "pending");
+        let (entries, _) = sender.sender_queue_snapshot().unwrap();
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);
+        assert_eq!(entries[0].busy_retries, 1);
     }
 
     /// `complete_handoff_slot` refuses a slot that is not a completed

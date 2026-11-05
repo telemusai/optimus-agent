@@ -494,6 +494,17 @@ impl Occ3InferenceInbox {
             .collect()
     }
 
+    /// Whether this record's bound lease was refused as receiver-busy
+    /// before any stream event (proven non-use). The dispatcher reads it for
+    /// the triples `poll_terminal_failures` returns, so a busy refusal can
+    /// ask the sender for a fresh capture instead of an OCC-1 fallback.
+    pub fn refused_busy(&self, message_id: &str) -> bool {
+        self.records
+            .get(message_id)
+            .and_then(|record| record.bound_lease.as_ref())
+            .is_some_and(|lease| lease.refused_busy())
+    }
+
     /// Bind exactly one request after claim and before native dispatch. The
     /// complete identity must come from fresh trusted enrollment. A coarse
     /// envelope method family is never a substitute for the actual version.
