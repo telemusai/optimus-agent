@@ -890,9 +890,14 @@ impl Occ3Connector for SglangOcc3Connector {
         {
             return Err(native_invalid());
         }
-        // Refresh both memberships/profile before the first publication side effect.
-        let source = self.enroll(&intent.source_session_id).await?;
-        let receiver = self.enroll(&request.receiver_session_id).await?;
+        // Refresh both memberships/profile before the first publication side
+        // effect. The two enrollments are independent control calls (distinct
+        // operation ids, idempotent per session server-side), so they run
+        // concurrently; the first failure cancels the other.
+        let (source, receiver) = tokio::try_join!(
+            self.enroll(&intent.source_session_id),
+            self.enroll(&request.receiver_session_id),
+        )?;
         if source.principal_digest != receiver.principal_digest
             || source.access_domain != receiver.access_domain
             || source.session_id == receiver.session_id

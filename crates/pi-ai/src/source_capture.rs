@@ -1020,6 +1020,23 @@ impl SourceSubmission {
     }
 }
 impl SourceSubmission {
+    /// Whether an identical resend after `delay` still fits this lease: the
+    /// submission is still `Submitted` and both the local deadline and the
+    /// intent expiry lie strictly after the delay. Called only after a
+    /// classified pre-admission busy refusal, before any stream event.
+    pub(crate) fn resend_window_allows(&self, delay: std::time::Duration) -> bool {
+        if self.lease.state() != SourceCaptureState::Submitted {
+            return false;
+        }
+        let Some(resume) = Instant::now().checked_add(delay) else {
+            return false;
+        };
+        let Ok(now) = epoch_now() else {
+            return false;
+        };
+        resume < self.lease.limits().deadline
+            && now.saturating_add(delay.as_secs()) < self.lease.intent().expires_at_epoch
+    }
     /// The server refused the armed capture as busy BEFORE any stream event:
     /// nothing was generated or captured. That is proven non-use, so the
     /// lease closes as `Cancelled` (never `Uncertain`, never reusable). The

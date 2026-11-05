@@ -102,6 +102,8 @@ enum Reply {
     /// Busy 503 whose body never finishes: headers plus a partial body, then
     /// the connection is held open.
     StalledRefusal,
+    /// One reply per accepted request, in order; the last one repeats.
+    Script(Vec<Reply>),
 }
 struct Fixture {
     model: Model,
@@ -116,7 +118,7 @@ impl Drop for Fixture {
     }
 }
 impl Fixture {
-    async fn new(reply: Reply) -> Self {
+    async fn new(script: Reply) -> Self {
         let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
             .await
             .unwrap();
@@ -128,8 +130,14 @@ impl Fixture {
         let release = Arc::new(tokio::sync::Notify::new());
         let gate = release.clone();
         let task = tokio::spawn(async move {
+            let mut served = 0usize;
             loop {
                 let (mut socket, _) = listener.accept().await.unwrap();
+                let reply = match &script {
+                    Reply::Script(steps) => steps[served.min(steps.len() - 1)].clone(),
+                    other => other.clone(),
+                };
+                served += 1;
                 let mut bytes = Vec::new();
                 let (head, payload) = loop {
                     let mut chunk = [0; 4096];
@@ -242,6 +250,9 @@ impl Fixture {
         self.requests.lock().unwrap().len()
     }
     fn lease(&self) -> SourceCaptureLease {
+        self.lease_with(Duration::from_secs(8))
+    }
+    fn lease_with(&self, budget: Duration) -> SourceCaptureLease {
         SourceCaptureLease::new(
             InferenceStateTarget {
                 provider: self.model.provider.clone(),
@@ -251,7 +262,7 @@ impl Fixture {
             intent(),
             profile(),
             SourceCaptureLimits {
-                deadline: Instant::now() + Duration::from_secs(8),
+                deadline: Instant::now() + budget,
                 max_response_bytes: 65536,
             },
         )
@@ -745,7 +756,8 @@ async fn source_pre_event_busy_is_retryable_non_use_without_resend() {
             "Retry-After: 5\r\n",
         ))
         .await;
-        let lease = fixture.lease();
+        // Retry-After 5 s outlasts this lease, so no same-request resend fits.
+        let lease = fixture.lease_with(Duration::from_secs(3));
         let stream =
             stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
         let events = collect(&stream).await;
@@ -763,7 +775,7 @@ async fn source_pre_event_busy_is_retryable_non_use_without_resend() {
         assert!(lease.receipt().is_none());
         let wire = serde_json::to_string(&events).unwrap();
         assert!(wire.contains("not delivered"), "{code}: truthful message");
-        assert_eq!(fixture.count(), 1, "{code}: no automatic resend");
+        assert_eq!(fixture.count(), 1, "{code}: no resend past the lease deadline");
         let replay =
             stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
         let _ = collect(&replay).await;
@@ -791,7 +803,8 @@ async fn source_busy_retry_after_is_bounded() {
         let fixture =
             Fixture::new(Reply::Refusal("503 Service Unavailable", busy_body("scheduler_busy"), extra))
                 .await;
-        let lease = fixture.lease();
+        // Shorter than any honoured delay: the refusal closes without a resend.
+        let lease = fixture.lease_with(Duration::from_millis(900));
         let stream =
             stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
         let details = failure_details(&collect(&stream).await);
@@ -853,4 +866,153 @@ async fn source_stalled_refusal_body_stays_uncertain_and_returns_quickly() {
     assert_uncertain(&events, &lease);
     assert!(lease.busy_refusal().is_none());
     assert_eq!(fixture.count(), 1);
+}
+
+fn busy(code: &'static str, extra: &'static str) -> Reply {
+    Reply::Refusal("503 Service Unavailable", busy_body(code), extra)
+}
+fn sent_bodies(fixture: &Fixture) -> Vec<Value> {
+    fixture.requests.lock().unwrap().iter().map(|(_, body)| body.clone()).collect()
+}
+
+/// A pre-admission busy 503 is followed by one resend of the IDENTICAL
+/// request after Retry-After; the resend's success captures normally.
+#[tokio::test]
+async fn source_busy_then_success_resends_identical_request() {
+    let fixture = Fixture::new(Reply::Script(vec![busy("scheduler_busy", "Retry-After: 1\r\n"), Reply::Good])).await;
+    let lease = fixture.lease();
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert!(started.elapsed() >= Duration::from_secs(1), "Retry-After honoured");
+    assert!(matches!(events.last(), Some(AssistantMessageEvent::Done { .. })), "{events:?}");
+    assert_eq!(lease.state(), SourceCaptureState::Captured);
+    assert!(lease.receipt().is_some());
+    assert!(lease.busy_refusal().is_none());
+    let bodies = sent_bodies(&fixture);
+    assert_eq!(bodies.len(), 2);
+    assert_eq!(bodies[0], bodies[1], "the resend is byte-for-byte the same body");
+    let heads: Vec<String> = fixture.requests.lock().unwrap().iter().map(|(head, _)| head.to_ascii_lowercase()).collect();
+    assert!(heads.iter().all(|head| head.contains("accept-encoding: identity")));
+}
+
+/// Three busy refusals: two resends, then the lease closes as proven
+/// non-use with the busy record of the final refusal.
+#[tokio::test]
+async fn source_busy_three_times_refuses_before_admission() {
+    let fixture = Fixture::new(Reply::Script(vec![
+        busy("scheduler_busy", "Retry-After: 1\r\n"),
+        busy("admission_capacity", "Retry-After: 1\r\n"),
+        busy("occ3_busy_batch", "Retry-After: 2\r\n"),
+    ]))
+    .await;
+    let lease = fixture.lease();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert_eq!(fixture.count(), 3, "exactly two resends");
+    assert_eq!(events.len(), 1);
+    let details = failure_details(&events);
+    assert_eq!(details["providerErrorType"], "occ3_source_busy");
+    assert_eq!(details["retryAfterMs"], 2000.0);
+    assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    assert_eq!(lease.busy_refusal().expect("busy refusal").retry_after_secs, Some(2));
+    let bodies = sent_bodies(&fixture);
+    assert!(bodies.iter().all(|body| body == &bodies[0]));
+}
+
+/// A server without the fence release answers the resend with 409
+/// replay_forbidden: that closes as the original busy refusal, not uncertain.
+#[tokio::test]
+async fn source_busy_then_replay_forbidden_is_busy_not_uncertain() {
+    let fixture = Fixture::new(Reply::Script(vec![
+        busy("scheduler_busy", "Retry-After: 1\r\n"),
+        Reply::Refusal("409 Conflict", busy_body("replay_forbidden"), ""),
+        Reply::Good,
+    ]))
+    .await;
+    let lease = fixture.lease();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert_eq!(fixture.count(), 2, "no retry after replay_forbidden");
+    let details = failure_details(&events);
+    assert_eq!(details["providerErrorType"], "occ3_source_busy");
+    assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    assert_eq!(lease.busy_refusal().expect("busy refusal").retry_after_secs, Some(1));
+}
+
+/// A first-attempt 409 replay_forbidden, any other 409 on a resend, and a
+/// 429 on a resend are never retried and keep the uncertain contract.
+#[tokio::test]
+async fn source_busy_resend_never_retries_other_refusals() {
+    let cases: Vec<Reply> = vec![
+        Reply::Script(vec![Reply::Refusal("409 Conflict", busy_body("replay_forbidden"), ""), Reply::Good]),
+        Reply::Script(vec![busy("scheduler_busy", "Retry-After: 1\r\n"), Reply::Refusal("409 Conflict", busy_body("unsupported_profile"), ""), Reply::Good]),
+        Reply::Script(vec![busy("scheduler_busy", "Retry-After: 1\r\n"), Reply::Refusal("429 Too Many Requests", busy_body("quota_exceeded"), "Retry-After: 1\r\n"), Reply::Good]),
+        Reply::Script(vec![busy("scheduler_busy", "Retry-After: 1\r\n"), Reply::Refusal("503 Service Unavailable", busy_body("native_completion_failed"), ""), Reply::Good]),
+        Reply::Script(vec![Reply::Refusal("429 Too Many Requests", busy_body("scheduler_busy"), "Retry-After: 1\r\n"), Reply::Good]),
+    ];
+    for (index, script) in cases.into_iter().enumerate() {
+        let expected = match &script { Reply::Script(steps) => steps.len() - 1, _ => unreachable!() };
+        let fixture = Fixture::new(script).await;
+        let lease = fixture.lease();
+        let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let events = collect(&stream).await;
+        assert_eq!(fixture.count(), expected, "case {index}");
+        assert_uncertain(&events, &lease);
+        assert!(lease.busy_refusal().is_none(), "case {index}");
+    }
+}
+
+/// An in-stream failure after a 200 is never resent.
+#[tokio::test]
+async fn source_in_stream_failure_is_never_resent() {
+    let fixture = Fixture::new(Reply::Script(vec![Reply::Disconnect, Reply::Good])).await;
+    let lease = fixture.lease();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert_eq!(fixture.count(), 1);
+    assert_uncertain(&events, &lease);
+}
+
+/// Cancelling during the Retry-After sleep stops at once without a resend.
+#[tokio::test]
+async fn source_busy_cancel_during_resend_sleep_stops_without_resend() {
+    let fixture = Fixture::new(Reply::Script(vec![busy("scheduler_busy", "Retry-After: 5\r\n"), Reply::Good])).await;
+    let lease = fixture.lease();
+    let signal = tokio_util::sync::CancellationToken::new();
+    let mut opts = options(Some(lease.clone()));
+    opts.stream.signal = Some(signal.clone());
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(opts));
+    fixture.seen.notified().await;
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    signal.cancel();
+    let events = collect(&stream).await;
+    assert!(started.elapsed() < Duration::from_secs(4), "cancel interrupts the sleep");
+    assert_eq!(fixture.count(), 1, "no resend after cancel");
+    assert!(lease.receipt().is_none());
+    assert!(lease.busy_refusal().is_none());
+    assert_ne!(lease.state(), SourceCaptureState::Captured);
+    assert!(matches!(events.last(), Some(AssistantMessageEvent::Error { .. })));
+}
+
+/// A resend whose delay would cross the lease deadline is not attempted:
+/// the refusal closes at once as proven non-use.
+#[tokio::test]
+async fn source_busy_resend_respects_lease_deadline() {
+    let fixture = Fixture::new(Reply::Script(vec![
+        busy("scheduler_busy", "Retry-After: 1\r\n"),
+        busy("scheduler_busy", "Retry-After: 3\r\n"),
+        Reply::Good,
+    ]))
+    .await;
+    let lease = fixture.lease_with(Duration::from_secs(3));
+    let started = std::time::Instant::now();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let events = collect(&stream).await;
+    assert!(started.elapsed() < Duration::from_secs(3));
+    assert_eq!(fixture.count(), 2, "second delay crosses the deadline");
+    assert_eq!(failure_details(&events)["providerErrorType"], "occ3_source_busy");
+    assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+    assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, Some(3));
 }
