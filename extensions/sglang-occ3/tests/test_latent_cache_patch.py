@@ -111,7 +111,7 @@ def request(committed=5, allocated=8, end=5):
     return NS(occ3_private_prefix=True, skip_radix_cache_insert=True, kv=Kv(committed, allocated),
               prefix_indices=Indices(), extend_range=NS(end=end), session=None, extra_key=None,
               last_node=None, host_hit_length=0, storage_hit_length=0, occ3_kv_released=False,
-              occ3_scheduler=object(), occ3_kv_quarantined=False, occ3_kv_release_started=False)
+              occ3_scheduler=NS(tp_group=NS(ranks=[0])), occ3_kv_quarantined=False, occ3_kv_release_started=False)
 
 
 def page_row(pages, allocated, page=64):
@@ -149,7 +149,7 @@ class TestPrivateCache(PinnedCase):
         # The page check is stubbed here; the list-based rows below include page 0.
         # test_private_release_* exercise the real check on numpy rows.
         release = self.sources.function(path, "occ3_release_private_kv",
-                                        occ3_private_row_fault=lambda *args: None)
+                                        occ3_private_release_fault=lambda *args: None)
         cache = self.sources.function(path, "maybe_cache_unfinished_req", occ3_private_match=match,
                                       torch=torch_module)
         public_release = self.sources.function(path, "release_kv_cache", occ3_release_private_kv=release)
@@ -434,21 +434,37 @@ class TestPrivateCache(PinnedCase):
             with self.subTest(name):
                 self.assertEqual(check(row), name)
 
+    def quarantine_owner(self, tree, log, ranks=(0,), group=None, capacity=4096):
+        """Scheduler stand-in carrying the manifest-applied quarantine method."""
+        owner = NS(token_to_kv_pool_allocator=tree.token_to_kv_pool_allocator,
+                   max_total_num_tokens=capacity, tp_group=NS(ranks=list(ranks)),
+                   tp_cpu_group=group, occ3_quarantined_tokens=0,
+                   _occ3_quarantine_error_logged=False)
+        method = self.sources.function("managers/scheduler.py", "_occ3_quarantine_private_kv",
+                                       "Scheduler", logger=log)
+        owner._occ3_quarantine_private_kv = types.MethodType(method, owner)
+        return owner
+
     def test_private_release_leaks_untrusted_row_and_frees_exact_pages(self):
         log = Log()
         fault = self.sources.function("mem_cache/common.py", "occ3_private_row_fault", torch=NP_TORCH)
+        decision = self.sources.function("mem_cache/common.py", "occ3_private_release_fault",
+                                         occ3_private_row_fault=fault, torch=NP_TORCH)
         release = self.sources.function("mem_cache/common.py", "occ3_release_private_kv",
-                                        occ3_private_row_fault=fault, logger=log)
+                                        occ3_private_release_fault=decision, logger=log)
         req, tree = request(138, 138), paged_cache(page_row([7, 3, 12], 138))
         release(req, tree)
         self.assertEqual(tree.calls, [("free", [(0, 138)])])
         self.assertEqual(tree.freed_pages, {7, 3, 12})
         self.assertTrue(req.occ3_kv_released)
         self.assertEqual(log.records, [])
+        totals = []
         for row in (page_row([7, 3, 7], 138), page_row([0, 3], 100)):
             req, tree = request(len(row), len(row)), paged_cache(row)
+            req.occ3_scheduler = owner = self.quarantine_owner(tree, log)
             release(req, tree)
             release(req, tree)  # the leaked row is not retried
+            totals.append(owner.occ3_quarantined_tokens)
             self.assertEqual(tree.calls, [])
             self.assertEqual(tree.freed_pages, set())
             self.assertEqual(tree.req_to_token_pool.frees, 1)
@@ -456,9 +472,278 @@ class TestPrivateCache(PinnedCase):
             self.assertFalse(req.occ3_kv_released)
             self.assertFalse(req.kv.holds_kv)
             self.assertEqual(req.kv.kv_allocated_len, 0)
+        # Page-rounded allocation length, counted once per quarantined row.
+        self.assertEqual(totals, [192, 128])
         self.assertEqual([(record[0], record[3]) for record in log.records],
                          [("warning", "duplicate"), ("warning", "range")])
+        self.assertEqual([record[4:7] for record in log.records], [(3, 192, 192), (2, 128, 128)])
         self.assertEqual(len(self.fence_calls), 3)
+
+    def idle_fixture(self, capacity=1024, page=64):
+        """Real manifest-applied on_idle, flush_cache and quarantine methods.
+
+        The invariant checker is a stand-in for the stock full-pool identity
+        (available + evictable + protected + session_held + uncached == total).
+        Strict idle mode is on, so any reported leak raises.
+        """
+        from contextlib import nullcontext
+        log, reports = Log(), []
+        stats = NS(full_available_size=capacity, full_evictable_size=0)
+        def check_all_pools(ps, uncached=0):
+            total = ps.full_available_size + ps.full_evictable_size + uncached
+            return total != capacity, [f"[full] total={capacity}, available={ps.full_available_size}, uncached={uncached}"]
+        def report(pool, message):
+            reports.append((pool, message))
+            raise ValueError(message)  # strict idle: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=True
+        checker = NS(_check_all_pools=check_all_pools, _report_leak=report,
+                     _check_req_pool=lambda: None, _check_tree_cache=lambda: None)
+        allocator = NS(page_size=page, verify_byte_accounting=lambda: [], clears=0)
+        def clear():
+            allocator.clears += 1
+            stats.full_available_size = capacity
+        allocator.clear = clear
+        metrics = NS(record_scheduler_idle=lambda: None, _maybe_log_idle_metrics=lambda: None,
+                     record_scheduler_active=lambda: None, reset_metrics=lambda: None,
+                     is_stats_logging_rank=False)
+        owner = NS(token_to_kv_pool_allocator=allocator, max_total_num_tokens=capacity,
+                   invariant_checker=checker, pool_stats_observer=NS(get_pool_stats=lambda: stats),
+                   scheduler_stage_metrics=NS(record=lambda stage: nullcontext()),
+                   maybe_send_health_check_signal=lambda: None, is_fully_idle=lambda **kw: True,
+                   enable_unified_memory=False, enable_hisparse=False, disaggregation_mode="null",
+                   metrics_reporter=metrics, kv_events_publisher=NS(publish_kv_events=lambda: None),
+                   new_token_ratio_tracker=NS(reset=lambda: None), publish_load_snapshot=lambda **kw: None,
+                   load_publisher=NS(publish_load_stat=lambda *a, **kw: None),
+                   load_inquirer=NS(get_loads=lambda: None), maybe_sleep_on_idle=lambda: None,
+                   _engine_paused=False, draft_worker=None, grammar_manager=NS(clear=lambda: None),
+                   tree_cache=NS(reset=lambda: None),
+                   req_to_token_pool=NS(clear=lambda: None, reset_aux_cache_allocator=lambda: None),
+                   is_hybrid_swa=False, is_hybrid_ssm=False, page_size=page, full_tokens_per_layer=None,
+                   swa_tokens_per_layer=None, kv_shard_widening=1)
+        fn = self.sources.function
+        init = fn("managers/scheduler.py", "init_invariant_checker", "Scheduler",
+                  SchedulerInvariantChecker=lambda **kw: checker)
+        init(owner)
+        owner.invariant_checker = checker
+        quarantine = fn("managers/scheduler.py", "_occ3_quarantine_private_kv", "Scheduler", logger=log)
+        owner._occ3_quarantine_private_kv = types.MethodType(quarantine, owner)
+        idle = fn("managers/scheduler.py", "on_idle", "Scheduler",
+                  DisaggregationMode=NS(DECODE="decode"), SCHEDULER_STAGE_SANITY_CHECK_CACHE="cache")
+        flush = fn("managers/scheduler.py", "flush_cache", "Scheduler", logger=log,
+                   logging=log, current_platform=NS(empty_cache=lambda: None))
+        def withhold(allocated, fault="duplicate"):
+            req = NS(rid=f"r{allocated}", occ3_kv_quarantined=False)
+            owner._occ3_quarantine_private_kv(req, allocated, fault)
+            stats.full_available_size -= ((allocated + page - 1) // page) * page
+            return req
+        return NS(owner=owner, stats=stats, log=log, reports=reports, idle=idle,
+                  flush=flush, withhold=withhold, allocator=allocator)
+
+    def test_quarantine_balances_strict_idle_identity(self):
+        f = self.idle_fixture()
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 0)
+        req = f.withhold(138)
+        self.assertTrue(req.occ3_kv_quarantined)
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 192)
+        f.idle(f.owner)  # strict: would raise on any reported leak
+        self.assertEqual(f.reports, [])
+        self.assertEqual(f.log.records[0][:4], ("warning", f.log.records[0][1], "r138", "duplicate"))
+        self.assertEqual(f.log.records[0][4:7], (3, 192, 192))
+
+    def test_quarantine_does_not_hide_an_unrelated_leak(self):
+        f = self.idle_fixture()
+        f.withhold(64)
+        f.stats.full_available_size -= 64  # a real leak outside quarantine
+        with self.assertRaises(ValueError):
+            f.idle(f.owner)
+        self.assertEqual([pool for pool, _ in f.reports], ["pool"])
+        self.assertIn("uncached=64", f.reports[0][1])
+
+    def test_quarantine_error_once_above_five_percent_and_flush_resets(self):
+        f = self.idle_fixture(capacity=1024)
+        f.withhold(64)  # 6.25% of capacity
+        f.withhold(64)
+        errors = [record for record in f.log.records if record[0] == "error"]
+        self.assertEqual(len(errors), 1)
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 128)
+        self.assertTrue(f.flush(f.owner))
+        self.assertEqual(f.allocator.clears, 1)
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 0)
+        self.assertFalse(f.owner._occ3_quarantine_error_logged)
+        f.idle(f.owner)
+        self.assertEqual(f.reports, [])
+
+    def test_quarantine_counter_kept_when_flush_declines(self):
+        f = self.idle_fixture()
+        f.withhold(64)
+        f.owner.is_fully_idle = lambda **kw: False
+        f.owner.waiting_queue, f.owner.running_batch = [1], NS(reqs=[])
+        self.assertFalse(f.flush(f.owner))
+        self.assertEqual(f.allocator.clears, 0)
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 64)
+
+    def test_private_release_tp_vote_quarantines_all_or_frees_all(self):
+        # Sequential rank stand-ins: each reducer supplies the known peer bit.
+        # This proves decision wiring, not distributed progress or CUDA behavior.
+        for faulty_rank in (None, 0, 1):
+            calls, logs, requests, trees = [], [], [], []
+            group = object()
+            for rank in range(2):
+                log = Log()
+                row = page_row([7, 3, 7] if rank == faulty_rank else [7, 3, 12], 138)
+                req, tree = request(138, 138), paged_cache(row)
+                req.occ3_scheduler = self.quarantine_owner(tree, log, ranks=(0, 1), group=group)
+                max_op = object()
+                def reduce_flag(flag, op, group, rank=rank):
+                    self.assertIs(op, max_op)
+                    self.assertIs(group, req.occ3_scheduler.tp_cpu_group)
+                    self.assertEqual(flag.dtype, np.int32)
+                    self.assertEqual(flag.device, "cpu")
+                    self.assertEqual(flag.tolist(), [int(rank == faulty_rank)])
+                    calls.append(rank)
+                    flag[0] = int(faulty_rank is not None)
+                torch_stub = NS(tensor=tensor, int32=np.int32,
+                                distributed=NS(all_reduce=reduce_flag, ReduceOp=NS(MAX=max_op)))
+                predicate = self.sources.function("mem_cache/common.py", "occ3_private_row_fault", torch=NP_TORCH)
+                decision = self.sources.function("mem_cache/common.py", "occ3_private_release_fault",
+                                                 occ3_private_row_fault=predicate, torch=torch_stub)
+                release = self.sources.function("mem_cache/common.py", "occ3_release_private_kv",
+                                                occ3_private_release_fault=decision, logger=log)
+                release(req, tree)
+                requests.append(req); trees.append(tree); logs.append(log)
+            self.assertEqual(calls, [0, 1])
+            for rank, (req, tree, log) in enumerate(zip(requests, trees, logs)):
+                self.assertEqual(req.occ3_kv_quarantined, faulty_rank is not None)
+                self.assertEqual(tree.req_to_token_pool.frees, 1)
+                self.assertEqual(bool(tree.calls), faulty_rank is None)
+                # Every rank counts the same quarantine, so capacity stays equal.
+                self.assertEqual(req.occ3_scheduler.occ3_quarantined_tokens,
+                                 0 if faulty_rank is None else 192)
+                if faulty_rank is not None:
+                    self.assertEqual(log.records[0][3], "duplicate" if rank == faulty_rank else "peer")
+                else:
+                    self.assertEqual(log.records, [])
+
+    def test_private_release_vote_empty_and_predicate_error_participate(self):
+        for allocated, expected_local in ((0, 0), (8, 1)):
+            calls = []
+            def predicate(*args):
+                raise ValueError("predicate failed")
+            def reduce_flag(flag, **kwargs):
+                calls.append(int(flag[0]))
+                flag[0] = 1  # A faulty peer also makes the empty local row decline.
+            torch_stub = NS(tensor=tensor, int32=np.int32,
+                            distributed=NS(all_reduce=reduce_flag, ReduceOp=NS(MAX="max")))
+            req = request(allocated, allocated)
+            req.occ3_scheduler = NS(tp_group=NS(ranks=[0, 1]), tp_cpu_group=object())
+            decision = self.sources.function("mem_cache/common.py", "occ3_private_release_fault",
+                                             occ3_private_row_fault=predicate, torch=torch_stub)
+            self.assertEqual(decision(req, Cache(), allocated), "check_failed" if allocated else "peer")
+            self.assertEqual(calls, [expected_local])
+
+    def test_private_release_vote_single_rank_has_no_collective(self):
+        # No tensor/distributed attribute: even constructing a flag would fail.
+        for local_fault in (None, "range"):
+            decision = self.sources.function("mem_cache/common.py", "occ3_private_release_fault",
+                                             occ3_private_row_fault=lambda *args: local_fault,
+                                             torch=NS())
+            self.assertEqual(decision(request(), Cache(), 8), local_fault)
+
+    def test_private_release_rejects_writer_shaped_duplicate_and_out_of_range_rows(self):
+        """Execute manifest-applied release and row check, not a predicate stub."""
+        fault = self.sources.function("mem_cache/common.py", "occ3_private_row_fault", torch=NP_TORCH)
+        good = page_row([7, 3], 128).astype(np.int32)
+        # Match the writer's int64 load / int32 store, with enough backing for
+        # every load. The second half is padding, not an out-of-allocation read.
+        backing = np.concatenate([good, np.zeros_like(good)])
+        writer_shaped = backing.view(np.int64).astype(np.int32)
+        cases = [("layout", writer_shaped),
+                 ("duplicate", page_row([7, 3, 7], 138)),
+                 ("range", page_row([7, 17], 100))]
+        for reason, row in cases:
+            with self.subTest(reason=reason):
+                log = Log()
+                decision = self.sources.function("mem_cache/common.py", "occ3_private_release_fault",
+                                                 occ3_private_row_fault=fault, torch=NP_TORCH)
+                release = self.sources.function("mem_cache/common.py", "occ3_release_private_kv",
+                                                occ3_private_release_fault=decision, logger=log)
+                req, tree = request(len(row), len(row)), paged_cache(row)
+                req.occ3_scheduler = owner = self.quarantine_owner(tree, log)
+                release(req, tree)
+                self.assertEqual(owner.occ3_quarantined_tokens, ((len(row) + 63) // 64) * 64)
+                self.assertEqual(tree.calls, [], "untrusted pages must not reach free_kv_row")
+                self.assertEqual(tree.freed_pages, set())
+                self.assertEqual(tree.req_to_token_pool.frees, 1)
+                self.assertTrue(req.occ3_kv_quarantined)
+                self.assertFalse(req.occ3_kv_released)
+                self.assertFalse(req.kv.holds_kv)
+                self.assertEqual(req.kv.kv_allocated_len, 0)
+                self.assertEqual(req.kv.kv_committed_len, 0)
+                self.assertEqual(len(req.prefix_indices), 0)
+                self.assertEqual([(record[0], record[3]) for record in log.records],
+                                 [("warning", reason)])
+                release(req, tree)
+                self.assertEqual(tree.calls, [])
+                self.assertEqual(tree.req_to_token_pool.frees, 1)
+                self.assertEqual(len(log.records), 1)
+        self.assertEqual(len(self.fence_calls), len(cases))
+
+    @unittest.skipUnless(os.environ.get("OCC3_ROOT_IMAGE_GPU_TESTS") == "1",
+                         "root-only actual Triton chunk-two writer test; allocates CUDA tensors")
+    def test_root_only_private_chunk_two_actual_triton_writer(self):
+        """Real writer plus manifest-applied stash; no model forward or TP proof."""
+        try:
+            import torch
+            import triton
+        except ImportError as exc:
+            self.skipTest(f"real writer dependency unavailable: {exc.name}")
+        if not torch.cuda.is_available():
+            self.skipTest("real writer requires an available CUDA GPU")
+        from sglang.kernels.ops.memory.common import write_req_to_token_pool_triton
+
+        _, _, stash, _ = self.functions(torch_module=torch)
+        # Chunk one ends within a page. Chunk two retains its private prefix and
+        # appends fresh slots, as alloc_for_extend does (one request, row 3).
+        committed, extension, capacity = 70, 19, 128
+        req, tree = request(committed, committed, end=committed), Cache()
+        table = torch.full((4, capacity), -1, dtype=torch.int32, device="cuda")
+        first = torch.arange(64, 64 + committed, dtype=torch.int32, device="cuda")
+        table[3, :committed] = first
+        tree.req_to_token_pool.req_to_token = table
+        req.prefix_indices = torch.empty(0, dtype=torch.int64, device="cuda")
+        stash(req, tree, chunked=True)
+        suffix = torch.arange(64 + committed, 64 + committed + extension,
+                              dtype=torch.int64, device="cuda")
+        indices = torch.tensor([3], dtype=torch.int64, device="cuda")
+        pre_lens = torch.tensor([committed], dtype=torch.int64, device="cuda")
+        seq_lens = torch.tensor([committed + extension], dtype=torch.int64, device="cuda")
+        extend_lens = torch.tensor([extension], dtype=torch.int64, device="cuda")
+
+        def write_chunk_two(prefix):
+            # Always reserve 2 * committed elements. Even an old int32 stash
+            # can be read as committed int64 elements entirely in-bounds.
+            backing = torch.zeros(2 * committed, dtype=prefix.dtype, device="cuda")
+            backing[:committed].copy_(prefix)
+            pointers = torch.tensor([backing.data_ptr()], dtype=torch.uint64, device="cuda")
+            result = table.clone()
+            write_req_to_token_pool_triton[(1,)](
+                result, indices, pointers, pre_lens, seq_lens, extend_lens,
+                suffix, result.stride(0),
+            )
+            torch.cuda.synchronize()  # retain backing until all pointer loads finish
+            return result
+
+        expected = table.clone()
+        expected[3, committed:committed + extension] = suffix.to(torch.int32)
+        # This assertion also rejects an old .clone() stash without an unsafe
+        # read: its padded int32 prefix produces every-other-slot values.
+        self.assertTrue(torch.equal(write_chunk_two(req.prefix_indices), expected))
+        self.assertEqual(req.prefix_indices.dtype, torch.int64)
+        narrow = write_chunk_two(first)
+        self.assertFalse(torch.equal(narrow[3, :committed], first))
+        backing = torch.cat([first, torch.zeros_like(first)])
+        self.assertTrue(torch.equal(narrow[3, :committed], backing.view(torch.int64).to(torch.int32)))
+        self.assertTrue(torch.equal(narrow[3, committed:], expected[3, committed:]))
+        self.assertTrue(torch.equal(narrow[:3], expected[:3]))
 
     def test_retraction_fence_failure_never_releases(self):
         worker=types.ModuleType("occ3_sglang.latent_worker");calls=[]
@@ -479,7 +764,10 @@ class TestPrivateCache(PinnedCase):
         """Root-only actual Torch/native paged allocator; no model or NCCL proof."""
         import hashlib
         from pathlib import Path
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("real allocator test requires Torch")
         from sglang.srt.managers import schedule_batch
         from sglang.srt.mem_cache import common
         from sglang.srt.mem_cache.base_prefix_cache import BasePrefixCache
@@ -493,7 +781,9 @@ class TestPrivateCache(PinnedCase):
                     device=device,kvcache=None,need_sort=False)
                 allocator.debug_mode=True
                 reserved=((allocated+page-1)//page)*page
-                row=allocator.alloc(reserved).reshape(1,-1)
+                # ReqToTokenPool stores int32, unlike the allocator's int64 output.
+                row=allocator.alloc(reserved).to(dtype=torch.int32).reshape(1,-1)
+                self.assertEqual(row.dtype,torch.int32)
                 self.assertEqual(allocator.available_size(),128-reserved)
                 kv=schedule_batch.ReqKvInfo(req_pool_idx=0,kv_committed_len=committed,kv_allocated_len=allocated)
                 releases=[]
@@ -511,7 +801,7 @@ class TestPrivateCache(PinnedCase):
                        occ3_scheduler=object(),occ3_kv_quarantined=False,occ3_kv_release_started=False)
                 common.maybe_cache_unfinished_req(req,tree)
                 self.assertEqual(req.prefix_indices.dtype,torch.int64)  # alloc_for_extend writer ABI
-                self.assertTrue(torch.equal(req.prefix_indices,row[0,:committed]))
+                self.assertTrue(torch.equal(req.prefix_indices,row[0,:committed].to(torch.int64)))
                 common.release_kv_cache(req,tree)
                 common.release_kv_cache(req,tree)
                 self.assertEqual(releases,[0])
@@ -527,7 +817,10 @@ class TestPrivateCache(PinnedCase):
 
     @unittest.skipUnless(os.environ.get("OCC3_ROOT_IMAGE_GPU_TESTS")=="1","root-only exact installed CUDA/native allocator test; allocates device tensors")
     def test_root_only_native_paged_allocator_cuda(self):
-        import torch
+        try:
+            import torch
+        except ImportError:
+            self.skipTest("real allocator test requires Torch")
         self.assertTrue(torch.cuda.is_available(),"explicit root GPU gate requires actual CUDA")
         self._root_actual_allocator_roundtrip("cuda")
 

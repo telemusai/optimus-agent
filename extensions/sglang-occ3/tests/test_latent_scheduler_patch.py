@@ -739,7 +739,7 @@ class TestAcceptedVisibleSpan(PinnedCase):
             events.append("row-free");actual_row_free(r)
         tree.free_kv_row=page_free;tree.req_to_token_pool.free=row_free
         # These list rows include page 0; the row page check is covered in test_latent_cache_patch.
-        private=self.sources.function("mem_cache/common.py","occ3_release_private_kv",occ3_private_row_fault=lambda *a:None)
+        private=self.sources.function("mem_cache/common.py","occ3_release_private_kv",occ3_private_release_fault=lambda *a:None)
         release=self.sources.function("mem_cache/common.py","release_kv_cache",occ3_release_private_kv=private)
         def configure(worker):
             def prefree(scheduler,r):
