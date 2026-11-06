@@ -13,7 +13,10 @@ filtered, merged or reordered batch cannot carry a stale pin. The indexer
 expands rows to logits rows itself (``row // width`` for decode,
 target-verify and draft-extend; ``token_to_batch_idx`` for ragged prefill),
 exactly the expansion ``get_seqlens_expanded()`` uses. ``forced`` receives the
-per-row maximum number of pin lanes forced in any indexer layer of the forward.
+per-row number of pin lanes forced in the forward. The indexer builds a
+logits-independent plan (row map, lane indices, validity, ``forced``) once per
+forward on its first layer and caches it on the forward batch as
+``occ3_dsa_pin_plan``; each layer then only gathers, fills and scatters.
 
 CUDA graph runners own a static ``[max_bs]`` copy (:class:`GraphPin`): the
 captured graph reads it, every replay zeroes all slots and copies the live
