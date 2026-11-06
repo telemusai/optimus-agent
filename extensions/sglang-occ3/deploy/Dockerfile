@@ -11,8 +11,8 @@
 # before and after the build, and builds with --pull=false --network=none.
 # Do not use the legacy deploy.sh/occ3_controller.py paths for a live swap.
 #
-# This layer stages the reviewed plugin sources, exactly the three reviewed
-# source manifests and the root-staged baseline/profile inputs, applies the
+# This layer stages the reviewed plugin sources, exactly the reviewed source
+# manifests listed in MANIFEST_NAMES and the root-staged baseline/profile inputs, applies the
 # pinned SGLang source overlay through deploy.v3.native_package, installs the
 # plugin package offline (no index, no build isolation, no cache, no network
 # fallback) and verifies the installed result in an isolated interpreter.
@@ -44,8 +44,9 @@ COPY pyproject.toml README.md* ./
 # CPU-only readability probe plus the offline build/packaging utilities.
 # Only these deploy/v3 files are staged; nothing else from deploy/ is used.
 COPY deploy/v3/artifact_preflight.py deploy/v3/__init__.py deploy/v3/source_patch.py deploy/v3/native_package.py deploy/v3/native_image_build.py ./deploy/v3/
-# Exactly the three reviewed source manifests, by name, from patches/.
-COPY patches/capture-eager-mtp.v1.json patches/native-startup.v2.json patches/scheduler-cache-ipc.v1.json ./native-build-inputs/
+# Exactly the reviewed source manifests named by
+# deploy.v3.native_image_build.MANIFEST_NAMES, by name, from patches/.
+COPY patches/capture-eager-mtp.v1.json patches/dsa-mtp-seed.v1.json patches/dsa-pin.v1.json patches/native-startup.v2.json patches/scheduler-cache-ipc.v1.json ./native-build-inputs/
 # Root-staged packaging inputs: the root operator stages these two files
 # into deploy/native-build-inputs/ before the build. Their absence fails
 # the build; there are no fallback inputs and no generated baselines.

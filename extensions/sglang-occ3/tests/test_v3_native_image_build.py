@@ -39,6 +39,8 @@ PROFILE = {"model_fingerprint": "fixture-fingerprint-not-production", "model_id"
            "max_ttl_seconds": 3600, "anchor_alpha": 0.0, "tile_rows": 256,
            "method": package.METHOD}
 MANIFEST_TARGETS = {"capture-eager-mtp.v1.json": "a.py",
+                    "dsa-mtp-seed.v1.json": "dsa/seed.py",
+                    "dsa-pin.v1.json": "dsa/pin.py",
                     "native-startup.v2.json": "http_server.py",
                     "scheduler-cache-ipc.v1.json": "sub/b.py"}
 
@@ -53,8 +55,10 @@ class Fixture:
         self.sg.mkdir()
         self.plugin.mkdir()
         (self.sg / "sub").mkdir()
+        (self.sg / "dsa").mkdir()
         self.originals = {"a.py": b"VALUE = 1\n", "sub/b.py": b"VALUE = 2\n",
-                          "http_server.py": b"VALUE = 3\n", "untouched.py": b"VALUE = 4\n"}
+                          "http_server.py": b"VALUE = 3\n", "untouched.py": b"VALUE = 4\n",
+                          "dsa/seed.py": b"VALUE = 5\n", "dsa/pin.py": b"VALUE = 6\n"}
         for path, raw in self.originals.items():
             (self.sg / path).write_bytes(raw)
         # CRLF bytes in one plugin source must survive staging, install and proof.
@@ -120,7 +124,7 @@ class FakeExecute:
         self.tools = {"pip": "24.0", "setuptools": "75.1.0"} if tools is None else tools
         self.pip_code = pip_code
         self.receipt = {"ok": True, "mode": "isolated-interpreter", "isolated": True,
-                        "installed_package_files": 7, "installed_sglang_files": 4,
+                        "installed_package_files": 7, "installed_sglang_files": 6,
                         "sglang_version": package.SOURCE_VERSION,
                         "distribution": "occ3-bridge==0.1.0",
                         "entry_point": "occ3_bridge=occ3_sglang.plugin:load",
@@ -183,8 +187,8 @@ def test_offline_build_receipt_reports_staged_inputs_tools_and_install(fixture, 
         assert receipt["input_receipt"][name] == {"sha256": digest(raw), "bytes": len(raw)}
     assert receipt["staged"] == {"sglang_srt_root": str(fixture.sg),
                                  "occ3_sglang_root": str(fixture.plugin),
-                                 "plugin_source_files": 5, "sg_source_files": 4,
-                                 "patched_source_files": 3}
+                                 "plugin_source_files": 5, "sg_source_files": 6,
+                                 "patched_source_files": 5}
     assert receipt["install"] == {"flags": list(nib.PIP_INSTALL_FLAGS), "offline": True,
                                  "index": False, "build_isolation": False,
                                  "network_fallback": False,
@@ -407,9 +411,12 @@ def test_oversized_spec_is_refused_before_any_child_process():
 
 
 def test_driver_constants_pin_the_finite_interface():
-    assert nib.MANIFEST_NAMES == ("capture-eager-mtp.v1.json", "native-startup.v2.json",
+    assert nib.MANIFEST_NAMES == ("capture-eager-mtp.v1.json", "dsa-mtp-seed.v1.json",
+                                  "dsa-pin.v1.json", "native-startup.v2.json",
                                   "scheduler-cache-ipc.v1.json")
-    assert nib.STAGED_NAMES == ("capture-eager-mtp.v1.json", "native-profile-input.json",
+    assert nib.MANIFEST_NAMES == tuple(sorted(nib.MANIFEST_NAMES))
+    assert nib.STAGED_NAMES == ("capture-eager-mtp.v1.json", "dsa-mtp-seed.v1.json",
+                                "dsa-pin.v1.json", "native-profile-input.json",
                                 "native-startup.v2.json", "scheduler-cache-ipc.v1.json",
                                 "source-baseline-expanded.json")
     assert nib.PIP_INSTALL_FLAGS == ("--no-index", "--no-deps", "--no-cache-dir",
@@ -577,7 +584,7 @@ def test_real_isolated_verify_proves_the_installed_tree(tmp_path):
     receipt = nib.run_isolated_verify(venv_interpreter(venv), spec)
     assert receipt["ok"] is True and receipt["mode"] == "isolated-interpreter"
     assert receipt["installed_package_files"] == len(spec["package_files"]) == 8
-    assert receipt["installed_sglang_files"] == 4
+    assert receipt["installed_sglang_files"] == 6
     assert receipt["sglang_version"] == package.SOURCE_VERSION
     assert receipt["entry_point"] == "occ3_bridge=occ3_sglang.plugin:load"
     assert receipt["runtime_imported"] is receipt["gpu_proof"] is False
@@ -832,8 +839,7 @@ def test_dockerfile_copy_set_is_bounded_to_staged_inputs():
                "deploy/v3/artifact_preflight.py", "deploy/v3/__init__.py",
                "deploy/v3/source_patch.py", "deploy/v3/native_package.py",
                "deploy/v3/native_image_build.py",
-               "patches/capture-eager-mtp.v1.json", "patches/native-startup.v2.json",
-               "patches/scheduler-cache-ipc.v1.json",
+               *("patches/" + name for name in nib.MANIFEST_NAMES),
                "deploy/native-build-inputs/source-baseline-expanded.json",
                "deploy/native-build-inputs/native-profile-input.json"}
     copies = [value for verb, value in dockerfile_instructions() if verb == "COPY"]
