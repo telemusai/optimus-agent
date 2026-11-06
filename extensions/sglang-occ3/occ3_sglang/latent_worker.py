@@ -495,6 +495,9 @@ class WorkerRuntime:
         # over-top-k consume declines pre-use; see _sparse_pin_required.
         self.dsa_pin_active = False
         self.dsa_pin_hits = 0
+        # Producer threshold margin (2 x draft-token width), also used by the
+        # unpinned admission bound (_sparse_pin_required).
+        self.sparse_pin_margin = 2
         local_error = ""
         local_layout = None
         local_pin = False
@@ -524,7 +527,18 @@ class WorkerRuntime:
                 self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None),
                 config=config)
             draft_tokens = getattr(args, "speculative_num_draft_tokens", None)
-            pin_margin = 2 * (draft_tokens if type(draft_tokens) is int and draft_tokens > 0 else 1)
+            if type(draft_tokens) is int and draft_tokens > 0:
+                pin_margin = 2 * draft_tokens
+            elif local_pin:
+                # Fable F5: no guessed margin. Without a known draft width the
+                # pin threshold could fire late, so the pin is not installed
+                # (static server arg: identical on every rank).
+                local_pin, pin_stage = False, "draft_tokens"
+            if local_pin and _deterministic_mode(torch, args):
+                # Fable F3: scatter_reduce_ (amax) raises on CUDA under
+                # torch deterministic algorithms, so every pinned forward
+                # would fault. Process-wide setting, identical on every rank.
+                local_pin, pin_stage = False, "deterministic"
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -581,6 +595,7 @@ class WorkerRuntime:
         # never let one rank admit an over-top-k consume another cannot pin.
         require(all(x["dsa_pin"] is local_layout["dsa_pin"] for x in layouts), "ranks")
         self.dsa_pin_active = local_layout["dsa_pin"] is True
+        self.sparse_pin_margin = pin_margin
         from . import dsa_pin as _dsa_pin
         # The producer pins a row only while it can exceed the top-k; the
         # inputs are static config, identical on every rank.
@@ -1061,7 +1076,13 @@ def admit_request(scheduler, req, value):
             # rows beyond the sparse top-k may be dropped from attention and a
             # completed-use receipt would be false. Inputs are rank-uniform
             # (gathered length, static config, install-time flag).
-            require(not _sparse_pin_required(runtime, len(new_ids)), "profile")
+            # With the pin inactive the bound also covers the request's
+            # output growth (Fable F1); sampling params and the scheduler's
+            # context bound are identical on every rank.
+            require(not _sparse_pin_required(
+                runtime, len(new_ids),
+                max_new_tokens=getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
+                max_context=_scheduler_max_context(scheduler)), "profile")
             if getattr(runtime, "dsa_pin_active", False) is True:
                 _require_pin_fits(runtime, count)
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
@@ -1150,17 +1171,79 @@ def release_consume_cohort(scheduler, req):
     return True
 
 
-def _sparse_pin_required(runtime, prompt_rows):
-    """True when a consume exceeds the DSA top-k and no indexer pin is active.
+_UNBOUNDED = object()
 
-    The admit preflight declines such a consume pre-use. With the pin active,
-    or at or below the top-k, the consume proceeds and _flag_sparse_topk only
-    records the regime. Bounded integers and one install-time flag only.
+
+def _sparse_pin_required(runtime, prompt_rows, max_new_tokens=_UNBOUNDED, max_context=None):
+    """True when a consume can exceed the DSA top-k and no indexer pin is active.
+
+    The admit preflight declines such a consume pre-use. With the pin active
+    the consume proceeds (the producer pins it once it can cross the top-k)
+    and _flag_sparse_topk only records the regime.
+
+    With the pin inactive the bound covers the whole sequence, not only the
+    prompt (Fable F1): a prompt at or below the top-k whose output crosses
+    it would otherwise be admitted, never pinned, and still get a receipt.
+    The request's ``max_new_tokens`` (when an int >= 0) plus the producer
+    margin (``runtime.sparse_pin_margin``, 2 x draft tokens) must stay at or
+    below the top-k. When ``max_new_tokens`` is unset (None, which the
+    scheduler treats as unbounded) the conservative choice is used: the
+    sequence may grow to the server's max context (``max_context``,
+    scheduler ``max_req_len``), so the consume declines unless that context
+    fits the top-k; an unknown context also declines. The default
+    ``max_new_tokens`` sentinel keeps the prompt-only check for callers that
+    do not pass output bounds. Bounded integers and one install-time flag.
     """
     topk = getattr(runtime, "sparse_index_topk", None)
-    if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
+    if type(topk) is not int or topk <= 0:
         return False
-    return getattr(runtime, "dsa_pin_active", False) is not True
+    if getattr(runtime, "dsa_pin_active", False) is True:
+        return False
+    if prompt_rows > topk:
+        return True
+    if max_new_tokens is _UNBOUNDED:
+        return False
+    if type(max_new_tokens) is int and max_new_tokens >= 0:
+        margin = getattr(runtime, "sparse_pin_margin", 2)
+        margin = margin if type(margin) is int and margin > 0 else 2
+        return prompt_rows + max_new_tokens + margin > topk
+    # Unset or not an int: the output is bounded only by the server context.
+    if type(max_context) is int and max_context > 0:
+        return max_context > topk
+    return True
+
+
+def _scheduler_max_context(scheduler):
+    """Server max sequence length (scheduler ``max_req_len``), or None.
+
+    Static scheduler config, identical on every rank. Falls back to the model
+    config ``context_len``; None means unknown (the caller declines).
+    """
+    value = getattr(scheduler, "max_req_len", None)
+    if type(value) is int and value > 0:
+        return value
+    value = getattr(getattr(scheduler, "model_config", None), "context_len", None)
+    return value if type(value) is int and value > 0 else None
+
+
+def _deterministic_mode(torch, args=None):
+    """True when deterministic execution is (or may be) enabled for the pin.
+
+    ``scatter_reduce_`` with ``amax`` (the pin's forced-count reduction)
+    raises on CUDA under ``torch.use_deterministic_algorithms(True)``, so the
+    pin is not installed then. SGLang's ``enable_deterministic_inference``
+    server arg is treated the same way. A torch without the query, or a
+    query that raises, counts as deterministic (pin off, fail closed).
+    """
+    if args is not None and getattr(args, "enable_deterministic_inference", False) is True:
+        return True
+    query = getattr(torch, "are_deterministic_algorithms_enabled", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:
+        return True
 
 
 def _dsa_pin_headroom_ok(topk, config):

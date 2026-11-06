@@ -1503,7 +1503,7 @@ def test_dsa_pin_install_stage_names_the_failing_stage_and_arms_the_threshold(mo
     assert 'logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)' in src
     assert "if not self.dsa_pin_active and self.rank == 0:" in src
     assert "_dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)" in src
-    assert 'pin_margin = 2 * (draft_tokens if type(draft_tokens) is int and draft_tokens > 0 else 1)' in src
+    assert "pin_margin = 2 * draft_tokens" in src
 
 
 def test_log_pin_hits_documents_the_overlap_overwrite():
@@ -1511,3 +1511,103 @@ def test_log_pin_hits_documents_the_overlap_overwrite():
     import inspect
     src = inspect.getsource(w._log_pin_hits)
     assert "overlap scheduling" in src and "occ3_dsa_pin_forced" in src
+
+
+def _admit_unpinned(monkeypatch, *, topk, max_new_tokens, max_req_len=None, active=False, margin=2):
+    d=consume(native_rid="rid")
+    record=NS(state="leased",admitted_consume=False,state_generation=123)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record, dsa_pin_active=active,
+               sparse_pin_margin=margin, preflight=lambda phase, check: check(),
+               sparse_index_topk=topk, rank=0, sparse_topk_exceeded=0)
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    r=req(); r.sampling_params=NS(custom_params=None, max_new_tokens=max_new_tokens)
+    scheduler=NS(occ3_runtime=runtime)
+    if max_req_len is not None:
+        scheduler.max_req_len=max_req_len
+    before=list(r.origin_input_ids)
+    try:
+        w.admit_request(scheduler,r,d)
+    except LatentError as error:
+        assert error.code == "profile"
+        # Declined inside validate(): nothing mutated.
+        assert list(r.origin_input_ids)==before and record.admitted_consume is False
+        assert getattr(r, "occ3_attached", False) is not True
+        return False
+    return r.occ3_attached is True
+
+
+def test_unpinned_consume_declines_when_output_can_cross_topk(monkeypatch):
+    """Fable F1: pin inactive, prompt within top-k, output crossing it -> decline."""
+    d = consume(native_rid="rid")
+    prompt = d.expected_prefix_tokens + 3   # holes + req() prompt ids
+    topk = prompt + 20
+    # prompt + max_new + margin(2) > topk: declined pre-use.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=19) is False
+    # Within bounds: admitted.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=18) is True
+    # The draft-token margin counts (margin 6 -> 14 output tokens max).
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=15, margin=6) is False
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=14, margin=6) is True
+    # Unset max_new_tokens: conservative, bounded by the server context.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None, max_req_len=topk + 1) is False
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None, max_req_len=topk) is True
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None) is False  # unknown context
+    # Pin active path unchanged: output growth is pinned by the producer.
+    assert _admit_unpinned(monkeypatch, topk=2048, max_new_tokens=10**6, active=True) is True
+    assert w._sparse_pin_required(NS(sparse_index_topk=8, dsa_pin_active=True), 10**6,
+                                  max_new_tokens=None) is False
+    # Prompt-only callers keep the old semantics; non-DSA never declines.
+    assert w._sparse_pin_required(NS(sparse_index_topk=8), 8) is False
+    assert w._sparse_pin_required(NS(), 10, max_new_tokens=None) is False
+    assert w._scheduler_max_context(NS(model_config=NS(context_len=4096))) == 4096
+    assert w._scheduler_max_context(NS(max_req_len=0)) is None
+
+
+def _install(monkeypatch, *, draft_tokens, deterministic=False, det_arg=False, query=True):
+    import types
+    runner, scheduler, group = _worker_init_env(monkeypatch, radix_match=True)
+    runner.forward_stream = NS(device="cuda:3", cuda_stream=4)
+    runner.model_config.hf_config.index_topk = 2048
+    runner.server_args.speculative_num_draft_tokens = draft_tokens
+    runner.server_args.enable_deterministic_inference = det_arg
+    monkeypatch.setattr(w, "_dsa_pin_install_stage", lambda *a, **k: (True, "ok"))
+    import builtins
+    torch_mod = builtins.__import__("torch")
+    torch_mod.distributed.get_rank = lambda group: 0  # rank-0 N3 log
+    if query:
+        monkeypatch.setattr(torch_mod, "are_deterministic_algorithms_enabled",
+                            lambda: deterministic, raising=False)
+    else:
+        monkeypatch.delattr(torch_mod, "are_deterministic_algorithms_enabled", raising=False)
+    seen = {}
+    from occ3_sglang import dsa_pin
+    monkeypatch.setattr(dsa_pin, "configure", lambda topk, margin: seen.update(topk=topk, margin=margin))
+    runtime = object.__new__(w.WorkerRuntime)
+    runtime.__init__(runner, group, profile(), scheduler=scheduler)
+    return runtime, seen
+
+
+@pytest.mark.parametrize("draft_tokens", [None, 0, -1, "4", 4.0, True])
+def test_non_positive_int_draft_tokens_turn_the_pin_off(monkeypatch, caplog, draft_tokens):
+    """Fable F5: no guessed margin; the pin is off and N3 names the stage."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="occ3_sglang.latent_worker"):
+        runtime, seen = _install(monkeypatch, draft_tokens=draft_tokens)
+    assert runtime.dsa_pin_active is False and seen["topk"] is None
+    assert any("occ3 dsa pin inactive (stage=draft_tokens)" in r.getMessage() for r in caplog.records)
+
+
+def test_positive_draft_tokens_arm_the_pin_with_twice_the_width(monkeypatch):
+    runtime, seen = _install(monkeypatch, draft_tokens=4)
+    assert runtime.dsa_pin_active is True and seen == {"topk": 2048, "margin": 8}
+    assert runtime.sparse_pin_margin == 8
+
+
+@pytest.mark.parametrize("kw", [dict(deterministic=True), dict(det_arg=True), dict(query=False)])
+def test_deterministic_mode_turns_the_pin_off(monkeypatch, caplog, kw):
+    """Fable F3: scatter_reduce_ amax raises under deterministic algorithms."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="occ3_sglang.latent_worker"):
+        runtime, seen = _install(monkeypatch, draft_tokens=4, **kw)
+    assert runtime.dsa_pin_active is False and seen["topk"] is None
+    assert any("occ3 dsa pin inactive (stage=deterministic)" in r.getMessage() for r in caplog.records)
