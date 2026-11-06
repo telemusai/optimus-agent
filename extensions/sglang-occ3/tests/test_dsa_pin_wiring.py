@@ -391,3 +391,46 @@ def test_pin_covers_every_chunk_and_decode_of_an_attached_request():
     req.occ3_force_eager = False  # cohort released after the injected chunk
     assert dsa_pin.pin_rows([req]) == ([0], [64])  # later chunks
     assert dsa_pin.pin_rows([NS(occ3_attached=False), req]) == ([0, 0], [0, 64])  # decode
+
+
+def test_two_batch_overlap_gets_no_pinned_graph_set(monkeypatch):
+    """Fable F6: TBO splits captured batches; no pinned set, pinned batches eager."""
+    import sys, types
+    from types import SimpleNamespace as NS
+    from occ3_sglang import dsa_pin
+
+    monkeypatch.setattr(dsa_pin, "_graph_runners", {})
+    monkeypatch.delenv(dsa_pin.GRAPHS_ENV, raising=False)
+    monkeypatch.delenv(dsa_pin.GRAPH_MAX_BS_ENV, raising=False)
+    mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
+    draft = NS(is_draft_worker=True, model_config=NS(hf_config=NS(index_topk=2048)))
+    exec_flag = {"value": False}
+    ctx = types.ModuleType("sglang.srt.runtime_context")
+    ctx.get_exec = lambda: NS(overlap=NS(enable_two_batch_overlap=exec_flag["value"]))
+    monkeypatch.setitem(sys.modules, ctx.__name__, ctx)
+
+    class Target: pass
+    class Draft: pass
+
+    assert dsa_pin.graph_bs(Target(), mr, [1, 2, 4]) == {1, 2, 4}
+    assert dsa_pin.graph_bs(Draft(), draft, [1, 2, 4]) == {1, 2, 4}
+    assert dsa_pin.graph_ok(2) is True
+    # Decode runner attribute (copied from get_exec at the pinned commit).
+    tbo = Target(); tbo.enable_two_batch_overlap = True
+    assert dsa_pin.graph_bs(tbo, mr, [1, 2, 4]) == frozenset()
+    assert dsa_pin.graph_ok(2) is False  # one runner without a pinned set: all eager
+    # The EAGLE runners read the global exec config (no runner attribute).
+    exec_flag["value"] = True
+    assert dsa_pin.graph_bs(Target(), mr, [1, 2, 4]) == frozenset()
+    assert dsa_pin.graph_bs(Draft(), draft, [1, 2, 4]) == frozenset()
+    assert dsa_pin.graph_ok(1) is False and dsa_pin.graph_ok(4) is False
+    exec_flag["value"] = False
+    # server_args flag also excludes.
+    tbo_mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)),
+                server_args=NS(enable_two_batch_overlap=True))
+    assert dsa_pin.graph_bs(Target(), tbo_mr, [1, 2]) == frozenset()
+    # An unreadable exec config fails closed (no pinned set).
+    def broken():
+        raise RuntimeError("no exec")
+    ctx.get_exec = broken
+    assert dsa_pin.graph_bs(Target(), mr, [1, 2]) == frozenset()

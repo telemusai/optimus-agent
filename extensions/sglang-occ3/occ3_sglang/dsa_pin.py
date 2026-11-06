@@ -261,12 +261,40 @@ def _dsa_model(model_runner):
     return type(topk) is int and topk > PIN_LANES
 
 
+def _two_batch_overlap(runner, model_runner):
+    """True when two-batch overlap (TBO) is or may be enabled.
+
+    TBO splits a captured batch into two sub-batches, which the per-row pin
+    view does not mirror, so no pinned graph set is captured and pinned
+    batches run eager in every runner (graph_ok then fails for all sizes).
+    At the pinned commit the flag is ``get_exec().overlap.
+    enable_two_batch_overlap`` (the decode runner copies it to
+    ``runner.enable_two_batch_overlap``; the EAGLE runners do not), with
+    ``server_args.enable_two_batch_overlap`` as the source. An unreadable
+    flag counts as enabled (fail closed to eager).
+    """
+    if getattr(runner, "enable_two_batch_overlap", False) is True:
+        return True
+    args = getattr(model_runner, "server_args", None)
+    if getattr(args, "enable_two_batch_overlap", False) is True:
+        return True
+    try:
+        from sglang.srt.runtime_context import get_exec
+    except Exception:
+        return False  # no runtime context (offline/test): runner and args decide
+    try:
+        return bool(get_exec().overlap.enable_two_batch_overlap)
+    except Exception:
+        return True
+
+
 def graph_bs(runner, model_runner, capture_bs):
     """Batch sizes that get a pinned graph for ``runner``; () disables it.
 
     Empty when the switch is off, the model has no DSA indexer top-k, or the
     runner keys or pads graphs in a way the pinned set does not mirror
-    (disabled padding, DP MLP gather, compact ragged verify, PD multiplexing).
+    (disabled padding, DP MLP gather, compact ragged verify, PD multiplexing,
+    two-batch overlap).
     ``OCC3_DSA_PIN_GRAPH_MAX_BS`` caps the list; the default is the full
     capture list. The result is registered for :func:`graph_ok`.
     """
@@ -277,7 +305,8 @@ def graph_bs(runner, model_runner, capture_bs):
                 and not getattr(runner, "disable_padding", False)
                 and not getattr(runner, "require_mlp_tp_gather", False)
                 and not getattr(runner, "ragged_verify_mode", False)
-                and not getattr(runner, "enable_pdmux", False)):
+                and not getattr(runner, "enable_pdmux", False)
+                and not _two_batch_overlap(runner, model_runner)):
             cap = _graph_max_bs()
             pinned = tuple(sorted(int(b) for b in capture_bs if cap is None or int(b) <= cap))
         _graph_runners[key] = (tuple(sorted(int(b) for b in capture_bs)), frozenset(pinned))
