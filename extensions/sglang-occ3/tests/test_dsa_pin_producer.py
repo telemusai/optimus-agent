@@ -130,9 +130,11 @@ def test_build_records_forced_on_target_only():
     assert dsa_pin.build(NS(reqs=[]), "cpu", record=True) is None
 
 
-def test_graph_pin_is_gone():
-    """No CUDA graph carries the pin, so the static graph buffer is removed."""
-    assert not hasattr(dsa_pin, "GraphPin")
+def test_graph_pin_is_the_static_buffer_of_the_pinned_variant_only():
+    """GraphPin backs only the pinned graph variants; build() never returns it,
+    so ordinary batches (pin None) carry no static view and do no pin work."""
+    assert hasattr(dsa_pin, "GraphPin")
+    assert dsa_pin.build(NS(reqs=[ordinary()]), "cpu", record=True) is None
 
 
 def test_build_never_raises_and_records_a_fault(monkeypatch):

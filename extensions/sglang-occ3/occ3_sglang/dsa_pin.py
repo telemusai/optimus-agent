@@ -20,11 +20,14 @@ logits-independent plan (row map, lane indices, validity, ``forced``) once per
 forward on its first layer and caches it on the forward batch as
 ``occ3_dsa_pin_plan``; each layer then only gathers, fills and scatters.
 
-No CUDA graph carries the pin. Every graph runner (prefill, decode and
-target-verify, EAGLE draft, draft-extend) captures with ``occ3_dsa_pin``
-None and its ``can_run_graph`` returns False for a batch that carries a pin,
-so ordinary batches replay the original unpinned graphs at their original
-cost and a pinned batch runs eager with this per-batch tensor.
+The original CUDA graphs never carry the pin: every graph runner captures
+them with ``occ3_dsa_pin`` None, so ordinary batches replay them at their
+original cost with no pin work. The decode-family runners (decode and
+target-verify, EAGLE draft, draft-extend) also capture a pinned variant per
+batch size that reads a static :class:`GraphPin` view; a pinned batch
+replays it when every such runner has one for its size (:func:`graph_ok`),
+otherwise it runs eager. Prefill graphs have no pinned variant: pinned
+prefill chunks run eager.
 """
 from __future__ import annotations
 
@@ -204,3 +207,171 @@ def read_forced(req):
         return None
     forced, index = held
     return max(0, min(PIN_LANES, int(forced[index].item())))
+
+
+# ---------------------------------------------------------------------------
+# Pinned CUDA graph variants
+#
+# Each decode-family graph runner (target decode/verify, EAGLE draft decode,
+# EAGLE draft extend) captures a second graph per batch size whose forward
+# batch carries a static pin view (GraphPin). The original unpinned graphs are
+# captured exactly as before and keep serving every batch without a pinned
+# row, with no pin work. A batch with a pinned row replays the pinned graph
+# for its padded batch size when every registered runner has one; otherwise
+# every runner runs it eager (the a8e98b759 behaviour). The choice is a pure
+# function of the raw batch size and static capture lists, so target, draft
+# and draft-extend always agree for a batch.
+# ---------------------------------------------------------------------------
+
+GRAPHS_ENV = "OCC3_DSA_PIN_GRAPHS"
+GRAPH_MAX_BS_ENV = "OCC3_DSA_PIN_GRAPH_MAX_BS"
+PIN_LABEL = "occ3_pin"
+
+# runner key -> (sorted capture bs tuple, frozenset of pinned bs)
+_graph_runners = {}
+
+
+def graphs_enabled():
+    """Pinned graph set switch; default ON. "0"/"false"/"off"/"no" disable it."""
+    import os
+
+    value = os.environ.get(GRAPHS_ENV, "1").strip().lower()
+    return value not in ("0", "false", "off", "no")
+
+
+def _graph_max_bs():
+    import os
+
+    raw = os.environ.get(GRAPH_MAX_BS_ENV, "").strip()
+    if not raw:
+        return None
+    try:
+        value = int(raw)
+    except ValueError:
+        logger.warning("occ3 dsa pin: ignoring non-integer %s", GRAPH_MAX_BS_ENV)
+        return None
+    return value if value >= 0 else None
+
+
+def _dsa_model(model_runner):
+    try:
+        topk = getattr(model_runner.model_config.hf_config, "index_topk", None)
+    except Exception:
+        return False
+    return type(topk) is int and topk > PIN_LANES
+
+
+def graph_bs(runner, model_runner, capture_bs):
+    """Batch sizes that get a pinned graph for ``runner``; () disables it.
+
+    Empty when the switch is off, the model has no DSA indexer top-k, or the
+    runner keys or pads graphs in a way the pinned set does not mirror
+    (disabled padding, DP MLP gather, compact ragged verify, PD multiplexing).
+    ``OCC3_DSA_PIN_GRAPH_MAX_BS`` caps the list; the default is the full
+    capture list. The result is registered for :func:`graph_ok`.
+    """
+    key = (type(runner).__name__, bool(getattr(model_runner, "is_draft_worker", False)))
+    pinned = ()
+    try:
+        if (graphs_enabled() and _dsa_model(model_runner)
+                and not getattr(runner, "disable_padding", False)
+                and not getattr(runner, "require_mlp_tp_gather", False)
+                and not getattr(runner, "ragged_verify_mode", False)
+                and not getattr(runner, "enable_pdmux", False)):
+            cap = _graph_max_bs()
+            pinned = tuple(sorted(int(b) for b in capture_bs if cap is None or int(b) <= cap))
+        _graph_runners[key] = (tuple(sorted(int(b) for b in capture_bs)), frozenset(pinned))
+    except Exception:
+        _graph_runners[key] = ((), frozenset())
+        pinned = ()
+    return frozenset(pinned)
+
+
+def graph_ok(raw_bs):
+    """True when every registered runner has a pinned graph for ``raw_bs``.
+
+    Pure function of the raw batch size and the static capture lists, so the
+    target, draft and draft-extend runners make the same pinned-graph vs
+    eager choice for a batch (no mix of graph and eager state for a pin).
+    """
+    if not _graph_runners or not graphs_enabled():
+        return False
+    try:
+        raw_bs = int(raw_bs)
+    except Exception:
+        return False
+    for capture, pinned in _graph_runners.values():
+        bucket = next((b for b in capture if b >= raw_bs), None)
+        if bucket is None or bucket not in pinned:
+            return False
+    return True
+
+
+def pinned_key(shape_key):
+    """Graph key of the pinned variant: the same key with a pin label."""
+    import dataclasses
+
+    label = getattr(shape_key, "variant_label", None)
+    label = PIN_LABEL if label is None else f"{label}+{PIN_LABEL}"
+    if dataclasses.is_dataclass(shape_key):
+        return dataclasses.replace(shape_key, variant_label=label)
+    if hasattr(shape_key, "_replace"):
+        return shape_key._replace(variant_label=label)
+    fields = ("size", "stream_idx", "variant_label", "attention_variant")
+    values = {f: getattr(shape_key, f, None) for f in fields}
+    values["variant_label"] = label
+    return type(shape_key)(**values)
+
+
+class GraphPin:
+    """Static [max_bs] pin buffers owned by one CUDA graph runner.
+
+    ``view(bs)`` is attached to the pinned capture batch so the pinned graph
+    reads these buffers. ``load`` runs before every pinned replay: it zeroes
+    all slots (padded and free slots get count 0) and copies the live rows,
+    using only fixed-shape device copies and fills. It never raises: on a
+    shape mismatch it records a fault, leaves the buffers zero and returns
+    False, so the pinned graph replays with count 0 (equal to unpinned) and
+    the OCC request fails at settle (_require_pin_evidence). ``publish``
+    copies the graph's forced counts back to the live batch's tensor.
+    """
+
+    def __init__(self, max_bs, device):
+        import torch
+
+        self.max_bs = int(max_bs)
+        self.start = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
+        self.count = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
+        self.forced = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
+
+    def view(self, bs):
+        return self.start[:bs], self.count[:bs], self.forced[:bs]
+
+    def load(self, forward_batch, raw_bs):
+        self.start.zero_()
+        self.count.zero_()
+        self.forced.zero_()
+        pin = getattr(forward_batch, "occ3_dsa_pin", None)
+        if pin is None:
+            return False
+        try:
+            if not 0 <= int(raw_bs) <= self.max_bs or pin[0].shape[0] < raw_bs \
+                    or pin[1].shape[0] < raw_bs:
+                raise ValueError("occ3_dsa_pin_shape")
+            self.start[:raw_bs].copy_(pin[0][:raw_bs])
+            self.count[:raw_bs].copy_(pin[1][:raw_bs])
+        except Exception:
+            self.start.zero_()
+            self.count.zero_()
+            note_fault(forward_batch)
+            return False
+        return True
+
+    def publish(self, forward_batch, raw_bs):
+        pin = getattr(forward_batch, "occ3_dsa_pin", None)
+        if pin is None:
+            return
+        try:
+            pin[2][:raw_bs].copy_(self.forced[:raw_bs])
+        except Exception:
+            note_fault(None)
