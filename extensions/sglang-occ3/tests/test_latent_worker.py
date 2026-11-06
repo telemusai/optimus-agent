@@ -1193,17 +1193,17 @@ def test_reserve_capture_refuses_a_v1_capture_when_collection_is_armed(caplog):
 
 
 def test_consume_admission_flags_prompts_beyond_the_sparse_indexer_topk(monkeypatch, caplog):
-    # GLM-5.3 DSA: index_topk=2048 keys per query; injected prefix rows are
-    # ordinary positions and nothing pins them into the selection.
+    # GLM-5.3 DSA: index_topk=2048 keys per query. With the indexer pin
+    # active an over-top-k consume is admitted and only flagged.
     import logging
     caplog.set_level(logging.WARNING, logger="occ3_sglang.latent_worker")
     d=consume(native_rid="rid")
     record=NS(state="leased",admitted_consume=False,state_generation=123)
-    runtime=NS(poisoned=False, resolve=lambda value, **kw: record,
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record, dsa_pin_active=True,
                preflight=lambda phase, check: check(), sparse_index_topk=8, rank=0, sparse_topk_exceeded=0)
     monkeypatch.setattr(w,"_RUNTIME",runtime)
     r=req(); w.admit_request(NS(occ3_runtime=runtime),r,d)
-    # 8 prefix holes + 3 prompt ids = 11 rows > top-k 8: flagged, never declined.
+    # 8 prefix holes + 3 prompt ids = 11 rows > top-k 8: pinned, flagged only.
     assert list(r.origin_input_ids)==[0]*8+[1,2,3]
     assert runtime.sparse_topk_exceeded==1
     assert any("sparse indexer top-k=8" in rec.getMessage() for rec in caplog.records)
@@ -1211,6 +1211,27 @@ def test_consume_admission_flags_prompts_beyond_the_sparse_indexer_topk(monkeypa
     assert w._flag_sparse_topk(NS(sparse_index_topk=11), 11) is False
     assert w._flag_sparse_topk(NS(), 10**6) is False
     assert w._flag_sparse_topk(NS(sparse_index_topk=2048, rank=1), 2049) is True
+
+
+@pytest.mark.parametrize("pin", [False, None, "yes"])
+def test_unpinned_over_topk_consume_declines_pre_use(monkeypatch, pin):
+    d=consume(native_rid="rid")
+    record=NS(state="leased",admitted_consume=False,state_generation=123)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record,
+               preflight=lambda phase, check: check(), sparse_index_topk=8, rank=0, sparse_topk_exceeded=0)
+    if pin is not None:
+        runtime.dsa_pin_active = pin
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    r=req(); before=list(r.origin_input_ids)
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(NS(occ3_runtime=runtime),r,d)
+    assert caught.value.code == "profile"
+    # Declined inside validate(): nothing mutated, no receipt path entered.
+    assert list(r.origin_input_ids)==before and record.admitted_consume is False
+    assert getattr(r, "occ3_attached", False) is not True and runtime.sparse_topk_exceeded==0
+    # At or under the bound an unpinned consume is still admitted.
+    assert w._sparse_pin_required(runtime, 8) is False
+    assert w._sparse_pin_required(NS(), 10**6) is False
 
 
 def test_release_consume_cohort_requires_complete_injection(monkeypatch):

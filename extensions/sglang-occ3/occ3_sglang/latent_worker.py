@@ -489,6 +489,10 @@ class WorkerRuntime:
         # consume admission, never a decline.
         self.sparse_index_topk = None
         self.sparse_topk_exceeded = 0
+        # True only when the DSA indexer pin (attested dsa-pin manifest plus
+        # graph-runner buffer wiring) is installed on every rank. Until then
+        # an over-top-k consume declines pre-use; see _sparse_pin_required.
+        self.dsa_pin_active = False
         local_error = ""
         local_layout = None
         stage = "init"
@@ -1030,6 +1034,11 @@ def admit_request(scheduler, req, value):
             # or KV for its rewritten prompt would park until the queue bound
             # and end in a dispatched, non-releasable admission_timeout.
             require(_consume_capacity_available(scheduler, len(new_ids)), "quota")
+            # Fail closed before any mutation: without the indexer pin, prefix
+            # rows beyond the sparse top-k may be dropped from attention and a
+            # completed-use receipt would be false. Inputs are rank-uniform
+            # (gathered length, static config, install-time flag).
+            require(not _sparse_pin_required(runtime, len(new_ids)), "profile")
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
@@ -1114,6 +1123,19 @@ def release_consume_cohort(scheduler, req):
     return True
 
 
+def _sparse_pin_required(runtime, prompt_rows):
+    """True when a consume exceeds the DSA top-k and no indexer pin is active.
+
+    The admit preflight declines such a consume pre-use. With the pin active,
+    or at or below the top-k, the consume proceeds and _flag_sparse_topk only
+    records the regime. Bounded integers and one install-time flag only.
+    """
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
+        return False
+    return getattr(runtime, "dsa_pin_active", False) is not True
+
+
 def _flag_sparse_topk(runtime, prompt_rows):
     """Flag a receiver sequence the DSA indexer can only attend sparsely.
 
@@ -1121,7 +1143,8 @@ def _flag_sparse_topk(runtime, prompt_rows):
     the sequence is longer than that. The injected prefix rows are ordinary
     positions and are not pinned into that selection, so beyond the bound the
     receiver may attend to only some of them (decode rows grow the sequence
-    further). Bounded integers only; this never declines the turn.
+    further). Informational: an unpinned over-top-k consume is already
+    declined in the admit preflight by _sparse_pin_required.
     """
     topk = getattr(runtime, "sparse_index_topk", None)
     if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
