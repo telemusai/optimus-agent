@@ -1055,7 +1055,7 @@ def admit_request(scheduler, req, value):
         # The continuous-prefix layout is a receiver concept: a capture never
         # rewrites the prompt, so its consensus value carries no offset.
         if type(descriptor) is ConsumeWorkerDescriptor:
-            layout, offset = ("marker" if descriptor.prefix_offset else "prepend"), int(descriptor.prefix_offset)
+            layout, offset = descriptor.prefix_layout, int(descriptor.prefix_offset)
         else:
             layout, offset = "capture", 0
         return {"descriptor": digest(asdict(descriptor)), "tokens": digest(list(original)),
@@ -1554,7 +1554,7 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,
-                    "prefix_layout": "marker" if descriptor.prefix_offset else "prepend",
+                    "prefix_layout": descriptor.prefix_layout,
                     "ready_ranks": runtime.profile.expected_ranks,
                     "expected_ranks": runtime.profile.expected_ranks, "num_retractions": 0,
                     "private_cache_namespace": True, "gpu_resident": bool(record.prefix.is_cuda), "completed": True}

@@ -198,18 +198,19 @@ def test_adapter_resolves_marker_and_pins_token_ids():
     assert 0 < layout.offset < len(pinned)
 
 
-def test_adapter_keeps_legacy_layout_without_marker_and_skips_tokenizer():
+def test_adapter_falls_back_to_prepend_without_marker_or_role_token():
+    # No marker and no attestable user role token (char tokenizer): the
+    # extension cannot place the prefix, so the legacy prepend layout runs
+    # with a bounded fallback reason and the prompt is not re-pinned.
     from types import SimpleNamespace as NS2
     from occ3_sglang.chat_adapter import ChatAttachmentAdapter
     adapter = ChatAttachmentAdapter()
-
-    class NoTokenizer:
-        def encode(self, *a, **k):
-            raise AssertionError("ordinary path must not tokenize")
-
     layout, pinned = adapter._prefix_layout(NS2(text="plain prompt", input_ids=None),
-                                            NS2(tokenizer=NoTokenizer()))
-    assert layout == pl.PrefixLayout(pl.LAYOUT_PREPEND, 0) and pinned is None
+                                            NS2(tokenizer=Tok()))
+    assert (layout.layout, layout.offset, pinned) == (pl.LAYOUT_PREPEND, 0, None)
+    assert layout.fallback in pl.FALLBACK_REASONS
+    layout, pinned = adapter._prefix_layout(NS2(text="plain prompt", input_ids=None), NS2())
+    assert (layout.layout, layout.fallback, pinned) == (pl.LAYOUT_PREPEND, "no_tokenizer", None)
 
 
 def test_adapter_refuses_duplicate_marker():

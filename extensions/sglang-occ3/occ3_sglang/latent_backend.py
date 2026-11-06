@@ -213,6 +213,9 @@ class LatentBackend:
         require(attachment.expires_at_epoch > time.time(), "expired")
         offset = getattr(native, "prefix_offset", 0)
         require(type(offset) is int and 0 <= offset <= 2**20, "profile")
+        layout = getattr(native, "prefix_layout", "marker" if offset else "prepend")
+        require(layout in ("prepend", "marker", "last_user")
+                and (layout != "prepend") == (offset > 0), "profile")
         self._slot(attempt_id)
         await self.refresh_readiness()
         record = await self.client.call("status", {"source_handle": attachment.state_handle,
@@ -229,7 +232,8 @@ class LatentBackend:
             model_fingerprint=attachment.model_fingerprint, method_id=attachment.method,
             tp_layout_digest=source["layout_digest"], expected_rank_count=source["expected_ranks"],
             expected_prefix_tokens=source["retained_count"], hidden_dim=source["hidden_dim"], dtype=source["dtype"],
-            deadline=native.deadline_monotonic, prefix_offset=offset)
+            deadline=native.deadline_monotonic, prefix_offset=offset,
+            prefix_layout=layout)
         reservation = self._reservation(descriptor, attachment.binding_digest, native)
         self.attempts[attempt_id] = {"descriptor": descriptor, "reservation": reservation,
                                      "principal": identity.principal_digest}
