@@ -13,7 +13,9 @@ filtered, merged or reordered batch cannot carry a stale pin. The indexer
 expands rows to logits rows itself (``row // width`` for decode,
 target-verify and draft-extend; ``token_to_batch_idx`` for ragged prefill),
 exactly the expansion ``get_seqlens_expanded()`` uses. ``forced`` receives the
-per-row number of pin lanes forced in the forward. The indexer builds a
+per-row number of pin lanes forced in the forward. A row is pinned only while
+its sequence can exceed ``index_topk`` (:func:`needs_pin`); shorter attached
+consumes carry no pin and their batches keep the ordinary graphs. The indexer builds a
 logits-independent plan (row map, lane indices, validity, ``forced``) once per
 forward on its first layer and caches it on the forward batch as
 ``occ3_dsa_pin_plan``; each layer then only gathers, fills and scatters.
@@ -40,11 +42,62 @@ faults = 0
 # Fixed lane width of the indexer pin; must stay strictly below index_topk.
 PIN_LANES = 128
 
+# Install-time threshold, set once per process by the latent runtime
+# (configure) after the rank gather: (index_topk, spec_rows). None means the
+# pin is not active on this rank and build() pins nothing. Both values are
+# static server config, identical on every rank, so the pin decision (and
+# with it the graph/eager choice) is rank-uniform.
+_threshold = None
 
-def pin_rows(reqs, shift=0):
+
+def configure(index_topk, spec_rows=1):
+    """Arm (or with ``index_topk=None`` disarm) the over-top-k pin threshold.
+
+    ``spec_rows`` is the margin a forward can add beyond the request's
+    committed tokens as seen by ``init_new``. latent_worker passes twice the
+    EAGLE draft-token width (2 without speculation): one step for this
+    forward's query rows and one for the output that overlap scheduling has
+    not appended yet. Pinning early only costs the eager path; it never
+    drops a pin that settle later requires.
+    """
+    global _threshold
+    if type(index_topk) is int and index_topk > 0:
+        rows = spec_rows if type(spec_rows) is int and spec_rows > 0 else 1
+        _threshold = (index_topk, rows)
+    else:
+        _threshold = None
+
+
+def sequence_rows(req):
+    """Committed sequence rows of a request: prompt plus visible output.
+
+    Host ints only (list lengths replicated on every rank by the scheduler).
+    Terminal settle (latent_worker._pin_evidence_required) and the producer
+    use this same count, so a receipt needs pin evidence only for a request
+    that the producer pinned on its last forward.
+    """
+    return (len(getattr(req, "origin_input_ids", ()) or ())
+            + len(getattr(req, "output_ids", ()) or ()))
+
+
+def needs_pin(req, index_topk, spec_rows=1):
+    """True when this forward's causal length can exceed ``index_topk``.
+
+    At or below the top-k the indexer already keeps every valid key, so the
+    injected rows are always selected and the pin is a no-op; such a row is
+    not pinned and its batch keeps the ordinary graphs. A receiver that grows
+    past the top-k during decode is pinned from the first forward whose rows
+    (committed rows plus this forward's ``spec_rows``) cross it.
+    """
+    return sequence_rows(req) + spec_rows > index_topk
+
+
+def pin_rows(reqs, shift=0, threshold=None):
     """Host-side (start, count) per batch row; zeros for every non-pinned row.
 
-    Only an attached consume row with a bounded descriptor is pinned.
+    Only an attached consume row with a bounded descriptor is pinned, and,
+    when ``threshold`` = (index_topk, spec_rows) is given, only while
+    :func:`needs_pin` holds for it.
     Returns None when no row is pinned, so ordinary batches carry no tensor.
     This runs inside ``ForwardBatch.init_new`` for every batch, so it never
     raises: an out-of-bounds descriptor (unreachable after admission, which
@@ -63,7 +116,9 @@ def pin_rows(reqs, shift=0):
     for req in reqs:
         descriptor = getattr(req, "occ3_worker_descriptor", None)
         start = count = 0
-        if getattr(req, "occ3_attached", False) is True and type(descriptor) is ConsumeWorkerDescriptor:
+        if (getattr(req, "occ3_attached", False) is True
+                and type(descriptor) is ConsumeWorkerDescriptor
+                and (threshold is None or needs_pin(req, *threshold))):
             count = descriptor.expected_prefix_tokens
             start = descriptor.prefix_offset
             if (type(count) is int and type(start) is int
@@ -121,8 +176,12 @@ def build(batch, device, *, record, draft=None):
 def _build(batch, device, *, record, draft):
     if draft is None:
         draft = not record
+    threshold = _threshold
+    if threshold is None:
+        # Pin not active on this rank: no over-top-k consume is admitted.
+        return None
     reqs = list(getattr(batch, "reqs", None) or ())
-    rows = pin_rows(reqs, shift=1 if draft else 0)
+    rows = pin_rows(reqs, shift=1 if draft else 0, threshold=threshold)
     if rows is None:
         return None
     import torch

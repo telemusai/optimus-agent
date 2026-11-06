@@ -8,8 +8,21 @@ from test_latent_registry import consume
 from test_latent_types import capture
 
 
-def attached(start=0, count=8):
-    return NS(occ3_attached=True,
+TOPK = 2048
+MARGIN = 2
+
+
+@pytest.fixture(autouse=True)
+def armed():
+    """The latent runtime arms the threshold at install; tests do it here."""
+    saved = dsa_pin._threshold
+    dsa_pin.configure(TOPK, MARGIN)
+    yield
+    dsa_pin._threshold = saved
+
+
+def attached(start=0, count=8, prompt=3000, output=0):
+    return NS(occ3_attached=True, origin_input_ids=[1] * prompt, output_ids=[2] * output,
               occ3_worker_descriptor=consume(prefix_offset=start, expected_prefix_tokens=count))
 
 
@@ -147,3 +160,64 @@ def test_note_fault_drops_the_batch_pin_and_logs_once(caplog):
         assert sum("occ3 dsa pin fault" in r.getMessage() for r in caplog.records) == 1
     finally:
         dsa_pin._fault_logged = saved or dsa_pin._fault_logged
+
+
+def test_short_attached_consume_carries_no_pin_and_keeps_graphs():
+    """Opus r3: at or below index_topk the pin is a no-op, so nothing is pinned.
+
+    build() returns None, so ForwardBatch.occ3_dsa_pin stays None and every
+    graph runner's can_run_graph keeps the ordinary graph for the batch.
+    """
+    torch = pytest.importorskip("torch")
+    short = attached(0, 8, prompt=1000)
+    batch = NS(reqs=[ordinary(), short])
+    assert dsa_pin.build(batch, "cpu", record=True) is None
+    assert dsa_pin.build(batch, "cpu", record=False) is None
+    assert getattr(short, "occ3_dsa_pin_forced", None) is None
+    # An over-top-k consume in the same batch is pinned; the short one is not.
+    long = attached(5, 8, prompt=4000)
+    start, count, _ = dsa_pin.build(NS(reqs=[short, long]), "cpu", record=True)
+    assert count.tolist() == [0, 8] and start.tolist() == [0, 5]
+
+
+def test_pin_turns_on_at_the_crossing_step():
+    """A receiver that grows past index_topk during decode is pinned from the
+    first forward whose committed rows plus the margin exceed the top-k."""
+    req = attached(0, 8, prompt=TOPK - 10)
+    steps = []
+    for _ in range(20):
+        steps.append(dsa_pin.pin_rows([req], threshold=dsa_pin._threshold) is not None)
+        req.output_ids.append(7)
+    first = steps.index(True)
+    assert not any(steps[:first]) and all(steps[first:])
+    # Pinned exactly when prompt + output + margin > topk.
+    assert (TOPK - 10) + first + MARGIN == TOPK + 1
+
+
+def test_disarmed_threshold_pins_nothing():
+    torch = pytest.importorskip("torch")
+    dsa_pin.configure(None)
+    assert dsa_pin.build(NS(reqs=[attached(0, 8, prompt=9000)]), "cpu", record=True) is None
+    dsa_pin.configure(TOPK, 0)  # bad margin falls back to 1
+    assert dsa_pin._threshold == (TOPK, 1)
+
+
+def test_settle_evidence_rule_matches_the_producer():
+    """Every request whose settle needs pin evidence was pinned on its last forward.
+
+    _pin_evidence_required uses sequence_rows > topk; the producer pins at
+    sequence_rows + margin > topk, which is weaker, so a requirement implies
+    a pin (and a forced record). Short consumes need no evidence and get none.
+    """
+    from occ3_sglang import latent_worker
+
+    runtime = NS(dsa_pin_active=True, sparse_index_topk=TOPK)
+    for rows in range(TOPK - 6, TOPK + 6):
+        req = attached(0, 8, prompt=rows)
+        required = latent_worker._pin_evidence_required(runtime, req)
+        pinned = dsa_pin.pin_rows([req], threshold=dsa_pin._threshold) is not None
+        assert required == (rows > TOPK)
+        assert not required or pinned
+    short = attached(0, 8, prompt=100)
+    assert latent_worker._pin_evidence_required(runtime, short) is False
+    assert dsa_pin.pin_rows([short], threshold=dsa_pin._threshold) is None

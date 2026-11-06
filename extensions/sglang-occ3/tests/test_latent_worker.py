@@ -1483,3 +1483,31 @@ def test_terminal_settle_logs_bounded_pin_hits_on_rank_zero(caplog):
     assert not caplog.records
     # No recorded pin (unpinned or eager-free row): nothing logged.
     assert w._log_pin_hits(runtime, NS(), d) is None and not caplog.records
+
+
+def test_dsa_pin_install_stage_names_the_failing_stage_and_arms_the_threshold(monkeypatch):
+    """Fable N3: deactivation names its stage once on rank 0; Opus r3: the
+    runtime arms the producer threshold from index_topk and the draft width."""
+    import inspect
+    assert w._dsa_pin_install_stage(None) == (False, "topk")
+    assert w._dsa_pin_install_stage(2048, 2) == (False, "eagle_topk")
+    from occ3_sglang import native_profile
+    def broken():
+        raise native_profile.ProfileError("profile_io")
+    monkeypatch.setattr(native_profile, "load_source_attestation", broken)
+    assert w._dsa_pin_install_stage(2048, 1) == (False, "attestation")
+    monkeypatch.setattr(native_profile, "load_source_attestation",
+                        lambda: {"manifests": [{"name": "dsa-pin.v1.json", "sha256": "a"*64}]})
+    assert w._dsa_pin_install_stage(2048, 1) == (False, "manifests")
+    src = inspect.getsource(w.LatentRuntime.__init__) if hasattr(w, "LatentRuntime") else inspect.getsource(w)
+    assert 'logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)' in src
+    assert "if not self.dsa_pin_active and self.rank == 0:" in src
+    assert "_dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)" in src
+    assert 'pin_margin = 2 * (draft_tokens if type(draft_tokens) is int and draft_tokens > 0 else 1)' in src
+
+
+def test_log_pin_hits_documents_the_overlap_overwrite():
+    """Fable N4: the overlap-scheduling overwrite of occ3_dsa_pin_forced is noted."""
+    import inspect
+    src = inspect.getsource(w._log_pin_hits)
+    assert "overlap scheduling" in src and "occ3_dsa_pin_forced" in src

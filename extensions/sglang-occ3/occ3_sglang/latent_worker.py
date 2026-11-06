@@ -498,6 +498,8 @@ class WorkerRuntime:
         local_error = ""
         local_layout = None
         local_pin = False
+        pin_margin = 2
+        pin_stage = "init"
         stage = "init"
         try:
             from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -518,9 +520,11 @@ class WorkerRuntime:
             topk = getattr(config, "index_topk", None)
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
             stage = "dsa_pin"
-            local_pin = _dsa_pin_installed(
+            local_pin, pin_stage = _dsa_pin_install_stage(
                 self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None),
                 config=config)
+            draft_tokens = getattr(args, "speculative_num_draft_tokens", None)
+            pin_margin = 2 * (draft_tokens if type(draft_tokens) is int and draft_tokens > 0 else 1)
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -577,6 +581,14 @@ class WorkerRuntime:
         # never let one rank admit an over-top-k consume another cannot pin.
         require(all(x["dsa_pin"] is local_layout["dsa_pin"] for x in layouts), "ranks")
         self.dsa_pin_active = local_layout["dsa_pin"] is True
+        from . import dsa_pin as _dsa_pin
+        # The producer pins a row only while it can exceed the top-k; the
+        # inputs are static config, identical on every rank.
+        _dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)
+        if not self.dsa_pin_active and self.rank == 0:
+            # N3: name the failing stage once so a declined over-top-k consume
+            # (code profile) can be traced to the pin.
+            logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)
         self.layout_digest = digest(layouts)
         self.consensus({"profile": profile.binding_digest, "layout": self.layout_digest})
         self.initialized = True
@@ -1196,27 +1208,40 @@ def _dsa_pin_installed(topk, eagle_topk=1, *, config=None):
     False. When present, the pin lane width must be strictly below the
     indexer top-k, and :func:`_dsa_pin_headroom_ok` must hold.
     """
+    return _dsa_pin_install_stage(topk, eagle_topk, config=config)[0]
+
+
+def _dsa_pin_install_stage(topk, eagle_topk=1, *, config=None):
+    """(installed, stage) for :func:`_dsa_pin_installed`; stage names the miss.
+
+    The stage is a closed-set ASCII label ("ok" when installed) used only
+    for the one rank-0 deactivation log line (Fable N3).
+    """
     from . import dsa_pin
 
-    if type(topk) is not int or topk <= 0 or eagle_topk != 1:
-        return False
+    if type(topk) is not int or topk <= 0:
+        return False, "topk"
+    if eagle_topk != 1:
+        return False, "eagle_topk"
     try:
         from .native_profile import load_source_attestation
         names = {entry["name"] for entry in load_source_attestation()["manifests"]}
     except Exception:
-        return False
+        return False, "attestation"
     if not {"dsa-pin.v1.json", "scheduler-cache-ipc.v1.json", "capture-eager-mtp.v1.json"} <= names:
-        return False
+        return False, "manifests"
     try:
         from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
         from sglang.srt.model_executor.forward_batch_info import ForwardBatch
     except Exception:
-        return False
+        return False, "import"
     if not (callable(getattr(Indexer, "_occ3_pin_mask", None))
             and "occ3_dsa_pin" in getattr(ForwardBatch, "__dataclass_fields__", {})):
-        return False
+        return False, "members"
     require(type(topk) is int and dsa_pin.PIN_LANES < topk, "profile")
-    return _dsa_pin_headroom_ok(topk, config)
+    if not _dsa_pin_headroom_ok(topk, config):
+        return False, "headroom"
+    return True, "ok"
 
 
 def _require_pin_fits(runtime, count):
@@ -1234,6 +1259,11 @@ def _log_pin_hits(runtime, req, descriptor):
     forward. Informational only; never part of consensus or the receipt.
     """
     from .dsa_pin import read_forced
+    # N4: under overlap scheduling the next batch's init_new may already have
+    # replaced req.occ3_dsa_pin_forced with a newer (forced, row) pair before
+    # this settle reads it. The terminal fence synchronized every stream, and
+    # the row's length still covers the span, so the newer forward forced the
+    # same count; either value is valid evidence.
     try:
         hits = read_forced(req)
     except Exception:
@@ -1256,11 +1286,16 @@ def _pin_evidence_required(runtime, req):
     longer than the indexer top-k: then the injected rows are kept in
     attention only by the pin. Rank-uniform inputs only.
     """
+    from .dsa_pin import sequence_rows
+
     topk = getattr(runtime, "sparse_index_topk", None)
     if getattr(runtime, "dsa_pin_active", False) is not True or type(topk) is not int:
         return False
-    rows = len(getattr(req, "origin_input_ids", ()) or ()) + len(getattr(req, "output_ids", ()) or ())
-    return rows > topk
+    # Same row count as the producer (dsa_pin.needs_pin). The producer pins
+    # from sequence_rows + margin > topk with margin >= this forward's rows
+    # plus one overlap step, so any request that ends above the top-k was
+    # pinned on its last target forward and recorded forced there.
+    return sequence_rows(req) > topk
 
 
 def _require_pin_evidence(runtime, req, descriptor):
