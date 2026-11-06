@@ -7,6 +7,8 @@ import unittest
 from unittest.mock import patch
 from types import SimpleNamespace as NS
 
+import numpy as np
+
 from test_latent_ipc_patch import PinnedCase
 
 
@@ -16,7 +18,46 @@ class Indices(list):
         result = super().__getitem__(key)
         return Indices(result) if isinstance(key, slice) else result
     def clone(self): return Indices(self)
+    def to(self, dtype=None, copy=False): return Indices(self)
     def numel(self): return len(self)
+
+
+class Tensor(np.ndarray):
+    """numpy stand-in for the few Torch tensor methods the OCC-3 guards call.
+
+    It keeps dtype, layout and a device label, so it can show the int32 row vs
+    int64 prefix contract. It is NOT a CUDA or Triton model.
+    """
+    def __array_finalize__(self, obj):
+        self._device = getattr(obj, "_device", "cuda:0")
+    @property
+    def device(self): return self._device  # numpy 2 ndarray.device is read-only
+    def _keep(self, out):
+        out = out.view(Tensor)
+        out._device = self._device
+        return out
+    def to(self, dtype=None, copy=False): return self._keep(np.array(self, dtype=dtype, copy=True))
+    def clone(self): return self._keep(np.array(self, copy=True))
+    def dim(self): return self.ndim
+    def is_contiguous(self): return bool(self.flags["C_CONTIGUOUS"])
+
+
+def tensor(values, dtype=np.int64, device="cuda:0"):
+    out = np.array(values, dtype=dtype).view(Tensor)
+    out._device = device
+    return out
+
+
+NP_TORCH = NS(int64=np.int64, int32=np.int32,
+              arange=lambda n, device="cuda:0": tensor(np.arange(n), device=device),
+              sort=lambda values: NS(values=np.sort(values)),
+              stack=lambda values: np.stack(values))
+
+
+class Log:
+    def __init__(self): self.records = []
+    def warning(self, *args): self.records.append(("warning",) + args)
+    def error(self, *args): self.records.append(("error",) + args)
 
 
 class RowPool:
@@ -73,6 +114,24 @@ def request(committed=5, allocated=8, end=5):
               occ3_scheduler=object(), occ3_kv_quarantined=False, occ3_kv_release_started=False)
 
 
+def page_row(pages, allocated, page=64):
+    """Page-exact slots: slot i is offset i % page of page pages[i // page]."""
+    return np.concatenate([p * page + np.arange(page) for p in pages])[:allocated]
+
+
+def paged_cache(row, page=64, pages=16):
+    """Cache whose request row 3 is an int32 table row, like ReqToTokenPool.
+
+    The allocator stub has the stock paged size, so valid pages are [1, pages].
+    """
+    tree = Cache(row=[int(slot) for slot in row], page=page)
+    table = np.zeros((4, len(row)), dtype=np.int32)
+    table[3] = row
+    tree.req_to_token_pool.req_to_token = tensor(table, np.int32)
+    tree.token_to_kv_pool_allocator = NS(page_size=page, size=page * pages)
+    return tree
+
+
 class TestPrivateCache(PinnedCase):
     def setUp(self):
         # The external fence is an explicit boundary stub in this allocator suite.
@@ -84,11 +143,15 @@ class TestPrivateCache(PinnedCase):
         self.worker_patch.start()
         self.addCleanup(self.worker_patch.stop)
 
-    def functions(self):
+    def functions(self, torch_module=NP_TORCH):
         path = "mem_cache/common.py"
         match = self.sources.function(path, "occ3_private_match", MatchResult=lambda **kwargs: NS(**kwargs))
-        release = self.sources.function(path, "occ3_release_private_kv")
-        cache = self.sources.function(path, "maybe_cache_unfinished_req", occ3_private_match=match)
+        # The page check is stubbed here; the list-based rows below include page 0.
+        # test_private_release_* exercise the real check on numpy rows.
+        release = self.sources.function(path, "occ3_release_private_kv",
+                                        occ3_private_row_fault=lambda *args: None)
+        cache = self.sources.function(path, "maybe_cache_unfinished_req", occ3_private_match=match,
+                                      torch=torch_module)
         public_release = self.sources.function(path, "release_kv_cache", occ3_release_private_kv=release)
         return match, release, cache, public_release
 
@@ -246,11 +309,13 @@ class TestPrivateCache(PinnedCase):
     @unittest.skipUnless(os.environ.get("OCC3_ROOT_IMAGE_CPU_TESTS") == "1", "root-only real Torch CPU index ownership test")
     def test_root_only_actual_torch_index_clone(self):
         import torch
-        match, _, cache, _ = self.functions()
+        match, _, cache, _ = self.functions(torch_module=torch)
         req, tree = request(), Cache()
         req.prefix_indices = torch.empty(0, dtype=torch.int64)
-        tree.req_to_token_pool.req_to_token = torch.arange(64, dtype=torch.int64).repeat(4, 1)
+        # The real ReqToTokenPool row is int32; the stash must widen it.
+        tree.req_to_token_pool.req_to_token = torch.arange(64, dtype=torch.int32).repeat(4, 1)
         cache(req, tree)
+        self.assertEqual(req.prefix_indices.dtype, torch.int64)
         self.assertEqual(req.prefix_indices.tolist(), list(range(5)))
         tree.req_to_token_pool.req_to_token[3, 0] = 999
         self.assertEqual(req.prefix_indices[0].item(), 0)
@@ -282,6 +347,118 @@ class TestPrivateCache(PinnedCase):
         self.assertEqual(len(self.fence_calls),1)
         with self.assertRaisesRegex(RuntimeError,"quarantined"):release(req,tree)
         self.assertEqual(len(tree.calls),1)
+
+    def test_private_stash_widens_int32_row_to_independent_int64_prefix(self):
+        _, _, cache, _ = self.functions()
+        req, tree = request(), Cache()
+        req.prefix_indices = tensor([])
+        table = tensor(np.arange(256).reshape(4, 64), np.int32)
+        tree.req_to_token_pool.req_to_token = table
+        cache(req, tree)
+        self.assertEqual(req.prefix_indices.dtype, np.int64)
+        # alloc_for_extend's writer loads prefix_indices through an int64 pointer.
+        as_int64 = np.frombuffer(req.prefix_indices.tobytes(), dtype=np.int64)
+        self.assertEqual(as_int64.tolist(), list(range(192, 197)))
+        req.prefix_indices[0] = -1
+        self.assertEqual(int(table[3, 0]), 192)
+
+    def test_private_prefix_fault_names_writer_abi_mismatches(self):
+        fault = self.sources.function("mem_cache/common.py", "occ3_private_prefix_fault", torch=NP_TORCH)
+        table = tensor(np.zeros((4, 64)), np.int32)
+        def req(prefix, committed=8, allocated=8, holds=True):
+            return NS(prefix_indices=prefix,
+                      kv=NS(holds_kv=holds, kv_committed_len=committed, kv_allocated_len=allocated))
+        good = tensor(range(8))
+        self.assertIsNone(fault(req(good), table))
+        self.assertIsNone(fault(req(tensor([], np.int32)), table))
+        cases = [("dtype", req(tensor(range(8), np.int32))),
+                 ("layout", req(tensor(range(16))[::2])),
+                 ("layout", req(tensor(np.arange(8).reshape(2, 4)))),
+                 ("device", req(tensor(range(8), device="cpu"))),
+                 ("length", req(tensor(range(9)))),
+                 ("length", req(good, holds=False)),
+                 ("length", req(good, allocated=6))]
+        for name, bad in cases:
+            with self.subTest(name):
+                self.assertEqual(fault(bad, table), name)
+
+    def test_bad_private_chunk_prefix_is_declined_before_the_writer(self):
+        log, aborted = Log(), []
+        common = types.ModuleType("sglang.srt.mem_cache.common")
+        common.occ3_private_prefix_fault = self.sources.function(
+            "mem_cache/common.py", "occ3_private_prefix_fault", torch=NP_TORCH)
+        decline = self.sources.function("managers/scheduler.py", "_occ3_decline_bad_private_prefix",
+                                        "Scheduler", logger=log)
+        table = tensor(np.zeros((4, 64)), np.int32)
+        def scheduler(prefix, private=True):
+            chunk = NS(rid="r1", occ3_private_prefix=private, prefix_indices=prefix,
+                       kv=NS(holds_kv=True, kv_committed_len=8, kv_allocated_len=8))
+            return NS(chunked_req=chunk, tree_cache=NS(req_to_token_pool=NS(req_to_token=table)),
+                      _occ3_abort_one=lambda req, reason: aborted.append((req, reason)))
+        with patch.dict("sys.modules", {common.__name__: common}):
+            for ok in (scheduler(tensor(range(8))), scheduler(tensor(range(8), np.int32), private=False),
+                       NS(chunked_req=None)):
+                decline(ok)
+            self.assertEqual(aborted, [])
+            bad = scheduler(tensor(range(8), np.int32))  # the pre-fix int32 copy
+            decline(bad)
+        self.assertEqual(aborted, [(bad.chunked_req, "private_prefix_invalid")])
+        self.assertEqual([record[0] for record in log.records], ["error"])
+        # The decline runs after the chunk stash and before the chunk's next round,
+        # so the raw-pointer writer in prepare_for_extend never sees a bad prefix.
+        text = self.sources.text["managers/scheduler.py"]
+        start = text.index("    def _get_new_batch_prefill_raw(")
+        body = text[start:text.index("\n    def ", start + 1)]
+        guard = body.index("self._occ3_decline_bad_private_prefix()")
+        self.assertLess(guard, body.index("self.chunked_req.init_next_round_input()"))
+        self.assertLess(guard, body.index("add_chunked_req("))
+        self.assertLess(guard, body.index("prepare_for_extend("))
+
+    def test_private_row_fault_requires_page_exact_unique_in_range_rows(self):
+        fault = self.sources.function("mem_cache/common.py", "occ3_private_row_fault", torch=NP_TORCH)
+        def check(row):
+            return fault(paged_cache(row), Kv(index=3), len(row))
+        good = page_row([7, 3, 12], 138)  # nonconsecutive pages, partial last page
+        self.assertIsNone(check(good))
+        self.assertIsNone(check(page_row([16], 1)))
+        shifted = good.copy(); shifted[64 + 5] += 1
+        straddle = good.copy(); straddle[96:128] = 4 * 64 + np.arange(32, 64)
+        # Pre-fix shape: an int32 row loaded through an int64 pointer and stored
+        # back as int32 keeps every other slot.
+        half = good.astype(np.int32).view(np.int64).astype(np.int32)
+        scrambled = np.concatenate([half, half])
+        cases = [("layout", shifted), ("layout", straddle), ("layout", scrambled),
+                 ("range", page_row([0, 3], 100)), ("range", page_row([7, 17], 100)),
+                 ("duplicate", page_row([7, 3, 7], 138))]
+        for name, row in cases:
+            with self.subTest(name):
+                self.assertEqual(check(row), name)
+
+    def test_private_release_leaks_untrusted_row_and_frees_exact_pages(self):
+        log = Log()
+        fault = self.sources.function("mem_cache/common.py", "occ3_private_row_fault", torch=NP_TORCH)
+        release = self.sources.function("mem_cache/common.py", "occ3_release_private_kv",
+                                        occ3_private_row_fault=fault, logger=log)
+        req, tree = request(138, 138), paged_cache(page_row([7, 3, 12], 138))
+        release(req, tree)
+        self.assertEqual(tree.calls, [("free", [(0, 138)])])
+        self.assertEqual(tree.freed_pages, {7, 3, 12})
+        self.assertTrue(req.occ3_kv_released)
+        self.assertEqual(log.records, [])
+        for row in (page_row([7, 3, 7], 138), page_row([0, 3], 100)):
+            req, tree = request(len(row), len(row)), paged_cache(row)
+            release(req, tree)
+            release(req, tree)  # the leaked row is not retried
+            self.assertEqual(tree.calls, [])
+            self.assertEqual(tree.freed_pages, set())
+            self.assertEqual(tree.req_to_token_pool.frees, 1)
+            self.assertTrue(req.occ3_kv_quarantined)
+            self.assertFalse(req.occ3_kv_released)
+            self.assertFalse(req.kv.holds_kv)
+            self.assertEqual(req.kv.kv_allocated_len, 0)
+        self.assertEqual([(record[0], record[3]) for record in log.records],
+                         [("warning", "duplicate"), ("warning", "range")])
+        self.assertEqual(len(self.fence_calls), 3)
 
     def test_retraction_fence_failure_never_releases(self):
         worker=types.ModuleType("occ3_sglang.latent_worker");calls=[]
@@ -333,6 +510,7 @@ class TestPrivateCache(PinnedCase):
                        extend_range=NS(end=committed),extra_key=None,occ3_kv_released=False,
                        occ3_scheduler=object(),occ3_kv_quarantined=False,occ3_kv_release_started=False)
                 common.maybe_cache_unfinished_req(req,tree)
+                self.assertEqual(req.prefix_indices.dtype,torch.int64)  # alloc_for_extend writer ABI
                 self.assertTrue(torch.equal(req.prefix_indices,row[0,:committed]))
                 common.release_kv_cache(req,tree)
                 common.release_kv_cache(req,tree)
