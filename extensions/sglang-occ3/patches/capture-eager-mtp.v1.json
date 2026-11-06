@@ -109,44 +109,100 @@
     {
       "path": "model_executor/runner/decode_cuda_graph_runner.py",
       "before_sha256": "1ec64d53550012a006d2fb7acbcabeefb6d3a3729864373d870314aed19f94cd",
-      "after_sha256": "260e2fde8c62dcfaf1141ea28662afebb65ceb67628ef8f0e106e90dcfb5e0ed",
+      "after_sha256": "35b1484ddede3aca84fafc0ff2af43c9a868e4a81f5ddc8b54ac47f122d5ac08",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
-          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n        # OCC-3 DSA pin: ordinary batches (no pinned row) replay the original\n        # unpinned graphs with no pin work. A batch with a pinned row (an\n        # over-top-k attached consume) replays the pinned graph variant when\n        # every decode-family runner captured one for its batch size;\n        # otherwise every runner runs it eager. The test reads only the host\n        # row count and static capture lists, so target, draft and\n        # draft-extend make the same choice.\n        occ3_pin = getattr(forward_batch, \"occ3_dsa_pin\", None)\n        if occ3_pin is not None:\n            from occ3_sglang.dsa_pin import graph_ok as _occ3_pin_graph_ok\n\n            if not getattr(self, \"_occ3_pin_bs\", None) or not _occ3_pin_graph_ok(\n                occ3_pin[1].shape[0]\n            ):\n                return False\n\n"
+        },
+        {
+          "before": "        # Init PDMux if needed\n        self.maybe_init_pdmux()\n",
+          "after": "        # Init PDMux if needed\n        self.maybe_init_pdmux()\n        # OCC-3 DSA pin: a second, pinned graph per batch size (same pool,\n        # captured right after the unpinned one). Empty when switched off\n        # (OCC3_DSA_PIN_GRAPHS=0), capped by OCC3_DSA_PIN_GRAPH_MAX_BS.\n        from occ3_sglang import dsa_pin as _occ3_dsa_pin\n\n        self._occ3_pin_capture = False\n        self._occ3_pin_bs = _occ3_dsa_pin.graph_bs(self, model_runner, self.capture_bs)\n        self._occ3_dsa_pin = (\n            _occ3_dsa_pin.GraphPin(self.max_bs, model_runner.device)\n            if self._occ3_pin_bs\n            else None\n        )\n"
+        },
+        {
+          "before": "        return ShapeKey(\n            size=size,\n            stream_idx=stream_idx,\n            variant_label=variant_label,\n            attention_variant=attention_variant,\n        )\n",
+          "after": "        key = ShapeKey(\n            size=size,\n            stream_idx=stream_idx,\n            variant_label=variant_label,\n            attention_variant=attention_variant,\n        )\n        if getattr(self, \"_occ3_pin_capture\", False):\n            from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n            return _occ3_pinned_key(key)\n        return key\n"
+        },
+        {
+          "before": "        if buffers.ngram_embedding_info is not None:\n            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)\n\n        return forward_batch, attn_backend, pp_proxy_tensors\n",
+          "after": "        if buffers.ngram_embedding_info is not None:\n            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)\n\n        if getattr(self, \"_occ3_pin_capture\", False):\n            # Pinned variant: the graph reads the runner's static pin buffers.\n            forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(bs)\n        return forward_batch, attn_backend, pp_proxy_tensors\n"
+        },
+        {
+          "before": "                        self.capture_one_shape(\n                            bs,\n                            forward,\n                            stream_idx,\n                            variant_label,\n                            attention_variant,\n                        )\n",
+          "after": "                        self.capture_one_shape(\n                            bs,\n                            forward,\n                            stream_idx,\n                            variant_label,\n                            attention_variant,\n                        )\n                        if bs in getattr(self, \"_occ3_pin_bs\", ()):\n                            # OCC-3 DSA pin: pinned variant of the same shape,\n                            # same capture session and graph memory pool.\n                            self._occ3_pin_capture = True\n                            try:\n                                self.capture_one_shape(\n                                    bs,\n                                    forward,\n                                    stream_idx,\n                                    variant_label,\n                                    attention_variant,\n                                )\n                            finally:\n                                self._occ3_pin_capture = False\n"
+        },
+        {
+          "before": "            self.load_batch(forward_batch, pp_proxy_tensors)\n",
+          "after": "            self.load_batch(forward_batch, pp_proxy_tensors)\n            occ3_pinned = (\n                getattr(forward_batch, \"occ3_dsa_pin\", None) is not None\n                and getattr(self, \"_occ3_dsa_pin\", None) is not None\n            )\n            if occ3_pinned:\n                from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n                # Zero the static pin buffers, load the live pin, replay the\n                # pinned variant. A load mismatch notes a fault and leaves\n                # count 0 (unpinned result); the OCC request fails at settle.\n                self._occ3_dsa_pin.load(forward_batch, forward_batch.batch_size)\n                self._replay_graph_key = _occ3_pinned_key(self._replay_graph_key)\n                if envs.SGLANG_LOG_DECODE_GRAPH_KEY.get():\n                    logger.info(\n                        \"Decode graph replay: occ3 pinned variant=%s\",\n                        self._replay_graph_key.variant_label,\n                    )\n"
+        },
+        {
+          "before": "            output = self.backend.replay(self._replay_graph_key, forward_batch)\n",
+          "after": "            output = self.backend.replay(self._replay_graph_key, forward_batch)\n            if occ3_pinned:\n                self._occ3_dsa_pin.publish(forward_batch, forward_batch.batch_size)\n"
         }
       ]
     },
     {
       "path": "model_executor/runner/prefill_cuda_graph_runner.py",
       "before_sha256": "3f9c35d036ed8c4469c262f6cc00084987deafc9787721d5d3475e93dcafcd6f",
-      "after_sha256": "acdc3858c086a88cf64b91cd4f0b9e7daf82654e8fa5873c97405bb164e3bdf6",
+      "after_sha256": "88a31ba20d7a512a2c31039509fc5cb93294bacd17ec1f1166c47c12e4cfb018",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n",
-          "after": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+          "after": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n        # The prefill graphs carry no OCC-3 DSA pin buffer: every chunk of an\n        # attached consume (after its injected chunk left the eager cohort)\n        # runs eager so the indexer applies the pin. Ordinary batches without\n        # a pinned row keep the prefill graph.\n        if getattr(forward_batch, \"occ3_dsa_pin\", None) is not None:\n            return False\n\n"
         }
       ]
     },
     {
       "path": "speculative/eagle_draft_cuda_graph_runner.py",
       "before_sha256": "cb3d031b739a9aa7f2a1b02bd289b6673652818482502ced101a6f506c7a8e9f",
-      "after_sha256": "6fe337333487ab669b6ee0ca9a67781f577226af2820acfc10a255d4ebf9b63b",
+      "after_sha256": "46019a13964d3a2b6e4cf50693c15a38628b8722809b3fb748741f86ba590bae",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
-          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n        # OCC-3 DSA pin: ordinary batches (no pinned row) replay the original\n        # unpinned graphs with no pin work. A batch with a pinned row (an\n        # over-top-k attached consume) replays the pinned graph variant when\n        # every decode-family runner captured one for its batch size;\n        # otherwise every runner runs it eager. The test reads only the host\n        # row count and static capture lists, so target, draft and\n        # draft-extend make the same choice.\n        occ3_pin = getattr(forward_batch, \"occ3_dsa_pin\", None)\n        if occ3_pin is not None:\n            from occ3_sglang.dsa_pin import graph_ok as _occ3_pin_graph_ok\n\n            if not getattr(self, \"_occ3_pin_bs\", None) or not _occ3_pin_graph_ok(\n                occ3_pin[1].shape[0]\n            ):\n                return False\n\n"
+        },
+        {
+          "before": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n",
+          "after": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n        # OCC-3 DSA pin: a second, pinned graph per batch size (same pool,\n        # captured right after the unpinned one). Empty when switched off\n        # (OCC3_DSA_PIN_GRAPHS=0), capped by OCC3_DSA_PIN_GRAPH_MAX_BS.\n        from occ3_sglang import dsa_pin as _occ3_dsa_pin\n\n        self._occ3_pin_capture = False\n        self._occ3_pin_bs = _occ3_dsa_pin.graph_bs(self, model_runner, self.capture_bs)\n        self._occ3_dsa_pin = (\n            _occ3_dsa_pin.GraphPin(self.max_bs, model_runner.device)\n            if self._occ3_pin_bs\n            else None\n        )\n"
+        },
+        {
+          "before": "        return ShapeKey(size=bs)\n",
+          "after": "        if getattr(self, \"_occ3_pin_capture\", False):\n            from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n            return _occ3_pinned_key(ShapeKey(size=bs))\n        return ShapeKey(size=bs)\n"
+        },
+        {
+          "before": "        def run_once():\n            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)\n",
+          "after": "        # OCC-3 DSA pin: only the pinned variant's capture batch carries the\n        # runner's static pin view; the unpinned capture is unchanged.\n        if getattr(self, \"_occ3_pin_capture\", False):\n            forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(num_seqs)\n\n        def run_once():\n            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)\n"
+        },
+        {
+          "before": "        # Replay via backend\n        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft\"):\n            out = self._replay_graph(shape_key, forward_batch)\n",
+          "after": "        # Replay via backend\n        shape_key = self._make_graph_key(bs)\n        occ3_pinned = (\n            getattr(forward_batch, \"occ3_dsa_pin\", None) is not None\n            and getattr(self, \"_occ3_dsa_pin\", None) is not None\n        )\n        if occ3_pinned:\n            from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n            # Zero, load the live (draft-shifted) pin, replay the pinned variant.\n            self._occ3_dsa_pin.load(forward_batch, raw_bs)\n            shape_key = _occ3_pinned_key(shape_key)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft\"):\n            out = self._replay_graph(shape_key, forward_batch)\n        if occ3_pinned:\n            self._occ3_dsa_pin.publish(forward_batch, raw_bs)\n"
         }
       ]
     },
     {
       "path": "speculative/eagle_draft_extend_cuda_graph_runner.py",
       "before_sha256": "4b5fe702938aae7d698578c6ffd31fd93766e2ad6c4210c19a75df03ea8a7f09",
-      "after_sha256": "314a986760c9be6559af5b032f6e5c4a6eb6668d5ee6eba4819d9436f2fd8ee7",
+      "after_sha256": "617cba937306ec0ff1c46c00021448da88315a07f184a14a99cd5c4413d98c76",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
-          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+          "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n        # OCC-3 DSA pin: ordinary batches (no pinned row) replay the original\n        # unpinned graphs with no pin work. A batch with a pinned row (an\n        # over-top-k attached consume) replays the pinned graph variant when\n        # every decode-family runner captured one for its batch size;\n        # otherwise every runner runs it eager. The test reads only the host\n        # row count and static capture lists, so target, draft and\n        # draft-extend make the same choice.\n        occ3_pin = getattr(forward_batch, \"occ3_dsa_pin\", None)\n        if occ3_pin is not None:\n            from occ3_sglang.dsa_pin import graph_ok as _occ3_pin_graph_ok\n\n            if not getattr(self, \"_occ3_pin_bs\", None) or not _occ3_pin_graph_ok(\n                occ3_pin[1].shape[0]\n            ):\n                return False\n\n"
+        },
+        {
+          "before": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n",
+          "after": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n        # OCC-3 DSA pin: a second, pinned graph per batch size (same pool,\n        # captured right after the unpinned one). Empty when switched off\n        # (OCC3_DSA_PIN_GRAPHS=0), capped by OCC3_DSA_PIN_GRAPH_MAX_BS.\n        from occ3_sglang import dsa_pin as _occ3_dsa_pin\n\n        self._occ3_pin_capture = False\n        self._occ3_pin_bs = _occ3_dsa_pin.graph_bs(self, model_runner, self.capture_bs)\n        self._occ3_dsa_pin = (\n            _occ3_dsa_pin.GraphPin(self.max_bs, model_runner.device)\n            if self._occ3_pin_bs\n            else None\n        )\n"
+        },
+        {
+          "before": "        return ShapeKey(size=bs)\n",
+          "after": "        if getattr(self, \"_occ3_pin_capture\", False):\n            from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n            return _occ3_pinned_key(ShapeKey(size=bs))\n        return ShapeKey(size=bs)\n"
+        },
+        {
+          "before": "        def run_once():\n            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)\n",
+          "after": "        # OCC-3 DSA pin: only the pinned variant's capture batch carries the\n        # runner's static pin view; the unpinned capture is unchanged.\n        if getattr(self, \"_occ3_pin_capture\", False):\n            forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(bs)\n\n        def run_once():\n            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)\n"
+        },
+        {
+          "before": "        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft_extend\"):\n            out = self._replay_graph(shape_key, forward_batch)\n",
+          "after": "        shape_key = self._make_graph_key(bs)\n        occ3_pinned = (\n            getattr(forward_batch, \"occ3_dsa_pin\", None) is not None\n            and getattr(self, \"_occ3_dsa_pin\", None) is not None\n        )\n        if occ3_pinned:\n            from occ3_sglang.dsa_pin import pinned_key as _occ3_pinned_key\n\n            # Zero, load the live (draft-shifted) pin, replay the pinned variant.\n            self._occ3_dsa_pin.load(forward_batch, raw_bs)\n            shape_key = _occ3_pinned_key(shape_key)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft_extend\"):\n            out = self._replay_graph(shape_key, forward_batch)\n        if occ3_pinned:\n            self._occ3_dsa_pin.publish(forward_batch, raw_bs)\n"
         }
       ]
     },

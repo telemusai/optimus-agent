@@ -1193,24 +1193,48 @@ def test_reserve_capture_refuses_a_v1_capture_when_collection_is_armed(caplog):
 
 
 def test_consume_admission_flags_prompts_beyond_the_sparse_indexer_topk(monkeypatch, caplog):
-    # GLM-5.3 DSA: index_topk=2048 keys per query; injected prefix rows are
-    # ordinary positions and nothing pins them into the selection.
+    # GLM-5.3 DSA: index_topk=2048 keys per query. With the indexer pin
+    # active an over-top-k consume is admitted and only flagged.
     import logging
+    from occ3_sglang import dsa_pin
     caplog.set_level(logging.WARNING, logger="occ3_sglang.latent_worker")
+    # Toy bound: 8 pin lanes strictly below a top-k of 9 (live: 128 < 2048).
+    monkeypatch.setattr(dsa_pin, "PIN_LANES", 8)
     d=consume(native_rid="rid")
     record=NS(state="leased",admitted_consume=False,state_generation=123)
-    runtime=NS(poisoned=False, resolve=lambda value, **kw: record,
-               preflight=lambda phase, check: check(), sparse_index_topk=8, rank=0, sparse_topk_exceeded=0)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record, dsa_pin_active=True,
+               preflight=lambda phase, check: check(), sparse_index_topk=9, rank=0, sparse_topk_exceeded=0)
     monkeypatch.setattr(w,"_RUNTIME",runtime)
     r=req(); w.admit_request(NS(occ3_runtime=runtime),r,d)
-    # 8 prefix holes + 3 prompt ids = 11 rows > top-k 8: flagged, never declined.
+    # 8 prefix holes + 3 prompt ids = 11 rows > top-k 9: pinned, flagged only.
     assert list(r.origin_input_ids)==[0]*8+[1,2,3]
     assert runtime.sparse_topk_exceeded==1
-    assert any("sparse indexer top-k=8" in rec.getMessage() for rec in caplog.records)
+    assert any("sparse indexer top-k=9 (dsa_pin_active=1" in rec.getMessage() for rec in caplog.records)
     # At or under the bound nothing is flagged; an unknown bound never flags.
     assert w._flag_sparse_topk(NS(sparse_index_topk=11), 11) is False
     assert w._flag_sparse_topk(NS(), 10**6) is False
     assert w._flag_sparse_topk(NS(sparse_index_topk=2048, rank=1), 2049) is True
+
+
+@pytest.mark.parametrize("pin", [False, None, "yes"])
+def test_unpinned_over_topk_consume_declines_pre_use(monkeypatch, pin):
+    d=consume(native_rid="rid")
+    record=NS(state="leased",admitted_consume=False,state_generation=123)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record,
+               preflight=lambda phase, check: check(), sparse_index_topk=8, rank=0, sparse_topk_exceeded=0)
+    if pin is not None:
+        runtime.dsa_pin_active = pin
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    r=req(); before=list(r.origin_input_ids)
+    with pytest.raises(LatentError) as caught:
+        w.admit_request(NS(occ3_runtime=runtime),r,d)
+    assert caught.value.code == "profile"
+    # Declined inside validate(): nothing mutated, no receipt path entered.
+    assert list(r.origin_input_ids)==before and record.admitted_consume is False
+    assert getattr(r, "occ3_attached", False) is not True and runtime.sparse_topk_exceeded==0
+    # At or under the bound an unpinned consume is still admitted.
+    assert w._sparse_pin_required(runtime, 8) is False
+    assert w._sparse_pin_required(NS(), 10**6) is False
 
 
 def test_release_consume_cohort_requires_complete_injection(monkeypatch):
@@ -1261,3 +1285,329 @@ def test_abort_request_is_latched_after_retire(monkeypatch):
     w.abort_request(NS(occ3_runtime=runtime), request, "cancelled")
     w.abort_request(NS(occ3_runtime=runtime), request, "cancelled")  # overshoot tick
     assert calls == ["abort_fence", "fence", "retire"]
+
+
+def test_pinned_admission_asserts_pin_lanes_below_topk(monkeypatch):
+    # With the pin active the forced span must fit 128 lanes < index_topk.
+    def run(topk, tokens):
+        record=NS(state="leased",admitted_consume=False,state_generation=123)
+        runtime=NS(poisoned=False, resolve=lambda value, **kw: record, dsa_pin_active=True,
+                   preflight=lambda phase, check: check(), sparse_index_topk=topk, rank=0,
+                   sparse_topk_exceeded=0)
+        monkeypatch.setattr(w,"_RUNTIME",runtime)
+        r=req(); w.admit_request(NS(occ3_runtime=runtime),r,consume(native_rid="rid",
+                                                                expected_prefix_tokens=tokens))
+        return r
+    assert run(2048, 128).occ3_attached is True
+    for topk in (128, 64, None):
+        with pytest.raises(LatentError) as caught:
+            run(topk, 8)
+        assert caught.value.code == "profile"
+    w._require_pin_fits(NS(sparse_index_topk=2048), 1)
+    for count in (0, 129, "8"):
+        with pytest.raises(LatentError):
+            w._require_pin_fits(NS(sparse_index_topk=2048), count)
+
+
+def test_dsa_pin_installed_requires_attested_manifests_and_patched_members(monkeypatch):
+    import types
+    from occ3_sglang import native_profile
+    names = ["capture-eager-mtp.v1.json", "dsa-pin.v1.json", "native-startup.v2.json",
+             "scheduler-cache-ipc.v1.json"]
+    def attest(manifests):
+        monkeypatch.setattr(native_profile, "load_source_attestation",
+                            lambda: {"manifests": [{"name": n, "sha256": "a"*64} for n in manifests]})
+    indexer = types.ModuleType("sglang.srt.layers.attention.dsa.dsa_indexer")
+    fbi = types.ModuleType("sglang.srt.model_executor.forward_batch_info")
+    class Indexer:
+        @staticmethod
+        def _occ3_pin_mask(*a): pass
+    class ForwardBatch:
+        __dataclass_fields__ = {"occ3_dsa_pin": None}
+    indexer.Indexer, fbi.ForwardBatch = Indexer, ForwardBatch
+    monkeypatch.setitem(sys.modules, indexer.__name__, indexer)
+    monkeypatch.setitem(sys.modules, fbi.__name__, fbi)
+    attest(names)
+    assert w._dsa_pin_installed(2048) is True
+    assert w._dsa_pin_installed(2048, 1) is True
+    with pytest.raises(LatentError):
+        w._dsa_pin_installed(128)
+    # N10: a model without an integer indexer top-k is simply not pinned.
+    for topk in (None, 0, -1, "2048", 2048.0):
+        assert w._dsa_pin_installed(topk) is False
+    # N5: EAGLE top-k > 1 (or unknown) breaks the paged row map; not installed.
+    for eagle in (2, 4, None, 0):
+        assert w._dsa_pin_installed(2048, eagle) is False
+    # A missing manifest (the pre-fix 3-manifest image) fails closed.
+    attest([n for n in names if n != "dsa-pin.v1.json"])
+    assert w._dsa_pin_installed(2048) is False
+    attest([n for n in names if n != "capture-eager-mtp.v1.json"])
+    assert w._dsa_pin_installed(2048) is False
+    attest(names)
+    del ForwardBatch.__dataclass_fields__["occ3_dsa_pin"]
+    assert w._dsa_pin_installed(2048) is False
+    def broken():
+        raise native_profile.ProfileError("profile_io")
+    monkeypatch.setattr(native_profile, "load_source_attestation", broken)
+    assert w._dsa_pin_installed(2048) is False
+
+
+def test_dsa_pin_installed_requires_init_local_headroom_and_mtp_width(monkeypatch):
+    """Opus notes: init+local+128 <= index_topk; MTP seed width == index_topk."""
+    import types
+    from occ3_sglang import native_profile
+    names = ["capture-eager-mtp.v1.json", "dsa-pin.v1.json", "scheduler-cache-ipc.v1.json"]
+    monkeypatch.setattr(native_profile, "load_source_attestation",
+                        lambda: {"manifests": [{"name": n, "sha256": "a"*64} for n in names]})
+    indexer = types.ModuleType("sglang.srt.layers.attention.dsa.dsa_indexer")
+    fbi = types.ModuleType("sglang.srt.model_executor.forward_batch_info")
+    class Indexer:
+        @staticmethod
+        def _occ3_pin_mask(*a): pass
+    class ForwardBatch:
+        __dataclass_fields__ = {"occ3_dsa_pin": None}
+    indexer.Indexer, fbi.ForwardBatch = Indexer, ForwardBatch
+    monkeypatch.setitem(sys.modules, indexer.__name__, indexer)
+    monkeypatch.setitem(sys.modules, fbi.__name__, fbi)
+    width = {"value": 2048}
+    mc = types.ModuleType("sglang.srt.configs.model_config")
+    mc.get_dsa_mtp_topk_width = lambda config: width["value"]
+    monkeypatch.setitem(sys.modules, mc.__name__, mc)
+    cfg = lambda **k: NS(**{"index_init_tokens": 0, "index_local_tokens": 0,
+                            "index_share_for_mtp_iteration": True, **k})
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is True
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=1000,
+                                                    index_local_tokens=920)) is True
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=1000,
+                                                    index_local_tokens=921)) is False
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=-1)) is False
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_local_tokens="4")) is False
+    width["value"] = 1024
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is False
+    # Without the MTP IndexShare seed the width is not consulted.
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_share_for_mtp_iteration=False)) is True
+    def broken(config):
+        raise RuntimeError("missing")
+    mc.get_dsa_mtp_topk_width = broken
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is False
+    # Install passes the model config through.
+    import inspect
+    src = inspect.getsource(w)
+    assert 'getattr(args, "speculative_eagle_topk", None),\n                config=config)' in src
+
+
+def _evidence_runtime(ok_by_rank=None, topk=2048, active=True):
+    gathered = []
+    def gather(value):
+        gathered.append(value)
+        others = ok_by_rank if ok_by_rank is not None else []
+        return [value] + [{"phase": "pin_evidence", "ok": ok} for ok in others]
+    return NS(rank=0, dsa_pin_active=active, dsa_pin_hits=0, sparse_index_topk=topk,
+              gather=gather, gathered=gathered)
+
+
+def test_terminal_pin_evidence_gate_fails_only_the_request(caplog):
+    """Opus #2: an over-top-k consume needs pin-hit evidence for a receipt."""
+    import logging
+    torch = pytest.importorskip("torch")
+    from occ3_sglang import dsa_pin
+    caplog.set_level(logging.INFO, logger="occ3_sglang.latent_worker")
+    d = consume(native_rid="rid", expected_prefix_tokens=96, prefix_offset=900)
+    def request(forced_value, rows=3000, faults0=None):
+        held = None
+        if forced_value is not None:
+            held = (torch.tensor([forced_value], dtype=torch.int32), 0)
+        return NS(occ3_dsa_pin_forced=held, origin_input_ids=[1] * rows, output_ids=[2] * 4,
+                  occ3_dsa_pin_faults0=dsa_pin.faults if faults0 is None else faults0)
+    # Full evidence on every rank: receipt allowed, one gather.
+    rt = _evidence_runtime([True] * 7)
+    assert w._require_pin_evidence(rt, request(96), d) is True
+    assert len(rt.gathered) == 1
+    # Missing record, forced < count, a fault since admission, or another rank's miss.
+    for req_, others in ((request(None), [True] * 7), (request(95), [True] * 7),
+                         (request(96, faults0=dsa_pin.faults - 1), [True] * 7),
+                         (request(96), [True] * 6 + [False])):
+        with pytest.raises(LatentError) as caught:
+            w._require_pin_evidence(_evidence_runtime(others), req_, d)
+        assert caught.value.code == "numerical"
+    assert any("pin evidence missing" in r.getMessage() for r in caplog.records)
+    # At or below top-k, or pin inactive: no evidence needed and no gather.
+    rt = _evidence_runtime([True] * 7)
+    assert w._require_pin_evidence(rt, request(None, rows=2000), d) is True
+    rt2 = _evidence_runtime([True] * 7, active=False)
+    assert w._require_pin_evidence(rt2, request(None), d) is True
+    assert rt.gathered == [] and rt2.gathered == []
+
+
+def test_terminal_settle_checks_pin_evidence_before_the_receipt():
+    import inspect
+    src = inspect.getsource(w.commit_result)
+    fence = src.index('runtime.preflight("terminal_fence"')
+    gate = src.index("_require_pin_evidence(runtime, req, descriptor)")
+    receipt = src.index('"completed": True')
+    assert fence < gate < receipt
+    assert src.index("runtime.consensus(metadata)") > gate
+    # Admission snapshots the fault counter on the request.
+    assert "req.occ3_dsa_pin_faults0 = _dsa_pin.faults" in inspect.getsource(w.admit_request)
+
+
+def test_scheduler_settle_routes_a_commit_error_to_commit_failed_and_clears_eager():
+    """The gate's LatentError lands in the existing settle except branch."""
+    import json
+    from pathlib import Path
+    manifest = json.loads((Path(__file__).resolve().parents[1] /
+                           "patches/scheduler-cache-ipc.v1.json").read_text())
+    text = "".join(r["after"] for f in manifest["files"] for r in f["replacements"])
+    settle = text[text.index("def _occ3_settle_result"):]
+    handler = settle[settle.index("except Exception as error:"):]
+    assert 'abort_request(self.scheduler, req, "commit_failed")' in handler[:900]
+    assert "req.occ3_force_eager = False" in handler[:900]
+    assert 'FINISH_ABORT("occ3_commit_failed"' in handler[:900]
+
+
+def test_terminal_settle_logs_bounded_pin_hits_on_rank_zero(caplog):
+    import logging
+    torch = pytest.importorskip("torch")
+    caplog.set_level(logging.INFO, logger="occ3_sglang.latent_worker")
+    d = consume(native_rid="rid", expected_prefix_tokens=96, prefix_offset=900)
+    forced = torch.tensor([0, 96], dtype=torch.int32)
+    r = NS(occ3_dsa_pin_forced=(forced, 1))
+    runtime = NS(rank=0, dsa_pin_active=True, dsa_pin_hits=0)
+    assert w._log_pin_hits(runtime, r, d) == 96
+    assert r.occ3_dsa_pin_forced is None and runtime.dsa_pin_hits == 1
+    messages = [rec.getMessage() for rec in caplog.records]
+    assert "occ3 dsa pin settle forced=96 expected=96 offset=900 active=1 count=1" in messages
+    caplog.clear()
+    r = NS(occ3_dsa_pin_forced=(forced, 1))
+    assert w._log_pin_hits(NS(rank=3, dsa_pin_active=True), r, d) == 96
+    assert not caplog.records
+    # No recorded pin (unpinned or eager-free row): nothing logged.
+    assert w._log_pin_hits(runtime, NS(), d) is None and not caplog.records
+
+
+def test_dsa_pin_install_stage_names_the_failing_stage_and_arms_the_threshold(monkeypatch):
+    """Fable N3: deactivation names its stage once on rank 0; Opus r3: the
+    runtime arms the producer threshold from index_topk and the draft width."""
+    import inspect
+    assert w._dsa_pin_install_stage(None) == (False, "topk")
+    assert w._dsa_pin_install_stage(2048, 2) == (False, "eagle_topk")
+    from occ3_sglang import native_profile
+    def broken():
+        raise native_profile.ProfileError("profile_io")
+    monkeypatch.setattr(native_profile, "load_source_attestation", broken)
+    assert w._dsa_pin_install_stage(2048, 1) == (False, "attestation")
+    monkeypatch.setattr(native_profile, "load_source_attestation",
+                        lambda: {"manifests": [{"name": "dsa-pin.v1.json", "sha256": "a"*64}]})
+    assert w._dsa_pin_install_stage(2048, 1) == (False, "manifests")
+    src = inspect.getsource(w.LatentRuntime.__init__) if hasattr(w, "LatentRuntime") else inspect.getsource(w)
+    assert 'logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)' in src
+    assert "if not self.dsa_pin_active and self.rank == 0:" in src
+    assert "_dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)" in src
+    assert "pin_margin = 2 * draft_tokens" in src
+
+
+def test_log_pin_hits_documents_the_overlap_overwrite():
+    """Fable N4: the overlap-scheduling overwrite of occ3_dsa_pin_forced is noted."""
+    import inspect
+    src = inspect.getsource(w._log_pin_hits)
+    assert "overlap scheduling" in src and "occ3_dsa_pin_forced" in src
+
+
+def _admit_unpinned(monkeypatch, *, topk, max_new_tokens, max_req_len=None, active=False, margin=2):
+    d=consume(native_rid="rid")
+    record=NS(state="leased",admitted_consume=False,state_generation=123)
+    runtime=NS(poisoned=False, resolve=lambda value, **kw: record, dsa_pin_active=active,
+               sparse_pin_margin=margin, preflight=lambda phase, check: check(),
+               sparse_index_topk=topk, rank=0, sparse_topk_exceeded=0)
+    monkeypatch.setattr(w,"_RUNTIME",runtime)
+    r=req(); r.sampling_params=NS(custom_params=None, max_new_tokens=max_new_tokens)
+    scheduler=NS(occ3_runtime=runtime)
+    if max_req_len is not None:
+        scheduler.max_req_len=max_req_len
+    before=list(r.origin_input_ids)
+    try:
+        w.admit_request(scheduler,r,d)
+    except LatentError as error:
+        assert error.code == "profile"
+        # Declined inside validate(): nothing mutated.
+        assert list(r.origin_input_ids)==before and record.admitted_consume is False
+        assert getattr(r, "occ3_attached", False) is not True
+        return False
+    return r.occ3_attached is True
+
+
+def test_unpinned_consume_declines_when_output_can_cross_topk(monkeypatch):
+    """Fable F1: pin inactive, prompt within top-k, output crossing it -> decline."""
+    d = consume(native_rid="rid")
+    prompt = d.expected_prefix_tokens + 3   # holes + req() prompt ids
+    topk = prompt + 20
+    # prompt + max_new + margin(2) > topk: declined pre-use.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=19) is False
+    # Within bounds: admitted.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=18) is True
+    # The draft-token margin counts (margin 6 -> 14 output tokens max).
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=15, margin=6) is False
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=14, margin=6) is True
+    # Unset max_new_tokens: conservative, bounded by the server context.
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None, max_req_len=topk + 1) is False
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None, max_req_len=topk) is True
+    assert _admit_unpinned(monkeypatch, topk=topk, max_new_tokens=None) is False  # unknown context
+    # Pin active path unchanged: output growth is pinned by the producer.
+    assert _admit_unpinned(monkeypatch, topk=2048, max_new_tokens=10**6, active=True) is True
+    assert w._sparse_pin_required(NS(sparse_index_topk=8, dsa_pin_active=True), 10**6,
+                                  max_new_tokens=None) is False
+    # Prompt-only callers keep the old semantics; non-DSA never declines.
+    assert w._sparse_pin_required(NS(sparse_index_topk=8), 8) is False
+    assert w._sparse_pin_required(NS(), 10, max_new_tokens=None) is False
+    assert w._scheduler_max_context(NS(model_config=NS(context_len=4096))) == 4096
+    assert w._scheduler_max_context(NS(max_req_len=0)) is None
+
+
+def _install(monkeypatch, *, draft_tokens, deterministic=False, det_arg=False, query=True):
+    import types
+    runner, scheduler, group = _worker_init_env(monkeypatch, radix_match=True)
+    runner.forward_stream = NS(device="cuda:3", cuda_stream=4)
+    runner.model_config.hf_config.index_topk = 2048
+    runner.server_args.speculative_num_draft_tokens = draft_tokens
+    runner.server_args.enable_deterministic_inference = det_arg
+    monkeypatch.setattr(w, "_dsa_pin_install_stage", lambda *a, **k: (True, "ok"))
+    import builtins
+    torch_mod = builtins.__import__("torch")
+    torch_mod.distributed.get_rank = lambda group: 0  # rank-0 N3 log
+    if query:
+        monkeypatch.setattr(torch_mod, "are_deterministic_algorithms_enabled",
+                            lambda: deterministic, raising=False)
+    else:
+        monkeypatch.delattr(torch_mod, "are_deterministic_algorithms_enabled", raising=False)
+    seen = {}
+    from occ3_sglang import dsa_pin
+    monkeypatch.setattr(dsa_pin, "configure", lambda topk, margin: seen.update(topk=topk, margin=margin))
+    runtime = object.__new__(w.WorkerRuntime)
+    runtime.__init__(runner, group, profile(), scheduler=scheduler)
+    return runtime, seen
+
+
+@pytest.mark.parametrize("draft_tokens", [None, 0, -1, "4", 4.0, True])
+def test_non_positive_int_draft_tokens_turn_the_pin_off(monkeypatch, caplog, draft_tokens):
+    """Fable F5: no guessed margin; the pin is off and N3 names the stage."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="occ3_sglang.latent_worker"):
+        runtime, seen = _install(monkeypatch, draft_tokens=draft_tokens)
+    assert runtime.dsa_pin_active is False and seen["topk"] is None
+    assert any("occ3 dsa pin inactive (stage=draft_tokens)" in r.getMessage() for r in caplog.records)
+
+
+def test_positive_draft_tokens_arm_the_pin_with_twice_the_width(monkeypatch):
+    runtime, seen = _install(monkeypatch, draft_tokens=4)
+    assert runtime.dsa_pin_active is True and seen == {"topk": 2048, "margin": 8}
+    assert runtime.sparse_pin_margin == 8
+
+
+@pytest.mark.parametrize("kw", [dict(deterministic=True), dict(det_arg=True), dict(query=False)])
+def test_deterministic_mode_turns_the_pin_off(monkeypatch, caplog, kw):
+    """Fable F3: scatter_reduce_ amax raises under deterministic algorithms."""
+    import logging
+    with caplog.at_level(logging.WARNING, logger="occ3_sglang.latent_worker"):
+        runtime, seen = _install(monkeypatch, draft_tokens=4, **kw)
+    assert runtime.dsa_pin_active is False and seen["topk"] is None
+    assert any("occ3 dsa pin inactive (stage=deterministic)" in r.getMessage() for r in caplog.records)

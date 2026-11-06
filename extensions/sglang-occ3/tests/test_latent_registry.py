@@ -49,6 +49,8 @@ def consume(**changes):
         tp_layout_digest="b"*64, expected_rank_count=8, expected_prefix_tokens=8, hidden_dim=6144,
         dtype="bfloat16", deadline=900.0)
     v.update(changes)
+    if v.get("prefix_offset") and "prefix_layout" not in changes:
+        v["prefix_layout"] = "marker"  # a positive offset names its layout
     return ConsumeWorkerDescriptor(**v)
 
 

@@ -489,8 +489,20 @@ class WorkerRuntime:
         # consume admission, never a decline.
         self.sparse_index_topk = None
         self.sparse_topk_exceeded = 0
+        # True only when the DSA indexer pin (attested dsa-pin manifest plus
+        # producer and graph-runner buffer wiring) is installed on every rank;
+        # set from _dsa_pin_installed after the rank gather. Otherwise an
+        # over-top-k consume declines pre-use; see _sparse_pin_required.
+        self.dsa_pin_active = False
+        self.dsa_pin_hits = 0
+        # Producer threshold margin (2 x draft-token width), also used by the
+        # unpinned admission bound (_sparse_pin_required).
+        self.sparse_pin_margin = 2
         local_error = ""
         local_layout = None
+        local_pin = False
+        pin_margin = 2
+        pin_stage = "init"
         stage = "init"
         try:
             from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -510,6 +522,23 @@ class WorkerRuntime:
             require(config.quantization_config.get("quant_method") == "fp8", "profile")
             topk = getattr(config, "index_topk", None)
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
+            stage = "dsa_pin"
+            local_pin, pin_stage = _dsa_pin_install_stage(
+                self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None),
+                config=config)
+            draft_tokens = getattr(args, "speculative_num_draft_tokens", None)
+            if type(draft_tokens) is int and draft_tokens > 0:
+                pin_margin = 2 * draft_tokens
+            elif local_pin:
+                # Fable F5: no guessed margin. Without a known draft width the
+                # pin threshold could fire late, so the pin is not installed
+                # (static server arg: identical on every rank).
+                local_pin, pin_stage = False, "draft_tokens"
+            if local_pin and _deterministic_mode(torch, args):
+                # Fable F3: scatter_reduce_ (amax) raises on CUDA under
+                # torch deterministic algorithms, so every pinned forward
+                # would fault. Process-wide setting, identical on every rank.
+                local_pin, pin_stage = False, "deterministic"
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -546,7 +575,7 @@ class WorkerRuntime:
             local_layout = {"rank": self.rank, "ranges": shard_ranges(self.embedding),
                             "embedding_tp": self.embedding.tp_size, "dim": profile.hidden_dim,
                             "vocab": self.embedding.num_embeddings, "dtype": self.dtype,
-                            "kv": kv_layout}
+                            "kv": kv_layout, "dsa_pin": local_pin}
         except Exception as error:
             members = getattr(error, "members", None)
             if isinstance(members, str) and members and members.isascii():
@@ -562,6 +591,19 @@ class WorkerRuntime:
         require([x["rank"] for x in layouts] == list(range(profile.expected_ranks)), "ranks")
         require(all(x["dim"] == profile.hidden_dim and x["vocab"] == self.embedding.num_embeddings
                     and x["dtype"] == self.dtype and x["kv"] == local_layout["kv"] for x in layouts), "ranks")
+        # Uniform across ranks or the runtime declines: a mixed install must
+        # never let one rank admit an over-top-k consume another cannot pin.
+        require(all(x["dsa_pin"] is local_layout["dsa_pin"] for x in layouts), "ranks")
+        self.dsa_pin_active = local_layout["dsa_pin"] is True
+        self.sparse_pin_margin = pin_margin
+        from . import dsa_pin as _dsa_pin
+        # The producer pins a row only while it can exceed the top-k; the
+        # inputs are static config, identical on every rank.
+        _dsa_pin.configure(self.sparse_index_topk if self.dsa_pin_active else None, pin_margin)
+        if not self.dsa_pin_active and self.rank == 0:
+            # N3: name the failing stage once so a declined over-top-k consume
+            # (code profile) can be traced to the pin.
+            logger.warning("occ3 dsa pin inactive (stage=%s); over-top-k consumes decline", pin_stage)
         self.layout_digest = digest(layouts)
         self.consensus({"profile": profile.binding_digest, "layout": self.layout_digest})
         self.initialized = True
@@ -1030,12 +1072,25 @@ def admit_request(scheduler, req, value):
             # or KV for its rewritten prompt would park until the queue bound
             # and end in a dispatched, non-releasable admission_timeout.
             require(_consume_capacity_available(scheduler, len(new_ids)), "quota")
+            # Fail closed before any mutation: without the indexer pin, prefix
+            # rows beyond the sparse top-k may be dropped from attention and a
+            # completed-use receipt would be false. Inputs are rank-uniform
+            # (gathered length, static config, install-time flag).
+            # With the pin inactive the bound also covers the request's
+            # output growth (Fable F1); sampling params and the scheduler's
+            # context bound are identical on every rank.
+            require(not _sparse_pin_required(
+                runtime, len(new_ids),
+                max_new_tokens=getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
+                max_context=_scheduler_max_context(scheduler)), "profile")
+            if getattr(runtime, "dsa_pin_active", False) is True:
+                _require_pin_fits(runtime, count)
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
         # rewrites the prompt, so its consensus value carries no offset.
         if type(descriptor) is ConsumeWorkerDescriptor:
-            layout, offset = ("marker" if descriptor.prefix_offset else "prepend"), int(descriptor.prefix_offset)
+            layout, offset = descriptor.prefix_layout, int(descriptor.prefix_offset)
         else:
             layout, offset = "capture", 0
         return {"descriptor": digest(asdict(descriptor)), "tokens": digest(list(original)),
@@ -1045,6 +1100,8 @@ def admit_request(scheduler, req, value):
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
     req.occ3_attached = True
+    from . import dsa_pin as _dsa_pin
+    req.occ3_dsa_pin_faults0 = _dsa_pin.faults
     if type(descriptor) is ConsumeWorkerDescriptor:
         _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
@@ -1114,6 +1171,244 @@ def release_consume_cohort(scheduler, req):
     return True
 
 
+_UNBOUNDED = object()
+
+
+def _sparse_pin_required(runtime, prompt_rows, max_new_tokens=_UNBOUNDED, max_context=None):
+    """True when a consume can exceed the DSA top-k and no indexer pin is active.
+
+    The admit preflight declines such a consume pre-use. With the pin active
+    the consume proceeds (the producer pins it once it can cross the top-k)
+    and _flag_sparse_topk only records the regime.
+
+    With the pin inactive the bound covers the whole sequence, not only the
+    prompt (Fable F1): a prompt at or below the top-k whose output crosses
+    it would otherwise be admitted, never pinned, and still get a receipt.
+    The request's ``max_new_tokens`` (when an int >= 0) plus the producer
+    margin (``runtime.sparse_pin_margin``, 2 x draft tokens) must stay at or
+    below the top-k. When ``max_new_tokens`` is unset (None, which the
+    scheduler treats as unbounded) the conservative choice is used: the
+    sequence may grow to the server's max context (``max_context``,
+    scheduler ``max_req_len``), so the consume declines unless that context
+    fits the top-k; an unknown context also declines. The default
+    ``max_new_tokens`` sentinel keeps the prompt-only check for callers that
+    do not pass output bounds. Bounded integers and one install-time flag.
+    """
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if type(topk) is not int or topk <= 0:
+        return False
+    if getattr(runtime, "dsa_pin_active", False) is True:
+        return False
+    if prompt_rows > topk:
+        return True
+    if max_new_tokens is _UNBOUNDED:
+        return False
+    if type(max_new_tokens) is int and max_new_tokens >= 0:
+        margin = getattr(runtime, "sparse_pin_margin", 2)
+        margin = margin if type(margin) is int and margin > 0 else 2
+        return prompt_rows + max_new_tokens + margin > topk
+    # Unset or not an int: the output is bounded only by the server context.
+    if type(max_context) is int and max_context > 0:
+        return max_context > topk
+    return True
+
+
+def _scheduler_max_context(scheduler):
+    """Server max sequence length (scheduler ``max_req_len``), or None.
+
+    Static scheduler config, identical on every rank. Falls back to the model
+    config ``context_len``; None means unknown (the caller declines).
+    """
+    value = getattr(scheduler, "max_req_len", None)
+    if type(value) is int and value > 0:
+        return value
+    value = getattr(getattr(scheduler, "model_config", None), "context_len", None)
+    return value if type(value) is int and value > 0 else None
+
+
+def _deterministic_mode(torch, args=None):
+    """True when deterministic execution is (or may be) enabled for the pin.
+
+    ``scatter_reduce_`` with ``amax`` (the pin's forced-count reduction)
+    raises on CUDA under ``torch.use_deterministic_algorithms(True)``, so the
+    pin is not installed then. SGLang's ``enable_deterministic_inference``
+    server arg is treated the same way. A torch without the query, or a
+    query that raises, counts as deterministic (pin off, fail closed).
+    """
+    if args is not None and getattr(args, "enable_deterministic_inference", False) is True:
+        return True
+    query = getattr(torch, "are_deterministic_algorithms_enabled", None)
+    if not callable(query):
+        return True
+    try:
+        return bool(query())
+    except Exception:
+        return True
+
+
+def _dsa_pin_headroom_ok(topk, config):
+    """Install-time bounds for the pin lanes inside the indexer selection.
+
+    The init and local tokens are forced to +inf as well, so the pin lanes
+    plus those tokens must fit inside ``index_topk``; otherwise ties among
+    +inf lanes would be broken arbitrarily. When the MTP IndexShare seed is
+    enabled, its buffer width (``get_dsa_mtp_topk_width``) must equal
+    ``index_topk`` so the seeded draft selection is the full pinned target
+    selection. Any miss returns False (pin not installed, consume declines
+    pre-use); nothing raises.
+    """
+    from . import dsa_pin
+
+    if config is None:
+        return True
+    init = getattr(config, "index_init_tokens", 0) or 0
+    local = getattr(config, "index_local_tokens", 0) or 0
+    if type(init) is not int or type(local) is not int or init < 0 or local < 0:
+        return False
+    if init + local + dsa_pin.PIN_LANES > topk:
+        return False
+    if getattr(config, "index_share_for_mtp_iteration", False):
+        try:
+            from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+            width = get_dsa_mtp_topk_width(config)
+        except Exception:
+            return False
+        if width != topk:
+            return False
+    return True
+
+
+def _dsa_pin_installed(topk, eagle_topk=1, *, config=None):
+    """True only when this rank's attested source carries the DSA indexer pin.
+
+    The pinned source attestation (native_sources.json, verified at install)
+    must list the dsa-pin manifest together with the scheduler and graph
+    manifests that produce and stage ``ForwardBatch.occ3_dsa_pin``, and the
+    imported classes must expose the patched members. Any miss returns False,
+    so fix A (_sparse_pin_required) still fails closed. A model without an
+    integer indexer top-k (not a DSA model) and EAGLE top-k other than 1
+    (the paged row map assumes one draft chain per request) also return
+    False. When present, the pin lane width must be strictly below the
+    indexer top-k, and :func:`_dsa_pin_headroom_ok` must hold.
+    """
+    return _dsa_pin_install_stage(topk, eagle_topk, config=config)[0]
+
+
+def _dsa_pin_install_stage(topk, eagle_topk=1, *, config=None):
+    """(installed, stage) for :func:`_dsa_pin_installed`; stage names the miss.
+
+    The stage is a closed-set ASCII label ("ok" when installed) used only
+    for the one rank-0 deactivation log line (Fable N3).
+    """
+    from . import dsa_pin
+
+    if type(topk) is not int or topk <= 0:
+        return False, "topk"
+    if eagle_topk != 1:
+        return False, "eagle_topk"
+    try:
+        from .native_profile import load_source_attestation
+        names = {entry["name"] for entry in load_source_attestation()["manifests"]}
+    except Exception:
+        return False, "attestation"
+    if not {"dsa-pin.v1.json", "scheduler-cache-ipc.v1.json", "capture-eager-mtp.v1.json"} <= names:
+        return False, "manifests"
+    try:
+        from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    except Exception:
+        return False, "import"
+    if not (callable(getattr(Indexer, "_occ3_pin_mask", None))
+            and "occ3_dsa_pin" in getattr(ForwardBatch, "__dataclass_fields__", {})):
+        return False, "members"
+    require(type(topk) is int and dsa_pin.PIN_LANES < topk, "profile")
+    if not _dsa_pin_headroom_ok(topk, config):
+        return False, "headroom"
+    return True, "ok"
+
+
+def _require_pin_fits(runtime, count):
+    """Admission bound: the forced span fits the pin lanes below the top-k."""
+    from .dsa_pin import PIN_LANES
+    topk = getattr(runtime, "sparse_index_topk", None)
+    require(type(count) is int and 0 < count <= PIN_LANES
+            and type(topk) is int and PIN_LANES < topk, "profile")
+
+
+def _log_pin_hits(runtime, req, descriptor):
+    """Rank-0 bounded log of the last target forward's forced pin lanes.
+
+    Read after the terminal fence, so the device read cannot race the
+    forward. Informational only; never part of consensus or the receipt.
+    """
+    from .dsa_pin import read_forced
+    # N4: under overlap scheduling the next batch's init_new may already have
+    # replaced req.occ3_dsa_pin_forced with a newer (forced, row) pair before
+    # this settle reads it. The terminal fence synchronized every stream, and
+    # the row's length still covers the span, so the newer forward forced the
+    # same count; either value is valid evidence.
+    try:
+        hits = read_forced(req)
+    except Exception:
+        hits = None
+    req.occ3_dsa_pin_forced = None
+    if hits is None:
+        return None
+    runtime.dsa_pin_hits = getattr(runtime, "dsa_pin_hits", 0) + 1
+    if getattr(runtime, "rank", 0) == 0:
+        logger.info("occ3 dsa pin settle forced=%d expected=%d offset=%d active=%d count=%d",
+                    hits, int(descriptor.expected_prefix_tokens), int(descriptor.prefix_offset),
+                    int(getattr(runtime, "dsa_pin_active", False) is True), runtime.dsa_pin_hits)
+    return hits
+
+
+def _pin_evidence_required(runtime, req):
+    """True when a completed-use receipt depends on the indexer pin.
+
+    Only with the pin active and the sequence (prompt plus visible output)
+    longer than the indexer top-k: then the injected rows are kept in
+    attention only by the pin. Rank-uniform inputs only.
+    """
+    from .dsa_pin import sequence_rows
+
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if getattr(runtime, "dsa_pin_active", False) is not True or type(topk) is not int:
+        return False
+    # Same row count as the producer (dsa_pin.needs_pin). The producer pins
+    # from sequence_rows + margin > topk with margin >= this forward's rows
+    # plus one overlap step, so any request that ends above the top-k was
+    # pinned on its last target forward and recorded forced there.
+    return sequence_rows(req) > topk
+
+
+def _require_pin_evidence(runtime, req, descriptor):
+    """Terminal gate: no completed-use receipt without pin-hit evidence.
+
+    Runs after the terminal fence. Each rank reads its last target forward's
+    forced count (also logged on rank 0) and checks that no pin fault was
+    recorded since admission. The local verdicts are gathered, so every rank
+    takes the same branch. A miss (no record, forced < expected, or a fault)
+    on any rank raises a uniform LatentError; the scheduler settle aborts
+    only this request through the existing commit_failed path (which also
+    clears occ3_force_eager), never the server.
+    """
+    from . import dsa_pin
+    hits = _log_pin_hits(runtime, req, descriptor)
+    if not _pin_evidence_required(runtime, req):
+        return True
+    expected = int(descriptor.expected_prefix_tokens)
+    faulted = dsa_pin.faults != getattr(req, "occ3_dsa_pin_faults0", dsa_pin.faults)
+    local_ok = hits is not None and hits >= expected and not faulted
+    outcomes = runtime.gather({"phase": "pin_evidence", "ok": bool(local_ok)})
+    if not all(item.get("ok") is True for item in outcomes):
+        if getattr(runtime, "rank", 0) == 0:
+            logger.error("occ3 dsa pin evidence missing at settle; request fails "
+                         "(forced=%s expected=%d fault=%d)",
+                         "none" if hits is None else int(hits), expected, int(faulted))
+        raise LatentError("numerical")
+    return True
+
+
 def _flag_sparse_topk(runtime, prompt_rows):
     """Flag a receiver sequence the DSA indexer can only attend sparsely.
 
@@ -1121,16 +1416,18 @@ def _flag_sparse_topk(runtime, prompt_rows):
     the sequence is longer than that. The injected prefix rows are ordinary
     positions and are not pinned into that selection, so beyond the bound the
     receiver may attend to only some of them (decode rows grow the sequence
-    further). Bounded integers only; this never declines the turn.
+    further). Informational: an unpinned over-top-k consume is already
+    declined in the admit preflight by _sparse_pin_required.
     """
     topk = getattr(runtime, "sparse_index_topk", None)
     if type(topk) is not int or topk <= 0 or prompt_rows <= topk:
         return False
     runtime.sparse_topk_exceeded = getattr(runtime, "sparse_topk_exceeded", 0) + 1
     if getattr(runtime, "rank", 0) == 0:
-        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d: "
-                       "injected prefix rows are not pinned in DSA selection (count=%d)",
-                       int(prompt_rows), topk, runtime.sparse_topk_exceeded)
+        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d "
+                       "(dsa_pin_active=%d count=%d)", int(prompt_rows), topk,
+                       int(getattr(runtime, "dsa_pin_active", False) is True),
+                       runtime.sparse_topk_exceeded)
     return True
 
 
@@ -1456,10 +1753,11 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
             runtime.align(record, req)
     elif terminal:
         runtime.preflight("terminal_fence", lambda: runtime.fence())
+        _require_pin_evidence(runtime, req, descriptor)
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,
-                    "prefix_layout": "marker" if descriptor.prefix_offset else "prepend",
+                    "prefix_layout": descriptor.prefix_layout,
                     "ready_ranks": runtime.profile.expected_ranks,
                     "expected_ranks": runtime.profile.expected_ranks, "num_retractions": 0,
                     "private_cache_namespace": True, "gpu_resident": bool(record.prefix.is_cuda), "completed": True}

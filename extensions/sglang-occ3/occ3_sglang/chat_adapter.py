@@ -28,7 +28,10 @@ from .attachment_contract import (
     canonical, digest, identifier, normalize_worker_descriptor, parse_opt_in, parse_terminal_mode,
 )
 from .span_policy import resolve_runtime_markers, wire_marker_entries
-from .prefix_layout import LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve_prefix_layout
+from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve_last_user_layout,
+                            resolve_prefix_layout)
+from .span_markers import resolve_user_role_id
+from . import metrics as _metrics
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -219,6 +222,8 @@ class NativeRequestView:
     deadline_monotonic: float
     #: Absolute row of the reserved continuous prefix in the receiver sequence.
     prefix_offset: int = 0
+    #: Which layout produced prefix_offset (prefix_layout.LAYOUTS).
+    prefix_layout: str = "prepend"
 
 
 class ChatStateBackend(Protocol):
@@ -841,27 +846,42 @@ class ChatAttachmentAdapter:
     def _prefix_layout(self, obj, tm):
         """Resolve the continuous-prefix row for this receiver request.
 
-        A marker in the rendered prompt selects a mid-sequence layout and the
-        prompt is pinned to the exact token ids used to compute the offset.
-        Without a marker the legacy prepend layout is kept unchanged.
+        A marker in the rendered prompt still wins: it selects a mid-sequence
+        layout and the prompt is pinned to the exact token ids used to compute
+        the offset. Without a marker the extension places the prefix itself,
+        immediately after the last user-turn role token (LAYOUT_LAST_USER),
+        found by exact token-id match against the tokenizer's own attested
+        role id. When that cannot be attested the legacy prepend layout runs
+        and the bounded fallback reason travels on the layout (metrics only).
+        Returns ``(layout, pinned_ids_or_None)``.
         """
         text = getattr(obj, "text", None)
-        if not isinstance(text, str) or PREFIX_MARKER not in text:
-            # No marker: the legacy prepend layout is kept byte-identical and
-            # no tokenizer call is made on the ordinary path.
-            return PrefixLayout(LAYOUT_PREPEND, 0), None
         tokenizer = getattr(tm, "tokenizer", None)
+        if isinstance(text, str) and PREFIX_MARKER in text:
+            if tokenizer is None or not callable(getattr(tokenizer, "encode", None)):
+                raise AttachmentError("unsupported_profile")
+            try:
+                layout = resolve_prefix_layout(text, tokenizer)
+                pinned = list(tokenizer.encode(text, add_special_tokens=False))
+            except AttachmentError:
+                raise
+            except Exception:
+                raise AttachmentError("unsupported_profile") from None
+            if not 0 < layout.offset < len(pinned):
+                raise AttachmentError("unsupported_profile")
+            return layout, pinned
         if tokenizer is None or not callable(getattr(tokenizer, "encode", None)):
-            raise AttachmentError("unsupported_profile")
-        try:
-            layout = resolve_prefix_layout(text, tokenizer)
-            pinned = list(tokenizer.encode(text, add_special_tokens=False))
-        except AttachmentError:
-            raise
-        except Exception:
-            raise AttachmentError("unsupported_profile") from None
-        if not 0 < layout.offset < len(pinned):
-            raise AttachmentError("unsupported_profile")
+            return PrefixLayout(LAYOUT_PREPEND, 0, fallback="no_tokenizer"), None
+        role_id = resolve_user_role_id(tokenizer)
+        ids = getattr(obj, "input_ids", None)
+        if isinstance(text, str) and text:
+            layout, pinned = resolve_last_user_layout(tokenizer, role_id, text=text)
+        elif isinstance(ids, list) and ids:
+            layout, pinned = resolve_last_user_layout(tokenizer, role_id, input_ids=ids)
+        else:
+            return PrefixLayout(LAYOUT_PREPEND, 0, fallback="shape"), None
+        if pinned is not None and not 0 < layout.offset < len(pinned):
+            return PrefixLayout(LAYOUT_PREPEND, 0, fallback="shape"), None
         return layout, pinned
 
     def _fence(self, ctx):
@@ -997,6 +1017,15 @@ class ChatAttachmentAdapter:
                     obj.text, obj.input_ids = None, pinned
                 object.__setattr__(ctx, "prefix_offset", layout.offset)
                 object.__setattr__(ctx, "prefix_layout", layout.layout)
+                # Bounded counters only: layout kind and fallback reason.
+                _metrics.inc("prefix_layout_" + layout.layout)
+                if layout.fallback:
+                    _metrics.inc("prefix_layout_fallback_" + layout.fallback)
+                    # One bounded info line per fallback admit (tokenizer
+                    # manager, a single process): the reason comes from the
+                    # closed FALLBACK_REASONS set; no prompt text or token id.
+                    logger.info("occ3 consume prefix layout prepend fallback=%s",
+                                layout.fallback)
             elif ctx.attachment.span_policy in SPAN_POLICIES_V2:
                 # v2 opt-in: the attested marker ids travel on the request's
                 # private custom_params channel, resolved once per tokenizer.
@@ -1014,7 +1043,8 @@ class ChatAttachmentAdapter:
             protected = copy.deepcopy({k: v for k, v in vars(obj).items()
                                        if k != "occ3_worker_descriptor"})
             view = NativeRequestView(obj, budget, digest(sampling), bool(obj.stream),
-                                     ctx.deadline, prefix_offset=ctx.prefix_offset)
+                                     ctx.deadline, prefix_offset=ctx.prefix_offset,
+                                     prefix_layout=ctx.prefix_layout)
             if source:
                 reservation = await self._bounded_admission(
                     self.backend.prepare_source(ctx.enrollment, view), ctx)
@@ -1084,7 +1114,8 @@ class ChatAttachmentAdapter:
                     or descriptor.message_id != ctx.attachment.message_id
                     or descriptor.consume_nonce != ctx.attachment.request_id
                     or descriptor.opaque_handle != ctx.attachment.state_handle
-                    or descriptor.prefix_offset != ctx.prefix_offset):
+                    or descriptor.prefix_offset != ctx.prefix_offset
+                    or descriptor.prefix_layout != ctx.prefix_layout):
                 raise AttachmentError("invalid_evidence")
             ctx.descriptor = descriptor
             if {k: v for k, v in vars(obj).items() if k != "occ3_worker_descriptor"} != protected:

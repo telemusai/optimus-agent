@@ -65,6 +65,10 @@ MAX_SOURCE_TOTAL = 32 * 1024 * 1024
 MAX_TREE_ENTRIES = 8192
 MAX_TREE_BYTES = 512 * 1024 * 1024
 MAX_SOURCE_FILES = 128
+# Bound on reviewed source manifests per prepare(); the image driver pins the
+# exact names (native_image_build.MANIFEST_NAMES). Stays below the loader's
+# 128-entry manifests limit (occ3_sglang/native_profile.py).
+MAX_MANIFESTS = 16
 _HEX = re.compile(r"[a-f0-9]{64}\Z")
 _NAME = re.compile(r"[A-Za-z0-9_][A-Za-z0-9_.-]{0,127}\Z")
 _IDENTIFIER = re.compile(r"[A-Za-z0-9._:/-]{1,256}\Z")
@@ -523,7 +527,11 @@ def _recheck_inputs(plan):
 
 
 def prepare(sglang_srt, occ3_sglang, baseline_path, profile_path, manifest_paths, *, experimental_startup=False):
-    """Validate all inputs, three plans, final bytes and tree identities; no writes."""
+    """Validate all inputs, every manifest plan, final bytes and tree identities; no writes.
+
+    Manifests are prepared and attested in the caller's order. Their file sets
+    must be disjoint, so the merged overlay does not depend on that order; the
+    attestation lists manifests sorted by name."""
     try:
         _need(type(experimental_startup) is bool, "invalid_experimental_startup_flag")
         sg, plugin = _absolute(sglang_srt), _absolute(occ3_sglang)
@@ -531,10 +539,12 @@ def prepare(sglang_srt, occ3_sglang, baseline_path, profile_path, manifest_paths
               "overlapping_package_roots")
         _fresh(plugin)
         trees = (_tree(sg), _tree(plugin))
-        _need(type(manifest_paths) in (list, tuple) and len(manifest_paths) == 3, "exactly_three_manifests_required")
+        _need(type(manifest_paths) in (list, tuple) and 1 <= len(manifest_paths) <= MAX_MANIFESTS,
+              "manifest_count_invalid")
         paths = tuple(_absolute(path) for path in (baseline_path, profile_path, *manifest_paths))
-        _need(len({str(path).casefold() for path in paths}) == 5, "duplicate_input_path")
-        limits = (MAX_BASELINE_BYTES, MAX_PROFILE_BYTES, *([source_patch.MAX_MANIFEST_BYTES] * 3))
+        _need(len({str(path).casefold() for path in paths}) == len(paths), "duplicate_input_path")
+        limits = (MAX_BASELINE_BYTES, MAX_PROFILE_BYTES,
+                  *([source_patch.MAX_MANIFEST_BYTES] * len(manifest_paths)))
         inputs = tuple(_read(path, limit) for path, limit in zip(paths, limits))
         baseline = _baseline(_json(inputs[0].raw))
         profile_raw = _profile(_json(inputs[1].raw))

@@ -520,6 +520,10 @@ class ConsumeWorkerDescriptor:
     #: sequence. 0 is the legacy prepend layout; a positive value comes from an
     #: attested prompt marker and must stay inside the ordinary prompt.
     prefix_offset: int = 0
+    #: Layout that produced prefix_offset: "prepend" (offset 0), "marker"
+    #: (explicit prompt marker) or "last_user" (extension placement after the
+    #: last user role token). Carried so the terminal record names the layout.
+    prefix_layout: str = "prepend"
 
     def __post_init__(self):
         import math
@@ -533,6 +537,9 @@ class ConsumeWorkerDescriptor:
         uint(self.state_generation)
         uint(self.runtime_generation)
         uint(self.prefix_offset, 2**20)
+        if (self.prefix_layout not in ("prepend", "marker", "last_user")
+                or (self.prefix_layout != "prepend") != (self.prefix_offset > 0)):
+            raise AttachmentError("invalid_evidence")
         if (not 1 <= uint(self.expected_rank_count, 1024) <= 1024
                 or not 1 <= uint(self.expected_prefix_tokens, 128) <= 128
                 or not 1 <= uint(self.hidden_dim, 2**20) <= 2**20
