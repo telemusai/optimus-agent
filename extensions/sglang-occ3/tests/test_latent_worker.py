@@ -1352,6 +1352,119 @@ def test_dsa_pin_installed_requires_attested_manifests_and_patched_members(monke
     assert w._dsa_pin_installed(2048) is False
 
 
+def test_dsa_pin_installed_requires_init_local_headroom_and_mtp_width(monkeypatch):
+    """Opus notes: init+local+128 <= index_topk; MTP seed width == index_topk."""
+    import types
+    from occ3_sglang import native_profile
+    names = ["capture-eager-mtp.v1.json", "dsa-pin.v1.json", "scheduler-cache-ipc.v1.json"]
+    monkeypatch.setattr(native_profile, "load_source_attestation",
+                        lambda: {"manifests": [{"name": n, "sha256": "a"*64} for n in names]})
+    indexer = types.ModuleType("sglang.srt.layers.attention.dsa.dsa_indexer")
+    fbi = types.ModuleType("sglang.srt.model_executor.forward_batch_info")
+    class Indexer:
+        @staticmethod
+        def _occ3_pin_mask(*a): pass
+    class ForwardBatch:
+        __dataclass_fields__ = {"occ3_dsa_pin": None}
+    indexer.Indexer, fbi.ForwardBatch = Indexer, ForwardBatch
+    monkeypatch.setitem(sys.modules, indexer.__name__, indexer)
+    monkeypatch.setitem(sys.modules, fbi.__name__, fbi)
+    width = {"value": 2048}
+    mc = types.ModuleType("sglang.srt.configs.model_config")
+    mc.get_dsa_mtp_topk_width = lambda config: width["value"]
+    monkeypatch.setitem(sys.modules, mc.__name__, mc)
+    cfg = lambda **k: NS(**{"index_init_tokens": 0, "index_local_tokens": 0,
+                            "index_share_for_mtp_iteration": True, **k})
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is True
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=1000,
+                                                    index_local_tokens=920)) is True
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=1000,
+                                                    index_local_tokens=921)) is False
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_init_tokens=-1)) is False
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_local_tokens="4")) is False
+    width["value"] = 1024
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is False
+    # Without the MTP IndexShare seed the width is not consulted.
+    assert w._dsa_pin_installed(2048, 1, config=cfg(index_share_for_mtp_iteration=False)) is True
+    def broken(config):
+        raise RuntimeError("missing")
+    mc.get_dsa_mtp_topk_width = broken
+    assert w._dsa_pin_installed(2048, 1, config=cfg()) is False
+    # Install passes the model config through.
+    import inspect
+    src = inspect.getsource(w)
+    assert 'getattr(args, "speculative_eagle_topk", None),\n                config=config)' in src
+
+
+def _evidence_runtime(ok_by_rank=None, topk=2048, active=True):
+    gathered = []
+    def gather(value):
+        gathered.append(value)
+        others = ok_by_rank if ok_by_rank is not None else []
+        return [value] + [{"phase": "pin_evidence", "ok": ok} for ok in others]
+    return NS(rank=0, dsa_pin_active=active, dsa_pin_hits=0, sparse_index_topk=topk,
+              gather=gather, gathered=gathered)
+
+
+def test_terminal_pin_evidence_gate_fails_only_the_request(caplog):
+    """Opus #2: an over-top-k consume needs pin-hit evidence for a receipt."""
+    import logging
+    torch = pytest.importorskip("torch")
+    from occ3_sglang import dsa_pin
+    caplog.set_level(logging.INFO, logger="occ3_sglang.latent_worker")
+    d = consume(native_rid="rid", expected_prefix_tokens=96, prefix_offset=900)
+    def request(forced_value, rows=3000, faults0=None):
+        held = None
+        if forced_value is not None:
+            held = (torch.tensor([forced_value], dtype=torch.int32), 0)
+        return NS(occ3_dsa_pin_forced=held, origin_input_ids=[1] * rows, output_ids=[2] * 4,
+                  occ3_dsa_pin_faults0=dsa_pin.faults if faults0 is None else faults0)
+    # Full evidence on every rank: receipt allowed, one gather.
+    rt = _evidence_runtime([True] * 7)
+    assert w._require_pin_evidence(rt, request(96), d) is True
+    assert len(rt.gathered) == 1
+    # Missing record, forced < count, a fault since admission, or another rank's miss.
+    for req_, others in ((request(None), [True] * 7), (request(95), [True] * 7),
+                         (request(96, faults0=dsa_pin.faults - 1), [True] * 7),
+                         (request(96), [True] * 6 + [False])):
+        with pytest.raises(LatentError) as caught:
+            w._require_pin_evidence(_evidence_runtime(others), req_, d)
+        assert caught.value.code == "numerical"
+    assert any("pin evidence missing" in r.getMessage() for r in caplog.records)
+    # At or below top-k, or pin inactive: no evidence needed and no gather.
+    rt = _evidence_runtime([True] * 7)
+    assert w._require_pin_evidence(rt, request(None, rows=2000), d) is True
+    rt2 = _evidence_runtime([True] * 7, active=False)
+    assert w._require_pin_evidence(rt2, request(None), d) is True
+    assert rt.gathered == [] and rt2.gathered == []
+
+
+def test_terminal_settle_checks_pin_evidence_before_the_receipt():
+    import inspect
+    src = inspect.getsource(w.commit_result)
+    fence = src.index('runtime.preflight("terminal_fence"')
+    gate = src.index("_require_pin_evidence(runtime, req, descriptor)")
+    receipt = src.index('"completed": True')
+    assert fence < gate < receipt
+    assert src.index("runtime.consensus(metadata)") > gate
+    # Admission snapshots the fault counter on the request.
+    assert "req.occ3_dsa_pin_faults0 = _dsa_pin.faults" in inspect.getsource(w.admit_request)
+
+
+def test_scheduler_settle_routes_a_commit_error_to_commit_failed_and_clears_eager():
+    """The gate's LatentError lands in the existing settle except branch."""
+    import json
+    from pathlib import Path
+    manifest = json.loads((Path(__file__).resolve().parents[1] /
+                           "patches/scheduler-cache-ipc.v1.json").read_text())
+    text = "".join(r["after"] for f in manifest["files"] for r in f["replacements"])
+    settle = text[text.index("def _occ3_settle_result"):]
+    handler = settle[settle.index("except Exception as error:"):]
+    assert 'abort_request(self.scheduler, req, "commit_failed")' in handler[:900]
+    assert "req.occ3_force_eager = False" in handler[:900]
+    assert 'FINISH_ABORT("occ3_commit_failed"' in handler[:900]
+
+
 def test_terminal_settle_logs_bounded_pin_hits_on_rank_zero(caplog):
     import logging
     torch = pytest.importorskip("torch")

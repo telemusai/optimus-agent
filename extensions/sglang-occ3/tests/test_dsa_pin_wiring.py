@@ -2,7 +2,8 @@
 
 Applies the scheduler-cache-ipc and capture-eager-mtp manifests through the
 real applier to pinned e00930c5 sources and checks the patched producer and
-the three graph runners (decode/target-verify, EAGLE draft, draft-extend).
+the graph runners (prefill, decode/target-verify, EAGLE draft, draft-extend):
+no graph captures the pin and every runner rejects pinned batches.
 Source evidence only; not GPU, kernel or CUDA-graph replay evidence.
 """
 from __future__ import annotations
@@ -109,25 +110,54 @@ def test_producer_rebuilds_pin_from_batch_reqs_in_init_new(patched):
 
 
 @pytest.mark.parametrize("path", sorted(RUNNERS))
-def test_graph_runner_static_pin_buffers(patched, path):
+def test_graph_runners_capture_without_a_pin_and_reject_pinned_batches(patched, path):
+    """Opus #1: no captured graph carries the pin; pinned batches run eager.
+
+    Ordinary batches keep the original unpinned graphs at their original
+    cost: capture, replay and __init__ contain no pin code, and the pin guard
+    is the first eligibility check after the request-local occ3 checks.
+    """
     text = patched[path]
+    assert "GraphPin" not in text and "_occ3_dsa_pin" not in text
     capture_name, replay_name = RUNNERS[path]
-    init = _method(text, "__init__")
-    assert "self._occ3_dsa_pin = _Occ3GraphPin(self.max_bs, model_runner.device)" in init
-    assert init.index("self.max_bs = max(self.capture_bs)") < init.index("_Occ3GraphPin(self.max_bs")
-    capture = _method(text, capture_name)
-    view = capture.index("forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(")
-    # Present on the capture batch before the captured forward is defined/run.
-    if "def run_once" in capture:
-        assert view < capture.index("def run_once")
-    else:
-        assert view < capture.index("return forward_batch, attn_backend, pp_proxy_tensors")
-    replay = _method(text, replay_name)
-    load = replay.index("self._occ3_dsa_pin.load(forward_batch,")
-    publish = replay.index("self._occ3_dsa_pin.publish(forward_batch,")
-    call = replay.index("_replay_graph(") if "_replay_graph(" in replay else replay.index("self.backend.replay(")
-    assert load < call < publish
-    assert replay.count("self._occ3_dsa_pin.load(") == 1
+    for name in ("__init__", capture_name, replay_name):
+        assert "occ3_dsa_pin" not in _method(text, name)
+    method = _method(text, "can_run_graph")
+    guard = method.index('if getattr(forward_batch, "occ3_dsa_pin", None) is not None:')
+    assert method.index('"occ3_context", None') < guard < method.index("spec_info")
+    # Execute the patched early-return prefix on stub batches.
+    cut = method.index("\n", method.index("return False", guard)) + 1
+    head = method[:cut] + "        return 'graph'\n"
+    ns = {"ForwardBatch": object}
+    exec(compile(textwrap.dedent(head), path, "exec"), ns)
+    can_run = ns["can_run_graph"]
+    from types import SimpleNamespace as NS
+
+    pinned = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=("s", "c", "f"))
+    plain = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=None)
+    assert can_run(None, pinned) is False
+    assert can_run(None, plain) == "graph"
+    assert can_run(None, NS()) == "graph"
+    assert can_run(None, NS(occ3_force_eager=True)) is False
+
+
+def test_capture_batches_carry_no_pin(patched):
+    """Capture builds ForwardBatch(...) directly; the field default is None.
+
+    The producer runs only in ForwardBatch.init_new, which graph capture
+    never calls, so every captured graph sees occ3_dsa_pin None.
+    """
+    assert "    occ3_dsa_pin: Optional[tuple] = None\n" in patched[FBI]
+    for path, (capture_name, _) in RUNNERS.items():
+        capture = _method(patched[path], capture_name)
+        assert "init_new(" not in capture and "occ3_dsa_pin" not in capture
+
+
+def test_no_graph_runner_has_pin_replay_hooks(patched):
+    for path in list(RUNNERS) + ["model_executor/runner/prefill_cuda_graph_runner.py"]:
+        text = patched[path]
+        assert ".load(forward_batch" not in text or "_occ3_dsa_pin" not in text
+        assert "publish(forward_batch" not in text
 
 
 PREFILL = "model_executor/runner/prefill_cuda_graph_runner.py"
@@ -161,8 +191,7 @@ def test_pin_covers_every_chunk_and_decode_of_an_attached_request():
 
     release_consume_cohort clears only occ3_force_eager after the injected
     chunk, so later prefill chunks and every decode step still carry the pin
-    (and therefore take the eager prefill path above, or the decode/verify
-    graphs that load the static pin buffers).
+    (and therefore take the eager path in every graph runner).
     """
     import inspect
     from types import SimpleNamespace as NS

@@ -519,7 +519,8 @@ class WorkerRuntime:
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
             stage = "dsa_pin"
             local_pin = _dsa_pin_installed(
-                self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None))
+                self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None),
+                config=config)
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -1066,6 +1067,8 @@ def admit_request(scheduler, req, value):
     descriptor, record, new_ids = prepared["descriptor"], prepared["record"], prepared["new_ids"]
     req.occ3_worker_descriptor, req.occ3_force_eager = descriptor, True
     req.occ3_attached = True
+    from . import dsa_pin as _dsa_pin
+    req.occ3_dsa_pin_faults0 = _dsa_pin.faults
     if type(descriptor) is ConsumeWorkerDescriptor:
         _flag_sparse_topk(runtime, len(new_ids))
     if type(descriptor) is CaptureWorkerDescriptor:
@@ -1148,7 +1151,39 @@ def _sparse_pin_required(runtime, prompt_rows):
     return getattr(runtime, "dsa_pin_active", False) is not True
 
 
-def _dsa_pin_installed(topk, eagle_topk=1):
+def _dsa_pin_headroom_ok(topk, config):
+    """Install-time bounds for the pin lanes inside the indexer selection.
+
+    The init and local tokens are forced to +inf as well, so the pin lanes
+    plus those tokens must fit inside ``index_topk``; otherwise ties among
+    +inf lanes would be broken arbitrarily. When the MTP IndexShare seed is
+    enabled, its buffer width (``get_dsa_mtp_topk_width``) must equal
+    ``index_topk`` so the seeded draft selection is the full pinned target
+    selection. Any miss returns False (pin not installed, consume declines
+    pre-use); nothing raises.
+    """
+    from . import dsa_pin
+
+    if config is None:
+        return True
+    init = getattr(config, "index_init_tokens", 0) or 0
+    local = getattr(config, "index_local_tokens", 0) or 0
+    if type(init) is not int or type(local) is not int or init < 0 or local < 0:
+        return False
+    if init + local + dsa_pin.PIN_LANES > topk:
+        return False
+    if getattr(config, "index_share_for_mtp_iteration", False):
+        try:
+            from sglang.srt.configs.model_config import get_dsa_mtp_topk_width
+            width = get_dsa_mtp_topk_width(config)
+        except Exception:
+            return False
+        if width != topk:
+            return False
+    return True
+
+
+def _dsa_pin_installed(topk, eagle_topk=1, *, config=None):
     """True only when this rank's attested source carries the DSA indexer pin.
 
     The pinned source attestation (native_sources.json, verified at install)
@@ -1159,7 +1194,7 @@ def _dsa_pin_installed(topk, eagle_topk=1):
     integer indexer top-k (not a DSA model) and EAGLE top-k other than 1
     (the paged row map assumes one draft chain per request) also return
     False. When present, the pin lane width must be strictly below the
-    indexer top-k.
+    indexer top-k, and :func:`_dsa_pin_headroom_ok` must hold.
     """
     from . import dsa_pin
 
@@ -1181,7 +1216,7 @@ def _dsa_pin_installed(topk, eagle_topk=1):
             and "occ3_dsa_pin" in getattr(ForwardBatch, "__dataclass_fields__", {})):
         return False
     require(type(topk) is int and dsa_pin.PIN_LANES < topk, "profile")
-    return True
+    return _dsa_pin_headroom_ok(topk, config)
 
 
 def _require_pin_fits(runtime, count):
@@ -1212,6 +1247,48 @@ def _log_pin_hits(runtime, req, descriptor):
                     hits, int(descriptor.expected_prefix_tokens), int(descriptor.prefix_offset),
                     int(getattr(runtime, "dsa_pin_active", False) is True), runtime.dsa_pin_hits)
     return hits
+
+
+def _pin_evidence_required(runtime, req):
+    """True when a completed-use receipt depends on the indexer pin.
+
+    Only with the pin active and the sequence (prompt plus visible output)
+    longer than the indexer top-k: then the injected rows are kept in
+    attention only by the pin. Rank-uniform inputs only.
+    """
+    topk = getattr(runtime, "sparse_index_topk", None)
+    if getattr(runtime, "dsa_pin_active", False) is not True or type(topk) is not int:
+        return False
+    rows = len(getattr(req, "origin_input_ids", ()) or ()) + len(getattr(req, "output_ids", ()) or ())
+    return rows > topk
+
+
+def _require_pin_evidence(runtime, req, descriptor):
+    """Terminal gate: no completed-use receipt without pin-hit evidence.
+
+    Runs after the terminal fence. Each rank reads its last target forward's
+    forced count (also logged on rank 0) and checks that no pin fault was
+    recorded since admission. The local verdicts are gathered, so every rank
+    takes the same branch. A miss (no record, forced < expected, or a fault)
+    on any rank raises a uniform LatentError; the scheduler settle aborts
+    only this request through the existing commit_failed path (which also
+    clears occ3_force_eager), never the server.
+    """
+    from . import dsa_pin
+    hits = _log_pin_hits(runtime, req, descriptor)
+    if not _pin_evidence_required(runtime, req):
+        return True
+    expected = int(descriptor.expected_prefix_tokens)
+    faulted = dsa_pin.faults != getattr(req, "occ3_dsa_pin_faults0", dsa_pin.faults)
+    local_ok = hits is not None and hits >= expected and not faulted
+    outcomes = runtime.gather({"phase": "pin_evidence", "ok": bool(local_ok)})
+    if not all(item.get("ok") is True for item in outcomes):
+        if getattr(runtime, "rank", 0) == 0:
+            logger.error("occ3 dsa pin evidence missing at settle; request fails "
+                         "(forced=%s expected=%d fault=%d)",
+                         "none" if hits is None else int(hits), expected, int(faulted))
+        raise LatentError("numerical")
+    return True
 
 
 def _flag_sparse_topk(runtime, prompt_rows):
@@ -1558,6 +1635,7 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
             runtime.align(record, req)
     elif terminal:
         runtime.preflight("terminal_fence", lambda: runtime.fence())
+        _require_pin_evidence(runtime, req, descriptor)
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,
@@ -1567,7 +1645,6 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
                     "private_cache_namespace": True, "gpu_resident": bool(record.prefix.is_cuda), "completed": True}
         runtime.consensus(metadata)
         record.terminal_metadata, record.state = metadata, "terminal"
-        _log_pin_hits(runtime, req, descriptor)
     runtime.reap_live(record)
 
 

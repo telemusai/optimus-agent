@@ -18,9 +18,11 @@ logits-independent plan (row map, lane indices, validity, ``forced``) once per
 forward on its first layer and caches it on the forward batch as
 ``occ3_dsa_pin_plan``; each layer then only gathers, fills and scatters.
 
-CUDA graph runners own a static ``[max_bs]`` copy (:class:`GraphPin`): the
-captured graph reads it, every replay zeroes all slots and copies the live
-rows, so padded and free slots always carry count 0 (a bitwise no-op).
+No CUDA graph carries the pin. Every graph runner (prefill, decode and
+target-verify, EAGLE draft, draft-extend) captures with ``occ3_dsa_pin``
+None and its ``can_run_graph`` returns False for a batch that carries a pin,
+so ordinary batches replay the original unpinned graphs at their original
+cost and a pinned batch runs eager with this per-batch tensor.
 """
 from __future__ import annotations
 
@@ -28,6 +30,12 @@ import logging
 
 logger = logging.getLogger(__name__)
 _bounds_logged = False
+_fault_logged = False
+# Process-wide count of pin faults (a pin that could not be built or
+# applied). Admission snapshots it on the request; terminal settle fails an
+# over-top-k consume whose window saw a fault, so a fault never yields a
+# completed-use receipt and never raises on the shared scheduler path.
+faults = 0
 
 # Fixed lane width of the indexer pin; must stay strictly below index_topk.
 PIN_LANES = 128
@@ -73,6 +81,26 @@ def pin_rows(reqs, shift=0):
     return (starts, counts) if any_pin else None
 
 
+def note_fault(forward_batch=None):
+    """Record a pin fault without raising: log once, drop the batch pin.
+
+    Called from the indexer call sites and from :func:`build` when pin work
+    raises. The forward then runs unpinned (ordinary rows are unaffected
+    either way); only the OCC request is failed later, at terminal settle.
+    """
+    global faults, _fault_logged
+    faults += 1
+    if forward_batch is not None:
+        try:
+            forward_batch.occ3_dsa_pin = None
+            forward_batch.occ3_dsa_pin_plan = None
+        except Exception:
+            pass
+    if not _fault_logged:
+        _fault_logged = True
+        logger.error("occ3 dsa pin fault; forward runs unpinned and the OCC request fails at settle")
+
+
 def build(batch, device, *, record, draft=None):
     """Build ``ForwardBatch.occ3_dsa_pin`` for one forward from ``batch.reqs``.
 
@@ -82,6 +110,15 @@ def build(batch, device, *, record, draft=None):
     overwrites the record. ``draft`` defaults to ``not record``: init_new
     passes ``record=not model_runner.is_draft_worker``.
     """
+    try:
+        return _build(batch, device, record=record, draft=draft)
+    except Exception:
+        # init_new runs for every batch: never raise there.
+        note_fault(None)
+        return None
+
+
+def _build(batch, device, *, record, draft):
     if draft is None:
         draft = not record
     reqs = list(getattr(batch, "reqs", None) or ())
@@ -108,42 +145,3 @@ def read_forced(req):
         return None
     forced, index = held
     return max(0, min(PIN_LANES, int(forced[index].item())))
-
-
-class GraphPin:
-    """Static [max_bs] pin buffers owned by one CUDA graph runner.
-
-    ``view(bs)`` is attached to the capture batch so the graph reads these
-    buffers. ``load`` runs before every replay: it zeroes all slots (padded
-    and free slots get count 0) and copies the live rows; it uses only
-    fixed-shape device copies and fills. ``publish`` copies the graph's forced
-    counts back to the live batch's tensor after replay.
-    """
-
-    def __init__(self, max_bs, device):
-        import torch
-
-        self.max_bs = int(max_bs)
-        self.start = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
-        self.count = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
-        self.forced = torch.zeros(self.max_bs, dtype=torch.int32, device=device)
-
-    def view(self, bs):
-        return self.start[:bs], self.count[:bs], self.forced[:bs]
-
-    def load(self, forward_batch, raw_bs):
-        self.start.zero_()
-        self.count.zero_()
-        self.forced.zero_()
-        pin = getattr(forward_batch, "occ3_dsa_pin", None)
-        if pin is None:
-            return
-        if not 0 <= raw_bs <= self.max_bs or pin[0].shape[0] < raw_bs:
-            raise RuntimeError("occ3_dsa_pin_shape")
-        self.start[:raw_bs].copy_(pin[0][:raw_bs])
-        self.count[:raw_bs].copy_(pin[1][:raw_bs])
-
-    def publish(self, forward_batch, raw_bs):
-        pin = getattr(forward_batch, "occ3_dsa_pin", None)
-        if pin is not None:
-            pin[2][:raw_bs].copy_(self.forced[:raw_bs])

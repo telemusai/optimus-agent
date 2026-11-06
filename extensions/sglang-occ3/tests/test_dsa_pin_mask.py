@@ -191,9 +191,9 @@ def test_expanded_rows_follow_static_width_like_seqlens_expanded(indexer):
     assert pin[2].tolist() == [0, 64]
 
 
-def test_graph_padded_rows_beyond_live_batch_are_noops(indexer):
+def test_padded_rows_beyond_live_batch_are_noops(indexer):
     torch = indexer.torch
-    # A graph captured at bs=4 replays a raw_bs=2 batch: slots 2,3 are zeroed.
+    # Rows with count 0 (unpinned or padded) stay bitwise unchanged.
     logits = torch.randn(4, 300)
     original = logits.clone()
     lengths = torch.tensor([300, 300, 1, 1], dtype=torch.int32)
@@ -216,6 +216,28 @@ def test_patched_call_sites_build_one_plan_per_forward(indexer):
     assert ragged.index("self._occ3_pin_plan(") < ragged.index("while start < q_offset:")
     body = text.split("def _occ3_pin_plan")[1].split("def _mask_init_and_local_tokens")[0]
     assert ".item()" not in body and ".tolist()" not in body
+    # Opus #2: pin work never raises on the shared forward. Both plan call
+    # sites and the per-layer mask fall back to unpinned and note a fault.
+    assert text.count("note_fault(forward_batch)") == 2
+    assert text.count("note_fault(None)") == 1
+    for site in text.split("occ3_plan = self._occ3_pin_plan(")[1:]:
+        tail = site.split("except Exception:")[1][:400]
+        assert "note_fault(forward_batch)" in tail and "occ3_plan = None" in tail
+    assert "raise" not in body
+
+
+def test_a_failing_pin_mask_runs_unpinned_and_records_a_fault(indexer):
+    from occ3_sglang import dsa_pin
+
+    torch = indexer.torch
+    logits = torch.randn(2, 64)
+    original = logits.clone()
+    before = dsa_pin.faults
+    bad_plan = (torch.zeros(2, 128, dtype=torch.long), "not-a-tensor", None)
+    out = indexer.native(logits, torch.tensor([64, 64], dtype=torch.int32), None,
+                         pin_plan=bad_plan)
+    assert out is logits and torch.equal(logits, original)
+    assert dsa_pin.faults == before + 1
 
 
 def _count_ops(torch, fn):
@@ -286,7 +308,7 @@ def test_plan_cache_rebuilds_for_new_forward_owner_pin_or_shape(indexer):
     p0 = indexer.plan(fb, a, 3, "paged", 2, 64, lengths, None, rows, "cpu")
     assert indexer.plan(fb, a, 4, "paged", 2, 64, lengths, None, rows, "cpu") is p0
     # Same or lower layer id: a new forward through a reused batch object
-    # (graph warmup then capture, EAGLE draft steps) rebuilds.
+    # (EAGLE draft steps) rebuilds.
     assert indexer.plan(fb, a, 3, "paged", 2, 64, lengths, None, rows, "cpu") is not p0
     p1 = fb.occ3_dsa_pin_plan[3]
     # Another metadata owner (draft backend), shape, or pin object rebuilds.
