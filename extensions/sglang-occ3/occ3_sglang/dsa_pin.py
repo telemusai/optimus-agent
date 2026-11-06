@@ -18,7 +18,9 @@ its sequence can exceed ``index_topk`` (:func:`needs_pin`); shorter attached
 consumes carry no pin and their batches keep the ordinary graphs. The indexer builds a
 logits-independent plan (row map, lane indices, validity, ``forced``) once per
 forward on its first layer and caches it on the forward batch as
-``occ3_dsa_pin_plan``; each layer then only gathers, fills and scatters.
+``occ3_dsa_pin_plan``; each indexer layer then only gathers, fills and scatters
+(GLM-5.3: 21 full layers plus NextN run their own indexer; the shared
+layers reuse the pinned indices).
 
 The original CUDA graphs never carry the pin: every graph runner captures
 them with ``occ3_dsa_pin`` None, so ordinary batches replay them at their
