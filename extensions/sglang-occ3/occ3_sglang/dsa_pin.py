@@ -26,10 +26,13 @@ The original CUDA graphs never carry the pin: every graph runner captures
 them with ``occ3_dsa_pin`` None, so ordinary batches replay them at their
 original cost with no pin work. The decode-family runners (decode and
 target-verify, EAGLE draft, draft-extend) also capture a pinned variant per
-batch size that reads a static :class:`GraphPin` view; a pinned batch
-replays it when every such runner has one for its size (:func:`graph_ok`),
-otherwise it runs eager. Prefill graphs have no pinned variant: pinned
-prefill chunks run eager.
+batch size that reads a static :class:`GraphPin` view. A pinned batch
+replays it only when every runner instance ever constructed in the process
+has one for its own bucket of the batch size (:func:`graph_ok`; adaptive MTP
+builds several runner sets and swaps them at runtime, so every set counts)
+and the replaying runner itself has one for its own bucket
+(:func:`runner_ok`); otherwise it runs eager. Prefill graphs have no pinned
+variant: pinned prefill chunks run eager.
 """
 from __future__ import annotations
 
@@ -222,15 +225,29 @@ def read_forced(req):
 # for its padded batch size when every registered runner has one; otherwise
 # every runner runs it eager (the a8e98b759 behaviour). The choice is a pure
 # function of the raw batch size and static capture lists, so target, draft
-# and draft-extend always agree for a batch.
+# and draft-extend always agree for a batch, on every TP rank.
+#
+# Adaptive MTP (eagle_worker_v2.build_adaptive_runtime_state) constructs one
+# runner set per candidate step count, each possibly with its own capture
+# list, and apply_runtime_state swaps the active set at runtime. Every
+# constructed runner is therefore recorded as its own registry entry (never
+# keyed by class, which let later builds overwrite earlier ones), and
+# graph_ok requires a pinned graph in all of them: conservative for whichever
+# state is active. Each can_run_graph additionally checks its own bucket
+# (runner_ok) as defence in depth.
 # ---------------------------------------------------------------------------
 
 GRAPHS_ENV = "OCC3_DSA_PIN_GRAPHS"
 GRAPH_MAX_BS_ENV = "OCC3_DSA_PIN_GRAPH_MAX_BS"
 PIN_LABEL = "occ3_pin"
 
-# runner key -> (sorted capture bs tuple, frozenset of pinned bs)
-_graph_runners = {}
+# One entry per constructed graph runner, appended in construction order and
+# never overwritten: ((class name, is_draft), sorted capture bs tuple,
+# frozenset of pinned bs). Entries hold host ints only, no runner reference,
+# so the list neither keeps runners alive nor depends on id() reuse. Runners
+# live for the process lifetime and are built a bounded number of times
+# (initial set plus one per adaptive candidate state), so the list is small.
+_graph_runners = []
 
 
 def graphs_enabled():
@@ -298,10 +315,15 @@ def graph_bs(runner, model_runner, capture_bs):
     (disabled padding, DP MLP gather, compact ragged verify, PD multiplexing,
     two-batch overlap).
     ``OCC3_DSA_PIN_GRAPH_MAX_BS`` caps the list; the default is the full
-    capture list. The result is registered for :func:`graph_ok`.
+    capture list. Every call appends a registry entry for :func:`graph_ok`;
+    an earlier runner's entry is never replaced (adaptive MTP builds several
+    runners of the same class).
     """
-    key = (type(runner).__name__, bool(getattr(model_runner, "is_draft_worker", False)))
     pinned = ()
+    try:
+        key = (type(runner).__name__, bool(getattr(model_runner, "is_draft_worker", False)))
+    except Exception:
+        key = ("?", False)
     try:
         if (graphs_enabled() and _dsa_model(model_runner)
                 and not getattr(runner, "disable_padding", False)
@@ -311,31 +333,61 @@ def graph_bs(runner, model_runner, capture_bs):
                 and not _two_batch_overlap(runner, model_runner)):
             cap = _graph_max_bs()
             pinned = tuple(sorted(int(b) for b in capture_bs if cap is None or int(b) <= cap))
-        _graph_runners[key] = (tuple(sorted(int(b) for b in capture_bs)), frozenset(pinned))
+        _graph_runners.append((key, tuple(sorted(int(b) for b in capture_bs)), frozenset(pinned)))
     except Exception:
-        _graph_runners[key] = ((), frozenset())
+        _graph_runners.append((key, (), frozenset()))
         pinned = ()
     return frozenset(pinned)
+
+
+def _bucket(capture, raw_bs):
+    """Smallest captured size >= raw_bs (the runners' _pad_to_bucket), or None."""
+    import bisect
+
+    index = bisect.bisect_left(capture, raw_bs)
+    return capture[index] if index < len(capture) else None
 
 
 def graph_ok(raw_bs):
     """True when every registered runner has a pinned graph for ``raw_bs``.
 
-    Pure function of the raw batch size and the static capture lists, so the
-    target, draft and draft-extend runners make the same pinned-graph vs
-    eager choice for a batch (no mix of graph and eager state for a pin).
+    Each runner is tested at its own bucket of ``raw_bs`` (the size it pads
+    to on replay). Every constructed runner counts, including the inactive
+    adaptive-MTP states, so the answer does not depend on which state is
+    active or which was built last. Pure function of the raw batch size and
+    the static capture lists, so the target, draft and draft-extend runners
+    make the same pinned-graph vs eager choice for a batch on every rank (no
+    mix of graph and eager state for a pin). Never raises.
     """
-    if not _graph_runners or not graphs_enabled():
-        return False
     try:
+        if not _graph_runners or not graphs_enabled():
+            return False
         raw_bs = int(raw_bs)
+        for _key, capture, pinned in _graph_runners:
+            bucket = _bucket(capture, raw_bs)
+            if bucket is None or bucket not in pinned:
+                return False
+        return True
     except Exception:
         return False
-    for capture, pinned in _graph_runners.values():
-        bucket = next((b for b in capture if b >= raw_bs), None)
-        if bucket is None or bucket not in pinned:
+
+
+def runner_ok(runner, raw_bs):
+    """True when ``runner`` itself has a pinned graph for its bucket of ``raw_bs``.
+
+    Defence in depth for each ``can_run_graph``: the bucket is computed from
+    the runner's own ``capture_bs`` exactly as its replay pads
+    (``_pad_to_bucket``), and must be in the runner's ``_occ3_pin_bs``. Host
+    ints only; never raises (False means eager).
+    """
+    try:
+        pinned = getattr(runner, "_occ3_pin_bs", None)
+        if not pinned:
             return False
-    return True
+        bucket = _bucket(runner.capture_bs, int(raw_bs))  # as replay: no re-sort
+        return bucket is not None and bucket in pinned
+    except Exception:
+        return False
 
 
 def pinned_key(shape_key):
