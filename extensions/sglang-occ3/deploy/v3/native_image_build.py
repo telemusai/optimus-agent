@@ -1,7 +1,7 @@
 """Offline native derived-image layer driver; runs inside the image build stage.
 
-Pipeline: verify the five root-staged input files (frozen raw-hash input
-receipt), apply the exclusive disposable SGLang source tree overlay and
+Pipeline: verify the root-staged input files, MANIFEST_NAMES plus
+INPUT_NAMES (frozen raw-hash input receipt), apply the exclusive disposable SGLang source tree overlay and
 generated packaging artifacts through ``deploy.v3.native_package``, install
 the staged plugin package with an offline-only pip command that also refuses
 bytecode compilation (``--no-compile``, so the installed tree contains only
@@ -37,8 +37,12 @@ else:
     from . import native_package, source_patch
 
 SCHEMA = "optimus.occ3.native-image-build.v1"
-MANIFEST_NAMES = ("capture-eager-mtp.v1.json", "native-startup.v2.json",
-                  "scheduler-cache-ipc.v1.json")
+# Reviewed source manifests, applied and attested in this fixed (sorted) order.
+# Each name must also be staged by deploy/Dockerfile and by
+# deploy/v3/live-instrumentation/stage_build.py. File contents are not pinned
+# here: native_package.prepare validates them against the baseline.
+MANIFEST_NAMES = ("capture-eager-mtp.v1.json", "dsa-mtp-seed.v1.json", "dsa-pin.v1.json",
+                  "native-startup.v2.json", "scheduler-cache-ipc.v1.json")
 INPUT_NAMES = ("source-baseline-expanded.json", "native-profile-input.json")
 STAGED_NAMES = tuple(sorted(MANIFEST_NAMES + INPUT_NAMES))
 DIST_NAME = "occ3-bridge"
@@ -229,7 +233,7 @@ def _read_input_file(path, maximum):
 
 
 def _load_staged_inputs(directory):
-    """Read exactly the five root-staged input files; nothing else is accepted."""
+    """Read exactly the STAGED_NAMES root-staged input files; nothing else is accepted."""
     directory = Path(directory)
     staged = {}
     with os.scandir(directory) as children:

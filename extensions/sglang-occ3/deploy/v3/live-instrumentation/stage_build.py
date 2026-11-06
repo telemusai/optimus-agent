@@ -14,7 +14,7 @@ Staged layout (live-build-sequence.md section 3, live-swap-checklist.md section 
       deploy/Dockerfile
       deploy/v3/*.py                           the five Dockerfile-copied utilities, plus the
                                                controller/lifecycle/supervisor modules P2 and S4 run
-      patches/<three>.v1.json                  the three pinned SGLang patch records
+      patches/<name>.v1.json                   the pinned SGLang patch records (MANIFEST_NAMES)
       deploy/native-build-inputs/*.json         the two root-staged packaging inputs
       stage-manifest.sha256                     `sha256sum -c` input for the S3 pre-build verify
   /data/occ3-bridge/v3-live-<WIN>/             attempt dir inputs
@@ -51,13 +51,15 @@ BUILD_UTILITIES = ("__init__.py", "artifact_preflight.py", "source_patch.py",
 CONTROLLER_MODULES = ("controller.py", "docker_api.py", "docker_config.py", "lifecycle.py",
                       "live_validation.py", "native_validator.py", "rehearsal.py",
                       "rehearsal_ingress.py", "service_checks.py", "supervisor.py")
-PATCHES = ("capture-eager-mtp.v1.json", "native-startup.v2.json", "scheduler-cache-ipc.v1.json")
+# The staged patch records are exactly the image driver's manifest set, in its order.
+sys.path.insert(0, str(EXT_ROOT))
+from deploy.v3.native_image_build import MANIFEST_NAMES as PATCHES  # noqa: E402
 BUILD_INPUTS = ("source-baseline-expanded.json", "native-profile-input.json")
 HOOK_FILES = ("occ3_p3_arms_hook.py", "zz_occ3_p3_arms.pth")
 
 # Hard pins from live-build-sequence.md section 3. A mismatch is a refusal, never a warning.
 PROFILE_SHA256 = "613698c4abf7ac20ba8e15dacdbcca8391c6deb379d168ba513a1f7a94d648a6"
-BASELINE_SHA256 = "509345ec366fe775e29412b057f68a0019b8a6829c98d303229f5ebf5387f8bc"
+BASELINE_SHA256 = "a3655153182f92f8985feeed5673526b4239b4abf7e119a5abbe7304dffe2dd9"
 PLUGIN_FILE_COUNT = 35
 GENERATED_OUTPUTS = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 PER_MESSAGE_METHOD = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1"
@@ -235,7 +237,9 @@ def _arm_order_document(window, hook_digests):
 
 
 def _verify(entries, plan, window):
-    _require(len(PATCHES) == 3, "patch_set_size")
+    _require(len(PATCHES) == len(set(PATCHES)) >= 1, "patch_set_size")
+    for name in PATCHES:
+        _require((EXT_ROOT / "patches" / name).is_file(), "patch_record_missing", name)
     profile = EXT_ROOT / "deploy" / "native-build-inputs" / "native-profile-input.json"
     baseline = EXT_ROOT / "deploy" / "native-build-inputs" / "source-baseline-expanded.json"
     _require(sha256_file(profile) == PROFILE_SHA256, "profile_digest_mismatch", sha256_file(profile))

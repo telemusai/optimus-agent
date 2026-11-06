@@ -303,12 +303,64 @@ def test_disjoint_manifest_paths_are_mandatory_before_any_write(fixture):
     fixture.no_writes()
 
 
-@pytest.mark.parametrize("count", [0, 1, 2, 4])
-def test_exactly_three_manifests_required(fixture, count):
-    fixture.manifest_paths = (fixture.manifest_paths * 2)[:count]
-    with pytest.raises(package.PackageError, match="exactly_three"):
+def test_manifest_count_must_be_within_bounds(fixture):
+    fixture.manifest_paths = []
+    with pytest.raises(package.PackageError, match="manifest_count_invalid"):
         fixture.prepare()
     fixture.no_writes()
+    fixture.manifest_paths = [fixture.root / ("m%d.json" % index)
+                              for index in range(package.MAX_MANIFESTS + 1)]
+    with pytest.raises(package.PackageError, match="manifest_count_invalid"):
+        fixture.prepare()
+    fixture.no_writes()
+
+
+@pytest.mark.parametrize("count", [1, 2])
+def test_fewer_disjoint_manifests_prepare_only_their_files(fixture, count):
+    fixture.manifest_paths = fixture.manifest_paths[:count]
+    plan = fixture.prepare()
+    assert [name for name, _ in plan.manifests] == sorted(path.name for path in fixture.manifest_paths)
+    assert len(plan.overlay.files) == count
+    fixture.no_writes()
+
+
+def test_repeated_manifest_path_is_refused(fixture):
+    fixture.manifest_paths = fixture.manifest_paths + [fixture.manifest_paths[0]]
+    with pytest.raises(package.PackageError, match="duplicate_input_path"):
+        fixture.prepare()
+    fixture.no_writes()
+
+
+def test_five_manifests_apply_with_order_independent_attestation(fixture):
+    """The image build passes five disjoint manifests; the merged overlay and the
+    generated attestation must not depend on the order they are passed in."""
+    (fixture.sg / "sub" / "c.py").write_bytes(b"VALUE = 5\n")
+    fixture.originals["sub/c.py"] = b"VALUE = 5\n"
+    fixture.baseline["files"].append({"path": "sub/c.py", "sha256": digest(b"VALUE = 5\n")})
+    write_json(fixture.baseline_path, fixture.baseline)
+    for index, path in ((3, "untouched.py"), (4, "sub/c.py")):
+        original = fixture.originals[path]
+        manifest = {"schema": package.source_patch.SCHEMA, "source_revision": package.SOURCE_REVISION,
+                    "source_version": package.SOURCE_VERSION, "patch_set": "fixture-" + str(index),
+                    "files": [{"path": path, "before_sha256": digest(original),
+                               "after_sha256": digest(original.replace(b"VALUE", b"PATCHED")),
+                               "replacements": [{"before": "VALUE", "after": "PATCHED"}]}]}
+        target = fixture.root / ("fixture-" + str(index) + ".json")
+        write_json(target, manifest)
+        fixture.manifest_paths.append(target)
+    assert len(fixture.manifest_paths) == 5
+    forward = fixture.prepare()
+    fixture.manifest_paths = list(reversed(fixture.manifest_paths))
+    backward = fixture.prepare()
+    assert forward.manifests == backward.manifests
+    assert forward.overlay.manifest_sha256 == backward.overlay.manifest_sha256
+    assert dict(forward.artifacts) == dict(backward.artifacts)
+    result = package.apply(forward, disposable=True)
+    assert result["patched_source_files"] == 5
+    assert [entry["name"] for entry in result["manifests"]] == sorted(
+        "fixture-%d.json" % index for index in range(5))
+    for path in ("a.py", "sub/b.py", "http_server.py", "untouched.py", "sub/c.py"):
+        assert (fixture.sg / path).read_bytes().startswith(b"PATCHED")
 
 
 def test_corrupt_third_manifest_and_syntax_do_not_apply_earlier_plans(fixture):
@@ -815,8 +867,8 @@ def test_merged_manifest_respects_same_byte_bound_as_normal_source_patch_prepare
 
 
 def fixture_final_source_bytes(fixture):
-    # Independent fixture arithmetic: manifests replace VALUE by PATCHED in
-    # exactly three SG files; the fourth and every plugin module are unchanged.
+    # Independent fixture arithmetic: the three fixture manifests replace VALUE
+    # by PATCHED in three SG files; the fourth and every plugin module are unchanged.
     patched = {"a.py", "sub/b.py", "http_server.py"}
     return (sum(len(raw.replace(b"VALUE", b"PATCHED")) if path in patched else len(raw)
                 for path, raw in fixture.originals.items())
