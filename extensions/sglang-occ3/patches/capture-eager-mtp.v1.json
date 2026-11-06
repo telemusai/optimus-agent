@@ -109,11 +109,23 @@
     {
       "path": "model_executor/runner/decode_cuda_graph_runner.py",
       "before_sha256": "1ec64d53550012a006d2fb7acbcabeefb6d3a3729864373d870314aed19f94cd",
-      "after_sha256": "260e2fde8c62dcfaf1141ea28662afebb65ceb67628ef8f0e106e90dcfb5e0ed",
+      "after_sha256": "afe3d0721748176a3d945c87501f4c6a8d6c812ac36f1057a91a32b71e680ee8",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
           "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+        },
+        {
+          "before": "        self.max_bs = max(self.capture_bs)\n        if KTRANSFORMERS_AVAILABLE:\n",
+          "after": "        self.max_bs = max(self.capture_bs)\n        # OCC-3 DSA indexer pin: static [max_bs] buffers read by every\n        # captured graph; zeroed and refilled before each replay.\n        from occ3_sglang.dsa_pin import GraphPin as _Occ3GraphPin\n\n        self._occ3_dsa_pin = _Occ3GraphPin(self.max_bs, model_runner.device)\n        if KTRANSFORMERS_AVAILABLE:\n"
+        },
+        {
+          "before": "        if buffers.ngram_embedding_info is not None:\n            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)\n\n        return forward_batch, attn_backend, pp_proxy_tensors\n",
+          "after": "        if buffers.ngram_embedding_info is not None:\n            forward_batch.ngram_embedding_info = buffers.ngram_embedding_info.slice(bs)\n\n        forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(bs)\n        return forward_batch, attn_backend, pp_proxy_tensors\n"
+        },
+        {
+          "before": "            output = self.backend.replay(self._replay_graph_key, forward_batch)\n",
+          "after": "            self._occ3_dsa_pin.load(forward_batch, forward_batch.batch_size)\n            output = self.backend.replay(self._replay_graph_key, forward_batch)\n            self._occ3_dsa_pin.publish(forward_batch, forward_batch.batch_size)\n"
         }
       ]
     },
@@ -131,22 +143,46 @@
     {
       "path": "speculative/eagle_draft_cuda_graph_runner.py",
       "before_sha256": "cb3d031b739a9aa7f2a1b02bd289b6673652818482502ced101a6f506c7a8e9f",
-      "after_sha256": "6fe337333487ab669b6ee0ca9a67781f577226af2820acfc10a255d4ebf9b63b",
+      "after_sha256": "9f62d1890dbd7ca20b3bf252cad9233ab8e664c547a5cef4ac96046c0c93fe12",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
           "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+        },
+        {
+          "before": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n",
+          "after": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n        # OCC-3 DSA indexer pin: static [max_bs] buffers read by the captured\n        # graph; zeroed and refilled from the live batch before each replay.\n        from occ3_sglang.dsa_pin import GraphPin as _Occ3GraphPin\n\n        self._occ3_dsa_pin = _Occ3GraphPin(self.max_bs, model_runner.device)\n"
+        },
+        {
+          "before": "        def run_once():\n            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)\n",
+          "after": "        forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(num_seqs)\n\n        def run_once():\n            self.draft_attn_backend.init_forward_metadata_in_graph(forward_batch)\n"
+        },
+        {
+          "before": "        # Replay via backend\n        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft\"):\n            out = self._replay_graph(shape_key, forward_batch)\n",
+          "after": "        self._occ3_dsa_pin.load(forward_batch, raw_bs)\n        # Replay via backend\n        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft\"):\n            out = self._replay_graph(shape_key, forward_batch)\n        self._occ3_dsa_pin.publish(forward_batch, raw_bs)\n"
         }
       ]
     },
     {
       "path": "speculative/eagle_draft_extend_cuda_graph_runner.py",
       "before_sha256": "4b5fe702938aae7d698578c6ffd31fd93766e2ad6c4210c19a75df03ea8a7f09",
-      "after_sha256": "314a986760c9be6559af5b032f6e5c4a6eb6668d5ee6eba4819d9436f2fd8ee7",
+      "after_sha256": "e6a0e85f5372d12d0f95510f41dd0dc9fd26c67352df97f7736dd0726e86829d",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch):\n",
           "after": "    def can_run_graph(self, forward_batch: ForwardBatch):\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+        },
+        {
+          "before": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n",
+          "after": "        self.max_bs = max(self.capture_bs)\n        self.max_num_token = self.max_bs * self.captured_req_width\n        # OCC-3 DSA indexer pin: static [max_bs] buffers read by the captured\n        # graph; zeroed and refilled from the live batch before each replay.\n        from occ3_sglang.dsa_pin import GraphPin as _Occ3GraphPin\n\n        self._occ3_dsa_pin = _Occ3GraphPin(self.max_bs, model_runner.device)\n"
+        },
+        {
+          "before": "        def run_once():\n            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)\n",
+          "after": "        forward_batch.occ3_dsa_pin = self._occ3_dsa_pin.view(bs)\n\n        def run_once():\n            self.draft_extend_attn_backend.init_forward_metadata_in_graph(forward_batch)\n"
+        },
+        {
+          "before": "        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft_extend\"):\n            out = self._replay_graph(shape_key, forward_batch)\n",
+          "after": "        self._occ3_dsa_pin.load(forward_batch, raw_bs)\n        shape_key = self._make_graph_key(bs)\n        with device_timer_ctx(self.model_runner.device_timer, \"eagle_draft_extend\"):\n            out = self._replay_graph(shape_key, forward_batch)\n        self._occ3_dsa_pin.publish(forward_batch, raw_bs)\n"
         }
       ]
     },
