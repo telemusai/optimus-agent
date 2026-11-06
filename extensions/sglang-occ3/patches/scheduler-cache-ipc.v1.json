@@ -449,11 +449,11 @@
     {
       "path": "model_executor/forward_batch_info.py",
       "before_sha256": "ef4426b3ece1b515eeb5223d394de6a8d154d912bcf62e7ed4bae20e17064797",
-      "after_sha256": "98414739ec4731bfd22547841dccd08f56572daa6f67508eec8bfcea213bf4db",
+      "after_sha256": "62dac8fa1ccb44151a37df70484a760f23f8c31d298493f4734298b0758cf8c8",
       "replacements": [
         {
           "before": "    # For input embeddings\n    input_embeds: Optional[torch.Tensor] = None",
-          "after": "    # Private worker-only state. None on ordinary/graph requests.\n    occ3_context: Optional[tuple] = None\n    occ3_force_eager: bool = False\n    occ3_forward_iter: Optional[int] = None\n    occ3_capture_rows: Optional[object] = None\n    occ3_effective_embeds: Optional[torch.Tensor] = None\n\n    # For input embeddings\n    input_embeds: Optional[torch.Tensor] = None"
+          "after": "    # Private worker-only state. None on ordinary/graph requests.\n    occ3_context: Optional[tuple] = None\n    occ3_force_eager: bool = False\n    occ3_forward_iter: Optional[int] = None\n    occ3_capture_rows: Optional[object] = None\n    occ3_effective_embeds: Optional[torch.Tensor] = None\n    # DSA indexer pin (occ3_sglang.dsa_pin): per-batch-row (start, count,\n    # forced) int32 tensors, rebuilt from batch.reqs every init_new; None\n    # when no attached consume row is in the batch.\n    occ3_dsa_pin: Optional[tuple] = None\n\n    # For input embeddings\n    input_embeds: Optional[torch.Tensor] = None"
         },
         {
           "before": "            # Scalar config / flags\n            return_logprob=batch.return_logprob,",
@@ -469,11 +469,15 @@
         },
         {
           "before": "    def can_run_tbo(self):\n        return self.tbo_split_seq_index is not None",
-          "after": "    def can_run_tbo(self):\n        if self.occ3_force_eager:\n            return False\n        return self.tbo_split_seq_index is not None"
+          "after": "    def can_run_tbo(self):\n        if self.occ3_force_eager:\n            return False\n        # The per-batch-row DSA pin is not split across TBO child batches.\n        if self.occ3_dsa_pin is not None:\n            return False\n        return self.tbo_split_seq_index is not None\n"
         },
         {
           "before": "        actual_forward_mode=forward_batch.forward_mode,\n",
           "after": "        actual_forward_mode=forward_batch.forward_mode,\n        occ3_context=getattr(forward_batch, \"occ3_context\", None),\n        occ3_force_eager=getattr(forward_batch, \"occ3_force_eager\", False),\n        occ3_forward_iter=getattr(forward_batch, \"occ3_forward_iter\", None),\n"
+        },
+        {
+          "before": "        model_runner.kv_index_translator.rebind_write_loc(ret)\n",
+          "after": "        model_runner.kv_index_translator.rebind_write_loc(ret)\n\n        # Keyed by batch index from this batch's reqs only: filter/merge or\n        # reorder can never carry a stale pin. Only the target runner records\n        # the forced counter that terminal settle reads.\n        from occ3_sglang import dsa_pin as _occ3_dsa_pin\n\n        ret.occ3_dsa_pin = _occ3_dsa_pin.build(\n            batch, device, record=not model_runner.is_draft_worker\n        )\n"
         }
       ]
     },
