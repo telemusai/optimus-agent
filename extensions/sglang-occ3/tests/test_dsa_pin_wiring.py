@@ -8,6 +8,7 @@ Source evidence only; not GPU, kernel or CUDA-graph replay evidence.
 from __future__ import annotations
 
 import ast
+import textwrap
 import hashlib
 import importlib.util
 import json
@@ -127,3 +128,53 @@ def test_graph_runner_static_pin_buffers(patched, path):
     call = replay.index("_replay_graph(") if "_replay_graph(" in replay else replay.index("self.backend.replay(")
     assert load < call < publish
     assert replay.count("self._occ3_dsa_pin.load(") == 1
+
+
+PREFILL = "model_executor/runner/prefill_cuda_graph_runner.py"
+
+
+def test_prefill_graph_runner_rejects_pinned_batches(patched):
+    """Fable #2: pinned consume chunks never replay a pin-less prefill graph."""
+    text = patched[PREFILL]
+    method = _method(text, "can_run_graph")
+    guard = method.index('if getattr(forward_batch, "occ3_dsa_pin", None) is not None:')
+    # Ahead of every native eligibility check (which reads live batch fields).
+    assert guard < method.index("global_num_tokens_cpu")
+    # Execute the patched early-return prefix on stub batches.
+    head = method[: method.index("        # DP check")] + "        return 'native'\n"
+    ns = {"ForwardBatch": object}
+    exec(compile("import textwrap\n" + textwrap.dedent(head), PREFILL, "exec"), ns)
+    can_run = ns["can_run_graph"]
+    from types import SimpleNamespace as NS
+
+    pinned = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=("s", "c", "f"))
+    plain = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=None)
+    legacy = NS()
+    assert can_run(None, pinned) is False
+    assert can_run(None, plain) == "native"
+    assert can_run(None, legacy) == "native"
+    assert can_run(None, NS(occ3_force_eager=True)) is False
+
+
+def test_pin_covers_every_chunk_and_decode_of_an_attached_request():
+    """The producer keys on occ3_attached, which cohort release never clears.
+
+    release_consume_cohort clears only occ3_force_eager after the injected
+    chunk, so later prefill chunks and every decode step still carry the pin
+    (and therefore take the eager prefill path above, or the decode/verify
+    graphs that load the static pin buffers).
+    """
+    import inspect
+    from types import SimpleNamespace as NS
+
+    from occ3_sglang import dsa_pin, latent_worker
+    from test_latent_registry import consume
+
+    src = inspect.getsource(latent_worker.release_consume_cohort)
+    assert "req.occ3_force_eager = False" in src and "occ3_attached" not in src
+    req = NS(occ3_attached=True, occ3_force_eager=True,
+             occ3_worker_descriptor=consume(prefix_offset=0, expected_prefix_tokens=64))
+    assert dsa_pin.pin_rows([req]) == ([0], [64])  # injected chunk
+    req.occ3_force_eager = False  # cohort released after the injected chunk
+    assert dsa_pin.pin_rows([req]) == ([0], [64])  # later chunks
+    assert dsa_pin.pin_rows([NS(occ3_attached=False), req]) == ([0, 0], [0, 64])  # decode

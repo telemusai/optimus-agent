@@ -132,11 +132,11 @@
     {
       "path": "model_executor/runner/prefill_cuda_graph_runner.py",
       "before_sha256": "3f9c35d036ed8c4469c262f6cc00084987deafc9787721d5d3475e93dcafcd6f",
-      "after_sha256": "acdc3858c086a88cf64b91cd4f0b9e7daf82654e8fa5873c97405bb164e3bdf6",
+      "after_sha256": "88a31ba20d7a512a2c31039509fc5cb93294bacd17ec1f1166c47c12e4cfb018",
       "replacements": [
         {
           "before": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n",
-          "after": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n\n"
+          "after": "    def can_run_graph(self, forward_batch: ForwardBatch) -> bool:\n        # Request-local only: reject before graph metadata/load/replay work.\n        if getattr(forward_batch, \"occ3_force_eager\", False) or getattr(\n            forward_batch, \"occ3_context\", None\n        ):\n            return False\n        # The prefill graphs carry no OCC-3 DSA pin buffer: every chunk of an\n        # attached consume (after its injected chunk left the eager cohort)\n        # runs eager so the indexer applies the pin. Ordinary batches without\n        # a pinned row keep the prefill graph.\n        if getattr(forward_batch, \"occ3_dsa_pin\", None) is not None:\n            return False\n\n"
         }
       ]
     },
