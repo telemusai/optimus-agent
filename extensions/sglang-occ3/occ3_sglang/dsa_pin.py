@@ -33,7 +33,7 @@ _bounds_logged = False
 PIN_LANES = 128
 
 
-def pin_rows(reqs):
+def pin_rows(reqs, shift=0):
     """Host-side (start, count) per batch row; zeros for every non-pinned row.
 
     Only an attached consume row with a bounded descriptor is pinned.
@@ -41,6 +41,12 @@ def pin_rows(reqs):
     This runs inside ``ForwardBatch.init_new`` for every batch, so it never
     raises: an out-of-bounds descriptor (unreachable after admission, which
     bounds both values) is logged once and treated as count 0 (no pin).
+
+    ``shift`` is 1 for the EAGLE/NextN draft runner. Its input is shifted by
+    one row (latent_worker._effective uses prefix_span(..., shift=1)), so
+    prefix row 0 sits at draft row ``offset - 1`` and the draft pin starts
+    there with the same count. At offset 0 prefix row 0 never reaches the
+    draft and the start stays 0.
     """
     global _bounds_logged
     from .attachment_contract import ConsumeWorkerDescriptor
@@ -55,6 +61,8 @@ def pin_rows(reqs):
             if (type(count) is int and type(start) is int
                     and 0 < count <= PIN_LANES and 0 <= start <= 2**20):
                 any_pin = True
+                if shift and start > 0:
+                    start -= 1
             else:
                 if not _bounds_logged:
                     _bounds_logged = True
@@ -65,15 +73,19 @@ def pin_rows(reqs):
     return (starts, counts) if any_pin else None
 
 
-def build(batch, device, *, record):
+def build(batch, device, *, record, draft=None):
     """Build ``ForwardBatch.occ3_dsa_pin`` for one forward from ``batch.reqs``.
 
     ``record`` (target runner only) stores ``(forced, row)`` on each pinned
     request so terminal settle can read the last forward's pin-hit count; the
-    draft runner applies the same pin but never overwrites the record.
+    draft runner applies the same pin, in its shifted row space, and never
+    overwrites the record. ``draft`` defaults to ``not record``: init_new
+    passes ``record=not model_runner.is_draft_worker``.
     """
+    if draft is None:
+        draft = not record
     reqs = list(getattr(batch, "reqs", None) or ())
-    rows = pin_rows(reqs)
+    rows = pin_rows(reqs, shift=1 if draft else 0)
     if rows is None:
         return None
     import torch

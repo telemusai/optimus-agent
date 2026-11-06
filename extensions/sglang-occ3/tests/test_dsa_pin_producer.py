@@ -70,13 +70,39 @@ def test_out_of_bounds_descriptor_never_raises_in_init_new(caplog):
     assert len(errors) == 1
 
 
+def test_draft_pin_is_in_the_shifted_draft_row_space():
+    """Fable D#1: draft input is shifted by one (prefix_span shift=1)."""
+    torch = pytest.importorskip("torch")
+    from occ3_sglang.prefix_layout import prefix_span
+
+    offset, count = 40, 8
+    a = attached(offset, count)
+    batch = NS(reqs=[ordinary(), a])
+    target = dsa_pin.build(batch, "cpu", record=True)
+    draft = dsa_pin.build(batch, "cpu", record=False)
+    assert target[0].tolist() == [0, offset] and draft[0].tolist() == [0, offset - 1]
+    assert target[1].tolist() == draft[1].tolist() == [0, count]
+    # The draft pin covers exactly the draft rows that receive prefix rows.
+    local, n, source = prefix_span(count, offset, 0, 100, shift=1)
+    assert source == 0 and n == count
+    pinned = set(range(int(draft[0][1]), int(draft[0][1]) + count))
+    assert set(range(local, local + n)) == pinned
+    # Offset 0 (prepend): prefix row 0 never reaches the draft; start stays 0.
+    p = attached(0, count)
+    assert dsa_pin.build(NS(reqs=[p]), "cpu", record=False)[0].tolist() == [0]
+    assert dsa_pin.pin_rows([p], shift=1) == ([0], [count])
+    # Explicit draft flag wins over the record default.
+    assert dsa_pin.build(batch, "cpu", record=False, draft=False)[0].tolist() == [0, offset]
+
+
 def test_build_records_forced_on_target_only():
     torch = pytest.importorskip("torch")
     a = attached(3, 8)
     batch = NS(reqs=[ordinary(), a, ordinary()])
     start, count, forced = dsa_pin.build(batch, "cpu", record=False)
     assert start.dtype == count.dtype == forced.dtype == torch.int32
-    assert start.tolist() == [0, 3, 0] and count.tolist() == [0, 8, 0]
+    # record=False is the draft runner: shifted draft row space (start - 1).
+    assert start.tolist() == [0, 2, 0] and count.tolist() == [0, 8, 0]
     assert forced.tolist() == [0, 0, 0]
     assert getattr(a, "occ3_dsa_pin_forced", None) is None
     pin = dsa_pin.build(batch, "cpu", record=True)
