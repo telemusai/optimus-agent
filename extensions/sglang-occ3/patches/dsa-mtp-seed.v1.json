@@ -1,0 +1,49 @@
+{
+  "schema": "optimus.sglang-occ3.source-patch.v1",
+  "source_revision": "e00930c5489053f26d86b179cee0d087f846acbb",
+  "source_version": "0.5.21",
+  "patch_set": "dsa-mtp-seed-v1",
+  "files": [
+    {
+      "path": "layers/attention/dsa_backend.py",
+      "before_sha256": "a43174977f4746f2d632cdc87cf1ab15f4f88d8a91e53fd76155b80e03ddfb15",
+      "after_sha256": "ba806cc770cff95f517325aea70e06389b76aaf391ae37a8be89fe0f2eb90ebd",
+      "replacements": [
+        {
+          "before": "            f\"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK.\"\n        )\n\n    def get_device_int32_arange(self, length: int) -> torch.Tensor:\n",
+          "after": "            f\"Unsupported {self.dsa_topk_backend = } for SGLANG_DSA_FUSE_TOPK.\"\n        )\n\n    def prepare_mtp_seed_indices(\n        self, topk_indices: torch.Tensor, forward_mode: ForwardMode\n    ) -> torch.Tensor:\n        \"\"\"Export a seed in the representation consumed by the next draft decode.\"\"\"\n        if (\n            not self.use_fused_topk\n            or self.get_topk_transform_method(forward_mode)\n            != TopkTransformMethod.RAGGED\n        ):\n            # PAGED output is already physical; unfused/PD seeds stay request-local.\n            return topk_indices\n\n        # Prefill addresses concatenated logical KV, but fused draft decode\n        # consumes allocator-local physical slots. Leave prefill's input intact.\n        metadata = self.forward_metadata\n        page_table = metadata.page_table_1_flattened\n        if page_table is None:\n            # Without a cached prefix attention does not need a flattened table.\n            # Build it in the producer indexer's request order for seed export.\n            page_table = torch.cat(\n                [\n                    metadata.page_table_1[i, :length]\n                    for i, length in enumerate(metadata.indexer_seq_lens_cpu.tolist())\n                ]\n            )\n        padding = topk_indices == -1\n        # index_select rejects invalid indices. Replace only the padding sentinel\n        # for the gather, then restore it; never clamp a bad positive index.\n        physical_indices = page_table.index_select(\n            0, topk_indices.masked_fill(padding, 0).reshape(-1).long()\n        ).view_as(topk_indices)\n        return physical_indices.masked_fill(padding, -1)\n\n    def get_device_int32_arange(self, length: int) -> torch.Tensor:\n"
+        }
+      ]
+    },
+    {
+      "path": "layers/attention/index_topk_share.py",
+      "before_sha256": "e4b2218c1b0ef472c5dc51c87e889c10742d33360d3fc7215458b64b6d3deebe",
+      "after_sha256": "c66979b1a295344ff70c68db5531c84b86828412224b80c41b2af0921b5e5174",
+      "replacements": [
+        {
+          "before": "        seed_buf = self._seed_buf\n        if seed_buf is not None:\n            sel = self._forward_batch.spec_info.dsa_seed_topk_select\n            src = (\n                self._topk_indices[: seed_buf.shape[0]]\n                if sel is None\n                else self._topk_indices[sel]\n            )\n            seed_buf[: src.shape[0]].copy_(src)\n\n    @classmethod\n",
+          "after": "        seed_buf = self._seed_buf\n        if seed_buf is not None:\n            write_mtp_seed(self._forward_batch, seed_buf, self._topk_indices)\n\n    @classmethod\n"
+        },
+        {
+          "before": "            spec_info.dsa_topk_indices = None\n            forward_batch.reuse_dsa_topk_indices = False\n",
+          "after": "            spec_info.dsa_topk_indices = None\n            forward_batch.reuse_dsa_topk_indices = False\n\n\ndef write_mtp_seed(\n    forward_batch: ForwardBatch, seed_buf: torch.Tensor, topk_indices: torch.Tensor\n) -> None:\n    \"\"\"Copy the selected top-k rows into the MTP seed buffer.\n\n    Both the MHA and sparse-MLA prefill paths export seeds here so the backend\n    can convert prefill-only index representations (e.g. fused RAGGED logical\n    offsets) into what the next draft decode consumes.\n    \"\"\"\n    from sglang.srt.models.deepseek_common.attention_forward_methods.forward_mha import (\n        resolve_attn_backend,\n    )\n\n    select = forward_batch.spec_info.dsa_seed_topk_select\n    src = topk_indices[: seed_buf.shape[0]] if select is None else topk_indices[select]\n    prepare_seed = getattr(\n        resolve_attn_backend(forward_batch), \"prepare_mtp_seed_indices\", None\n    )\n    if prepare_seed is not None:\n        src = prepare_seed(src, forward_batch.forward_mode)\n    seed_buf[: src.shape[0]].copy_(src)\n"
+        }
+      ]
+    },
+    {
+      "path": "models/deepseek_common/attention_forward_methods/forward_mha.py",
+      "before_sha256": "e829796b7ca422199542e29d9f7ddc975e050a39982219f9ebcd31d1699196a1",
+      "after_sha256": "5b685b8790788f520cefc3a2186b7c2d252b83dcac57694f55d42373ca1c00b6",
+      "replacements": [
+        {
+          "before": "from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton\nfrom sglang.srt.environ import envs\nfrom sglang.srt.layers.attention.tbo_backend import TboAttnBackend\nfrom sglang.srt.layers.dcp import (\n",
+          "after": "from sglang.kernels.ops.attention.utils import concat_and_cast_mha_k_triton\nfrom sglang.srt.environ import envs\nfrom sglang.srt.layers.attention.index_topk_share import write_mtp_seed\nfrom sglang.srt.layers.attention.tbo_backend import TboAttnBackend\nfrom sglang.srt.layers.dcp import (\n"
+        },
+        {
+          "before": "        raise RuntimeError(\"DSA MHA indexer did not produce the requested MTP seed\")\n\n    select = spec_info.dsa_seed_topk_select\n    src = topk_indices if select is None else topk_indices[select]\n    seed_buf[: src.shape[0]].copy_(src)\n\n\n",
+          "after": "        raise RuntimeError(\"DSA MHA indexer did not produce the requested MTP seed\")\n\n    write_mtp_seed(forward_batch, seed_buf, topk_indices)\n\n\n"
+        }
+      ]
+    }
+  ]
+}
