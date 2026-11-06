@@ -6,10 +6,14 @@ rendered prompt tells the adapter where the sender's continuous message
 belongs; the worker reserves that many positions and overwrites exactly
 those rows with the authorised native prefix.
 
-An absent marker keeps the legacy layout (prefix prepended at absolute row 0)
-so an existing client keeps working and the receipt says which layout ran.
-Everything here is integer arithmetic over token counts; no prompt text is
-retained and no token id is logged.
+Without a marker the extension places the prefix itself: immediately after
+the last user-turn role token of the rendered prompt (LAYOUT_LAST_USER). The
+role token is found by exact token-id match against the tokenizer's own
+attested role-token id, never by a text search. When that id cannot be
+attested, does not occur, or the prefix-stability proof fails, the legacy
+layout (prefix prepended at absolute row 0) is used and the bounded fallback
+reason is recorded. Everything here is integer arithmetic over token ids and
+counts; no prompt text is retained and no token id is logged.
 """
 from __future__ import annotations
 
@@ -22,6 +26,11 @@ PREFIX_MARKER = "<<occ3-statebegin>>"
 
 LAYOUT_MARKER = "marker"
 LAYOUT_PREPEND = "prepend"
+LAYOUT_LAST_USER = "last_user"
+LAYOUTS = (LAYOUT_MARKER, LAYOUT_PREPEND, LAYOUT_LAST_USER)
+
+#: Bounded reasons a no-marker request fell back to the prepend layout.
+FALLBACK_REASONS = ("no_tokenizer", "no_role_token", "role_absent", "unstable", "shape")
 
 
 @dataclass(frozen=True)
@@ -30,11 +39,15 @@ class PrefixLayout:
 
     layout: str
     offset: int
+    #: Why a no-marker request used the prepend layout; empty otherwise.
+    fallback: str = ""
 
     def __post_init__(self):
-        require(self.layout in (LAYOUT_MARKER, LAYOUT_PREPEND), "profile")
+        require(self.layout in LAYOUTS, "profile")
         require(type(self.offset) is int and 0 <= self.offset <= 2**20, "profile")
-        require((self.layout == LAYOUT_MARKER) == (self.offset > 0), "profile")
+        require((self.layout != LAYOUT_PREPEND) == (self.offset > 0), "profile")
+        require(self.fallback == "" or (self.layout == LAYOUT_PREPEND
+                                        and self.fallback in FALLBACK_REASONS), "profile")
 
 
 def _encoder(tokenizer, add_special_tokens):
@@ -79,6 +92,65 @@ def resolve_prefix_layout(text, tokenizer, *, marker=PREFIX_MARKER,
     head = encode(text[:cut])
     require(len(head) == offset and ids[:offset] == head, "profile")
     return PrefixLayout(LAYOUT_MARKER, offset)
+
+
+def _plain(ids):
+    ids = list(ids) if isinstance(ids, (list, tuple)) else list(ids.tolist())
+    require(all(type(value) is int for value in ids), "profile")
+    return ids
+
+
+def resolve_last_user_layout(tokenizer, role_id, *, text=None, input_ids=None,
+                             add_special_tokens=False):
+    """Place the prefix immediately after the last user-turn role token.
+
+    ``role_id`` is the tokenizer's own attested user role-token id
+    (span_markers.resolve_role_token_id). The position is an exact token-id
+    match in the rendered prompt's ids. Returns ``(layout, pinned_ids)``:
+    ``pinned_ids`` is the exact id sequence the offset was computed on (the
+    caller must send these ids, not the text), or None on a prepend fallback.
+
+    For a text prompt the same prefix-stability proof as resolve_prefix_layout
+    holds: the head (the decoded ids up to and including the role token) must
+    be a strict prefix of the text and must encode to exactly ids[:offset].
+    A prompt that is already token ids needs no proof: the offset indexes them.
+    Never raises for an ordinary prompt; every refusal is a bounded fallback.
+    """
+    def fallback(reason):
+        return PrefixLayout(LAYOUT_PREPEND, 0, fallback=reason), None
+    if type(role_id) is not int or role_id < 0:
+        return fallback("no_role_token")
+    try:
+        if text is not None:
+            if type(text) is not str or not text:
+                return fallback("shape")
+            ids = _encoder(tokenizer, add_special_tokens)(text)
+        elif input_ids is not None:
+            ids = _plain(input_ids)
+        else:
+            return fallback("shape")
+    except Exception:
+        return fallback("shape")
+    if not ids or len(ids) > 2**20:
+        return fallback("shape")
+    index = _find_last(ids, [role_id])
+    if index < 0:
+        return fallback("role_absent")
+    offset = index + 1
+    if offset >= len(ids):
+        # Nothing follows the role token: no room to place the prefix before
+        # the generation prompt. Not a GLM chat-template prompt.
+        return fallback("shape")
+    if text is not None:
+        try:
+            head = tokenizer.decode(ids[:offset], skip_special_tokens=False)
+            stable = (type(head) is str and 0 < len(head) < len(text) and text.startswith(head)
+                      and _encoder(tokenizer, add_special_tokens)(head) == ids[:offset])
+        except Exception:
+            stable = False
+        if not stable:
+            return fallback("unstable")
+    return PrefixLayout(LAYOUT_LAST_USER, offset), ids
 
 
 def prefix_span(tokens, offset, prefix_len, extend_len, shift=0):
