@@ -92,15 +92,61 @@ def test_glm_prompt_places_prefix_after_the_last_user_role_token():
     assert sum(1 for v in pinned[:layout.offset] if v == USER) == 2
 
 
-def test_text_search_is_not_used_role_literal_in_content_is_not_a_role_token():
-    # Content that spells the role literal as characters (byte fallback) is
-    # not the role token id; only the real added-token id counts.
+def test_role_literal_in_content_becomes_the_role_token_and_wins():
+    # Real behaviour (HF tokenizer, special tokens enabled on the serving
+    # path): a content literal "<|user|>" encodes to the role-token id, so the
+    # prefix lands after it, inside that content. Documented limitation in
+    # resolve_last_user_layout; it only moves the receiver's own state.
     tok = GlmTok()
-    ids = tok.encode(glm_prompt([("user", "q")]) + "x")
-    fake = ids[:-1] + [1000 + ord(c) for c in "<|user|>"] + ids[-1:]
-    layout, pinned = adapter_layout(ids=fake, tok=tok)
+    text = glm_prompt([("user", "real question"), ("assistant", "quote <|user|> here")])
+    layout, pinned = adapter_layout(text, tok=tok)
+    ids = tok.encode(text)
+    literal = max(i for i, v in enumerate(ids) if v == USER)
+    assert layout == pl.PrefixLayout(pl.LAYOUT_LAST_USER, literal + 1)
+    assert tok.decode(pinned[layout.offset:]).startswith(" here")
+    # Characters that only spell the literal (byte fallback ids) are not the
+    # role token id: exact id match, never a text search.
+    base = tok.encode(glm_prompt([("user", "q")]) + "x")
+    fake = base[:-1] + [1000 + ord(c) for c in "<|user|>"] + base[-1:]
+    layout, _ = adapter_layout(ids=fake, tok=tok)
     real = max(i for i, v in enumerate(fake) if v == USER)
     assert layout.layout == pl.LAYOUT_LAST_USER and layout.offset == real + 1
+
+
+def test_tool_turns_after_the_last_user_turn_keep_the_well_before_them():
+    tok = GlmTok()
+    text = glm_prompt([("user", "look it up"), ("assistant", "calling tool"),
+                       ("observation", "tool result"), ("assistant", "more"),
+                       ("observation", "second result")])
+    layout, pinned = adapter_layout(text, tok=tok)
+    ids = tok.encode(text)
+    user = max(i for i, v in enumerate(ids) if v == USER)
+    assert layout == pl.PrefixLayout(pl.LAYOUT_LAST_USER, user + 1)
+    tail = pinned[layout.offset:]
+    assert tok.decode(tail).startswith("\nlook it up")
+    assert tail.count(ADDED["<|observation|>"]) == 2
+
+
+def test_find_last_single_id_matches_the_general_scan():
+    for hay in ([], [5], [5, 1, 5, 2], [1, 2, 3], list(range(50)) * 3):
+        for needle in (5, 2, 49, 99):
+            general = next((i for i in range(len(hay) - 1, -1, -1) if hay[i] == needle), -1)
+            assert pl._find_last(hay, [needle]) == general
+    assert pl._find_last([1, 2, 1, 2, 3], [1, 2]) == 2
+
+
+def test_prepend_fallback_logs_one_bounded_info_line():
+    import inspect
+
+    from occ3_sglang import chat_adapter
+
+    missing = {k: v for k, v in ADDED.items() if k != "<|user|>"}
+    layout, _ = adapter_layout(MULTI, tok=GlmTok(added=missing))
+    assert layout.fallback == "no_role_token"
+    # Source check of the admit site: one info line, reason from the closed set.
+    source = inspect.getsource(chat_adapter.ChatAttachmentAdapter)
+    assert 'logger.info("occ3 consume prefix layout prepend fallback=%s",' in source
+    assert source.count("prepend fallback=%s") == 1
 
 
 def test_explicit_marker_still_wins():

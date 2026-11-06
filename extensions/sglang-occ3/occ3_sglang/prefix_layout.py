@@ -60,9 +60,18 @@ def _encoder(tokenizer, add_special_tokens):
 
 
 def _find_last(haystack, needle):
-    """Last exact token-id occurrence, or -1. Token matching, never text."""
+    """Last exact token-id occurrence, or -1. Token matching, never text.
+
+    A single-id needle (the role token) uses one reversed C-level
+    ``list.index`` scan instead of a per-position slice comparison.
+    """
     if not needle or len(needle) > len(haystack):
         return -1
+    if len(needle) == 1:
+        try:
+            return len(haystack) - 1 - list(reversed(haystack)).index(needle[0])
+        except ValueError:
+            return -1
     for start in range(len(haystack) - len(needle), -1, -1):
         if haystack[start:start + len(needle)] == needle:
             return start
@@ -115,6 +124,15 @@ def resolve_last_user_layout(tokenizer, role_id, *, text=None, input_ids=None,
     be a strict prefix of the text and must encode to exactly ids[:offset].
     A prompt that is already token ids needs no proof: the offset indexes them.
     Never raises for an ordinary prompt; every refusal is a bounded fallback.
+
+    Limitation: the match is on the role-token id, not on the chat-template
+    structure. The serving path encodes the rendered template with special
+    tokens enabled, so a user message or tool result that contains the
+    literal ``<|user|>`` becomes the same id, and the prefix is placed after
+    that literal, inside the content, while the layout still reads
+    ``last_user``. This only moves the receiver's own attached state within
+    its own prompt; it never crosses requests. A structural guard would be
+    just as spoofable by content, so none is attempted.
     """
     def fallback(reason):
         return PrefixLayout(LAYOUT_PREPEND, 0, fallback=reason), None

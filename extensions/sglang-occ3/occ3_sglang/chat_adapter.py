@@ -1021,6 +1021,11 @@ class ChatAttachmentAdapter:
                 _metrics.inc("prefix_layout_" + layout.layout)
                 if layout.fallback:
                     _metrics.inc("prefix_layout_fallback_" + layout.fallback)
+                    # One bounded info line per fallback admit (tokenizer
+                    # manager, a single process): the reason comes from the
+                    # closed FALLBACK_REASONS set; no prompt text or token id.
+                    logger.info("occ3 consume prefix layout prepend fallback=%s",
+                                layout.fallback)
             elif ctx.attachment.span_policy in SPAN_POLICIES_V2:
                 # v2 opt-in: the attested marker ids travel on the request's
                 # private custom_params channel, resolved once per tokenizer.
