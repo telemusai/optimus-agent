@@ -490,11 +490,14 @@ class WorkerRuntime:
         self.sparse_index_topk = None
         self.sparse_topk_exceeded = 0
         # True only when the DSA indexer pin (attested dsa-pin manifest plus
-        # graph-runner buffer wiring) is installed on every rank. Until then
-        # an over-top-k consume declines pre-use; see _sparse_pin_required.
+        # producer and graph-runner buffer wiring) is installed on every rank;
+        # set from _dsa_pin_installed after the rank gather. Otherwise an
+        # over-top-k consume declines pre-use; see _sparse_pin_required.
         self.dsa_pin_active = False
+        self.dsa_pin_hits = 0
         local_error = ""
         local_layout = None
+        local_pin = False
         stage = "init"
         try:
             from sglang.srt.mem_cache.radix_cache import RadixCache
@@ -514,6 +517,8 @@ class WorkerRuntime:
             require(config.quantization_config.get("quant_method") == "fp8", "profile")
             topk = getattr(config, "index_topk", None)
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
+            stage = "dsa_pin"
+            local_pin = _dsa_pin_installed(self.sparse_index_topk)
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -550,7 +555,7 @@ class WorkerRuntime:
             local_layout = {"rank": self.rank, "ranges": shard_ranges(self.embedding),
                             "embedding_tp": self.embedding.tp_size, "dim": profile.hidden_dim,
                             "vocab": self.embedding.num_embeddings, "dtype": self.dtype,
-                            "kv": kv_layout}
+                            "kv": kv_layout, "dsa_pin": local_pin}
         except Exception as error:
             members = getattr(error, "members", None)
             if isinstance(members, str) and members and members.isascii():
@@ -566,6 +571,10 @@ class WorkerRuntime:
         require([x["rank"] for x in layouts] == list(range(profile.expected_ranks)), "ranks")
         require(all(x["dim"] == profile.hidden_dim and x["vocab"] == self.embedding.num_embeddings
                     and x["dtype"] == self.dtype and x["kv"] == local_layout["kv"] for x in layouts), "ranks")
+        # Uniform across ranks or the runtime declines: a mixed install must
+        # never let one rank admit an over-top-k consume another cannot pin.
+        require(all(x["dsa_pin"] is local_layout["dsa_pin"] for x in layouts), "ranks")
+        self.dsa_pin_active = local_layout["dsa_pin"] is True
         self.layout_digest = digest(layouts)
         self.consensus({"profile": profile.binding_digest, "layout": self.layout_digest})
         self.initialized = True
@@ -1039,6 +1048,8 @@ def admit_request(scheduler, req, value):
             # completed-use receipt would be false. Inputs are rank-uniform
             # (gathered length, static config, install-time flag).
             require(not _sparse_pin_required(runtime, len(new_ids)), "profile")
+            if getattr(runtime, "dsa_pin_active", False) is True:
+                _require_pin_fits(runtime, count)
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
                         span_markers=span_markers, content_state=content_state)
         # The continuous-prefix layout is a receiver concept: a capture never
@@ -1136,6 +1147,66 @@ def _sparse_pin_required(runtime, prompt_rows):
     return getattr(runtime, "dsa_pin_active", False) is not True
 
 
+def _dsa_pin_installed(topk):
+    """True only when this rank's attested source carries the DSA indexer pin.
+
+    The pinned source attestation (native_sources.json, verified at install)
+    must list the dsa-pin manifest together with the scheduler and graph
+    manifests that produce and stage ``ForwardBatch.occ3_dsa_pin``, and the
+    imported classes must expose the patched members. Any miss returns False,
+    so fix A (_sparse_pin_required) still fails closed. When present, the pin
+    lane width must be strictly below the indexer top-k.
+    """
+    from . import dsa_pin
+    try:
+        from .native_profile import load_source_attestation
+        names = {entry["name"] for entry in load_source_attestation()["manifests"]}
+    except Exception:
+        return False
+    if not {"dsa-pin.v1.json", "scheduler-cache-ipc.v1.json", "capture-eager-mtp.v1.json"} <= names:
+        return False
+    try:
+        from sglang.srt.layers.attention.dsa.dsa_indexer import Indexer
+        from sglang.srt.model_executor.forward_batch_info import ForwardBatch
+    except Exception:
+        return False
+    if not (callable(getattr(Indexer, "_occ3_pin_mask", None))
+            and "occ3_dsa_pin" in getattr(ForwardBatch, "__dataclass_fields__", {})):
+        return False
+    require(type(topk) is int and dsa_pin.PIN_LANES < topk, "profile")
+    return True
+
+
+def _require_pin_fits(runtime, count):
+    """Admission bound: the forced span fits the pin lanes below the top-k."""
+    from .dsa_pin import PIN_LANES
+    topk = getattr(runtime, "sparse_index_topk", None)
+    require(type(count) is int and 0 < count <= PIN_LANES
+            and type(topk) is int and PIN_LANES < topk, "profile")
+
+
+def _log_pin_hits(runtime, req, descriptor):
+    """Rank-0 bounded log of the last target forward's forced pin lanes.
+
+    Read after the terminal fence, so the device read cannot race the
+    forward. Informational only; never part of consensus or the receipt.
+    """
+    from .dsa_pin import read_forced
+    try:
+        hits = read_forced(req)
+    except Exception:
+        hits = None
+    req.occ3_dsa_pin_forced = None
+    if hits is None:
+        return None
+    runtime.dsa_pin_hits = getattr(runtime, "dsa_pin_hits", 0) + 1
+    if getattr(runtime, "rank", 0) == 0:
+        logger.info("occ3 dsa pin settle forced=%d expected=%d offset=%d active=%d count=%d",
+                    hits, int(descriptor.expected_prefix_tokens), int(descriptor.prefix_offset),
+                    int(getattr(runtime, "dsa_pin_active", False) is True), runtime.dsa_pin_hits)
+    return hits
+
+
 def _flag_sparse_topk(runtime, prompt_rows):
     """Flag a receiver sequence the DSA indexer can only attend sparsely.
 
@@ -1151,9 +1222,10 @@ def _flag_sparse_topk(runtime, prompt_rows):
         return False
     runtime.sparse_topk_exceeded = getattr(runtime, "sparse_topk_exceeded", 0) + 1
     if getattr(runtime, "rank", 0) == 0:
-        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d: "
-                       "injected prefix rows are not pinned in DSA selection (count=%d)",
-                       int(prompt_rows), topk, runtime.sparse_topk_exceeded)
+        logger.warning("occ3 consume prompt rows=%d exceed the sparse indexer top-k=%d "
+                       "(dsa_pin_active=%d count=%d)", int(prompt_rows), topk,
+                       int(getattr(runtime, "dsa_pin_active", False) is True),
+                       runtime.sparse_topk_exceeded)
     return True
 
 
@@ -1488,6 +1560,7 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
                     "private_cache_namespace": True, "gpu_resident": bool(record.prefix.is_cuda), "completed": True}
         runtime.consensus(metadata)
         record.terminal_metadata, record.state = metadata, "terminal"
+        _log_pin_hits(runtime, req, descriptor)
     runtime.reap_live(record)
 
 
