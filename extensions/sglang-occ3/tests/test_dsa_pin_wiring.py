@@ -128,20 +128,29 @@ def test_can_run_graph_pinned_batches_need_a_pinned_graph(patched, path, monkeyp
     exec(compile(textwrap.dedent(head), path, "exec"), ns)
     can_run = ns["can_run_graph"]
     pin = (None, NS(shape=(3,)), None)
-    pinned = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=pin)
+    pinned = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=pin, batch_size=3)
     plain = NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=None)
     ok = {"value": True}
     monkeypatch.setattr(dsa_pin, "graph_ok", lambda raw_bs: ok["value"] and raw_bs == 3)
-    runner = NS(_occ3_pin_bs=frozenset({4}))
+    runner = NS(_occ3_pin_bs=frozenset({4}), capture_bs=[1, 2, 4, 8])
     assert can_run(runner, plain) == "graph"
     assert can_run(runner, NS()) == "graph"
     assert can_run(runner, pinned) == "graph"
     ok["value"] = False  # some runner lacks the pinned graph: eager
     assert can_run(runner, pinned) is False
     ok["value"] = True
-    assert can_run(NS(_occ3_pin_bs=frozenset()), pinned) is False  # flag off
+    assert can_run(NS(_occ3_pin_bs=frozenset(), capture_bs=[4]), pinned) is False  # flag off
     assert can_run(NS(), pinned) is False
     assert can_run(runner, NS(occ3_force_eager=True)) is False
+    # Fable adaptive note 1: graph_ok True, but this runner's own bucket (3
+    # pads to 8 on its capture list) has no pinned graph: eager, no raise.
+    own = NS(_occ3_pin_bs=frozenset({1, 2, 4}), capture_bs=[1, 2, 8])
+    assert can_run(own, pinned) is False
+    assert can_run(own, plain) == "graph"  # unpinned batches unchanged
+    assert can_run(NS(_occ3_pin_bs=frozenset({1, 2}), capture_bs=[1, 2]), pinned) is False  # 3 > max
+    assert can_run(NS(_occ3_pin_bs=frozenset({4}), capture_bs=None), pinned) is False  # unreadable
+    # The own-bucket check pads forward_batch.batch_size, as replay does.
+    assert can_run(runner, NS(occ3_force_eager=False, occ3_context=None, occ3_dsa_pin=pin, batch_size=5)) is False
 
 
 def _exec_method(text, name, cls=None, **globs):
@@ -258,7 +267,7 @@ def test_graph_ok_requires_every_runner_and_falls_back_eager_for_a_missing_bs(mo
     from types import SimpleNamespace as NS
     from occ3_sglang import dsa_pin
 
-    monkeypatch.setattr(dsa_pin, "_graph_runners", {})
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
     monkeypatch.delenv(dsa_pin.GRAPHS_ENV, raising=False)
     monkeypatch.delenv(dsa_pin.GRAPH_MAX_BS_ENV, raising=False)
     mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
@@ -282,7 +291,7 @@ def test_graph_ok_requires_every_runner_and_falls_back_eager_for_a_missing_bs(mo
     assert dsa_pin.graph_bs(NS(disable_padding=True), mr, [1, 2]) == frozenset()
     assert dsa_pin.graph_ok(1) is False
     # Non-DSA models never get pinned graphs.
-    monkeypatch.setattr(dsa_pin, "_graph_runners", {})
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
     assert dsa_pin.graph_bs(Target(), NS(model_config=NS(hf_config=NS())), [1]) == frozenset()
 
 
@@ -291,7 +300,7 @@ def test_flag_off_restores_a8e98b759(monkeypatch):
     from types import SimpleNamespace as NS
     from occ3_sglang import dsa_pin
 
-    monkeypatch.setattr(dsa_pin, "_graph_runners", {})
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
     mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
     for value in ("0", "false", "off", "NO"):
         monkeypatch.setenv(dsa_pin.GRAPHS_ENV, value)
@@ -399,7 +408,7 @@ def test_two_batch_overlap_gets_no_pinned_graph_set(monkeypatch):
     from types import SimpleNamespace as NS
     from occ3_sglang import dsa_pin
 
-    monkeypatch.setattr(dsa_pin, "_graph_runners", {})
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
     monkeypatch.delenv(dsa_pin.GRAPHS_ENV, raising=False)
     monkeypatch.delenv(dsa_pin.GRAPH_MAX_BS_ENV, raising=False)
     mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
@@ -434,3 +443,65 @@ def test_two_batch_overlap_gets_no_pinned_graph_set(monkeypatch):
         raise RuntimeError("no exec")
     ctx.get_exec = broken
     assert dsa_pin.graph_bs(Target(), mr, [1, 2]) == frozenset()
+
+
+def test_adaptive_runner_sets_all_register_and_graph_ok_needs_every_one(monkeypatch):
+    """Fable adaptive note 2: adaptive MTP builds several runners of the same
+    class (one set per candidate step), possibly with different capture lists.
+    Every construction is recorded (no overwrite) and graph_ok needs a pinned
+    graph at each runner's own bucket, independent of build order."""
+    from types import SimpleNamespace as NS
+    from occ3_sglang import dsa_pin
+
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
+    monkeypatch.delenv(dsa_pin.GRAPHS_ENV, raising=False)
+    monkeypatch.delenv(dsa_pin.GRAPH_MAX_BS_ENV, raising=False)
+    mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
+    draft = NS(is_draft_worker=True, model_config=NS(hf_config=NS(index_topk=2048)))
+
+    class DecodeCudaGraphRunner: pass
+    class EAGLEDraftCudaGraphRunner: pass
+
+    full = [1, 2, 4, 8, 16, 32]
+    pruned = [1, 2, 4, 8, 16]
+    initial = DecodeCudaGraphRunner()
+    assert dsa_pin.graph_bs(initial, mr, full) == set(full)
+    assert dsa_pin.graph_bs(EAGLEDraftCudaGraphRunner(), draft, full) == set(full)
+    assert dsa_pin.graph_ok(31) is True
+    # A later adaptive state with a pruned list must not replace the first entry.
+    monkeypatch.setenv(dsa_pin.GRAPH_MAX_BS_ENV, "8")
+    state = DecodeCudaGraphRunner()
+    assert dsa_pin.graph_bs(state, mr, pruned) == {1, 2, 4, 8}
+    monkeypatch.delenv(dsa_pin.GRAPH_MAX_BS_ENV)
+    assert len(dsa_pin._graph_runners) == 3
+    keys = [entry[0] for entry in dsa_pin._graph_runners]
+    assert keys.count(("DecodeCudaGraphRunner", False)) == 2
+    assert dsa_pin._graph_runners[0][1] == tuple(full)  # first entry intact
+    assert dsa_pin.graph_ok(8) is True
+    assert dsa_pin.graph_ok(9) is False   # pruned state pads 9 -> 16, unpinned
+    assert dsa_pin.graph_ok(31) is False  # pruned state cannot hold 31
+    # Order-independent: the same set built in reverse gives the same answers.
+    monkeypatch.setattr(dsa_pin, "_graph_runners", list(reversed(dsa_pin._graph_runners)))
+    assert [dsa_pin.graph_ok(b) for b in (1, 8, 9, 31, 33)] == [True, True, False, False, False]
+    # Per-runner own-bucket check agrees with each runner's own list.
+    full_runner = NS(_occ3_pin_bs=frozenset(full), capture_bs=full)
+    pruned_runner = NS(_occ3_pin_bs=frozenset({1, 2, 4, 8}), capture_bs=pruned)
+    assert dsa_pin.runner_ok(full_runner, 9) is True
+    assert dsa_pin.runner_ok(pruned_runner, 9) is False
+    assert dsa_pin.runner_ok(pruned_runner, 17) is False  # beyond its max
+    assert dsa_pin.runner_ok(NS(), 1) is False
+    assert dsa_pin.graph_ok("x") is False  # never raises
+
+
+def test_graph_bs_registers_empty_set_on_exception(monkeypatch):
+    from types import SimpleNamespace as NS
+    from occ3_sglang import dsa_pin
+
+    monkeypatch.setattr(dsa_pin, "_graph_runners", [])
+    monkeypatch.delenv(dsa_pin.GRAPHS_ENV, raising=False)
+    mr = NS(is_draft_worker=False, model_config=NS(hf_config=NS(index_topk=2048)))
+    assert dsa_pin.graph_bs(NS(), mr, [1, 2]) == {1, 2}
+    assert dsa_pin.graph_bs(NS(), mr, [1, "bad"]) == frozenset()
+    assert len(dsa_pin._graph_runners) == 2
+    assert dsa_pin._graph_runners[1][1:] == ((), frozenset())
+    assert dsa_pin.graph_ok(1) is False
