@@ -50,6 +50,26 @@ def test_pin_rows_bounds_fail_closed():
     assert dsa_pin.PIN_LANES == 128
 
 
+def test_out_of_bounds_descriptor_never_raises_in_init_new(caplog):
+    """N8: pin_rows runs in ForwardBatch.init_new; it logs once, never raises."""
+    import logging
+
+    good = attached(0, 8)
+    bad_values = ((0, 129), (0, 0), (2**20 + 1, 8), (-1, 8))
+    rows = []
+    for start, count in bad_values:
+        d = consume(prefix_offset=0, expected_prefix_tokens=8)
+        object.__setattr__(d, "prefix_offset", start)
+        object.__setattr__(d, "expected_prefix_tokens", count)
+        rows.append(NS(occ3_attached=True, occ3_worker_descriptor=d))
+    dsa_pin._bounds_logged = False
+    with caplog.at_level(logging.ERROR, logger=dsa_pin.__name__):
+        assert dsa_pin.pin_rows(rows) is None
+        assert dsa_pin.pin_rows([rows[0], good]) == ([0, 0], [0, 8])
+    errors = [r for r in caplog.records if "out of bounds" in r.getMessage()]
+    assert len(errors) == 1
+
+
 def test_build_records_forced_on_target_only():
     torch = pytest.importorskip("torch")
     a = attached(3, 8)

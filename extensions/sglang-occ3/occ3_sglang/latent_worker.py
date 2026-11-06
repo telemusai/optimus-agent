@@ -518,7 +518,8 @@ class WorkerRuntime:
             topk = getattr(config, "index_topk", None)
             self.sparse_index_topk = topk if type(topk) is int and topk > 0 else None
             stage = "dsa_pin"
-            local_pin = _dsa_pin_installed(self.sparse_index_topk)
+            local_pin = _dsa_pin_installed(
+                self.sparse_index_topk, getattr(args, "speculative_eagle_topk", None))
             stage = "model_class"
             validate_target_model_class(model_runner.model)
             from sglang.srt.runtime_context import get_parallel
@@ -1147,17 +1148,23 @@ def _sparse_pin_required(runtime, prompt_rows):
     return getattr(runtime, "dsa_pin_active", False) is not True
 
 
-def _dsa_pin_installed(topk):
+def _dsa_pin_installed(topk, eagle_topk=1):
     """True only when this rank's attested source carries the DSA indexer pin.
 
     The pinned source attestation (native_sources.json, verified at install)
     must list the dsa-pin manifest together with the scheduler and graph
     manifests that produce and stage ``ForwardBatch.occ3_dsa_pin``, and the
     imported classes must expose the patched members. Any miss returns False,
-    so fix A (_sparse_pin_required) still fails closed. When present, the pin
-    lane width must be strictly below the indexer top-k.
+    so fix A (_sparse_pin_required) still fails closed. A model without an
+    integer indexer top-k (not a DSA model) and EAGLE top-k other than 1
+    (the paged row map assumes one draft chain per request) also return
+    False. When present, the pin lane width must be strictly below the
+    indexer top-k.
     """
     from . import dsa_pin
+
+    if type(topk) is not int or topk <= 0 or eagle_topk != 1:
+        return False
     try:
         from .native_profile import load_source_attestation
         names = {entry["name"] for entry in load_source_attestation()["manifests"]}

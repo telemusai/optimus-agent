@@ -1329,8 +1329,15 @@ def test_dsa_pin_installed_requires_attested_manifests_and_patched_members(monke
     monkeypatch.setitem(sys.modules, fbi.__name__, fbi)
     attest(names)
     assert w._dsa_pin_installed(2048) is True
+    assert w._dsa_pin_installed(2048, 1) is True
     with pytest.raises(LatentError):
         w._dsa_pin_installed(128)
+    # N10: a model without an integer indexer top-k is simply not pinned.
+    for topk in (None, 0, -1, "2048", 2048.0):
+        assert w._dsa_pin_installed(topk) is False
+    # N5: EAGLE top-k > 1 (or unknown) breaks the paged row map; not installed.
+    for eagle in (2, 4, None, 0):
+        assert w._dsa_pin_installed(2048, eagle) is False
     # A missing manifest (the pre-fix 3-manifest image) fails closed.
     attest([n for n in names if n != "dsa-pin.v1.json"])
     assert w._dsa_pin_installed(2048) is False

@@ -24,6 +24,11 @@ rows, so padded and free slots always carry count 0 (a bitwise no-op).
 """
 from __future__ import annotations
 
+import logging
+
+logger = logging.getLogger(__name__)
+_bounds_logged = False
+
 # Fixed lane width of the indexer pin; must stay strictly below index_topk.
 PIN_LANES = 128
 
@@ -33,7 +38,11 @@ def pin_rows(reqs):
 
     Only an attached consume row with a bounded descriptor is pinned.
     Returns None when no row is pinned, so ordinary batches carry no tensor.
+    This runs inside ``ForwardBatch.init_new`` for every batch, so it never
+    raises: an out-of-bounds descriptor (unreachable after admission, which
+    bounds both values) is logged once and treated as count 0 (no pin).
     """
+    global _bounds_logged
     from .attachment_contract import ConsumeWorkerDescriptor
 
     starts, counts, any_pin = [], [], False
@@ -41,11 +50,16 @@ def pin_rows(reqs):
         descriptor = getattr(req, "occ3_worker_descriptor", None)
         start = count = 0
         if getattr(req, "occ3_attached", False) is True and type(descriptor) is ConsumeWorkerDescriptor:
-            count = int(descriptor.expected_prefix_tokens)
-            start = int(descriptor.prefix_offset)
-            if not (0 < count <= PIN_LANES and 0 <= start <= 2**20):
-                raise ValueError("occ3_dsa_pin_bounds")
-            any_pin = True
+            count = descriptor.expected_prefix_tokens
+            start = descriptor.prefix_offset
+            if (type(count) is int and type(start) is int
+                    and 0 < count <= PIN_LANES and 0 <= start <= 2**20):
+                any_pin = True
+            else:
+                if not _bounds_logged:
+                    _bounds_logged = True
+                    logger.error("occ3 dsa pin descriptor out of bounds; row left unpinned")
+                start = count = 0
         starts.append(start)
         counts.append(count)
     return (starts, counts) if any_pin else None
