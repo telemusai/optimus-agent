@@ -196,11 +196,12 @@ pub enum Occ3Error {
     NativeInferenceUnsupported { connector_id: String },
     /// The connector refused to prepare the receiver's native inference as
     /// busy before any dispatch: a synchronous admission-unavailability
-    /// decline (the connector control path's busy/quota gate or the
-    /// server's pre-dispatch busy refusal, the reserve_consume class).
-    /// Proven non-use - nothing was generated and the attachment was never
-    /// submitted - so the receiver may release its inbox claim and retry
-    /// the consume on the next inference request. Never a replay permit.
+    /// decline (the control path's busy/quota gate; on sessions/enroll the
+    /// real decline is quota). Proven non-use - nothing was generated and
+    /// the attachment was never submitted - so the receiver retires its
+    /// inbox claim terminally and routes the busy signal to the sender,
+    /// whose fresh-capture re-arm becomes the sole retry path. Never a
+    /// replay permit.
     NativeInferenceBusyRefused { connector_id: String },
     /// A native inference may have accepted the state. Never replay as text.
     InferenceOutcomeUncertain { message_id: String },

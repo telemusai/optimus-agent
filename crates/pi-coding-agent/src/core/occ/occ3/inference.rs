@@ -424,7 +424,7 @@ impl Occ3InferenceInbox {
     /// marker is pre-notified, so the TurnEnd poll never re-routes it as an
     /// ordinary receiver failure (which would trigger an OCC-1 fallback the
     /// busy route must not spend). Returns whether the claim was retired.
-    pub fn release_busy_claim(&mut self, message_id: &str) -> bool {
+    pub fn retire_busy_claim(&mut self, message_id: &str) -> bool {
         let Some(record) = self.records.get_mut(message_id) else {
             return false;
         };
@@ -434,7 +434,10 @@ impl Occ3InferenceInbox {
         {
             return false;
         }
-        record.claimed = false;
+        // The claim flag stays set, matching every other terminal
+        // transition in this inbox (cancel_pending, invalidate_all):
+        // `claimed && Failed` is the terminal shape, and the never-again
+        // guarantee rests on the terminal status the claim loop skips.
         record.busy_refused = true;
         record.status = Occ3DeliveryStatus::Failed;
         record.terminal_notified = true;
@@ -811,7 +814,7 @@ mod tests {
     /// (`Cancelled`, the provider's pre-event busy refusal) resolves to
     /// `Failed`. The next claim skips it, so the session's retry runs as an
     /// ordinary turn without the attachment, and the terminal poll reports
-    /// it exactly once so the sender falls back to ordinary OCC-1 delivery.
+    /// it exactly once so the sender takes one bounded busy retry.
     #[test]
     fn busy_refused_lease_lets_the_retry_run_ordinary_and_reports_failed_once() {
         let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
@@ -858,15 +861,15 @@ mod tests {
     /// (its outcome belongs to the provider), a terminal status, an unclaimed
     /// or an unknown record never releases - their outcomes stay fail-closed.
     #[test]
-    fn occ3_release_busy_claim_retires_only_an_unbound_claim_as_busy_failed() {
+    fn occ3_retire_busy_claim_retires_only_an_unbound_claim_as_busy_failed() {
         let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
         assert!(inbox.admit(unit_envelope("m1", "s1"), "m1", "s1", 1).unwrap());
         // Unknown and never-claimed records never release.
-        assert!(!inbox.release_busy_claim("unknown"));
-        assert!(!inbox.release_busy_claim("m1"));
+        assert!(!inbox.retire_busy_claim("unknown"));
+        assert!(!inbox.retire_busy_claim("m1"));
         assert!(inbox.claim(&["m1".to_string()], &[], 1).unwrap().is_some());
         // The pre-bind busy release: claimed, Delivered, no bound lease.
-        assert!(inbox.release_busy_claim("m1"));
+        assert!(inbox.retire_busy_claim("m1"));
         assert_eq!(inbox.status("m1"), Some(Occ3DeliveryStatus::Failed));
         // The retirement is terminal: the same delivery is never claimable
         // again, and the TurnEnd poll never re-routes it as an ordinary
@@ -876,7 +879,7 @@ mod tests {
         let audit = inbox.audit();
         assert_eq!(audit[0]["busy_refused"], serde_json::json!(true));
         // A busy-retired record never releases a second time.
-        assert!(!inbox.release_busy_claim("m1"));
+        assert!(!inbox.retire_busy_claim("m1"));
         // Once a lease is bound the outcome belongs to the provider: never
         // released, whatever the refusal class claims to prove. A second
         // record exercises the bound and terminal guards the retired record
@@ -905,13 +908,13 @@ mod tests {
         )
         .unwrap();
         inbox.records.get_mut("m2").unwrap().bound_lease = Some(lease);
-        assert!(!inbox.release_busy_claim("m2"));
+        assert!(!inbox.retire_busy_claim("m2"));
         assert_eq!(inbox.status("m2"), Some(Occ3DeliveryStatus::Delivered));
         // A terminal record never releases either.
         let record = inbox.records.get_mut("m2").unwrap();
         record.bound_lease = None;
         record.status = Occ3DeliveryStatus::Failed;
-        assert!(!inbox.release_busy_claim("m2"));
+        assert!(!inbox.retire_busy_claim("m2"));
     }
 
     /// Reversed context order cannot reorder the queue: the earliest pending

@@ -686,14 +686,18 @@ impl SglangOcc3Connector {
             // never parsed. The envelope otherwise proves nothing about
             // server state (the worker may have written its session table
             // before a frontend readiness decline), which is exactly why
-            // the release only returns the claim to `Admitted`: nothing is
-            // marked consumed and no second delivery is ever issued. The
-            // classification itself is the generic control-path rule and is
-            // not operation-scoped; only `prepare_inference`'s enroll
-            // error reaches the resolver's release arm - publication and
-            // retirement keep their existing status-probe/uncertain paths.
-            // Every other code - including a 409 `expired` or `replay` -
-            // keeps the fail-closed generic refusal.
+            // the receiver RETIRES the claim terminally and routes the busy
+            // signal to the sender: nothing is marked consumed on this
+            // side, and the sender's fresh-capture re-arm - never a replay
+            // of this handle - is the sole retry path. The classification
+            // itself is the generic control-path rule and is not
+            // operation-scoped; only `prepare_inference`'s enroll error
+            // reaches the resolver's retire arm - publication and
+            // retirement keep their existing status-probe/uncertain paths
+            // (their control errors keep the generic refusal; nothing
+            // matches the busy kind there today). Every other code -
+            // including a 409 `expired` or `replay` - keeps the
+            // fail-closed generic refusal.
             let code = if identity_encoded {
                 Self::read_bounded_control_error_code(&mut response).await
             } else {

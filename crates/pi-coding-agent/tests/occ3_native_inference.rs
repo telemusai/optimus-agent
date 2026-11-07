@@ -1027,10 +1027,9 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
         ("200 OK", "", r#"{"error":{"code":"busy"}}"#.into(), false),
     ];
     // The expected classification per scripted row, captured before the
-    // server task consumes the scripted table by move.
-    let EXPECTED_BUSY: [bool; 11] = [
-        true, true, true, false, false, false, false, false, false, false, false,
-    ];
+    // server task consumes the scripted table by move, so the two tables
+    // cannot drift apart.
+    let expected_busy: Vec<bool> = scripted.iter().map(|row| row.3).collect();
     let server = tokio::spawn(async move {
         for (status, extra, body, _) in scripted {
             let (mut socket, _) = listener.accept().await.unwrap();
@@ -1148,7 +1147,7 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
     // distinct proven-non-use refusal; every other row is pinned to the
     // exact generic fail-closed error, so neither an unrelated error kind
     // nor a false Ok can pass the negative assertions.
-    for (index, expect_busy) in EXPECTED_BUSY.into_iter().enumerate() {
+    for (index, expect_busy) in expected_busy.into_iter().enumerate() {
         let error = connector
             .prepare_inference(request())
             .await
