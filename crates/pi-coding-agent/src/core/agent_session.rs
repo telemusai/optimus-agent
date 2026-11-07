@@ -3442,8 +3442,9 @@ fn install_sender_queue_listener(
     // Receiver borrows the outer `session` clone (identical `Arc`), so the
     // move closure below keeps `listener_session` for itself - same shape
     // as the agent-event listener installed in `AgentSession::new`.
+    let listener_prompt_gate = head_prompt_gate.clone();
     let unsubscribe = session.agent.subscribe(Arc::new(move |event, _signal| {
-        let head_prompt_gate = head_prompt_gate.clone();
+        let head_prompt_gate = listener_prompt_gate.clone();
         let state = listener_state.clone();
         let session = listener_session.clone();
         let controller = listener_controller.clone();
@@ -3481,6 +3482,8 @@ fn install_sender_queue_listener(
                     }
                     return;
                 }
+                pi_agent_core::types::AgentEvent::ToolExecutionEnd { tool_name, .. }
+                    if tool_name == occ3_state::NATIVE_HANDOFF_TOOL => {}
                 pi_agent_core::types::AgentEvent::TurnEnd { .. } => {
                     // The fallback turn (if any) ends here: no later send
                     // in another turn may carry the token.
@@ -3499,6 +3502,7 @@ fn install_sender_queue_listener(
                 }
                 _ => return,
             }
+            let _drain = state.queue_notice_drain.lock().await;
             let notices = state.take_pending_queue_notices();
             // The loops below consume the vecs; capture emptiness first for
             // the trailing snapshot-notice gate.
@@ -3571,7 +3575,7 @@ fn install_sender_queue_listener(
         let state = std::sync::Arc::downgrade(&state);
         let session = std::sync::Arc::downgrade(&session);
         let controller = std::sync::Arc::downgrade(&controller);
-        let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller);
+        let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller, head_prompt_gate);
     }
     Ok(())
 }
@@ -3602,7 +3606,9 @@ async fn await_retry_then_drive_occ3_head_prompt(
     if let Ok(mut gate) = gate.lock() {
         gate.settle_deferred(&key);
     }
-    Self::drive_occ3_head_prompt(session, state, gate).await;
+    // Serialize with the event drain's cancellation of obsolete retry prompts.
+    let _drain = state.queue_notice_drain.lock().await;
+    Self::drive_occ3_head_prompt(session, state.clone(), gate).await;
     true
 }
 
@@ -3627,9 +3633,17 @@ fn drive_occ3_head_prompt(
     if blocked.is_some() {
         return;
     }
+    let prompt_key = "occ3-sender-head";
     let Some(head) = entries.first() else {
+        session.remove_queued_follow_up(prompt_key);
+        if let Ok(mut gate) = gate.lock() { gate.clear_sent(); }
         return;
     };
+    if occ3_sender_queue::head_prompt(head, entries.len()).is_none() {
+        session.remove_queued_follow_up(prompt_key);
+        if let Ok(mut gate) = gate.lock() { gate.clear_sent(); }
+        return;
+    }
     let decision = match gate.lock() {
         Ok(mut gate) => gate.decide(head, entries.len(), session.is_retrying()),
         Err(_) => return,
@@ -3663,7 +3677,7 @@ fn drive_occ3_head_prompt(
                 None
             };
             let _ = session
-                .queue_agent_message_prompt(&prompt, "followUp", custom)
+                .queue_keyed_agent_message_follow_up(&prompt, prompt_key, custom)
                 .await;
             if fallback_head {
                 // The host issued this fallback
@@ -3681,8 +3695,9 @@ fn drive_occ3_head_prompt(
 /// after the durable write succeeds) and then the parent notification
 /// (target resolved exclusively from the authenticated
 /// `semantic_parent_session_id` relationship; acknowledged only after the
-/// trusted controller accepts). The live follow-up prompt follows the
-/// transcript write. A failed transcript write or a refused/failed
+/// trusted controller accepts). Notices are durable history only; the
+/// current head driver owns sender prompts. Callers hold queue_notice_drain
+/// across each batch. A failed transcript write or a refused/failed
 /// parent delivery leaves the record pending in the durable outbox: the
 /// next drain retries it, and the bounded outbox keeps it visible
 /// (overflow is flagged, never silently dropped).
@@ -3692,6 +3707,7 @@ async fn deliver_queue_notice_record(
     controller: &Arc<dyn crate::core::agent_messages::AgentSessionMessageController>,
     record: occ3_sender_queue::Occ3DurableQueueNotice,
 ) {
+    let Some(record) = state.current_queue_notice(&record.notice_id) else { return };
     if !record.transcript_done {
         // F3 wording: a terminal fallback acknowledges ordinary
         // transport acceptance only - the recorded status says which
@@ -3711,15 +3727,18 @@ async fn deliver_queue_notice_record(
         // a notice must survive restart even when the turn ends here.
         let appended = {
             let mut manager = session.session_manager.lock().unwrap();
-            manager
-                .append_custom_message_entry(
-                    &custom.custom_type,
-                    &custom_message_entry_content(&custom.content),
-                    custom.display,
-                    custom.details.clone(),
-                )
-                .and_then(|_| manager.flush_now())
-                .is_ok()
+            if manager.has_custom_message_notice(&custom.custom_type, &record.notice_id) {
+                true
+            } else {
+                manager
+                    .append_custom_message_entry_with_rollback(
+                        &custom.custom_type,
+                        &custom_message_entry_content(&custom.content),
+                        custom.display,
+                        custom.details.clone(),
+                    )
+                    .is_ok()
+            }
         };
         if !appended {
             // Persistence failed: the record stays pending in the
@@ -3727,9 +3746,23 @@ async fn deliver_queue_notice_record(
             return;
         }
         state.sender_queue_notice_ack_transcript(&record.notice_id);
-        let _ = session
-            .queue_agent_message_prompt(&AgentSession::custom_text(&custom), "followUp", Some(custom))
-            .await;
+        // The retained roster reads agent.messages(), not the disk journal.
+        // Update both views without scheduling a model turn.
+        let message = custom_message_agent_message(&custom);
+        let appended = message.clone();
+        let notice_id = record.notice_id.clone();
+        session.agent.update_state(Box::new(move |state| {
+            let exists = state.messages.iter().any(|message| matches!(message,
+                AgentMessage::Custom(CustomAgentMessage::Custom { custom_type, details: Some(details), .. })
+                    if custom_type == occ3_sender_queue::OCC3_QUEUE_NOTICE_CUSTOM_TYPE
+                        && details.get("noticeId").and_then(Value::as_str) == Some(notice_id.as_str())
+            ));
+            if !exists { state.messages.push(appended); }
+        }));
+        session.emit(AgentSessionEvent::MessageEnd { message });
+        // Journal records are history, not instructions. Only the current
+        // head driver may prompt the sender; replaying pending/armed history
+        // here creates extra turns even after the handoff was admitted.
     }
     if !record.parent_done {
         match session.semantic_parent_session_id() {
@@ -3766,6 +3799,7 @@ fn unsubscribe_timer_sweep(
     state: std::sync::Weak<occ3_state::Occ3NativeSession>,
     session: std::sync::Weak<AgentSession>,
     controller: std::sync::Weak<dyn crate::core::agent_messages::AgentSessionMessageController>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         // Bounded cadence: twice per minimum TTL window, hard-capped at a
@@ -3779,34 +3813,27 @@ fn unsubscribe_timer_sweep(
             let Some(state) = state.upgrade() else { break };
             let Some(session) = session.upgrade() else { break };
             let Some(controller) = controller.upgrade() else { break };
-            // The sweep wrapper journals every expired notice into the
-            // durable outbox atomically with the queue rewrite.
-            let _ = state.sender_queue_sweep_expired();
-            let notices = state.take_pending_queue_notices();
-            for record in notices {
-                Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
-            }
-            // Same-process retry: unacked records re-enter the worklist
-            // for the next 30s tick; the outbox is the source of truth.
-            state.requeue_unacked_queue_notices();
+            Self::sender_queue_idle_tick(session, state, controller, gate.clone()).await;
         }
     })
     .abort_handle()
 }
 
-/// Renders a custom notice message as its live-context text.
-fn custom_text(message: &CustomMessage) -> String {
-    match &message.content {
-        CustomMessageContent::Text(text) => text.clone(),
-        CustomMessageContent::Blocks(blocks) => blocks
-            .iter()
-            .filter_map(|block| match block {
-                pi_agent_core::types::ContentBlock::Text(text) => Some(text.text.clone()),
-                _ => None,
-            })
-            .collect::<Vec<_>>()
-            .join("\n"),
+/// Idle receiver outcomes need a current-head prompt even without a sender
+/// event. Share the event driver's gate and lock so retries stay one-shot.
+async fn sender_queue_idle_tick(
+    session: Arc<AgentSession>,
+    state: Arc<occ3_state::Occ3NativeSession>,
+    controller: Arc<dyn crate::core::agent_messages::AgentSessionMessageController>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
+) {
+    let _drain = state.queue_notice_drain.lock().await;
+    let _ = state.sender_queue_sweep_expired();
+    for record in state.take_pending_queue_notices() {
+        Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
     }
+    state.requeue_unacked_queue_notices();
+    Self::drive_occ3_head_prompt(session, state.clone(), gate).await;
 }
 
     /// Refreshes MCP provider registrations without rebuilding the session runtime.
