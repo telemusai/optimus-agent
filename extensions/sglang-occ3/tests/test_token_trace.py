@@ -96,6 +96,46 @@ def test_capture_consume_geometry(caplog, monkeypatch):
     assert rows(caplog)[-1]["copy_matches"] is False
 
 
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_copied_per_rank_and_missing_capture(monkeypatch, caplog, rank):
+    class Matrix:
+        def __init__(self, values): self.values = values
+        def __getitem__(self, key): return Matrix(self.values[key])
+    monkeypatch.setattr(trace, "tensor_hash", lambda value: trace.ids_hash(value.values))
+    record = NS(prefix=Matrix([1, 2]))
+    if rank == 0:
+        record.occ3_trace_prefix_hash = trace.ids_hash([1, 2])
+    trace.copied(NS(rank=rank), record, Matrix([1, 2]), 0, 2, 0, "target")
+    row = rows(caplog)[-1]
+    assert row["rank"] == rank and row["copy_matches"] is True
+    assert row["prefix_matches_capture"] is (True if rank == 0 else None)
+    trace.copied(NS(rank=rank), record, Matrix([1, 9]), 0, 2, 0, "draft")
+    assert rows(caplog)[-1]["copy_matches"] is False
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    monkeypatch.setattr(trace, "tensor_hash", lambda _: pytest.fail("disabled hash"))
+    trace.copied(None, None, None, None, None, None, None)
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_saved_fence_failure_is_visible_and_isolated(monkeypatch, caplog, rank):
+    events = []
+    def fail_fence():
+        events.append("fence")
+        raise RuntimeError("private-exception-text")
+    monkeypatch.setattr(trace, "kv_snapshot", lambda *args: pytest.fail("unfenced read"))
+    runtime = NS(rank=rank, fence=fail_fence)
+    record = NS(occ3_trace_kv_pool=object(), occ3_trace_slots={4:2, 5:3})
+    descriptor = NS(prefix_offset=4, expected_prefix_tokens=2)
+    trace.kv_saved(runtime, record, descriptor, "consume_released", fence=True)
+    assert rows(caplog)[-1] == {"event": "consume_kv_values", "rank": rank,
+                               "point": "consume_released", "skipped": "fence_failed"}
+    assert "private-exception-text" not in caplog.text
+    assert events == ["fence"]
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.kv_saved(runtime, record, descriptor, "consume_released", fence=True)
+    assert events == ["fence"]
+
+
 def test_rank_and_decoder_failure(caplog):
     trace.capture_text(NS(rank=1), NS(occ3_trace_labels=(1,)), NS())
     class Broken:

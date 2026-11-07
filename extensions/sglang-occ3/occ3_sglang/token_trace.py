@@ -144,14 +144,17 @@ def tensor_hash(tensor):
 
 @isolated
 def copied(runtime, record, values, local, count, source, lane):
-    if runtime.rank != 0 or not count:
+    """Each rank verifies its local injection; capture comparison needs a baseline."""
+    if not count:
         return
     original = tensor_hash(record.prefix)
     selected = tensor_hash(record.prefix[source:source+count])
     actual = tensor_hash(values[local:local+count])
-    emit("consume_embeddings", lane=lane, source_sha256=getattr(record, "occ3_trace_hash", None),
-         prefix_sha256=original, prefix_matches_capture=(original is not None and
-             original == getattr(record, "occ3_trace_prefix_hash", None)),
+    capture_hash = getattr(record, "occ3_trace_prefix_hash", None)
+    emit("consume_embeddings", lane=lane, rank=runtime.rank,
+         source_sha256=getattr(record, "occ3_trace_hash", None),
+         prefix_sha256=original, prefix_matches_capture=(original == capture_hash
+             if original is not None and capture_hash is not None else None),
          source_start=source, rows=count, selected_sha256=selected, copied_sha256=actual,
          copy_matches=selected is not None and selected == actual)
 
@@ -211,7 +214,12 @@ def kv_saved(runtime, record, descriptor, point, fence=False):
     saved = getattr(record, "occ3_trace_slots", {})
     slots = [saved.get(i) for i in range(at, at+count)]
     if fence:
-        runtime.fence()
+        try:
+            runtime.fence()
+        except Exception:
+            emit("consume_kv_values", point=point, rank=runtime.rank,
+                 skipped="fence_failed")
+            return
     kv_snapshot(runtime, record, pool, slots, point)
 
 

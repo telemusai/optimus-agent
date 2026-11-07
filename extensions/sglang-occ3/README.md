@@ -157,18 +157,21 @@ INFO `occ3-bridge: token trace` JSON lines (ASCII escaped, at most 16 KiB each):
 - `alignment`: at most 128 per-row cosines between the aligned prefix and its
   source-token embeddings, rounded to six decimals (nonfinite values are null).
   Both tensors are already present on rank zero; no vocabulary lookup is added.
-- `consume_embeddings`: full retained-prefix hash versus capture, selected-row
-  hash versus the freshly copied target/draft embedding slice. Hashes distinguish
-  mutated stored rows from a bad copy, without logging tensor contents.
+- `consume_embeddings`: per-rank full retained-prefix hash, selected-row hash
+  versus the freshly copied target/draft embedding slice, and rank. Capture
+  comparison is null on ranks without a capture hash (currently all except zero).
+  Hashes distinguish mutated stored rows from a bad copy without logging contents.
 
 These diagnostics never inspect keys, headers, principals, state handles or
 receipt objects. **Token IDs are reversible content**, and decoded source text
 can contain private data. Run only authorized synthetic prompts without secrets
 (including conversation history), restrict log access/retention, then disable.
 Every hook is exception-isolated, including logger/decoder failures. Size overflow
-emits a fixed size-limit record. Chunk and KV-value lines are per-rank; other
-lines are rank zero only. No diagnostic collectives or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
+emits a fixed size-limit record. Chunk, embedding and KV-value lines are per-rank;
+other lines are rank zero only. No diagnostic collectives or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
 timing; it does not change request state, alignment, positions or inference policy.
+Embedding hashes add three bounded copies per rank per overlapping chunk (about
+1.8 MB D2H per rank at 128 rows and the drill profile's hidden width).
 
 Equal IDs/hashes do not establish semantic fidelity: the receiver attends to
 continuous aligned embeddings, not the source IDs. KV slot IDs expose placement
@@ -240,8 +243,12 @@ slots at or above `pool.size`. HIP layouts are not interpreted as CUDA layouts.
 `first_changed_slot` identifies the first changed sampled physical slot in prefix
 order. Unchanged hashes with wrong text point toward fidelity/alignment but do
 not prove it: unsampled slots, missing rank logs and transient mutations between
-observations remain invisible. Synchronization can perturb or mask timing-sensitive
-behavior. Never treat a sampled/skipped observation as whole-pool proof.
+observations remain invisible. For a drill, confirm in `consume_chunk` that one
+target chunk covers `prefix_offset .. prefix_offset+rows`: the baseline is the
+end of the chunk containing the last injected row, so earlier wrong writes inside
+that chunk (or across earlier chunks) can already be baked into the baseline.
+A diagnostic local-fence failure emits `skipped="fence_failed"`, not an unchanged
+comparison. Synchronization can perturb or mask timing-sensitive behavior. Never treat a sampled/skipped observation as whole-pool proof.
 
 Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
 `PLUGIN_FILE_COUNT=36`; it was already stale on main (37 modules), and this PR
