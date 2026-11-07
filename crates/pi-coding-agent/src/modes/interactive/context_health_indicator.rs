@@ -114,8 +114,8 @@ pub(super) fn status_line(
     };
     for text in [
         format!("{with_badge}  {throughput}  {full}"),
-        format!("{with_badge}  {throughput}  {compact}"),
         format!("{communication}  {throughput}  {full}"),
+        format!("{with_badge}  {throughput}  {compact}"),
         format!("{communication}  {throughput}  {compact}"),
         format!("{throughput}  {full}"),
         format!("{throughput}  {compact}"),
@@ -249,6 +249,11 @@ mod tests {
         assert!(!rendered.contains("QUEUED"));
         assert!(rendered.contains("● OCC3"));
         assert_eq!(visible_width(&rendered), width);
+        let full = format!("{communication}  {throughput}  {}", Indicator::from_input(&input).label(false));
+        let compact_with_badge = format!("{communication}  ● QUEUED 2  {throughput}  {}", Indicator::from_input(&input).label(true));
+        let width = visible_width(&full).max(visible_width(&compact_with_badge));
+        let rendered = status_line(communication, "● QUEUED 2", throughput, &input, width);
+        assert_eq!(rendered, full, "drop badge before compacting health");
     }
 
     #[test]

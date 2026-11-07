@@ -91,6 +91,8 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // Revision 45 adds optional, capability-gated communicationQueue roster metadata:
 // an advisory, content-free view of the sender's OCC-3 queue notices. Existing
 // roster commands/events and startup remain compatible (the activity pattern).
+// pendingTotal now counts pending/armed only; this advisory semantic narrowing
+// is backward-compatible and needs no schema bump (older daemons may count in-flight work).
 // Revision 46 adds the optional, capability-gated occ_resolve_queue_entry
 // command: manual resolution (cancel or explicitly confirmed re-emit) of one
 // uncertain entry on the attached session's own OCC-3 queue. Purely additive:

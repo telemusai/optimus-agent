@@ -2114,3 +2114,29 @@ async fn idle_receiver_failure_tick_schedules_one_fallback_prompt() {
     assert_eq!(session.get_follow_up_messages(), prompts);
     session.dispose_async(Some(false)).await;
 }
+
+/// A model may arm the pending head before its queued prompt is consumed.
+/// Returning to pending after a capture failure is a new prompting occasion.
+#[tokio::test]
+async fn cancelled_head_prompt_can_prompt_once_after_nonterminal_capture_failure() {
+    let (session, native) = sending_session_fixture().await;
+    let gate = Arc::new(Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+    let controller: Arc<dyn AgentSessionMessageController> = Arc::new(PermittingController);
+    let _drain = native.queue_notice_drain.lock().await;
+    native.sender_queue_enqueue("child", "receiver").unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages().len(), 1);
+    native.sender_queue_mark_armed(None, None).unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert!(session.get_follow_up_messages().is_empty());
+    native.sender_queue_capture_failed(false, "capture_failed").unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    let prompts = session.get_follow_up_messages();
+    assert_eq!(prompts.len(), 1);
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages(), prompts);
+    drop(_drain);
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller, gate).await;
+    assert_eq!(session.get_follow_up_messages(), prompts, "idle tick cannot duplicate the retry");
+    session.dispose_async(Some(false)).await;
+}

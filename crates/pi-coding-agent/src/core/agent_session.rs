@@ -3636,10 +3636,12 @@ fn drive_occ3_head_prompt(
     let prompt_key = "occ3-sender-head";
     let Some(head) = entries.first() else {
         session.remove_queued_follow_up(prompt_key);
+        if let Ok(mut gate) = gate.lock() { gate.clear_sent(); }
         return;
     };
     if occ3_sender_queue::head_prompt(head, entries.len()).is_none() {
         session.remove_queued_follow_up(prompt_key);
+        if let Ok(mut gate) = gate.lock() { gate.clear_sent(); }
         return;
     }
     let decision = match gate.lock() {

@@ -1492,6 +1492,12 @@ pub struct HeadPromptGate {
 }
 
 impl HeadPromptGate {
+    /// Cancellation ends this prompting occasion, even if a later capture
+    /// failure returns the same entry to the same pending-state key.
+    pub fn clear_sent(&mut self) {
+        self.last_sent = None;
+    }
+
     pub fn decide(
         &mut self,
         head: &Occ3SenderQueueEntry,
