@@ -901,6 +901,8 @@ class WorkerRuntime:
         self.consensus(metadata)
         self.preflight("align_complete", lambda: _end_gpu(self, record))
         record.capture_commit_id, record.source_metadata, record.state = commit, metadata, "ready"
+        from . import token_trace
+        token_trace.capture(self, record, req, tokens, start, end)
         if "span_selection" in prepared:
             _calibration_handoff(self, record, prepared, embeddings)
             record.occ3_span_markers = None
@@ -1118,6 +1120,8 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+        from . import token_trace
+        token_trace.admit(runtime, record, req, scheduler, descriptor)
 
 
 def _consume_capacity_available(scheduler, prompt_tokens):
@@ -1594,6 +1598,9 @@ def _effective(model_runner, forward_batch, shift):
         return {"count": count, "dtype": str(values.dtype)}
     runtime.preflight("draft_embedding_replace", replace)
     runtime.preflight("draft_embedding_complete", lambda: _end_gpu(runtime, record))
+    from . import token_trace
+    token_trace.draft_chunk(runtime, record, item, forward_batch, values,
+                            prepared["local"], count, prepared["source"])
     # NextN already keeps its normal embedding through the forward. Do not add
     # a second clone, target sidecar or registry reference to this full chunk.
     return values
@@ -1644,6 +1651,8 @@ def inject_target_embeddings(forward_batch, hidden_states):
                 "dtype": str(hidden_states.dtype)}
     runtime.preflight("target_embedding_inplace", validate_and_copy)
     forward_batch.occ3_effective_embeds = prepared["span"]
+    from . import token_trace
+    token_trace.target_chunk(runtime, item, forward_batch, hidden_states)
 
 
 def draft_input_embeds(model_runner, forward_batch, batch, tail_tokens):
@@ -1751,9 +1760,13 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
         stage.committed = True
         if terminal:
             runtime.align(record, req)
+            from . import token_trace
+            token_trace.capture_text(runtime, record, scheduler)
     elif terminal:
         runtime.preflight("terminal_fence", lambda: runtime.fence())
         _require_pin_evidence(runtime, req, descriptor)
+        from . import token_trace
+        token_trace.settled(runtime, record, scheduler, req, descriptor)
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,

@@ -128,6 +128,51 @@ diagnosis. Request prompts, headers, keys, receipts, and authentication fields
 are not collected by this diagnostic. It is not proof that transferred facts
 were understood, and it does not change the attested SGLang source overlays.
 
+### Token/position drill trace
+
+Set **server** `OCC3_DIAG_TOKEN_TRACE=1` for a temporary synthetic-data drill.
+Unset (or any other value) is off. No client change is needed: Rust source
+capture enrolls the actual generation request; tokenization, accepted rows and
+alignment live on the server. The plugin module is included in `_REQUIRED_PLUGIN`;
+rebuild its attestation manifest when deploying. No SGLang overlay changes.
+
+INFO `occ3-bridge: token trace` JSON lines (ASCII escaped, at most 16 KiB each):
+
+- `capture`: first/last 64 selected token IDs, full-list SHA-256, accepted-output
+  comparison and first mismatch (zero-based, null = equal), accepted span and
+  absolute predictor positions (exclusive end, predictor offset -1), row count,
+  and aligned-prefix byte hash. Source labels are retained locally, at most 128.
+- `capture_text`: source excerpts decoded by the scheduler tokenizer when it is
+  available (512 characters each); no tokenizer means IDs only.
+- `consume_admit`: the same source labels/hash, placeholder holes and 64 prompt
+  IDs on each side, full rewritten prompt row count, offset and private-cache flag.
+  Prompt neighbors are IDs only, not decoded. Holes are **not** receiver text.
+- `consume_chunk`: target prefill chunk boundaries (including zero-overlap
+  chunks), mapped source labels, actual position IDs and first expected-position
+  mismatch, DSA offset/count, and bounded KV slot IDs. Draft overlapping chunks
+  are labeled separately and show their one-row pin shift.
+- `consume_settle`: terminal request-to-KV slot mapping versus injected slots,
+  with first mismatch and retraction count (if the scheduler exposes its pool).
+- `consume_embeddings`: full retained-prefix hash versus capture, selected-row
+  hash versus the freshly copied target/draft embedding slice. Hashes distinguish
+  mutated stored rows from a bad copy, without logging tensor contents.
+
+These diagnostics never inspect keys, headers, principals, state handles or
+receipt objects. **Token IDs are reversible content**, and decoded source text
+can contain private data. Run only authorized synthetic prompts without secrets
+(including conversation history), restrict log access/retention, then disable.
+Every hook is exception-isolated, including logger/decoder failures. Size overflow
+emits a fixed size-limit record. Rank zero alone emits; no diagnostic collectives
+or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
+timing; it does not change request state, alignment, positions or inference policy.
+
+Equal IDs/hashes do not establish semantic fidelity: the receiver attends to
+continuous aligned embeddings, not the source IDs. KV slot IDs expose placement
+and reuse across observed chunks, **not** later KV content overwrites or other
+ranks' memory. If all traces agree, investigate alignment quality and downstream
+attention/KV behavior with separate runtime instrumentation rather than treating
+source labels as text that the receiver necessarily saw.
+
 ## Offline development
 
 Run tests through the extension's documented project Python environment:
