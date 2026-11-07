@@ -2470,7 +2470,8 @@ class ChatAttachmentAdapter:
                     await self._terminal_bounded_op(value, ctx, abort_token)
                 else:
                     ledger.resolve(abort_token, True)
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
                 ledger.resolve(abort_token, False)
         # Tracked retire: a positive return is ONE required ack, never
         # permission to release while any other required op pends.
@@ -2479,7 +2480,8 @@ class ChatAttachmentAdapter:
             try:
                 task = asyncio.ensure_future(
                     self.backend.retire(ctx.attempt_id, ctx.native_rid, ctx.dispatched))
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
                 task = None
             if task is None:
                 ledger.resolve(retire_token, False)
@@ -2490,7 +2492,8 @@ class ChatAttachmentAdapter:
         for token, iterator in close_tokens:
             try:
                 await self._terminal_bounded_op(iterator.aclose(), ctx, token)
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "iterator_close")
                 ledger.resolve(token, False)
         self._terminal_try_release(ctx)
 

@@ -402,7 +402,8 @@ and release-gate checks even when the gate refuses release. They contain
 counts, settle/failure/release/completion/cancel flags, and fixed per-kind
 `abort`, `retire`, `close`, `emission`, `native`, and `proof` pending/latched
 counts. Initial parsing/admission refusals and cleanup/iterator exceptions
-also produce payload-free failure lines. Snapshots are observational, not a
+also produce payload-free failure lines, including synchronous terminal
+abort, retire, and iterator-close failures before a task exists. Snapshots are observational, not a
 new reservation or a proof of GPU release.
 
 `/occ3/v1/status.parallel_handoff_diagnostics` contains `last_error_code`,

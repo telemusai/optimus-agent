@@ -267,3 +267,34 @@ async def test_early_refusal_is_logged(boundary, monkeypatch, caplog):
     assert response.status_code == 409
     assert '"code":"unsupported_profile"' in caplog.text
     assert "private-prompt" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_terminal_cleanup_sync_failures_logged(monkeypatch, caplog):
+    from types import SimpleNamespace
+    from occ3_sglang.chat_adapter import _TerminalLedger
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    adapter = _retention_adapter()
+    class Iterator:
+        def aclose(self):
+            raise LatentError("invalid")
+    def abort(_):
+        raise LatentError("busy")
+    def retire(*args):
+        raise LatentError("not_ready")
+    adapter.backend = SimpleNamespace(retire=retire)
+    ctx = SimpleNamespace(terminal_settled=False, terminal_ledger=_TerminalLedger(),
+        terminal_watchdog_task=None, completed=False, terminal_released=False,
+        terminal_failure_latch=False, cancel_requested=False, cleanup_started=False,
+        dispatched=True, native_rid="private-rid", tm=SimpleNamespace(abort_request=abort),
+        attempted=True, attempt_id="private-attempt", retire_confirmed=False, retire_started=False,
+        response_iterator=Iterator(), outer=None, inner=None)
+    with caplog.at_level(logging.INFO):
+        await adapter._terminal_settle_body(ctx)
+    for code, function in (("busy", "abort"), ("not_ready", "retire"), ("invalid", "aclose")):
+        assert '"code":"' + code + '"' in caplog.text
+        assert '"function":"' + function + '"' in caplog.text
+    assert all(op[1] == "latched" for op in ctx.terminal_ledger.ops.values())
+    assert len(ctx.terminal_ledger.ops) == 3
+    assert adapter._active == adapter._terminal_active == 1
+    assert "private-rid" not in caplog.text and "private-attempt" not in caplog.text
