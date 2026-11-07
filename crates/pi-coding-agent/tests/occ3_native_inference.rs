@@ -958,15 +958,18 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
 }
 
 /// The receiver's `prepare_inference` control round trip must classify a
-/// synchronous PRE-DISPATCH busy refusal as the distinct proven-non-use
-/// error, so the resolver can release its inbox claim and the next
-/// inference request retries the consume cleanly (the live 2026-11-07
-/// receiver wedge). `prepare_inference` awaits exactly one control call
-/// before the attachment exists - `sessions/enroll` - so a busy-envelope
-/// refusal on that call proves no receiver attachment was created or
-/// submitted. The two classified declines are the registry admission
-/// decline (409 `busy`) and the control-plane saturation gate
-/// (429 `quota`). Every other decline - including a 409 `expired`, a
+/// synchronous proven-non-use refusal as the distinct busy error, so the
+/// resolver can release its inbox claim and the next inference request
+/// retries the consume cleanly (the live 2026-11-07 receiver wedge).
+/// `prepare_inference` awaits exactly one control call before the
+/// attachment exists - `sessions/enroll` - so a refusal on that call
+/// proves no receiver attachment was created or submitted. On that route
+/// today the real classified decline is the saturation gate's `quota`
+/// (429: session-table capacity, or the pre-parse 16 KiB body bound);
+/// enroll has no `busy` code, which exists only in the registry's
+/// reserve_capture/reserve_consume admission declines - the paired 409
+/// row keeps the classification's contract for a future control route
+/// that reuses it. Every other decline - including a 409 `expired`, a
 /// malformed, oversized or empty-code envelope, a non-identity
 /// content-encoding, or a 200 carrying an error body on the success path
 /// - keeps the generic fail-closed `TransferFailed { "native control
@@ -992,7 +995,11 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
     // table including every parser boundary: the exact-256-byte accept, the
     // 257-byte reject, empty/64/65-char codes, a non-identity
     // content-encoding, and a 200 that carries an error body onto the
-    // success path.
+    // success path. Route coverage today: enroll returns 429 for quota
+    // (session capacity or the pre-parse 16 KiB body bound) and can never
+    // return `busy` (that is a registry-only decline); the 409-busy row
+    // exists so the paired classification keeps its contract if a future
+    // control route reuses the registry's busy decline.
     let long_code = "e".repeat(64);
     let over_code = "e".repeat(65);
     let busy_pad = r#"{"error":{"code":  "busy"}}"#;

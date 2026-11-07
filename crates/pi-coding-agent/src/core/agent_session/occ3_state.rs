@@ -822,6 +822,10 @@ impl Occ3NativeSession {
                     return Err(anyhow::anyhow!(failure()));
                 }
                 let claimed_message_id = envelope.message_id.clone();
+                // Routed to the sender when a busy refusal releases this
+                // claim; captured before the envelope moves into the
+                // prepare request.
+                let sender_session_id = envelope.sender_session_id.clone();
                 let lease = match this
                     .connector
                     .prepare_inference(PrepareInferenceRequest {
@@ -847,9 +851,10 @@ impl Occ3NativeSession {
                         // nothing about the server's own state (an admission
                         // decline can follow earlier control mutations), so
                         // nothing is marked consumed and no second delivery
-                        // is ever issued. Mirrors the source-side busy
-                        // absorption: busy is never a counted failure and
-                        // never a replay permit.
+                        // is ever issued; the receiver's in-memory retry stays
+                        // the sole consumer of the same delivery. Mirrors the
+                        // source-side busy absorption: busy is never a counted
+                        // failure and never a replay permit.
                         let released = this
                             .inbox
                             .lock()
@@ -857,6 +862,23 @@ impl Occ3NativeSession {
                             .release_busy_claim(&claimed_message_id);
                         receiver_busy_claim_released(&claimed_message_id, &connector_id, released);
                         if released {
+                            // Liveness: this receiver's busy turn now proceeds
+                            // WITHOUT the attachment, and the receiver's
+                            // control-only transcript body never carries the
+                            // source facts - only a completed consume would
+                            // surface them. The released record is Admitted
+                            // (in-flight), so the sender's queue entry never
+                            // TTL-expires and no terminal failure poll ever
+                            // fires. Route the same proven-non-use busy
+                            // signal the TurnEnd dispatcher uses for refused
+                            // leases: the sender's in-flight (admitted) entry
+                            // takes one bounded busy retry (2s/4s/8s backoff)
+                            // and re-arms a FRESH capture, so the facts are
+                            // re-sent instead of being silently lost.
+                            route_receiver_busy_to_sender(
+                                &sender_session_id,
+                                &claimed_message_id,
+                            );
                             return Ok(None);
                         }
                         return Err(anyhow::anyhow!(failure()));
@@ -3885,6 +3907,28 @@ mod tests {
         )
         .await
         .expect("fixture enrollment");
+        // The live sender of this delivery, so the release route has a real
+        // queue to notify (liveness: the released record never surfaces
+        // through terminal-failure polls, and an in-flight Admitted entry
+        // never TTL-expires).
+        let sender = Occ3NativeSession::enroll(
+            "sender-busy",
+            &fixture_model(),
+            Arc::new(FixtureConnector::new()),
+        )
+        .await
+        .expect("fixture sender enrollment");
+        sender.sender_queue_enqueue("child", "receiver").unwrap();
+        sender
+            .sender_queue_mark_armed(Some("busy-1"), Some("receiver"))
+            .unwrap();
+        sender
+            .sender_queue_mark_progressed(
+                crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Admitted,
+                "busy-1",
+            )
+            .unwrap();
+        let _sender_setup = sender.take_pending_queue_notices();
         let fingerprint = fixture_identity().fingerprint();
         let envelope = Occ3Envelope {
             schema: "optimus.occ3.v1".into(),
@@ -3966,6 +4010,26 @@ mod tests {
                 !values[0].to_string().contains("busy-release-proof"),
                 "the notice never carries envelope content"
             );
+        }
+        // Liveness: the release must ALSO notify the sender. The receiver's
+        // control-only transcript body carries no source facts and the
+        // released record never reaches a terminal-failure poll, so without
+        // this route the sender's in-flight Admitted entry would sit
+        // unexpired forever and the facts would be silently lost. The same
+        // proven-non-use route the TurnEnd dispatcher uses for refused
+        // leases schedules one bounded busy retry on the sender.
+        {
+            let notices = sender.take_pending_queue_notices();
+            assert_eq!(notices.len(), 1, "exactly one sender busy-retry notice");
+            assert_eq!(notices[0].state, "pending");
+            assert_eq!(notices[0].message_id.as_deref(), Some("busy-1"));
+            let (entries_snapshot, _) = sender.sender_queue_snapshot().unwrap();
+            assert_eq!(
+                entries_snapshot[0].state,
+                crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Pending
+            );
+            assert_eq!(entries_snapshot[0].busy_retries, 1);
+            assert!(entries_snapshot[0].retry_not_before_epoch.is_some());
         }
         // 2) The next inference request retries the consume cleanly: the
         //    same record claims and binds through the real prepare path.

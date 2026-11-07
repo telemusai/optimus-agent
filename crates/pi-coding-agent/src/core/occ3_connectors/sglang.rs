@@ -666,19 +666,26 @@ impl SglangOcc3Connector {
             // Busy (409), quota, malformed responses and outages are not proof
             // of revoked enrollment and must not trigger recovery probes.
             //
-            // Two synchronous declines of THIS control call surface as the
-            // distinct `NativeInferenceBusyRefused` instead of the generic
-            // invalid site: the control-plane saturation gate's `quota`
-            // (429) and the admission decline's `busy` (409). For the
-            // receiver release boundary the proof is narrower than "no
-            // server work happened": `prepare_inference` awaits exactly
-            // one control call (sessions/enroll) before building the
-            // receiver attachment, and only a bound, submitted attachment
-            // can ever reach the provider - so a refusal here proves the
-            // attachment for this consume was never created or submitted.
-            // The 429/409 envelope itself does not prove the server made
-            // no prior mutation (an enrollment can update membership
-            // before a later readiness read declines), which is exactly why
+            // A synchronous `quota` decline of THIS control call surfaces
+            // as the distinct `NativeInferenceBusyRefused` instead of the
+            // generic invalid site. Route coverage today: `sessions/enroll`
+            // maps quota to 429 (session-table capacity, or the 16 KiB
+            // body bound before any parse); its other codes are
+            // identity/invalid/unavailable/409-fallback and can never be
+            // `busy` (registry `busy` exists only on reserve_capture and
+            // reserve_consume). The classification pairs the two codes
+            // anyway so a future control route that reuses the admission
+            // decline's `busy` gets the same contract. For the receiver
+            // release boundary the proof is narrower than "no server work
+            // happened": `prepare_inference` awaits exactly one control
+            // call (sessions/enroll) before building the receiver
+            // attachment, and only a bound, submitted attachment can ever
+            // reach the provider - so a refusal here proves the attachment
+            // for this consume was never created or submitted. A 429
+            // envelope from the body-size bound also proves the request
+            // never parsed; one from session capacity proves no mutation
+            // (the table write never happened). The envelope otherwise
+            // proves nothing about earlier mutations, which is exactly why
             // the release only returns the claim to `Admitted`: nothing is
             // marked consumed and no second delivery is ever issued. The
             // classification itself is the generic control-path rule and is
