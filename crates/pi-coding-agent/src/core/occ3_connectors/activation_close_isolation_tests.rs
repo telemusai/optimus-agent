@@ -72,14 +72,30 @@ async fn unverified_runtime_refusal_preserves_ready_connector() {
     }
 }
 
-/// Repeated failures must not fan out into repeated control-plane probes.
+/// Failed identity probes retain the longer cooldown during an outage.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn runtime_refusal_probe_has_connector_cooldown() {
+async fn failed_runtime_probe_has_connector_cooldown() {
     let _cache_guard = reset_ready_cache().await;
     let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
     let request = fixture_request(&fixture, None, None);
     let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
     fixture.enrollment_failure.store(4, std::sync::atomic::Ordering::SeqCst);
+    let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
+    for _ in 0..3 {
+        assert!(ready.connector.enroll_native_session("probe-cooldown").await.is_err());
+    }
+    let calls = fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+    assert_eq!(calls, 5, "three refusals plus only one pair of identity probes");
+}
+
+/// Verified unchanged identity still bounds persistent authority-refusal traffic.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_runtime_probe_has_short_connector_cooldown() {
+    let _cache_guard = reset_ready_cache().await;
+    let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+    let request = fixture_request(&fixture, None, None);
+    let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+    fixture.enrollment_failure.store(1, std::sync::atomic::Ordering::SeqCst);
     let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..3 {
         assert!(ready.connector.enroll_native_session("probe-cooldown").await.is_err());
@@ -158,9 +174,9 @@ async fn non_authority_refusals_do_not_probe_runtime() {
     }
 }
 
-/// A healthy unchanged probe cannot mask a restart immediately afterward.
+/// Restart recovery resumes after the short unchanged-runtime cooldown.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn unchanged_probe_does_not_suppress_subsequent_restart() {
+async fn unchanged_probe_short_cooldown_allows_later_restart() {
     let _cache_guard = reset_ready_cache().await;
     let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
     let request = fixture_request(&fixture, None, None);
@@ -168,8 +184,13 @@ async fn unchanged_probe_does_not_suppress_subsequent_restart() {
     fixture.enrollment_failure.store(1, std::sync::atomic::Ordering::SeqCst);
     assert!(ready.connector.enroll_native_session("unchanged-refusal").await.is_err());
     fixture.enrollment_failure.store(3, std::sync::atomic::Ordering::SeqCst);
+    let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
     assert!(ready.connector.enroll_native_session("immediate-restart").await.is_err());
+    assert_eq!(fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before, 1,
+        "short cooldown bounds repeated authority probes");
+    tokio::time::sleep(Duration::from_millis(1100)).await;
+    assert!(ready.connector.enroll_native_session("restart-after-cooldown").await.is_err());
     fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
     let replacement = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
-    assert!(!std::sync::Arc::ptr_eq(&ready, &replacement), "verified unchanged probe must not impose cooldown");
+    assert!(!std::sync::Arc::ptr_eq(&ready, &replacement), "restart after the bounded cooldown must evict stale readiness");
 }

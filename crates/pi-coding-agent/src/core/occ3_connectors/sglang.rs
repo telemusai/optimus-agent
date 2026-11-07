@@ -551,13 +551,13 @@ impl SglangOcc3Connector {
     /// before evicting this connector; existing operations still fail closed.
     async fn invalidate_ready_if_runtime_changed(&self) {
         let Some(native) = self.native.as_ref() else { return };
-        // Never queue recovery probes behind one another. A failed probe also
-        // consumes the cooldown, preventing an unavailable server from fan-out.
-        let Ok(mut last_probe) = self.runtime_probe.try_lock() else { return };
-        if last_probe.is_some_and(|last| last.elapsed() < Duration::from_secs(5)) {
+        // Never queue recovery probes behind one another. The not-before
+        // deadline also bounds repeated failures against an unavailable server.
+        let Ok(mut next_probe) = self.runtime_probe.try_lock() else { return };
+        if next_probe.is_some_and(|deadline| std::time::Instant::now() < deadline) {
             return;
         }
-        *last_probe = Some(std::time::Instant::now());
+        *next_probe = Some(std::time::Instant::now() + Duration::from_secs(5));
         let Ok(Some((identity, runtime))) = tokio::time::timeout(
             Duration::from_millis(1500),
             async {
@@ -582,9 +582,9 @@ impl SglangOcc3Connector {
         {
             crate::core::occ3_connectors::activation::invalidate_connector_ready(self);
         } else {
-            // A verified unchanged runtime is healthy, not a failed probe.
-            // Do not hide an actual restart that happens immediately afterward.
-            *last_probe = None;
+            // Persistent authority refusals still need a short traffic bound.
+            // A subsequent failure after this window rechecks a fresh restart.
+            *next_probe = Some(std::time::Instant::now() + Duration::from_secs(1));
         }
     }
 

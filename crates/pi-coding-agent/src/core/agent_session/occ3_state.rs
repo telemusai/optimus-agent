@@ -554,6 +554,11 @@ impl Occ3NativeSession {
                                     // No capture was attempted: disabling policy releases
                                     // capacity without consuming the capture-failure budget.
                                     Self::reset_slot_for_fresh_arm(&mut slot);
+                                    // Never hold the source guard across queue journaling
+                                    // or persistence. No capture attempt was dispatched.
+                                    drop(slot);
+                                    this.sender_queue_capture_policy_denied()
+                                        .map_err(anyhow::Error::msg)?;
                                     return Err(anyhow::Error::msg(error));
                                 }
                                 (Some(budget), slot.retained)
@@ -1912,7 +1917,6 @@ Do not call occ3_handoff again for these facts."
             if source.handoff_admitted {
                 source.capture_permit = None;
             }
-            drop(source); // Explicitly end source ownership before queue persistence.
         }
         let mut queue = self.queue.lock().map_err(|_| failure())?;
         let notice = queue.mark_progressed(state, message_id, now());
@@ -2055,6 +2059,16 @@ Do not call occ3_handoff again for these facts."
         slot.budget = None;
         slot.capture_permit = None;
         slot.armed_receiver = None;
+    }
+
+    /// Requeues a policy-denied arm without spending a capture attempt.
+    /// Queue transition, outbox journal, and persistence share the queue lock.
+    fn sender_queue_capture_policy_denied(&self) -> Result<Option<Occ3QueueNotice>, String> {
+        let mut queue = self.queue.lock().map_err(|_| failure())?;
+        let notice = queue.capture_policy_denied(now());
+        self.journal_notices_locked(&mut queue, notice.clone());
+        self.persist_sender_queue(&queue)?;
+        Ok(notice)
     }
 
     /// A capture failure for the armed head. `terminal` marks the native
@@ -3473,6 +3487,75 @@ mod tests {
         assert!(session.arm_handoff_if_needed("other", None).is_err());
         session.invalidate();
         assert!(session.arm_handoff_if_needed("receiver", None).is_err());
+    }
+
+    #[tokio::test]
+    async fn occ3_policy_denial_requeues_unattempted_armed_head_without_spending_attempts() {
+        use super::super::occ3_sender_queue::Occ3SenderQueueState;
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("session.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"rlmDepth\":0}\n").unwrap();
+        let session = enrolled().await;
+        session.bind_chat_preferences(Some(file.to_string_lossy().into_owned())).unwrap();
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let args = json!({"receiver_role":"child","receiver_name":"receiver"});
+        let armed = (tool.execute)("policy-arm".into(), args.clone(), None, None).await.unwrap();
+        assert_eq!(armed.details["status"], "capture_armed");
+        let before = session.sender_queue_snapshot().unwrap().0;
+        assert_eq!(before.len(), 1);
+        assert_eq!(before[0].state, Occ3SenderQueueState::Armed);
+        let queue_id = before[0].queue_id.clone();
+        let _setup = session.take_pending_queue_notices();
+        crate::core::occ::session_settings::save_occ3(file.to_str().unwrap(), true, false).unwrap();
+        assert!((session.source_hooks().resolve)(hook_request()).await.is_err());
+        let pending = session.sender_queue_snapshot().unwrap().0;
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].state, Occ3SenderQueueState::Pending);
+        assert_eq!(pending[0].queue_id, queue_id);
+        assert_eq!(pending[0].attempts, 0);
+        assert_eq!(session.failed_capture_attempts(), 0);
+        let notices = session.take_pending_queue_notices();
+        assert_eq!(notices.len(), 1);
+        assert_eq!(notices[0].state, "pending");
+        assert_eq!(notices[0].reason.as_deref(), Some("capture_policy_denied"));
+        assert!((tool.execute)("policy-still-disabled".into(), args.clone(), None, None).await.is_err());
+        assert_eq!(session.sender_queue_snapshot().unwrap().0[0].state, Occ3SenderQueueState::Pending);
+        assert!(session.source.lock().unwrap().budget.is_none());
+        crate::core::occ::session_settings::save_occ3(file.to_str().unwrap(), true, true).unwrap();
+        let rearmed = (tool.execute)("policy-rearm".into(), args, None, None).await.unwrap();
+        assert_eq!(rearmed.details["status"], "capture_armed");
+        let after = session.sender_queue_snapshot().unwrap().0;
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].queue_id, queue_id);
+        assert_eq!(after[0].state, Occ3SenderQueueState::Armed);
+        assert_eq!(after[0].attempts, 0);
+        assert_eq!(session.failed_capture_attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn occ3_submitted_capture_cancellation_releases_capacity_at_agent_end() {
+        let session = enrolled().await;
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(session.arm_handoff_if_needed("receiver", Some(pool.clone().acquire_owned().await.unwrap())).unwrap());
+        resolve_capture(&session).await;
+        let lease = session.source.lock().unwrap().lease.clone().unwrap();
+        assert_eq!(lease.state(), SourceCaptureState::Prepared);
+        assert!(lease.cancel_submitted_for_test());
+        assert_eq!(lease.state(), SourceCaptureState::Uncertain);
+        assert!(lease.receipt().is_none());
+        assert!(lease.retirement_receipt().is_none());
+        assert!(!lease.cancel_submitted_for_test(), "cannot replay a terminal lease");
+        assert_eq!(pool.available_permits(), 0);
+        assert!(!session.absorb_source_busy_refusal(), "uncertain is not a busy refusal");
+        assert_eq!(pool.available_permits(), 1, "AgentEnd releases abandoned submitted capture");
+        assert_eq!(session.failed_capture_attempts(), 0);
+        assert!(session.arm_handoff_if_needed("receiver", None).is_err());
+        assert!((session.source_hooks().resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
+        assert!(session.arm_handoff_if_needed("receiver", Some(pool.clone().try_acquire_owned().unwrap())).unwrap());
+        assert_eq!(pool.available_permits(), 0);
     }
 
     #[test]

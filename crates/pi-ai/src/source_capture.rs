@@ -850,6 +850,17 @@ impl SourceCaptureLease {
         self.0.cancellation.cancel();
         true
     }
+    /// Downstream lifecycle-test seam: simulate submission, then revoke it.
+    /// Only a Prepared lease can enter this path. It produces Uncertain with
+    /// no receipt or publication authority and never sends a network request.
+    #[doc(hidden)]
+    pub fn cancel_submitted_for_test(&self) -> bool {
+        let Ok(_submission) = self.submit() else {
+            return false;
+        };
+        self.cancel() == SourceCaptureState::Uncertain
+    }
+
     /// Revokes local authority; callers separately retire the runtime resource.
     pub fn cancel(&self) -> SourceCaptureState {
         let mut record = self.0.state.lock();

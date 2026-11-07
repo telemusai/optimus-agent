@@ -22,9 +22,11 @@ async fn arm_queued_source_and_prompt(pf: &ProofFamily) {
     assert_eq!(entries[0].state.as_str(), "admitted");
 }
 
-/// Closing a third session sharing the connector must not revoke an admitted delivery.
+/// Consumption completes the sender queue even after an unrelated session closes.
+/// This fixture does not populate the ready cache; the bug-2 cache regression is
+/// `unrelated_close_preserves_shared_ready_connector`, not this provider proof.
 #[tokio::test]
-async fn unrelated_close_preserves_admitted_provider_consume() {
+async fn consumed_delivery_completes_sender_queue_after_unrelated_close() {
     let pf = build_family(FamilyConfig {
         source_tool: SourceTool::QueueController,
         ..Default::default()

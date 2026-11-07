@@ -654,7 +654,8 @@ pub(crate) mod test_support {
         pub endpoint: url::Url,
         pub requests: Arc<AtomicUsize>,
         /// 0 healthy; 1 generic refusal; 2 epoch mismatch; 3 restart refusal;
-        /// 4 refusal with unavailable runtime identity probe.
+        /// 4 refusal with unavailable identity probe; 5 busy HTTP 409;
+        /// 6 unavailable HTTP 503; 7 HTTP 200 with malformed JSON.
         pub enrollment_failure: Arc<AtomicUsize>,
         shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     }

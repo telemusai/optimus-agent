@@ -1184,6 +1184,18 @@ impl Occ3SenderQueue {
         }
     }
 
+    /// Policy stopped an armed capture before dispatch; keep the same head
+    /// for explicit re-arm without consuming failure or busy retry budgets.
+    pub fn capture_policy_denied(&mut self, now_epoch: u64) -> Option<Occ3QueueNotice> {
+        let head = self.entries.front_mut()?;
+        if head.state != Occ3SenderQueueState::Armed {
+            return None;
+        }
+        head.state = Occ3SenderQueueState::Pending;
+        head.reason = Some("capture_policy_denied".into());
+        self.notice_at(0, now_epoch, Some("capture_policy_denied".into()))
+    }
+
     /// A capture failure for the armed head. This is NOT a queue retry: the
     /// PR235 slot budget owns capture retries. The queue demotes the entry
     /// to fallback only when the native path is terminally unavailable.
