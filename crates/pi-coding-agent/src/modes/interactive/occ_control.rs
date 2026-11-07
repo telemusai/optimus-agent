@@ -177,7 +177,7 @@ fn status_of(
         }
         if !queue.entries.is_empty() {
             panel.push_str(&format!(
-                "\nNative handoff queue: {} pending (shown in the subagents bar as QUEUED; queued handoffs carry no pulse until the receiver proves completed use).",
+                "\nNative handoff queue: {} waiting (pending/armed; the blue QUEUED marker flashes while waiting, independently of the OCC3 completed-use delivery pulse).",
                 queue.pending_total
             ));
             for entry in &queue.entries {
@@ -662,7 +662,7 @@ mod tests {
         assert!(panel.contains("An explicit chat preference gates native actions dynamically"));
         assert!(!panel.contains("Inherited from chat"));
         // Count line uses the full pending total, not the bounded list.
-        assert!(panel.contains("Native handoff queue: 2 pending"));
+        assert!(panel.contains("Native handoff queue: 2 waiting"));
         // Per-entry rows: position, receiver, state (sender's UI labels,
         // corrected: admitted is an honest transport acknowledgment, never
         // consumed; unfinished re-emission renders "fallback (pending)"),

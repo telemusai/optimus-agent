@@ -2028,3 +2028,115 @@ async fn token_grant_uses_the_authenticated_receiver_id() {
     );
     session.end_fallback_turn();
 }
+
+/// Historical busy/arm records may drain after admission. They remain audit
+/// records, never sender prompts, and replayed worklist clones do nothing.
+#[tokio::test]
+async fn admitted_queue_drain_does_not_prompt_or_replay_busy_history() {
+    let (session, native) = sending_session_fixture().await;
+    let controller: Arc<dyn AgentSessionMessageController> = Arc::new(PermittingController);
+    let _drain = native.queue_notice_drain.lock().await;
+    native.sender_queue_enqueue("child", "receiver").unwrap();
+    native.sender_queue_mark_armed(Some("old"), None).unwrap();
+    native.sender_queue_source_busy(pi_ai::source_capture::SourceBusyRefusal {
+        refused_at_epoch: occ3_state_now(), retry_after_secs: Some(1),
+    }).unwrap();
+    let gate = Arc::new(Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages().len(), 1);
+    native.sender_queue_mark_progressed(occ3_sender_queue::Occ3SenderQueueState::Admitted, "sent").unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate).await;
+    assert!(session.get_follow_up_messages().is_empty(), "admission cancels queued retry prompt");
+    let records = native.take_pending_queue_notices();
+    assert_eq!(records.len(), 4);
+    for record in &records {
+        AgentSession::deliver_queue_notice_record(&session, &native, &controller, record.clone()).await;
+    }
+    assert!(session.get_follow_up_messages().is_empty(), "historical notices cannot drive turns");
+    assert!(native.sender_queue_outbox_snapshot().is_empty());
+    let projected = crate::core::occ::queue::from_queue_notices(&session.messages(), &session.session_id(), "test");
+    assert_eq!(projected.pending_total, 0, "live roster sees admission without a model turn");
+    let before = session.session_manager.lock().unwrap().get_entries().len();
+    for record in records {
+        AgentSession::deliver_queue_notice_record(&session, &native, &controller, record).await;
+    }
+    assert_eq!(session.session_manager.lock().unwrap().get_entries().len(), before);
+    assert!(native.sender_queue_mark_armed(None, None).unwrap().is_none());
+    assert!(!native.sender_queue_source_busy(pi_ai::source_capture::SourceBusyRefusal {
+        refused_at_epoch: occ3_state_now(), retry_after_secs: None,
+    }).unwrap());
+    assert!(native.take_pending_queue_notices().is_empty());
+    drop(_drain);
+    session.dispose_async(Some(false)).await;
+}
+
+/// Exercise the production idle-timer body, without waiting for wall time.
+#[tokio::test]
+async fn idle_receiver_busy_tick_prompts_once_and_admission_cancels_it() {
+    let (session, native) = sending_session_fixture().await;
+    let controller: Arc<dyn AgentSessionMessageController> = Arc::new(PermittingController);
+    let gate = Arc::new(Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+    native.sender_queue_enqueue("child", "receiver").unwrap();
+    native.sender_queue_mark_armed(Some("idle-busy"), None).unwrap();
+    native.sender_queue_mark_progressed(occ3_sender_queue::Occ3SenderQueueState::Admitted, "idle-busy").unwrap();
+    occ3_state::route_receiver_busy_to_sender(&native.session_id(), "idle-busy");
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller.clone(), gate.clone()).await;
+    let prompts = session.get_follow_up_messages();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("was busy and did not use"));
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages(), prompts);
+    native.sender_queue_mark_progressed(occ3_sender_queue::Occ3SenderQueueState::Admitted, "idle-retry").unwrap();
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller.clone(), gate.clone()).await;
+    assert!(session.get_follow_up_messages().is_empty());
+    // Old receiver outcome and another idle tick cannot revive the retry.
+    occ3_state::route_receiver_busy_to_sender(&native.session_id(), "idle-busy");
+    native.requeue_unacked_queue_notices();
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller, gate).await;
+    assert!(session.get_follow_up_messages().is_empty());
+    session.dispose_async(Some(false)).await;
+}
+
+#[tokio::test]
+async fn idle_receiver_failure_tick_schedules_one_fallback_prompt() {
+    let (session, native) = sending_session_fixture().await;
+    let controller: Arc<dyn AgentSessionMessageController> = Arc::new(PermittingController);
+    let gate = Arc::new(Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+    native.sender_queue_enqueue("child", "receiver").unwrap();
+    native.sender_queue_mark_armed(Some("idle-failure"), None).unwrap();
+    native.sender_queue_mark_progressed(occ3_sender_queue::Occ3SenderQueueState::Admitted, "idle-failure").unwrap();
+    occ3_state::route_delivery_event_to_sender(&native.session_id(), "idle-failure", false, None);
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller.clone(), gate.clone()).await;
+    let prompts = session.get_follow_up_messages();
+    assert_eq!(prompts.len(), 1);
+    assert!(prompts[0].contains("fell back to ordinary messaging"));
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller, gate).await;
+    assert_eq!(session.get_follow_up_messages(), prompts);
+    session.dispose_async(Some(false)).await;
+}
+
+/// A model may arm the pending head before its queued prompt is consumed.
+/// Returning to pending after a capture failure is a new prompting occasion.
+#[tokio::test]
+async fn cancelled_head_prompt_can_prompt_once_after_nonterminal_capture_failure() {
+    let (session, native) = sending_session_fixture().await;
+    let gate = Arc::new(Mutex::new(occ3_sender_queue::HeadPromptGate::default()));
+    let controller: Arc<dyn AgentSessionMessageController> = Arc::new(PermittingController);
+    let _drain = native.queue_notice_drain.lock().await;
+    native.sender_queue_enqueue("child", "receiver").unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages().len(), 1);
+    native.sender_queue_mark_armed(None, None).unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert!(session.get_follow_up_messages().is_empty());
+    native.sender_queue_capture_failed(false, "capture_failed").unwrap();
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    let prompts = session.get_follow_up_messages();
+    assert_eq!(prompts.len(), 1);
+    AgentSession::drive_occ3_head_prompt(session.clone(), native.clone(), gate.clone()).await;
+    assert_eq!(session.get_follow_up_messages(), prompts);
+    drop(_drain);
+    AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller, gate).await;
+    assert_eq!(session.get_follow_up_messages(), prompts, "idle tick cannot duplicate the retry");
+    session.dispose_async(Some(false)).await;
+}
