@@ -3493,7 +3493,11 @@ mod tests {
     #[tokio::test]
     async fn occ3_policy_disabled_before_capture_does_not_spend_failure_budget() {
         let dir = tempfile::tempdir().unwrap();
-        let file = dir.path().join("session.jsonl");
+        // Preferences live beside the sessions directory, so nest the session
+        // file to keep this test's policy artifact inside its own temp root.
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("session.jsonl");
         std::fs::write(&file, "{\"type\":\"session\",\"rlmDepth\":0}\n").unwrap();
         let session = enrolled().await;
         session.bind_chat_preferences(Some(file.to_string_lossy().into_owned())).unwrap();
