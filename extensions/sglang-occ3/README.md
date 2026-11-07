@@ -372,7 +372,7 @@ device through the full loop. Logit-lens tiles share the 256-row bound.
 
 For one controlled two-handoff repro, enable `OCC3_DIAG_TOKEN_TRACE=1`
 on the server. Grep server logs for `occ3-bridge: native failure` and
-`occ3-bridge: admission`; grep client logs for `native_binding_rejected`
+`occ3-bridge: admission` and `occ3-bridge: retention`; grep client logs for `native_binding_rejected`
 and `native_binding_invalid_site`. Disable the trace after the repro.
 
 Failure lines contain an allowlisted `code`, optional source-defined `detail`,
@@ -390,10 +390,20 @@ preceding `error`. Registry snapshots include `active`, `max_active`, `total`,
 `admitted_capture`, and `admitted_consume`. The active slot is a registry state
 predicate, not a separate semaphore. Frontend snapshots show `active`,
 `max_active`, `terminal_active`, and `terminal_attempts`; backend snapshots
-show `attempts` and available control queue counts. Worker snapshots also
+show `attempts` and the real control client's `pending`, `uncertain`,
+`operations`, and `max_pending` counts. Worker snapshots also
 show `poisoned` and `commands`. DEBUG logging adds `admission lock`
-acquire/wait/release ordering on capture reservation, under the same flag.
-Snapshots are observational, not a new reservation or a proof of GPU release.
+acquire/wait/release ordering on capture reservation. This lock trace reads
+the same opt-in at process startup and uses the original lock directly when
+opt-in or DEBUG logging is off.
+`retention` lines run at quarantine, late settlement, terminal resolution,
+and release-gate checks even when the gate refuses release. They contain
+`pending`, `negative`, `positive`, `quarantined`, `terminal_tasks`, charge
+counts, settle/failure/release/completion/cancel flags, and fixed per-kind
+`abort`, `retire`, `close`, `emission`, `native`, and `proof` pending/latched
+counts. Initial parsing/admission refusals and cleanup/iterator exceptions
+also produce payload-free failure lines. Snapshots are observational, not a
+new reservation or a proof of GPU release.
 
 `/occ3/v1/status.parallel_handoff_diagnostics` contains `last_error_code`,
 `last_error_count`, `error_count` (saturating), `first_failure_unix_seconds`, and `admission`.

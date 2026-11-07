@@ -207,7 +207,7 @@ def log_failure(error, ctx=None, phase="unknown"):
                   for frame in frames]
         status = getattr(error, "status", 409)
         status = status if type(status) is int and status in (400, 401, 409, 413, 429, 499, 503, 504) else 409
-        phase = phase if phase in ("admission", "native_iterator", "keepalive", "terminal", "unknown", "validation", "worker_control") else "unknown"
+        phase = phase if phase in ("admission", "native_iterator", "keepalive", "terminal", "unknown", "validation", "worker_control", "parse", "cleanup", "iterator_close") else "unknown"
         row = {"detail": getattr(error, "detail", None) if isinstance(error, LatentError) else None, "code": code, "status": status, "origin": origin, "phase": phase,
                "dispatched": bool(getattr(ctx, "dispatched", False))}
         with _FAILURE_LOCK:
@@ -218,5 +218,38 @@ def log_failure(error, ctx=None, phase="unknown"):
             if not _FAILURE_STATE["first_failure_unix_seconds"]:
                 _FAILURE_STATE["first_failure_unix_seconds"] = min(9999999999, max(0, int(time.time())))
         LOG.error("occ3-bridge: native failure %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def log_retention(adapter, ctx, event):
+    """Observe fail-closed ownership before the release gate, without token IDs."""
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return
+        if event not in ("quarantine", "quarantine_settled", "terminal_gate",
+                         "terminal_resolve", "terminal_track"):
+            return
+        from .latent_types import admission_event
+        operation = "quarantine" if event.startswith("quarantine") else "terminal_gate"
+        admission_event(operation, "entry", owner=adapter)
+        ledger = getattr(ctx, "terminal_ledger", None)
+        ops = tuple(ledger.ops.values()) if ledger is not None else ()
+        clamp = lambda value: min(2147483647, max(0, value))
+        row = {"event": event, "pending": clamp(sum(op[1] == "pending" for op in ops)),
+               "negative": clamp(sum(op[1] == "latched" for op in ops)),
+               "positive": clamp(sum(op[1] == "positive" for op in ops)),
+               "quarantined": clamp(len(adapter._quarantined)),
+               "terminal_tasks": clamp(len(adapter._terminal_tasks)),
+               "active": clamp(adapter._active), "terminal_active": clamp(adapter._terminal_active),
+               "settled": bool(getattr(ctx, "terminal_settled", False)),
+               "failure_latch": bool(getattr(ctx, "terminal_failure_latch", False)),
+               "released": bool(getattr(ctx, "terminal_released", False)),
+               "completed": bool(getattr(ctx, "completed", False)),
+               "cancel_requested": bool(getattr(ctx, "cancel_requested", False))}
+        for kind in ("abort", "retire", "close", "emission", "native", "proof"):
+            for state in ("pending", "latched"):
+                row[kind + "_" + state] = clamp(sum(op[0] == kind and op[1] == state for op in ops))
+        LOG.info("occ3-bridge: retention %s", json.dumps(row, separators=(",", ":")))
     except Exception:
         pass

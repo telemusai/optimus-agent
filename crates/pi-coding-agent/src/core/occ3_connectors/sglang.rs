@@ -465,7 +465,7 @@ fn native_invalid() -> Occ3Error {
 /// it from the same server-attested method id, never from a constant.
 fn permit_method(native: &NativeExperiment) -> Result<Occ3Method, Occ3Error> {
     crate::core::occ3_connectors::method_family(&native.permit.identity.latent_method)
-        .ok_or_else(native_invalid)
+        .ok_or_else(|| native_invalid())
 }
 fn native_uncertain(message_id: &str) -> Occ3Error {
     Occ3Error::InferenceOutcomeUncertain {
@@ -893,7 +893,7 @@ impl Occ3Connector for SglangOcc3Connector {
         use crate::core::occ::occ3::types::Occ3Envelope;
         let native = self.experiment()?;
         let intent = request.source.intent();
-        let receipt = request.source.receipt().ok_or_else(native_invalid)?;
+        let receipt = request.source.receipt().ok_or_else(|| native_invalid())?;
         // Mode-scoped dispatch validation. The legacy protocol requires the
         // captured turn's own exact occ3_handoff tool binding; the retained
         // content-only mode requires zero tool bindings and the v3 intent
@@ -967,7 +967,7 @@ impl Occ3Connector for SglangOcc3Connector {
         let mut binding = body.clone();
         binding
             .as_object_mut()
-            .ok_or_else(native_invalid)?
+            .ok_or_else(|| native_invalid())?
             .remove("schema");
         binding["principal_digest"] = serde_json::json!(source.principal_digest);
         let digest = pi_ai::source_capture::sha256(
@@ -1057,7 +1057,7 @@ impl Occ3Connector for SglangOcc3Connector {
         records
             .publications
             .get_mut(&request.publication_id)
-            .ok_or_else(native_invalid)?
+            .ok_or_else(|| native_invalid())?
             .publication = Some(publication.clone());
         Ok(publication)
     }
@@ -1113,7 +1113,7 @@ impl Occ3Connector for SglangOcc3Connector {
     ) -> Result<crate::core::occ::occ3::connector::NativeRetirement, Occ3Error> {
         let native = self.native.as_ref().ok_or_else(native_unsupported)?;
         let intent = source.intent();
-        let receipt = source.retirement_receipt().ok_or_else(native_invalid)?;
+        let receipt = source.retirement_receipt().ok_or_else(|| native_invalid())?;
         if native_binding_failed!("retire";
             "runtime_id" => intent.runtime_id != native.permit.runtime_id,
             "runtime_generation" => intent.runtime_generation != native.permit.runtime_generation,
@@ -1299,6 +1299,17 @@ mod tests {
         let encoded = values[0].to_string();
         assert!(encoded.len() < 256);
         assert!(!encoded.contains(secret));
+        drop(values);
+        // FnOnce adapters must retain each real call site, not the helper's line.
+        let first_line = line!() + 1;
+        let _ = None::<()>.ok_or_else(|| native_invalid());
+        let second_line = line!() + 1;
+        let _ = None::<()>.ok_or_else(|| native_invalid());
+        let values = entries.lock().unwrap();
+        assert_eq!(values[1]["msg"], "native_binding_invalid_site");
+        assert_eq!(values[1]["line"], first_line);
+        assert_eq!(values[2]["line"], second_line);
+        assert_ne!(first_line, second_line);
         drop(values);
         pi_ai::log::set_log_sink(Some(Box::new(|_| panic!("broken test sink"))));
         let result = std::panic::catch_unwind(|| {

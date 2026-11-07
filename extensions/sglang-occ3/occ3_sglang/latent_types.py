@@ -64,7 +64,7 @@ _ADMISSION_DETAILS = frozenset((
 _ADMISSION_OPERATIONS = frozenset(("reserve_capture", "reserve_consume", "release_lease",
     "retire", "reap", "worker_admit", "enroll_source", "prepare_source",
     "release_unused", "backend_retire", "frontend_charge", "frontend_release",
-    "terminal_release", "worker_abort", "worker_control", "finish_source"))
+    "terminal_release", "worker_abort", "worker_control", "finish_source", "quarantine", "terminal_gate", "terminal_resolve"))
 _ADMISSION_LOCK = threading.Lock()
 _ADMISSION_COUNTS = {}
 _ADMISSION_LOGS = 0
@@ -116,13 +116,15 @@ def admission_event(operation, outcome, *, registry=None, error=None, owner=None
             if hasattr(owner, "_active"):
                 row.update(active=owner._active, max_active=owner.profile.max_active,
                            terminal_active=owner._terminal_active,
-                           terminal_attempts=len(owner._terminal_attempts))
+                           terminal_attempts=len(owner._terminal_attempts),
+                           quarantined=len(getattr(owner, "_quarantined", ())),
+                           terminal_tasks=len(getattr(owner, "_terminal_tasks", ())))
             if hasattr(owner, "attempts"):
                 row["attempts"] = len(owner.attempts)
-            control = getattr(owner, "control", None)
+            control = getattr(owner, "client", None)
             if hasattr(control, "pending"):
                 row.update(pending=len(control.pending), uncertain=len(control._uncertain),
-                           operations=len(control._operations))
+                           operations=len(control._operations), max_pending=control.max_pending)
             if hasattr(owner, "poisoned"):
                 row["poisoned"] = bool(owner.poisoned)
                 row["commands"] = len(owner.commands)
@@ -178,24 +180,38 @@ def admission_probe(operation, *, registry=False):
     return decorate
 
 
-@contextmanager
+_ADMISSION_LOCK_TRACE = os.environ.get("OCC3_DIAG_TOKEN_TRACE") == "1"
+_ADMISSION_LOG = logging.getLogger("occ3_sglang.admission")
+
+
 def admission_lock(registry):
+    """Return the original lock unless import-time opt-in and DEBUG are enabled."""
+    try:
+        if _ADMISSION_LOCK_TRACE and _ADMISSION_LOG.isEnabledFor(logging.DEBUG):
+            return _traced_admission_lock(registry)
+    except Exception:
+        pass
+    return registry.lock
+
+
+def _admission_lock_note(event):
+    try:
+        _ADMISSION_LOG.debug("occ3-bridge: admission lock %s", event)
+    except Exception:
+        pass
+
+
+@contextmanager
+def _traced_admission_lock(registry):
     """Observe the existing lock boundary without adding a second lock scope."""
-    def note(event):
-        try:
-            if os.environ.get("OCC3_DIAG_TOKEN_TRACE") == "1":
-                logging.getLogger("occ3_sglang.admission").debug(
-                    "occ3-bridge: admission lock %s", event)
-        except Exception:
-            pass
-    note("acquire_wait")
+    _admission_lock_note("acquire_wait")
     with registry.lock:
-        note("acquired")
+        _admission_lock_note("acquired")
         try:
             yield
         finally:
-            note("releasing")
-    note("released")
+            _admission_lock_note("releasing")
+    _admission_lock_note("released")
 
 
 class LatentError(RuntimeError):
