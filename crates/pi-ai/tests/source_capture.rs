@@ -79,6 +79,7 @@ fn receipt(intent: &SourceCaptureIntent, body: &str) -> SourceCaptureReceipt {
         ready_ranks: 8,
         expected_ranks: 8,
         accepted_sequence_digest: "c".repeat(64),
+        label_anchor_alpha: Default::default(),
         output_sha256: sha256(body.as_bytes()),
         expires_at_epoch: intent.expires_at_epoch,
         byte_count: 32,

@@ -1403,3 +1403,41 @@ def test_readiness_record_cannot_survive_a_runtime_generation_change(tmp_path):
                   runtime_generation=report["observed"]["runtime_generation"] + 1)
     result = make_validator(journal).before_restart()
     assert result["ok"] is False and result["code"] == "pin_generation_mismatch"
+
+
+@pytest.mark.parametrize("alpha", [0, 0.0, 0.3, 0.5, 0.7, 1])
+def test_label_anchor_admission_allowed(tmp_path, alpha):
+    value = native_plan()
+    value["native_validator"]["admission_template"]["source_profile"]["label_anchor_alpha"] = alpha
+    journal = make_journal(tmp_path, value)
+    assert make_validator(journal).pre_mutation_admission()["ok"] is True
+
+
+@pytest.mark.parametrize("alpha", [True, False, None, "0.3", -0.3, 0.2, 1.1])
+def test_label_anchor_admission_invalid(tmp_path, alpha):
+    value = native_plan()
+    value["native_validator"]["admission_template"]["source_profile"]["label_anchor_alpha"] = alpha
+    journal = make_journal(tmp_path, value)
+    result = make_validator(journal).pre_mutation_admission()
+    assert result["ok"] is False
+    assert result["code"] == "source_label_anchor_alpha_invalid"
+
+
+def test_label_anchor_admission_conflicts_with_source_anchor(tmp_path):
+    value = native_plan()
+    value["native_validator"]["admission_template"]["source_profile"].update(
+        anchor_alpha=0.3, label_anchor_alpha=0.5)
+    journal = make_journal(tmp_path, value)
+    assert make_validator(journal).pre_mutation_admission()["code"] == "source_anchor_conflict"
+
+
+def test_label_anchor_derivation_zero_keeps_historical_digest():
+    observed = {"runtime_epoch": TS8_RUNTIME_EPOCH,
+                "runtime_generation": TS8_RUNTIME_GENERATION}
+    profile = dict(TS8_STATIC_PROFILE, label_anchor_alpha=0.0)
+    assert nv._derived_profile_digest(profile, observed) == TS8_WIRE_DIGEST
+    for alpha in (0.3, 0.5, 0.7, 1.0):
+        profile["label_anchor_alpha"] = alpha
+        actual = nv._derived_profile_digest(profile, observed)
+        assert actual != TS8_WIRE_DIGEST
+        assert actual == RuntimeProfile(**profile, **observed).binding_digest

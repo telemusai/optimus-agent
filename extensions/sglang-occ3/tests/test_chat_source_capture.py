@@ -162,8 +162,9 @@ def test_shared_source_fixture_canonical_bytes_and_units():
     assert r.byte_count == r.retained_count * r.hidden_dim * 2
     assert canonical(FIXTURE["canonical_probe"]).decode() == FIXTURE["canonical_probe_bytes"]
     assert digest(FIXTURE["canonical_probe"]) == FIXTURE["canonical_probe_sha256"]
-    assert json.loads(source_receipt_upper_bound()) == FIXTURE["max_valid_receipt"]
-    assert len(source_receipt_upper_bound()) == FIXTURE["max_valid_receipt_bytes"] <= 2048
+    assert json.loads(source_receipt_upper_bound()) == dict(
+        FIXTURE["max_valid_receipt"], label_anchor_alpha=0.7)
+    assert len(source_receipt_upper_bound()) == FIXTURE["max_valid_receipt_bytes"] + 25 <= 2048
 
 
 @pytest.mark.parametrize("case", FIXTURE["negative_intents"], ids=lambda c: c["name"])

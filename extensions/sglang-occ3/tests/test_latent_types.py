@@ -168,3 +168,31 @@ def latent_types_module():
 def builtins_module():
     import builtins
     return builtins
+
+
+@pytest.mark.parametrize("alpha", [0, 0.0, 0.3, 0.5, 0.7, 1, 1.0])
+def test_label_anchor_allowed_and_bound(alpha):
+    from occ3_sglang.attachment_contract import digest
+    original = profile()
+    legacy = asdict(original)
+    legacy.pop("label_anchor_alpha")
+    assert original.label_anchor_alpha == 0.0
+    assert original.binding_digest == digest(legacy)
+    changed = profile(label_anchor_alpha=alpha)
+    assert (changed.binding_digest == original.binding_digest) == (alpha == 0)
+    if alpha:
+        assert changed.binding_digest == digest(asdict(changed))
+
+
+@pytest.mark.parametrize("alpha", [True, False, None, "0.3", -0.3, 0.1,
+                                      float("nan"), float("inf"), -float("inf")])
+def test_label_anchor_invalid_values(alpha):
+    with pytest.raises(LatentError):
+        profile(label_anchor_alpha=alpha)
+
+
+@pytest.mark.parametrize("alpha", [0.3, 0.5, 0.7, 1.0])
+def test_anchor_modes_mutually_exclusive(alpha):
+    with pytest.raises(LatentError):
+        profile(anchor_alpha=0.3, label_anchor_alpha=alpha)
+    assert profile(anchor_alpha=0.3, label_anchor_alpha=0).anchor_alpha == 0.3

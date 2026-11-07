@@ -60,7 +60,7 @@ HOOK_FILES = ("occ3_p3_arms_hook.py", "zz_occ3_p3_arms.pth")
 # Hard pins from live-build-sequence.md section 3. A mismatch is a refusal, never a warning.
 PROFILE_SHA256 = "613698c4abf7ac20ba8e15dacdbcca8391c6deb379d168ba513a1f7a94d648a6"
 BASELINE_SHA256 = "a3655153182f92f8985feeed5673526b4239b4abf7e119a5abbe7304dffe2dd9"
-PLUGIN_FILE_COUNT = 36
+PLUGIN_FILE_COUNT = 38
 GENERATED_OUTPUTS = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 PER_MESSAGE_METHOD = "statebridge.glm53.final-prenorm-predictor.continuous-prefix.v1"
 
@@ -137,7 +137,7 @@ CAPTURE_DIR_PREFIX = "/data/neo-glm53/occ3-calibration-capture/"
 
 
 def plugin_files():
-    """(the 36 flat plugin modules, local dirs present but never staged, excluded files).
+    """(the 38 flat plugin modules, local dirs present but never staged, excluded files).
 
     Only `*.py` at the top level is staged. A `__pycache__` inside the staged tree is a hard build
     failure (`plugin_flat_source_only`, deploy/v3/native_package.py:530-533), so local caches are

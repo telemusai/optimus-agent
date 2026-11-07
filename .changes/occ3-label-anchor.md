@@ -1,0 +1,3 @@
+- Added an optional known-token label anchor for OCC-3 aligned prefixes, with attested profile selection and receipt metadata.
+- Changed alignment diagnostics to report the active label anchor beside final-prefix token-embedding cosines.
+- Fixed unseen-token alignment drift with an opt-in embedding blend while preserving the zero-setting path.

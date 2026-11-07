@@ -252,11 +252,12 @@ def test_a_profile_reference_is_all_or_nothing_and_message_method_takes_none(art
 def test_capture_metadata_reports_the_method_and_only_the_digest_it_has():
     from occ3_sglang.latent_worker import method_metadata
     message = method_metadata(_message_profile())
-    assert message == {"method_id": PER_MESSAGE_METHOD}
+    assert message == {"method_id": PER_MESSAGE_METHOD, "label_anchor_alpha": 0.0}
     calibrated = method_metadata(_calibrated_profile(PLACEHOLDER, "c" * 64), "d" * 64)
-    assert calibrated == {"method_id": CALIBRATED_METHOD, "artifact_digest": "d" * 64}
+    assert calibrated == {"method_id": CALIBRATED_METHOD, "artifact_digest": "d" * 64,
+                          "label_anchor_alpha": 0.0}
     # Scalars only: nothing that could carry rows or tensor content.
-    assert all(type(value) is str for value in calibrated.values())
+    assert all(type(value) in (str, float) for value in calibrated.values())
 
 
 def test_the_worker_resolves_one_aligner_and_calls_it_once():

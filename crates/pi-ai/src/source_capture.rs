@@ -325,6 +325,35 @@ impl SourceReceiptSpan {
     }
 }
 
+/// Bounded label anchoring coefficient. Old receipts default to disabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct LabelAnchorAlpha(u8);
+
+impl LabelAnchorAlpha {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl TryFrom<f64> for LabelAnchorAlpha {
+    type Error = SourceCaptureError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        [0.0, 0.3, 0.5, 0.7, 1.0]
+            .iter()
+            .position(|allowed| *allowed == value)
+            .map(|index| Self(index as u8))
+            .ok_or(SourceCaptureError::InvalidReceipt)
+    }
+}
+
+impl From<LabelAnchorAlpha> for f64 {
+    fn from(value: LabelAnchorAlpha) -> Self {
+        [0.0, 0.3, 0.5, 0.7, 1.0][usize::from(value.0)]
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SourceCaptureReceiptWire", into = "SourceCaptureReceiptWire")]
 pub struct SourceCaptureReceipt {
@@ -352,6 +381,7 @@ pub struct SourceCaptureReceipt {
     pub byte_count: u64,
     /// Present exactly on an `occ3.source.v2` wire (the whole block or none).
     pub span: Option<SourceReceiptSpan>,
+    pub label_anchor_alpha: LabelAnchorAlpha,
 }
 
 /// The flat wire shape: the 21 v1 fields and, on v2, the 18 span fields at the
@@ -380,6 +410,8 @@ struct SourceCaptureReceiptWire {
     output_sha256: String,
     expires_at_epoch: u64,
     byte_count: u64,
+    #[serde(default, skip_serializing_if = "LabelAnchorAlpha::is_zero")]
+    label_anchor_alpha: LabelAnchorAlpha,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +479,7 @@ impl From<SourceCaptureReceipt> for SourceCaptureReceiptWire {
             output_sha256: receipt.output_sha256,
             expires_at_epoch: receipt.expires_at_epoch,
             byte_count: receipt.byte_count,
+            label_anchor_alpha: receipt.label_anchor_alpha,
             span_schema: field(|s| s.span_schema.clone()),
             span_policy: field(|s| s.span_policy.clone()),
             span_marker_profile: field(|s| s.span_marker_profile.clone()),
@@ -542,6 +575,7 @@ impl TryFrom<SourceCaptureReceiptWire> for SourceCaptureReceipt {
             output_sha256: wire.output_sha256,
             expires_at_epoch: wire.expires_at_epoch,
             byte_count: wire.byte_count,
+            label_anchor_alpha: wire.label_anchor_alpha,
             span,
         })
     }
@@ -1424,6 +1458,38 @@ mod span_arming_tests {
 
     fn parse(wire: &serde_json::Value) -> Result<SourceCaptureReceipt, serde_json::Error> {
         serde_json::from_value(wire.clone())
+    }
+
+    #[test]
+    fn label_anchor_receipt_defaults_and_bounded_roundtrip() {
+        let intent = intent(SourceSpanArming::resolve(None).unwrap());
+        for mut wire in [v1_wire(&intent), v2_wire(&intent)] {
+            assert_eq!(f64::from(parse(&wire).unwrap().label_anchor_alpha), 0.0);
+            for alpha in [0.0, 0.3, 0.5, 0.7, 1.0] {
+                wire["label_anchor_alpha"] = serde_json::json!(alpha);
+                let receipt = parse(&wire).unwrap();
+                assert_eq!(f64::from(receipt.label_anchor_alpha), alpha);
+                assert_eq!(
+                    serde_json::to_value(receipt)
+                        .unwrap()
+                        .get("label_anchor_alpha")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    alpha
+                );
+            }
+            for invalid in [
+                serde_json::json!(true),
+                serde_json::json!(null),
+                serde_json::json!("0.3"),
+                serde_json::json!(0.1),
+                serde_json::json!(-0.3),
+                serde_json::json!(1.1),
+            ] {
+                wire["label_anchor_alpha"] = invalid;
+                assert!(parse(&wire).is_err());
+            }
+        }
     }
 
     #[test]

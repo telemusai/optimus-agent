@@ -370,9 +370,11 @@ class LatentBackend:
         artifact_digest = source.get("artifact_digest")
         require(artifact_digest is None
                 or (type(artifact_digest) is str and 1 <= len(artifact_digest) <= 64), "identity")
+        require(source.get("label_anchor_alpha", 0.0) == self.profile.label_anchor_alpha, "identity")
         require(all(name in source for name in _SOURCE_COMMIT_FIELDS), "identity")
         block = {name: source.get(name) for name in SPAN_BLOCK_FIELDS}
-        commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS}, **block)
+        commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS},
+                                     label_anchor_alpha=source.get("label_anchor_alpha", 0.0), **block)
         require(commit.ready_ranks == commit.expected_ranks == enrollment.expected_ranks
                 and commit.layout_digest == enrollment.layout_digest, "ranks")
         return SourceCaptureEvidence(enrollment, reservation.reservation_id, commit,

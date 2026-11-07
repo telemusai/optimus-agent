@@ -116,6 +116,26 @@ class PackagedArtifactTests(ErrorAssertions, unittest.TestCase):
         path.write_bytes(path.read_bytes() + b" ")
         self.error_code("profile_digest", profile.load_pinned_profile)
 
+    def test_optional_label_anchor_profile_loading(self):
+        # Omitted fields remain omitted in pinned metadata; RuntimeProfile defaults to zero.
+        self.assertNotIn("label_anchor_alpha", profile.load_pinned_profile())
+        for alpha in (0, 0.0, 0.3, 0.5, 0.7, 1, 1.0):
+            value = dict(static_profile(), label_anchor_alpha=alpha)
+            self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+            self.assertEqual(profile.load_pinned_profile(), value)
+
+    def test_label_anchor_invalid_or_conflicting_values(self):
+        for alpha in (True, False, None, "0.3", -0.3, 0.1,
+                      float("nan"), float("inf"), -float("inf")):
+            value = dict(static_profile(), label_anchor_alpha=alpha)
+            self.error_code("profile_invalid", lambda: profile._validate_profile(value))
+            self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+            self.error_code("profile_invalid", profile.load_pinned_profile)
+        for alpha in (0.3, 0.5, 0.7, 1):
+            value = dict(static_profile(), anchor_alpha=0.3, label_anchor_alpha=alpha)
+            self.store("native_profile.json", encoded(value), "PROFILE_SHA256")
+            self.error_code("profile_invalid", profile.load_pinned_profile)
+
     def test_static_identifiers_match_existing_runtime_profile_alphabet(self):
         value = static_profile()
         value["model_id"] = "organization/offline-model"

@@ -969,3 +969,28 @@ def test_offline_prepare_and_apply_survive_a_blocked_registry_import(fixture, mo
     monkeypatch.setitem(_sys.modules, "occ3_sglang.native_profile", _Poison())
     plan = fixture.prepare()
     assert package.apply(plan, disposable=True)["ok"] is True
+
+
+@pytest.mark.parametrize("alpha", [0, 0.0, 0.3, 0.5, 0.7, 1])
+def test_label_anchor_profile_allowed(fixture, alpha):
+    fixture.profile["label_anchor_alpha"] = alpha
+    assert json.loads(package._profile(fixture.profile))["label_anchor_alpha"] == alpha
+
+
+@pytest.mark.parametrize("alpha", [True, False, None, "0.3", -0.3, 0.2, 1.1,
+                                    float("inf"), float("-inf"), float("nan")])
+def test_label_anchor_profile_invalid(fixture, alpha):
+    fixture.profile["label_anchor_alpha"] = alpha
+    with pytest.raises(package.PackageError):
+        package._profile(fixture.profile)
+
+
+def test_label_anchor_profile_conflicts_with_source_anchor(fixture):
+    fixture.profile.update(anchor_alpha=0.3, label_anchor_alpha=0.3)
+    with pytest.raises(package.PackageError):
+        package._profile(fixture.profile)
+
+
+def test_omitted_label_anchor_preserves_packaged_bytes(fixture):
+    raw = package._profile(fixture.profile)
+    assert "label_anchor_alpha" not in json.loads(raw)

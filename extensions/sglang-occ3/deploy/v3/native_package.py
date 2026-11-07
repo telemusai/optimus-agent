@@ -47,7 +47,7 @@ _DECLARED_IDENTITY_FIELDS = frozenset({
 })
 # Frozen-artifact reference: optional, because the per-message method names none.
 OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
-                                     DECLARED_IDENTITY})
+                                     "label_anchor_alpha", DECLARED_IDENTITY})
 OUTPUT_NAMES = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 MAX_PROFILE_BYTES = 16384
 MAX_SOURCES_BYTES = 65536
@@ -476,6 +476,11 @@ def _profile(value):
               "invalid_profile_integer")
     _need(type(value["anchor_alpha"]) in (int, float) and math.isfinite(value["anchor_alpha"]),
           "invalid_profile_alpha")
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _need(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+          and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "invalid_profile_label_alpha")
+    _need(not (value["anchor_alpha"] != 0 and label_alpha != 0),
+          "conflicting_profile_anchors")
     # Current audited RuntimeProfile bounds, not evidence of actual model/TP/GPU state.
     # A packaged profile may only pin a method the installed registry advertises.
     # The registry is parsed, not imported: the build path stays pure-file.

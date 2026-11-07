@@ -75,6 +75,46 @@ prerequisites. The historical deployment scripts and an endpoint health
 check are not substitutes for those gates. No automated production swap
 is authorized by this README.
 
+## Known-token label anchor
+
+The optional server profile field `label_anchor_alpha` accepts only `0.0`, `0.3`,
+`0.5`, `0.7`, or `1.0`. Missing means `0.0`: the prefix takes the original path
+without any blend arithmetic. For a candidate deploy, set e.g.
+`"label_anchor_alpha": 0.5` and `"anchor_alpha": 0.0` in the native profile input
+used by `deploy.v3.native_package`, and in the deployment plan's matching static
+profile. Rebuild the package and its attestation; this is not a request option or
+an environment override. Keep the model, calibration artifact and method ID
+unchanged. Test receiver fidelity separately before promoting the candidate.
+
+On rank zero, after the solver and before the existing TP broadcast, rows become
+`(1-a) * aligned + a * E_in[accepted_token]`, in float32 then cast to prefix dtype.
+The accepted labels were checked against the retained capture ring. The existing
+nearest-vocabulary `anchor_alpha` runs afterward, unchanged. Both anchors cannot
+be nonzero in one profile. At `1.0`, finite rows equal the known token embedding;
+intermediate values retain an aligned residual but do not guarantee exact text
+recovery or contextual benefit. No new vocabulary-sized tensor, collective or
+hot-path synchronization is introduced; existing embeddings and bounded row
+scratch fit within the solver workspace allowance.
+
+Changing profile file bytes changes generated `PROFILE_SHA256`. The plugin files
+also change, so regenerate `native_sources.json` and its baked `SOURCE_SHA256`
+with the normal package builder. No SGLang overlay or calibration artifact changes.
+Historical pinned profile files that omit the field still load unchanged. Zero
+is omitted from the runtime binding-digest input to preserve old zero-setting
+bindings; nonzero values enter that digest. Old receipts omit the field and mean
+zero. Worker method metadata always reports `label_anchor_alpha`; public source
+receipts omit zero to preserve their legacy bytes and explicitly report nonzero.
+The existing method ID still identifies the solver. **Install the updated client
+before enabling nonzero alpha on the server**: older strict clients reject the new
+receipt field. Updated clients accept old receipts as zero. This additive source
+receipt metadata does not change the daemon protocol. A new runtime incarnation
+still requires new live handles, as before.
+
+`OCC3_ALIGN_PROBE` records the active value. The existing opt-in token-trace
+`alignment` event records it alongside per-row final-prefix cosine to
+`E_in[accepted_token]`; it runs after both anchor stages. Trace collection remains
+bounded and exception-isolated and can perturb timing when enabled.
+
 ## Resource limits
 
 Current bounded response handling does not prove compatibility with the
@@ -251,11 +291,9 @@ that chunk (or across earlier chunks) can already be baked into the baseline.
 A diagnostic local-fence failure emits `skipped="fence_failed"`, not an unchanged
 comparison. Synchronization can perturb or mask timing-sensitive behavior. Never treat a sampled/skipped observation as whole-pool proof.
 
-Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
-`PLUGIN_FILE_COUNT=36`; it was already stale on main (37 modules), and this PR
-has 38. The live staging assembler refuses this count. The full native package
-build enumerates modules instead. No deploy files are changed here; correct the
-pin separately before using that assembler.
+Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins the current
+`PLUGIN_FILE_COUNT=38`; an inventory regression checks this against the plugin
+modules. The full native package build enumerates modules and regenerates hashes.
 
 ### Opt-in alignment neighbour evidence
 

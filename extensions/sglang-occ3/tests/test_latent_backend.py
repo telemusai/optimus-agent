@@ -1,6 +1,6 @@
 """Frontend real backend with synthetic control transport/journal; NOT GPU proof."""
 import asyncio
-from dataclasses import asdict
+from dataclasses import asdict, replace
 from types import SimpleNamespace as NS
 import sys
 import time
@@ -75,13 +75,17 @@ async def test_source_exact_enrollment_prepare_bind_and_commit():
 
 
 @pytest.mark.asyncio
-async def test_source_commit_carries_method_metadata_without_type_error():
+@pytest.mark.parametrize("alpha", [0.0, 0.3, 0.5, 0.7, 1.0])
+async def test_source_commit_carries_method_metadata_without_type_error(alpha):
     # Red test: the worker's method_metadata() has added method_id (and
     # artifact_digest for a calibrated method) to record.source_metadata since
     # wave 445d1cdd4, so production source captures reach finish_source with
     # more keys than SourceCaptureCommit(**record["source"]) accepts. The
     # backend must project the commit, not splat the worker metadata.
-    backend,client,identity,expiry=fixture(); p=backend.profile
+    backend,client,identity,expiry=fixture()
+    backend.profile = replace(backend.profile, label_anchor_alpha=alpha)
+    client.p = backend.profile
+    p = backend.profile
     intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
         model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
         retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
@@ -94,11 +98,23 @@ async def test_source_commit_carries_method_metadata_without_type_error():
         retained_count=8,predictor_position_offset=-1,representation="final_layer_prenorm_predictor",
         layer_index=77,hidden_dim=6144,dtype="bfloat16",layout_digest="b"*64,ready_ranks=8,expected_ranks=8,
         accepted_sequence_digest="c"*64,expires_at_epoch=expiry,byte_count=8*6144*2,
-        method_id=p.method,artifact_digest="e"*64)
+        method_id=p.method,artifact_digest="e"*64,label_anchor_alpha=alpha)
     provenance=SourceToolProvenance(tool_calls=())
     completion=NativeCompletion("native-rid","stop","d"*64,50,True)
     evidence=await backend.finish_source(enrollment,reservation,completion,provenance)
     assert evidence.commit.capture_commit_id=="commit" and evidence.bound_output_sha256=="d"*64
+    assert evidence.commit.label_anchor_alpha == alpha
+    from occ3_sglang.use_receipts import validate_source_evidence
+    receipt = validate_source_evidence(intent, enrollment, reservation,
+        native.occ3_worker_descriptor, completion, provenance, evidence)
+    assert receipt.wire().get("label_anchor_alpha", 0.0) == alpha
+    client.record["source"]["label_anchor_alpha"] = 0.3 if alpha == 0.0 else 0.0
+    with pytest.raises(LatentError, match="identity"):
+        await backend.finish_source(enrollment,reservation,completion,provenance)
+    if alpha:
+        client.record["source"].pop("label_anchor_alpha")
+        with pytest.raises(LatentError, match="identity"):
+            await backend.finish_source(enrollment,reservation,completion,provenance)
 
 
 @pytest.mark.asyncio

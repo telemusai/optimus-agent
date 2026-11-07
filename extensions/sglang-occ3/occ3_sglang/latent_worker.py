@@ -25,7 +25,7 @@ from .latent_types import (LatentError, UniformRequestCancellation, Publication,
                            validate_control_payload)
 from .prefix_layout import prefix_span
 from .alignment_dispatch import aligner_for, artifact_resident_bytes, load_frozen_artifact
-from .statebridge import (anchor_tiled, mean_embedding_norm, shard_ranges, workspace_bound)
+from .statebridge import (anchor_tiled, anchor_to_labels, mean_embedding_norm, shard_ranges, workspace_bound)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +36,11 @@ def method_metadata(profile, calibration_digest=""):
     Every capture reports the method id it was aligned under. A calibrated
     capture additionally reports the frozen artifact digest, so a consumer can
     tell which frozen transform produced the prefix; the per-message method has
-    no artifact and therefore no digest key.
+    no artifact and therefore no digest key. Label anchoring is a profile
+    post-transform, so its coefficient is reported alongside the solver identity.
     """
-    metadata = {"method_id": profile.method}
+    metadata = {"method_id": profile.method,
+                "label_anchor_alpha": float(profile.label_anchor_alpha)}
     if calibration_digest:
         metadata["artifact_digest"] = calibration_digest
     return metadata
@@ -858,6 +860,10 @@ class WorkerRuntime:
                 prefix.copy_(aligned)
                 from . import token_trace
                 token_trace.alignment_cast(self, h, aligned, prefix)
+                if self.profile.label_anchor_alpha != 0:
+                    # Blend solver-precision rows, not the already-cast scratch.
+                    prefix.copy_(anchor_to_labels(aligned, embeddings,
+                                                   alpha=self.profile.label_anchor_alpha))
             except Exception:
                 solver_error = "numerical"
         errors = self.gather(solver_error)
@@ -1888,6 +1894,7 @@ def _probe_alignment(hidden, embeddings, prefix, profile):
         result = probe_relation(hidden, embeddings, prefix,
                                 generator=torch.Generator(device=hidden.device).manual_seed(0))
         result["anchor_alpha"] = float(profile.anchor_alpha)
+        result["label_anchor_alpha"] = float(profile.label_anchor_alpha)
         result["max_prefix_tokens"] = int(profile.max_prefix_tokens)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(result, sort_keys=True) + "\n")
@@ -1905,7 +1912,7 @@ def load_runtime_profile():
     expected = set(RuntimeProfile.__dataclass_fields__) - {"runtime_epoch", "runtime_generation"}
     # A pinned profile may omit the frozen-artifact reference: the per-message
     # method names none, so the runtime profile takes its empty default.
-    optional = {"calibration_path", "calibration_digest"}
+    optional = {"calibration_path", "calibration_digest", "label_anchor_alpha"}
     # The declared-launch identity block (native_profile.DECLARED_IDENTITY) is
     # route-served deployment metadata, never worker state: it is dropped
     # before the RuntimeProfile fieldset is checked or constructed.

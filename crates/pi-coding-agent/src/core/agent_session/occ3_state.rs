@@ -1574,6 +1574,7 @@ Do not call occ3_handoff again for these facts."
             "accepted_span_end": receipt.accepted_span_end,
             "retained_count": receipt.retained_count,
             "accepted_sequence_digest": receipt.accepted_sequence_digest,
+            "label_anchor_alpha": receipt.label_anchor_alpha,
             "output_sha256": receipt.output_sha256,
         }))
     }
@@ -3729,6 +3730,7 @@ mod tests {
             ready_ranks: 8,
             expected_ranks: 8,
             accepted_sequence_digest: "c".repeat(64),
+            label_anchor_alpha: Default::default(),
             output_sha256: "d".repeat(64),
             expires_at_epoch: now() + 600,
             byte_count: 128,

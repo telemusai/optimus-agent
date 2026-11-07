@@ -285,6 +285,8 @@ class RuntimeProfile:
     # dispatch) before any aligner exists, so a mismatched file is never loaded.
     calibration_path: str = ""
     calibration_digest: str = ""
+    # Optional label-space anchoring; mutually exclusive with nearest-vocab anchoring.
+    label_anchor_alpha: float = 0.0
 
     def __post_init__(self):
         for key in ("runtime_epoch", "model_fingerprint", "model_id"):
@@ -314,11 +316,19 @@ class RuntimeProfile:
         require(self.max_active == 1 and 1 <= self.max_records <= 4096, "profile")
         require(0 < self.max_live_bytes <= 2**30 and 0 < self.workspace_bytes <= 2**30, "profile")
         require(self.anchor_alpha in (0.0, 0.3) and 1 <= self.tile_rows <= 4096, "profile")
+        require(type(self.label_anchor_alpha) in (int, float)
+                and math.isfinite(self.label_anchor_alpha)
+                and self.label_anchor_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "profile")
+        require(not (self.anchor_alpha and self.label_anchor_alpha), "profile")
         require(0 < self.max_ttl_seconds <= 3600, "profile")
 
     @property
     def binding_digest(self):
-        return digest(asdict(self))
+        values = asdict(self)
+        # Zero is the legacy path: retain bindings minted before this field existed.
+        if self.label_anchor_alpha == 0:
+            values.pop("label_anchor_alpha")
+        return digest(values)
 
 
 @dataclass(frozen=True, repr=False)

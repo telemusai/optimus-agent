@@ -371,7 +371,7 @@ _SOURCE_RECEIPT_SPAN_FIELDS = (
 
 @dataclass(frozen=True, repr=False)
 class SourceCaptureReceipt:
-    """Strict 21-field source wire plus the schema-gated v2 span block."""
+    """Source wire with optional label anchoring and the schema-gated v2 span block."""
     intent_digest: str
     source_handle: str
     native_rid: str
@@ -412,7 +412,12 @@ class SourceCaptureReceipt:
     span_contains_tool_call: bool | None = None
     span_message_truncated: bool | None = None
 
+    label_anchor_alpha: float = 0.0
+
     def __post_init__(self):
+        if (type(self.label_anchor_alpha) not in (int, float)
+                or self.label_anchor_alpha not in (0.0, 0.3, 0.5, 0.7, 1.0)):
+            raise AttachmentError("invalid_evidence")
         for name in ("intent_digest", "layout_digest", "accepted_sequence_digest", "output_sha256"):
             sha256_hex(getattr(self, name))
         bounded_identifier(self.source_handle, 128)
@@ -434,7 +439,7 @@ class SourceCaptureReceipt:
             raise AttachmentError("invalid_evidence")
         block = [getattr(self, name) for name in _SOURCE_RECEIPT_SPAN_FIELDS]
         if self.schema == SOURCE_SCHEMA_V1:
-            # A v1 wire carries exactly the 21 fields; any span block is refused.
+            # A v1 wire has no span block; label anchoring is optional.
             if any(value is not None for value in block):
                 raise AttachmentError("invalid_evidence")
         elif self.schema == SOURCE_SCHEMA_V2:
@@ -479,14 +484,19 @@ class SourceCaptureReceipt:
         if not isinstance(value, dict):
             raise AttachmentError("invalid_evidence")
         v1 = set(_SOURCE_RECEIPT_V1_FIELDS)
-        if set(value) not in (v1, v1 | set(_SOURCE_RECEIPT_SPAN_FIELDS)):
+        if set(value) - {"label_anchor_alpha"} not in (v1, v1 | set(_SOURCE_RECEIPT_SPAN_FIELDS)):
             raise AttachmentError("invalid_evidence")
         return cls(**value)
 
     def wire(self):
         value = asdict(self)
         if self.schema == SOURCE_SCHEMA_V1:
-            return {name: value[name] for name in _SOURCE_RECEIPT_V1_FIELDS}
+            value = {name: value[name] for name in _SOURCE_RECEIPT_V1_FIELDS}
+        # Preserve the original wire at zero; omission unambiguously means disabled.
+        if self.label_anchor_alpha:
+            value["label_anchor_alpha"] = self.label_anchor_alpha
+        else:
+            value.pop("label_anchor_alpha", None)
         return value
 
 

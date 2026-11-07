@@ -288,7 +288,7 @@ def _method_descriptor(method_id):
     return registry, method_id, descriptor
 
 
-def _method_profile_fields(descriptor):
+def _method_profile_fields(descriptor, profile=None):
     """Exact admission source_profile fieldset for one registered method.
 
     Shared static fields for every method, plus the frozen-artifact
@@ -297,6 +297,8 @@ def _method_profile_fields(descriptor):
     registry descriptor declares.
     """
     fields = list(SOURCE_PROFILE_FIELDS)
+    if type(profile) is dict and "label_anchor_alpha" in profile:
+        fields.append("label_anchor_alpha")
     if descriptor["requires_calibration_artifact"]:
         fields += list(CALIBRATION_REFERENCE_FIELDS)
     fields += sorted(frozenset(descriptor.get("profile_fields") or ()))
@@ -363,6 +365,10 @@ def _derivation_value(profile, observed):
             _require(name in CALIBRATION_REFERENCE_FIELDS,
                      "profile_derivation_field_missing")
             value[name] = ""
+    # Zero (including an omitted field) retains the historical wire digest.
+    # Only an enabled label anchor changes the binding identity.
+    if profile.get("label_anchor_alpha", 0.0) != 0:
+        value["label_anchor_alpha"] = profile["label_anchor_alpha"]
     value["runtime_epoch"] = observed["runtime_epoch"]
     value["runtime_generation"] = observed["runtime_generation"]
     return value
@@ -548,7 +554,8 @@ class NativeHandoffValidator:
         # exactly for methods that require a calibration artifact (and never
         # for the per-message method, which consumes none).
         profile = _exact_fields(value["source_profile"],
-                                _method_profile_fields(descriptor), "source_profile_invalid")
+                                _method_profile_fields(descriptor, value["source_profile"]),
+                                "source_profile_invalid")
         _require(profile["dtype"] in DTYPES, "source_dtype_unsupported")
         _require(profile["expected_ranks"] == 8, "expected_ranks_not_tp8")
         _uint(profile["layer_index"], "layer_index_invalid")
@@ -576,6 +583,12 @@ class NativeHandoffValidator:
                           else len(str(extra)) <= 256), "source_profile_invalid")
         _require(type(profile["anchor_alpha"]) in (int, float)
                  and math.isfinite(profile["anchor_alpha"]), "source_anchor_alpha_invalid")
+        label_alpha = profile.get("label_anchor_alpha", 0.0)
+        _require(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+                 and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0),
+                 "source_label_anchor_alpha_invalid")
+        _require(not (profile["anchor_alpha"] != 0 and label_alpha != 0),
+                 "source_anchor_conflict")
         _uint(profile["max_prefix_tokens"], "max_prefix_tokens_invalid", positive=True)
         _uint(profile["max_live_bytes"], "max_live_bytes_invalid", positive=True)
         _uint(profile["workspace_bytes"], "workspace_bytes_invalid", positive=True)

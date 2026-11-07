@@ -201,6 +201,7 @@ def alignment(runtime, prefix, embeddings):
     values = torch.nn.functional.cosine_similarity(
         prefix.detach().float(), embeddings.detach().float(), dim=1).cpu().tolist()
     emit("alignment", rank=runtime.rank, rows=len(values),
+         label_anchor_alpha=float(getattr(getattr(runtime, "profile", None), "label_anchor_alpha", 0.0)),
          row_cosine=[round(v, 6) if math.isfinite(v) else None for v in values])
 
 

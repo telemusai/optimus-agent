@@ -73,7 +73,7 @@ _DECLARED_IDENTITY_FIELDS = frozenset({
 # pinned file stays valid. load_pinned_profile always returns the pair, empty
 # when absent, so the runtime profile has one shape.
 _OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
-                                      DECLARED_IDENTITY})
+                                      DECLARED_IDENTITY, "label_anchor_alpha"})
 _RUNTIME_FIELDS = frozenset({"runtime_epoch", "runtime_generation",
                             "incarnation_digest", "profile_sha256",
                             "source_attestation_sha256"})
@@ -450,6 +450,10 @@ def _validate_profile(value):
         _require(_uint(value[name], minimum=0 if name == "layer_index" else 1))
     _require(type(value["anchor_alpha"]) in (int, float)
              and math.isfinite(value["anchor_alpha"]))
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _require(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+             and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0))
+    _require(not (value["anchor_alpha"] and label_alpha))
     # RuntimeProfile owns semantic/model/TP/cache validation. No second profile type.
     return value
 
