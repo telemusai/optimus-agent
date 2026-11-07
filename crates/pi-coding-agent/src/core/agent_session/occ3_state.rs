@@ -909,6 +909,9 @@ impl Occ3NativeSession {
                             // the retirement attempt itself: emit the
                             // diagnostic with released=false so the sender's
                             // waiting Admitted entry is not unobservable.
+                            // No sender route here: the record was not
+                            // retired, so a sender re-send could race a
+                            // later claim of this handle.
                             Err(_) => {
                                 receiver_busy_claim_released(
                                     &claimed_message_id,
@@ -1209,11 +1212,10 @@ impl Occ3NativeSession {
                                 // fresh capture (bounded backoff). Any
                                 // other non-use outcome falls back.
                                 if refused_busy {
-                                    // The bound-lease busy path has no
-                                    // per-event diagnostic today; the
-                                    // sender's own queue notice is the
-                                    // observable record, so the bool needs
-                                    // no separate log here.
+                                    // A false here is unobservable today;
+                                    // the bound-lease busy path predates
+                                    // the retirement diagnostic and is
+                                    // left as-is deliberately.
                                     let _sender_absorbed =
                                         route_receiver_busy_to_sender(
                                             &sender_session_id,
@@ -3990,8 +3992,8 @@ mod tests {
         )
         .await
         .expect("fixture enrollment");
-        // The live sender of this delivery, so the release route has a real
-        // queue to notify (liveness: the released record never surfaces
+        // The live sender of this delivery, so the retire route has a real
+        // queue to notify (liveness: the retired record never surfaces
         // through terminal-failure polls, and an in-flight Admitted entry
         // never TTL-expires).
         let sender = Occ3NativeSession::enroll(
@@ -4068,7 +4070,7 @@ mod tests {
                 .collect(),
             signal: None,
         };
-        // 1) The busy turn: the claim is released and the turn proceeds
+        // 1) The busy turn: the claim is retired and the turn proceeds
         //    without the attachment - never the generic uncertain error
         //    with the record stuck claimed.
         assert!(
@@ -4081,7 +4083,7 @@ mod tests {
         assert_eq!(
             session.inbox.lock().unwrap().status("busy-1"),
             Some(Occ3DeliveryStatus::Failed),
-            "the busy-released delivery retires as a terminal busy failure: it must not stay claimable while the sender re-arms"
+            "the busy-retired delivery retires as a terminal busy failure: it must not stay claimable while the sender re-arms"
         );
         // The distinct content-free notice names the retirement exactly
         // once, including that a live sender absorbed the route.
@@ -4097,9 +4099,9 @@ mod tests {
                 "the notice never carries envelope content"
             );
         }
-        // Liveness: the release must ALSO notify the sender. The receiver's
+        // Liveness: the retire route must ALSO notify the sender. The receiver's
         // control-only transcript body carries no source facts and the
-        // released record never reaches a terminal-failure poll, so without
+        // retired record never reaches a terminal-failure poll, so without
         // this route the sender's in-flight Admitted entry would sit
         // unexpired forever and the facts would be silently lost. The same
         // proven-non-use route the TurnEnd dispatcher uses for refused
@@ -4228,8 +4230,27 @@ mod tests {
         );
         let values = entries.lock().unwrap();
         assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
+        assert_eq!(values[0]["message_id"], "busy-orphan-1");
+        assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
         assert_eq!(values[0]["released"], serde_json::json!(true));
         assert_eq!(values[0]["sender_routed"], serde_json::json!(false));
+        assert!(
+            !values[0].to_string().contains("busy-orphan-proof"),
+            "the notice never carries envelope content"
+        );
+        // The orphan diagnostic is the only record of the lost facts, so
+        // its fields are pinned like the sibling's: never re-claimable,
+        // and no terminal poll ever re-routes it.
+        assert!(
+            (resolver)(request()).await.unwrap().is_none(),
+            "a busy-retired delivery must never be claimable again"
+        );
+        assert!(session
+            .inbox
+            .lock()
+            .unwrap()
+            .poll_terminal_failures()
+            .is_empty());
     }
 
     /// Fail-closed stays fail-closed: a NON-busy `prepare_inference`

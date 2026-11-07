@@ -856,10 +856,10 @@ mod tests {
     }
 
     /// Fix (receiver busy, pre-bind): a busy-refused `prepare_inference`
-    /// provably dispatched nothing, so the claim it took must be releasable
+    /// provably dispatched nothing, so the claim it took must be retireable
     /// as a terminal busy `Failed` so the next claim never re-claims it
     /// (the sender's fresh-capture retry is the sole retry path). Only the
-    /// exact claimed-unbound state releases: a bound lease
+    /// exact claimed-unbound state retires: a bound lease
     /// (its outcome belongs to the provider), a terminal status, an unclaimed
     /// or an unknown record never retires - their outcomes stay fail-closed.
     #[test]
