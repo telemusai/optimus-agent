@@ -956,3 +956,165 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
         .is_none());
     server.await.unwrap();
 }
+
+/// The receiver's `prepare_inference` control round trip must classify a
+/// synchronous PRE-DISPATCH busy refusal as the distinct proven-non-use
+/// error, so the resolver can release its inbox claim and the next
+/// inference request retries the consume cleanly (the live 2026-11-07
+/// receiver wedge). The server's registry busy decline (the
+/// reserve_consume class) answers HTTP 409 `busy`; the control-plane
+/// saturation gate answers 429 `quota` before any worker round trip.
+/// Every other decline - including a 409 `expired` - keeps the generic
+/// fail-closed refusal: only proven-undispatched busy classes release.
+#[tokio::test]
+async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
+    use pi_coding_agent::core::occ3_connectors::sglang::{
+        NativeExperimentalPermit, SglangOcc3Config, SglangOcc3Connector,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // One raw control fixture: each accepted connection is answered with
+    // the next scripted (status, body) pair, then closed.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    let scripted = vec![
+        ("409 Conflict", r#"{"error":{"code":"busy"}}"#),
+        ("429 Too Many Requests", r#"{"error":{"code":"quota"}}"#),
+        ("409 Conflict", r#"{"error":{"code":"expired"}}"#),
+        ("503 Service Unavailable", r#"{"error":{"code":"unavailable"}}"#),
+    ];
+    let server = tokio::spawn(async move {
+        for (status, body) in scripted {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            // Read until the full head plus content-length body arrived.
+            let length = loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break length;
+                    }
+                }
+            };
+            let _ = length;
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let endpoint: url::Url = format!("http://{address}").parse().unwrap();
+    let mut identity = identity();
+    identity.model_id = "fixture-model".into();
+    let permit = NativeExperimentalPermit {
+        attempt_id: "attempt-fixture-1".into(),
+        identity: identity.clone(),
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+        runtime_id: "fixture-runtime-epoch-001".into(),
+        runtime_generation: 7,
+        access_domain: "fixture-family".into(),
+        expires_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600,
+        source_profile: pi_ai::source_capture::SourceCaptureProfile {
+            layer_index: 77,
+            hidden_dim: 6144,
+            dtype: "bfloat16".into(),
+            layout_digest: "b".repeat(64),
+            expected_ranks: 8,
+        },
+        profile_digest: "c".repeat(64),
+        max_capture_bytes: 268_435_456,
+    };
+    let connector = SglangOcc3Connector::new_experimental(
+        SglangOcc3Config {
+            endpoint,
+            api_key: Some("synthetic-fixture-key".into()),
+            control_headers: None,
+        },
+        permit,
+    )
+    .unwrap();
+
+    let request = || PrepareInferenceRequest {
+        envelope: Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "message-busy-1".into(),
+            sender_session_id: "sender".into(),
+            receiver_session_id: "receiver".into(),
+            model_fingerprint: identity.fingerprint(),
+            runtime_id: "fixture-runtime-epoch-001".into(),
+            connector_id: "sglang-occ3".into(),
+            latent_method: Occ3Method::KvHandoff,
+            state_handle: pi_coding_agent::core::occ::occ3::Occ3HandleRef {
+                handle_id: "handle-busy-1".into(),
+                connector_id: "sglang-occ3".into(),
+                model_fingerprint: identity.fingerprint(),
+                runtime_generation: 7,
+                expires_at_epoch: u64::MAX,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy classification fixture".into(),
+            fallback_reference: "occ1".into(),
+        },
+        request_id: "inference-busy-1".into(),
+        receiver_session_id: "receiver".into(),
+        receiver_identity: identity.clone(),
+        now_epoch: 1,
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+    };
+
+    // 409 `busy` (the reserve_consume decline class): the distinct
+    // proven-non-use busy refusal, never the generic invalid site.
+    assert!(matches!(
+        connector.prepare_inference(request()).await,
+        Err(Occ3Error::NativeInferenceBusyRefused { .. })
+    ));
+    // 429 `quota` (the control-plane saturation gate, no worker round
+    // trip): the same busy class.
+    assert!(matches!(
+        connector.prepare_inference(request()).await,
+        Err(Occ3Error::NativeInferenceBusyRefused { .. })
+    ));
+    // A 409 with any other code, and a 503, keep the fail-closed generic
+    // refusal: only the proven busy classes release a claim.
+    for _ in 0..2 {
+        assert!(
+            !matches!(
+                connector.prepare_inference(request()).await,
+                Err(Occ3Error::NativeInferenceBusyRefused { .. })
+            ),
+            "non-busy declines must not masquerade as the busy refusal"
+        );
+    }
+    server.await.unwrap();
+}

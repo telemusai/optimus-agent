@@ -2704,6 +2704,11 @@ mod tests {
     struct FixtureConnector {
         identity: Occ3ModelIdentity,
         profile: SourceCaptureProfile,
+        /// Scripted `prepare_inference` refusals, returned in order before
+        /// the real lease path (the mock connector's fault-table style).
+        /// Used to reproduce a live pre-dispatch refusal that provably
+        /// dispatched nothing.
+        prepare_refusals: Arc<Mutex<Vec<Occ3Error>>>,
     }
 
     impl FixtureConnector {
@@ -2717,7 +2722,14 @@ mod tests {
                     layout_digest: "1".repeat(64),
                     expected_ranks: 8,
                 },
+                prepare_refusals: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Script the next `prepare_inference` calls to fail with these
+        /// errors, in order, before the real lease path runs.
+        fn refuse_prepare_with(&self, errors: &[Occ3Error]) {
+            *self.prepare_refusals.lock().unwrap() = errors.to_vec();
         }
     }
 
@@ -2752,6 +2764,13 @@ mod tests {
             &self,
             request: PrepareInferenceRequest,
         ) -> Result<InferenceStateLease, Occ3Error> {
+            let refusal = {
+                let mut scripted = self.prepare_refusals.lock().unwrap();
+                (!scripted.is_empty()).then(|| scripted.remove(0))
+            };
+            if let Some(error) = refusal {
+                return Err(error);
+            }
             // Real-attachment fixture: binds the exact envelope the receiver
             // inbox claimed, mirroring the daemon wiring fixture, so the
             // receiver resolver's bind path is exercised end to end.
@@ -3775,6 +3794,216 @@ mod tests {
             session.inbox.lock().unwrap().status("message-x"),
             Some(Occ3DeliveryStatus::Expired),
             "the expired record is never consumed by the live claim"
+        );
+    }
+
+    /// The receiver-side stuck-inbox-claim wedge (live 2026-11-07 parallel
+    /// handoff pair q1): `claim` marks the earliest admitted record
+    /// claimed/`Delivered`, then a busy-refused `prepare_inference` must
+    /// RELEASE that claim instead of parking the record claimed forever.
+    /// The busy turn proceeds as an ordinary turn without the attachment,
+    /// the NEXT inference request claims and binds the same record cleanly,
+    /// and a distinct content-free notice names the release so live
+    /// diagnosis needs no source archaeology.
+    #[tokio::test]
+    async fn receiver_resolver_releases_claim_on_busy_refusal_and_retries_cleanly() {
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str() == Some("receiver_busy_claim_released")
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::NativeInferenceBusyRefused {
+            connector_id: "unit-fixture-occ3".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "busy-1".into(),
+            sender_session_id: "sender-busy".into(),
+            receiver_session_id: "unit-session".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-busy-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint.clone(),
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy-release-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox.admit(envelope, "busy-1", "sender-busy", 1).unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = |ids: &[&str], fresh: &[&str]| InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: ids
+                .iter()
+                .map(|id| {
+                    AgentMessage::Custom(CustomAgentMessage::Custom {
+                        custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                        content: CustomMessageContent::Text(String::new()),
+                        display: false,
+                        details: Some(json!({"id": id})),
+                        timestamp: 0,
+                    })
+                })
+                .collect(),
+            newly_supplied_messages: fresh
+                .iter()
+                .map(|id| {
+                    AgentMessage::Custom(CustomAgentMessage::Custom {
+                        custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                        content: CustomMessageContent::Text(String::new()),
+                        display: false,
+                        details: Some(json!({"id": id})),
+                        timestamp: 0,
+                    })
+                })
+                .collect(),
+            signal: None,
+        };
+        // 1) The busy turn: the claim is released and the turn proceeds
+        //    without the attachment - never the generic uncertain error
+        //    with the record stuck claimed.
+        assert!(
+            (resolver)(request(&["busy-1"], &["busy-1"]))
+                .await
+                .unwrap()
+                .is_none(),
+            "a proven-undispatched busy refusal must release the claim and run the turn ordinary"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-1"),
+            Some(Occ3DeliveryStatus::Admitted),
+            "the busy-released record returns to Admitted for the next claim"
+        );
+        // The distinct content-free notice names the release exactly once.
+        {
+            let values = entries.lock().unwrap();
+            assert_eq!(values.len(), 1, "exactly one busy-release notice");
+            assert_eq!(values[0]["message_id"], "busy-1");
+            assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
+            assert!(
+                !values[0].to_string().contains("busy-release-proof"),
+                "the notice never carries envelope content"
+            );
+        }
+        // 2) The next inference request retries the consume cleanly: the
+        //    same record claims and binds through the real prepare path.
+        let lease = (resolver)(request(&["busy-1"], &["busy-1"]))
+            .await
+            .expect("the retry claim must not fail")
+            .expect("the released record must bind on retry");
+        drop(lease);
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-1"),
+            Some(Occ3DeliveryStatus::Delivered)
+        );
+    }
+
+    /// Fail-closed stays fail-closed: a NON-busy `prepare_inference`
+    /// failure keeps today's exact generic uncertain error and the record
+    /// stays claimed, so nothing is ever replayed and the error string the
+    /// live wedge investigations pinned stays byte-identical.
+    #[tokio::test]
+    async fn receiver_resolver_keeps_fail_closed_error_when_prepare_is_not_busy() {
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::TransferFailed {
+            reason: "unit-fixture-prepare".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "uncertain-1".into(),
+            sender_session_id: "sender-uncertain".into(),
+            receiver_session_id: "unit-session".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-uncertain-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint,
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "uncertain-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox.admit(envelope, "uncertain-1", "sender-uncertain", 1).unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": "uncertain-1"})),
+                timestamp: 0,
+            })],
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        // The first turn fails with today's exact generic string and the
+        // record stays claimed...
+        assert_eq!(
+            (resolver)(request()).await.unwrap_err().to_string(),
+            failure(),
+            "a non-busy prepare failure keeps the fail-closed error unchanged"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("uncertain-1"),
+            Some(Occ3DeliveryStatus::Delivered)
+        );
+        // ...so the next turn still refuses on the claimed record instead of
+        // silently re-arming it: replay stays forbidden.
+        assert_eq!(
+            (resolver)(request()).await.unwrap_err().to_string(),
+            failure(),
+            "the claimed record must keep refusing until a terminal outcome"
         );
     }
 
