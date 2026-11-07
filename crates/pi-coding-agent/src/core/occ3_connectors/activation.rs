@@ -542,8 +542,9 @@ pub(crate) fn invalidate_connector_ready(connector: &dyn Occ3Connector) {
     }
 }
 
-/// Drop the cached verification. Called when a runtime restart invalidates
-/// every enrollment, so the next activation re-handshakes.
+/// Reset all cached readiness for isolated tests. Production recovery evicts
+/// only the specific connector whose runtime authority was verified changed.
+#[cfg(test)]
 pub fn invalidate_ready_cache() {
     if let Ok(mut cache) = ready_cache().lock() {
         cache.clear();
@@ -806,6 +807,18 @@ pub(crate) mod test_support {
             "max_capture_bytes": MAX_CAPTURE_BYTES,
         });
         let failure = enrollment_failure.load(Ordering::SeqCst);
+        if path == "/occ3/v1/native/sessions/enroll" {
+            let response = match failure {
+                5 => Some(("409 Conflict", "{}")),
+                6 => Some(("503 Service Unavailable", "{}")),
+                7 => Some(("200 OK", "invalid-json")),
+                _ => None,
+            };
+            if let Some((status, payload)) = response {
+                let _ = write_response(&mut socket, status, payload, &[]).await;
+                return;
+            }
+        }
         if (path == "/occ3/v1/native/sessions/enroll" && matches!(failure, 1 | 3 | 4))
             || (path == "/occ3/v1/native/runtime/identity" && failure == 4) {
             let _ = write_response(&mut socket, "401 Unauthorized", "{}", &[]).await;

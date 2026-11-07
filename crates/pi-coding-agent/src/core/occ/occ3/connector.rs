@@ -114,7 +114,9 @@ pub trait Occ3Connector: Send + Sync {
     fn connector_id(&self) -> &str;
 
     /// Process-local instance identity for targeted readiness eviction. Wrappers
-    /// must forward their inner connector identity; never use a shared type id.
+    /// MUST forward their inner connector's exact accessor result, including
+    /// None; never synthesize a wrapper identity or use a shared connector type
+    /// id. Wrapper tests should assert equality with the inner accessor result.
     fn readiness_instance_id(&self) -> Option<&str> {
         None
     }

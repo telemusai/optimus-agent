@@ -551,7 +551,9 @@ impl Occ3NativeSession {
                             Some(budget) => {
                                 slot.resolved = true;
                                 if let Err(error) = this.check_native_allowed() {
-                                    slot.capture_permit = None;
+                                    // No capture was attempted: disabling policy releases
+                                    // capacity without consuming the capture-failure budget.
+                                    Self::reset_slot_for_fresh_arm(&mut slot);
                                     return Err(anyhow::Error::msg(error));
                                 }
                                 (Some(budget), slot.retained)
@@ -1043,16 +1045,8 @@ impl Occ3NativeSession {
                             // sender session id the poll carries - never to
                             // this receiver's own queue. The polls are
                             // disjoint; a record can never appear twice.
-                            if let Ok(mut inbox) = receiver.inbox.lock() {
+                            let consumed = if let Ok(mut inbox) = receiver.inbox.lock() {
                                 let consumed = inbox.poll_consumed();
-                                for (message_id, sender_session_id) in consumed {
-                                    route_delivery_event_to_sender(
-                                        &sender_session_id,
-                                        &message_id,
-                                        true,
-                                        None,
-                                    );
-                                }
                                 let terminal = inbox.poll_terminal_failures();
                                 for (message_id, sender_session_id, _status) in terminal {
                                     // A pre-event busy refusal proved the
@@ -1073,6 +1067,25 @@ impl Occ3NativeSession {
                                         );
                                     }
                                 }
+                                consumed
+                            } else {
+                                Vec::new()
+                            };
+                            // Receipt lookup takes the inbox lock itself. Drop
+                            // the poll guard before lookup or sender routing.
+                            for (message_id, sender_session_id) in consumed {
+                                let receipt = receiver
+                                    .completed_use_receipt_sha256(&message_id)
+                                    .ok()
+                                    .flatten();
+                                // A missing proof remains consumed-but-uncertain,
+                                // never a proven non-use eligible for fallback.
+                                route_delivery_event_to_sender(
+                                    &sender_session_id,
+                                    &message_id,
+                                    true,
+                                    receipt.as_deref(),
+                                );
                             }
                             let ids = receiver.admitted_message_ids();
                             if ids.is_empty() {
@@ -1899,6 +1912,7 @@ Do not call occ3_handoff again for these facts."
             if source.handoff_admitted {
                 source.capture_permit = None;
             }
+            drop(source); // Explicitly end source ownership before queue persistence.
         }
         let mut queue = self.queue.lock().map_err(|_| failure())?;
         let notice = queue.mark_progressed(state, message_id, now());
@@ -1993,9 +2007,7 @@ Do not call occ3_handoff again for these facts."
         // retain process-wide capacity until that next turn. Busy retries also
         // release capacity deliberately: other sessions may capture during the
         // backoff, and the next explicit arm must acquire a fresh permit.
-        if slot.lease.as_ref().is_some_and(|lease| lease.state() == SourceCaptureState::Cancelled)
-            || slot.lease.is_none()
-        {
+        if Self::capture_capacity_releasable(slot.lease.as_ref().map(|lease| lease.state())) {
             slot.capture_permit = None;
         }
         let Some(refusal) = slot.lease.as_ref().and_then(|lease| {
@@ -2008,6 +2020,11 @@ Do not call occ3_handoff again for these facts."
         }
         Self::reset_slot_for_fresh_arm(&mut slot);
         true
+    }
+
+    /// Terminal leases cannot retain capture capacity between turns.
+    fn capture_capacity_releasable(state: Option<SourceCaptureState>) -> bool {
+        !matches!(state, Some(SourceCaptureState::Prepared | SourceCaptureState::Submitted | SourceCaptureState::Captured))
     }
 
     /// Slot reset after a completed (admitted, retired) handoff. Also
@@ -3456,6 +3473,41 @@ mod tests {
         assert!(session.arm_handoff_if_needed("other", None).is_err());
         session.invalidate();
         assert!(session.arm_handoff_if_needed("receiver", None).is_err());
+    }
+
+    #[test]
+    fn occ3_terminal_capture_capacity_covers_every_lease_state() {
+        use SourceCaptureState::*;
+        assert!(Occ3NativeSession::capture_capacity_releasable(None));
+        for state in [Prepared, Submitted, Captured] {
+            assert!(!Occ3NativeSession::capture_capacity_releasable(Some(state)), "active {state:?}");
+        }
+        // SourceCaptureLease::cancel maps Submitted to Uncertain. Its submit
+        // method is pi-ai-private, so test the exact state predicate here;
+        // the Cancelled lifecycle test covers actual slot/permit release.
+        for state in [Cancelled, Uncertain, Retired] {
+            assert!(Occ3NativeSession::capture_capacity_releasable(Some(state)), "terminal {state:?}");
+        }
+    }
+
+    #[tokio::test]
+    async fn occ3_policy_disabled_before_capture_does_not_spend_failure_budget() {
+        let dir = tempfile::tempdir().unwrap();
+        let file = dir.path().join("session.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"rlmDepth\":0}\n").unwrap();
+        let session = enrolled().await;
+        session.bind_chat_preferences(Some(file.to_string_lossy().into_owned())).unwrap();
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        assert!(session.arm_handoff_if_needed("receiver", Some(pool.clone().acquire_owned().await.unwrap())).unwrap());
+        crate::core::occ::session_settings::save_occ3(file.to_str().unwrap(), true, false).unwrap();
+        assert!((session.source_hooks().resolve)(hook_request()).await.is_err());
+        assert_eq!(pool.available_permits(), 1);
+        assert!((session.source_hooks().resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 0, "policy denial is not capture failure");
+        let slot = session.source.lock().unwrap();
+        assert!(!slot.resolved);
+        assert!(slot.budget.is_none() && slot.lease.is_none());
+        assert!(slot.armed_receiver.is_none());
     }
 
     #[tokio::test]

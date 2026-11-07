@@ -731,6 +731,8 @@ struct ProofFamily {
     source_ceiling: Option<Arc<OnceCounter>>,
     receiver_resolver_calls: Arc<AtomicUsize>,
     receiver_leased: Arc<AtomicUsize>,
+    // Last field: release only after every native session/agent field drops.
+    _capture_serialization: tokio::sync::OwnedMutexGuard<()>,
 }
 
 impl ProofFamily {
@@ -864,6 +866,12 @@ fn proof_options(model: Model) -> AgentOptions {
 }
 
 async fn build_family(config: FamilyConfig) -> ProofFamily {
+    // Every fixture can arm the process-wide capture pool. Hold one shared
+    // async guard for the entire family lifetime, including cleanup.
+    static SERIAL: std::sync::OnceLock<Arc<tokio::sync::Mutex<()>>> = std::sync::OnceLock::new();
+    let capture_serialization = SERIAL
+        .get_or_init(|| Arc::new(tokio::sync::Mutex::new(())))
+        .clone().lock_owned().await;
     let state = Arc::new(FixtureState::default());
     let (endpoint, server) = serve(config.mode.clone(), state.clone()).await;
     let model = proof_model(&endpoint, "fixture-model");
@@ -1005,6 +1013,7 @@ async fn build_family(config: FamilyConfig) -> ProofFamily {
     }
 
     ProofFamily {
+        _capture_serialization: capture_serialization,
         family,
         source,
         receiver,

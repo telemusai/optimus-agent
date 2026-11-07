@@ -21,3 +21,28 @@ outcome notifications.
 Idle receiver outcomes use the same keyed head-prompt gate as sender events.
 The bounded idle timer requests one fresh capture or fallback when needed;
 admitted or completed heads never receive a stale retry prompt.
+
+## Capture capacity and completed use
+
+An armed capture holds process-wide capture capacity through publication, not
+through the sender session's lifetime. Terminal capture outcomes release that
+capacity. Busy retry backoff does not hold it. A fresh capture waits at most
+30 seconds for capacity and supports cancellation; refusal does not arm, send,
+or replay a capture.
+
+Receiver turn completion forwards the completed-use receipt digest to the
+sender. A verified consumed receipt completes the queue entry and lets the next
+head proceed. A consumed report without a usable digest remains `uncertain`;
+it must not trigger an ordinary-message copy of state already consumed.
+
+## Runtime restart recovery
+
+Closing one session does not evict the shared runtime connector. An authority
+refusal can trigger a bounded identity probe. Only a verified change to the
+runtime epoch, generation, or model identity evicts that connector's cached
+readiness. Other cached connectors remain intact.
+
+The operation that detects a restart still declines once. The next explicit
+activation verifies a new connector. Neither the failed capture nor its
+publication is replayed automatically. Existing admitted state from the old
+runtime does not become valid again through reactivation.

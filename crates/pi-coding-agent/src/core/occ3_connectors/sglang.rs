@@ -106,6 +106,18 @@ fn native_unsupported() -> Occ3Error {
     }
 }
 
+/// Internal recovery classification; public errors retain their original form.
+struct NativeControlFailure {
+    error: Occ3Error,
+    authority: bool,
+}
+
+impl From<Occ3Error> for NativeControlFailure {
+    fn from(error: Occ3Error) -> Self {
+        Self { error, authority: false }
+    }
+}
+
 /// The live connector. Cheap to clone behind an `Arc` (reqwest keeps an
 /// internal connection pool).
 #[derive(Debug)]
@@ -222,7 +234,7 @@ impl SglangOcc3Connector {
         let body = serde_json::json!({"schema":"occ3.runtime.identity.request.v1"});
         let identity: NativeRuntimeIdentity = self
             .control_raw("/occ3/v1/native/runtime/identity", &body)
-            .await?;
+            .await.map_err(|failure| failure.error)?;
         if !identity.is_self_consistent() {
             return Err(native_invalid());
         }
@@ -549,9 +561,8 @@ impl SglangOcc3Connector {
         let Ok(Some((identity, runtime))) = tokio::time::timeout(
             Duration::from_millis(1500),
             async {
-                let probe = Self::new(self.config.clone()).ok()?;
-                let identity = probe.model_identity().await.ok()?;
-                let runtime = probe.runtime_identity().await.ok()?;
+                let identity = self.model_identity().await.ok()?;
+                let runtime = self.runtime_identity().await.ok()?;
                 Some((identity, runtime))
             },
         ).await else { return };
@@ -570,6 +581,10 @@ impl SglangOcc3Connector {
             || identity != permit.identity
         {
             crate::core::occ3_connectors::activation::invalidate_connector_ready(self);
+        } else {
+            // A verified unchanged runtime is healthy, not a failed probe.
+            // Do not hide an actual restart that happens immediately afterward.
+            *last_probe = None;
         }
     }
 
@@ -580,9 +595,11 @@ impl SglangOcc3Connector {
     ) -> Result<T, Occ3Error> {
         match self.control_raw(path, body).await {
             Ok(response) => Ok(response),
-            Err(error) => {
-                self.invalidate_ready_if_runtime_changed().await;
-                Err(error)
+            Err(failure) => {
+                if failure.authority {
+                    self.invalidate_ready_if_runtime_changed().await;
+                }
+                Err(failure.error)
             }
         }
     }
@@ -591,11 +608,11 @@ impl SglangOcc3Connector {
         &self,
         path: &str,
         body: &Value,
-    ) -> Result<T, Occ3Error> {
+    ) -> Result<T, NativeControlFailure> {
         let bytes =
             pi_ai::source_capture::canonical_json_bytes(body).map_err(|_| native_invalid())?;
         if bytes.len() > 16384 {
-            return Err(native_invalid());
+            return Err(native_invalid().into());
         }
         let mut response = self
             .request_builder(reqwest::Method::POST, path, HEALTH_TIMEOUT)?
@@ -611,16 +628,24 @@ impl SglangOcc3Connector {
                 .is_some_and(|v| v != "identity")
         {
             native_binding_diagnostic("control", "http_status", Some(response.status().as_u16()));
-            return Err(native_invalid());
+            // latent_control_api.control_error_response maps both `identity`
+            // and `identity_mismatch` to 401. latent_registry._profile and
+            // _session use `identity` for epoch and absent-enrollment failures.
+            // Busy (409), quota, malformed responses and outages are not proof
+            // of revoked enrollment and must not trigger recovery probes.
+            return Err(NativeControlFailure {
+                error: native_invalid(),
+                authority: matches!(response.status().as_u16(), 401 | 403),
+            });
         }
         let mut received = Vec::new();
         while let Some(chunk) = response.chunk().await.map_err(|_| native_invalid())? {
             if received.len().saturating_add(chunk.len()) > 16384 {
-                return Err(native_invalid());
+                return Err(native_invalid().into());
             }
             received.extend_from_slice(&chunk);
         }
-        serde_json::from_slice(&received).map_err(|_| native_invalid())
+        serde_json::from_slice(&received).map_err(|_| native_invalid().into())
     }
     fn check_enrollment_response(
         permit: &NativeExperimentalPermit,
@@ -702,10 +727,23 @@ impl SglangOcc3Connector {
         let response: EnrollmentResponse = self
             .control("/occ3/v1/native/sessions/enroll", &body)
             .await?;
+        // Only authority fields in a correctly addressed enrollment response
+        // justify a runtime probe, not malformed schema or capability errors.
+        let authority_mismatch = response.schema == "occ3.sessions.enrolled.v1"
+            && response.operation_id == operation_id
+            && response.session_id == session_id
+            && (response.runtime_id != permit.runtime_id
+                || response.runtime_generation != permit.runtime_generation
+                || response.model_fingerprint != fingerprint
+                || response.readiness.runtime_epoch != permit.runtime_id
+                || response.readiness.runtime_generation != permit.runtime_generation
+                || response.readiness.model_fingerprint != fingerprint);
         let result = match Self::check_enrollment_response(permit, response, &operation_id, session_id) {
             Ok(result) => result,
             Err(error) => {
-                self.invalidate_ready_if_runtime_changed().await;
+                if authority_mismatch {
+                    self.invalidate_ready_if_runtime_changed().await;
+                }
                 return Err(error);
             }
         };

@@ -47,10 +47,9 @@ async fn runtime_refusal_evicts_only_affected_ready_connector() {
         let other_cached = verify_cached(&other_request, Duration::from_secs(5)).await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&untouched, &other_cached),
             "unrelated runtime readiness must survive");
-        // Late failure from the old connector cannot remove its replacement.
-        fixture.enrollment_failure.store(failure, std::sync::atomic::Ordering::SeqCst);
-        assert!(ready.connector.enroll_native_session("late-old-permit").await.is_err());
-        fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+        // Exercise eviction directly: a probe cooldown must not mask a late
+        // old-instance failure accidentally evicting the replacement.
+        invalidate_connector_ready(ready.connector.as_ref());
         let still_new = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
         assert!(std::sync::Arc::ptr_eq(&replacement, &still_new));
     }
@@ -80,7 +79,7 @@ async fn runtime_refusal_probe_has_connector_cooldown() {
     let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
     let request = fixture_request(&fixture, None, None);
     let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
-    fixture.enrollment_failure.store(1, std::sync::atomic::Ordering::SeqCst);
+    fixture.enrollment_failure.store(4, std::sync::atomic::Ordering::SeqCst);
     let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
     for _ in 0..3 {
         assert!(ready.connector.enroll_native_session("probe-cooldown").await.is_err());
@@ -127,6 +126,9 @@ mod wrapped_ready_tests {
             method_id: ready.method_id.clone(), artifact_digest: ready.artifact_digest.clone(),
             expires_at_epoch: ready.expires_at_epoch, connector_id: ready.connector_id.clone(),
         });
+        assert!(ready.connector.readiness_instance_id().is_some(), "native readiness has instance identity");
+        assert_eq!(wrapped.connector.readiness_instance_id(), ready.connector.readiness_instance_id(),
+            "wrapper MUST forward the exact inner instance identity");
         let config = configured_connector(&request).unwrap();
         ready_cache().lock().unwrap().insert(cache_key(&request, &config), wrapped.clone());
         fixture.enrollment_failure.store(2, std::sync::atomic::Ordering::SeqCst);
@@ -135,4 +137,39 @@ mod wrapped_ready_tests {
         let fresh = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
         assert!(!std::sync::Arc::ptr_eq(&wrapped, &fresh), "inner failure evicts wrapper readiness");
     }
+}
+
+/// Busy, service failure, and malformed payloads carry no authority evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn non_authority_refusals_do_not_probe_runtime() {
+    let _cache_guard = reset_ready_cache().await;
+    for failure in [5, 6, 7] {
+        let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        fixture.enrollment_failure.store(failure, std::sync::atomic::Ordering::SeqCst);
+        let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
+        assert!(ready.connector.enroll_native_session("not-authority").await.is_err());
+        assert_eq!(fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before, 1,
+            "non-authority refusal must not probe (failure={failure})");
+        fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+        let cached = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&ready, &cached));
+    }
+}
+
+/// A healthy unchanged probe cannot mask a restart immediately afterward.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unchanged_probe_does_not_suppress_subsequent_restart() {
+    let _cache_guard = reset_ready_cache().await;
+    let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+    let request = fixture_request(&fixture, None, None);
+    let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+    fixture.enrollment_failure.store(1, std::sync::atomic::Ordering::SeqCst);
+    assert!(ready.connector.enroll_native_session("unchanged-refusal").await.is_err());
+    fixture.enrollment_failure.store(3, std::sync::atomic::Ordering::SeqCst);
+    assert!(ready.connector.enroll_native_session("immediate-restart").await.is_err());
+    fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+    let replacement = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+    assert!(!std::sync::Arc::ptr_eq(&ready, &replacement), "verified unchanged probe must not impose cooldown");
 }
