@@ -4243,7 +4243,7 @@ mod tests {
             );
         }
         // The orphan diagnostic is the only record of the lost facts, so
-        // its fields are pinned like the sibling's: never re-claimable,
+        // the retirement is pinned like the sibling's: never re-claimable,
         // and no terminal poll ever re-routes it.
         assert!(
             (resolver)(request()).await.unwrap().is_none(),
