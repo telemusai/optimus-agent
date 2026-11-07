@@ -416,7 +416,7 @@ impl Occ3InferenceInbox {
     /// `prepare_inference` succeeded and only a bound, submitted lease can
     /// ever have reached the provider. A record with a bound lease, a
     /// terminal status, an unclaimed record or an unknown id is NEVER
-    /// released: its outcome stays fail-closed and replay stays forbidden.
+    /// retired: its outcome stays fail-closed and replay stays forbidden.
     ///
     /// Terminal-instead-of-Admitted is deliberate: the sender is routed the
     /// same proven-non-use busy signal and re-arms a FRESH capture, so this
@@ -883,7 +883,7 @@ mod tests {
         // A busy-retired record never retires a second time.
         assert!(!inbox.retire_busy_claim("m1"));
         // Once a lease is bound the outcome belongs to the provider: never
-        // released, whatever the refusal class claims to prove. A second
+        // retired, whatever the refusal class claims to prove. A second
         // record exercises the bound and terminal guards the retired record
         // can no longer reach.
         assert!(inbox.admit(unit_envelope("m2", "s2"), "m2", "s2", 1).unwrap());

@@ -862,7 +862,7 @@ impl Occ3NativeSession {
                     return Err(anyhow::anyhow!(failure()));
                 }
                 let claimed_message_id = envelope.message_id.clone();
-                // Routed to the sender when a busy refusal releases this
+                // Routed to the sender when a busy refusal retires this
                 // claim; captured before the envelope moves into the
                 // prepare request.
                 let sender_session_id = envelope.sender_session_id.clone();
@@ -4228,16 +4228,20 @@ mod tests {
             session.inbox.lock().unwrap().status("busy-orphan-1"),
             Some(Occ3DeliveryStatus::Failed)
         );
-        let values = entries.lock().unwrap();
-        assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
-        assert_eq!(values[0]["message_id"], "busy-orphan-1");
-        assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
-        assert_eq!(values[0]["released"], serde_json::json!(true));
-        assert_eq!(values[0]["sender_routed"], serde_json::json!(false));
-        assert!(
-            !values[0].to_string().contains("busy-orphan-proof"),
-            "the notice never carries envelope content"
-        );
+        {
+            // Scoped so the guard drops before the second resolve: the log
+            // sink locks the same mutex.
+            let values = entries.lock().unwrap();
+            assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
+            assert_eq!(values[0]["message_id"], "busy-orphan-1");
+            assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
+            assert_eq!(values[0]["released"], serde_json::json!(true));
+            assert_eq!(values[0]["sender_routed"], serde_json::json!(false));
+            assert!(
+                !values[0].to_string().contains("busy-orphan-proof"),
+                "the notice never carries envelope content"
+            );
+        }
         // The orphan diagnostic is the only record of the lost facts, so
         // its fields are pinned like the sibling's: never re-claimable,
         // and no terminal poll ever re-routes it.

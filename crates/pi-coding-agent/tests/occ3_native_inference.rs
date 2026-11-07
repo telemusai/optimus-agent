@@ -959,8 +959,8 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
 
 /// The receiver's `prepare_inference` control round trip must classify a
 /// synchronous proven-non-use refusal as the distinct busy error, so the
-/// resolver can release its inbox claim and the next inference request
-/// retries the consume cleanly (the live 2026-11-07 receiver wedge).
+/// resolver can retire its inbox claim terminally and route the sender a
+/// fresh-capture retry (the live 2026-11-07 receiver wedge).
 /// `prepare_inference` awaits exactly one control call before the
 /// attachment exists - `sessions/enroll` - so a refusal on that call
 /// proves no receiver attachment was created or submitted. On that route
@@ -973,7 +973,7 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
 /// malformed, oversized or empty-code envelope, a non-identity
 /// content-encoding, or a 200 carrying an error body on the success path
 /// - keeps the generic fail-closed `TransferFailed { "native control
-/// binding invalid" }` refusal: only the proven busy classes release a
+/// binding invalid" }` refusal: only the proven busy classes retire a
 /// claim. The request line is asserted to be the enroll route so the
 /// classification is pinned to `prepare_inference`'s own control round
 /// trip, never a publication or retirement call.
@@ -1035,7 +1035,7 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
             // Read until the full head plus content-length body arrived.
-            let length = loop {
+            loop {
                 let mut chunk = [0; 4096];
                 let count = socket.read(&mut chunk).await.unwrap();
                 assert_ne!(count, 0);
@@ -1052,11 +1052,10 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
                         .parse()
                         .unwrap();
                     if bytes.len() >= end + 4 + length {
-                        break length;
+                        break;
                     }
                 }
-            };
-            let _ = length;
+            }
             let head = String::from_utf8(bytes[..bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap()].to_vec()).unwrap();
             let request_line = head.lines().next().unwrap().to_string();
             assert!(

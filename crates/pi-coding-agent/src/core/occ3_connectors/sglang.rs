@@ -676,7 +676,7 @@ impl SglangOcc3Connector {
             // reserve_consume). The classification pairs the two codes
             // anyway so a future control route that reuses the admission
             // decline's `busy` gets the same contract. For the receiver
-            // release boundary the proof is narrower than "no server work
+            // retire boundary the proof is narrower than "no server work
             // happened": `prepare_inference` awaits exactly one control
             // call (sessions/enroll) before building the receiver
             // attachment, and only a bound, submitted attachment can ever
