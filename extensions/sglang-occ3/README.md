@@ -170,8 +170,9 @@ Every hook is exception-isolated, including logger/decoder failures. Size overfl
 emits a fixed size-limit record. Chunk, embedding and KV-value lines are per-rank;
 other lines are rank zero only. No diagnostic collectives or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
 timing; it does not change request state, alignment, positions or inference policy.
-Embedding hashes add three bounded copies per rank per overlapping chunk (about
-1.8 MB D2H per rank at 128 rows and the drill profile's hidden width).
+Embedding hashes add three bounded copies per lane per rank: up to about 4.7 MB
+per lane per rank when one chunk covers the full 128-row span. The draft lane
+repeats these copies when its chunk overlaps the span.
 
 Equal IDs/hashes do not establish semantic fidelity: the receiver attends to
 continuous aligned embeddings, not the source IDs. KV slot IDs expose placement
