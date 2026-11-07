@@ -231,8 +231,10 @@ if shorter) are mandatory; remaining budget samples the earlier region evenly.
 If the mandatory tail cannot fit, the point reports `layout_exceeds_budget`.
 `sampled=true` limits conclusions to selected slots. No GPU work or Torch import
 occurs through these hooks when disabled. The uncompressed CUDA DSA layout is
-required; invalid indices or unsupported layouts skip before indexing. HIP
-layouts are not interpreted as CUDA layouts.
+required; invalid indices or unsupported layouts log a `skipped` reason before
+indexing. Bounds use each buffer's physical capacity, not logical `pool.size`:
+the paged allocator reserves page zero, so the final allocated page has valid
+slots at or above `pool.size`. HIP layouts are not interpreted as CUDA layouts.
 
 `changed=true` relative to prefill indicates mutation of observed KV bytes;
 `first_changed_slot` identifies the first changed sampled physical slot in prefix

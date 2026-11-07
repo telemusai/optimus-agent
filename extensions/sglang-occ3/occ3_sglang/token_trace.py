@@ -297,9 +297,10 @@ def kv_snapshot(runtime, record, pool, slots, point):
     """Per-rank bounded D2H copy; compare original physical slots, no collectives."""
     try:
         buffers = kv_buffers(pool)
-        if (not slots or any(type(i) is not int or i < 0 or i >= pool.size
-                             for i in slots)):
+        if not slots or any(type(i) is not int or i < 0 for i in slots):
             raise ValueError("invalid_slots")
+        # Paged allocators reserve page zero: the last allocated page can hold
+        # slots >= pool.size. Physical buffer capacity, not logical size, bounds reads.
         for kind, _, buf, _ in buffers:
             capacity = buf.shape[0] * (64 if kind == "index" else 1)
             if max(slots) >= capacity:

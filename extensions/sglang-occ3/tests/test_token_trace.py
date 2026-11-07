@@ -181,9 +181,10 @@ def test_kv_values(monkeypatch, caplog):
     assert rows(caplog)[-1]["changed"] is True
     assert rows(caplog)[-1]["first_changed_slot"] == 4
     assert rows(caplog)[-1]["bytes_copied"] == 4
-    for invalid in ([-1], [10], [None]):
+    for invalid, reason in (([-1], "invalid_slots"), ([10], "invalid_buffer_slots"),
+                            ([None], "invalid_slots")):
         trace.kv_snapshot(NS(rank=0), record, pool, invalid, "invalid")
-        assert rows(caplog)[-1]["skipped"] == "invalid_slots"
+        assert rows(caplog)[-1]["skipped"] == reason
     assert len(calls) == 3
     monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
     trace.kv_snapshot(None, None, None, None, None)
@@ -198,6 +199,40 @@ def test_kv_rank_and_buffer_bounds(monkeypatch, caplog, rank):
     trace.kv_snapshot(NS(rank=rank), NS(), NS(size=10, kv_buffer=[buf]), [3], "test")
     assert rows(caplog)[-1]["skipped"] == "invalid_buffer_slots"
     assert rows(caplog)[-1]["rank"] == rank
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_kv_final_allocated_page_and_physical_bounds(monkeypatch, caplog, rank):
+    # Allocator pages are 1..size//page_size; page zero is padding. Both
+    # real buffer layouts therefore include the final page above logical size.
+    mla = NS(shape=(192, 1, 2), element_size=lambda: 1)
+    index = NS(shape=(3, 64 * 132), element_size=lambda: 1)
+    pool = NS(size=128, page_size=64, kv_buffer=[mla],
+              index_k_with_scale_buffer=[index], index_head_dim=128,
+              index_kpool=1, index_kpool_compress=False)
+    copies = []
+    def copy(buffers, slots):
+        copies.append(list(slots))
+        return [b"a" * len(slots) * width for _, _, _, width in buffers]
+    monkeypatch.setattr(trace, "kv_point_bytes", copy)
+    record = NS()
+    for point in ("prefill_complete", "consume_released", "private_release"):
+        trace.kv_snapshot(NS(rank=rank), record, pool, [128, 191], point)
+        row = rows(caplog)[-1]
+        assert row["rank"] == rank and row["point"] == point
+        assert row["hashed_slots"] == 2 and "skipped" not in row
+    assert rows(caplog)[-1]["changed"] is False
+    # First slot past storage is reported, not silently dropped or gathered.
+    trace.kv_snapshot(NS(rank=rank), record, pool, [192], "private_release")
+    row = rows(caplog)[-1]
+    assert row["skipped"] == "invalid_buffer_slots"
+    assert row["point"] == "private_release" and row["rank"] == rank
+    assert "changed" not in row
+    # The narrower index allocation also constrains reads independently of MLA.
+    index.shape = (2, 64 * 132)
+    trace.kv_snapshot(NS(rank=rank), record, pool, [128], "private_release")
+    assert rows(caplog)[-1]["skipped"] == "invalid_buffer_slots"
+    assert copies == [[128, 191]] * 3
 
 
 @pytest.mark.parametrize("limit", [1, 15, 16, 20, 32])
