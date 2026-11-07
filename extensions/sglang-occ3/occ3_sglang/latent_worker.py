@@ -856,17 +856,27 @@ class WorkerRuntime:
                 # output; any failure stays a uniform numerical decline.
                 aligned, _ = self.aligner(h, embeddings, self.target_norm)
                 prefix.copy_(aligned)
+                from . import token_trace
+                token_trace.alignment_cast(self, h, aligned, prefix)
             except Exception:
                 solver_error = "numerical"
         errors = self.gather(solver_error)
         require(not any(errors), "numerical")
         torch.distributed.broadcast(prefix, src=self.group.ranks[0], group=self.group.device_group)
+        from . import token_trace
+        token_trace.alignment_logit_lens(self, h, tokens)
+        token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "aligned")
+        token_trace.alignment_nearest(self, prefix, tokens, "aligned")
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
             _probe_alignment(h, embeddings, prefix, self.profile)
         from . import token_trace
         token_trace.alignment(self, prefix, embeddings)
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "final")
+        token_trace.alignment_nearest(self, prefix, tokens)
+        token_trace.alignment_precision(self, prefix, embeddings)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)

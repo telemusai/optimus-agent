@@ -439,3 +439,220 @@ def test_alignment_cosines_bounded_and_rounded(caplog):
     caplog.clear()
     trace.alignment(NS(rank=0), torch.ones((129, 2)), torch.ones((129, 2)))
     assert not caplog.records
+
+
+def test_alignment_neighbors_and_stages(caplog):
+    torch = pytest.importorskip("torch")
+    e = torch.eye(3)
+    runtime = NS(rank=0, embedding=NS(num_embeddings=3),
+                 profile=NS(anchor_alpha=0.3), target_norm=2.0)
+    tokens = torch.tensor([0, 1, 2])
+    for stage in ("raw", "aligned", "final"):
+        trace.alignment_stage(runtime, e[[1, 2, 0]], e, tokens, stage)
+    result = rows(caplog)
+    assert len(result) == 9
+    assert result[0]["cosine_offsets"] == [None, 0.0, 1.0]
+    assert result[1]["cosine_offsets"] == [0.0, 0.0, 1.0]
+    assert result[2]["cosine_offsets"] == [0.0, 0.0, None]
+    assert result[0]["row_norm"] == result[0]["embedding_norm"] == 1.0
+    assert result[0]["target_norm"] == 2.0
+    assert result[0]["anchor_alpha"] == 0.3
+    trace.alignment_stage(runtime, e, e, torch.tensor([-1, 1, 2]), "raw")
+    assert len(rows(caplog)) == 9
+
+
+def test_nearest_shard_padding_and_ties(caplog):
+    torch = pytest.importorskip("torch")
+    embedding = NS(weight=torch.tensor([[1.,0.], [0.,1.], [9.,9.], [1.,0.]]),
+        embedding_dim=2, num_embeddings=8, shard_indices=NS(
+        org_vocab_start_index=2, org_vocab_end_index=4,
+        added_vocab_start_index=7, added_vocab_end_index=8, num_org_elements_padded=3))
+    trace.alignment_nearest(NS(rank=1, embedding=embedding), torch.eye(2), torch.tensor([2, 3]))
+    result = rows(caplog)
+    assert [r["top1_id"] for r in result] == [2, 3]
+    assert all(r["top1_hit"] and r["top1_cosine"] == 1.0 for r in result)
+    assert all(r["rank"] == 1 for r in result)
+
+
+def test_alignment_disabled_no_access(monkeypatch, caplog):
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_stage(None, None, None, None, "raw")
+    trace.alignment_nearest(None, None, None)
+    assert not rows(caplog)
+
+
+def test_alignment_cast_precision(caplog):
+    torch = pytest.importorskip("torch")
+    solved = torch.tensor([[1.0003, 0.5001], [0.0, 0.0]])
+    copied = solved.to(torch.float16)
+    original = solved.clone()
+    trace.alignment_cast(NS(rank=0, profile=NS(method="test", anchor_alpha=0.3)), copied, solved, copied)
+    result = rows(caplog)
+    assert result[0]["solver_dtype"] == "torch.float32"
+    assert result[0]["buffer_dtype"] == "torch.float16"
+    assert result[0]["cosine"] == 1.0
+    assert result[0]["cast_observed"] is True
+    assert result[0]["max_abs_diff"] == 0.0003
+    assert result[1]["cosine"] is None
+    assert torch.equal(original, solved)
+
+
+def test_alignment_fp8_baseline(caplog):
+    torch = pytest.importorskip("torch")
+    values = torch.tensor([[1.1, 0.7], [0.0, 0.0]])
+    trace.alignment_precision(NS(rank=0), values, values)
+    result = rows(caplog)
+    assert len(result) == 2
+    assert result[0]["fp8_cosine"] == result[0]["embedding_fp8_cosine"]
+    if result[0]["fp8_skipped"] is None:
+        expected = trace.precision_cosine(values, trace.fp8_row_roundtrip(values, torch.float8_e4m3fn))
+        assert result[0]["fp8_cosine"] == expected[0]
+        assert expected[0] >= 0.999
+        assert result[1]["fp8_cosine"] is None
+    assert result[0]["fp32_end_to_end_skipped"] == "requires_solver_and_global_anchor_replay"
+
+
+def test_precision_off_and_isolated(monkeypatch, caplog):
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_cast(None, None, None, None)
+    trace.alignment_precision(None, None, None)
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    trace.alignment_cast(NS(rank=0), None, None, None)
+    trace.alignment_precision(NS(rank=0), None, None)
+    assert not rows(caplog)
+
+
+def test_logit_lens_offsets_shard_and_one_copy(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    norm = type("RMSNorm", (), {})()
+    norm.weight = torch.ones(3)
+    norm.variance_epsilon = 1e-6
+    norm.variance_size_override = norm.override_orig_dtype = None
+    norm.cast_x_before_out_mul = False
+    head = NS(weight=torch.eye(3), bias=None, embedding_dim=3, num_embeddings=3,
+        quant_method=type("UnquantizedEmbeddingMethod", (), {})(),
+        shard_indices=NS(org_vocab_start_index=0, org_vocab_end_index=3,
+                         added_vocab_start_index=3, added_vocab_end_index=3,
+                         num_org_elements_padded=3))
+    runtime = NS(rank=0, profile=NS(method="probe", anchor_alpha=0.0), runner=NS(model=NS(
+        model=NS(norm=norm), lm_head=head,
+        logits_processor=NS(logit_scale=None, final_logit_softcapping=None))))
+    count = []
+    original = trace.point_copy
+    def copy(*args):
+        count.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    result = rows(caplog)
+    assert count == [1]
+    assert len(result) == 3
+    assert [r["top_ids"][0] for r in result] == [0, 1, 2]
+    assert result[0]["label_logits_offsets"] == [None, 1.732, 0.0]
+    assert result[1]["label_logits_offsets"] == [0.0, 1.732, 0.0]
+    assert result[2]["label_logits_offsets"] == [0.0, 1.732, None]
+    assert result[0]["method_id"] == "probe"
+    assert result[0]["vocab_start"] == 0
+    head.bias = torch.zeros(3)
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    assert rows(caplog)[-1]["reason"] == "unsupported_head_bias"
+    assert count == [1]
+    head.bias = None
+    head.num_embeddings = 6
+    head.shard_indices.org_vocab_start_index = 3
+    head.shard_indices.org_vocab_end_index = 6
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.tensor([0, 4, 5]))
+    assert rows(caplog)[-3]["label_logits_offsets"][1] is None  # Label on another shard.
+    assert rows(caplog)[-2]["label_logits_offsets"][1] == 1.732
+    assert count == [1, 1]
+    head.quant_method = object()
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    assert rows(caplog)[-1]["reason"] == "unsupported_norm_or_head"
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_logit_lens(None, None, None)
+    assert count == [1, 1]
+
+
+def test_stage_single_copy(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    original = trace.point_copy
+    calls = []
+    def copy(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    runtime = NS(rank=0, embedding=NS(num_embeddings=3),
+        profile=NS(anchor_alpha=0.3, method="probe"), target_norm=torch.tensor(2.0))
+    trace.alignment_stage(runtime, torch.eye(3), torch.eye(3), torch.arange(3), "raw")
+    assert calls == [1]
+    assert rows(caplog)[0]["target_norm"] == 2.0
+
+
+def test_documented_global_top8_rank_bound():
+    """A label present in a local top-8 need not have a known global rank."""
+    from pathlib import Path
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    assert "truncate\nthe merged list to the global top-8" in readme
+    assert "otherwise report `>8`" in readme
+    shard_a = [(float(8-i), i) for i in range(8)]
+    shard_b_full = [(float(200-i), 100+i) for i in range(100)]
+    union = sorted(shard_a + shard_b_full[:8], reverse=True)
+    label = 7  # Local rank 8; union rank 16, but true global rank 108.
+    assert next(i+1 for i, (_, token) in enumerate(union) if token == label) == 16
+    full = sorted(shard_a + shard_b_full, reverse=True)
+    assert next(i+1 for i, (_, token) in enumerate(full) if token == label) == 108
+    merged_top8 = union[:8]
+    rank = next((i+1 for i, (_, token) in enumerate(merged_top8) if token == label), ">8")
+    assert rank == ">8"
+    assert merged_top8 == full[:8]
+
+
+def test_documented_lens_residual_rounding_and_sync_scope():
+    from pathlib import Path
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    assert "rounded fused add+norm input (the post-add residual)" in readme
+    assert "not a bit-exact replay" in readme
+    assert "One bounded synchronous packed copy per point inside align()" in readme
+    assert "there is no asynchronous staging" in readme
+
+
+def test_other_points_single_copy_and_same_dtype(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    embedding = NS(weight=torch.eye(3), embedding_dim=3, num_embeddings=3,
+        shard_indices=NS(org_vocab_start_index=0, org_vocab_end_index=3,
+                         added_vocab_start_index=3, added_vocab_end_index=3,
+                         num_org_elements_padded=3))
+    runtime = NS(rank=0, embedding=embedding, profile=NS(method="probe", anchor_alpha=0.3))
+    original = trace.point_copy
+    calls = []
+    def copy(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    matrix = torch.eye(3)
+    trace.alignment_nearest(runtime, matrix, torch.arange(3), "aligned")
+    assert len(calls) == 1
+    assert rows(caplog)[-1]["stage"] == "aligned"
+    trace.alignment_cast(runtime, matrix, matrix, matrix)
+    assert len(calls) == 2
+    assert rows(caplog)[-1]["cast_observed"] is False
+    trace.alignment_precision(runtime, matrix, matrix)
+    if rows(caplog)[-1]["fp8_skipped"] is None:
+        assert len(calls) == 3
+    else:
+        assert len(calls) == 2
+
+
+def test_fp8_scaling_preserves_small_rows():
+    torch = pytest.importorskip("torch")
+    dtype = getattr(torch, "float8_e4m3fn", None)
+    if dtype is None:
+        pytest.skip("float8 unavailable")
+    values = torch.tensor([[1e-9, 0.5e-9], [0.0, 0.0]])
+    try:
+        result = trace.fp8_row_roundtrip(values, dtype)
+    except (RuntimeError, TypeError):
+        pytest.skip("float8 conversion unsupported")
+    assert torch.allclose(result[0], values[0], rtol=0.001, atol=0)
+    assert torch.equal(result[1], values[1])
+    assert trace.precision_cosine(values, result) == [1.0, None]

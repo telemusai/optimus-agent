@@ -256,3 +256,113 @@ Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
 has 38. The live staging assembler refuses this count. The full native package
 build enumerates modules instead. No deploy files are changed here; correct the
 pin separately before using that assembler.
+
+### Opt-in alignment neighbour evidence
+
+`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor,
+post-solver (`aligned`), and post-anchor (`final`) rows on rank zero. Each
+line contains one of at most 128 rows, cosine offsets [-1, 0, +1] (null at
+edges), row/embedding norms, anchor alpha and target norm, rounded to four
+decimals. Zero-norm cosine is undefined (null).
+
+`alignment_nearest_shard` runs at both `stage="aligned"` (before anchoring)
+and `stage="final"` (after anchoring), and scans only each rank's resident embedding weight,
+excluding padding via StateBridge shard ranges. It never calls embedding
+forward or a collective. Vocabulary tiles are 256 rows (at most 32 MiB per
+float tile at hidden width 32768); scores are at most 128 x 256. It logs local
+top-1, not global rank. Merge matching capture rows offline across all ranks
+by highest cosine, then smallest token ID for ties. Rounded near-ties are
+ambiguous; do not infer global top-1 from one shard. Missing ranks invalidate
+the global conclusion. Run one isolated capture at a time to associate rows;
+no request identities are emitted. Failures remain isolated from serving.
+
+Decision rule: a clearly higher neighbour-offset score on misread rows, or
+a global nearest token equal to a neighbour, points to a capture alignment
+bug. A token lost only at the solver or anchoring stage points to that
+transform. Raw hidden rows far from all reasonable targets and a different
+nearest token support a latent-channel fidelity limit. These are diagnostic
+hypotheses, not proof: predictor hidden states and input embeddings need not
+share geometry, and reading a continuous prefix is not nearest-token decoding.
+The existing live evidence shows intact delivery and repeatably weak tokens,
+but lacks raw/solver stage comparisons; no causal conclusion is yet justified.
+All added tensor work is disabled unless the existing trace flag is exactly 1.
+
+Precision diagnostics emit `alignment_cast` at the solver-copy boundary
+(hidden/solver/buffer dtypes, float32 cosine and max absolute difference).
+`cast_observed` is true only when solver and buffer dtypes differ. All current
+solvers already return hidden.dtype, so this is normally a same-dtype copy
+with cosine 1 and difference 0, **not a measurement of solver output rounding**.
+The fp32-to-bf16 cast occurs inside apply_map/the solver and is unobserved here.
+For finite normal values, a single bf16 rounding has cosine loss of order
+2^-16 or smaller: substantial loss from that one rounding can be excluded
+analytically, not by the copy trace. This does not exclude accumulated solver
+numerical error, underflow, overflow, or earlier precision loss.
+
+`alignment_precision` compares each final row and plain token-embedding
+baseline with their own row-scaled float8_e4m3fn round trips. Each row is scaled
+by 448/amax before casting and unscaled afterwards (divide first to avoid
+scale overflow); zero/nonfinite rows have null cosine. Unsupported conversions
+have an explicit skip reason. FP32 end-to-end replay remains skipped because
+rerunning the solver/global anchor adds expensive work and collectives.
+
+Precision decision rule: FP8 cosines around 0.999+ on misread rows, matching
+the plain-embedding baseline, rule out substantial loss at this proxy boundary.
+Use cast cosine as evidence only when `cast_observed` is true. Clearly worse
+loss on misread rows makes precision a contributor worth testing. This proxy
+is not actual KV quantization (which transforms/scales states); it cannot rule
+out all numerical causes or prove real KV-storage fidelity by itself.
+
+#### Offset conventions and raw-state logit lens
+
+Offset `k` in neighbour cosines means `cos(values[i], E[tok[i+k]])`.
+Capture `predictor_offset=-1` means raw row `i` is the hidden state at the
+sequence position that **produced** `tok[i]`, not the state after consuming
+that token. Normal raw-state/input-embedding cosine need not peak at offset
+zero: GLM-5's input embeddings and LM head are untied. A real indexing defect
+needs systematic shifted label likelihood in the model readout, not just an
+isolated raw embedding neighbour win.
+
+`alignment_logit_lens_shard` reads the verified candidate model objects
+`runner.model.model.norm` (RMSNorm) and `runner.model.lm_head` (ParallelLMHead),
+from GlmMoeDsaForCausalLM's DeepseekV2 base. It evaluates RMSNorm's native
+formula and the unquantized head weight in bounded tiles, never calling
+model/norm/head forwards or LogitsProcessor. Unsupported quantized head,
+norm override, head bias, or logit transforms explicitly skip. The live
+LogitsProcessor readout ignores head bias, so the lens does not add it. This is a float32
+readout approximation with the normal norm-output dtype cast, not a replay
+of fused inference kernels or sampling penalties/temperature. The captured
+residual is the rounded fused add+norm input (the post-add residual), not an
+unrounded reconstruction of the separate addends. Residual rounding therefore
+also makes this an approximation of the served readout, not a bit-exact replay.
+
+Each rank logs local top-8 IDs/logits, label logits at offsets [-1,0,+1]
+(null for edges or labels owned elsewhere), actual shard ranges/vocab start,
+and local logsumexp. Merge local top-8 by descending logits, then **truncate
+the merged list to the global top-8**. Report exact global label rank only
+for positions 1-8 in that truncated list; otherwise report `>8`. Positions
+beyond eight in the untruncated union are not exact ranks: unreported tokens
+from other shards may outrank them. Exact full-vocabulary rank is unavailable
+without exchanging the owning rank's label logit; this trace adds no such
+collective. Combine all shard logsumexp values with logaddexp to compute
+untempered label probabilities. Missing ranks, rounded ties, or unsupported
+readouts leave the conclusion unresolved.
+The profile method ID and live anchor alpha accompany the diagnostic rows.
+
+Run the sender greedy for this drill, or use p(label) from merged logsumexp
+rather than top-1 rank. Under sampling the accepted label need not be top-1;
+that alone is not evidence of an indexing defect.
+
+| Raw logit-lens result | Interpretation |
+| --- | --- |
+| Label top-1/high probability at producer position -1, but aligned row misses | Map/solver loses information. This is label offset 0 in our log. |
+| Label top-1 only at sequence position 0 or +1 instead of producer -1 | Indexing hypothesis. Compare adjacent raw rows; do not confuse sequence-position offsets with label offsets. |
+| Label low probability, misread tokens are runner-ups | Distribution/fidelity hypothesis: hidden state encodes alternatives. |
+| Label top-1 and aligned nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the map. |
+
+All new points now pack device-side arrays and perform one small host copy
+per call immediately before emission. No per-row scalar reads or per-tile
+host validity checks occur. One bounded synchronous packed copy per point inside align() is an accepted
+scope tradeoff for this opt-in trace; there is no asynchronous staging.
+Copies include points before anchoring rather than being deferred past the
+completion event, so opt-in trace overhead can still delay other ranks. Vocabulary validity stays on
+device through the full loop. Logit-lens tiles share the 256-row bound.
