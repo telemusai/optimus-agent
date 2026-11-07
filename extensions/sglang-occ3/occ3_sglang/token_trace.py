@@ -189,7 +189,7 @@ def pin_summary(pin):
 
 
 @isolated
-def alignment(runtime, prefix, embeddings):
+def alignment(runtime, prefix, embeddings, *, label_anchor_alpha=None):
     """Compare aligned and token-embedding rows already resident on this rank."""
     if runtime.rank != 0:
         return
@@ -201,7 +201,8 @@ def alignment(runtime, prefix, embeddings):
     values = torch.nn.functional.cosine_similarity(
         prefix.detach().float(), embeddings.detach().float(), dim=1).cpu().tolist()
     emit("alignment", rank=runtime.rank, rows=len(values),
-         label_anchor_alpha=float(getattr(getattr(runtime, "profile", None), "label_anchor_alpha", 0.0)),
+         label_anchor_alpha=(float(label_anchor_alpha) if label_anchor_alpha is not None else
+                             float(getattr(getattr(runtime, "profile", None), "label_anchor_alpha", 0.0))),
          row_cosine=[round(v, 6) if math.isfinite(v) else None for v in values])
 
 
@@ -435,7 +436,7 @@ def local_ranges(embedding, values):
 
 
 @isolated
-def alignment_stage(runtime, values, embeddings, tokens, stage):
+def alignment_stage(runtime, values, embeddings, tokens, stage, *, label_anchor_alpha=None):
     """Pack all neighbour cosines/norms on device; one host copy before logging."""
     if runtime.rank != 0 or stage not in ("raw", "aligned", "label_anchored", "final"):
         return
@@ -465,7 +466,8 @@ def alignment_stage(runtime, values, embeddings, tokens, stage):
              dtype=str(values.dtype), cosine_offsets=[rounded(x) for x in row[1:4]],
              row_norm=rounded(row[4]), embedding_norm=rounded(row[5]),
              anchor_alpha=rounded(runtime.profile.anchor_alpha), target_norm=rounded(row[6]),
-             label_anchor_alpha=rounded(getattr(runtime.profile, "label_anchor_alpha", 0.0)),
+             label_anchor_alpha=rounded(label_anchor_alpha if label_anchor_alpha is not None else
+                                        getattr(runtime.profile, "label_anchor_alpha", 0.0)),
              method_id=getattr(runtime.profile, "method", None))
 
 

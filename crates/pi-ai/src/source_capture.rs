@@ -172,6 +172,19 @@ pub struct SourceCaptureIntent {
     /// v3 intent may carry it, pinned to `content_only_orchestrator_v1`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capture_mode: String,
+    /// None uses the server profile default; explicit zero disables anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_selected_label_anchor_alpha")]
+    pub label_anchor_alpha: Option<LabelAnchorAlpha>,
+}
+
+// Absence selects the profile default; a supplied null is not a selection.
+fn deserialize_selected_label_anchor_alpha<'de, D>(
+    deserializer: D,
+) -> Result<Option<LabelAnchorAlpha>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    LabelAnchorAlpha::deserialize(deserializer).map(Some)
 }
 
 impl std::fmt::Debug for SourceCaptureIntent {
@@ -228,7 +241,26 @@ impl SourceCaptureIntent {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SourceCaptureError> {
         let value =
             serde_json::to_value(self).map_err(|_| SourceCaptureError::InvalidField("intent"))?;
-        canonical_json_bytes(&value)
+        // Only this bounded intent field admits decimals. Keep the generic
+        // canonical encoder integer-only for all other protocol documents.
+        if self.label_anchor_alpha.is_none() {
+            return canonical_json_bytes(&value);
+        }
+        let fields = value.as_object().ok_or(SourceCaptureError::InvalidField("intent"))?;
+        let sorted: BTreeMap<_, _> = fields.iter().collect();
+        let mut out = vec![b'{'];
+        for (index, (key, value)) in sorted.into_iter().enumerate() {
+            if index > 0 { out.push(b','); }
+            out.extend(canonical_json_bytes(&serde_json::Value::String(key.clone()))?);
+            out.push(b':');
+            if key == "label_anchor_alpha" {
+                out.extend(serde_json::to_vec(value).map_err(|_| SourceCaptureError::InvalidField("intent"))?);
+            } else {
+                out.extend(canonical_json_bytes(value)?);
+            }
+        }
+        out.push(b'}');
+        Ok(out)
     }
 
     pub fn digest(&self) -> Result<String, SourceCaptureError> {
@@ -1146,6 +1178,9 @@ pub fn validate_receipt(
         (Some(_), SOURCE_CAPTURE_SCHEMA_V3) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
         _ => false,
     };
+    if intent.label_anchor_alpha.is_some_and(|alpha| alpha != receipt.label_anchor_alpha) {
+        return Err(SourceCaptureError::InvalidReceipt);
+    }
     if !schema_matches
         || receipt.representation != SOURCE_REPRESENTATION
         || receipt.predictor_position_offset != -1
@@ -1385,6 +1420,7 @@ mod span_arming_tests {
             expires_at_epoch: now() + 300,
             span_policy: arming.span_policy.into(),
             capture_mode: arming.capture_mode.into(),
+            label_anchor_alpha: None,
         }
     }
 

@@ -16,12 +16,14 @@ def test_stage_plugin_inventory_pin_matches_current_sources():
     assert not set(names).intersection(module.GENERATED_OUTPUTS)
 
 
-def test_label_anchor_candidate_inputs_select_half_blend():
+def test_label_anchor_candidate_inputs_attest_live_policy():
     import json
     root = Path(__file__).resolve().parents[1]
     packaged = json.loads((root / "deploy/native-build-inputs/native-profile-input.json.v3").read_text())
     template = json.loads((root / "deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json").read_text())
     admission = template["native_validator"]["admission_template"]["source_profile"]
     for profile in (packaged, admission):
-        assert profile["label_anchor_alpha"] == 0.5
+        assert "label_anchor_alpha" not in profile
+        assert profile["label_anchor_alpha_allowed"] == [0.0, 0.3, 0.5, 0.7, 1.0]
+        assert profile["label_anchor_alpha_default"] == 0.0
         assert profile["anchor_alpha"] == 0.0

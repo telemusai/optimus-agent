@@ -75,46 +75,101 @@ prerequisites. The historical deployment scripts and an endpoint health
 check are not substitutes for those gates. No automated production swap
 is authorized by this README.
 
-## Known-token label anchor
+## Live known-token label anchor
 
-The optional server profile field `label_anchor_alpha` accepts only `0.0`, `0.3`,
-`0.5`, `0.7`, or `1.0`. Missing means `0.0`: the prefix takes the original path
-without any blend arithmetic. For a candidate deploy, set e.g.
-`"label_anchor_alpha": 0.5` and `"anchor_alpha": 0.0` in the native profile input
-used by `deploy.v3.native_package`, and in the deployment plan's matching static
-profile. Rebuild the package and its attestation; this is not a request option or
-an environment override. Keep the model, calibration artifact and method ID
-unchanged. Test receiver fidelity separately before promoting the candidate.
+The attested profile pins **policy, not a mutable scalar**:
+
+```json
+{"label_anchor_alpha_allowed": [0.0, 0.3, 0.5, 0.7, 1.0],
+ "label_anchor_alpha_default": 0.0, "anchor_alpha": 0.0}
+```
+
+Both calibrated candidate files carry this policy:
+`deploy/native-build-inputs/native-profile-input.json.v3` and
+`deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json`. Allowed values
+must be a nonempty, duplicate-free subset of the five coefficients above; the
+default must belong to it. Old profiles without these fields keep the fixed
+`label_anchor_alpha` setting (missing means zero). A conflicting legacy scalar
+and new policy is rejected. If nearest-vocabulary `anchor_alpha` is nonzero,
+a request selecting nonzero label alpha is rejected even if listed in the policy.
+
+### Sweep a running server and client
+
+The sender reads its selection **fresh for every source capture**, in this order:
+
+1. `OCC3_LABEL_ANCHOR_ALPHA` when set; an invalid or empty value is a local error.
+2. Otherwise the file selected by `OCC3_LABEL_ANCHOR_ALPHA_FILE`, or by default
+   `<optimus config dir>/occ3_label_anchor_alpha` (the client's existing
+   `config::get_agent_dir()` resolver, including its agent-directory override).
+   The file contains one allowed
+   decimal, under 32 bytes including surrounding whitespace; the value is trimmed.
+3. A missing file omits the request field, so the server chooses its attested default.
+
+A malformed, oversized or unreadable file fails locally before enrollment or
+inference; it never silently falls back. Environment wins over file. Unset the
+scalar environment override before starting a file-driven sweep. Environment
+variables belong to the generating process: changing an export in another shell
+does not change an already-running daemon. Editing its selected file **does**
+affect the next capture, with no restart of either server or client:
+
+```sh
+# Use the file selected by the running client's configuration.
+printf '0.3\n' > "$ALPHA_FILE"
+# Run one synthetic OCC-3 handoff drill against the same running server.
+printf '0.5\n' > "$ALPHA_FILE"
+# Run the next drill; no rebuild/restart is required between values.
+```
+
+For concurrent editors use a temporary sibling file and an atomic rename so a
+capture does not read a partial write. The existing rotating debug log (`config::get_debug_log_path()`) records
+`occ3 capture label_anchor_alpha=<number|profile-default> source=<env|file|default>`,
+never file contents or paths. Set server `OCC3_DIAG_TOKEN_TRACE=1` for an authorized synthetic drill;
+the existing `alignment` event reports the **used** coefficient plus each final
+prefix row's cosine to `E_in[accepted_token]`. See stage semantics below to compare
+pre-label `aligned`, post-label `label_anchored`, and `final` evidence. Restore
+`0.0` to disable the blend. A selected value outside the attested set is rejected
+with a fixed server error; expanding that set is an attestation change, not a live knob.
+
+### Binding, computation and compatibility
+
+The optional numeric `occ3_capture.label_anchor_alpha` travels through the real
+Rust `SourceCaptureIntent`, Python `CaptureIntent`, and resolved
+`CaptureWorkerDescriptor`. Omitted differs from explicit zero: explicit zero can
+override a nonzero default. The resolved value is validated on all ranks and
+included in existing request/control and alignment-prepare consensus digests;
+no collective is added. Each capture owns an immutable coefficient and stored
+prefix. Later file edits cannot change an existing handoff or its consume.
 
 On rank zero, after the solver and before the existing TP broadcast, rows become
 `(1-a) * aligned + a * E_in[accepted_token]`, in float32 then cast to prefix dtype.
-The accepted labels were checked against the retained capture ring. The existing
-nearest-vocabulary `anchor_alpha` runs afterward, unchanged. Both anchors cannot
-be nonzero in one profile. At `1.0`, finite rows equal the known token embedding;
-intermediate values retain an aligned residual but do not guarantee exact text
-recovery or contextual benefit. No new vocabulary-sized tensor, collective or
-hot-path synchronization is introduced; existing embeddings and bounded row
-scratch fit within the solver workspace allowance.
+The labels were checked against the retained capture ring. The existing nearest
+vocabulary anchor runs afterward, unchanged. At zero the blend performs no
+arithmetic; at one finite rows equal the known-token embedding. Intermediate
+values retain a residual but do not guarantee exact decoding or contextual value.
+Existing embeddings and bounded row scratch fit the solver workspace; no new
+vocabulary-sized tensor or non-diagnostic hot-path synchronization is added.
 
-Changing profile file bytes changes generated `PROFILE_SHA256`. The plugin files
-also change, so regenerate `native_sources.json` and its baked `SOURCE_SHA256`
-with the normal package builder. No SGLang overlay or calibration artifact changes.
+The actual nonzero coefficient enters the capture commit and source receipt;
+zero remains omitted from public receipts and omitted requests retain their old
+wire bytes. Updated Rust clients default old receipts to zero and check explicitly
+requested values against receipts. Install the updated client before selecting
+nonzero alpha: older strict clients reject that receipt field. This optional
+source-capture metadata does not change the daemon protocol. Legacy zero-profile
+binding digests remain unchanged; allowed/default policy is bound when present.
 
-The checked-in calibrated candidate files now select **0.5**:
-`deploy/native-build-inputs/native-profile-input.json.v3` and
-`deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json`. The default in
-code and the historical `native-profile-input.json` remain zero. The Dockerfile
-reads the basename without `.v3`, so select the candidate explicitly in a fresh,
-clean staging build context, not by editing the historical checkout input.
+### One-time installation cost; no cost to change a permitted value
 
-**Operator cost:** the supported Docker lane requires rebuilding the derived OCI
-image's native package layer, then replacing/restarting the candidate container.
-It does not require rebuilding the SGLang base, downloading weights, or fitting a
-new calibration artifact; unchanged base layers can be reused. A profile edit
-and container restart alone is insufficient, and in-place package hot-patching
-is not a supported deploy path. With `CONTEXT` set to a prepared clean extension
-build context and `BASE_IMAGE_TAG` to the verified preserved original base image
-(not an already-overlay-patched candidate), the build command is:
+Installing this plugin/client version and its allowed/default policy requires the
+normal attested build once. The supported Docker lane rebuilds the derived OCI
+image's native-package layer and replaces/restarts the candidate container; it
+reuses the preserved original SGLang base and weights, with no calibration refit.
+Thereafter, **changing the file or a per-process environment selection needs no
+image/package rebuild or server/client restart**. Changing the allowed/default
+policy itself still needs that attested rebuild. In-place package hot-patching
+is not a supported deployment path.
+
+In a prepared clean extension context, select the calibrated policy explicitly
+(the Dockerfile reads the basename without `.v3`):
 
 ```sh
 cp "$CONTEXT/deploy/native-build-inputs/native-profile-input.json.v3" \
@@ -125,32 +180,15 @@ docker build --pull=false --network=none \
   -f "$CONTEXT/deploy/Dockerfile" -t "$CANDIDATE_TAG" "$CONTEXT"
 ```
 
-The context must include the reviewed `source-baseline-expanded.json`, patch
-manifests, and actual calibration path/digest. The Dockerfile invokes
-`python3 -m deploy.v3.native_image_build`, which invokes `native_package` and
-writes `occ3_sglang/native_profile.json`, `native_sources.json`, and
+`BASE_IMAGE_TAG` must identify the verified preserved original base, not an
+already-patched candidate. Include the reviewed source baseline/manifests and
+actual calibration path/digest. `deploy.v3.native_image_build` calls
+`native_package` to generate `native_profile.json`, `native_sources.json`, and
 `_native_profile_digest.py` (`PROFILE_SHA256` and `SOURCE_SHA256`). These outputs
-are generated at package build, not checked into Git. Update the candidate plan
-from `deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json` with the
-resulting image ID, static-input SHA and runtime/admission evidence, then use the
-reviewed V3 candidate replacement/restart flow. Historical `stage_build.py`'s
-fixed zero-profile SHA is not a candidate-profile selector and remains unchanged.
-
-Historical pinned profile files that omit the field still load unchanged. Zero
-is omitted from the runtime binding-digest input to preserve old zero-setting
-bindings; nonzero values enter that digest. Old receipts omit the field and mean
-zero. Worker method metadata always reports `label_anchor_alpha`; public source
-receipts omit zero to preserve their legacy bytes and explicitly report nonzero.
-The existing method ID still identifies the solver. **Install the updated client
-before enabling nonzero alpha on the server**: older strict clients reject the new
-receipt field. Updated clients accept old receipts as zero. This additive source
-receipt metadata does not change the daemon protocol. A new runtime incarnation
-still requires new live handles, as before.
-
-`OCC3_ALIGN_PROBE` records the active value. The existing opt-in token-trace
-`alignment` event records it alongside per-row final-prefix cosine to
-`E_in[accepted_token]`; it runs after both anchor stages. Trace collection remains
-bounded and exception-isolated and can perturb timing when enabled.
+are build artifacts, not tracked Git files. Policy bytes change `PROFILE_SHA256`;
+updated plugin source changes its attestation/SOURCE digest. Per-handoff selection
+changes neither attestation. Update the candidate plan's image/static-input/runtime
+pins for the one-time install. Historical fixed zero-profile SHA pins stay unchanged.
 
 ## Resource limits
 

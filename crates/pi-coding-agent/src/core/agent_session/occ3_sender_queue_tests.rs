@@ -106,6 +106,7 @@ impl Occ3Connector for QueueFixtureConnector {
                 expires_at_epoch: occ3_state_now() + 600,
                 span_policy: SOURCE_SPAN_POLICY.into(),
                 capture_mode: String::new(),
+                label_anchor_alpha: None,
             },
             SourceCaptureProfile {
                 layer_index: 3,

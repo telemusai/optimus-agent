@@ -287,6 +287,8 @@ class RuntimeProfile:
     calibration_digest: str = ""
     # Optional label-space anchoring; mutually exclusive with nearest-vocab anchoring.
     label_anchor_alpha: float = 0.0
+    label_anchor_alpha_allowed: tuple[float, ...] | list[float] | None = None
+    label_anchor_alpha_default: float | None = None
 
     def __post_init__(self):
         for key in ("runtime_epoch", "model_fingerprint", "model_id"):
@@ -319,12 +321,41 @@ class RuntimeProfile:
         require(type(self.label_anchor_alpha) in (int, float)
                 and math.isfinite(self.label_anchor_alpha)
                 and self.label_anchor_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "profile")
-        require(not (self.anchor_alpha and self.label_anchor_alpha), "profile")
+        allowed = self.label_anchor_alpha_allowed
+        default = self.label_anchor_alpha_default
+        require((allowed is None) == (default is None), "profile")
+        if allowed is not None:
+            require(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5, "profile")
+            require(all(type(x) in (int, float) and math.isfinite(x)
+                        and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed), "profile")
+            require(len(set(allowed)) == len(allowed), "profile")
+            require(type(default) in (int, float) and math.isfinite(default)
+                    and default in allowed, "profile")
+            require(not self.label_anchor_alpha or
+                    (len(allowed) == 1 and default == self.label_anchor_alpha), "profile")
+            # Freeze caller-owned lists so attested policy cannot change after binding.
+            object.__setattr__(self, "label_anchor_alpha_allowed", tuple(allowed))
+        self.resolve_label_anchor()
         require(0 < self.max_ttl_seconds <= 3600, "profile")
+
+    def resolve_label_anchor(self, requested=None):
+        """Resolve one request against attested policy; never combine two anchors."""
+        allowed = self.label_anchor_alpha_allowed
+        default = self.label_anchor_alpha_default
+        if allowed is None:
+            allowed, default = (self.label_anchor_alpha,), self.label_anchor_alpha
+        selected = default if requested is None else requested
+        require(type(selected) in (int, float) and math.isfinite(selected)
+                and selected in allowed, "profile")
+        require(not (self.anchor_alpha and selected), "profile")
+        return float(selected)
 
     @property
     def binding_digest(self):
         values = asdict(self)
+        if self.label_anchor_alpha_allowed is None:
+            values.pop("label_anchor_alpha_allowed")
+            values.pop("label_anchor_alpha_default")
         # Zero is the legacy path: retain bindings minted before this field existed.
         if self.label_anchor_alpha == 0:
             values.pop("label_anchor_alpha")

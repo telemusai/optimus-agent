@@ -24,7 +24,8 @@
    },
    "source_profile": {
     "anchor_alpha": 0.0,
-    "label_anchor_alpha": 0.5,
+    "label_anchor_alpha_allowed": [0.0, 0.3, 0.5, 0.7, 1.0],
+    "label_anchor_alpha_default": 0.0,
     "calibration_digest": "0000000000000000000000000000000000000000000000000000000000000000",
     "calibration_path": "/occ3/calibration/to-be-filled-at-window-artifact",
     "dtype": "bfloat16",

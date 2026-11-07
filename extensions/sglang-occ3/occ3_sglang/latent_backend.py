@@ -278,6 +278,7 @@ class LatentBackend:
                 and intent.model_fingerprint == self.profile.model_fingerprint, "identity")
         require(intent.retained_count_limit in (8, 16, 32, 64, 128), "profile")
         require(native_rid != intent.source_request_id, "identity")
+        alpha = self.profile.resolve_label_anchor(intent.label_anchor_alpha)
         self._slot(attempt_id)
         health = await self.refresh_readiness()
         marker_profile = ""
@@ -307,7 +308,7 @@ class LatentBackend:
             source_turn_nonce=intent.turn_nonce, runtime_generation=intent.runtime_generation,
             span_policy=intent.span_policy, max_prefix_tokens=intent.retained_count_limit,
             max_capture_bytes=intent.max_capture_bytes, marker_profile=marker_profile,
-            capture_mode=intent.capture_mode)
+            capture_mode=intent.capture_mode, label_anchor_alpha=alpha)
         enrollment = SourceEnrollment(attempt_id, intent.binding_digest, native_rid,
             identity.principal_digest, uuid.uuid4().hex, int(uuid.uuid4().hex[:16], 16),
             intent.expires_at_epoch, intent.source_session_id, intent.runtime_id, intent.runtime_generation,
@@ -370,7 +371,7 @@ class LatentBackend:
         artifact_digest = source.get("artifact_digest")
         require(artifact_digest is None
                 or (type(artifact_digest) is str and 1 <= len(artifact_digest) <= 64), "identity")
-        require(source.get("label_anchor_alpha", 0.0) == self.profile.label_anchor_alpha, "identity")
+        require(source.get("label_anchor_alpha", 0.0) == state["descriptor"].label_anchor_alpha, "identity")
         require(all(name in source for name in _SOURCE_COMMIT_FIELDS), "identity")
         block = {name: source.get(name) for name in SPAN_BLOCK_FIELDS}
         commit = SourceCaptureCommit(**{name: source[name] for name in _SOURCE_COMMIT_FIELDS},

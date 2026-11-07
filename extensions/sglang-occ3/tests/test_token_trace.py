@@ -428,7 +428,8 @@ def test_alignment_cosines_bounded_and_rounded(caplog):
     torch = pytest.importorskip("torch")
     prefix = torch.tensor([[1., 0.], [1., 0.], [0., 0.], [1., 1.]])
     embeddings = torch.tensor([[1., 0.], [-1., 0.], [1., 0.], [1., 0.]])
-    trace.alignment(NS(rank=0, profile=NS(label_anchor_alpha=0.5)), prefix, embeddings)
+    trace.alignment(NS(rank=0, profile=NS(label_anchor_alpha=0.0)), prefix, embeddings,
+                    label_anchor_alpha=0.5)
     row = rows(caplog)[-1]
     assert row["event"] == "alignment"
     assert row["label_anchor_alpha"] == 0.5

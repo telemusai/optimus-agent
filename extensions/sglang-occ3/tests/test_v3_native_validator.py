@@ -1441,3 +1441,25 @@ def test_label_anchor_derivation_zero_keeps_historical_digest():
         actual = nv._derived_profile_digest(profile, observed)
         assert actual != TS8_WIRE_DIGEST
         assert actual == RuntimeProfile(**profile, **observed).binding_digest
+
+
+def test_live_label_policy_admission_and_digest(tmp_path):
+    value = native_plan()
+    p = value["native_validator"]["admission_template"]["source_profile"]
+    p.update(label_anchor_alpha_allowed=[0, 0.3, 0.5, 0.7, 1], label_anchor_alpha_default=0)
+    assert make_validator(make_journal(tmp_path, value)).pre_mutation_admission()["ok"]
+    observed = {"runtime_epoch": TS8_RUNTIME_EPOCH, "runtime_generation": TS8_RUNTIME_GENERATION}
+    assert nv._derived_profile_digest(p, observed) == RuntimeProfile(**{k: v for k, v in p.items()
+                                  if k in RuntimeProfile.__dataclass_fields__},
+                          **observed).binding_digest
+    assert nv._derived_profile_digest(p, observed) != TS8_WIRE_DIGEST
+
+
+@pytest.mark.parametrize("allowed,default", [([], 0), ([0, 0], 0), ([True], 1),
+                                              ([0.2], 0.2), ([0], False), ([0], 0.5)])
+def test_live_label_policy_admission_invalid(tmp_path, allowed, default):
+    value = native_plan()
+    value["native_validator"]["admission_template"]["source_profile"].update(
+        label_anchor_alpha_allowed=allowed, label_anchor_alpha_default=default)
+    result = make_validator(make_journal(tmp_path, value)).pre_mutation_admission()
+    assert result["code"] == "source_label_anchor_alpha_invalid"

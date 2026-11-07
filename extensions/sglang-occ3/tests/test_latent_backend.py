@@ -76,19 +76,23 @@ async def test_source_exact_enrollment_prepare_bind_and_commit():
 
 @pytest.mark.asyncio
 @pytest.mark.parametrize("alpha", [0.0, 0.3, 0.5, 0.7, 1.0])
-async def test_source_commit_carries_method_metadata_without_type_error(alpha):
+@pytest.mark.parametrize("explicit", [False, True])
+async def test_source_commit_carries_method_metadata_without_type_error(alpha, explicit):
     # Red test: the worker's method_metadata() has added method_id (and
     # artifact_digest for a calibrated method) to record.source_metadata since
     # wave 445d1cdd4, so production source captures reach finish_source with
     # more keys than SourceCaptureCommit(**record["source"]) accepts. The
     # backend must project the commit, not splat the worker metadata.
     backend,client,identity,expiry=fixture()
-    backend.profile = replace(backend.profile, label_anchor_alpha=alpha)
+    backend.profile = (replace(backend.profile,
+        label_anchor_alpha_allowed=(0., .3, .5, .7, 1.), label_anchor_alpha_default=.7)
+        if explicit else replace(backend.profile, label_anchor_alpha=alpha))
     client.p = backend.profile
     p = backend.profile
     intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
         model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
-        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry,
+        label_anchor_alpha=alpha if explicit else None)
     enrollment=await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
     native=NS(rid="native-rid",sampling_params={"max_new_tokens":200},input_ids=[1,2],stream=True)
     view=NativeRequestView(native,200,"s",True,identity.deadline_monotonic)

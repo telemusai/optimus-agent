@@ -266,7 +266,7 @@ def test_the_worker_resolves_one_aligner_and_calls_it_once():
     assert source.count("self.aligner = aligner_for(profile, self.calibration)") == 1
     assert source.count("aligned, _ = self.aligner(h, embeddings, self.target_norm)") == 1
     assert "align_hidden_sequence(" not in source
-    assert "method_metadata(self.profile, self.calibration_digest)" in source
+    assert "method_metadata(self.profile, self.calibration_digest, label_anchor_alpha=alpha)" in source
     assert '"artifact_digest"' in source
     # The renorm step is serving-config driven: N0 skips the norm measurement.
     assert "_serving_renorm(self.aligner)" in source

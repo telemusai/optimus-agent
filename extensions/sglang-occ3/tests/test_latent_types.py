@@ -176,12 +176,17 @@ def test_label_anchor_allowed_and_bound(alpha):
     original = profile()
     legacy = asdict(original)
     legacy.pop("label_anchor_alpha")
+    legacy.pop("label_anchor_alpha_allowed")
+    legacy.pop("label_anchor_alpha_default")
     assert original.label_anchor_alpha == 0.0
     assert original.binding_digest == digest(legacy)
     changed = profile(label_anchor_alpha=alpha)
     assert (changed.binding_digest == original.binding_digest) == (alpha == 0)
     if alpha:
-        assert changed.binding_digest == digest(asdict(changed))
+        bound = asdict(changed)
+        bound.pop("label_anchor_alpha_allowed")
+        bound.pop("label_anchor_alpha_default")
+        assert changed.binding_digest == digest(bound)
 
 
 @pytest.mark.parametrize("alpha", [True, False, None, "0.3", -0.3, 0.1,
@@ -196,3 +201,41 @@ def test_anchor_modes_mutually_exclusive(alpha):
     with pytest.raises(LatentError):
         profile(anchor_alpha=0.3, label_anchor_alpha=alpha)
     assert profile(anchor_alpha=0.3, label_anchor_alpha=0).anchor_alpha == 0.3
+
+
+def test_live_label_policy_resolution_binding_and_freeze():
+    allowed = [0, 0.3, 0.5, 0.7, 1]
+    p = profile(label_anchor_alpha_allowed=allowed, label_anchor_alpha_default=0)
+    allowed.clear()
+    assert p.resolve_label_anchor() == 0
+    for alpha in (0, 0.3, 0.5, 0.7, 1):
+        assert p.resolve_label_anchor(alpha) == alpha
+    assert p.binding_digest != profile().binding_digest
+    q = profile(anchor_alpha=0.3, label_anchor_alpha_allowed=[0, 0.5],
+                label_anchor_alpha_default=0)
+    assert q.resolve_label_anchor() == 0
+    with pytest.raises(LatentError):
+        q.resolve_label_anchor(0.5)
+    with pytest.raises(LatentError):
+        profile(label_anchor_alpha=0.5).resolve_label_anchor(0)
+    for alpha in (True, "0.5", 0.2, float("nan")):
+        with pytest.raises(LatentError):
+            p.resolve_label_anchor(alpha)
+
+
+@pytest.mark.parametrize("changes", [
+    {"label_anchor_alpha_allowed": [0]},
+    {"label_anchor_alpha_default": 0},
+    {"label_anchor_alpha_allowed": [], "label_anchor_alpha_default": 0},
+    {"label_anchor_alpha_allowed": [0, 0.0], "label_anchor_alpha_default": 0},
+    {"label_anchor_alpha_allowed": [True], "label_anchor_alpha_default": 1},
+    {"label_anchor_alpha_allowed": [float("nan")], "label_anchor_alpha_default": 0},
+    {"label_anchor_alpha_allowed": [0.2], "label_anchor_alpha_default": 0.2},
+    {"label_anchor_alpha_allowed": [0], "label_anchor_alpha_default": True},
+    {"label_anchor_alpha_allowed": [0], "label_anchor_alpha_default": 0.5},
+    {"label_anchor_alpha_allowed": [0, 0.5], "label_anchor_alpha_default": 0,
+     "label_anchor_alpha": 0.5},
+])
+def test_live_label_policy_invalid(changes):
+    with pytest.raises(LatentError):
+        profile(**changes)

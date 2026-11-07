@@ -113,6 +113,7 @@ class LatentRegistry:
     def reserve_capture(self, descriptor, handle, generation, expiry, budget, reserved_bytes):
         with self.lock:
             require(type(descriptor) is CaptureWorkerDescriptor)
+            self.profile.resolve_label_anchor(descriptor.label_anchor_alpha)
             self._profile(descriptor.runtime_epoch, descriptor.runtime_generation, descriptor.model_fingerprint)
             require(descriptor.method_id == self.profile.method and descriptor.deadline > self.monotonic(), "expired")
             owner = self.session(descriptor.principal_digest, descriptor.source_session_id)

@@ -30,7 +30,7 @@ from .statebridge import (anchor_tiled, anchor_to_labels, mean_embedding_norm, s
 logger = logging.getLogger(__name__)
 
 
-def method_metadata(profile, calibration_digest=""):
+def method_metadata(profile, calibration_digest="", *, label_anchor_alpha=None):
     """Scalar method identity for the capture record: no tensor bytes, no content.
 
     Every capture reports the method id it was aligned under. A calibrated
@@ -39,8 +39,8 @@ def method_metadata(profile, calibration_digest=""):
     no artifact and therefore no digest key. Label anchoring is a profile
     post-transform, so its coefficient is reported alongside the solver identity.
     """
-    metadata = {"method_id": profile.method,
-                "label_anchor_alpha": float(profile.label_anchor_alpha)}
+    alpha = profile.resolve_label_anchor(label_anchor_alpha)
+    metadata = {"method_id": profile.method, "label_anchor_alpha": alpha}
     if calibration_digest:
         metadata["artifact_digest"] = calibration_digest
     return metadata
@@ -824,8 +824,13 @@ class WorkerRuntime:
         prepared = {}
         self.preflight("align_begin", lambda: _begin_gpu(self, record))
         def local_prepare():
+            # Include the immutable per-capture coefficient in the existing
+            # prepare handshake. Disagreement declines before solver/broadcast.
+            alpha = self.profile.resolve_label_anchor(record.descriptor.label_anchor_alpha)
+            prepared["label_anchor_alpha"] = alpha
             if record.descriptor.span_policy in SPAN_POLICIES_V2:
-                return _prepare_v2_window(self, record, req, prepared)
+                binding = _prepare_v2_window(self, record, req, prepared)
+                return {**binding, "label_anchor_alpha": alpha}
             n = min(record.accepted_count, record.descriptor.max_prefix_tokens)
             require(n >= 2 and record.retained, "lineage")
             require(workspace_bound(n, self.profile.hidden_dim, self.profile.expected_ranks,
@@ -839,8 +844,10 @@ class WorkerRuntime:
                 order = (torch.arange(n, device=self.device) + cursor) % ring_h.shape[0]
             selected = ring_h.index_select(0, order)
             prepared.update(n=n, h=selected, tokens=ring_t.index_select(0, order), prefix=torch.empty_like(selected))
-            return {"n": n, "count": record.accepted_count, "dtype": self.dtype}
+            return {"n": n, "count": record.accepted_count, "dtype": self.dtype,
+                    "label_anchor_alpha": alpha}
         self.preflight("align_prepare", local_prepare)
+        alpha = prepared["label_anchor_alpha"]
         n, h, tokens = prepared["n"], prepared["h"], prepared["tokens"]
         embeddings = self.embedding(tokens)
         # N0 (the binding's serving config is None) must not renormalise, so
@@ -860,13 +867,12 @@ class WorkerRuntime:
                 prefix.copy_(aligned)
                 from . import token_trace
                 token_trace.alignment_cast(self, h, aligned, prefix)
-                if self.profile.label_anchor_alpha != 0:
-                    token_trace.alignment_stage(self, aligned, embeddings, tokens, "aligned")
+                if alpha != 0:
+                    token_trace.alignment_stage(self, aligned, embeddings, tokens, "aligned",
+                                                label_anchor_alpha=alpha)
                     token_trace.alignment_nearest(self, aligned, tokens, "aligned")
-                if self.profile.label_anchor_alpha != 0:
                     # Blend solver-precision rows, not the already-cast scratch.
-                    prefix.copy_(anchor_to_labels(aligned, embeddings,
-                                                   alpha=self.profile.label_anchor_alpha))
+                    prefix.copy_(anchor_to_labels(aligned, embeddings, alpha=alpha))
             except Exception:
                 solver_error = "numerical"
         errors = self.gather(solver_error)
@@ -874,17 +880,17 @@ class WorkerRuntime:
         torch.distributed.broadcast(prefix, src=self.group.ranks[0], group=self.group.device_group)
         from . import token_trace
         token_trace.alignment_logit_lens(self, h, tokens)
-        token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
-        aligned_stage = "label_anchored" if self.profile.label_anchor_alpha != 0 else "aligned"
-        token_trace.alignment_stage(self, prefix, embeddings, tokens, aligned_stage)
+        token_trace.alignment_stage(self, h, embeddings, tokens, "raw", label_anchor_alpha=alpha)
+        aligned_stage = "label_anchored" if alpha != 0 else "aligned"
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, aligned_stage, label_anchor_alpha=alpha)
         token_trace.alignment_nearest(self, prefix, tokens, aligned_stage)
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
-            _probe_alignment(h, embeddings, prefix, self.profile)
+            _probe_alignment(h, embeddings, prefix, self.profile, label_anchor_alpha=alpha)
         from . import token_trace
-        token_trace.alignment(self, prefix, embeddings)
-        token_trace.alignment_stage(self, prefix, embeddings, tokens, "final")
+        token_trace.alignment(self, prefix, embeddings, label_anchor_alpha=alpha)
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "final", label_anchor_alpha=alpha)
         token_trace.alignment_nearest(self, prefix, tokens)
         token_trace.alignment_precision(self, prefix, embeddings)
         event = self.event()
@@ -906,6 +912,8 @@ class WorkerRuntime:
             start = end - n
             sequence_digest = digest(list(req.output_ids[start:end]))
             commit = digest([record.descriptor.reservation_id, start, end, sequence_digest, self.layout_digest])
+        if alpha != 0:
+            commit = digest([commit, {"label_anchor_alpha": alpha}])
         metadata = {"capture_commit_id": commit, "accepted_span_start": start,
                     "accepted_span_end": end, "retained_count": n,
                     "predictor_position_offset": -1, "representation": "final_layer_prenorm_predictor",
@@ -914,7 +922,7 @@ class WorkerRuntime:
                     "ready_ranks": self.profile.expected_ranks, "expected_ranks": self.profile.expected_ranks,
                     "accepted_sequence_digest": sequence_digest, "expires_at_epoch": record.expires_at_epoch,
                     "byte_count": prefix.numel() * prefix.element_size()}
-        metadata.update(method_metadata(self.profile, self.calibration_digest))
+        metadata.update(method_metadata(self.profile, self.calibration_digest, label_anchor_alpha=alpha))
         if "span_selection" in prepared:
             # The bounded occ3.span block rides the same source metadata; the
             # backend projects it into the commit and the receipt carries it.
@@ -1878,7 +1886,7 @@ def abort_request(scheduler, req, reason):
         raise
 
 
-def _probe_alignment(hidden, embeddings, prefix, profile):
+def _probe_alignment(hidden, embeddings, prefix, profile, *, label_anchor_alpha=None):
     """Optional scalar probe of one captured turn. Never fails the turn.
 
     Enabled only by OCC3_ALIGN_PROBE=<path>. Writes one JSON object per line with
@@ -1898,7 +1906,7 @@ def _probe_alignment(hidden, embeddings, prefix, profile):
         result = probe_relation(hidden, embeddings, prefix,
                                 generator=torch.Generator(device=hidden.device).manual_seed(0))
         result["anchor_alpha"] = float(profile.anchor_alpha)
-        result["label_anchor_alpha"] = float(profile.label_anchor_alpha)
+        result["label_anchor_alpha"] = profile.resolve_label_anchor(label_anchor_alpha)
         result["max_prefix_tokens"] = int(profile.max_prefix_tokens)
         with open(path, "a", encoding="utf-8") as handle:
             handle.write(json.dumps(result, sort_keys=True) + "\n")
@@ -1916,7 +1924,8 @@ def load_runtime_profile():
     expected = set(RuntimeProfile.__dataclass_fields__) - {"runtime_epoch", "runtime_generation"}
     # A pinned profile may omit the frozen-artifact reference: the per-message
     # method names none, so the runtime profile takes its empty default.
-    optional = {"calibration_path", "calibration_digest", "label_anchor_alpha"}
+    optional = {"calibration_path", "calibration_digest", "label_anchor_alpha",
+                "label_anchor_alpha_allowed", "label_anchor_alpha_default"}
     # The declared-launch identity block (native_profile.DECLARED_IDENTITY) is
     # route-served deployment metadata, never worker state: it is dropped
     # before the RuntimeProfile fieldset is checked or constructed.

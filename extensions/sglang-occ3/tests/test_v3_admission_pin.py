@@ -1899,3 +1899,30 @@ def test_legacy_facade_serialization_byte_equivalence(tmp_path):
     assert ap._publish_exclusive(target, document, conflict_code="c",
                                  limit=4096) == "written"
     assert target.read_bytes() == expected_bytes
+
+
+def test_live_label_policy_plan_and_staged_binding(tmp_path, seam):
+    digest, size, host = staged_fixture(tmp_path)
+    plan = calibrated_plan(digest, size)
+    source = plan["native_validator"]["admission_template"]["source_profile"]
+    source.update(label_anchor_alpha_allowed=[0, 0.3, 0.5, 0.7, 1], label_anchor_alpha_default=0)
+    journal = make_journal(tmp_path, plan)
+    assert ap._plan_contract(journal.directory)[3] == source
+    seam[STAGED_LOGICAL] = host
+    # A valid policy in the plan cannot authorize a different staged profile.
+    with pytest.raises(nv._Reject, match="staged_profile_label_anchor_alpha_allowed_mismatch"):
+        ap._verified_staged_profile(plan["calibrated_profile_evidence"], source)
+
+
+@pytest.mark.parametrize("changes", [
+    {"label_anchor_alpha_allowed": [0]},
+    {"label_anchor_alpha_default": 0},
+    {"label_anchor_alpha_allowed": [0], "label_anchor_alpha_default": None},
+])
+def test_live_label_policy_plan_requires_both_fields(tmp_path, changes):
+    digest, size, _ = staged_fixture(tmp_path)
+    plan = calibrated_plan(digest, size)
+    plan["native_validator"]["admission_template"]["source_profile"].update(changes)
+    journal = make_journal(tmp_path, plan)
+    with pytest.raises(nv._Reject, match="source_label_anchor_alpha_invalid"):
+        ap._plan_contract(journal.directory)

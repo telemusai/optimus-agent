@@ -153,7 +153,8 @@ def test_calibrated_derivation_equals_the_wire_binding_digest():
 
 
 def test_derivation_fieldset_is_the_wire_fieldset_for_every_method():
-    wire_fields = set(RuntimeProfile.__dataclass_fields__)
+    wire_fields = set(RuntimeProfile.__dataclass_fields__) - {
+        "label_anchor_alpha", "label_anchor_alpha_allowed", "label_anchor_alpha_default"}
     incarnation = observed()
     for profile in (per_message_profile(), calibrated_profile()):
         assert nv._method_descriptor(profile["method"])[2] is not None
