@@ -388,124 +388,234 @@ def rounded(value):
     return round(value, 4) if math.isfinite(value) else None
 
 
+def bounded_rows(values, other=None):
+    return (values.ndim == 2 and 0 < values.shape[0] <= 128 and
+            0 < values.shape[1] <= 32768 and
+            (other is None or values.shape == other.shape))
+
+
+def cosine_tensor(left, right):
+    """Stay on device until the caller packs its one diagnostic transfer."""
+    import torch
+    a, b = left.detach().float(), right.detach().float()
+    value = torch.nn.functional.cosine_similarity(a, b, dim=1)
+    valid = (torch.isfinite(a).all(dim=1) & torch.isfinite(b).all(dim=1) &
+             (a.norm(dim=1) > 0) & (b.norm(dim=1) > 0))
+    return value.masked_fill(~valid, float("nan"))
+
+
+def precision_cosine(left, right):
+    """Standalone CPU-test accessor; serving callers pack cosine_tensor instead."""
+    return [rounded(v) for v in cosine_tensor(left, right).cpu().tolist()]
+
+
+def point_copy(*columns):
+    """One bounded D2H transfer per diagnostic point; float64 preserves token IDs."""
+    import torch
+    return torch.cat([c.detach().reshape(c.shape[0], -1).double()
+                      for c in columns], dim=1).cpu().tolist()
+
+
+def valid_labels(labels, size):
+    return all(value.is_integer() and 0 <= value < size for value in labels)
+
+
+def local_ranges(embedding, values):
+    """Validate metadata without reading device scalars or calling a forward."""
+    from .statebridge import shard_ranges
+    ranges = shard_ranges(embedding)
+    weight = embedding.weight
+    if weight.shape[1] != values.shape[1] or weight.device != values.device:
+        raise ValueError("layout")
+    if any(not (0 <= a <= b <= weight.shape[0] and 0 <= g <= g+b-a <= embedding.num_embeddings)
+           for a, b, g in ranges):
+        raise ValueError("layout")
+    return ranges
+
+
 @isolated
 def alignment_stage(runtime, values, embeddings, tokens, stage):
-    """Observe resident rows before/after each transform, without retaining tensors."""
+    """Pack all neighbour cosines/norms on device; one host copy before logging."""
     if runtime.rank != 0 or stage not in ("raw", "aligned", "final"):
         return
     import torch
-    if (values.ndim != 2 or values.shape != embeddings.shape or
-            not 0 < values.shape[0] <= 128 or not 0 < values.shape[1] <= 32768 or
-            tokens.ndim != 1 or tokens.numel() != values.shape[0]):
-        return
-    labels = tokens.tolist()
-    if any(type(t) is not int or not 0 <= t < runtime.embedding.num_embeddings for t in labels):
+    if (not bounded_rows(values, embeddings) or tokens.ndim != 1 or
+            tokens.numel() != values.shape[0]):
         return
     with torch.no_grad():
         v, e = values.detach().float(), embeddings.detach().float()
         vn, en = v.norm(dim=1), e.norm(dim=1)
-        cos = torch.nn.functional.normalize(v, dim=1) @ torch.nn.functional.normalize(e, dim=1).mT
-        for i, token in enumerate(labels):
-            offsets = [rounded(cos[i, j]) if 0 <= j < len(labels) and vn[i] > 0 and en[j] > 0
-                       else None for j in (i-1, i, i+1)]
-            emit("alignment_row", rank=0, stage=stage, row=i, token=token,
-                 dtype=str(values.dtype), cosine_offsets=offsets,
-                 row_norm=rounded(vn[i]), embedding_norm=rounded(en[i]),
-                 anchor_alpha=rounded(runtime.profile.anchor_alpha),
-                 target_norm=None if runtime.target_norm is None else rounded(runtime.target_norm))
+        neighbours = []
+        for offset in (-1, 0, 1):
+            shifted = torch.roll(e, -offset, dims=0)
+            cos = cosine_tensor(v, shifted)
+            if offset == -1:
+                cos[0] = float("nan")
+            elif offset == 1:
+                cos[-1] = float("nan")
+            neighbours.append(cos)
+        target = torch.as_tensor(float("nan") if runtime.target_norm is None else runtime.target_norm,
+                                 device=v.device).expand(v.shape[0])
+        data = point_copy(tokens, *neighbours, vn, en, target)
+    if not valid_labels([row[0] for row in data], runtime.embedding.num_embeddings):
+        return
+    for i, row in enumerate(data):
+        emit("alignment_row", rank=0, stage=stage, row=i, token=int(row[0]),
+             dtype=str(values.dtype), cosine_offsets=[rounded(x) for x in row[1:4]],
+             row_norm=rounded(row[4]), embedding_norm=rounded(row[5]),
+             anchor_alpha=rounded(runtime.profile.anchor_alpha), target_norm=rounded(row[6]),
+             method_id=getattr(runtime.profile, "method", None))
 
 
 @isolated
 def alignment_nearest(runtime, prefix, tokens):
-    """Shard-local top-1 only: no embedding forward, gather, or collective."""
+    """Shard-local top-1; validity remains on device throughout the tiled scan."""
     import torch
-    from .statebridge import shard_ranges
     embedding = runtime.embedding
-    if (prefix.ndim != 2 or not 0 < prefix.shape[0] <= 128 or
-            not 0 < prefix.shape[1] <= 32768 or tokens.ndim != 1 or
-            tokens.numel() != prefix.shape[0]):
+    if (not bounded_rows(prefix) or tokens.ndim != 1 or tokens.numel() != prefix.shape[0]):
         return
-    labels = tokens.tolist()
-    if any(type(t) is not int or not 0 <= t < embedding.num_embeddings for t in labels):
-        return
-    ranges = shard_ranges(embedding)
-    weight = embedding.weight
-    if weight.shape[1] != prefix.shape[1] or weight.device != prefix.device:
-        return
-    if any(not (0 <= a <= b <= weight.shape[0] and 0 <= g <= g+b-a <= embedding.num_embeddings)
-           for a, b, g in ranges):
-        return
+    ranges = local_ranges(embedding, prefix)
     with torch.no_grad():
         query = torch.nn.functional.normalize(prefix.detach().float(), dim=1)
-        scores = torch.full((len(labels),), -float("inf"), device=prefix.device)
-        ids = torch.full((len(labels),), 2**62, dtype=torch.int64, device=prefix.device)
+        scores = torch.full((prefix.shape[0],), -float("inf"), device=prefix.device)
+        ids = torch.full((prefix.shape[0],), 2**62, dtype=torch.int64, device=prefix.device)
+        valid = torch.isfinite(query).all(dim=1) & (prefix.norm(dim=1) > 0)
         for start, end, global_start in ranges:
             for offset in range(start, end, 256):
-                tile = weight[offset:min(offset+256, end)].detach().float()
-                if not bool(torch.isfinite(tile).all()):
-                    return
+                tile = embedding.weight[offset:min(offset+256, end)].detach().float()
+                valid = valid & torch.isfinite(tile).all()
                 tile = torch.nn.functional.normalize(tile, dim=1)
                 score, index = (query @ tile.mT).max(dim=1)
                 token = index + offset - start + global_start
                 better = (score > scores) | ((score == scores) & (token < ids))
                 scores = torch.where(better, score, scores)
                 ids = torch.where(better, token, ids)
-        for i, (token, score) in enumerate(zip(ids.tolist(), scores.tolist())):
-            emit("alignment_nearest_shard", rank=runtime.rank, row=i, token=labels[i],
-                 top1_id=token, top1_cosine=rounded(score), top1_hit=token == labels[i],
-                 scope="local_shard", ranges=ranges)
-
-
-def precision_cosine(left, right):
-    """Per-row cosine, with null for zero or nonfinite rows; inputs stay untouched."""
-    import torch
-    a, b = left.detach().float(), right.detach().float()
-    values = torch.nn.functional.cosine_similarity(a, b, dim=1)
-    valid = (torch.isfinite(a).all(dim=1) & torch.isfinite(b).all(dim=1) &
-             (a.norm(dim=1) > 0) & (b.norm(dim=1) > 0))
-    return [rounded(v) if ok else None for v, ok in zip(values.tolist(), valid.tolist())]
+        data = point_copy(tokens, ids, scores, valid)
+    if not valid_labels([r[0] for r in data], embedding.num_embeddings):
+        return
+    for i, (label, token, score, ok) in enumerate(data):
+        emit("alignment_nearest_shard", rank=runtime.rank, row=i, token=int(label),
+             top1_id=int(token) if ok else None, top1_cosine=rounded(score) if ok else None,
+             top1_hit=(token == label) if ok else None, scope="local_shard", ranges=ranges)
 
 
 @isolated
 def alignment_cast(runtime, hidden, solved, copied):
-    """Measure the actual solver-to-serving-buffer cast, before anchoring."""
+    """Measure actual solver-to-buffer cast with one packed host transfer."""
     if runtime.rank != 0:
         return
     import torch
-    if (solved.ndim != 2 or solved.shape != copied.shape or solved.shape != hidden.shape or
-            not 0 < solved.shape[0] <= 128 or not 0 < solved.shape[1] <= 32768):
+    if not bounded_rows(solved, copied) or solved.shape != hidden.shape:
         return
     with torch.no_grad():
-        cosine = precision_cosine(solved, copied)
-        difference = (solved.detach().float() - copied.detach().float()).abs().amax(dim=1).tolist()
-        for i, (cos, delta) in enumerate(zip(cosine, difference)):
-            emit("alignment_cast", rank=0, row=i, hidden_dtype=str(hidden.dtype),
-                 solver_dtype=str(solved.dtype), buffer_dtype=str(copied.dtype),
-                 cosine=cos, max_abs_diff=rounded(delta))
+        difference = (solved.detach().float() - copied.detach().float()).abs().amax(dim=1)
+        data = point_copy(cosine_tensor(solved, copied), difference)
+    for i, (cos, delta) in enumerate(data):
+        emit("alignment_cast", rank=0, row=i, hidden_dtype=str(hidden.dtype),
+             solver_dtype=str(solved.dtype), buffer_dtype=str(copied.dtype),
+             cosine=rounded(cos), max_abs_diff=rounded(delta),
+             method_id=getattr(runtime.profile, "method", None),
+             anchor_alpha=rounded(runtime.profile.anchor_alpha))
 
 
 @isolated
 def alignment_precision(runtime, prefix, embeddings):
-    """Unscaled FP8 round-trip proxy only, not a simulation of the KV encoder."""
+    """Unscaled FP8 proxy only; both cosine arrays share one host transfer."""
     if runtime.rank != 0:
         return
     import torch
-    if (prefix.ndim != 2 or prefix.shape != embeddings.shape or
-            not 0 < prefix.shape[0] <= 128 or not 0 < prefix.shape[1] <= 32768):
+    if not bounded_rows(prefix, embeddings):
         return
     dtype = getattr(torch, "float8_e4m3fn", None)
     reason = None
-    served, baseline = [None] * prefix.shape[0], [None] * prefix.shape[0]
+    data = [[None, None] for _ in range(prefix.shape[0])]
     if dtype is None:
         reason = "float8_unavailable"
     else:
         try:
             with torch.no_grad():
-                served = precision_cosine(prefix, prefix.detach().to(dtype).float())
-                baseline = precision_cosine(embeddings, embeddings.detach().to(dtype).float())
+                data = point_copy(cosine_tensor(prefix, prefix.detach().to(dtype).float()),
+                                  cosine_tensor(embeddings, embeddings.detach().to(dtype).float()))
         except Exception:
             reason = "float8_conversion_unsupported"
-    for i, (cos, ref) in enumerate(zip(served, baseline)):
+    for i, (cos, ref) in enumerate(data):
         emit("alignment_precision", rank=0, row=i, anchored_dtype=str(prefix.dtype),
-             embedding_dtype=str(embeddings.dtype), fp8_cosine=cos, embedding_fp8_cosine=ref,
+             embedding_dtype=str(embeddings.dtype), fp8_cosine=rounded(cos) if cos is not None else None,
+             embedding_fp8_cosine=rounded(ref) if ref is not None else None,
              fp8_skipped=reason, fp32_end_to_end_skipped="requires_solver_and_global_anchor_replay")
+
+
+@isolated
+def alignment_logit_lens(runtime, hidden, tokens):
+    """GLM DSA final RMSNorm + unquantized shard head; no model forwards."""
+    import math
+    import torch
+    if not bounded_rows(hidden) or tokens.ndim != 1 or tokens.numel() != hidden.shape[0]:
+        return
+    model = runtime.runner.model
+    norm, head = model.model.norm, model.lm_head
+    # Verified against cand's GlmMoeDsaForCausalLM -> DeepseekV2ForCausalLM,
+    # RMSNorm.forward_native and ParallelLMHead. Fail closed for other layouts.
+    if (type(norm).__name__ != "RMSNorm" or
+            type(head.quant_method).__name__ != "UnquantizedEmbeddingMethod" or
+            head.weight.dtype not in (torch.float32, torch.float16, torch.bfloat16) or
+            norm.weight.shape != (hidden.shape[1],) or
+            norm.variance_size_override is not None or norm.override_orig_dtype is not None or
+            not math.isfinite(norm.variance_epsilon) or norm.variance_epsilon <= 0):
+        emit("alignment_logit_lens_skipped", rank=runtime.rank, reason="unsupported_norm_or_head")
+        return
+    ranges = local_ranges(head, hidden)
+    processor = model.logits_processor
+    if processor.logit_scale is not None or processor.final_logit_softcapping:
+        emit("alignment_logit_lens_skipped", rank=runtime.rank, reason="unsupported_logit_transform")
+        return
+    with torch.no_grad():
+        h = hidden.detach().float()
+        normalized = h * torch.rsqrt(h.square().mean(dim=1, keepdim=True) + norm.variance_epsilon)
+        if norm.cast_x_before_out_mul:
+            normalized = norm.weight.detach() * normalized.to(hidden.dtype)
+        else:
+            normalized = (normalized * norm.weight.detach()).to(hidden.dtype)
+        query = normalized.float()
+        n, k = hidden.shape[0], 8
+        best = torch.full((n, k), -float("inf"), device=h.device)
+        best_ids = torch.full((n, k), -1, dtype=torch.int64, device=h.device)
+        lse = torch.full((n,), -float("inf"), device=h.device)
+        valid = torch.isfinite(query).all(dim=1)
+        targets = torch.stack([torch.roll(tokens, -offset) for offset in (-1, 0, 1)], dim=1)
+        edge = torch.ones((n, 3), dtype=torch.bool, device=h.device)
+        edge[0, 0] = False
+        edge[-1, 2] = False
+        label_logits = torch.full((n, 3), float("nan"), device=h.device)
+        for start, end, global_start in ranges:
+            for offset in range(start, end, 256):
+                tile = head.weight[offset:min(offset+256, end)].detach().float()
+                logits = query @ tile.mT
+                if head.bias is not None:
+                    logits = logits + head.bias[offset:offset+tile.shape[0]].detach().float()
+                valid = valid & torch.isfinite(logits).all(dim=1)
+                lse = torch.logaddexp(lse, torch.logsumexp(logits, dim=1))
+                first = global_start + offset - start
+                owned = edge & (targets >= first) & (targets < first + tile.shape[0])
+                selected = logits.gather(1, (targets - first).clamp(0, tile.shape[0]-1).long())
+                label_logits = torch.where(owned, selected, label_logits)
+                tile_ids = torch.arange(first, first+tile.shape[0], device=h.device).expand(n, -1)
+                all_scores = torch.cat((best, logits), dim=1)
+                all_ids = torch.cat((best_ids, tile_ids), dim=1)
+                # Stable score order preserves ascending IDs for sorted shard ranges.
+                order = torch.argsort(all_scores, dim=1, descending=True, stable=True)[:, :k]
+                best = all_scores.gather(1, order)
+                best_ids = all_ids.gather(1, order)
+        data = point_copy(tokens, label_logits, best_ids, best, lse, valid)
+    if not valid_labels([r[0] for r in data], head.num_embeddings):
+        return
+    for i, row in enumerate(data):
+        ok = bool(row[-1])
+        emit("alignment_logit_lens_shard", rank=runtime.rank, row=i, token=int(row[0]),
+             label_logits_offsets=[rounded(x) if ok else None for x in row[1:4]],
+             top_ids=[int(x) if x >= 0 and ok else None for x in row[4:12]],
+             top_logits=[rounded(x) if ok else None for x in row[12:20]],
+             logsumexp=rounded(row[20]) if ok else None, ranges=ranges,
+             vocab_start=ranges[0][2], scope="local_shard", predictor_offset=-1,
+             method_id=getattr(runtime.profile, "method", None),
+             anchor_alpha=rounded(runtime.profile.anchor_alpha))

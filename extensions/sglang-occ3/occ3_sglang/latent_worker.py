@@ -864,6 +864,7 @@ class WorkerRuntime:
         require(not any(errors), "numerical")
         torch.distributed.broadcast(prefix, src=self.group.ranks[0], group=self.group.device_group)
         from . import token_trace
+        token_trace.alignment_logit_lens(self, h, tokens)
         token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
         token_trace.alignment_stage(self, prefix, embeddings, tokens, "aligned")
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,

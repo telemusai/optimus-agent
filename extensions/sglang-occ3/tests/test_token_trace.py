@@ -486,7 +486,7 @@ def test_alignment_cast_precision(caplog):
     solved = torch.tensor([[1.0003, 0.5001], [0.0, 0.0]])
     copied = solved.to(torch.float16)
     original = solved.clone()
-    trace.alignment_cast(NS(rank=0), copied, solved, copied)
+    trace.alignment_cast(NS(rank=0, profile=NS(method="test", anchor_alpha=0.3)), copied, solved, copied)
     result = rows(caplog)
     assert result[0]["solver_dtype"] == "torch.float32"
     assert result[0]["buffer_dtype"] == "torch.float16"
@@ -519,3 +519,57 @@ def test_precision_off_and_isolated(monkeypatch, caplog):
     trace.alignment_cast(NS(rank=0), None, None, None)
     trace.alignment_precision(NS(rank=0), None, None)
     assert not rows(caplog)
+
+
+def test_logit_lens_offsets_shard_and_one_copy(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    norm = type("RMSNorm", (), {})()
+    norm.weight = torch.ones(3)
+    norm.variance_epsilon = 1e-6
+    norm.variance_size_override = norm.override_orig_dtype = None
+    norm.cast_x_before_out_mul = False
+    head = NS(weight=torch.eye(3), bias=None, embedding_dim=3, num_embeddings=3,
+        quant_method=type("UnquantizedEmbeddingMethod", (), {})(),
+        shard_indices=NS(org_vocab_start_index=0, org_vocab_end_index=3,
+                         added_vocab_start_index=3, added_vocab_end_index=3,
+                         num_org_elements_padded=3))
+    runtime = NS(rank=0, profile=NS(method="probe", anchor_alpha=0.0), runner=NS(model=NS(
+        model=NS(norm=norm), lm_head=head,
+        logits_processor=NS(logit_scale=None, final_logit_softcapping=None))))
+    count = []
+    original = trace.point_copy
+    def copy(*args):
+        count.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    result = rows(caplog)
+    assert count == [1]
+    assert len(result) == 3
+    assert [r["top_ids"][0] for r in result] == [0, 1, 2]
+    assert result[0]["label_logits_offsets"] == [None, 1.732, 0.0]
+    assert result[1]["label_logits_offsets"] == [0.0, 1.732, 0.0]
+    assert result[2]["label_logits_offsets"] == [0.0, 1.732, None]
+    assert result[0]["method_id"] == "probe"
+    assert result[0]["vocab_start"] == 0
+    head.quant_method = object()
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    assert rows(caplog)[-1]["reason"] == "unsupported_norm_or_head"
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_logit_lens(None, None, None)
+    assert count == [1]
+
+
+def test_stage_single_copy(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    original = trace.point_copy
+    calls = []
+    def copy(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    runtime = NS(rank=0, embedding=NS(num_embeddings=3),
+        profile=NS(anchor_alpha=0.3, method="probe"), target_norm=torch.tensor(2.0))
+    trace.alignment_stage(runtime, torch.eye(3), torch.eye(3), torch.arange(3), "raw")
+    assert calls == [1]
+    assert rows(caplog)[0]["target_norm"] == 2.0

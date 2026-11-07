@@ -302,3 +302,44 @@ loss **at these measured boundaries**. Clearly worse loss for misread rows
 than the baseline makes precision a contributor worth testing. This FP8 proxy
 is not actual KV quantization (which transforms/scales states); it cannot rule
 out all numerical causes or prove real KV-storage fidelity by itself.
+
+#### Offset conventions and raw-state logit lens
+
+Offset `k` in neighbour cosines means `cos(values[i], E[tok[i+k]])`.
+Capture `predictor_offset=-1` means raw row `i` is the hidden state at the
+sequence position that **produced** `tok[i]`, not the state after consuming
+that token. Normal raw-state/input-embedding cosine need not peak at offset
+zero: GLM-5's input embeddings and LM head are untied. A real indexing defect
+needs systematic shifted label likelihood in the model readout, not just an
+isolated raw embedding neighbour win.
+
+`alignment_logit_lens_shard` reads the verified candidate model objects
+`runner.model.model.norm` (RMSNorm) and `runner.model.lm_head` (ParallelLMHead),
+from GlmMoeDsaForCausalLM's DeepseekV2 base. It evaluates RMSNorm's native
+formula and the unquantized head weight in bounded tiles, never calling
+model/norm/head forwards or LogitsProcessor. Unsupported quantized head,
+norm override, or logit transforms explicitly skip. This is a float32
+readout approximation with the normal norm-output dtype cast, not a replay
+of fused inference kernels or sampling penalties/temperature.
+
+Each rank logs local top-8 IDs/logits, label logits at offsets [-1,0,+1]
+(null for edges or labels owned elsewhere), actual shard ranges/vocab start,
+and local logsumexp. Merge local top-8 by descending logits; global label
+rank is its position if present, otherwise >8. Combine all shard logsumexp
+values with logaddexp to compute untempered label probabilities. Missing
+ranks, rounded ties, or unsupported readouts leave the conclusion unresolved.
+The profile method ID and live anchor alpha accompany the diagnostic rows.
+
+| Raw logit-lens result | Interpretation |
+| --- | --- |
+| Label top-1/high probability at producer position -1, but aligned row misses | Map/solver loses information. This is label offset 0 in our log. |
+| Label top-1 only at sequence position 0 or +1 instead of producer -1 | Indexing hypothesis. Compare adjacent raw rows; do not confuse sequence-position offsets with label offsets. |
+| Label low probability, misread tokens are runner-ups | Distribution/fidelity hypothesis: hidden state encodes alternatives. |
+| Label top-1 and aligned nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the map. |
+
+All new points now pack device-side arrays and perform one small host copy
+per call immediately before emission. No per-row scalar reads or per-tile
+host validity checks occur. Copies are synchronous on align(), including
+before anchoring, rather than deferred past the completion event; opt-in
+trace overhead can still delay other ranks. Vocabulary validity stays on
+device through the full loop. Logit-lens tiles share the 256-row bound.
