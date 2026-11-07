@@ -479,3 +479,43 @@ def test_alignment_disabled_no_access(monkeypatch, caplog):
     trace.alignment_stage(None, None, None, None, "raw")
     trace.alignment_nearest(None, None, None)
     assert not rows(caplog)
+
+
+def test_alignment_cast_precision(caplog):
+    torch = pytest.importorskip("torch")
+    solved = torch.tensor([[1.0003, 0.5001], [0.0, 0.0]])
+    copied = solved.to(torch.float16)
+    original = solved.clone()
+    trace.alignment_cast(NS(rank=0), copied, solved, copied)
+    result = rows(caplog)
+    assert result[0]["solver_dtype"] == "torch.float32"
+    assert result[0]["buffer_dtype"] == "torch.float16"
+    assert result[0]["cosine"] == 1.0
+    assert result[0]["max_abs_diff"] == 0.0003
+    assert result[1]["cosine"] is None
+    assert torch.equal(original, solved)
+
+
+def test_alignment_fp8_baseline(caplog):
+    torch = pytest.importorskip("torch")
+    values = torch.tensor([[1.1, 0.7], [0.0, 0.0]])
+    trace.alignment_precision(NS(rank=0), values, values)
+    result = rows(caplog)
+    assert len(result) == 2
+    assert result[0]["fp8_cosine"] == result[0]["embedding_fp8_cosine"]
+    if result[0]["fp8_skipped"] is None:
+        expected = trace.precision_cosine(values, values.to(torch.float8_e4m3fn).float())
+        assert result[0]["fp8_cosine"] == expected[0]
+        assert expected[0] >= 0.999
+        assert result[1]["fp8_cosine"] is None
+    assert result[0]["fp32_end_to_end_skipped"] == "requires_solver_and_global_anchor_replay"
+
+
+def test_precision_off_and_isolated(monkeypatch, caplog):
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_cast(None, None, None, None)
+    trace.alignment_precision(None, None, None)
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    trace.alignment_cast(NS(rank=0), None, None, None)
+    trace.alignment_precision(NS(rank=0), None, None)
+    assert not rows(caplog)

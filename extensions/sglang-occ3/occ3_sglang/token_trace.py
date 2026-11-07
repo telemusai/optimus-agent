@@ -409,7 +409,8 @@ def alignment_stage(runtime, values, embeddings, tokens, stage):
             offsets = [rounded(cos[i, j]) if 0 <= j < len(labels) and vn[i] > 0 and en[j] > 0
                        else None for j in (i-1, i, i+1)]
             emit("alignment_row", rank=0, stage=stage, row=i, token=token,
-                 cosine_offsets=offsets, row_norm=rounded(vn[i]), embedding_norm=rounded(en[i]),
+                 dtype=str(values.dtype), cosine_offsets=offsets,
+                 row_norm=rounded(vn[i]), embedding_norm=rounded(en[i]),
                  anchor_alpha=rounded(runtime.profile.anchor_alpha),
                  target_norm=None if runtime.target_norm is None else rounded(runtime.target_norm))
 
@@ -453,3 +454,58 @@ def alignment_nearest(runtime, prefix, tokens):
             emit("alignment_nearest_shard", rank=runtime.rank, row=i, token=labels[i],
                  top1_id=token, top1_cosine=rounded(score), top1_hit=token == labels[i],
                  scope="local_shard", ranges=ranges)
+
+
+def precision_cosine(left, right):
+    """Per-row cosine, with null for zero or nonfinite rows; inputs stay untouched."""
+    import torch
+    a, b = left.detach().float(), right.detach().float()
+    values = torch.nn.functional.cosine_similarity(a, b, dim=1)
+    valid = (torch.isfinite(a).all(dim=1) & torch.isfinite(b).all(dim=1) &
+             (a.norm(dim=1) > 0) & (b.norm(dim=1) > 0))
+    return [rounded(v) if ok else None for v, ok in zip(values.tolist(), valid.tolist())]
+
+
+@isolated
+def alignment_cast(runtime, hidden, solved, copied):
+    """Measure the actual solver-to-serving-buffer cast, before anchoring."""
+    if runtime.rank != 0:
+        return
+    import torch
+    if (solved.ndim != 2 or solved.shape != copied.shape or solved.shape != hidden.shape or
+            not 0 < solved.shape[0] <= 128 or not 0 < solved.shape[1] <= 32768):
+        return
+    with torch.no_grad():
+        cosine = precision_cosine(solved, copied)
+        difference = (solved.detach().float() - copied.detach().float()).abs().amax(dim=1).tolist()
+        for i, (cos, delta) in enumerate(zip(cosine, difference)):
+            emit("alignment_cast", rank=0, row=i, hidden_dtype=str(hidden.dtype),
+                 solver_dtype=str(solved.dtype), buffer_dtype=str(copied.dtype),
+                 cosine=cos, max_abs_diff=rounded(delta))
+
+
+@isolated
+def alignment_precision(runtime, prefix, embeddings):
+    """Unscaled FP8 round-trip proxy only, not a simulation of the KV encoder."""
+    if runtime.rank != 0:
+        return
+    import torch
+    if (prefix.ndim != 2 or prefix.shape != embeddings.shape or
+            not 0 < prefix.shape[0] <= 128 or not 0 < prefix.shape[1] <= 32768):
+        return
+    dtype = getattr(torch, "float8_e4m3fn", None)
+    reason = None
+    served, baseline = [None] * prefix.shape[0], [None] * prefix.shape[0]
+    if dtype is None:
+        reason = "float8_unavailable"
+    else:
+        try:
+            with torch.no_grad():
+                served = precision_cosine(prefix, prefix.detach().to(dtype).float())
+                baseline = precision_cosine(embeddings, embeddings.detach().to(dtype).float())
+        except Exception:
+            reason = "float8_conversion_unsupported"
+    for i, (cos, ref) in enumerate(zip(served, baseline)):
+        emit("alignment_precision", rank=0, row=i, anchored_dtype=str(prefix.dtype),
+             embedding_dtype=str(embeddings.dtype), fp8_cosine=cos, embedding_fp8_cosine=ref,
+             fp8_skipped=reason, fp32_end_to_end_skipped="requires_solver_and_global_anchor_replay")

@@ -1,3 +1,4 @@
 - Added: Opt-in per-stage neighbour cosine and row-norm diagnostics for OCC-3 alignment.
 - Added: Bounded, collective-free local vocabulary top-1 traces with offline merge guidance.
 - Changed: Documented how to distinguish capture alignment, solver, anchor and fidelity hypotheses.
+- Added: Solver-copy precision and FP8 round-trip proxy diagnostics with plain-embedding baselines.

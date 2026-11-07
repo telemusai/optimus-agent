@@ -856,6 +856,8 @@ class WorkerRuntime:
                 # output; any failure stays a uniform numerical decline.
                 aligned, _ = self.aligner(h, embeddings, self.target_norm)
                 prefix.copy_(aligned)
+                from . import token_trace
+                token_trace.alignment_cast(self, h, aligned, prefix)
             except Exception:
                 solver_error = "numerical"
         errors = self.gather(solver_error)
@@ -872,6 +874,7 @@ class WorkerRuntime:
         token_trace.alignment(self, prefix, embeddings)
         token_trace.alignment_stage(self, prefix, embeddings, tokens, "final")
         token_trace.alignment_nearest(self, prefix, tokens)
+        token_trace.alignment_precision(self, prefix, embeddings)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)

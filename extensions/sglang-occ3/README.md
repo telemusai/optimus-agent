@@ -285,3 +285,20 @@ share geometry, and reading a continuous prefix is not nearest-token decoding.
 The existing live evidence shows intact delivery and repeatably weak tokens,
 but lacks raw/solver stage comparisons; no causal conclusion is yet justified.
 All added tensor work is disabled unless the existing trace flag is exactly 1.
+
+Precision diagnostics additionally emit `alignment_cast` at the actual solver
+copy boundary (hidden/solver/buffer dtypes, float32 cosine and max absolute
+cast difference), stage dtypes, and `alignment_precision` after anchoring.
+The latter compares each final row and its plain token-embedding baseline
+with their own unscaled float8_e4m3fn round trips. Unsupported conversions
+have an explicit skip reason; zero/nonfinite rows have null cosine. FP32
+end-to-end replay is skipped: rerunning the solver and global anchor would
+add expensive work and anchor collectives, violating this diagnostic's scope.
+The cast comparison cannot measure precision already lost inside the solver.
+
+Precision decision rule: cast and FP8 cosines around 0.999+ on misread rows,
+matching the plain-embedding FP8 baseline, rule out a substantial rounding
+loss **at these measured boundaries**. Clearly worse loss for misread rows
+than the baseline makes precision a contributor worth testing. This FP8 proxy
+is not actual KV quantization (which transforms/scales states); it cannot rule
+out all numerical causes or prove real KV-storage fidelity by itself.
