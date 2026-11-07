@@ -113,6 +113,8 @@ pub struct SglangOcc3Connector {
     client: reqwest::Client,
     config: SglangOcc3Config,
     native: Option<NativeExperiment>,
+    readiness_instance_id: String,
+    runtime_probe: tokio::sync::Mutex<Option<std::time::Instant>>,
 }
 
 impl SglangOcc3Connector {
@@ -150,6 +152,8 @@ impl SglangOcc3Connector {
             client,
             config,
             native: None,
+            readiness_instance_id: uuid::Uuid::new_v4().to_string(),
+            runtime_probe: tokio::sync::Mutex::new(None),
         })
     }
 
@@ -535,23 +539,35 @@ impl SglangOcc3Connector {
     /// before evicting this connector; existing operations still fail closed.
     async fn invalidate_ready_if_runtime_changed(&self) {
         let Some(native) = self.native.as_ref() else { return };
-        let Ok(probe) = Self::new(self.config.clone()) else { return };
-        let Ok(identity) = probe.model_identity().await else { return };
-        let Ok(runtime) = probe.runtime_identity().await else { return };
+        // Never queue recovery probes behind one another. A failed probe also
+        // consumes the cooldown, preventing an unavailable server from fan-out.
+        let Ok(mut last_probe) = self.runtime_probe.try_lock() else { return };
+        if last_probe.is_some_and(|last| last.elapsed() < Duration::from_secs(5)) {
+            return;
+        }
+        *last_probe = Some(std::time::Instant::now());
+        let Ok(Some((identity, runtime))) = tokio::time::timeout(
+            Duration::from_millis(1500),
+            async {
+                let probe = Self::new(self.config.clone()).ok()?;
+                let identity = probe.model_identity().await.ok()?;
+                let runtime = probe.runtime_identity().await.ok()?;
+                Some((identity, runtime))
+            },
+        ).await else { return };
         let identity = Occ3ModelIdentity { latent_method: runtime.method_id.clone(), ..identity };
         if identity.fingerprint() != runtime.model_fingerprint {
             return;
         }
         let permit = &native.permit;
+        // Server authority is exactly (epoch, generation, fingerprint):
+        // latent_registry.py::_profile. Generation is incarnation-wide, not
+        // per capture (latent_worker.py::load_runtime_profile); use_receipts.py
+        // also requires source enrollment and intent generations to match.
+        // Profile-only drift is not proof that this enrollment was revoked.
         if runtime.runtime_id != permit.runtime_id
             || runtime.runtime_generation != permit.runtime_generation
             || identity != permit.identity
-            || runtime.profile_digest != permit.profile_digest
-            || runtime.tp_layout_digest != permit.source_profile.layout_digest
-            || runtime.layer_index != permit.source_profile.layer_index
-            || runtime.hidden_dim != permit.source_profile.hidden_dim
-            || runtime.dtype != permit.source_profile.dtype
-            || runtime.expected_ranks != permit.source_profile.expected_ranks
         {
             crate::core::occ3_connectors::activation::invalidate_connector_ready(self);
         }
@@ -977,6 +993,10 @@ fn parse_method(value: &str) -> Result<Occ3Method, Occ3Error> {
 impl Occ3Connector for SglangOcc3Connector {
     fn connector_id(&self) -> &str {
         CONNECTOR_ID
+    }
+
+    fn readiness_instance_id(&self) -> Option<&str> {
+        Some(&self.readiness_instance_id)
     }
 
     fn protocol_version(&self) -> u32 {

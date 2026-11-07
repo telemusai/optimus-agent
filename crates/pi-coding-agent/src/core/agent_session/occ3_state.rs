@@ -381,7 +381,7 @@ impl Occ3NativeSession {
         if let Some(lease) = &slot.lease {
             // Terminal captures retain cleanup metadata, never reuse authority.
             if !matches!(lease.state(), SourceCaptureState::Prepared | SourceCaptureState::Captured) {
-                return Err(failure());
+                return Err("Native capture ended and is awaiting reset; nothing was sent again. On the next turn, explicitly re-arm the handoff after failure accounting; do not retry this capture in the same turn. [occ3_capture_terminal_pending_reset]".into());
             }
             return Ok(false);
         }
@@ -604,7 +604,7 @@ impl Occ3NativeSession {
                         if let Some(lease) = failed_lease {
                             if lease.retirement_receipt().is_some() {
                                 let _ = tokio::time::timeout(
-                                    std::time::Duration::from_secs(5),
+                                    std::time::Duration::from_millis(250),
                                     this.connector.retire_native_source(&lease),
                                 ).await;
                             }
@@ -2950,7 +2950,10 @@ mod tests {
             assert!(slot.budget.is_none());
             assert!(slot.resolved, "failure accounting remains pending");
         }
-        assert!(session.arm_handoff_if_needed("receiver", None).is_err(), "no reuse before accounting");
+        let terminal_error = session.arm_handoff_if_needed("receiver", None)
+            .expect_err("no reuse before accounting");
+        assert!(terminal_error.contains("[occ3_capture_terminal_pending_reset]"));
+        assert!(terminal_error.contains("next turn"));
         assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
         assert_eq!(session.failed_capture_attempts(), 1);
         assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());

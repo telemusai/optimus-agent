@@ -536,8 +536,9 @@ pub async fn verify_cached(
 /// Evict only the failed connector instance. A late failure cannot evict a
 /// newer verification for the same key or readiness for another runtime.
 pub(crate) fn invalidate_connector_ready(connector: &dyn Occ3Connector) {
+    let Some(instance_id) = connector.readiness_instance_id() else { return };
     if let Ok(mut cache) = ready_cache().lock() {
-        cache.retain(|_, ready| !std::ptr::addr_eq(ready.connector.as_ref(), connector));
+        cache.retain(|_, ready| ready.connector.readiness_instance_id() != Some(instance_id));
     }
 }
 

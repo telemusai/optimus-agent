@@ -113,6 +113,12 @@ pub trait Occ3Connector: Send + Sync {
     /// Stable connector id (e.g. `sglang-occ3`).
     fn connector_id(&self) -> &str;
 
+    /// Process-local instance identity for targeted readiness eviction. Wrappers
+    /// must forward their inner connector identity; never use a shared type id.
+    fn readiness_instance_id(&self) -> Option<&str> {
+        None
+    }
+
     /// OCC-3 protocol version this connector implements.
     fn protocol_version(&self) -> u32;
 
