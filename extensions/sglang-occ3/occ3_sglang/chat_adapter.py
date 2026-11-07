@@ -32,6 +32,7 @@ from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve
                             resolve_prefix_layout)
 from .span_markers import resolve_user_role_id
 from . import metrics as _metrics
+from .turn_diagnostics import TurnDiagnostics
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -526,6 +527,7 @@ class _Context:
     admission_control_deadline: float = 0.0
     first_event_deadline: float = 0.0
     native_started: bool = False
+    diagnostics: Any = None
 
 
 class ChatAttachmentAdapter:
@@ -696,6 +698,8 @@ class ChatAttachmentAdapter:
             ctx.tm = serving.tokenizer_manager
             ctx.terminal_mode = terminal_mode
             ctx.keepalive_stream = keepalive
+            ctx.diagnostics = TurnDiagnostics(self.monotonic, ctx.attempt_id,
+                                              "source" if source else "receiver", keepalive)
             if terminal_mode is not None:
                 profile = self.terminal_profile
                 if len(self._terminal_attempts) >= profile.max_attempts:
@@ -715,6 +719,8 @@ class ChatAttachmentAdapter:
                 self._authorize_and_run(original, serving, request, raw_request, ctx), ctx)
         except AttachmentError as error:
             if ctx is not None:
+                if ctx.diagnostics is not None:
+                    ctx.diagnostics.fail(error.code, error.status)
                 await self._release_busy_fence(ctx, error)
             if ctx is not None and (error.code, error.status) in _CUT_TURN:
                 # Bounded cut-turn record: fixed code, status and whether native
@@ -724,6 +730,8 @@ class ChatAttachmentAdapter:
                              error.code, error.status, ctx.dispatched)
             return self._error(error)
         except asyncio.CancelledError:
+            if ctx is not None and ctx.diagnostics is not None:
+                ctx.diagnostics.fail("cancelled", 499)
             raise
         except Exception as error:
             # Same bounded diagnostic contract as the native_completion_failed
@@ -731,9 +739,14 @@ class ChatAttachmentAdapter:
             # handles. The public response stays a fixed generic code.
             logger.error("occ3-bridge: native turn failed (inner=%s)",
                          type(error).__name__)
+            if ctx is not None and ctx.diagnostics is not None:
+                ctx.diagnostics.fail("native_completion_failed", 409)
             return self._error(AttachmentError())
         finally:
             if ctx is not None:
+                if (ctx.diagnostics is not None and not ctx.terminal_handed_off
+                        and not ctx.stream_handed_off):
+                    ctx.diagnostics.emit(ctx.completed, ctx.deadline)
                 try:
                     # After terminal hand-off the owner (streaming iterator,
                     # ASGI response lifecycle, watchdog) owns cleanup; running
@@ -1136,6 +1149,7 @@ class ChatAttachmentAdapter:
             ctx.first_event_deadline = self.monotonic() + self.profile.admission_first_event_seconds
             emitted = False  # No native output has flowed yet.
             async for output in ctx.inner:
+                ctx.diagnostics.inner_event()
                 if obj.rid != ctx.native_rid or not isinstance(output, dict):
                     raise AttachmentError("native_completion_failed")
                 meta = output.get("meta_info", {})
@@ -1260,6 +1274,7 @@ class ChatAttachmentAdapter:
                     chunk = chunk.encode(getattr(response, "charset", "utf-8"))
                 if not isinstance(chunk, bytes):
                     raise AttachmentError("native_completion_failed")
+                ctx.diagnostics.feed(chunk)
                 audit.feed(chunk)
                 chunks.append(chunk)
                 if self._dump_stream_path is not None:
@@ -1280,6 +1295,7 @@ class ChatAttachmentAdapter:
                 body = response.model_dump_json().encode("utf-8")
             else:
                 raise AttachmentError("native_completion_failed")
+            ctx.diagnostics.nonstream(body)
             completion = audit.nonstream(body, ctx.native_rid)
         if not ctx.exhausted:
             try:
@@ -1458,6 +1474,7 @@ class ChatAttachmentAdapter:
         if ctx.stream_settled:
             return
         ctx.stream_settled = True
+        ctx.diagnostics.emit(ctx.completed, ctx.deadline)
         try:
             if not ctx.completed:
                 ctx.cancel_requested = True
@@ -1489,8 +1506,8 @@ class ChatAttachmentAdapter:
         Races the operation against the absolute turn deadline, the client
         disconnect (polled at the profile's disconnect interval, exactly like
         the buffered path's _guard) and the keepalive cadence. Keepalive
-        frames are yielded only while the operation is still pending; the
-        outcome is delivered through `box` because an async generator cannot
+        frames are yielded when due even across rapidly completed operations;
+        the outcome is delivered through `box` because an async generator cannot
         return a value to `async for`.
         """
         task = asyncio.ensure_future(awaitable)
@@ -1515,8 +1532,14 @@ class ChatAttachmentAdapter:
                     raise AttachmentError("client_disconnected", 499)
                 if asyncio.current_task().cancelling():
                     raise asyncio.CancelledError
+                # Check before consuming even an already-ready result: steady
+                # decode must not starve the shared client-visible cadence.
+                if now >= next_keepalive[0]:
+                    next_keepalive[0] = now + self.profile.keepalive_seconds
+                    yield _KEEPALIVE_FRAME
                 done, _ = await asyncio.wait(
-                    {task}, timeout=min(remaining, self.profile.disconnect_interval))
+                    {task}, timeout=min(remaining, self.profile.disconnect_interval,
+                                        max(0.0, next_keepalive[0] - now)))
                 if done:
                     if await ctx.raw_request.is_disconnected():
                         raise AttachmentError("client_disconnected", 499)
@@ -1529,10 +1552,6 @@ class ChatAttachmentAdapter:
                     except StopAsyncIteration:
                         box.stop = True
                     return
-                now = self.monotonic()
-                if now >= next_keepalive[0]:
-                    next_keepalive[0] = now + self.profile.keepalive_seconds
-                    yield _KEEPALIVE_FRAME
         except BaseException:
             ctx.cancel_requested = True
             raise
@@ -1696,6 +1715,7 @@ class ChatAttachmentAdapter:
                     chunk = chunk.encode("utf-8")
                 if not isinstance(chunk, bytes):
                     raise AttachmentError("native_completion_failed")
+                ctx.diagnostics.feed(chunk)
                 audit.feed(chunk)
                 chunks.append(chunk)
                 if self._dump_stream_path is not None:
@@ -1766,8 +1786,10 @@ class ChatAttachmentAdapter:
             ctx.completed = True
             return
         except asyncio.CancelledError:
+            ctx.diagnostics.fail("cancelled", 499)
             raise
         except AttachmentError as error:
+            ctx.diagnostics.fail(error.code, error.status)
             # The response already started, so the bounded refusal that the
             # buffered path would have answered with an HTTP status becomes
             # one SSE error event before the stream ends.
@@ -1777,6 +1799,7 @@ class ChatAttachmentAdapter:
             # bounded class name is recorded server-side only.
             logger.error("occ3-bridge: native turn failed (inner=%s)",
                          type(error).__name__)
+            ctx.diagnostics.fail("native_completion_failed", 409)
             yield self._stream_error_event(AttachmentError())
         finally:
             # The settle must complete even when the transport framework
@@ -2179,6 +2202,7 @@ class ChatAttachmentAdapter:
                     chunk = chunk.encode("utf-8")
                 if not isinstance(chunk, bytes):
                     raise AttachmentError("native_completion_failed")
+                ctx.diagnostics.feed(chunk)
                 for frame in audit.feed(chunk):
                     yield frame
             completion = audit.finish(audit.rid)
@@ -2217,6 +2241,15 @@ class ChatAttachmentAdapter:
             # No charge release here: the ALL-work predicate (including the
             # still-open ASGI emission) decides, in the settle/finally path.
             return
+        except AttachmentError as error:
+            ctx.diagnostics.fail(error.code, error.status)
+            raise
+        except Exception:
+            ctx.diagnostics.fail("native_completion_failed", 409)
+            raise
+        except asyncio.CancelledError:
+            ctx.diagnostics.fail("cancelled", 499)
+            raise
         except GeneratorExit:
             # The client abandoned the stream mid-flight. Delivery state is
             # uncertain: no further bytes are emitted and the backend commit,
@@ -2324,6 +2357,8 @@ class ChatAttachmentAdapter:
 
     async def _terminal_settle(self, ctx):
         """Create-or-await the single tracked settle task; never blocks unbounded."""
+        if ctx.diagnostics is not None:
+            ctx.diagnostics.emit(ctx.completed, ctx.deadline)
         task = ctx.terminal_settle_task
         if task is None:
             try:

@@ -84,6 +84,50 @@ or infer capacity from a short timeout estimate. Output-byte, context,
 GPU-memory, rank and deadline limits need independent verification. A
 failed or uncertain operation yields no verified lease or tool dispatch.
 
+## Native-turn transport and diagnostics
+
+Guarded OCC-3 client requests offer `keepalive-v1` by default, for both
+source capture and receiver inference. A server that accepts sends SSE comment
+keepalives while native generation runs; the client verifies the deferred
+receipt before accepting completion. Servers that do not accept retain the
+buffered response contract. Set client `OCC3_KEEPALIVE_STREAM=0`, `false`, or
+`off`, or an empty `OCC3_KEEPALIVE_STREAM=` to disable the offer; unset, `1`, `true`, or `on` enables it. This does
+not lower reasoning effort or change token budgets.
+
+A bounded admission-busy error as the first data event of an accepted deferred
+stream closes the lease as proven non-use, with the same busy-code allowlist and
+retry timing as HTTP 503. Source capture then requires a fresh capture attempt;
+the already-started stream is not replayed. Unknown errors, errors after data,
+and receiver admission timeouts retain the uncertain outcome. Keepalive comments
+do not count as data and continue during steady decode as well as stalls.
+
+The bridge logs a one-line INFO `occ3-bridge: native turn summary` for each
+native turn, including completion and interrupted turns. It reports timing,
+inner-event and output-character counts, available token usage and finish
+reason, transport mode, and channel/attempt identifiers. Text is off by default.
+Treat `cancelled` as disconnect-class on ASGI servers below spec 2.4.
+
+For temporary diagnosis on an **operator-owned server**, set server
+`OCC3_DIAG_TURN_TEXT=<N>` to include the first and last N characters of visible
+content and reasoning in that summary. The maximum is 4096 characters per
+excerpt; zero or unset disables text. Newlines are escaped. The summary message
+is capped at 16 KiB of ASCII text (excluding logger-added prefixes). If escaped
+excerpts exceed that cap, their per-excerpt limit is repeatedly halved until
+it fits, recorded as `text_truncated_log_cap`. Four full excerpts have room for
+about 3900 ASCII characters each (so a requested 4096 becomes 2048); escaped
+CJK and emoji need more space (4096 becomes 512 and 256 respectively for
+uniform text). Metadata can reduce these effective maxima further. An oversized
+metadata-only summary falls back to `summary_size_limit`. Diagnostic failures
+disable collection and record a fixed `diag_error`
+code, without exposing exception text or interrupting the turn. Inner-event
+counts continue even after output parsing is disabled. A logger failure
+is swallowed and cannot guarantee a summary line. This setting can
+expose generated private content and reasoning in server logs. Enable it only
+with authorization, restrict log access and retention, and disable it after
+diagnosis. Request prompts, headers, keys, receipts, and authentication fields
+are not collected by this diagnostic. It is not proof that transferred facts
+were understood, and it does not change the attested SGLang source overlays.
+
 ## Offline development
 
 Run tests through the extension's documented project Python environment:
