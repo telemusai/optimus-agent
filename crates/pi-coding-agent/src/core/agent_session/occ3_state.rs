@@ -2590,8 +2590,8 @@ Do not call occ3_handoff again for these facts."
         Ok(notice)
     }
 
-    /// Persists the queue artifact (best-effort; a persistence failure is
-    /// logged by the caller, never fatal to the in-memory queue).
+    /// Persists the queue artifact, returning persistence failures to callers.
+    /// Best-effort callers ignore them; the in-memory queue stays authoritative.
     fn persist_sender_queue(&self, queue: &Occ3SenderQueue) -> Result<(), String> {
         let Some(session_file) = self.session_file.get().cloned().flatten() else {
             return Ok(());
@@ -3561,6 +3561,7 @@ mod tests {
         std::fs::create_dir(&queue_path).unwrap();
         assert!(session.check_native_allowed().unwrap_err().contains("/occ 3 on"));
         let error = (session.source_hooks().resolve)(hook_request()).await.unwrap_err().to_string();
+        assert!(queue_path.is_dir(), "queue persist must have failed");
         assert!(error.contains("disabled for this chat"), "{error}");
         assert!(error.contains("/occ 3 on"), "{error}");
         let entries = session.sender_queue_snapshot().unwrap().0;
