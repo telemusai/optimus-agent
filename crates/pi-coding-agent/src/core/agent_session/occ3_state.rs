@@ -844,17 +844,24 @@ impl Occ3NativeSession {
                         // `prepare_inference` awaits before building this
                         // consume's attachment. The attachment was therefore
                         // never created nor submitted to the provider, so the
-                        // claim is releasable - the record returns to
-                        // `Admitted` and the NEXT inference request retries
-                        // the SAME delivery cleanly, while THIS turn proceeds
-                        // without the native attachment. The refusal proves
-                        // nothing about the server's own state (an admission
-                        // decline can follow earlier control mutations), so
+                        // claim is provably undispatched and this delivery is
+                        // RETIRED as a terminal busy Failed (pre-notified, so
+                        // the TurnEnd poll never re-routes it as an ordinary
+                        // receiver failure that would spend an OCC-1
+                        // fallback). The SENDER is routed the same
+                        // proven-non-use busy signal and re-arms a FRESH
+                        // capture; making this record unclaimable is what
+                        // keeps the two retry paths exclusive - a re-claim
+                        // here could consume this delivery while the sender's
+                        // re-send is already in flight and deliver the same
+                        // facts twice. This turn proceeds without the native
+                        // attachment. The refusal proves nothing about the
+                        // server's own state (the worker may have written its
+                        // session table before a readiness decline), so
                         // nothing is marked consumed and no second delivery
-                        // is ever issued; the receiver's in-memory retry stays
-                        // the sole consumer of the same delivery. Mirrors the
-                        // source-side busy absorption: busy is never a counted
-                        // failure and never a replay permit.
+                        // is ever issued. Mirrors the source-side busy
+                        // absorption: busy is never a counted failure and
+                        // never a replay permit.
                         let released = this
                             .inbox
                             .lock()
@@ -866,15 +873,15 @@ impl Occ3NativeSession {
                             // WITHOUT the attachment, and the receiver's
                             // control-only transcript body never carries the
                             // source facts - only a completed consume would
-                            // surface them. The released record is Admitted
-                            // (in-flight), so the sender's queue entry never
-                            // TTL-expires and no terminal failure poll ever
-                            // fires. Route the same proven-non-use busy
-                            // signal the TurnEnd dispatcher uses for refused
-                            // leases: the sender's in-flight (admitted) entry
-                            // takes one bounded busy retry (2s/4s/8s backoff)
-                            // and re-arms a FRESH capture, so the facts are
-                            // re-sent instead of being silently lost.
+                            // surface them. The retired record can never be
+                            // re-claimed, so without this route the facts
+                            // would be silently lost. Route the same
+                            // proven-non-use busy signal the TurnEnd
+                            // dispatcher uses for refused leases: the
+                            // sender's in-flight (admitted) entry takes one
+                            // bounded busy retry (2s/4s/8s backoff) and
+                            // re-arms a FRESH capture, which becomes the sole
+                            // retry path for these facts.
                             route_receiver_busy_to_sender(
                                 &sender_session_id,
                                 &claimed_message_id,
@@ -3873,9 +3880,11 @@ mod tests {
     /// claimed/`Delivered`, then a busy-refused `prepare_inference` must
     /// RELEASE that claim instead of parking the record claimed forever.
     /// The busy turn proceeds as an ordinary turn without the attachment,
-    /// the NEXT inference request claims and binds the same record cleanly,
-    /// and a distinct content-free notice names the release so live
-    /// diagnosis needs no source archaeology.
+    /// the delivery retires as a terminal busy failure (never re-claimable:
+    /// the sender's fresh-capture retry is the sole path for these facts,
+    /// so the two retries can never double-deliver), and a distinct
+    /// content-free notice names the release so live diagnosis needs no
+    /// source archaeology.
     #[tokio::test]
     async fn receiver_resolver_releases_claim_on_busy_refusal_and_retries_cleanly() {
         struct ResetSink;
@@ -3997,8 +4006,8 @@ mod tests {
         );
         assert_eq!(
             session.inbox.lock().unwrap().status("busy-1"),
-            Some(Occ3DeliveryStatus::Admitted),
-            "the busy-released record returns to Admitted for the next claim"
+            Some(Occ3DeliveryStatus::Failed),
+            "the busy-released delivery retires as a terminal busy failure: it must not stay claimable while the sender re-arms"
         );
         // The distinct content-free notice names the release exactly once.
         {
@@ -4031,17 +4040,24 @@ mod tests {
             assert_eq!(entries_snapshot[0].busy_retries, 1);
             assert!(entries_snapshot[0].retry_not_before_epoch.is_some());
         }
-        // 2) The next inference request retries the consume cleanly: the
-        //    same record claims and binds through the real prepare path.
-        let lease = (resolver)(request(&["busy-1"], &["busy-1"]))
-            .await
-            .expect("the retry claim must not fail")
-            .expect("the released record must bind on retry");
-        drop(lease);
+        // 2) The retired record is never re-claimed: a later inference
+        //    request finds no claimable delivery, so the receiver cannot
+        //    consume this handle while the sender's busy-retry re-arm is
+        //    already in flight (the duplicate-delivery guard).
+        assert!(
+            (resolver)(request(&["busy-1"], &["busy-1"]))
+                .await
+                .unwrap()
+                .is_none(),
+            "a busy-retired delivery must never be claimable again"
+        );
         assert_eq!(
             session.inbox.lock().unwrap().status("busy-1"),
-            Some(Occ3DeliveryStatus::Delivered)
+            Some(Occ3DeliveryStatus::Failed)
         );
+        // The pre-notified terminal marker means the TurnEnd poll never
+        // re-routes this record as an ordinary receiver failure.
+        assert!(session.inbox.lock().unwrap().poll_terminal_failures().is_empty());
     }
 
     /// Fail-closed stays fail-closed: a NON-busy `prepare_inference`

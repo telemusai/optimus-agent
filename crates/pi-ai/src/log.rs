@@ -36,6 +36,7 @@ pub fn set_log_sink(next: Option<LogSink>) {
 /// other's sink mid-assert. Every test that installs a sink must hold this
 /// guard for its whole body (drop order with the reset guard does not
 /// matter: both are released at test end).
+#[doc(hidden)]
 pub fn test_sink_guard() -> std::sync::MutexGuard<'static, ()> {
     static TEST_SINK_LOCK: OnceLock<Mutex<()>> = OnceLock::new();
     TEST_SINK_LOCK

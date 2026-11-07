@@ -195,6 +195,10 @@ struct Admission {
     /// Whether `poll_terminal_failures` already reported this record's
     /// terminal non-use outcome.
     terminal_notified: bool,
+    /// Terminal `Failed` outcome came from a proven-non-use busy refusal of
+    /// the pre-dispatch control call (never a provider failure). Diagnostic
+    /// only: distinguishes busy retirements in `audit` output.
+    busy_refused: bool,
 }
 
 /// Bounded session-local inbox. Only the authenticated host calls `admit`.
@@ -272,6 +276,7 @@ impl Occ3InferenceInbox {
                 admission_seq: self.admissions,
                 consumed_notified: false,
                 terminal_notified: false,
+                busy_refused: false,
             },
         );
         Ok(true)
@@ -400,17 +405,25 @@ impl Occ3InferenceInbox {
         }
     }
 
-    /// Release a busy-refused claim: the record returns to `Admitted` so the
-    /// NEXT inference request retries the consume cleanly (the same
-    /// delivery, never a second one). Strict preconditions mirror the
-    /// source-side busy absorption: only the exact state between `claim`
-    /// and `bind_lease` - claimed, still `Delivered`, with NO bound lease -
-    /// is provably undispatched, because a lease is bound only after
+    /// Retire a busy-refused claim as a terminal `Failed` outcome with the
+    /// busy non-use flag set, so this delivery is never re-claimed by this
+    /// receiver. Strict preconditions mirror the source-side busy
+    /// absorption: only the exact state between `claim` and `bind_lease` -
+    /// claimed, still `Delivered`, with NO bound lease - is provably
+    /// undispatched, because a lease is bound only after
     /// `prepare_inference` succeeded and only a bound, submitted lease can
     /// ever have reached the provider. A record with a bound lease, a
     /// terminal status, an unclaimed record or an unknown id is NEVER
     /// released: its outcome stays fail-closed and replay stays forbidden.
-    /// Returns whether the claim was released.
+    ///
+    /// Terminal-instead-of-Admitted is deliberate: the sender is routed the
+    /// same proven-non-use busy signal and re-arms a FRESH capture, so this
+    /// handle must not stay claimable - otherwise the receiver's next
+    /// inference could consume THIS delivery while the sender's re-send is
+    /// already in flight, delivering the same facts twice. The terminal
+    /// marker is pre-notified, so the TurnEnd poll never re-routes it as an
+    /// ordinary receiver failure (which would trigger an OCC-1 fallback the
+    /// busy route must not spend). Returns whether the claim was retired.
     pub fn release_busy_claim(&mut self, message_id: &str) -> bool {
         let Some(record) = self.records.get_mut(message_id) else {
             return false;
@@ -422,7 +435,9 @@ impl Occ3InferenceInbox {
             return false;
         }
         record.claimed = false;
-        record.status = Occ3DeliveryStatus::Admitted;
+        record.busy_refused = true;
+        record.status = Occ3DeliveryStatus::Failed;
+        record.terminal_notified = true;
         true
     }
 
@@ -436,6 +451,7 @@ impl Occ3InferenceInbox {
             let id=&record.envelope.message_id;
             let lease=record.bound_lease.as_ref();
             serde_json::json!({"message_id":id,"receiver_session_id":self.receiver_session_id,
+                "busy_refused":record.busy_refused,
                 "admission_seq":record.admission_seq,
                 "sender_session_id":record.envelope.sender_session_id,"runtime_id":record.envelope.runtime_id,
                 "runtime_generation":record.envelope.state_handle.runtime_generation,"model_fingerprint":record.envelope.model_fingerprint,
@@ -836,12 +852,13 @@ mod tests {
 
     /// Fix (receiver busy, pre-bind): a busy-refused `prepare_inference`
     /// provably dispatched nothing, so the claim it took must be releasable
-    /// back to `Admitted` and the next claim retries the SAME delivery
-    /// cleanly. Only the exact claimed-unbound state releases: a bound lease
+    /// as a terminal busy `Failed` so the next claim never re-claims it
+    /// (the sender's fresh-capture retry is the sole retry path). Only the
+    /// exact claimed-unbound state releases: a bound lease
     /// (its outcome belongs to the provider), a terminal status, an unclaimed
     /// or an unknown record never releases - their outcomes stay fail-closed.
     #[test]
-    fn occ3_release_busy_claim_returns_only_an_unbound_claim_to_admitted() {
+    fn occ3_release_busy_claim_retires_only_an_unbound_claim_as_busy_failed() {
         let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
         assert!(inbox.admit(unit_envelope("m1", "s1"), "m1", "s1", 1).unwrap());
         // Unknown and never-claimed records never release.
@@ -850,11 +867,22 @@ mod tests {
         assert!(inbox.claim(&["m1".to_string()], &[], 1).unwrap().is_some());
         // The pre-bind busy release: claimed, Delivered, no bound lease.
         assert!(inbox.release_busy_claim("m1"));
-        assert_eq!(inbox.status("m1"), Some(Occ3DeliveryStatus::Admitted));
-        // The next claim retries the same delivery cleanly.
-        assert!(inbox.claim(&["m1".to_string()], &["m1".to_string()], 1).unwrap().is_some());
+        assert_eq!(inbox.status("m1"), Some(Occ3DeliveryStatus::Failed));
+        // The retirement is terminal: the same delivery is never claimable
+        // again, and the TurnEnd poll never re-routes it as an ordinary
+        // receiver failure.
+        assert!(inbox.claim(&["m1".to_string()], &["m1".to_string()], 1).unwrap().is_none());
+        assert!(inbox.poll_terminal_failures().is_empty());
+        let audit = inbox.audit();
+        assert_eq!(audit[0]["busy_refused"], serde_json::json!(true));
+        // A busy-retired record never releases a second time.
+        assert!(!inbox.release_busy_claim("m1"));
         // Once a lease is bound the outcome belongs to the provider: never
-        // released, whatever the refusal class claims to prove.
+        // released, whatever the refusal class claims to prove. A second
+        // record exercises the bound and terminal guards the retired record
+        // can no longer reach.
+        assert!(inbox.admit(unit_envelope("m2", "s2"), "m2", "s2", 1).unwrap());
+        assert!(inbox.claim(&["m2".to_string()], &[], 1).unwrap().is_some());
         let lease = pi_ai::inference_attachment::InferenceStateLease::new(
             pi_ai::inference_attachment::InferenceStateTarget {
                 provider: "fixture".into(),
@@ -863,27 +891,27 @@ mod tests {
             },
             pi_ai::inference_attachment::InferenceAttachment {
                 protocol_version: 1,
-                request_id: "consume-1".into(),
-                message_id: "m1".into(),
+                request_id: "consume-2".into(),
+                message_id: "m2".into(),
                 connector_id: "connector-1".into(),
                 receiver_session_id: "receiver".into(),
                 model_fingerprint: "fp-1".into(),
                 runtime_id: "runtime-1".into(),
                 runtime_generation: 1,
-                state_handle: "handle-m1".into(),
+                state_handle: "handle-m2".into(),
                 expires_at_epoch: u64::MAX / 2,
                 method: "kv-radix-channel-v1".into(),
             },
         )
         .unwrap();
-        inbox.records.get_mut("m1").unwrap().bound_lease = Some(lease);
-        assert!(!inbox.release_busy_claim("m1"));
-        assert_eq!(inbox.status("m1"), Some(Occ3DeliveryStatus::Delivered));
+        inbox.records.get_mut("m2").unwrap().bound_lease = Some(lease);
+        assert!(!inbox.release_busy_claim("m2"));
+        assert_eq!(inbox.status("m2"), Some(Occ3DeliveryStatus::Delivered));
         // A terminal record never releases either.
-        let record = inbox.records.get_mut("m1").unwrap();
+        let record = inbox.records.get_mut("m2").unwrap();
         record.bound_lease = None;
         record.status = Occ3DeliveryStatus::Failed;
-        assert!(!inbox.release_busy_claim("m1"));
+        assert!(!inbox.release_busy_claim("m2"));
     }
 
     /// Reversed context order cannot reorder the queue: the earliest pending

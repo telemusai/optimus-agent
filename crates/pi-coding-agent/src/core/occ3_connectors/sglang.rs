@@ -683,9 +683,9 @@ impl SglangOcc3Connector {
             // reach the provider - so a refusal here proves the attachment
             // for this consume was never created or submitted. A 429
             // envelope from the body-size bound also proves the request
-            // never parsed; one from session capacity proves no mutation
-            // (the table write never happened). The envelope otherwise
-            // proves nothing about earlier mutations, which is exactly why
+            // never parsed. The envelope otherwise proves nothing about
+            // server state (the worker may have written its session table
+            // before a frontend readiness decline), which is exactly why
             // the release only returns the claim to `Admitted`: nothing is
             // marked consumed and no second delivery is ever issued. The
             // classification itself is the generic control-path rule and is
