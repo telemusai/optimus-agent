@@ -54,12 +54,15 @@ fn failure() -> String {
     "Experimental native handoff unavailable or uncertain; replay is forbidden".into()
 }
 
-/// Content-free diagnostic for a receiver-busy claim release, in the
-/// connector-diagnostics style: names the released message id, the refusing
-/// connector and whether the claim actually released, never any envelope
-/// content, so live diagnosis of a busy-released turn no longer needs source
-/// archaeology. Exception-safe like `native_binding_diagnostic`: a broken
-/// sink can never turn a released claim into a failed turn.
+/// Content-free diagnostic for a receiver-busy claim retirement, in the
+/// connector-diagnostics style: names the retired message id, the refusing
+/// connector, whether the claim actually retired, and whether a live
+/// sender absorbed the route - never any envelope content, so live
+/// diagnosis of a busy-retired turn needs no source archaeology. The log
+/// name `receiver_busy_claim_released` and its `released` key deliberately
+/// keep the pre-rename wording for grep stability across builds.
+/// Exception-safe like `native_binding_diagnostic`: a broken sink can
+/// never turn a retired claim into a failed turn.
 fn receiver_busy_claim_released(
     message_id: &str,
     connector_id: &str,
@@ -118,6 +121,11 @@ fn unregister_sender_session(session: &Occ3NativeSession) {
             weak_list.retain(|weak| {
                 !std::sync::Weak::ptr_eq(weak, self_weak)
             });
+            // Prune the key itself once the last registration is gone, so
+            // a long-lived daemon does not accumulate empty Vec entries.
+            if weak_list.is_empty() {
+                registry.remove(session.session_id());
+            }
         }
     }
 }
@@ -163,16 +171,14 @@ pub(crate) fn route_delivery_event_to_sender(
         }
     }
 }
-/// Routes one receiver-busy refusal to the sender's queue by sender session
-/// id. The receiver refused the attached request before any stream event,
-/// so the published capture was proven unused. The sender re-captures with
-/// backoff (bounded) instead of falling straight back to OCC-1. No-op when
-/// the sender is gone or has no matching in-flight entry.
-/// Routes one proven-non-use receiver-busy refusal to the sender's queue.
-/// Returns `true` when a live sender absorbed the busy signal (its queue
-/// took the bounded busy retry or exhausted it to fallback); `false` when
-/// no live sender, a closed sender or no matching in-flight entry took
-/// it, so the caller can record that the facts need explicit attention.
+/// Routes one proven-non-use receiver-busy refusal to the sender's queue
+/// by sender session id: the published capture was proven unused, so the
+/// sender re-captures with bounded backoff instead of falling straight
+/// back to OCC-1. Returns `true` when a live sender absorbed the busy
+/// signal (its queue took the bounded busy retry or exhausted it to
+/// fallback); `false` when no live sender, a closed sender or no matching
+/// in-flight entry took it, so the caller can record that the facts need
+/// explicit attention.
 pub(crate) fn route_receiver_busy_to_sender(sender_session_id: &str, message_id: &str) -> bool {
     let senders = {
         let Ok(registry) = sender_session_registry().lock() else {
@@ -839,6 +845,13 @@ impl Occ3NativeSession {
                 let Some(envelope) = envelope else {
                     return Ok(None);
                 };
+                // The record is now claimed/`Delivered`: the deterministic
+                // checks below (native allowed, session check, registry
+                // supports) intentionally fail closed with the record left
+                // claimed - the same stuck-claimed shape the busy arm
+                // retires. Those refusals are deterministic
+                // configuration/identity failures where a silent ordinary
+                // turn would hide a broken setup, so they stay loud.
                 this.check_native_allowed().map_err(anyhow::Error::msg)?;
                 this.check().map_err(anyhow::Error::msg)?;
                 if !this.registry.supports(
@@ -889,11 +902,23 @@ impl Occ3NativeSession {
                         // is ever issued. Mirrors the source-side busy
                         // absorption: busy is never a counted failure and
                         // never a replay permit.
-                        let released = this
-                            .inbox
-                            .lock()
-                            .map_err(|_| anyhow::anyhow!(failure()))?
-                            .retire_busy_claim(&claimed_message_id);
+                        let released = match this.inbox.lock() {
+                            Ok(mut inbox) => inbox.retire_busy_claim(&claimed_message_id),
+                            // A poisoned inbox lock keeps the fail-closed
+                            // error, but the one event that must be loud is
+                            // the retirement attempt itself: emit the
+                            // diagnostic with released=false so the sender's
+                            // waiting Admitted entry is not unobservable.
+                            Err(_) => {
+                                receiver_busy_claim_released(
+                                    &claimed_message_id,
+                                    &connector_id,
+                                    false,
+                                    false,
+                                );
+                                return Err(anyhow::anyhow!(failure()));
+                            }
+                        };
                         // Route first so the diagnostic reports whether a
                         // live sender actually absorbed the busy signal: a
                         // retired delivery whose route found no sender
@@ -1184,10 +1209,16 @@ impl Occ3NativeSession {
                                 // fresh capture (bounded backoff). Any
                                 // other non-use outcome falls back.
                                 if refused_busy {
-                                    route_receiver_busy_to_sender(
-                                        &sender_session_id,
-                                        &message_id,
-                                    );
+                                    // The bound-lease busy path has no
+                                    // per-event diagnostic today; the
+                                    // sender's own queue notice is the
+                                    // observable record, so the bool needs
+                                    // no separate log here.
+                                    let _sender_absorbed =
+                                        route_receiver_busy_to_sender(
+                                            &sender_session_id,
+                                            &message_id,
+                                        );
                                 } else {
                                     route_delivery_event_to_sender(
                                         &sender_session_id,
@@ -4045,7 +4076,7 @@ mod tests {
                 .await
                 .unwrap()
                 .is_none(),
-            "a proven-undispatched busy refusal must release the claim and run the turn ordinary"
+            "a proven-undispatched busy refusal must retire the claim and run the turn ordinary"
         );
         assert_eq!(
             session.inbox.lock().unwrap().status("busy-1"),
@@ -4056,7 +4087,7 @@ mod tests {
         // once, including that a live sender absorbed the route.
         {
             let values = entries.lock().unwrap();
-            assert_eq!(values.len(), 1, "exactly one busy-release notice");
+            assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
             assert_eq!(values[0]["message_id"], "busy-1");
             assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
             assert_eq!(values[0]["released"], serde_json::json!(true));
@@ -4104,6 +4135,101 @@ mod tests {
         // The pre-notified terminal marker means the TurnEnd poll never
         // re-routes this record as an ordinary receiver failure.
         assert!(session.inbox.lock().unwrap().poll_terminal_failures().is_empty());
+    }
+
+    /// The orphan case of the busy retirement: the sender is gone (no live
+    /// native session under the envelope's sender id), so the route finds
+    /// nobody. The turn must STILL proceed ordinary (the retirement itself
+    /// is not a failure), the record retires terminal, and the diagnostic
+    /// carries `released == true, sender_routed == false` so the lost facts
+    /// are visible instead of silent.
+    #[tokio::test]
+    async fn receiver_resolver_busy_retirement_without_a_live_sender_is_visible() {
+        let _sink_guard = pi_ai::log::test_sink_guard();
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str() == Some("receiver_busy_claim_released")
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
+        // No sender session is enrolled for "sender-orphan": the route
+        // must report false and nothing may panic or wedge.
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::NativeInferenceBusyRefused {
+            connector_id: "unit-fixture-occ3".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session-orphan",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "busy-orphan-1".into(),
+            sender_session_id: "sender-orphan".into(),
+            receiver_session_id: "unit-session-orphan".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-orphan-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint,
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy-orphan-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox
+                .admit(envelope, "busy-orphan-1", "sender-orphan", 1)
+                .unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": "busy-orphan-1"})),
+                timestamp: 0,
+            })],
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        assert!(
+            (resolver)(request()).await.unwrap().is_none(),
+            "an orphaned busy retirement must still run the turn ordinary"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-orphan-1"),
+            Some(Occ3DeliveryStatus::Failed)
+        );
+        let values = entries.lock().unwrap();
+        assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
+        assert_eq!(values[0]["released"], serde_json::json!(true));
+        assert_eq!(values[0]["sender_routed"], serde_json::json!(false));
     }
 
     /// Fail-closed stays fail-closed: a NON-busy `prepare_inference`

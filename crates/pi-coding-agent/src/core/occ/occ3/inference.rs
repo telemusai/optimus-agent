@@ -197,8 +197,10 @@ struct Admission {
     terminal_notified: bool,
     /// Terminal `Failed` outcome came from a proven-non-use busy refusal of
     /// the pre-dispatch control call (never a provider failure). Diagnostic
-    /// only: distinguishes busy retirements in `audit` output.
-    busy_refused: bool,
+    /// only: distinguishes busy retirements in `audit` output. Distinct from
+    /// the lease-derived `refused_busy()` (a bound lease the provider
+    /// refused pre-event): this flag marks a RETIRED record.
+    busy_retired: bool,
 }
 
 /// Bounded session-local inbox. Only the authenticated host calls `admit`.
@@ -276,7 +278,7 @@ impl Occ3InferenceInbox {
                 admission_seq: self.admissions,
                 consumed_notified: false,
                 terminal_notified: false,
-                busy_refused: false,
+                busy_retired: false,
             },
         );
         Ok(true)
@@ -438,7 +440,7 @@ impl Occ3InferenceInbox {
         // transition in this inbox (cancel_pending, invalidate_all):
         // `claimed && Failed` is the terminal shape, and the never-again
         // guarantee rests on the terminal status the claim loop skips.
-        record.busy_refused = true;
+        record.busy_retired = true;
         record.status = Occ3DeliveryStatus::Failed;
         record.terminal_notified = true;
         true
@@ -454,7 +456,7 @@ impl Occ3InferenceInbox {
             let id=&record.envelope.message_id;
             let lease=record.bound_lease.as_ref();
             serde_json::json!({"message_id":id,"receiver_session_id":self.receiver_session_id,
-                "busy_refused":record.busy_refused,
+                "busy_retired":record.busy_retired,
                 "admission_seq":record.admission_seq,
                 "sender_session_id":record.envelope.sender_session_id,"runtime_id":record.envelope.runtime_id,
                 "runtime_generation":record.envelope.state_handle.runtime_generation,"model_fingerprint":record.envelope.model_fingerprint,
@@ -859,16 +861,16 @@ mod tests {
     /// (the sender's fresh-capture retry is the sole retry path). Only the
     /// exact claimed-unbound state releases: a bound lease
     /// (its outcome belongs to the provider), a terminal status, an unclaimed
-    /// or an unknown record never releases - their outcomes stay fail-closed.
+    /// or an unknown record never retires - their outcomes stay fail-closed.
     #[test]
     fn occ3_retire_busy_claim_retires_only_an_unbound_claim_as_busy_failed() {
         let mut inbox = Occ3InferenceInbox::new("receiver".into()).unwrap();
         assert!(inbox.admit(unit_envelope("m1", "s1"), "m1", "s1", 1).unwrap());
-        // Unknown and never-claimed records never release.
+        // Unknown and never-claimed records never retire.
         assert!(!inbox.retire_busy_claim("unknown"));
         assert!(!inbox.retire_busy_claim("m1"));
         assert!(inbox.claim(&["m1".to_string()], &[], 1).unwrap().is_some());
-        // The pre-bind busy release: claimed, Delivered, no bound lease.
+        // The pre-bind busy retirement: claimed, Delivered, no bound lease.
         assert!(inbox.retire_busy_claim("m1"));
         assert_eq!(inbox.status("m1"), Some(Occ3DeliveryStatus::Failed));
         // The retirement is terminal: the same delivery is never claimable
@@ -877,8 +879,8 @@ mod tests {
         assert!(inbox.claim(&["m1".to_string()], &["m1".to_string()], 1).unwrap().is_none());
         assert!(inbox.poll_terminal_failures().is_empty());
         let audit = inbox.audit();
-        assert_eq!(audit[0]["busy_refused"], serde_json::json!(true));
-        // A busy-retired record never releases a second time.
+        assert_eq!(audit[0]["busy_retired"], serde_json::json!(true));
+        // A busy-retired record never retires a second time.
         assert!(!inbox.retire_busy_claim("m1"));
         // Once a lease is bound the outcome belongs to the provider: never
         // released, whatever the refusal class claims to prove. A second
@@ -910,7 +912,7 @@ mod tests {
         inbox.records.get_mut("m2").unwrap().bound_lease = Some(lease);
         assert!(!inbox.retire_busy_claim("m2"));
         assert_eq!(inbox.status("m2"), Some(Occ3DeliveryStatus::Delivered));
-        // A terminal record never releases either.
+        // A terminal record never retires either.
         let record = inbox.records.get_mut("m2").unwrap();
         record.bound_lease = None;
         record.status = Occ3DeliveryStatus::Failed;
