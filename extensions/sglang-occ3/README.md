@@ -99,6 +99,43 @@ scratch fit within the solver workspace allowance.
 Changing profile file bytes changes generated `PROFILE_SHA256`. The plugin files
 also change, so regenerate `native_sources.json` and its baked `SOURCE_SHA256`
 with the normal package builder. No SGLang overlay or calibration artifact changes.
+
+The checked-in calibrated candidate files now select **0.5**:
+`deploy/native-build-inputs/native-profile-input.json.v3` and
+`deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json`. The default in
+code and the historical `native-profile-input.json` remain zero. The Dockerfile
+reads the basename without `.v3`, so select the candidate explicitly in a fresh,
+clean staging build context, not by editing the historical checkout input.
+
+**Operator cost:** the supported Docker lane requires rebuilding the derived OCI
+image's native package layer, then replacing/restarting the candidate container.
+It does not require rebuilding the SGLang base, downloading weights, or fitting a
+new calibration artifact; unchanged base layers can be reused. A profile edit
+and container restart alone is insufficient, and in-place package hot-patching
+is not a supported deploy path. With `CONTEXT` set to a prepared clean extension
+build context and `BASE_IMAGE_TAG` to the verified preserved original base image
+(not an already-overlay-patched candidate), the build command is:
+
+```sh
+cp "$CONTEXT/deploy/native-build-inputs/native-profile-input.json.v3" \
+   "$CONTEXT/deploy/native-build-inputs/native-profile-input.json"
+docker build --pull=false --network=none \
+  --build-arg BASE_IMAGE="$BASE_IMAGE_TAG" \
+  --build-arg OCC3_EXPERIMENTAL_STARTUP=true \
+  -f "$CONTEXT/deploy/Dockerfile" -t "$CANDIDATE_TAG" "$CONTEXT"
+```
+
+The context must include the reviewed `source-baseline-expanded.json`, patch
+manifests, and actual calibration path/digest. The Dockerfile invokes
+`python3 -m deploy.v3.native_image_build`, which invokes `native_package` and
+writes `occ3_sglang/native_profile.json`, `native_sources.json`, and
+`_native_profile_digest.py` (`PROFILE_SHA256` and `SOURCE_SHA256`). These outputs
+are generated at package build, not checked into Git. Update the candidate plan
+from `deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json` with the
+resulting image ID, static-input SHA and runtime/admission evidence, then use the
+reviewed V3 candidate replacement/restart flow. Historical `stage_build.py`'s
+fixed zero-profile SHA is not a candidate-profile selector and remains unchanged.
+
 Historical pinned profile files that omit the field still load unchanged. Zero
 is omitted from the runtime binding-digest input to preserve old zero-setting
 bindings; nonzero values enter that digest. Old receipts omit the field and mean
