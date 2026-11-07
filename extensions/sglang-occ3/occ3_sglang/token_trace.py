@@ -100,8 +100,6 @@ def admit(runtime, record, req, scheduler, descriptor):
 @isolated
 def chunk(runtime, record, item, forward_batch, local, count, source, lane):
     """Observe actual RoPE positions and mapped source rows, including empty chunks."""
-    if runtime.rank != 0:
-        return
     labels = list(getattr(record, "occ3_trace_labels", ()))
     positions = forward_batch.positions
     actual = [int(x) for x in positions[local:local+count].tolist()]
@@ -113,7 +111,8 @@ def chunk(runtime, record, item, forward_batch, local, count, source, lane):
         saved = getattr(record, "occ3_trace_slots", {})
         saved.update(zip(expected, slots))
         record.occ3_trace_slots = saved
-    emit("consume_chunk", lane=lane, source_sha256=getattr(record, "occ3_trace_hash", None),
+    emit("consume_chunk", lane=lane, rank=runtime.rank,
+         dsa_pin=pin_summary(getattr(forward_batch, "occ3_dsa_pin", None)), source_sha256=getattr(record, "occ3_trace_hash", None),
          chunk_start=item.prefix_len, chunk_end=item.prefix_len + item.extend_len,
          local_start=local, source_start=source, rows=count,
          source_labels=summary(labels[source:source+count]),
@@ -165,20 +164,55 @@ def draft_chunk(runtime, record, item, forward_batch, values, local, count, sour
 
 @isolated
 def settled(runtime, record, scheduler, req, descriptor):
-    """Compare terminal slot mapping, not KV values; no engine-owned state changes."""
+    """The request row is already freed; report saved injection mapping only."""
     if runtime.rank != 0:
         return
     at, count = descriptor.prefix_offset, descriptor.expected_prefix_tokens
-    pool = scheduler.req_to_token_pool.req_to_token
-    slots = [int(x) for x in pool[req.req_pool_idx, at:at+count].tolist()]
     saved = getattr(record, "occ3_trace_slots", {})
     initial = [saved.get(position) for position in range(at, at+count)]
-    if hasattr(record, "occ3_trace_kv_pool"):
-        kv_snapshot(runtime, record, record.occ3_trace_kv_pool, initial, "terminal_settle")
     emit("consume_settle", source_sha256=getattr(record, "occ3_trace_hash", None),
-         kv_slots=summary(slots), initial_mapping_complete=all(x is not None for x in initial),
-         first_slot_mismatch=first_mismatch(initial, slots),
-         prefix_offset=at, rows=count, num_retractions=req.retraction_count)
+         kv_slots=summary(initial), initial_mapping_complete=all(x is not None for x in initial),
+         mapping_source="injection", prefix_offset=at, rows=count,
+         num_retractions=req.retraction_count)
+
+
+def pin_summary(pin):
+    """Read the actual forward pin's three bounded integer vectors, not its repr."""
+    if pin is None:
+        return None
+    if len(pin) != 3 or any(value.ndim != 1 or value.numel() > 128 for value in pin):
+        return {"skipped": "pin_shape"}
+    return [[int(x) for x in value.tolist()] for value in pin]
+
+
+@isolated
+def alignment(runtime, prefix, embeddings):
+    """Compare aligned and token-embedding rows already resident on this rank."""
+    if runtime.rank != 0:
+        return
+    if (prefix.ndim != 2 or prefix.shape != embeddings.shape or
+            not 0 < prefix.shape[0] <= 128 or prefix.numel() > 128 * 32768):
+        return
+    import math
+    import torch
+    values = torch.nn.functional.cosine_similarity(
+        prefix.detach().float(), embeddings.detach().float(), dim=1).cpu().tolist()
+    emit("alignment", rank=runtime.rank, rows=len(values),
+         row_cosine=[round(v, 6) if math.isfinite(v) else None for v in values])
+
+
+@isolated
+def kv_saved(runtime, record, descriptor, point, fence=False):
+    """Use owned physical slots before release; never read a freed request row."""
+    pool = getattr(record, "occ3_trace_kv_pool", None)
+    if pool is None:
+        return
+    at, count = descriptor.prefix_offset, descriptor.expected_prefix_tokens
+    saved = getattr(record, "occ3_trace_slots", {})
+    slots = [saved.get(i) for i in range(at, at+count)]
+    if fence:
+        runtime.fence()
+    kv_snapshot(runtime, record, pool, slots, point)
 
 
 KV_COPY_LIMIT = 8 * 1024 * 1024
@@ -203,29 +237,64 @@ def kv_buffers(pool):
     return result
 
 
-def kv_bytes(kind, buf, slots):
-    """Gather only selected token bytes, never their neighbouring page rows."""
+def kv_indices(slots, device):
+    """Build bounded gather indices once per point on the pool's device."""
     import torch
     if torch.version.hip:
         raise ValueError("unsupported_hip_layout")
-    ids = torch.tensor(slots, dtype=torch.long, device=buf.device)
+    ids = torch.tensor(slots, dtype=torch.long, device=device)
+    page, row = ids // 64, ids % 64
+    return (ids, page[:, None],
+            row[:, None] * 128 + torch.arange(128, device=device)[None, :],
+            64 * 128 + row[:, None] * 4 + torch.arange(4, device=device)[None, :])
+
+
+def kv_selected(kind, buf, slots, indices):
+    """Gather independently allocated buffers without copying whole caches."""
+    import torch
+    if not slots or any(type(i) is not int or i < 0 for i in slots):
+        raise ValueError("invalid_slots")
+    capacity = buf.shape[0] * (64 if kind == "index" else 1)
+    if max(slots) >= capacity:
+        raise ValueError("invalid_buffer_slots")
+    ids, page, keys, scales = indices
     if kind == "mla":
         selected = buf.index_select(0, ids).reshape(len(slots), -1)
+    elif kind == "index":
+        selected = torch.cat((buf[page, keys], buf[page, scales]), dim=1)
     else:
-        page, row = ids // 64, ids % 64
-        keys = buf[page[:, None], row[:, None] * 128 +
-                   torch.arange(128, device=buf.device)[None, :]]
-        scales = buf[page[:, None], 64 * 128 + row[:, None] * 4 +
-                     torch.arange(4, device=buf.device)[None, :]]
-        selected = torch.cat((keys, scales), dim=1)
-    return selected.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+        raise ValueError("unsupported_index_layout")
+    return selected.contiguous().view(torch.uint8).reshape(-1)
+
+
+def kv_bytes(kind, buf, slots):
+    """Standalone accessor for layout tests; point reads use kv_point_bytes."""
+    indices = kv_indices(slots, buf.device)
+    return kv_selected(kind, buf, slots, indices).cpu().numpy().tobytes()
+
+
+def kv_point_bytes(buffers, slots):
+    """One bounded D2H transfer; a gather per allocation avoids whole-pool copies."""
+    import torch
+    device = buffers[0][2].device
+    if any(buf.device != device for _, _, buf, _ in buffers):
+        raise ValueError("unsupported_mla_layout")
+    indices = kv_indices(slots, device)
+    pieces = [kv_selected(kind, buf, slots, indices) for kind, _, buf, _ in buffers]
+    data = torch.cat(pieces).cpu().numpy().tobytes()
+    result, offset = [], 0
+    for _, _, _, width in buffers:
+        length = len(slots) * width
+        result.append(data[offset:offset+length])
+        offset += length
+    if offset != len(data):
+        raise ValueError("copy_length")
+    return result
 
 
 @isolated
 def kv_snapshot(runtime, record, pool, slots, point):
-    """Rank zero only, bounded D2H copies; compare original physical slots."""
-    if runtime.rank != 0:
-        return
+    """Per-rank bounded D2H copy; compare original physical slots, no collectives."""
     try:
         buffers = kv_buffers(pool)
         if (not slots or any(type(i) is not int or i < 0 or i >= pool.size
@@ -239,13 +308,21 @@ def kv_snapshot(runtime, record, pool, slots, point):
         if not width or width > KV_COPY_LIMIT:
             raise ValueError("layout_exceeds_budget")
         limit = KV_COPY_LIMIT // width
-        chosen = slots if len(slots) <= limit else [
-            slots[i * (len(slots)-1) // (limit-1)] for i in range(limit)] if limit > 1 else slots[:1]
+        tail = min(16, len(slots))
+        if limit < tail:
+            raise ValueError("layout_exceeds_budget")
+        chosen = slots
+        if len(slots) > limit:
+            rest = limit - tail
+            head = len(slots) - tail
+            spaced = ([slots[i * (head-1) // (rest-1)] for i in range(rest)]
+                      if rest > 1 else slots[:rest])
+            chosen = spaced + slots[-tail:]
         digests = [hashlib.sha256() for _ in chosen]
         whole = hashlib.sha256()
         copied = 0
-        for kind, layer, buf, row_bytes in buffers:
-            data = kv_bytes(kind, buf, chosen)
+        point_bytes = kv_point_bytes(buffers, chosen)
+        for (_, _, _, row_bytes), data in zip(buffers, point_bytes):
             if len(data) != len(chosen) * row_bytes:
                 raise ValueError("copy_length")
             whole.update(data)
@@ -263,7 +340,7 @@ def kv_snapshot(runtime, record, pool, slots, point):
              sha256=whole.hexdigest(), changed=(mismatch is not None) if comparable else None,
              first_changed_slot=chosen[mismatch] if mismatch is not None else None,
              sampled=len(chosen) != len(slots), slots=len(slots), hashed_slots=len(chosen),
-             bytes_copied=copied, blocking_copies=len(buffers),
+             bytes_copied=copied, blocking_copies=1,
              baseline_comparable=comparable)
     except Exception as error:
         reason = str(error) if type(error) is ValueError else "snapshot_failed"
@@ -275,29 +352,21 @@ def kv_snapshot(runtime, record, pool, slots, point):
 
 @isolated
 def kv_forward(model_runner, forward_batch, point):
+    """Only eager prefill owns context; shared decode deliberately has none."""
     from .latent_worker import _runtime, ConsumeWorkerDescriptor
-    runtime = _runtime()
-    if runtime.rank != 0 or getattr(model_runner, "is_draft_worker", False):
+    context = getattr(forward_batch, "occ3_context", None)
+    if (point != "prefill_complete" or not context or
+            getattr(model_runner, "is_draft_worker", False)):
         return
-    item = forward_batch.occ3_context[0]
-    record = runtime.resolve(item.descriptor)
+    item = context[0]
     if type(item.descriptor) is not ConsumeWorkerDescriptor:
         return
+    runtime = _runtime()
+    record = runtime.resolve(item.descriptor)
     at, count = item.descriptor.prefix_offset, item.descriptor.expected_prefix_tokens
     saved = getattr(record, "occ3_trace_slots", {})
     slots = [saved.get(i) for i in range(at, at+count)]
-    if any(i is None for i in slots):
+    if any(i is None for i in slots) or hasattr(record, "occ3_trace_kv_pool"):
         return
-    if point == "prefill_complete":
-        if hasattr(record, "occ3_trace_kv_pool"):
-            return
-        record.occ3_trace_kv_pool = model_runner.token_to_kv_pool
-    else:
-        mode = forward_batch.forward_mode
-        if mode.is_extend() and not mode.is_target_verify():
-            return
-        if (not hasattr(record, "occ3_trace_kv_pool") or
-                getattr(record, "occ3_trace_kv_decode", False)):
-            return
-        record.occ3_trace_kv_decode = True
+    record.occ3_trace_kv_pool = model_runner.token_to_kv_pool
     kv_snapshot(runtime, record, model_runner.token_to_kv_pool, slots, point)

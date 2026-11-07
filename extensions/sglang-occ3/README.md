@@ -149,10 +149,14 @@ INFO `occ3-bridge: token trace` JSON lines (ASCII escaped, at most 16 KiB each):
   Prompt neighbors are IDs only, not decoded. Holes are **not** receiver text.
 - `consume_chunk`: target prefill chunk boundaries (including zero-overlap
   chunks), mapped source labels, actual position IDs and first expected-position
-  mismatch, DSA offset/count, and bounded KV slot IDs. Draft overlapping chunks
-  are labeled separately and show their one-row pin shift.
-- `consume_settle`: terminal request-to-KV slot mapping versus injected slots,
-  with first mismatch and retraction count (if the scheduler exposes its pool).
+  mismatch, computed DSA offset/count, actual `occ3_dsa_pin` vectors (up to
+  128 entries each), rank and bounded KV slot IDs. Every TP rank records its
+  slots. Draft chunks are labeled separately and show their one-row pin shift.
+- `consume_settle`: saved injection slots and retraction count. The live request
+  row has already been freed; this is not a terminal mapping comparison.
+- `alignment`: at most 128 per-row cosines between the aligned prefix and its
+  source-token embeddings, rounded to six decimals (nonfinite values are null).
+  Both tensors are already present on rank zero; no vocabulary lookup is added.
 - `consume_embeddings`: full retained-prefix hash versus capture, selected-row
   hash versus the freshly copied target/draft embedding slice. Hashes distinguish
   mutated stored rows from a bad copy, without logging tensor contents.
@@ -162,14 +166,14 @@ receipt objects. **Token IDs are reversible content**, and decoded source text
 can contain private data. Run only authorized synthetic prompts without secrets
 (including conversation history), restrict log access/retention, then disable.
 Every hook is exception-isolated, including logger/decoder failures. Size overflow
-emits a fixed size-limit record. Rank zero alone emits; no diagnostic collectives
-or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
+emits a fixed size-limit record. Chunk and KV-value lines are per-rank; other
+lines are rank zero only. No diagnostic collectives or wire fields are added. Tensor hashing copies bounded rows to CPU and can change
 timing; it does not change request state, alignment, positions or inference policy.
 
 Equal IDs/hashes do not establish semantic fidelity: the receiver attends to
 continuous aligned embeddings, not the source IDs. KV slot IDs expose placement
 and reuse across observed chunks. The value hashes below additionally detect
-observed rank-zero KV mutations, not other ranks' memory. If all traces agree,
+observed KV mutations on each traced rank. If all traces agree,
 investigate alignment quality and downstream attention behavior rather than
 treating source labels as text that the receiver necessarily saw.
 
@@ -195,30 +199,50 @@ MIT, same as the repository.
 
 ### Injected KV value diagnostics
 
-With `OCC3_DIAG_TOKEN_TRACE=1`, `consume_kv_values` hashes rank 0's target
-MLA bytes and DSA index key **and scale** bytes at `prefill_complete` (completion
-of the chunk containing the last injected row), `first_decode` (before the first
-decode/target-verify forward), and `terminal_settle` (existing terminal fence).
-It reads the original physical slots recorded by injection, not neighbouring
-page rows. Slot-map comparisons remain separate. No engine storage is written.
-Rank 0 alone reads its local shard: no collectives, no other-rank guarantees.
+With `OCC3_DIAG_TOKEN_TRACE=1`, `consume_kv_values` hashes each TP rank's
+local target MLA bytes and DSA index key **and scale** bytes. These are lifecycle
+observations, not hooks on shared decode batches (which have no `occ3_context`):
+
+- `prefill_complete`: forward completion of the chunk containing the last injected
+  row. Saves the pool and original physical injection slots for later reads.
+- `consume_released`: final prefill result settle, after the result copy-done wait
+  and an opt-in local `runtime.fence()`, before clearing the eager flag. This is
+  before the next shared decode/target-verify, not a first-decode forward hook.
+- `private_release`: inside the existing private-KV release fence, before the
+  allocator releases KV or frees `req.kv.req_pool_idx`. This is the last safe
+  observation, not a terminal-settle read of storage that may have been reused.
+
+A request finishing during prefill does not leave the eager cohort and therefore
+has no `consume_released` point. Aborted/incomplete injection may lack a baseline;
+missing saved pools skip later reads. These traces never promise three lines for
+every attempt. All reads use saved physical injection slots, not neighbouring
+page rows. No engine storage is written and no diagnostic collectives are added.
 
 Each point copies at most **8 MiB** GPU-to-CPU, plus existing slot-map reads.
 For N selected slots the exact copy cost is N times the sum of all MLA row
-widths plus 132 bytes per allocated DSA index layer. Each buffer uses one
-blocking CPU copy (normally 156 copies for 78 MLA + 78 DSA layers); this
-synchronizes its producing CUDA stream. Logs report `bytes_copied` and
-`blocking_copies`. CPU SHA-256 hashes the copied bytes and retains only per-slot
-digests. Above the budget, deterministic evenly spaced injected slots are used;
-`sampled=true` explicitly limits conclusions to those slots. No work or Torch
-import occurs through these hooks when disabled. The profile's uncompressed
-CUDA DSA layout is required; invalid indices or unsupported layouts are logged
-as skipped before indexing. HIP layouts are not interpreted as CUDA layouts.
+widths plus 132 bytes per allocated DSA index layer. Index tensors are built once
+per point. Selected bytes from independent layer allocations are gathered on-device,
+concatenated, and transferred with **one `.cpu()`**. A single gather across all
+layers would require stacking whole caches or a custom pointer-array kernel;
+this diagnostic instead keeps per-allocation gathers to avoid whole-pool copies
+and new kernel dependencies. Logs report `bytes_copied` and `blocking_copies=1`.
+CPU SHA-256 retains only per-slot digests. The last 16 injected slots (or all slots
+if shorter) are mandatory; remaining budget samples the earlier region evenly.
+If the mandatory tail cannot fit, the point reports `layout_exceeds_budget`.
+`sampled=true` limits conclusions to selected slots. No GPU work or Torch import
+occurs through these hooks when disabled. The uncompressed CUDA DSA layout is
+required; invalid indices or unsupported layouts skip before indexing. HIP
+layouts are not interpreted as CUDA layouts.
 
-`changed=true` relative to prefill indicates mutation of the observed KV bytes
-(overwrite/aliasing is a candidate); `first_changed_slot` identifies the first
-changed sampled physical slot in prefix order. An unchanged hash with wrong
-text points toward fidelity/alignment, but does not prove it: other ranks,
-unsampled slots, and transient mutations between observations remain invisible.
-These diagnostic synchronizations can change timing. Never use a sampled or
-skipped observation as proof of unchanged whole-pool state.
+`changed=true` relative to prefill indicates mutation of observed KV bytes;
+`first_changed_slot` identifies the first changed sampled physical slot in prefix
+order. Unchanged hashes with wrong text point toward fidelity/alignment but do
+not prove it: unsampled slots, missing rank logs and transient mutations between
+observations remain invisible. Synchronization can perturb or mask timing-sensitive
+behavior. Never treat a sampled/skipped observation as whole-pool proof.
+
+Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
+`PLUGIN_FILE_COUNT=36`; it was already stale on main (37 modules), and this PR
+has 38. The live staging assembler refuses this count. The full native package
+build enumerates modules instead. No deploy files are changed here; correct the
+pin separately before using that assembler.

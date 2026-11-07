@@ -118,18 +118,24 @@ def test_tensor_hash_cpu():
     assert trace.tensor_hash(torch.zeros((129,2))) is None
 
 
-@pytest.mark.parametrize("slots,mismatch", [([21,22], None), ([21,99], 1)])
-def test_terminal_mapping(caplog, slots, mismatch):
-    class Pool:
-        def __getitem__(self, key):
-            assert key == (7, slice(4,6))
-            return NS(tolist=lambda: slots)
+def test_terminal_saved_mapping_without_live_pool(monkeypatch, caplog):
+    rank = 0
+    class FreedScheduler:
+        @property
+        def req_to_token_pool(self):
+            pytest.fail("terminal settle must not read a freed pool row")
+    monkeypatch.setattr(trace, "kv_snapshot", lambda *a: pytest.fail("late KV read"))
+    monkeypatch.setattr(trace, "tensor_hash", lambda *a: pytest.fail("late tensor hash"))
     record = NS(occ3_trace_slots={4:21, 5:22}, occ3_trace_hash="a"*64)
-    trace.settled(NS(rank=0), record, NS(req_to_token_pool=NS(req_to_token=Pool())),
-                  NS(req_pool_idx=7, retraction_count=0),
+    trace.settled(NS(rank=rank), record, FreedScheduler(),
+                  NS(kv=NS(req_pool_idx=None), retraction_count=3),
                   NS(prefix_offset=4, expected_prefix_tokens=2))
-    assert rows(caplog)[-1]["initial_mapping_complete"] is True
-    assert rows(caplog)[-1]["first_slot_mismatch"] == mismatch
+    row = rows(caplog)[-1]
+    assert row["kv_slots"]["first_ids"] == [21, 22]
+    assert row["initial_mapping_complete"] is True
+    assert row["mapping_source"] == "injection"
+    assert row["num_retractions"] == 3
+    assert "first_slot_mismatch" not in row
 
 
 def test_no_transport_fields(caplog):
@@ -161,17 +167,17 @@ def test_kv_values(monkeypatch, caplog):
     pool = NS(size=10, kv_buffer=[buf])
     data = {2: b"ab", 4: b"cd"}
     calls = []
-    def copy(kind, buffer, slots):
+    def copy(buffers, slots):
         calls.append(slots)
-        return b"".join(data[i] for i in slots)
-    monkeypatch.setattr(trace, "kv_bytes", copy)
+        return [b"".join(data[i] for i in slots)]
+    monkeypatch.setattr(trace, "kv_point_bytes", copy)
     record = NS()
-    for point in ("prefill_complete", "first_decode"):
+    for point in ("prefill_complete", "consume_released"):
         trace.kv_snapshot(NS(rank=0), record, pool, [2, 4], point)
     assert rows(caplog)[-1]["changed"] is False
     assert rows(caplog)[-1]["sha256"] == rows(caplog)[-2]["sha256"]
     data[4] = b"ce"
-    trace.kv_snapshot(NS(rank=0), record, pool, [2, 4], "terminal_settle")
+    trace.kv_snapshot(NS(rank=0), record, pool, [2, 4], "private_release")
     assert rows(caplog)[-1]["changed"] is True
     assert rows(caplog)[-1]["first_changed_slot"] == 4
     assert rows(caplog)[-1]["bytes_copied"] == 4
@@ -185,55 +191,176 @@ def test_kv_values(monkeypatch, caplog):
     assert len(calls) == 3
 
 
-def test_kv_rank_and_buffer_bounds(monkeypatch, caplog):
-    monkeypatch.setattr(trace, "kv_bytes", lambda *a: pytest.fail("unexpected copy"))
-    trace.kv_snapshot(NS(rank=1), None, None, None, "prefill_complete")
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_kv_rank_and_buffer_bounds(monkeypatch, caplog, rank):
+    monkeypatch.setattr(trace, "kv_point_bytes", lambda *a: pytest.fail("unexpected copy"))
     buf = NS(shape=(2, 1, 2), element_size=lambda: 1)
-    trace.kv_snapshot(NS(rank=0), NS(), NS(size=10, kv_buffer=[buf]), [3], "test")
+    trace.kv_snapshot(NS(rank=rank), NS(), NS(size=10, kv_buffer=[buf]), [3], "test")
     assert rows(caplog)[-1]["skipped"] == "invalid_buffer_slots"
+    assert rows(caplog)[-1]["rank"] == rank
 
 
-def test_kv_sampling_and_index_layout(monkeypatch, caplog):
+@pytest.mark.parametrize("limit", [1, 15, 16, 20, 32])
+def test_kv_sampling_preserves_tail(monkeypatch, caplog, limit):
     mla = NS(shape=(100, 1, 2), element_size=lambda: 1)
     index = NS(shape=(2, 64 * 132), element_size=lambda: 1)
     pool = NS(size=100, kv_buffer=[mla], index_k_with_scale_buffer=[index],
               page_size=64, index_head_dim=128, index_kpool=1, index_kpool_compress=False)
-    monkeypatch.setattr(trace, "KV_COPY_LIMIT", 268)
+    monkeypatch.setattr(trace, "KV_COPY_LIMIT", 134 * limit)
     copied = []
-    def copy(kind, buf, slots):
-        copied.append((kind, slots))
-        return b"a" * len(slots) * (2 if kind == "mla" else 132)
-    monkeypatch.setattr(trace, "kv_bytes", copy)
-    trace.kv_snapshot(NS(rank=0), NS(), pool, [1, 2, 3, 4], "prefill_complete")
-    assert copied == [("mla", [1, 4]), ("index", [1, 4])]
-    assert rows(caplog)[-1]["sampled"] is True
-    assert rows(caplog)[-1]["bytes_copied"] == 268
+    def copy(buffers, slots):
+        copied.append(list(slots))
+        return [b"a" * len(slots) * width for _, _, _, width in buffers]
+    monkeypatch.setattr(trace, "kv_point_bytes", copy)
+    slots = list(range(32))
+    trace.kv_snapshot(NS(rank=1), NS(), pool, slots, "prefill_complete")
+    row = rows(caplog)[-1]
+    if limit < 16:
+        assert row["skipped"] == "layout_exceeds_budget"
+        assert not copied
+    else:
+        assert len(copied) == 1
+        assert len(copied[0]) <= limit
+        assert len(set(copied[0])) == len(copied[0])
+        assert set(slots[-16:]) <= set(copied[0])
+        assert row["bytes_copied"] <= 134 * limit
+        assert row["sampled"] is (limit < 32)
+        assert row["blocking_copies"] == 1
     pool.index_kpool = 2
-    trace.kv_snapshot(NS(rank=0), NS(), pool, [1], "test")
+    trace.kv_snapshot(NS(rank=1), NS(), pool, [1], "test")
     assert rows(caplog)[-1]["skipped"] == "unsupported_index_layout"
 
 
-def test_kv_forward_points(monkeypatch):
-    from occ3_sglang import latent_worker as worker
+def test_kv_short_prefix_must_fit_entire_tail(monkeypatch, caplog):
+    buf = NS(shape=(10, 1, 2), element_size=lambda: 1)
+    monkeypatch.setattr(trace, "KV_COPY_LIMIT", 4)
+    monkeypatch.setattr(trace, "kv_point_bytes", lambda *a: pytest.fail("unexpected copy"))
+    trace.kv_snapshot(NS(rank=0), NS(), NS(size=10, kv_buffer=[buf]), [1, 2, 3], "prefill_complete")
+    assert rows(caplog)[-1]["skipped"] == "layout_exceeds_budget"
+
+
+def descriptor_for(worker):
+    from dataclasses import fields
     descriptor = object.__new__(worker.ConsumeWorkerDescriptor)
-    object.__setattr__(descriptor, "prefix_offset", 4)
-    object.__setattr__(descriptor, "expected_prefix_tokens", 2)
+    for field in fields(worker.ConsumeWorkerDescriptor):
+        object.__setattr__(descriptor, field.name, None)
+    for key, value in dict(prefix_offset=4, expected_prefix_tokens=2,
+                           attempt_id="attempt", native_rid="rid", reservation_id="reservation").items():
+        object.__setattr__(descriptor, key, value)
+    return descriptor
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_kv_forward_points(monkeypatch, rank):
+    from occ3_sglang import latent_worker as worker
+    descriptor = descriptor_for(worker)
     record = NS(occ3_trace_slots={4: 2})
-    runtime = NS(rank=0, resolve=lambda d: record)
+    runtime = NS(rank=rank, resolve=lambda d: record)
     monkeypatch.setattr(worker, "_runtime", lambda: runtime)
     points = []
     monkeypatch.setattr(trace, "kv_snapshot", lambda *a: points.append(a[-1]))
     runner = NS(token_to_kv_pool=object())
-    mode = NS(is_extend=lambda: True, is_target_verify=lambda: False)
-    batch = NS(occ3_context=[NS(descriptor=descriptor)], forward_mode=mode)
+    batch = NS(occ3_context=[NS(descriptor=descriptor)])
     trace.kv_forward(runner, batch, "prefill_complete")
     assert not points
     record.occ3_trace_slots[5] = 3
     trace.kv_forward(runner, batch, "prefill_complete")
     trace.kv_forward(runner, batch, "prefill_complete")
     trace.kv_forward(runner, batch, "first_decode")
+    # Real shared decode batches cannot carry the eager consume context.
+    trace.kv_forward(runner, NS(occ3_context=None), "prefill_complete")
+    trace.kv_forward(runner, NS(occ3_context=None), "first_decode")
     assert points == ["prefill_complete"]
-    mode.is_target_verify = lambda: True
-    trace.kv_forward(runner, batch, "first_decode")
-    trace.kv_forward(runner, batch, "first_decode")
-    assert points == ["prefill_complete", "first_decode"]
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_release_hooks_snapshot_before_eager_clear_and_pool_free(monkeypatch, rank):
+    from occ3_sglang import latent_worker as worker
+    descriptor = descriptor_for(worker)
+    record = NS(consumer=descriptor, state="injected", injected_positions={4, 5},
+                occ3_trace_slots={4:2, 5:3}, occ3_trace_kv_pool=object(), inflight=1)
+    req = NS(occ3_worker_descriptor=descriptor, occ3_force_eager=True,
+             rid="rid", kv=NS(req_pool_idx=7))
+    events = []
+    runtime = NS(rank=rank, registry=NS(source_for_attempt=lambda _: record),
+                 fence=lambda: events.append("fence"),
+                 preflight=lambda name, operation: operation())
+    monkeypatch.setattr(worker, "_runtime", lambda *a: runtime)
+    monkeypatch.setattr(worker, "_cleanup_runtime", lambda *a: runtime)
+    def snapshot(rt, rec, pool, slots, point):
+        assert rt is runtime and rec is record and pool is record.occ3_trace_kv_pool
+        assert slots == [2, 3]
+        assert req.kv.req_pool_idx == 7
+        if point == "consume_released":
+            assert req.occ3_force_eager is True
+        events.append(point)
+    monkeypatch.setattr(trace, "kv_snapshot", snapshot)
+    assert worker.release_consume_cohort(NS(), req) is True
+    assert req.occ3_force_eager is False
+    assert events == ["fence", "consume_released"]
+    worker.fence_private_kv_release(NS(), req)
+    assert events == ["fence", "consume_released", "fence", "private_release"]
+    assert record.inflight == 0
+
+
+@pytest.mark.parametrize("rank", [0, 1, 7])
+def test_chunk_records_slots_on_all_ranks(caplog, rank):
+    class Vector:
+        ndim = 1
+        def __init__(self, values): self.values = values
+        def numel(self): return len(self.values)
+        def __getitem__(self, key):
+            return Vector(self.values[key]) if isinstance(key, slice) else self.values[key]
+        def tolist(self): return self.values
+    record = NS()
+    item = NS(prefix_len=4, extend_len=2, descriptor=NS(prefix_offset=4, expected_prefix_tokens=2))
+    batch = NS(positions=Vector([4, 5]), out_cache_loc=Vector([21, 22]),
+               occ3_dsa_pin=tuple(Vector(v) for v in ([4], [2], [1])))
+    trace.chunk(NS(rank=rank), record, item, batch, 0, 2, 0, "target")
+    assert record.occ3_trace_slots == {4:21, 5:22}
+    row = rows(caplog)[-1]
+    assert row["rank"] == rank
+    assert row["dsa_pin"] == [[4], [2], [1]]
+
+
+def test_real_mla_and_paged_index_bytes(monkeypatch):
+    torch = pytest.importorskip("torch")
+    monkeypatch.setattr(torch.version, "hip", None)
+    mla = torch.arange(70 * 3, dtype=torch.int64).to(torch.uint8).reshape(70, 1, 3)
+    index = torch.zeros((2, 64 * 132), dtype=torch.uint8)
+    slots = [63, 64, 1]
+    expected = []
+    for i, slot in enumerate(slots):
+        page, row = divmod(slot, 64)
+        index[page, row*128:(row+1)*128] = 11 + i
+        index[page, 8192+row*4:8192+(row+1)*4] = 91 + i
+        expected.append(bytes([11+i])*128 + bytes([91+i])*4)
+    expected_mla = bytes(value for slot in slots for value in mla[slot].flatten().tolist())
+    assert trace.kv_bytes("mla", mla, slots) == expected_mla
+    assert trace.kv_bytes("index", index, slots) == b"".join(expected)
+    buffers = [("mla", 0, mla, 3), ("index", 0, index, 132)]
+    transfers = []
+    original_cpu = torch.Tensor.cpu
+    def counted_cpu(tensor, *args, **kwargs):
+        transfers.append(tensor.numel())
+        return original_cpu(tensor, *args, **kwargs)
+    monkeypatch.setattr(torch.Tensor, "cpu", counted_cpu)
+    assert trace.kv_point_bytes(buffers, slots) == [expected_mla, b"".join(expected)]
+    assert transfers == [len(slots) * 135]
+
+
+def test_alignment_cosines_bounded_and_rounded(caplog):
+    torch = pytest.importorskip("torch")
+    prefix = torch.tensor([[1., 0.], [1., 0.], [0., 0.], [1., 1.]])
+    embeddings = torch.tensor([[1., 0.], [-1., 0.], [1., 0.], [1., 0.]])
+    trace.alignment(NS(rank=0), prefix, embeddings)
+    row = rows(caplog)[-1]
+    assert row["event"] == "alignment"
+    assert row["row_cosine"] == [1.0, -1.0, 0.0, 0.707107]
+    assert row["rows"] == 4 and row["rank"] == 0
+    caplog.clear()
+    trace.alignment(NS(rank=0), torch.ones((128, 2)), torch.ones((128, 2)))
+    assert len(rows(caplog)[-1]["row_cosine"]) == 128
+    caplog.clear()
+    trace.alignment(NS(rank=0), torch.ones((129, 2)), torch.ones((129, 2)))
+    assert not caplog.records

@@ -865,6 +865,8 @@ class WorkerRuntime:
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
             _probe_alignment(h, embeddings, prefix, self.profile)
+        from . import token_trace
+        token_trace.alignment(self, prefix, embeddings)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)
@@ -1159,8 +1161,9 @@ def release_consume_cohort(scheduler, req):
     row stays attached (abort, retraction, terminal journal, private KV), but
     clears occ3_force_eager so it merges into the ordinary running batch and
     decodes with CUDA graphs. The batch flag is recomputed by filter_batch /
-    merge_batch before the next schedule. No GPU work and no gather: injection
-    is complete, and the terminal receipt reads only integers and tokens.
+    merge_batch before the next schedule. No gather; GPU work occurs only for
+    opt-in token tracing. Injection is complete, and the terminal receipt reads
+    only integers and tokens.
     Returns False (row stays eager, safe) unless injection is complete.
     """
     descriptor = getattr(req, "occ3_worker_descriptor", None)
@@ -1171,6 +1174,10 @@ def release_consume_cohort(scheduler, req):
     if (record.consumer != descriptor or record.state != "injected"
             or len(record.injected_positions) != descriptor.expected_prefix_tokens):
         return False
+    # Result processing has waited for copy_done before reaching this hook.
+    # The opt-in diagnostic adds a local stream fence; disabled means no GPU work.
+    from . import token_trace
+    token_trace.kv_saved(runtime, record, descriptor, "consume_released", fence=True)
     req.occ3_force_eager = False
     return True
 
@@ -1813,6 +1820,9 @@ def fence_private_kv_release(scheduler, req):
         require(record.consumer == descriptor, "identity")
         prepared["record"] = record
         runtime.fence()
+        # Native release frees the request row only after this hook returns.
+        from . import token_trace
+        token_trace.kv_saved(runtime, record, descriptor, "private_release")
         return {"reservation": descriptor.reservation_id, "rid": req.rid}
     try:
         runtime.preflight("private_kv_fence", fence_owned)
@@ -1955,8 +1965,6 @@ def record_forward_start(model_runner, forward_batch):
     runtime.preflight("forward_start", validate, descriptor=forward_batch.occ3_context[0].descriptor)
     # An incomplete call cannot be reaped from its already-complete start event.
     runtime.preflight("forward_submit", lambda: _begin_gpu(runtime, prepared["record"]))
-    from . import token_trace
-    token_trace.kv_forward(model_runner, forward_batch, "first_decode")
 
 
 def validate_target_model_class(model):
