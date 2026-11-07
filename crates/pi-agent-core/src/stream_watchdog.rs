@@ -233,6 +233,32 @@ impl StreamWatchdogConfig {
     }
 }
 
+impl StreamWatchdogConfig {
+    /// Widens these limits for an armed native source-capture turn.
+    ///
+    /// An armed turn buffers its whole response server-side, so a healthy
+    /// turn sends no client events until the server finishes or fails it.
+    /// `remaining` is the time left on the capture lease's own deadline,
+    /// which bounds that silent period. Each limit is raised to at least
+    /// `armed_stream_bounds` for that remaining time. A larger configured
+    /// value is kept, and a disabled limit (`None`) stays disabled. The
+    /// result stays inside this module's maxima.
+    ///
+    /// This is computed per attempt from the lease and never written to the
+    /// process environment, so it cannot leak into other sessions' turns.
+    pub fn for_armed_turn(self, remaining: Duration) -> Self {
+        let seconds = remaining.as_millis().div_ceil(1000).min(u128::from(u64::MAX)) as u64;
+        let (gap_ms, deadline_ms) = armed_stream_bounds(seconds);
+        let widen = |limit: Option<Duration>, floor_ms: u64| {
+            limit.map(|limit| limit.max(Duration::from_millis(floor_ms)))
+        };
+        Self {
+            event_gap: widen(self.event_gap, gap_ms),
+            stream_deadline: widen(self.stream_deadline, deadline_ms),
+        }
+    }
+}
+
 fn parse_watchdog_ms(
     raw: Option<&str>,
     default_ms: u64,
@@ -550,6 +576,30 @@ mod tests {
         let (gap, deadline) = armed_stream_bounds(3_600);
         assert_eq!(gap, MAX_STREAM_EVENT_GAP_MS);
         assert_eq!(deadline, MAX_STREAM_DEADLINE_MS);
+    }
+
+    #[test]
+    fn armed_turn_widening_uses_the_lease_deadline_and_never_lowers_or_reenables() {
+        // Live failure 2026-11-07: an armed capture with a ~113k-token
+        // context stayed silent past the default 120 s gap and was aborted
+        // four times. A lease with 600 s left must widen the gap to the max.
+        let defaults = StreamWatchdogConfig::from_env_values(None, None);
+        let armed = defaults.for_armed_turn(Duration::from_secs(600));
+        assert_eq!(armed.event_gap, Some(Duration::from_millis(MAX_STREAM_EVENT_GAP_MS)));
+        assert_eq!(armed.stream_deadline, Some(Duration::from_millis(1_230_000)));
+        // A shorter lease still gets its own deadline plus grace.
+        let short = defaults.for_armed_turn(Duration::from_millis(200_500));
+        assert_eq!(short.event_gap, Some(Duration::from_millis(231_000)));
+        // An expired lease never lowers the configured limits.
+        let expired = defaults.for_armed_turn(Duration::ZERO);
+        assert_eq!(expired, defaults);
+        // A larger operator value is kept.
+        let wide = StreamWatchdogConfig::from_env_values(Some("590000"), Some("7000000"));
+        let kept = wide.for_armed_turn(Duration::from_secs(100));
+        assert_eq!(kept, wide);
+        // Explicitly disabled limits stay disabled.
+        let off = StreamWatchdogConfig::from_env_values(Some("0"), Some("0"));
+        assert_eq!(off.for_armed_turn(Duration::from_secs(600)), off);
     }
 
     #[test]

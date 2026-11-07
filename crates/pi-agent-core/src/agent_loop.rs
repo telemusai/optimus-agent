@@ -1542,7 +1542,15 @@ async fn stream_assistant_response_inner(
 
     // Stream stall watchdog: bounds a silent event gap and the overall stream
     // phase of this attempt (`crate::stream_watchdog` documents the incident).
-    let watchdog = crate::stream_watchdog::StreamWatchdogConfig::from_env();
+    let mut watchdog = crate::stream_watchdog::StreamWatchdogConfig::from_env();
+    if let Some(lease) = &source_capture {
+        // An armed source-capture turn is silent by design until the server
+        // finishes the buffered response, which is bounded by the lease's
+        // own deadline. Widen the limits for this attempt only; the default
+        // 120 s gap otherwise aborts healthy large-context captures.
+        let remaining = lease.limits().deadline.saturating_duration_since(std::time::Instant::now());
+        watchdog = watchdog.for_armed_turn(remaining);
+    }
     let attempt_started = tokio::time::Instant::now();
     let deadline_at = watchdog
         .stream_deadline
