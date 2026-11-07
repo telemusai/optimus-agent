@@ -173,7 +173,131 @@ def settled(runtime, record, scheduler, req, descriptor):
     slots = [int(x) for x in pool[req.req_pool_idx, at:at+count].tolist()]
     saved = getattr(record, "occ3_trace_slots", {})
     initial = [saved.get(position) for position in range(at, at+count)]
+    if hasattr(record, "occ3_trace_kv_pool"):
+        kv_snapshot(runtime, record, record.occ3_trace_kv_pool, initial, "terminal_settle")
     emit("consume_settle", source_sha256=getattr(record, "occ3_trace_hash", None),
          kv_slots=summary(slots), initial_mapping_complete=all(x is not None for x in initial),
          first_slot_mismatch=first_mismatch(initial, slots),
          prefix_offset=at, rows=count, num_retractions=req.retraction_count)
+
+
+KV_COPY_LIMIT = 8 * 1024 * 1024
+
+
+def kv_buffers(pool):
+    """Physical CUDA DSA layout: MLA rows; paged index keys then FP32 scales."""
+    result = []
+    for layer, buf in enumerate(pool.kv_buffer):
+        if len(buf.shape) != 3 or buf.shape[1] != 1 or buf.element_size() != 1:
+            raise ValueError("unsupported_mla_layout")
+        result.append(("mla", layer, buf, buf.shape[2]))
+    for layer, buf in enumerate(getattr(pool, "index_k_with_scale_buffer", ())):
+        if not buf.shape[0]:
+            continue
+        if (pool.page_size != 64 or pool.index_head_dim != 128 or
+                pool.index_kpool != 1 or pool.index_kpool_compress or
+                len(buf.shape) != 2 or buf.shape[1] != 64 * 132 or
+                buf.element_size() != 1):
+            raise ValueError("unsupported_index_layout")
+        result.append(("index", layer, buf, 132))
+    return result
+
+
+def kv_bytes(kind, buf, slots):
+    """Gather only selected token bytes, never their neighbouring page rows."""
+    import torch
+    if torch.version.hip:
+        raise ValueError("unsupported_hip_layout")
+    ids = torch.tensor(slots, dtype=torch.long, device=buf.device)
+    if kind == "mla":
+        selected = buf.index_select(0, ids).reshape(len(slots), -1)
+    else:
+        page, row = ids // 64, ids % 64
+        keys = buf[page[:, None], row[:, None] * 128 +
+                   torch.arange(128, device=buf.device)[None, :]]
+        scales = buf[page[:, None], 64 * 128 + row[:, None] * 4 +
+                     torch.arange(4, device=buf.device)[None, :]]
+        selected = torch.cat((keys, scales), dim=1)
+    return selected.contiguous().view(torch.uint8).cpu().numpy().tobytes()
+
+
+@isolated
+def kv_snapshot(runtime, record, pool, slots, point):
+    """Rank zero only, bounded D2H copies; compare original physical slots."""
+    if runtime.rank != 0:
+        return
+    try:
+        buffers = kv_buffers(pool)
+        if (not slots or any(type(i) is not int or i < 0 or i >= pool.size
+                             for i in slots)):
+            raise ValueError("invalid_slots")
+        for kind, _, buf, _ in buffers:
+            capacity = buf.shape[0] * (64 if kind == "index" else 1)
+            if max(slots) >= capacity:
+                raise ValueError("invalid_buffer_slots")
+        width = sum(entry[3] for entry in buffers)
+        if not width or width > KV_COPY_LIMIT:
+            raise ValueError("layout_exceeds_budget")
+        limit = KV_COPY_LIMIT // width
+        chosen = slots if len(slots) <= limit else [
+            slots[i * (len(slots)-1) // (limit-1)] for i in range(limit)] if limit > 1 else slots[:1]
+        digests = [hashlib.sha256() for _ in chosen]
+        whole = hashlib.sha256()
+        copied = 0
+        for kind, layer, buf, row_bytes in buffers:
+            data = kv_bytes(kind, buf, chosen)
+            if len(data) != len(chosen) * row_bytes:
+                raise ValueError("copy_length")
+            whole.update(data)
+            copied += len(data)
+            for i, digest in enumerate(digests):
+                digest.update(data[i*row_bytes:(i+1)*row_bytes])
+        current = [d.hexdigest() for d in digests]
+        baseline = getattr(record, "occ3_trace_kv_baseline", None)
+        comparable = baseline is not None and baseline[0] == chosen
+        mismatch = first_mismatch(baseline[1], current) if comparable else None
+        if point == "prefill_complete":
+            record.occ3_trace_kv_baseline = (chosen, current)
+        emit("consume_kv_values", point=point, rank=runtime.rank,
+             source_sha256=getattr(record, "occ3_trace_hash", None),
+             sha256=whole.hexdigest(), changed=(mismatch is not None) if comparable else None,
+             first_changed_slot=chosen[mismatch] if mismatch is not None else None,
+             sampled=len(chosen) != len(slots), slots=len(slots), hashed_slots=len(chosen),
+             bytes_copied=copied, blocking_copies=len(buffers),
+             baseline_comparable=comparable)
+    except Exception as error:
+        reason = str(error) if type(error) is ValueError else "snapshot_failed"
+        emit("consume_kv_values", point=point, rank=runtime.rank,
+             skipped=reason if reason in {"invalid_slots", "invalid_buffer_slots",
+                 "unsupported_mla_layout", "unsupported_index_layout", "layout_exceeds_budget",
+                 "copy_length", "unsupported_hip_layout"} else "snapshot_failed")
+
+
+@isolated
+def kv_forward(model_runner, forward_batch, point):
+    from .latent_worker import _runtime, ConsumeWorkerDescriptor
+    runtime = _runtime()
+    if runtime.rank != 0 or getattr(model_runner, "is_draft_worker", False):
+        return
+    item = forward_batch.occ3_context[0]
+    record = runtime.resolve(item.descriptor)
+    if type(item.descriptor) is not ConsumeWorkerDescriptor:
+        return
+    at, count = item.descriptor.prefix_offset, item.descriptor.expected_prefix_tokens
+    saved = getattr(record, "occ3_trace_slots", {})
+    slots = [saved.get(i) for i in range(at, at+count)]
+    if any(i is None for i in slots):
+        return
+    if point == "prefill_complete":
+        if hasattr(record, "occ3_trace_kv_pool"):
+            return
+        record.occ3_trace_kv_pool = model_runner.token_to_kv_pool
+    else:
+        mode = forward_batch.forward_mode
+        if mode.is_extend() and not mode.is_target_verify():
+            return
+        if (not hasattr(record, "occ3_trace_kv_pool") or
+                getattr(record, "occ3_trace_kv_decode", False)):
+            return
+        record.occ3_trace_kv_decode = True
+    kv_snapshot(runtime, record, model_runner.token_to_kv_pool, slots, point)

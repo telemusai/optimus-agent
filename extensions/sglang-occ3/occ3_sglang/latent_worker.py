@@ -1935,6 +1935,8 @@ def record_forward_completion(model_runner, forward_batch):
         return
     runtime = _runtime()
     runtime.preflight("forward_complete", lambda: _end_gpu(runtime, runtime.resolve(context[0].descriptor)))
+    from . import token_trace
+    token_trace.kv_forward(model_runner, forward_batch, "prefill_complete")
 
 
 def record_forward_start(model_runner, forward_batch):
@@ -1953,6 +1955,8 @@ def record_forward_start(model_runner, forward_batch):
     runtime.preflight("forward_start", validate, descriptor=forward_batch.occ3_context[0].descriptor)
     # An incomplete call cannot be reaped from its already-complete start event.
     runtime.preflight("forward_submit", lambda: _begin_gpu(runtime, prepared["record"]))
+    from . import token_trace
+    token_trace.kv_forward(model_runner, forward_batch, "first_decode")
 
 
 def validate_target_model_class(model):

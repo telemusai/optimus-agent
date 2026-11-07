@@ -168,10 +168,10 @@ timing; it does not change request state, alignment, positions or inference poli
 
 Equal IDs/hashes do not establish semantic fidelity: the receiver attends to
 continuous aligned embeddings, not the source IDs. KV slot IDs expose placement
-and reuse across observed chunks, **not** later KV content overwrites or other
-ranks' memory. If all traces agree, investigate alignment quality and downstream
-attention/KV behavior with separate runtime instrumentation rather than treating
-source labels as text that the receiver necessarily saw.
+and reuse across observed chunks. The value hashes below additionally detect
+observed rank-zero KV mutations, not other ranks' memory. If all traces agree,
+investigate alignment quality and downstream attention behavior rather than
+treating source labels as text that the receiver necessarily saw.
 
 ## Offline development
 
@@ -191,3 +191,34 @@ model calls for regression tests. The repository also requires
 ## License
 
 MIT, same as the repository.
+
+
+### Injected KV value diagnostics
+
+With `OCC3_DIAG_TOKEN_TRACE=1`, `consume_kv_values` hashes rank 0's target
+MLA bytes and DSA index key **and scale** bytes at `prefill_complete` (completion
+of the chunk containing the last injected row), `first_decode` (before the first
+decode/target-verify forward), and `terminal_settle` (existing terminal fence).
+It reads the original physical slots recorded by injection, not neighbouring
+page rows. Slot-map comparisons remain separate. No engine storage is written.
+Rank 0 alone reads its local shard: no collectives, no other-rank guarantees.
+
+Each point copies at most **8 MiB** GPU-to-CPU, plus existing slot-map reads.
+For N selected slots the exact copy cost is N times the sum of all MLA row
+widths plus 132 bytes per allocated DSA index layer. Each buffer uses one
+blocking CPU copy (normally 156 copies for 78 MLA + 78 DSA layers); this
+synchronizes its producing CUDA stream. Logs report `bytes_copied` and
+`blocking_copies`. CPU SHA-256 hashes the copied bytes and retains only per-slot
+digests. Above the budget, deterministic evenly spaced injected slots are used;
+`sampled=true` explicitly limits conclusions to those slots. No work or Torch
+import occurs through these hooks when disabled. The profile's uncompressed
+CUDA DSA layout is required; invalid indices or unsupported layouts are logged
+as skipped before indexing. HIP layouts are not interpreted as CUDA layouts.
+
+`changed=true` relative to prefill indicates mutation of the observed KV bytes
+(overwrite/aliasing is a candidate); `first_changed_slot` identifies the first
+changed sampled physical slot in prefix order. An unchanged hash with wrong
+text points toward fidelity/alignment, but does not prove it: other ranks,
+unsampled slots, and transient mutations between observations remain invisible.
+These diagnostic synchronizations can change timing. Never use a sampled or
+skipped observation as proof of unchanged whole-pool state.

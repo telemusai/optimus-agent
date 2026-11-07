@@ -154,3 +154,86 @@ def test_zero_overlap_chunk(caplog):
     assert row["rows"] == 0
     assert row["chunk_end"] == 2
     assert row["first_position_mismatch"] is None
+
+
+def test_kv_values(monkeypatch, caplog):
+    buf = NS(shape=(10, 1, 2), element_size=lambda: 1)
+    pool = NS(size=10, kv_buffer=[buf])
+    data = {2: b"ab", 4: b"cd"}
+    calls = []
+    def copy(kind, buffer, slots):
+        calls.append(slots)
+        return b"".join(data[i] for i in slots)
+    monkeypatch.setattr(trace, "kv_bytes", copy)
+    record = NS()
+    for point in ("prefill_complete", "first_decode"):
+        trace.kv_snapshot(NS(rank=0), record, pool, [2, 4], point)
+    assert rows(caplog)[-1]["changed"] is False
+    assert rows(caplog)[-1]["sha256"] == rows(caplog)[-2]["sha256"]
+    data[4] = b"ce"
+    trace.kv_snapshot(NS(rank=0), record, pool, [2, 4], "terminal_settle")
+    assert rows(caplog)[-1]["changed"] is True
+    assert rows(caplog)[-1]["first_changed_slot"] == 4
+    assert rows(caplog)[-1]["bytes_copied"] == 4
+    for invalid in ([-1], [10], [None]):
+        trace.kv_snapshot(NS(rank=0), record, pool, invalid, "invalid")
+        assert rows(caplog)[-1]["skipped"] == "invalid_slots"
+    assert len(calls) == 3
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.kv_snapshot(None, None, None, None, None)
+    trace.kv_forward(None, None, None)
+    assert len(calls) == 3
+
+
+def test_kv_rank_and_buffer_bounds(monkeypatch, caplog):
+    monkeypatch.setattr(trace, "kv_bytes", lambda *a: pytest.fail("unexpected copy"))
+    trace.kv_snapshot(NS(rank=1), None, None, None, "prefill_complete")
+    buf = NS(shape=(2, 1, 2), element_size=lambda: 1)
+    trace.kv_snapshot(NS(rank=0), NS(), NS(size=10, kv_buffer=[buf]), [3], "test")
+    assert rows(caplog)[-1]["skipped"] == "invalid_buffer_slots"
+
+
+def test_kv_sampling_and_index_layout(monkeypatch, caplog):
+    mla = NS(shape=(100, 1, 2), element_size=lambda: 1)
+    index = NS(shape=(2, 64 * 132), element_size=lambda: 1)
+    pool = NS(size=100, kv_buffer=[mla], index_k_with_scale_buffer=[index],
+              page_size=64, index_head_dim=128, index_kpool=1, index_kpool_compress=False)
+    monkeypatch.setattr(trace, "KV_COPY_LIMIT", 268)
+    copied = []
+    def copy(kind, buf, slots):
+        copied.append((kind, slots))
+        return b"a" * len(slots) * (2 if kind == "mla" else 132)
+    monkeypatch.setattr(trace, "kv_bytes", copy)
+    trace.kv_snapshot(NS(rank=0), NS(), pool, [1, 2, 3, 4], "prefill_complete")
+    assert copied == [("mla", [1, 4]), ("index", [1, 4])]
+    assert rows(caplog)[-1]["sampled"] is True
+    assert rows(caplog)[-1]["bytes_copied"] == 268
+    pool.index_kpool = 2
+    trace.kv_snapshot(NS(rank=0), NS(), pool, [1], "test")
+    assert rows(caplog)[-1]["skipped"] == "unsupported_index_layout"
+
+
+def test_kv_forward_points(monkeypatch):
+    from occ3_sglang import latent_worker as worker
+    descriptor = object.__new__(worker.ConsumeWorkerDescriptor)
+    object.__setattr__(descriptor, "prefix_offset", 4)
+    object.__setattr__(descriptor, "expected_prefix_tokens", 2)
+    record = NS(occ3_trace_slots={4: 2})
+    runtime = NS(rank=0, resolve=lambda d: record)
+    monkeypatch.setattr(worker, "_runtime", lambda: runtime)
+    points = []
+    monkeypatch.setattr(trace, "kv_snapshot", lambda *a: points.append(a[-1]))
+    runner = NS(token_to_kv_pool=object())
+    mode = NS(is_extend=lambda: True, is_target_verify=lambda: False)
+    batch = NS(occ3_context=[NS(descriptor=descriptor)], forward_mode=mode)
+    trace.kv_forward(runner, batch, "prefill_complete")
+    assert not points
+    record.occ3_trace_slots[5] = 3
+    trace.kv_forward(runner, batch, "prefill_complete")
+    trace.kv_forward(runner, batch, "prefill_complete")
+    trace.kv_forward(runner, batch, "first_decode")
+    assert points == ["prefill_complete"]
+    mode.is_target_verify = lambda: True
+    trace.kv_forward(runner, batch, "first_decode")
+    trace.kv_forward(runner, batch, "first_decode")
+    assert points == ["prefill_complete", "first_decode"]
