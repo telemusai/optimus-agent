@@ -386,31 +386,49 @@ async def test_steady_decode_keeps_client_visible_cadence(harness):
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("keepalive", [False, True])
-async def test_task_cancellation_has_distinct_summary(harness, caplog, keepalive):
+@pytest.mark.parametrize("mode", ["buffered", "keepalive", "terminal"])
+async def test_task_cancellation_has_distinct_summary(harness, caplog, mode, monkeypatch):
     """Explicit task cancellation is not evidence of client disconnect."""
     import logging
     caplog.set_level(logging.INFO)
+    keepalive = mode == "keepalive"
     harness.chat.buffer_gate = asyncio.Event()
     fast_profile(harness, 0.01)
     streaming = asyncio.Event()
     raw = keepalive_raw(canonical({"occ3": attachment().wire()}),
                         header=KEEPALIVE_REQUEST_MODE if keepalive else None)
 
+    if mode == "terminal":
+        from contextvars import ContextVar
+        from test_terminal_receipt import terminal_profile, terminal_call
+        # This lifecycle test does not exercise the optional parser overlay.
+        strict = ContextVar("fixture_terminal_strict", default=False)
+        monkeypatch.setattr(harness.adapter, "_terminal_strict_flag", lambda: strict)
+        monkeypatch.setattr(harness.adapter, "_terminal_tools_admissible", lambda tools: True)
+        harness.adapter.terminal_profile = terminal_profile()
+        raw = terminal_call(harness)
+
     async def run():
         response = await harness.chat.handle_request(chat_request(), raw)
-        if keepalive:
+        if mode == "terminal":
+            async def send(event):
+                if event.get("body"):
+                    streaming.set()
+            await response(raw.scope, raw.receive, send)
+        elif keepalive:
             async for _ in response.body_iterator:
                 streaming.set()
 
     task = asyncio.create_task(run())
     # Ensure the streaming owner is inside its body, not at the hand-off seam.
-    await spin_until(lambda: streaming.is_set() if keepalive else bool(harness.chat.frames))
+    await spin_until(lambda: streaming.is_set() if mode != "buffered" else bool(harness.chat.frames))
     task.cancel()
     with pytest.raises(asyncio.CancelledError):
         await task
     prefix = "occ3-bridge: native turn summary "
-    await spin_until(lambda: harness.adapter._active == 0 and any(
+    # Terminal task cancellation retains charges for non-positive ledger ops;
+    # this regression checks the summary, not a successful emission/release.
+    await spin_until(lambda: (mode == "terminal" or harness.adapter._active == 0) and any(
         record.message.startswith(prefix) for record in caplog.records))
     row, = [json.loads(record.message[len(prefix):]) for record in caplog.records
             if record.message.startswith(prefix)]

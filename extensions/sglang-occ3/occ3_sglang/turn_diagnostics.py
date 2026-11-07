@@ -15,7 +15,7 @@ def _isolated(method):
     """Telemetry failures must never alter native completion or cleanup."""
     @wraps(method)
     def guarded(self, *args, **kwargs):
-        if self.disabled and method.__name__ != "emit":
+        if self.disabled and method.__name__ not in ("emit", "inner_event"):
             return
         try:
             return method(self, *args, **kwargs)
@@ -152,11 +152,13 @@ class TurnDiagnostics:
                 row[name + "_first"] = self.head[name]
                 row[name + "_last"] = self.tail[name]
         encoded = json.dumps(row, ensure_ascii=True, separators=(",", ":"))
-        if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
+        effective_limit = self.limit
+        while len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS and effective_limit > 0:
+            effective_limit //= 2
+            row["text_truncated_log_cap"] = effective_limit
             for name in self.chars:
-                row.pop(name + "_first", None)
-                row.pop(name + "_last", None)
-            row["text_omitted_log_cap"] = True
+                row[name + "_first"] = self.head[name][:effective_limit]
+                row[name + "_last"] = self.tail[name][-effective_limit:] if effective_limit else ""
             encoded = json.dumps(row, ensure_ascii=True, separators=(",", ":"))
         if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
             encoded = '{"diag_error":"summary_size_limit"}'

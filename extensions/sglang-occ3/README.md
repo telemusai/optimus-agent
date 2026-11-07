@@ -105,15 +105,22 @@ The bridge logs a one-line INFO `occ3-bridge: native turn summary` for each
 native turn, including completion and interrupted turns. It reports timing,
 inner-event and output-character counts, available token usage and finish
 reason, transport mode, and channel/attempt identifiers. Text is off by default.
+Treat `cancelled` as disconnect-class on ASGI servers below spec 2.4.
 
 For temporary diagnosis on an **operator-owned server**, set server
 `OCC3_DIAG_TURN_TEXT=<N>` to include the first and last N characters of visible
 content and reasoning in that summary. The maximum is 4096 characters per
 excerpt; zero or unset disables text. Newlines are escaped. The summary message
 is capped at 16 KiB of ASCII text (excluding logger-added prefixes). If escaped
-excerpts exceed that cap, all excerpts are omitted and `text_omitted_log_cap`
-is set. Diagnostic failures disable collection and record a fixed `diag_error`
-code, without exposing exception text or interrupting the turn. A logger failure
+excerpts exceed that cap, their per-excerpt limit is repeatedly halved until
+it fits, recorded as `text_truncated_log_cap`. Four full excerpts have room for
+about 3900 ASCII characters each (so a requested 4096 becomes 2048); escaped
+CJK and emoji need more space (4096 becomes 512 and 256 respectively for
+uniform text). Metadata can reduce these effective maxima further. An oversized
+metadata-only summary falls back to `summary_size_limit`. Diagnostic failures
+disable collection and record a fixed `diag_error`
+code, without exposing exception text or interrupting the turn. Inner-event
+counts continue even after output parsing is disabled. A logger failure
 is swallowed and cannot guarantee a summary line. This setting can
 expose generated private content and reasoning in server logs. Enable it only
 with authorization, restrict log access and retention, and disable it after

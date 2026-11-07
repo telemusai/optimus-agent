@@ -2247,6 +2247,9 @@ class ChatAttachmentAdapter:
         except Exception:
             ctx.diagnostics.fail("native_completion_failed", 409)
             raise
+        except asyncio.CancelledError:
+            ctx.diagnostics.fail("cancelled", 499)
+            raise
         except GeneratorExit:
             # The client abandoned the stream mid-flight. Delivery state is
             # uncertain: no further bytes are emitted and the backend commit,

@@ -873,6 +873,9 @@ async fn deferred_receiver_busy_first_data_only() {
 
 #[tokio::test]
 async fn default_receiver_offer_declined_uses_header_receipt() {
+    // ScopedEnv is crate-private and cfg(test), unavailable to integration tests.
+    // This tests the unset default; run with OCC3_KEEPALIVE_STREAM unset rather
+    // than mutating process-global env while sibling async tests are running.
     assert!(std::env::var_os("OCC3_KEEPALIVE_STREAM").is_none());
     let fixture = Fixture::new(Reply::Good).await;
     let lease = lease(&fixture.model);

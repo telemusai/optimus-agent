@@ -180,16 +180,41 @@ def test_diagnostic_fault_isolated(monkeypatch, operation):
     assert "PRIVATE" not in d.diag_error
 
 
-def test_log_line_cap(monkeypatch, caplog):
+@pytest.mark.parametrize("text", ["a" * 8192, "漢😀" * 4096], ids=["ascii", "cjk-emoji"])
+def test_log_line_cap(monkeypatch, caplog, text):
     from occ3_sglang.turn_diagnostics import MAX_LOG_CHARS
     monkeypatch.setenv("OCC3_DIAG_TURN_TEXT", "4096")
     caplog.set_level(logging.INFO)
     d = TurnDiagnostics(lambda: 0, "attempt", "source", False)
-    d.payload({"choices": [{"delta": {"content": "\U0001f600" * 4096,
-                                      "reasoning_text": "\U0001f600" * 4096}}]})
+    d.payload({"choices": [{"delta": {"content": text, "reasoning_text": text}}]})
     d.emit(True, 20)
     row, = rows(caplog)
-    assert row["text_omitted_log_cap"] is True
-    assert "content_first" not in row and "reasoning_last" not in row
-    assert row["content_chars"] == row["reasoning_chars"] == 4096
+    effective = row["text_truncated_log_cap"]
+    assert 0 < effective < 4096
+    for name in ("content", "reasoning"):
+        assert row[name + "_first"] == text[:effective]
+        assert row[name + "_last"] == text[-effective:]
+    assert row["content_chars"] == row["reasoning_chars"] == len(text)
     assert len(caplog.records[-1].message) <= MAX_LOG_CHARS
+
+
+@pytest.mark.parametrize("overflow", [False, True])
+def test_event_count_continues_after_collection_disabled(caplog, overflow):
+    caplog.set_level(logging.INFO)
+    d = TurnDiagnostics(lambda: 1, "attempt", "source", False)
+    d.inner_event()
+    d.feed(b"x" * (1024 * 1024 + 1) if overflow else b"data: invalid-json\n\n")
+    assert d.disabled
+    d.inner_event()
+    d.inner_event()
+    d.emit(True, 20)
+    row, = rows(caplog)
+    assert row["event_count"] == 3
+    assert row["output_parse_limited"] is True
+
+
+def test_metadata_log_cap_fallback(caplog):
+    caplog.set_level(logging.INFO)
+    d = TurnDiagnostics(lambda: 0, "x" * 20000, "source", False)
+    d.emit(True, 20)
+    assert rows(caplog) == [{"diag_error": "summary_size_limit"}]

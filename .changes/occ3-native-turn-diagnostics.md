@@ -2,3 +2,4 @@
 - Added native-turn completion and interruption summaries, plus bounded opt-in server output excerpts for operator diagnosis.
 - Fixed keepalive cadence during steady decode and classified first-event deferred busy refusals as proven non-use, preserving bounded retry guidance.
 - Fixed diagnostic failure isolation and cancellation labels; capped summary messages at 16 KiB.
+- Preserved all output excerpt kinds under the log cap by reducing their effective limit; kept event counts after collection stops and aligned terminal cancellation summaries.
