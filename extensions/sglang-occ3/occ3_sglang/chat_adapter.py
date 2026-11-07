@@ -32,7 +32,8 @@ from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve
                             resolve_prefix_layout)
 from .span_markers import resolve_user_role_id
 from . import metrics as _metrics
-from .turn_diagnostics import TurnDiagnostics
+from .turn_diagnostics import TurnDiagnostics, log_failure, log_retention
+from .latent_types import admission_probe
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -444,6 +445,8 @@ class _TerminalLedger:
         if isinstance(exception, StopAsyncIteration):
             self.resolve(token, True)
             return
+        if exception is not None:
+            log_failure(exception, phase="cleanup")
         self.resolve(token, exception is None)
 
     def all_positive(self):
@@ -586,6 +589,7 @@ class ChatAttachmentAdapter:
             function = getattr(function, "__wrapped__", None)
         return False
 
+    @admission_probe("frontend_charge")
     def _charge(self, ctx):
         profile = self.profile
         if (self._active >= profile.max_active
@@ -599,6 +603,7 @@ class ChatAttachmentAdapter:
         self._active += 1
         ctx.charged = True
 
+    @admission_probe("frontend_release")
     def _release(self, ctx):
         if ctx.charged:
             self._active -= 1
@@ -628,19 +633,25 @@ class ChatAttachmentAdapter:
             attachment = parse_opt_in(body)
             terminal_mode = parse_terminal_mode(body)
         except AttachmentError as error:
+            log_failure(error, phase="parse")
             return self._error(error)
         if attachment is None:
             if terminal_mode is not None:
                 # Mode without an attachment/capture is a refusal, never a silent downgrade.
-                return self._error(AttachmentError("unsupported_profile", 409))
+                error = AttachmentError("unsupported_profile", 409)
+                log_failure(error, phase="admission")
+                return self._error(error)
             return await original(serving, request, raw_request)
         if terminal_mode is not None:
             try:
                 admitted = self._terminal_admission(request, raw_request)
             except AttachmentError as error:
+                log_failure(error, phase="admission")
                 return self._error(error)
             if not admitted:
-                return self._error(AttachmentError("unsupported_profile", 409))
+                error = AttachmentError("unsupported_profile", 409)
+                log_failure(error, phase="admission")
+                return self._error(error)
         ctx = None
         try:
             source = type(attachment) is CaptureIntent
@@ -718,6 +729,7 @@ class ChatAttachmentAdapter:
             return await self._guard(
                 self._authorize_and_run(original, serving, request, raw_request, ctx), ctx)
         except AttachmentError as error:
+            log_failure(error, ctx, "admission")
             if ctx is not None:
                 if ctx.diagnostics is not None:
                     ctx.diagnostics.fail(error.code, error.status)
@@ -735,10 +747,9 @@ class ChatAttachmentAdapter:
             raise
         except Exception as error:
             # Same bounded diagnostic contract as the native_completion_failed
-            # seam: exception class name only, never payloads, identifiers or
+            # seam: fixed codes and source locations only, never identifiers or
             # handles. The public response stays a fixed generic code.
-            logger.error("occ3-bridge: native turn failed (inner=%s)",
-                         type(error).__name__)
+            log_failure(error, ctx, "admission")
             if ctx is not None and ctx.diagnostics is not None:
                 ctx.diagnostics.fail("native_completion_failed", 409)
             return self._error(AttachmentError())
@@ -1208,7 +1219,7 @@ class ChatAttachmentAdapter:
             # Unexpected non-abort failures also fold into the generic 409; record
             # the bounded exception class server-side so live refusals caused by
             # adapter/engine defects are diagnosable offline (no payload logged).
-            logger.error("occ3-bridge: native turn failed (class=%s)", type(exc).__name__)
+            log_failure(exc, ctx, "native_iterator")
             raise AttachmentError() from None
 
     async def _run(self, original, serving, request, raw_request, ctx):
@@ -1564,7 +1575,9 @@ class ChatAttachmentAdapter:
                     if not task.done():
                         self._quarantine(task, ctx)
             elif not task.cancelled():
-                task.exception()  # Retrieve failure without exposing its message.
+                error = task.exception()
+                if error is not None:
+                    log_failure(error, ctx, "cleanup")
 
     async def _close_race(self, race, ctx):
         """Deterministically close one finished-or-suspended race generator.
@@ -1789,6 +1802,7 @@ class ChatAttachmentAdapter:
             ctx.diagnostics.fail("cancelled", 499)
             raise
         except AttachmentError as error:
+            log_failure(error, ctx, "terminal" if ctx.terminal_mode else "keepalive")
             ctx.diagnostics.fail(error.code, error.status)
             # The response already started, so the bounded refusal that the
             # buffered path would have answered with an HTTP status becomes
@@ -1797,8 +1811,7 @@ class ChatAttachmentAdapter:
         except Exception as error:
             # Unexpected failures fold into the same generic event; the
             # bounded class name is recorded server-side only.
-            logger.error("occ3-bridge: native turn failed (inner=%s)",
-                         type(error).__name__)
+            log_failure(error, ctx, "keepalive")
             ctx.diagnostics.fail("native_completion_failed", 409)
             yield self._stream_error_event(AttachmentError())
         finally:
@@ -1888,6 +1901,7 @@ class ChatAttachmentAdapter:
         except Exception:
             return None
 
+    @admission_probe("terminal_release")
     def _release_terminal(self, ctx):
         """Exactly-once terminal charge release, guarded per context.
 
@@ -2242,9 +2256,11 @@ class ChatAttachmentAdapter:
             # still-open ASGI emission) decides, in the settle/finally path.
             return
         except AttachmentError as error:
+            log_failure(error, ctx, "terminal" if ctx.terminal_mode else "keepalive")
             ctx.diagnostics.fail(error.code, error.status)
             raise
-        except Exception:
+        except Exception as error:
+            log_failure(error, ctx, "terminal")
             ctx.diagnostics.fail("native_completion_failed", 409)
             raise
         except asyncio.CancelledError:
@@ -2288,6 +2304,7 @@ class ChatAttachmentAdapter:
              retains BOTH charge domains and the attempt registration, and
              new work is then refused at the limits.
         """
+        log_retention(self, ctx, "terminal_gate")
         if ctx.terminal_released:
             return
         if not ctx.terminal_settled:
@@ -2308,6 +2325,7 @@ class ChatAttachmentAdapter:
         """
         self._terminal_tasks.add(task)
         ctx.terminal_ledger.attach(token, task)
+        log_retention(self, ctx, "terminal_track")
 
         def settled(future):
             self._terminal_tasks.discard(future)
@@ -2319,6 +2337,7 @@ class ChatAttachmentAdapter:
         """Resolve one required op by the task outcome; re-check release."""
         ledger = ctx.terminal_ledger
         ledger.resolve_task(token, task)
+        log_retention(self, ctx, "terminal_resolve")
         if ledger.kind(token) == "retire" and ledger.state(token) == "positive":
             ctx.retire_confirmed = True
         self._terminal_try_release(ctx)
@@ -2451,7 +2470,8 @@ class ChatAttachmentAdapter:
                     await self._terminal_bounded_op(value, ctx, abort_token)
                 else:
                     ledger.resolve(abort_token, True)
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
                 ledger.resolve(abort_token, False)
         # Tracked retire: a positive return is ONE required ack, never
         # permission to release while any other required op pends.
@@ -2460,7 +2480,8 @@ class ChatAttachmentAdapter:
             try:
                 task = asyncio.ensure_future(
                     self.backend.retire(ctx.attempt_id, ctx.native_rid, ctx.dispatched))
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
                 task = None
             if task is None:
                 ledger.resolve(retire_token, False)
@@ -2471,7 +2492,8 @@ class ChatAttachmentAdapter:
         for token, iterator in close_tokens:
             try:
                 await self._terminal_bounded_op(iterator.aclose(), ctx, token)
-            except Exception:
+            except Exception as error:
+                log_failure(error, ctx, "iterator_close")
                 ledger.resolve(token, False)
         self._terminal_try_release(ctx)
 
@@ -2576,15 +2598,21 @@ class ChatAttachmentAdapter:
                     if not task.done():
                         self._quarantine(task, ctx)
             if task.done() and not task.cancelled():
-                task.exception()  # Retrieve failure without exposing its message.
+                error = task.exception()
+                if error is not None:
+                    log_failure(error, ctx, "cleanup")
 
     def _quarantine(self, task, ctx):
         task._occ3_context = ctx
         self._quarantined.add(task)
+        log_retention(self, ctx, "quarantine")
         def settled(future):
             self._quarantined.discard(future)
+            log_retention(self, ctx, "quarantine_settled")
             if not future.cancelled():
-                future.exception()
+                error = future.exception()
+                if error is not None:
+                    log_failure(error, ctx, "cleanup")
             if ctx.owner_finished and not any(getattr(t, "_occ3_context", None) is ctx for t in self._quarantined):
                 self._release(ctx)
         task.add_done_callback(settled)
@@ -2598,7 +2626,9 @@ class ChatAttachmentAdapter:
                 task.cancel()
                 self._quarantine(task, ctx)
             elif not task.cancelled():
-                task.exception()
+                error = task.exception()
+                if error is not None:
+                    log_failure(error, ctx, "cleanup")
 
     async def _cleanup(self, ctx):
         if ctx.cleanup_started:
@@ -2610,18 +2640,18 @@ class ChatAttachmentAdapter:
                 value = ctx.tm.abort_request(ctx.native_rid)
                 if inspect.isawaitable(value):
                     await self._bounded_cleanup(value, ctx)
-            except Exception:
-                pass
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
         if ctx.attempted and not ctx.retired:
             ctx.retired = True
             try:
                 await self._bounded_cleanup(
                     self.backend.retire(ctx.attempt_id, ctx.native_rid, ctx.dispatched), ctx)
-            except Exception:
-                pass
+            except Exception as error:
+                log_failure(error, ctx, "cleanup")
         for iterator in (ctx.response_iterator, ctx.outer, ctx.inner):
             if iterator is not None and callable(getattr(iterator, "aclose", None)):
                 try:
                     await self._bounded_cleanup(iterator.aclose(), ctx)
-                except Exception:
-                    pass
+                except Exception as error:
+                    log_failure(error, ctx, "iterator_close")

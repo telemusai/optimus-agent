@@ -288,6 +288,8 @@ def _served_fingerprint():
 
 def status_payload():
     """Superset of the old StatusView; old fields verbatim, fixed key set."""
+    from .turn_diagnostics import failure_snapshot
+    from .latent_types import admission_diagnostics_snapshot
     fingerprint_value = _served_fingerprint()
     machine = current()
     return {
@@ -309,6 +311,8 @@ def status_payload():
         "model_fingerprint": fingerprint_value,
         "channels": registry().counts(),
         "metrics": metrics.snapshot(),
+        "parallel_handoff_diagnostics": {**failure_snapshot(),
+            "admission": admission_diagnostics_snapshot()},
     }
 
 

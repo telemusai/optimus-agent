@@ -163,3 +163,97 @@ class TurnDiagnostics:
         if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
             encoded = '{"diag_error":"summary_size_limit"}'
         LOG.info("%s%s", LOG_PREFIX, encoded)
+
+
+# Error telemetry is independent of output excerpts and never serializes errors.
+_FAILURE_CODES = frozenset((
+    "latent_failed unavailable profile identity expired quota replay state lineage "
+    "ranks invalid not_ready retired numerical cancelled busy invalid_attachment "
+    "unsupported_attachment attachment_expired identity_mismatch unsupported_profile "
+    "deadline_unavailable deadline_exceeded buffer_limit quota_exceeded replay_forbidden "
+    "invalid_evidence native_completion_failed client_disconnected attachment_failed "
+    "capture_transport_unnegotiated cleanup_pending scheduler_busy admission_timeout "
+    "admission_capacity client_cancelled"
+).split())
+import threading
+
+_FAILURE_LOCK = threading.Lock()
+_FAILURE_STATE = {"last_error_code": "none", "error_count": 0,
+                  "first_failure_unix_seconds": 0, "last_error_count": 0}
+_FAILURE_COUNTS = {}
+
+
+def failure_snapshot():
+    """Process-local telemetry only; first failure is not proof of stuck state."""
+    try:
+        with _FAILURE_LOCK:
+            return dict(_FAILURE_STATE)
+    except Exception:
+        return {}
+
+
+def log_failure(error, ctx=None, phase="unknown"):
+    """Log fixed codes and source locations only, without exception text/locals."""
+    try:
+        if getattr(error, "_occ3_logged", False):
+            return
+        import traceback
+        import time
+        from .attachment_contract import AttachmentError
+        from .latent_types import LatentError
+        code = getattr(error, "code", None) if isinstance(error, (LatentError, AttachmentError)) else None
+        code = code if code in _FAILURE_CODES else "unknown"
+        frames = traceback.extract_tb(error.__traceback__, limit=-3)
+        origin = [{"module": os.path.basename(frame.filename)[:96],
+                   "function": frame.name[:96], "line": min(1000000, frame.lineno)}
+                  for frame in frames]
+        status = getattr(error, "status", 409)
+        status = status if type(status) is int and status in (400, 401, 409, 413, 429, 499, 503, 504) else 409
+        phase = phase if phase in ("admission", "native_iterator", "keepalive", "terminal", "unknown", "validation", "worker_control", "parse", "cleanup", "iterator_close") else "unknown"
+        row = {"detail": getattr(error, "detail", None) if isinstance(error, LatentError) else None, "code": code, "status": status, "origin": origin, "phase": phase,
+               "dispatched": bool(getattr(ctx, "dispatched", False))}
+        with _FAILURE_LOCK:
+            _FAILURE_COUNTS[code] = min(2147483647, _FAILURE_COUNTS.get(code, 0) + 1)
+            _FAILURE_STATE["last_error_count"] = _FAILURE_COUNTS[code]
+            _FAILURE_STATE["last_error_code"] = code
+            _FAILURE_STATE["error_count"] = min(2147483647, _FAILURE_STATE["error_count"] + 1)
+            if not _FAILURE_STATE["first_failure_unix_seconds"]:
+                _FAILURE_STATE["first_failure_unix_seconds"] = min(9999999999, max(0, int(time.time())))
+        emit = LOG.info if isinstance(error, AttachmentError) and code != "native_completion_failed" else LOG.error
+        emit("occ3-bridge: native failure %s", json.dumps(row, separators=(",", ":")))
+        error._occ3_logged = True
+    except Exception:
+        pass
+
+
+def log_retention(adapter, ctx, event):
+    """Observe fail-closed ownership before the release gate, without token IDs."""
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return
+        if event not in ("quarantine", "quarantine_settled", "terminal_gate",
+                         "terminal_resolve", "terminal_track"):
+            return
+        from .latent_types import admission_event
+        operation = "quarantine" if event.startswith("quarantine") else "terminal_gate"
+        admission_event(operation, "entry", owner=adapter)
+        ledger = getattr(ctx, "terminal_ledger", None)
+        ops = tuple(ledger.ops.values()) if ledger is not None else ()
+        clamp = lambda value: min(2147483647, max(0, value))
+        row = {"event": event, "pending": clamp(sum(op[1] == "pending" for op in ops)),
+               "negative": clamp(sum(op[1] == "latched" for op in ops)),
+               "positive": clamp(sum(op[1] == "positive" for op in ops)),
+               "quarantined": clamp(len(adapter._quarantined)),
+               "terminal_tasks": clamp(len(adapter._terminal_tasks)),
+               "active": clamp(adapter._active), "terminal_active": clamp(adapter._terminal_active),
+               "settled": bool(getattr(ctx, "terminal_settled", False)),
+               "failure_latch": bool(getattr(ctx, "terminal_failure_latch", False)),
+               "released": bool(getattr(ctx, "terminal_released", False)),
+               "completed": bool(getattr(ctx, "completed", False)),
+               "cancel_requested": bool(getattr(ctx, "cancel_requested", False))}
+        for kind in ("abort", "retire", "close", "emission", "native", "proof"):
+            for state in ("pending", "latched"):
+                row[kind + "_" + state] = clamp(sum(op[0] == kind and op[1] == state for op in ops))
+        LOG.info("occ3-bridge: retention %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass

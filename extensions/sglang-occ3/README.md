@@ -489,3 +489,71 @@ scope tradeoff for this opt-in trace; there is no asynchronous staging.
 Copies include points before anchoring rather than being deferred past the
 completion event, so opt-in trace overhead can still delay other ranks. Vocabulary validity stays on
 device through the full loop. Logit-lens tiles share the 256-row bound.
+
+
+### Diagnosing parallel handoff failures
+
+For one controlled two-handoff repro, enable `OCC3_DIAG_TOKEN_TRACE=1`
+on the server. Grep server logs for `occ3-bridge: native failure` and
+`occ3-bridge: admission` and `occ3-bridge: retention`; grep client logs for `native_binding_rejected`
+and `native_binding_invalid_site`. Disable the trace after the repro.
+
+Failure lines contain an allowlisted `code`, optional source-defined `detail`,
+HTTP `status`, `phase`, `dispatched`, and at most three origin frames
+(module basename, function, line only). Worker preflight/control failures are
+logged before their error is normalized onto the control wire. Public errors
+and control replies are unchanged. No exception message, locals, request ID,
+handle, principal, receipt, headers, keys or prompt text is added.
+
+Admission lines report `operation` and `outcome` (`entry`, `error`, `exit`).
+`exit` means the call exited, not that admission succeeded: look for its
+preceding `error`. Registry snapshots include `active`, `max_active`, `total`,
+`max_records`, `inflight`, `reservation`, `leased`, `capturing`, `revoked`,
+`gpu_freed`, `charged_bytes`, `max_live_bytes`, `retained_rows`,
+`admitted_capture`, and `admitted_consume`. The active slot is a registry state
+predicate, not a separate semaphore. Frontend snapshots show `active`,
+`max_active`, `terminal_active`, and `terminal_attempts`; backend snapshots
+show `attempts` and the real control client's `pending`, `uncertain`,
+`operations`, and `max_pending` counts. Worker snapshots also
+show `poisoned` and `commands`. DEBUG logging adds `admission lock`
+acquire/wait/release ordering on capture reservation. This lock trace reads
+the same opt-in at process startup and uses the original lock directly when
+opt-in or DEBUG logging is off.
+`retention` lines run at quarantine, late settlement, terminal resolution,
+and release-gate checks even when the gate refuses release. They contain
+`pending`, `negative`, `positive`, `quarantined`, `terminal_tasks`, charge
+counts, settle/failure/release/completion/cancel flags, and fixed per-kind
+`abort`, `retire`, `close`, `emission`, `native`, and `proof` pending/latched
+counts. Initial parsing/admission refusals and cleanup/iterator exceptions
+also produce payload-free failure lines, including synchronous terminal
+abort, retire, and iterator-close failures before a task exists. Snapshots are observational, not a
+new reservation or a proof of GPU release.
+
+`/occ3/v1/status.parallel_handoff_diagnostics` contains `last_error_code`,
+`last_error_count`, `error_count` (saturating), `first_failure_unix_seconds`, and `admission`.
+The latter contains bounded-key `counts`, `logged`, and `last` snapshots when
+the flag is on, otherwise `{}`. These are **process-local**: frontend status
+cannot expose rank-local worker records without changing the control protocol.
+Use worker logs for those records. First failure time is not a claim that the
+runtime is stuck; compare repeated failures and active-slot snapshots. Existing
+metrics retain the prefix-layout counters. Lines stay below 16 KiB and logger
+failures are ignored. No GPU sync or collective is added.
+
+Client `native_binding_rejected` events identify a fixed `stage` and `reason`
+for enrollment, capture, publication intent, receiver and retirement checks.
+`native_binding_invalid_site` additionally reports the source line for other
+control validation sites, without binding values. User-facing error text is
+unchanged. The diagnostic does not repair a leaked slot or retry a handoff.
+
+The repro build must regenerate `native_sources.json`: the attestation hashes
+cover the modified plugin files. The deploy build does this; reusing an old
+manifest causes `source_digest_mismatch` rather than a valid diagnostic run.
+Failure counters count each exception object once across propagation boundaries;
+a distinct normalized exception remains a distinct failure. Cancellation does
+not count as an unknown failure in admission probes. Typed attachment refusals
+use INFO; `LatentError` codes, untyped exceptions and `native_completion_failed`
+use ERROR. Worker admission rows include numeric `rank`, and frontend snapshots
+include replay `fences`. Client control rejection includes only numeric HTTP
+`status`, never the response body. Poison-transition logs fire once per runtime
+latch, and later worker unavailable gates include code and origin before wire
+normalization.
