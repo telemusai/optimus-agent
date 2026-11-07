@@ -1393,18 +1393,20 @@ const OCC3_CAUSE_HTTP_NON_SUCCESS: &str = "http_non_success";
 const OCC3_CAUSE_RECEIPT_INVALID: &str = "receipt_invalid";
 const OCC3_CAUSE_SSE_IDLE: &str = "sse_idle";
 const OCC3_CAUSE_INCOMPLETE_STREAM: &str = "incomplete_stream";
-/// Environment opt-in for the keepalive stream extension on armed turns. The
-/// buffered armed-turn contract stays the default: fully buffered server-side,
-/// receipt in the response headers. Setting this makes the client offer
-/// `x-optimus-occ3-keepalive: keepalive-v1` on guarded requests so a server
-/// that accepts can emit SSE comment keepalives while the inner stream drains,
-/// defeating intermediary idle timeouts on the public origin.
+/// Offer keepalive streaming by default on armed turns. Servers that do not
+/// accept the offer retain the buffered, header-receipt contract. Set
+/// `OCC3_KEEPALIVE_STREAM=0` (or `false`/`off`) to disable the offer.
 const ENV_OCC3_KEEPALIVE_STREAM: &str = "OCC3_KEEPALIVE_STREAM";
 
 fn occ3_keepalive_stream_enabled() -> bool {
-	match std::env::var(ENV_OCC3_KEEPALIVE_STREAM) {
-		Ok(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"),
-		Err(_) => false,
+	occ3_keepalive_stream_setting(std::env::var(ENV_OCC3_KEEPALIVE_STREAM).ok().as_deref())
+}
+
+// Keep parsing independent of process-global environment mutation in tests.
+fn occ3_keepalive_stream_setting(value: Option<&str>) -> bool {
+	match value {
+		Some(value) => matches!(value.trim().to_ascii_lowercase().as_str(), "1" | "true" | "on"),
+		None => true,
 	}
 }
 
@@ -6614,6 +6616,17 @@ mod message_tests {
 	// ------------------------------------------------------------------
 	// OCC3 keepalive stream extension: deferred-receipt transport framing
 	// ------------------------------------------------------------------
+
+	#[test]
+	fn keepalive_stream_defaults_enabled_and_honors_overrides() {
+		assert!(occ3_keepalive_stream_setting(None));
+		for value in ["1", "true", "on", " TRUE ", "On"] {
+			assert!(occ3_keepalive_stream_setting(Some(value)), "{value:?}");
+		}
+		for value in ["0", "false", "off", " FALSE ", "Off", "", "invalid"] {
+			assert!(!occ3_keepalive_stream_setting(Some(value)), "{value:?}");
+		}
+	}
 
 	#[test]
 	fn keepalive_transport_strips_to_the_exact_native_bytes() {

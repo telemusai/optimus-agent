@@ -1,0 +1,2 @@
+- Fixed long guarded OCC-3 turns by offering negotiated keepalive streaming by default, with an explicit client opt-out.
+- Added native-turn completion and interruption summaries, plus bounded opt-in server output excerpts for operator diagnosis.

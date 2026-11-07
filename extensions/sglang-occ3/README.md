@@ -84,6 +84,31 @@ or infer capacity from a short timeout estimate. Output-byte, context,
 GPU-memory, rank and deadline limits need independent verification. A
 failed or uncertain operation yields no verified lease or tool dispatch.
 
+## Native-turn transport and diagnostics
+
+Guarded OCC-3 client requests offer `keepalive-v1` by default, for both
+source capture and receiver inference. A server that accepts sends SSE comment
+keepalives while native generation runs; the client verifies the deferred
+receipt before accepting completion. Servers that do not accept retain the
+buffered response contract. Set client `OCC3_KEEPALIVE_STREAM=0`, `false`, or
+`off` to disable the offer; unset, `1`, `true`, or `on` enables it. This does
+not lower reasoning effort or change token budgets.
+
+The bridge logs a one-line INFO `occ3-bridge: native turn summary` for each
+native turn, including completion and interrupted turns. It reports timing,
+inner-event and output-character counts, available token usage and finish
+reason, transport mode, and channel/attempt identifiers. Text is off by default.
+
+For temporary diagnosis on an **operator-owned server**, set server
+`OCC3_DIAG_TURN_TEXT=<N>` to include the first and last N characters of visible
+content and reasoning in that summary. The maximum is 4096 characters per
+excerpt; zero or unset disables text. Newlines are escaped. This setting can
+expose generated private content and reasoning in server logs. Enable it only
+with authorization, restrict log access and retention, and disable it after
+diagnosis. Request prompts, headers, keys, receipts, and authentication fields
+are not collected by this diagnostic. It is not proof that transferred facts
+were understood, and it does not change the attested SGLang source overlays.
+
 ## Offline development
 
 Run tests through the extension's documented project Python environment:
