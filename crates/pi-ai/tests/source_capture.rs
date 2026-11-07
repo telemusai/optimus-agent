@@ -1148,6 +1148,7 @@ fn label_anchor_selection_matches_python_canonical_digest_vectors() {
         (None, "5de0308e3e394cd7e5275a5f7c35704853935b63b3eac78dec6617f123b98065"),
         (Some(0.0), "4eb17b21225a458fe37d74ff24638047d183fbbd1124ddda8b51c7fb84d68dae"),
         (Some(0.3), "b85e8d6b733560ce31d25a6a79b9d0aa75ebfa28c65c3b6b68a58d0bdf9b7042"),
+        (Some(0.7), "39be23526a02271d94083bcab9296ffff4d627ccb39e8b196b0ce6ca75ccf402"),
         (Some(1.0), "87d087f82898938d6c1dbd59601928b932bb1b9c9c087e2642d57f9edd01b1b0"),
     ] {
         intent.label_anchor_alpha = alpha.map(|v| LabelAnchorAlpha::try_from(v).unwrap());

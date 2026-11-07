@@ -135,7 +135,8 @@ with a fixed server error; expanding that set is an attestation change, not a li
 The optional numeric `occ3_capture.label_anchor_alpha` travels through the real
 Rust `SourceCaptureIntent`, Python `CaptureIntent`, and resolved
 `CaptureWorkerDescriptor`. Omitted differs from explicit zero: explicit zero can
-override a nonzero default. The resolved value is validated on all ranks and
+override a nonzero default, and its explicit request field changes the intent
+digest relative to omission. The resolved value is validated on all ranks and
 included in existing request/control and alignment-prepare consensus digests;
 no collective is added. Each capture owns an immutable coefficient and stored
 prefix. Later file edits cannot change an existing handoff or its consume.

@@ -773,14 +773,19 @@ fn resolve_label_anchor_alpha(
     let invalid = || Occ3Error::TransferFailed {
         reason: "invalid OCC3_LABEL_ANCHOR_ALPHA_FILE: expected readable UTF-8 decimal under 32 bytes (0, 0.3, 0.5, 0.7, or 1)".into(),
     };
-    let path = path();
-    match std::fs::metadata(&path) {
-        Ok(metadata) if metadata.is_file() => {}
-        Ok(_) => return Err(invalid()),
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Validate the opened handle below; a path swap to a FIFO cannot stall capture.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path()) {
+        Ok(file) => file,
         Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, "default")),
         Err(_) => return Err(invalid()),
-    }
-    let file = std::fs::File::open(path).map_err(|_| invalid())?;
+    };
     if !file.metadata().map_err(|_| invalid())?.is_file() { return Err(invalid()); }
     let mut bytes = Vec::new();
     file.take(32).read_to_end(&mut bytes).map_err(|_| invalid())?;
@@ -841,6 +846,26 @@ mod label_anchor_alpha_tests {
         assert!(resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || dir.path().into()).is_err());
     }
 
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_selection_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // The CString is live and terminated; the private fixture path does not exist yet.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rejected = resolve_label_anchor_alpha(
+                Err(std::env::VarError::NotPresent), || path).is_err();
+            let _ = sender.send(rejected);
+        });
+        assert!(receiver.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("FIFO selection must not wait for a writer"));
+        worker.join().unwrap();
+    }
 
     #[test]
     fn selection_is_strict_and_absence_is_distinct_from_zero() {
