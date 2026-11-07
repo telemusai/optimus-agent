@@ -379,3 +379,77 @@ def kv_forward(model_runner, forward_batch, point):
         return
     record.occ3_trace_kv_pool = model_runner.token_to_kv_pool
     kv_snapshot(runtime, record, model_runner.token_to_kv_pool, slots, point)
+
+
+def rounded(value):
+    """JSON-safe scalar; undefined/nonfinite geometry is null."""
+    import math
+    value = float(value)
+    return round(value, 4) if math.isfinite(value) else None
+
+
+@isolated
+def alignment_stage(runtime, values, embeddings, tokens, stage):
+    """Observe resident rows before/after each transform, without retaining tensors."""
+    if runtime.rank != 0 or stage not in ("raw", "aligned", "final"):
+        return
+    import torch
+    if (values.ndim != 2 or values.shape != embeddings.shape or
+            not 0 < values.shape[0] <= 128 or not 0 < values.shape[1] <= 32768 or
+            tokens.ndim != 1 or tokens.numel() != values.shape[0]):
+        return
+    labels = tokens.tolist()
+    if any(type(t) is not int or not 0 <= t < runtime.embedding.num_embeddings for t in labels):
+        return
+    with torch.no_grad():
+        v, e = values.detach().float(), embeddings.detach().float()
+        vn, en = v.norm(dim=1), e.norm(dim=1)
+        cos = torch.nn.functional.normalize(v, dim=1) @ torch.nn.functional.normalize(e, dim=1).mT
+        for i, token in enumerate(labels):
+            offsets = [rounded(cos[i, j]) if 0 <= j < len(labels) and vn[i] > 0 and en[j] > 0
+                       else None for j in (i-1, i, i+1)]
+            emit("alignment_row", rank=0, stage=stage, row=i, token=token,
+                 cosine_offsets=offsets, row_norm=rounded(vn[i]), embedding_norm=rounded(en[i]),
+                 anchor_alpha=rounded(runtime.profile.anchor_alpha),
+                 target_norm=None if runtime.target_norm is None else rounded(runtime.target_norm))
+
+
+@isolated
+def alignment_nearest(runtime, prefix, tokens):
+    """Shard-local top-1 only: no embedding forward, gather, or collective."""
+    import torch
+    from .statebridge import shard_ranges
+    embedding = runtime.embedding
+    if (prefix.ndim != 2 or not 0 < prefix.shape[0] <= 128 or
+            not 0 < prefix.shape[1] <= 32768 or tokens.ndim != 1 or
+            tokens.numel() != prefix.shape[0]):
+        return
+    labels = tokens.tolist()
+    if any(type(t) is not int or not 0 <= t < embedding.num_embeddings for t in labels):
+        return
+    ranges = shard_ranges(embedding)
+    weight = embedding.weight
+    if weight.shape[1] != prefix.shape[1] or weight.device != prefix.device:
+        return
+    if any(not (0 <= a <= b <= weight.shape[0] and 0 <= g <= g+b-a <= embedding.num_embeddings)
+           for a, b, g in ranges):
+        return
+    with torch.no_grad():
+        query = torch.nn.functional.normalize(prefix.detach().float(), dim=1)
+        scores = torch.full((len(labels),), -float("inf"), device=prefix.device)
+        ids = torch.full((len(labels),), 2**62, dtype=torch.int64, device=prefix.device)
+        for start, end, global_start in ranges:
+            for offset in range(start, end, 256):
+                tile = weight[offset:min(offset+256, end)].detach().float()
+                if not bool(torch.isfinite(tile).all()):
+                    return
+                tile = torch.nn.functional.normalize(tile, dim=1)
+                score, index = (query @ tile.mT).max(dim=1)
+                token = index + offset - start + global_start
+                better = (score > scores) | ((score == scores) & (token < ids))
+                scores = torch.where(better, score, scores)
+                ids = torch.where(better, token, ids)
+        for i, (token, score) in enumerate(zip(ids.tolist(), scores.tolist())):
+            emit("alignment_nearest_shard", rank=runtime.rank, row=i, token=labels[i],
+                 top1_id=token, top1_cosine=rounded(score), top1_hit=token == labels[i],
+                 scope="local_shard", ranges=ranges)

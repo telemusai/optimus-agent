@@ -256,3 +256,32 @@ Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
 has 38. The live staging assembler refuses this count. The full native package
 build enumerates modules instead. No deploy files are changed here; correct the
 pin separately before using that assembler.
+
+### Opt-in alignment neighbour evidence
+
+`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor,
+post-solver (`aligned`), and post-anchor (`final`) rows on rank zero. Each
+line contains one of at most 128 rows, cosine offsets [-1, 0, +1] (null at
+edges), row/embedding norms, anchor alpha and target norm, rounded to four
+decimals. Zero-norm cosine is undefined (null).
+
+`alignment_nearest_shard` scans only each rank's resident embedding weight,
+excluding padding via StateBridge shard ranges. It never calls embedding
+forward or a collective. Vocabulary tiles are 256 rows (at most 32 MiB per
+float tile at hidden width 32768); scores are at most 128 x 256. It logs local
+top-1, not global rank. Merge matching capture rows offline across all ranks
+by highest cosine, then smallest token ID for ties. Rounded near-ties are
+ambiguous; do not infer global top-1 from one shard. Missing ranks invalidate
+the global conclusion. Run one isolated capture at a time to associate rows;
+no request identities are emitted. Failures remain isolated from serving.
+
+Decision rule: a clearly higher neighbour-offset score on misread rows, or
+a global nearest token equal to a neighbour, points to a capture alignment
+bug. A token lost only at the solver or anchoring stage points to that
+transform. Raw hidden rows far from all reasonable targets and a different
+nearest token support a latent-channel fidelity limit. These are diagnostic
+hypotheses, not proof: predictor hidden states and input embeddings need not
+share geometry, and reading a continuous prefix is not nearest-token decoding.
+The existing live evidence shows intact delivery and repeatably weak tokens,
+but lacks raw/solver stage comparisons; no causal conclusion is yet justified.
+All added tensor work is disabled unless the existing trace flag is exactly 1.

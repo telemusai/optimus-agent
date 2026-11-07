@@ -439,3 +439,43 @@ def test_alignment_cosines_bounded_and_rounded(caplog):
     caplog.clear()
     trace.alignment(NS(rank=0), torch.ones((129, 2)), torch.ones((129, 2)))
     assert not caplog.records
+
+
+def test_alignment_neighbors_and_stages(caplog):
+    torch = pytest.importorskip("torch")
+    e = torch.eye(3)
+    runtime = NS(rank=0, embedding=NS(num_embeddings=3),
+                 profile=NS(anchor_alpha=0.3), target_norm=2.0)
+    tokens = torch.tensor([0, 1, 2])
+    for stage in ("raw", "aligned", "final"):
+        trace.alignment_stage(runtime, e[[1, 2, 0]], e, tokens, stage)
+    result = rows(caplog)
+    assert len(result) == 9
+    assert result[0]["cosine_offsets"] == [None, 0.0, 1.0]
+    assert result[1]["cosine_offsets"] == [0.0, 0.0, 1.0]
+    assert result[2]["cosine_offsets"] == [0.0, 0.0, None]
+    assert result[0]["row_norm"] == result[0]["embedding_norm"] == 1.0
+    assert result[0]["target_norm"] == 2.0
+    assert result[0]["anchor_alpha"] == 0.3
+    trace.alignment_stage(runtime, e, e, torch.tensor([-1, 1, 2]), "raw")
+    assert len(rows(caplog)) == 9
+
+
+def test_nearest_shard_padding_and_ties(caplog):
+    torch = pytest.importorskip("torch")
+    embedding = NS(weight=torch.tensor([[1.,0.], [0.,1.], [9.,9.], [1.,0.]]),
+        embedding_dim=2, num_embeddings=8, shard_indices=NS(
+        org_vocab_start_index=2, org_vocab_end_index=4,
+        added_vocab_start_index=7, added_vocab_end_index=8, num_org_elements_padded=3))
+    trace.alignment_nearest(NS(rank=1, embedding=embedding), torch.eye(2), torch.tensor([2, 3]))
+    result = rows(caplog)
+    assert [r["top1_id"] for r in result] == [2, 3]
+    assert all(r["top1_hit"] and r["top1_cosine"] == 1.0 for r in result)
+    assert all(r["rank"] == 1 for r in result)
+
+
+def test_alignment_disabled_no_access(monkeypatch, caplog):
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    trace.alignment_stage(None, None, None, None, "raw")
+    trace.alignment_nearest(None, None, None)
+    assert not rows(caplog)

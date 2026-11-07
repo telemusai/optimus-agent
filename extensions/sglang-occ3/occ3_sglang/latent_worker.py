@@ -861,12 +861,17 @@ class WorkerRuntime:
         errors = self.gather(solver_error)
         require(not any(errors), "numerical")
         torch.distributed.broadcast(prefix, src=self.group.ranks[0], group=self.group.device_group)
+        from . import token_trace
+        token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "aligned")
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
             _probe_alignment(h, embeddings, prefix, self.profile)
         from . import token_trace
         token_trace.alignment(self, prefix, embeddings)
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, "final")
+        token_trace.alignment_nearest(self, prefix, tokens)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)
