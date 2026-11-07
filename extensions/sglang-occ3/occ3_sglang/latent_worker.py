@@ -865,6 +865,8 @@ class WorkerRuntime:
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
             _probe_alignment(h, embeddings, prefix, self.profile)
+        from . import token_trace
+        token_trace.alignment(self, prefix, embeddings)
         event = self.event()
         record.prefix = prefix
         record.events.append(event)
@@ -901,6 +903,8 @@ class WorkerRuntime:
         self.consensus(metadata)
         self.preflight("align_complete", lambda: _end_gpu(self, record))
         record.capture_commit_id, record.source_metadata, record.state = commit, metadata, "ready"
+        from . import token_trace
+        token_trace.capture(self, record, req, tokens, start, end)
         if "span_selection" in prepared:
             _calibration_handoff(self, record, prepared, embeddings)
             record.occ3_span_markers = None
@@ -1118,6 +1122,8 @@ def admit_request(scheduler, req, value):
             if isinstance(new_ids, array) else new_ids + list(req.output_ids))
         req.skip_radix_cache_insert, req.occ3_private_kv = True, True
         req.occ3_private_prefix = True
+        from . import token_trace
+        token_trace.admit(runtime, record, req, scheduler, descriptor)
 
 
 def _consume_capacity_available(scheduler, prompt_tokens):
@@ -1155,8 +1161,9 @@ def release_consume_cohort(scheduler, req):
     row stays attached (abort, retraction, terminal journal, private KV), but
     clears occ3_force_eager so it merges into the ordinary running batch and
     decodes with CUDA graphs. The batch flag is recomputed by filter_batch /
-    merge_batch before the next schedule. No GPU work and no gather: injection
-    is complete, and the terminal receipt reads only integers and tokens.
+    merge_batch before the next schedule. No gather; GPU work occurs only for
+    opt-in token tracing. Injection is complete, and the terminal receipt reads
+    only integers and tokens.
     Returns False (row stays eager, safe) unless injection is complete.
     """
     descriptor = getattr(req, "occ3_worker_descriptor", None)
@@ -1167,6 +1174,10 @@ def release_consume_cohort(scheduler, req):
     if (record.consumer != descriptor or record.state != "injected"
             or len(record.injected_positions) != descriptor.expected_prefix_tokens):
         return False
+    # Result processing has waited for copy_done before reaching this hook.
+    # The opt-in diagnostic adds a local stream fence; disabled means no GPU work.
+    from . import token_trace
+    token_trace.kv_saved(runtime, record, descriptor, "consume_released", fence=True)
     req.occ3_force_eager = False
     return True
 
@@ -1594,6 +1605,9 @@ def _effective(model_runner, forward_batch, shift):
         return {"count": count, "dtype": str(values.dtype)}
     runtime.preflight("draft_embedding_replace", replace)
     runtime.preflight("draft_embedding_complete", lambda: _end_gpu(runtime, record))
+    from . import token_trace
+    token_trace.draft_chunk(runtime, record, item, forward_batch, values,
+                            prepared["local"], count, prepared["source"])
     # NextN already keeps its normal embedding through the forward. Do not add
     # a second clone, target sidecar or registry reference to this full chunk.
     return values
@@ -1644,6 +1658,8 @@ def inject_target_embeddings(forward_batch, hidden_states):
                 "dtype": str(hidden_states.dtype)}
     runtime.preflight("target_embedding_inplace", validate_and_copy)
     forward_batch.occ3_effective_embeds = prepared["span"]
+    from . import token_trace
+    token_trace.target_chunk(runtime, item, forward_batch, hidden_states)
 
 
 def draft_input_embeds(model_runner, forward_batch, batch, tail_tokens):
@@ -1751,9 +1767,13 @@ def commit_result(scheduler, req, result, request_index, output_start, output_en
         stage.committed = True
         if terminal:
             runtime.align(record, req)
+            from . import token_trace
+            token_trace.capture_text(runtime, record, scheduler)
     elif terminal:
         runtime.preflight("terminal_fence", lambda: runtime.fence())
         _require_pin_evidence(runtime, req, descriptor)
+        from . import token_trace
+        token_trace.settled(runtime, record, scheduler, req, descriptor)
         metadata = {"native_rid": req.rid, "injection_commit_id": record.injection_commit_id,
                     "injected_prefix_count": len(record.injected_positions),
                     "prefix_offset": descriptor.prefix_offset,
@@ -1800,6 +1820,9 @@ def fence_private_kv_release(scheduler, req):
         require(record.consumer == descriptor, "identity")
         prepared["record"] = record
         runtime.fence()
+        # Native release frees the request row only after this hook returns.
+        from . import token_trace
+        token_trace.kv_saved(runtime, record, descriptor, "private_release")
         return {"reservation": descriptor.reservation_id, "rid": req.rid}
     try:
         runtime.preflight("private_kv_fence", fence_owned)
@@ -1922,6 +1945,8 @@ def record_forward_completion(model_runner, forward_batch):
         return
     runtime = _runtime()
     runtime.preflight("forward_complete", lambda: _end_gpu(runtime, runtime.resolve(context[0].descriptor)))
+    from . import token_trace
+    token_trace.kv_forward(model_runner, forward_batch, "prefill_complete")
 
 
 def record_forward_start(model_runner, forward_batch):
