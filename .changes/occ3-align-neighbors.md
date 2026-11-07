@@ -5,3 +5,4 @@
 - Fixed: Batch diagnostic device-to-host transfers instead of synchronizing per row or vocabulary tile.
 - Added: Collective-free raw-state RMSNorm/LM-head logit lens with local top-8 and label logits.
 - Fixed: Limit offline exact rank claims to global top-8 and document captured-residual rounding.
+- Fixed: Mark same-dtype copies as non-casts, scale FP8 proxy rows, trace pre-anchor nearest tokens, and skip unsupported head bias.

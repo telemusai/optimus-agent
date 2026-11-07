@@ -867,6 +867,7 @@ class WorkerRuntime:
         token_trace.alignment_logit_lens(self, h, tokens)
         token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
         token_trace.alignment_stage(self, prefix, embeddings, tokens, "aligned")
+        token_trace.alignment_nearest(self, prefix, tokens, "aligned")
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:

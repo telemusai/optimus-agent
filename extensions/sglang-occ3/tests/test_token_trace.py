@@ -491,6 +491,7 @@ def test_alignment_cast_precision(caplog):
     assert result[0]["solver_dtype"] == "torch.float32"
     assert result[0]["buffer_dtype"] == "torch.float16"
     assert result[0]["cosine"] == 1.0
+    assert result[0]["cast_observed"] is True
     assert result[0]["max_abs_diff"] == 0.0003
     assert result[1]["cosine"] is None
     assert torch.equal(original, solved)
@@ -504,7 +505,7 @@ def test_alignment_fp8_baseline(caplog):
     assert len(result) == 2
     assert result[0]["fp8_cosine"] == result[0]["embedding_fp8_cosine"]
     if result[0]["fp8_skipped"] is None:
-        expected = trace.precision_cosine(values, values.to(torch.float8_e4m3fn).float())
+        expected = trace.precision_cosine(values, trace.fp8_row_roundtrip(values, torch.float8_e4m3fn))
         assert result[0]["fp8_cosine"] == expected[0]
         assert expected[0] >= 0.999
         assert result[1]["fp8_cosine"] is None
@@ -552,12 +553,24 @@ def test_logit_lens_offsets_shard_and_one_copy(caplog, monkeypatch):
     assert result[2]["label_logits_offsets"] == [0.0, 1.732, None]
     assert result[0]["method_id"] == "probe"
     assert result[0]["vocab_start"] == 0
+    head.bias = torch.zeros(3)
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
+    assert rows(caplog)[-1]["reason"] == "unsupported_head_bias"
+    assert count == [1]
+    head.bias = None
+    head.num_embeddings = 6
+    head.shard_indices.org_vocab_start_index = 3
+    head.shard_indices.org_vocab_end_index = 6
+    trace.alignment_logit_lens(runtime, torch.eye(3), torch.tensor([0, 4, 5]))
+    assert rows(caplog)[-3]["label_logits_offsets"][1] is None  # Label on another shard.
+    assert rows(caplog)[-2]["label_logits_offsets"][1] == 1.732
+    assert count == [1, 1]
     head.quant_method = object()
     trace.alignment_logit_lens(runtime, torch.eye(3), torch.arange(3))
     assert rows(caplog)[-1]["reason"] == "unsupported_norm_or_head"
     monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
     trace.alignment_logit_lens(None, None, None)
-    assert count == [1]
+    assert count == [1, 1]
 
 
 def test_stage_single_copy(caplog, monkeypatch):
@@ -601,3 +614,45 @@ def test_documented_lens_residual_rounding_and_sync_scope():
     assert "not a bit-exact replay" in readme
     assert "One bounded synchronous packed copy per point inside align()" in readme
     assert "there is no asynchronous staging" in readme
+
+
+def test_other_points_single_copy_and_same_dtype(caplog, monkeypatch):
+    torch = pytest.importorskip("torch")
+    embedding = NS(weight=torch.eye(3), embedding_dim=3, num_embeddings=3,
+        shard_indices=NS(org_vocab_start_index=0, org_vocab_end_index=3,
+                         added_vocab_start_index=3, added_vocab_end_index=3,
+                         num_org_elements_padded=3))
+    runtime = NS(rank=0, embedding=embedding, profile=NS(method="probe", anchor_alpha=0.3))
+    original = trace.point_copy
+    calls = []
+    def copy(*args):
+        calls.append(1)
+        return original(*args)
+    monkeypatch.setattr(trace, "point_copy", copy)
+    matrix = torch.eye(3)
+    trace.alignment_nearest(runtime, matrix, torch.arange(3), "aligned")
+    assert len(calls) == 1
+    assert rows(caplog)[-1]["stage"] == "aligned"
+    trace.alignment_cast(runtime, matrix, matrix, matrix)
+    assert len(calls) == 2
+    assert rows(caplog)[-1]["cast_observed"] is False
+    trace.alignment_precision(runtime, matrix, matrix)
+    if rows(caplog)[-1]["fp8_skipped"] is None:
+        assert len(calls) == 3
+    else:
+        assert len(calls) == 2
+
+
+def test_fp8_scaling_preserves_small_rows():
+    torch = pytest.importorskip("torch")
+    dtype = getattr(torch, "float8_e4m3fn", None)
+    if dtype is None:
+        pytest.skip("float8 unavailable")
+    values = torch.tensor([[1e-9, 0.5e-9], [0.0, 0.0]])
+    try:
+        result = trace.fp8_row_roundtrip(values, dtype)
+    except (RuntimeError, TypeError):
+        pytest.skip("float8 conversion unsupported")
+    assert torch.allclose(result[0], values[0], rtol=0.001, atol=0)
+    assert torch.equal(result[1], values[1])
+    assert trace.precision_cosine(values, result) == [1.0, None]

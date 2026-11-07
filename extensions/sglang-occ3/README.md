@@ -265,7 +265,8 @@ line contains one of at most 128 rows, cosine offsets [-1, 0, +1] (null at
 edges), row/embedding norms, anchor alpha and target norm, rounded to four
 decimals. Zero-norm cosine is undefined (null).
 
-`alignment_nearest_shard` scans only each rank's resident embedding weight,
+`alignment_nearest_shard` runs at both `stage="aligned"` (before anchoring)
+and `stage="final"` (after anchoring), and scans only each rank's resident embedding weight,
 excluding padding via StateBridge shard ranges. It never calls embedding
 forward or a collective. Vocabulary tiles are 256 rows (at most 32 MiB per
 float tile at hidden width 32768); scores are at most 128 x 256. It logs local
@@ -286,20 +287,28 @@ The existing live evidence shows intact delivery and repeatably weak tokens,
 but lacks raw/solver stage comparisons; no causal conclusion is yet justified.
 All added tensor work is disabled unless the existing trace flag is exactly 1.
 
-Precision diagnostics additionally emit `alignment_cast` at the actual solver
-copy boundary (hidden/solver/buffer dtypes, float32 cosine and max absolute
-cast difference), stage dtypes, and `alignment_precision` after anchoring.
-The latter compares each final row and its plain token-embedding baseline
-with their own unscaled float8_e4m3fn round trips. Unsupported conversions
-have an explicit skip reason; zero/nonfinite rows have null cosine. FP32
-end-to-end replay is skipped: rerunning the solver and global anchor would
-add expensive work and anchor collectives, violating this diagnostic's scope.
-The cast comparison cannot measure precision already lost inside the solver.
+Precision diagnostics emit `alignment_cast` at the solver-copy boundary
+(hidden/solver/buffer dtypes, float32 cosine and max absolute difference).
+`cast_observed` is true only when solver and buffer dtypes differ. All current
+solvers already return hidden.dtype, so this is normally a same-dtype copy
+with cosine 1 and difference 0, **not a measurement of solver output rounding**.
+The fp32-to-bf16 cast occurs inside apply_map/the solver and is unobserved here.
+For finite normal values, a single bf16 rounding has cosine loss of order
+2^-16 or smaller: substantial loss from that one rounding can be excluded
+analytically, not by the copy trace. This does not exclude accumulated solver
+numerical error, underflow, overflow, or earlier precision loss.
 
-Precision decision rule: cast and FP8 cosines around 0.999+ on misread rows,
-matching the plain-embedding FP8 baseline, rule out a substantial rounding
-loss **at these measured boundaries**. Clearly worse loss for misread rows
-than the baseline makes precision a contributor worth testing. This FP8 proxy
+`alignment_precision` compares each final row and plain token-embedding
+baseline with their own row-scaled float8_e4m3fn round trips. Each row is scaled
+by 448/amax before casting and unscaled afterwards (divide first to avoid
+scale overflow); zero/nonfinite rows have null cosine. Unsupported conversions
+have an explicit skip reason. FP32 end-to-end replay remains skipped because
+rerunning the solver/global anchor adds expensive work and collectives.
+
+Precision decision rule: FP8 cosines around 0.999+ on misread rows, matching
+the plain-embedding baseline, rule out substantial loss at this proxy boundary.
+Use cast cosine as evidence only when `cast_observed` is true. Clearly worse
+loss on misread rows makes precision a contributor worth testing. This proxy
 is not actual KV quantization (which transforms/scales states); it cannot rule
 out all numerical causes or prove real KV-storage fidelity by itself.
 
@@ -318,7 +327,8 @@ isolated raw embedding neighbour win.
 from GlmMoeDsaForCausalLM's DeepseekV2 base. It evaluates RMSNorm's native
 formula and the unquantized head weight in bounded tiles, never calling
 model/norm/head forwards or LogitsProcessor. Unsupported quantized head,
-norm override, or logit transforms explicitly skip. This is a float32
+norm override, head bias, or logit transforms explicitly skip. The live
+LogitsProcessor readout ignores head bias, so the lens does not add it. This is a float32
 readout approximation with the normal norm-output dtype cast, not a replay
 of fused inference kernels or sampling penalties/temperature. The captured
 residual is the rounded fused add+norm input (the post-add residual), not an
@@ -337,6 +347,10 @@ collective. Combine all shard logsumexp values with logaddexp to compute
 untempered label probabilities. Missing ranks, rounded ties, or unsupported
 readouts leave the conclusion unresolved.
 The profile method ID and live anchor alpha accompany the diagnostic rows.
+
+Run the sender greedy for this drill, or use p(label) from merged logsumexp
+rather than top-1 rank. Under sampling the accepted label need not be top-1;
+that alone is not evidence of an indexing defect.
 
 | Raw logit-lens result | Interpretation |
 | --- | --- |

@@ -398,7 +398,7 @@ def cosine_tensor(left, right):
     """Stay on device until the caller packs its one diagnostic transfer."""
     import torch
     a, b = left.detach().float(), right.detach().float()
-    value = torch.nn.functional.cosine_similarity(a, b, dim=1)
+    value = torch.nn.functional.cosine_similarity(a, b, dim=1, eps=torch.finfo(a.dtype).tiny)
     valid = (torch.isfinite(a).all(dim=1) & torch.isfinite(b).all(dim=1) &
              (a.norm(dim=1) > 0) & (b.norm(dim=1) > 0))
     return value.masked_fill(~valid, float("nan"))
@@ -468,10 +468,12 @@ def alignment_stage(runtime, values, embeddings, tokens, stage):
 
 
 @isolated
-def alignment_nearest(runtime, prefix, tokens):
+def alignment_nearest(runtime, prefix, tokens, stage="final"):
     """Shard-local top-1; validity remains on device throughout the tiled scan."""
     import torch
     embedding = runtime.embedding
+    if stage not in ("aligned", "final"):
+        return
     if (not bounded_rows(prefix) or tokens.ndim != 1 or tokens.numel() != prefix.shape[0]):
         return
     ranges = local_ranges(embedding, prefix)
@@ -494,7 +496,7 @@ def alignment_nearest(runtime, prefix, tokens):
     if not valid_labels([r[0] for r in data], embedding.num_embeddings):
         return
     for i, (label, token, score, ok) in enumerate(data):
-        emit("alignment_nearest_shard", rank=runtime.rank, row=i, token=int(label),
+        emit("alignment_nearest_shard", rank=runtime.rank, stage=stage, row=i, token=int(label),
              top1_id=int(token) if ok else None, top1_cosine=rounded(score) if ok else None,
              top1_hit=(token == label) if ok else None, scope="local_shard", ranges=ranges)
 
@@ -514,13 +516,24 @@ def alignment_cast(runtime, hidden, solved, copied):
         emit("alignment_cast", rank=0, row=i, hidden_dtype=str(hidden.dtype),
              solver_dtype=str(solved.dtype), buffer_dtype=str(copied.dtype),
              cosine=rounded(cos), max_abs_diff=rounded(delta),
+             cast_observed=solved.dtype != copied.dtype,
              method_id=getattr(runtime.profile, "method", None),
              anchor_alpha=rounded(runtime.profile.anchor_alpha))
 
 
+def fp8_row_roundtrip(values, dtype):
+    """Scale each row to E4M3's finite range; zero rows stay zero."""
+    import torch
+    source = values.detach().float()
+    maximum = source.abs().amax(dim=1, keepdim=True)
+    # Divide first to avoid overflow in 448/amax for very small rows.
+    divisor = torch.where(maximum > 0, maximum, torch.ones_like(maximum))
+    return ((source / divisor * 448.0).to(dtype).float() / 448.0) * divisor
+
+
 @isolated
 def alignment_precision(runtime, prefix, embeddings):
-    """Unscaled FP8 proxy only; both cosine arrays share one host transfer."""
+    """Row-scaled FP8 proxy; both cosine arrays share one host transfer."""
     if runtime.rank != 0:
         return
     import torch
@@ -534,8 +547,8 @@ def alignment_precision(runtime, prefix, embeddings):
     else:
         try:
             with torch.no_grad():
-                data = point_copy(cosine_tensor(prefix, prefix.detach().to(dtype).float()),
-                                  cosine_tensor(embeddings, embeddings.detach().to(dtype).float()))
+                data = point_copy(cosine_tensor(prefix, fp8_row_roundtrip(prefix, dtype)),
+                                  cosine_tensor(embeddings, fp8_row_roundtrip(embeddings, dtype)))
         except Exception:
             reason = "float8_conversion_unsupported"
     for i, (cos, ref) in enumerate(data):
@@ -564,6 +577,9 @@ def alignment_logit_lens(runtime, hidden, tokens):
             not math.isfinite(norm.variance_epsilon) or norm.variance_epsilon <= 0):
         emit("alignment_logit_lens_skipped", rank=runtime.rank, reason="unsupported_norm_or_head")
         return
+    if head.bias is not None:
+        emit("alignment_logit_lens_skipped", rank=runtime.rank, reason="unsupported_head_bias")
+        return
     ranges = local_ranges(head, hidden)
     processor = model.logits_processor
     if processor.logit_scale is not None or processor.final_logit_softcapping:
@@ -591,8 +607,6 @@ def alignment_logit_lens(runtime, hidden, tokens):
             for offset in range(start, end, 256):
                 tile = head.weight[offset:min(offset+256, end)].detach().float()
                 logits = query @ tile.mT
-                if head.bias is not None:
-                    logits = logits + head.bias[offset:offset+tile.shape[0]].detach().float()
                 valid = valid & torch.isfinite(logits).all(dim=1)
                 lse = torch.logaddexp(lse, torch.logsumexp(logits, dim=1))
                 first = global_start + offset - start
