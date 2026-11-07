@@ -180,8 +180,9 @@ def test_diagnostic_fault_isolated(monkeypatch, operation):
     assert "PRIVATE" not in d.diag_error
 
 
-@pytest.mark.parametrize("text", ["a" * 8192, "漢😀" * 4096], ids=["ascii", "cjk-emoji"])
-def test_log_line_cap(monkeypatch, caplog, text):
+@pytest.mark.parametrize(("text", "expected"), [("a" * 8192, 2048), ("漢😀" * 4096, 256)],
+                         ids=["ascii", "cjk-emoji"])
+def test_log_line_cap(monkeypatch, caplog, text, expected):
     from occ3_sglang.turn_diagnostics import MAX_LOG_CHARS
     monkeypatch.setenv("OCC3_DIAG_TURN_TEXT", "4096")
     caplog.set_level(logging.INFO)
@@ -190,7 +191,8 @@ def test_log_line_cap(monkeypatch, caplog, text):
     d.emit(True, 20)
     row, = rows(caplog)
     effective = row["text_truncated_log_cap"]
-    assert 0 < effective < 4096
+    # README.md documents these effective limits.
+    assert effective == expected
     for name in ("content", "reasoning"):
         assert row[name + "_first"] == text[:effective]
         assert row[name + "_last"] == text[-effective:]

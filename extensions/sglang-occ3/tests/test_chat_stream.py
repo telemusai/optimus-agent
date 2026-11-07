@@ -437,3 +437,11 @@ async def test_task_cancellation_has_distinct_summary(harness, caplog, mode, mon
     assert row["keepalive"] is keepalive
     assert harness.tm.aborts
     assert harness.backend.retires
+    if mode == "terminal":
+        # Fail-closed retention for a cancelled native op (see
+        # test_terminal_receipt.test_terminal_stalled_native_next_is_deadline_bounded).
+        assert harness.adapter._active == 1 and harness.adapter._terminal_active == 1
+        pending = [t for t in harness.adapter._terminal_tasks if not t.done()]
+        for t in pending:
+            t.cancel()
+        await asyncio.gather(*pending, return_exceptions=True)
