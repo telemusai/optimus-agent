@@ -557,8 +557,9 @@ impl Occ3NativeSession {
                                     // Never hold the source guard across queue journaling
                                     // or persistence. No capture attempt was dispatched.
                                     drop(slot);
-                                    this.sender_queue_capture_policy_denied()
-                                        .map_err(anyhow::Error::msg)?;
+                                    // The in-memory transition already happened if
+                                    // persistence failed; preserve actionable policy guidance.
+                                    let _ = this.sender_queue_capture_policy_denied();
                                     return Err(anyhow::Error::msg(error));
                                 }
                                 (Some(budget), slot.retained)
@@ -3530,8 +3531,44 @@ mod tests {
         assert_eq!(after.len(), 1);
         assert_eq!(after[0].queue_id, queue_id);
         assert_eq!(after[0].state, Occ3SenderQueueState::Armed);
+        assert_eq!(after[0].reason, None, "re-arm must not retain policy denial");
+        let rearm_notices = session.take_pending_queue_notices();
+        assert_eq!(rearm_notices.len(), 1);
+        assert_eq!(rearm_notices[0].state, "armed");
+        assert_eq!(rearm_notices[0].reason, None);
         assert_eq!(after[0].attempts, 0);
         assert_eq!(session.failed_capture_attempts(), 0);
+    }
+
+    #[tokio::test]
+    async fn occ3_policy_denial_preserves_actionable_error_when_queue_persist_fails() {
+        use super::super::occ3_sender_queue::{sender_queue_path, Occ3SenderQueueState};
+        let dir = tempfile::tempdir().unwrap();
+        let sessions = dir.path().join("sessions");
+        std::fs::create_dir_all(&sessions).unwrap();
+        let file = sessions.join("session.jsonl");
+        std::fs::write(&file, "{\"type\":\"session\",\"rlmDepth\":0}\n").unwrap();
+        let session = enrolled().await;
+        session.bind_chat_preferences(Some(file.to_string_lossy().into_owned())).unwrap();
+        let tool = session.handoff_tool(Arc::new(ArmingController(true)));
+        let armed = (tool.execute)("policy-persist-arm".into(),
+            json!({"receiver_role":"child","receiver_name":"receiver"}), None, None).await.unwrap();
+        assert_eq!(armed.details["status"], "capture_armed");
+        crate::core::occ::session_settings::save_occ3(file.to_str().unwrap(), true, false).unwrap();
+        // Block only the queue artifact replacement, leaving occ.json readable.
+        let queue_path = sender_queue_path(file.to_str().unwrap());
+        std::fs::remove_file(&queue_path).unwrap();
+        std::fs::create_dir(&queue_path).unwrap();
+        assert!(session.check_native_allowed().unwrap_err().contains("/occ 3 on"));
+        let error = (session.source_hooks().resolve)(hook_request()).await.unwrap_err().to_string();
+        assert!(error.contains("disabled for this chat"), "{error}");
+        assert!(error.contains("/occ 3 on"), "{error}");
+        let entries = session.sender_queue_snapshot().unwrap().0;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].state, Occ3SenderQueueState::Pending);
+        assert_eq!(entries[0].attempts, 0);
+        assert_eq!(session.failed_capture_attempts(), 0);
+        assert!(session.source.lock().unwrap().capture_permit.is_none());
     }
 
     #[tokio::test]

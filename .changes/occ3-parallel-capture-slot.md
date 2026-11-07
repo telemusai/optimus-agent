@@ -2,4 +2,4 @@
 - Fixed native consumed reports to complete the sender queue when a verified receipt digest exists; digestless reports remain uncertain and never trigger duplicate ordinary-message fallback.
 - Fixed session-local OCC-3 teardown evicting the shared runtime connector used by other sessions; verified runtime identity changes evict only the affected cached connector.
 - Fixed failed capture completion retaining a reusable lease after releasing capture capacity.
-- Fixed policy-disabled capture arms returning to pending without spending attempts, allowing explicit re-arm after re-enabling OCC-3.
+- Fixed a policy-disabled capture leaving the sender queue head stuck armed; it now returns to pending without spending an attempt and can be re-armed after OCC-3 is re-enabled.

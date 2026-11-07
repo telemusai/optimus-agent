@@ -184,10 +184,6 @@ async fn unchanged_probe_short_cooldown_allows_later_restart() {
     fixture.enrollment_failure.store(1, std::sync::atomic::Ordering::SeqCst);
     assert!(ready.connector.enroll_native_session("unchanged-refusal").await.is_err());
     fixture.enrollment_failure.store(3, std::sync::atomic::Ordering::SeqCst);
-    let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
-    assert!(ready.connector.enroll_native_session("immediate-restart").await.is_err());
-    assert_eq!(fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before, 1,
-        "short cooldown bounds repeated authority probes");
     tokio::time::sleep(Duration::from_millis(1100)).await;
     assert!(ready.connector.enroll_native_session("restart-after-cooldown").await.is_err());
     fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);

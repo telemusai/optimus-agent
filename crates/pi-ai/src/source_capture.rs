@@ -853,6 +853,9 @@ impl SourceCaptureLease {
     /// Downstream lifecycle-test seam: simulate submission, then revoke it.
     /// Only a Prepared lease can enter this path. It produces Uncertain with
     /// no receipt or publication authority and never sends a network request.
+    /// Like `cancel_unsent_as_busy`, this is public for downstream-crate tests:
+    /// callers can only revoke their own Prepared lease into a conservative
+    /// failure; submitted, captured, and terminal leases cannot be changed.
     #[doc(hidden)]
     pub fn cancel_submitted_for_test(&self) -> bool {
         let Ok(_submission) = self.submit() else {

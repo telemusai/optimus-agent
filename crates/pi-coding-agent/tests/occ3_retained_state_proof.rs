@@ -332,8 +332,9 @@ async fn serve(
                                 "layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,
                                 "accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),
                                 "expires_at_epoch":expires,"byte_count":128});
-                            // These new provider regressions exposed pre-existing fixture
-                            // drift: label_anchor_alpha is a negotiated decimal, rejected
+                            // The new close-isolation and capture-slot families arm via
+                            // the real handoff tool, exposing pre-existing fixture drift:
+                            // label_anchor_alpha is a negotiated decimal, rejected
                             // by generic integer-only canonical_json_bytes. Use the typed
                             // intent digest above and echo alpha to match the live contract.
                             if let Some(alpha) = intent.get("label_anchor_alpha") {

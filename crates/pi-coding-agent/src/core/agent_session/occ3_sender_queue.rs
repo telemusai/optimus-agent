@@ -1192,7 +1192,7 @@ impl Occ3SenderQueue {
             return None;
         }
         head.state = Occ3SenderQueueState::Pending;
-        head.reason = Some("capture_policy_denied".into());
+        head.reason = None;
         self.notice_at(0, now_epoch, Some("capture_policy_denied".into()))
     }
 
