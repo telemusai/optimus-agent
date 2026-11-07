@@ -33,6 +33,7 @@ fn intent() -> SourceCaptureIntent {
         expires_at_epoch: epoch() + 300,
         span_policy: SOURCE_SPAN_POLICY.into(),
         capture_mode: String::new(),
+        label_anchor_alpha: None,
     }
 }
 fn profile() -> SourceCaptureProfile {
@@ -79,6 +80,7 @@ fn receipt(intent: &SourceCaptureIntent, body: &str) -> SourceCaptureReceipt {
         ready_ranks: 8,
         expected_ranks: 8,
         accepted_sequence_digest: "c".repeat(64),
+        label_anchor_alpha: Default::default(),
         output_sha256: sha256(body.as_bytes()),
         expires_at_epoch: intent.expires_at_epoch,
         byte_count: 32,
@@ -1107,4 +1109,50 @@ async fn deferred_source_unknown_or_unaccepted_error_stays_uncertain() {
         assert_eq!(lease.state(), SourceCaptureState::Uncertain);
         assert!(lease.busy_refusal().is_none());
     }
+}
+
+#[test]
+fn label_anchor_selection_serialization_and_receipt_binding() {
+    let mut intent = intent();
+    let default_wire = serde_json::to_value(&intent).unwrap();
+    assert!(default_wire.get("label_anchor_alpha").is_none());
+    assert_eq!(serde_json::from_value::<SourceCaptureIntent>(default_wire).unwrap().label_anchor_alpha, None);
+    for alpha in [0.0, 0.3, 0.5, 0.7, 1.0] {
+        let selected = LabelAnchorAlpha::try_from(alpha).unwrap();
+        intent.label_anchor_alpha = Some(selected);
+        let wire = serde_json::to_value(&intent).unwrap();
+        assert_eq!(wire["label_anchor_alpha"], json!(alpha));
+        assert_eq!(serde_json::from_value::<SourceCaptureIntent>(wire).unwrap().label_anchor_alpha, Some(selected));
+        let mut receipt = receipt(&intent, "body");
+        receipt.label_anchor_alpha = selected;
+        assert!(validate_receipt(&receipt, &intent, &profile(), epoch()).is_ok());
+        receipt.label_anchor_alpha = LabelAnchorAlpha::try_from(if alpha == 0.0 { 1.0 } else { 0.0 }).unwrap();
+        assert!(validate_receipt(&receipt, &intent, &profile(), epoch()).is_err());
+        intent.label_anchor_alpha = None;
+        receipt.intent_digest = intent.digest().unwrap();
+        assert!(validate_receipt(&receipt, &intent, &profile(), epoch()).is_ok());
+    }
+    for invalid in [json!(0.4), json!("0.3"), json!(-1), json!(null), json!(true)] {
+        let mut wire = serde_json::to_value(&intent).unwrap();
+        wire["label_anchor_alpha"] = invalid;
+        assert!(serde_json::from_value::<SourceCaptureIntent>(wire).is_err());
+    }
+}
+
+#[test]
+fn label_anchor_selection_matches_python_canonical_digest_vectors() {
+    // Python json.dumps(sort_keys=True, separators=(",", ":"), ensure_ascii=True), SHA-256.
+    let mut intent = intent();
+    intent.expires_at_epoch = 2_000_000_000;
+    for (alpha, expected) in [
+        (None, "5de0308e3e394cd7e5275a5f7c35704853935b63b3eac78dec6617f123b98065"),
+        (Some(0.0), "4eb17b21225a458fe37d74ff24638047d183fbbd1124ddda8b51c7fb84d68dae"),
+        (Some(0.3), "b85e8d6b733560ce31d25a6a79b9d0aa75ebfa28c65c3b6b68a58d0bdf9b7042"),
+        (Some(0.7), "39be23526a02271d94083bcab9296ffff4d627ccb39e8b196b0ce6ca75ccf402"),
+        (Some(1.0), "87d087f82898938d6c1dbd59601928b932bb1b9c9c087e2642d57f9edd01b1b0"),
+    ] {
+        intent.label_anchor_alpha = alpha.map(|v| LabelAnchorAlpha::try_from(v).unwrap());
+        assert_eq!(intent.digest().unwrap(), expected);
+    }
+    assert!(canonical_json_bytes(&json!({"unrelated": 0.3})).is_err());
 }

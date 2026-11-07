@@ -75,6 +75,122 @@ prerequisites. The historical deployment scripts and an endpoint health
 check are not substitutes for those gates. No automated production swap
 is authorized by this README.
 
+## Live known-token label anchor
+
+The attested profile pins **policy, not a mutable scalar**:
+
+```json
+{"label_anchor_alpha_allowed": [0.0, 0.3, 0.5, 0.7, 1.0],
+ "label_anchor_alpha_default": 0.0, "anchor_alpha": 0.0}
+```
+
+Both calibrated candidate files carry this policy:
+`deploy/native-build-inputs/native-profile-input.json.v3` and
+`deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json`. Allowed values
+must be a nonempty, duplicate-free subset of the five coefficients above; the
+default must belong to it. Old profiles without these fields keep the fixed
+`label_anchor_alpha` setting (missing means zero). A conflicting legacy scalar
+and new policy is rejected. If nearest-vocabulary `anchor_alpha` is nonzero,
+a request selecting nonzero label alpha is rejected even if listed in the policy.
+
+### Sweep a running server and client
+
+The sender reads its selection **fresh for every source capture**, in this order:
+
+1. `OCC3_LABEL_ANCHOR_ALPHA` when set; an invalid or empty value is a local error.
+2. Otherwise the file selected by `OCC3_LABEL_ANCHOR_ALPHA_FILE`, or by default
+   `<optimus config dir>/occ3_label_anchor_alpha` (the client's existing
+   `config::get_agent_dir()` resolver, including its agent-directory override).
+   The file contains one allowed
+   decimal, under 32 bytes including surrounding whitespace; the value is trimmed.
+3. A missing file omits the request field, so the server chooses its attested default.
+
+A malformed, oversized or unreadable file fails locally before enrollment or
+inference; it never silently falls back. Environment wins over file. Unset the
+scalar environment override before starting a file-driven sweep. Environment
+variables belong to the generating process: changing an export in another shell
+does not change an already-running daemon. Editing its selected file **does**
+affect the next capture, with no restart of either server or client:
+
+```sh
+# Use the file selected by the running client's configuration.
+printf '0.3\n' > "$ALPHA_FILE"
+# Run one synthetic OCC-3 handoff drill against the same running server.
+printf '0.5\n' > "$ALPHA_FILE"
+# Run the next drill; no rebuild/restart is required between values.
+```
+
+For concurrent editors use a temporary sibling file and an atomic rename so a
+capture does not read a partial write. The existing rotating debug log (`config::get_debug_log_path()`) records
+`occ3 capture label_anchor_alpha=<number|profile-default> source=<env|file|default>`,
+never file contents or paths. Set server `OCC3_DIAG_TOKEN_TRACE=1` for an authorized synthetic drill;
+the existing `alignment` event reports the **used** coefficient plus each final
+prefix row's cosine to `E_in[accepted_token]`. See stage semantics below to compare
+pre-label `aligned`, post-label `label_anchored`, and `final` evidence. Restore
+`0.0` to disable the blend. A selected value outside the attested set is rejected
+with a fixed server error; expanding that set is an attestation change, not a live knob.
+
+### Binding, computation and compatibility
+
+The optional numeric `occ3_capture.label_anchor_alpha` travels through the real
+Rust `SourceCaptureIntent`, Python `CaptureIntent`, and resolved
+`CaptureWorkerDescriptor`. Omitted differs from explicit zero: explicit zero can
+override a nonzero default, and its explicit request field changes the intent
+digest relative to omission. The resolved value is validated on all ranks and
+included in existing request/control and alignment-prepare consensus digests;
+no collective is added. Each capture owns an immutable coefficient and stored
+prefix. Later file edits cannot change an existing handoff or its consume.
+
+On rank zero, after the solver and before the existing TP broadcast, rows become
+`(1-a) * aligned + a * E_in[accepted_token]`, in float32 then cast to prefix dtype.
+The labels were checked against the retained capture ring. The existing nearest
+vocabulary anchor runs afterward, unchanged. At zero the blend performs no
+arithmetic; at one finite rows equal the known-token embedding. Intermediate
+values retain a residual but do not guarantee exact decoding or contextual value.
+Existing embeddings and bounded row scratch fit the solver workspace; no new
+vocabulary-sized tensor or non-diagnostic hot-path synchronization is added.
+
+The actual nonzero coefficient enters the capture commit and source receipt;
+zero remains omitted from public receipts and omitted requests retain their old
+wire bytes. Updated Rust clients default old receipts to zero and check explicitly
+requested values against receipts. Install the updated client before selecting
+nonzero alpha: older strict clients reject that receipt field. This optional
+source-capture metadata does not change the daemon protocol. Legacy zero-profile
+binding digests remain unchanged; allowed/default policy is bound when present.
+
+### One-time installation cost; no cost to change a permitted value
+
+Installing this plugin/client version and its allowed/default policy requires the
+normal attested build once. The supported Docker lane rebuilds the derived OCI
+image's native-package layer and replaces/restarts the candidate container; it
+reuses the preserved original SGLang base and weights, with no calibration refit.
+Thereafter, **changing the file or a per-process environment selection needs no
+image/package rebuild or server/client restart**. Changing the allowed/default
+policy itself still needs that attested rebuild. In-place package hot-patching
+is not a supported deployment path.
+
+In a prepared clean extension context, select the calibrated policy explicitly
+(the Dockerfile reads the basename without `.v3`):
+
+```sh
+cp "$CONTEXT/deploy/native-build-inputs/native-profile-input.json.v3" \
+   "$CONTEXT/deploy/native-build-inputs/native-profile-input.json"
+docker build --pull=false --network=none \
+  --build-arg BASE_IMAGE="$BASE_IMAGE_TAG" \
+  --build-arg OCC3_EXPERIMENTAL_STARTUP=true \
+  -f "$CONTEXT/deploy/Dockerfile" -t "$CANDIDATE_TAG" "$CONTEXT"
+```
+
+`BASE_IMAGE_TAG` must identify the verified preserved original base, not an
+already-patched candidate. Include the reviewed source baseline/manifests and
+actual calibration path/digest. `deploy.v3.native_image_build` calls
+`native_package` to generate `native_profile.json`, `native_sources.json`, and
+`_native_profile_digest.py` (`PROFILE_SHA256` and `SOURCE_SHA256`). These outputs
+are build artifacts, not tracked Git files. Policy bytes change `PROFILE_SHA256`;
+updated plugin source changes its attestation/SOURCE digest. Per-handoff selection
+changes neither attestation. Update the candidate plan's image/static-input/runtime
+pins for the one-time install. Historical fixed zero-profile SHA pins stay unchanged.
+
 ## Resource limits
 
 Current bounded response handling does not prove compatibility with the
@@ -251,22 +367,27 @@ that chunk (or across earlier chunks) can already be baked into the baseline.
 A diagnostic local-fence failure emits `skipped="fence_failed"`, not an unchanged
 comparison. Synchronization can perturb or mask timing-sensitive behavior. Never treat a sampled/skipped observation as whole-pool proof.
 
-Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins
-`PLUGIN_FILE_COUNT=36`; it was already stale on main (37 modules), and this PR
-has 38. The live staging assembler refuses this count. The full native package
-build enumerates modules instead. No deploy files are changed here; correct the
-pin separately before using that assembler.
+Staging note: `deploy/v3/live-instrumentation/stage_build.py` pins the current
+`PLUGIN_FILE_COUNT=38`; an inventory regression checks this against the plugin
+modules. The full native package build enumerates modules and regenerates hashes.
 
 ### Opt-in alignment neighbour evidence
 
-`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor,
-post-solver (`aligned`), and post-anchor (`final`) rows on rank zero. Each
-line contains one of at most 128 rows, cosine offsets [-1, 0, +1] (null at
-edges), row/embedding norms, anchor alpha and target norm, rounded to four
-decimals. Zero-norm cosine is undefined (null).
+`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor (`raw`),
+pre-label solver (`aligned`), post-label (`label_anchored`, only when enabled),
+and post-nearest (`final`) rows on rank zero. Each line contains one of at most
+128 rows, cosine offsets [-1, 0, +1] (null at edges), row/embedding norms, both
+anchor coefficients and target norm, rounded to four decimals. Zero-norm cosine
+is undefined (null). `alignment_cast` remains before the label blend and measures
+only the solver-to-buffer cast, not the anchor's effect.
 
-`alignment_nearest_shard` runs at both `stage="aligned"` (before anchoring)
-and `stage="final"` (after anchoring), and scans only each rank's resident embedding weight,
+At zero label alpha the existing `aligned` points remain unchanged on all ranks.
+When label anchoring is enabled, `aligned` reads the original solver rows before
+the blend **on rank zero only**, because no other rank owns these rows. Its
+`alignment_nearest_shard` result is only rank zero's local nearest token; it
+cannot establish global pre-label nearest identity. `label_anchored` and `final`
+nearest scans run on all ranks after the existing broadcast. No new collective
+is added. The scans use only each rank's resident embedding weight,
 excluding padding via StateBridge shard ranges. It never calls embedding
 forward or a collective. Vocabulary tiles are 256 rows (at most 32 MiB per
 float tile at hidden width 32768); scores are at most 128 x 256. It logs local
@@ -357,7 +478,9 @@ that alone is not evidence of an indexing defect.
 | Label top-1/high probability at producer position -1, but aligned row misses | Map/solver loses information. This is label offset 0 in our log. |
 | Label top-1 only at sequence position 0 or +1 instead of producer -1 | Indexing hypothesis. Compare adjacent raw rows; do not confuse sequence-position offsets with label offsets. |
 | Label low probability, misread tokens are runner-ups | Distribution/fidelity hypothesis: hidden state encodes alternatives. |
-| Label top-1 and aligned nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the map. |
+| Label top-1 and final global nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the final map+anchor output. |
+| Pre-label `aligned` cosine is weak but `label_anchored` improves | The label anchor changes the row as intended; receiver fidelity still requires a separate drill. |
+| Nonzero label alpha and only rank-zero `aligned` nearest available | Do not infer global pre-label nearest identity; compare offsets and cosine, then global post-label nearest across ranks. |
 
 All new points now pack device-side arrays and perform one small host copy
 per call immediately before emission. No per-row scalar reads or per-tile

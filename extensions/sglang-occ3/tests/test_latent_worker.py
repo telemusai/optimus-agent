@@ -457,7 +457,7 @@ def test_the_live_probe_uses_a_probe_local_generator_and_writes_scalars(tmp_path
     assert len(lines) == 1
     result = json.loads(lines[0])
     from occ3_sglang.calibration_probe import PROBE_KEYS
-    assert set(result) >= set(PROBE_KEYS) | {"anchor_alpha", "max_prefix_tokens"}
+    assert set(result) >= set(PROBE_KEYS) | {"anchor_alpha", "label_anchor_alpha", "max_prefix_tokens"}
     assert not probe.with_suffix(".jsonl.error").exists()
 
 

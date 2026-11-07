@@ -47,7 +47,8 @@ _DECLARED_IDENTITY_FIELDS = frozenset({
 })
 # Frozen-artifact reference: optional, because the per-message method names none.
 OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
-                                     DECLARED_IDENTITY})
+                                     "label_anchor_alpha", "label_anchor_alpha_allowed",
+                                     "label_anchor_alpha_default", DECLARED_IDENTITY})
 OUTPUT_NAMES = ("native_profile.json", "native_sources.json", "_native_profile_digest.py")
 MAX_PROFILE_BYTES = 16384
 MAX_SOURCES_BYTES = 65536
@@ -476,6 +477,25 @@ def _profile(value):
               "invalid_profile_integer")
     _need(type(value["anchor_alpha"]) in (int, float) and math.isfinite(value["anchor_alpha"]),
           "invalid_profile_alpha")
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _need(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+          and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0), "invalid_profile_label_alpha")
+    allowed_present = "label_anchor_alpha_allowed" in value
+    default_present = "label_anchor_alpha_default" in value
+    _need(allowed_present == default_present, "invalid_profile_label_alpha")
+    if allowed_present:
+        allowed = value["label_anchor_alpha_allowed"]
+        default = value["label_anchor_alpha_default"]
+        _need(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5, "invalid_profile_label_alpha")
+        _need(all(type(x) in (int, float) and math.isfinite(x)
+                     and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed), "invalid_profile_label_alpha")
+        _need(len(set(allowed)) == len(allowed), "invalid_profile_label_alpha")
+        _need(type(default) in (int, float) and math.isfinite(default)
+                     and default in allowed, "invalid_profile_label_alpha")
+        _need(not label_alpha or (len(allowed) == 1 and default == label_alpha), "invalid_profile_label_alpha")
+        label_alpha = default
+    _need(not (value["anchor_alpha"] != 0 and label_alpha != 0),
+          "conflicting_profile_anchors")
     # Current audited RuntimeProfile bounds, not evidence of actual model/TP/GPU state.
     # A packaged profile may only pin a method the installed registry advertises.
     # The registry is parsed, not imported: the build path stays pure-file.

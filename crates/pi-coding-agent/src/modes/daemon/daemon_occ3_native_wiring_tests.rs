@@ -180,6 +180,7 @@ impl Occ3Connector for FixtureConnector {
                 expires_at_epoch: now() + 600,
                 span_policy: SOURCE_SPAN_POLICY.into(),
                 capture_mode: String::new(),
+                label_anchor_alpha: None,
             },
             self.profile.clone(),
             limits,

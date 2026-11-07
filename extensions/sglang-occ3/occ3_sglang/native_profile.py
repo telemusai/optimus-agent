@@ -73,7 +73,8 @@ _DECLARED_IDENTITY_FIELDS = frozenset({
 # pinned file stays valid. load_pinned_profile always returns the pair, empty
 # when absent, so the runtime profile has one shape.
 _OPTIONAL_PROFILE_FIELDS = frozenset({"calibration_path", "calibration_digest",
-                                      DECLARED_IDENTITY})
+                                      DECLARED_IDENTITY, "label_anchor_alpha",
+                                      "label_anchor_alpha_allowed", "label_anchor_alpha_default"})
 _RUNTIME_FIELDS = frozenset({"runtime_epoch", "runtime_generation",
                             "incarnation_digest", "profile_sha256",
                             "source_attestation_sha256"})
@@ -450,6 +451,24 @@ def _validate_profile(value):
         _require(_uint(value[name], minimum=0 if name == "layer_index" else 1))
     _require(type(value["anchor_alpha"]) in (int, float)
              and math.isfinite(value["anchor_alpha"]))
+    label_alpha = value.get("label_anchor_alpha", 0.0)
+    _require(type(label_alpha) in (int, float) and math.isfinite(label_alpha)
+             and label_alpha in (0.0, 0.3, 0.5, 0.7, 1.0))
+    allowed_present = "label_anchor_alpha_allowed" in value
+    default_present = "label_anchor_alpha_default" in value
+    _require(allowed_present == default_present)
+    if allowed_present:
+        allowed = value["label_anchor_alpha_allowed"]
+        default = value["label_anchor_alpha_default"]
+        _require(type(allowed) in (list, tuple) and 0 < len(allowed) <= 5)
+        _require(all(type(x) in (int, float) and math.isfinite(x)
+                     and x in (0.0, 0.3, 0.5, 0.7, 1.0) for x in allowed))
+        _require(len(set(allowed)) == len(allowed))
+        _require(type(default) in (int, float) and math.isfinite(default)
+                     and default in allowed)
+        _require(not label_alpha or (len(allowed) == 1 and default == label_alpha))
+        label_alpha = default
+    _require(not (value["anchor_alpha"] and label_alpha))
     # RuntimeProfile owns semantic/model/TP/cache validation. No second profile type.
     return value
 

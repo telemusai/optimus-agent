@@ -428,9 +428,11 @@ def test_alignment_cosines_bounded_and_rounded(caplog):
     torch = pytest.importorskip("torch")
     prefix = torch.tensor([[1., 0.], [1., 0.], [0., 0.], [1., 1.]])
     embeddings = torch.tensor([[1., 0.], [-1., 0.], [1., 0.], [1., 0.]])
-    trace.alignment(NS(rank=0), prefix, embeddings)
+    trace.alignment(NS(rank=0, profile=NS(label_anchor_alpha=0.0)), prefix, embeddings,
+                    label_anchor_alpha=0.5)
     row = rows(caplog)[-1]
     assert row["event"] == "alignment"
+    assert row["label_anchor_alpha"] == 0.5
     assert row["row_cosine"] == [1.0, -1.0, 0.0, 0.707107]
     assert row["rows"] == 4 and row["rank"] == 0
     caplog.clear()
@@ -447,10 +449,12 @@ def test_alignment_neighbors_and_stages(caplog):
     runtime = NS(rank=0, embedding=NS(num_embeddings=3),
                  profile=NS(anchor_alpha=0.3), target_norm=2.0)
     tokens = torch.tensor([0, 1, 2])
-    for stage in ("raw", "aligned", "final"):
+    for stage in ("raw", "aligned", "label_anchored", "final"):
         trace.alignment_stage(runtime, e[[1, 2, 0]], e, tokens, stage)
     result = rows(caplog)
-    assert len(result) == 9
+    assert len(result) == 12
+    assert [r["stage"] for r in result[6:9]] == ["label_anchored"] * 3
+    assert all(r["label_anchor_alpha"] == 0.0 for r in result)
     assert result[0]["cosine_offsets"] == [None, 0.0, 1.0]
     assert result[1]["cosine_offsets"] == [0.0, 0.0, 1.0]
     assert result[2]["cosine_offsets"] == [0.0, 0.0, None]
@@ -458,16 +462,17 @@ def test_alignment_neighbors_and_stages(caplog):
     assert result[0]["target_norm"] == 2.0
     assert result[0]["anchor_alpha"] == 0.3
     trace.alignment_stage(runtime, e, e, torch.tensor([-1, 1, 2]), "raw")
-    assert len(rows(caplog)) == 9
+    assert len(rows(caplog)) == 12
 
 
-def test_nearest_shard_padding_and_ties(caplog):
+@pytest.mark.parametrize("stage", ["aligned", "label_anchored", "final"])
+def test_nearest_shard_padding_and_ties(caplog, stage):
     torch = pytest.importorskip("torch")
     embedding = NS(weight=torch.tensor([[1.,0.], [0.,1.], [9.,9.], [1.,0.]]),
         embedding_dim=2, num_embeddings=8, shard_indices=NS(
         org_vocab_start_index=2, org_vocab_end_index=4,
         added_vocab_start_index=7, added_vocab_end_index=8, num_org_elements_padded=3))
-    trace.alignment_nearest(NS(rank=1, embedding=embedding), torch.eye(2), torch.tensor([2, 3]))
+    trace.alignment_nearest(NS(rank=1, embedding=embedding), torch.eye(2), torch.tensor([2, 3]), stage)
     result = rows(caplog)
     assert [r["top1_id"] for r in result] == [2, 3]
     assert all(r["top1_hit"] and r["top1_cosine"] == 1.0 for r in result)
