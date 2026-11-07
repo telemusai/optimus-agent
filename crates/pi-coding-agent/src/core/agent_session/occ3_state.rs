@@ -54,6 +54,44 @@ fn failure() -> String {
     "Experimental native handoff unavailable or uncertain; replay is forbidden".into()
 }
 
+/// Content-free diagnostic for a receiver-side fail-closed refusal.
+/// `reason` is a fixed label naming the exit, and `error_kind` is the
+/// connector error's variant name when the refusal came from the
+/// connector. It never logs envelope content, facts, keys or server text,
+/// and the turn still returns the same generic failure. Exception-safe
+/// like `receiver_busy_claim_released`.
+fn receiver_refusal_diagnostic(message_id: Option<&str>, reason: &'static str, error_kind: Option<&'static str>) {
+    let _ = std::panic::catch_unwind(|| {
+        let mut fields = serde_json::Map::from_iter([("reason".into(), Value::from(reason))]);
+        if let Some(message_id) = message_id {
+            fields.insert("message_id".into(), Value::from(message_id));
+        }
+        if let Some(error_kind) = error_kind {
+            fields.insert("error_kind".into(), Value::from(error_kind));
+        }
+        pi_ai::log::get_logger("occ3.receiver").warn("receiver_refused", Some(fields));
+    });
+}
+
+/// The variant name of a connector error, for content-free diagnostics.
+fn occ3_error_kind(error: &Occ3Error) -> &'static str {
+    match error {
+        Occ3Error::IncompatibleModel { .. } => "incompatible_model",
+        Occ3Error::Unauthorized => "unauthorized",
+        Occ3Error::ConnectorUnreachable { .. } => "connector_unreachable",
+        Occ3Error::ConnectorTimeout { .. } => "connector_timeout",
+        Occ3Error::HandleExpired { .. } => "handle_expired",
+        Occ3Error::HandleAlreadyConsumed { .. } => "handle_already_consumed",
+        Occ3Error::RuntimeGenerationChanged { .. } => "runtime_generation_changed",
+        Occ3Error::TransferFailed { .. } => "transfer_failed",
+        Occ3Error::NativeInferenceUnsupported { .. } => "native_inference_unsupported",
+        Occ3Error::NativeInferenceBusyRefused { .. } => "native_inference_busy_refused",
+        Occ3Error::InferenceOutcomeUncertain { .. } => "inference_outcome_uncertain",
+        Occ3Error::Disabled => "disabled",
+        Occ3Error::UnknownConnector { .. } => "unknown_connector",
+    }
+}
+
 /// Content-free diagnostic for a receiver-busy claim retirement, in the
 /// connector-diagnostics style: names the retired message id, the refusing
 /// connector, whether the claim actually retired, and whether a live
@@ -795,8 +833,10 @@ impl Occ3NativeSession {
         Arc::new(move |request| {
             let this = this.clone();
             Box::pin(async move {
-                this.check_model(&request.model)
-                    .map_err(anyhow::Error::msg)?;
+                this.check_model(&request.model).map_err(|error| {
+                    receiver_refusal_diagnostic(None, "model_check_failed", None);
+                    anyhow::Error::msg(error)
+                })?;
                 let ids: Vec<String> = request
                     .messages
                     .iter()
@@ -839,9 +879,15 @@ impl Occ3NativeSession {
                 let envelope = this
                     .inbox
                     .lock()
-                    .map_err(|_| anyhow::anyhow!(failure()))?
+                    .map_err(|_| {
+                        receiver_refusal_diagnostic(None, "inbox_lock_poisoned", None);
+                        anyhow::anyhow!(failure())
+                    })?
                     .claim(&ids, &fresh_ids, now())
-                    .map_err(|_| anyhow::anyhow!(failure()))?;
+                    .map_err(|_| {
+                        receiver_refusal_diagnostic(None, "inbox_claim_refused", None);
+                        anyhow::anyhow!(failure())
+                    })?;
                 let Some(envelope) = envelope else {
                     return Ok(None);
                 };
@@ -852,13 +898,20 @@ impl Occ3NativeSession {
                 // retires. Those refusals are deterministic
                 // configuration/identity failures where a silent ordinary
                 // turn would hide a broken setup, so they stay loud.
-                this.check_native_allowed().map_err(anyhow::Error::msg)?;
-                this.check().map_err(anyhow::Error::msg)?;
+                if let Err(error) = this.check_native_allowed() {
+                    receiver_refusal_diagnostic(Some(&envelope.message_id), "native_not_allowed", None);
+                    return Err(anyhow::Error::msg(error));
+                }
+                if let Err(error) = this.check() {
+                    receiver_refusal_diagnostic(Some(&envelope.message_id), "session_check_failed", None);
+                    return Err(anyhow::Error::msg(error));
+                }
                 if !this.registry.supports(
                     this.connector.connector_id(),
                     envelope.latent_method,
                     &envelope.model_fingerprint,
                 ) {
+                    receiver_refusal_diagnostic(Some(&envelope.message_id), "registry_unsupported", None);
                     return Err(anyhow::anyhow!(failure()));
                 }
                 let claimed_message_id = envelope.message_id.clone();
@@ -947,13 +1000,26 @@ impl Occ3NativeSession {
                         }
                         return Err(anyhow::anyhow!(failure()));
                     }
-                    Err(_) => return Err(anyhow::anyhow!(failure())),
+                    Err(error) => {
+                        receiver_refusal_diagnostic(
+                            Some(&claimed_message_id),
+                            "prepare_inference_refused",
+                            Some(occ3_error_kind(&error)),
+                        );
+                        return Err(anyhow::anyhow!(failure()));
+                    }
                 };
                 this.inbox
                     .lock()
-                    .map_err(|_| anyhow::anyhow!(failure()))?
+                    .map_err(|_| {
+                        receiver_refusal_diagnostic(Some(&claimed_message_id), "inbox_lock_poisoned", None);
+                        anyhow::anyhow!(failure())
+                    })?
                     .bind_lease(&lease, &this.enrollment.identity)
-                    .map_err(|_| anyhow::anyhow!(failure()))?;
+                    .map_err(|_| {
+                        receiver_refusal_diagnostic(Some(&claimed_message_id), "bind_lease_refused", None);
+                        anyhow::anyhow!(failure())
+                    })?;
                 Ok(Some(lease))
             })
         })
@@ -4263,6 +4329,24 @@ mod tests {
     /// live wedge investigations pinned stays byte-identical.
     #[tokio::test]
     async fn receiver_resolver_keeps_fail_closed_error_when_prepare_is_not_busy() {
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _sink_guard = pi_ai::log::test_sink_guard();
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str() == Some("receiver_refused")
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
         let connector = FixtureConnector::new();
         connector.refuse_prepare_with(&[Occ3Error::TransferFailed {
             reason: "unit-fixture-prepare".into(),
@@ -4325,6 +4409,18 @@ mod tests {
             session.inbox.lock().unwrap().status("uncertain-1"),
             Some(Occ3DeliveryStatus::Delivered)
         );
+        // The refusal is now visible: one content-free diagnostic naming the
+        // exit and the connector error kind, never the envelope or reason text.
+        {
+            let values = entries.lock().unwrap();
+            assert_eq!(values.len(), 1, "exactly one receiver refusal diagnostic");
+            assert_eq!(values[0]["reason"], "prepare_inference_refused");
+            assert_eq!(values[0]["error_kind"], "transfer_failed");
+            assert_eq!(values[0]["message_id"], "uncertain-1");
+            let text = values[0].to_string();
+            assert!(!text.contains("uncertain-proof"), "never envelope content");
+            assert!(!text.contains("unit-fixture-prepare"), "never connector reason text");
+        }
         // ...so the next turn still refuses on the claimed record instead of
         // silently re-arming it: replay stays forbidden.
         assert_eq!(
