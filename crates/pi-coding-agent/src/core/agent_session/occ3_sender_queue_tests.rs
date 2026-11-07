@@ -1443,6 +1443,39 @@ async fn delivery_events_route_to_the_sender_session_queue() {
     assert_eq!(decoy.len(), 1, "receiver's own queue untouched by the sender's event");
 }
 
+/// A consumed event without proof must never authorize an ordinary fallback.
+#[tokio::test]
+async fn digestless_consumed_delivery_routes_to_uncertain_without_fallback() {
+    let sender = Occ3NativeSession::enroll(
+        "sender-route-digestless",
+        &fixture_model(),
+        Arc::new(QueueFixtureConnector),
+    )
+    .await
+    .expect("sender fixture");
+    sender.sender_queue_enqueue("child", "digestless-target").expect("enqueue");
+    sender.sender_queue_mark_armed(None, None).expect("armed");
+    sender.sender_queue_mark_progressed(
+        crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Admitted,
+        "agentmsg_route_digestless",
+    ).expect("admitted");
+    let _setup = sender.take_pending_queue_notices();
+    crate::core::agent_session::occ3_state::route_delivery_event_to_sender(
+        "sender-route-digestless", "agentmsg_route_digestless", true, None,
+    );
+    let notices = sender.take_pending_queue_notices();
+    assert_eq!(notices.len(), 1);
+    assert_eq!(notices[0].state, "uncertain");
+    assert!(sender.active_fallback_token_for("child:digestless-target").is_none(), "no fallback authority");
+    let (entries, _) = sender.sender_queue_snapshot().expect("snapshot");
+    assert_eq!(entries.len(), 1);
+    assert_eq!(entries[0].state,
+        crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Uncertain);
+    assert!(sender.sender_queue_sweep_expired().expect("sweep").is_empty());
+    assert!(sender.sender_queue_capture_failed(true, "native_path_deactivated")
+        .expect("failure").is_none());
+}
+
 /// F2: an unrelated ordinary message to the same receiver cannot
 /// acknowledge the fallback entry (token gate); a duplicate ack with the
 /// same token is idempotent; two entries correlate separately.

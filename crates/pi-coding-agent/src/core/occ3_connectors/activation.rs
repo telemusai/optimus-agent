@@ -672,6 +672,9 @@ pub(crate) mod test_support {
         .expect("endpoint url");
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_outer = Arc::clone(&requests);
+        let enrollments = Arc::new(std::sync::Mutex::new(
+            std::collections::BTreeMap::<String, serde_json::Value>::new(),
+        ));
         let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
         tokio::spawn(async move {
             loop {
@@ -685,8 +688,9 @@ pub(crate) mod test_support {
                 let identity = identity.clone();
                 let required_bearer = required_bearer.clone();
                 let requests = Arc::clone(&requests);
+                let enrollments = Arc::clone(&enrollments);
                 tokio::spawn(async move {
-                    serve_connection(socket, identity, required_bearer, requests).await;
+                    serve_connection(socket, identity, required_bearer, requests, enrollments).await;
                 });
             }
         });
@@ -702,6 +706,7 @@ pub(crate) mod test_support {
         identity: Occ3ModelIdentity,
         required_bearer: Option<String>,
         requests: Arc<AtomicUsize>,
+        enrollments: Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
     ) {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -783,6 +788,26 @@ pub(crate) mod test_support {
             "terminal_journal": true,
             "max_capture_bytes": MAX_CAPTURE_BYTES,
         });
+        // Match the runtime's immutable same-session enrollment contract. A
+        // fresh connector must not silently replace a live session's permit.
+        if path == "/occ3/v1/native/sessions/enroll" {
+            if let Some(body) = body.as_ref() {
+                let mut record = body.clone();
+                record.as_object_mut().unwrap().remove("operation_id");
+                let session_id = body["session_id"].as_str().unwrap().to_string();
+                let conflict = {
+                    let mut records = enrollments.lock().unwrap();
+                    match records.get(&session_id) {
+                        Some(existing) => existing != &record,
+                        None => { records.insert(session_id, record); false }
+                    }
+                };
+                if conflict {
+                    let _ = write_response(&mut socket, "401 Unauthorized", "{}", &[]).await;
+                    return;
+                }
+            }
+        }
         let response = match (path.as_str(), body.as_ref()) {
             ("/occ3/v1/identity", _) => serde_json::json!({
                 "schema": "optimus.occ3.identity.v1",
@@ -1403,7 +1428,7 @@ mod tests {
         assert_eq!(super::method_family(""), None);
     }
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn invalidating_session_state_drops_the_cached_ready() {
+    async fn runtime_invalidation_after_session_close_drops_the_cached_ready() {
         let _cache_guard = reset_ready_cache().await;
         let fixture =
             serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
@@ -1419,10 +1444,8 @@ mod tests {
             std::sync::Arc::ptr_eq(&primed, &cached),
             "the same ready serves repeated activations"
         );
-        // A real native session enrolled against the verified connector is
-        // the session lifecycle the daemon owns; invalidating its state must
-        // retire the process-wide ready, so the next activation re-handshakes
-        // instead of reusing a ready whose session state no longer exists.
+        // Session teardown preserves runtime-scoped readiness. Explicit
+        // runtime invalidation still forces the next activation to verify.
         let session = crate::core::agent_session::occ3_state::Occ3NativeSession::enroll(
             "session-x",
             &model,
@@ -1431,12 +1454,17 @@ mod tests {
         .await
         .expect("session enrolls against the verified connector");
         session.invalidate();
+        let still_cached = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&cached, &still_cached));
+        invalidate_ready_cache();
         let reverified = verify_cached(&request, Duration::from_secs(5))
             .await
             .expect("the next activation re-verifies");
         assert!(
             !std::sync::Arc::ptr_eq(&cached, &reverified),
-            "invalidate() must drop the cached ready"
+            "explicit runtime invalidation must drop the cached ready"
         );
     }
+    include!("activation_close_isolation_tests.rs");
+
 }

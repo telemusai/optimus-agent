@@ -1,0 +1,3 @@
+- Fixed OCC-3 capture capacity remaining occupied after publication or terminal failure while the sender session stayed open; capacity waits now cancel or refuse after 30 seconds without replay.
+- Fixed digestless native consumption reports incorrectly requesting a duplicate ordinary-message fallback; these reports remain uncertain.
+- Fixed session-local OCC-3 teardown evicting the shared runtime connector used by other sessions.

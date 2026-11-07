@@ -114,13 +114,11 @@ pub(crate) fn route_delivery_event_to_sender(
             })
             .unwrap_or_default()
     };
-    // A consumed report without a receipt digest is NOT completion proof:
-    // the entry resolves to `uncertain` (visible, explicit, never
-    // auto-advanced), not to `completed`.
-    let consumable = consumed && receipt_sha256.is_some();
+    // Preserve consumption even without a receipt digest: the queue marks
+    // that report uncertain, never proven unused or eligible for fallback.
     for sender in senders {
         if let Ok(notices) =
-            sender.sender_queue_record_delivery_event(message_id, consumable, receipt_sha256)
+            sender.sender_queue_record_delivery_event(message_id, consumed, receipt_sha256)
         {
             if !notices.is_empty() {
                 // The notices belong to the SENDER's transcript, not the
@@ -386,9 +384,6 @@ impl Occ3NativeSession {
         if slot.resolved || slot.budget.is_some() {
             return Err(failure());
         }
-        if slot.capture_permit.is_none() && capture_permit.is_some() {
-            slot.capture_permit = capture_permit;
-        }
         let caps = self.registry.capabilities(self.connector.connector_id()).ok_or_else(failure)?;
         let bytes_per_element = match self.enrollment.source_profile.dtype.as_str() {
             "bfloat16" | "float16" => 2u64,
@@ -406,6 +401,9 @@ impl Occ3NativeSession {
         let seconds = self.enrollment.expires_at_epoch.saturating_sub(now()).min(600);
         if retained_count_limit == 0 || seconds == 0 {
             return Err(failure());
+        }
+        if slot.capture_permit.is_none() && capture_permit.is_some() {
+            slot.capture_permit = capture_permit;
         }
         slot.budget = Some(NativeSourceBudget {
             retained_count_limit,
@@ -614,6 +612,10 @@ impl Occ3NativeSession {
                         return Ok(None);
                     }
                     let Some(budget) = budget else { return Ok(None); };
+                    // Preparation owns capacity across its await; a failed or
+                    // cancelled preparation must not leave a permit in the slot.
+                    let capture_permit = this.source.lock()
+                        .map_err(|_| anyhow::anyhow!(failure()))?.capture_permit.take();
                     let lease = this
                         .connector
                         .prepare_source_capture(
@@ -629,16 +631,20 @@ impl Occ3NativeSession {
                         )
                         .await
                         .map_err(|_| anyhow::anyhow!(failure()))?;
-                    this.source
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!(failure()))?
-                        .lease = Some(lease.clone());
+                    let mut slot = this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
+                    this.check().map_err(anyhow::Error::msg)?;
+                    slot.lease = Some(lease.clone());
+                    slot.capture_permit = capture_permit;
                     Ok(Some(lease))
                 })
             }),
             completed: Arc::new(move |completion| {
                 let this = complete.clone();
                 Box::pin(async move {
+                    // Failed completion checks are terminal for this capture.
+                    // Return capacity to the slot only when publication is valid.
+                    let capture_permit = this.source.lock()
+                        .map_err(|_| anyhow::anyhow!(failure()))?.capture_permit.take();
                     this.check_model(&completion.model)
                         .map_err(anyhow::Error::msg)?;
                     // Each refusal names its check: live TS14 evidence showed
@@ -667,7 +673,7 @@ impl Occ3NativeSession {
                             return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_name]", failure())));
                         }
                     }
-                    let slot = this
+                    let mut slot = this
                         .source
                         .lock()
                         .map_err(|_| anyhow::anyhow!(format!("{} [occ3_source_lock]", failure())))?;
@@ -681,6 +687,8 @@ impl Occ3NativeSession {
                     if slot.tool_claimed {
                         return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_claimed]", failure())));
                     }
+                    this.check().map_err(anyhow::Error::msg)?;
+                    slot.capture_permit = capture_permit;
                     Ok(())
                 })
             }),
@@ -1338,7 +1346,28 @@ Do not call occ3_handoff again for these facts."
                     let capture_permit = if slot_holds_active_capture {
                         None
                     } else {
-                        Some(crate::core::occ3_connectors::activation::acquire_capture_permit().await)
+                        // Waiting does not arm or replay anything. A stuck holder
+                        // must not prevent cancellation or monopolize this turn.
+                        let wait = tokio::time::timeout(
+                            std::time::Duration::from_secs(30),
+                            crate::core::occ3_connectors::activation::acquire_capture_permit(),
+                        );
+                        let cancelled = async {
+                            match signal.as_ref() {
+                                Some(signal) => signal.cancelled().await,
+                                None => std::future::pending::<()>().await,
+                            }
+                        };
+                        let permit = tokio::select! {
+                            biased;
+                            _ = cancelled => return Err(anyhow::anyhow!(
+                                "Native capture capacity wait cancelled; nothing was armed, sent, or replayed [occ3_capture_capacity_cancelled]"
+                            )),
+                            result = wait => result.map_err(|_| anyhow::anyhow!(
+                                "Native capture capacity wait timed out; nothing was armed, sent, or replayed [occ3_capture_capacity_timeout]"
+                            ))?,
+                        };
+                        Some(permit)
                     };
                     // Busy re-arm context for the truthful tool text: read
                     // before mark_armed clears the busy reason.
@@ -1404,17 +1433,24 @@ Do not call occ3_handoff again for these facts."
                             MAX_NATIVE_CAPTURE_RETRIES
                         ))], json!({"status":"capture_armed","delivery_completed":false,"capture_attempts_failed":attempts,"busy_retries":busy_rearm.map(|(retry, _)| retry).unwrap_or(0)})));
                     }
-                    let source={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
+                    // Publication owns the permit now. Local ownership releases
+                    // it on failure or cancellation without resetting the spent slot.
+                    let (source, publication_permit)={let mut slot=this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_source_lock]", failure())))?;
+                        let permit = slot.capture_permit.take();
                         let source=slot.lease.clone().ok_or_else(||anyhow::anyhow!(format!("{} [occ3_tool_source_lease_missing]", failure())))?;
                         source.validate_tool(&tool_id,NATIVE_HANDOFF_TOOL,&args).map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_validate_tool: {e}]", failure())))?;
-                        if slot.tool_claimed {return Err(anyhow::anyhow!(format!("{} [occ3_tool_already_claimed]", failure())));} slot.tool_claimed=true; source};
+                        if slot.tool_claimed {return Err(anyhow::anyhow!(format!("{} [occ3_tool_already_claimed]", failure())));} slot.tool_claimed=true; (source, permit)};
                     this.check().map_err(anyhow::Error::msg)?;
                     if signal.as_ref().is_some_and(|s|s.is_cancelled()) { source.cancel(); return Err(anyhow::anyhow!(failure())); }
                     let expected_message_id=authorized.message_id().to_string();
                     let expected_receiver_id=authorized.target_session_id().to_string();
                     let publication=this.connector.publish_native_source(NativePublicationRequest {source:source.clone(),
                         receiver_session_id:authorized.target_session_id().into(),message_id:authorized.message_id().into(),
-                        publication_id:format!("publication-{}",uuid::Uuid::new_v4()),dispatch:NativePublicationDispatch::ModelTool{tool_call_id:tool_id,tool_name:NATIVE_HANDOFF_TOOL.into(),tool_arguments:args}}).await
+                        publication_id:format!("publication-{}",uuid::Uuid::new_v4()),dispatch:NativePublicationDispatch::ModelTool{tool_call_id:tool_id,tool_name:NATIVE_HANDOFF_TOOL.into(),tool_arguments:args}}).await;
+                    // Publication spends capture capacity; receiver admission and
+                    // consumption may finish much later and do not own this slot.
+                    drop(publication_permit);
+                    let publication = publication
                         .map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_publish: {e}]", failure())))?;
                     this.source.lock().map_err(|_|anyhow::anyhow!(format!("{} [occ3_tool_publish_lock]", failure())))?.published_message=Some((publication.envelope.message_id.clone(),publication.binding_digest.clone()));
                     this.check().map_err(|e|anyhow::anyhow!(format!("{} [occ3_tool_check_publish: {e}]", failure())))?;
@@ -1471,7 +1507,7 @@ Do not call occ3_handoff again for these facts."
     ) -> Result<crate::core::agent_messages::AgentSessionMessageReceipt, String> {
         self.check()?;
         self.check_native_allowed()?;
-        let source = {
+        let (source, publication_permit) = {
             let mut slot = self
                 .source
                 .lock()
@@ -1495,7 +1531,7 @@ Do not call occ3_handoff again for these facts."
             // One-shot claim BEFORE any await: concurrent callers cannot
             // publish the same retained capture twice.
             slot.publication_claimed = true;
-            source
+            (source, slot.capture_permit.take())
         };
         let authorized = controller
             .authorize_native_handoff(relationship.into(), selector.into())
@@ -1516,7 +1552,10 @@ Do not call occ3_handoff again for these facts."
                 publication_id: format!("publication-{}", uuid::Uuid::new_v4()),
                 dispatch: NativePublicationDispatch::Orchestrator,
             })
-            .await
+            .await;
+        // Retained publication has the same capacity lifetime as tool publication.
+        drop(publication_permit);
+        let publication = publication
             .map_err(|e| format!("{} [occ3_publish_publish: {e}]", failure()))?;
         self.source
             .lock()
@@ -1624,10 +1663,10 @@ Do not call occ3_handoff again for these facts."
                 lease.cancel();
             }
         }
-        // The ready cache is a cache of THIS connector's live handshake:
-        // once the session state is invalid, a cached ready must not be
-        // served to the next activation as if nothing had changed.
-        crate::core::occ3_connectors::activation::invalidate_ready_cache();
+        // Readiness and publication authority belong to the shared runtime
+        // connector, not this session. Evicting it here splits later senders
+        // from live receivers' enrollment and publication records. Only an
+        // explicit runtime invalidation may clear the process-wide cache.
         // No restamp may run for dead receiver state.
         if let Ok(mut guard) = self.restamp_unsubscribe.lock() {
             if let Some(unsubscribe) = guard.take() {
@@ -1657,8 +1696,8 @@ Do not call occ3_handoff again for these facts."
         }
     }
     /// Recoverable deactivation for a terminally failed source capture
-    /// (retry budget exhausted). Unlike [`Self::invalidate`] it does not
-    /// drop the process-wide ready cache: the connector handshake stays
+    /// (retry budget exhausted). Like [`Self::invalidate`] it preserves
+    /// the process-wide ready cache: the connector handshake stays
     /// valid for other sessions and later re-activation. It marks this
     /// session closed, cancels any residual lease, and runs the registered
     /// tombstone cleanup so the host clears its native hooks and removes
@@ -1815,6 +1854,14 @@ Do not call occ3_handoff again for these facts."
         state: super::occ3_sender_queue::Occ3SenderQueueState,
         message_id: &str,
     ) -> Result<Option<Occ3QueueNotice>, String> {
+        if state == super::occ3_sender_queue::Occ3SenderQueueState::Admitted {
+            // Admission cannot retain capture capacity, including alternate
+            // controller paths. Drop the source lock before taking the queue lock.
+            let mut source = self.source.lock().map_err(|_| failure())?;
+            if source.handoff_admitted {
+                source.capture_permit = None;
+            }
+        }
         let mut queue = self.queue.lock().map_err(|_| failure())?;
         let notice = queue.mark_progressed(state, message_id, now());
         self.journal_notices_locked(&mut queue, notice.clone());
@@ -1886,9 +1933,10 @@ Do not call occ3_handoff again for these facts."
     /// code). The armed queue head takes one busy retry (or falls back once
     /// the busy budget is spent) and the slot resets for a fresh arm; the
     /// refused lease was never published, so it is dropped, never retired
-    /// or replayed. Returns false (and changes nothing) when the slot holds
-    /// no such refusal or no queue head is armed; the resolve hook then
-    /// counts an ordinary capture failure. Called from the resolve hook's
+    /// or replayed. Returns false when the slot holds no such refusal or no
+    /// queue head is armed; the resolve hook then counts an ordinary capture
+    /// failure. Terminal captures release their capacity even without a busy
+    /// refusal to absorb. Called from the resolve hook's
     /// tombstone path and, eagerly, at AgentEnd so the outcome is recorded
     /// even when no automatic provider retry follows.
     pub(crate) fn absorb_source_busy_refusal(&self) -> bool {
@@ -1901,6 +1949,14 @@ Do not call occ3_handoff again for these facts."
         };
         if !slot.resolved || slot.handoff_admitted {
             return false;
+        }
+        // AgentEnd also visits ordinary failed captures. They still count
+        // against the normal retry budget on the next resolve, but must not
+        // retain process-wide capacity until that next turn.
+        if slot.lease.as_ref().is_some_and(|lease| lease.state() == SourceCaptureState::Cancelled)
+            || slot.lease.is_none()
+        {
+            slot.capture_permit = None;
         }
         let Some(refusal) = slot.lease.as_ref().and_then(|lease| {
             (lease.state() == SourceCaptureState::Cancelled).then(|| lease.busy_refusal()).flatten()
@@ -2802,6 +2858,34 @@ mod tests {
         }
     }
 
+    /// An admitted sender may stay alive while another session captures.
+    #[tokio::test]
+    async fn occ3_admitted_sender_releases_capture_slot_for_another_session() {
+        let first = enrolled().await;
+        let second = enrolled().await;
+        // A private one-slot pool makes the process-wide ownership invariant
+        // deterministic without contending with unrelated parallel tests.
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = pool.clone().acquire_owned().await.unwrap();
+        assert!(first.arm_handoff_if_needed("receiver", Some(permit)).unwrap());
+        assert!(pool.clone().try_acquire_owned().is_err(), "armed capture stays exclusive");
+        // Resolve the armed turn; the completing second call reuses its
+        // lease and never reacquires the capacity held by that lease.
+        resolve_capture(&first).await;
+        assert!(!first.arm_handoff_if_needed("receiver", None).unwrap());
+        first.sender_queue_enqueue("child", "receiver").unwrap();
+        first.sender_queue_mark_armed(Some("admitted-slot"), Some("receiver")).unwrap();
+        first.source.lock().unwrap().handoff_admitted = true;
+        first.sender_queue_mark_progressed(
+            super::super::occ3_sender_queue::Occ3SenderQueueState::Admitted,
+            "admitted-slot",
+        ).unwrap();
+        let next = pool.clone().try_acquire_owned()
+            .expect("admitted sender must release capture capacity without teardown or another tool call");
+        assert!(second.arm_handoff_if_needed("another-receiver", Some(next)).unwrap());
+        assert!(first.source.lock().unwrap().handoff_admitted);
+    }
+
     #[tokio::test]
     async fn repeated_handoff_after_admission_reports_already_delivered() {
         let session = enrolled().await;
@@ -3138,14 +3222,17 @@ mod tests {
     #[tokio::test]
     async fn agent_end_absorb_ignores_ordinary_failures() {
         let session = enrolled().await;
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = pool.clone().acquire_owned().await.unwrap();
         session.sender_queue_enqueue("child", "receiver").unwrap();
-        assert!(session.arm_handoff_if_needed("receiver", None).expect("arm"));
+        assert!(session.arm_handoff_if_needed("receiver", Some(permit)).expect("arm"));
         session.sender_queue_mark_armed(None, Some("receiver")).unwrap();
         let hooks = session.source_hooks();
         let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("fresh lease");
         lease.cancel();
         assert!(!session.absorb_source_busy_refusal());
-        assert!(session.source.lock().unwrap().lease.is_some(), "slot untouched");
+        assert_eq!(pool.available_permits(), 1, "terminal failure releases capacity immediately");
+        assert!(session.source.lock().unwrap().lease.is_some(), "retry accounting remains untouched");
         assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
         assert_eq!(session.failed_capture_attempts(), 1);
     }

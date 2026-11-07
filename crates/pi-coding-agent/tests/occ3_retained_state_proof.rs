@@ -324,7 +324,7 @@ async fn serve(
                                 .unwrap_or_else(|| intent["expires_at_epoch"].as_u64().unwrap());
                             let stale_v1 = mode.receipt == ReceiptMode::StaleV1;
                             let mut receipt = json!({"schema":if stale_v1 {"occ3.source.v1"} else {"occ3.source.v2"},
-                                "intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),
+                                "intent_digest":serde_json::from_value::<SourceCaptureIntent>(intent.clone()).unwrap().digest().unwrap(),
                                 "source_handle":RAW_SOURCE_HANDLE,"native_rid":"retained-source-rid","response_id":"retained-source-rid",
                                 "capture_commit_id":"retained-proof-capture-commit",
                                 "accepted_span_start":0,"accepted_span_end":8,"retained_count":8,"predictor_position_offset":-1,
@@ -332,6 +332,10 @@ async fn serve(
                                 "layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,
                                 "accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),
                                 "expires_at_epoch":expires,"byte_count":128});
+                            // Intent canonicalization permits this negotiated decimal only.
+                            if let Some(alpha) = intent.get("label_anchor_alpha") {
+                                receipt["label_anchor_alpha"] = alpha.clone();
+                            }
                             // The default arming is occ3.capture.v2, so the
                             // intent is answered on the v2 wire with the
                             // occ3.span.v1 block. The counts model this
@@ -1899,3 +1903,8 @@ async fn retained_wrong_epoch_runtime_restart_is_refused_at_consume_time() {
     assert!(pf.family.receipts().is_empty());
     cleanup(&pf).await;
 }
+
+#[path = "support/occ3_close_isolation.rs"]
+mod close_isolation;
+
+include!("support/occ3_capture_slot.rs");
