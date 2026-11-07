@@ -426,7 +426,7 @@ pub(crate) fn native_digest(value: &str) -> bool {
 macro_rules! native_binding_failed {
     ($stage:literal; $($reason:literal => $failed:expr),+ $(,)?) => {{
         false $(|| if $failed {
-            native_binding_diagnostic($stage, $reason);
+            native_binding_diagnostic($stage, $reason, None);
             true
         } else {
             false
@@ -434,16 +434,17 @@ macro_rules! native_binding_failed {
     }};
 }
 
-fn native_binding_diagnostic(stage: &'static str, reason: &'static str) {
+fn native_binding_diagnostic(stage: &'static str, reason: &'static str, status: Option<u16>) {
     // Also protect against a broken console fallback, not only a sink panic.
     let _ = std::panic::catch_unwind(|| {
-        pi_ai::log::get_logger("occ3.sglang").warn(
-            "native_binding_rejected",
-            Some(serde_json::Map::from_iter([
-                ("stage".into(), Value::from(stage)),
-                ("reason".into(), Value::from(reason)),
-            ])),
-        );
+        let mut fields = serde_json::Map::from_iter([
+            ("stage".into(), Value::from(stage)),
+            ("reason".into(), Value::from(reason)),
+        ]);
+        if let Some(status) = status {
+            fields.insert("status".into(), Value::from(status));
+        }
+        pi_ai::log::get_logger("occ3.sglang").warn("native_binding_rejected", Some(fields));
     });
 }
 
@@ -553,6 +554,7 @@ impl SglangOcc3Connector {
                 .get("content-encoding")
                 .is_some_and(|v| v != "identity")
         {
+            native_binding_diagnostic("control", "http_status", Some(response.status().as_u16()));
             return Err(native_invalid());
         }
         let mut received = Vec::new();
@@ -646,13 +648,11 @@ impl SglangOcc3Connector {
             .await?;
         let result = Self::check_enrollment_response(permit, response, &operation_id, session_id)?;
         let mut records = native.records.lock().map_err(|_| native_invalid())?;
-        if records.stopped
-            || records
-                .sessions
-                .values()
-                .any(|old| old.principal_digest != result.principal_digest)
-            || (!records.sessions.contains_key(session_id) && records.sessions.len() >= 64)
-        {
+        if native_binding_failed!("enroll_records";
+            "stopped" => records.stopped,
+            "principal_mismatch" => records.sessions.values().any(|old| old.principal_digest != result.principal_digest),
+            "session_capacity" => !records.sessions.contains_key(session_id) && records.sessions.len() >= 64,
+        ) {
             return Err(native_invalid());
         }
         records.sessions.insert(session_id.into(), result.clone());
@@ -1283,7 +1283,9 @@ mod tests {
         let entries = Arc::new(Mutex::new(Vec::new()));
         let captured = entries.clone();
         pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
-            captured.lock().unwrap().push(entry.clone());
+            if entry["msg"].as_str().is_some_and(|msg| msg.starts_with("native_binding_")) {
+                captured.lock().unwrap().push(entry.clone());
+            }
         })));
         let secret = "synthetic-private-binding-value";
         assert!(native_binding_failed!("test";
@@ -1310,6 +1312,12 @@ mod tests {
         assert_eq!(values[1]["line"], first_line);
         assert_eq!(values[2]["line"], second_line);
         assert_ne!(first_line, second_line);
+        drop(values);
+        native_binding_diagnostic("control", "http_status", Some(503));
+        let values = entries.lock().unwrap();
+        assert_eq!(values[3]["stage"], "control");
+        assert_eq!(values[3]["reason"], "http_status");
+        assert_eq!(values[3]["status"], 503);
         drop(values);
         pi_ai::log::set_log_sink(Some(Box::new(|_| panic!("broken test sink"))));
         let result = std::panic::catch_unwind(|| {

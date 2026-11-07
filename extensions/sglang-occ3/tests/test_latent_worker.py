@@ -1448,7 +1448,9 @@ def test_terminal_settle_checks_pin_evidence_before_the_receipt():
     assert fence < gate < receipt
     assert src.index("runtime.consensus(metadata)") > gate
     # Admission snapshots the fault counter on the request.
-    assert "req.occ3_dsa_pin_faults0 = _dsa_pin.faults" in inspect.getsource(w.admit_request)
+    admission = inspect.getsource(w.admit_request)
+    assert admission.index("if value is None:") < admission.index("_admit_request(scheduler, req, value)")
+    assert "req.occ3_dsa_pin_faults0 = _dsa_pin.faults" in inspect.getsource(w._admit_request)
 
 
 def test_scheduler_settle_routes_a_commit_error_to_commit_failed_and_clears_eager():

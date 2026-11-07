@@ -92,8 +92,10 @@ def admission_event(operation, outcome, *, registry=None, error=None, owner=None
         if operation not in _ADMISSION_OPERATIONS or outcome not in ("entry", "exit", "error"):
             return
         row = {"operation": operation, "outcome": outcome}
-        if isinstance(error, LatentError):
-            row.update(code=error.code, detail=error.detail)
+        from .attachment_contract import AttachmentError
+        from .turn_diagnostics import _FAILURE_CODES
+        if isinstance(error, (LatentError, AttachmentError)) and error.code in _FAILURE_CODES:
+            row.update(code=error.code, detail=getattr(error, "detail", None))
         if registry is not None:
             with registry.lock:
                 records = tuple(registry.records.values())
@@ -117,6 +119,7 @@ def admission_event(operation, outcome, *, registry=None, error=None, owner=None
                 row.update(active=owner._active, max_active=owner.profile.max_active,
                            terminal_active=owner._terminal_active,
                            terminal_attempts=len(owner._terminal_attempts),
+                           fences=len(getattr(owner, "_attempts", ())),
                            quarantined=len(getattr(owner, "_quarantined", ())),
                            terminal_tasks=len(getattr(owner, "_terminal_tasks", ())))
             if hasattr(owner, "attempts"):
@@ -125,6 +128,8 @@ def admission_event(operation, outcome, *, registry=None, error=None, owner=None
             if hasattr(control, "pending"):
                 row.update(pending=len(control.pending), uncertain=len(control._uncertain),
                            operations=len(control._operations), max_pending=control.max_pending)
+            if type(getattr(owner, "rank", None)) is int:
+                row["rank"] = min(65535, max(0, owner.rank))
             if hasattr(owner, "poisoned"):
                 row["poisoned"] = bool(owner.poisoned)
                 row["commands"] = len(owner.commands)
@@ -149,7 +154,7 @@ def admission_probe(operation, *, registry=False):
                 owner = runtime if runtime is not None else owner
                 reg = owner if registry else getattr(owner, "registry", None)
                 admission_event(operation, outcome, registry=reg, error=error, owner=owner)
-                if error is not None:
+                if isinstance(error, Exception):
                     from .turn_diagnostics import log_failure
                     log_failure(error, phase="admission")
             except Exception:

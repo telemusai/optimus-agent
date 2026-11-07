@@ -262,7 +262,7 @@ async def test_early_refusal_is_logged(boundary, monkeypatch, caplog):
     monkeypatch.setattr(chat_adapter, "parse_opt_in", refuse if boundary == "parse" else lambda _: object())
     monkeypatch.setattr(chat_adapter, "parse_terminal_mode", lambda _: object())
     adapter._terminal_admission = refuse
-    with caplog.at_level(logging.ERROR):
+    with caplog.at_level(logging.INFO):
         response = await adapter.handle_around(None, None, object(), SimpleNamespace(body=body))
     assert response.status_code == 409
     assert '"code":"unsupported_profile"' in caplog.text
@@ -298,3 +298,112 @@ async def test_terminal_cleanup_sync_failures_logged(monkeypatch, caplog):
     assert len(ctx.terminal_ledger.ops) == 3
     assert adapter._active == adapter._terminal_active == 1
     assert "private-rid" not in caplog.text and "private-attempt" not in caplog.text
+
+
+@pytest.mark.asyncio
+async def test_async_probe_one_error_and_cancel_not_counted(monkeypatch, caplog):
+    import asyncio
+    from occ3_sglang.latent_types import admission_probe
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    monkeypatch.setitem(diag._FAILURE_STATE, "error_count", 0)
+    error = LatentError("busy")
+    @admission_probe("enroll_source")
+    async def failed(owner):
+        raise error
+    @admission_probe("enroll_source")
+    async def cancelled(owner):
+        raise asyncio.CancelledError()
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(LatentError):
+            await failed(object())
+        # The outer adapter boundary observes exactly the same exception.
+        diag.log_failure(error, phase="admission")
+        with pytest.raises(asyncio.CancelledError):
+            await cancelled(object())
+    assert diag.failure_snapshot()["error_count"] == 1
+    assert caplog.text.count("occ3-bridge: native failure ") == 1
+    assert '"code":"unknown"' not in caplog.text
+    assert '"outcome":"exit"' in caplog.text
+
+
+def test_attachment_refusals_info_and_admission_code(monkeypatch, caplog):
+    from occ3_sglang.attachment_contract import AttachmentError
+    from occ3_sglang.latent_types import admission_event
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    with caplog.at_level(logging.INFO):
+        error = AttachmentError("scheduler_busy", 503)
+        admission_event("frontend_charge", "error", error=error)
+        diag.log_failure(error)
+    assert all(record.levelno == logging.INFO for record in caplog.records)
+    assert '"code":"scheduler_busy"' in caplog.records[0].message
+
+
+def test_worker_poison_and_unavailable_gates(monkeypatch, caplog):
+    import os
+    import sys
+    from types import SimpleNamespace as NS
+    from occ3_sglang import latent_worker as worker
+    runtime = NS(poisoned=False, members=tuple([os.getpid()] * 8))
+    monkeypatch.setattr(worker, "_RUNTIME", runtime)
+    scheduler = NS(occ3_runtime=runtime, tp_group=NS(cpu_group=object()))
+    def gather(states, value, **kwargs):
+        states[:] = [dict(value) for _ in states]
+    torch = NS(distributed=NS(get_world_size=lambda _: 8, all_gather_object=gather))
+    monkeypatch.setitem(sys.modules, "torch", torch)
+    with caplog.at_level(logging.ERROR):
+        worker._poison_unless_uniform(runtime, LatentError("ranks"), "abort_fence")
+        worker._poison_unless_uniform(runtime, LatentError("ranks"), "abort_fence")
+        with pytest.raises(LatentError, match="unavailable"):
+            worker.handle_control(scheduler, {})
+        with pytest.raises(LatentError, match="unavailable"):
+            worker.bootstrap_worker(scheduler)
+    assert caplog.text.count("runtime poisoned") == 1
+    assert '"code":"unavailable"' in caplog.text
+    assert '"function":"_runtime"' in caplog.text
+    assert '"function":"_bootstrap_worker"' in caplog.text
+
+
+def test_worker_probes_skip_optout_and_include_rank(monkeypatch, caplog):
+    from types import SimpleNamespace as NS
+    from occ3_sglang import latent_worker as worker
+    from test_latent_registry import registry
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    reg, _ = registry()
+    runtime = NS(rank=3, poisoned=True, commands={}, registry=reg)
+    monkeypatch.setattr(worker, "_RUNTIME", runtime)
+    scheduler = NS(occ3_runtime=runtime)
+    request = NS(occ3_worker_descriptor=None)
+    with caplog.at_level(logging.INFO):
+        worker.admit_request(scheduler, request, None)
+        worker.abort_request(scheduler, request, "unused")
+    assert not caplog.records
+    with caplog.at_level(logging.INFO):
+        with pytest.raises(LatentError):
+            worker.admit_request(scheduler, request, object())
+    assert '"rank":3' in caplog.text
+    assert '"operation":"worker_admit"' in caplog.text
+
+
+def test_status_block_contains_counts_and_fences(monkeypatch, caplog):
+    import json
+    from types import SimpleNamespace as NS
+    from occ3_sglang import startup_state, latent_types
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    machine = NS(state=NS(value="NATIVE_READY"), code="ready", stage="done", attempt=1,
+        experimental_selected=True, preflight_reached=True, backend_constructed=True,
+        worker_readiness_reached=True, hooks_prepared=True, route_mount_attempted=True,
+        rollback_completed=False)
+    monkeypatch.setattr(startup_state, "current", lambda: machine)
+    monkeypatch.setattr(startup_state, "_served_fingerprint", lambda: "fixed")
+    monkeypatch.setattr(startup_state, "registry", lambda: NS(counts=lambda: {}))
+    adapter = _retention_adapter()
+    adapter._attempts = {"private-fence": object()}
+    latent_types.admission_event("frontend_charge", "entry", owner=adapter)
+    block = startup_state.status_payload()["parallel_handoff_diagnostics"]
+    assert set(block) == {"last_error_code", "last_error_count", "error_count", "first_failure_unix_seconds", "admission"}
+    assert block["admission"]["last"]["frontend_charge"]["fences"] == 1
+    assert 0 <= block["error_count"] <= 2147483647
+    assert len(json.dumps(block)) < 16384
+    assert "private-fence" not in json.dumps(block)
+    monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
+    assert startup_state.status_payload()["parallel_handoff_diagnostics"]["admission"] == {}

@@ -443,6 +443,23 @@ class CaptureStage:
     committed: bool = False
 
 
+def _log_poison(runtime, site, code, *, op="none", phase="none"):
+    """Log only the first poison transition; never change the poison latch."""
+    try:
+        if runtime.poisoned:
+            return
+        sites = {"consensus", "preflight", "control", "private_kv_fence", "abort_fence", "bootstrap"}
+        phases = {'align_prepare', 'none', 'draft_embedding_replace', 'terminal_fence', 'forward_complete', 'stage_verify', 'admit', 'private_kv_fence', 'source_ready', 'draft_embedding_prepare', 'align_complete', 'stage_prefill', 'draft_embedding_begin', 'commit_write', 'prepare', 'commit_lineage', 'forward_submit', 'forward_start', 'align_begin', 'capture_prenorm', 'target_embedding_inplace', 'draft_embedding_complete', 'abort_fence'}
+        operations = {"health", "status", "publication_status", "enroll_session", "reserve_capture",
+                      "reserve_consume", "publish", "bind_output", "release_lease", "retire", "none"}
+        from .turn_diagnostics import _FAILURE_CODES
+        logger.error("occ3-bridge: runtime poisoned (site=%s code=%s op=%s phase=%s)",
+                     site if site in sites else "unknown", code if code in _FAILURE_CODES else "unknown",
+                     op if op in operations else "unknown", phase if phase in phases else "unknown")
+    except Exception:
+        pass
+
+
 class WorkerRuntime:
     def __init__(self, model_runner, tp_group, profile, *, scheduler, artifact=None):
         import torch
@@ -624,7 +641,7 @@ class WorkerRuntime:
     def consensus(self, value):
         values = self.gather(value)
         if not all(x == values[0] for x in values):
-            logger.error("occ3-bridge: runtime poisoned (site=consensus code=ranks)")
+            _log_poison(self, "consensus", "ranks")
             self.poisoned = True
             raise LatentError("ranks")
         return value
@@ -644,7 +661,7 @@ class WorkerRuntime:
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"phase": phase, "request": request_binding, "binding": value, "error": error})
         if any(item != outcomes[0] for item in outcomes):
-            logger.error("occ3-bridge: runtime poisoned (site=preflight code=ranks phase=%s)", phase)
+            _log_poison(self, "preflight", "ranks", phase=phase)
             self.poisoned = True
             raise LatentError("ranks")
         if error:
@@ -794,7 +811,7 @@ class WorkerRuntime:
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"error": error, "result": result})
         if any(item != outcomes[0] for item in outcomes):
-            logger.error("occ3-bridge: runtime poisoned (site=control code=ranks op=%s)", op)
+            _log_poison(self, "control", "ranks", op=op)
             self.poisoned = True
             result, error = {}, "ranks"
         if error:
@@ -977,7 +994,12 @@ def _prune_commands(runtime):
 
 
 def handle_control(scheduler, payload):
-    return _runtime(scheduler).control(payload)
+    try:
+        return _runtime(scheduler).control(payload)
+    except Exception as error:
+        from .turn_diagnostics import log_failure
+        log_failure(error, phase="worker_control")
+        raise
 
 
 def deliver_control(tokenizer_manager, payload):
@@ -1022,10 +1044,14 @@ def prepare_batch(scheduler, batch):
     batch.occ3_context, batch.occ3_force_eager = prepared["context"], True
 
 
-@admission_probe("worker_admit")
 def admit_request(scheduler, req, value):
     if value is None:
         return
+    return _admit_request(scheduler, req, value)
+
+
+@admission_probe("worker_admit")
+def _admit_request(scheduler, req, value):
     runtime = _runtime(scheduler)
     prepared = {}
     def validate():
@@ -1821,8 +1847,7 @@ def _poison_unless_uniform(runtime, exc, site):
     """
     uniform = isinstance(exc, LatentError) and exc.code != "ranks"
     if not uniform:
-        logger.error("occ3-bridge: runtime poisoned (site=%s code=%s)",
-                     site, getattr(exc, "code", type(exc).__name__))
+        _log_poison(runtime, site, exc.code if isinstance(exc, LatentError) else "latent_failed")
         runtime.poisoned = True
 
 
@@ -1849,13 +1874,18 @@ def fence_private_kv_release(scheduler, req):
         raise
 
 
-@admission_probe("worker_abort")
 def abort_request(scheduler, req, reason):
     descriptor = getattr(req, "occ3_worker_descriptor", None)
     if descriptor is None or getattr(req, "occ3_abort_done", False):
         # Latched: an overlap overshoot tick re-presents an already aborted
         # row; its record is retired and fenced, so no second gather.
         return
+    return _abort_request(scheduler, req, reason)
+
+
+@admission_probe("worker_abort")
+def _abort_request(scheduler, req, reason):
+    descriptor = req.occ3_worker_descriptor
     runtime = _cleanup_runtime(scheduler)
     prepared = {}
     def fence_owned():
@@ -1925,6 +1955,16 @@ def load_runtime_profile():
 
 
 def bootstrap_worker(scheduler):
+    """Log gates before control admission without changing bootstrap outcomes."""
+    try:
+        return _bootstrap_worker(scheduler)
+    except Exception as error:
+        from .turn_diagnostics import log_failure
+        log_failure(error, phase="worker_control")
+        raise
+
+
+def _bootstrap_worker(scheduler):
     """Only the trusted ordered internal-control path may initialize this worker."""
     import os
     import torch
@@ -1939,6 +1979,7 @@ def bootstrap_worker(scheduler):
     if any(installed):
         if not all(installed) or _RUNTIME is None or _RUNTIME.members != members:
             if _RUNTIME is not None:
+                _log_poison(_RUNTIME, "bootstrap", "ranks")
                 _RUNTIME.poisoned = True
             raise LatentError("ranks")
         require(not _RUNTIME.poisoned and getattr(scheduler, "occ3_runtime", None) is _RUNTIME, "unavailable")

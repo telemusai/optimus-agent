@@ -421,3 +421,15 @@ for enrollment, capture, publication intent, receiver and retirement checks.
 `native_binding_invalid_site` additionally reports the source line for other
 control validation sites, without binding values. User-facing error text is
 unchanged. The diagnostic does not repair a leaked slot or retry a handoff.
+
+The repro build must regenerate `native_sources.json`: the attestation hashes
+cover the modified plugin files. The deploy build does this; reusing an old
+manifest causes `source_digest_mismatch` rather than a valid diagnostic run.
+Failure counters count each exception object once across propagation boundaries;
+a distinct normalized exception remains a distinct failure. Cancellation does
+not count as an unknown failure in admission probes. Typed attachment refusals
+use INFO; untyped exceptions and `native_completion_failed` use ERROR. Worker
+admission rows include numeric `rank`, and frontend snapshots include replay
+`fences`. Client control rejection includes only numeric HTTP `status`, never
+the response body. Poison-transition logs fire once per runtime latch, and
+later worker unavailable gates include code and origin before wire normalization.

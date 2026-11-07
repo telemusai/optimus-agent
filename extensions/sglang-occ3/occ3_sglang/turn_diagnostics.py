@@ -195,6 +195,8 @@ def failure_snapshot():
 def log_failure(error, ctx=None, phase="unknown"):
     """Log fixed codes and source locations only, without exception text/locals."""
     try:
+        if getattr(error, "_occ3_logged", False):
+            return
         import traceback
         import time
         from .attachment_contract import AttachmentError
@@ -217,7 +219,9 @@ def log_failure(error, ctx=None, phase="unknown"):
             _FAILURE_STATE["error_count"] = min(2147483647, _FAILURE_STATE["error_count"] + 1)
             if not _FAILURE_STATE["first_failure_unix_seconds"]:
                 _FAILURE_STATE["first_failure_unix_seconds"] = min(9999999999, max(0, int(time.time())))
-        LOG.error("occ3-bridge: native failure %s", json.dumps(row, separators=(",", ":")))
+        emit = LOG.info if isinstance(error, AttachmentError) and code != "native_completion_failed" else LOG.error
+        emit("occ3-bridge: native failure %s", json.dumps(row, separators=(",", ":")))
+        error._occ3_logged = True
     except Exception:
         pass
 
