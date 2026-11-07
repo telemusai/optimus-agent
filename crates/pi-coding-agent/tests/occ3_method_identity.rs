@@ -168,6 +168,18 @@ async fn serve(method: &'static str) -> (String, Arc<Mutex<FixtureRecords>>, tok
                         if let Some(intent) = body.get("occ3_capture") {
                             records.lock().unwrap().source_intent = Some(intent.clone());
                             let output = sse("native-source-rid", true);
+                            // The production digest is alpha-aware (the label
+                            // anchor is the one intent field that may carry a
+                            // decimal, resolved from the environment), and the
+                            // server echoes the negotiated anchor back in the
+                            // receipt. Mirror both so this fixture stays
+                            // faithful regardless of a local label-anchor
+                            // preference: parse the intent with the production
+                            // type, digest it with the production method, and
+                            // echo the anchor when one was negotiated.
+                            let parsed_intent: pi_ai::source_capture::SourceCaptureIntent =
+                                serde_json::from_value(intent.clone()).unwrap();
+                            let intent_digest = parsed_intent.digest().unwrap();
                             // The default arming is occ3.capture.v2, so the intent is
                             // answered on the v2 wire with the occ3.span.v1 block. This
                             // fixture's captured turn emits no reasoning_content and no
@@ -176,7 +188,7 @@ async fn serve(method: &'static str) -> (String, Arc<Mutex<FixtureRecords>>, tok
                             // row and the stop row (both CONTROL), the single tool-call
                             // row and its argument rows, no THINKING row, no CONTENT row
                             // and the "none" reasoning terminator.
-                            let mut receipt = json!({"schema":"occ3.source.v2","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                            let mut receipt = json!({"schema":"occ3.source.v2","intent_digest":intent_digest,"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
                                 "accepted_span_start":0,"accepted_span_end":6,"retained_count":6,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":sha256(output.as_bytes()),"expires_at_epoch":intent["expires_at_epoch"],"byte_count":96});
                             let span = json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
                                 "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
@@ -188,6 +200,16 @@ async fn serve(method: &'static str) -> (String, Arc<Mutex<FixtureRecords>>, tok
                                 "span_contains_tool_call":true,"span_message_truncated":false});
                             for (key, value) in span.as_object().unwrap() {
                                 receipt[key.clone()] = value.clone();
+                            }
+                            // The production wire omits an explicit zero
+                            // anchor (skip_serializing_if is_zero), so this
+                            // fixture must too: only a negotiated NONZERO
+                            // anchor is echoed back.
+                            if let Some(alpha) = parsed_intent.label_anchor_alpha {
+                                if f64::from(alpha) != 0.0 {
+                                    receipt["label_anchor_alpha"] =
+                                        serde_json::json!(f64::from(alpha));
+                                }
                             }
                             headers.push(("x-optimus-occ3-source", receipt.to_string()));
                             send(&mut socket, output, headers).await;

@@ -956,3 +956,216 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
         .is_none());
     server.await.unwrap();
 }
+
+/// The receiver's `prepare_inference` control round trip must classify a
+/// synchronous proven-non-use refusal as the distinct busy error, so the
+/// resolver can retire its inbox claim terminally and route the sender a
+/// fresh-capture retry (the live 2026-11-07 receiver wedge).
+/// `prepare_inference` awaits exactly one control call before the
+/// attachment exists - `sessions/enroll` - so a refusal on that call
+/// proves no receiver attachment was created or submitted. On that route
+/// today the real classified decline is the saturation gate's `quota`
+/// (429: session-table capacity, or the pre-parse 16 KiB body bound);
+/// enroll has no `busy` code, which exists only in the registry's
+/// reserve_capture/reserve_consume admission declines - the paired 409
+/// row keeps the classification's contract for a future control route
+/// that reuses it. Every other decline - including a 409 `expired`, a
+/// malformed, oversized or empty-code envelope, a non-identity
+/// content-encoding, or a 200 carrying an error body on the success path
+/// - keeps the generic fail-closed `TransferFailed { "native control
+/// binding invalid" }` refusal: only the proven busy classes retire a
+/// claim. The request line is asserted to be the enroll route so the
+/// classification is pinned to `prepare_inference`'s own control round
+/// trip, never a publication or retirement call.
+#[tokio::test]
+async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
+    use pi_coding_agent::core::occ3_connectors::sglang::{
+        NativeExperimentalPermit, SglangOcc3Config, SglangOcc3Connector,
+    };
+    use std::sync::Arc;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    // One raw control fixture: each accepted connection is answered with
+    // the next scripted (status, body) pair, then closed.
+    let listener = tokio::net::TcpListener::bind((std::net::Ipv4Addr::LOCALHOST, 0))
+        .await
+        .unwrap();
+    let address = listener.local_addr().unwrap();
+    // (status line, extra headers, body, expected busy) — the classification
+    // table including every parser boundary: the exact-256-byte accept, the
+    // 257-byte reject, empty/64/65-char codes, a non-identity
+    // content-encoding, and a 200 that carries an error body onto the
+    // success path. Route coverage today: enroll returns 429 for quota
+    // (session capacity or the pre-parse 16 KiB body bound) and can never
+    // return `busy` (that is a registry-only decline); the 409-busy row
+    // exists so the paired classification keeps its contract if a future
+    // control route reuses the registry's busy decline.
+    let long_code = "e".repeat(64);
+    let over_code = "e".repeat(65);
+    let busy_pad = r#"{"error":{"code":  "busy"}}"#;
+    assert_eq!(busy_pad.len(), 27);
+    let busy_256 = format!("{busy_pad}{}", " ".repeat(256 - busy_pad.len()));
+    let busy_257 = format!("{busy_pad}{}", " ".repeat(257 - busy_pad.len()));
+    assert_eq!(busy_256.len(), 256);
+    assert_eq!(busy_257.len(), 257);
+    let scripted: Vec<(&str, &str, String, bool)> = vec![
+        ("409 Conflict", "", r#"{"error":{"code":"busy"}}"#.into(), true),
+        ("429 Too Many Requests", "", r#"{"error":{"code":"quota"}}"#.into(), true),
+        // Exactly 256 bytes is still accepted at the bound.
+        ("409 Conflict", "", busy_256, true),
+        ("409 Conflict", "", r#"{"error":{"code":"expired"}}"#.into(), false),
+        ("503 Service Unavailable", "", r#"{"error":{"code":"unavailable"}}"#.into(), false),
+        // One byte over the bound: never classified.
+        ("409 Conflict", "", busy_257, false),
+        ("409 Conflict", "", r#"{"error":{"code":""}}"#.into(), false),
+        // A 64-char code is inside the bound but is not busy; 65 is rejected.
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{long_code}"}}}}"#), false),
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{over_code}"}}}}"#), false),
+        // A busy code behind a non-identity content-encoding stays generic.
+        ("409 Conflict", "Content-Encoding: gzip\r\n", r#"{"error":{"code":"busy"}}"#.into(), false),
+        // A 200 carrying an error body fails on the success path, generically.
+        ("200 OK", "", r#"{"error":{"code":"busy"}}"#.into(), false),
+    ];
+    // The expected classification per scripted row, captured before the
+    // server task consumes the scripted table by move, so the two tables
+    // cannot drift apart.
+    let expected_busy: Vec<bool> = scripted.iter().map(|row| row.3).collect();
+    let server = tokio::spawn(async move {
+        for (status, extra, body, _) in scripted {
+            let (mut socket, _) = listener.accept().await.unwrap();
+            let mut bytes = Vec::new();
+            // Read until the full head plus content-length body arrived.
+            loop {
+                let mut chunk = [0; 4096];
+                let count = socket.read(&mut chunk).await.unwrap();
+                assert_ne!(count, 0);
+                bytes.extend_from_slice(&chunk[..count]);
+                if let Some(end) = bytes.windows(4).position(|v| v == b"\r\n\r\n") {
+                    let head = String::from_utf8(bytes[..end].to_vec()).unwrap();
+                    let length: usize = head
+                        .lines()
+                        .filter_map(|line| line.split_once(':'))
+                        .find(|(name, _)| name.eq_ignore_ascii_case("content-length"))
+                        .unwrap()
+                        .1
+                        .trim()
+                        .parse()
+                        .unwrap();
+                    if bytes.len() >= end + 4 + length {
+                        break;
+                    }
+                }
+            }
+            let head = String::from_utf8(bytes[..bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap()].to_vec()).unwrap();
+            let request_line = head.lines().next().unwrap().to_string();
+            assert!(
+                request_line.contains("/occ3/v1/native/sessions/enroll"),
+                "the busy classification must see the enroll control route, saw: {request_line}"
+            );
+            let response = format!(
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len(),
+            );
+            socket.write_all(response.as_bytes()).await.unwrap();
+        }
+    });
+
+    let endpoint: url::Url = format!("http://{address}").parse().unwrap();
+    let mut identity = identity();
+    identity.model_id = "fixture-model".into();
+    let permit = NativeExperimentalPermit {
+        attempt_id: "attempt-fixture-1".into(),
+        identity: identity.clone(),
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+        runtime_id: "fixture-runtime-epoch-001".into(),
+        runtime_generation: 7,
+        access_domain: "fixture-family".into(),
+        expires_at_epoch: std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs()
+            + 600,
+        source_profile: pi_ai::source_capture::SourceCaptureProfile {
+            layer_index: 77,
+            hidden_dim: 6144,
+            dtype: "bfloat16".into(),
+            layout_digest: "b".repeat(64),
+            expected_ranks: 8,
+        },
+        profile_digest: "c".repeat(64),
+        max_capture_bytes: 268_435_456,
+    };
+    let connector = SglangOcc3Connector::new_experimental(
+        SglangOcc3Config {
+            endpoint,
+            api_key: Some("synthetic-fixture-key".into()),
+            control_headers: None,
+        },
+        permit,
+    )
+    .unwrap();
+
+    let request = || PrepareInferenceRequest {
+        envelope: Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "message-busy-1".into(),
+            sender_session_id: "sender".into(),
+            receiver_session_id: "receiver".into(),
+            model_fingerprint: identity.fingerprint(),
+            runtime_id: "fixture-runtime-epoch-001".into(),
+            connector_id: "sglang-occ3".into(),
+            latent_method: Occ3Method::KvHandoff,
+            state_handle: pi_coding_agent::core::occ::occ3::Occ3HandleRef {
+                handle_id: "handle-busy-1".into(),
+                connector_id: "sglang-occ3".into(),
+                model_fingerprint: identity.fingerprint(),
+                runtime_generation: 7,
+                expires_at_epoch: u64::MAX,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy classification fixture".into(),
+            fallback_reference: "occ1".into(),
+        },
+        request_id: "inference-busy-1".into(),
+        receiver_session_id: "receiver".into(),
+        receiver_identity: identity.clone(),
+        now_epoch: 1,
+        target: InferenceStateTarget {
+            provider: "fixture-provider".into(),
+            model_id: identity.model_id.clone(),
+            base_url: format!("http://{address}/v1"),
+        },
+    };
+
+    // The classification table, in scripted order. The busy rows are the
+    // distinct proven-non-use refusal; every other row is pinned to the
+    // exact generic fail-closed error, so neither an unrelated error kind
+    // nor a false Ok can pass the negative assertions.
+    for (index, expect_busy) in expected_busy.into_iter().enumerate() {
+        let error = connector
+            .prepare_inference(request())
+            .await
+            .err()
+            .expect("every scripted response must decline or fail the success parse");
+        if expect_busy {
+            assert!(
+                matches!(error, Occ3Error::NativeInferenceBusyRefused { .. }),
+                "row {index}: expected the busy refusal, saw {error:?}"
+            );
+        } else {
+            match error {
+                Occ3Error::TransferFailed { reason } => assert_eq!(
+                    reason, "native control binding invalid",
+                    "row {index}: expected the generic fail-closed refusal, saw {reason}"
+                ),
+                other => panic!("row {index}: expected the generic refusal, saw {other:?}"),
+            }
+        }
+    }
+    server.await.unwrap();
+}

@@ -588,6 +588,37 @@ impl SglangOcc3Connector {
         }
     }
 
+    /// Bounded error-code read from a non-success control response. The
+    /// server's fixed envelope is `{"error":{"code":"..."}}` and never
+    /// carries exception text; a body over 256 bytes, a malformed body or
+    /// an empty/oversized code means the decline is not recognizably one of
+    /// the fixed pre-dispatch busy classes, so it must stay fail-closed.
+    /// Never a replay permit: the code only chooses the error KIND.
+    async fn read_bounded_control_error_code(
+        response: &mut reqwest::Response,
+    ) -> Option<String> {
+        let mut received = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if received.len().saturating_add(chunk.len()) > 256 {
+                return None;
+            }
+            received.extend_from_slice(&chunk);
+        }
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            error: Inner,
+        }
+        #[derive(serde::Deserialize)]
+        struct Inner {
+            code: String,
+        }
+        let parsed: Envelope = serde_json::from_slice(&received).ok()?;
+        if parsed.error.code.is_empty() || parsed.error.code.len() > 64 {
+            return None;
+        }
+        Some(parsed.error.code)
+    }
+
     async fn control<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -621,21 +652,68 @@ impl SglangOcc3Connector {
             .send()
             .await
             .map_err(|_| native_invalid())?;
-        if !response.status().is_success()
-            || response
-                .headers()
-                .get("content-encoding")
-                .is_some_and(|v| v != "identity")
-        {
-            native_binding_diagnostic("control", "http_status", Some(response.status().as_u16()));
+        let status = response.status().as_u16();
+        let identity_encoded = response
+            .headers()
+            .get("content-encoding")
+            .map(|v| v == "identity")
+            .unwrap_or(true);
+        if !response.status().is_success() || !identity_encoded {
+            native_binding_diagnostic("control", "http_status", Some(status));
             // latent_control_api.control_error_response maps both `identity`
             // and `identity_mismatch` to 401. latent_registry._profile and
             // _session use `identity` for epoch and absent-enrollment failures.
             // Busy (409), quota, malformed responses and outages are not proof
             // of revoked enrollment and must not trigger recovery probes.
+            //
+            // A synchronous `quota` decline of THIS control call surfaces
+            // as the distinct `NativeInferenceBusyRefused` instead of the
+            // generic invalid site. Route coverage today: `sessions/enroll`
+            // maps quota to 429 (session-table capacity, or the 16 KiB
+            // body bound before any parse); its other codes are
+            // identity/invalid/unavailable/409-fallback and can never be
+            // `busy` (registry `busy` exists only on reserve_capture and
+            // reserve_consume). The classification pairs the two codes
+            // anyway so a future control route that reuses the admission
+            // decline's `busy` gets the same contract. For the receiver
+            // retire boundary the proof is narrower than "no server work
+            // happened": `prepare_inference` awaits exactly one control
+            // call (sessions/enroll) before building the receiver
+            // attachment, and only a bound, submitted attachment can ever
+            // reach the provider - so a refusal here proves the attachment
+            // for this consume was never created or submitted. A 429
+            // envelope from the body-size bound also proves the request
+            // never parsed. The envelope otherwise proves nothing about
+            // server state (the worker may have written its session table
+            // before a frontend readiness decline), which is exactly why
+            // the receiver RETIRES the claim terminally and routes the busy
+            // signal to the sender: nothing is marked consumed on this
+            // side, and the sender's fresh-capture re-arm - never a replay
+            // of this handle - is the sole retry path. The classification
+            // itself is the generic control-path rule and is not
+            // operation-scoped; only `prepare_inference`'s enroll error
+            // reaches the resolver's retire arm - publication and
+            // retirement keep their existing status-probe/uncertain paths
+            // (their control errors keep the generic refusal; nothing
+            // matches the busy kind there today). Every other code -
+            // including a 409 `expired` or `replay` - keeps the
+            // fail-closed generic refusal.
+            let code = if identity_encoded {
+                Self::read_bounded_control_error_code(&mut response).await
+            } else {
+                None
+            };
+            let error = match (status, code.as_deref()) {
+                (409, Some("busy")) | (429, Some("quota")) => {
+                    Occ3Error::NativeInferenceBusyRefused {
+                        connector_id: CONNECTOR_ID.into(),
+                    }
+                }
+                _ => native_invalid(),
+            };
             return Err(NativeControlFailure {
-                error: native_invalid(),
-                authority: matches!(response.status().as_u16(), 401 | 403),
+                error,
+                authority: matches!(status, 401 | 403),
             });
         }
         let mut received = Vec::new();
@@ -1514,6 +1592,7 @@ mod tests {
                 pi_ai::log::set_log_sink(None);
             }
         }
+        let _sink_guard = pi_ai::log::test_sink_guard();
         let _reset = ResetSink;
         let entries = Arc::new(Mutex::new(Vec::new()));
         let captured = entries.clone();

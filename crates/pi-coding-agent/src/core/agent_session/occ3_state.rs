@@ -10,7 +10,7 @@ use crate::core::occ::occ3::connector::{
 };
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
-use crate::core::occ::occ3::types::Occ3DeliveryStatus;
+use crate::core::occ::occ3::types::{Occ3DeliveryStatus, Occ3Error};
 use pi_agent_core::types::ContentBlock;
 use pi_agent_core::types::{
     AgentMessage, AgentTool, AgentToolResult, CustomAgentMessage, ResolveInferenceState,
@@ -54,6 +54,34 @@ fn failure() -> String {
     "Experimental native handoff unavailable or uncertain; replay is forbidden".into()
 }
 
+/// Content-free diagnostic for a receiver-busy claim retirement, in the
+/// connector-diagnostics style: names the retired message id, the refusing
+/// connector, whether the claim actually retired, and whether a live
+/// sender absorbed the route - never any envelope content, so live
+/// diagnosis of a busy-retired turn needs no source archaeology. The log
+/// name `receiver_busy_claim_released` and its `released` key deliberately
+/// keep the pre-rename wording for grep stability across builds.
+/// Exception-safe like `native_binding_diagnostic`: a broken sink can
+/// never turn a retired claim into a failed turn.
+fn receiver_busy_claim_released(
+    message_id: &str,
+    connector_id: &str,
+    released: bool,
+    sender_routed: bool,
+) {
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.receiver").warn(
+            "receiver_busy_claim_released",
+            Some(serde_json::Map::from_iter([
+                ("message_id".into(), Value::from(message_id)),
+                ("connector_id".into(), Value::from(connector_id)),
+                ("released".into(), Value::from(released)),
+                ("sender_routed".into(), Value::from(sender_routed)),
+            ])),
+        );
+    });
+}
+
 /// Process-local registry of live native sessions BY SENDER SESSION ID, so
 /// a receiver's consumption dispatcher can route delivery events to the
 /// queue of the session that SENT the message - never to the receiver's own
@@ -81,11 +109,23 @@ fn register_sender_session(session: &Arc<Occ3NativeSession>) {
     }
 }
 
-/// Removes one session's registrations (terminal teardown).
-fn unregister_sender_session(session_id: &str) {
+/// Removes one session's registration (terminal teardown). Only THIS
+/// instance's weak ref is dropped, so two live sessions sharing an id
+/// (test fixtures) never unregister each other.
+fn unregister_sender_session(session: &Occ3NativeSession) {
+    let Some(self_weak) = session.self_registration.get() else {
+        return;
+    };
     if let Ok(mut registry) = sender_session_registry().lock() {
-        if let Some(weak_list) = registry.get_mut(session_id) {
-            weak_list.clear();
+        if let Some(weak_list) = registry.get_mut(session.session_id()) {
+            weak_list.retain(|weak| {
+                !std::sync::Weak::ptr_eq(weak, self_weak)
+            });
+            // Prune the key itself once the last registration is gone, so
+            // a long-lived daemon does not accumulate empty Vec entries.
+            if weak_list.is_empty() {
+                registry.remove(session.session_id());
+            }
         }
     }
 }
@@ -131,15 +171,18 @@ pub(crate) fn route_delivery_event_to_sender(
         }
     }
 }
-/// Routes one receiver-busy refusal to the sender's queue by sender session
-/// id. The receiver refused the attached request before any stream event,
-/// so the published capture was proven unused. The sender re-captures with
-/// backoff (bounded) instead of falling straight back to OCC-1. No-op when
-/// the sender is gone or has no matching in-flight entry.
-pub(crate) fn route_receiver_busy_to_sender(sender_session_id: &str, message_id: &str) {
+/// Routes one proven-non-use receiver-busy refusal to the sender's queue
+/// by sender session id: the published capture was proven unused, so the
+/// sender re-captures with bounded backoff instead of falling straight
+/// back to OCC-1. Returns `true` when a live sender absorbed the busy
+/// signal (its queue took the bounded busy retry or exhausted it to
+/// fallback); `false` when no live sender, a closed sender or no matching
+/// in-flight entry took it, so the caller can record that the facts need
+/// explicit attention.
+pub(crate) fn route_receiver_busy_to_sender(sender_session_id: &str, message_id: &str) -> bool {
     let senders = {
         let Ok(registry) = sender_session_registry().lock() else {
-            return;
+            return false;
         };
         registry
             .get(sender_session_id)
@@ -154,10 +197,11 @@ pub(crate) fn route_receiver_busy_to_sender(sender_session_id: &str, message_id:
     for sender in senders {
         if let Ok(notices) = sender.sender_queue_record_receiver_busy(message_id) {
             if !notices.is_empty() {
-                return;
+                return true;
             }
         }
     }
+    false
 }
 #[derive(Clone)]
 pub struct NativeSourceBudget {
@@ -272,6 +316,9 @@ pub struct Occ3NativeSession {
     /// removes the handoff tool so later turns take the ordinary
     /// inference path instead of failing on a closed native session.
     tombstone_cleanup: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
+    /// This instance's own weak registration, so terminal teardown removes
+    /// exactly this instance and never a sibling sharing the session id.
+    self_registration: std::sync::OnceLock<std::sync::Weak<Occ3NativeSession>>,
     /// Unsubscribe for the delivery-marker restamp listener installed by
     /// [`Self::install_delivery_restamp`]; dropped by [`Self::invalidate`].
     restamp_unsubscribe: Mutex<Option<Box<dyn Fn() + Send + Sync>>>,
@@ -352,7 +399,12 @@ impl Occ3NativeSession {
             closed: std::sync::atomic::AtomicBool::new(false),
             chat_preferences: std::sync::OnceLock::new(),
             tombstone_cleanup: Mutex::new(None),
+            self_registration: std::sync::OnceLock::new(),
         });
+        session
+            .self_registration
+            .set(Arc::downgrade(&session))
+            .map_err(|_| failure())?;
         register_sender_session(&session);
         Ok(session)
     }
@@ -793,6 +845,13 @@ impl Occ3NativeSession {
                 let Some(envelope) = envelope else {
                     return Ok(None);
                 };
+                // The record is now claimed/`Delivered`: the deterministic
+                // checks below (native allowed, session check, registry
+                // supports) intentionally fail closed with the record left
+                // claimed - the same stuck-claimed shape the busy arm
+                // retires. Those refusals are deterministic
+                // configuration/identity failures where a silent ordinary
+                // turn would hide a broken setup, so they stay loud.
                 this.check_native_allowed().map_err(anyhow::Error::msg)?;
                 this.check().map_err(anyhow::Error::msg)?;
                 if !this.registry.supports(
@@ -802,7 +861,12 @@ impl Occ3NativeSession {
                 ) {
                     return Err(anyhow::anyhow!(failure()));
                 }
-                let lease = this
+                let claimed_message_id = envelope.message_id.clone();
+                // Routed to the sender when a busy refusal retires this
+                // claim; captured before the envelope moves into the
+                // prepare request.
+                let sender_session_id = envelope.sender_session_id.clone();
+                let lease = match this
                     .connector
                     .prepare_inference(PrepareInferenceRequest {
                         envelope,
@@ -813,7 +877,78 @@ impl Occ3NativeSession {
                         now_epoch: now(),
                     })
                     .await
-                    .map_err(|_| anyhow::anyhow!(failure()))?;
+                {
+                    Ok(lease) => lease,
+                    Err(Occ3Error::NativeInferenceBusyRefused { connector_id }) => {
+                        // A busy refusal of the enroll control call that
+                        // `prepare_inference` awaits before building this
+                        // consume's attachment. The attachment was therefore
+                        // never created nor submitted to the provider, so the
+                        // claim is provably undispatched and this delivery is
+                        // RETIRED as a terminal busy Failed (pre-notified, so
+                        // the TurnEnd poll never re-routes it as an ordinary
+                        // receiver failure that would spend an OCC-1
+                        // fallback). The SENDER is routed the same
+                        // proven-non-use busy signal and re-arms a FRESH
+                        // capture; making this record unclaimable is what
+                        // keeps the two retry paths exclusive - a re-claim
+                        // here could consume this delivery while the sender's
+                        // re-send is already in flight and deliver the same
+                        // facts twice. This turn proceeds without the native
+                        // attachment. The refusal proves nothing about the
+                        // server's own state (the worker may have written its
+                        // session table before a readiness decline), so
+                        // nothing is marked consumed and no second delivery
+                        // is ever issued. Mirrors the source-side busy
+                        // absorption: busy is never a counted failure and
+                        // never a replay permit.
+                        let released = match this.inbox.lock() {
+                            Ok(mut inbox) => inbox.retire_busy_claim(&claimed_message_id),
+                            // A poisoned inbox lock keeps the fail-closed
+                            // error, but the one event that must be loud is
+                            // the retirement attempt itself: emit the
+                            // diagnostic with released=false so the sender's
+                            // waiting Admitted entry is not unobservable.
+                            // No sender route here: the record was not
+                            // retired, so a sender re-send could race a
+                            // later claim of this handle.
+                            Err(_) => {
+                                receiver_busy_claim_released(
+                                    &claimed_message_id,
+                                    &connector_id,
+                                    false,
+                                    false,
+                                );
+                                return Err(anyhow::anyhow!(failure()));
+                            }
+                        };
+                        // Route first so the diagnostic reports whether a
+                        // live sender actually absorbed the busy signal: a
+                        // retired delivery whose route found no sender
+                        // needs explicit attention, not a silent success.
+                        let sender_routed = route_receiver_busy_to_sender(
+                            &sender_session_id,
+                            &claimed_message_id,
+                        );
+                        receiver_busy_claim_released(
+                            &claimed_message_id,
+                            &connector_id,
+                            released,
+                            sender_routed,
+                        );
+                        if released {
+                            // Liveness: this receiver's busy turn proceeds
+                            // WITHOUT the attachment, and the control-only
+                            // transcript body never carries the source
+                            // facts. The retired record is never re-claimable,
+                            // so the sender's busy-routed re-arm (above) is
+                            // the sole retry path for these facts.
+                            return Ok(None);
+                        }
+                        return Err(anyhow::anyhow!(failure()));
+                    }
+                    Err(_) => return Err(anyhow::anyhow!(failure())),
+                };
                 this.inbox
                     .lock()
                     .map_err(|_| anyhow::anyhow!(failure()))?
@@ -1051,32 +1186,50 @@ impl Occ3NativeSession {
                             // sender session id the poll carries - never to
                             // this receiver's own queue. The polls are
                             // disjoint; a record can never appear twice.
-                            let consumed = if let Ok(mut inbox) = receiver.inbox.lock() {
+                            // Collect both polls under the inbox lock, then
+                            // drop the guard before any sender routing:
+                            // sender-queue routing persists queue files, and
+                            // no sender IO may run under the inbox lock.
+                            let (consumed, terminal) = if let Ok(mut inbox) =
+                                receiver.inbox.lock()
+                            {
                                 let consumed = inbox.poll_consumed();
-                                let terminal = inbox.poll_terminal_failures();
-                                for (message_id, sender_session_id, _status) in terminal {
-                                    // A pre-event busy refusal proved the
-                                    // capture unused: ask the sender for a
-                                    // fresh capture (bounded backoff). Any
-                                    // other non-use outcome falls back.
-                                    if inbox.refused_busy(&message_id) {
+                                let terminal = inbox
+                                    .poll_terminal_failures()
+                                    .into_iter()
+                                    .map(|(message_id, sender_session_id, _status)| {
+                                        let refused_busy = inbox.refused_busy(&message_id);
+                                        (message_id, sender_session_id, refused_busy)
+                                    })
+                                    .collect::<Vec<_>>();
+                                (consumed, terminal)
+                            } else {
+                                (Vec::new(), Vec::new())
+                            };
+                            for (message_id, sender_session_id, refused_busy) in terminal {
+                                // A pre-event busy refusal proved the
+                                // capture unused: ask the sender for a
+                                // fresh capture (bounded backoff). Any
+                                // other non-use outcome falls back.
+                                if refused_busy {
+                                    // A false here is unobservable today;
+                                    // the bound-lease busy path predates
+                                    // the retirement diagnostic and is
+                                    // left as-is deliberately.
+                                    let _sender_absorbed =
                                         route_receiver_busy_to_sender(
                                             &sender_session_id,
                                             &message_id,
                                         );
-                                    } else {
-                                        route_delivery_event_to_sender(
-                                            &sender_session_id,
-                                            &message_id,
-                                            false,
-                                            None,
-                                        );
-                                    }
+                                } else {
+                                    route_delivery_event_to_sender(
+                                        &sender_session_id,
+                                        &message_id,
+                                        false,
+                                        None,
+                                    );
                                 }
-                                consumed
-                            } else {
-                                Vec::new()
-                            };
+                            }
                             // Receipt lookup takes the inbox lock itself. Drop
                             // the poll guard before lookup or sender routing.
                             for (message_id, sender_session_id) in consumed {
@@ -1734,7 +1887,7 @@ Do not call occ3_handoff again for these facts."
                 unsubscribe();
             }
         }
-        unregister_sender_session(self.session_id());
+        unregister_sender_session(self);
         self.run_tombstone_cleanup();
     }
     /// Runs the host-side recovery callback exactly once. Called on every
@@ -1781,7 +1934,7 @@ Do not call occ3_handoff again for these facts."
                 unsubscribe();
             }
         }
-        unregister_sender_session(self.session_id());
+        unregister_sender_session(self);
         self.run_tombstone_cleanup();
     }
     /// Stores the host's queue-notice listener unsubscribe so teardown can
@@ -2704,6 +2857,11 @@ mod tests {
     struct FixtureConnector {
         identity: Occ3ModelIdentity,
         profile: SourceCaptureProfile,
+        /// Scripted `prepare_inference` refusals, returned in order before
+        /// the real lease path (the mock connector's fault-table style).
+        /// Used to reproduce a live pre-dispatch refusal that provably
+        /// dispatched nothing.
+        prepare_refusals: Arc<Mutex<Vec<Occ3Error>>>,
     }
 
     impl FixtureConnector {
@@ -2717,7 +2875,14 @@ mod tests {
                     layout_digest: "1".repeat(64),
                     expected_ranks: 8,
                 },
+                prepare_refusals: Arc::new(Mutex::new(Vec::new())),
             }
+        }
+
+        /// Script the next `prepare_inference` calls to fail with these
+        /// errors, in order, before the real lease path runs.
+        fn refuse_prepare_with(&self, errors: &[Occ3Error]) {
+            *self.prepare_refusals.lock().unwrap() = errors.to_vec();
         }
     }
 
@@ -2752,6 +2917,13 @@ mod tests {
             &self,
             request: PrepareInferenceRequest,
         ) -> Result<InferenceStateLease, Occ3Error> {
+            let refusal = {
+                let mut scripted = self.prepare_refusals.lock().unwrap();
+                (!scripted.is_empty()).then(|| scripted.remove(0))
+            };
+            if let Some(error) = refusal {
+                return Err(error);
+            }
             // Real-attachment fixture: binds the exact envelope the receiver
             // inbox claimed, mirroring the daemon wiring fixture, so the
             // receiver resolver's bind path is exercised end to end.
@@ -3775,6 +3947,390 @@ mod tests {
             session.inbox.lock().unwrap().status("message-x"),
             Some(Occ3DeliveryStatus::Expired),
             "the expired record is never consumed by the live claim"
+        );
+    }
+
+    /// The receiver-side stuck-inbox-claim wedge (live 2026-11-07 parallel
+    /// handoff pair q1): `claim` marks the earliest admitted record
+    /// claimed/`Delivered`, then a busy-refused `prepare_inference` must
+    /// retire that claim terminally instead of parking the record claimed
+    /// forever. The busy turn proceeds as an ordinary turn without the
+    /// attachment, the delivery retires as a terminal busy failure (never
+    /// re-claimable: the sender's fresh-capture retry is the sole path for
+    /// these facts, so the two retries can never double-deliver), and a
+    /// distinct content-free notice - including whether a live sender
+    /// absorbed the route - names the retirement so live diagnosis needs
+    /// no source archaeology.
+    #[tokio::test]
+    async fn receiver_resolver_retires_claim_on_busy_refusal_and_routes_sender_retry() {
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _sink_guard = pi_ai::log::test_sink_guard();
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str() == Some("receiver_busy_claim_released")
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::NativeInferenceBusyRefused {
+            connector_id: "unit-fixture-occ3".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        // The live sender of this delivery, so the retire route has a real
+        // queue to notify (liveness: the retired record never surfaces
+        // through terminal-failure polls, and an in-flight Admitted entry
+        // never TTL-expires).
+        let sender = Occ3NativeSession::enroll(
+            "sender-busy",
+            &fixture_model(),
+            Arc::new(FixtureConnector::new()),
+        )
+        .await
+        .expect("fixture sender enrollment");
+        sender.sender_queue_enqueue("child", "receiver").unwrap();
+        sender
+            .sender_queue_mark_armed(Some("busy-1"), Some("receiver"))
+            .unwrap();
+        sender
+            .sender_queue_mark_progressed(
+                crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Admitted,
+                "busy-1",
+            )
+            .unwrap();
+        let _sender_setup = sender.take_pending_queue_notices();
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "busy-1".into(),
+            sender_session_id: "sender-busy".into(),
+            receiver_session_id: "unit-session".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-busy-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint.clone(),
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy-release-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox.admit(envelope, "busy-1", "sender-busy", 1).unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = |ids: &[&str], fresh: &[&str]| InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: ids
+                .iter()
+                .map(|id| {
+                    AgentMessage::Custom(CustomAgentMessage::Custom {
+                        custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                        content: CustomMessageContent::Text(String::new()),
+                        display: false,
+                        details: Some(json!({"id": id})),
+                        timestamp: 0,
+                    })
+                })
+                .collect(),
+            newly_supplied_messages: fresh
+                .iter()
+                .map(|id| {
+                    AgentMessage::Custom(CustomAgentMessage::Custom {
+                        custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                        content: CustomMessageContent::Text(String::new()),
+                        display: false,
+                        details: Some(json!({"id": id})),
+                        timestamp: 0,
+                    })
+                })
+                .collect(),
+            signal: None,
+        };
+        // 1) The busy turn: the claim is retired and the turn proceeds
+        //    without the attachment - never the generic uncertain error
+        //    with the record stuck claimed.
+        assert!(
+            (resolver)(request(&["busy-1"], &["busy-1"]))
+                .await
+                .unwrap()
+                .is_none(),
+            "a proven-undispatched busy refusal must retire the claim and run the turn ordinary"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-1"),
+            Some(Occ3DeliveryStatus::Failed),
+            "the busy-retired delivery retires as a terminal busy failure: it must not stay claimable while the sender re-arms"
+        );
+        // The distinct content-free notice names the retirement exactly
+        // once, including that a live sender absorbed the route.
+        {
+            let values = entries.lock().unwrap();
+            assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
+            assert_eq!(values[0]["message_id"], "busy-1");
+            assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
+            assert_eq!(values[0]["released"], serde_json::json!(true));
+            assert_eq!(values[0]["sender_routed"], serde_json::json!(true));
+            assert!(
+                !values[0].to_string().contains("busy-release-proof"),
+                "the notice never carries envelope content"
+            );
+        }
+        // Liveness: the retire route must ALSO notify the sender. The receiver's
+        // control-only transcript body carries no source facts and the
+        // retired record never reaches a terminal-failure poll, so without
+        // this route the sender's in-flight Admitted entry would sit
+        // unexpired forever and the facts would be silently lost. The same
+        // proven-non-use route the TurnEnd dispatcher uses for refused
+        // leases schedules one bounded busy retry on the sender.
+        {
+            let notices = sender.take_pending_queue_notices();
+            assert_eq!(notices.len(), 1, "exactly one sender busy-retry notice");
+            assert_eq!(notices[0].state, "pending");
+            assert_eq!(notices[0].message_id.as_deref(), Some("busy-1"));
+            let (entries_snapshot, _) = sender.sender_queue_snapshot().unwrap();
+            assert_eq!(
+                entries_snapshot[0].state,
+                crate::core::agent_session::occ3_sender_queue::Occ3SenderQueueState::Pending
+            );
+            assert_eq!(entries_snapshot[0].busy_retries, 1);
+            assert!(entries_snapshot[0].retry_not_before_epoch.is_some());
+        }
+        // 2) The retired record is never re-claimed: a later inference
+        //    request finds no claimable delivery, so the receiver cannot
+        //    consume this handle while the sender's busy-retry re-arm is
+        //    already in flight (the duplicate-delivery guard).
+        assert!(
+            (resolver)(request(&["busy-1"], &["busy-1"]))
+                .await
+                .unwrap()
+                .is_none(),
+            "a busy-retired delivery must never be claimable again"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-1"),
+            Some(Occ3DeliveryStatus::Failed)
+        );
+        // The pre-notified terminal marker means the TurnEnd poll never
+        // re-routes this record as an ordinary receiver failure.
+        assert!(session.inbox.lock().unwrap().poll_terminal_failures().is_empty());
+    }
+
+    /// The orphan case of the busy retirement: the sender is gone (no live
+    /// native session under the envelope's sender id), so the route finds
+    /// nobody. The turn must STILL proceed ordinary (the retirement itself
+    /// is not a failure), the record retires terminal, and the diagnostic
+    /// carries `released == true, sender_routed == false` so the lost facts
+    /// are visible instead of silent.
+    #[tokio::test]
+    async fn receiver_resolver_busy_retirement_without_a_live_sender_is_visible() {
+        let _sink_guard = pi_ai::log::test_sink_guard();
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        let me = std::thread::current().id();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str() == Some("receiver_busy_claim_released")
+            {
+                captured.lock().unwrap().push(entry.clone());
+            }
+        })));
+        // No sender session is enrolled for "sender-orphan": the route
+        // must report false and nothing may panic or wedge.
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::NativeInferenceBusyRefused {
+            connector_id: "unit-fixture-occ3".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session-orphan",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "busy-orphan-1".into(),
+            sender_session_id: "sender-orphan".into(),
+            receiver_session_id: "unit-session-orphan".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-orphan-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint,
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "busy-orphan-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox
+                .admit(envelope, "busy-orphan-1", "sender-orphan", 1)
+                .unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": "busy-orphan-1"})),
+                timestamp: 0,
+            })],
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        assert!(
+            (resolver)(request()).await.unwrap().is_none(),
+            "an orphaned busy retirement must still run the turn ordinary"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("busy-orphan-1"),
+            Some(Occ3DeliveryStatus::Failed)
+        );
+        {
+            // Scoped so the guard drops before the second resolve: the log
+            // sink locks the same mutex.
+            let values = entries.lock().unwrap();
+            assert_eq!(values.len(), 1, "exactly one busy-retirement notice");
+            assert_eq!(values[0]["message_id"], "busy-orphan-1");
+            assert_eq!(values[0]["connector_id"], "unit-fixture-occ3");
+            assert_eq!(values[0]["released"], serde_json::json!(true));
+            assert_eq!(values[0]["sender_routed"], serde_json::json!(false));
+            assert!(
+                !values[0].to_string().contains("busy-orphan-proof"),
+                "the notice never carries envelope content"
+            );
+        }
+        // The orphan diagnostic is the only record of the lost facts, so
+        // the retirement is pinned like the sibling's: never re-claimable,
+        // and no terminal poll ever re-routes it.
+        assert!(
+            (resolver)(request()).await.unwrap().is_none(),
+            "a busy-retired delivery must never be claimable again"
+        );
+        assert!(session
+            .inbox
+            .lock()
+            .unwrap()
+            .poll_terminal_failures()
+            .is_empty());
+    }
+
+    /// Fail-closed stays fail-closed: a NON-busy `prepare_inference`
+    /// failure keeps today's exact generic uncertain error and the record
+    /// stays claimed, so nothing is ever replayed and the error string the
+    /// live wedge investigations pinned stays byte-identical.
+    #[tokio::test]
+    async fn receiver_resolver_keeps_fail_closed_error_when_prepare_is_not_busy() {
+        let connector = FixtureConnector::new();
+        connector.refuse_prepare_with(&[Occ3Error::TransferFailed {
+            reason: "unit-fixture-prepare".into(),
+        }]);
+        let session = Occ3NativeSession::enroll(
+            "unit-session",
+            &fixture_model(),
+            Arc::new(connector),
+        )
+        .await
+        .expect("fixture enrollment");
+        let fingerprint = fixture_identity().fingerprint();
+        let envelope = Occ3Envelope {
+            schema: "optimus.occ3.v1".into(),
+            protocol_version: 1,
+            message_id: "uncertain-1".into(),
+            sender_session_id: "sender-uncertain".into(),
+            receiver_session_id: "unit-session".into(),
+            model_fingerprint: fingerprint.clone(),
+            runtime_id: "unit-fixture-runtime".into(),
+            connector_id: "unit-fixture-occ3".into(),
+            latent_method: Occ3Method::StatebridgePrefix,
+            state_handle: Occ3HandleRef {
+                handle_id: "handle-uncertain-1".into(),
+                connector_id: "unit-fixture-occ3".into(),
+                model_fingerprint: fingerprint,
+                runtime_generation: 7,
+                expires_at_epoch: now() + 600,
+                state_size_bytes: 128,
+            },
+            control_summary: "uncertain-proof".into(),
+            fallback_reference: "occ1".into(),
+        };
+        {
+            let mut inbox = session.inbox.lock().unwrap();
+            assert!(inbox.admit(envelope, "uncertain-1", "sender-uncertain", 1).unwrap());
+        }
+        let resolver = session.receiver_resolver();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": "uncertain-1"})),
+                timestamp: 0,
+            })],
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        // The first turn fails with today's exact generic string and the
+        // record stays claimed...
+        assert_eq!(
+            (resolver)(request()).await.unwrap_err().to_string(),
+            failure(),
+            "a non-busy prepare failure keeps the fail-closed error unchanged"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status("uncertain-1"),
+            Some(Occ3DeliveryStatus::Delivered)
+        );
+        // ...so the next turn still refuses on the claimed record instead of
+        // silently re-arming it: replay stays forbidden.
+        assert_eq!(
+            (resolver)(request()).await.unwrap_err().to_string(),
+            failure(),
+            "the claimed record must keep refusing until a terminal outcome"
         );
     }
 

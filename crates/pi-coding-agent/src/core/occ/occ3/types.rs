@@ -194,6 +194,15 @@ pub enum Occ3Error {
     TransferFailed { reason: String },
     /// The connector cannot attach state to an actual native inference.
     NativeInferenceUnsupported { connector_id: String },
+    /// The connector refused to prepare the receiver's native inference as
+    /// busy before any dispatch: a synchronous admission-unavailability
+    /// decline (the control path's busy/quota gate; on sessions/enroll the
+    /// real decline is quota). Proven non-use - nothing was generated and
+    /// the attachment was never submitted - so the receiver retires its
+    /// inbox claim terminally and routes the busy signal to the sender,
+    /// whose fresh-capture re-arm becomes the sole retry path. Never a
+    /// replay permit.
+    NativeInferenceBusyRefused { connector_id: String },
     /// A native inference may have accepted the state. Never replay as text.
     InferenceOutcomeUncertain { message_id: String },
     /// OCC-3 disabled by configuration or policy.
@@ -227,6 +236,12 @@ impl std::fmt::Display for Occ3Error {
                 write!(
                     f,
                     "occ3: native inference attachment unsupported: {connector_id}"
+                )
+            }
+            Occ3Error::NativeInferenceBusyRefused { connector_id } => {
+                write!(
+                    f,
+                    "occ3: native inference busy refused: {connector_id}"
                 )
             }
             Occ3Error::InferenceOutcomeUncertain { message_id } => {
