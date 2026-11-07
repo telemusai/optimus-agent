@@ -297,14 +297,21 @@ modules. The full native package build enumerates modules and regenerates hashes
 
 ### Opt-in alignment neighbour evidence
 
-`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor,
-post-solver (`aligned`), and post-anchor (`final`) rows on rank zero. Each
-line contains one of at most 128 rows, cosine offsets [-1, 0, +1] (null at
-edges), row/embedding norms, anchor alpha and target norm, rounded to four
-decimals. Zero-norm cosine is undefined (null).
+`OCC3_DIAG_TOKEN_TRACE=1` also emits `alignment_row` for raw predictor (`raw`),
+pre-label solver (`aligned`), post-label (`label_anchored`, only when enabled),
+and post-nearest (`final`) rows on rank zero. Each line contains one of at most
+128 rows, cosine offsets [-1, 0, +1] (null at edges), row/embedding norms, both
+anchor coefficients and target norm, rounded to four decimals. Zero-norm cosine
+is undefined (null). `alignment_cast` remains before the label blend and measures
+only the solver-to-buffer cast, not the anchor's effect.
 
-`alignment_nearest_shard` runs at both `stage="aligned"` (before anchoring)
-and `stage="final"` (after anchoring), and scans only each rank's resident embedding weight,
+At zero label alpha the existing `aligned` points remain unchanged on all ranks.
+When label anchoring is enabled, `aligned` reads the original solver rows before
+the blend **on rank zero only**, because no other rank owns these rows. Its
+`alignment_nearest_shard` result is only rank zero's local nearest token; it
+cannot establish global pre-label nearest identity. `label_anchored` and `final`
+nearest scans run on all ranks after the existing broadcast. No new collective
+is added. The scans use only each rank's resident embedding weight,
 excluding padding via StateBridge shard ranges. It never calls embedding
 forward or a collective. Vocabulary tiles are 256 rows (at most 32 MiB per
 float tile at hidden width 32768); scores are at most 128 x 256. It logs local
@@ -395,7 +402,9 @@ that alone is not evidence of an indexing defect.
 | Label top-1/high probability at producer position -1, but aligned row misses | Map/solver loses information. This is label offset 0 in our log. |
 | Label top-1 only at sequence position 0 or +1 instead of producer -1 | Indexing hypothesis. Compare adjacent raw rows; do not confuse sequence-position offsets with label offsets. |
 | Label low probability, misread tokens are runner-ups | Distribution/fidelity hypothesis: hidden state encodes alternatives. |
-| Label top-1 and aligned nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the map. |
+| Label top-1 and final global nearest is label, but receiver reads incorrectly | Investigate injection/attention rather than the final map+anchor output. |
+| Pre-label `aligned` cosine is weak but `label_anchored` improves | The label anchor changes the row as intended; receiver fidelity still requires a separate drill. |
+| Nonzero label alpha and only rank-zero `aligned` nearest available | Do not infer global pre-label nearest identity; compare offsets and cosine, then global post-label nearest across ranks. |
 
 All new points now pack device-side arrays and perform one small host copy
 per call immediately before emission. No per-row scalar reads or per-tile

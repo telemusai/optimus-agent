@@ -437,7 +437,7 @@ def local_ranges(embedding, values):
 @isolated
 def alignment_stage(runtime, values, embeddings, tokens, stage):
     """Pack all neighbour cosines/norms on device; one host copy before logging."""
-    if runtime.rank != 0 or stage not in ("raw", "aligned", "final"):
+    if runtime.rank != 0 or stage not in ("raw", "aligned", "label_anchored", "final"):
         return
     import torch
     if (not bounded_rows(values, embeddings) or tokens.ndim != 1 or
@@ -465,6 +465,7 @@ def alignment_stage(runtime, values, embeddings, tokens, stage):
              dtype=str(values.dtype), cosine_offsets=[rounded(x) for x in row[1:4]],
              row_norm=rounded(row[4]), embedding_norm=rounded(row[5]),
              anchor_alpha=rounded(runtime.profile.anchor_alpha), target_norm=rounded(row[6]),
+             label_anchor_alpha=rounded(getattr(runtime.profile, "label_anchor_alpha", 0.0)),
              method_id=getattr(runtime.profile, "method", None))
 
 
@@ -473,7 +474,7 @@ def alignment_nearest(runtime, prefix, tokens, stage="final"):
     """Shard-local top-1; validity remains on device throughout the tiled scan."""
     import torch
     embedding = runtime.embedding
-    if stage not in ("aligned", "final"):
+    if stage not in ("aligned", "label_anchored", "final"):
         return
     if (not bounded_rows(prefix) or tokens.ndim != 1 or tokens.numel() != prefix.shape[0]):
         return

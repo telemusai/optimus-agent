@@ -32,13 +32,14 @@ def test_invalid_blend_alpha(alpha):
 
 
 @pytest.mark.parametrize("alpha", [0.0, 0.5, 1.0])
-def test_worker_blends_on_root_before_broadcast(monkeypatch, alpha):
+@pytest.mark.parametrize("dtype", ["float32", "bfloat16"])
+def test_worker_blends_on_root_before_broadcast(monkeypatch, alpha, dtype):
     torch = pytest.importorskip("torch")
-    hidden = torch.arange(16, dtype=torch.float32).reshape(2, 8)
+    hidden = torch.arange(16, dtype=getattr(torch, dtype)).reshape(2, 8)
     embedded = hidden + 8
-    aligned = hidden * .25
+    aligned = hidden.float() * .25123
     runtime = object.__new__(w.WorkerRuntime)
-    runtime.torch, runtime.device, runtime.dtype = torch, "cpu", "float32"
+    runtime.torch, runtime.device, runtime.dtype = torch, "cpu", dtype
     runtime.profile, runtime.rank = profile(label_anchor_alpha=alpha), 0
     runtime.group = NS(ranks=[0], device_group=None)
     runtime.target_norm = None
@@ -52,7 +53,7 @@ def test_worker_blends_on_root_before_broadcast(monkeypatch, alpha):
     record = NS(descriptor=capture(), accepted_count=2,
                 retained=[hidden, torch.tensor([1, 2])], events=[], live_refs=[], expires_at_epoch=123)
     seen = []
-    expected = ((1-alpha)*aligned.float()+alpha*embedded.float()).to(aligned.dtype)
+    expected = ((1-alpha)*aligned.float()+alpha*embedded.float()).to(hidden.dtype)
     def broadcast(prefix, **kwargs):
         assert torch.equal(prefix, expected)
         seen.append("broadcast")

@@ -861,6 +861,9 @@ class WorkerRuntime:
                 from . import token_trace
                 token_trace.alignment_cast(self, h, aligned, prefix)
                 if self.profile.label_anchor_alpha != 0:
+                    token_trace.alignment_stage(self, aligned, embeddings, tokens, "aligned")
+                    token_trace.alignment_nearest(self, aligned, tokens, "aligned")
+                if self.profile.label_anchor_alpha != 0:
                     # Blend solver-precision rows, not the already-cast scratch.
                     prefix.copy_(anchor_to_labels(aligned, embeddings,
                                                    alpha=self.profile.label_anchor_alpha))
@@ -872,8 +875,9 @@ class WorkerRuntime:
         from . import token_trace
         token_trace.alignment_logit_lens(self, h, tokens)
         token_trace.alignment_stage(self, h, embeddings, tokens, "raw")
-        token_trace.alignment_stage(self, prefix, embeddings, tokens, "aligned")
-        token_trace.alignment_nearest(self, prefix, tokens, "aligned")
+        aligned_stage = "label_anchored" if self.profile.label_anchor_alpha != 0 else "aligned"
+        token_trace.alignment_stage(self, prefix, embeddings, tokens, aligned_stage)
+        token_trace.alignment_nearest(self, prefix, tokens, aligned_stage)
         prefix = anchor_tiled(prefix, self.embedding, alpha=self.profile.anchor_alpha,
                               tp_group=self.group, tile_rows=self.profile.tile_rows)
         if self.rank == 0:
