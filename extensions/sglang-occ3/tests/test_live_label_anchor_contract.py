@@ -19,6 +19,25 @@ def intent_for(backend, expiry, **changes):
         max_capture_bytes=128*1024*1024, expires_at_epoch=expiry, **changes)
 
 
+@pytest.mark.parametrize("alpha,expected", [
+    (None, "5de0308e3e394cd7e5275a5f7c35704853935b63b3eac78dec6617f123b98065"),
+    (0.0, "4eb17b21225a458fe37d74ff24638047d183fbbd1124ddda8b51c7fb84d68dae"),
+    (0.3, "b85e8d6b733560ce31d25a6a79b9d0aa75ebfa28c65c3b6b68a58d0bdf9b7042"),
+    (0.7, "39be23526a02271d94083bcab9296ffff4d627ccb39e8b196b0ce6ca75ccf402"),
+    (1.0, "87d087f82898938d6c1dbd59601928b932bb1b9c9c087e2642d57f9edd01b1b0"),
+])
+def test_capture_intent_matches_rust_canonical_digest_vectors(alpha, expected):
+    # Pin the same wire fixture as crates/pi-ai/tests/source_capture.rs.
+    intent = CaptureIntent(schema="occ3.capture.v1", capture_id="capture-1",
+        source_session_id="source-1", source_request_id="client-request-1",
+        turn_nonce="turn-1", model_fingerprint="a" * 64, runtime_id="runtime-1",
+        runtime_generation=7, method="statebridge-prenorm-v1",
+        retained_count_limit=128, max_capture_bytes=4096,
+        expires_at_epoch=2000000000, span_policy="whole_completed_response_tail_v1",
+        label_anchor_alpha=alpha)
+    assert intent.binding_digest == expected
+
+
 def test_omission_retains_legacy_wire_and_zero_is_explicit():
     backend, _, _, expiry = fixture()
     intent = intent_for(backend, expiry)

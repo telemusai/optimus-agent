@@ -30,7 +30,7 @@ pub const SOURCE_CAPTURE_MODE_SAME_TURN_TOOL: &str = "same_turn_tool_v1";
 /// controller (orchestrator dispatch), never a forged tool binding.
 pub const SOURCE_CAPTURE_MODE_CONTENT_ONLY: &str = "content_only_orchestrator_v1";
 pub const SOURCE_RECEIPT_SCHEMA: &str = "occ3.source.v1";
-/// Source receipt that carries the 21 v1 fields plus the occ3.span.v1 block.
+/// Source receipt with 21 v1 fields plus the optional label anchor and occ3.span.v1 block.
 pub const SOURCE_RECEIPT_SCHEMA_V2: &str = "occ3.source.v2";
 pub const SOURCE_RECEIPT_HEADER: &str = "x-optimus-occ3-source";
 pub const MAX_SOURCE_RECEIPT_BYTES: usize = 2048;
@@ -282,8 +282,9 @@ impl SourceCaptureIntent {
     }
 }
 
-/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1
-/// fields (extension SOURCE-SPAN-SELECTION.md section 6.2). Counts cover the
+/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1 fields
+/// plus the optional label anchor (extension SOURCE-SPAN-SELECTION.md section 6.2).
+/// Counts cover the
 /// retained window; the aligned span stays `accepted_span_start/_end`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -416,7 +417,8 @@ pub struct SourceCaptureReceipt {
     pub label_anchor_alpha: LabelAnchorAlpha,
 }
 
-/// The flat wire shape: the 21 v1 fields and, on v2, the 18 span fields at the
+/// The flat wire shape: 21 v1 fields plus the optional label anchor and, on v2,
+/// the 18 span fields at the
 /// same level. Unknown fields and a partial span block are refused.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
@@ -1169,7 +1171,8 @@ pub fn validate_receipt(
 ) -> Result<(), SourceCaptureError> {
     intent.validate(now)?;
     // The receipt schema follows the intent schema: a v1 intent is answered by
-    // the bare 21-field wire, a v2 intent by the wire with the span block.
+    // the 21 v1 fields plus the optional label anchor, a v2 intent by that wire
+    // with the span block.
     let schema_matches = match (&receipt.span, intent.schema.as_str()) {
         (None, SOURCE_CAPTURE_SCHEMA) => receipt.schema == SOURCE_RECEIPT_SCHEMA,
         (Some(_), SOURCE_CAPTURE_SCHEMA_V2) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
