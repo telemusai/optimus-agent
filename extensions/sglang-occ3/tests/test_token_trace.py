@@ -573,3 +573,31 @@ def test_stage_single_copy(caplog, monkeypatch):
     trace.alignment_stage(runtime, torch.eye(3), torch.eye(3), torch.arange(3), "raw")
     assert calls == [1]
     assert rows(caplog)[0]["target_norm"] == 2.0
+
+
+def test_documented_global_top8_rank_bound():
+    """A label present in a local top-8 need not have a known global rank."""
+    from pathlib import Path
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    assert "truncate\nthe merged list to the global top-8" in readme
+    assert "otherwise report `>8`" in readme
+    shard_a = [(float(8-i), i) for i in range(8)]
+    shard_b_full = [(float(200-i), 100+i) for i in range(100)]
+    union = sorted(shard_a + shard_b_full[:8], reverse=True)
+    label = 7  # Local rank 8; union rank 16, but true global rank 108.
+    assert next(i+1 for i, (_, token) in enumerate(union) if token == label) == 16
+    full = sorted(shard_a + shard_b_full, reverse=True)
+    assert next(i+1 for i, (_, token) in enumerate(full) if token == label) == 108
+    merged_top8 = union[:8]
+    rank = next((i+1 for i, (_, token) in enumerate(merged_top8) if token == label), ">8")
+    assert rank == ">8"
+    assert merged_top8 == full[:8]
+
+
+def test_documented_lens_residual_rounding_and_sync_scope():
+    from pathlib import Path
+    readme = (Path(__file__).parents[1] / "README.md").read_text()
+    assert "rounded fused add+norm input (the post-add residual)" in readme
+    assert "not a bit-exact replay" in readme
+    assert "One bounded synchronous packed copy per point inside align()" in readme
+    assert "there is no asynchronous staging" in readme

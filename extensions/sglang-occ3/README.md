@@ -320,14 +320,22 @@ formula and the unquantized head weight in bounded tiles, never calling
 model/norm/head forwards or LogitsProcessor. Unsupported quantized head,
 norm override, or logit transforms explicitly skip. This is a float32
 readout approximation with the normal norm-output dtype cast, not a replay
-of fused inference kernels or sampling penalties/temperature.
+of fused inference kernels or sampling penalties/temperature. The captured
+residual is the rounded fused add+norm input (the post-add residual), not an
+unrounded reconstruction of the separate addends. Residual rounding therefore
+also makes this an approximation of the served readout, not a bit-exact replay.
 
 Each rank logs local top-8 IDs/logits, label logits at offsets [-1,0,+1]
 (null for edges or labels owned elsewhere), actual shard ranges/vocab start,
-and local logsumexp. Merge local top-8 by descending logits; global label
-rank is its position if present, otherwise >8. Combine all shard logsumexp
-values with logaddexp to compute untempered label probabilities. Missing
-ranks, rounded ties, or unsupported readouts leave the conclusion unresolved.
+and local logsumexp. Merge local top-8 by descending logits, then **truncate
+the merged list to the global top-8**. Report exact global label rank only
+for positions 1-8 in that truncated list; otherwise report `>8`. Positions
+beyond eight in the untruncated union are not exact ranks: unreported tokens
+from other shards may outrank them. Exact full-vocabulary rank is unavailable
+without exchanging the owning rank's label logit; this trace adds no such
+collective. Combine all shard logsumexp values with logaddexp to compute
+untempered label probabilities. Missing ranks, rounded ties, or unsupported
+readouts leave the conclusion unresolved.
 The profile method ID and live anchor alpha accompany the diagnostic rows.
 
 | Raw logit-lens result | Interpretation |
@@ -339,7 +347,8 @@ The profile method ID and live anchor alpha accompany the diagnostic rows.
 
 All new points now pack device-side arrays and perform one small host copy
 per call immediately before emission. No per-row scalar reads or per-tile
-host validity checks occur. Copies are synchronous on align(), including
-before anchoring, rather than deferred past the completion event; opt-in
-trace overhead can still delay other ranks. Vocabulary validity stays on
+host validity checks occur. One bounded synchronous packed copy per point inside align() is an accepted
+scope tradeoff for this opt-in trace; there is no asynchronous staging.
+Copies include points before anchoring rather than being deferred past the
+completion event, so opt-in trace overhead can still delay other ranks. Vocabulary validity stays on
 device through the full loop. Logit-lens tiles share the 256-row bound.

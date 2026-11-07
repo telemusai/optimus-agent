@@ -4,3 +4,4 @@
 - Added: Solver-copy precision and FP8 round-trip proxy diagnostics with plain-embedding baselines.
 - Fixed: Batch diagnostic device-to-host transfers instead of synchronizing per row or vocabulary tile.
 - Added: Collective-free raw-state RMSNorm/LM-head logit lens with local top-8 and label logits.
+- Fixed: Limit offline exact rank claims to global top-8 and document captured-residual rounding.
