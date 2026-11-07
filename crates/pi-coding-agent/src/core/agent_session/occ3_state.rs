@@ -378,7 +378,11 @@ impl Occ3NativeSession {
         if slot.armed_receiver.as_deref().is_some_and(|id| id != receiver) {
             return Err("Native handoff receiver changed after capture was armed".into());
         }
-        if slot.lease.is_some() {
+        if let Some(lease) = &slot.lease {
+            // Terminal captures retain cleanup metadata, never reuse authority.
+            if !matches!(lease.state(), SourceCaptureState::Prepared | SourceCaptureState::Captured) {
+                return Err(failure());
+            }
             return Ok(false);
         }
         if slot.resolved || slot.budget.is_some() {
@@ -545,8 +549,11 @@ impl Occ3NativeSession {
                             this.source.lock().map_err(|_| anyhow::anyhow!(failure()))?;
                         match slot.budget.take() {
                             Some(budget) => {
-                                this.check_native_allowed().map_err(anyhow::Error::msg)?;
                                 slot.resolved = true;
+                                if let Err(error) = this.check_native_allowed() {
+                                    slot.capture_permit = None;
+                                    return Err(anyhow::Error::msg(error));
+                                }
                                 (Some(budget), slot.retained)
                             }
                             None => {
@@ -588,6 +595,19 @@ impl Occ3NativeSession {
                         // failure so it stays bounded.
                         if this.absorb_source_busy_refusal() {
                             return Ok(None);
+                        }
+                        // Preserve terminal receipt metadata until cleanup is attempted.
+                        // A failed cleanup is best-effort, as in close(); it never
+                        // restores publication authority or silently retries capture.
+                        let failed_lease = this.source.lock()
+                            .map_err(|_| anyhow::anyhow!(failure()))?.lease.clone();
+                        if let Some(lease) = failed_lease {
+                            if lease.retirement_receipt().is_some() {
+                                let _ = tokio::time::timeout(
+                                    std::time::Duration::from_secs(5),
+                                    this.connector.retire_native_source(&lease),
+                                ).await;
+                            }
                         }
                         let exhausted = {
                             let mut slot =
@@ -643,53 +663,69 @@ impl Occ3NativeSession {
                 Box::pin(async move {
                     // Failed completion checks are terminal for this capture.
                     // Return capacity to the slot only when publication is valid.
-                    let capture_permit = this.source.lock()
+                    let mut capture_permit = this.source.lock()
                         .map_err(|_| anyhow::anyhow!(failure()))?.capture_permit.take();
-                    this.check_model(&completion.model)
-                        .map_err(anyhow::Error::msg)?;
-                    // Each refusal names its check: live TS14 evidence showed
-                    // one generic message is not diagnosable from evidence.
-                    let bindings = completion.lease.tool_bindings();
-                    if completion.lease.state() != SourceCaptureState::Captured {
-                        return Err(anyhow::anyhow!(format!("{} [occ3_completed_state_not_captured]", failure())));
-                    }
-                    if completion.lease.is_retained_content_only() {
-                        // Retained content-only mode: the captured turn must
-                        // be exactly a content turn. Any tool call forbids the
-                        // mode; the empty binding is the valid shape.
-                        if !bindings.is_empty() {
-                            return Err(anyhow::anyhow!(format!(
-                                "{} [occ3_completed_mode_tool_forbidden]",
-                                failure()
-                            )));
+                    let result = (|| -> anyhow::Result<()> {
+                        this.check_model(&completion.model)
+                            .map_err(anyhow::Error::msg)?;
+                        // Each refusal names its check: live TS14 evidence showed
+                        // one generic message is not diagnosable from evidence.
+                        let bindings = completion.lease.tool_bindings();
+                        if completion.lease.state() != SourceCaptureState::Captured {
+                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_state_not_captured]", failure())));
                         }
-                    } else {
-                        // Legacy same-turn protocol: exactly one occ3_handoff
-                        // binding from this same captured turn.
-                        if bindings.len() != 1 {
-                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_binding_count]", failure())));
+                        if completion.lease.is_retained_content_only() {
+                            // Retained content-only mode: the captured turn must
+                            // be exactly a content turn. Any tool call forbids the
+                            // mode; the empty binding is the valid shape.
+                            if !bindings.is_empty() {
+                                return Err(anyhow::anyhow!(format!(
+                                    "{} [occ3_completed_mode_tool_forbidden]",
+                                    failure()
+                                )));
+                            }
+                        } else {
+                            // Legacy same-turn protocol: exactly one occ3_handoff
+                            // binding from this same captured turn.
+                            if bindings.len() != 1 {
+                                return Err(anyhow::anyhow!(format!("{} [occ3_completed_binding_count]", failure())));
+                            }
+                            if bindings[0].tool_name != NATIVE_HANDOFF_TOOL {
+                                return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_name]", failure())));
+                            }
                         }
-                        if bindings[0].tool_name != NATIVE_HANDOFF_TOOL {
-                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_name]", failure())));
+                        let mut slot = this
+                            .source
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!(format!("{} [occ3_source_lock]", failure())))?;
+                        let expected = slot
+                            .lease
+                            .as_ref()
+                            .ok_or_else(|| anyhow::anyhow!(format!("{} [occ3_source_slot_missing]", failure())))?;
+                        if expected.intent() != completion.lease.intent() {
+                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_intent_mismatch]", failure())));
+                        }
+                        if slot.tool_claimed {
+                            return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_claimed]", failure())));
+                        }
+                        this.check().map_err(anyhow::Error::msg)?;
+                        slot.capture_permit = capture_permit.take();
+                        Ok(())
+                    })();
+                    if result.is_err() {
+                        // Keep the receipt for close/tombstone cleanup, but revoke
+                        // capture authority before any subsequent handoff can run.
+                        if let Ok(mut slot) = this.source.lock() {
+                            if let Some(lease) = &slot.lease {
+                                lease.cancel();
+                            }
+                            slot.budget = None;
+                            slot.resolved = true;
                         }
                     }
-                    let mut slot = this
-                        .source
-                        .lock()
-                        .map_err(|_| anyhow::anyhow!(format!("{} [occ3_source_lock]", failure())))?;
-                    let expected = slot
-                        .lease
-                        .as_ref()
-                        .ok_or_else(|| anyhow::anyhow!(format!("{} [occ3_source_slot_missing]", failure())))?;
-                    if expected.intent() != completion.lease.intent() {
-                        return Err(anyhow::anyhow!(format!("{} [occ3_completed_intent_mismatch]", failure())));
-                    }
-                    if slot.tool_claimed {
-                        return Err(anyhow::anyhow!(format!("{} [occ3_completed_tool_claimed]", failure())));
-                    }
-                    this.check().map_err(anyhow::Error::msg)?;
-                    slot.capture_permit = capture_permit;
-                    Ok(())
+                    // Revoke failed authority before releasing capacity to another session.
+                    drop(capture_permit);
+                    result
                 })
             }),
         }
@@ -1855,8 +1891,10 @@ Do not call occ3_handoff again for these facts."
         message_id: &str,
     ) -> Result<Option<Occ3QueueNotice>, String> {
         if state == super::occ3_sender_queue::Occ3SenderQueueState::Admitted {
-            // Admission cannot retain capture capacity, including alternate
-            // controller paths. Drop the source lock before taking the queue lock.
+            // Defensive cleanup for admission paths that did not pass through
+            // publication (normal publication already released this permit).
+            // Lock order is source -> queue; never retain either lock across
+            // delivery routing, and drop source before acquiring queue here.
             let mut source = self.source.lock().map_err(|_| failure())?;
             if source.handoff_admitted {
                 source.capture_permit = None;
@@ -1952,7 +1990,9 @@ Do not call occ3_handoff again for these facts."
         }
         // AgentEnd also visits ordinary failed captures. They still count
         // against the normal retry budget on the next resolve, but must not
-        // retain process-wide capacity until that next turn.
+        // retain process-wide capacity until that next turn. Busy retries also
+        // release capacity deliberately: other sessions may capture during the
+        // backoff, and the next explicit arm must acquire a fresh permit.
         if slot.lease.as_ref().is_some_and(|lease| lease.state() == SourceCaptureState::Cancelled)
             || slot.lease.is_none()
         {
@@ -2858,7 +2898,8 @@ mod tests {
         }
     }
 
-    /// An admitted sender may stay alive while another session captures.
+    /// Pins defensive admission cleanup with a deterministic one-slot pool.
+    /// The retained-state provider test covers the real publication path.
     #[tokio::test]
     async fn occ3_admitted_sender_releases_capture_slot_for_another_session() {
         let first = enrolled().await;
@@ -2884,6 +2925,39 @@ mod tests {
             .expect("admitted sender must release capture capacity without teardown or another tool call");
         assert!(second.arm_handoff_if_needed("another-receiver", Some(next)).unwrap());
         assert!(first.source.lock().unwrap().handoff_admitted);
+    }
+
+    /// Failed completion cannot leave a reusable lease after releasing capacity.
+    #[tokio::test]
+    async fn occ3_failed_completion_tombstones_capture_before_releasing_capacity() {
+        let session = enrolled().await;
+        let pool = Arc::new(tokio::sync::Semaphore::new(1));
+        let permit = pool.clone().acquire_owned().await.unwrap();
+        assert!(session.arm_handoff_if_needed("receiver", Some(permit)).unwrap());
+        resolve_capture(&session).await;
+        let lease = session.source.lock().unwrap().lease.clone().unwrap();
+        let hooks = session.source_hooks();
+        assert!((hooks.completed)(pi_agent_core::types::SourceCaptureCompletion {
+            model: fixture_model(),
+            lease,
+            assistant_message: Default::default(),
+        }).await.is_err(), "prepared lease cannot complete");
+        assert_eq!(pool.available_permits(), 1, "failed capture releases capacity");
+        {
+            let slot = session.source.lock().unwrap();
+            assert_eq!(slot.lease.as_ref().unwrap().state(), SourceCaptureState::Cancelled,
+                "failed completion must leave a terminal lease, not reusable capture authority");
+            assert!(slot.budget.is_none());
+            assert!(slot.resolved, "failure accounting remains pending");
+        }
+        assert!(session.arm_handoff_if_needed("receiver", None).is_err(), "no reuse before accounting");
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1);
+        assert!((hooks.resolve)(hook_request()).await.unwrap().is_none());
+        assert_eq!(session.failed_capture_attempts(), 1, "count each failure once");
+        let next = pool.clone().try_acquire_owned().unwrap();
+        assert!(session.arm_handoff_if_needed("receiver", Some(next)).unwrap());
+        assert_eq!(pool.available_permits(), 0, "explicit fresh arm holds capacity");
     }
 
     #[tokio::test]

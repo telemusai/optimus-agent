@@ -217,7 +217,7 @@ impl SglangOcc3Connector {
     pub async fn runtime_identity(&self) -> Result<NativeRuntimeIdentity, Occ3Error> {
         let body = serde_json::json!({"schema":"occ3.runtime.identity.request.v1"});
         let identity: NativeRuntimeIdentity = self
-            .control("/occ3/v1/native/runtime/identity", &body)
+            .control_raw("/occ3/v1/native/runtime/identity", &body)
             .await?;
         if !identity.is_self_consistent() {
             return Err(native_invalid());
@@ -531,7 +531,47 @@ impl SglangOcc3Connector {
         }
         Ok(native)
     }
+    /// A refusal alone is not restart evidence. Re-probe the attested identity
+    /// before evicting this connector; existing operations still fail closed.
+    async fn invalidate_ready_if_runtime_changed(&self) {
+        let Some(native) = self.native.as_ref() else { return };
+        let Ok(probe) = Self::new(self.config.clone()) else { return };
+        let Ok(identity) = probe.model_identity().await else { return };
+        let Ok(runtime) = probe.runtime_identity().await else { return };
+        let identity = Occ3ModelIdentity { latent_method: runtime.method_id.clone(), ..identity };
+        if identity.fingerprint() != runtime.model_fingerprint {
+            return;
+        }
+        let permit = &native.permit;
+        if runtime.runtime_id != permit.runtime_id
+            || runtime.runtime_generation != permit.runtime_generation
+            || identity != permit.identity
+            || runtime.profile_digest != permit.profile_digest
+            || runtime.tp_layout_digest != permit.source_profile.layout_digest
+            || runtime.layer_index != permit.source_profile.layer_index
+            || runtime.hidden_dim != permit.source_profile.hidden_dim
+            || runtime.dtype != permit.source_profile.dtype
+            || runtime.expected_ranks != permit.source_profile.expected_ranks
+        {
+            crate::core::occ3_connectors::activation::invalidate_connector_ready(self);
+        }
+    }
+
     async fn control<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+    ) -> Result<T, Occ3Error> {
+        match self.control_raw(path, body).await {
+            Ok(response) => Ok(response),
+            Err(error) => {
+                self.invalidate_ready_if_runtime_changed().await;
+                Err(error)
+            }
+        }
+    }
+
+    async fn control_raw<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
         body: &Value,
@@ -646,7 +686,13 @@ impl SglangOcc3Connector {
         let response: EnrollmentResponse = self
             .control("/occ3/v1/native/sessions/enroll", &body)
             .await?;
-        let result = Self::check_enrollment_response(permit, response, &operation_id, session_id)?;
+        let result = match Self::check_enrollment_response(permit, response, &operation_id, session_id) {
+            Ok(result) => result,
+            Err(error) => {
+                self.invalidate_ready_if_runtime_changed().await;
+                return Err(error);
+            }
+        };
         let mut records = native.records.lock().map_err(|_| native_invalid())?;
         if native_binding_failed!("enroll_records";
             "stopped" => records.stopped,

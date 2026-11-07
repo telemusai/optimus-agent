@@ -25,3 +25,50 @@ async fn unrelated_close_preserves_shared_ready_connector() {
     sender.close().await.unwrap();
     receiver.close().await.unwrap();
 }
+
+/// A rejected old permit must force only that connector to re-handshake.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn runtime_refusal_evicts_only_affected_ready_connector() {
+    let _cache_guard = reset_ready_cache().await;
+    for failure in [2, 3] {
+        let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let other = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let other_request = fixture_request(&other, None, None);
+        let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        let untouched = verify_cached(&other_request, Duration::from_secs(5)).await.unwrap();
+        fixture.enrollment_failure.store(failure, std::sync::atomic::Ordering::SeqCst);
+        assert!(ready.connector.enroll_native_session("restart-victim").await.is_err(),
+            "the old runtime binding must remain fail closed");
+        fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+        let replacement = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(!std::sync::Arc::ptr_eq(&ready, &replacement),
+            "runtime refusal must evict the affected cached connector (failure={failure})");
+        let other_cached = verify_cached(&other_request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&untouched, &other_cached),
+            "unrelated runtime readiness must survive");
+        // Late failure from the old connector cannot remove its replacement.
+        fixture.enrollment_failure.store(failure, std::sync::atomic::Ordering::SeqCst);
+        assert!(ready.connector.enroll_native_session("late-old-permit").await.is_err());
+        fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+        let still_new = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&replacement, &still_new));
+    }
+}
+
+/// Authentication/admission errors and failed probes are not restart evidence.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn unverified_runtime_refusal_preserves_ready_connector() {
+    let _cache_guard = reset_ready_cache().await;
+    for failure in [1, 4] {
+        let fixture = serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let ready = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        fixture.enrollment_failure.store(failure, std::sync::atomic::Ordering::SeqCst);
+        assert!(ready.connector.enroll_native_session("ordinary-refusal").await.is_err());
+        fixture.enrollment_failure.store(0, std::sync::atomic::Ordering::SeqCst);
+        let cached = verify_cached(&request, Duration::from_secs(5)).await.unwrap();
+        assert!(std::sync::Arc::ptr_eq(&ready, &cached),
+            "unverified refusal must not split live connectors");
+    }
+}

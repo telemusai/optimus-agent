@@ -533,6 +533,14 @@ pub async fn verify_cached(
     Ok(ready)
 }
 
+/// Evict only the failed connector instance. A late failure cannot evict a
+/// newer verification for the same key or readiness for another runtime.
+pub(crate) fn invalidate_connector_ready(connector: &dyn Occ3Connector) {
+    if let Ok(mut cache) = ready_cache().lock() {
+        cache.retain(|_, ready| !std::ptr::addr_eq(ready.connector.as_ref(), connector));
+    }
+}
+
 /// Drop the cached verification. Called when a runtime restart invalidates
 /// every enrollment, so the next activation re-handshakes.
 pub fn invalidate_ready_cache() {
@@ -643,6 +651,9 @@ pub(crate) mod test_support {
     pub(crate) struct ActivationFixture {
         pub endpoint: url::Url,
         pub requests: Arc<AtomicUsize>,
+        /// 0 healthy; 1 generic refusal; 2 epoch mismatch; 3 restart refusal;
+        /// 4 refusal with unavailable runtime identity probe.
+        pub enrollment_failure: Arc<AtomicUsize>,
         shutdown: Option<tokio::sync::oneshot::Sender<()>>,
     }
 
@@ -672,6 +683,8 @@ pub(crate) mod test_support {
         .expect("endpoint url");
         let requests = Arc::new(AtomicUsize::new(0));
         let requests_outer = Arc::clone(&requests);
+        let enrollment_failure = Arc::new(AtomicUsize::new(0));
+        let enrollment_failure_outer = Arc::clone(&enrollment_failure);
         let enrollments = Arc::new(std::sync::Mutex::new(
             std::collections::BTreeMap::<String, serde_json::Value>::new(),
         ));
@@ -689,14 +702,16 @@ pub(crate) mod test_support {
                 let required_bearer = required_bearer.clone();
                 let requests = Arc::clone(&requests);
                 let enrollments = Arc::clone(&enrollments);
+                let enrollment_failure = Arc::clone(&enrollment_failure);
                 tokio::spawn(async move {
-                    serve_connection(socket, identity, required_bearer, requests, enrollments).await;
+                    serve_connection(socket, identity, required_bearer, requests, enrollments, enrollment_failure).await;
                 });
             }
         });
         ActivationFixture {
             endpoint,
             requests: requests_outer,
+            enrollment_failure: enrollment_failure_outer,
             shutdown: Some(shutdown),
         }
     }
@@ -707,6 +722,7 @@ pub(crate) mod test_support {
         required_bearer: Option<String>,
         requests: Arc<AtomicUsize>,
         enrollments: Arc<std::sync::Mutex<std::collections::BTreeMap<String, serde_json::Value>>>,
+        enrollment_failure: Arc<AtomicUsize>,
     ) {
         use tokio::io::AsyncReadExt;
         let mut bytes = Vec::new();
@@ -788,6 +804,12 @@ pub(crate) mod test_support {
             "terminal_journal": true,
             "max_capture_bytes": MAX_CAPTURE_BYTES,
         });
+        let failure = enrollment_failure.load(Ordering::SeqCst);
+        if (path == "/occ3/v1/native/sessions/enroll" && matches!(failure, 1 | 3 | 4))
+            || (path == "/occ3/v1/native/runtime/identity" && failure == 4) {
+            let _ = write_response(&mut socket, "401 Unauthorized", "{}", &[]).await;
+            return;
+        }
         // Match the runtime's immutable same-session enrollment contract. A
         // fresh connector must not silently replace a live session's permit.
         if path == "/occ3/v1/native/sessions/enroll" {
@@ -808,7 +830,7 @@ pub(crate) mod test_support {
                 }
             }
         }
-        let response = match (path.as_str(), body.as_ref()) {
+        let mut response = match (path.as_str(), body.as_ref()) {
             ("/occ3/v1/identity", _) => serde_json::json!({
                 "schema": "optimus.occ3.identity.v1",
                 "fields": legacy_fields,
@@ -850,6 +872,10 @@ pub(crate) mod test_support {
             }),
             _ => return,
         };
+        if (path == "/occ3/v1/native/sessions/enroll" && failure == 2)
+            || (path == "/occ3/v1/native/runtime/identity" && matches!(failure, 2 | 3)) {
+            response["runtime_id"] = serde_json::json!("restarted-runtime-epoch");
+        }
         let payload = serde_json::to_string(&response).expect("fixture response serializes");
         let _ = write_response(&mut socket, "200 OK", &payload, &[]).await;
     }
