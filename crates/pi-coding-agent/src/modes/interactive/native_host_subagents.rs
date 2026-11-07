@@ -243,6 +243,7 @@ impl Bar {
         ).ok()).collect::<Vec<_>>();
         let now = std::time::Instant::now();
         self.communication.observe(&rows, &parent, now);
+        let queue_badge = self.communication.queue_badge(&rows, now);
         let deadline = self.communication.next_deadline(now);
         if self.pulse_deadline != deadline {
             self.pulse_deadline = deadline;
@@ -268,7 +269,6 @@ impl Bar {
         // The advisory queue badge is composed after the pulse indicators:
         // truncated away first when the line narrows, never displacing the
         // delivered-message pulses or the health/TPS segments.
-        let queue_badge = self.communication.queue_badge(&rows);
         self.line.set_communication_status(Some(context_health_indicator::status_line(
             &format!("{}{}", self.communication.indicators(now),
                 if queue_badge.is_empty() { String::new() } else { format!("  {queue_badge}") }),

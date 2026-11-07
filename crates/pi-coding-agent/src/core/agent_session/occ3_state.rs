@@ -242,6 +242,8 @@ pub struct Occ3NativeSession {
     /// next arm. Never serialized into the transcript; its artifact is the
     /// bounded, content-free `occ3-sender-queue.json` projection.
     queue: Mutex<Occ3SenderQueue>,
+    /// Serializes event and timer notice drains, including their async parent leg.
+    pub(super) queue_notice_drain: tokio::sync::Mutex<()>,
     /// Session-file path bound at install time; `None` in isolated tests
     /// (no persistence, no notices persisted to disk).
     session_file: std::sync::OnceLock<Option<String>>,
@@ -329,6 +331,7 @@ impl Occ3NativeSession {
             queue_listener_unsubscribe: Mutex::new(None),
             inbox: Mutex::new(Occ3InferenceInbox::new(session_id.into()).map_err(|_| failure())?),
             queue: Mutex::new(Occ3SenderQueue::from_configured()),
+            queue_notice_drain: tokio::sync::Mutex::new(()),
             session_file: std::sync::OnceLock::new(),
             pending_queue_notices: Mutex::new(Vec::new()),
             active_fallback_turn: Mutex::new(None),
@@ -2241,6 +2244,15 @@ Do not call occ3_handoff again for these facts."
             .lock()
             .map(|mut pending| std::mem::take(&mut *pending))
             .unwrap_or_default()
+    }
+
+    /// The durable outbox, not a cached worklist clone, owns acknowledgment.
+    pub(super) fn current_queue_notice(
+        &self,
+        notice_id: &str,
+    ) -> Option<super::occ3_sender_queue::Occ3DurableQueueNotice> {
+        self.queue.lock().ok()?.outbox_pending().into_iter()
+            .find(|record| record.notice_id == notice_id)
     }
 
     /// Re-selects every outbox record not yet acknowledged by BOTH

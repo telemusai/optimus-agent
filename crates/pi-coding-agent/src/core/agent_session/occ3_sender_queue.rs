@@ -845,7 +845,14 @@ impl Occ3SenderQueue {
         ) {
             return None;
         }
+        // Admission is monotonic; delayed publication/duplicate callbacks
+        // must not revive capture work or emit another prompting occasion.
+        if head.state == Occ3SenderQueueState::Admitted {
+            return None;
+        }
         head.state = state;
+        head.reason = None;
+        head.retry_not_before_epoch = None;
         head.message_id = Some(message_id.to_string());
         self.notice_at(0, now_epoch, None)
     }
@@ -2279,6 +2286,32 @@ mod tests {
             parent_notice_queue_key("child-1", "occ3q_x"),
             format!("{}occ3q_x", parent_notice_queue_key_prefix("child-1"))
         );
+    }
+
+    #[test]
+    fn source_busy_then_admission_cancels_retry_and_never_rearms() {
+        let mut queue = queue();
+        queue.enqueue("child", "receiver", 100).unwrap();
+        queue.mark_armed(Some("old"), None, 100).unwrap();
+        queue.record_source_busy(None, 100, 100).unwrap();
+        let mut gate = HeadPromptGate::default();
+        let HeadPromptDecision::Defer(key) = gate.decide(queue.head().unwrap(), 1, true) else {
+            panic!("source busy waits for provider retry");
+        };
+        let admitted = queue.mark_progressed(Occ3SenderQueueState::Admitted, "admitted", 101).unwrap();
+        assert_eq!(admitted.state, "admitted");
+        assert_eq!(admitted.reason, None);
+        assert_eq!(queue.head().unwrap().retry_not_before_epoch, None);
+        gate.settle_deferred(&key);
+        assert_eq!(gate.decide(queue.head().unwrap(), 1, false), HeadPromptDecision::Skip);
+        assert!(queue.mark_armed(None, None, 110).is_none());
+        assert!(queue.record_source_busy(None, 100, 110).is_none());
+        assert!(queue.mark_progressed(Occ3SenderQueueState::Published, "admitted", 110).is_none());
+        assert!(queue.mark_progressed(Occ3SenderQueueState::Admitted, "admitted", 110).is_none());
+        assert_eq!(queue.head().unwrap().state, Occ3SenderQueueState::Admitted);
+        assert_eq!(queue.record_delivery_event("admitted", true, Some("digest"), 111).len(), 1);
+        assert!(queue.mark_armed(None, None, 112).is_none());
+        assert!(queue.record_source_busy(None, 100, 112).is_none());
     }
 
     #[test]

@@ -8,6 +8,7 @@ use crate::modes::daemon::daemon_session_list::SessionSummary;
 use crate::modes::interactive::components::subagent_summary_line::{linkage_row_for_roster_summary, RosterParent};
 
 pub(super) const PULSE: Duration = Duration::from_millis(1400);
+const QUEUE_FLASH: Duration = Duration::from_millis(500);
 const MAX_RECEIVERS: usize = 256;
 const MAX_SEEN: usize = 256;
 
@@ -24,6 +25,7 @@ pub(super) struct ActivityState {
     receivers: BTreeMap<String, Receiver>,
     until: [Option<Instant>; 4],
     supported: bool,
+    queue_started: Option<Instant>,
     observed_since_ms: Option<i64>,
     links: BTreeMap<(String, String), Instant>,
 }
@@ -113,17 +115,23 @@ impl ActivityState {
     }
 
     pub(super) fn next_deadline(&self, now: Instant) -> Option<Instant> {
-        self.until.iter().flatten().copied().filter(|deadline| *deadline > now).min()
+        let queue_deadline = self.queue_started.map(|start| {
+            let elapsed = now.saturating_duration_since(start);
+            let remainder = Duration::from_nanos((elapsed.as_nanos() % QUEUE_FLASH.as_nanos()) as u64);
+            now + (QUEUE_FLASH - remainder)
+        });
+        self.until.iter().flatten().copied().filter(|deadline| *deadline > now)
+            .chain(queue_deadline).min()
     }
 
     /// The advisory queue badge from the same roster rows: pending OCC-3
-    /// queue entries of the observed family. Never a pulse: completed-use
+    /// queue entries of the roster. Its independent flash is not a delivery pulse: completed-use
     /// deliveries remain the only pulse trigger, and a queued notice lights
     /// no TXT/OCC slot. The roster subscription already strips
     /// `communicationQueue` when the daemon does not advertise the (separate)
     /// queue capability, so field presence is the gate — the badge stays
     /// independent of the activity capability.
-    pub(super) fn queue_badge(&self, rows: &[SessionSummary]) -> String {
+    pub(super) fn queue_badge(&mut self, rows: &[SessionSummary], now: Instant) -> String {
         let mut pending = 0usize;
         for row in rows.iter().filter(|row| !row.session_id.is_empty()) {
             let Some(queue) = row.extra.get("communicationQueue") else { continue };
@@ -137,15 +145,20 @@ impl ActivityState {
             let Some(entries) = queue.get("entries").and_then(|value| value.as_array()) else { continue };
             for entry in entries {
                 let Some(state) = entry.get("state").and_then(serde_json::Value::as_str) else { continue };
-                if !crate::core::occ::queue::is_terminal_state(state) {
+                if crate::core::occ::queue::is_waiting_state(state) {
                     pending = pending.saturating_add(1);
                 }
             }
         }
         if pending == 0 {
+            self.queue_started = None;
             String::new()
         } else {
-            format!("\u{1f4e9}QUEUED {pending}")
+            let start = *self.queue_started.get_or_insert(now);
+            let bright = (now.saturating_duration_since(start).as_nanos() / QUEUE_FLASH.as_nanos()) % 2 == 0;
+            let intensity = if bright { "1" } else { "2" };
+            let marker = if bright { "●" } else { "○" };
+            format!("\x1b[{intensity};38;5;39m{marker} QUEUED {pending}\x1b[22;39m")
         }
     }
 
@@ -311,7 +324,7 @@ mod tests {
         ];
         state.observe(&rows, &parent(), now);
         // No queue field: no badge.
-        assert_eq!(state.queue_badge(&rows), "");
+        assert_eq!(state.queue_badge(&rows, now), "");
         rows[1].extra.insert("communicationQueue".into(), json!({
             "generation":"g",
             "entries":[
@@ -323,23 +336,87 @@ mod tests {
                 {"queueId":"q6","state":"future-unknown"}
             ]
         }));
-        // Pending + armed + admitted + unknown = 4; terminal states
+        // Only pending + armed = 2; all other states
         // (fallback/failed, and the corrected completed/expired) excluded.
         rows[1].extra.get_mut("communicationQueue").unwrap()["entries"].as_array_mut().unwrap()
             .push(json!({"queueId":"q7","state":"completed"}));
         rows[1].extra.get_mut("communicationQueue").unwrap()["entries"].as_array_mut().unwrap()
             .push(json!({"queueId":"q8","state":"expired"}));
-        assert_eq!(state.queue_badge(&rows), "\u{1f4e9}QUEUED 4");
+        assert_eq!(state.queue_badge(&rows, now), "\x1b[1;38;5;39m● QUEUED 2\x1b[22;39m");
         // pendingTotal is authoritative when present: it survives the
         // display bound, so larger configured queues are not undercounted.
         rows[1].extra.get_mut("communicationQueue").unwrap()["pendingTotal"] = json!(11);
-        assert_eq!(state.queue_badge(&rows), "\u{1f4e9}QUEUED 11");
-        // The badge never lights any pulse slot.
+        assert_eq!(state.queue_badge(&rows, now), "\x1b[1;38;5;39m● QUEUED 11\x1b[22;39m");
+        // The independent flash never lights a delivery slot.
         assert_eq!(strip_ansi(&state.indicators(now)), IDLE);
-        assert_eq!(state.next_deadline(now), None);
+        assert_eq!(state.next_deadline(now), Some(now + QUEUE_FLASH));
+        assert_eq!(state.queue_badge(&rows, now + QUEUE_FLASH), "\x1b[2;38;5;39m○ QUEUED 11\x1b[22;39m");
+        assert_eq!(state.next_deadline(now + QUEUE_FLASH), Some(now + QUEUE_FLASH * 2));
+        assert_eq!(state.queue_badge(&rows, now + QUEUE_FLASH * 2), "\x1b[1;38;5;39m● QUEUED 11\x1b[22;39m");
+        // Intermediate renders retain the original boundary rather than postponing it.
+        assert_eq!(state.next_deadline(now + Duration::from_millis(750)), Some(now + QUEUE_FLASH * 2));
         // A queue field with no entries array and no pendingTotal is ignored.
         rows[1].extra.insert("communicationQueue".into(), json!({"generation":"g"}));
-        assert_eq!(state.queue_badge(&rows), "");
+        assert_eq!(state.queue_badge(&rows, now), "");
+        assert_eq!(state.next_deadline(now), None);
+    }
+
+    #[test]
+    fn queue_flash_is_independent_of_activity_and_stops_on_capability_loss() {
+        let now = Instant::now();
+        let mut state = ActivityState::default();
+        let mut rows = vec![row("parent", false, json!([]))];
+        rows[0].extra.remove("communicationActivity");
+        rows[0].extra.insert("communicationQueue".into(), json!({"pendingTotal": 1}));
+        state.observe(&rows, &parent(), now);
+        assert!(state.queue_badge(&rows, now).contains("● QUEUED 1"));
+        assert_eq!(state.next_deadline(now), Some(now + QUEUE_FLASH));
+        assert_eq!(strip_ansi(&state.indicators(now)), "- TXT  - OCC1  - OCC2  - OCC3");
+        // Delivery expiry takes precedence when earlier than the flash boundary.
+        state.until[3] = Some(now + Duration::from_millis(100));
+        assert_eq!(state.next_deadline(now), state.until[3]);
+        rows[0].extra.remove("communicationQueue");
+        assert_eq!(state.queue_badge(&rows, now), "");
+        assert_eq!(state.next_deadline(now + Duration::from_millis(100)), None);
+        rows[0].extra.insert("communicationQueue".into(), json!({"pendingTotal": 1}));
+        assert!(state.queue_badge(&rows, now + QUEUE_FLASH).starts_with("\x1b[1;38;5;39m"));
+        // Session changes discard the old animation clock.
+        state.observe(&[], &RosterParent::default(), now + QUEUE_FLASH);
+        assert_eq!(state.next_deadline(now + QUEUE_FLASH), None);
+    }
+
+    #[test]
+    fn queue_projection_admission_drains_waiting_badge_and_deadline() {
+        use crate::core::occ::queue::{from_queue_notices, QUEUE_NOTICE_CUSTOM_TYPE};
+        use pi_agent_core::types::{AgentMessage, CustomAgentMessage, CustomMessageContent};
+        let now = Instant::now();
+        let mut state = ActivityState::default();
+        let mut rows = vec![row("parent", false, json!([]))];
+        let mut messages = Vec::new();
+        for (id, phase, count) in [("q1", "pending", 1), ("q2", "armed", 2),
+            ("q1", "admitted", 1), ("q2", "admitted", 0)] {
+            messages.push(AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: QUEUE_NOTICE_CUSTOM_TYPE.into(),
+                content: CustomMessageContent::Text(String::new()), display: false,
+                details: Some(json!({"queueId": id, "state": phase, "position": 1,
+                    "receiver": "child:a"})), timestamp: 0,
+            }));
+            let snapshot = from_queue_notices(&messages, "parent", "g");
+            assert_eq!(snapshot.pending_total, count);
+            rows[0].extra.insert("communicationQueue".into(), serde_json::to_value(snapshot).unwrap());
+            let badge = state.queue_badge(&rows, now);
+            if count == 0 {
+                assert!(badge.is_empty());
+                assert_eq!(state.next_deadline(now), None);
+            } else {
+                assert_eq!(strip_ansi(&badge), format!("● QUEUED {count}"));
+                assert_eq!(state.next_deadline(now), Some(now + QUEUE_FLASH));
+            }
+        }
+        for phase in ["published", "admitted", "delivered", "failed", "cancelled", "uncertain"] {
+            rows[0].extra.insert("communicationQueue".into(), json!({"entries": [{"state": phase}]}));
+            assert!(state.queue_badge(&rows, now).is_empty(), "{phase}");
+        }
     }
 
     #[test]
