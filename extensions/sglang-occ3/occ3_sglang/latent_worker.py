@@ -9,6 +9,7 @@ import hashlib
 import logging
 import os
 import queue
+import re
 import threading
 import time
 from array import array
@@ -449,13 +450,12 @@ def _log_poison(runtime, site, code, *, op="none", phase="none"):
         if runtime.poisoned:
             return
         sites = {"consensus", "preflight", "control", "private_kv_fence", "abort_fence", "bootstrap"}
-        phases = {'align_prepare', 'none', 'draft_embedding_replace', 'terminal_fence', 'forward_complete', 'stage_verify', 'admit', 'private_kv_fence', 'source_ready', 'draft_embedding_prepare', 'align_complete', 'stage_prefill', 'draft_embedding_begin', 'commit_write', 'prepare', 'commit_lineage', 'forward_submit', 'forward_start', 'align_begin', 'capture_prenorm', 'target_embedding_inplace', 'draft_embedding_complete', 'abort_fence'}
         operations = {"health", "status", "publication_status", "enroll_session", "reserve_capture",
                       "reserve_consume", "publish", "bind_output", "release_lease", "retire", "none"}
         from .turn_diagnostics import _FAILURE_CODES
         logger.error("occ3-bridge: runtime poisoned (site=%s code=%s op=%s phase=%s)",
                      site if site in sites else "unknown", code if code in _FAILURE_CODES else "unknown",
-                     op if op in operations else "unknown", phase if phase in phases else "unknown")
+                     op if op in operations else "unknown", phase if isinstance(phase, str) and re.fullmatch(r"[a-z_]{1,40}", phase) else "unknown")
     except Exception:
         pass
 

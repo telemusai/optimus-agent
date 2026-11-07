@@ -428,7 +428,8 @@ manifest causes `source_digest_mismatch` rather than a valid diagnostic run.
 Failure counters count each exception object once across propagation boundaries;
 a distinct normalized exception remains a distinct failure. Cancellation does
 not count as an unknown failure in admission probes. Typed attachment refusals
-use INFO; untyped exceptions and `native_completion_failed` use ERROR. Worker
+use INFO; `LatentError` codes, untyped exceptions and
+`native_completion_failed` use ERROR. Worker
 admission rows include numeric `rank`, and frontend snapshots include replay
 `fences`. Client control rejection includes only numeric HTTP `status`, never
 the response body. Poison-transition logs fire once per runtime latch, and

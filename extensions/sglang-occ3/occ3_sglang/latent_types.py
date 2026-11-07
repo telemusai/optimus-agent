@@ -154,7 +154,7 @@ def admission_probe(operation, *, registry=False):
                 owner = runtime if runtime is not None else owner
                 reg = owner if registry else getattr(owner, "registry", None)
                 admission_event(operation, outcome, registry=reg, error=error, owner=owner)
-                if isinstance(error, Exception):
+                if isinstance(error, Exception) and operation in ("worker_admit", "worker_abort"):
                     from .turn_diagnostics import log_failure
                     log_failure(error, phase="admission")
             except Exception:

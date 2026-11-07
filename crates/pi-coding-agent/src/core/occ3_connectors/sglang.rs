@@ -1282,8 +1282,11 @@ mod tests {
         let _reset = ResetSink;
         let entries = Arc::new(Mutex::new(Vec::new()));
         let captured = entries.clone();
+        let me = std::thread::current().id();
         pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
-            if entry["msg"].as_str().is_some_and(|msg| msg.starts_with("native_binding_")) {
+            if std::thread::current().id() == me
+                && entry["msg"].as_str().is_some_and(|msg| msg.starts_with("native_binding_"))
+            {
                 captured.lock().unwrap().push(entry.clone());
             }
         })));

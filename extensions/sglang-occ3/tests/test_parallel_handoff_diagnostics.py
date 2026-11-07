@@ -407,3 +407,27 @@ def test_status_block_contains_counts_and_fences(monkeypatch, caplog):
     assert "private-fence" not in json.dumps(block)
     monkeypatch.delenv("OCC3_DIAG_TOKEN_TRACE")
     assert startup_state.status_payload()["parallel_handoff_diagnostics"]["admission"] == {}
+
+
+@pytest.mark.asyncio
+async def test_post_dispatch_probe_preserves_outer_phase(monkeypatch, caplog):
+    import json
+    from types import SimpleNamespace
+    from occ3_sglang.latent_types import admission_probe
+    monkeypatch.setenv("OCC3_DIAG_TOKEN_TRACE", "1")
+    monkeypatch.setitem(diag._FAILURE_STATE, "error_count", 0)
+    @admission_probe("finish_source")
+    async def finish_source(owner):
+        raise LatentError("not_ready")
+    with caplog.at_level(logging.INFO):
+        try:
+            await finish_source(object())
+        except LatentError as error:
+            diag.log_failure(error, SimpleNamespace(dispatched=True), "terminal")
+            diag.log_failure(error, SimpleNamespace(dispatched=True), "cleanup")
+    rows = [json.loads(record.message.split("native failure ")[1])
+            for record in caplog.records if "occ3-bridge: native failure " in record.message]
+    assert len(rows) == 1
+    assert rows[0]["phase"] == "terminal" and rows[0]["dispatched"] is True
+    assert rows[0]["code"] == "not_ready"
+    assert diag.failure_snapshot()["error_count"] == 1
