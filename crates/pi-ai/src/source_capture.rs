@@ -283,9 +283,9 @@ impl SourceCaptureIntent {
 }
 
 /// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1 fields
-/// plus the optional label anchor (extension SOURCE-SPAN-SELECTION.md section 6.2).
-/// Counts cover the
-/// retained window; the aligned span stays `accepted_span_start/_end`.
+/// plus the optional label anchor (extension SOURCE-SPAN-SELECTION.md section
+/// 6.2). Counts cover the retained window; the aligned span stays
+/// `accepted_span_start/_end`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceReceiptSpan {
@@ -418,8 +418,8 @@ pub struct SourceCaptureReceipt {
 }
 
 /// The flat wire shape: 21 v1 fields plus the optional label anchor and, on v2,
-/// the 18 span fields at the
-/// same level. Unknown fields and a partial span block are refused.
+/// the 18 span fields at the same level. Unknown fields and a partial span block
+/// are refused.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceCaptureReceiptWire {
