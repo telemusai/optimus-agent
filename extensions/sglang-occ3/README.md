@@ -91,8 +91,15 @@ source capture and receiver inference. A server that accepts sends SSE comment
 keepalives while native generation runs; the client verifies the deferred
 receipt before accepting completion. Servers that do not accept retain the
 buffered response contract. Set client `OCC3_KEEPALIVE_STREAM=0`, `false`, or
-`off` to disable the offer; unset, `1`, `true`, or `on` enables it. This does
+`off`, or an empty `OCC3_KEEPALIVE_STREAM=` to disable the offer; unset, `1`, `true`, or `on` enables it. This does
 not lower reasoning effort or change token budgets.
+
+A bounded admission-busy error as the first data event of an accepted deferred
+stream closes the lease as proven non-use, with the same busy-code allowlist and
+retry timing as HTTP 503. Source capture then requires a fresh capture attempt;
+the already-started stream is not replayed. Unknown errors, errors after data,
+and receiver admission timeouts retain the uncertain outcome. Keepalive comments
+do not count as data and continue during steady decode as well as stalls.
 
 The bridge logs a one-line INFO `occ3-bridge: native turn summary` for each
 native turn, including completion and interrupted turns. It reports timing,
@@ -102,7 +109,12 @@ reason, transport mode, and channel/attempt identifiers. Text is off by default.
 For temporary diagnosis on an **operator-owned server**, set server
 `OCC3_DIAG_TURN_TEXT=<N>` to include the first and last N characters of visible
 content and reasoning in that summary. The maximum is 4096 characters per
-excerpt; zero or unset disables text. Newlines are escaped. This setting can
+excerpt; zero or unset disables text. Newlines are escaped. The summary message
+is capped at 16 KiB of ASCII text (excluding logger-added prefixes). If escaped
+excerpts exceed that cap, all excerpts are omitted and `text_omitted_log_cap`
+is set. Diagnostic failures disable collection and record a fixed `diag_error`
+code, without exposing exception text or interrupting the turn. A logger failure
+is swallowed and cannot guarantee a summary line. This setting can
 expose generated private content and reasoning in server logs. Enable it only
 with authorization, restrict log access and retention, and disable it after
 diagnosis. Request prompts, headers, keys, receipts, and authentication fields

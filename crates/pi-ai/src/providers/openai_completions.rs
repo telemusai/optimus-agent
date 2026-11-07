@@ -1486,6 +1486,26 @@ fn is_occ3_busy_code(code: &str, source: bool) -> bool {
 	}
 }
 
+/// Classify only the first data event of an accepted deferred stream. The
+/// fixed error shape and bounded allowlist prove pre-admission non-use;
+/// arbitrary model errors (or errors after any data) never grant replay.
+fn deferred_busy_payload(payload: &str, source: bool) -> Option<Option<u64>> {
+	if payload.len() > OCC3_BUSY_BODY_LIMIT { return None; }
+	let value: Value = serde_json::from_str(payload).ok()?;
+	let object = value.as_object()?;
+	if object.len() != 1 { return None; }
+	let error = object.get("error")?.as_object()?;
+	if error.keys().any(|key| !matches!(key.as_str(), "type" | "code" | "message" | "retryAfterSeconds")) { return None; }
+	if error.get("type")?.as_str()? != "occ3_attachment_error"
+		|| error.get("code")?.as_u64()? != 503
+		|| !is_occ3_busy_code(error.get("message")?.as_str()?, source) {
+		return None;
+	}
+	let retry = error.get("retryAfterSeconds").and_then(Value::as_u64)
+		.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds));
+	Some(retry)
+}
+
 /// Parses a busy refusal's `Retry-After` header: one header, plain ASCII
 /// delta-seconds in `1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS`. Anything else
 /// (missing, repeated, HTTP-date, zero, too large, garbage) is ignored.
@@ -1564,14 +1584,18 @@ fn record_completions_failure(model: &Model, output: &mut AssistantMessage, erro
 	}
 	if error.value.get("code").and_then(Value::as_str) == Some(OCC3_RECEIVER_BUSY) {
 		// Retryable overload: the session retry policy re-runs the turn
-		// without the (now cancelled) attachment. No Retry-After is
-		// forwarded, so the configured 2s/4s/8s backoff applies.
+		// without the (now cancelled) attachment. Deferred errors may carry
+		// bounded retry timing; otherwise the configured backoff applies.
+		let retry_after_ms = error.value.get("retryAfterSecs").and_then(Value::as_u64)
+			.filter(|seconds| (1..=OCC3_BUSY_RETRY_AFTER_MAX_SECS).contains(seconds))
+			.map(|seconds| (seconds * 1000) as f64);
 		let failure = crate::utils::stream_failure::StreamFailureError::new(
 			error.message.clone(),
 			crate::utils::stream_failure::StreamFailureInfo {
 				kind: crate::utils::stream_failure::KIND_OVERLOADED.into(),
 				provider_error_type: Some(OCC3_RECEIVER_BUSY.into()),
 				status: Some(503),
+				retry_after_ms,
 				..Default::default()
 			},
 		);
@@ -2310,8 +2334,9 @@ fn strip_occ3_keepalive_transport(bytes: &[u8]) -> Result<(Vec<u8>, String), Sou
 async fn buffer_source_sse(
     mut response: reqwest::Response,
     lease: &SourceCaptureLease,
-    submission: &mut SourceSubmission,
+    source_submission: &mut Option<SourceSubmission>,
 ) -> Result<Vec<String>, StreamError> {
+    let submission = source_submission.as_mut().expect("source submission present");
     let mut bytes = Vec::new();
     while let Some(chunk) = response.chunk().await.map_err(|_| SourceCaptureError::InvalidCompletion)? {
         submission.ensure_active()?;
@@ -2331,6 +2356,16 @@ async fn buffer_source_sse(
     // bytes, so the receipt verifies from the envelope and the hash covers
     // only the reconstructed native bytes.
     let inner: Vec<u8> = if submission.is_deferred() {
+        let mut reader = SseLineReader::new();
+        let mut first_payload = None;
+        reader.push(&bytes, |payload| { first_payload = Some(payload); false });
+        if let Some(payload) = first_payload {
+            if let Some(retry_after) = deferred_busy_payload(&payload, true) {
+                source_submission.take().expect("source submission present")
+                    .refuse_before_admission(retry_after);
+                return Err(StreamError::occ3_source_busy(retry_after));
+            }
+        }
         let (stripped, envelope) = strip_occ3_keepalive_transport(&bytes)?;
         let envelope: Value = serde_json::from_str(&envelope)
             .map_err(|_| SourceCaptureError::InvalidCompletion)?;
@@ -2616,10 +2651,9 @@ async fn post_chat_completions(
 		// closes as proven non-use with a busy record and the sender re-arms
 		// a FRESH capture on its own busy budget. Unknown codes keep the
 		// uncertain contract.
-		// Known gap: with the keepalive offer accepted, the server sends 200
-		// headers first and a busy refusal arrives as an SSE error event;
-		// that shape is not classified here, never resent, and keeps the
-		// uncertain path.
+		// Accepted deferred streams classify a first-data busy refusal in
+		// buffer_source_sse instead. That closes as proven non-use and lets
+		// the sender re-arm a fresh capture, without replaying this stream.
 		let retry_after = parse_occ3_busy_retry_after(response.headers());
 		let mut response = response;
 		let code = read_bounded_error_code(&mut response).await;
@@ -3545,8 +3579,8 @@ async fn run_stream_body(
 	let status = response.status().as_u16();
 	let headers = response.headers().clone();
 	let mut ordinary_response = Some(response);
-	let source_payloads = if let (Some(lease), Some(submission)) = (source, source_submission.as_mut()) {
-		Some(buffer_source_sse(ordinary_response.take().expect("response present"), lease, submission).await?)
+	let source_payloads = if let Some(lease) = source.filter(|_| source_submission.is_some()) {
+		Some(buffer_source_sse(ordinary_response.take().expect("response present"), lease, &mut source_submission).await?)
 	} else { None };
 	if let Some(on_response) = options_ref.and_then(|options| options.stream.on_response.clone()) {
 		let mut response_record = crate::types::ProviderResponse {
@@ -3592,6 +3626,7 @@ async fn run_stream_body(
 	// Set once the deferred terminal receipt event has been verified. A stream
 	// that ends (or errors) before it never reaches `complete()`.
 	let mut deferred_receipt_seen = false;
+	let mut first_data = true;
 	while let Some(payload) = receiver.recv().await {
 		if let Some(submission) = submission.as_ref() { submission.ensure_active()?; }
 		let (payload, parsed) = match payload? {
@@ -3613,6 +3648,15 @@ async fn run_stream_body(
 				break;
 			}
 		};
+		if first_data && submission.as_ref().is_some_and(|submission| submission.is_deferred()) {
+			if let Some(retry_after) = deferred_busy_payload(&payload, false) {
+				submission.take().expect("receiver submission present").refuse_before_admission();
+				let mut error = StreamError::occ3_receiver_busy();
+				if let Some(seconds) = retry_after { error.value["retryAfterSecs"] = json!(seconds); }
+				return Err(error);
+			}
+		}
+		first_data = false;
 		if let Some(submission) = submission.as_mut() {
 			if submission.is_deferred() {
 				if let Some(envelope) = parse_occ3_terminal_envelope(&payload, parsed.as_ref())
@@ -6616,6 +6660,27 @@ mod message_tests {
 	// ------------------------------------------------------------------
 	// OCC3 keepalive stream extension: deferred-receipt transport framing
 	// ------------------------------------------------------------------
+
+	#[test]
+	fn deferred_busy_requires_bounded_typed_admission_error() {
+		let valid = json!({"error":{"type":"occ3_attachment_error","code":503,"message":"scheduler_busy","retryAfterSeconds":5}});
+		assert_eq!(deferred_busy_payload(&valid.to_string(), false), Some(Some(5)));
+		for (key, value) in [("type", json!("other")), ("code", json!(504)), ("code", json!("503")), ("message", json!("native_completion_failed"))] {
+			let mut invalid = valid.clone();
+			invalid["error"][key] = value;
+			assert_eq!(deferred_busy_payload(&invalid.to_string(), true), None);
+		}
+		for seconds in [json!(0), json!(31), json!(-1), json!("5")] {
+			let mut advisory = valid.clone();
+			advisory["error"]["retryAfterSeconds"] = seconds;
+			assert_eq!(deferred_busy_payload(&advisory.to_string(), true), Some(None));
+		}
+		let mut timeout = valid.clone();
+		timeout["error"]["message"] = json!("admission_timeout");
+		assert_eq!(deferred_busy_payload(&timeout.to_string(), false), None);
+		assert_eq!(deferred_busy_payload(&timeout.to_string(), true), Some(Some(5)));
+		assert_eq!(deferred_busy_payload(&"x".repeat(OCC3_BUSY_BODY_LIMIT + 1), true), None);
+	}
 
 	#[test]
 	fn keepalive_stream_defaults_enabled_and_honors_overrides() {

@@ -723,11 +723,12 @@ def attested_tree(tmp_path):
     return roots, value
 
 
-def test_startup_state_module_is_a_required_attested_plugin_member(attested_tree):
+@pytest.mark.parametrize("module", ["startup_state.py", "turn_diagnostics.py"])
+def test_runtime_module_is_a_required_attested_plugin_member(attested_tree, module):
     roots, value = attested_tree
-    assert "startup_state.py" in install._REQUIRED_PLUGIN
+    assert module in install._REQUIRED_PLUGIN
     value["files"] = [item for item in value["files"]
-                      if not (item["root"] == "occ3_sglang" and item["path"] == "startup_state.py")]
+                      if not (item["root"] == "occ3_sglang" and item["path"] == module)]
     with pytest.raises(install.InstallationError, match="source_attestation_incomplete"):
         install._verify_installed_sources(value, roots)
 

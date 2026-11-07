@@ -421,6 +421,7 @@ _REQUIRED_SGLANG = {
 }
 _REQUIRED_PLUGIN = {
     "native_install.py", "native_profile.py", "plugin.py", "chat_adapter.py",
+    "turn_diagnostics.py",
     "attachment_contract.py", "use_receipts.py", "latent_backend.py",
     "latent_control_api.py", "latent_worker.py", "latent_types.py",
     "latent_registry.py", "statebridge.py", "startup_state.py",

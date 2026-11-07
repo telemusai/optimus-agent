@@ -730,6 +730,8 @@ class ChatAttachmentAdapter:
                              error.code, error.status, ctx.dispatched)
             return self._error(error)
         except asyncio.CancelledError:
+            if ctx is not None and ctx.diagnostics is not None:
+                ctx.diagnostics.fail("cancelled", 499)
             raise
         except Exception as error:
             # Same bounded diagnostic contract as the native_completion_failed
@@ -1504,8 +1506,8 @@ class ChatAttachmentAdapter:
         Races the operation against the absolute turn deadline, the client
         disconnect (polled at the profile's disconnect interval, exactly like
         the buffered path's _guard) and the keepalive cadence. Keepalive
-        frames are yielded only while the operation is still pending; the
-        outcome is delivered through `box` because an async generator cannot
+        frames are yielded when due even across rapidly completed operations;
+        the outcome is delivered through `box` because an async generator cannot
         return a value to `async for`.
         """
         task = asyncio.ensure_future(awaitable)
@@ -1530,8 +1532,14 @@ class ChatAttachmentAdapter:
                     raise AttachmentError("client_disconnected", 499)
                 if asyncio.current_task().cancelling():
                     raise asyncio.CancelledError
+                # Check before consuming even an already-ready result: steady
+                # decode must not starve the shared client-visible cadence.
+                if now >= next_keepalive[0]:
+                    next_keepalive[0] = now + self.profile.keepalive_seconds
+                    yield _KEEPALIVE_FRAME
                 done, _ = await asyncio.wait(
-                    {task}, timeout=min(remaining, self.profile.disconnect_interval))
+                    {task}, timeout=min(remaining, self.profile.disconnect_interval,
+                                        max(0.0, next_keepalive[0] - now)))
                 if done:
                     if await ctx.raw_request.is_disconnected():
                         raise AttachmentError("client_disconnected", 499)
@@ -1544,10 +1552,6 @@ class ChatAttachmentAdapter:
                     except StopAsyncIteration:
                         box.stop = True
                     return
-                now = self.monotonic()
-                if now >= next_keepalive[0]:
-                    next_keepalive[0] = now + self.profile.keepalive_seconds
-                    yield _KEEPALIVE_FRAME
         except BaseException:
             ctx.cancel_requested = True
             raise
@@ -1782,6 +1786,7 @@ class ChatAttachmentAdapter:
             ctx.completed = True
             return
         except asyncio.CancelledError:
+            ctx.diagnostics.fail("cancelled", 499)
             raise
         except AttachmentError as error:
             ctx.diagnostics.fail(error.code, error.status)

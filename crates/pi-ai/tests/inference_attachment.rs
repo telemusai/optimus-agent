@@ -37,6 +37,7 @@ enum Reply {
     Status,
     /// Pre-event admission-unavailability 503 with this bounded code.
     Busy(&'static str),
+    Deferred(String),
     Redirect(String),
     Incomplete,
     Body(&'static str),
@@ -128,6 +129,9 @@ impl Fixture {
                         headers.push_str(&format!("{INFERENCE_RECEIPT_HEADER}: {encoded}\r\n"));
                     }
                 }
+                if matches!(reply, Reply::Deferred(_)) {
+                    headers = "x-optimus-occ3-deferred-receipt: deferred-v1\r\n".into();
+                }
                 let status = match &reply {
                     Reply::Status | Reply::Busy(_) => "503 Service Unavailable",
                     Reply::Redirect(destination) => {
@@ -137,7 +141,8 @@ impl Fixture {
                     _ => "200 OK",
                 };
                 let busy_body;
-                let body = match reply {
+                let body = match &reply {
+                    Reply::Deferred(body) => body.as_str(),
                     Reply::Busy(code) => {
                         busy_body = format!("{{\"error\":{{\"message\":\"{code}\",\"type\":\"occ3_attachment_error\",\"code\":503}}}}");
                         busy_body.as_str()
@@ -843,4 +848,49 @@ async fn attached_503_with_unknown_code_stays_uncertain() {
     assert!(!lease.refused_busy(), "an unknown 503 is not a busy refusal");
     assert_eq!(fixture.count(), 1);
   }
+}
+
+#[tokio::test]
+async fn deferred_receiver_busy_first_data_only() {
+    let busy = format!("data: {}\n\n", json!({"error":{"type":"occ3_attachment_error","code":503,"message":"scheduler_busy","retryAfterSeconds":5}}));
+    for (prefix, refused) in [(": occ3-keepalive\n\n", true), (PARTIAL, false)] {
+        let fixture = Fixture::new(Reply::Deferred(format!("{prefix}{busy}"))).await;
+        let lease = lease(&fixture.model);
+        let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let output = events(&stream).await;
+        assert!(output.iter().any(|e| matches!(e, AssistantMessageEvent::Error { .. })));
+        assert_eq!(lease.refused_busy(), refused);
+        if refused {
+            let details = error(&output).diagnostics.as_ref().unwrap().iter()
+                .find(|d| d.type_ == "provider_stream_failure").unwrap().details.as_ref().unwrap();
+            assert_eq!(details["providerErrorType"], "occ3_receiver_busy");
+            assert_eq!(details["retryAfterMs"], 5000.0);
+        }
+        assert_eq!(lease.state(), if refused { InferenceStateLeaseState::Cancelled } else { InferenceStateLeaseState::Uncertain });
+        assert_eq!(fixture.count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn default_receiver_offer_declined_uses_header_receipt() {
+    assert!(std::env::var_os("OCC3_KEEPALIVE_STREAM").is_none());
+    let fixture = Fixture::new(Reply::Good).await;
+    let lease = lease(&fixture.model);
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let output = events(&stream).await;
+    assert!(!output.iter().any(|e| matches!(e, AssistantMessageEvent::Error { .. })));
+    assert!(fixture.requests.lock().unwrap()[0].0.to_lowercase().contains("x-optimus-occ3-keepalive: keepalive-v1"));
+}
+
+#[tokio::test]
+async fn deferred_receiver_unknown_or_unaccepted_error_stays_uncertain() {
+    for reply in [Reply::Deferred("data: {\"error\":{\"type\":\"occ3_attachment_error\",\"code\":503,\"message\":\"unknown\"}}\n\n".into()),
+        Reply::Body("data: {\"error\":{\"type\":\"occ3_attachment_error\",\"code\":503,\"message\":\"scheduler_busy\"}}\n\n")] {
+        let fixture = Fixture::new(reply).await;
+        let lease = lease(&fixture.model);
+        let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let _ = events(&stream).await;
+        assert_eq!(lease.state(), InferenceStateLeaseState::Uncertain);
+        assert!(!lease.refused_busy());
+    }
 }

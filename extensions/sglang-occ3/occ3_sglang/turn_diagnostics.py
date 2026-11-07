@@ -1,10 +1,31 @@
 """Bounded, output-only native turn telemetry; never inspect request payloads."""
 import json
+from functools import wraps
 import logging
 import os
 import re
 
 LOG = logging.getLogger("occ3_sglang.turn_diagnostics")
+
+MAX_LOG_CHARS = 16 * 1024
+LOG_PREFIX = "occ3-bridge: native turn summary "
+
+
+def _isolated(method):
+    """Telemetry failures must never alter native completion or cleanup."""
+    @wraps(method)
+    def guarded(self, *args, **kwargs):
+        if self.disabled and method.__name__ != "emit":
+            return
+        try:
+            return method(self, *args, **kwargs)
+        except Exception:
+            self.disabled = True
+            self.pending = b""
+            # Fixed operation codes only: exception messages may contain output.
+            if self.diag_error is None:
+                self.diag_error = method.__name__ + "_failed"
+    return guarded
 
 
 class TurnDiagnostics:
@@ -30,9 +51,11 @@ class TurnDiagnostics:
         self.finish_reason = None
         self.pending = b""
         self.disabled = False
+        self.diag_error = None
         self.failure = None
         self.logged = False
 
+    @_isolated
     def inner_event(self):
         if self.first is None:
             self.first = self.clock() - self.started
@@ -42,6 +65,7 @@ class TurnDiagnostics:
         if self.failure is None:
             self.failure = (reason, status)
 
+    @_isolated
     def payload(self, value):
         """Read only renderer output fields, never arbitrary metadata."""
         if not isinstance(value, dict):
@@ -68,7 +92,7 @@ class TurnDiagnostics:
             if not isinstance(delta, dict):
                 continue
             for name, field in (("content", "content"), ("reasoning", "reasoning_content")):
-                text = delta.get(field, delta.get("reasoning") if name == "reasoning" else None)
+                text = delta.get(field, delta.get("reasoning", delta.get("reasoning_text")) if name == "reasoning" else None)
                 if not isinstance(text, str):
                     continue
                 self.chars[name] += len(text)
@@ -76,12 +100,11 @@ class TurnDiagnostics:
                     self.head[name] = (self.head[name] + text[:self.limit])[:self.limit]
                     self.tail[name] = (self.tail[name] + text[-self.limit:])[-self.limit:]
 
+    @_isolated
     def nonstream(self, body):
-        try:
-            self.payload(json.loads(body))
-        except (ValueError, TypeError, UnicodeError):
-            pass
+        self.payload(json.loads(body))
 
+    @_isolated
     def feed(self, chunk):
         """Parse inner SSE only, bounded independently of the protocol audit."""
         if self.disabled:
@@ -102,6 +125,7 @@ class TurnDiagnostics:
             if data and data != b"[DONE]":
                 self.nonstream(data)
 
+    @_isolated
     def emit(self, completed, deadline):
         """Called at the owning lifecycle exit, including abandoned responses."""
         if self.logged:
@@ -121,10 +145,19 @@ class TurnDiagnostics:
                    first_inner_event_seconds=self.first, event_count=self.events,
                    content_chars=self.chars["content"], reasoning_chars=self.chars["reasoning"],
                    completion_tokens=self.completion_tokens, reasoning_tokens=self.reasoning_tokens,
-                   finish_reason=self.finish_reason, output_parse_limited=self.disabled)
+                   finish_reason=self.finish_reason, output_parse_limited=self.disabled, diag_error=self.diag_error)
         if self.limit:
             row["text_limit"] = self.limit
             for name in self.chars:
                 row[name + "_first"] = self.head[name]
                 row[name + "_last"] = self.tail[name]
-        LOG.info("occ3-bridge: native turn summary %s", json.dumps(row, ensure_ascii=True, separators=(",", ":")))
+        encoded = json.dumps(row, ensure_ascii=True, separators=(",", ":"))
+        if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
+            for name in self.chars:
+                row.pop(name + "_first", None)
+                row.pop(name + "_last", None)
+            row["text_omitted_log_cap"] = True
+            encoded = json.dumps(row, ensure_ascii=True, separators=(",", ":"))
+        if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
+            encoded = '{"diag_error":"summary_size_limit"}'
+        LOG.info("%s%s", LOG_PREFIX, encoded)

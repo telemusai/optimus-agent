@@ -89,7 +89,7 @@ async def test_cut_summary(harness, caplog, keepalive, disconnect):
     from occ3_sglang.attachment_contract import KEEPALIVE_REQUEST_HEADER, KEEPALIVE_REQUEST_MODE
     caplog.set_level(logging.INFO)
     h = harness
-    h.adapter.profile = replace(h.adapter.profile, max_turn_seconds=.12, deadline_margin_seconds=.001,
+    h.adapter.profile = replace(h.adapter.profile, max_turn_seconds=.5, deadline_margin_seconds=.001,
                                 keepalive_seconds=.01)
     h.backend.required_seconds = .001
     gate = asyncio.Event()
@@ -100,6 +100,8 @@ async def test_cut_summary(harness, caplog, keepalive, disconnect):
             yield "data: " + json.dumps({"id": obj.rid, "choices": [{"index": 0,
                 "delta": {"content": "partial visible", "reasoning_content": "partial reasoning"},
                 "finish_reason": None}]}) + "\n\n"
+            # Resumption proves the consumer drained the partial frame.
+            h.chat.frames.append(b"partial-drained")
             await gate.wait()
     h.chat._generate_chat_stream = partial_stream
     raw, queue = raw_request(canonical({"occ3": attachment().wire()}))
@@ -111,8 +113,7 @@ async def test_cut_summary(harness, caplog, keepalive, disconnect):
             async for _ in response.body_iterator:
                 pass
     task = asyncio.create_task(run())
-    await spin_until(lambda: h.chat.frames)
-    await asyncio.sleep(.02)  # allow the partial renderer frame to reach the drain
+    await spin_until(lambda: len(h.chat.frames) >= 2)
     if disconnect:
         queue.put_nowait({"type": "http.disconnect"})
     await asyncio.wait_for(task, 2)
@@ -133,3 +134,62 @@ async def test_keepalive_success_summary(harness, caplog):
     row, = rows(caplog)
     assert row["reason"] == "complete" and row["keepalive"] is True
     assert row["reasoning_chars"] == len("fixture reasoning")
+
+
+@pytest.mark.parametrize("field", ["reasoning_content", "reasoning", "reasoning_text"])
+def test_reasoning_renderers(field):
+    d = TurnDiagnostics(lambda: 0, "attempt", "source", False)
+    d.nonstream(json.dumps({"choices": [{"message": {field: "thought"}}]}))
+    assert d.chars["reasoning"] == 7
+
+
+def test_recursive_json_isolated(caplog):
+    caplog.set_level(logging.INFO)
+    d = TurnDiagnostics(lambda: 0, "attempt", "source", False)
+    d.feed(b"data: " + b"[" * 2000 + b"0" + b"]" * 2000 + b"\n\n")
+    assert d.disabled and d.diag_error == "nonstream_failed"
+    d.feed(b'data: {"choices":[{"delta":{"content":"ignored"}}]}\n\n')
+    d.emit(True, 20)
+    row, = rows(caplog)
+    assert row["reason"] == "complete"
+    assert row["diag_error"] == "nonstream_failed"
+    assert row["content_chars"] == 0
+
+
+@pytest.mark.parametrize("operation", ["inner_event", "feed", "nonstream", "emit"])
+def test_diagnostic_fault_isolated(monkeypatch, operation):
+    from occ3_sglang import turn_diagnostics as module
+    d = TurnDiagnostics(lambda: 0, "attempt", "source", False)
+    def fail(*args, **kwargs):
+        raise RuntimeError("PRIVATE_EXCEPTION_SENTINEL")
+    if operation == "inner_event":
+        d.clock = fail
+        d.inner_event()
+    elif operation == "feed":
+        monkeypatch.setattr(module.re, "search", fail)
+        d.feed(b"data: {}\n\n")
+    elif operation == "nonstream":
+        monkeypatch.setattr(module.json, "loads", fail)
+        d.nonstream(b"{}")
+    else:
+        monkeypatch.setattr(module.LOG, "info", fail)
+        d.emit(True, 20)
+        d.emit(True, 20)
+        assert d.logged
+    assert d.disabled and d.diag_error == operation + "_failed"
+    assert "PRIVATE" not in d.diag_error
+
+
+def test_log_line_cap(monkeypatch, caplog):
+    from occ3_sglang.turn_diagnostics import MAX_LOG_CHARS
+    monkeypatch.setenv("OCC3_DIAG_TURN_TEXT", "4096")
+    caplog.set_level(logging.INFO)
+    d = TurnDiagnostics(lambda: 0, "attempt", "source", False)
+    d.payload({"choices": [{"delta": {"content": "\U0001f600" * 4096,
+                                      "reasoning_text": "\U0001f600" * 4096}}]})
+    d.emit(True, 20)
+    row, = rows(caplog)
+    assert row["text_omitted_log_cap"] is True
+    assert "content_first" not in row and "reasoning_last" not in row
+    assert row["content_chars"] == row["reasoning_chars"] == 4096
+    assert len(caplog.records[-1].message) <= MAX_LOG_CHARS

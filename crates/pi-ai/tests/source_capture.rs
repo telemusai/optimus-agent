@@ -1051,3 +1051,57 @@ async fn source_busy_resend_respects_lease_deadline() {
     assert_eq!(lease.state(), SourceCaptureState::Cancelled);
     assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, Some(3));
 }
+
+#[tokio::test]
+async fn deferred_source_busy_is_proven_non_use() {
+    for code in ["scheduler_busy", "admission_capacity", "occ3_busy_batch", "admission_timeout"] {
+        let body = format!(": occ3-keepalive\n\ndata: {}\n\n", json!({"error":{"type":"occ3_attachment_error","code":503,"message":code,"retryAfterSeconds":5}}));
+        let fixture = Fixture::new(Reply::Refusal("200 OK", body,
+            "x-optimus-occ3-deferred-receipt: deferred-v1\r\n")).await;
+        let lease = fixture.lease();
+        let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let events = collect(&stream).await;
+        assert_eq!(failure_details(&events)["providerErrorType"], "occ3_source_busy");
+        assert_eq!(lease.state(), SourceCaptureState::Cancelled);
+        assert_eq!(lease.busy_refusal().unwrap().retry_after_secs, Some(5));
+        assert!(lease.receipt().is_none());
+        assert_eq!(fixture.count(), 1);
+    }
+}
+
+#[tokio::test]
+async fn default_source_offer_declined_uses_header_receipt() {
+    assert!(std::env::var_os("OCC3_KEEPALIVE_STREAM").is_none());
+    let fixture = Fixture::new(Reply::Good).await;
+    let lease = fixture.lease();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let _ = collect(&stream).await;
+    assert!(lease.receipt().is_some());
+    assert!(fixture.requests.lock().unwrap()[0].0.to_lowercase().contains("x-optimus-occ3-keepalive: keepalive-v1"));
+}
+
+#[tokio::test]
+async fn deferred_source_error_after_data_stays_uncertain() {
+    let busy = json!({"error":{"type":"occ3_attachment_error","code":503,"message":"scheduler_busy"}});
+    let body = format!("data: {{\"choices\":[]}}\n\ndata: {busy}\n\n");
+    let fixture = Fixture::new(Reply::Refusal("200 OK", body,
+        "x-optimus-occ3-deferred-receipt: deferred-v1\r\n")).await;
+    let lease = fixture.lease();
+    let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+    let _ = collect(&stream).await;
+    assert_eq!(lease.state(), SourceCaptureState::Uncertain);
+    assert!(lease.busy_refusal().is_none());
+}
+
+#[tokio::test]
+async fn deferred_source_unknown_or_unaccepted_error_stays_uncertain() {
+    for (code, headers) in [("unknown", "x-optimus-occ3-deferred-receipt: deferred-v1\r\n"), ("scheduler_busy", "")] {
+        let body = format!("data: {}\n\n", json!({"error":{"type":"occ3_attachment_error","code":503,"message":code}}));
+        let fixture = Fixture::new(Reply::Refusal("200 OK", body, headers)).await;
+        let lease = fixture.lease();
+        let stream = stream_openai_completions(&fixture.model, &context(), Some(options(Some(lease.clone()))));
+        let _ = collect(&stream).await;
+        assert_eq!(lease.state(), SourceCaptureState::Uncertain);
+        assert!(lease.busy_refusal().is_none());
+    }
+}
