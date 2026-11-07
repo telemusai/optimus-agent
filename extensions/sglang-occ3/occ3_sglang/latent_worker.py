@@ -20,6 +20,7 @@ from .attachment_contract import (CAPTURE_MODE_CONTENT_ONLY, CaptureWorkerDescri
                                     SPAN_POLICIES_V2, digest)
 from .span_policy import marker_table_from_wire, select_span_v2
 from .latent_registry import LatentRegistry
+from .latent_types import admission_probe
 from .latent_types import (LatentError, UniformRequestCancellation, Publication, RequestSlice, RuntimeProfile, require_members,
                            SessionEnrollment, decode_descriptor, require,
                            validate_control_payload)
@@ -637,6 +638,8 @@ class WorkerRuntime:
         try:
             value = check()
         except Exception as exc:
+            from .turn_diagnostics import log_failure
+            log_failure(exc, phase="worker_control")
             declined = exc if isinstance(exc, LatentError) else None
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"phase": phase, "request": request_binding, "binding": value, "error": error})
@@ -685,11 +688,11 @@ class WorkerRuntime:
     def capture_budget(self, count, span_policy=SPAN_POLICY_V1):
         # Fixed ring + terminal ordered H/E/Z + stage/safe gather/dtype cast margin.
         # Small alignment solver workspace is separately reserved by profile.
-        require(count in (8, 16, 32, 64, 128) and count <= self.profile.max_prefix_tokens, "profile")
-        require(span_policy in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2, "profile")
+        require(count in (8, 16, 32, 64, 128) and count <= self.profile.max_prefix_tokens, "profile", detail="latent_worker.capture_budget.prefix_count")
+        require(span_policy in (SPAN_POLICY_V1,) + SPAN_POLICIES_V2, "profile", detail="latent_worker.capture_budget.span_policy")
         require(workspace_bound(count, self.profile.hidden_dim, self.profile.expected_ranks,
                                 self.profile.tile_rows, self.profile.anchor_alpha)
-                <= self.profile.workspace_bytes, "quota")
+                <= self.profile.workspace_bytes, "quota", detail="latent_worker.capture_budget.workspace_capacity")
         charge = (5 * count + 32) * self.profile.hidden_dim * self.element_size + (4 * count + 64) * 8
         if span_policy in SPAN_POLICIES_V2:
             # The v2 content buffer stores the same row capacity again (hidden
@@ -698,6 +701,7 @@ class WorkerRuntime:
             charge += count * self.profile.hidden_dim * self.element_size + 2 * count * 8
         return self.profile.expected_ranks * charge
 
+    @admission_probe("worker_control")
     def control(self, envelope):
         command = validate_control_payload(envelope)
         command_id, op, payload = command["command_id"], command["operation"], command["payload"]
@@ -785,6 +789,8 @@ class WorkerRuntime:
             else:
                 raise LatentError("invalid")
         except Exception as exc:
+            from .turn_diagnostics import log_failure
+            log_failure(exc, phase="worker_control")
             error = exc.code if isinstance(exc, LatentError) else "latent_failed"
         outcomes = self.gather({"error": error, "result": result})
         if any(item != outcomes[0] for item in outcomes):
@@ -1016,6 +1022,7 @@ def prepare_batch(scheduler, batch):
     batch.occ3_context, batch.occ3_force_eager = prepared["context"], True
 
 
+@admission_probe("worker_admit")
 def admit_request(scheduler, req, value):
     if value is None:
         return
@@ -1023,15 +1030,15 @@ def admit_request(scheduler, req, value):
     prepared = {}
     def validate():
         descriptor = decode_descriptor(value)
-        require(req.rid == descriptor.native_rid and not req.output_ids, "identity")
+        require(req.rid == descriptor.native_rid and not req.output_ids, "identity", detail="latent_worker.admit_request.request_identity")
         record = runtime.resolve(descriptor, check_deadline=True)
         if type(descriptor) is CaptureWorkerDescriptor:
-            require(record.state == "reserved" and not record.admitted_capture, "replay")
+            require(record.state == "reserved" and not record.admitted_capture, "replay", detail="latent_worker.admit_request.capture_reserved")
         else:
-            require(record.state == "leased" and not record.admitted_consume, "replay")
-        require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile")
-        require(getattr(req, "positional_embed_overrides", None) is None, "profile")
-        require(getattr(req, "occ3_worker_descriptor", None) is None, "replay")
+            require(record.state == "leased" and not record.admitted_consume, "replay", detail="latent_worker.admit_request.consume_leased")
+        require(getattr(req, "session", None) is None and getattr(req, "multimodal_inputs", None) is None, "profile", detail="latent_worker.admit_request.request_shape")
+        require(getattr(req, "positional_embed_overrides", None) is None, "profile", detail="latent_worker.admit_request.embedding_override")
+        require(getattr(req, "occ3_worker_descriptor", None) is None, "replay", detail="latent_worker.admit_request.already_attached")
         # Busy-batch admission bound, capture only: a capture turn runs as an
         # isolated eager cohort for its whole decode (its rows end at the stop
         # row), so ordinary inflight work must drain first. Parking it would
@@ -1053,9 +1060,9 @@ def admit_request(scheduler, req, value):
                   if not (callable(getattr(held, "finished", None))
                           and held.finished())]
         if type(descriptor) is CaptureWorkerDescriptor:
-            require(not active, "quota")
+            require(not active, "quota", detail="latent_worker.admit_request.capture_inflight")
         else:
-            require(not any(getattr(held, "occ3_force_eager", False) for held in active), "quota")
+            require(not any(getattr(held, "occ3_force_eager", False) for held in active), "quota", detail="latent_worker.admit_request.consume_eager_inflight")
         original = req.origin_input_ids
         new_ids = original
         span_markers, content_state = None, None
@@ -1066,7 +1073,7 @@ def admit_request(scheduler, req, value):
             params = getattr(req, "sampling_params", None)
             span_markers = marker_table_from_wire(getattr(params, "custom_params", None))
             require(span_markers[0].profile == descriptor.marker_profile
-                    and span_markers[0].roundtrip_attested, "profile")
+                    and span_markers[0].roundtrip_attested, "profile", detail="latent_worker.admit_request.marker_attestation")
             # Capacity decline ("profile") fires here, inside the preflight, so a
             # marker set that would leave no content slot never enters a turn.
             content_state = _ContentState(span_markers[0], span_markers[1],
@@ -1076,7 +1083,7 @@ def admit_request(scheduler, req, value):
         if type(descriptor) is ConsumeWorkerDescriptor:
             count = descriptor.expected_prefix_tokens
             at = descriptor.prefix_offset
-            require(0 <= at <= len(original), "profile")
+            require(0 <= at <= len(original), "profile", detail="latent_worker.admit_request.prefix_offset")
             holes = [0] * count
             if isinstance(original, array):
                 new_ids = original[:at] + array(original.typecode, holes) + original[at:]
@@ -1085,7 +1092,7 @@ def admit_request(scheduler, req, value):
             # Pre-use capacity floor: a consume that cannot get a request slot
             # or KV for its rewritten prompt would park until the queue bound
             # and end in a dispatched, non-releasable admission_timeout.
-            require(_consume_capacity_available(scheduler, len(new_ids)), "quota")
+            require(_consume_capacity_available(scheduler, len(new_ids)), "quota", detail="latent_worker.admit_request.consume_capacity")
             # Fail closed before any mutation: without the indexer pin, prefix
             # rows beyond the sparse top-k may be dropped from attention and a
             # completed-use receipt would be false. Inputs are rank-uniform
@@ -1096,7 +1103,7 @@ def admit_request(scheduler, req, value):
             require(not _sparse_pin_required(
                 runtime, len(new_ids),
                 max_new_tokens=getattr(getattr(req, "sampling_params", None), "max_new_tokens", None),
-                max_context=_scheduler_max_context(scheduler)), "profile")
+                max_context=_scheduler_max_context(scheduler)), "profile", detail="latent_worker.admit_request.sparse_pin")
             if getattr(runtime, "dsa_pin_active", False) is True:
                 _require_pin_fits(runtime, count)
         prepared.update(descriptor=descriptor, record=record, new_ids=new_ids,
@@ -1842,6 +1849,7 @@ def fence_private_kv_release(scheduler, req):
         raise
 
 
+@admission_probe("worker_abort")
 def abort_request(scheduler, req, reason):
     descriptor = getattr(req, "occ3_worker_descriptor", None)
     if descriptor is None or getattr(req, "occ3_abort_done", False):

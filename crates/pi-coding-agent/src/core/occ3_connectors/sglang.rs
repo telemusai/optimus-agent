@@ -421,7 +421,41 @@ pub(crate) fn native_digest(value: &str) -> bool {
             .bytes()
             .all(|v| v.is_ascii_digit() || (b'a'..=b'f').contains(&v))
 }
+// Literal-only reason codes preserve short-circuit validation and emit at most
+// one value-free event per failed check group. Diagnostics cannot change errors.
+macro_rules! native_binding_failed {
+    ($stage:literal; $($reason:literal => $failed:expr),+ $(,)?) => {{
+        false $(|| if $failed {
+            native_binding_diagnostic($stage, $reason);
+            true
+        } else {
+            false
+        })+
+    }};
+}
+
+fn native_binding_diagnostic(stage: &'static str, reason: &'static str) {
+    // Also protect against a broken console fallback, not only a sink panic.
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.sglang").warn(
+            "native_binding_rejected",
+            Some(serde_json::Map::from_iter([
+                ("stage".into(), Value::from(stage)),
+                ("reason".into(), Value::from(reason)),
+            ])),
+        );
+    });
+}
+
+#[track_caller]
 fn native_invalid() -> Occ3Error {
+    let line = std::panic::Location::caller().line();
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.sglang").warn(
+            "native_binding_invalid_site",
+            Some(serde_json::Map::from_iter([("line".into(), Value::from(line))])),
+        );
+    });
     Occ3Error::TransferFailed {
         reason: "native control binding invalid".into(),
     }
@@ -539,28 +573,30 @@ impl SglangOcc3Connector {
         use crate::core::occ::occ3::connector::NativeSessionEnrollment;
         let fingerprint = permit.identity.fingerprint();
         let ready = &response.readiness;
-        if response.schema != "occ3.sessions.enrolled.v1"
-            || response.operation_id != operation_id
-            || response.session_id != session_id
-            || !native_digest(&response.principal_digest)
-            || response.runtime_id != permit.runtime_id
-            || response.runtime_generation != permit.runtime_generation
-            || response.model_fingerprint != fingerprint
-            || response.expires_at_epoch != permit.expires_at_epoch
-            || ready.runtime_epoch != permit.runtime_id
-            || ready.runtime_generation != permit.runtime_generation
-            || ready.model_fingerprint != fingerprint
-            || ready.method_id != permit.identity.latent_method
-            || ready.expected_ranks != permit.source_profile.expected_ranks
-            || ready.ready_ranks != ready.expected_ranks
-            || ready.tp_layout_digest != permit.source_profile.layout_digest
-            || ready.hidden_dim != permit.source_profile.hidden_dim
-            || ready.layer_index != permit.source_profile.layer_index
-            || ready.dtype != permit.source_profile.dtype
-            || ready.profile_digest != permit.profile_digest
-            || !ready.source_capture
-            || !ready.continuous_prefix
-            || !ready.terminal_journal
+        if native_binding_failed!("enrollment";
+            "schema" => response.schema != "occ3.sessions.enrolled.v1",
+            "operation_id" => response.operation_id != operation_id,
+            "session_id" => response.session_id != session_id,
+            "principal_digest" => !native_digest(&response.principal_digest),
+            "runtime_id" => response.runtime_id != permit.runtime_id,
+            "runtime_generation" => response.runtime_generation != permit.runtime_generation,
+            "model_fingerprint" => response.model_fingerprint != fingerprint,
+            "expires_at_epoch" => response.expires_at_epoch != permit.expires_at_epoch,
+            "readiness.runtime_epoch" => ready.runtime_epoch != permit.runtime_id,
+            "readiness.runtime_generation" => ready.runtime_generation != permit.runtime_generation,
+            "readiness.model_fingerprint" => ready.model_fingerprint != fingerprint,
+            "readiness.method_id" => ready.method_id != permit.identity.latent_method,
+            "readiness.expected_ranks" => ready.expected_ranks != permit.source_profile.expected_ranks,
+            "readiness.ready_ranks" => ready.ready_ranks != ready.expected_ranks,
+            "readiness.tp_layout_digest" => ready.tp_layout_digest != permit.source_profile.layout_digest,
+            "readiness.hidden_dim" => ready.hidden_dim != permit.source_profile.hidden_dim,
+            "readiness.layer_index" => ready.layer_index != permit.source_profile.layer_index,
+            "readiness.dtype" => ready.dtype != permit.source_profile.dtype,
+            "readiness.profile_digest" => ready.profile_digest != permit.profile_digest,
+            "readiness.source_capture" => !ready.source_capture,
+            "readiness.continuous_prefix" => !ready.continuous_prefix,
+            "readiness.terminal_journal" => !ready.terminal_journal,
+        )
         {
             return Err(native_invalid());
         }
@@ -805,7 +841,10 @@ impl Occ3Connector for SglangOcc3Connector {
         use pi_ai::source_capture::*;
         let enrolled = self.enroll(session_id).await?;
         let permit = &self.experiment()?.permit;
-        if target != permit.target || max_capture_bytes > permit.max_capture_bytes {
+        if native_binding_failed!("capture";
+            "target" => target != permit.target,
+            "capture_budget" => max_capture_bytes > permit.max_capture_bytes,
+        ) {
             return Err(native_invalid());
         }
         // v2 (content_tail_v2) is the default arming: only a v2 capture yields
@@ -877,16 +916,18 @@ impl Occ3Connector for SglangOcc3Connector {
                     && request.source.tool_bindings().is_empty()
             }
         };
-        if !native_id(&request.message_id)
-            || request.message_id.len() > 128
-            || !native_id(&request.publication_id)
-            || !dispatch_valid
-            || intent.model_fingerprint != native.permit.identity.fingerprint()
-            || intent.runtime_id != native.permit.runtime_id
-            || intent.runtime_generation != native.permit.runtime_generation
-            || intent.method != native.permit.identity.latent_method
-            || request.source.target() != &native.permit.target
-            || receipt.expires_at_epoch <= native_now()
+        if native_binding_failed!("publish_source";
+            "message_id" => !native_id(&request.message_id),
+            "message_id_length" => request.message_id.len() > 128,
+            "publication_id" => !native_id(&request.publication_id),
+            "dispatch_binding" => !dispatch_valid,
+            "model_fingerprint" => intent.model_fingerprint != native.permit.identity.fingerprint(),
+            "runtime_id" => intent.runtime_id != native.permit.runtime_id,
+            "runtime_generation" => intent.runtime_generation != native.permit.runtime_generation,
+            "method" => intent.method != native.permit.identity.latent_method,
+            "target" => request.source.target() != &native.permit.target,
+            "receipt_expired" => receipt.expires_at_epoch <= native_now(),
+        )
         {
             return Err(native_invalid());
         }
@@ -1027,8 +1068,10 @@ impl Occ3Connector for SglangOcc3Connector {
     ) -> Result<pi_ai::inference_attachment::InferenceStateLease, Occ3Error> {
         use crate::core::occ::occ3::inference::{inference_attachment, VerifiedInferenceRuntime};
         let native = self.experiment()?;
-        if request.target != native.permit.target
-            || request.receiver_identity != native.permit.identity
+        if native_binding_failed!("prepare_inference";
+            "target" => request.target != native.permit.target,
+            "receiver_identity" => request.receiver_identity != native.permit.identity,
+        )
         {
             return Err(native_invalid());
         }
@@ -1071,9 +1114,11 @@ impl Occ3Connector for SglangOcc3Connector {
         let native = self.native.as_ref().ok_or_else(native_unsupported)?;
         let intent = source.intent();
         let receipt = source.retirement_receipt().ok_or_else(native_invalid)?;
-        if intent.runtime_id != native.permit.runtime_id
-            || intent.runtime_generation != native.permit.runtime_generation
-            || intent.model_fingerprint != native.permit.identity.fingerprint()
+        if native_binding_failed!("retire";
+            "runtime_id" => intent.runtime_id != native.permit.runtime_id,
+            "runtime_generation" => intent.runtime_generation != native.permit.runtime_generation,
+            "model_fingerprint" => intent.model_fingerprint != native.permit.identity.fingerprint(),
+        )
         {
             return Err(native_invalid());
         }
@@ -1224,6 +1269,47 @@ impl Occ3Connector for SglangOcc3Connector {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_binding_diagnostics_are_fixed_bounded_and_exception_safe() {
+        use std::sync::{Arc, Mutex};
+        struct ResetSink;
+        impl Drop for ResetSink {
+            fn drop(&mut self) {
+                pi_ai::log::set_log_sink(None);
+            }
+        }
+        let _reset = ResetSink;
+        let entries = Arc::new(Mutex::new(Vec::new()));
+        let captured = entries.clone();
+        pi_ai::log::set_log_sink(Some(Box::new(move |entry| {
+            captured.lock().unwrap().push(entry.clone());
+        })));
+        let secret = "synthetic-private-binding-value";
+        assert!(native_binding_failed!("test";
+            "runtime_id" => secret != "expected",
+            "must_not_run" => { assert!(false, "short circuit changed"); false }
+        ));
+        assert!(!native_binding_failed!("test"; "valid" => false));
+        let values = entries.lock().unwrap();
+        assert_eq!(values.len(), 1);
+        assert_eq!(values[0]["stage"], "test");
+        assert_eq!(values[0]["reason"], "runtime_id");
+        assert_eq!(values[0]["msg"], "native_binding_rejected");
+        let encoded = values[0].to_string();
+        assert!(encoded.len() < 256);
+        assert!(!encoded.contains(secret));
+        drop(values);
+        pi_ai::log::set_log_sink(Some(Box::new(|_| panic!("broken test sink"))));
+        let result = std::panic::catch_unwind(|| {
+            if native_binding_failed!("test"; "runtime_id" => true) {
+                return Err::<(), _>(native_invalid());
+            }
+            Ok(())
+        }).expect("diagnostics must not escape");
+        assert!(matches!(result, Err(Occ3Error::TransferFailed { reason })
+            if reason == "native control binding invalid"));
+    }
 
     // TS12 live regression: the deployed server (PR #200 baseline) carries
     // `max_capture_bytes` in the enrollment readiness payload. Captured

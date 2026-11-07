@@ -31,7 +31,8 @@ IDENTITY_FIELDS = {"schema", "runtime_id", "runtime_generation", "model_fingerpr
 STATUS_KEYS = {"schema", "state", "code", "stage", "attempt", "experimental_selected",
     "preflight_reached", "backend_constructed", "worker_readiness_reached",
     "hooks_prepared", "route_mount_attempted", "rollback_completed", "plugin",
-    "version", "enabled", "model_fingerprint", "channels", "metrics"}
+    "version", "enabled", "model_fingerprint", "channels", "metrics",
+    "parallel_handoff_diagnostics"}
 CAPABILITY_KEYS = {"schema", "supported", "reason", "experimental_prompt_kv_path",
     "model_fingerprint", "connector_id", "methods", "experimental_baselines",
     "protocol", "api_version", "same_model_only", "verification", "cache", "native"}

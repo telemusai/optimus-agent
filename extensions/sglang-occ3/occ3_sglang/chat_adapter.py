@@ -32,7 +32,8 @@ from .prefix_layout import (LAYOUT_PREPEND, PREFIX_MARKER, PrefixLayout, resolve
                             resolve_prefix_layout)
 from .span_markers import resolve_user_role_id
 from . import metrics as _metrics
-from .turn_diagnostics import TurnDiagnostics
+from .turn_diagnostics import TurnDiagnostics, log_failure
+from .latent_types import admission_probe
 from .use_receipts import (
     NativeCompletion, NativeOutputAudit, TerminalOutputAudit, TerminalUseEvidence,
     receipt_bytes, terminal_envelope, terminal_event_bytes,
@@ -586,6 +587,7 @@ class ChatAttachmentAdapter:
             function = getattr(function, "__wrapped__", None)
         return False
 
+    @admission_probe("frontend_charge")
     def _charge(self, ctx):
         profile = self.profile
         if (self._active >= profile.max_active
@@ -599,6 +601,7 @@ class ChatAttachmentAdapter:
         self._active += 1
         ctx.charged = True
 
+    @admission_probe("frontend_release")
     def _release(self, ctx):
         if ctx.charged:
             self._active -= 1
@@ -718,6 +721,7 @@ class ChatAttachmentAdapter:
             return await self._guard(
                 self._authorize_and_run(original, serving, request, raw_request, ctx), ctx)
         except AttachmentError as error:
+            log_failure(error, ctx, "admission")
             if ctx is not None:
                 if ctx.diagnostics is not None:
                     ctx.diagnostics.fail(error.code, error.status)
@@ -735,10 +739,9 @@ class ChatAttachmentAdapter:
             raise
         except Exception as error:
             # Same bounded diagnostic contract as the native_completion_failed
-            # seam: exception class name only, never payloads, identifiers or
+            # seam: fixed codes and source locations only, never identifiers or
             # handles. The public response stays a fixed generic code.
-            logger.error("occ3-bridge: native turn failed (inner=%s)",
-                         type(error).__name__)
+            log_failure(error, ctx, "admission")
             if ctx is not None and ctx.diagnostics is not None:
                 ctx.diagnostics.fail("native_completion_failed", 409)
             return self._error(AttachmentError())
@@ -1208,7 +1211,7 @@ class ChatAttachmentAdapter:
             # Unexpected non-abort failures also fold into the generic 409; record
             # the bounded exception class server-side so live refusals caused by
             # adapter/engine defects are diagnosable offline (no payload logged).
-            logger.error("occ3-bridge: native turn failed (class=%s)", type(exc).__name__)
+            log_failure(exc, ctx, "native_iterator")
             raise AttachmentError() from None
 
     async def _run(self, original, serving, request, raw_request, ctx):
@@ -1789,6 +1792,7 @@ class ChatAttachmentAdapter:
             ctx.diagnostics.fail("cancelled", 499)
             raise
         except AttachmentError as error:
+            log_failure(error, ctx, "terminal" if ctx.terminal_mode else "keepalive")
             ctx.diagnostics.fail(error.code, error.status)
             # The response already started, so the bounded refusal that the
             # buffered path would have answered with an HTTP status becomes
@@ -1797,8 +1801,7 @@ class ChatAttachmentAdapter:
         except Exception as error:
             # Unexpected failures fold into the same generic event; the
             # bounded class name is recorded server-side only.
-            logger.error("occ3-bridge: native turn failed (inner=%s)",
-                         type(error).__name__)
+            log_failure(error, ctx, "keepalive")
             ctx.diagnostics.fail("native_completion_failed", 409)
             yield self._stream_error_event(AttachmentError())
         finally:
@@ -1888,6 +1891,7 @@ class ChatAttachmentAdapter:
         except Exception:
             return None
 
+    @admission_probe("terminal_release")
     def _release_terminal(self, ctx):
         """Exactly-once terminal charge release, guarded per context.
 
@@ -2242,9 +2246,11 @@ class ChatAttachmentAdapter:
             # still-open ASGI emission) decides, in the settle/finally path.
             return
         except AttachmentError as error:
+            log_failure(error, ctx, "terminal" if ctx.terminal_mode else "keepalive")
             ctx.diagnostics.fail(error.code, error.status)
             raise
-        except Exception:
+        except Exception as error:
+            log_failure(error, ctx, "terminal")
             ctx.diagnostics.fail("native_completion_failed", 409)
             raise
         except asyncio.CancelledError:

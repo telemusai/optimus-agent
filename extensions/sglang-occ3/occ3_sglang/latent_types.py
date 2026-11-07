@@ -3,6 +3,12 @@ from __future__ import annotations
 
 import ast
 import math
+import inspect
+import json
+import logging
+import threading
+from functools import wraps
+from contextlib import contextmanager
 import os
 import re
 import sys
@@ -21,8 +27,179 @@ _REGISTRY_SOURCE_LIMIT = 2 * 1024 * 1024
 _METHOD_TABLE = {"method_id", "requires_calibration_artifact"}
 
 
+# Only source-defined detail tags may leave the worker. No request-derived strings.
+_ADMISSION_DETAILS = frozenset((
+    'latent_registry.reserve_capture.descriptor_type',
+    'latent_registry.reserve_capture.method_deadline',
+    'latent_registry.reserve_capture.budget_owner_expiry',
+    'latent_registry.reserve_capture.existing_attempt',
+    'latent_registry.reserve_capture.tombstone_replay',
+    'latent_registry.reserve_capture.record_capacity',
+    'latent_registry.reserve_capture.tombstone_capacity',
+    'latent_registry.reserve_capture.active_slot',
+    'latent_registry.reserve_capture.byte_capacity',
+    'latent_worker.admit_request.request_identity',
+    'latent_worker.admit_request.capture_reserved',
+    'latent_worker.admit_request.consume_leased',
+    'latent_worker.admit_request.request_shape',
+    'latent_worker.admit_request.embedding_override',
+    'latent_worker.admit_request.already_attached',
+    'latent_worker.admit_request.capture_inflight',
+    'latent_worker.admit_request.consume_eager_inflight',
+    'latent_worker.admit_request.marker_attestation',
+    'latent_worker.admit_request.prefix_offset',
+    'latent_worker.admit_request.consume_capacity',
+    'latent_worker.admit_request.sparse_pin',
+    'latent_worker.capture_budget.prefix_count',
+    'latent_worker.capture_budget.span_policy',
+    'latent_worker.capture_budget.workspace_capacity',
+    'latent_backend._slot.attempt_slot',
+    'latent_backend._reservation.native_identity',
+    'latent_backend._reservation.native_bounds',
+    'latent_backend.enroll_source.profile_identity',
+    'latent_backend.enroll_source.retained_limit',
+    'latent_backend.enroll_source.source_request_identity',
+    'latent_backend.prepare_source.source_reservation',
+))
+_ADMISSION_OPERATIONS = frozenset(("reserve_capture", "reserve_consume", "release_lease",
+    "retire", "reap", "worker_admit", "enroll_source", "prepare_source",
+    "release_unused", "backend_retire", "frontend_charge", "frontend_release",
+    "terminal_release", "worker_abort", "worker_control", "finish_source"))
+_ADMISSION_LOCK = threading.Lock()
+_ADMISSION_COUNTS = {}
+_ADMISSION_LOGS = 0
+_ADMISSION_LAST = {}
+
+
+def admission_diagnostics_snapshot():
+    """Process-local counters only; not a cross-rank status or proof of release."""
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return {}
+        with _ADMISSION_LOCK:
+            return {"counts": dict(_ADMISSION_COUNTS), "logged": _ADMISSION_LOGS,
+                    "last": {k: dict(v) for k, v in _ADMISSION_LAST.items()}}
+    except Exception:
+        return {}
+
+
+def admission_event(operation, outcome, *, registry=None, error=None, owner=None):
+    """Bounded scalar-only diagnostics; failures never alter admission/cleanup."""
+    global _ADMISSION_LOGS
+    try:
+        if os.environ.get("OCC3_DIAG_TOKEN_TRACE") != "1":
+            return
+        if operation not in _ADMISSION_OPERATIONS or outcome not in ("entry", "exit", "error"):
+            return
+        row = {"operation": operation, "outcome": outcome}
+        if isinstance(error, LatentError):
+            row.update(code=error.code, detail=error.detail)
+        if registry is not None:
+            with registry.lock:
+                records = tuple(registry.records.values())
+                row.update(active=sum(not r.revoked and r.state in
+                    ("reserved", "capturing", "leased", "injected") for r in records),
+                    max_active=registry.profile.max_active, total=len(records),
+                    max_records=registry.profile.max_records,
+                    inflight=sum(r.inflight for r in records),
+                    reservation=sum(not r.revoked and r.state == "reserved" for r in records),
+                    charged_bytes=registry.charged_bytes,
+                    max_live_bytes=registry.profile.max_live_bytes,
+                    revoked=sum(r.revoked for r in records),
+                    gpu_freed=sum(r.gpu_freed for r in records),
+                    retained_rows=sum(len(r.retained) for r in records),
+                    admitted_capture=sum(r.admitted_capture for r in records),
+                    admitted_consume=sum(r.admitted_consume for r in records),
+                    leased=sum(not r.revoked and r.state == "leased" for r in records),
+                    capturing=sum(not r.revoked and r.state == "capturing" for r in records))
+        if owner is not None:
+            if hasattr(owner, "_active"):
+                row.update(active=owner._active, max_active=owner.profile.max_active,
+                           terminal_active=owner._terminal_active,
+                           terminal_attempts=len(owner._terminal_attempts))
+            if hasattr(owner, "attempts"):
+                row["attempts"] = len(owner.attempts)
+            control = getattr(owner, "control", None)
+            if hasattr(control, "pending"):
+                row.update(pending=len(control.pending), uncertain=len(control._uncertain),
+                           operations=len(control._operations))
+            if hasattr(owner, "poisoned"):
+                row["poisoned"] = bool(owner.poisoned)
+                row["commands"] = len(owner.commands)
+        with _ADMISSION_LOCK:
+            _ADMISSION_LAST[operation] = dict(row)
+            key = operation + "." + outcome
+            _ADMISSION_COUNTS[key] = min(2**63 - 1, _ADMISSION_COUNTS.get(key, 0) + 1)
+            _ADMISSION_LOGS = min(2**63 - 1, _ADMISSION_LOGS + 1)
+        logging.getLogger("occ3_sglang.admission").info(
+            "occ3-bridge: admission %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass
+
+
+def admission_probe(operation, *, registry=False):
+    """Count entries and every exit, including cancellation, without inspecting args."""
+    def decorate(function):
+        def event(args, outcome, error=None):
+            try:
+                owner = args[0]
+                runtime = getattr(owner, "occ3_runtime", None)
+                owner = runtime if runtime is not None else owner
+                reg = owner if registry else getattr(owner, "registry", None)
+                admission_event(operation, outcome, registry=reg, error=error, owner=owner)
+                if error is not None:
+                    from .turn_diagnostics import log_failure
+                    log_failure(error, phase="admission")
+            except Exception:
+                pass
+        if inspect.iscoroutinefunction(function):
+            @wraps(function)
+            async def asynchronous(*args, **kwargs):
+                event(args, "entry")
+                try:
+                    return await function(*args, **kwargs)
+                except BaseException as error:
+                    event(args, "error", error)
+                    raise
+                finally:
+                    event(args, "exit")
+            return asynchronous
+        @wraps(function)
+        def synchronous(*args, **kwargs):
+            event(args, "entry")
+            try:
+                return function(*args, **kwargs)
+            except BaseException as error:
+                event(args, "error", error)
+                raise
+            finally:
+                event(args, "exit")
+        return synchronous
+    return decorate
+
+
+@contextmanager
+def admission_lock(registry):
+    """Observe the existing lock boundary without adding a second lock scope."""
+    def note(event):
+        try:
+            if os.environ.get("OCC3_DIAG_TOKEN_TRACE") == "1":
+                logging.getLogger("occ3_sglang.admission").debug(
+                    "occ3-bridge: admission lock %s", event)
+        except Exception:
+            pass
+    note("acquire_wait")
+    with registry.lock:
+        note("acquired")
+        try:
+            yield
+        finally:
+            note("releasing")
+    note("released")
+
+
 class LatentError(RuntimeError):
-    def __init__(self, code="latent_failed", members=None):
+    def __init__(self, code="latent_failed", members=None, *, detail=None):
         allowed = {"latent_failed", "unavailable", "profile", "identity", "expired",
                    "quota", "replay", "state", "lineage", "ranks", "invalid",
                    "not_ready", "retired", "numerical", "cancelled", "busy"}
@@ -35,6 +212,7 @@ class LatentError(RuntimeError):
             self.members = ",".join(members)[:128]
         else:
             self.members = None
+        self.detail = detail if detail in _ADMISSION_DETAILS else None
         super().__init__(self.code)
 
 
@@ -49,9 +227,9 @@ class UniformRequestCancellation(LatentError):
         super().__init__(code)
 
 
-def require(condition, code="invalid"):
+def require(condition, code="invalid", *, detail=None):
     if not condition:
-        raise LatentError(code)
+        raise LatentError(code, detail=detail)
 
 
 def require_members(checks, code="profile"):

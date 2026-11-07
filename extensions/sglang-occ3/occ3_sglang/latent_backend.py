@@ -12,7 +12,7 @@ from .attachment_contract import (AttachmentError, BackendReadiness, CaptureWork
                                   ConsumeWorkerDescriptor, Reservation, SourceEnrollment,
                                   SPAN_POLICIES_V2, digest)
 from .span_policy import resolve_runtime_markers
-from .latent_types import LatentError, control_request, require, validate_control_payload
+from .latent_types import LatentError, admission_probe, control_request, require, validate_control_payload
 from .use_receipts import (SourceCaptureCommit, SourceCaptureEvidence, TerminalUseEvidence,
                            SPAN_BLOCK_FIELDS)
 
@@ -176,7 +176,7 @@ class LatentBackend:
 
     def _slot(self, attempt):
         self._prune()
-        require(attempt not in self.attempts and len(self.attempts) < self.profile.max_records, "replay")
+        require(attempt not in self.attempts and len(self.attempts) < self.profile.max_records, "replay", detail="latent_backend._slot.attempt_slot")
 
     def _prune(self):
         """Drop per-turn frontend state that no caller can use any more.
@@ -197,9 +197,9 @@ class LatentBackend:
             del self.attempts[key]
 
     def _reservation(self, descriptor, binding, native):
-        require(native.request.rid == descriptor.native_rid and native.max_new_tokens > 0, "identity")
+        require(native.request.rid == descriptor.native_rid and native.max_new_tokens > 0, "identity", detail="latent_backend._reservation.native_identity")
         require(descriptor.deadline <= native.deadline_monotonic and
-                descriptor.deadline > time.monotonic() + self.required_seconds, "expired")
+                descriptor.deadline > time.monotonic() + self.required_seconds, "expired", detail="latent_backend._reservation.native_bounds")
         # A positive admission floor, NOT a prediction of full inference latency.
         return Reservation(descriptor.attempt_id, binding, descriptor.native_rid,
                            descriptor.principal_digest, self.required_seconds, self.max_output_bytes,
@@ -271,13 +271,14 @@ class LatentBackend:
             t["injected_prefix_count"], t["ready_ranks"], t["expected_ranks"], True, False, 0, True, True,
             reservation.reservation_id)
 
+    @admission_probe("enroll_source")
     async def enroll_source(self, intent, identity, attempt_id, native_rid, deadline):
         self._identity(identity, intent.source_session_id)
         require(intent.method == self.profile.method and intent.runtime_id == self.profile.runtime_epoch
                 and intent.runtime_generation == self.profile.runtime_generation
-                and intent.model_fingerprint == self.profile.model_fingerprint, "identity")
-        require(intent.retained_count_limit in (8, 16, 32, 64, 128), "profile")
-        require(native_rid != intent.source_request_id, "identity")
+                and intent.model_fingerprint == self.profile.model_fingerprint, "identity", detail="latent_backend.enroll_source.profile_identity")
+        require(intent.retained_count_limit in (8, 16, 32, 64, 128), "profile", detail="latent_backend.enroll_source.retained_limit")
+        require(native_rid != intent.source_request_id, "identity", detail="latent_backend.enroll_source.source_request_identity")
         self._slot(attempt_id)
         health = await self.refresh_readiness()
         marker_profile = ""
@@ -333,9 +334,10 @@ class LatentBackend:
             raise AttachmentError("scheduler_busy", 503) from None
         return enrollment
 
+    @admission_probe("prepare_source")
     async def prepare_source(self, enrollment, native):
         state = self.attempts.get(enrollment.attempt_id)
-        require(state is not None and state.get("enrollment") == enrollment and "reservation" not in state, "replay")
+        require(state is not None and state.get("enrollment") == enrollment and "reservation" not in state, "replay", detail="latent_backend.prepare_source.source_reservation")
         reservation = self._reservation(state["descriptor"], enrollment.intent_digest, native)
         state["reservation"] = reservation
         return reservation
@@ -345,6 +347,7 @@ class LatentBackend:
         require(state is not None and state.get("enrollment") == enrollment, "identity")
         self.bind(reservation, native)
 
+    @admission_probe("finish_source")
     async def finish_source(self, enrollment, reservation, completion, provenance):
         state = self.attempts.get(enrollment.attempt_id)
         require(state is not None and state.get("enrollment") == enrollment and state.get("reservation") == reservation, "identity")
@@ -378,6 +381,7 @@ class LatentBackend:
         return SourceCaptureEvidence(enrollment, reservation.reservation_id, commit,
             completion.output_sha256, completion.native_rid, provenance.binding_digest, True, True, 0)
 
+    @admission_probe("release_unused")
     async def release_unused_attempt(self, attempt_id, native_rid):
         """Worker-side proof that a busy-declined attempt never ran.
 
@@ -400,6 +404,7 @@ class LatentBackend:
         require(record["state"] == "reserved" and not record["revoked"], "state")
         return "unadmitted"
 
+    @admission_probe("backend_retire")
     async def retire(self, attempt_id, native_rid, dispatched):
         state = self.attempts.get(attempt_id)
         if state is None:

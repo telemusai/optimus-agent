@@ -1,0 +1,5 @@
+- Added: bounded OCC-3 failure origin, admission lifecycle and client binding diagnostics.
+- Added: process-local status counters and parallel-repro guidance.
+- Changed: internal diagnostic detail tags at capture/admission checks; public error contracts stay unchanged.
+- Fixed: no runtime behavior changes; diagnostics only.
+- Removed: none.

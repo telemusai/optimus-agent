@@ -8,6 +8,7 @@ from typing import Any
 
 from .attachment_contract import (CAPTURE_MODE_CONTENT_ONLY, CaptureWorkerDescriptor,
                                   ConsumeWorkerDescriptor, digest)
+from .latent_types import admission_probe, admission_lock
 from .latent_types import (DISPATCH_MODEL_TOOL_V1, DISPATCH_ORCHESTRATOR_V1, LatentError,
                            Publication, RuntimeProfile, SessionEnrollment, require, sha)
 from .span_policy import POLICY_NO_TOOL
@@ -110,31 +111,32 @@ class LatentRegistry:
         require(value is not None and value.expires_at_epoch > self.epoch(), "identity")
         return value
 
+    @admission_probe("reserve_capture", registry=True)
     def reserve_capture(self, descriptor, handle, generation, expiry, budget, reserved_bytes):
-        with self.lock:
-            require(type(descriptor) is CaptureWorkerDescriptor)
+        with admission_lock(self):
+            require(type(descriptor) is CaptureWorkerDescriptor, detail="latent_registry.reserve_capture.descriptor_type")
             self._profile(descriptor.runtime_epoch, descriptor.runtime_generation, descriptor.model_fingerprint)
-            require(descriptor.method_id == self.profile.method and descriptor.deadline > self.monotonic(), "expired")
+            require(descriptor.method_id == self.profile.method and descriptor.deadline > self.monotonic(), "expired", detail="latent_registry.reserve_capture.method_deadline")
             owner = self.session(descriptor.principal_digest, descriptor.source_session_id)
             self._expiry(expiry)
-            require(expiry <= owner.expires_at_epoch and 0 < reserved_bytes <= budget == descriptor.max_capture_bytes, "quota")
+            require(expiry <= owner.expires_at_epoch and 0 < reserved_bytes <= budget == descriptor.max_capture_bytes, "quota", detail="latent_registry.reserve_capture.budget_owner_expiry")
             existing = self.attempts.get(descriptor.attempt_id)
             if existing:
                 record = self.records[existing]
-                require(record.handle == handle and record.descriptor == descriptor and not record.revoked, "replay")
+                require(record.handle == handle and record.descriptor == descriptor and not record.revoked, "replay", detail="latent_registry.reserve_capture.existing_attempt")
                 return record
             require(descriptor.attempt_id not in self.tombstone_attempts
-                    and handle not in self.tombstone_handles, "replay")
+                    and handle not in self.tombstone_handles, "replay", detail="latent_registry.reserve_capture.tombstone_replay")
             self._prune()
-            require(handle not in self.records and len(self.records) < self.profile.max_records, "quota")
-            require(len(self.tombstone_attempts) < self.profile.max_records * 16, "quota")
+            require(handle not in self.records and len(self.records) < self.profile.max_records, "quota", detail="latent_registry.reserve_capture.record_capacity")
+            require(len(self.tombstone_attempts) < self.profile.max_records * 16, "quota", detail="latent_registry.reserve_capture.tombstone_capacity")
             # Another OCC-3 turn holds the single active slot: a distinct
             # "busy" decline, raised before ANY mutation (no record, attempt
             # or byte charge), so the frontend can prove non-use and return
             # the retryable busy contract instead of a generic failure.
             require(sum(not r.revoked and r.state in _ACTIVE_STATES
-                        for r in self.records.values()) < self.profile.max_active, "busy")
-            require(self.charged_bytes + reserved_bytes <= self.profile.max_live_bytes, "quota")
+                        for r in self.records.values()) < self.profile.max_active, "busy", detail="latent_registry.reserve_capture.active_slot")
+            require(self.charged_bytes + reserved_bytes <= self.profile.max_live_bytes, "quota", detail="latent_registry.reserve_capture.byte_capacity")
             record = StateRecord(handle, generation, descriptor, expiry, budget, reserved_bytes)
             self.records[handle] = record
             self.attempts[descriptor.attempt_id] = handle
@@ -188,6 +190,7 @@ class LatentRegistry:
             self.publications[publication.publication_id] = publication
             return record.snapshot()
 
+    @admission_probe("reserve_consume", registry=True)
     def reserve_consume(self, descriptor):
         with self.lock:
             require(type(descriptor) is ConsumeWorkerDescriptor)
@@ -224,6 +227,7 @@ class LatentRegistry:
             record.consumer, record.state = descriptor, "leased"
             return record
 
+    @admission_probe("release_lease", registry=True)
     def release_unused_lease(self, attempt_id, principal_digest):
         """Undo a consume lease the scheduler declined before admission.
 
@@ -271,6 +275,7 @@ class LatentRegistry:
             record.output_binding = dict(binding)
             return record.snapshot()
 
+    @admission_probe("retire", registry=True)
     def retire(self, attempt_id=None, handle=None):
         with self.lock:
             if handle is None:
@@ -291,6 +296,7 @@ class LatentRegistry:
             self.reap()
             return record.snapshot()
 
+    @admission_probe("reap", registry=True)
     def reap(self):
         """No synchronize/free while any producer/consumer event is incomplete."""
         with self.lock:

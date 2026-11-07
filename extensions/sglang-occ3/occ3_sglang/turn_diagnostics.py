@@ -163,3 +163,60 @@ class TurnDiagnostics:
         if len(LOG_PREFIX) + len(encoded) > MAX_LOG_CHARS:
             encoded = '{"diag_error":"summary_size_limit"}'
         LOG.info("%s%s", LOG_PREFIX, encoded)
+
+
+# Error telemetry is independent of output excerpts and never serializes errors.
+_FAILURE_CODES = frozenset((
+    "latent_failed unavailable profile identity expired quota replay state lineage "
+    "ranks invalid not_ready retired numerical cancelled busy invalid_attachment "
+    "unsupported_attachment attachment_expired identity_mismatch unsupported_profile "
+    "deadline_unavailable deadline_exceeded buffer_limit quota_exceeded replay_forbidden "
+    "invalid_evidence native_completion_failed client_disconnected attachment_failed "
+    "capture_transport_unnegotiated cleanup_pending scheduler_busy admission_timeout "
+    "admission_capacity client_cancelled"
+).split())
+import threading
+
+_FAILURE_LOCK = threading.Lock()
+_FAILURE_STATE = {"last_error_code": "none", "error_count": 0,
+                  "first_failure_unix_seconds": 0, "last_error_count": 0}
+_FAILURE_COUNTS = {}
+
+
+def failure_snapshot():
+    """Process-local telemetry only; first failure is not proof of stuck state."""
+    try:
+        with _FAILURE_LOCK:
+            return dict(_FAILURE_STATE)
+    except Exception:
+        return {}
+
+
+def log_failure(error, ctx=None, phase="unknown"):
+    """Log fixed codes and source locations only, without exception text/locals."""
+    try:
+        import traceback
+        import time
+        from .attachment_contract import AttachmentError
+        from .latent_types import LatentError
+        code = getattr(error, "code", None) if isinstance(error, (LatentError, AttachmentError)) else None
+        code = code if code in _FAILURE_CODES else "unknown"
+        frames = traceback.extract_tb(error.__traceback__, limit=-3)
+        origin = [{"module": os.path.basename(frame.filename)[:96],
+                   "function": frame.name[:96], "line": min(1000000, frame.lineno)}
+                  for frame in frames]
+        status = getattr(error, "status", 409)
+        status = status if type(status) is int and status in (400, 401, 409, 413, 429, 499, 503, 504) else 409
+        phase = phase if phase in ("admission", "native_iterator", "keepalive", "terminal", "unknown", "validation", "worker_control") else "unknown"
+        row = {"detail": getattr(error, "detail", None) if isinstance(error, LatentError) else None, "code": code, "status": status, "origin": origin, "phase": phase,
+               "dispatched": bool(getattr(ctx, "dispatched", False))}
+        with _FAILURE_LOCK:
+            _FAILURE_COUNTS[code] = min(2147483647, _FAILURE_COUNTS.get(code, 0) + 1)
+            _FAILURE_STATE["last_error_count"] = _FAILURE_COUNTS[code]
+            _FAILURE_STATE["last_error_code"] = code
+            _FAILURE_STATE["error_count"] = min(2147483647, _FAILURE_STATE["error_count"] + 1)
+            if not _FAILURE_STATE["first_failure_unix_seconds"]:
+                _FAILURE_STATE["first_failure_unix_seconds"] = min(9999999999, max(0, int(time.time())))
+        LOG.error("occ3-bridge: native failure %s", json.dumps(row, separators=(",", ":")))
+    except Exception:
+        pass
