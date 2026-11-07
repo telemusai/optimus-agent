@@ -10,7 +10,7 @@ use crate::core::occ::occ3::connector::{
 };
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
-use crate::core::occ::occ3::types::Occ3DeliveryStatus;
+use crate::core::occ::occ3::types::{Occ3DeliveryStatus, Occ3Error};
 use pi_agent_core::types::ContentBlock;
 use pi_agent_core::types::{
     AgentMessage, AgentTool, AgentToolResult, CustomAgentMessage, ResolveInferenceState,
@@ -52,6 +52,25 @@ fn target(model: &Model) -> InferenceStateTarget {
 }
 fn failure() -> String {
     "Experimental native handoff unavailable or uncertain; replay is forbidden".into()
+}
+
+/// Content-free diagnostic for a receiver-busy claim release, in the
+/// connector-diagnostics style: names the released message id, the refusing
+/// connector and whether the claim actually released, never any envelope
+/// content, so live diagnosis of a busy-released turn no longer needs source
+/// archaeology. Exception-safe like `native_binding_diagnostic`: a broken
+/// sink can never turn a released claim into a failed turn.
+fn receiver_busy_claim_released(message_id: &str, connector_id: &str, released: bool) {
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.receiver").warn(
+            "receiver_busy_claim_released",
+            Some(serde_json::Map::from_iter([
+                ("message_id".into(), Value::from(message_id)),
+                ("connector_id".into(), Value::from(connector_id)),
+                ("released".into(), Value::from(released)),
+            ])),
+        );
+    });
 }
 
 /// Process-local registry of live native sessions BY SENDER SESSION ID, so
@@ -802,7 +821,8 @@ impl Occ3NativeSession {
                 ) {
                     return Err(anyhow::anyhow!(failure()));
                 }
-                let lease = this
+                let claimed_message_id = envelope.message_id.clone();
+                let lease = match this
                     .connector
                     .prepare_inference(PrepareInferenceRequest {
                         envelope,
@@ -813,7 +833,33 @@ impl Occ3NativeSession {
                         now_epoch: now(),
                     })
                     .await
-                    .map_err(|_| anyhow::anyhow!(failure()))?;
+                {
+                    Ok(lease) => lease,
+                    Err(Occ3Error::NativeInferenceBusyRefused { connector_id }) => {
+                        // A proven-undispatched busy refusal: the connector's
+                        // control path was saturated before any round trip, or
+                        // the server declined admission before any mutation
+                        // (the reserve_consume busy class). Nothing was
+                        // generated and the attachment was never submitted,
+                        // so the claim is releasable - the record returns to
+                        // `Admitted` and the NEXT inference request retries
+                        // the consume cleanly, while THIS turn proceeds
+                        // without the native attachment. Mirrors the
+                        // source-side busy absorption: busy is never a
+                        // counted failure and never a replay permit.
+                        let released = this
+                            .inbox
+                            .lock()
+                            .map_err(|_| anyhow::anyhow!(failure()))?
+                            .release_busy_claim(&claimed_message_id);
+                        receiver_busy_claim_released(&claimed_message_id, &connector_id, released);
+                        if released {
+                            return Ok(None);
+                        }
+                        return Err(anyhow::anyhow!(failure()));
+                    }
+                    Err(_) => return Err(anyhow::anyhow!(failure())),
+                };
                 this.inbox
                     .lock()
                     .map_err(|_| anyhow::anyhow!(failure()))?

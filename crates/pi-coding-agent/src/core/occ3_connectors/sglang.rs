@@ -588,6 +588,37 @@ impl SglangOcc3Connector {
         }
     }
 
+    /// Bounded error-code read from a non-success control response. The
+    /// server's fixed envelope is `{"error":{"code":"..."}}` and never
+    /// carries exception text; a body over 256 bytes, a malformed body or
+    /// an empty/oversized code means the decline is not recognizably one of
+    /// the fixed pre-dispatch busy classes, so it must stay fail-closed.
+    /// Never a replay permit: the code only chooses the error KIND.
+    async fn read_bounded_control_error_code(
+        response: &mut reqwest::Response,
+    ) -> Option<String> {
+        let mut received = Vec::new();
+        while let Some(chunk) = response.chunk().await.ok()? {
+            if received.len().saturating_add(chunk.len()) > 256 {
+                return None;
+            }
+            received.extend_from_slice(&chunk);
+        }
+        #[derive(serde::Deserialize)]
+        struct Envelope {
+            error: Inner,
+        }
+        #[derive(serde::Deserialize)]
+        struct Inner {
+            code: String,
+        }
+        let parsed: Envelope = serde_json::from_slice(&received).ok()?;
+        if parsed.error.code.is_empty() || parsed.error.code.len() > 64 {
+            return None;
+        }
+        Some(parsed.error.code)
+    }
+
     async fn control<T: serde::de::DeserializeOwned>(
         &self,
         path: &str,
@@ -621,21 +652,48 @@ impl SglangOcc3Connector {
             .send()
             .await
             .map_err(|_| native_invalid())?;
-        if !response.status().is_success()
-            || response
-                .headers()
-                .get("content-encoding")
-                .is_some_and(|v| v != "identity")
-        {
-            native_binding_diagnostic("control", "http_status", Some(response.status().as_u16()));
+        let status = response.status().as_u16();
+        let identity_encoded = response
+            .headers()
+            .get("content-encoding")
+            .map(|v| v == "identity")
+            .unwrap_or(true);
+        if !response.status().is_success() || !identity_encoded {
+            native_binding_diagnostic("control", "http_status", Some(status));
             // latent_control_api.control_error_response maps both `identity`
             // and `identity_mismatch` to 401. latent_registry._profile and
             // _session use `identity` for epoch and absent-enrollment failures.
             // Busy (409), quota, malformed responses and outages are not proof
             // of revoked enrollment and must not trigger recovery probes.
+            //
+            // Two synchronous PRE-DISPATCH declines carry their own
+            // proven-non-use contract (the same classes pi-ai recognizes as
+            // busy for the source side), so they surface as the distinct
+            // `NativeInferenceBusyRefused` instead of the generic invalid
+            // site: the control-plane saturation gate's `quota` (429,
+            // raised before the request is dispatched to the scheduler)
+            // and the registry admission decline's `busy` (409, raised by
+            // reserve_capture/reserve_consume before any nonce, attempt or
+            // lease mutation). The receiver may then release its inbox
+            // claim and retry the consume on the next inference request.
+            // Every other code - including a 409 `expired` or `replay` -
+            // keeps the fail-closed generic refusal.
+            let code = if identity_encoded {
+                Self::read_bounded_control_error_code(&mut response).await
+            } else {
+                None
+            };
+            let error = match (status, code.as_deref()) {
+                (409, Some("busy")) | (429, Some("quota")) => {
+                    Occ3Error::NativeInferenceBusyRefused {
+                        connector_id: CONNECTOR_ID.into(),
+                    }
+                }
+                _ => native_invalid(),
+            };
             return Err(NativeControlFailure {
-                error: native_invalid(),
-                authority: matches!(response.status().as_u16(), 401 | 403),
+                error,
+                authority: matches!(status, 401 | 403),
             });
         }
         let mut received = Vec::new();
