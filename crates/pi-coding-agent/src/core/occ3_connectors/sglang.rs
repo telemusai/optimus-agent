@@ -666,16 +666,25 @@ impl SglangOcc3Connector {
             // Busy (409), quota, malformed responses and outages are not proof
             // of revoked enrollment and must not trigger recovery probes.
             //
-            // Two synchronous PRE-DISPATCH declines carry their own
-            // proven-non-use contract (the same classes pi-ai recognizes as
-            // busy for the source side), so they surface as the distinct
-            // `NativeInferenceBusyRefused` instead of the generic invalid
-            // site: the control-plane saturation gate's `quota` (429,
-            // raised before the request is dispatched to the scheduler)
-            // and the registry admission decline's `busy` (409, raised by
-            // reserve_capture/reserve_consume before any nonce, attempt or
-            // lease mutation). The receiver may then release its inbox
-            // claim and retry the consume on the next inference request.
+            // Two synchronous declines of THIS control call surface as the
+            // distinct `NativeInferenceBusyRefused` instead of the generic
+            // invalid site: the control-plane saturation gate's `quota`
+            // (429) and the admission decline's `busy` (409). For the
+            // receiver release boundary the proof is narrower than "no
+            // server work happened": `prepare_inference` awaits exactly
+            // one control call (sessions/enroll) before building the
+            // receiver attachment, and only a bound, submitted attachment
+            // can ever reach the provider - so a refusal here proves the
+            // attachment for this consume was never created or submitted.
+            // The 429/409 envelope itself does not prove the server made
+            // no prior mutation (an enrollment can update membership
+            // before a later readiness read declines), which is exactly why
+            // the release only returns the claim to `Admitted`: nothing is
+            // marked consumed and no second delivery is ever issued. The
+            // classification itself is the generic control-path rule and is
+            // not operation-scoped; only `prepare_inference`'s enroll
+            // error reaches the resolver's release arm - publication and
+            // retirement keep their existing status-probe/uncertain paths.
             // Every other code - including a 409 `expired` or `replay` -
             // keeps the fail-closed generic refusal.
             let code = if identity_encoded {
@@ -1572,6 +1581,7 @@ mod tests {
                 pi_ai::log::set_log_sink(None);
             }
         }
+        let _sink_guard = pi_ai::log::test_sink_guard();
         let _reset = ResetSink;
         let entries = Arc::new(Mutex::new(Vec::new()));
         let captured = entries.clone();

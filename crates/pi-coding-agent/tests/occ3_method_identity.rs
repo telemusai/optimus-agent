@@ -201,9 +201,15 @@ async fn serve(method: &'static str) -> (String, Arc<Mutex<FixtureRecords>>, tok
                             for (key, value) in span.as_object().unwrap() {
                                 receipt[key.clone()] = value.clone();
                             }
+                            // The production wire omits an explicit zero
+                            // anchor (skip_serializing_if is_zero), so this
+                            // fixture must too: only a negotiated NONZERO
+                            // anchor is echoed back.
                             if let Some(alpha) = parsed_intent.label_anchor_alpha {
-                                receipt["label_anchor_alpha"] =
-                                    serde_json::json!(f64::from(alpha));
+                                if f64::from(alpha) != 0.0 {
+                                    receipt["label_anchor_alpha"] =
+                                        serde_json::json!(f64::from(alpha));
+                                }
                             }
                             headers.push(("x-optimus-occ3-source", receipt.to_string()));
                             send(&mut socket, output, headers).await;

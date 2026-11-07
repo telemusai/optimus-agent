@@ -961,11 +961,19 @@ async fn consumed_receipt_flows_through_real_provider_transport_to_poll_consumed
 /// synchronous PRE-DISPATCH busy refusal as the distinct proven-non-use
 /// error, so the resolver can release its inbox claim and the next
 /// inference request retries the consume cleanly (the live 2026-11-07
-/// receiver wedge). The server's registry busy decline (the
-/// reserve_consume class) answers HTTP 409 `busy`; the control-plane
-/// saturation gate answers 429 `quota` before any worker round trip.
-/// Every other decline - including a 409 `expired` - keeps the generic
-/// fail-closed refusal: only proven-undispatched busy classes release.
+/// receiver wedge). `prepare_inference` awaits exactly one control call
+/// before the attachment exists - `sessions/enroll` - so a busy-envelope
+/// refusal on that call proves no receiver attachment was created or
+/// submitted. The two classified declines are the registry admission
+/// decline (409 `busy`) and the control-plane saturation gate
+/// (429 `quota`). Every other decline - including a 409 `expired`, a
+/// malformed, oversized or empty-code envelope, a non-identity
+/// content-encoding, or a 200 carrying an error body on the success path
+/// - keeps the generic fail-closed `TransferFailed { "native control
+/// binding invalid" }` refusal: only the proven busy classes release a
+/// claim. The request line is asserted to be the enroll route so the
+/// classification is pinned to `prepare_inference`'s own control round
+/// trip, never a publication or retirement call.
 #[tokio::test]
 async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
     use pi_coding_agent::core::occ3_connectors::sglang::{
@@ -980,14 +988,44 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
         .await
         .unwrap();
     let address = listener.local_addr().unwrap();
-    let scripted = vec![
-        ("409 Conflict", r#"{"error":{"code":"busy"}}"#),
-        ("429 Too Many Requests", r#"{"error":{"code":"quota"}}"#),
-        ("409 Conflict", r#"{"error":{"code":"expired"}}"#),
-        ("503 Service Unavailable", r#"{"error":{"code":"unavailable"}}"#),
+    // (status line, extra headers, body, expected busy) — the classification
+    // table including every parser boundary: the exact-256-byte accept, the
+    // 257-byte reject, empty/64/65-char codes, a non-identity
+    // content-encoding, and a 200 that carries an error body onto the
+    // success path.
+    let long_code = "e".repeat(64);
+    let over_code = "e".repeat(65);
+    let busy_pad = r#"{"error":{"code":  "busy"}}"#;
+    assert_eq!(busy_pad.len(), 27);
+    let busy_256 = format!("{busy_pad}{}", " ".repeat(256 - busy_pad.len()));
+    let busy_257 = format!("{busy_pad}{}", " ".repeat(257 - busy_pad.len()));
+    assert_eq!(busy_256.len(), 256);
+    assert_eq!(busy_257.len(), 257);
+    let scripted: Vec<(&str, &str, String, bool)> = vec![
+        ("409 Conflict", "", r#"{"error":{"code":"busy"}}"#.into(), true),
+        ("429 Too Many Requests", "", r#"{"error":{"code":"quota"}}"#.into(), true),
+        // Exactly 256 bytes is still accepted at the bound.
+        ("409 Conflict", "", busy_256, true),
+        ("409 Conflict", "", r#"{"error":{"code":"expired"}}"#.into(), false),
+        ("503 Service Unavailable", "", r#"{"error":{"code":"unavailable"}}"#.into(), false),
+        // One byte over the bound: never classified.
+        ("409 Conflict", "", busy_257, false),
+        ("409 Conflict", "", r#"{"error":{"code":""}}"#.into(), false),
+        // A 64-char code is inside the bound but is not busy; 65 is rejected.
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{long_code}"}}}}"#), false),
+        ("409 Conflict", "", format!(r#"{{"error":{{"code":"{over_code}"}}}}"#), false),
+        // A busy code behind a non-identity content-encoding stays generic.
+        ("409 Conflict", "Content-Encoding: gzip\r\n", r#"{"error":{"code":"busy"}}"#.into(), false),
+        // A 200 carrying an error body fails on the success path, generically.
+        ("200 OK", "", r#"{"error":{"code":"busy"}}"#.into(), false),
+    ];
+    // The expected classification per scripted row, captured before the
+    // server task consumes the scripted table by move.
+    let EXPECTED_BUSY: [bool; 11] = [
+        true, true, true, false, false, false, false, false, false, false, false,
     ];
     let server = tokio::spawn(async move {
-        for (status, body) in scripted {
+        for (status, extra, body, _) in scripted {
             let (mut socket, _) = listener.accept().await.unwrap();
             let mut bytes = Vec::new();
             // Read until the full head plus content-length body arrived.
@@ -1013,8 +1051,14 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
                 }
             };
             let _ = length;
+            let head = String::from_utf8(bytes[..bytes.windows(4).position(|v| v == b"\r\n\r\n").unwrap()].to_vec()).unwrap();
+            let request_line = head.lines().next().unwrap().to_string();
+            assert!(
+                request_line.contains("/occ3/v1/native/sessions/enroll"),
+                "the busy classification must see the enroll control route, saw: {request_line}"
+            );
             let response = format!(
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\n{extra}Content-Length: {}\r\nConnection: close\r\n\r\n{body}",
                 body.len(),
             );
             socket.write_all(response.as_bytes()).await.unwrap();
@@ -1093,28 +1137,30 @@ async fn sglang_prepare_inference_classifies_pre_dispatch_busy_refusals() {
         },
     };
 
-    // 409 `busy` (the reserve_consume decline class): the distinct
-    // proven-non-use busy refusal, never the generic invalid site.
-    assert!(matches!(
-        connector.prepare_inference(request()).await,
-        Err(Occ3Error::NativeInferenceBusyRefused { .. })
-    ));
-    // 429 `quota` (the control-plane saturation gate, no worker round
-    // trip): the same busy class.
-    assert!(matches!(
-        connector.prepare_inference(request()).await,
-        Err(Occ3Error::NativeInferenceBusyRefused { .. })
-    ));
-    // A 409 with any other code, and a 503, keep the fail-closed generic
-    // refusal: only the proven busy classes release a claim.
-    for _ in 0..2 {
-        assert!(
-            !matches!(
-                connector.prepare_inference(request()).await,
-                Err(Occ3Error::NativeInferenceBusyRefused { .. })
-            ),
-            "non-busy declines must not masquerade as the busy refusal"
-        );
+    // The classification table, in scripted order. The busy rows are the
+    // distinct proven-non-use refusal; every other row is pinned to the
+    // exact generic fail-closed error, so neither an unrelated error kind
+    // nor a false Ok can pass the negative assertions.
+    for (index, expect_busy) in EXPECTED_BUSY.into_iter().enumerate() {
+        let error = connector
+            .prepare_inference(request())
+            .await
+            .err()
+            .expect("every scripted response must decline or fail the success parse");
+        if expect_busy {
+            assert!(
+                matches!(error, Occ3Error::NativeInferenceBusyRefused { .. }),
+                "row {index}: expected the busy refusal, saw {error:?}"
+            );
+        } else {
+            match error {
+                Occ3Error::TransferFailed { reason } => assert_eq!(
+                    reason, "native control binding invalid",
+                    "row {index}: expected the generic fail-closed refusal, saw {reason}"
+                ),
+                other => panic!("row {index}: expected the generic refusal, saw {other:?}"),
+            }
+        }
     }
     server.await.unwrap();
 }

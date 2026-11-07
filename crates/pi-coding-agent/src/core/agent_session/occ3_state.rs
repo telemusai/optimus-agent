@@ -836,17 +836,20 @@ impl Occ3NativeSession {
                 {
                     Ok(lease) => lease,
                     Err(Occ3Error::NativeInferenceBusyRefused { connector_id }) => {
-                        // A proven-undispatched busy refusal: the connector's
-                        // control path was saturated before any round trip, or
-                        // the server declined admission before any mutation
-                        // (the reserve_consume busy class). Nothing was
-                        // generated and the attachment was never submitted,
-                        // so the claim is releasable - the record returns to
+                        // A busy refusal of the enroll control call that
+                        // `prepare_inference` awaits before building this
+                        // consume's attachment. The attachment was therefore
+                        // never created nor submitted to the provider, so the
+                        // claim is releasable - the record returns to
                         // `Admitted` and the NEXT inference request retries
-                        // the consume cleanly, while THIS turn proceeds
-                        // without the native attachment. Mirrors the
-                        // source-side busy absorption: busy is never a
-                        // counted failure and never a replay permit.
+                        // the SAME delivery cleanly, while THIS turn proceeds
+                        // without the native attachment. The refusal proves
+                        // nothing about the server's own state (an admission
+                        // decline can follow earlier control mutations), so
+                        // nothing is marked consumed and no second delivery
+                        // is ever issued. Mirrors the source-side busy
+                        // absorption: busy is never a counted failure and
+                        // never a replay permit.
                         let released = this
                             .inbox
                             .lock()
@@ -3859,6 +3862,7 @@ mod tests {
                 pi_ai::log::set_log_sink(None);
             }
         }
+        let _sink_guard = pi_ai::log::test_sink_guard();
         let _reset = ResetSink;
         let entries = Arc::new(Mutex::new(Vec::new()));
         let captured = entries.clone();
