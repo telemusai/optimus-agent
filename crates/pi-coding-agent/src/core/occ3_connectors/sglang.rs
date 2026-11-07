@@ -797,6 +797,125 @@ fn parse_identity(fields: &Value) -> Result<Occ3ModelIdentity, Occ3Error> {
     })
 }
 
+/// Resolve each capture afresh; environment selection never reads the file.
+fn resolve_label_anchor_alpha(
+    env: Result<String, std::env::VarError>,
+    path: impl FnOnce() -> std::path::PathBuf,
+) -> Result<(Option<pi_ai::source_capture::LabelAnchorAlpha>, &'static str), Occ3Error> {
+    use std::io::Read;
+    if !matches!(env, Err(std::env::VarError::NotPresent)) {
+        return parse_label_anchor_alpha_env(env).map(|alpha| (alpha, "env"));
+    }
+    let invalid = || Occ3Error::TransferFailed {
+        reason: "invalid OCC3_LABEL_ANCHOR_ALPHA_FILE: expected readable UTF-8 decimal under 32 bytes (0, 0.3, 0.5, 0.7, or 1)".into(),
+    };
+    let mut options = std::fs::OpenOptions::new();
+    options.read(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // Validate the opened handle below; a path swap to a FIFO cannot stall capture.
+        options.custom_flags(libc::O_NONBLOCK);
+    }
+    let file = match options.open(path()) {
+        Ok(file) => file,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, "default")),
+        Err(_) => return Err(invalid()),
+    };
+    if !file.metadata().map_err(|_| invalid())?.is_file() { return Err(invalid()); }
+    let mut bytes = Vec::new();
+    file.take(32).read_to_end(&mut bytes).map_err(|_| invalid())?;
+    if bytes.len() >= 32 { return Err(invalid()); }
+    let value = std::str::from_utf8(&bytes).map_err(|_| invalid())?.trim();
+    parse_label_anchor_alpha_env(Ok(value.into()))
+        .map(|alpha| (alpha, "file"))
+        .map_err(|_| invalid())
+}
+
+/// Parse the per-handoff selection before enrollment or capture network traffic.
+fn parse_label_anchor_alpha_env(
+    value: Result<String, std::env::VarError>,
+) -> Result<Option<pi_ai::source_capture::LabelAnchorAlpha>, Occ3Error> {
+    let invalid = || Occ3Error::TransferFailed {
+        reason: "invalid OCC3_LABEL_ANCHOR_ALPHA: expected 0, 0.3, 0.5, 0.7, or 1".into(),
+    };
+    let value = match value {
+        Ok(value) => value,
+        Err(std::env::VarError::NotPresent) => return Ok(None),
+        Err(std::env::VarError::NotUnicode(_)) => return Err(invalid()),
+    };
+    let alpha = match value.as_str() {
+        "0" | "0.0" => 0.0,
+        "0.3" | ".3" => 0.3,
+        "0.5" | ".5" => 0.5,
+        "0.7" | ".7" => 0.7,
+        "1" | "1.0" => 1.0,
+        _ => return Err(invalid()),
+    };
+    pi_ai::source_capture::LabelAnchorAlpha::try_from(alpha)
+        .map(Some)
+        .map_err(|_| invalid())
+}
+
+#[cfg(test)]
+mod label_anchor_alpha_tests {
+    use super::{parse_label_anchor_alpha_env, resolve_label_anchor_alpha};
+
+    #[test]
+    fn file_selection_is_fresh_bounded_and_lower_precedence() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha");
+        let resolve = || resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || path.clone());
+        assert_eq!(resolve().unwrap(), (None, "default"));
+        for alpha in ["0", "0.3", "0.5", "0.7", "1"] {
+            std::fs::write(&path, format!(" {alpha}\n")).unwrap();
+            let (selected, source) = resolve().unwrap();
+            assert_eq!(f64::from(selected.unwrap()), alpha.parse::<f64>().unwrap());
+            assert_eq!(source, "file");
+        }
+        assert_eq!(resolve_label_anchor_alpha(Ok("0".into()), || panic!("env must win")).unwrap().1, "env");
+        assert!(resolve_label_anchor_alpha(Ok("".into()), || panic!("bad env must fail")).is_err());
+        for bad in [vec![b'0'; 32], vec![0xff], b"0.4".to_vec(), Vec::new()] {
+            std::fs::write(&path, bad).unwrap();
+            assert!(resolve().is_err());
+        }
+        assert!(resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || dir.path().into()).is_err());
+    }
+
+
+    #[cfg(unix)]
+    #[test]
+    fn fifo_selection_is_rejected_without_waiting_for_a_writer() {
+        use std::os::unix::ffi::OsStrExt;
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha-fifo");
+        let name = std::ffi::CString::new(path.as_os_str().as_bytes()).unwrap();
+        // The CString is live and terminated; the private fixture path does not exist yet.
+        assert_eq!(unsafe { libc::mkfifo(name.as_ptr(), 0o600) }, 0);
+        let (sender, receiver) = std::sync::mpsc::channel();
+        let worker = std::thread::spawn(move || {
+            let rejected = resolve_label_anchor_alpha(
+                Err(std::env::VarError::NotPresent), || path).is_err();
+            let _ = sender.send(rejected);
+        });
+        assert!(receiver.recv_timeout(std::time::Duration::from_secs(1))
+            .expect("FIFO selection must not wait for a writer"));
+        worker.join().unwrap();
+    }
+
+    #[test]
+    fn selection_is_strict_and_absence_is_distinct_from_zero() {
+        assert_eq!(parse_label_anchor_alpha_env(Err(std::env::VarError::NotPresent)).unwrap(), None);
+        for (input, expected) in [("0.0", 0.0), ("1.0", 1.0), ("0", 0.0), (".3", 0.3), ("0.3", 0.3), (".5", 0.5), ("0.5", 0.5), (".7", 0.7), ("0.7", 0.7), ("1", 1.0)] {
+            assert_eq!(f64::from(parse_label_anchor_alpha_env(Ok(input.into())).unwrap().unwrap()), expected);
+        }
+        for input in ["", " ", " 0", "0 ", "NaN", "inf", "0.4", "-0", "1e0"] {
+            assert!(parse_label_anchor_alpha_env(Ok(input.into())).is_err(), "{input}");
+        }
+        assert!(parse_label_anchor_alpha_env(Err(std::env::VarError::NotUnicode(std::ffi::OsString::from("invalid")))).is_err());
+    }
+}
+
 #[cfg(test)]
 fn parse_method(value: &str) -> Result<Occ3Method, Occ3Error> {
     match value {
@@ -839,6 +958,17 @@ impl Occ3Connector for SglangOcc3Connector {
         arming: Option<SourceSpanArming>,
     ) -> Result<pi_ai::source_capture::SourceCaptureLease, Occ3Error> {
         use pi_ai::source_capture::*;
+        let (label_anchor_alpha, alpha_source) = resolve_label_anchor_alpha(
+            std::env::var("OCC3_LABEL_ANCHOR_ALPHA"),
+            || std::env::var_os("OCC3_LABEL_ANCHOR_ALPHA_FILE")
+                .map(std::path::PathBuf::from)
+                .unwrap_or_else(|| std::path::PathBuf::from(crate::config::get_agent_dir()).join("occ3_label_anchor_alpha")),
+        )?;
+        crate::config::append_rotating_log_default(
+            &crate::config::get_debug_log_path(),
+            &format!("occ3 capture label_anchor_alpha={} source={alpha_source}",
+                label_anchor_alpha.map(f64::from).map(|v| v.to_string()).unwrap_or_else(|| "profile-default".into())),
+        );
         let enrolled = self.enroll(session_id).await?;
         let permit = &self.experiment()?.permit;
         if native_binding_failed!("capture";
@@ -878,6 +1008,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 expires_at_epoch: enrolled.expires_at_epoch,
                 span_policy: arming.span_policy.into(),
                 capture_mode: arming.capture_mode.into(),
+                label_anchor_alpha,
             },
             enrolled.source_profile,
             limits,

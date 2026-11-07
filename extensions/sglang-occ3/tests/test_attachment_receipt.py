@@ -222,7 +222,8 @@ def test_v2_receipt_upper_bound_is_measured_and_under_the_cap():
     upper = source_receipt_v2_upper_bound(MAX_RECEIPT_BYTES)
     assert len(upper) <= 2048
     parsed = SourceCaptureReceipt.parse(json.loads(upper.decode()))
-    assert len(parsed.wire()) == 39
+    assert len(parsed.wire()) == 40
+    assert parsed.label_anchor_alpha == 0.7
     assert parsed.span_policy == max(SPAN_POLICIES_V2)
     v1 = source_receipt_upper_bound(MAX_RECEIPT_BYTES)
     assert len(v1) < len(upper) <= MAX_RECEIPT_BYTES

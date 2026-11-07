@@ -30,7 +30,7 @@ pub const SOURCE_CAPTURE_MODE_SAME_TURN_TOOL: &str = "same_turn_tool_v1";
 /// controller (orchestrator dispatch), never a forged tool binding.
 pub const SOURCE_CAPTURE_MODE_CONTENT_ONLY: &str = "content_only_orchestrator_v1";
 pub const SOURCE_RECEIPT_SCHEMA: &str = "occ3.source.v1";
-/// Source receipt that carries the 21 v1 fields plus the occ3.span.v1 block.
+/// Source receipt with 21 v1 fields plus the optional label anchor and occ3.span.v1 block.
 pub const SOURCE_RECEIPT_SCHEMA_V2: &str = "occ3.source.v2";
 pub const SOURCE_RECEIPT_HEADER: &str = "x-optimus-occ3-source";
 pub const MAX_SOURCE_RECEIPT_BYTES: usize = 2048;
@@ -172,6 +172,19 @@ pub struct SourceCaptureIntent {
     /// v3 intent may carry it, pinned to `content_only_orchestrator_v1`.
     #[serde(default, skip_serializing_if = "String::is_empty")]
     pub capture_mode: String,
+    /// None uses the server profile default; explicit zero disables anchoring.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_selected_label_anchor_alpha")]
+    pub label_anchor_alpha: Option<LabelAnchorAlpha>,
+}
+
+// Absence selects the profile default; a supplied null is not a selection.
+fn deserialize_selected_label_anchor_alpha<'de, D>(
+    deserializer: D,
+) -> Result<Option<LabelAnchorAlpha>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    LabelAnchorAlpha::deserialize(deserializer).map(Some)
 }
 
 impl std::fmt::Debug for SourceCaptureIntent {
@@ -228,7 +241,26 @@ impl SourceCaptureIntent {
     pub fn canonical_bytes(&self) -> Result<Vec<u8>, SourceCaptureError> {
         let value =
             serde_json::to_value(self).map_err(|_| SourceCaptureError::InvalidField("intent"))?;
-        canonical_json_bytes(&value)
+        // Only this bounded intent field admits decimals. Keep the generic
+        // canonical encoder integer-only for all other protocol documents.
+        if self.label_anchor_alpha.is_none() {
+            return canonical_json_bytes(&value);
+        }
+        let fields = value.as_object().ok_or(SourceCaptureError::InvalidField("intent"))?;
+        let sorted: BTreeMap<_, _> = fields.iter().collect();
+        let mut out = vec![b'{'];
+        for (index, (key, value)) in sorted.into_iter().enumerate() {
+            if index > 0 { out.push(b','); }
+            out.extend(canonical_json_bytes(&serde_json::Value::String(key.clone()))?);
+            out.push(b':');
+            if key == "label_anchor_alpha" {
+                out.extend(serde_json::to_vec(value).map_err(|_| SourceCaptureError::InvalidField("intent"))?);
+            } else {
+                out.extend(canonical_json_bytes(value)?);
+            }
+        }
+        out.push(b'}');
+        Ok(out)
     }
 
     pub fn digest(&self) -> Result<String, SourceCaptureError> {
@@ -250,9 +282,10 @@ impl SourceCaptureIntent {
     }
 }
 
-/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1
-/// fields (extension SOURCE-SPAN-SELECTION.md section 6.2). Counts cover the
-/// retained window; the aligned span stays `accepted_span_start/_end`.
+/// The bounded occ3.span.v1 block a v2 receipt carries next to the 21 v1 fields
+/// plus the optional label anchor (extension SOURCE-SPAN-SELECTION.md section
+/// 6.2). Counts cover the retained window; the aligned span stays
+/// `accepted_span_start/_end`.
 #[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 pub struct SourceReceiptSpan {
@@ -325,6 +358,35 @@ impl SourceReceiptSpan {
     }
 }
 
+/// Bounded label anchoring coefficient. Old receipts default to disabled.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(try_from = "f64", into = "f64")]
+pub struct LabelAnchorAlpha(u8);
+
+impl LabelAnchorAlpha {
+    fn is_zero(&self) -> bool {
+        self.0 == 0
+    }
+}
+
+impl TryFrom<f64> for LabelAnchorAlpha {
+    type Error = SourceCaptureError;
+
+    fn try_from(value: f64) -> Result<Self, Self::Error> {
+        [0.0, 0.3, 0.5, 0.7, 1.0]
+            .iter()
+            .position(|allowed| *allowed == value)
+            .map(|index| Self(index as u8))
+            .ok_or(SourceCaptureError::InvalidReceipt)
+    }
+}
+
+impl From<LabelAnchorAlpha> for f64 {
+    fn from(value: LabelAnchorAlpha) -> Self {
+        [0.0, 0.3, 0.5, 0.7, 1.0][usize::from(value.0)]
+    }
+}
+
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(try_from = "SourceCaptureReceiptWire", into = "SourceCaptureReceiptWire")]
 pub struct SourceCaptureReceipt {
@@ -352,10 +414,12 @@ pub struct SourceCaptureReceipt {
     pub byte_count: u64,
     /// Present exactly on an `occ3.source.v2` wire (the whole block or none).
     pub span: Option<SourceReceiptSpan>,
+    pub label_anchor_alpha: LabelAnchorAlpha,
 }
 
-/// The flat wire shape: the 21 v1 fields and, on v2, the 18 span fields at the
-/// same level. Unknown fields and a partial span block are refused.
+/// The flat wire shape: 21 v1 fields plus the optional label anchor and, on v2,
+/// the 18 span fields at the same level. Unknown fields and a partial span block
+/// are refused.
 #[derive(Serialize, Deserialize)]
 #[serde(deny_unknown_fields)]
 struct SourceCaptureReceiptWire {
@@ -380,6 +444,8 @@ struct SourceCaptureReceiptWire {
     output_sha256: String,
     expires_at_epoch: u64,
     byte_count: u64,
+    #[serde(default, skip_serializing_if = "LabelAnchorAlpha::is_zero")]
+    label_anchor_alpha: LabelAnchorAlpha,
     #[serde(default, skip_serializing_if = "Option::is_none")]
     span_schema: Option<String>,
     #[serde(default, skip_serializing_if = "Option::is_none")]
@@ -447,6 +513,7 @@ impl From<SourceCaptureReceipt> for SourceCaptureReceiptWire {
             output_sha256: receipt.output_sha256,
             expires_at_epoch: receipt.expires_at_epoch,
             byte_count: receipt.byte_count,
+            label_anchor_alpha: receipt.label_anchor_alpha,
             span_schema: field(|s| s.span_schema.clone()),
             span_policy: field(|s| s.span_policy.clone()),
             span_marker_profile: field(|s| s.span_marker_profile.clone()),
@@ -542,6 +609,7 @@ impl TryFrom<SourceCaptureReceiptWire> for SourceCaptureReceipt {
             output_sha256: wire.output_sha256,
             expires_at_epoch: wire.expires_at_epoch,
             byte_count: wire.byte_count,
+            label_anchor_alpha: wire.label_anchor_alpha,
             span,
         })
     }
@@ -1103,7 +1171,8 @@ pub fn validate_receipt(
 ) -> Result<(), SourceCaptureError> {
     intent.validate(now)?;
     // The receipt schema follows the intent schema: a v1 intent is answered by
-    // the bare 21-field wire, a v2 intent by the wire with the span block.
+    // the 21 v1 fields plus the optional label anchor, a v2 intent by that wire
+    // with the span block.
     let schema_matches = match (&receipt.span, intent.schema.as_str()) {
         (None, SOURCE_CAPTURE_SCHEMA) => receipt.schema == SOURCE_RECEIPT_SCHEMA,
         (Some(_), SOURCE_CAPTURE_SCHEMA_V2) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
@@ -1112,6 +1181,9 @@ pub fn validate_receipt(
         (Some(_), SOURCE_CAPTURE_SCHEMA_V3) => receipt.schema == SOURCE_RECEIPT_SCHEMA_V2,
         _ => false,
     };
+    if intent.label_anchor_alpha.is_some_and(|alpha| alpha != receipt.label_anchor_alpha) {
+        return Err(SourceCaptureError::InvalidReceipt);
+    }
     if !schema_matches
         || receipt.representation != SOURCE_REPRESENTATION
         || receipt.predictor_position_offset != -1
@@ -1351,6 +1423,7 @@ mod span_arming_tests {
             expires_at_epoch: now() + 300,
             span_policy: arming.span_policy.into(),
             capture_mode: arming.capture_mode.into(),
+            label_anchor_alpha: None,
         }
     }
 
@@ -1424,6 +1497,38 @@ mod span_arming_tests {
 
     fn parse(wire: &serde_json::Value) -> Result<SourceCaptureReceipt, serde_json::Error> {
         serde_json::from_value(wire.clone())
+    }
+
+    #[test]
+    fn label_anchor_receipt_defaults_and_bounded_roundtrip() {
+        let intent = intent(SourceSpanArming::resolve(None).unwrap());
+        for mut wire in [v1_wire(&intent), v2_wire(&intent)] {
+            assert_eq!(f64::from(parse(&wire).unwrap().label_anchor_alpha), 0.0);
+            for alpha in [0.0, 0.3, 0.5, 0.7, 1.0] {
+                wire["label_anchor_alpha"] = serde_json::json!(alpha);
+                let receipt = parse(&wire).unwrap();
+                assert_eq!(f64::from(receipt.label_anchor_alpha), alpha);
+                assert_eq!(
+                    serde_json::to_value(receipt)
+                        .unwrap()
+                        .get("label_anchor_alpha")
+                        .and_then(serde_json::Value::as_f64)
+                        .unwrap_or(0.0),
+                    alpha
+                );
+            }
+            for invalid in [
+                serde_json::json!(true),
+                serde_json::json!(null),
+                serde_json::json!("0.3"),
+                serde_json::json!(0.1),
+                serde_json::json!(-0.3),
+                serde_json::json!(1.1),
+            ] {
+                wire["label_anchor_alpha"] = invalid;
+                assert!(parse(&wire).is_err());
+            }
+        }
     }
 
     #[test]

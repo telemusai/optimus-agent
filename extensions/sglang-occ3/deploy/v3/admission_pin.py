@@ -68,6 +68,7 @@ from . import atomic_publish
 from .native_validator import (DTYPES, MAX_CHALLENGE_BYTES, MAX_PIN_BYTES, PIN_FIELDS,
                                PIN_SCHEMA, _Reject, _derived_profile_digest, _exact_fields,
                                _method_descriptor, _method_profile_fields,
+                               _validate_label_anchor_policy,
                                _phase_challenge_path, _phase_pin_path, _require, _safe_read,
                                _sha_field, _strict_loads, _string, _uint)
 from .service_checks import request_json
@@ -147,8 +148,9 @@ def _plan_contract(attempt_dir):
     _require(isinstance(block, dict), "admission_template_invalid")
     source_profile = block.get("source_profile")
     _require(isinstance(source_profile, dict), "source_profile_invalid")
-    _exact_fields(source_profile, _method_profile_fields(descriptor), "source_profile_invalid")
+    _exact_fields(source_profile, _method_profile_fields(descriptor, source_profile), "source_profile_invalid")
     _require(source_profile.get("method") == method_id, "source_method_mismatch")
+    _validate_label_anchor_policy(source_profile)
     return state, evidence, method_id, source_profile
 
 
@@ -171,6 +173,10 @@ def _verified_staged_profile(evidence, source_profile):
         if name in value:
             _require(value[name] == source_profile.get(name),
                      "staged_profile_" + name + "_mismatch")
+    for name in ("label_anchor_alpha", "label_anchor_alpha_allowed", "label_anchor_alpha_default"):
+        fallback = 0.0 if name == "label_anchor_alpha" else None
+        _require(value.get(name, fallback) == source_profile.get(name, fallback),
+                 "staged_profile_" + name + "_mismatch")
     return value
 
 
