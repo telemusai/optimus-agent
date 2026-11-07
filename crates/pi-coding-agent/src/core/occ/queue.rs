@@ -47,6 +47,11 @@ pub const MAX_QUEUE_ENTRIES: usize = 8;
 const QUEUE_SCAN_LIMIT: usize = 512;
 const MAX_QUEUE_ID_CHARS: usize = 128;
 
+/// Only pre-publication work belongs in the flashing waiting badge.
+pub fn is_waiting_state(state: &str) -> bool {
+    matches!(state, "pending" | "armed")
+}
+
 /// Queue states the sender queue treats as terminal for visibility:
 /// `fallback` (only after the ordinary fallback delivery was acknowledged),
 /// `failed`, `completed` and `expired` leave no pending work. Every other
@@ -54,7 +59,7 @@ const MAX_QUEUE_ID_CHARS: usize = 128;
 /// `fallback_pending` (ordinary fallback in flight, not yet acknowledged),
 /// and unknown future states — still represents queued work and stays
 /// visible. Conservative for visibility: an unrecognized state keeps the
-/// badge honest rather than hiding work.
+/// detailed view honest rather than hiding work.
 pub fn is_terminal_state(state: &str) -> bool {
     matches!(state, "fallback" | "failed" | "completed" | "expired")
 }
@@ -142,7 +147,7 @@ pub struct CommunicationQueueRefusal {
 
 /// The queue view of one session: the owning session's runtime generation,
 /// the bounded newest entries, and the counts that survive the display
-/// bound. `pending_total` counts every non-terminal entry before
+/// bound. `pending_total` counts only waiting (`pending`/`armed`) entries before
 /// truncation; `omitted` is how many PENDING entries the bounded list
 /// dropped. Terminal history beyond the bound is not queued work and is
 /// not counted, so a deep completion history can never inflate the
@@ -179,9 +184,8 @@ pub struct CommunicationQueueSnapshot {
 impl CommunicationQueueSnapshot {
     /// Entries that still represent queued work. Terminal entries
     /// (fallback/failed/completed/expired) stay in [`Self::entries`] for
-    /// reporting, but the badge and the pending count use
-    /// [`Self::pending_total`], which also counts entries beyond the
-    /// display bound.
+    /// reporting. This detailed-view iterator includes in-flight and uncertain
+    /// work; the badge instead uses [`Self::pending_total`] for waiting work only.
     pub fn pending_entries(&self) -> impl Iterator<Item = &CommunicationQueueEntry> {
         self.entries
             .iter()
@@ -328,7 +332,7 @@ pub fn from_queue_notices(messages: &[AgentMessage], session_id: &str, generatio
     };
     let pending_total = all
         .values()
-        .filter(|entry| !is_terminal_state(&entry.state))
+        .filter(|entry| is_waiting_state(&entry.state))
         .count();
     // The bounded display list: live (non-terminal) entries are the
     // queue's work, so they claim the display slots first, by position.
@@ -557,7 +561,7 @@ mod tests {
             "g",
         );
         assert_eq!(snapshot.entries.len(), 7);
-        assert_eq!(snapshot.pending_total, 3);
+        assert_eq!(snapshot.pending_total, 1);
         let pending: Vec<_> = snapshot.pending_entries().map(|entry| entry.queue_id.as_str()).collect();
         assert_eq!(pending, vec!["q1", "q6", "q7"]);
         for state in ["fallback", "failed", "completed", "expired"] {
@@ -604,7 +608,7 @@ mod tests {
         let messages = vec![stale_q1, snapshot_notice, q1_advanced, q3_terminal, q4_new];
         let snapshot = from_queue_notices(&messages, "sender", "g");
         assert_eq!(snapshot.entries.len(), 4);
-        assert_eq!(snapshot.pending_total, 3);
+        assert_eq!(snapshot.pending_total, 2);
         // Ascending by the CURRENT positions: q1 (1), q3 (2), q4 (3), q2 (still 2? no: q2 kept its snapshot position 2).
         // q3 overrode to position 2 and q2 stayed at 2; the tie breaks by id: q2 < q3.
         assert_eq!(snapshot.entries[0].queue_id, "q1");
@@ -644,7 +648,7 @@ mod tests {
         messages.push(q1_new);
         let snapshot = from_queue_notices(&messages, "sender", "g");
         assert_eq!(snapshot.entries.len(), 2);
-        assert_eq!(snapshot.pending_total, 2);
+        assert_eq!(snapshot.pending_total, 1);
         assert_eq!(snapshot.entries[0].queue_id, "q1");
         assert_eq!(snapshot.entries[0].state, "armed");
         assert_eq!(snapshot.entries[1].queue_id, "q2");
