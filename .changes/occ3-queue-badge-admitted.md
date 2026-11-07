@@ -1,3 +1,4 @@
 - Changed the QUEUED badge to a neon-blue round marker alternating filled/bold and hollow/dim every 500 ms, with no idle redraws or delivery pulses.
 - Fixed QUEUED counts to include only pending/armed work, removing admitted handoffs and clearing the flash deadline at zero.
 - Fixed stale OCC-3 queue history prompting repeated handoffs after admission; serialize notice delivery and clear source retry scheduling on admission.
+- Fixed idle receiver-outcome prompting and kept delivery indicators visible before the optional queue badge on narrow terminals.

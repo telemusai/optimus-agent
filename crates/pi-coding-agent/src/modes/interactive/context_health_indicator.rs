@@ -99,6 +99,7 @@ impl Indicator {
 /// communication labels. The caller owns border padding and final truncation.
 pub(super) fn status_line(
     communication: &str,
+    queue_badge: &str,
     throughput: &str,
     input: &ContextHealthInput,
     available: usize,
@@ -106,7 +107,14 @@ pub(super) fn status_line(
     let health = Indicator::from_input(input);
     let full = health.label(false);
     let compact = health.label(true);
+    let with_badge = if queue_badge.is_empty() {
+        communication.to_string()
+    } else {
+        format!("{communication}  {queue_badge}")
+    };
     for text in [
+        format!("{with_badge}  {throughput}  {full}"),
+        format!("{with_badge}  {throughput}  {compact}"),
         format!("{communication}  {throughput}  {full}"),
         format!("{communication}  {throughput}  {compact}"),
         format!("{throughput}  {full}"),
@@ -194,6 +202,7 @@ mod tests {
 
     #[test]
     fn compaction_is_at_least_amber_and_clears_when_the_snapshot_recovers() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
         for tokens in [None, Some(100.0), Some(900.0)] {
             let mut input = ContextHealthInput {
                 tokens,
@@ -211,6 +220,7 @@ mod tests {
 
     #[test]
     fn all_bands_have_explicit_text_and_green_amber_red_ansi_colours() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
         for (tokens, name, code) in [
             (100.0, "GREEN", 82),
             (750.0, "AMBER", 214),
@@ -228,10 +238,24 @@ mod tests {
     }
 
     #[test]
+    fn queue_badge_drops_before_delivery_slots_at_width_boundary() {
+        let communication = "○ TXT  ○ OCC1  ○ OCC2  ● OCC3";
+        let throughput = "STREAM TPS ~50.0";
+        let input = input(100.0);
+        let expected = format!("{communication}  {throughput}  {}", Indicator::from_input(&input).label(true));
+        let width = visible_width(&expected);
+        let rendered = status_line(communication, "● QUEUED 2", throughput, &input, width);
+        assert_eq!(rendered, expected);
+        assert!(!rendered.contains("QUEUED"));
+        assert!(rendered.contains("● OCC3"));
+        assert_eq!(visible_width(&rendered), width);
+    }
+
+    #[test]
     fn tps_and_health_stay_adjacent_before_communication_labels_are_dropped() {
         let throughput = "\x1b[1;38;5;196mSTREAM TPS ~50.0\x1b[22;39m";
         for width in [0, 8, 20, 30, 40, 60, 80, 120] {
-            let text = status_line("○ TXT  ○ OCC1  ○ OCC2", throughput, &input(100.0), width);
+            let text = status_line("○ TXT  ○ OCC1  ○ OCC2", "", throughput, &input(100.0), width);
             let plain = strip_ansi(&text);
             if width >= 25 {
                 assert!(plain.contains("STREAM TPS ~50.0  CTX"), "{width}: {plain}");

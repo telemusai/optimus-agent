@@ -270,8 +270,7 @@ impl Bar {
         // truncated away first when the line narrows, never displacing the
         // delivered-message pulses or the health/TPS segments.
         self.line.set_communication_status(Some(context_health_indicator::status_line(
-            &format!("{}{}", self.communication.indicators(now),
-                if queue_badge.is_empty() { String::new() } else { format!("  {queue_badge}") }),
+            &self.communication.indicators(now), &queue_badge,
             &self.throughput.indicator(), &input,
             width.saturating_sub(2),
         )));

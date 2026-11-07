@@ -3442,8 +3442,9 @@ fn install_sender_queue_listener(
     // Receiver borrows the outer `session` clone (identical `Arc`), so the
     // move closure below keeps `listener_session` for itself - same shape
     // as the agent-event listener installed in `AgentSession::new`.
+    let listener_prompt_gate = head_prompt_gate.clone();
     let unsubscribe = session.agent.subscribe(Arc::new(move |event, _signal| {
-        let head_prompt_gate = head_prompt_gate.clone();
+        let head_prompt_gate = listener_prompt_gate.clone();
         let state = listener_state.clone();
         let session = listener_session.clone();
         let controller = listener_controller.clone();
@@ -3574,7 +3575,7 @@ fn install_sender_queue_listener(
         let state = std::sync::Arc::downgrade(&state);
         let session = std::sync::Arc::downgrade(&session);
         let controller = std::sync::Arc::downgrade(&controller);
-        let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller);
+        let _timer_abort = AgentSession::unsubscribe_timer_sweep(state, session, controller, head_prompt_gate);
     }
     Ok(())
 }
@@ -3796,6 +3797,7 @@ fn unsubscribe_timer_sweep(
     state: std::sync::Weak<occ3_state::Occ3NativeSession>,
     session: std::sync::Weak<AgentSession>,
     controller: std::sync::Weak<dyn crate::core::agent_messages::AgentSessionMessageController>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
 ) -> tokio::task::AbortHandle {
     tokio::spawn(async move {
         // Bounded cadence: twice per minimum TTL window, hard-capped at a
@@ -3809,20 +3811,27 @@ fn unsubscribe_timer_sweep(
             let Some(state) = state.upgrade() else { break };
             let Some(session) = session.upgrade() else { break };
             let Some(controller) = controller.upgrade() else { break };
-            // The sweep wrapper journals every expired notice into the
-            // durable outbox atomically with the queue rewrite.
-            let _drain = state.queue_notice_drain.lock().await;
-            let _ = state.sender_queue_sweep_expired();
-            let notices = state.take_pending_queue_notices();
-            for record in notices {
-                Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
-            }
-            // Same-process retry: unacked records re-enter the worklist
-            // for the next 30s tick; the outbox is the source of truth.
-            state.requeue_unacked_queue_notices();
+            Self::sender_queue_idle_tick(session, state, controller, gate.clone()).await;
         }
     })
     .abort_handle()
+}
+
+/// Idle receiver outcomes need a current-head prompt even without a sender
+/// event. Share the event driver's gate and lock so retries stay one-shot.
+async fn sender_queue_idle_tick(
+    session: Arc<AgentSession>,
+    state: Arc<occ3_state::Occ3NativeSession>,
+    controller: Arc<dyn crate::core::agent_messages::AgentSessionMessageController>,
+    gate: Arc<std::sync::Mutex<occ3_sender_queue::HeadPromptGate>>,
+) {
+    let _drain = state.queue_notice_drain.lock().await;
+    let _ = state.sender_queue_sweep_expired();
+    for record in state.take_pending_queue_notices() {
+        Self::deliver_queue_notice_record(&session, &state, &controller, record).await;
+    }
+    state.requeue_unacked_queue_notices();
+    Self::drive_occ3_head_prompt(session, state.clone(), gate).await;
 }
 
     /// Refreshes MCP provider registrations without rebuilding the session runtime.

@@ -558,7 +558,7 @@ mod tests {
         assert!(indicators.contains("● OCC3"), "{indicators}");
         assert_eq!(visible_width(&strip_ansi(&indicators)), 29);
         for width in [2usize, 5, 8, 20, 30, 40, 60, 80, 120] {
-            let status = status_line(&indicators, "", &ContextHealthInput::default(), width.saturating_sub(2));
+            let status = status_line(&indicators, "", "", &ContextHealthInput::default(), width.saturating_sub(2));
             if width >= 8 {
                 assert!(visible_width(&status) <= width.saturating_sub(2), "{width}: {status:?}");
             }

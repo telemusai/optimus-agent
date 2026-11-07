@@ -4,6 +4,7 @@ The status bar shows a blue round `QUEUED n` badge for handoffs waiting to
 capture or send (`pending` and `armed`). It alternates filled/bold and
 hollow/dim every 500 ms. Published, admitted, completed, failed and cancelled
 handoffs do not count. At zero, the badge and its animation deadline disappear.
+On narrow terminals, the optional queue badge drops before delivery indicators.
 The separate OCC3 delivery indicator pulses only on completed native use.
 
 Queue notices are durable audit history, not commands to repeat a handoff.
@@ -16,3 +17,7 @@ The host serializes timer and event notice drains and checks current durable
 acknowledgments before retrying delivery. Sender transcript replay is deduplicated
 by notice ID. The parent continues to receive durable notices and coalesced
 outcome notifications.
+
+Idle receiver outcomes use the same keyed head-prompt gate as sender events.
+The bounded idle timer requests one fresh capture or fallback when needed;
+admitted or completed heads never receive a stale retry prompt.
