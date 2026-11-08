@@ -477,6 +477,50 @@ def test_profile_loader_uses_no_client_fields(monkeypatch):
         w.load_runtime_profile()
 
 
+def test_profile_loader_applies_the_max_active_env_override(monkeypatch):
+    # OCC3_MAX_ACTIVE selects the effective admission cap at profile load:
+    # exactly 1 or 2, anything else fails closed, and the pinned file value
+    # (1) applies when the variable is unset. The override is part of the
+    # constructed RuntimeProfile, so binding_digest attests the effective
+    # value to clients.
+    import types
+    from dataclasses import asdict
+
+    def load():
+        module = types.ModuleType("occ3_sglang.native_profile")
+        static = asdict(profile())
+        static.pop("runtime_epoch")
+        static.pop("runtime_generation")
+        module.load_pinned_profile = lambda: static
+        module.get_runtime_incarnation = lambda: dict(
+            runtime_epoch="fresh", runtime_generation=99,
+            incarnation_digest="a" * 64, profile_sha256="b" * 64,
+            source_attestation_sha256="c" * 64)
+        monkeypatch.setitem(sys.modules, "occ3_sglang.native_profile", module)
+        return static
+
+    static = load()
+    assert static["max_active"] == 1
+    actual = w.load_runtime_profile()
+    assert actual.max_active == 1
+
+    monkeypatch.setenv("OCC3_MAX_ACTIVE", "2")
+    load()
+    actual = w.load_runtime_profile()
+    assert actual.max_active == 2
+    assert actual.max_active != static["max_active"]
+
+    for refused in ("3", "0", "", "two", "1.0"):
+        monkeypatch.setenv("OCC3_MAX_ACTIVE", refused)
+        load()
+        with pytest.raises(LatentError):
+            w.load_runtime_profile()
+
+    monkeypatch.delenv("OCC3_MAX_ACTIVE", raising=False)
+    load()
+    assert w.load_runtime_profile().max_active == 1
+
+
 def test_profile_loader_drops_the_declared_identity_block(monkeypatch):
     # The declared-launch identity is route-served metadata: it never enters
     # the RuntimeProfile fieldset the worker binds.

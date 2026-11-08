@@ -46,8 +46,13 @@ def test_descriptor_is_chat_canonical():
     assert profile().tile_rows == 256
     with pytest.raises(LatentError):
         profile(expected_ranks=1)
+    # The admission cap is operator-selectable between 1 and 2; anything
+    # else stays refused (latent_worker.load_runtime_profile reads the
+    # same pair from OCC3_MAX_ACTIVE).
+    assert profile(max_active=2).max_active == 2
+    assert profile(max_active=1).max_active == 1
     with pytest.raises(LatentError):
-        profile(max_active=2)
+        profile(max_active=3)
 
 
 @pytest.mark.parametrize("field", ["max_active","max_records","max_live_bytes","workspace_bytes","tile_rows"])

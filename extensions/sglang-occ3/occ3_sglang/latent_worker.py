@@ -1969,6 +1969,19 @@ def load_runtime_profile():
     # before the RuntimeProfile fieldset is checked or constructed.
     static = {name: value for name, value in static.items()
               if name != "declared_identity"}
+    # Operator-selected active-capture admission cap. The pinned file stays
+    # byte-attested (its PROFILE_SHA256 never moves); OCC3_MAX_ACTIVE may
+    # only select 1 or 2, and any other value fails closed so admission
+    # semantics can never silently change. The effective value is attested
+    # to clients through binding_digest (the RuntimeProfile includes
+    # max_active), and a swap that changes it also changes the container
+    # incarnation, so clients re-activate against the new profile through
+    # the existing authority path.
+    override = os.environ.get("OCC3_MAX_ACTIVE")
+    if override is not None:
+        require(override in ("1", "2"), "profile",
+                detail="latent_worker.load_runtime_profile.max_active_env")
+        static = {**static, "max_active": int(override)}
     require(type(static) is dict and expected - optional <= set(static) <= expected, "profile")
     return RuntimeProfile(**static, runtime_epoch=incarnation["runtime_epoch"],
                           runtime_generation=incarnation["runtime_generation"])
