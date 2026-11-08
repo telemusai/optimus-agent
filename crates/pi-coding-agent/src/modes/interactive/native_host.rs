@@ -2197,7 +2197,7 @@ async fn run_terminal(
                         // the ephemeral `?` guide (interactive-mode.ts:4931-4936).
                         mode.borrow_mut().handle_hotkeys_command();
                     } else if text.trim() == "/help" {
-                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter queues a follow-up while busy; Alt+Enter steers the running turn; Ctrl+O expands tools.", "dim");
+                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter steers the running turn while busy; Alt+Enter or Shift+Enter queues a follow-up; Ctrl+O expands tools.", "dim");
                     } else {
                         if submission_is_prompt(&text) { ui.borrow_mut().scroll_to_bottom(); }
                         submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
@@ -3704,16 +3704,17 @@ async fn prompt_model(
     follow_up: bool,
     images: Option<Vec<ImageContent>>,
 ) -> Result<(), String> {
-    // Ordinary submissions queue as in-order follow-ups while the agent is
-    // busy; the follow-up key opts into steering the running turn instead.
-    // The core session applies the same followUp default to behavior-less
-    // ordinary prompts, so every caller stays consistent.
+    // Enter steers the running turn while the agent is busy; the
+    // follow-up key opts into queueing an in-order follow-up instead.
+    // The core session keeps its behavior-less fallback (busy ordinary
+    // programmatic submissions queue rather than error), so every
+    // caller stays consistent.
     connection
         .prompt(
             line,
             Some(wire::AgentConnectionPromptOptions {
                 images,
-                streaming_behavior: Some(if follow_up { "steer" } else { "followUp" }.into()),
+                streaming_behavior: Some(if follow_up { "followUp" } else { "steer" }.into()),
                 ..Default::default()
             }),
         )
@@ -6048,8 +6049,8 @@ fn apply_event_legacy_for_speed(
         h.editor.borrow_mut().handle_input("\x1b[D");
         let cursor = h.editor.borrow().editor().get_cursor();
         tokio::task::yield_now().await;
-        // The ordinary submit path queues as a follow-up; the follow-up key now steers.
-        assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "followUp", "None"]);
+        // The ordinary submit path steers; the follow-up key queues.
+        assert_eq!(fake.only_call("prompt"), ["private submitted prompt", "steer", "None"]);
         assert!(receive.try_recv().is_err(), "held reply must not claim completion");
         reply.send(Err("synthetic host rejection".into())).unwrap();
         tokio::task::yield_now().await;
@@ -6984,8 +6985,8 @@ fn apply_event_legacy_for_speed(
                 .unwrap_or_else(|| panic!("{text} must reach connection.prompt, got {recorded:?}"));
             assert_eq!(prompt.1[0], text.trim(), "{text} must be prompted verbatim");
             assert_eq!(
-                prompt.1[1], "followUp",
-                "{text} must keep the default in-order follow-up queue mode"
+                prompt.1[1], "steer",
+                "{text} must keep the default steer queue mode"
             );
             assert!(
                 result.is_ok(),
@@ -7496,7 +7497,7 @@ fn apply_event_legacy_for_speed(
             assert_eq!(result.is_ok(), supported);
             let calls = recorder.calls();
             if supported {
-                assert!(calls.iter().any(|(name, args)| name == "prompt" && args[0] == "/mode toggle" && args[1] == "steer"));
+                assert!(calls.iter().any(|(name, args)| name == "prompt" && args[0] == "/mode toggle" && args[1] == "followUp"));
             } else {
                 assert!(calls.is_empty());
                 assert!(result.unwrap_err().contains("restart the daemon"));
@@ -8389,7 +8390,7 @@ fn apply_event_legacy_for_speed(
         tokio::time::sleep(std::time::Duration::from_millis(300)).await;
         let prompt = recorder.only_call("prompt");
         assert_eq!(prompt[0], "/model", "the prompt must reach the model verbatim");
-        assert_eq!(prompt[1], "followUp");
+        assert_eq!(prompt[1], "steer");
         assert!(
             editor.borrow().editor().get_history().iter().any(|entry| entry == "/model"),
             "the prompt must be recorded in history: {:?}",
