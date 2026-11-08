@@ -10,7 +10,10 @@ use crate::core::occ::occ3::connector::{
 };
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
-use crate::core::occ::occ3::types::{Occ3DeliveryStatus, OCC3_CONTROL_SUMMARY};
+use crate::core::occ::occ3::types::Occ3DeliveryStatus;
+// Separate line (not folded into the import above) so this branch merges
+// cleanly into main, which independently extended that import with Occ3Error.
+use crate::core::occ::occ3::types::OCC3_CONTROL_SUMMARY;
 use pi_agent_core::types::ContentBlock;
 use pi_agent_core::types::{
     AgentMessage, AgentTool, AgentToolResult, CustomAgentMessage, ResolveInferenceState,
