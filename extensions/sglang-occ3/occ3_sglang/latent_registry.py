@@ -61,7 +61,8 @@ PRUNE_GRACE_SECONDS = 60
 #: Terminal record states that may be pruned once revoked and GPU-freed.
 _PRUNABLE_STATES = ("retired", "expired")
 
-#: Live states that hold the single active OCC-3 slot (profile.max_active).
+#: Live states that hold one of the OCC-3 active slots (profile.max_active,
+#: operator-selectable 1 or 2 via OCC3_MAX_ACTIVE at profile load).
 _ACTIVE_STATES = ("reserved", "capturing", "leased", "injected")
 
 

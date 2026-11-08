@@ -468,6 +468,10 @@ class RuntimeProfile:
     max_live_bytes: int = 256 * 1024 * 1024
     workspace_bytes: int = 128 * 1024 * 1024
     max_records: int = 256
+    #: Concurrent live captures/leases the registry admits. 1 is the pinned
+    #: deployment default; 2 is operator-selectable through OCC3_MAX_ACTIVE at
+    #: profile load (see latent_worker.load_runtime_profile). The effective
+    #: value is attested to clients via binding_digest.
     max_active: int = 1
     max_ttl_seconds: int = 3600
     anchor_alpha: float = 0.0
@@ -514,7 +518,7 @@ class RuntimeProfile:
             # Registry-driven, method-agnostic: a reference may only be carried
             # by a method whose registry entry requires a calibration artifact.
             require(_registered_table().get(self.method, False), "profile")
-        require(self.max_active == 1 and 1 <= self.max_records <= 4096, "profile")
+        require(self.max_active in (1, 2) and 1 <= self.max_records <= 4096, "profile")
         require(0 < self.max_live_bytes <= 2**30 and 0 < self.workspace_bytes <= 2**30, "profile")
         require(self.anchor_alpha in (0.0, 0.3) and 1 <= self.tile_rows <= 4096, "profile")
         require(type(self.label_anchor_alpha) in (int, float)
