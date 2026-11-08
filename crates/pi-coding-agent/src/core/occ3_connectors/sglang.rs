@@ -28,6 +28,17 @@ pub const CONNECTOR_ID: &str = "sglang-occ3";
 
 const HEALTH_TIMEOUT: Duration = Duration::from_secs(15);
 const OP_TIMEOUT: Duration = Duration::from_secs(90);
+/// Bounded send-phase transport retries for the enrollment control call
+/// only. `sessions/enroll` re-enrolls the identical per-session record (the
+/// registry keys its immutable session record on session_id; operation_id is
+/// ignored for the same-session comparison), so a transient send failure - a
+/// pooled connection reset by the gateway between reuse, the live round-1
+/// stability failure on 2026-11-08 - is safely retried with the identical
+/// body instead of aborting the whole armed turn. Timeouts are deliberately
+/// NOT retried: a hanging server must fail at one HEALTH_TIMEOUT, never
+/// multiply it against the turn budget.
+const ENROLL_TRANSPORT_RETRIES: u32 = 2;
+const CONTROL_TRANSPORT_RETRY_DELAY: Duration = Duration::from_millis(250);
 
 /// Construction parameters (from a model's `occ3` block + environment).
 #[derive(Clone)]
@@ -233,7 +244,9 @@ impl SglangOcc3Connector {
     pub async fn runtime_identity(&self) -> Result<NativeRuntimeIdentity, Occ3Error> {
         let body = serde_json::json!({"schema":"occ3.runtime.identity.request.v1"});
         let identity: NativeRuntimeIdentity = self
-            .control_raw("/occ3/v1/native/runtime/identity", &body)
+            // Read-only runtime probe: no transport retry (unchanged
+            // behavior; only enroll is idempotent-by-record).
+            .control_raw("/occ3/v1/native/runtime/identity", &body, 0)
             .await.map_err(|failure| failure.error)?;
         if !identity.is_self_consistent() {
             return Err(native_invalid());
@@ -624,7 +637,25 @@ impl SglangOcc3Connector {
         path: &str,
         body: &Value,
     ) -> Result<T, Occ3Error> {
-        match self.control_raw(path, body).await {
+        self.control_with_retries(path, body, 0).await
+    }
+
+    /// Same contract as [`control`](Self::control), plus a bounded retry
+    /// budget for send-phase transport failures. A retried attempt never
+    /// produced any response, and only a control route that is idempotent
+    /// under the identical body (`sessions/enroll` re-enrolls the same
+    /// per-session record) may pass a nonzero budget. Declines that produced
+    /// an HTTP status keep their first-occurrence classification - busy/quota
+    /// refusals and authority failures are semantic, not transient transport
+    /// noise - and timeouts are never retried, so a hanging server still
+    /// fails at exactly one HEALTH_TIMEOUT.
+    async fn control_with_retries<T: serde::de::DeserializeOwned>(
+        &self,
+        path: &str,
+        body: &Value,
+        transport_retries: u32,
+    ) -> Result<T, Occ3Error> {
+        match self.control_raw(path, body, transport_retries).await {
             Ok(response) => Ok(response),
             Err(failure) => {
                 if failure.authority {
@@ -639,19 +670,38 @@ impl SglangOcc3Connector {
         &self,
         path: &str,
         body: &Value,
+        transport_retries: u32,
     ) -> Result<T, NativeControlFailure> {
         let bytes =
             pi_ai::source_capture::canonical_json_bytes(body).map_err(|_| native_invalid())?;
         if bytes.len() > 16384 {
             return Err(native_invalid().into());
         }
-        let mut response = self
-            .request_builder(reqwest::Method::POST, path, HEALTH_TIMEOUT)?
-            .header("accept-encoding", "identity")
-            .body(bytes)
-            .send()
-            .await
-            .map_err(|_| native_invalid())?;
+        let mut send_retries: u32 = 0;
+        let mut response = loop {
+            let sent = self
+                .request_builder(reqwest::Method::POST, path, HEALTH_TIMEOUT)?
+                .header("accept-encoding", "identity")
+                .body(bytes.clone())
+                .send()
+                .await;
+            match sent {
+                Ok(response) => break response,
+                Err(transport) => {
+                    // A send-phase failure produced no response at all. For
+                    // an idempotent route the identical resend is safe even
+                    // when the first attempt reached the server. Timeouts
+                    // stay excluded: the request may still be in flight and
+                    // a hanging server must fail once, not 1+N times.
+                    if transport.is_timeout() || send_retries >= transport_retries {
+                        return Err(native_invalid().into());
+                    }
+                    send_retries += 1;
+                    native_binding_diagnostic("control", "send_transport_retry", None);
+                    tokio::time::sleep(CONTROL_TRANSPORT_RETRY_DELAY).await;
+                }
+            }
+        };
         let status = response.status().as_u16();
         let identity_encoded = response
             .headers()
@@ -802,8 +852,18 @@ impl SglangOcc3Connector {
             "session_id":session_id,"model_fingerprint":fingerprint,"runtime_id":permit.runtime_id,
             "runtime_generation":permit.runtime_generation,"access_domain":permit.access_domain,
             "expires_at_epoch":permit.expires_at_epoch});
+        // Enrollment is the one control route that is idempotent under an
+        // identical body, so a send-phase transport failure is retried here
+        // instead of aborting the whole armed turn with the failure text
+        // (the live round-1 stability failure: a pooled connection reset
+        // 0.35s after the armed capture began). A decline that produced a
+        // response keeps its first-occurrence classification above.
         let response: EnrollmentResponse = self
-            .control("/occ3/v1/native/sessions/enroll", &body)
+            .control_with_retries(
+                "/occ3/v1/native/sessions/enroll",
+                &body,
+                ENROLL_TRANSPORT_RETRIES,
+            )
             .await?;
         // Only authority fields in a correctly addressed enrollment response
         // justify a runtime probe, not malformed schema or capability errors.
@@ -2091,5 +2151,290 @@ mod tests {
             assert!(!error.to_string().contains("one"));
             assert!(!error.to_string().contains("two"));
         }
+    }
+
+    // ---- enroll send-phase transport retry regressions ----
+    // Live round-1 stability failure (2026-11-08, client b2ae1805): the
+    // armed capture's enroll control call runs at the start of the facts
+    // turn, and a transient send-phase transport failure - a pooled
+    // connection reset by the gateway between reuse - aborted the whole
+    // turn with the failure text 0.35s after the capture armed. The mock
+    // below reproduces that wire shape on loopback: a dropped connection
+    // is read in full and then closed with no response at all, exactly
+    // like a reset between reuse.
+
+    struct EnrollTransportMock {
+        endpoint: Url,
+        enroll_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+        shutdown: Option<tokio::sync::oneshot::Sender<()>>,
+    }
+
+    impl Drop for EnrollTransportMock {
+        fn drop(&mut self) {
+            if let Some(shutdown) = self.shutdown.take() {
+                let _ = shutdown.send(());
+            }
+        }
+    }
+
+    fn find_head_end(buffer: &[u8]) -> Option<usize> {
+        buffer.windows(4).position(|window| window == b"\r\n\r\n")
+    }
+
+    async fn write_mock_response(
+        socket: &mut tokio::net::TcpStream,
+        status_line: &str,
+        body: &str,
+    ) {
+        use tokio::io::AsyncWriteExt;
+        let head = format!(
+            "HTTP/1.1 {status_line}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
+            body.len()
+        );
+        let _ = socket.write_all(head.as_bytes()).await;
+        let _ = socket.write_all(body.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    }
+
+    async fn serve_enroll_transport_connection(
+        mut socket: tokio::net::TcpStream,
+        drop_first: usize,
+        decline: Option<(u16, &'static str)>,
+        enroll_requests: std::sync::Arc<std::sync::atomic::AtomicUsize>,
+    ) {
+        use std::sync::atomic::Ordering;
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        // Read the full request head + body, bounded like the connector's
+        // own 16 KiB control envelope.
+        let mut received = Vec::new();
+        let mut chunk = [0u8; 4096];
+        let content_length = loop {
+            let n = match socket.read(&mut chunk).await {
+                Ok(n) => n,
+                Err(_) => return,
+            };
+            if n == 0 {
+                return;
+            }
+            received.extend_from_slice(&chunk[..n]);
+            let Some(head_end) = find_head_end(&received) else {
+                if received.len() > 16384 {
+                    return;
+                }
+                continue;
+            };
+            let head = String::from_utf8_lossy(&received[..head_end]).to_string();
+            let content_length = head
+                .lines()
+                .find_map(|line| {
+                    let (name, value) = line.split_once(':')?;
+                    name.eq_ignore_ascii_case("content-length")
+                        .then(|| value.trim().parse::<usize>().ok())?
+                })
+                .unwrap_or(0);
+            if received.len() >= head_end + 4 + content_length {
+                break content_length;
+            }
+        };
+        let head_end = find_head_end(&received).expect("head end known");
+        let head = String::from_utf8_lossy(&received[..head_end]).to_string();
+        let path = head
+            .lines()
+            .next()
+            .and_then(|line| line.split_whitespace().nth(1))
+            .unwrap_or_default()
+            .to_string();
+        if path != "/occ3/v1/native/sessions/enroll" {
+            return;
+        }
+        let body: Option<Value> = if content_length == 0 {
+            None
+        } else {
+            serde_json::from_slice(
+                &received[head_end + 4..head_end + 4 + content_length],
+            )
+            .ok()
+        };
+        let Some(body) = body else { return };
+        let seen = enroll_requests.fetch_add(1, Ordering::SeqCst);
+        if seen < drop_first {
+            // The transient failure under test: the request was read in
+            // full, then the connection closes with no response.
+            let _ = socket.shutdown().await;
+            return;
+        }
+        if let Some((status, code)) = decline {
+            let payload = format!("{{\"error\":{{\"code\":\"{code}\"}}}}");
+            write_mock_response(&mut socket, &format!("{status} decline"), &payload).await;
+            return;
+        }
+        let response = serde_json::json!({
+            "schema": "occ3.sessions.enrolled.v1",
+            "operation_id": body["operation_id"],
+            "session_id": body["session_id"],
+            "principal_digest": "a".repeat(64),
+            "runtime_id": body["runtime_id"],
+            "runtime_generation": body["runtime_generation"],
+            "model_fingerprint": body["model_fingerprint"],
+            "expires_at_epoch": body["expires_at_epoch"],
+            "readiness": {
+                "runtime_epoch": body["runtime_id"],
+                "runtime_generation": body["runtime_generation"],
+                "model_fingerprint": body["model_fingerprint"],
+                "method_id": "statebridge.fixture.method.v1",
+                "expected_ranks": 8,
+                "ready_ranks": 8,
+                "tp_layout_digest": "b".repeat(64),
+                "hidden_dim": 6144,
+                "layer_index": 77,
+                "dtype": "bfloat16",
+                "profile_digest": "c".repeat(64),
+                "source_capture": true,
+                "continuous_prefix": true,
+                "terminal_journal": true,
+                "max_capture_bytes": 134217728,
+            },
+        });
+        let payload = response.to_string();
+        write_mock_response(&mut socket, "200 OK", &payload).await;
+    }
+
+    async fn serve_enroll_transport_mock(
+        drop_first: usize,
+        decline: Option<(u16, &'static str)>,
+    ) -> EnrollTransportMock {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+            .await
+            .expect("bind loopback");
+        let endpoint = Url::parse(&format!(
+            "http://{}",
+            listener.local_addr().expect("local addr")
+        ))
+        .expect("endpoint url");
+        let enroll_requests = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let (shutdown, mut shutdown_rx) = tokio::sync::oneshot::channel::<()>();
+        let counter = std::sync::Arc::clone(&enroll_requests);
+        tokio::spawn(async move {
+            loop {
+                let socket = tokio::select! {
+                    accepted = listener.accept() => match accepted {
+                        Ok((socket, _)) => socket,
+                        Err(_) => break,
+                    },
+                    _ = &mut shutdown_rx => break,
+                };
+                let counter = std::sync::Arc::clone(&counter);
+                tokio::spawn(async move {
+                    serve_enroll_transport_connection(socket, drop_first, decline, counter)
+                        .await;
+                });
+            }
+        });
+        EnrollTransportMock {
+            endpoint,
+            enroll_requests,
+            shutdown: Some(shutdown),
+        }
+    }
+
+    fn fixture_permit(endpoint: &Url) -> NativeExperimentalPermit {
+        NativeExperimentalPermit {
+            attempt_id: "activation-fixture".into(),
+            identity: Occ3ModelIdentity {
+                model_id: "fixture-model".into(),
+                architecture: "fixture-arch".into(),
+                checkpoint_revision: "fixture-revision".into(),
+                weight_fingerprint: "fixture-weights".into(),
+                tokenizer_fingerprint: "fixture-tokenizer".into(),
+                chat_template_fingerprint: "fixture-template".into(),
+                quantisation: "fixture-bf16".into(),
+                tensor_geometry: "fixture-tp8".into(),
+                kv_layout: "fixture-kv".into(),
+                latent_method: "statebridge.fixture.method.v1".into(),
+                runtime: "fixture-runtime".into(),
+            },
+            target: pi_ai::inference_attachment::InferenceStateTarget {
+                provider: "fixture-provider".into(),
+                model_id: "fixture-model".into(),
+                base_url: endpoint.to_string(),
+            },
+            runtime_id: "fixture-runtime-epoch".into(),
+            runtime_generation: 1,
+            access_domain: "experimental.fixture-runtime-epoch".into(),
+            expires_at_epoch: native_now() + 600,
+            source_profile: pi_ai::source_capture::SourceCaptureProfile {
+                layer_index: 77,
+                hidden_dim: 6144,
+                dtype: "bfloat16".into(),
+                layout_digest: "b".repeat(64),
+                expected_ranks: 8,
+            },
+            profile_digest: "c".repeat(64),
+            max_capture_bytes: 134_217_728,
+        }
+    }
+
+    fn fixture_connector(endpoint: &Url) -> SglangOcc3Connector {
+        SglangOcc3Connector::new_experimental(
+            SglangOcc3Config {
+                endpoint: endpoint.clone(),
+                api_key: None,
+                control_headers: None,
+            },
+            fixture_permit(endpoint),
+        )
+        .expect("fixture connector")
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_retries_a_transient_send_failure_and_enrolls() {
+        let mock = serve_enroll_transport_mock(1, None).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector
+            .enroll("fixture-session-a1")
+            .await
+            .expect("enrollment succeeds after one transient send failure");
+        assert_eq!(result.session_id, "fixture-session-a1");
+        assert_eq!(result.identity.model_id, "fixture-model");
+        assert_eq!(result.source_profile.expected_ranks, 8);
+        // One dropped attempt plus one successful resend.
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            2
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_send_retry_exhaustion_fails_closed() {
+        let mock = serve_enroll_transport_mock(usize::MAX, None).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector.enroll("fixture-session-b2").await;
+        assert!(matches!(
+            result,
+            Err(Occ3Error::TransferFailed { ref reason })
+                if reason == "native control binding invalid"
+        ));
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1 + ENROLL_TRANSPORT_RETRIES as usize
+        );
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn enroll_never_retries_an_http_decline() {
+        let mock = serve_enroll_transport_mock(0, Some((429, "quota"))).await;
+        let connector = fixture_connector(&mock.endpoint);
+        let result = connector.enroll("fixture-session-c3").await;
+        assert!(matches!(
+            result,
+            Err(Occ3Error::NativeInferenceBusyRefused { .. })
+        ));
+        assert_eq!(
+            mock.enroll_requests
+                .load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
     }
 }
