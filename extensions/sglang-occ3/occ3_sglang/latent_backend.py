@@ -323,14 +323,17 @@ class LatentBackend:
                 "source_handle": enrollment.source_handle, "state_generation": enrollment.state_generation,
                 "expires_at_epoch": enrollment.expires_at_epoch}, command_id="reserve-" + descriptor.reservation_id)
         except LatentError as error:
-            if error.code != "busy":
+            if error.code not in ("busy", "quota"):
                 raise
-            # Proven non-use: the registry declines "busy" before creating
-            # any record, attempt or byte charge, on every rank (a rank
-            # mismatch would have come back as "ranks"). Nothing was
-            # dispatched and no receipt can exist, so this is the same
-            # retryable contract as the scheduler busy-batch refusal. The
-            # local entry is marked retired so it is pruned.
+            # Proven non-use: the registry declines "busy" and every
+            # reserve-capture quota require (byte, record, tombstone or
+            # budget-owner capacity) BEFORE creating any record, attempt or
+            # byte charge, on every rank (a rank mismatch would have come
+            # back as "ranks"). Nothing was dispatched and no receipt can
+            # exist, so this is the same retryable contract as the
+            # scheduler busy-batch refusal: a distinct 503 with Retry-After
+            # instead of a terminal 409 that strands the sender. The local
+            # entry is marked retired so it is pruned.
             self.attempts[attempt_id]["retired"] = True
             raise AttachmentError("scheduler_busy", 503) from None
         return enrollment

@@ -103,8 +103,13 @@ def _intent(p, n=1):
 
 
 @pytest.mark.asyncio
-async def test_backend_maps_registry_busy_to_scheduler_busy_503():
-    b = _backend("busy")
+@pytest.mark.parametrize("code", ["busy", "quota"])
+async def test_backend_maps_registry_busy_to_scheduler_busy_503(code):
+    """Both are pre-mutation capacity refusals at reserve_capture: busy is
+    the single active slot, quota is the byte/record/tombstone budget. They
+    share the retryable scheduler_busy contract so a saturated live-byte
+    budget cannot strand the sender with a terminal 409."""
+    b = _backend(code)
     p = b.profile
     with pytest.raises(AttachmentError) as caught:
         await b.enroll_source(_intent(p), _identity(p), "attempt-1", "rid-1", time.monotonic() + 30)
@@ -113,7 +118,7 @@ async def test_backend_maps_registry_busy_to_scheduler_busy_503():
 
 
 @pytest.mark.asyncio
-@pytest.mark.parametrize("code", ["quota", "replay", "identity", "expired"])
+@pytest.mark.parametrize("code", ["replay", "identity", "expired"])
 async def test_backend_keeps_other_latent_errors(code):
     b = _backend(code)
     p = b.profile

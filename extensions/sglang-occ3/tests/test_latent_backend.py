@@ -347,6 +347,29 @@ async def test_v1_enroll_refuses_when_calibration_collection_is_armed(monkeypatc
 
 
 @pytest.mark.asyncio
+@pytest.mark.parametrize("code", ["busy", "quota"])
+async def test_source_reserve_capacity_refusal_is_scheduler_busy_503(code):
+    """Byte/record-capacity quota at reserve_capture is pre-dispatch non-use:
+    it must carry the retryable scheduler_busy contract, not a terminal 409
+    that strands the sender while the live-byte budget is saturated."""
+    from occ3_sglang.attachment_contract import AttachmentError
+    backend,client,identity,expiry=fixture(); p=backend.profile
+    intent=CaptureIntent(capture_id="capture",source_session_id="source",source_request_id="client-rid",turn_nonce="turn",
+        model_fingerprint=p.model_fingerprint,runtime_id=p.runtime_epoch,runtime_generation=9,method=p.method,
+        retained_count_limit=8,max_capture_bytes=128*1024*1024,expires_at_epoch=expiry)
+    call=client.call
+    async def refused(op,payload,command_id=None):
+        if op=="reserve_capture":
+            raise LatentError(code, detail="latent_registry.reserve_capture.byte_capacity")
+        return await call(op,payload,command_id)
+    client.call=refused
+    with pytest.raises(AttachmentError) as caught:
+        await backend.enroll_source(intent,identity,"attempt","native-rid",identity.deadline_monotonic)
+    assert (caught.value.code,caught.value.status)==("scheduler_busy",503)
+    assert backend.attempts["attempt"]["retired"]
+
+
+@pytest.mark.asyncio
 async def test_receiver_registry_busy_is_scheduler_busy_503_and_retires_the_attempt():
     """Fable review 4: the consume busy decline uses the capture busy contract."""
     from occ3_sglang.attachment_contract import AttachmentError
