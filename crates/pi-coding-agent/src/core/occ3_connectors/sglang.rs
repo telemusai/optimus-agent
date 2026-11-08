@@ -1035,7 +1035,17 @@ fn parse_identity(fields: &Value) -> Result<Occ3ModelIdentity, Occ3Error> {
     })
 }
 
+/// Client default when neither the environment nor the alpha file selects a
+/// value: 0.3, the attested hybrid coefficient. Sending `None` instead makes
+/// the server fall back to its profile default, which garbled every
+/// alphanumeric handoff code on one Windows host while 0.3 stayed byte-exact
+/// (2026-11-08 cross-machine finding: profile-default garbled 5/5 codes on
+/// Windows; 0.3 was byte-exact on Linux 6/6 and Windows 5/5).
+const DEFAULT_LABEL_ANCHOR_ALPHA: f64 = 0.3;
+
 /// Resolve each capture afresh; environment selection never reads the file.
+/// A missing file selects the attested client default instead of the server
+/// profile default, so precedence is env > file > client default.
 fn resolve_label_anchor_alpha(
     env: Result<String, std::env::VarError>,
     path: impl FnOnce() -> std::path::PathBuf,
@@ -1057,7 +1067,13 @@ fn resolve_label_anchor_alpha(
     }
     let file = match options.open(path()) {
         Ok(file) => file,
-        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok((None, "default")),
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok((
+                Some(pi_ai::source_capture::LabelAnchorAlpha::try_from(DEFAULT_LABEL_ANCHOR_ALPHA)
+                    .expect("DEFAULT_LABEL_ANCHOR_ALPHA is an attested alpha")),
+                "client-default",
+            ));
+        }
         Err(_) => return Err(invalid()),
     };
     if !file.metadata().map_err(|_| invalid())?.is_file() { return Err(invalid()); }
@@ -1104,7 +1120,9 @@ mod label_anchor_alpha_tests {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("alpha");
         let resolve = || resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || path.clone());
-        assert_eq!(resolve().unwrap(), (None, "default"));
+        let (selected, source) = resolve().unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.3);
+        assert_eq!(source, "client-default");
         for alpha in ["0", "0.3", "0.5", "0.7", "1"] {
             std::fs::write(&path, format!(" {alpha}\n")).unwrap();
             let (selected, source) = resolve().unwrap();
@@ -1139,6 +1157,22 @@ mod label_anchor_alpha_tests {
         assert!(receiver.recv_timeout(std::time::Duration::from_secs(1))
             .expect("FIFO selection must not wait for a writer"));
         worker.join().unwrap();
+    }
+
+    #[test]
+    fn explicit_zero_is_never_replaced_by_the_client_default() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("alpha");
+        std::fs::write(&path, "0.3\n").unwrap();
+        let (selected, source) =
+            resolve_label_anchor_alpha(Ok("0".into()), || path.clone()).unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.0);
+        assert_eq!(source, "env");
+        std::fs::write(&path, "0\n").unwrap();
+        let (selected, source) =
+            resolve_label_anchor_alpha(Err(std::env::VarError::NotPresent), || path.clone()).unwrap();
+        assert_eq!(f64::from(selected.unwrap()), 0.0);
+        assert_eq!(source, "file");
     }
 
     #[test]
