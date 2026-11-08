@@ -272,7 +272,13 @@ async fn serve(
                         // occ3_handoff tool-call row and its argument rows.
                         // The turn emits no content delta, so the window
                         // carries no CONTENT row.
-                        let mut receipt=json!({"schema":"occ3.source.v2","intent_digest":sha256(&canonical_json_bytes(intent).unwrap()),"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                        // The receipt digest mirrors the client's own
+                        // canonicalization, including the label-anchor
+                        // decimal exception, by hashing through the same
+                        // production digest the lease verifies.
+                        let intent_digest=serde_json::from_value::<pi_ai::source_capture::SourceCaptureIntent>(intent.clone()).unwrap().digest().unwrap();
+                        let mut receipt=json!({"schema":"occ3.source.v2","intent_digest":intent_digest,"source_handle":"private-source-handle","native_rid":"native-source-rid","response_id":"native-source-rid","capture_commit_id":"synthetic-capture-commit",
+                            "label_anchor_alpha":intent.get("label_anchor_alpha").cloned().unwrap_or(json!(0.0)),
                             "accepted_span_start":0,"accepted_span_end":8,"retained_count":8,"predictor_position_offset":-1,"representation":"final_layer_prenorm_predictor","layer_index":3,"hidden_dim":8,"dtype":"bfloat16","layout_digest":"b".repeat(64),"ready_ranks":8,"expected_ranks":8,"accepted_sequence_digest":"d".repeat(64),"output_sha256":if mode.bad_source_hash{"0".repeat(64)}else{sha256(output.as_bytes())},"expires_at_epoch":intent["expires_at_epoch"],"byte_count":128});
                         let span=json!({"span_schema":"occ3.span.v1","span_policy":intent["span_policy"],
                             "span_marker_profile":"glm45_glm47_xml_kv.v1","span_marker_schema":"occ3.span.markers.v1",
