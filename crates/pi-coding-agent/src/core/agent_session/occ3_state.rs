@@ -29,6 +29,9 @@ use pi_ai::types::Model;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+// Imported separately (below, away from the types import that main
+// independently extended) so this branch merges cleanly into main.
+use crate::core::occ::occ3::types::OCC3_CONTROL_SUMMARY;
 
 pub const NATIVE_HANDOFF_TOOL: &str = "occ3_handoff";
 
@@ -4722,7 +4725,7 @@ mod tests {
                 expires_at_epoch: now() + 600,
                 state_size_bytes: 128,
             },
-            control_summary: "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
+            control_summary: OCC3_CONTROL_SUMMARY.into(),
             fallback_reference: "occ1".into(),
         };
         PreparedNativeHandoff::new(

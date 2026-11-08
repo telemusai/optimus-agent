@@ -21,7 +21,7 @@ use crate::core::occ::occ3::connector::{
 use pi_ai::source_capture::SourceSpanArming;
 use crate::core::occ::occ3::types::{
     Occ3ConnectorCapabilities, Occ3Error, Occ3HandleRef, Occ3Method, Occ3ModelIdentity,
-    Occ3TransferMetrics,
+    Occ3TransferMetrics, OCC3_CONTROL_SUMMARY,
 };
 
 pub const CONNECTOR_ID: &str = "sglang-occ3";
@@ -1419,7 +1419,7 @@ impl Occ3Connector for SglangOcc3Connector {
                 // never copied into the successful receiver message. The
                 // summary is receiver-framed so the receiving model answers
                 // as itself, not in the sender's voice.
-                control_summary: "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
+                control_summary: OCC3_CONTROL_SUMMARY.into(),
                 fallback_reference: "text".into(),
             },
         };
