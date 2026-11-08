@@ -6,7 +6,7 @@
 #   2. rename neo-glm53-pre-occ3 back to neo-glm53;
 #   3. restore its original restart policy (deploy.sh had set it to 'no');
 #   4. start it;
-#   5. poll GET http://127.0.0.1:30001/health until 200 (timeout 900s);
+#   5. poll GET http://127.0.0.1:30001/health until 200 (timeout 1500s);
 #   6. confirm the plugin routes are gone (informational) and report.
 #
 # The original container and base image are never deleted by deploy.sh, so
@@ -21,7 +21,7 @@
 #   BASE_CONTAINER        default neo-glm53
 #   PRE_CONTAINER         default neo-glm53-pre-occ3
 #   HOST_IP / HOST_PORT   health endpoint (default 127.0.0.1:30001)
-#   OCC3_HEALTH_TIMEOUT   seconds to wait for /health (default 900)
+#   OCC3_HEALTH_TIMEOUT   seconds to wait for /health (default 1500)
 #   OCC3_POLL_INTERVAL    seconds between polls (default 5)
 #   OCC3_STOP_TIMEOUT    docker stop timeout in seconds (default 300)
 #   OCC3_LOG_FILE         log file (default rollback-occ3.log next to this
@@ -37,7 +37,7 @@ BASE_CONTAINER="${BASE_CONTAINER:-neo-glm53}"
 PRE_CONTAINER="${PRE_CONTAINER:-neo-glm53-pre-occ3}"
 HOST_IP="${HOST_IP:-127.0.0.1}"
 HOST_PORT="${HOST_PORT:-30001}"
-OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-900}"
+OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-1500}"
 OCC3_POLL_INTERVAL="${OCC3_POLL_INTERVAL:-5}"
 OCC3_STOP_TIMEOUT="${OCC3_STOP_TIMEOUT:-300}"
 
