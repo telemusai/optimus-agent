@@ -146,7 +146,7 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.tools.expand` | `ctrl+o` | Cycle and save conversation detail |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
-| `app.message.followUp` | `alt+enter` | Queue follow-up message |
+| `app.message.followUp` | `alt+enter`, `shift+enter` | Queue a follow-up message; Enter steers the running turn |
 | `app.message.navigateOlder` | `alt+up` | Select the next older pending message |
 | `app.message.navigateNewer` | `alt+down` | Select the next newer pending message or restore the draft |
 | `app.message.moveEarlier` | `ctrl+alt+up` | Move the selected pending message one place earlier in its queue |

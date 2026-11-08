@@ -290,10 +290,10 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
     map.insert(
         "app.message.followUp".to_string(),
         KeybindingDefinition {
-            default_keys: vec![String::from("alt+enter")],
-            default_keys_is_single: true,
+            default_keys: vec![String::from("alt+enter"), String::from("shift+enter")],
+            default_keys_is_single: false,
             description: Some(
-                "Steer the running turn; Enter queues a follow-up".to_string(),
+                "Queue a follow-up message; Enter steers the running turn".to_string(),
             ),
             default_key_scope: None,
         },

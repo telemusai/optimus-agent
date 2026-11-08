@@ -2548,7 +2548,7 @@ impl InteractiveMode {
             return None;
         }
         Some(format!(
-            "{} to steer now; Enter queues a follow-up",
+            "{} to queue message",
             self.key_text("app.message.followUp")
         ))
     }
@@ -2709,7 +2709,7 @@ impl InteractiveMode {
 | `{manage_heartbeats}` | Manage heartbeats |
 | `{external_editor}` | Edit message in external editor |
 | `{prompt_stash}` | Stash or restore draft prompt |
-| `{follow_up}` | Steer the running turn; Enter queues a follow-up |
+| `{follow_up}` | Queue follow-up message |
 | `{browse_queue}` | Browse and edit queued messages |
 | `{reorder_queue}` | Reorder the selected queued message |
 | `{paste_image}` | Paste image from clipboard |
@@ -2783,7 +2783,7 @@ impl InteractiveMode {
         Some(theme().fg(
             "dim",
             &format!(
-                "{lane} {} \u{b7} {older}/{newer} browse \u{b7} {earlier}/{later} reorder \u{b7} enter queues \u{b7} {queue} steers \u{b7} empty deletes",
+                "{lane} {} \u{b7} {older}/{newer} browse \u{b7} {earlier}/{later} reorder \u{b7} enter steers \u{b7} {queue} queues \u{b7} empty deletes",
                 selected.index + 1
             ),
         ))
