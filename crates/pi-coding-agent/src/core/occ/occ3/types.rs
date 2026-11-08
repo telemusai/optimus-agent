@@ -165,6 +165,18 @@ pub struct Occ3Envelope {
 /// Bounded default for the embedded control summary.
 pub const OCC3_MAX_SUMMARY_CHARS: usize = 2048;
 
+/// Fixed receiver-framed control summary for native handoffs.
+///
+/// The summary is the only durable, model-visible text framing the receiver
+/// gets for an attached native state. Differential forensics (2026-11-08
+/// cross-machine drills) showed receivers in long contexts recovering the
+/// sender's facts only approximately (prefix loss, case loss, adjacent-token
+/// drift) when the framing did not direct the model to extract from the
+/// attached state. The proof harness framing that recovered facts byte-exact
+/// named the attachment position and required verbatim reporting; this
+/// constant carries those properties while staying receiver-framed.
+pub const OCC3_CONTROL_SUMMARY: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. The sender's latent rows are attached to this turn immediately after this message as the primary information source. Read the attached state carefully before answering, and prefer its content verbatim: when it carries facts, codes, or numbers, report them exactly as the state presents them, character for character, without paraphrasing, completing, or guessing. As the receiver, answer your current task using that state.";
+
 /// Error taxonomy for OCC-3 bridge operations. All variants are
 /// fallback-classified by [`super::negotiation`].
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]

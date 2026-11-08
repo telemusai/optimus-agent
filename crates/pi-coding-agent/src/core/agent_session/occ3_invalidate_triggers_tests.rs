@@ -32,7 +32,7 @@ use crate::core::occ::occ3::connector::{
 };
 use crate::core::occ::occ3::types::{
     Occ3ConnectorCapabilities, Occ3DeliveryStatus, Occ3Envelope, Occ3Error, Occ3HandleRef,
-    Occ3Method, Occ3ModelIdentity,
+    Occ3Method, Occ3ModelIdentity, OCC3_CONTROL_SUMMARY,
 };
 use pi_agent_core::types::InferenceStateRequest;
 use pi_ai::inference_attachment::InferenceStateTarget;
@@ -348,7 +348,7 @@ fn admit_envelope(native: &Arc<Occ3NativeSession>) -> String {
                 state_size_bytes: 128,
             },
             control_summary:
-                "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
+                OCC3_CONTROL_SUMMARY.into(),
             fallback_reference: "occ1".into(),
         },
     };
@@ -419,7 +419,7 @@ fn admit_after_close_errs(native: &Arc<Occ3NativeSession>) {
                 state_size_bytes: 128,
             },
             control_summary:
-                "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.".into(),
+                OCC3_CONTROL_SUMMARY.into(),
             fallback_reference: "occ1".into(),
         },
     };

@@ -117,7 +117,7 @@ use pi_coding_agent::core::agent_session::occ3_state::{
     NativeSourceBudget, Occ3NativeSession, NATIVE_HANDOFF_TOOL,
 };
 use pi_coding_agent::core::occ::occ3::connector::Occ3Connector;
-use pi_coding_agent::core::occ::occ3::types::{Occ3DeliveryStatus, Occ3ModelIdentity};
+use pi_coding_agent::core::occ::occ3::types::{Occ3DeliveryStatus, Occ3ModelIdentity, OCC3_CONTROL_SUMMARY};
 use pi_coding_agent::core::occ3_connectors::sglang::{
     NativeExperimentalPermit, SglangOcc3Config, SglangOcc3Connector,
 };
@@ -3171,7 +3171,7 @@ async fn run_no_state_case(
 /// control_summary and PreparedNativeHandoff pins it). The NO_ATTACHMENT arm
 /// presents this question verbatim, so the ONLY difference from the positive
 /// case is the missing attachment itself.
-const NATIVE_CONTROL_SUMMARY: &str = "You are the receiver of this attached native state. It is the sender's context, not your own history. As the receiver, answer your current task using that state.";
+const NATIVE_CONTROL_SUMMARY: &str = OCC3_CONTROL_SUMMARY;
 
 /// NO_ATTACHMENT arm: the positive case's receiver framing with NO source
 /// handoff and NO attachment - one plain chat request that carries no occ3
