@@ -1652,8 +1652,13 @@ Do not call occ3_handoff again for these facts."
                     } else {
                         // Waiting does not arm or replay anything. A stuck holder
                         // must not prevent cancellation or monopolize this turn.
+                        // The default 90s covers a sibling sender's whole
+                        // arm->publish window, which is dominated by that
+                        // model's facts turn (measured ~40s live); 30s cut it
+                        // off and forced a noisy re-arm cycle. The wait runs
+                        // between model turns, so no inference stream stalls.
                         let wait = tokio::time::timeout(
-                            std::time::Duration::from_secs(30),
+                            crate::core::occ3_connectors::activation::capture_capacity_wait(),
                             crate::core::occ3_connectors::activation::acquire_capture_permit(),
                         );
                         let cancelled = async {
