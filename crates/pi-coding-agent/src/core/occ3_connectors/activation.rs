@@ -512,25 +512,62 @@ pub async fn verify_cached(
 ) -> Result<std::sync::Arc<Occ3Ready>, Occ3Decline> {
     let config = configured_connector(request)?;
     let key = cache_key(request, &config);
-    if let Some(ready) = ready_cache()
-        .lock()
-        .ok()
-        .and_then(|cache| cache.get(&key).cloned())
-    {
-        if ready.expires_at_epoch > now_epoch() {
-            return Ok(ready);
-        }
-        // An expired permit is not a verification: drop that entry so the
-        // handshake below replaces it.
-        if let Ok(mut cache) = ready_cache().lock() {
-            cache.remove(&key);
-        }
+    if let Some(ready) = fresh_ready(&key) {
+        return Ok(ready);
+    }
+    // One cold handshake per key. Two sessions activating concurrently (for
+    // example sibling RLM children spawned milliseconds apart) both miss the
+    // cache above; without serialization each `verify` mints its own
+    // connector instance, and the connector's process-local native records
+    // (publications, retirements) would silently split one cache key across
+    // instances. A sender on one instance and a receiver on another then lose
+    // each other's publications and the receiver's `prepare_inference`
+    // fails closed as Unauthorized. Racers wait here, then reuse the
+    // winner's fresh entry instead of minting a second instance.
+    let _one_handshake = verifying_lock(&key).lock_owned().await;
+    if let Some(ready) = fresh_ready(&key) {
+        return Ok(ready);
     }
     let ready = std::sync::Arc::new(verify(request, handshake_timeout).await?);
     if let Ok(mut cache) = ready_cache().lock() {
-        cache.insert(key, std::sync::Arc::clone(&ready));
+        // Converge on a fresh entry another caller inserted while this
+        // verification ran, so a key never maps to two live instances.
+        let existing_is_fresh = cache
+            .get(&key)
+            .is_some_and(|ready| ready.expires_at_epoch > now_epoch());
+        if !existing_is_fresh {
+            cache.insert(key, std::sync::Arc::clone(&ready));
+        }
     }
     Ok(ready)
+}
+
+/// Cached entry for `key` when its permit is still valid, else `None` (the
+/// stale entry is dropped so a later handshake replaces it).
+fn fresh_ready(key: &str) -> Option<std::sync::Arc<Occ3Ready>> {
+    let ready = ready_cache().lock().ok()?.get(key).cloned()?;
+    if ready.expires_at_epoch > now_epoch() {
+        return Some(ready);
+    }
+    if let Ok(mut cache) = ready_cache().lock() {
+        cache.remove(key);
+    }
+    None
+}
+
+/// Per-key handshake serialization for cold `verify_cached` calls. The map is
+/// bounded by distinct cache keys (endpoint, model, method, artifact digest);
+/// entries are empty mutexes kept for the process lifetime.
+fn verifying_lock(key: &str) -> std::sync::Arc<tokio::sync::Mutex<()>> {
+    static LOCKS: std::sync::OnceLock<
+        std::sync::Mutex<std::collections::BTreeMap<String, std::sync::Arc<tokio::sync::Mutex<()>>>>,
+    > = std::sync::OnceLock::new();
+    let map = LOCKS.get_or_init(Default::default);
+    let mut map = match map.lock() {
+        Ok(map) => map,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    map.entry(key.to_string()).or_default().clone()
 }
 
 /// Evict only the failed connector instance. A late failure cannot evict a
@@ -586,6 +623,19 @@ pub async fn acquire_capture_permit() -> tokio::sync::OwnedSemaphorePermit {
         .acquire_owned()
         .await
         .expect("capture permit semaphore closed")
+}
+
+/// How long a sender may wait for a free armed-capture permit before its
+/// `occ3_handoff` call returns the retryable capacity-wait error. The wait
+/// covers a sibling sender's whole arm->publish window (dominated by that
+/// model's facts turn), so it must exceed one sibling turn, not one network
+/// call. `OCC3_CAPTURE_CAPACITY_WAIT_SECONDS` clamps into 5..=240; default 90.
+pub fn capture_capacity_wait() -> Duration {
+    std::env::var("OCC3_CAPTURE_CAPACITY_WAIT_SECONDS")
+        .ok()
+        .and_then(|value| value.parse::<u64>().ok())
+        .map(|value| Duration::from_secs(value.clamp(5, 240)))
+        .unwrap_or(Duration::from_secs(90))
 }
 
 /// Non-blocking permit take for sync arming paths (orchestrator retained
@@ -1183,6 +1233,37 @@ mod tests {
         request.method_id = declared_method.map(str::to_string);
         request.artifact_digest = declared_digest.map(str::to_string);
         request
+    }
+
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn concurrent_cold_verifications_share_one_connector_instance() {
+        let _cache_guard = reset_ready_cache().await;
+        let fixture =
+            serve_activation_fixture(fixture_identity("glm-5.3", METHOD_A), None).await;
+        let request = fixture_request(&fixture, None, None);
+        let before = fixture.requests.load(std::sync::atomic::Ordering::SeqCst);
+        // Two sessions activating at the same instant (the live failure was
+        // two sibling receivers 58 ms apart on a cold daemon). Without
+        // per-key serialization each caller mints a private connector
+        // instance; a sender and a receiver on different instances cannot
+        // see each other's native publication records, and the receiver's
+        // prepare fails closed as Unauthorized.
+        let (first, second) = tokio::join!(
+            verify_cached(&request, Duration::from_secs(5)),
+            verify_cached(&request, Duration::from_secs(5)),
+        );
+        let first = first.expect("first cold verification activates");
+        let second = second.expect("racing cold verification activates");
+        assert!(
+            std::sync::Arc::ptr_eq(&first, &second),
+            "concurrent cold verifications must converge on one connector instance"
+        );
+        let handshakes = fixture.requests.load(std::sync::atomic::Ordering::SeqCst) - before;
+        assert!(
+            handshakes <= 4,
+            "the racing caller must reuse the winner's handshake, not run a second one (requests: {handshakes})"
+        );
     }
 
     #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
