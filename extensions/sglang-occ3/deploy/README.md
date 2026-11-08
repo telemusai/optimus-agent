@@ -98,7 +98,7 @@ Every step is logged to `deploy-occ3.log` with UTC timestamps.
    for GPU memory release, then `docker run -d` starts a NEW `neo-glm53`
    with the captured configuration on the derived image.
 8. **Health wait.** Polls `GET http://127.0.0.1:30001/health` with the
-   Authorization header from the key file until HTTP 200 (timeout 900 s;
+   Authorization header from the key file until HTTP 200 (timeout 1500 s;
    loading the B300 weights takes minutes). Fails fast if the container
    dies.
 9. **Plugin verification.** `GET /occ3/v1/status` with the same
@@ -122,7 +122,7 @@ the server process once:
 - Every in-flight request and every model session powered by this server
   is killed at `docker stop`. Schedule the deploy in a maintenance window.
 - The KV/radix cache starts cold; expect the usual minutes-long weight
-  load before `/health` turns 200 (the script waits up to 900 s).
+  load before `/health` turns 200 (the script waits up to 1500 s).
 - External access through `launchpad-traefik` / Pomerium is interrupted
   for the same interval.
 - Keep `rollback.sh` at hand; the whole restore path is exercised only by
@@ -164,7 +164,7 @@ What it does:
 3. Restores the original restart policy from
    `occ3-deploy-state.env` (deploy.sh had set it to `no`).
 4. Starts the restored container.
-5. Polls `GET http://127.0.0.1:30001/health` until 200 (timeout 900 s).
+5. Polls `GET http://127.0.0.1:30001/health` until 200 (timeout 1500 s).
 6. Reports the plugin endpoint status (a 404 there confirms the plugin
    routes are gone) and removes the state file.
 
