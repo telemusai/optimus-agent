@@ -574,3 +574,99 @@ fn revoked_native_admission_never_permits_text_fallback() {
         Occ3DeliveryStatus::Failed
     ));
 }
+
+/// Live-wedge regression (hive agent f24cd1341c53): an enrollment that aged
+/// out with its permit (server `max_ttl_seconds`, bounded to one hour) must
+/// not fail every later turn with the native fail-closed error. The first
+/// hook call after expiry terminally recovers instead: the resolver answers
+/// `None` (ordinary inference), the session is closed, and the registered
+/// tombstone cleanup clears the host hooks by removing the handoff tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_enrollment_recovers_terminally_and_clears_host_hooks() {
+    let fixture = native_fixture().await;
+    assert!(!fixture.native.is_dead(), "the fixture enrollment is live");
+    let has_handoff_tool = |session: &AgentSession| {
+        session
+            .agent
+            .state()
+            .tools
+            .iter()
+            .flatten()
+            .any(|tool| tool.name == occ3_state::NATIVE_HANDOFF_TOOL)
+    };
+    assert!(
+        has_handoff_tool(&fixture.session),
+        "the install seam adds the handoff tool"
+    );
+    fixture.native.force_expire_enrollment_for_test();
+    assert!(fixture.native.is_dead());
+    let request = InferenceStateRequest {
+        model: fixture_model(),
+        context: Default::default(),
+        messages: Vec::new(),
+        newly_supplied_messages: Vec::new(),
+        signal: None,
+    };
+    let resolved = (fixture.native.receiver_resolver())(request)
+        .await
+        .expect("an expired enrollment must not fail the turn");
+    assert!(
+        resolved.is_none(),
+        "the turn must run on the ordinary inference path"
+    );
+    assert!(fixture.native.is_dead(), "terminal recovery closed it");
+    assert!(
+        !has_handoff_tool(&fixture.session),
+        "the tombstone cleanup must remove the handoff tool"
+    );
+}
+
+/// Re-activation after expiry: the install seam replaces a dead native
+/// session instead of refusing, so a fresh enrollment restores native
+/// handoffs on a long-lived session without a restart, with exactly one
+/// handoff tool installed.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn fresh_enrollment_replaces_dead_native_state() {
+    let fixture = native_fixture().await;
+    fixture.native.force_expire_enrollment_for_test();
+    // Run one ordinary turn through the resolver so the terminal recovery
+    // clears the host hooks, exactly like a live expired turn would.
+    let request = InferenceStateRequest {
+        model: fixture_model(),
+        context: Default::default(),
+        messages: Vec::new(),
+        newly_supplied_messages: Vec::new(),
+        signal: None,
+    };
+    assert!((fixture.native.receiver_resolver())(request).await.unwrap().is_none());
+    let fresh = Occ3NativeSession::enroll(
+        &fixture.session.session_id(),
+        &fixture_model(),
+        Arc::new(FixtureConnector::new()),
+    )
+    .await
+    .expect("fresh enrollment");
+    fixture
+        .session
+        .install_experimental_native_occ3(
+            fresh.clone(),
+            Arc::new(InertController) as Arc<dyn AgentSessionMessageController>,
+        )
+        .expect("install over the dead native state");
+    let installed = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("fresh native state installed");
+    assert!(Arc::ptr_eq(&installed, &fresh));
+    assert!(!installed.is_dead(), "the fresh enrollment is live");
+    let handoff_tools = fixture
+        .session
+        .agent
+        .state()
+        .tools
+        .iter()
+        .flatten()
+        .filter(|tool| tool.name == occ3_state::NATIVE_HANDOFF_TOOL)
+        .count();
+    assert_eq!(handoff_tools, 1, "exactly one handoff tool after re-install");
+}

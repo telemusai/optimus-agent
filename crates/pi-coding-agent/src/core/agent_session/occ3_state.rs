@@ -376,6 +376,11 @@ pub struct Occ3NativeSession {
     source: Mutex<SourceSlot>,
     chat_preferences: std::sync::OnceLock<Option<String>>,
     closed: std::sync::atomic::AtomicBool,
+    /// Test-only bias added to the wall clock for this session's enrollment
+    /// lifetime checks, so expiry-driven recovery is testable offline without
+    /// sleeping. Production always reads zero; see [`Self::session_now`].
+    #[cfg(test)]
+    test_clock_bias: std::sync::atomic::AtomicI64,
     /// Host-side recovery callback run exactly once when this session's
     /// native path is terminally deactivated (retry budget exhausted, or
     /// invalidate from teardown). The host clears its agent hooks and
@@ -463,6 +468,8 @@ impl Occ3NativeSession {
                 capture_permit: None,
             }),
             closed: std::sync::atomic::AtomicBool::new(false),
+            #[cfg(test)]
+            test_clock_bias: std::sync::atomic::AtomicI64::new(0),
             chat_preferences: std::sync::OnceLock::new(),
             tombstone_cleanup: Mutex::new(None),
             self_registration: std::sync::OnceLock::new(),
@@ -520,7 +527,7 @@ impl Occ3NativeSession {
         // before inference. Stay within both the verified and local limits.
         let max_capture_bytes = caps.max_state_bytes.min(128 * 1024 * 1024);
         let retained_count_limit = (max_capture_bytes / bytes_per_row).min(128) as u32;
-        let seconds = self.enrollment.expires_at_epoch.saturating_sub(now()).min(600);
+        let seconds = self.enrollment.expires_at_epoch.saturating_sub(self.session_now()).min(600);
         if retained_count_limit == 0 || seconds == 0 {
             return Err(failure());
         }
@@ -635,9 +642,39 @@ impl Occ3NativeSession {
         }
         Ok(())
     }
+    /// Wall clock for this session's enrollment lifetime. Tests may bias it
+    /// past the enrollment TTL without sleeping; production always reads the
+    /// real clock. Both expiry predicates (`check`, `is_dead`) and the arm
+    /// budget consult this, never a stale cached instant.
+    fn session_now(&self) -> u64 {
+        #[cfg(test)]
+        {
+            let bias = self.test_clock_bias.load(std::sync::atomic::Ordering::Relaxed);
+            if bias != 0 {
+                return now().saturating_add_signed(bias);
+            }
+        }
+        now()
+    }
+    /// Test-only: bias this session's clock one second past the enrollment
+    /// TTL so expiry-driven recovery runs offline without sleeping.
+    #[cfg(test)]
+    pub(crate) fn force_expire_enrollment_for_test(&self) {
+        let remaining = self.enrollment.expires_at_epoch.saturating_sub(now());
+        self.test_clock_bias
+            .store(remaining as i64 + 1, std::sync::atomic::Ordering::Relaxed);
+    }
+    /// Terminal but replaceable: an explicitly closed session, or one whose
+    /// enrollment aged out with its permit (server max_ttl_seconds, bounded
+    /// to one hour). The install seam uses this to let a fresh activation
+    /// replace the dead state instead of wedging long-lived sessions.
+    pub fn is_dead(&self) -> bool {
+        self.closed.load(std::sync::atomic::Ordering::Acquire)
+            || self.enrollment.expires_at_epoch <= self.session_now()
+    }
     fn check(&self) -> Result<(), String> {
         if self.closed.load(std::sync::atomic::Ordering::Acquire)
-            || self.enrollment.expires_at_epoch <= now()
+            || self.enrollment.expires_at_epoch <= self.session_now()
         {
             Err(failure())
         } else {
@@ -645,6 +682,22 @@ impl Occ3NativeSession {
         }
     }
     fn check_model(&self, model: &Model) -> Result<(), String> {
+        // An enrollment that merely aged out with its permit is
+        // terminal-recoverable, not a hard failure: deactivate so the
+        // registered cleanup clears the host hooks and the handoff tool,
+        // then let THIS request take the ordinary inference path. Nothing
+        // was captured or claimed yet - the inbox was invalidated and the
+        // sender queue's own entry epochs retire the rest. This is the
+        // live wedge fixed: an expired enrollment used to fail every turn
+        // with `model_check_failed` because the hooks were never cleared.
+        // A model switch stays a loud identity break, and an explicitly
+        // closed session still fails closed for in-flight hook calls.
+        if !self.closed.load(std::sync::atomic::Ordering::Acquire)
+            && self.enrollment.expires_at_epoch <= self.session_now()
+        {
+            self.deactivate();
+            return Ok(());
+        }
         self.check()?;
         if model.api != pi_ai::types::API_OPENAI_COMPLETIONS || target(model) != self.target {
             self.invalidate();
@@ -3999,6 +4052,52 @@ mod tests {
         assert!(!slot.resolved);
         assert!(slot.budget.is_none() && slot.lease.is_none());
         assert!(slot.armed_receiver.is_none());
+    }
+
+    /// The live wedge: an enrollment that aged out with its permit (server
+    /// max_ttl_seconds, at most one hour) must not fail every later turn.
+    /// Both hook entry points deactivate the native session (terminal
+    /// recovery clears the host hooks and the handoff tool) and let the
+    /// request run on the ordinary inference path. Before the fix,
+    /// `check_model` returned early from `check()` without any recovery,
+    /// so the installed receiver resolver failed every inference request
+    /// with `model_check_failed` forever.
+    #[tokio::test]
+    async fn expired_enrollment_deactivates_instead_of_failing_turns() {
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: Vec::new(),
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        // Receiver side: the resolver runs the turn ordinary instead of
+        // refusing it, and the session is terminally recovered.
+        let receiver = enrolled().await;
+        receiver.force_expire_enrollment_for_test();
+        assert!(receiver.is_dead());
+        assert!(
+            (receiver.receiver_resolver())(request()).await.unwrap().is_none(),
+            "an expired enrollment must fall back to ordinary inference"
+        );
+        assert!(receiver.check().is_err(), "terminal recovery closed the native session");
+        // Source side: an expired enrollment arms no capture and the turn
+        // also runs uncaptured instead of erroring.
+        let sender = enrolled().await;
+        sender.force_expire_enrollment_for_test();
+        assert!(
+            (sender.source_hooks().resolve)(request()).await.unwrap().is_none(),
+            "an expired enrollment must not fail the source turn"
+        );
+        assert!(sender.is_dead());
+        // A live session is unaffected and a model switch stays a loud
+        // identity break.
+        let live = enrolled().await;
+        assert!(!live.is_dead());
+        assert!(live.check_model(&fixture_model()).is_ok());
+        let mut other_model = fixture_model();
+        other_model.id = "other-model".into();
+        assert!(live.check_model(&other_model).is_err());
     }
 
     #[tokio::test]

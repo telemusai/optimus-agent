@@ -11777,6 +11777,11 @@ impl AgentDaemon {
                 return Err(error);
             }
         };
+        // Long-lived OCC-3 sessions: renew a native enrollment that aged out
+        // with its permit before the prompt dispatches, so handoffs keep
+        // working past the one-hour server TTL instead of degrading until a
+        // session restart.
+        self.maybe_reactivate_expired_occ3(&state).await;
         let controller = admission_entry
             .as_ref()
             .and_then(|(_, controller)| controller.clone());
@@ -16813,6 +16818,27 @@ impl AgentDaemon {
                 Err(Occ3Decline::ModelIdentityMismatch)
             }
         }
+    }
+
+    /// Renewal hook for long-lived sessions. The native OCC-3 enrollment ages
+    /// out with its permit (server max_ttl_seconds, bounded to one hour); an
+    /// enrollment that died of expiry deactivates cleanly so turns keep the
+    /// ordinary inference path, and this hook re-runs the activation so
+    /// native handoffs work again without a session restart. No-op unless an
+    /// installed native session is dead: disabled sessions and sessions that
+    /// never activated keep their existing behavior, and a live enrollment
+    /// is never re-installed.
+    async fn maybe_reactivate_expired_occ3(
+        self: &Arc<Self>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+    ) {
+        let Some(agent_session) = self.session_of(state).agent_session() else { return };
+        // Installing fresh hooks requires an idle session; a busy one
+        // retries the renewal on its next prompt.
+        if agent_session.is_streaming() { return; }
+        let Some(native) = agent_session.experimental_native_occ3() else { return };
+        if !native.is_dead() { return; }
+        let _ = self.activate_experimental_occ3(state).await;
     }
 
     /// `createAgentMessageController(getCurrentState)` (`daemon-mode.ts:3363-3386`).

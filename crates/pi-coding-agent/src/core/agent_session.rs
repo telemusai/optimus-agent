@@ -3369,9 +3369,25 @@ impl AgentSession {
     ) -> Result<(),String> {
         if self.is_streaming() || state.session_id()!=self.session_id() { return Err("Native session binding rejected".into()); }
         let mut installed=self.native_occ3.lock().map_err(|_|"Native session state unavailable")?;
-        if installed.is_some() {return Err("Native state already installed".into());}
+        // A dead native session (explicitly closed, or aged out with its
+        // permit: the server bounds enrollment TTL to one hour) may be
+        // replaced by a fresh activation so long-lived sessions re-enroll
+        // instead of staying wedged on stale state. A live session still
+        // refuses re-installation.
+        let replacing_dead=match installed.as_ref() {
+            None=>false,
+            Some(existing)=>{
+                if !existing.is_dead() {return Err("Native state already installed".into());}
+                true
+            }
+        };
         let mut tools=self.agent.state().tools.unwrap_or_default();
-        if tools.iter().any(|t|t.name==occ3_state::NATIVE_HANDOFF_TOOL) {return Err("Native tool name conflict".into());}
+        if replacing_dead {
+            // The dead state's tombstone cleanup already removed its handoff
+            // tool; drop any leftover entry so re-activation cannot wedge on
+            // a stale tool name.
+            tools.retain(|tool|tool.name!=occ3_state::NATIVE_HANDOFF_TOOL);
+        } else if tools.iter().any(|t|t.name==occ3_state::NATIVE_HANDOFF_TOOL) {return Err("Native tool name conflict".into());}
         if !self.agent.set_native_state_hooks(state.receiver_resolver(),state.source_hooks()) {return Err("Native callbacks unsupported".into());}
         tools.push(state.handoff_tool(controller.clone()));
         self.agent.update_state(Box::new(move |live|live.tools=Some(tools)));
