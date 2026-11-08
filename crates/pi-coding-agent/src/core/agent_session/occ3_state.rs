@@ -11,9 +11,6 @@ use crate::core::occ::occ3::connector::{
 use crate::core::occ::occ3::inference::{Occ3InferenceInbox, PrepareInferenceRequest};
 use crate::core::occ::occ3::registry::Occ3ConnectorRegistry;
 use crate::core::occ::occ3::types::Occ3DeliveryStatus;
-// Separate line (not folded into the import above) so this branch merges
-// cleanly into main, which independently extended that import with Occ3Error.
-use crate::core::occ::occ3::types::OCC3_CONTROL_SUMMARY;
 use pi_agent_core::types::ContentBlock;
 use pi_agent_core::types::{
     AgentMessage, AgentTool, AgentToolResult, CustomAgentMessage, ResolveInferenceState,
@@ -28,6 +25,9 @@ use pi_ai::types::Model;
 use serde_json::{json, Value};
 use std::sync::{Arc, Mutex};
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
+// Imported separately (below, away from the types import that main
+// independently extended) so this branch merges cleanly into main.
+use crate::core::occ::occ3::types::OCC3_CONTROL_SUMMARY;
 
 pub const NATIVE_HANDOFF_TOOL: &str = "occ3_handoff";
 fn now() -> u64 {
