@@ -172,7 +172,7 @@ fn unregister_sender_session(session: &Occ3NativeSession) {
 /// journals the resulting notices on the SENDER (no-op when the sender is
 /// gone or has no matching in-flight entry). `pub(crate)` so the routing
 /// proof test can drive the exact production path.
-pub(crate) fn route_delivery_event_to_sender(
+pub(crate) async fn route_delivery_event_to_sender(
     sender_session_id: &str,
     message_id: &str,
     consumed: bool,
@@ -194,6 +194,7 @@ pub(crate) fn route_delivery_event_to_sender(
     };
     // Preserve consumption even without a receipt digest: the queue marks
     // that report uncertain, never proven unused or eligible for fallback.
+    let mut proven_completion = false;
     for sender in senders {
         if let Ok(notices) =
             sender.sender_queue_record_delivery_event(message_id, consumed, receipt_sha256)
@@ -204,8 +205,35 @@ pub(crate) fn route_delivery_event_to_sender(
                 // sender's durable outbox under the same lock as the queue
                 // transition (one atomic persist) - nothing to journal
                 // here.
-                return;
+                if consumed && receipt_sha256.is_some() {
+                    proven_completion = true;
+                }
+                break;
             }
+        }
+    }
+    if proven_completion {
+        // Proven completion frees the server reservation immediately: the
+        // capture behind this message was consumed, so holding its bytes
+        // until the sender's next arm (or its session teardown) lets two
+        // finished one-shot senders wedge the server's whole live-byte
+        // budget until expiry. Best-effort, guarded by the slot's own
+        // published message id so a sender already re-armed for a later
+        // queue entry is untouched.
+        let senders = {
+            let Ok(registry) = sender_session_registry().lock() else { return; };
+            registry
+                .get(sender_session_id)
+                .map(|weak_list| {
+                    weak_list
+                        .iter()
+                        .filter_map(std::sync::Weak::upgrade)
+                        .collect::<Vec<_>>()
+                })
+                .unwrap_or_default()
+        };
+        for sender in senders {
+            sender.retire_capture_for_completed(message_id).await;
         }
     }
 }
@@ -1293,7 +1321,8 @@ impl Occ3NativeSession {
                                         &message_id,
                                         false,
                                         None,
-                                    );
+                                    )
+                                    .await;
                                 }
                             }
                             // Receipt lookup takes the inbox lock itself. Drop
@@ -1310,7 +1339,8 @@ impl Occ3NativeSession {
                                     &message_id,
                                     true,
                                     receipt.as_deref(),
-                                );
+                                )
+                                .await;
                             }
                             let ids = receiver.admitted_message_ids();
                             if ids.is_empty() {
@@ -2162,6 +2192,41 @@ Do not call occ3_handoff again for these facts."
         Ok(notices)
     }
 
+    /// Retires the completed capture bound to a published message id.
+    /// No-op when the slot has no lease, the lease belongs to a different
+    /// (later) publication, or the handoff was not admitted: every skip is
+    /// a state where retirement would be wrong, not an error to surface.
+    /// Called from the async delivery-event routing path on every live
+    /// sender registered for the sender session id; the message-id guard
+    /// makes it a no-op on every sender except the one that published it.
+    pub(crate) async fn retire_capture_for_completed(&self, message_id: &str) {
+        let lease = {
+            let Ok(slot) = self.source.lock() else { return };
+            let bound = slot
+                .published_message
+                .as_ref()
+                .is_some_and(|(id, _)| id == message_id);
+            if !bound || !slot.handoff_admitted {
+                return;
+            }
+            match slot.lease.as_ref() {
+                Some(lease) if lease.state() == SourceCaptureState::Captured => lease.clone(),
+                _ => return,
+            }
+        };
+        if lease.retirement_receipt().is_some() {
+            let _ = self.connector.retire_native_source(&lease).await;
+        } else {
+            lease.cancel();
+        }
+        if let Ok(mut slot) = self.source.lock() {
+            // Same reset the sender's own completion path applies, so a
+            // skipped failure here only delays cleanup to the next arm,
+            // exactly like today.
+            Self::reset_slot_after_completed_handoff(&mut slot);
+        }
+    }
+
     /// Receiver-busy refusal for one of this sender's in-flight messages:
     /// the entry returns to `pending` with a backoff for a fresh capture, or
     /// falls back to OCC-1 once the busy retry budget is spent.
@@ -2855,6 +2920,24 @@ Do not call occ3_handoff again for these facts."
     pub async fn close(&self) -> Result<(), String> {
         self.invalidate();
         let source = self.source.lock().map_err(|_| failure())?.lease.clone();
+        // Copy-only facts so the closure stays unwind-safe; the lease
+        // itself never crosses the boundary.
+        let had_lease = source.is_some();
+        let retirable = source
+            .as_ref()
+            .is_some_and(|lease| lease.retirement_receipt().is_some());
+        let _ = std::panic::catch_unwind(|| {
+            // Content-free visibility for teardown leaks: without this,
+            // a close that never reaches the server is indistinguishable
+            // from a session that never closed.
+            pi_ai::log::get_logger("occ3.sender").warn(
+                "native_session_closed",
+                Some(serde_json::Map::from_iter([
+                    ("had_lease".into(), Value::from(had_lease)),
+                    ("retirable".into(), Value::from(retirable)),
+                ])),
+            );
+        });
         if let Some(source) = source {
             if source.retirement_receipt().is_some() {
                 self.connector
@@ -3699,6 +3782,46 @@ mod tests {
         let mut slot = session.source.lock().unwrap();
         Occ3NativeSession::reset_slot_after_completed_handoff(&mut slot);
         assert_eq!(slot.armed_receiver.as_deref(), Some("receiver-b"));
+    }
+
+
+    /// Proven completion may only retire the capture bound to THAT message:
+    /// an unrelated completion, or a slot whose lease never reached the
+    /// Captured state, must leave the slot untouched. (A Captured lease
+    /// cannot be built without a real receipt - see
+    /// `complete_handoff_slot_refuses_unfinished_states` - so the positive
+    /// retirement path is covered by the live parallel-handoff canary.)
+    #[tokio::test]
+    async fn proven_completion_retirement_guards_the_slot_state() {
+        let session = enrolled().await;
+        {
+            // A different publication still bound: not this message's
+            // capture, so nothing may be retired or reset.
+            let mut slot = session.source.lock().unwrap();
+            slot.handoff_admitted = true;
+            slot.published_message = Some(("other-message".into(), "digest".into()));
+        }
+        session.retire_capture_for_completed("agentmsg-done").await;
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.handoff_admitted, "unbound completion changes nothing");
+            assert_eq!(
+                slot.published_message.as_ref().unwrap().0,
+                "other-message"
+            );
+        }
+        {
+            // Bound to this message, but the slot never held a Captured
+            // lease: retirement would be wrong, so the slot stays.
+            let mut slot = session.source.lock().unwrap();
+            slot.published_message = Some(("agentmsg-done".into(), "digest".into()));
+        }
+        session.retire_capture_for_completed("agentmsg-done").await;
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.handoff_admitted, "a not-yet-captured slot is never retired");
+            assert!(slot.published_message.is_some());
+        }
     }
 
     /// A busy refusal or ordinary failure frees the binding too, so the

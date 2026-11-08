@@ -1431,7 +1431,8 @@ async fn delivery_events_route_to_the_sender_session_queue() {
         "agentmsg_route",
         true,
         Some("sha256_route_digest"),
-    );
+    )
+    .await;
     // The notice was journaled ON THE SENDER (not the receiver).
     let sender_notices = sender.take_pending_queue_notices();
     assert_eq!(sender_notices.len(), 1, "sender journals its completion notice");
@@ -1462,7 +1463,8 @@ async fn digestless_consumed_delivery_routes_to_uncertain_without_fallback() {
     let _setup = sender.take_pending_queue_notices();
     crate::core::agent_session::occ3_state::route_delivery_event_to_sender(
         "sender-route-digestless", "agentmsg_route_digestless", true, None,
-    );
+    )
+    .await;
     let notices = sender.take_pending_queue_notices();
     assert_eq!(notices.len(), 1);
     assert_eq!(notices[0].state, "uncertain");
@@ -2139,7 +2141,7 @@ async fn idle_receiver_failure_tick_schedules_one_fallback_prompt() {
     native.sender_queue_enqueue("child", "receiver").unwrap();
     native.sender_queue_mark_armed(Some("idle-failure"), None).unwrap();
     native.sender_queue_mark_progressed(occ3_sender_queue::Occ3SenderQueueState::Admitted, "idle-failure").unwrap();
-    occ3_state::route_delivery_event_to_sender(&native.session_id(), "idle-failure", false, None);
+    occ3_state::route_delivery_event_to_sender(&native.session_id(), "idle-failure", false, None).await;
     AgentSession::sender_queue_idle_tick(session.clone(), native.clone(), controller.clone(), gate.clone()).await;
     let prompts = session.get_follow_up_messages();
     assert_eq!(prompts.len(), 1);
