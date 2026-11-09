@@ -250,6 +250,19 @@ async def test_lost_control_replies_age_out_of_the_pending_table(monkeypatch):
     # A late reply for the aged-out command is ignored like any unknown id.
     deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="lost",ok=True,result={},error=""))
     assert "lost" not in client._uncertain and "fresh" in client._uncertain
+    # Reuse of the aged-out id is refused while it is retired: the old
+    # operation may still be live server-side, and its delayed reply would
+    # otherwise settle the new future (deliver matches command_id only and
+    # the result envelope carries no request echo to compare against).
+    deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="fresh",ok=True,result={},error=""))
+    await asyncio.gather(*client._operations.values(), return_exceptions=True)
+    assert "lost" in client._retired
+    with pytest.raises(LatentError): await client.call("health",{},command_id="lost")
+    # The retirement is bounded: after one further sweep window the id is
+    # usable again instead of growing the retired set forever.
+    client._retired["lost"] -= client.timeout_seconds * 10
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="lost")
+    assert "lost" in client._uncertain and "lost" not in client._retired
     await client.close()
 
 

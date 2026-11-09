@@ -61,6 +61,13 @@ class ControlClient:
         # identifies the dispatched envelope; the timestamp bounds the entry.
         self.pending = {}
         self._uncertain = {}
+        # command_id -> retirement monotonic. An aged-out (swept) command id
+        # stays unusable for a further sweep window: the operation may still
+        # be running server-side, so a caller reusing the id would let a
+        # merely-delayed reply for the old operation settle the new future
+        # (deliver matches command_id only, and the result envelope carries
+        # no request echo to compare against).
+        self._retired = {}
         self._operations = {}
         self.closed = False
         tokenizer_manager._occ3_control_client = self
@@ -75,16 +82,27 @@ class ControlClient:
         aged-out entry is released from quota accounting only. It is never
         treated as proof the operation did not run, and a late reply for it
         is ignored exactly like any unknown command id (the caller's future
-        is already settled or cancelled by then). Entries with a live,
-        cancellation-resistant operation task still hold their quota slot
-        through self._operations, which this sweep never touches.
+        is already settled or cancelled by then). The swept id moves to a
+        bounded retirement table for one further sweep window: the operation
+        may still be live server-side, and a reused id would otherwise let a
+        merely-delayed reply for the old operation settle the new future.
+        Entries with a live, cancellation-resistant operation task still
+        hold their quota slot through self._operations, which this sweep
+        never touches.
         """
-        cutoff = time.monotonic() - self.timeout_seconds * UNCERTAIN_TTL_MULTIPLE
+        now = time.monotonic()
+        horizon = self.timeout_seconds * UNCERTAIN_TTL_MULTIPLE
+        cutoff = now - horizon
         stale = [command_id for command_id, (_, dispatched_at) in self._uncertain.items()
                  if dispatched_at <= cutoff]
         for command_id in stale:
+            self._retired[command_id] = now
             del self._uncertain[command_id]
-        if stale:
+        expired = [command_id for command_id, retired_at in self._retired.items()
+                   if retired_at <= cutoff]
+        for command_id in expired:
+            del self._retired[command_id]
+        if stale or expired:
             self._detach_if_settled()
 
     async def call(self, operation, payload, command_id=None):
@@ -94,7 +112,8 @@ class ControlClient:
         from sglang.srt.managers.io_struct import Occ3ControlReq
         command_id = command_id or uuid.uuid4().hex
         envelope = control_request(command_id, operation, payload)
-        require(command_id not in self.pending and command_id not in self._uncertain, "replay")
+        require(command_id not in self.pending and command_id not in self._uncertain
+                and command_id not in self._retired, "replay")
         future = asyncio.get_running_loop().create_future()
         self.pending[command_id] = future
         try:
