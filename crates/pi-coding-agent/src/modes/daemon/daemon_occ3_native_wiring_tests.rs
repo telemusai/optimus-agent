@@ -1712,6 +1712,18 @@ struct ModelChangeActivationFixture {
 
 impl ModelChangeActivationFixture {
     async fn new() -> Self {
+        Self::build(false, 0).await
+    }
+
+    /// Variant for the worker-ready activation path: the session starts on
+    /// the OCC-3-capable model (a daemon restart resuming an enrolled
+    /// session), and `first_enrollment_failure` arms the fixture's
+    /// enroll-route refusal mode before `add_runtime` runs.
+    async fn new_starting_on_occ3(first_enrollment_failure: usize) -> Self {
+        Self::build(true, first_enrollment_failure).await
+    }
+
+    async fn build(start_on_occ3: bool, first_enrollment_failure: usize) -> Self {
         let directory = tempfile::tempdir().expect("temp dir");
         let cwd = directory
             .path()
@@ -1738,6 +1750,9 @@ impl ModelChangeActivationFixture {
             None,
         )
         .await;
+        first_occ3
+            .enrollment_failure
+            .store(first_enrollment_failure, std::sync::atomic::Ordering::SeqCst);
         // The live configuration this defect was observed under: the session
         // opted in, but the model it starts on is not OCC-3-capable.
         let settings = Arc::new(StdMutex::new(SettingsManager::in_memory(
@@ -1813,6 +1828,20 @@ impl ModelChangeActivationFixture {
                 },
             )
             .expect("register the plain fixture provider");
+        let initial_model = if start_on_occ3 {
+            let endpoint = first_occ3.endpoint.as_str().trim_end_matches('/');
+            let mut model = pi_ai::types::Model::new(
+                "glm-5.3",
+                "glm-5.3",
+                API_OPENAI_COMPLETIONS,
+                "unit-occ3",
+                format!("{endpoint}/v1"),
+            );
+            model.occ3 = Some(occ3_capability(first_occ3.endpoint.as_str()));
+            model
+        } else {
+            fixture_model()
+        };
         let services = create_agent_session_services(CreateAgentSessionServicesOptions {
             cwd: cwd.clone(),
             agent_dir: Some(agent_dir.clone()),
@@ -1843,7 +1872,7 @@ impl ModelChangeActivationFixture {
             session_manager: Arc::clone(&session_manager),
             session_start_event: None,
             creation: CoreCreationOptions {
-                model: Some(fixture_model()),
+                model: Some(initial_model),
                 no_tools: Some("all".to_string()),
                 prewarm_ipython_kernel: Some(false),
                 telemetry_disabled: Some(true),
@@ -1912,9 +1941,10 @@ impl ModelChangeActivationFixture {
             )
             .await
             .expect("daemon registers the runtime");
-        // `add_runtime` already attempted activation for the non-OCC-3
-        // startup model and declined; the session starts without a native
-        // permit and without the handoff tool.
+        // `add_runtime` already attempted the worker-ready activation and
+        // declined (NotConfigured for the plain startup model; the armed
+        // fixture refusal for the restart variant): the session starts
+        // without a native permit and without the handoff tool.
         assert!(
             session.experimental_native_occ3().is_none(),
             "the fixture session starts on a non-OCC-3 model and must decline activation"
@@ -2236,4 +2266,115 @@ async fn model_change_to_another_non_occ3_model_still_never_activates() {
         "a same-model re-selection never activates"
     );
     assert!(!handoff_tool_installed(&fixture.session));
+}
+
+/// A worker-ready activation refused by the server (a daemon restart inside
+/// the server permit window: the registry refuses a same-session
+/// re-enrollment until the previous daemon's permit expires) arms the
+/// windowed restart retry instead of dropping the activation. The
+/// pre-prompt consumer retries and re-arms inside the window, and the
+/// activation lands once the transient refusal clears.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn restart_refusal_arms_windowed_activation_retry_until_it_clears() {
+    let fixture = ModelChangeActivationFixture::new_starting_on_occ3(3).await;
+    // add_runtime (the worker-ready path) already attempted activation
+    // against the refusing control plane and armed the restart retry.
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "the refused worker-ready activation installs nothing"
+    );
+    {
+        let state = fixture.state.lock().expect("active session poisoned");
+        assert!(
+            state.occ3_activation_pending,
+            "the restart refusal arms the pending activation retry"
+        );
+        assert!(
+            state.occ3_activation_retry_until_epoch.is_some(),
+            "the restart retry carries a window"
+        );
+    }
+    // The pre-prompt consumer retries while the refusal persists and
+    // re-arms inside the window.
+    fixture
+        .daemon
+        .maybe_activate_pending_occ3(&fixture.state)
+        .await;
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "the persisted refusal still installs nothing"
+    );
+    assert!(
+        fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending,
+        "a transient refusal inside the window re-arms the retry"
+    );
+    // The refusal clears (the server pruned the previous daemon's expired
+    // permit): the next consumer retry activates and installs the handoff
+    // tool exactly like the model-change path.
+    fixture
+        .first_occ3
+        .enrollment_failure
+        .store(0, std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .daemon
+        .maybe_activate_pending_occ3(&fixture.state)
+        .await;
+    let native = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("the cleared refusal lets the armed retry activate");
+    assert!(!native.is_dead(), "the restart-retry activation is live");
+    assert!(
+        handoff_tool_installed(&fixture.session),
+        "the restart-retry activation installs the occ3_handoff tool"
+    );
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending,
+        "the successful retry clears the marker"
+    );
+}
+
+/// Outside the restart window a transient refusal clears the marker: the
+/// one-shot retry semantics stay intact when no worker-ready arming set a
+/// window.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn expired_restart_window_clears_the_marker_after_a_transient_refusal() {
+    let fixture = ModelChangeActivationFixture::new_starting_on_occ3(3).await;
+    assert!(
+        fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending
+    );
+    // Force the restart window into the past.
+    fixture
+        .state
+        .lock()
+        .expect("active session poisoned")
+        .occ3_activation_retry_until_epoch = Some(1);
+    fixture
+        .daemon
+        .maybe_activate_pending_occ3(&fixture.state)
+        .await;
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "the refusal persists"
+    );
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending,
+        "an expired window does not re-arm the retry"
+    );
 }

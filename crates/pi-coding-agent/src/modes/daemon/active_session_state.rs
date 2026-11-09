@@ -212,6 +212,14 @@ pub struct ActiveSessionState {
     /// pre-prompt path (`maybe_activate_pending_occ3`) consumes it at the
     /// next idle prompt. Cleared after that single attempt.
     pub occ3_activation_pending: bool,
+    /// Restart-retry deadline for the armed OCC-3 activation retry (epoch
+    /// seconds). Set together with [`Self::occ3_activation_pending`] by the
+    /// worker-ready arming site when a transient activation refusal happens
+    /// (a daemon restart inside the server permit window, or a control plane
+    /// that is not reachable at boot); the pre-prompt consumer re-arms the
+    /// marker after a transiently refused retry only while this deadline is
+    /// in the future.
+    pub occ3_activation_retry_until_epoch: Option<u64>,
 }
 
 impl ActiveSessionState {
@@ -230,6 +238,7 @@ impl ActiveSessionState {
             client_env: None,
             hydrated_from_passive: false,
             occ3_activation_pending: false,
+            occ3_activation_retry_until_epoch: None,
         }
     }
 }
