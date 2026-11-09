@@ -530,6 +530,10 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
                 scoped_models: session.scoped_models().into_iter().map(|entry| AgentConnectionScopedModel { model: entry.model, thinking_level: entry.thinking_level }).collect(),
                 // `activeToolNames: session.getActiveToolNames()` (snapshot.ts:55).
                 active_tool_names: session.get_active_tool_names(),
+                // A dead native OCC-3 enrollment keeps the handoff tool on
+                // the list until the next turn removes it; the panel must
+                // not present that boundary turn as a live enrollment.
+                occ3_native_dead: session.experimental_native_occ3().map(|native| native.is_dead()).unwrap_or(false),
                 // `contextUsage: session.getContextUsage()` (snapshot.ts:56).
                 context_usage: serde_json::to_value(session.get_context_usage()).unwrap(),
                 persisted_recap,

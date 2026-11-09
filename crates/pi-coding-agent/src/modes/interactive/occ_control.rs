@@ -311,7 +311,10 @@ async fn read_occ3_preference_native(connection: &Arc<dyn wire::AgentConnection>
     // Match the existing chat-local OCC-3 write path; the OCC-2 daemon
     // preference payload does not include OCC-3.
     let state = connection.get_state().await?;
-    let live = state.active_tool_names.iter().any(|name| name == "occ3_handoff");
+    // The tool name lingers on a dead enrollment until the next turn removes
+    // it, so liveness additionally requires the permit to be alive.
+    let live = state.active_tool_names.iter().any(|name| name == "occ3_handoff")
+        && !state.occ3_native_dead;
     let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
     let preference = crate::core::occ::session_settings::resolve(session_file)?;
     let enabled = if preference.source_session_id.is_some() {
@@ -474,6 +477,11 @@ pub(super) async fn run(
             return Ok(CommandOutput::Panel(panel));
         }
         Choice::Menu => {
+            // The menu title intentionally shows the saved ON/OFF preference,
+            // not the live PREFERRED state: the menu toggles the preference,
+            // while the status panel reports liveness. The two labels can
+            // differ for the same chat by design (preference ON + tool
+            // present = PREFERRED in the panel, ON in the menu).
             let (occ3_enabled, supported) = read_occ3_preference(connection).await?;
             let title = format!(
                 "OCC-1 ON · OCC-2 {} · OCC-3 {} (preference)",
