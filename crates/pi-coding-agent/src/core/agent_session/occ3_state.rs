@@ -1615,7 +1615,7 @@ Do not call occ3_handoff again for these facts."
         let this = self.clone();
         AgentTool {
             name:NATIVE_HANDOFF_TOOL.into(),label:"Experimental native state handoff".into(),
-            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. If the server or receiver is busy, nothing is delivered or used; call this tool again to re-arm a fresh capture after a short wait (up to 3 busy retries, not counted as failures), then emit the facts again; after that the handoff falls back to ordinary messaging. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
+            description:"Transfer native state to one compatible authorized family agent. On an unarmed session the first call returns capture_armed without sending anything. Then emit the concise source facts as assistant content and call this tool once more for the same receiver, with no other tool calls in that response. Never put source facts in arguments. After admission do not repeat the handoff. If the server or receiver is busy, nothing is delivered or used; call this tool again to re-arm a fresh capture after a short wait (up to the configured busy-retry budget, not counted as failures), then emit the facts again; after that the handoff falls back to ordinary messaging. A failed capture can be retried by calling this tool again (up to 3 retries); after that native handoffs are disabled for this session and ordinary messages continue to work.".into(),
             parameters:json!({"type":"object","additionalProperties":false,"properties":{"receiver_role":{"type":"string","enum":["parent","sibling","child"]},"receiver_name":{"type":"string"}},"required":["receiver_role","receiver_name"]}),
             prepare_arguments:None,execution_mode:None,
             execute:Arc::new(move |tool_id,args,signal,_update| {
@@ -1814,11 +1814,11 @@ Do not call occ3_handoff again for these facts."
                         let busy_note = match busy_rearm {
                             Some((retry, true)) => format!(
                                 " (busy retry {retry} of {}: the server was busy and captured nothing; the backoff wait has elapsed, so emit the facts again)",
-                                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES
+                                super::occ3_sender_queue::busy_max_retries()
                             ),
                             Some((retry, false)) => format!(
                                 " (busy retry {retry} of {}: the receiver was busy and did not use the earlier capture; the backoff wait has elapsed, so emit the facts again)",
-                                super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES
+                                super::occ3_sender_queue::busy_max_retries()
                             ),
                             None => String::new(),
                         };
@@ -1835,7 +1835,7 @@ Do not call occ3_handoff again for these facts."
                         };
                         return Ok(AgentToolResult::new(vec![ContentBlock::text(format!(
                             "Native source capture armed{busy_note}{retry_note}; nothing has been sent. In your next response emit only the concise source facts as assistant content, then call occ3_handoff once with the same receiver_role and receiver_name. Do not call other tools or include source facts in tool arguments. If the server is busy, call this tool again to re-arm after a short wait (up to {} busy retries, which do not count as failures); after that the handoff falls back to ordinary messaging. If the captured turn fails for another reason you can re-arm up to {} times before native handoffs are disabled for this session; ordinary messages always keep working.",
-                            super::occ3_sender_queue::OCC3_RECEIVER_BUSY_MAX_RETRIES,
+                            super::occ3_sender_queue::busy_max_retries(),
                             MAX_NATIVE_CAPTURE_RETRIES
                         ))], json!({"status":"capture_armed","delivery_completed":false,"capture_attempts_failed":attempts,"busy_retries":busy_rearm.map(|(retry, _)| retry).unwrap_or(0)})));
                     }

@@ -220,6 +220,11 @@ fn is_zero_u32(value: &u32) -> bool {
 /// Maximum receiver-busy re-captures per queue entry before the entry falls
 /// back to ordinary OCC-1 re-emission.
 pub const OCC3_RECEIVER_BUSY_MAX_RETRIES: u32 = 3;
+/// Hard ceiling for the operator-selectable busy-retry budget
+/// (`OCC3_BUSY_MAX_RETRIES`). Bounds persisted-entry validation so a queue
+/// legitimately written under a larger operator budget still loads when the
+/// environment later reverts to the default.
+pub const OCC3_BUSY_MAX_RETRIES_LIMIT: u32 = 10;
 
 /// Queue reason of a pending head whose armed SOURCE capture the server
 /// refused as busy before admission (nothing captured, nothing published).
@@ -237,6 +242,57 @@ pub const OCC3_BUSY_BACKOFF_MAX_SECS: u64 = 30;
 /// Matches the session provider retry policy's base delays.
 pub fn receiver_busy_backoff_secs(retry: u32) -> u64 {
     2u64.saturating_pow(retry.clamp(1, OCC3_RECEIVER_BUSY_MAX_RETRIES))
+}
+
+/// Parses `OCC3_BUSY_MAX_RETRIES`: any `u32` clamped to
+/// 1..=[`OCC3_BUSY_MAX_RETRIES_LIMIT`]; empty or unparseable values keep the
+/// default budget ([`OCC3_RECEIVER_BUSY_MAX_RETRIES`]). Pure so tests never
+/// mutate process env.
+fn parse_busy_max_retries(value: &str) -> u32 {
+    value
+        .trim()
+        .parse::<u32>()
+        .ok()
+        .map_or(OCC3_RECEIVER_BUSY_MAX_RETRIES, |parsed| {
+            parsed.clamp(1, OCC3_BUSY_MAX_RETRIES_LIMIT)
+        })
+}
+
+/// Effective busy-retry budget for this process. A serialize-by-design
+/// server (for example a wave of parallel child sessions inferring on one
+/// deployment) can stay busy far longer than the default 3x2/4/8s window;
+/// operators may raise the budget instead of losing the native transfer to
+/// OCC-1 fallback. Mirrors the `OCC3_SENDER_QUEUE_*` env-knob pattern:
+/// parsed once per refusal, never persisted.
+pub fn busy_max_retries() -> u32 {
+    parse_busy_max_retries(&std::env::var("OCC3_BUSY_MAX_RETRIES").unwrap_or_default())
+}
+
+/// Parses `OCC3_BUSY_BACKOFF_SECS`: comma-separated seconds; each parsed
+/// value clamped into 1..=[`OCC3_BUSY_BACKOFF_MAX_SECS`]; unparseable parts
+/// are dropped; an empty result keeps the default 2/4/8 ladder. Pure so
+/// tests never mutate process env.
+fn parse_busy_backoff_schedule(value: &str) -> Vec<u64> {
+    let schedule: Vec<u64> = value
+        .split(',')
+        .filter_map(|part| part.trim().parse::<u64>().ok())
+        .map(|secs| secs.clamp(1, OCC3_BUSY_BACKOFF_MAX_SECS))
+        .collect();
+    if schedule.is_empty() {
+        vec![2, 4, 8]
+    } else {
+        schedule
+    }
+}
+
+/// Effective backoff before busy retry `retry` (1-based). Past the schedule's
+/// length the last (largest) wait repeats, so a short schedule never
+/// shortens later waits.
+pub fn busy_backoff_secs(retry: u32) -> u64 {
+    let schedule = parse_busy_backoff_schedule(
+        &std::env::var("OCC3_BUSY_BACKOFF_SECS").unwrap_or_default(),
+    );
+    schedule[(retry.saturating_sub(1) as usize).min(schedule.len() - 1)]
 }
 
 impl Occ3SenderQueueEntry {
@@ -621,7 +677,11 @@ impl Occ3SenderQueue {
                         || entry.receiver_name.is_empty()
                         || entry.receiver_name.len() > 128
                         || entry.attempts > 64
-                        || entry.busy_retries > OCC3_RECEIVER_BUSY_MAX_RETRIES
+                        // Validated against the hard limit, not the current
+                        // effective budget: a queue legitimately written under
+                        // a larger OCC3_BUSY_MAX_RETRIES must still load when
+                        // the environment reverts to the default.
+                        || entry.busy_retries > OCC3_BUSY_MAX_RETRIES_LIMIT
                         || entry.message_ids.len() > 8
                 }) {
                     queue.blocked = Some(Occ3SenderQueueBlocked::Unreadable {
@@ -961,7 +1021,7 @@ impl Occ3SenderQueue {
         }) else {
             return Vec::new();
         };
-        if self.entries[index].busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
+        if self.entries[index].busy_retries >= busy_max_retries() {
             let queue_id = self.entries[index].queue_id.clone();
             return self
                 .mark_fallback(Some(&queue_id), "receiver_busy_exhausted", now_epoch)
@@ -973,7 +1033,7 @@ impl Occ3SenderQueue {
         entry.state = Occ3SenderQueueState::Pending;
         entry.reason = Some(OCC3_RECEIVER_BUSY_RETRY_REASON.into());
         entry.retry_not_before_epoch =
-            Some(now_epoch.saturating_add(receiver_busy_backoff_secs(entry.busy_retries)));
+            Some(now_epoch.saturating_add(busy_backoff_secs(entry.busy_retries)));
         self.notice_at(index, now_epoch, None).into_iter().collect()
     }
 
@@ -997,7 +1057,7 @@ impl Occ3SenderQueue {
         if head.state != Occ3SenderQueueState::Armed {
             return None;
         }
-        if head.busy_retries >= OCC3_RECEIVER_BUSY_MAX_RETRIES {
+        if head.busy_retries >= busy_max_retries() {
             let queue_id = head.queue_id.clone();
             return self.mark_fallback(Some(&queue_id), OCC3_SOURCE_BUSY_EXHAUSTED_REASON, now_epoch);
         }
@@ -1007,7 +1067,7 @@ impl Occ3SenderQueue {
         head.reason = Some(OCC3_SOURCE_BUSY_RETRY_REASON.into());
         let wait = retry_after_secs
             .filter(|seconds| (1..=OCC3_BUSY_BACKOFF_MAX_SECS).contains(seconds))
-            .unwrap_or_else(|| receiver_busy_backoff_secs(head.busy_retries));
+            .unwrap_or_else(|| busy_backoff_secs(head.busy_retries));
         let anchor = if refused_at_epoch == 0 { now_epoch } else { refused_at_epoch.min(now_epoch) };
         head.retry_not_before_epoch = Some(anchor.saturating_add(wait));
         self.notice_at(0, now_epoch, None)
@@ -1449,8 +1509,9 @@ source facts again as assistant content and call occ3_handoff once more. Do not 
 /// emitted again into a fresh capture. Busy retries are counted only at a
 /// refusal, never per handoff call.
 pub fn source_busy_prompt(receiver: &str, retry: u32) -> String {
+    let max = busy_max_retries();
     format!(
-        "OCC-3 native handoff to {receiver} was not delivered: the server was busy and captured nothing (busy retry {retry} of {OCC3_RECEIVER_BUSY_MAX_RETRIES}). \
+        "OCC-3 native handoff to {receiver} was not delivered: the server was busy and captured nothing (busy retry {retry} of {max}). \
 If occ3_handoff has not already returned capture_armed since then, call it with receiver_role and receiver_name for that receiver; it waits out the \
 short backoff and arms a fresh capture. Then emit the concise source facts again as assistant content and call occ3_handoff once more. \
 Do not reuse or replay any earlier capture."
@@ -1705,6 +1766,30 @@ mod tests {
         assert!(queue.record_source_busy(None, now, now).is_none());
     }
 
+    /// The operator knobs parse without touching process env: clamped
+    /// bounds, default on invalid, and the schedule's last wait repeats.
+    #[test]
+    fn busy_knob_parsers_clamp_and_default() {
+        assert_eq!(parse_busy_max_retries(""), 3);
+        assert_eq!(parse_busy_max_retries("  "), 3);
+        assert_eq!(parse_busy_max_retries("abc"), 3);
+        assert_eq!(parse_busy_max_retries("5"), 5);
+        assert_eq!(parse_busy_max_retries("0"), 1);
+        assert_eq!(parse_busy_max_retries("99"), OCC3_BUSY_MAX_RETRIES_LIMIT);
+        assert_eq!(parse_busy_max_retries("-1"), 3);
+
+        assert_eq!(parse_busy_backoff_schedule(""), vec![2, 4, 8]);
+        assert_eq!(parse_busy_backoff_schedule("x"), vec![2, 4, 8]);
+        assert_eq!(parse_busy_backoff_schedule("5,15,30"), vec![5, 15, 30]);
+        assert_eq!(parse_busy_backoff_schedule("5, 15 ,30"), vec![5, 15, 30]);
+        // Out-of-range entries clamp into 1..=30; junk parts drop.
+        assert_eq!(parse_busy_backoff_schedule("0,40"), vec![1, 30]);
+        assert_eq!(parse_busy_backoff_schedule("5,,15,x"), vec![5, 15]);
+        // The effective schedule's last wait repeats past its length.
+        let schedule = parse_busy_backoff_schedule("5,15");
+        assert_eq!(schedule[1.min(schedule.len() - 1)], 15);
+    }
+
     #[test]
     fn source_busy_honours_bounded_retry_after_anchored_at_the_refusal() {
         let mut queue = queue();
@@ -1902,7 +1987,9 @@ mod tests {
         assert_eq!(queue.head().unwrap().busy_retries, 0);
         assert_eq!(queue.head().unwrap().retry_not_before_epoch, None);
         let mut over = legacy.clone();
-        over["entries"][0]["busyRetries"] = json!(OCC3_RECEIVER_BUSY_MAX_RETRIES + 1);
+        // The bound is the hard limit, not the default budget: a file written
+        // under a raised OCC3_BUSY_MAX_RETRIES must still load.
+        over["entries"][0]["busyRetries"] = json!(OCC3_BUSY_MAX_RETRIES_LIMIT + 1);
         std::fs::write(&path, over.to_string()).unwrap();
         let (_, load) = Occ3SenderQueue::load(&path, OCC3_SENDER_QUEUE_TTL_SECS);
         assert!(matches!(load, Occ3SenderQueueLoad::Blocked(..)));
