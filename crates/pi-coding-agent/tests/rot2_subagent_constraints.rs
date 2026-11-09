@@ -716,6 +716,7 @@ impl AgentSessionMessageController for FamilyBus {
                 delivered_at: Some("fixture-delivered".to_string()),
                 delivery_mode: Some("direct".to_string()),
                 delivery_status: "delivered".to_string(),
+                delivered_to_hydrated: None,
             };
             inner
                 .receipts
