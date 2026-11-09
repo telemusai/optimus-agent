@@ -1379,6 +1379,47 @@ async fn ordinary_send_receipt_acknowledges_fallback_entry() {
     assert!(entries.is_empty());
 }
 
+
+#[tokio::test]
+async fn hydrated_receiver_receipt_closes_fallback_with_honest_status() {
+    // Live-incident shape (2026-11-09, occ3q_ed361452): the ordinary
+    // re-emission for a dead/non-resident receiver is accepted only after
+    // the daemon hydrates its saved session artifacts. The receipt carries
+    // `delivered_to_hydrated`, and the queue must close the entry on it
+    // (nothing better is possible for a non-resident receiver) while
+    // recording the distinction - never a clean `delivered`.
+    let session = enrolled_session().await;
+    session.sender_queue_enqueue("sibling", "dead-receiver").expect("enqueue");
+    session.sender_queue_mark_armed(None, None).expect("armed");
+    let notice = session
+        .sender_queue_capture_failed(true, "native_path_deactivated")
+        .expect("terminal capture failure")
+        .expect("notice");
+    session.issue_fallback_prompt(&notice.queue_id);
+    assert!(session.note_fallback_prompt_message(&notice.queue_id));
+    session.begin_fallback_turn(&notice.queue_id);
+    let token = session
+        .active_fallback_token_for("sibling:dead-receiver")
+        .expect("token present during the fallback turn");
+    let acknowledged = session
+        .sender_queue_note_ordinary_send(
+            Some(&token),
+            Some(crate::core::agent_session::occ3_sender_queue::OCC3_FALLBACK_HYDRATED_STATUS),
+            Some("agentmsg_zombie"),
+        )
+        .expect("note");
+    assert_eq!(acknowledged.len(), 1);
+    assert_eq!(acknowledged[0].state, "fallback");
+    assert_eq!(
+        acknowledged[0].reason.as_deref(),
+        Some("ordinary_delivery:delivered_to_hydrated")
+    );
+    assert_eq!(acknowledged[0].message_id.as_deref(), Some("agentmsg_zombie"));
+    session.end_fallback_turn();
+    let (entries, _) = session.sender_queue_snapshot().expect("snapshot");
+    assert!(entries.is_empty());
+}
+
 /// F6: routing registry proof. A delivery event for a message sent by a
 /// DIFFERENT session routes to THAT sender's queue, never to the
 /// receiver's own queue. Two distinct sessions with distinct ids: the

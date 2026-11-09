@@ -201,6 +201,12 @@ pub struct ActiveSessionState {
     pub unsubscribe: Option<Box<dyn FnOnce() + Send>>,
     /// Client env (e.g. herdr pane identity) bound when the runtime was created.
     pub client_env: Option<HashMap<String, String>>,
+    /// True when this session was restored from a passivated RLM subagent
+    /// (hydration) rather than being live from creation. Agent-message
+    /// receipts consult it to distinguish delivery into a restored
+    /// transcript from delivery to a live consumer; see
+    /// `agent_message_requires_hydration_marker`.
+    pub hydrated_from_passive: bool,
 }
 
 impl ActiveSessionState {
@@ -217,6 +223,7 @@ impl ActiveSessionState {
             summary_state: None,
             unsubscribe: None,
             client_env: None,
+            hydrated_from_passive: false,
         }
     }
 }

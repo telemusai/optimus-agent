@@ -49,6 +49,13 @@ pub const OCC3_SENDER_QUEUE_MAX_TTL_SECS: u64 = 24 * 3600;
 /// so the communication-activity projection never pulses on it.
 pub const OCC3_QUEUE_NOTICE_CUSTOM_TYPE: &str = "occ3_queue_notice";
 
+/// Ordinary-send receipt status for a fallback re-emission that a
+/// non-resident receiver accepted only through hydration (restored from
+/// saved session artifacts): transport-accepted, never consumption-proven.
+/// The queue closes the entry on it (nothing better is possible for a
+/// non-resident receiver) but the recorded reason keeps the distinction.
+pub const OCC3_FALLBACK_HYDRATED_STATUS: &str = "delivered_to_hydrated";
+
 /// The sender-context fallback re-emission prompt custom type. The prompt
 /// that drives the model's ordinary re-emission turn; its details carry the
 /// queueId (already public in notices) but never the dispatch token - the

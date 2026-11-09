@@ -505,6 +505,23 @@ pub struct AgentSessionMessageReceipt {
     pub queued_at: Option<String>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub delivery_mode: Option<String>,
+    /// Present only when the target was not resident and had to be hydrated
+    /// (restored from its saved session artifacts) for this delivery: the
+    /// transport accepted the message, but nothing resident consumed it, so
+    /// callers that need proof of consumption (e.g. the OCC-3 native
+    /// fallback acknowledgment) must not read this as a live delivery.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub delivered_to_hydrated: Option<bool>,
+}
+
+impl AgentSessionMessageReceipt {
+    /// Mark this receipt as delivered into a hydrated (non-resident) target.
+    /// Builder-style: applied only by the send path that actually had to
+    /// hydrate the receiver.
+    pub fn with_hydrated_receiver(mut self) -> Self {
+        self.delivered_to_hydrated = Some(true);
+        self
+    }
 }
 
 #[derive(Debug, Clone, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
@@ -2023,6 +2040,7 @@ pub fn create_agent_session_message_receipt(
             Some(at.to_string())
         },
         delivery_mode: Some(DELIVERY_MODE_STEER.to_string()),
+        delivered_to_hydrated: None,
     }
 }
 
@@ -3195,6 +3213,25 @@ mod tests {
         );
         assert!(delivered.queued_at.is_none());
         assert_eq!(delivered.delivery_mode.as_deref(), Some("steer"));
+        // Default receipts carry no hydration marker.
+        assert!(delivered.delivered_to_hydrated.is_none());
+        assert!(
+            serde_json::to_value(&delivered)
+                .expect("serialize")
+                .get("deliveredToHydrated")
+                .is_none(),
+            "the hydration marker must stay absent for ordinary live deliveries"
+        );
+        let hydrated = delivered.with_hydrated_receiver();
+        assert_eq!(hydrated.delivered_to_hydrated, Some(true));
+        assert_eq!(
+            serde_json::to_value(&hydrated)
+                .expect("serialize")
+                .get("deliveredToHydrated")
+                .and_then(|value| value.as_bool()),
+            Some(true),
+            "the hydration marker must round-trip so the OCC-3 fallback ack can see it"
+        );
         let queued = create_agent_session_message_receipt(
             &payload(),
             &DELIVERY_STATUS_QUEUED.to_string(),
@@ -3624,6 +3661,7 @@ mod tests {
                     delivered_at: None,
                     queued_at: None,
                     delivery_mode: None,
+                    delivered_to_hydrated: None,
                 })
             })
         }
@@ -3829,6 +3867,7 @@ mod agent_message_provenance_gate_tests {
                     delivered_at: None,
                     queued_at: None,
                     delivery_mode: None,
+                    delivered_to_hydrated: None,
                 })
             })
         }

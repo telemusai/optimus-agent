@@ -6229,7 +6229,17 @@ async fn sender_queue_idle_tick(
                 let token = native.active_fallback_token_for(&target);
                 let (receipt_status, receipt_message_id) = match outcome.as_ref() {
                     Ok(receipt) => (
-                        Some(receipt.delivery_status.clone()),
+                        Some(if receipt.delivered_to_hydrated == Some(true) {
+                            // Honest fallback close for a non-resident
+                            // receiver: the bytes landed in a hydrated
+                            // transcript, but nothing live consumed them,
+                            // so the queue records the distinction
+                            // instead of a clean `delivered`.
+                            occ3_sender_queue::OCC3_FALLBACK_HYDRATED_STATUS
+                                .to_string()
+                        } else {
+                            receipt.delivery_status.clone()
+                        }),
                         Some(receipt.id.clone()),
                     ),
                     Err(_) => (None, None),
