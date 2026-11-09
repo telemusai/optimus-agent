@@ -1108,6 +1108,124 @@ async fn t08_receipt_outcomes_are_truthful_queued_is_not_delivered() {
     );
 }
 
+/// C-02 (e): receiver-liveness honesty for hydrated receivers. A target
+/// restored from a passivated subagent with no live consumer (no attached
+/// client, no attach in flight, not streaming) must carry
+/// `delivered_to_hydrated` on its receipt, and the marker must key on the
+/// receiver's state at receipt time (not on which resolution branch the
+/// send took), so later sends to the same hydrated receiver stay marked
+/// while any live consumer clears it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn t08_hydrated_receiver_receipts_are_marked_and_live_receivers_are_not() {
+    // Hydrated receiver, nothing live: marked.
+    let session = ReportingSession::arc(
+        "active-hydrated",
+        "session-hydrated",
+        "C:/parity/session-hydrated.jsonl",
+        Some((true, false)),
+        None,
+    );
+    let fixture = ScriptedDaemonFixture::new("t08-hydrated", session);
+    fixture
+        .state
+        .lock()
+        .expect("active session poisoned")
+        .hydrated_from_passive = true;
+
+    let message = fixture
+        .daemon
+        .send_agent_session_message(SendAgentMessageInput {
+            target_selector: fixture.active_session_id.clone(),
+            message: "hydrated receiver case".to_string(),
+            from_state: None,
+            sender: None,
+            client_id: Some("parity-client".to_string()),
+            sender_key: None,
+            origin: "cli".to_string(),
+        })
+        .await
+        .expect("the send itself must return a receipt");
+    assert_eq!(
+        message.delivery_status, "delivered",
+        "the delivery itself succeeded into the restored transcript"
+    );
+    assert_eq!(
+        message.delivered_to_hydrated,
+        Some(true),
+        "a delivery into a hydrated receiver with no live consumer must be marked: {message:?}"
+    );
+
+    // Same hydrated receiver, but a client has since attached: live, unmarked.
+    let session_live = ReportingSession::arc(
+        "active-hydrated-live",
+        "session-hydrated-live",
+        "C:/parity/session-hydrated-live.jsonl",
+        Some((true, false)),
+        None,
+    );
+    let fixture_live = ScriptedDaemonFixture::new("t08-hydrated-live", session_live);
+    {
+        let mut state = fixture_live.state.lock().expect("active session poisoned");
+        state.hydrated_from_passive = true;
+        // The liveness signal the marker reads is the raw attached-client
+        // slot on the session state, not the daemon-wide client registry.
+        state
+            .clients
+            .push(Arc::new(StdMutex::new(DaemonSocketClient::new(
+                "live-attached-client",
+                false,
+            ))));
+    }
+    let message = fixture_live
+        .daemon
+        .send_agent_session_message(SendAgentMessageInput {
+            target_selector: fixture_live.active_session_id.clone(),
+            message: "live attached receiver case".to_string(),
+            from_state: None,
+            sender: None,
+            client_id: Some("parity-client".to_string()),
+            sender_key: None,
+            origin: "cli".to_string(),
+        })
+        .await
+        .expect("the send itself must return a receipt");
+    assert_eq!(message.delivery_status, "delivered");
+    assert_ne!(
+        message.delivered_to_hydrated,
+        Some(true),
+        "a hydrated receiver with an attached client is live and must not be marked: {message:?}"
+    );
+
+    // Never-hydrated resident receiver: ordinary unmarked delivery.
+    let session_plain = ReportingSession::arc(
+        "active-plain",
+        "session-plain",
+        "C:/parity/session-plain.jsonl",
+        Some((true, false)),
+        None,
+    );
+    let fixture_plain = ScriptedDaemonFixture::new("t08-plain", session_plain);
+    let message = fixture_plain
+        .daemon
+        .send_agent_session_message(SendAgentMessageInput {
+            target_selector: fixture_plain.active_session_id.clone(),
+            message: "plain receiver case".to_string(),
+            from_state: None,
+            sender: None,
+            client_id: Some("parity-client".to_string()),
+            sender_key: None,
+            origin: "cli".to_string(),
+        })
+        .await
+        .expect("the send itself must return a receipt");
+    assert_eq!(message.delivery_status, "delivered");
+    assert_ne!(
+        message.delivered_to_hydrated,
+        Some(true),
+        "a never-hydrated resident receiver must not be marked: {message:?}"
+    );
+}
+
 /// C-02 (b): a session that reports `preflight(false, false)` (rejected admission)
 /// must fail the send instead of returning a fabricated delivery.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

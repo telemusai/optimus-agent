@@ -188,6 +188,16 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
             "For structured task and result communication with other agents, encode agent_message bodies as OCC-1 compact structured English (see the agent-message skill; codec preinstalled as rlm.occ1). Plain English remains fine for conversational replies.".to_string(),
         );
     }
+    // OCC-3 is the preferred communication channel whenever the native
+    // session is live for THIS chat (the tool being active means the
+    // connector enrolled and the runtime exposes it): the model should
+    // reach for native handoffs first, with ordinary messaging as the
+    // fallback rather than the default.
+    if active_tools.iter().any(|tool| tool == "occ3_handoff") {
+        parts.push(
+            "OCC-3 preference: this session has a live native OCC-3 enrollment, so occ3_handoff is the preferred path for exchanging facts with compatible family agents (parent, siblings, direct children on the same OCC-3-configured model). Prefer it over ordinary agent_message for substantive fact and state exchange; use ordinary OCC-1/OCC-2 messaging for receivers that are not OCC-3-compatible, for conversational replies, and whenever a handoff is busy, refused, or exhausted its retry budget.".to_string(),
+        );
+    }
     if has_agent_message || active_tools.iter().any(|tool| tool == "subagent" || tool == "occ3_handoff") {
         parts.push(
             "OCC-3 hive mind: coordinate compatible agents as a team with a shared objective and distinct responsibilities. Exchange focused native context between authorized family members, then reconcile their results; each agent still has its own session, memory and permissions. Never assume automatic shared memory, broadcast access, or identical conclusions. Use OCC-3 for eligible native handoffs only when the runtime exposes the occ3_handoff tool and both sender and receiver subagents use explicitly OCC-3-configured models with matching verified model/runtime identity. For example, a configured DGX MTP (OCC-3) model is distinct from the ordinary DGX MTP model; a shared display name or model id does not establish support. Discover the configured OCC-3 entry using available model discovery (rlm.find_models in IPython) and pass its exact provider/model selector explicitly when creating both subagents through rlm or the native subagent tool, according to the current execution mode (for example dgx-glm53-occ3/glm-5.3 only when listed). Do not select by bare model id, which can resolve to the ordinary provider. Keep compatible subagents on that same configured OCC-3 model. Use its configured inference and OCC-3 endpoints with the existing provider credentials; do not substitute remembered SSH tunnels, known-hosts entries, or gateway routes. Report failure of the configured endpoint instead of inventing an alternate route. Call occ3_handoff as a native tool with only receiver_role and receiver_name, following its schema. If the first call returns capture_armed, no transfer occurred: emit concise source facts as assistant content in the next response and call occ3_handoff once for the same receiver, with no other tools in that response. After admission, do not repeat it. Never invent OCC/3 envelopes, handles, or source facts in its arguments. If the tool or a compatible receiver is unavailable, use ordinary agent messaging with valid OCC-1 bodies and let the runtime select OCC-2 where eligible. agent_message.send does not itself perform native OCC-3 transfer. A queued/admitted handoff is not completed native use; inspect receipts and do not replay an uncertain handoff blindly. A completed-use receipt proves native consumption, not semantic accuracy: verify transferred critical facts before acting on them.".to_string(),
@@ -336,6 +346,40 @@ mod tests {
             "when the user explicitly asks for a data search; say so then instead of silently omitting it"
         ));
         assert!(!prompt.contains("You are a child agent spawned by"));
+    }
+
+    #[test]
+    fn live_native_enrollment_states_the_occ3_preference() {
+        // A chat with a live native enrollment (occ3_handoff active) is told
+        // OCC-3 is the preferred channel for compatible-family fact exchange.
+        let mut options = base();
+        options.installed_skills = Some(vec!["agent_message".to_string()]);
+        options.active_tools = Some(vec![
+            "ipython".to_string(),
+            "occ3_handoff".to_string(),
+        ]);
+        let prompt = build_rlm_prompt(&options);
+        assert!(prompt.contains("OCC-3 preference: this session has a live native OCC-3 enrollment"));
+        assert!(prompt.contains("occ3_handoff is the preferred path for exchanging facts with compatible family agents"));
+        // The general hive doctrine is present too.
+        assert!(prompt.contains("OCC-3 hive mind: coordinate compatible agents"));
+    }
+
+    #[test]
+    fn chats_without_a_live_native_enrollment_get_no_occ3_preference_line() {
+        // Tool absent (or only the subagent tool): the preference line must
+        // NOT appear - OCC-3 stays an available option, not a preference.
+        let mut options = base();
+        options.installed_skills = Some(vec!["agent_message".to_string()]);
+        options.active_tools = Some(vec![
+            "ipython".to_string(),
+            "subagent".to_string(),
+        ]);
+        let prompt = build_rlm_prompt(&options);
+        assert!(!prompt.contains("OCC-3 preference: this session has a live native OCC-3 enrollment"));
+        // The hive doctrine may still be present (it documents how to spawn
+        // OCC-3 subagents) - only the preference line is gated on liveness.
+        assert!(prompt.contains("OCC-3 hive mind: coordinate compatible agents"));
     }
 
     #[test]

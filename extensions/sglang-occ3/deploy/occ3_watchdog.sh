@@ -28,7 +28,14 @@ stamp() { date -u +%Y-%m-%dT%H:%M:%SZ; }
   echo "$(stamp) controller exited rc=$rc"
   if [ "$rc" -ne 0 ]; then
       echo "$(stamp) watchdog: automatic rollback"
-      timeout --signal=TERM --kill-after=60 900 \
+      # The controller's rollback verification uses the same health budget
+      # as the deploy gate (OCC3_HEALTH_TIMEOUT, default 1500); the watchdog
+      # hard-kill must cover that plus the stop/rename/start overhead, or a
+      # slow-restoring original is killed mid-verification and reported as
+      # a failed rollback.
+      OCC3_HEALTH_TIMEOUT="${OCC3_HEALTH_TIMEOUT:-1500}"
+      ROLLBACK_KILL_S=$((OCC3_HEALTH_TIMEOUT + 600))
+      timeout --signal=TERM --kill-after=60 "$ROLLBACK_KILL_S" \
           python3 "$CONTROLLER" rollback --key-file "$KEY_FILE" \
           --recovery-dir "$RECOVERY_DIR"
       # rollback serves the OLD key again; flip the local env back if the

@@ -27,7 +27,8 @@ admitted or completed heads never receive a stale retry prompt.
 An armed capture holds process-wide capture capacity through publication, not
 through the sender session's lifetime. Terminal capture outcomes release that
 capacity. Busy retry backoff does not hold it. A fresh capture waits at most
-30 seconds for capacity and supports cancellation; refusal does not arm, send,
+90 seconds for capacity (operator-tunable through `OCC3_CAPTURE_CAPACITY_WAIT_SECONDS`,
+clamped to 5-240 seconds) and supports cancellation; refusal does not arm, send,
 or replay a capture. Disabling OCC-3 before dispatch returns an armed queue
 head to pending without spending a capture attempt. Re-enabling permits an
 explicit fresh arm of that same head.

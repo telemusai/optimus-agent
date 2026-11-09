@@ -58,4 +58,7 @@ research/latent_handoff/.venv/
 research/**/__pycache__/
 research/**/*.json.tmp
 .rlm-review-target/
+
+# OCC-3 deploy runtime state (deploy.sh writes it next to the scripts)
+extensions/sglang-occ3/deploy/occ3-deploy-state.env
 nul

@@ -15133,7 +15133,13 @@ impl AgentDaemon {
                     let mut slot = state_ref_for_callback.lock().expect("session state slot poisoned");
                     *slot = Some(Arc::clone(state));
                 }
-                state.lock().expect("active session poisoned").client_env = hydration_env.clone();
+                let mut state = state.lock().expect("active session poisoned");
+                state.client_env = hydration_env.clone();
+                // Hydration marker for receiver-liveness honesty: this
+                // session came back from a passivated subagent, so message
+                // receipts must distinguish it from a live consumer until a
+                // client attaches or the session starts running.
+                state.hydrated_from_passive = true;
             })), None)
             .await?;
         // The session transcript is authoritative for mutable metadata such as a
@@ -15616,6 +15622,28 @@ impl AgentDaemon {
         .map(|_| ())
     }
 
+    /// Receiver-liveness honesty for `sendAgentSessionMessage` receipts: the
+    /// target was restored from a passivated subagent and nothing live is
+    /// consuming it right now (no attached client, no attach in flight, not
+    /// streaming). Such a delivery lands in a restored transcript; the
+    /// receipt must not present it as an ordinary live delivery. Keyed on
+    /// the receiver's state at receipt time so it stays true for later sends
+    /// to the same hydrated receiver, and clears as soon as a client
+    /// attaches or the session runs.
+    fn agent_message_requires_hydration_marker(
+        &self,
+        target_state: &Arc<StdMutex<ActiveSessionState>>,
+    ) -> bool {
+        let (hydrated, clients, pending_attaches) = {
+            let state = target_state.lock().expect("active session poisoned");
+            (state.hydrated_from_passive, state.clients.len(), state.pending_attaches)
+        };
+        hydrated
+            && clients == 0
+            && pending_attaches == 0
+            && !self.session_of(target_state).is_streaming()
+    }
+
     /// `sendAgentSessionMessage(options)`.
     async fn send_agent_session_message(
         self: &Arc<Self>,
@@ -15627,6 +15655,15 @@ impl AgentDaemon {
         let target_selector = assert_direct_agent_message_target(&options.target_selector)?;
         let message =
             normalize_agent_session_message(&options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS)?;
+        // Receiver-liveness honesty: a target that is not currently resident
+        // and had to be hydrated (restored from saved session artifacts)
+        // accepts the message into its transcript, but nothing live consumed
+        // it. The marker is keyed on the receiver's actual state at receipt
+        // time (`agent_message_requires_hydration_marker`), not on which
+        // resolution branch this send took, so a second send to the same
+        // hydrated receiver is still marked, while waiting for an
+        // in-flight spawn of a never-passivated session is not (a live child
+        // will consume the message).
         let target_state = match self.get_bound_session_state(&target_selector) {
             Ok(state) => state,
             Err(error) => {
@@ -15763,11 +15800,14 @@ impl AgentDaemon {
             .accept_agent_session_message(&target_state, &payload)
             .await
         {
-            Ok(status) => Ok(create_agent_session_message_receipt(
-                &payload,
-                &status,
-                &now_iso(),
-            )),
+            Ok(status) => {
+                let receipt = create_agent_session_message_receipt(&payload, &status, &now_iso());
+                Ok(if self.agent_message_requires_hydration_marker(&target_state) {
+                    receipt.with_hydrated_receiver()
+                } else {
+                    receipt
+                })
+            }
             Err(error) => {
                 self.agent_message_rate_limiter
                     .lock()
