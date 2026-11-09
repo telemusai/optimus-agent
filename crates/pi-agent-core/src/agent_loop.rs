@@ -2836,15 +2836,18 @@ async fn stream_assistant_response(
             // reaching this guard with a simultaneous attachment means
             // that deferral did not apply. Both leases cancel here: the
             // sender's queue re-arms a fresh capture within its bounded
-            // retry budget and the receiver's delivery stays pending for
-            // its next turn, so the session itself is recoverable.
+            // retry budget, and the receiver's already-claimed delivery
+            // goes terminal as failed delivery - the sender's ordinary
+            // fallback (re-emission as an agent message) is the recovery
+            // path for that delivery, not a pending retry.
             return Err(anyhow::anyhow!(
                 "A source capture lease reached the provider request without meeting its \
 preconditions: native completion hooks, OpenAI completions API, a prepared lease, and no \
 simultaneous receiver attachment. Both attachments fail closed - the capture cancels for a \
-bounded re-arm and a receiver attachment, if any, stays pending for the receiver's next turn \
-(the receiver resolver defers its claim while a capture is armed; a simultaneous attachment \
-here means that deferral did not apply)."
+bounded re-arm and a receiver attachment, if any, fails its claimed delivery (the receiver \
+resolver defers its claim while a capture is armed; a simultaneous attachment here means that \
+deferral did not apply, and the sender's ordinary fallback is the recovery path for that \
+delivery)."
             ));
         }
     }

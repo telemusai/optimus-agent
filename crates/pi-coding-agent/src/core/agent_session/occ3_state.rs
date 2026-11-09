@@ -4830,11 +4830,27 @@ mod tests {
             assert!(slot.budget.is_some(), "capture budget armed");
         }
         let resolver = session.receiver_resolver();
+        // The receiver request must present the message in context for the
+        // claim (mirror of the real loop: the delivery record rides the
+        // inference messages). The FIRST request already carries it: the
+        // incident shape is an armed source capture AND the admitted
+        // delivery id arriving on the same request. A deferral test that
+        // claims from an empty request would pass with the deferral
+        // removed, because an empty request claims nothing either way.
+        let marker = |id: &str| {
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": id})),
+                timestamp: 0,
+            })
+        };
         let request = || InferenceStateRequest {
             model: fixture_model(),
             context: Default::default(),
-            messages: Vec::new(),
-            newly_supplied_messages: Vec::new(),
+            messages: vec![marker(&message_id)],
+            newly_supplied_messages: vec![marker(&message_id)],
             signal: None,
         };
         assert!(
@@ -4856,18 +4872,6 @@ mod tests {
             assert!(slot.budget.is_none(), "budget consumed by the capture resolve");
             assert!(slot.lease.is_some());
         }
-        // The receiver request must present the message in context for the
-        // claim (mirror of the real loop: the delivery record rides the
-        // inference messages).
-        let marker = |id: &str| {
-            AgentMessage::Custom(CustomAgentMessage::Custom {
-                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
-                content: CustomMessageContent::Text(String::new()),
-                display: false,
-                details: Some(json!({"id": id})),
-                timestamp: 0,
-            })
-        };
         let claimed = (resolver)(InferenceStateRequest {
             model: fixture_model(),
             context: Default::default(),
