@@ -1630,3 +1630,510 @@ async fn parent_queue_notice_prompts_only_terminal_states_and_coalesce() {
     );
     assert_eq!(live_prompts("occ3q_flood"), 0, "deleted child leaves no queued prompts");
 }
+
+
+// ---------------------------------------------------------------------------
+// Model-change activation (root-session retry).
+//
+// The live defect these tests pin: a root chat session created on a
+// non-OCC-3 model declined activation once at creation and the daemon never
+// retried, so after switching that session to an OCC-3-capable model it
+// still had no `occ3_handoff` tool - only freshly spawned subagents
+// activated. The daemon now re-attempts activation when the session's model
+// identity changes and no native session is installed, while a live native
+// enrollment is never re-installed and ordinary models still never activate.
+//
+// The fixture keeps the wiring-fixture shape (real daemon, real
+// `AgentSession` behind the real adapter, registered through `add_runtime`)
+// and adds the offline activation control plane from
+// `activation::test_support`: two loopback servers, each attesting its own
+// model identity, so "no re-installation attempt" is observable as zero
+// requests against the second runtime.
+// ---------------------------------------------------------------------------
+
+use crate::core::model_registry::{ModelDefinition, ProviderConfigInput};
+use crate::core::occ3_connectors::activation::test_support as activation_support;
+use tokio::sync::mpsc;
+
+/// A live-verified OCC-3 block pointing at one loopback control plane.
+fn occ3_capability(endpoint: &str) -> pi_ai::types::Occ3Capability {
+    pi_ai::types::Occ3Capability {
+        protocol: pi_ai::types::OCC3_PROTOCOL_V1.into(),
+        connector: "sglang".into(),
+        endpoint: endpoint.into(),
+        api_version: pi_ai::types::OCC3_API_VERSION_V1.into(),
+        same_model_only: true,
+        enabled: true,
+        validation: pi_ai::types::Occ3Validation::LiveVerified,
+        fallback: vec!["occ2".into(), "occ1".into(), "text".into()],
+        method: None,
+        artifact_digest: None,
+    }
+}
+
+/// One OCC-3-capable model whose inference base URL shares the control-plane
+/// origin, which is what the connector's target binding requires.
+fn occ3_model_definition(model_id: &str, endpoint: &str) -> ModelDefinition {
+    ModelDefinition {
+        id: model_id.to_string(),
+        name: Some(model_id.to_string()),
+        base_url: Some(format!("{}/v1", endpoint.trim_end_matches('/'))),
+        context_window: Some(128000.0),
+        max_tokens: Some(16384.0),
+        occ3: Some(occ3_capability(endpoint)),
+        ..Default::default()
+    }
+}
+
+/// The `occ3_handoff` tool lives on the agent's tool list (that is where
+/// `install_experimental_native_occ3` installs it), not on the session's
+/// extension tool-definition map.
+fn handoff_tool_installed(session: &Arc<AgentSession>) -> bool {
+    session
+        .agent
+        .state()
+        .tools
+        .unwrap_or_default()
+        .iter()
+        .any(|tool| tool.name == NATIVE_HANDOFF_TOOL)
+}
+
+struct ModelChangeActivationFixture {
+    _directory: tempfile::TempDir,
+    daemon: Arc<AgentDaemon>,
+    session: Arc<AgentSession>,
+    state: Arc<StdMutex<ActiveSessionState>>,
+    first_occ3: activation_support::ActivationFixture,
+    second_occ3: activation_support::ActivationFixture,
+    outbound: mpsc::UnboundedReceiver<Vec<u8>>,
+    client: Arc<DaemonClientHandle>,
+    active_session_id: String,
+}
+
+impl ModelChangeActivationFixture {
+    async fn new() -> Self {
+        let directory = tempfile::tempdir().expect("temp dir");
+        let cwd = directory
+            .path()
+            .join("workspace")
+            .to_string_lossy()
+            .into_owned();
+        let agent_dir = directory
+            .path()
+            .join("agent")
+            .to_string_lossy()
+            .into_owned();
+        std::fs::create_dir_all(&cwd).expect("workspace dir");
+        std::fs::create_dir_all(&agent_dir).expect("agent dir");
+        // Two offline control planes: each OCC-3-capable model binds to its
+        // own loopback server, exactly like the activation module's own
+        // tests, so attempts against the second runtime are countable.
+        let first_occ3 = activation_support::serve_activation_fixture(
+            activation_support::fixture_identity("glm-5.3", activation_support::METHOD_A),
+            None,
+        )
+        .await;
+        let second_occ3 = activation_support::serve_activation_fixture(
+            activation_support::fixture_identity("glm-5.4", activation_support::METHOD_A),
+            None,
+        )
+        .await;
+        // The live configuration this defect was observed under: the session
+        // opted in, but the model it starts on is not OCC-3-capable.
+        let settings = Arc::new(StdMutex::new(SettingsManager::in_memory(
+            serde_json::json!({
+                "autoRefine": {"enabled": false},
+                "retry": {"enabled": false},
+                "compaction": {"enabled": false},
+                "telemetryEnabled": false,
+                "agentTracesEnabled": false,
+                "agentCommunication": {"occ3Enabled": true, "occ3Experimental": true},
+            })
+            .as_object()
+            .unwrap()
+            .clone(),
+        )));
+        let session_manager = Arc::new(StdMutex::new(
+            SessionManager::in_memory(Some(&cwd), Some(&agent_dir)).expect("session manager"),
+        ));
+        let auth_storage = Arc::new(tokio::sync::Mutex::new(AuthStorage::in_memory(
+            Default::default(),
+            None,
+        )));
+        let model_registry = Arc::new(StdMutex::new(ModelRegistry::in_memory(
+            AuthStorage::in_memory(Default::default(), None),
+        )));
+        auth_storage
+            .lock()
+            .await
+            .set_runtime_api_key("unit-fixture", "occ3-model-change-key");
+        model_registry
+            .lock()
+            .expect("model registry poisoned")
+            .set_runtime_api_key("unit-fixture", "occ3-model-change-key");
+        // The OCC-3-capable switch targets, plus one more ordinary model,
+        // all resolvable through the session's own registry so the
+        // production `set_model` command finds them.
+        model_registry
+            .lock()
+            .expect("model registry poisoned")
+            .register_provider(
+                "unit-occ3",
+                ProviderConfigInput {
+                    name: Some("unit-occ3".to_string()),
+                    base_url: Some("http://127.0.0.1:40000/v1".to_string()),
+                    api_key: Some("occ3-model-change-key".to_string()),
+                    api: Some(API_OPENAI_COMPLETIONS.to_string()),
+                    models: Some(vec![
+                        occ3_model_definition("glm-5.3", first_occ3.endpoint.as_str()),
+                        occ3_model_definition("glm-5.4", second_occ3.endpoint.as_str()),
+                    ]),
+                    ..Default::default()
+                },
+            )
+            .expect("register the occ3 fixture provider");
+        model_registry
+            .lock()
+            .expect("model registry poisoned")
+            .register_provider(
+                "unit-plain",
+                ProviderConfigInput {
+                    name: Some("unit-plain".to_string()),
+                    base_url: Some("http://127.0.0.1:40001/v1".to_string()),
+                    api_key: Some("occ3-model-change-key".to_string()),
+                    api: Some(API_OPENAI_COMPLETIONS.to_string()),
+                    models: Some(vec![ModelDefinition {
+                        id: "plain-other-model".to_string(),
+                        name: Some("plain-other-model".to_string()),
+                        context_window: Some(128000.0),
+                        max_tokens: Some(16384.0),
+                        ..Default::default()
+                    }]),
+                    ..Default::default()
+                },
+            )
+            .expect("register the plain fixture provider");
+        let services = create_agent_session_services(CreateAgentSessionServicesOptions {
+            cwd: cwd.clone(),
+            agent_dir: Some(agent_dir.clone()),
+            auth_storage: Some(Arc::clone(&auth_storage)),
+            settings_manager: Some(Arc::clone(&settings)),
+            model_registry: Some(Arc::clone(&model_registry)),
+            extension_flag_values: None,
+            no_builtin_herdr_reporter: Some(true),
+            telemetry_disabled: Some(true),
+            resource_loader_options: Some(DefaultResourceLoaderOptions {
+                cwd: cwd.clone(),
+                agent_dir: agent_dir.clone(),
+                settings_manager: Some(Arc::clone(&settings)),
+                no_extensions: true,
+                no_skills: true,
+                no_prompt_templates: true,
+                no_themes: true,
+                no_context_files: true,
+                bundled_skills_dir: Some(None),
+                ..Default::default()
+            }),
+        })
+        .await
+        .expect("session services");
+        let services = Arc::new(services);
+        let created = create_agent_session_from_services(CreateAgentSessionFromServicesOptions {
+            services: Arc::clone(&services),
+            session_manager: Arc::clone(&session_manager),
+            session_start_event: None,
+            creation: CoreCreationOptions {
+                model: Some(fixture_model()),
+                no_tools: Some("all".to_string()),
+                prewarm_ipython_kernel: Some(false),
+                telemetry_disabled: Some(true),
+                ..Default::default()
+            },
+        })
+        .await
+        .expect("agent session");
+        let session = created.session;
+        install_scripted_provider(&session);
+        let refuse: CreateAgentSessionRuntimeFactory = Arc::new(|_| {
+            Box::pin(async {
+                Err("occ3 model-change fixture does not create runtimes".to_string())
+            })
+        });
+        let runtime = AgentSessionRuntime::new(
+            Arc::clone(&session),
+            services,
+            refuse,
+            Vec::new(),
+            None,
+            None,
+            CoreRuntimeMetadata::top_level(),
+            None,
+        );
+        let adapter: Arc<dyn DaemonSession> = Arc::new(AgentSessionDaemonAdapter::new(runtime));
+        let socket_path = directory
+            .path()
+            .join("occ3-model-change.sock")
+            .to_string_lossy()
+            .into_owned();
+        let daemon = AgentDaemon::new(
+            socket_path.clone(),
+            DaemonModeOptions {
+                socket_path: Some(socket_path),
+                default_session_config: AgentSessionRuntimeConfig {
+                    cwd: Some(cwd.clone()),
+                    agent_dir: Some(agent_dir.clone()),
+                    ..AgentSessionRuntimeConfig::default()
+                },
+                create_runtime: Arc::new(|_| {
+                    Box::pin(async {
+                        Err("occ3 model-change fixture does not create runtimes".to_string())
+                    })
+                }),
+                worker: None,
+            },
+        );
+        let state = daemon
+            .add_runtime(
+                AgentSessionRuntimeHandle {
+                    session: adapter,
+                    metadata: AgentSessionRuntimeMetadata {
+                        kind: Some("top-level".to_string()),
+                        ..AgentSessionRuntimeMetadata::default()
+                    },
+                    model_fallback_message: None,
+                    new_session: None,
+                    switch_session: None,
+                    fork: None,
+                    import_from_jsonl: None,
+                },
+                None,
+                None,
+                None,
+            )
+            .await
+            .expect("daemon registers the runtime");
+        // `add_runtime` already attempted activation for the non-OCC-3
+        // startup model and declined; the session starts without a native
+        // permit and without the handoff tool.
+        assert!(
+            session.experimental_native_occ3().is_none(),
+            "the fixture session starts on a non-OCC-3 model and must decline activation"
+        );
+        assert!(
+            !handoff_tool_installed(&session),
+            "the non-OCC-3 startup model installs no handoff tool"
+        );
+        let active_session_id = state
+            .lock()
+            .expect("active session poisoned")
+            .active_session_id
+            .clone();
+        let (sender, outbound) = mpsc::unbounded_channel();
+        let client = Arc::new(DaemonClientHandle::new(
+            "occ3-model-change-client",
+            Arc::new(DaemonClientWriter::new(sender)),
+            Arc::new(|| {}),
+        ));
+        {
+            let mut client_state = client.state.lock().expect("daemon client poisoned");
+            client_state.authenticated = Some(true);
+            client_state.transport = Some("jsonl".to_string());
+            client_state.capabilities = normalize_client_capabilities(None, None);
+        }
+        daemon
+            .clients
+            .lock()
+            .expect("clients poisoned")
+            .push(Arc::clone(&client));
+        Self {
+            _directory: directory,
+            daemon,
+            session,
+            state,
+            first_occ3,
+            second_occ3,
+            outbound,
+            client,
+            active_session_id,
+        }
+    }
+
+    /// Drive the production `set_model` command through the daemon command
+    /// path and return its response frame.
+    async fn set_model(&mut self, id: &str, provider: &str, model_id: &str) -> Value {
+        let command = serde_json::json!({
+            "type": "set_model",
+            "id": id,
+            "activeSessionId": self.active_session_id,
+            "provider": provider,
+            "modelId": model_id,
+        });
+        let daemon = Arc::clone(&self.daemon);
+        let client = Arc::clone(&self.client);
+        let line = serialize_json_line(&command);
+        daemon.handle_line(client, line).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(10);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            if remaining.is_zero() {
+                panic!("set_model command {id} never answered");
+            }
+            let frame = match tokio::time::timeout(remaining, self.outbound.recv()).await {
+                Ok(Some(frame)) => frame,
+                _ => panic!("set_model command {id} never answered"),
+            };
+            if let Ok(value) = serde_json::from_slice::<Value>(&frame) {
+                if value.get("type").and_then(Value::as_str) == Some("response")
+                    && value.get("id").and_then(Value::as_str) == Some(id)
+                {
+                    return value;
+                }
+            }
+        }
+    }
+}
+
+/// (a) The root-session defect: starting on a non-OCC-3 model declines
+/// activation once, and switching to an OCC-3-capable model re-attempts it
+/// and installs the native handoff tool.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_change_to_an_occ3_model_retries_activation_and_installs_the_tool() {
+    let mut fixture = ModelChangeActivationFixture::new().await;
+    let response = fixture.set_model("occ3mc-a1", "unit-occ3", "glm-5.3").await;
+    assert_eq!(response["success"], true, "{response}");
+    let native = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("the model change re-attempts activation");
+    assert!(!native.is_dead(), "the retried activation is live");
+    assert!(
+        handoff_tool_installed(&fixture.session),
+        "the retried activation installs the occ3_handoff tool"
+    );
+    assert!(
+        fixture
+            .first_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the activation handshake ran against the OCC-3 runtime"
+    );
+}
+
+/// (b) A model change while a native session exists never re-installs it: a
+/// live enrollment is not re-activated (no handshake, no enrollment, no
+/// replacement), and switching to another OCC-3-capable model performs no
+/// re-installation attempt either - the closed enrollment keeps its
+/// pre-prompt renewal path.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_change_with_a_live_native_session_never_reinstalls_it() {
+    let mut fixture = ModelChangeActivationFixture::new().await;
+    // Arrange: a live native session on the first OCC-3 model.
+    let response = fixture.set_model("occ3mc-b1", "unit-occ3", "glm-5.3").await;
+    assert_eq!(response["success"], true, "{response}");
+    let native = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("the first switch activates");
+    assert!(!native.is_dead());
+    // The hook itself, with an identity that changed: a live enrollment
+    // must not be re-activated (the install seam's live-session guard stays
+    // authoritative; no handshake or enrollment may run).
+    let handshakes = fixture
+        .first_occ3
+        .requests
+        .load(std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .daemon
+        .maybe_activate_occ3_on_model_change(&fixture.state, Some(fixture_model()))
+        .await;
+    assert_eq!(
+        fixture
+            .first_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        handshakes,
+        "a live native session is never re-activated on a model change"
+    );
+    assert!(Arc::ptr_eq(
+        &native,
+        &fixture
+            .session
+            .experimental_native_occ3()
+            .expect("the live enrollment stays installed")
+    ));
+    // The production command path: switching to ANOTHER OCC-3-capable model
+    // while a native session existed still performs no re-installation
+    // attempt. `set_model` closes the enrollment (existing semantics), and
+    // the model-change hook leaves the closed enrollment to the pre-prompt
+    // renewal path instead of re-activating against the new runtime.
+    let response = fixture.set_model("occ3mc-b2", "unit-occ3", "glm-5.4").await;
+    assert_eq!(response["success"], true, "{response}");
+    assert_eq!(
+        fixture
+            .second_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0,
+        "the model-change hook makes no attempt against the new runtime"
+    );
+    let still = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("the closed enrollment stays installed for the renewal path");
+    assert!(
+        Arc::ptr_eq(&native, &still),
+        "no replacement native session was installed"
+    );
+    assert!(
+        still.is_dead(),
+        "set_model closed the enrollment; the pre-prompt renewal owns it from here"
+    );
+    assert!(
+        !handoff_tool_installed(&fixture.session),
+        "the closed enrollment's tombstone cleanup removed the handoff tool"
+    );
+}
+
+/// (c) Switching between ordinary models still never activates: the
+/// re-attempt declines fast and named at configuration (no control-plane
+/// contact), and a same-model re-selection adds no further attempt.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_change_to_another_non_occ3_model_still_never_activates() {
+    let mut fixture = ModelChangeActivationFixture::new().await;
+    let response = fixture
+        .set_model("occ3mc-c1", "unit-plain", "plain-other-model")
+        .await;
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "a non-OCC-3 target model never installs a native session"
+    );
+    assert!(!handoff_tool_installed(&fixture.session));
+    // The decline is configuration-only: neither runtime was contacted.
+    assert_eq!(
+        fixture
+            .first_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    assert_eq!(
+        fixture
+            .second_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        0
+    );
+    // A same-model re-selection is not an identity change: still no
+    // activation and no multiplied attempts.
+    let response = fixture
+        .set_model("occ3mc-c2", "unit-plain", "plain-other-model")
+        .await;
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "a same-model re-selection never activates"
+    );
+    assert!(!handoff_tool_installed(&fixture.session));
+}
