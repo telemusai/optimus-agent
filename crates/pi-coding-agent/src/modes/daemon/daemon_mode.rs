@@ -15616,6 +15616,14 @@ impl AgentDaemon {
         let target_selector = assert_direct_agent_message_target(&options.target_selector)?;
         let message =
             normalize_agent_session_message(&options.message, DEFAULT_AGENT_MESSAGE_MAX_CHARS)?;
+        // Receiver-liveness honesty: a target that is not currently resident
+        // and had to be hydrated (restored from saved session artifacts)
+        // accepts the message into its transcript, but nothing live consumed
+        // it. The receipt marks that (consumption-protection consumers such
+        // as the OCC-3 native fallback acknowledgment distinguish it from an
+        // ordinary live delivery); waiting for an in-flight spawn hydration
+        // is NOT marked, because a live child will consume the message.
+        let mut target_required_hydration = false;
         let target_state = match self.get_bound_session_state(&target_selector) {
             Ok(state) => state,
             Err(error) => {
@@ -15626,9 +15634,11 @@ impl AgentDaemon {
                             self.assert_agent_family_reachable(from_state, &state)?;
                         }
                     }
+                    target_required_hydration = true;
                     self.get_or_hydrate_bound_session_state(&target_selector)
                         .await?
                 } else if error.starts_with("__ambiguous_active_session__") {
+                    target_required_hydration = true;
                     self.get_or_hydrate_bound_session_state(&target_selector)
                         .await?
                 } else if let Some(passive) = self
@@ -15643,6 +15653,7 @@ impl AgentDaemon {
                             )?;
                         }
                     }
+                    target_required_hydration = true;
                     self.hydrate_passive_rlm_subagent(passive, None).await?
                 } else if let Some(hydrating_child) =
                     self.session_states().into_iter().find(|entry| {
@@ -15752,11 +15763,14 @@ impl AgentDaemon {
             .accept_agent_session_message(&target_state, &payload)
             .await
         {
-            Ok(status) => Ok(create_agent_session_message_receipt(
-                &payload,
-                &status,
-                &now_iso(),
-            )),
+            Ok(status) => {
+                let receipt = create_agent_session_message_receipt(&payload, &status, &now_iso());
+                Ok(if target_required_hydration {
+                    receipt.with_hydrated_receiver()
+                } else {
+                    receipt
+                })
+            }
             Err(error) => {
                 self.agent_message_rate_limiter
                     .lock()

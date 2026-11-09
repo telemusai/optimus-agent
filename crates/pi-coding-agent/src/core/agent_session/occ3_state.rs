@@ -2624,7 +2624,14 @@ Do not call occ3_handoff again for these facts."
         }) else {
             return Ok(Vec::new());
         };
-        let accepted = matches!(receipt_status, Some("delivered") | Some("queued"));
+        // `delivered_to_hydrated` closes the entry too: the receiver was not
+        // resident and only a hydrated transcript accepted the re-emission,
+        // so no retry can do better - but the status travels on in the
+        // notice reason instead of masquerading as a live `delivered`.
+        let accepted = matches!(
+            receipt_status,
+            Some("delivered") | Some("queued") | Some(super::occ3_sender_queue::OCC3_FALLBACK_HYDRATED_STATUS)
+        );
         let status_note = format!(
             "ordinary_delivery:{}",
             receipt_status.unwrap_or("unknown")
