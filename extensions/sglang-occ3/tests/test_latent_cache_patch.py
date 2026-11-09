@@ -495,8 +495,25 @@ class TestPrivateCache(PinnedCase):
         def report(pool, message):
             reports.append((pool, message))
             raise ValueError(message)  # strict idle: SGLANG_ENABLE_STRICT_MEM_CHECK_DURING_IDLE=True
-        checker = NS(_check_all_pools=check_all_pools, _report_leak=report,
-                     _check_req_pool=lambda: None, _check_tree_cache=lambda: None)
+
+        class IdleChecker:
+            """Stock stand-in; the idle path never asks for busy uncached sizes.
+
+            A real class, not a lambda: the patched init_invariant_checker
+            subclasses SchedulerInvariantChecker so the busy check can add the
+            quarantine counter to the stock uncached sum.
+            """
+
+            def __init__(self, **kwargs):
+                self._check_all_pools = check_all_pools
+                self._report_leak = report
+                self._check_req_pool = lambda: None
+                self._check_tree_cache = lambda: None
+
+            def _get_total_uncached_sizes(self):
+                return 0, 0
+
+        checker = IdleChecker()
         allocator = NS(page_size=page, verify_byte_accounting=lambda: [], clears=0)
         def clear():
             allocator.clears += 1
@@ -521,9 +538,12 @@ class TestPrivateCache(PinnedCase):
                    swa_tokens_per_layer=None, kv_shard_widening=1)
         fn = self.sources.function
         init = fn("managers/scheduler.py", "init_invariant_checker", "Scheduler",
-                  SchedulerInvariantChecker=lambda **kw: checker)
+                  SchedulerInvariantChecker=IdleChecker)
         init(owner)
-        owner.invariant_checker = checker
+        # The patched init wraps the stock checker in the quarantine-aware
+        # subclass; the idle stand-in methods still come from IdleChecker.
+        assert type(owner.invariant_checker) is not IdleChecker
+        assert isinstance(owner.invariant_checker, IdleChecker)
         quarantine = fn("managers/scheduler.py", "_occ3_quarantine_private_kv", "Scheduler", logger=log)
         owner._occ3_quarantine_private_kv = types.MethodType(quarantine, owner)
         idle = fn("managers/scheduler.py", "on_idle", "Scheduler",
@@ -580,6 +600,121 @@ class TestPrivateCache(PinnedCase):
         self.assertFalse(f.flush(f.owner))
         self.assertEqual(f.allocator.clears, 0)
         self.assertEqual(f.owner.occ3_quarantined_tokens, 64)
+
+    def busy_fixture(self, capacity=1024, page=64):
+        """Real manifest-applied init_invariant_checker with a stock-like checker.
+
+        The stand-in mirrors the stock busy identity: uncached tokens come
+        from active batches only (_get_total_uncached_sizes), and the full
+        pool must balance available + evictable + uncached == total. The
+        patched init wraps the stand-in in the quarantine-aware subclass, so
+        self_check_during_busy sees quarantined pages as uncached, exactly
+        like the patched idle path.
+        """
+        from contextlib import nullcontext
+        log = Log()
+        stats = NS(full_available_size=capacity, full_evictable_size=0)
+        observer = NS(get_pool_stats=lambda: stats)
+
+        class StockChecker:
+            """Stand-in for the stock SchedulerInvariantChecker busy path."""
+
+            def __init__(self, **kwargs):
+                self.kwargs = kwargs
+                self.active_uncached = 0
+
+            def _get_total_uncached_sizes(self):
+                return self.active_uncached, 0
+
+            def _check_full_pool(self, ps, uncached=0):
+                total = ps.full_available_size + ps.full_evictable_size + uncached
+                leak = total != self.kwargs["max_total_num_tokens"]
+                return leak, (f"[full] total={self.kwargs['max_total_num_tokens']}, "
+                              f"available={ps.full_available_size}, uncached={uncached}")
+
+            def self_check_during_busy(self):
+                full_uncached, _ = self._get_total_uncached_sizes()
+                return self._check_full_pool(self.kwargs["pool_stats_observer"].get_pool_stats(),
+                                             uncached=full_uncached)
+
+        allocator = NS(page_size=page, verify_byte_accounting=lambda: [], clears=0)
+        owner = NS(token_to_kv_pool_allocator=allocator, max_total_num_tokens=capacity,
+                   tp_group=NS(ranks=[0]), tp_cpu_group=None,
+                   pool_stats_observer=observer,
+                   scheduler_stage_metrics=NS(record=lambda stage: nullcontext()),
+                   is_hybrid_swa=False, is_hybrid_ssm=False,
+                   disaggregation_mode="null", page_size=page,
+                   full_tokens_per_layer=None, swa_tokens_per_layer=None,
+                   kv_shard_widening=1, tree_cache=NS(),
+                   req_to_token_pool=NS(), scheduler_stage_metrics_recorder=None)
+        fn = self.sources.function
+        init = fn("managers/scheduler.py", "init_invariant_checker", "Scheduler",
+                  SchedulerInvariantChecker=StockChecker)
+        init(owner)
+        checker = owner.invariant_checker
+        # The patched init produced the quarantine-aware subclass of the stock
+        # stand-in, not the stand-in class itself.
+        self.assertIsNot(type(checker), StockChecker)
+        self.assertIsInstance(checker, StockChecker)
+        quarantine = fn("managers/scheduler.py", "_occ3_quarantine_private_kv", "Scheduler", logger=log)
+        owner._occ3_quarantine_private_kv = types.MethodType(quarantine, owner)
+
+        def withhold(allocated, fault="duplicate"):
+            req = NS(rid=f"r{allocated}", occ3_kv_quarantined=False)
+            owner._occ3_quarantine_private_kv(req, allocated, fault)
+            stats.full_available_size -= ((allocated + page - 1) // page) * page
+            return req
+
+        return NS(owner=owner, checker=checker, stats=stats, log=log,
+                  withhold=withhold, allocator=allocator)
+
+    def test_busy_check_counts_quarantined_pages(self):
+        f = self.busy_fixture()
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 0)
+        # No quarantine: ordinary active-batch uncached tokens balance (the
+        # pages are allocated, so they are missing from available).
+        f.checker.active_uncached = 64
+        f.stats.full_available_size -= 64
+        leak, message = f.checker.self_check_during_busy()
+        self.assertFalse(leak)
+        self.assertIn("uncached=64", message)
+        # A quarantined row releases its KV claim while its pages stay
+        # allocated: without quarantine accounting the strict busy check
+        # would report exactly those tokens as a leak.
+        f.withhold(138)  # 3 pages of 64 -> 192 tokens
+        self.assertEqual(f.owner.occ3_quarantined_tokens, 192)
+        leak, message = f.checker.self_check_during_busy()
+        self.assertFalse(leak)
+        # Active-batch uncached and quarantined tokens add up together.
+        self.assertIn("uncached=256", message)
+        # The counter is read live: a second quarantined row is counted on the
+        # very next busy check without re-running init_invariant_checker.
+        f.withhold(70)  # 2 pages of 64 -> 128 tokens
+        leak, message = f.checker.self_check_during_busy()
+        self.assertFalse(leak)
+        self.assertIn("uncached=384", message)
+
+    def test_busy_check_does_not_hide_an_unrelated_leak(self):
+        f = self.busy_fixture()
+        f.withhold(64)
+        f.stats.full_available_size -= 64  # a real leak outside quarantine
+        leak, message = f.checker.self_check_during_busy()
+        self.assertTrue(leak)
+        self.assertIn("uncached=64", message)
+
+    def test_busy_check_quarantine_accounting_survives_flush_reset(self):
+        f = self.busy_fixture()
+        f.withhold(64)
+        leak, _ = f.checker.self_check_during_busy()
+        self.assertFalse(leak)
+        # flush_cache reclaims quarantined pages and zeroes the counter; the
+        # busy identity balances again without the quarantine term.
+        f.owner.occ3_quarantined_tokens = 0
+        f.stats.full_available_size += 64
+        f.checker.active_uncached = 0
+        leak, message = f.checker.self_check_during_busy()
+        self.assertFalse(leak)
+        self.assertIn("uncached=0", message)
 
     def test_private_release_tp_vote_quarantines_all_or_frees_all(self):
         # Sequential rank stand-ins: each reducer supplies the known peer bit.

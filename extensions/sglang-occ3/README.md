@@ -81,14 +81,18 @@ The attested profile pins **policy, not a mutable scalar**:
 
 ```json
 {"label_anchor_alpha_allowed": [0.0, 0.3, 0.5, 0.7, 1.0],
- "label_anchor_alpha_default": 0.0, "anchor_alpha": 0.0}
+ "label_anchor_alpha_default": 0.3, "anchor_alpha": 0.0}
 ```
 
 Both calibrated candidate files carry this policy:
 `deploy/native-build-inputs/native-profile-input.json.v3` and
 `deploy/v3/plan-templates/occ3-icalib-persistent-candidate.json`. Allowed values
 must be a nonempty, duplicate-free subset of the five coefficients above; the
-default must belong to it. Old profiles without these fields keep the fixed
+default must belong to it. The default is the attested hybrid 0.3 so a client
+that omits the request field is anchored at the byte-exact coefficient instead
+of silently dropping to 0.0 - the exact garbling class the PR #265 client
+default (env > file > client-default 0.3) fixed client-side. An explicit 0.0
+request still selects zero. Old profiles without these fields keep the fixed
 `label_anchor_alpha` setting (missing means zero). A conflicting legacy scalar
 and new policy is rejected. If nearest-vocabulary `anchor_alpha` is nonzero,
 a request selecting nonzero label alpha is rejected even if listed in the policy.

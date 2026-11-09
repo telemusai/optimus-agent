@@ -74,11 +74,13 @@ class LatentRegistry:
         self.prune_grace_seconds = prune_grace_seconds
         self.records: dict[str, StateRecord] = {}
         self.attempts: dict[str, str] = {}
-        # Replay tombstones for pruned records: attempt id / handle ->
-        # (expiry epoch, final state). Kept until the record's own expiry,
-        # after which every replay is refused by the expiry checks anyway.
-        self.tombstone_attempts: dict[str, tuple[float, str]] = {}
-        self.tombstone_handles: dict[str, tuple[float, str]] = {}
+        # Replay tombstones for pruned records. Attempt ids and handles map
+        # to (expiry epoch, final state, principal digest, session id);
+        # publication ids map to (expiry epoch, final state). Kept until the
+        # record's own expiry, after which every replay is refused by the
+        # expiry checks anyway.
+        self.tombstone_attempts: dict[str, tuple[float, str, str, str]] = {}
+        self.tombstone_handles: dict[str, tuple[float, str, str, str]] = {}
         self.tombstone_publications: dict[str, tuple[float, str]] = {}
         self._nonce_expiry: dict[str, float] = {}
         self.sessions: dict[tuple[str, str], SessionEnrollment] = {}
