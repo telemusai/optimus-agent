@@ -224,6 +224,36 @@ async def test_canceled_control_remains_uncertain_until_valid_late_reply(monkeyp
 
 
 @pytest.mark.asyncio
+async def test_lost_control_replies_age_out_of_the_pending_table(monkeypatch):
+    module=types.ModuleType("sglang.srt.managers.io_struct"); module.Occ3ControlReq=lambda **kw:NS(**kw)
+    monkeypatch.setitem(sys.modules,module.__name__,module)
+    lost=asyncio.Event()
+    async def dispatch(request):
+        if request.rid=="lost":
+            await lost.wait()  # reply never arrives
+    tm=NS(auto_create_handle_loop=lambda:None,_async_dispatch_to_scheduler=dispatch)
+    client=ControlClient(tm,timeout_seconds=0.01,max_pending=1)
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="lost")
+    await asyncio.gather(*client._operations.values(), return_exceptions=True)
+    assert client.has_uncertain_control
+    assert not client._operations
+    # A recent lost reply still holds the only quota slot: the sweep must not
+    # release an entry that is still inside the bounded reply window.
+    with pytest.raises(LatentError): await client.call("health",{})
+    # Age the entry past the TTL; the slot is released, so a new control op is
+    # admitted again instead of refusing "quota" until process restart.
+    envelope_digest, dispatched_at = client._uncertain["lost"]
+    client._uncertain["lost"] = (envelope_digest,
+                                 dispatched_at - client.timeout_seconds * 10)
+    with pytest.raises(asyncio.TimeoutError): await client.call("health",{},command_id="fresh")
+    assert "fresh" in client._uncertain and "lost" not in client._uncertain
+    # A late reply for the aged-out command is ignored like any unknown id.
+    deliver_control(tm,dict(schema="occ3.control.result.v1",command_id="lost",ok=True,result={},error=""))
+    assert "lost" not in client._uncertain and "fresh" in client._uncertain
+    await client.close()
+
+
+@pytest.mark.asyncio
 async def test_partial_dispatch_failure_keeps_control_uncertainty(monkeypatch):
     module=types.ModuleType("sglang.srt.managers.io_struct"); module.Occ3ControlReq=lambda **kw:NS(**kw)
     monkeypatch.setitem(sys.modules,module.__name__,module)

@@ -45,19 +45,50 @@ _SOURCE_COMMIT_FIELDS = ("capture_commit_id", "accepted_span_start", "accepted_s
 #: pruned. Covers a quarantined retire (control timeout <= 120 s).
 ATTEMPT_PRUNE_GRACE_SECONDS = 150
 
+#: How many dispatch timeouts an unanswered control op may stay in the
+#: bounded pending table before the entry is released. The worker always
+#: replies to Occ3ControlReq, so a reply missing after several dispatch
+#: timeouts is a lost IPC reply, not a slow operation.
+UNCERTAIN_TTL_MULTIPLE = 4
+
 
 class ControlClient:
     def __init__(self, tokenizer_manager, *, timeout_seconds=30, max_pending=64):
         require(0 < timeout_seconds <= 120 and 0 < max_pending <= 256)
         require(getattr(tokenizer_manager, "_occ3_control_client", None) is None, "state")
         self.tm, self.timeout_seconds, self.max_pending = tokenizer_manager, timeout_seconds, max_pending
+        # command_id -> (envelope digest, dispatch monotonic). The digest
+        # identifies the dispatched envelope; the timestamp bounds the entry.
         self.pending = {}
         self._uncertain = {}
         self._operations = {}
         self.closed = False
         tokenizer_manager._occ3_control_client = self
 
+    def _sweep_uncertain(self):
+        """Release pending-table slots for replies that can no longer arrive.
+
+        A lost control reply (operation cancelled or timed out after the
+        transport accepted bytes) otherwise leaks its entry forever, and
+        max_pending leaked entries refuse every later control op with
+        "quota" until process restart. Fail-closed on uncertainty: an
+        aged-out entry is released from quota accounting only. It is never
+        treated as proof the operation did not run, and a late reply for it
+        is ignored exactly like any unknown command id (the caller's future
+        is already settled or cancelled by then). Entries with a live,
+        cancellation-resistant operation task still hold their quota slot
+        through self._operations, which this sweep never touches.
+        """
+        cutoff = time.monotonic() - self.timeout_seconds * UNCERTAIN_TTL_MULTIPLE
+        stale = [command_id for command_id, (_, dispatched_at) in self._uncertain.items()
+                 if dispatched_at <= cutoff]
+        for command_id in stale:
+            del self._uncertain[command_id]
+        if stale:
+            self._detach_if_settled()
+
     async def call(self, operation, payload, command_id=None):
+        self._sweep_uncertain()
         require(not self.closed and len(self._uncertain) < self.max_pending
                 and len(self.pending) < self.max_pending and len(self._operations) < self.max_pending, "quota")
         from sglang.srt.managers.io_struct import Occ3ControlReq
@@ -71,7 +102,7 @@ class ControlClient:
             request = Occ3ControlReq(rid=command_id, payload=envelope)
             # Dispatch can fail after transport accepted bytes. Keep ownership
             # until a valid same-command terminal reply is actually observed.
-            self._uncertain[command_id] = digest(envelope)
+            self._uncertain[command_id] = (digest(envelope), time.monotonic())
             async def dispatch_and_wait():
                 await self.tm._async_dispatch_to_scheduler(request)
                 return await asyncio.shield(future)

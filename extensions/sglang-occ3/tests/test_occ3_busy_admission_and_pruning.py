@@ -164,6 +164,13 @@ def test_registry_survives_more_than_max_records_arm_retire_cycles():
         reserve(r, 3 * r.profile.max_records - 2, expiry=clock[0] + 300)
     snap = r.retire(attempt_id=f"attempt-{3 * r.profile.max_records - 2}")
     assert snap["state"] == "retired" and snap["revoked"] and snap["gpu_freed"]
+    # Tombstone values carry their documented shape: attempt/handle entries
+    # are (expiry, final state, principal digest, session id); publication
+    # entries are (expiry, final state).
+    assert r.tombstone_handles
+    tomb = next(iter(r.tombstone_handles.values()))
+    assert type(tomb) is tuple and len(tomb) == 4
+    assert type(tomb[0]) is float and tomb[1] in ("retired", "expired")
     # Tombstones are bounded by the records' own expiry.
     clock[0] += 400
     r._prune()
