@@ -171,6 +171,17 @@ What it does:
 6. Reports the plugin endpoint status (a 404 there confirms the plugin
    routes are gone) and removes the state file.
 
+One known refusal path: a deploy that fails AFTER renaming the old
+container to `neo-glm53-pre-occ3` and then fails again on a second deploy
+attempt leaves the FIRST deploy's image recorded in the state file while
+`neo-glm53-pre-occ3` is still preserved. The second attempt overwrites
+the state file with its own image tag before `docker run`, so if that
+`docker run` itself fails (for example a name conflict), the failure hint
+points at `rollback.sh`, whose image guard then refuses because the
+recorded tag no longer matches the running base container. Removing the
+stopped container manually (`docker rm neo-glm53`) and rerunning deploy
+is the explicit operator recovery step for that sequence.
+
 The API key is only read from `docker inspect` into memory for the health
 poll; it is never printed, logged, or written to a file. The derived image
 (`neo-glm53:occ3-...`) is not deleted automatically; remove it with

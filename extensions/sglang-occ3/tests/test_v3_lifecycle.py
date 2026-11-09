@@ -251,7 +251,7 @@ def assert_restored(api, journal):
 def test_plan_default_startup_timeout_matches_shell_lanes():
     """A plan that omits the deployment-health deadline defaults to the
     same 1500 s wait deploy.sh/rollback.sh/occ3_controller apply (PR #258
-    rationale: a 13.5-minute healthy overlay leaves only ~4.5 min margin
+    rationale: a 13.5-minute healthy overlay leaves only ~6.5 min margin
     at the old 1200 s default)."""
     value = plan()
     value.pop("startup_timeout_s")

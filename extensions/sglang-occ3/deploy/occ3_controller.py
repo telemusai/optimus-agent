@@ -75,7 +75,13 @@ BASE_URL = "http://127.0.0.1:30001"
 
 HEALTH_TIMEOUT_S = _env_int("OCC3_HEALTH_TIMEOUT", 1500)  # B300 weight load takes minutes
 DEPLOY_DEADLINE_S = 2700
-ROLLBACK_DEADLINE_S = 900
+# Rollback verification waits for the RESTORED original to pass the same
+# health gate, so it must use the same health budget, not a shorter fixed
+# cap: a slow-restoring original (the same B300 load that justified raising
+# the deploy-side budget) would otherwise false-fail "rollback did not
+# verify" under the controller lane while the shell lane
+# (rollback.sh, OCC3_HEALTH_TIMEOUT) would pass.
+ROLLBACK_DEADLINE_S = _env_int("OCC3_ROLLBACK_DEADLINE_S", max(900, HEALTH_TIMEOUT_S))
 
 KEY_SENTINEL = "***KEY***"
 
