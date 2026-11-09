@@ -76,6 +76,25 @@ fn receiver_refusal_diagnostic(message_id: Option<&str>, reason: &'static str, e
     });
 }
 
+/// Content-free diagnostic for the receiver-side claim deferral: the
+/// session's own armed source capture owns this provider request, so the
+/// earliest pending admission stays `Admitted` for the next turn (the
+/// pi-agent-core stream guard is the fail-closed backstop if that
+/// scheduling ever breaks). One line per armed turn, no message ids, no
+/// envelope content. Exception-safe like `receiver_refusal_diagnostic`:
+/// a broken sink can never turn a deferral into a failed turn.
+fn receiver_deferred_diagnostic() {
+    let _ = std::panic::catch_unwind(|| {
+        pi_ai::log::get_logger("occ3.receiver").warn(
+            "receiver_claim_deferred_while_armed",
+            Some(serde_json::Map::from_iter([(
+                "reason".into(),
+                Value::from("source_capture_armed"),
+            )])),
+        );
+    });
+}
+
 /// The variant name of a connector error, for content-free diagnostics.
 fn occ3_error_kind(error: &Occ3Error) -> &'static str {
     match error {
@@ -921,6 +940,28 @@ impl Occ3NativeSession {
                     receiver_refusal_diagnostic(None, "model_check_failed", None);
                     anyhow::Error::msg(error)
                 })?;
+                // One provider request cannot be both the armed
+                // source-capture turn and a receiver consume turn: the
+                // server-side contract attests the generation either way
+                // (pi-agent-core's stream guard enforces it as a fail-closed
+                // backstop). Defer the claim while this session's own source
+                // slot is armed for THIS request; the admission stays
+                // `Admitted` and the inbox's earliest-pending rule claims it
+                // on the next turn after the capture settles. The deferral
+                // key is the armed budget: `budget.is_some()` holds exactly
+                // from the arming call until the source resolve hook takes
+                // it (receiver hooks run before source hooks in one request),
+                // and a failed or completed capture resets the slot so the
+                // delivery is never deferred twice for one capture.
+                let armed = this
+                    .source
+                    .lock()
+                    .map(|slot| slot.budget.is_some())
+                    .unwrap_or(false);
+                if armed {
+                    receiver_deferred_diagnostic();
+                    return Ok(None);
+                }
                 let ids: Vec<String> = request
                     .messages
                     .iter()
@@ -4767,6 +4808,124 @@ mod tests {
         assert!(!failed.is_completed_native_latent());
         // An unknown message id has no marker at all.
         assert!(session.delivery_marker("no-such-message").is_err());
+    }
+
+    /// The incident shape (2026-11-09 hive collision): a session with an
+    /// ARMED source capture receives an admitted envelope in the same
+    /// request. The receiver resolver must DEFER the claim - return no
+    /// attachment, leave the record `Admitted` - instead of binding a
+    /// lease the pi-agent-core stream guard would have to kill the turn
+    /// over. The capture proceeds on its own turn; the delivery attaches at
+    /// the next turn boundary once the slot settles.
+    #[tokio::test]
+    async fn receiver_claim_defers_while_source_capture_is_armed() {
+        let session = enrolled().await;
+        let prepared = prepared_handoff(authorized_handoff());
+        let message_id = prepared.authorization().message_id().to_string();
+        assert!(session.admit(&prepared).expect("fixture admit"));
+        // Arm the source capture for this session's own next request.
+        assert!(session.arm_handoff_if_needed("receiver", None).expect("arm"));
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.budget.is_some(), "capture budget armed");
+        }
+        let resolver = session.receiver_resolver();
+        let request = || InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: Vec::new(),
+            newly_supplied_messages: Vec::new(),
+            signal: None,
+        };
+        assert!(
+            (resolver)(request()).await.unwrap().is_none(),
+            "the armed turn must not claim or bind the delivery"
+        );
+        assert_eq!(
+            session.inbox.lock().unwrap().status(&message_id),
+            Some(Occ3DeliveryStatus::Admitted),
+            "the deferral keeps the record claimable, never claimed or terminal"
+        );
+        // The capture settles (resolved + captured lease in the slot): the
+        // budget is gone, so the SAME request shape now claims and binds.
+        let hooks = session.source_hooks();
+        let lease = (hooks.resolve)(hook_request()).await.unwrap().expect("capture lease");
+        assert_eq!(lease.state(), SourceCaptureState::Prepared);
+        {
+            let slot = session.source.lock().unwrap();
+            assert!(slot.budget.is_none(), "budget consumed by the capture resolve");
+            assert!(slot.lease.is_some());
+        }
+        // The receiver request must present the message in context for the
+        // claim (mirror of the real loop: the delivery record rides the
+        // inference messages).
+        let marker = |id: &str| {
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": id})),
+                timestamp: 0,
+            })
+        };
+        let claimed = (resolver)(InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![marker(&message_id)],
+            newly_supplied_messages: vec![marker(&message_id)],
+            signal: None,
+        })
+        .await
+        .expect("the settled capture must not block the claim")
+        .expect("the deferred delivery must bind at the next turn");
+        drop(claimed);
+        assert_eq!(
+            session.inbox.lock().unwrap().status(&message_id),
+            Some(Occ3DeliveryStatus::Delivered)
+        );
+    }
+
+    /// The deferral keys on the ARMED budget only: a resolved slot with a
+    /// terminal (completed or failed) capture must never park an admitted
+    /// delivery behind it, or a single completed handoff would defer every
+    /// later inbound envelope until expiry.
+    #[tokio::test]
+    async fn receiver_claim_defers_only_while_the_budget_is_armed() {
+        let session = enrolled().await;
+        let prepared = prepared_handoff(authorized_handoff());
+        let message_id = prepared.authorization().message_id().to_string();
+        assert!(session.admit(&prepared).expect("fixture admit"));
+        let resolver = session.receiver_resolver();
+        let marker = |id: &str| {
+            AgentMessage::Custom(CustomAgentMessage::Custom {
+                custom_type: AGENT_MESSAGE_CUSTOM_TYPE.to_string(),
+                content: CustomMessageContent::Text(String::new()),
+                display: false,
+                details: Some(json!({"id": id})),
+                timestamp: 0,
+            })
+        };
+        // Settled slot WITHOUT an armed budget (resolved, no lease):
+        // the delivery claims immediately.
+        {
+            let mut slot = session.source.lock().unwrap();
+            slot.resolved = true;
+        }
+        let lease = (resolver)(InferenceStateRequest {
+            model: fixture_model(),
+            context: Default::default(),
+            messages: vec![marker(&message_id)],
+            newly_supplied_messages: vec![marker(&message_id)],
+            signal: None,
+        })
+        .await
+        .expect("a settled slot must not defer the claim")
+        .expect("the delivery must bind");
+        drop(lease);
+        assert_eq!(
+            session.inbox.lock().unwrap().status(&message_id),
+            Some(Occ3DeliveryStatus::Delivered)
+        );
     }
 
     /// A receiver-busy refusal returns the head to `pending`, and the next

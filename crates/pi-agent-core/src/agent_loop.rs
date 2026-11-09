@@ -2827,7 +2827,25 @@ async fn stream_assistant_response(
     if let Some(lease) = &source_guard.lease {
         if config.source_capture.is_none() || config.model.api != pi_ai::types::API_OPENAI_COMPLETIONS
             || inference_state_guard.0.is_some() || lease.state() != SourceCaptureState::Prepared {
-            return Err(anyhow::anyhow!("Source capture requires its native completion hooks, an unused lease and no simultaneous receiver attachment."));
+            // Fail-closed backstop for a scheduling invariant, not a
+            // protocol violation: an armed source capture and a receiver
+            // inference-state attachment cannot share one provider request
+            // (the capture's attested generation cannot also carry an
+            // injected receiver prefix). The embedding host's receiver
+            // resolver defers its claim while a capture is armed, so
+            // reaching this guard with a simultaneous attachment means
+            // that deferral did not apply. Both leases cancel here: the
+            // sender's queue re-arms a fresh capture within its bounded
+            // retry budget and the receiver's delivery stays pending for
+            // its next turn, so the session itself is recoverable.
+            return Err(anyhow::anyhow!(
+                "A source capture lease reached the provider request without meeting its \
+preconditions: native completion hooks, OpenAI completions API, a prepared lease, and no \
+simultaneous receiver attachment. Both attachments fail closed - the capture cancels for a \
+bounded re-arm and a receiver attachment, if any, stays pending for the receiver's next turn \
+(the receiver resolver defers its claim while a capture is armed; a simultaneous attachment \
+here means that deferral did not apply)."
+            ));
         }
     }
     let observed = create_observed_callbacks(config, metrics.clone(), &request_metrics);
