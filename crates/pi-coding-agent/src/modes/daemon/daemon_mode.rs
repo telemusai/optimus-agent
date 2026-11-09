@@ -1081,6 +1081,20 @@ fn now_millis() -> f64 {
         .unwrap_or(0.0)
 }
 
+fn now_epoch_secs() -> u64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|duration| duration.as_secs())
+        .unwrap_or(0)
+}
+
+/// Restart-retry window for a transient OCC-3 activation refusal. The server
+/// registry refuses a same-session re-enrollment while the previous
+/// daemon's permit is still live and prunes it once it expires; server
+/// permits are bounded to one hour, so this window covers the whole
+/// conflict span plus a margin.
+const OCC3_ACTIVATION_RESTART_RETRY_WINDOW_SECS: u64 = 3700;
+
 fn json_string(value: &str) -> String {
     serde_json::to_string(value).unwrap_or_else(|_| "\"\"".to_string())
 }
@@ -7373,7 +7387,28 @@ impl AgentDaemon {
         // ordinary session. When it is opted in, the session is enrolled
         // before its first prompt so the native permit and handoff tool are
         // installed while the session is still idle.
-        let _ = self.activate_experimental_occ3(&state).await;
+        if let Err(decline) = self.activate_experimental_occ3(&state).await {
+            // A daemon restart inside the server's permit window leaves the
+            // previous daemon's enrollment for this session still live, and
+            // the registry refuses a same-session re-enrollment until the old
+            // permit expires (bounded by the one-hour server TTL); a control
+            // plane that is not reachable yet behaves the same at boot. Both
+            // refusals are transient, so the retry is armed for the
+            // pre-prompt consumer instead of leaving the root session
+            // without the occ3_handoff tool until a manual model change or
+            // another restart happens to fire.
+            if matches!(
+                decline,
+                crate::core::occ3_connectors::activation::Occ3Decline::ModelIdentityMismatch
+                    | crate::core::occ3_connectors::activation::Occ3Decline::ConnectorUnavailable
+            ) {
+                let mut guard = state.lock().expect("active session poisoned");
+                guard.occ3_activation_pending = true;
+                guard.occ3_activation_retry_until_epoch = Some(
+                    now_epoch_secs() + OCC3_ACTIVATION_RESTART_RETRY_WINDOW_SECS,
+                );
+            }
+        }
         Ok(state)
     }
 
@@ -16977,7 +17012,31 @@ impl AgentDaemon {
         // dead enrollments keep their existing lifecycle paths (the dead
         // one through `maybe_reactivate_expired_occ3`).
         if agent_session.experimental_native_occ3().is_some() { return; }
-        let _ = self.activate_experimental_occ3(state).await;
+        if let Err(decline) = self.activate_experimental_occ3(state).await {
+            // A transient refusal re-arms the marker while the restart-retry
+            // window (set by the worker-ready arming site) is still open: a
+            // restart inside the server permit window cannot re-enroll this
+            // session until the old permit expires, so a single prompt-spaced
+            // retry is not enough there. Past the window - or for stable
+            // declines - the marker stays cleared exactly like the one-shot
+            // model-change retry: the next model change or restart re-arms.
+            if matches!(
+                decline,
+                crate::core::occ3_connectors::activation::Occ3Decline::ModelIdentityMismatch
+                    | crate::core::occ3_connectors::activation::Occ3Decline::ConnectorUnavailable
+            ) {
+                let retry_until = state
+                    .lock()
+                    .expect("active session poisoned")
+                    .occ3_activation_retry_until_epoch;
+                if retry_until.is_some_and(|deadline| now_epoch_secs() < deadline) {
+                    state
+                        .lock()
+                        .expect("active session poisoned")
+                        .occ3_activation_pending = true;
+                }
+            }
+        }
     }
 
     /// `createAgentMessageController(getCurrentState)` (`daemon-mode.ts:3363-3386`).
