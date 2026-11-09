@@ -614,6 +614,11 @@ pub struct AgentConnectionState {
     pub heartbeat: Option<Option<Value>>,
     pub scoped_models: Vec<AgentConnectionScopedModel>,
     pub active_tool_names: Vec<String>,
+    /// True when this chat holds a native OCC-3 enrollment whose permit has
+    /// expired (the tool lingers until the next turn removes it). Consumers
+    /// must not treat the tool's presence alone as a live enrollment.
+    #[serde(default)]
+    pub occ3_native_dead: bool,
     pub context_usage: Value,
     /// One-line recent-work recap for the prompt UI.
     #[serde(skip_serializing_if = "Option::is_none")]

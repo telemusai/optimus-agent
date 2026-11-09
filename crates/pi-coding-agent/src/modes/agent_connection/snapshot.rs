@@ -34,6 +34,7 @@ pub struct AgentSessionSnapshotSource {
     pub goal: serde_json::Value,
     pub scoped_models: Vec<crate::modes::agent_connection::types::AgentConnectionScopedModel>,
     pub active_tool_names: Vec<String>,
+    pub occ3_native_dead: bool,
     pub context_usage: serde_json::Value,
     pub persisted_recap: Option<String>,
     pub messages: Vec<pi_agent_core::types::AgentMessage>,
@@ -83,6 +84,7 @@ pub fn create_agent_connection_state(
         heartbeat: None,
         scoped_models: session.scoped_models.clone(),
         active_tool_names: session.active_tool_names.clone(),
+        occ3_native_dead: session.occ3_native_dead,
         context_usage: session.context_usage.clone(),
         // Baseline recap; the daemon overlays the live summary when attaching.
         recap: persisted_recap(session),

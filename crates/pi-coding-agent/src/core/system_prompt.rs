@@ -241,7 +241,7 @@ pub fn build_system_prompt(options: &BuildSystemPromptOptions) -> String {
         active_tools: Some(
             tools
                 .iter()
-                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "clang" || name.as_str() == "bash" || name.as_str() == "edit" || name.as_str() == "subagent")
+                .filter(|name| name.as_str() == "ipython" || name.as_str() == "node" || name.as_str() == "clang" || name.as_str() == "bash" || name.as_str() == "edit" || name.as_str() == "subagent" || name.as_str() == "occ3_handoff")
                 .cloned()
                 .collect(),
         ),
@@ -416,6 +416,51 @@ mod tests {
             },
             kind: SkillKind::Markdown,
         })
+    }
+
+    #[test]
+    fn occ3_preference_line_reaches_the_production_prompt_only_with_the_live_tool() {
+        // Production-path pin: build_system_prompt is the only production
+        // caller of build_rlm_prompt, and it filters active_tools through an
+        // allowlist. If occ3_handoff is dropped from that allowlist again,
+        // the preference line (and the hive-mind tool-gated disjunct) can
+        // never reach a real system prompt - exactly the gap the first
+        // review of this change found. This test fails closed on that
+        // regression by asserting the line arrives through the production
+        // path with the tool selected, and never arrives without it.
+        let base_options = || BuildSystemPromptOptions {
+            custom_prompt: None,
+            prompt_guidelines: None,
+            append_system_prompt: None,
+            cwd: "/repo".to_string(),
+            messages_path: Some("/sessions/s.jsonl".to_string()),
+            context_files: None,
+            skills: None,
+            skill_hint: None,
+            allow_recursion: Some(true),
+            rlm_depth: None,
+            rlm_parent_agent: None,
+            harness_state: None,
+            generic_mcp_servers: None,
+            tool_snippets: None,
+            selected_tools: Some(vec![
+                "ipython".to_string(),
+                "occ3_handoff".to_string(),
+            ]),
+        };
+        let with_tool = build_system_prompt(&base_options());
+        assert!(
+            with_tool.contains("OCC-3 preference: this session has a live native OCC-3 enrollment"),
+            "the production prompt must state the preference when occ3_handoff is selected"
+        );
+        let without_tool = build_system_prompt(&BuildSystemPromptOptions {
+            selected_tools: Some(vec!["ipython".to_string()]),
+            ..base_options()
+        });
+        assert!(
+            !without_tool.contains("OCC-3 preference: this session has a live native OCC-3 enrollment"),
+            "the preference line must not appear when occ3_handoff is not selected"
+        );
     }
 
     #[test]
