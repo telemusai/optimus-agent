@@ -735,3 +735,37 @@ def test_v3_supervisor_attempt_local_fence_needs_no_system_path(tmp_path, monkey
     fence = journal.directory / "fences" / (journal.read()["original_id"] + ".json")
     assert fence.exists()
     assert journal.read()["phase"] == "NOOP"
+
+
+# --- health timeout consistency with the shell deploy lanes (PR #258) -------
+#
+# deploy.sh and rollback.sh default OCC3_HEALTH_TIMEOUT to 1500 s; the
+# controller must apply the same default and honor the same override so no
+# lane can roll back a working 13.5-minute B300 weight load.
+
+
+def load_controller_fresh():
+    """Exec the controller source into a brand-new module object so the
+    environment-dependent constants can be exercised without disturbing the
+    shared module instance the other tests import."""
+    fresh_spec = importlib.util.spec_from_file_location(
+        "occ3_controller_env_probe", DEPLOY_DIR / "occ3_controller.py"
+    )
+    module = importlib.util.module_from_spec(fresh_spec)
+    fresh_spec.loader.exec_module(module)
+    return module
+
+
+def test_controller_health_timeout_default_matches_shell_lanes(monkeypatch):
+    monkeypatch.delenv("OCC3_HEALTH_TIMEOUT", raising=False)
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 1500
+
+
+def test_controller_health_timeout_reads_the_shared_env_override(monkeypatch):
+    monkeypatch.setenv("OCC3_HEALTH_TIMEOUT", "2400")
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 2400
+
+
+def test_controller_health_timeout_env_garbage_falls_back_to_default(monkeypatch):
+    monkeypatch.setenv("OCC3_HEALTH_TIMEOUT", "not-a-number")
+    assert load_controller_fresh().HEALTH_TIMEOUT_S == 1500

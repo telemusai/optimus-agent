@@ -50,6 +50,17 @@ try:
 except ImportError:  # pragma: no cover - Windows unit-test shim
     fcntl = None
 
+
+def _env_int(name, default):
+    """Integer environment override shared with the deploy.sh / rollback.sh
+    lanes. An absent, empty, or unparseable value falls back to the default
+    instead of aborting a running deployment."""
+    try:
+        return int(os.environ.get(name, ""))
+    except ValueError:
+        return default
+
+
 BASE_CONTAINER = "neo-glm53"
 PRESERVED_CONTAINER = "neo-glm53-pre-occ3"
 CANDIDATE_PREFIX = "occ3-candidate-"
@@ -62,7 +73,7 @@ LOCK_FILE = "/tmp/occ3-controller.lock"
 HEALTH_URL = "http://127.0.0.1:30001/health"
 BASE_URL = "http://127.0.0.1:30001"
 
-HEALTH_TIMEOUT_S = 1200  # B300 weight load takes minutes
+HEALTH_TIMEOUT_S = _env_int("OCC3_HEALTH_TIMEOUT", 1500)  # B300 weight load takes minutes
 DEPLOY_DEADLINE_S = 2700
 ROLLBACK_DEADLINE_S = 900
 

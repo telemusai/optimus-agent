@@ -248,6 +248,17 @@ def assert_restored(api, journal):
     assert KEY not in (journal.directory / "journal.json").read_text()
 
 
+def test_plan_default_startup_timeout_matches_shell_lanes():
+    """A plan that omits the deployment-health deadline defaults to the
+    same 1500 s wait deploy.sh/rollback.sh/occ3_controller apply (PR #258
+    rationale: a 13.5-minute healthy overlay leaves only ~4.5 min margin
+    at the old 1200 s default)."""
+    value = plan()
+    value.pop("startup_timeout_s")
+    validated = life.validate_plan(value)
+    assert validated["startup_timeout_s"] == 1500
+
+
 def test_prepare_keeps_exact_unstarted_inspected_candidate(tmp_path):
     api, journal, _ = prepared(tmp_path)
     assert journal.read()["candidate_id"] == CANDIDATE

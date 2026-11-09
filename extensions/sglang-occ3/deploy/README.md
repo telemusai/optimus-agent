@@ -158,8 +158,11 @@ sudo bash rollback.sh
 
 What it does:
 
-1. Stops and removes the occ3-bridge container currently named
-   `neo-glm53` (only the OCC-3-added container is ever removed).
+1. Verifies the container currently named `neo-glm53` runs the image
+   recorded in `occ3-deploy-state.env`, then stops and removes it. On an
+   image mismatch (an intervening manual deploy replaced the container)
+   rollback refuses instead of destroying the newer container; removing
+   it manually and rerunning remains the explicit operator decision.
 2. Renames `neo-glm53-pre-occ3` back to `neo-glm53`.
 3. Restores the original restart policy from
    `occ3-deploy-state.env` (deploy.sh had set it to `no`).
@@ -271,6 +274,9 @@ replicated launch command):
 - Any failure after the mutation begins triggers an automatic rollback
   that restores the preserved original and re-verifies it (health,
   authenticated chat, ingress path).
+- The controller's `/health` wait reads the same `OCC3_HEALTH_TIMEOUT`
+  override as `deploy.sh`/`rollback.sh` (default 1500 s), so every deploy
+  lane applies one consistent deployment-health budget.
 - `occ3_watchdog.sh` supervises a deploy with a hard timeout and runs
   the rollback even if the controller itself is killed; it never
   retries the deployment.
