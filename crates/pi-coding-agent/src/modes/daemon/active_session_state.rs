@@ -207,6 +207,11 @@ pub struct ActiveSessionState {
     /// transcript from delivery to a live consumer; see
     /// `agent_message_requires_hydration_marker`.
     pub hydrated_from_passive: bool,
+    /// True when a model change to an OCC-3-capable model arrived while the
+    /// session was streaming and its activation retry is still owed: the
+    /// pre-prompt path (`maybe_activate_pending_occ3`) consumes it at the
+    /// next idle prompt. Cleared after that single attempt.
+    pub occ3_activation_pending: bool,
 }
 
 impl ActiveSessionState {
@@ -224,6 +229,7 @@ impl ActiveSessionState {
             unsubscribe: None,
             client_env: None,
             hydrated_from_passive: false,
+            occ3_activation_pending: false,
         }
     }
 }
