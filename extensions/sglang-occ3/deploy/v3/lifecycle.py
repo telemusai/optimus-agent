@@ -51,7 +51,9 @@ IMMUTABLE = {"attempt_id", "original_id", "original_image_id", "candidate_image_
              "plan", "created_at", "schema",
              "calibration_source", "calibration_destination", "calibration_basename",
              "calibration_source_identity"}
-DEFAULTS = {"startup_timeout_s": 1200, "deployment_timeout_s": 3600,
+# The deployment-health default matches the OCC3_HEALTH_TIMEOUT default of the
+# deploy.sh / rollback.sh / occ3_controller.py lanes (1500 s; PR #258).
+DEFAULTS = {"startup_timeout_s": 1500, "deployment_timeout_s": 3600,
             "rollback_timeout_s": 900, "proof_timeout_s": 300,
             "controller_timeout_s": 45, "supervisor_lease_s": 5,
             "poll_interval_s": 0.5, "request_timeout_s": 120,

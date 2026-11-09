@@ -14,6 +14,12 @@
 # docker inspect only (in memory); it is never printed, logged, or written
 # to a file.
 #
+# Safety: before removing the deployed container, this script verifies that
+# its image matches the OCC3_STATE_NEW_IMAGE recorded by deploy.sh. A
+# mismatch means a newer manual deploy already replaced it while the
+# preserved container lingered; rollback refuses rather than destroying the
+# running container.
+#
 # Usage (on the DGX host, from extensions/sglang-occ3/deploy):
 #   sudo bash rollback.sh
 #
@@ -148,9 +154,22 @@ if [[ -f "$STATE_FILE" ]]; then
 fi
 
 # ---------------------------------------------------------------------------
-# 1. Remove the occ3-bridge container
+# 1. Remove the occ3-bridge container (only after proving it is ours)
 # ---------------------------------------------------------------------------
 if container_exists "$BASE_CONTAINER"; then
+    # Image guard: deploy.sh recorded the image it deployed in $STATE_FILE.
+    # If the running container's image no longer matches, an intervening
+    # (manual) deploy replaced it; removing it here would destroy a newer
+    # container while restoring the stale preserved one. Refuse instead.
+    if [[ -n "${OCC3_STATE_NEW_IMAGE:-}" ]]; then
+        running_image="$(docker inspect -f '{{.Config.Image}}' "$BASE_CONTAINER" 2>/dev/null || true)"
+        if [[ "$running_image" != "$OCC3_STATE_NEW_IMAGE" ]]; then
+            die "$BASE_CONTAINER runs image '${running_image:-<unknown>}' but the deploy state records '$OCC3_STATE_NEW_IMAGE' -- refusing to remove a container this deploy did not create. Inspect both containers; if you really want to restore $PRE_CONTAINER, remove $BASE_CONTAINER manually and rerun this script."
+        fi
+        log "image guard passed: $BASE_CONTAINER runs the deployed image $OCC3_STATE_NEW_IMAGE"
+    else
+        log "note: deploy state records no image; cannot verify $BASE_CONTAINER identity before removal"
+    fi
     if container_running "$BASE_CONTAINER"; then
         log "stopping occ3 container $BASE_CONTAINER (timeout ${OCC3_STOP_TIMEOUT}s)"
         docker stop -t "$OCC3_STOP_TIMEOUT" "$BASE_CONTAINER" >/dev/null
