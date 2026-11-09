@@ -146,11 +146,13 @@ Use `tab` to cycle forward and `shift+tab` to cycle backward through Providers, 
 | `app.tools.expand` | `ctrl+o` | Cycle and save conversation detail |
 | `app.messages.expand` | `ctrl+p` | Collapse or expand agent-to-agent messages |
 | `app.edits.expand` | `ctrl+j` | Collapse or expand edit diffs |
-| `app.message.followUp` | `alt+enter`, `shift+enter` | Queue a follow-up message; Enter steers the running turn |
+| `app.message.followUp` | `alt+enter` | Queue a follow-up message; Enter steers the running turn |
 | `app.message.navigateOlder` | `alt+up` | Select the next older pending message |
 | `app.message.navigateNewer` | `alt+down` | Select the next newer pending message or restore the draft |
 | `app.message.moveEarlier` | `ctrl+alt+up` | Move the selected pending message one place earlier in its queue |
 | `app.message.moveLater` | `ctrl+alt+down` | Move the selected pending message one place later in its queue |
+
+`app.message.followUp` deliberately keeps `shift+enter` free: the editor's `tui.input.newLine` binding owns it, so multi-line input keeps working in the main prompt. Do not add `shift+enter` back to the follow-up default without also changing the input dispatch order. Terminals that intercept Alt+Enter (for example Windows Terminal's fullscreen toggle) can forward it with a `sendInput` remap as described in [Terminal setup](terminal-setup.md).
 
 Ctrl+O cycles overview → details → all output. Details is the default; new, resumed, and attached chats use the last saved `chatDetail` choice. Overview hides thinking and collapses tools and diffs; details shows thinking and diffs; all output also expands tools and agent-to-agent message bodies. Individual thinking, diff, and message toggles remain available for adjustments to the current view; Ctrl+O saves a complete level. These controls never rewrite the conversation or session file.
 

@@ -290,8 +290,13 @@ pub fn keybindings() -> IndexMap<String, KeybindingDefinition> {
     map.insert(
         "app.message.followUp".to_string(),
         KeybindingDefinition {
-            default_keys: vec![String::from("alt+enter"), String::from("shift+enter")],
-            default_keys_is_single: false,
+            // Shift+Enter is deliberately NOT a follow-up default: the editor's
+            // `tui.input.newLine` binding owns it, and the interactive host
+            // dispatch checks this action before handing input to the editor.
+            // Claiming it here would submit the partial draft as a queued
+            // follow-up instead of inserting a newline (PR #263 regression).
+            default_keys: vec![String::from("alt+enter")],
+            default_keys_is_single: true,
             description: Some(
                 "Queue a follow-up message; Enter steers the running turn".to_string(),
             ),
@@ -1022,6 +1027,34 @@ mod tests {
             assert_eq!(suspend.default_keys, vec!["ctrl+z".to_string()]);
             assert!(suspend.default_keys_is_single);
         }
+    }
+
+    #[test]
+    fn follow_up_default_keeps_shift_enter_reserved_for_editor_newline() {
+        let definitions = keybindings();
+        let follow_up = &definitions["app.message.followUp"];
+        assert_eq!(follow_up.default_keys, vec!["alt+enter".to_string()]);
+        assert!(follow_up.default_keys_is_single);
+
+        // PR #263 regression guard: the interactive host checks the follow-up
+        // action before the editor sees the key, so any follow-up default that
+        // also matches the editor newline binding hijacks multi-line input.
+        let new_line = &pi_tui::keybindings::tui_keybindings()["tui.input.newLine"];
+        for key in &follow_up.default_keys {
+            assert!(
+                !new_line.default_keys.contains(key),
+                "app.message.followUp default {key} collides with tui.input.newLine"
+            );
+        }
+
+        // The installed bindings must keep the kitty shift+enter sequence out
+        // of the follow-up action and inside the editor newline action.
+        let manager = KeybindingsManager::new(KeybindingsConfig::new(), None);
+        assert!(!manager.matches("\x1b[13;2u", "app.message.followUp"));
+        assert!(manager.matches("\x1b[13;2u", "tui.input.newLine"));
+        // Alt+Enter keeps queueing a follow-up in both encodings.
+        assert!(manager.matches("\x1b\r", "app.message.followUp"));
+        assert!(manager.matches("\x1b[13;3u", "app.message.followUp"));
     }
 
     #[test]

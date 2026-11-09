@@ -2197,7 +2197,7 @@ async fn run_terminal(
                         // the ephemeral `?` guide (interactive-mode.ts:4931-4936).
                         mode.borrow_mut().handle_hotkeys_command();
                     } else if text.trim() == "/help" {
-                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter steers the running turn while busy; Alt+Enter or Shift+Enter queues a follow-up; Ctrl+O expands tools.", "dim");
+                        mode.borrow_mut().show_status("/model  select a model\n/login  provider setup\n/new  new session\n/context  context usage\n/compact [instructions]  compact session\n/refine  refine reusable knowledge\n/goal <objective>  pursue a goal\n!<command>  run shell command\n/quit  exit\nEsc interrupts; Ctrl+C twice exits; Ctrl+D exits an empty prompt; Enter steers the running turn while busy; Alt+Enter queues a follow-up; Shift+Enter inserts a newline; Ctrl+O expands tools.", "dim");
                     } else {
                         if submission_is_prompt(&text) { ui.borrow_mut().scroll_to_bottom(); }
                         submit_from_editor(&connection, &send, text, follow_up, &mut ui_metrics, &transcript);
