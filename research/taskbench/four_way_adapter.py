@@ -658,6 +658,16 @@ class LiveHarness:
         self.daemon_socket = daemon_socket
         self.stage_outputs: list[str] = []
 
+    def _provider_model_flags(self) -> list[str]:
+        # The CLI takes --provider and --model as SEPARATE flags; a compound
+        # "provider/model" passed to --model is silently ignored and the run
+        # falls back to the default provider (verified live 2026-11-09 run2:
+        # compound -> codex/gpt-6-astra refused; split form -> rc 0 in 8.9s).
+        if "/" in self.model:
+            prov, _, mid = self.model.partition("/")
+            return ["--provider", prov, "--model", mid]
+        return ["--model", self.model]
+
     def _run(self, args: list[str], timeout: float, check: bool = True) -> subprocess.CompletedProcess:
         # Position-aware daemon-socket wiring (root-probed 2026-11-09): a global
         # flag BEFORE a subcommand demotes the rest to a run-mode PROMPT, so for
@@ -808,7 +818,7 @@ class LiveHarness:
             before = {s.get("activeSessionId") or s.get("sessionId") for s in self.list_sessions()}
             prompt = parent_spawn_prompt(speaker_name, listener_name)
             self._run(
-                ["--print", "--model", self.model, "--cwd", str(self.run_dir), prompt],
+                ["--print", *self._provider_model_flags(), "--cwd", str(self.run_dir), prompt],
                 timeout=900,
             )
             sessions = self.list_sessions()
