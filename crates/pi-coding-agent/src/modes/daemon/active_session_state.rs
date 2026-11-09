@@ -201,6 +201,11 @@ pub struct ActiveSessionState {
     pub unsubscribe: Option<Box<dyn FnOnce() + Send>>,
     /// Client env (e.g. herdr pane identity) bound when the runtime was created.
     pub client_env: Option<HashMap<String, String>>,
+    /// True when a model change to an OCC-3-capable model arrived while the
+    /// session was streaming and its activation retry is still owed: the
+    /// pre-prompt path (`maybe_activate_pending_occ3`) consumes it at the
+    /// next idle prompt. Cleared after that single attempt.
+    pub occ3_activation_pending: bool,
 }
 
 impl ActiveSessionState {
@@ -217,6 +222,7 @@ impl ActiveSessionState {
             summary_state: None,
             unsubscribe: None,
             client_env: None,
+            occ3_activation_pending: false,
         }
     }
 }

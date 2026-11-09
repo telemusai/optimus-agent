@@ -2020,6 +2020,106 @@ async fn model_change_to_an_occ3_model_retries_activation_and_installs_the_tool(
     );
 }
 
+/// (d) A model change that arrives while the session is streaming arms a
+/// pending activation retry instead of dropping it: the pre-prompt consumer
+/// (`maybe_activate_pending_occ3`) activates at the next idle prompt, so the
+/// streaming window cannot leave a root session without the occ3_handoff
+/// tool until another model change happens to fire.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn model_change_while_streaming_defers_activation_to_the_next_prompt() {
+    let mut fixture = ModelChangeActivationFixture::new().await;
+    // Hold the session in a streaming turn.
+    let entered = CancellationToken::new();
+    install_holding_provider(&fixture.session, entered.clone());
+    let session = Arc::clone(&fixture.session);
+    let prompt = tokio::spawn(async move {
+        let _ = session.prompt("hold busy", None).await;
+    });
+    assert!(
+        tokio::time::timeout(Duration::from_secs(10), entered.cancelled())
+            .await
+            .is_ok(),
+        "the holding provider must be reached"
+    );
+    // The model change while streaming: no immediate activation, but the
+    // retry is armed.
+    let response = fixture.set_model("occ3mc-d1", "unit-occ3", "glm-5.3").await;
+    assert_eq!(response["success"], true, "{response}");
+    assert!(
+        fixture.session.experimental_native_occ3().is_none(),
+        "the streaming model change must not activate immediately"
+    );
+    assert!(
+        fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending,
+        "the streaming model change arms the pending activation retry"
+    );
+    let handshakes_while_streaming = fixture
+        .first_occ3
+        .requests
+        .load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        handshakes_while_streaming, 0,
+        "no activation handshake may run while the session streams"
+    );
+    // End the held turn (the holding provider's stream never completes on
+    // its own): abort makes the session idle, which is what the pre-prompt
+    // consumer requires.
+    let _ = tokio::time::timeout(Duration::from_secs(10), fixture.session.abort()).await;
+    let _ = tokio::time::timeout(Duration::from_secs(10), prompt).await;
+    // The pre-prompt consumer activates the armed retry once.
+    fixture
+        .daemon
+        .maybe_activate_pending_occ3(&fixture.state)
+        .await;
+    let native = fixture
+        .session
+        .experimental_native_occ3()
+        .expect("the pending retry activates at the next idle prompt");
+    assert!(!native.is_dead(), "the deferred activation is live");
+    assert!(
+        handoff_tool_installed(&fixture.session),
+        "the deferred activation installs the occ3_handoff tool"
+    );
+    assert!(
+        fixture
+            .first_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst)
+            > 0,
+        "the activation handshake ran against the OCC-3 runtime"
+    );
+    assert!(
+        !fixture
+            .state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending,
+        "the consumed retry clears the pending marker"
+    );
+    // A second consumer pass is a no-op (marker cleared), and re-arming
+    // requires another model change.
+    let handshakes = fixture
+        .first_occ3
+        .requests
+        .load(std::sync::atomic::Ordering::SeqCst);
+    fixture
+        .daemon
+        .maybe_activate_pending_occ3(&fixture.state)
+        .await;
+    assert_eq!(
+        fixture
+            .first_occ3
+            .requests
+            .load(std::sync::atomic::Ordering::SeqCst),
+        handshakes,
+        "the consumed marker does not re-arm per prompt"
+    );
+}
+
 /// (b) A model change while a native session exists never re-installs it: a
 /// live enrollment is not re-activated (no handshake, no enrollment, no
 /// replacement), and switching to another OCC-3-capable model performs no

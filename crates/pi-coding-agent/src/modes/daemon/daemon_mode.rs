@@ -11789,8 +11789,10 @@ impl AgentDaemon {
         // Long-lived OCC-3 sessions: renew a native enrollment that aged out
         // with its permit before the prompt dispatches, so handoffs keep
         // working past the one-hour server TTL instead of degrading until a
-        // session restart.
+        // session restart. A model-change activation that armed while the
+        // session was streaming retries here too.
         self.maybe_reactivate_expired_occ3(&state).await;
+        self.maybe_activate_pending_occ3(&state).await;
         let controller = admission_entry
             .as_ref()
             .and_then(|(_, controller)| controller.clone());
@@ -16884,9 +16886,17 @@ impl AgentDaemon {
         let Some(agent_session) = session.agent_session() else {
             return;
         };
-        // Installing fresh hooks requires an idle session; a busy one keeps
-        // its ordinary path and a later model change retries.
+        // Installing fresh hooks requires an idle session. A busy one keeps
+        // its ordinary path, but the retry is not dropped: it is armed as
+        // pending and the pre-prompt path
+        // (`maybe_activate_pending_occ3`) consumes it at the next idle
+        // prompt, so the streaming window cannot leave the session without
+        // the occ3_handoff tool until another model change happens to fire.
         if agent_session.is_streaming() {
+            state
+                .lock()
+                .expect("active session poisoned")
+                .occ3_activation_pending = true;
             return;
         }
         // Only a session with no installed native permit retries here. This
@@ -16895,6 +16905,38 @@ impl AgentDaemon {
         if agent_session.experimental_native_occ3().is_some() {
             return;
         }
+        let _ = self.activate_experimental_occ3(state).await;
+    }
+
+    /// Pre-prompt consumer for a model-change activation retry that armed
+    /// while the session was streaming (see `maybe_activate_occ3_on_model_change`).
+    /// Runs once at the next idle prompt, then clears the pending marker
+    /// whether or not activation succeeded: a failed attempt does not
+    /// re-arm per prompt (the next model change re-arms it), and a success
+    /// installs the enrollment this hook exists to reach.
+    async fn maybe_activate_pending_occ3(
+        self: &Arc<Self>,
+        state: &Arc<StdMutex<ActiveSessionState>>,
+    ) {
+        let Some(agent_session) = self.session_of(state).agent_session() else { return };
+        // Installing fresh hooks requires an idle session; a still-busy one
+        // keeps the marker armed for a later prompt.
+        if agent_session.is_streaming() { return; }
+        if !state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending
+        {
+            return;
+        }
+        state
+            .lock()
+            .expect("active session poisoned")
+            .occ3_activation_pending = false;
+        // Only a session with no installed native permit retries; live and
+        // dead enrollments keep their existing lifecycle paths (the dead
+        // one through `maybe_reactivate_expired_occ3`).
+        if agent_session.experimental_native_occ3().is_some() { return; }
         let _ = self.activate_experimental_occ3(state).await;
     }
 
