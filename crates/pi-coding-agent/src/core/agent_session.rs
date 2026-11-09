@@ -2663,6 +2663,13 @@ mod occ3_invalidate_triggers_tests;
 #[path = "agent_session/occ3_export_gap_tests.rs"]
 mod occ3_export_gap_tests;
 
+// Fail-loud OCC-3 twin resolution for `rlm` spawns: children silently lacked
+// the native occ3_handoff tool whenever the spawn resolved to a non-OCC-3
+// entry sharing a model id with an OCC-3-configured one.
+#[cfg(test)]
+#[path = "agent_session/rlm_model_resolution_tests.rs"]
+mod rlm_model_resolution_tests;
+
 /// `AgentSession`.
 ///
 /// Fields keep the TypeScript names in `snake_case`. Mutable callback state
