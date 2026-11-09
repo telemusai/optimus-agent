@@ -612,6 +612,66 @@ impl crate::core::tools::BashOperations for ExtensionBashOperations {
     }
 }
 
+/// Fail-loud OCC-3 twin guard for `resolve_rlm_subagent_model`. The selection
+/// is returned unchanged when no authenticated entry shares the model id with
+/// an enabled OCC-3 configuration; otherwise the error names the resolved
+/// selector and the exact OCC-3 selector(s) to use instead.
+fn occ3_twin_guarded_selection(
+    model: Model,
+    target: &str,
+    authenticated: &[Model],
+) -> Result<RlmSubagentModelSelection, String> {
+    if let Some(error) = occ3_twin_error(&model, target, authenticated) {
+        return Err(error);
+    }
+    Ok(RlmSubagentModelSelection { model })
+}
+
+/// The OCC-3 twin refusal for `model`, or `None` when the spawn may proceed.
+fn occ3_twin_error(model: &Model, target: &str, authenticated: &[Model]) -> Option<String> {
+    let twins = crate::core::rlm_runtime::occ3_configured_twin_selectors(model, authenticated);
+    if twins.is_empty() {
+        return None;
+    }
+    let selectors: Vec<String> = twins.iter().map(|twin| format!("\"{twin}\"")).collect();
+    let selector_hint = if twins.len() == 1 {
+        format!("Pass the exact OCC-3 selector {}", selectors[0])
+    } else {
+        format!("Pass one of the exact OCC-3 selectors {}", selectors.join(", "))
+    };
+    Some(format!(
+        "Requested {target} model \"{}/{}\" has no OCC-3 configuration, but an OCC-3-configured entry with the same model id exists. Children on this entry never receive the native occ3_handoff tool. {selector_hint} instead",
+        model.provider,
+        model.id,
+    ))
+}
+
+/// The unavailable-model refusal. A bare model id shared by multiple
+/// providers additionally lists the exact `provider/id` selectors,
+/// OCC-3-configured entries first, so the reference can be disambiguated.
+fn format_unavailable_rlm_model_message(
+    reference: &str,
+    target: &str,
+    authenticated: &[Model],
+) -> String {
+    let mut message = format!(
+        "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+    );
+    if !reference.contains('/') {
+        let selectors =
+            crate::core::rlm_runtime::selectors_for_model_id(reference, authenticated);
+        if selectors.len() > 1 {
+            let quoted: Vec<String> =
+                selectors.iter().map(|selector| format!("\"{selector}\"")).collect();
+            message.push_str(&format!(
+                "; the model id \"{reference}\" is available from multiple providers: {}",
+                quoted.join(", ")
+            ));
+        }
+    }
+    message
+}
+
 impl AgentSession {
     pub async fn bind_extensions(
         self: &Arc<Self>,
@@ -3194,6 +3254,12 @@ impl AgentSession {
     }
 
     /// `_resolveRlmSubagentModel(reference, target)` (agent-session.ts:11418-11446).
+    ///
+    /// Fails loud when the resolution lands on a non-OCC-3 entry while an
+    /// OCC-3-configured entry with the same model id is authenticated: latent
+    /// transfer is same-exact-model only, so a child spawned on the ordinary
+    /// entry silently lacks the native `occ3_handoff` tool and the missing
+    /// tool is the only symptom. No fallback, no auto-rewrite.
     pub(super) async fn resolve_rlm_subagent_model(
         self: &Arc<Self>,
         reference: Option<&str>,
@@ -3201,31 +3267,34 @@ impl AgentSession {
     ) -> Result<RlmSubagentModelSelection, String> {
         let parent_model = self.model().ok_or_else(format_no_model_selected_message)?;
         let Some(reference) = reference else {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         };
         let normalized_reference = reference.to_lowercase();
         let parent_selector =
             format!("{}/{}", parent_model.provider, parent_model.id).to_lowercase();
         if parent_selector == normalized_reference {
-            return Ok(RlmSubagentModelSelection {
-                model: parent_model,
-            });
+            let authenticated = self.authenticated_rlm_models().await;
+            return occ3_twin_guarded_selection(parent_model, target, &authenticated);
         }
-        let model = self
-            .authenticated_rlm_models()
-            .await
-            .into_iter()
+        let authenticated = self.authenticated_rlm_models().await;
+        let model = authenticated
+            .iter()
             .find(|candidate| {
                 format!("{}/{}", candidate.provider, candidate.id).to_lowercase()
                     == normalized_reference
-            });
+            })
+            .cloned();
         let Some(model) = model else {
-            return Err(format!(
-                "Requested {target} model \"{reference}\" is unavailable, unauthenticated, or expired"
+            return Err(format_unavailable_rlm_model_message(
+                reference,
+                target,
+                &authenticated,
             ));
         };
+        if let Some(error) = occ3_twin_error(&model, target, &authenticated) {
+            return Err(error);
+        }
         let request_model = model.clone();
         let registry = self.model_registry.clone();
         let auth = crate::core::sdk::with_model_registry(registry, move |registry| {

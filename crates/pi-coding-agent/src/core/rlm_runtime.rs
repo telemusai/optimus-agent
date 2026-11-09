@@ -452,6 +452,61 @@ pub fn find_rlm_model_matches(query: &str, models: &[Model], limit: f64) -> Vec<
         .collect()
 }
 
+/// Whether a registry entry carries an enabled OCC-3 capability block: the
+/// model-level half of the activation gate
+/// (`occ3_connectors::activation::configured_connector`).
+fn occ3_enabled(model: &Model) -> bool {
+    model.occ3.as_ref().is_some_and(|occ3| occ3.enabled)
+}
+
+/// Exact selectors of the OCC-3 twins of `selected`: authenticated entries
+/// that share its model id and carry an enabled OCC-3 configuration.
+///
+/// OCC-3 latent transfer is same-exact-model only, so a child spawned on a
+/// non-OCC-3 entry with an OCC-3-configured twin silently lacks the native
+/// `occ3_handoff` tool — the missing tool is the only symptom. Returns an
+/// empty list when `selected` is itself OCC-3-configured or no twin exists,
+/// which keeps unambiguous ids on the previous behavior.
+pub fn occ3_configured_twin_selectors(selected: &Model, authenticated: &[Model]) -> Vec<String> {
+    if occ3_enabled(selected) {
+        return Vec::new();
+    }
+    let selected_selector = format!("{}/{}", selected.provider, selected.id).to_lowercase();
+    authenticated
+        .iter()
+        .filter(|candidate| candidate.id == selected.id)
+        .filter(|candidate| {
+            format!("{}/{}", candidate.provider, candidate.id).to_lowercase()
+                != selected_selector
+        })
+        .filter(|candidate| occ3_enabled(candidate))
+        .map(|candidate| format!("{}/{}", candidate.provider, candidate.id))
+        .collect()
+}
+
+/// Exact `provider/id` selectors of authenticated entries exposing
+/// `model_id` (case-insensitive), OCC-3-configured entries first so a bare
+/// model-id reference can be disambiguated toward the native-capable entry.
+/// Registry order is kept within each group.
+pub fn selectors_for_model_id(model_id: &str, authenticated: &[Model]) -> Vec<String> {
+    let normalized = model_id.trim().to_lowercase();
+    let mut selectors: Vec<String> = Vec::new();
+    let mut ordinary: Vec<String> = Vec::new();
+    for candidate in authenticated {
+        if candidate.id.to_lowercase() != normalized {
+            continue;
+        }
+        let selector = format!("{}/{}", candidate.provider, candidate.id);
+        if occ3_enabled(candidate) {
+            selectors.push(selector);
+        } else {
+            ordinary.push(selector);
+        }
+    }
+    selectors.extend(ordinary);
+    selectors
+}
+
 /// `createRlmCreateSessionHostHandler(handler)`.
 pub fn create_rlm_create_session_host_handler(handler: RlmCreateSessionHandler) -> HostRequestHandler {
     Arc::new(move |payload: Value| {
@@ -806,6 +861,82 @@ mod tests {
         let long_prompt = "word ".repeat(200);
         let name = create_default_rlm_subagent_session_name(&long_prompt, "sub-12345678");
         assert!(name.chars().count() <= RLM_SUBAGENT_SESSION_NAME_MAX_LENGTH);
+    }
+
+    fn occ3_model(provider: &str, id: &str, name: &str) -> Model {
+        let mut entry = model(provider, id, name);
+        entry.occ3 = Some(pi_ai::types::Occ3Capability {
+            protocol: pi_ai::types::OCC3_PROTOCOL_V1.to_string(),
+            connector: "sglang".to_string(),
+            endpoint: "https://fixture.invalid/occ3".to_string(),
+            api_version: pi_ai::types::OCC3_API_VERSION_V1.to_string(),
+            same_model_only: true,
+            enabled: true,
+            validation: pi_ai::types::Occ3Validation::LiveVerified,
+            fallback: Vec::new(),
+            method: None,
+            artifact_digest: None,
+        });
+        entry
+    }
+
+    #[test]
+    fn occ3_twin_selectors_name_enabled_entries_with_the_same_id() {
+        let ordinary = model("dgx-glm53", "glm-5.3", "GLM 5.3");
+        let mut disabled = occ3_model("disabled-occ3", "glm-5.3", "GLM 5.3 disabled");
+        disabled.occ3.as_mut().unwrap().enabled = false;
+        let models = vec![
+            ordinary.clone(),
+            occ3_model("dgx-glm53-occ3", "glm-5.3", "GLM 5.3 OCC-3"),
+            model("ollama-cloud", "llama", "Llama"),
+            disabled,
+        ];
+        assert_eq!(
+            occ3_configured_twin_selectors(&ordinary, &models),
+            vec!["dgx-glm53-occ3/glm-5.3"]
+        );
+        // The selected entry itself is never its own twin, and an OCC-3
+        // entry has no conflict at all.
+        assert_eq!(
+            occ3_configured_twin_selectors(&models[1], &models),
+            Vec::<String>::new()
+        );
+        // A different model id has no twins.
+        assert_eq!(
+            occ3_configured_twin_selectors(&models[2], &models),
+            Vec::<String>::new()
+        );
+        // A disabled OCC-3 block on the selected entry does not spare it: the
+        // enabled twin still refuses the toolless spawn.
+        assert_eq!(
+            occ3_configured_twin_selectors(&models[3], &models),
+            vec!["dgx-glm53-occ3/glm-5.3"]
+        );
+    }
+
+    #[test]
+    fn selectors_for_model_id_list_occ3_entries_first_in_registry_order() {
+        let models = vec![
+            model("dgx-glm53", "glm-5.3", "GLM 5.3"),
+            occ3_model("dgx-glm53-occ3", "glm-5.3", "GLM 5.3 OCC-3"),
+            model("ollama-cloud", "glm-5.3", "GLM 5.3"),
+            model("anthropic", "claude", "Claude"),
+        ];
+        assert_eq!(
+            selectors_for_model_id("glm-5.3", &models),
+            vec![
+                "dgx-glm53-occ3/glm-5.3",
+                "dgx-glm53/glm-5.3",
+                "ollama-cloud/glm-5.3"
+            ]
+        );
+        // Matching is case-insensitive and trims, like selector resolution.
+        assert_eq!(
+            selectors_for_model_id(" GLM-5.3 ", &models),
+            selectors_for_model_id("glm-5.3", &models)
+        );
+        // Unknown ids produce no selectors.
+        assert_eq!(selectors_for_model_id("missing", &models), Vec::<String>::new());
     }
 
     #[test]
