@@ -141,7 +141,7 @@ The user can select the OCC-3 preference in `/occ`, inspect `/occ status`, or
 use `/occ 3 on` and `/occ 3 off`. The explicit chat preference gates native actions dynamically, including
 inherited subagent actions. Without an override, an installed connector follows
 the global opt-in. A chat preference does not install a missing connector. Native activation separately requires the existing
-`agentCommunication.occ3Enabled` and `occ3Experimental` settings, compatible
+`agentCommunication.occ3Enabled` and `agentCommunication.occ3Experimental` settings, compatible
 model configuration, and a successful live connector handshake. Do not change
 global settings or invent configuration to make a model eligible.
 
@@ -165,6 +165,134 @@ English), or OCC2 (validated symbolic encoding). OCC3 requires a completed
 native-use receipt. A configured preference, exposed tool, successful
 handshake, or queued/admitted handoff does not prove completed use or semantic
 accuracy. OCC-3 remains experimental.
+
+### Setting up an OCC-3 team
+
+A "hive" is a coordinated family of sessions, not shared memory. Start with one
+sender and one receiver. A successful setup checklist does not guarantee a
+successful native turn; prove one hop before attempting a longer chain.
+
+1. **Check activation.** Ask the user to run `/occ status`, then `/occ 3 on`
+   when the chat preference is off. A missing connector also requires the
+   operator's global `agentCommunication.occ3Enabled` and
+   `agentCommunication.occ3Experimental` opt-ins, and a compatible model's
+   enabled `occ3` block and successful handshake. The model's `occ3.endpoint`
+   is used unless `agentCommunication.occ3Endpoint` overrides it. Changing the chat
+   preference alone cannot install that connector. Report the exact activation
+   decline; do not edit settings, `models.json`, or `occ.json` yourself.
+2. **Select every member explicitly.** Discover the exact provider/model
+   selector with `rlm.find_models` (or the current mode's model discovery).
+   Pass that same selector for each member; do not rely on inheritance or a
+   bare model id. Check each child's own exposed tools, not just the parent's.
+3. **Create receivers first.** Use stable, unique sibling names. Give each
+   member the common objective, its distinct role, the expected sender, the
+   exact next receiver name, and the two-call protocol below. For a chain,
+   create the final receiver first, then work back toward the first sender.
+   Run only one dependent hop at a time; avoid unrelated inference during the
+   smoke test to reduce busy refusals.
+4. **Keep waiting separate from role work.** Receivers must not solve from the
+   question alone before the attached native state arrives. If it is missing,
+   report that blocker and finish the current turn with
+   `RLM_CHILD_STATUS: blocked`. Keep the child session available. Do not omit
+   terminal status to create a waiting loop: `RLM_CHILD_MAX_CONTINUATIONS = 3`
+   bounds automatic continuation. An idle/blocked result is not completed
+   native use. The parent inspects delivery and receiver state before sending
+   any explicit follow-up; do not repeatedly wake a receiver with no input.
+5. **Arm, emit, publish.** The sender calls native `occ3_handoff` with only
+   `receiver_role` and `receiver_name`. `capture_armed` means nothing was sent.
+   In its next response it emits concise source facts as assistant content and
+   calls the tool once more for the same receiver, with no other tool calls
+   in that response. Calling once, describing the intent, or sending ordinary
+   `agent_message` text does not perform this native transfer.
+6. **Reconcile before advancing.** Save each message id and inspect the
+   completed-use receipt and the receiver's actual role output. Do not count an `agentmsg_` id alone, a queued/admitted result, a "state arrived" phrase,
+   server counters, or a child settling as proof of completed native use.
+   `agent_observe` and `rlm.collect(..., timeout_ms=0)` support bounded
+   inspection; end the parent turn while work runs. Keep both sessions until
+   the outcome is resolved. Missing or uncertain evidence blocks the next
+   hop; do not delete receivers or resend an admitted handoff blindly.
+7. **Handle busy and fallback explicitly.** Follow the runtime's fresh-capture
+   re-arm instruction only after a proven busy/unused refusal. The tool handles
+   its backoff. The default busy budget is three retries; the operator can
+   configure `OCC3_BUSY_MAX_RETRIES` within the runtime's bounds. A failed
+   capture has a separate retry budget. Do not add fixed sleeps or an unlimited
+   retry loop. Follow an explicit ordinary-message fallback instruction and
+   label that hop as text, not OCC-3. For a native-only smoke, stop on failure
+   instead of substituting text. Never send blocked-report text as role output.
+8. **Report plainly.** Send structured coordination reports using OCC-1, but
+   return the final user-facing answer in plain text. Preserve the child's
+   terminal-status line separately from any answer line. Report native,
+   fallback, failed, and uncertain hops separately. A receipt proves use, not
+   correctness; check critical facts. Benchmark answers and scoring keys must
+   stay outside child-visible prompts, parent transcripts, and tools. Asking
+   a child not to look is not an access-control boundary.
+
+### Troubleshooting
+
+Known limitation at `c34c0bdcc`: changing OCC-2 calls an OCC-2-only save path
+that writes `occ3Enabled: false`, even if it was true. Make the desired OCC-2
+selection first, then ask the user to run `/occ 3 on` on the affected chat.
+This guidance does not change that persistence behavior. A deliberately saved
+off preference is valid and must not be silently overridden. A child's own
+preference record masks its parent's record. Also, `/occ status` can show an
+installed live connector as preferred even when a saved off preference blocks
+its use; inspect the actual decline rather than treating that label as proof.
+
+| Symptom | Check | Action |
+|---|---|---|
+| `occ3_handoff` absent | Activation decline, exact selector, global opt-ins, endpoint, handshake | Ask the operator to inspect `/occ status` and the reported decline. Do not invent a tool or alternate route. |
+| "OCC-3 is disabled for this chat" | Saved preference on this chat or its nearest parent | Ask the user to enable `/occ 3 on` on the governing chat. Global opt-in does not override an explicit saved off preference. |
+| Sender stops after `capture_armed`, or never calls the tool | Tool results, not the sender's intent | Give the sender the two-call template. Only after arming, emit and publish in the next response. |
+| Receiver answers early or exhausts continuations | Did native state arrive before role output? | Retain the blocked child and inspect the handoff. Do not suppress terminal markers or use the question-alone escape. |
+| Unknown/unavailable receiver | Family roster and exact unique child name | Create the receiver before the sender publishes; keep it available through completion. |
+| `source_busy` / `scheduler_busy` / receiver busy | Runtime refusal and retry outcome | Serialize hops and follow the fresh-capture instruction within the runtime budget. Label any text fallback. |
+| Counters stay unchanged or receipt id exists without completion | Per-message completed-use receipt and receiver output | Treat admission as pending, not success. Preserve evidence when the receiver errors or is cancelled. |
+| Final answer arrives in OCC-1/OCC-2 notation | Final solver's output format | Require a plain-text answer; use structured encoding only for coordination. |
+| Fixed waits, cleanup races, missing role output | Queue outcome and child lifecycle | Inspect on completion notifications; do not delete a child just because its initial turn settled. Stop the chain on unknown use. |
+
+### Child prompt templates
+
+Replace the bracketed fields before spawning. The receiver must already exist
+under the exact name supplied to the sender. These are task prompts, not Python
+wrappers for the native tool.
+
+**Sender**
+
+```text
+Shared objective: [objective]. Your role: [role].
+Input: [input without reference answers]. Expected output: [role output].
+Next receiver: sibling named [receiver-name].
+Produce concise source facts for that receiver, then use native occ3_handoff:
+1. Call it with receiver_role="sibling", receiver_name="[receiver-name]".
+2. If capture_armed, in your NEXT response emit the facts as assistant content
+   and call it once more for that same receiver. No other tools in that response.
+After admission, do not repeat the handoff. Follow explicit runtime busy/re-arm
+instructions only when unused; report uncertain or failed outcomes to the parent.
+Report the message id as admitted but not verified complete until receipt evidence
+proves otherwise. If native-only execution was requested, stop on failure.
+Do not inspect the parent's transcript or scoring data to obtain an answer.
+Finish your current task with the appropriate RLM_CHILD_STATUS terminal line.
+```
+
+**Receiver / final solver**
+
+```text
+Shared objective: [objective]. Your role: [role]. Expected sender: [sender-name].
+Do no role work until that sender's attached native state arrives in a later turn.
+If absent, report the missing-state blocker to the parent, then end this turn:
+RLM_CHILD_STATUS: blocked
+Do not loop, suppress terminal status, or solve from the question alone.
+Do not inspect the parent's transcript or scoring data to obtain an answer.
+When native state arrives, use it for [role task] and verify critical facts.
+If it is unusable, report the blocker; do not claim successful native use.
+For a forwarding role, use the sender template for [next-receiver-name].
+For the final solver, return a plain-text answer, not an OCC envelope:
+FINAL_ANSWER: <answer>
+RLM_CHILD_STATUS: complete
+```
+
+An answer extractor must read `FINAL_ANSWER` independently of the final
+`RLM_CHILD_STATUS` line. Do not remove the terminal line to satisfy a scorer.
 
 ## Safety
 

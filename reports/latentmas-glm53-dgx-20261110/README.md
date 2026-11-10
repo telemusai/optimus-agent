@@ -1,12 +1,14 @@
 # LatentMAS benchmarks on GLM-5.3 (DGX, 2026-11-10): interim results
 
 These are interim results from running the LatentMAS evaluation suite
-([Gen-Verse/LatentMAS](https://github.com/Gen-Verse/LatentMAS) at `9a9e4d3`, prompts and
-scoring used verbatim) against GLM-5.3. The model is served by SGLang with the OCC-3
+([Gen-Verse/LatentMAS](https://github.com/Gen-Verse/LatentMAS) at `9a9e4d3`) against
+GLM-5.3. The API conditions use the upstream prompts and scoring. The OCC-3
+condition adapts the role prompts and includes the answer recoveries below. The model is served by SGLang with the OCC-3
 bridge. The suite adds an Optimus OCC-3 native-handoff condition. The run was paused at
 2026-11-10 09:29 UTC so that PR #279 could be deployed. Reruns on the updated stack will
 be added to this directory. All numbers are measured. Untested items are listed under
-NOT-RUN.
+NOT-RUN. The post-update smoke failed; see [smoke-validation.md](smoke-validation.md).
+It is diagnostic evidence, not an additional benchmark sample.
 
 ## Setup
 
@@ -33,7 +35,8 @@ Conditions:
     with the prompts in `harness/occ3_v3_prompts.py`.
   - Role wording comes from the LatentMAS latent-method prompts. A required handoff
     protocol is added: arm, emit the role output, publish.
-  - Each hop is a native `occ3_handoff`. The judger ends with `FINAL_ANSWER: <answer>`.
+  - Each hop attempts native `occ3_handoff`; admitted and completed are distinct.
+    The judger is instructed to emit `FINAL_ANSWER: <answer>`.
   - Items ran one at a time, with no other benchmark traffic.
   - A busy decline was retried up to 3 times. After that, the hop used a text fallback
     marked `FALLBACK_USED`.
@@ -66,16 +69,22 @@ Conditions:
 | TextMAS sequential | 0-19 | 19/20 | 95.0% | 76.4-99.1% | 62,160 + 52,531 |
 | baseline (same items as OCC-3) | 0-13 | 13/14 | 92.9% | 68.5-98.7% | - |
 | TextMAS sequential (same items) | 0-13 | 13/14 | 92.9% | 68.5-98.7% | - |
-| OCC-3 sequential | 0-13 | 13/14 | 92.9% | 68.5-98.7% | not recorded |
+| OCC-3 sequential (adjudicated) | 0-13 | 13/14 | 92.9% | 68.5-98.7% | not recorded |
 
 On items 0-13, all three conditions miss only item 12 (McNemar OCC-3 vs baseline:
 b=0, c=0). The GSM8K API rows were produced with `bench_lib.run_baseline` and
 `bench_lib.run_text_mas`. The driver command for these rows was not saved.
 
-OCC-3 protocol results on the 14 clean items:
+OCC-3 protocol labels on the 14 items in the historical `clean` file (that
+filename does not certify isolated scoring or completed native use):
 
-- Native hops: 38/42 (90.5%, 95% CI 77.9-96.2%). Each hop has a recorded receipt.
-- Fully native items: 10/14, all correct (10/10).
+- Admission-reported hops: 38/42 (90.5%, descriptive Wilson 95% CI 77.9-96.2%).
+  Hops are clustered within items, not independent observations.
+- Items with all three hops reported admitted: 10/14, all adjudicated correct (10/10).
+- Only 31 receipt-id entries accompany the 38 admitted labels. Seven are missing,
+  and item 13 has a shortened planner-to-critic id. The published artifacts do not
+  establish a completed-native-use rate; do not interpret this as either 38/42
+  verified completions or proof of zero completions.
 - Items with one text-fallback hop: 4 (items 0, 8, 10, 12), 3 correct.
 - Wall time per item: mean 294 s, median 274 s, range 212-442 s. This includes the root
   session's fixed 150-180 s waits between checks, so it is not comparable with the API
@@ -104,8 +113,12 @@ OCC-3 protocol results on the 14 clean items:
    - it uses Optimus provider sampling defaults;
    - its children have the Optimus system prompt and tools.
 
-   Compare its accuracy only with these differences in mind. On GSM8K all conditions are
-   near the ceiling (13/14).
+   This is not a channel-only comparison and cannot establish token efficiency,
+   speedup, or equivalence to LatentMAS latent reasoning. On GSM8K all conditions
+   are near the ceiling (13/14). Gold-answer isolation in the historical OCC-3
+   run is unverified. Full-agent observation tools can expose parent transcripts
+   and files; the later smoke reported access to a parent transcript containing
+   scoring context. This does not prove historical answer leakage.
 3. OCC-3 rows do not record token counts. Their wall time includes fixed waits.
 4. Five OCC-3 items needed answer recovery, recorded in each row's `scoring_note`:
    - item 2 used a comma-aware parse of `$70,000` (the verbatim LatentMAS extractor reads
@@ -116,17 +129,23 @@ OCC-3 protocol results on the 14 clean items:
 
    All five recovered answers match the gold answer. If these five items are scored as
    wrong, the result is 8/14. The OCC-3 team guidance in the same PR addresses this
-   failure mode (plain-text final answers).
-5. A late handoff still counts as native. Judgers sometimes solved the problem while they
-   waited and confirmed it when the state arrived. A receipt proves delivery, not that the
-   state changed the answer.
+   failure mode (plain-text final answers). The historical rows omit judger/role
+   outputs, so the reported recoveries cannot be independently re-extracted from
+   this publication. Treat 13/14 as adjudicated accuracy; 8/14 is a conservative
+   no-recovery sensitivity score, not a fresh blinded run.
+5. The historical prompts permit solving from the question alone after several
+   continuations. The rows do not establish native-state-before-answer ordering.
+   An admission or receipt id does not prove receiver completion; that requires
+   a matched completed-native-use receipt. Even verified use does not prove
+   that native state improved the answer. The current team recipe removes the
+   question-alone escape, but has not been live-validated as a runtime fix.
 6. Excluded rows:
    - `glm53_gsm8k_occ3.jsonl` (3 rows) ran under concurrent benchmark load and is marked
      `invalid_concurrent_load`.
    - Item 14 of the clean run was halted for the stack update and is marked
      `invalid_stack_update_halt`.
-7. Every condition is one sample on 14-30 items (API conditions at temperature 0.6). The
-   intervals are wide.
+7. The AIME/GSM8K conditions use one sample on 14-30 items (API temperature
+   0.6). GPQA has 160 items. The small-set intervals are wide.
 8. The GPQA authors ask that examples not be published in plain text. So
    `results/glm53_gpqa_baseline.jsonl` omits question text, options and model outputs.
    Per-item scoring fields remain. Numeric predictions are replaced by
@@ -138,7 +157,8 @@ OCC-3 protocol results on the 14 clean items:
 - GPQA baseline items 160-197 and GPQA TextMAS.
 - HumanEval+, MBPP+, MedQA, ARC-Easy and ARC-Challenge (300 each) and GSM8K-300. Their
   manifests are listed in `MANIFESTS.json`.
-- OCC-3 items 14-19, and a rerun of items 0-13 on the PR #279 stack.
+- OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
+  The later item-0 smoke failed and remains separate from these denominators.
 - AIME and GPQA at a higher token cap.
 - Token accounting for OCC-3 rows.
 
@@ -146,11 +166,13 @@ OCC-3 protocol results on the 14 clean items:
 
 | Path | Contents |
 |---|---|
-| `results/*.jsonl` | One row per item and condition, with model outputs (GPQA reduced to scoring fields) |
+| `results/*.jsonl` | Per-item records; API rows include model outputs except GPQA; OCC-3 rows omit role/judger outputs |
 | `results/*_summary.json*` | Per-condition summaries written by the runner |
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |
-| `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | OCC-3 helpers and the child prompts used in the clean protocol |
+| `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | Historical OCC-3 helpers/prompts, retained unchanged; not a validated team recipe |
+| `smoke-validation.md`, `server-smoke-excerpt.txt` | Post-update smoke failure and bounded server-log evidence |
+| `results/glm53_gsm8k_occ3_v6.jsonl` | Original diagnostic-only item-0 smoke row; its `native_hops` field counts admission, not proven completion |
 | `harness/sandbox-img/Dockerfile` | Code-task sandbox image (not used by any completed task yet) |
 | `MANIFESTS.json` | Item manifest SHA-256 values, sources, counts and sampled indices |
 | `occ3-activation-notes.md` | Root-cause notes for OCC-3 activation on the DGX (settings keys and the per-chat `occ.json` preference) |
@@ -164,4 +186,9 @@ OCC-3 protocol results on the 14 clean items:
   3. Run `python harness/runner.py [task,...]`. The runner skips rows that are already
      recorded.
 - The OCC-3 condition is run from an Optimus root session with the prompts in `harness/`.
-  `occ3-activation-notes.md` lists the settings it needs.
+  `occ3-activation-notes.md` lists historical activation observations, not a
+  recommended agent-side settings-edit procedure. Use the current agent-message
+  skill for setup and operator-owned configuration changes. A clean quality
+  rerun also needs isolated scoring, fixed extraction, matched budgets/sampling,
+  no alternate observation path to answers, per-role timestamps, token accounting,
+  and receipt-correlated completion outcomes.

@@ -1,0 +1,2 @@
+- Added an OCC-3 team setup checklist, child prompt templates, and troubleshooting guidance for activation, bounded waiting, retries, and completed-use receipts.
+- Added an interim GLM-5.3 LatentMAS benchmark report with comparison limits and strict-answer scoring caveats.
