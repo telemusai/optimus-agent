@@ -4,3 +4,4 @@
 - Added the completed 198-item GPQA TextMAS sequential result, sanitized accounting, and explicit unequal-budget comparison limits.
 - Added the completed 198-item GPQA TextMAS hierarchical result, source-contract recheck, and sanitized accounting without repairing or rerunning the low score.
 - Added the completed MedQA300 baseline result with strict historical scoring, gold-separated offline audit, and sanitized usage and timing.
+- Added the completed MedQA300 TextMAS sequential result, sanitized accounting, and explicit four-call versus one-call comparison limits.

@@ -19,8 +19,9 @@ is complete at **10/198 (5.05%)**. The low result is preserved without answer
 repair or rerun; source-contract review found no discrepancy. See
 [GPQA_TEXTMAS_HIERARCHICAL.md](GPQA_TEXTMAS_HIERARCHICAL.md).
 MedQA300 baseline is complete at **174/300 (58.00%)**; see
-[MEDQA_BASELINE.md](MEDQA_BASELINE.md). Its TextMAS sequential run is separate
-and still in progress.
+[MEDQA_BASELINE.md](MEDQA_BASELINE.md). TextMAS sequential is complete at
+**268/300 (89.33%)**; see [MEDQA_TEXTMAS_SEQUENTIAL.md](MEDQA_TEXTMAS_SEQUENTIAL.md).
+Four calls per item versus one baseline call are not budget matched.
 
 ## Setup
 
@@ -202,9 +203,31 @@ Provider totals are 97,628 prompt and 389,509 completion tokens. Missing cache
 and nested reasoning details remain unknown. Driver wall time is 368.978 seconds,
 separate from the overlapping request-latency sum and not isolated GPU time.
 This is ordinary HTTP inference, not native OCC-3 or a clinical reliability claim.
-MedQA TextMAS conditions are separate and have no published result here yet.
+The separate sequential TextMAS condition is complete below; hierarchical is not run.
 See [MEDQA_BASELINE.md](MEDQA_BASELINE.md) for cohort/source bindings, accounting,
 metric limits and sanitized metadata.
+
+### MedQA300 TextMAS sequential (complete, 300 items)
+
+| Condition | Correct | Strict accuracy | Calls per item | Any-role length-limited pipelines |
+|---|---:|---:|---:|---:|
+| Sequential TextMAS | **268/300** | **89.33%** | 4 | **67/300 (22.33%)** |
+
+All 300 pipelines and 1,200 role-result receipts are complete. Failed, incomplete,
+missing, unstarted and unconfirmed counts are zero. All capped pipelines remain
+in the denominator; the length flag means any role, not necessarily the Judger.
+The historical context slice and stripped Judger normal-content final are preserved.
+No answer repair, alternate extraction, cap change or rerun was performed.
+
+The baseline remains 174/300. The descriptive difference is 94 correct items or
+31.33 percentage points on the same cohort, not a paired-win count, causal effect
+or significance result. Four calls versus one are **not budget matched**.
+Provider totals are 1,637,784 prompt and 1,925,873 completion tokens. Missing cache
+and nested reasoning details remain unknown. Driver wall time is 1525.444 seconds,
+separate from the overlapping request-latency sum and not isolated GPU time.
+This is ordinary HTTP TextMAS, not native OCC-3 or a clinical reliability claim.
+See [MEDQA_TEXTMAS_SEQUENTIAL.md](MEDQA_TEXTMAS_SEQUENTIAL.md) for source/cohort
+bindings, strict scoring, accounting and sanitized evidence.
 
 ## Caveats
 
@@ -260,8 +283,8 @@ metric limits and sanitized metadata.
 
 - The `latent_mas` condition, because it needs model internals.
 - HumanEval+, MBPP+, ARC-Easy, ARC-Challenge and GSM8K-300 have no published result
-  here. MedQA baseline is complete above; its TextMAS sequential run is in progress
-  and its hierarchical condition is not complete. Manifests are listed in `MANIFESTS.json`.
+  here. MedQA baseline and TextMAS sequential are complete above; its hierarchical
+  condition is not run. Manifests are listed in `MANIFESTS.json`.
 - OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
   The later item-0 smoke failed and remains separate from these denominators.
 - AIME and GPQA at a higher token cap.
@@ -288,6 +311,8 @@ metric limits and sanitized metadata.
 | `results/gpqa_textmas_hierarchical_safe.json` | Sanitized hierarchical score, coverage, hashes, timing and usage; no answer content |
 | `MEDQA_BASELINE.md` | Completed 300-item single-agent baseline, strict historical scoring and accounting |
 | `results/medqa_baseline_safe.json` | Sanitized MedQA baseline score, coverage, hashes, timing and usage; no answer content |
+| `MEDQA_TEXTMAS_SEQUENTIAL.md` | Completed 300-item HTTP TextMAS sequential result, strict historical scoring and unequal-budget limits |
+| `results/medqa_textmas_sequential_safe.json` | Sanitized MedQA sequential score, coverage, hashes, timing and usage; no answer content |
 | `occ3-activation-notes.md` | Root-cause notes for OCC-3 activation on the DGX (settings keys and the per-chat `occ.json` preference) |
 
 ## Reproduce
@@ -300,9 +325,10 @@ offline scorer. Its exact source and artifact pins are in
 [GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md) and
 [GPQA_TEXTMAS_HIERARCHICAL.md](GPQA_TEXTMAS_HIERARCHICAL.md). Do not use the
 historical retry/resume driver to overwrite or supplement these frozen results.
-The new MedQA baseline likewise uses a separate source-pinned, question-only
-noncode driver with one-attempt receipts and sealed offline scoring; its exact
-pins and differences are in [MEDQA_BASELINE.md](MEDQA_BASELINE.md).
+The new MedQA baseline and sequential conditions likewise use a separate
+source-pinned, question-only noncode driver with one-attempt receipts and sealed
+offline scoring. Exact pins and differences are in [MEDQA_BASELINE.md](MEDQA_BASELINE.md)
+and [MEDQA_TEXTMAS_SEQUENTIAL.md](MEDQA_TEXTMAS_SEQUENTIAL.md).
 
 - Historical main conditions:
   1. Put the LatentMAS repo at `9a9e4d3` in `../LatentMAS`.
