@@ -399,14 +399,18 @@ def guard_synthetic_backend(collected_texts: list[str], model: str) -> str | Non
 
 
 def parent_spawn_prompt(speaker_name: str, listener_name: str) -> str:
-    return f"""You are the setup agent for a two-agent benchmark trial. Your only job is to spawn two subagents with the rlm skill and then finish.
+    return f"""You are the setup agent for a two-agent benchmark trial. Your only job is to spawn two subagents with the rlm skill, keep your session alive, and then finish your turn.
 
 In your Python kernel run exactly these two spawns (both children inherit your model; do not request a different model):
 
 handle_l = await rlm({STANDBY_PROMPT!r}, name={listener_name!r})
 handle_s = await rlm({STANDBY_PROMPT!r}, name={speaker_name!r})
 
-Do not modify the sub-task text. Do not send the children any messages. Do not inspect them. After both admissions return, reply with exactly:
+Do not modify the sub-task text. Do not send the children any messages. Do not inspect them. After both admissions return, keep your session alive by launching a NON-BLOCKING long-lived shell handle in your Python kernel with exactly:
+
+h = bash('ping -n 7200 127.0.0.1')
+
+It returns immediately with a handle. Do NOT wait for it, do NOT inspect it, do NOT close it. Then reply with exactly:
 DONE {speaker_name}=<its rlm_child_id> {listener_name}=<its rlm_child_id>"""
 
 
@@ -647,7 +651,8 @@ class LiveHarness:
     def __init__(self, cli: str, model: str, run_dir: Path, answer_timeout_s: float,
                  send_timeout_s: float, verbose: bool = False,
                  sessions_dir: str | None = None,
-                 daemon_socket: str = r"\\.\pipe\optimus-assistant"):
+                 daemon_socket: str = r"\\.\pipe\optimus-assistant",
+                 spawn_timeout_s: float = 900.0):
         self.cli = cli
         self.model = model
         self.run_dir = run_dir
@@ -656,7 +661,9 @@ class LiveHarness:
         self.verbose = verbose
         self.sessions_dir = sessions_dir
         self.daemon_socket = daemon_socket
+        self.spawn_timeout_s = spawn_timeout_s
         self.stage_outputs: list[str] = []
+        self._parent_proc: subprocess.Popen | None = None
 
     def _provider_model_flags(self) -> list[str]:
         # The CLI takes --provider and --model as SEPARATE flags; a compound
@@ -668,7 +675,7 @@ class LiveHarness:
             return ["--provider", prov, "--model", mid]
         return ["--model", self.model]
 
-    def _run(self, args: list[str], timeout: float, check: bool = True) -> subprocess.CompletedProcess:
+    def _build_cmd(self, args: list[str]) -> list[str]:
         # Position-aware daemon-socket wiring (root-probed 2026-11-09): a global
         # flag BEFORE a subcommand demotes the rest to a run-mode PROMPT, so for
         # subcommands the flag must come after the subcommand name; before
@@ -680,6 +687,10 @@ class LiveHarness:
                 cmd = [self.cli, args[0], "--daemon-socket", self.daemon_socket, *args[1:]]
             elif args[0] in ("-p", "--print"):
                 cmd = [self.cli, "--daemon-socket", self.daemon_socket, *args]
+        return cmd
+
+    def _run(self, args: list[str], timeout: float, check: bool = True) -> subprocess.CompletedProcess:
+        cmd = self._build_cmd(args)
         if self.verbose:
             print(f"  [cli] {' '.join(args[:6])}{' ...' if len(args) > 6 else ''}", flush=True)
         try:
@@ -749,6 +760,22 @@ class LiveHarness:
         target.write_text(json.dumps(preference) + "\n", encoding="utf-8")
         return target
 
+    def _kill_held_parent(self) -> None:
+        """Kill the held parent CLI if it is still running (idempotent)."""
+        if self._parent_proc is not None and self._parent_proc.poll() is None:
+            self._parent_proc.kill()
+
+    def _done_marker_seen(self, session_file: str | Path | None, marker: str) -> bool:
+        """Pure transcript check (no subprocess): True when an assistant
+        message in the session file contains the DONE marker."""
+        if not session_file:
+            return False
+        records = parse_session_records(session_file)
+        return any(
+            _role(m) == "assistant" and marker in _message_text(m)
+            for m in records
+        )
+
     # -- one trial ---------------------------------------------------------
 
     def run_trial(self, arm: str, task: dict, trial_index: int) -> dict:
@@ -812,25 +839,55 @@ class LiveHarness:
                 })
                 raise
 
-        # 1. parent spawn turn ------------------------------------------------
+        # 1. parent spawn turn (held parent) ----------------------------------
         def _spawn_parent():
+            # A mid-trial failure skips the cleanup stage and would orphan the
+            # previous attempt's held parent CLI; sweep any leftover first.
+            self._kill_held_parent()
             _spawn_started_at = time.time()
             before = {s.get("activeSessionId") or s.get("sessionId") for s in self.list_sessions()}
             prompt = parent_spawn_prompt(speaker_name, listener_name)
-            self._run(
-                ["--print", *self._provider_model_flags(), "--cwd", str(self.run_dir), prompt],
-                timeout=900,
+            # A one-shot --print session ARCHIVES when its turn completes,
+            # which aborts its children and makes the parent unreachable for
+            # rename (run4 evidence 2026-11-09). The parent now holds a
+            # non-blocking keep-alive bash handle, so it stays live: launch it
+            # in the background, poll its transcript for the DONE marker, and
+            # kill the process handle at cleanup.
+            self._parent_proc = subprocess.Popen(
+                self._build_cmd(["--print", *self._provider_model_flags(), "--cwd", str(self.run_dir), prompt]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
             )
-            sessions = self.list_sessions()
+            done_marker = f"DONE {speaker_name}"
+            sessions = []
             children: dict[str, dict] = {}
             parent = None
-            for entry in sessions:
-                name = entry.get("sessionName") or entry.get("name") or ""
-                sid = entry.get("activeSessionId") or entry.get("sessionId")
-                if name in (speaker_name, listener_name) and sid not in before:
-                    children[name] = entry
-                elif sid not in before and entry.get("cwd") == str(self.run_dir):
-                    parent = entry
+            deadline = time.perf_counter() + self.spawn_timeout_s
+            while time.perf_counter() < deadline:
+                sessions = self.list_sessions()
+                children = {}
+                parent = None
+                for entry in sessions:
+                    name = entry.get("sessionName") or entry.get("name") or ""
+                    sid = entry.get("activeSessionId") or entry.get("sessionId")
+                    if name in (speaker_name, listener_name) and sid not in before:
+                        children[name] = entry
+                    elif sid not in before and entry.get("cwd") == str(self.run_dir):
+                        parent = entry
+                if parent is None:
+                    # fall back: the remaining new session
+                    new = [s for s in sessions if (s.get("activeSessionId") or s.get("sessionId")) not in before]
+                    parent = next((s for s in new if (s.get("sessionName") or s.get("name")) not in (speaker_name, listener_name)), None)
+                if parent is not None and len(children) == 2 and self._done_marker_seen(parent.get("sessionFile"), done_marker):
+                    break
+                time.sleep(5)
+            else:
+                self._kill_held_parent()
+                raise CliError("parent spawn: DONE marker not seen in time")
             missing = {speaker_name, listener_name} - set(children)
             if missing and self.sessions_dir and os.path.isdir(self.sessions_dir):
                 # Filesystem fallback: children spawned since the snapshot
@@ -1064,6 +1121,8 @@ class LiveHarness:
         # 10. cleanup (best effort) ---------------------------------------------
         def _cleanup():
             self._run(["stop", parent_name], timeout=120, check=False)
+            # Belt-and-braces: kill the held parent process if it is still running.
+            self._kill_held_parent()
             return True
 
         stage("cleanup", _cleanup)
@@ -1382,6 +1441,7 @@ def run_matrix(args) -> int:
         verbose=args.verbose,
         sessions_dir=args.sessions_dir,
         daemon_socket=args.daemon_socket,
+        spawn_timeout_s=args.spawn_timeout,
     )
     preflight = harness.preflight()
     print(f"preflight: cli={Path(args.cli).name} daemon_keys={sorted(preflight['daemon_status'])[:6]}")
@@ -1451,6 +1511,9 @@ def run_matrix(args) -> int:
                 flush=True,
             )
 
+    # Final belt-and-braces: never leave the last trial's held parent CLI running.
+    harness._kill_held_parent()
+
     agg = aggregate(trials)
     out_json.write_text(json.dumps(agg, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
     print(f"wrote {out_json} and appended {len(trials)} trials to {out_jsonl}")
@@ -1488,6 +1551,8 @@ def main() -> int:
     run.add_argument("--sessions-dir", default=os.environ.get("OPTIMUS_SESSIONS_DIR"),
                      help="daemon sessions dir; enables the filesystem fallback for child discovery")
     run.add_argument("--answer-timeout", type=float, default=900.0)
+    run.add_argument("--spawn-timeout", type=float, default=900.0,
+                    help="seconds to wait for the held parent's DONE marker")
     run.add_argument("--send-timeout", type=float, default=600.0)
     run.add_argument("--max-trials", type=int, default=2,
                     help="infra-level trial attempts (never retries wrong answers)")
