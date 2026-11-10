@@ -911,10 +911,12 @@ impl Component for SettingsSelectorComponent {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::modes::interactive::theme::theme::init_theme;
     use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
     use std::sync::Arc;
 
     fn config() -> SettingsConfig {
+        init_theme(Some("prime"), false);
         SettingsConfig {
             auto_compact: true,
             idle_eviction_minutes: IdleEvictionMinutes::Minutes(90.0),
@@ -1148,6 +1150,7 @@ mod tests {
 
     #[test]
     fn the_select_submenu_marks_the_current_value_and_selects_it() {
+        init_theme(Some("prime"), false);
         let selected = Rc::new(RefCell::new(Vec::<String>::new()));
         let sink = Rc::clone(&selected);
         let mut submenu = SelectSubmenu::new(
@@ -1181,6 +1184,7 @@ mod tests {
 
     #[test]
     fn the_select_submenu_omits_an_empty_description_block() {
+        init_theme(Some("prime"), false);
         let mut submenu = SelectSubmenu::new(
             "Theme",
             "",

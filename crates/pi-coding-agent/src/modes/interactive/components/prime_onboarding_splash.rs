@@ -643,6 +643,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn component(options: PrimeOnboardingSplashOptions) -> PrimeOnboardingSplashComponent {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         PrimeOnboardingSplashComponent::new(Box::new(|| {}), Box::new(|| {}), options)
     }
 
