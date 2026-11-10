@@ -1,0 +1,2 @@
+- Fixed first-run and OAuth completion screens to identify Optimus as a Telemus AI product, including the Telemus tesseract on browser authentication pages.
+- Changed remaining active agent identity prompts, client display names, and bundled setup/support entrypoints to use the Optimus fork branding while retaining accurate external provider names and upstream credits.

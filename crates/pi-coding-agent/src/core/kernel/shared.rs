@@ -54,7 +54,7 @@ pub const KERNEL_BUSY_REUSE_WAIT_MS: u64 = 15_000;
 pub const KERNEL_BUSY_INTERRUPT_INTERVAL_MS: u64 = 500;
 pub const MAX_LATE_SENT_AGENT_MESSAGE_HANDLERS: usize = 256;
 pub const KERNEL_BUSY_AFTER_INTERRUPT_MESSAGE: &str =
-    "The Python kernel is still busy after Prime requested an interrupt. Wait to preserve state, or explicitly kill and restart the kernel.";
+    "The Python kernel is still busy after Optimus requested an interrupt. Wait to preserve state, or explicitly kill and restart the kernel.";
 
 /// Boxed future used by the [`KernelClient`] trait so it stays object-safe without
 /// pulling `async-trait` into this crate.

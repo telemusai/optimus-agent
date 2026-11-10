@@ -669,7 +669,7 @@ impl SettingsSelectorComponent {
             true_false_item(
                 "builtin-skills",
                 "Built-in skills",
-                "Load built-in skills shipped with prime-agent (takes effect after reload)",
+                "Load built-in skills shipped with Optimus (takes effect after reload)",
                 config.enable_builtin_skills,
             ),
         );

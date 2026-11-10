@@ -1255,7 +1255,7 @@ async fn ensure_uv(options: &EnsureKernelPythonOptions) -> Result<String, Kernel
     let should_install_uv = install_flag == "1" || (options.on_progress.is_none() && confirm_uv_install().await);
     if !should_install_uv {
         return Err(KernelError::new(format!(
-            "uv is required to set up the Python kernel. Install uv yourself: {UV_INSTALL_COMMAND}, or set PRIME_AGENT_INSTALL_UV=1 to let prime-agent run that installer."
+            "uv is required to set up the Python kernel. Install uv yourself: {UV_INSTALL_COMMAND}, or set PRIME_AGENT_INSTALL_UV=1 to let Optimus run that installer."
         )));
     }
 
@@ -1272,7 +1272,7 @@ async fn ensure_uv(options: &EnsureKernelPythonOptions) -> Result<String, Kernel
     .await
     {
         return Err(KernelError::new(format!(
-            "couldn't install uv from astral.sh; install it yourself: {UV_INSTALL_COMMAND}, then re-run prime-agent. {error}"
+            "couldn't install uv from astral.sh; install it yourself: {UV_INSTALL_COMMAND}, then re-run optimus-agent. {error}"
         )));
     }
 
@@ -1297,7 +1297,7 @@ async fn confirm_uv_install() -> bool {
     use std::io::Write;
     let _ = write!(
         std::io::stderr(),
-        "Prime Agent needs uv to set up Python. Install uv from astral.sh now? [Y/n] "
+        "Optimus needs uv to set up Python. Install uv from astral.sh now? [Y/n] "
     );
     let _ = std::io::stderr().flush();
     let mut line = String::new();
@@ -1777,7 +1777,7 @@ async fn kernel_ready(
 
 fn format_bootstrap_failure(error: &KernelError) -> KernelError {
     KernelError::new(format!(
-        "Failed to set up the Python kernel runtime. {error}\nFirst-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, prime-agent runs offline. Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap."
+        "Failed to set up the Python kernel runtime. {error}\nFirst-time setup needs internet to install uv, Python, prime-agent-runtime, and default Python packages; once set up, Optimus runs offline. Set PRIME_AGENT_KERNEL_PYTHON to a Python with a current prime-agent-runtime and default Python packages installed to skip auto-bootstrap."
     ))
 }
 

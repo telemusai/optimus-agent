@@ -55,7 +55,7 @@ trap 'preview_signal_cleanup 143' TERM
 
 i=0
 while [ "$i" -lt "$1" ]; do
-	prime_agent_screen "Installing Prime Agent" "Downloading Prime Agent$(prime_agent_pulse)" "Fetching the verified package." ""
+	prime_agent_screen "Installing Optimus by Telemus AI" "Downloading Optimus$(prime_agent_pulse)" "Fetching the verified package." ""
 	sleep 0.18
 	i=$((i + 1))
 done

@@ -1119,7 +1119,7 @@ async fn run_rename(
     let active_session_id = require_active_session_id(args)?;
     let name = args[1.min(args.len())..].join(" ").trim().to_string();
     if name.is_empty() {
-        return Err("Usage: prime-agent rename <agent> <name>".to_string());
+        return Err("Usage: optimus-agent rename <agent> <name>".to_string());
     }
     let response = request(
         client,
@@ -1326,7 +1326,7 @@ pub fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs, String> {
     }
 
     if explicit_message.is_some() && !message_parts.is_empty() {
-        return Err("Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]".to_string());
+        return Err("Usage: optimus-agent send [--from <agent>] <agent> [--message <message>|<message>]".to_string());
     }
     let message = explicit_message
         .unwrap_or_else(|| message_parts.join(" "))
@@ -1336,7 +1336,7 @@ pub fn parse_send_args(args: &[String]) -> Result<ParsedSendArgs, String> {
         Some(target) if !message.is_empty() => target,
         _ => {
             return Err(
-                "Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]".to_string(),
+                "Usage: optimus-agent send [--from <agent>] <agent> [--message <message>|<message>]".to_string(),
             )
         }
     };
@@ -1417,16 +1417,16 @@ async fn run_cron(
         let separator = args.iter().position(|arg| arg == "--");
         let separator = match separator {
             Some(separator) => separator,
-            None => return Err("Usage: prime-agent schedule add <agent> <schedule> -- <message>".to_string()),
+            None => return Err("Usage: optimus-agent schedule add <agent> <schedule> -- <message>".to_string()),
         };
         let active_session_id = match args.get(1) {
             Some(active_session_id) => active_session_id.clone(),
-            None => return Err("Usage: prime-agent schedule add <agent> <schedule> -- <message>".to_string()),
+            None => return Err("Usage: optimus-agent schedule add <agent> <schedule> -- <message>".to_string()),
         };
         let schedule = args[2.min(separator)..separator].join(" ").trim().to_string();
         let message = args[separator + 1..].join(" ").trim().to_string();
         if schedule.is_empty() || message.is_empty() {
-            return Err("Usage: prime-agent schedule add <agent> <schedule> -- <message>".to_string());
+            return Err("Usage: optimus-agent schedule add <agent> <schedule> -- <message>".to_string());
         }
         let response = request(
             client,
@@ -1457,7 +1457,7 @@ async fn run_cron(
     if subcommand == "cancel" || subcommand == "delete" || subcommand == "remove" {
         let job_id = match args.get(1) {
             Some(job_id) => job_id.clone(),
-            None => return Err("Usage: prime-agent schedule cancel <job-id>".to_string()),
+            None => return Err("Usage: optimus-agent schedule cancel <job-id>".to_string()),
         };
         let response = request(client, serde_json::json!({ "type": "cron_cancel", "jobId": job_id })).await?;
         let data = require_success(&response)?;
@@ -1552,7 +1552,7 @@ async fn run_shutdown(
 }
 
 fn run_help(io: &DaemonCommandIo<'_>) -> Result<(), String> {
-    (io.log)("Usage: prime-agent daemon <command> [args...]");
+    (io.log)("Usage: optimus-agent daemon <command> [args...]");
     (io.log)(&format!("Commands: {}", DAEMON_CLIENT_COMMANDS.join(", ")));
     Ok(())
 }
@@ -2944,10 +2944,10 @@ mod tests {
             parse_send_args(&args(&["a", "--nope"])).unwrap_err(),
             "Unknown option for send: --nope (use -- before message text starting with --)"
         );
-        assert_eq!(parse_send_args(&args(&["a"])).unwrap_err(), "Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]");
+        assert_eq!(parse_send_args(&args(&["a"])).unwrap_err(), "Usage: optimus-agent send [--from <agent>] <agent> [--message <message>|<message>]");
         assert_eq!(
             parse_send_args(&args(&["a", "text", "--message", "other"])).unwrap_err(),
-            "Usage: prime-agent send [--from <agent>] <agent> [--message <message>|<message>]"
+            "Usage: optimus-agent send [--from <agent>] <agent> [--message <message>|<message>]"
         );
     }
 
@@ -3087,7 +3087,7 @@ mod tests {
         };
         assert!(run_help(&io).is_ok());
         let logged = logged.borrow();
-        assert_eq!(logged[0], "Usage: prime-agent daemon <command> [args...]");
+        assert_eq!(logged[0], "Usage: optimus-agent daemon <command> [args...]");
         assert!(logged[1].starts_with("Commands: start, ps, list, create"));
     }
 

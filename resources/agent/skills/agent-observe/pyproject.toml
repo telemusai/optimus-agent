@@ -1,7 +1,7 @@
 [project]
 name = "agent-observe"
 version = "0.1.0"
-description = "Read-only Prime Agent session observation skill"
+description = "Read-only Optimus session observation skill"
 requires-python = ">=3.10"
 
 [build-system]
