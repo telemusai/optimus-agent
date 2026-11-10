@@ -1,0 +1,115 @@
+{
+  "meta": {
+    "campaign_id": "occ3-bench-opt-20261109",
+    "protocol": "four-way adapter: TXT / OCC-1 / OCC-2 / OCC-3-native over real daemon sessions",
+    "schema": "optimus.four-way-trial.v1",
+    "model": "dgx-glm53-occ3/glm-5.3",
+    "seed": 42,
+    "tasks_file": "research\\tasks\\tasks_dev.json",
+    "generated": "2026-11-10T02:46:58",
+    "num_trials": 5,
+    "notes": [
+      "historical_* metrics use research/tasks/checkers.py exactly as the 2026-10-16 baseline runner did",
+      "strict_* metrics are separately named byte/field equality and are never conflated with historical",
+      "effective channel labels come from the receiver's durable delivery record, not the requested arm"
+    ]
+  },
+  "cells": {
+    "txt": {
+      "n_trials": 5,
+      "historical_accuracy": null,
+      "historical_lenient_accuracy": null,
+      "strict_exact_accuracy": null,
+      "strict_field_match_accuracy": null,
+      "terminal_error_rate": 1.0,
+      "wire_bytes": {
+        "count": 0
+      },
+      "duration_s": {
+        "count": 0
+      }
+    },
+    "occ1": {
+      "n_trials": 0,
+      "historical_accuracy": null,
+      "historical_lenient_accuracy": null,
+      "strict_exact_accuracy": null,
+      "strict_field_match_accuracy": null,
+      "terminal_error_rate": null,
+      "wire_bytes": {
+        "count": 0
+      },
+      "duration_s": {
+        "count": 0
+      }
+    },
+    "occ2": {
+      "n_trials": 0,
+      "historical_accuracy": null,
+      "historical_lenient_accuracy": null,
+      "strict_exact_accuracy": null,
+      "strict_field_match_accuracy": null,
+      "terminal_error_rate": null,
+      "wire_bytes": {
+        "count": 0
+      },
+      "duration_s": {
+        "count": 0
+      }
+    },
+    "occ3": {
+      "n_trials": 0,
+      "historical_accuracy": null,
+      "historical_lenient_accuracy": null,
+      "strict_exact_accuracy": null,
+      "strict_field_match_accuracy": null,
+      "terminal_error_rate": null,
+      "wire_bytes": {
+        "count": 0
+      },
+      "duration_s": {
+        "count": 0
+      },
+      "native_success_rate": null,
+      "native_fallback_rate": null
+    }
+  },
+  "per_family": {
+    "txt|A": {
+      "n": 1,
+      "historical_accuracy": null,
+      "strict_exact_accuracy": null
+    },
+    "txt|B": {
+      "n": 1,
+      "historical_accuracy": null,
+      "strict_exact_accuracy": null
+    },
+    "txt|C": {
+      "n": 1,
+      "historical_accuracy": null,
+      "strict_exact_accuracy": null
+    },
+    "txt|D": {
+      "n": 1,
+      "historical_accuracy": null,
+      "strict_exact_accuracy": null
+    },
+    "txt|E": {
+      "n": 1,
+      "historical_accuracy": null,
+      "strict_exact_accuracy": null
+    }
+  },
+  "delivered_channel_distribution": {
+    "txt": {
+      "null": 5
+    },
+    "occ1": {},
+    "occ2": {},
+    "occ3": {}
+  },
+  "guards": {
+    "legacy_410": 5
+  }
+}
