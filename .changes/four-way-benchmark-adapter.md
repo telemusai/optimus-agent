@@ -34,6 +34,14 @@ live CLI harness that drives real optimus-agent daemon sessions.
   spawn-timeout stops that attempt's already-discovered children.
 - Offline selftest extended from 36 to 47 checks (spawn-settled decision table,
   stand-by prompt embedding, transcript signature, no-op sweep).
+- Legacy-410 guard scoped to transport-command outputs (fixwave1 probe: the
+  `list --all --json` roster polls carry an idle session's firstMessage
+  "legacy /occ3/v1/send|recv|release return 410", so guard_legacy_410 fired on
+  100% of run records, txt arms included). The two `send` turns now run with
+  `transport=True`; only their outputs (timeout notes included) feed the new
+  guard_outputs list the guard scans, while stage_outputs stays the full
+  diagnostic log. Selftest extended from 47 to 48 checks: a roster dump does not
+  trip the scoped guard; the same string from a transport command does.
 
 NOT-RUN: live four-way trials after the held-parent and completion/standby fixes
 (smoke runs 1-5 all failed at the spawn stage; both fixes are offline-verified only,

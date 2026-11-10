@@ -683,6 +683,10 @@ class LiveHarness:
         self.spawn_timeout_s = spawn_timeout_s
         self.parent_quiet_s = parent_quiet_s
         self.stage_outputs: list[str] = []
+        # Transport-scoped subset fed to guard_legacy_410 (see _run): the full
+        # stage_outputs log also collects roster dumps, whose unrelated
+        # sessions' firstMessages can mention legacy routes + 410.
+        self.guard_outputs: list[str] = []
         self._parent_proc: subprocess.Popen | None = None
         # Named sessions owned by the trial currently in flight (children then
         # parent); swept best-effort at cleanup and on any trial failure.
@@ -712,7 +716,14 @@ class LiveHarness:
                 cmd = [self.cli, "--daemon-socket", self.daemon_socket, *args]
         return cmd
 
-    def _run(self, args: list[str], timeout: float, check: bool = True) -> subprocess.CompletedProcess:
+    def _run(self, args: list[str], timeout: float, check: bool = True,
+             transport: bool = False) -> subprocess.CompletedProcess:
+        # transport=True tags a command that exercises the message-transport
+        # path (the CLI `send` turns). Only transport outputs reach
+        # self.guard_outputs, the list guard_legacy_410 scans, so roster dumps
+        # (list --all --json carries every session's firstMessage, and an
+        # unrelated idle session mentions legacy /occ3/v1 routes + 410)
+        # cannot trip the guard; stage_outputs keeps the full diagnostic log.
         cmd = self._build_cmd(args)
         if self.verbose:
             print(f"  [cli] {' '.join(args[:6])}{' ...' if len(args) > 6 else ''}", flush=True)
@@ -726,10 +737,15 @@ class LiveHarness:
                 timeout=timeout,
             )
         except subprocess.TimeoutExpired as exc:
-            self.stage_outputs.append(f"timeout: {' '.join(args[:4])}: {exc}")
+            note = f"timeout: {' '.join(args[:4])}: {exc}"
+            self.stage_outputs.append(note)
+            if transport:  # a transport timeout string may legitimately mention routes
+                self.guard_outputs.append(note)
             raise CliError(f"CLI timeout: {' '.join(args[:4])}") from exc
-        self.stage_outputs.append(proc.stdout or "")
-        self.stage_outputs.append(proc.stderr or "")
+        outputs = [proc.stdout or "", proc.stderr or ""]
+        self.stage_outputs.extend(outputs)
+        if transport:
+            self.guard_outputs.extend(outputs)
         if check and proc.returncode != 0:
             raise CliError(
                 f"CLI failed ({proc.returncode}): {' '.join(args[:4])}: "
@@ -843,7 +859,8 @@ class LiveHarness:
 
     def run_trial(self, arm: str, task: dict, trial_index: int) -> dict:
         t_start = time.perf_counter()
-        self.stage_outputs = []  # guards are evaluated per trial
+        self.stage_outputs = []  # full log, kept for diagnostics
+        self.guard_outputs = []  # transport-scoped log; guards are evaluated per trial
         trial_id = f"t{trial_index:04d}-{arm}-{task['task_id']}"
         speaker_name = f"fwS{trial_index:04d}"
         listener_name = f"fwL{trial_index:04d}"
@@ -1072,6 +1089,7 @@ class LiveHarness:
             self._run(
                 ["send", listener_name, "--message", listener_setup_prompt(task, speaker_name)],
                 timeout=600,
+                transport=True,
             )
             deadline = time.perf_counter() + self.send_timeout_s
             while time.perf_counter() < deadline:
@@ -1093,6 +1111,7 @@ class LiveHarness:
             self._run(
                 ["send", speaker_name, "--message", prompt],
                 timeout=900,
+                transport=True,
             )
             return True
 
@@ -1200,7 +1219,7 @@ class LiveHarness:
         }
 
         # 9. guards -------------------------------------------------------------
-        record["guards"]["legacy_410"] = guard_legacy_410(self.stage_outputs)
+        record["guards"]["legacy_410"] = guard_legacy_410(self.guard_outputs)
         record["guards"]["mislabel"] = guard_mislabel(arm, record["effective_label_alpha"] or "", record["native_success"])
         record["guards"]["synthetic_backend"] = guard_synthetic_backend(
             [json.dumps(record["delivery"]), json.dumps(record["identities"]), self.model],
@@ -1436,6 +1455,40 @@ def dry_selftest(tasks_per_family: int, cli: str, model: str) -> tuple[bool, lis
     except Exception as exc:  # noqa: BLE001 - selftest must report, not crash
         check("sweep_noop_offline", False, f"{type(exc).__name__}: {exc}")
 
+    # 13. legacy-410 guard scoped to transport-command outputs ------------------
+    roster_dump = json.dumps({
+        "sessions": [
+            {
+                "sessionName": "C Clean up 2",
+                "activeSessionId": "01a1c082-0000-4000-8000-000000000000",
+                "firstMessage": "legacy /occ3/v1/send|recv|release return 410 (do not call them)",
+            }
+        ]
+    })
+
+    def _fake_subprocess_run(cmd, **_kwargs):  # offline: the CLI is never executed
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=roster_dump, stderr="")
+
+    _real_subprocess_run = subprocess.run
+    subprocess.run = _fake_subprocess_run
+    try:
+        probe_harness.stage_outputs = []
+        probe_harness.guard_outputs = []
+        # roster poll (list --all --json): same 410 + route text, not transport
+        probe_harness._run(["list", "--all", "--json"], timeout=5, check=False)
+        roster_only = guard_legacy_410(probe_harness.guard_outputs)
+        # the SAME string as the output of a transport command must still trip
+        probe_harness._run(["send", "fwL0001", "--message", "ping"], timeout=5, check=False, transport=True)
+        after_transport = guard_legacy_410(probe_harness.guard_outputs)
+        full_log_would_trip = guard_legacy_410(probe_harness.stage_outputs)
+    finally:
+        subprocess.run = _real_subprocess_run
+    check(
+        "guard_410_transport_scope",
+        roster_only is False and after_transport is True and full_log_would_trip is True,
+        f"roster_only={roster_only} after_transport={after_transport} full_log={full_log_would_trip}",
+    )
+
     print(f"selftest: {len(checks) - len(failures)}/{len(checks)} checks passed")
     for name, ok, detail in checks:
         mark = "PASS" if ok else "FAIL"
@@ -1626,7 +1679,7 @@ def run_matrix(args) -> int:
                     "model": args.model,
                     "terminal_error": f"trial_failed_after_{args.max_trials}_attempts",
                     "guards": {
-                        "legacy_410": guard_legacy_410(harness.stage_outputs),
+                        "legacy_410": guard_legacy_410(harness.guard_outputs),
                         "native_receipt_missing": arm == "occ3",
                         "mislabel": None,
                         "synthetic_backend": None,
