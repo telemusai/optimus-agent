@@ -217,7 +217,7 @@ pub fn bounded_rlm_visible_text(text: &str, max_chars: Option<usize>) -> String 
     // `slice(0, maxChars - 32)` counts UTF-16 units; the port counts chars.
     let keep = max_chars.saturating_sub(32);
     let head: String = normalized.chars().take(keep).collect();
-    format!("{}\n[truncated by Prime runtime]", head.trim_end())
+    format!("{}\n[truncated by Optimus runtime]", head.trim_end())
 }
 
 fn is_record(value: &serde_json::Value) -> bool {
@@ -554,8 +554,8 @@ mod tests {
         assert_eq!(bounded_rlm_visible_text("  short  ", None), "short");
         let long = "a".repeat(7000);
         let bounded = bounded_rlm_visible_text(&long, None);
-        assert!(bounded.ends_with("[truncated by Prime runtime]"));
-        assert_eq!(bounded.chars().count(), 6000 - 32 + "\n[truncated by Prime runtime]".chars().count());
+        assert!(bounded.ends_with("[truncated by Optimus runtime]"));
+        assert_eq!(bounded.chars().count(), 6000 - 32 + "\n[truncated by Optimus runtime]".chars().count());
     }
 
     #[test]

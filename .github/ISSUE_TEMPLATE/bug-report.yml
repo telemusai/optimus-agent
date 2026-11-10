@@ -20,7 +20,7 @@ body:
       label: Steps to reproduce
       description: Steps to reliably reproduce the issue.
       placeholder: |
-        1. Run `prime-agent ...`
+        1. Run `optimus-agent ...`
         2. ...
         3. See error
     validations:
@@ -42,16 +42,16 @@ body:
   - type: input
     id: version
     attributes:
-      label: Prime Agent version
-      description: Output of `prime-agent --version`, or the commit SHA when running from source.
-      placeholder: "e.g. 0.9.1 or 81ae3cb"
+      label: Optimus version
+      description: Output of `optimus-agent --version`, or the commit SHA when running from source.
+      placeholder: "e.g. 0.1.44 or 62677f0"
     validations:
       required: true
   - type: dropdown
     id: install_method
     attributes:
       label: Installation method
-      description: How was this Prime Agent version installed?
+      description: How was this Optimus version installed?
       options:
         - Stable release installer
         - Native release archive

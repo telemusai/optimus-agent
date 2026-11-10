@@ -968,7 +968,7 @@ pub fn create_mcp_oauth_provider(config: McpOAuthConfig) -> OAuthProviderInterfa
                 if let Some(on_progress) = callbacks.on_progress.as_ref() {
                     on_progress("Registering OAuth client\u{2026}".to_string());
                 }
-                client_id = Some(register_client(&registration_endpoint, &format!("Prime Agent ({})", label)).await?);
+                client_id = Some(register_client(&registration_endpoint, &format!("Optimus by Telemus AI ({})", label)).await?);
             }
             let client_id = client_id.unwrap_or_default();
 

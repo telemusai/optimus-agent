@@ -5,7 +5,7 @@
 [project]
 name = "goal"
 version = "0.1.0"
-description = "Prime Agent goal skill: persistent thread goal control over the host bridge"
+description = "Optimus goal skill: persistent thread goal control over the host bridge"
 requires-python = ">=3.10"
 dependencies = []
 

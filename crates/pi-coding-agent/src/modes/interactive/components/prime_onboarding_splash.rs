@@ -183,7 +183,7 @@ impl PrimeOnboardingSplashComponent {
             .options
             .continue_action_label
             .clone()
-            .unwrap_or_else(|| "login with Prime Intellect".to_string());
+            .unwrap_or_else(|| "continue".to_string());
         vec![
             styled("Press ", "muted"),
             styled_bold("Enter", "accent"),
@@ -215,6 +215,10 @@ impl PrimeOnboardingSplashComponent {
             parts: Vec::new(),
         });
         lines.push(self.center_parts(&self.format_brand_line(), width));
+        lines.push(self.center_parts(
+            &vec![styled("by ", "muted"), styled_bold("Telemus AI", "text")],
+            width,
+        ));
         lines.push(self.center_parts(&self.format_continue_hint(), width));
 
         lines
@@ -639,6 +643,7 @@ mod tests {
     use std::sync::atomic::AtomicUsize;
 
     fn component(options: PrimeOnboardingSplashOptions) -> PrimeOnboardingSplashComponent {
+        crate::modes::interactive::theme::theme::init_theme(Some("prime"), false);
         PrimeOnboardingSplashComponent::new(Box::new(|| {}), Box::new(|| {}), options)
     }
 
@@ -658,14 +663,25 @@ mod tests {
     }
 
     #[test]
-    fn narrow_renders_still_produce_the_panel() {
+    fn narrow_renders_keep_telemus_branding_inside_the_panel() {
         let mut splash = component(PrimeOnboardingSplashOptions {
             get_rows: Some(Box::new(|| 36.0)),
             ..Default::default()
         });
-        let lines = splash.render(80.0);
-        assert_eq!(lines.len(), 36);
-        assert!(lines.iter().any(|line| !line.is_empty()));
+        for width in [24, 40, 80, 120] {
+            let lines = splash.render(width as f64);
+            assert_eq!(lines.len(), 36);
+            assert!(lines.iter().all(|line| visible_width(line) <= width));
+            let text = lines
+                .iter()
+                .map(|line| pi_tui::utils::strip_ansi(line))
+                .collect::<Vec<_>>()
+                .join("\n");
+            assert!(text.contains("Welcome to OPTIMUS"));
+            assert!(text.contains("by Telemus AI"));
+            assert!(text.contains("Press Enter to continue"));
+            assert!(!text.contains("Prime Intellect"));
+        }
     }
 
     #[test]

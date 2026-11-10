@@ -1,6 +1,6 @@
 # Optimus documentation
 
-Optimus is a Rust coding and research agent with a persistent Python runtime.
+Optimus is a Rust coding and research agent maintained by Telemus AI, with a persistent Python runtime.
 
 Start with the [root README](../../../README.md), [installation guide](../../../docs/RUST_LAUNCHER.md), and [native development guide](development.md).
 
