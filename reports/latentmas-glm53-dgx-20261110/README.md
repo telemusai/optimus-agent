@@ -12,12 +12,18 @@ It is diagnostic evidence, not an additional benchmark sample.
 
 Update: GPQA baseline is now complete (73/198). The separate 38-item continuation
 on the PR #281 overlay is documented below; the historical setup and OCC-3
-results remain unchanged.
+results remain unchanged. TextMAS sequential is also complete at **103/198
+(52.02%)**, with four calls per item; it is not a budget-matched comparison. See
+[GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md). Hierarchical execution
+is in progress and has no published score.
 
 ## Setup
 
 This table describes the historical runs. The GPQA continuation records its
-updated runtime separately in [GPQA_COMPLETION.md](GPQA_COMPLETION.md).
+updated runtime separately in [GPQA_COMPLETION.md](GPQA_COMPLETION.md). The new
+sequential result records its own execution and scoring contract in
+[GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md). Historical statistics
+and OCC-3 labels below do not describe the new HTTP TextMAS run.
 
 | Item | Value |
 |---|---|
@@ -128,6 +134,28 @@ Historical-only extraction diagnostics for indices 0-159:
 This ordinary baseline completion does not prove native OCC-3 transport or
 retirement behavior. Native acceptance and the new GSM8K run remain separate.
 
+### GPQA-Diamond TextMAS sequential (complete, 198 items)
+
+| Condition | Correct | Strict accuracy | Calls per item | Items with any length-limited role |
+|---|---:|---:|---:|---:|
+| TextMAS sequential | **103/198** | **52.02%** | 4 | **160/198 (80.81%)** |
+
+All 792 role requests have confirmed result receipts. Failed, incomplete and
+missing item counts are zero. Strict scoring preserves the upstream extractor;
+there was no answer repair, retry or higher-cap rerun. The 160 length-limited
+pipelines remain in the denominator. This counts pipelines with any capped role,
+not individual capped calls or necessarily capped Judger calls.
+
+The difference from the preserved 73/198 baseline is descriptive only. Four
+4096-token calls per item are not budget matched to one baseline call, and the
+baseline spans two runtime segments. No native OCC-3, causal quality,
+token-efficiency, speedup or paired-significance claim follows from this result.
+Provider totals are 633,590 prompt and 2,385,777 completion tokens. Missing cache
+and nested reasoning details remain unknown. The 1511.858-second driver wall
+interval is separate from overlapping role latency sums and is not GPU time.
+See [GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md) for exact accounting,
+provenance, limitations and the sanitized artifact.
+
 ## Caveats
 
 1. Token cap. 4096 completion tokens per call truncates most single-agent AIME and GPQA
@@ -181,7 +209,8 @@ retirement behavior. Native acceptance and the new GSM8K run remain separate.
 ## NOT-RUN
 
 - The `latent_mas` condition, because it needs model internals.
-- GPQA TextMAS.
+- GPQA TextMAS hierarchical has no published result yet; its run is in progress.
+  TextMAS sequential is complete above.
 - HumanEval+, MBPP+, MedQA, ARC-Easy and ARC-Challenge (300 each) and GSM8K-300. Their
   manifests are listed in `MANIFESTS.json`.
 - OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
@@ -204,11 +233,21 @@ retirement behavior. Native acceptance and the new GSM8K run remain separate.
 | `MANIFESTS.json` | Item manifest SHA-256 values, sources, counts and sampled indices |
 | `GPQA_COMPLETION.md` | Completed GPQA baseline aggregate and segmented continuation provenance |
 | `results/gpqa_baseline_160_197_safe.json` | Continuation index, truncation, usage and timing only; no answer content |
+| `GPQA_TEXTMAS_SEQUENTIAL.md` | Completed 198-item HTTP TextMAS sequential result, strict scoring and unequal-budget limits |
+| `results/gpqa_textmas_sequential_safe.json` | Sanitized sequential score, coverage, hashes, timing and usage; no answer content |
 | `occ3-activation-notes.md` | Root-cause notes for OCC-3 activation on the DGX (settings keys and the per-chat `occ.json` preference) |
 
 ## Reproduce
 
-- Main conditions:
+The commands below describe the preserved historical harness. They do not
+reproduce the new GPQA sequential driver
+(`6b7eaa11be5394870b41cdd7dbc241bdd2c85ee711570738adaef7ad7847e1af`),
+which uses question-only inputs, one-attempt receipts and a separate sealed
+offline scorer. Its exact source and artifact pins are in
+[GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md). Do not use the
+historical retry/resume driver to overwrite or supplement these frozen results.
+
+- Historical main conditions:
   1. Put the LatentMAS repo at `9a9e4d3` in `../LatentMAS`.
   2. Regenerate the manifests with the repo loaders and check them against
      `MANIFESTS.json`.
