@@ -10,7 +10,14 @@ be added to this directory. All numbers are measured. Untested items are listed 
 NOT-RUN. The post-update smoke failed; see [smoke-validation.md](smoke-validation.md).
 It is diagnostic evidence, not an additional benchmark sample.
 
+Update: GPQA baseline is now complete (73/198). The separate 38-item continuation
+on the PR #281 overlay is documented below; the historical setup and OCC-3
+results remain unchanged.
+
 ## Setup
+
+This table describes the historical runs. The GPQA continuation records its
+updated runtime separately in [GPQA_COMPLETION.md](GPQA_COMPLETION.md).
 
 | Item | Value |
 |---|---|
@@ -90,16 +97,36 @@ filename does not certify isolated scoring or completed native use):
   session's fixed 150-180 s waits between checks, so it is not comparable with the API
   latencies above.
 
-### GPQA-Diamond baseline (160 of 198 items)
+### GPQA-Diamond baseline (complete, 198 items)
 
+| Segment | Indices | Correct | Accuracy | Length-limited |
+|---|---:|---:|---:|---:|
+| Historical baseline | 0-159 | 48/160 | 30.00% | 103/160 |
+| PR #281 overlay continuation | 160-197 | 25/38 | 65.79% | 12/38 |
+| Combined | 0-197 | **73/198** | **36.87%** | **115/198 (58.08%)** |
+
+The remaining 38 items completed at 2026-11-10 14:01 UTC. The original 160 rows
+were preserved and their joins/scoring rechecked offline. All capped responses
+remain in the denominator; no 16k rerun or answer repair was performed.
+
+The continuation kept the upstream prompts, actual `glm-5.3` model, 4096-token
+cap, temperature 0.6, top_p 0.95 and concurrency 16. It used a single HTTP attempt
+per item instead of the historical retry loop. The literal Qwen identity in the
+upstream prompt was retained for prompt equivalence; no Qwen model was run.
+The two question segments and runtime versions differ, so their accuracy gap is
+not evidence of an overlay quality improvement. Timing is segmented, not pooled.
+See [GPQA_COMPLETION.md](GPQA_COMPLETION.md) for provenance, token accounting,
+validation and the sanitized continuation artifact.
+
+Historical-only extraction diagnostics for indices 0-159:
 - 48/160 correct (30.0%, 95% CI 23.4-37.5%).
-- 103/160 items (64.4%) stopped at the 4096-token cap.
-- 103/160 items have no extracted answer. 102 of them were truncated.
-- 57 items have an extracted answer:
-  - 49 are option letters, and 48 of these are correct;
-  - 8 are numbers, all scored as wrong. These answers were not boxed, so the LatentMAS
-    extractor took the last number in the text.
-- At this cap, the run measures truncation more than GPQA ability.
+- 103/160 stopped at the 4096-token cap.
+- 103/160 have no extracted answer; 102 of these were truncated.
+- 57 have an extracted answer: 49 option letters (48 correct) and 8 numbers
+  (all wrong). The unboxed numeric outputs used the extractor's last-number path.
+
+This ordinary baseline completion does not prove native OCC-3 transport or
+retirement behavior. Native acceptance and the new GSM8K run remain separate.
 
 ## Caveats
 
@@ -145,7 +172,7 @@ filename does not certify isolated scoring or completed native use):
    - Item 14 of the clean run was halted for the stack update and is marked
      `invalid_stack_update_halt`.
 7. The AIME/GSM8K conditions use one sample on 14-30 items (API temperature
-   0.6). GPQA has 160 items. The small-set intervals are wide.
+   0.6). The completed GPQA baseline has 198 items across two runtime segments. The small-set intervals are wide.
 8. The GPQA authors ask that examples not be published in plain text. So
    `results/glm53_gpqa_baseline.jsonl` omits question text, options and model outputs.
    Per-item scoring fields remain. Numeric predictions are replaced by
@@ -154,7 +181,7 @@ filename does not certify isolated scoring or completed native use):
 ## NOT-RUN
 
 - The `latent_mas` condition, because it needs model internals.
-- GPQA baseline items 160-197 and GPQA TextMAS.
+- GPQA TextMAS.
 - HumanEval+, MBPP+, MedQA, ARC-Easy and ARC-Challenge (300 each) and GSM8K-300. Their
   manifests are listed in `MANIFESTS.json`.
 - OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
@@ -175,6 +202,8 @@ filename does not certify isolated scoring or completed native use):
 | `results/glm53_gsm8k_occ3_v6.jsonl` | Original diagnostic-only item-0 smoke row; its `native_hops` field counts admission, not proven completion |
 | `harness/sandbox-img/Dockerfile` | Code-task sandbox image (not used by any completed task yet) |
 | `MANIFESTS.json` | Item manifest SHA-256 values, sources, counts and sampled indices |
+| `GPQA_COMPLETION.md` | Completed GPQA baseline aggregate and segmented continuation provenance |
+| `results/gpqa_baseline_160_197_safe.json` | Continuation index, truncation, usage and timing only; no answer content |
 | `occ3-activation-notes.md` | Root-cause notes for OCC-3 activation on the DGX (settings keys and the per-chat `occ.json` preference) |
 
 ## Reproduce
