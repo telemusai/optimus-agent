@@ -20,6 +20,21 @@ live CLI harness that drives real optimus-agent daemon sessions.
   non-blocking keep-alive bash handle, the adapter runs the parent CLI as a background
   Popen polled for the DONE transcript marker (new `--spawn-timeout`, default 900 s),
   and kills the CLI at cleanup, on retry, and at run end.
+- Spawn completion no longer requires the literal DONE marker (run5 2026-11-10,
+  run_id 20261110-001625-7ed39d: 10/10 attempts timed out because the parent ended
+  its turn with a frozen transcript or a prose reply). Completion is now both children
+  discovered AND (DONE marker fast path OR parent transcript unchanged for 60 s after
+  both children appeared OR roster activity "idle" on two consecutive 5 s polls);
+  the 900 s ceiling and the timeout kill sweep are unchanged.
+- Stand-by children launch the same non-blocking keep-alive bash handle as the parent
+  before replying READY (run5 probe: one-shot children archived right after READY, so
+  the CLI `send` stage could not resolve them: "Unknown active session" by name and
+  id). Because active children never archive themselves, cleanup now sweeps the
+  trial's children by name at trial end, on every retry, and at run end, and a
+  spawn-timeout stops that attempt's already-discovered children.
+- Offline selftest extended from 36 to 47 checks (spawn-settled decision table,
+  stand-by prompt embedding, transcript signature, no-op sweep).
 
-NOT-RUN: live four-way trials after the held-parent fix (pre-fix smoke runs all hit
-the parent-archival wall; the fix is offline-verified only).
+NOT-RUN: live four-way trials after the held-parent and completion/standby fixes
+(smoke runs 1-5 all failed at the spawn stage; both fixes are offline-verified only,
+47/47 selftest checks, py_compile clean).

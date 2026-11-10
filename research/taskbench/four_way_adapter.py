@@ -123,7 +123,25 @@ DRY_RESULTS_JSON = HERE / "four_way_dry_results.json"
 OCC2_OCC1_PREFERENCE = {"schema": "optimus.occ-session.v1", "occ2Enabled": True, "occ3Enabled": False}
 OCC1_OCC2_OFF_PREFERENCE = {"schema": "optimus.occ-session.v1", "occ2Enabled": False, "occ3Enabled": False}
 
-STANDBY_PROMPT = "Stand by for the benchmark. Reply READY and nothing else."
+# Run5 evidence (2026-11-10, run_id 20261110-001625-7ed39d): one-shot children
+# archive themselves right after their READY turn, so the later CLI `send`
+# cannot resolve them ("Unknown active session: fwL0001", by name AND id).
+# Probe-verified: a session holding a non-blocking keep-alive bash handle
+# stays live and roster-active (the held-parent pattern). The stand-by task
+# therefore makes each child launch that same handle before replying READY.
+STANDBY_PROMPT = (
+    "Stand by for the benchmark. First keep your session alive: from your "
+    "Python kernel launch a NON-BLOCKING long-lived shell handle with exactly "
+    "h = bash('ping -n 7200 127.0.0.1') (it returns immediately with a handle; "
+    "do NOT wait for it, do NOT inspect it, do NOT close it). Then reply "
+    "READY and nothing else."
+)
+
+# Run5 evidence: parents finish their turn without writing the literal DONE
+# marker (transcript frozen after the thinking block, or a prose reply), so
+# spawn completion also accepts a quiet or idle parent once both children
+# have been discovered.
+PARENT_QUIET_S = 60.0
 
 # ---------------------------------------------------------------------------
 # Task loading + checkers (reused verbatim from the existing framework)
@@ -652,7 +670,8 @@ class LiveHarness:
                  send_timeout_s: float, verbose: bool = False,
                  sessions_dir: str | None = None,
                  daemon_socket: str = r"\\.\pipe\optimus-assistant",
-                 spawn_timeout_s: float = 900.0):
+                 spawn_timeout_s: float = 900.0,
+                 parent_quiet_s: float = PARENT_QUIET_S):
         self.cli = cli
         self.model = model
         self.run_dir = run_dir
@@ -662,8 +681,12 @@ class LiveHarness:
         self.sessions_dir = sessions_dir
         self.daemon_socket = daemon_socket
         self.spawn_timeout_s = spawn_timeout_s
+        self.parent_quiet_s = parent_quiet_s
         self.stage_outputs: list[str] = []
         self._parent_proc: subprocess.Popen | None = None
+        # Named sessions owned by the trial currently in flight (children then
+        # parent); swept best-effort at cleanup and on any trial failure.
+        self._trial_sessions: list[str] = []
 
     def _provider_model_flags(self) -> list[str]:
         # The CLI takes --provider and --model as SEPARATE flags; a compound
@@ -776,6 +799,46 @@ class LiveHarness:
             for m in records
         )
 
+    @staticmethod
+    def _transcript_signature(session_file: str | Path | None) -> tuple[int, float] | None:
+        """(size, mtime) of a session transcript; None when absent/unreadable."""
+        if not session_file:
+            return None
+        try:
+            stat = Path(session_file).stat()
+        except OSError:
+            return None
+        return (stat.st_size, stat.st_mtime)
+
+    @staticmethod
+    def _spawn_settled(both_seen_at: float | None, sig: tuple[int, float] | None,
+                       sig_at: float | None, idle_polls: int, now: float,
+                       quiet_s: float) -> bool:
+        """Spawn-completion decision once both children are discovered.
+
+        The DONE marker is checked separately as the fast path. Here the
+        parent counts as settled when it stopped producing output: the roster
+        reported activity "idle" on two consecutive polls (5 s apart; run5
+        mode (a): the parent never writes any final assistant text), or its
+        transcript signature was unchanged for quiet_s AND at least quiet_s
+        passed since both children appeared (run5 mode (b): prose reply)."""
+        if idle_polls >= 2:
+            return True
+        if both_seen_at is None or sig is None or sig_at is None:
+            return False
+        return (now - both_seen_at >= quiet_s) and (now - sig_at >= quiet_s)
+
+    def sweep_trial_sessions(self) -> None:
+        """Best-effort stop of the current trial's named sessions (idempotent).
+
+        Stand-by children hold non-blocking keep-alive bash handles, so they
+        stay roster-ACTIVE after their READY turn and never archive
+        themselves: they must be stopped by name. Order: children first, then
+        the parent session, then the held parent CLI process."""
+        for name in list(getattr(self, "_trial_sessions", []) or []):
+            self._run(["stop", name], timeout=120, check=False)
+        self._kill_held_parent()
+
     # -- one trial ---------------------------------------------------------
 
     def run_trial(self, arm: str, task: dict, trial_index: int) -> dict:
@@ -785,6 +848,9 @@ class LiveHarness:
         speaker_name = f"fwS{trial_index:04d}"
         listener_name = f"fwL{trial_index:04d}"
         parent_name = f"fwP{trial_index:04d}"
+        # Children hold keep-alive handles once spawned, so every named
+        # session of this trial must be swept at cleanup and on failure.
+        self._trial_sessions = [speaker_name, listener_name, parent_name]
         chain: list[dict] = []
         record = {
             "schema": TRIAL_SCHEMA,
@@ -851,8 +917,11 @@ class LiveHarness:
             # which aborts its children and makes the parent unreachable for
             # rename (run4 evidence 2026-11-09). The parent now holds a
             # non-blocking keep-alive bash handle, so it stays live: launch it
-            # in the background, poll its transcript for the DONE marker, and
-            # kill the process handle at cleanup.
+            # in the background, poll for completion, and kill the process
+            # handle at cleanup. Completion = both children discovered AND the
+            # parent no longer producing output: the DONE marker (fast path)
+            # or, since run5 (2026-11-10) showed parents that never write it,
+            # a quiet transcript or an idle roster entry.
             self._parent_proc = subprocess.Popen(
                 self._build_cmd(["--print", *self._provider_model_flags(), "--cwd", str(self.run_dir), prompt]),
                 stdout=subprocess.PIPE,
@@ -866,6 +935,10 @@ class LiveHarness:
             sessions = []
             children: dict[str, dict] = {}
             parent = None
+            both_seen_at: float | None = None
+            parent_sig: tuple[int, float] | None = None
+            parent_sig_at: float | None = None
+            parent_idle_polls = 0
             deadline = time.perf_counter() + self.spawn_timeout_s
             while time.perf_counter() < deadline:
                 sessions = self.list_sessions()
@@ -882,12 +955,37 @@ class LiveHarness:
                     # fall back: the remaining new session
                     new = [s for s in sessions if (s.get("activeSessionId") or s.get("sessionId")) not in before]
                     parent = next((s for s in new if (s.get("sessionName") or s.get("name")) not in (speaker_name, listener_name)), None)
+                if len(children) == 2 and both_seen_at is None:
+                    both_seen_at = time.perf_counter()
                 if parent is not None and len(children) == 2 and self._done_marker_seen(parent.get("sessionFile"), done_marker):
-                    break
+                    break  # fast path: explicit DONE marker
+                if parent is not None and both_seen_at is not None:
+                    now = time.perf_counter()
+                    sig = self._transcript_signature(parent.get("sessionFile"))
+                    if sig is None or sig != parent_sig:
+                        parent_sig = sig
+                        parent_sig_at = now
+                    if str(parent.get("activity", "")).lower() == "idle":
+                        parent_idle_polls += 1
+                    else:
+                        parent_idle_polls = 0
+                    if self._spawn_settled(
+                        both_seen_at, sig, parent_sig_at, parent_idle_polls,
+                        now, self.parent_quiet_s,
+                    ):
+                        break  # settled path: parent stopped producing output
                 time.sleep(5)
             else:
                 self._kill_held_parent()
-                raise CliError("parent spawn: DONE marker not seen in time")
+                # Never leak this attempt's roster-active children (they now
+                # hold keep-alive handles and would survive the parent kill).
+                for child_name in (speaker_name, listener_name):
+                    if child_name in children:
+                        self._run(["stop", child_name], timeout=120, check=False)
+                raise CliError(
+                    "parent spawn: no completion signal (DONE marker, quiet transcript, "
+                    "or idle parent) in time"
+                )
             missing = {speaker_name, listener_name} - set(children)
             if missing and self.sessions_dir and os.path.isdir(self.sessions_dir):
                 # Filesystem fallback: children spawned since the snapshot
@@ -1120,9 +1218,9 @@ class LiveHarness:
 
         # 10. cleanup (best effort) ---------------------------------------------
         def _cleanup():
-            self._run(["stop", parent_name], timeout=120, check=False)
-            # Belt-and-braces: kill the held parent process if it is still running.
-            self._kill_held_parent()
+            # Children first (they hold keep-alive handles and stay
+            # roster-active), then the parent session, then the held CLI.
+            self.sweep_trial_sessions()
             return True
 
         stage("cleanup", _cleanup)
@@ -1305,6 +1403,39 @@ def dry_selftest(tasks_per_family: int, cli: str, model: str) -> tuple[bool, lis
     # 11. CLI path configured (existence only; dry never executes it) -------------
     check("cli_path_configured", os.path.isfile(cli), cli)
 
+    # 12. held-spawn completion + active-child standby (run5 fixes) ---------------
+    check("standby_keepalive",
+          "bash('ping -n 7200 127.0.0.1')" in STANDBY_PROMPT
+          and "do NOT wait for it" in STANDBY_PROMPT
+          and "reply ready" in STANDBY_PROMPT.lower(),
+          STANDBY_PROMPT[:100])
+    check("standby_embedded", repr(STANDBY_PROMPT) in parent_spawn_prompt("fwS0001", "fwL0001"),
+          "parent prompt must relay the stand-by prompt verbatim")
+    sig = LiveHarness._transcript_signature(Path(__file__))
+    check("transcript_signature", isinstance(sig, tuple) and len(sig) == 2
+          and all(isinstance(v, (int, float)) for v in sig), str(sig))
+    check("transcript_signature_missing",
+          LiveHarness._transcript_signature(Path("no/such/file.jsonl")) is None)
+    check("spawn_settled_idle",
+          LiveHarness._spawn_settled(0.0, None, None, 2, 10.0, 60.0) is True)
+    check("spawn_settled_quiet",
+          LiveHarness._spawn_settled(0.0, (1, 1.0), 0.0, 0, 61.0, 60.0) is True)
+    check("spawn_settled_early",
+          LiveHarness._spawn_settled(0.0, (1, 1.0), 0.0, 0, 59.0, 60.0) is False)
+    check("spawn_settled_growing",
+          LiveHarness._spawn_settled(0.0, (1, 1.0), 55.0, 0, 61.0, 60.0) is False)
+    check("spawn_settled_nosig",
+          LiveHarness._spawn_settled(0.0, None, None, 0, 100.0, 60.0) is False)
+    check("spawn_settled_unset",
+          LiveHarness._spawn_settled(None, (1, 1.0), 0.0, 1, 100.0, 60.0) is False)
+    probe_harness = LiveHarness(cli="offline-probe", model="probe", run_dir=HERE,
+                                answer_timeout_s=1.0, send_timeout_s=1.0)
+    try:
+        probe_harness.sweep_trial_sessions()  # no named sessions: no CLI call
+        check("sweep_noop_offline", probe_harness._trial_sessions == [])
+    except Exception as exc:  # noqa: BLE001 - selftest must report, not crash
+        check("sweep_noop_offline", False, f"{type(exc).__name__}: {exc}")
+
     print(f"selftest: {len(checks) - len(failures)}/{len(checks)} checks passed")
     for name, ok, detail in checks:
         mark = "PASS" if ok else "FAIL"
@@ -1475,6 +1606,9 @@ def run_matrix(args) -> int:
                     break
                 except (CliError,) as exc:
                     print(f"  trial error (attempt {attempt}/{args.max_trials}): {exc}", flush=True)
+                    # The failed attempt's children hold keep-alive handles and
+                    # stay roster-active; sweep them before the next attempt.
+                    harness.sweep_trial_sessions()
                     index += 1
             if record is None:
                 record = {
@@ -1511,8 +1645,9 @@ def run_matrix(args) -> int:
                 flush=True,
             )
 
-    # Final belt-and-braces: never leave the last trial's held parent CLI running.
-    harness._kill_held_parent()
+    # Final belt-and-braces: never leave the last trial's sessions or its
+    # held parent CLI running.
+    harness.sweep_trial_sessions()
 
     agg = aggregate(trials)
     out_json.write_text(json.dumps(agg, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
@@ -1552,7 +1687,7 @@ def main() -> int:
                      help="daemon sessions dir; enables the filesystem fallback for child discovery")
     run.add_argument("--answer-timeout", type=float, default=900.0)
     run.add_argument("--spawn-timeout", type=float, default=900.0,
-                    help="seconds to wait for the held parent's DONE marker")
+                    help="seconds to wait for the held parent's completion signal (DONE marker, quiet transcript, or idle parent)")
     run.add_argument("--send-timeout", type=float, default=600.0)
     run.add_argument("--max-trials", type=int, default=2,
                     help="infra-level trial attempts (never retries wrong answers)")
