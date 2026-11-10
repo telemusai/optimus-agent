@@ -2,3 +2,4 @@
 - Added an interim GLM-5.3 LatentMAS benchmark report with comparison limits and strict-answer scoring caveats.
 - Added the completed 198-item GPQA baseline aggregate, preserved historical rows, and sanitized continuation accounting with segmented runtime provenance.
 - Added the completed 198-item GPQA TextMAS sequential result, sanitized accounting, and explicit unequal-budget comparison limits.
+- Added the completed 198-item GPQA TextMAS hierarchical result, source-contract recheck, and sanitized accounting without repairing or rerunning the low score.
