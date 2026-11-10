@@ -18,6 +18,9 @@ results remain unchanged. TextMAS sequential is also complete at **103/198
 is complete at **10/198 (5.05%)**. The low result is preserved without answer
 repair or rerun; source-contract review found no discrepancy. See
 [GPQA_TEXTMAS_HIERARCHICAL.md](GPQA_TEXTMAS_HIERARCHICAL.md).
+MedQA300 baseline is complete at **174/300 (58.00%)**; see
+[MEDQA_BASELINE.md](MEDQA_BASELINE.md). Its TextMAS sequential run is separate
+and still in progress.
 
 ## Setup
 
@@ -182,6 +185,27 @@ separate from overlapping request-latency sums and not GPU time.
 See [GPQA_TEXTMAS_HIERARCHICAL.md](GPQA_TEXTMAS_HIERARCHICAL.md) for the source
 checks, accounting, comparison limits and sanitized artifact.
 
+### MedQA300 baseline (complete, 300 items)
+
+| Condition | Correct | Strict accuracy | Calls per item | Length-limited items |
+|---|---:|---:|---:|---:|
+| Single-agent baseline | **174/300** | **58.00%** | 1 | **27/300 (9.00%)** |
+
+All 300 items and single-request result receipts are complete. Failed,
+incomplete, missing and unconfirmed counts are zero. The historical baseline
+retains raw normal response content and uses the exact upstream extractor and
+normalizer against unchanged gold after sealed offline audit. No answer repair,
+alternate extraction, cap change or rerun was performed. All capped outputs
+remain in the denominator.
+
+Provider totals are 97,628 prompt and 389,509 completion tokens. Missing cache
+and nested reasoning details remain unknown. Driver wall time is 368.978 seconds,
+separate from the overlapping request-latency sum and not isolated GPU time.
+This is ordinary HTTP inference, not native OCC-3 or a clinical reliability claim.
+MedQA TextMAS conditions are separate and have no published result here yet.
+See [MEDQA_BASELINE.md](MEDQA_BASELINE.md) for cohort/source bindings, accounting,
+metric limits and sanitized metadata.
+
 ## Caveats
 
 1. Token cap. 4096 completion tokens per call truncates most single-agent AIME and GPQA
@@ -236,8 +260,8 @@ checks, accounting, comparison limits and sanitized artifact.
 
 - The `latent_mas` condition, because it needs model internals.
 - HumanEval+, MBPP+, ARC-Easy, ARC-Challenge and GSM8K-300 have no published result
-  here. MedQA baseline has completed; its separate report is pending. Remaining
-  MedQA conditions are not yet complete. Manifests are listed in `MANIFESTS.json`.
+  here. MedQA baseline is complete above; its TextMAS sequential run is in progress
+  and its hierarchical condition is not complete. Manifests are listed in `MANIFESTS.json`.
 - OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
   The later item-0 smoke failed and remains separate from these denominators.
 - AIME and GPQA at a higher token cap.
@@ -262,6 +286,8 @@ checks, accounting, comparison limits and sanitized artifact.
 | `results/gpqa_textmas_sequential_safe.json` | Sanitized sequential score, coverage, hashes, timing and usage; no answer content |
 | `GPQA_TEXTMAS_HIERARCHICAL.md` | Completed 198-item HTTP TextMAS hierarchical result, source recheck and unresolved low-score diagnosis |
 | `results/gpqa_textmas_hierarchical_safe.json` | Sanitized hierarchical score, coverage, hashes, timing and usage; no answer content |
+| `MEDQA_BASELINE.md` | Completed 300-item single-agent baseline, strict historical scoring and accounting |
+| `results/medqa_baseline_safe.json` | Sanitized MedQA baseline score, coverage, hashes, timing and usage; no answer content |
 | `occ3-activation-notes.md` | Root-cause notes for OCC-3 activation on the DGX (settings keys and the per-chat `occ.json` preference) |
 
 ## Reproduce
@@ -274,6 +300,9 @@ offline scorer. Its exact source and artifact pins are in
 [GPQA_TEXTMAS_SEQUENTIAL.md](GPQA_TEXTMAS_SEQUENTIAL.md) and
 [GPQA_TEXTMAS_HIERARCHICAL.md](GPQA_TEXTMAS_HIERARCHICAL.md). Do not use the
 historical retry/resume driver to overwrite or supplement these frozen results.
+The new MedQA baseline likewise uses a separate source-pinned, question-only
+noncode driver with one-attempt receipts and sealed offline scoring; its exact
+pins and differences are in [MEDQA_BASELINE.md](MEDQA_BASELINE.md).
 
 - Historical main conditions:
   1. Put the LatentMAS repo at `9a9e4d3` in `../LatentMAS`.
