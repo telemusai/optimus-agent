@@ -157,6 +157,7 @@ pub struct SubagentSummaryLine {
     openable: bool,
     always_visible: bool,
     right_status: Option<RightStatus>,
+    mode_status: Option<RightStatus>,
     communication_status: Option<String>,
     get_location_label: Box<dyn Fn() -> Option<String>>,
     get_context_label: Box<dyn Fn() -> Option<String>>,
@@ -178,6 +179,7 @@ impl SubagentSummaryLine {
             openable: false,
             always_visible: false,
             right_status: None,
+            mode_status: None,
             communication_status: None,
             get_location_label,
             get_context_label,
@@ -194,6 +196,11 @@ impl SubagentSummaryLine {
 
     pub fn set_right_status(&mut self, status: Option<RightStatus>) {
         self.right_status = status;
+    }
+
+    /// Steady mode configuration belongs in the title, separate from delivery pulses.
+    pub fn set_mode_status(&mut self, status: Option<RightStatus>) {
+        self.mode_status = status;
     }
 
     pub fn set_communication_status(&mut self, status: Option<String>) {
@@ -236,6 +243,18 @@ impl SubagentSummaryLine {
         if let Some(handler) = self.on_chat_action.as_mut() {
             handler(data);
         }
+    }
+
+    fn render_status_row(&self, status: &str, inner: usize) -> String {
+        // Optional padding must not hide status text that fits exactly.
+        let inset = if visible_width(status) < inner { " " } else { "" };
+        let text = truncate_to_width(&format!("{inset}{status}"), inner as f64, "…", false);
+        let content = format!("{text}{}", " ".repeat(inner.saturating_sub(visible_width(&text))));
+        let content = if self.focused {
+            content.split("\x1b[0m").map(|part| theme().bg("selectedBg", part))
+                .collect::<Vec<_>>().join("\x1b[0m")
+        } else { content };
+        format!("{}{content}{}", theme().fg("border", "│"), theme().fg("border", "│"))
     }
 
     fn render_info_line(&self, width: f64) -> Vec<String> {
@@ -300,7 +319,15 @@ impl Component for SubagentSummaryLine {
             "subagents".to_string()
         };
         let label = theme().fg("accent", &format!("\u{1b}[1m{title}\u{1b}[22m"));
-        let top = truncate_to_width(
+        let mode_in_title = self.mode_status.as_ref().and_then(|status| {
+            [&status.full, &status.compact, &status.minimal].into_iter()
+                .find(|text| visible_width(&label) + visible_width(text) + 8 <= safe_width as usize)
+        });
+        let top = if let Some(status) = mode_in_title {
+            let fill = (safe_width as usize).saturating_sub(visible_width(&label) + visible_width(status) + 8);
+            format!("{}{label} {} {status} {}", theme().fg("border", "╭─ "),
+                theme().fg("border", &"─".repeat(fill)), theme().fg("border", "─╮"))
+        } else { truncate_to_width(
             &format!(
                 "{}{}{}",
                 theme().fg("border", "\u{256d}\u{2500} "),
@@ -320,7 +347,7 @@ impl Component for SubagentSummaryLine {
             safe_width,
             "\u{2026}",
             false,
-        );
+        ) };
         let mut counts = format!(
             "{}{}{}{}{}",
             theme().fg(
@@ -409,15 +436,17 @@ impl Component for SubagentSummaryLine {
             theme().fg("border", "\u{2502}"),
             theme().fg("border", "\u{2502}")
         ));
+        if mode_in_title.is_none() {
+            if let Some(status) = &self.mode_status {
+                let status = [&status.full, &status.compact, &status.minimal].into_iter()
+                    .find(|text| visible_width(text) <= inner as usize)
+                    .map(String::as_str).unwrap_or("CFG /occ");
+                lines.push(self.render_status_row(status, inner as usize));
+            }
+        }
         if communication_below {
             if let Some(status) = &self.communication_status {
-                // Keep optional padding from displacing status text that fits.
-                let inset = if visible_width(status) < inner as usize { " " } else { "" };
-                let text = truncate_to_width(&format!("{inset}{status}"), inner, "…", false);
-                let padding = " ".repeat((inner as usize).saturating_sub(visible_width(&text)));
-                let content = format!("{text}{padding}");
-                let content = if self.focused { theme().bg("selectedBg", &content) } else { content };
-                lines.push(format!("{}{content}{}", theme().fg("border", "│"), theme().fg("border", "│")));
+                lines.push(self.render_status_row(status, inner as usize));
             }
         }
         lines.push(theme().fg(
@@ -465,10 +494,10 @@ mod tests {
     /// without the tray right status, and with the selectable open hint.
     ///
     /// Measured bands (see the campaign report): the caller's stages keep
-    /// the slots down to the compact-health stage boundary (width 59);
+    /// the slots down to the compact-health stage boundary (width 61);
     /// below that the status the caller supplies carries no slots at all
     /// (out of this component's ownership). Within this component the rule
-    /// is: whenever the supplied status carries the OCC3 slot and fits one
+    /// is: whenever the supplied status carries the OCC3.2 slot and fits one
     /// row, the render must show it - no ellipsization may eat it - and at
     /// widths 104-110 the four-segment status renders on one more status
     /// row instead of overflowing or losing the slot.
@@ -478,7 +507,7 @@ mod tests {
     /// communication slots, so below the compact-health boundary the caller
     /// supplies a status with no slot in it at all.
     fn caller_status(width: usize) -> String {
-        let indicators = ["TXT", "OCC1", "OCC2", "OCC3"]
+        let indicators = ["TXT", "OCC1", "OCC2", "OCC3.2"]
             .iter()
             .map(|label| format!("\x1b[2;38;5;39m\u{25cb} {label}\x1b[22;39m"))
             .collect::<Vec<_>>()
@@ -528,11 +557,11 @@ mod tests {
                     "width {width} overflows its row"
                 );
                 let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
-                let carried = status.contains("OCC3");
+                let carried = status.contains("OCC3.2");
                 if carried && visible_width(&status) + 2 <= width {
                     assert!(
-                        text.contains("OCC3"),
-                        "width {width} (right={with_right}) ellipsized the OCC3 slot away:\n{text}"
+                        text.contains("OCC3.2"),
+                        "width {width} (right={with_right}) ellipsized the OCC3.2 slot away:\n{text}"
                     );
                 }
                 // The L-1 row rule: at the widths where the four-segment
@@ -543,7 +572,7 @@ mod tests {
                         rows.len() >= 4,
                         "width {width} (right={with_right}) must render one more status row:\n{rows:?}"
                     );
-                    assert!(text.contains("OCC3"), "width {width} lost OCC3");
+                    assert!(text.contains("OCC3.2"), "width {width} lost OCC3.2");
                 }
             }
         }
@@ -551,20 +580,51 @@ mod tests {
 
     /// The measured band, pinned: the caller's stages first carry the four
     /// slots when the compact-health stage fits its budget, and every width
-    /// from there up renders the OCC3 slot. Below that width the caller
+    /// from there up renders the OCC3.2 slot. Below that width the caller
     /// supplies no slot at all, which this component cannot recover: that
     /// band is the caller's documented stage policy, not ellipsization here.
     #[test]
     fn l1_measured_band_is_where_the_caller_stages_first_carry_the_slots() {
         let first = (2..=200usize)
-            .find(|width| caller_status(*width).contains("OCC3"))
+            .find(|width| caller_status(*width).contains("OCC3.2"))
             .expect("the caller must carry the slots at some width");
-        assert_eq!(first, 59, "measured compact-health stage boundary");
+        assert_eq!(first, 61, "measured compact-health stage boundary");
         for width in first..=200usize {
             assert!(
-                caller_status(width).contains("OCC3"),
+                caller_status(width).contains("OCC3.2"),
                 "width {width} lost the slots above the measured boundary"
             );
+        }
+    }
+
+    #[test]
+    fn mode_pair_survives_title_and_extra_row_boundaries_without_displacing_metrics() {
+        crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        for width in 2..=200usize {
+            for focused in [false, true] {
+                let mut line = SubagentSummaryLine::default();
+                line.set_always_visible(true);
+                line.set_focused(focused);
+                line.set_mode_status(Some(RightStatus {
+                    full: "CONFIG ● OCC3.1 hier  ! OCC3.2 blocked".into(),
+                    compact: "CFG OCC3.1 hier  OCC3.2 blocked".into(),
+                    minimal: "OCC3.1 hier  OCC3.2 blocked".into(),
+                }));
+                line.set_right_status(Some(RightStatus {
+                    full: "Jev C+A · 12 req".into(), compact: "Jev 12r".into(), minimal: "Jev".into(),
+                }));
+                line.set_communication_status(Some(caller_status(width)));
+                let rows = line.render(width as f64);
+                assert!(rows.iter().all(|row| visible_width(row) <= width), "{width}: {rows:?}");
+                let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
+                if width >= 29 {
+                    assert!(text.contains("OCC3.1 hier") && text.contains("OCC3.2 blocked"), "{width}: {text}");
+                }
+                if width >= 80 {
+                    assert!(rows[0].contains("CONFIG"), "{width}: {text}");
+                    assert!(text.contains("STREAM TPS ~50.0  CTX HEALTH GREEN 100"), "{width}: {text}");
+                }
+            }
         }
     }
 

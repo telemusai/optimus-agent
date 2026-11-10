@@ -1270,7 +1270,18 @@ impl DaemonAgentConnection {
         *self.latest_snapshot_is_fresh.lock().unwrap() = true;
     }
 
-    fn emit(&self, event: AgentConnectionEvent) -> BoxFuture<()> {
+    fn filter_occ3_modes(&self, state: &mut AgentConnectionState) {
+        if !self.client.supports_server_capability("occ31_textmas") {
+            state.occ3_modes = None;
+        }
+    }
+
+    fn emit(&self, mut event: AgentConnectionEvent) -> BoxFuture<()> {
+        match &mut event {
+            AgentConnectionEvent::SessionResynced { snapshot } => self.filter_occ3_modes(&mut snapshot.state),
+            AgentConnectionEvent::SessionReplaced { state, .. } => self.filter_occ3_modes(state),
+            _ => {}
+        }
         self.observe_replacement_snapshot(&event);
         let listeners = self.listeners.lock().unwrap().clone();
         Box::pin(async move {
@@ -1982,7 +1993,8 @@ impl DaemonAgentConnection {
             }
         }
         if *self.latest_snapshot_is_fresh.lock().unwrap() {
-            if let Some(snapshot) = self.latest_snapshot.lock().unwrap().clone() {
+            if let Some(mut snapshot) = self.latest_snapshot.lock().unwrap().clone() {
+                self.filter_occ3_modes(&mut snapshot.state);
                 return Ok(snapshot);
             }
         }
@@ -2017,8 +2029,9 @@ impl DaemonAgentConnection {
         );
         let (state_data, messages_data, context_data) =
             tokio::join!(state_future, messages_future, context_future);
-        let state: AgentConnectionState = serde_json::from_value(state_data?)
+        let mut state: AgentConnectionState = serde_json::from_value(state_data?)
             .map_err(|error| format!("Daemon returned an invalid connection state: {error}"))?;
+        self.filter_occ3_modes(&mut state);
         let messages: Vec<AgentMessage> = messages_data?
             .get("messages")
             .cloned()
@@ -2814,7 +2827,8 @@ impl AgentConnection for DaemonAgentConnection {
         let opening_error = this.deferred_session_events.lock().unwrap().failure.clone();
         if let Some(error) = opening_error { return Box::pin(async move { Err(error) }); }
         if *this.latest_snapshot_is_fresh.lock().unwrap() {
-            if let Some(snapshot) = this.latest_snapshot.lock().unwrap().clone() {
+            if let Some(mut snapshot) = this.latest_snapshot.lock().unwrap().clone() {
+                this.filter_occ3_modes(&mut snapshot.state);
                 return Box::pin(async move { Ok(snapshot.state) });
             }
         }
@@ -2824,7 +2838,10 @@ impl AgentConnection for DaemonAgentConnection {
         );
         Box::pin(async move {
             let data = this.request_data(command, None).await?;
-            serde_json::from_value(data).map_err(|error| format!("Daemon returned an invalid connection state: {error}"))
+            let mut state: AgentConnectionState = serde_json::from_value(data)
+                .map_err(|error| format!("Daemon returned an invalid connection state: {error}"))?;
+            this.filter_occ3_modes(&mut state);
+            Ok(state)
         })
     }
 
@@ -2882,9 +2899,69 @@ impl AgentConnection for DaemonAgentConnection {
             if this.active_session_id() != active_session_id {
                 return Err("Session changed while setting OCC preferences".to_string());
             }
+            *this.latest_snapshot_is_fresh.lock().unwrap() = false;
             Ok(data)
         })
     }
+    fn set_occ32_enabled(&self, enabled: bool) -> BoxFuture<Result<Value, String>> {
+        let this = self.clone();
+        Box::pin(async move {
+            if !this.supports_occ31_textmas() {
+                return Err("The attached daemon does not support OCC3.2 host-owned controls".into());
+            }
+            let active_session_id = this.active_session_id();
+            let data = this.request_data(command_body("occ32_set_enabled", vec![
+                ("activeSessionId", Value::String(active_session_id.clone())),
+                ("enabled", Value::Bool(enabled)),
+            ]), None).await?;
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while setting OCC3.2 preferences".into());
+            }
+            *this.latest_snapshot_is_fresh.lock().unwrap() = false;
+            Ok(data)
+        })
+    }
+
+    fn supports_occ31_textmas(&self) -> bool {
+        self.client.supports_server_capability("occ31_textmas")
+    }
+
+    fn get_occ31_preferences(&self) -> BoxFuture<Result<Value, String>> {
+        let this = self.clone();
+        Box::pin(async move {
+            if !this.supports_occ31_textmas() {
+                return Err("The attached daemon does not support OCC3.1 TextMAS controls".into());
+            }
+            let active_session_id = this.active_session_id();
+            let data = this.request_data(command_body("occ31_get_preferences", vec![
+                ("activeSessionId", Value::String(active_session_id.clone())),
+            ]), None).await?;
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while reading OCC3.1 preferences".into());
+            }
+            Ok(data)
+        })
+    }
+
+    fn set_occ31_mode(&self, mode: crate::core::occ::textmas::TextMasMode) -> BoxFuture<Result<Value, String>> {
+        let this = self.clone();
+        Box::pin(async move {
+            if !this.supports_occ31_textmas() {
+                return Err("The attached daemon does not support OCC3.1 TextMAS controls".into());
+            }
+            let active_session_id = this.active_session_id();
+            let data = this.request_data(command_body("occ31_set_mode", vec![
+                ("activeSessionId", Value::String(active_session_id.clone())),
+                ("mode", Value::String(mode.as_str().into())),
+            ]), None).await?;
+            if this.active_session_id() != active_session_id {
+                return Err("Session changed while setting OCC3.1 preferences".into());
+            }
+            *this.latest_snapshot_is_fresh.lock().unwrap() = false;
+            Ok(data)
+        })
+    }
+
     fn supports_occ_queue_resolution(&self) -> bool {
         self.client.supports_server_capability("agent_communication_queue_control")
     }
@@ -4638,6 +4715,9 @@ mod daemon_restart_tests;
 #[cfg(test)]
 #[path = "jev_status_tests.rs"]
 mod jev_status_tests;
+#[cfg(test)]
+#[path = "occ31_control_tests.rs"]
+mod occ31_control_tests;
 
 #[cfg(test)]
 mod tests {

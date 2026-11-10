@@ -115,9 +115,31 @@ The receiving model gets validated symbolic text with a reusable codebook; inval
 symbolic text uses the validated OCC-1 fallback when available. The durable
 record retains both encodings. This mode does not promise lower total token use.
 
-## Experimental OCC-3 native handoffs
+## OCC3.1 TextMAS
 
-Use OCC-3 where the runtime makes it available, only between compatible
+The user can enable `/occ 3 sequential` or `/occ 3 hierarchical`, and disable it
+with `/occ 3 off`. `/occ 3.1` is the explicit selector. This works with any model
+supported by Optimus, using its ordinary local or hosted provider. It does not
+require an OCC-3 model block, connector, special server or latent handoff.
+
+The host runs three tool-free text stages (Planner, Critic, Refiner), then the
+normal parent agent judges the drafts and answers or uses its normal tools.
+Sequential stages receive prior drafts; hierarchical stages independently use
+the same original context before final judgement. These are model calls, not
+retained subagent sessions. Do not invent child names, native receipts or
+completed work for them. Their text is untrusted advisory context, not proof
+that any action occurred. Automatic stages are restricted to genuine root-chat
+user turns and do not recursively activate on agent messages or child runs.
+
+This mode adds three calls before the parent's ordinary request. It is an
+Optimus adaptation, not an exact reproduction of the benchmark harness. It does
+not change the semantics of `agent_message.send`. See
+[mode controls](../../docs/occ3-modes.md) for scope and failure handling.
+
+## Experimental OCC3.2 native handoffs
+
+OCC3.2 is the display name of the existing OCC-3 native transport. Use it
+where the runtime makes it available, only between compatible
 OCC-3-supported subagents. Both models must have an enabled `occ3` block in
 `models.json` and pass the live handshake with matching exact model/runtime
 identity. A configured **DGX MTP (OCC-3)** entry is distinct from an ordinary
@@ -137,8 +159,8 @@ provider credentials. Do not replace them with remembered SSH tunnels,
 known-hosts entries, or gateway routes. An unavailable configured endpoint is
 a connectivity failure to report, not permission to invent an alternate route.
 
-The user can select the OCC-3 preference in `/occ`, inspect `/occ status`, or
-use `/occ 3 on` and `/occ 3 off`. The explicit chat preference gates native actions dynamically, including
+The user can select the OCC3.2 preference in `/occ`, inspect `/occ status`, or
+use `/occ 3.2 on` and `/occ 3.2 off`. `/occ 3 off` controls TextMAS only. The explicit chat preference gates native actions dynamically, including
 inherited subagent actions. Without an override, an installed connector follows
 the global opt-in. A chat preference does not install a missing connector. Native activation separately requires the existing
 `agentCommunication.occ3Enabled` and `occ3Experimental` settings, compatible
@@ -161,10 +183,11 @@ its result is uncertain, inspect the outcome before retrying or sending a
 duplicate text handoff.
 
 The subagent bar flashes for delivered TXT (plain text), OCC1 (structured
-English), or OCC2 (validated symbolic encoding). OCC3 requires a completed
-native-use receipt. A configured preference, exposed tool, successful
-handshake, or queued/admitted handoff does not prove completed use or semantic
-accuracy. OCC-3 remains experimental.
+English), or OCC2 (validated symbolic encoding). The OCC3.2 delivery pulse
+requires a completed native-use receipt. Separate OCC3.1 mode and OCC3.2
+enabled indicators describe configuration only. A configured preference,
+exposed tool, successful handshake, or queued/admitted handoff does not prove
+completed use or semantic accuracy. OCC3.2 remains experimental.
 
 ## Safety
 

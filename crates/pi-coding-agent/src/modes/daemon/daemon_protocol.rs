@@ -98,8 +98,12 @@ pub const DAEMON_COMMAND_ENVELOPE_MIN_PROTOCOL_VERSION: u32 = 7;
 // uncertain entry on the attached session's own OCC-3 queue. Purely additive:
 // daemons without the capability keep answering every pre-46 command, and
 // clients gate the new command on the capability before sending.
-pub const DAEMON_SCHEMA_REVISION: u32 = 46;
-pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-46-communication-queue-control";
+// Revision 47 adds optional provider-neutral OCC3.1 mode controls, independent
+// OCC3.2 preference writes and configuration display metadata. Optional
+// SessionStats/ContextTreeNode textmasUsage reports preparation usage separately.
+// Existing startup, roster and OCC2 command requirements stay unchanged.
+pub const DAEMON_SCHEMA_REVISION: u32 = 47;
+pub const DAEMON_SCHEMA_ID: &str = "protocol-7-schema-47-occ31-textmas";
 
 pub type DaemonProtocolName = String;
 pub type DaemonProtocolVersion = u32;
@@ -209,6 +213,8 @@ pub enum DaemonServerCapability {
     /// native OCC-3 queue. Read-only clients never need it; the roster
     /// visibility above stays available without it.
     AgentCommunicationQueueControl,
+    /// Optional host-owned TextMAS mode controls and OCC3 configuration metadata.
+    Occ31Textmas,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
@@ -259,7 +265,7 @@ pub const DAEMON_SUPPORTED_CLIENT_CAPABILITIES: [DaemonClientCapability; 7] = [
 /// `DAEMON_DEFAULT_SERVER_CAPABILITIES`: the supported client list plus the
 /// server-only surfaces. `direct_peer_transport` and `agent_roster` are
 /// deliberately absent, exactly as in the TypeScript.
-pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 34] = [
+pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 35] = [
     DaemonServerCapability::AttachSnapshot,
     DaemonServerCapability::EventSequence,
     DaemonServerCapability::ExtensionUi,
@@ -294,6 +300,7 @@ pub const DAEMON_DEFAULT_SERVER_CAPABILITIES: [DaemonServerCapability; 34] = [
     DaemonServerCapability::StreamingThroughput,
     DaemonServerCapability::AgentCommunicationQueue,
     DaemonServerCapability::AgentCommunicationQueueControl,
+    DaemonServerCapability::Occ31Textmas,
 ];
 
 /// `{ dev: number; ino: number }` on the peer transport ticket.
@@ -2239,6 +2246,9 @@ pub fn daemon_command_compatibility(command: &str) -> DaemonCommandCompatibility
         "occ_get_preferences" | "occ_set_preferences" => {
             DaemonCommandCompatibility::capability(Capability::OccSessionPreferences)
         }
+        "occ31_get_preferences" | "occ31_set_mode" | "occ32_set_enabled" => {
+            DaemonCommandCompatibility::gated(47, Capability::Occ31Textmas)
+        }
         // Manual OCC-3 queue resolution (revision 46): cancel or explicitly
         // confirmed re-emit of one uncertain entry on the attached session's
         // own queue. BOTH gates enforce the send: the revision (a pre-46
@@ -2306,7 +2316,8 @@ pub fn daemon_command_plane(command: &str) -> Option<&'static str> {
         | "set_rlm_max_depth" | "get_session_context" | "get_session_tree" | "get_user_messages_for_forking"
         | "get_last_assistant_text" | "get_system_prompt" | "get_tool_definition" | "set_session_entry_label"
         | "extension_ui_response" | "jev_get_settings" | "jev_set_session_mode" | "jev_get_status"
-        | "occ_get_preferences" | "occ_set_preferences" | "occ_resolve_queue_entry" => {
+        | "occ_get_preferences" | "occ_set_preferences" | "occ_resolve_queue_entry"
+        | "occ31_get_preferences" | "occ31_set_mode" | "occ32_set_enabled" => {
             Some("session")
         }
         _ => None,
@@ -2909,7 +2920,7 @@ pub fn salvage_daemon_command_id(line: &str) -> Option<String> {
 }
 
 /// `READ_ONLY_DAEMON_COMMANDS`.
-pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 37] = [
+pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 38] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -2952,6 +2963,7 @@ pub const READ_ONLY_DAEMON_COMMANDS: [DaemonCommandName; 37] = [
     // The OCC getter is read-only. The SETTER is deliberately absent: it
     // persists the chat preference, so a read-only client must not send it.
     "occ_get_preferences",
+    "occ31_get_preferences",
 ];
 
 pub fn is_daemon_mutating_command(command_type: &str) -> bool {
@@ -3165,7 +3177,7 @@ mod tests {
 
     #[test]
     fn keeps_the_advertised_schema_identity() {
-        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-communication-queue-control"));
+        assert_eq!(DAEMON_SCHEMA_ID, format!("protocol-{DAEMON_PROTOCOL_VERSION}-schema-{DAEMON_SCHEMA_REVISION}-occ31-textmas"));
     }
 
     #[test]

@@ -7,18 +7,18 @@ use std::path::{Path, PathBuf};
 use serde::{Deserialize, Serialize};
 
 const SCHEMA: &str = "optimus.occ-session.v1";
+static WRITE_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
 
 #[derive(Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct Preference {
     schema: String,
-    occ2_enabled: bool,
-    /// OCC-3 latent communication preference. Absent in existing
-    /// `occ.json` files: `#[serde(default)]` keeps v1 files loading and
-    /// the value OFF (activation is opt-in and additionally requires a
-    /// live connector handshake).
-    #[serde(default)]
-    occ3_enabled: bool,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    occ2_enabled: Option<bool>,
+    // Each lane inherits independently. An absent latent override leaves the
+    // already-verified global opt-in authoritative; it is not an implicit veto.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    occ3_enabled: Option<bool>,
 }
 
 pub fn preference_path(session_file: &str) -> PathBuf {
@@ -33,11 +33,12 @@ pub struct Resolution {
     pub occ2_enabled: bool,
     pub occ3_enabled: bool,
     pub source_session_id: Option<String>,
+    pub occ3_source_session_id: Option<String>,
 }
 
 impl Default for Resolution {
     fn default() -> Self {
-        Resolution { occ2_enabled: true, occ3_enabled: false, source_session_id: None }
+        Resolution { occ2_enabled: true, occ3_enabled: false, source_session_id: None, occ3_source_session_id: None }
     }
 }
 
@@ -55,46 +56,51 @@ fn session_id_of(session_file: &str) -> String {
 /// Only bounded headers are read, never the chat transcript; no process cache
 /// means existing workers see the next toggle without being restarted.
 pub fn load(session_file: &str) -> Result<bool, String> {
-    resolve(session_file).map(|resolution| resolution.occ2_enabled)
+    resolve_inner(session_file, true).map(|resolution| resolution.occ2_enabled)
 }
 
 /// `load` with provenance for the daemon-owned `occ_get_preferences`
 /// response: the effective value plus the chat whose preference decided.
 pub fn resolve(session_file: &str) -> Result<Resolution, String> {
+    resolve_inner(session_file, false)
+}
+
+fn resolve_inner(session_file: &str, occ2_only: bool) -> Result<Resolution, String> {
     let mut file = PathBuf::from(session_file);
     let mut visited = BTreeSet::new();
+    let mut resolution = Resolution::default();
     for _ in 0..64 {
         if !visited.insert(file.clone()) { return Err("OCC session ancestry contains a cycle".into()); }
-        let path = preference_path(&file.to_string_lossy());
-        match File::open(path) {
-            Ok(reader) => {
-                let mut bytes = Vec::new();
-                reader.take(4097).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
-                if bytes.len() > 4096 { return Err("OCC session preference is too large".into()); }
-                let value: Preference = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
-                if value.schema != SCHEMA { return Err("Unsupported OCC session preference schema".into()); }
-                return Ok(Resolution {
-                    occ2_enabled: value.occ2_enabled,
-                    occ3_enabled: value.occ3_enabled,
-                    source_session_id: Some(session_id_of(&file.to_string_lossy())),
-                });
+        if let Some(value) = read_preference(&file.to_string_lossy())? {
+            let id = session_id_of(&file.to_string_lossy());
+            if resolution.source_session_id.is_none() {
+                if let Some(enabled) = value.occ2_enabled {
+                    resolution.occ2_enabled = enabled;
+                    resolution.source_session_id = Some(id.clone());
+                }
             }
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.to_string()),
+            if resolution.occ3_source_session_id.is_none() {
+                if let Some(enabled) = value.occ3_enabled {
+                    resolution.occ3_enabled = enabled;
+                    resolution.occ3_source_session_id = Some(id);
+                }
+            }
+            if resolution.source_session_id.is_some() && (occ2_only || resolution.occ3_source_session_id.is_some()) {
+                return Ok(resolution);
+            }
         }
         let reader = match File::open(&file) {
             Ok(reader) => reader,
-            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(Resolution::default()),
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(resolution),
             Err(error) => return Err(error.to_string()),
         };
         let mut header = Vec::new();
         BufReader::new(reader.take(65537)).read_until(b'\n', &mut header).map_err(|e| e.to_string())?;
         if header.len() > 65536 { return Err("OCC session header is too large".into()); }
         let header: serde_json::Value = serde_json::from_slice(&header).map_err(|e| e.to_string())?;
-        // Forks can have parentSession while retaining depth zero. They are
-        // independent chats, not subagents, so they never inherit this toggle.
-        if header["rlmDepth"].as_u64().unwrap_or(0) == 0 { return Ok(Resolution::default()); }
-        let Some(parent) = header["parentSession"].as_str().filter(|s| !s.is_empty()) else { return Ok(Resolution::default()); };
+        // Depth-zero forks are independent chats even when parentSession exists.
+        if header["rlmDepth"].as_u64().unwrap_or(0) == 0 { return Ok(resolution); }
+        let Some(parent) = header["parentSession"].as_str().filter(|s| !s.is_empty()) else { return Ok(resolution); };
         let parent = Path::new(parent);
         file = if parent.is_absolute() { parent.to_path_buf() }
             else { file.parent().unwrap_or_else(|| Path::new(".")).join(parent) };
@@ -102,12 +108,26 @@ pub fn resolve(session_file: &str) -> Result<Resolution, String> {
     Err("OCC session ancestry exceeds the supported depth".into())
 }
 
+fn read_preference(session_file: &str) -> Result<Option<Preference>, String> {
+    let reader = match File::open(preference_path(session_file)) {
+        Ok(reader) => reader,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error.to_string()),
+    };
+    let mut bytes = Vec::new();
+    reader.take(4097).read_to_end(&mut bytes).map_err(|e| e.to_string())?;
+    if bytes.len() > 4096 { return Err("OCC session preference is too large".into()); }
+    let value: Preference = serde_json::from_slice(&bytes).map_err(|e| e.to_string())?;
+    if value.schema != SCHEMA { return Err("Unsupported OCC session preference schema".into()); }
+    Ok(Some(value))
+}
+
 /// The `occ_get_preferences` response payload, built where the preference
 /// lives so the daemon and an in-process host report identical shapes:
 /// `occ2Enabled`, `inherited` (decided by an ancestor chat) and
 /// `sourceSessionId` (the deciding chat, or null for the default).
 pub fn preferences(session_file: &str) -> Result<serde_json::Value, String> {
-    let resolution = resolve(session_file)?;
+    let resolution = resolve_inner(session_file, true)?;
     let inherited = resolution
         .source_session_id
         .as_deref()
@@ -124,7 +144,7 @@ pub fn preferences(session_file: &str) -> Result<serde_json::Value, String> {
 /// never report a value the storage did not accept.
 pub fn set_preferences(session_file: &str, enabled: bool) -> Result<serde_json::Value, String> {
     save(session_file, enabled)?;
-    let resolution = resolve(session_file)?;
+    let resolution = resolve_inner(session_file, true)?;
     Ok(serde_json::json!({
         "occ2Enabled": resolution.occ2_enabled,
         "applied": resolution.occ2_enabled == enabled,
@@ -139,19 +159,60 @@ pub fn enabled(session_file: Option<&str>) -> bool {
 }
 
 pub fn save(session_file: &str, enabled: bool) -> Result<(), String> {
-    save_occ3(session_file, enabled, false)
+    let _guard = WRITE_LOCK.lock().map_err(|_| "OCC preference writer unavailable".to_string())?;
+    // Preserve the historical heal-on-set behavior, but never turn a damaged
+    // latent override into a global opt-in. Valid files keep the other lane.
+    let mut value = preference_for_write(session_file);
+    value.occ2_enabled = Some(enabled);
+    write_preference(session_file, &value)
 }
 
-/// Save both preferences; `save` keeps the OCC-2-only signature for
-/// existing callers.
+pub fn save_latent(session_file: &str, enabled: bool) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().map_err(|_| "OCC preference writer unavailable".to_string())?;
+    // Unlike the legacy OCC2 healing contract, latent-only writes must not
+    // silently replace an unreadable OCC2 override.
+    let mut value = read_preference(session_file)?.unwrap_or(Preference {
+        schema: SCHEMA.into(), occ2_enabled: None, occ3_enabled: None,
+    });
+    value.occ3_enabled = Some(enabled);
+    write_preference(session_file, &value)
+}
+
+/// Host-owned latent setter echo; the legacy OCC2 JSON contract stays unchanged.
+pub fn set_latent_preferences(session_file: &str, enabled: bool) -> Result<serde_json::Value, String> {
+    save_latent(session_file, enabled)?;
+    let resolution = resolve(session_file)?;
+    Ok(serde_json::json!({
+        "occ32Enabled": resolution.occ3_enabled,
+        "applied": resolution.occ3_enabled == enabled,
+        "scope": "this chat",
+        "effectiveForNewOperations": true,
+    }))
+}
+
+fn preference_for_write(session_file: &str) -> Preference {
+    match read_preference(session_file) {
+        Ok(Some(value)) => value,
+        Ok(None) => Preference { schema: SCHEMA.into(), occ2_enabled: None, occ3_enabled: None },
+        Err(_) => Preference { schema: SCHEMA.into(), occ2_enabled: None, occ3_enabled: Some(false) },
+    }
+}
+
+/// Explicitly saves both existing lanes; single-lane setters preserve inheritance.
 pub fn save_occ3(session_file: &str, occ2_enabled: bool, occ3_enabled: bool) -> Result<(), String> {
+    let _guard = WRITE_LOCK.lock().map_err(|_| "OCC preference writer unavailable".to_string())?;
+    write_preference(session_file, &Preference {
+        schema: SCHEMA.into(), occ2_enabled: Some(occ2_enabled), occ3_enabled: Some(occ3_enabled),
+    })
+}
+
+fn write_preference(session_file: &str, value: &Preference) -> Result<(), String> {
     if session_file.is_empty() { return Err("This chat has no saved session identity".into()); }
     let path = preference_path(session_file);
     let parent = path.parent().ok_or("Invalid OCC session preference path")?;
     fs::create_dir_all(parent).map_err(|e| e.to_string())?;
-    let value = Preference { schema: SCHEMA.into(), occ2_enabled: occ2_enabled, occ3_enabled };
     let mut pending = tempfile::NamedTempFile::new_in(parent).map_err(|e| e.to_string())?;
-    serde_json::to_writer(pending.as_file_mut(), &value).map_err(|e| e.to_string())?;
+    serde_json::to_writer(pending.as_file_mut(), value).map_err(|e| e.to_string())?;
     pending.write_all(b"\n").map_err(|e| e.to_string())?;
     pending.as_file().sync_all().map_err(|e| e.to_string())?;
     pending.persist(path).map_err(|e| e.to_string())?;
@@ -209,6 +270,40 @@ mod tests {
         save(&a, true).unwrap();
         assert!(load(&child).unwrap());
         assert!(load(&nested).unwrap());
+    }
+
+    #[test]
+    fn occ2_and_latent_overrides_preserve_each_other_and_inherit_independently() {
+        let root = tempfile::tempdir().unwrap();
+        let sessions = root.path().join("sessions");
+        fs::create_dir(&sessions).unwrap();
+        let a = session(&sessions, "a", None, 0);
+        let child = session(&sessions, "child", Some("a.jsonl"), 1);
+        save(&a, false).unwrap();
+        assert_eq!(resolve(&a).unwrap().occ3_source_session_id, None);
+        save_latent(&a, true).unwrap();
+        save(&child, true).unwrap();
+        let inherited = resolve(&child).unwrap();
+        assert!(inherited.occ2_enabled && inherited.occ3_enabled);
+        assert_eq!(inherited.source_session_id.as_deref(), Some("child"));
+        assert_eq!(inherited.occ3_source_session_id.as_deref(), Some("a"));
+        save_latent(&a, false).unwrap();
+        assert!(!resolve(&child).unwrap().occ3_enabled);
+        save_latent(&child, true).unwrap();
+        save(&child, false).unwrap();
+        assert!(resolve(&child).unwrap().occ3_enabled);
+        save_latent(&child, false).unwrap();
+        save(&child, true).unwrap();
+        assert!(!resolve(&child).unwrap().occ3_enabled);
+        assert_eq!(resolve(&child).unwrap().occ3_source_session_id.as_deref(), Some("child"));
+        // Previously written explicit false remains a veto, never an ambient opt-in.
+        fs::write(preference_path(&a), json!({"schema":SCHEMA,"occ2Enabled":true,"occ3Enabled":false}).to_string()).unwrap();
+        save(&a, false).unwrap();
+        assert!(!resolve(&a).unwrap().occ3_enabled);
+        assert_eq!(resolve(&a).unwrap().occ3_source_session_id.as_deref(), Some("a"));
+        // An old OCC2-only record has no explicit latent preference.
+        fs::write(preference_path(&a), json!({"schema":SCHEMA,"occ2Enabled":true}).to_string()).unwrap();
+        assert_eq!(resolve(&a).unwrap().occ3_source_session_id, None);
     }
 
     #[test]

@@ -166,6 +166,7 @@ impl StatsPanel {
                     }
                     lines = paired;
                 }
+                lines.extend(textmas_lines(snapshot));
                 lines.push(title("CURRENT CHAT CONTEXT"));
                 lines.extend(context_lines(snapshot, width));
                 lines.push(title(&format!(
@@ -240,6 +241,7 @@ impl StatsPanel {
                 if snapshot.accounting.models.is_empty() {
                     lines.push(dim("No model responses recorded yet"));
                 }
+                lines.extend(textmas_lines(snapshot));
                 lines.push(title("JEV OVERHEAD / RETAINED RECORDS"));
                 for row in snapshot.jev.models.values() {
                     lines.push(format!(
@@ -337,7 +339,7 @@ impl StatsPanel {
             _ => {
                 lines.push(title("TOKENS PER USER TURN / CURRENT CHAT"));
                 lines.push(dim(
-                    "Recorded input + output + cache; subagent usage excluded.",
+                    "Ordinary response tokens; subagent and TextMAS overhead excluded.",
                 ));
                 lines.push(String::new());
                 let turns = &snapshot.accounting.turns;
@@ -617,6 +619,22 @@ fn bar(value: f64, peak: f64, width: usize) -> String {
         theme().fg("dim", &".".repeat(width.saturating_sub(filled)))
     )
 }
+/// Auxiliary calls are a separate category: they are not ordinary replies or extra model identities.
+fn textmas_lines(snapshot: &Snapshot) -> Vec<String> {
+    let Some(summary) = &snapshot.accounting.textmas_usage else { return Vec::new(); };
+    let usage = &summary.known_subtotal;
+    let tokens = summary.known_tokens;
+    let known_cost = if summary.unknown_cost_calls == summary.calls {
+        "unavailable".to_string()
+    } else { format!("${:.4}", usage.cost.total) };
+    vec![
+        theme().bold(&theme().fg("thinkingText", "OCC3.1 PREPARATION OVERHEAD")),
+        format!("Calls {}   Known tokens {}   Known est. cost {}", summary.calls, number(tokens), known_cost),
+        format!("Unknown usage: {} calls; unknown cost: {} calls", summary.unknown_usage_calls, summary.unknown_cost_calls),
+        theme().fg("dim", "Separate from ordinary model totals and turn charts."),
+    ]
+}
+
 fn model_bar(row: &ModelUsage, peak: f64, width: usize) -> String {
     let label_width = (width / 3).clamp(8, 30);
     let label = truncate_to_width(

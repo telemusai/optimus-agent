@@ -43,7 +43,7 @@ fn deliver(row: &mut SessionSummary, id: &str, from: &str) {
     }]);
 }
 /// A completed native OCC-3 handoff reports a `latent` delivery: it must
-/// pulse the OCC3 indicator and flash the sender->receiver edge in the
+/// pulse the OCC3.2 indicator and flash the sender->receiver edge in the
 /// top-right agents graph exactly like an ordinary message link.
 fn deliver_latent(row: &mut SessionSummary, id: &str, from: &str) {
     row.extra.get_mut("communicationActivity").unwrap()["deliveries"] = json!([{
@@ -114,11 +114,31 @@ fn graph_flashes_the_edge_and_occ3_indicator_for_a_completed_native_handoff() {
     assert_eq!(links, [("a", "b")]);
     assert_eq!(
         strip_ansi(&graph.activity.indicators(now)),
-        "○ TXT  ○ OCC1  ○ OCC2  ● OCC3"
+        "○ TXT  ○ OCC1  ○ OCC2  ● OCC3.2"
     );
     // The link expires with the pulse window like every other message edge.
     graph.observe(&rows, &parent("root"), false, now + PULSE);
     assert_eq!(graph.activity.live_links(now + PULSE).count(), 0);
+}
+
+#[test]
+fn graph_mode_configuration_and_queue_never_create_delivery_links() {
+    let now = Instant::now();
+    let mut graph = Graph::default();
+    let mut rows = vec![row("root", None, false), row("child", Some("root"), false)];
+    graph.observe(&rows, &parent("root"), false, now);
+    rows[0].extra.insert("occ3Modes".into(), json!({
+        "textmasMode":"sequential", "latentEnabled":true, "latentActive":true, "latentAvailable":true,
+    }));
+    rows[1].extra.insert("communicationQueue".into(), json!({"pendingTotal":1}));
+    graph.observe(&rows, &parent("root"), false, now);
+    assert_eq!(graph.activity.live_links(now).count(), 0);
+    assert!(!graph.activity.indicators(now).contains('●'));
+    assert_eq!(graph.nodes.len(), 2);
+    let frame = graph.render("root", 24, 4, now);
+    assert_eq!(strip_ansi(&frame.join("\n")).matches('◆').count(), 1);
+    assert_eq!(strip_ansi(&frame.join("\n")).matches('○').count(), 1);
+    assert!(frame.iter().all(|row| visible_width(row) == 24));
 }
 
 #[test]

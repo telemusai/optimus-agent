@@ -580,6 +580,22 @@ pub struct AgentConnectionModelCycleResult {
     pub is_scoped: bool,
 }
 
+/// Configuration only: these fields are never proof that a handoff completed.
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Occ3Modes {
+    pub textmas_mode: crate::core::occ::textmas::TextMasMode,
+    pub latent_enabled: bool,
+    pub latent_active: bool,
+    pub latent_available: bool,
+}
+
+/// Optional display metadata must not make an otherwise valid attachment fail.
+fn deserialize_occ3_modes<'de, D: serde::Deserializer<'de>>(deserializer: D) -> Result<Option<Occ3Modes>, D::Error> {
+    let value = serde_json::Value::deserialize(deserializer)?;
+    Ok(serde_json::from_value(value).ok())
+}
+
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AgentConnectionState {
@@ -619,6 +635,9 @@ pub struct AgentConnectionState {
     /// must not treat the tool's presence alone as a live enrollment.
     #[serde(default)]
     pub occ3_native_dead: bool,
+    /// Schema-47 optional display metadata; absent on older hosts or read errors.
+    #[serde(default, skip_serializing_if = "Option::is_none", deserialize_with = "deserialize_occ3_modes")]
+    pub occ3_modes: Option<Occ3Modes>,
     pub context_usage: Value,
     /// One-line recent-work recap for the prompt UI.
     #[serde(skip_serializing_if = "Option::is_none")]
@@ -1366,6 +1385,20 @@ pub trait AgentConnection: Send + Sync {
     fn set_occ_preferences(&self, occ2_enabled: bool) -> pi_ai::types::BoxFuture<Result<Value, String>> {
         let _ = occ2_enabled;
         Box::pin(async { Err("set_occ_preferences is not supported by this connection".to_string()) })
+    }
+    /// Schema 47 plus occ31_textmas; never required for ordinary session startup.
+    fn supports_occ31_textmas(&self) -> bool { false }
+    fn get_occ31_preferences(&self) -> pi_ai::types::BoxFuture<Result<Value, String>> {
+        Box::pin(async { Err("OCC3.1 controls are not supported by this connection".into()) })
+    }
+    fn set_occ31_mode(&self, mode: crate::core::occ::textmas::TextMasMode) -> pi_ai::types::BoxFuture<Result<Value, String>> {
+        let _ = mode;
+        Box::pin(async { Err("OCC3.1 controls are not supported by this connection".into()) })
+    }
+    /// Host-owned latent preference; it does not enroll or bypass native policy.
+    fn set_occ32_enabled(&self, enabled: bool) -> pi_ai::types::BoxFuture<Result<Value, String>> {
+        let _ = enabled;
+        Box::pin(async { Err("OCC3.2 host-owned controls are not supported by this connection".into()) })
     }
     /// Whether the execution host can resolve entries on this chat's own
     /// native OCC-3 queue (`agent_communication_queue_control`, schema

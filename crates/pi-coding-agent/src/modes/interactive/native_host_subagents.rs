@@ -259,6 +259,9 @@ impl Bar {
         let resource_rows = if self.mode.borrow().fullscreen_enabled { rows.as_slice() } else { &[] };
         self.resources.observe(resource_rows, &parent, &self.throughput);
         let mode = self.mode.borrow();
+        self.line.set_mode_status(Some(communication_activity::mode_status(
+            mode.connection_state.as_ref().and_then(|state| state.occ3_modes.as_ref()),
+        )));
         let usage = mode.get_connection_context_usage();
         let input = crate::core::context_health::ContextHealthInput {
             tokens: usage.as_ref().and_then(|usage| usage.tokens),
@@ -414,6 +417,10 @@ pub(super) fn project_child(
 #[cfg(test)]
 #[path = "context_health_bar_tests.rs"]
 mod context_health_bar_tests;
+
+#[cfg(test)]
+#[path = "occ3_mode_bar_tests.rs"]
+mod occ3_mode_bar_tests;
 
 #[cfg(test)]
 #[path = "agent_graph_host_tests.rs"]

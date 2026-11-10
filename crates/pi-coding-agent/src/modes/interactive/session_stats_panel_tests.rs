@@ -127,3 +127,34 @@ fn missing_metrics_are_not_rendered_as_proven_savings() {
     panel.page = 3;
     assert!(panel.render_at(100, 50).join("\n").contains("#"));
 }
+
+
+#[test]
+fn textmas_overhead_shows_known_subtotals_and_explicit_unknowns() {
+    use crate::core::occ::textmas::TextMasUsageSummary;
+    let (mut panel, _) = panel();
+    let mut snapshot = panel.data.lock().unwrap().snapshot.clone().unwrap();
+    assert!(textmas_lines(&snapshot).is_empty(), "legacy and off sessions retain their layout");
+    let mut usage = crate::core::usage::empty_usage();
+    usage.input = 100.0;
+    usage.output = 25.0;
+    usage.total_tokens = 125.0;
+    snapshot.accounting.textmas_usage = Some(TextMasUsageSummary {
+        calls: 3, unknown_usage_calls: 1, unknown_cost_calls: 3, known_tokens: 125.0, known_subtotal: usage,
+    });
+    for page in [0, 1] {
+        panel.page = page;
+        let lines = panel.lines(&snapshot, 106).join("\n");
+        assert!(lines.contains("OCC3.1 PREPARATION OVERHEAD"));
+        assert!(lines.contains("Calls 3   Known tokens 125   Known est. cost unavailable"));
+        assert!(lines.contains("Unknown usage: 1 calls; unknown cost: 3 calls"));
+        assert!(!lines.contains("$0.0000"));
+    }
+    *panel.data.lock().unwrap() = LiveData { snapshot: Some(snapshot), error: None };
+    for width in [28, 40, 80, 110, 160] {
+        for page in [0, 1] {
+            panel.page = page;
+            assert!(panel.render_at(width, 50).iter().all(|line| visible_width(line) <= width));
+        }
+    }
+}
