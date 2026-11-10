@@ -158,6 +158,36 @@ def test_private_marker_cannot_be_prepopulated():
     with pytest.raises(LatentError): authority.verified(request)
 
 
+def test_authority_prunes_expired_enrollments_before_the_quota_and_identity_checks():
+    """Expired permits free their slot; live enrollments keep every guard."""
+    now=[1_000_000.0]
+    p=profile(max_records=2); authority=BrokerAuthority(p,principal_id="server-owned",epoch=lambda:now[0])
+    def enrollment(session,expiry):
+        return SessionEnrollment(authority.principal_digest,session,p.model_fingerprint,p.runtime_epoch,9,"domain",expiry)
+    def code(call):
+        with pytest.raises(LatentError) as error: call()
+        return error.value.code
+    authority.remember_session(enrollment("a",1_000_100))
+    authority.remember_session(enrollment("b",1_000_100))
+    # A full table of live enrollments still refuses a new session.
+    assert code(lambda:authority.remember_session(enrollment("c",1_000_100)))=="quota"
+    # Re-sending the same live enrollment stays idempotent; a conflicting
+    # live one stays an identity conflict.
+    authority.remember_session(enrollment("a",1_000_100))
+    assert code(lambda:authority.remember_session(enrollment("a",1_000_200)))=="identity"
+    assert set(authority.sessions)=={(authority.principal_digest,"a"),(authority.principal_digest,"b")}
+    now[0]=1_000_100.0  # Both permits have now expired.
+    # Expired permits no longer hold quota: a new session enrolls.
+    authority.remember_session(enrollment("c",1_003_700))
+    # Renewing a session whose permit expired is not an identity conflict.
+    authority.remember_session(enrollment("a",1_003_700))
+    assert set(authority.sessions)=={(authority.principal_digest,"a"),(authority.principal_digest,"c")}
+    assert authority.check_session(authority.principal_digest,"a").expires_at_epoch==1_003_700
+    assert code(lambda:authority.check_session(authority.principal_digest,"b"))=="identity"
+    # The renewed table is full of live enrollments again, so quota holds.
+    assert code(lambda:authority.remember_session(enrollment("d",1_003_700)))=="quota"
+
+
 @pytest.mark.asyncio
 async def test_authorizer_requires_enrollment_model_and_deadline():
     p=profile(); authority=BrokerAuthority(p,principal_id="server-owned")

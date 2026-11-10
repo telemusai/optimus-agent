@@ -16853,18 +16853,41 @@ impl AgentDaemon {
             }
             None => (false, false, None),
         };
-        // Off by default: no network, no log line, no behaviour change.
+        // Off by default: no network and no behaviour change. Ordinary models
+        // also get no log line; a model that declares an enabled `occ3` block
+        // logs the named decline, because the missing `occ3_handoff` tool is
+        // otherwise the only symptom of the missing opt-in.
         if !enabled && !experimental {
+            if let Some(line) = activation::early_decline_log_line(
+                &model,
+                Occ3Decline::DisabledByPolicy,
+                &session.session_id(),
+            ) {
+                self.log(&line);
+            }
             return Err(Occ3Decline::DisabledByPolicy);
         }
         // The control plane is keyed to the provider the session runs on, so
         // activation uses the credential this session resolves for its own
         // requests; nothing comes from `models.json`. An unresolvable
-        // credential is a named decline before any network.
-        let (api_key, control_headers) = agent_session
+        // credential is a named decline before any network, logged on the
+        // same terms as the policy decline above.
+        let (api_key, control_headers) = match agent_session
             .occ3_activation_credentials(&model)
             .await
-            .map_err(|_| Occ3Decline::ConnectorUnavailable)?;
+        {
+            Ok(credentials) => credentials,
+            Err(_) => {
+                if let Some(line) = activation::early_decline_log_line(
+                    &model,
+                    Occ3Decline::ConnectorUnavailable,
+                    &session.session_id(),
+                ) {
+                    self.log(&line);
+                }
+                return Err(Occ3Decline::ConnectorUnavailable);
+            }
+        };
         let request = Occ3ActivationRequest::new(&model, enabled, experimental)
             .with_endpoint_override(endpoint)
             .with_credentials(api_key, control_headers);

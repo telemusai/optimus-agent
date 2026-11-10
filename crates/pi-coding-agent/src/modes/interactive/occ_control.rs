@@ -285,6 +285,59 @@ fn model_supports_occ3(model: Option<&pi_ai::types::Model>) -> bool {
     })
 }
 
+/// The settings half of native activation for the selected model: the
+/// configuration-only decline under this host's `agentCommunication` opt-in
+/// and endpoint override. `None` when the model is not OCC-3 configured (the
+/// "unavailable" line covers it) or the gate passes. No network: the daemon
+/// still owns the live handshake.
+fn occ3_settings_decline(
+    model: Option<&pi_ai::types::Model>,
+    occ3_enabled: bool,
+    occ3_experimental: bool,
+    endpoint_override: Option<String>,
+) -> Option<crate::core::occ3_connectors::activation::Occ3Decline> {
+    use crate::core::occ3_connectors::activation::{configured_connector, Occ3ActivationRequest};
+    let model = model?;
+    if !model_supports_occ3(Some(model)) {
+        return None;
+    }
+    configured_connector(
+        &Occ3ActivationRequest::new(model, occ3_enabled, occ3_experimental)
+            .with_endpoint_override(endpoint_override),
+    )
+    .err()
+}
+
+/// Reads the opt-in fresh from settings.json, which is what a new chat or
+/// subagent reads when it starts.
+fn occ3_settings_decline_now(
+    model: Option<&pi_ai::types::Model>,
+    cwd: &str,
+) -> Option<crate::core::occ3_connectors::activation::Occ3Decline> {
+    let settings = crate::core::settings_manager::SettingsManager::create(cwd, None);
+    occ3_settings_decline(
+        model,
+        settings.get_agent_communication_occ3_enabled(),
+        settings.get_agent_communication_occ3_experimental(),
+        settings.get_agent_communication_occ3_endpoint(),
+    )
+}
+
+/// The user-facing sentence for a settings decline, naming the exact keys.
+fn occ3_settings_decline_line(decline: crate::core::occ3_connectors::activation::Occ3Decline) -> String {
+    use crate::core::occ3_connectors::activation::{Occ3Decline, OCC3_POLICY_REMEDY};
+    match decline {
+        Occ3Decline::DisabledByPolicy | Occ3Decline::ExperimentalAckRequired => format!(
+            "Native OCC-3 is disabled by settings ({}), so the occ3_handoff tool is not installed. To enable it, {OCC3_POLICY_REMEDY}. New chats and subagents read these settings when they start.",
+            decline.message()
+        ),
+        other => format!(
+            "Native OCC-3 is blocked by settings ({}), so the occ3_handoff tool is not installed.",
+            other.message()
+        ),
+    }
+}
+
 fn menu_choice(value: &str) -> Result<Choice, String> {
     if value == OCC3_UNAVAILABLE {
         return Ok(Choice::SetOcc3(true));
@@ -474,6 +527,16 @@ pub(super) async fn run(
             } else {
                 "\nSelected model: OCC-3 unavailable. Use an explicitly configured OCC-3 model for both subagents."
             });
+            // Model eligibility alone is not activation: name a settings
+            // decline instead of letting "configured" imply the tool.
+            if supported && !live_native {
+                if let Ok(state) = connection.get_state().await {
+                    if let Some(decline) = occ3_settings_decline_now(state.model.as_ref(), &state.cwd) {
+                        panel.push('\n');
+                        panel.push_str(&occ3_settings_decline_line(decline));
+                    }
+                }
+            }
             return Ok(CommandOutput::Panel(panel));
         }
         Choice::Menu => {
@@ -513,6 +576,17 @@ pub(super) async fn run(
             resolution.occ2_enabled,
             value,
         )?;
+        // The chat preference only gates native actions; it does not
+        // install the connector. Say so when the settings opt-in would
+        // decline, instead of reporting a bare success.
+        if value {
+            if let Some(decline) = occ3_settings_decline_now(state.model.as_ref(), &state.cwd) {
+                return Ok(CommandOutput::Warning(format!(
+                    "OCC-3 preference saved for this chat. {}",
+                    occ3_settings_decline_line(decline)
+                )));
+            }
+        }
         return Ok(CommandOutput::TransientStatus(status_occ3(enabled, value)));
     }
     match choice {
@@ -793,6 +867,68 @@ mod tests {
         model.occ3.as_mut().unwrap().same_model_only = true;
         model.occ3.as_mut().unwrap().connector = "unsupported".into();
         assert!(!model_supports_occ3(Some(&model)));
+    }
+
+    #[test]
+    fn occ3_settings_decline_names_the_missing_opt_in_for_configured_models_only() {
+        use crate::core::occ3_connectors::activation::Occ3Decline;
+        use pi_ai::types::{Model, Occ3Capability, Occ3Validation, OCC3_API_VERSION_V1, OCC3_PROTOCOL_V1};
+
+        let ordinary = Model {
+            id: "glm-5.3".into(),
+            name: "GLM-5.3 - DGX MTP".into(),
+            ..Default::default()
+        };
+        let mut configured = ordinary.clone();
+        configured.occ3 = Some(Occ3Capability {
+            protocol: OCC3_PROTOCOL_V1.into(),
+            api_version: OCC3_API_VERSION_V1.into(),
+            connector: "sglang".into(),
+            endpoint: "http://127.0.0.1:30001".into(),
+            same_model_only: true,
+            enabled: true,
+            validation: Occ3Validation::LiveVerified,
+            fallback: Vec::new(),
+            method: None,
+            artifact_digest: None,
+        });
+        // No model, or a model without OCC-3: the "unavailable" line covers
+        // it, so there is no settings decline to report.
+        assert_eq!(occ3_settings_decline(None, false, false, None), None);
+        assert_eq!(occ3_settings_decline(Some(&ordinary), false, false, None), None);
+        // A configured model under a missing opt-in names the exact gate.
+        assert_eq!(
+            occ3_settings_decline(Some(&configured), false, false, None),
+            Some(Occ3Decline::DisabledByPolicy)
+        );
+        assert_eq!(
+            occ3_settings_decline(Some(&configured), true, false, None),
+            Some(Occ3Decline::ExperimentalAckRequired)
+        );
+        // Both keys set: the configuration gate passes.
+        assert_eq!(occ3_settings_decline(Some(&configured), true, true, None), None);
+        assert_eq!(
+            occ3_settings_decline(
+                Some(&configured),
+                true,
+                true,
+                Some("http://127.0.0.1:30001".into())
+            ),
+            None
+        );
+        // A broken endpoint override in settings is named too.
+        assert_eq!(
+            occ3_settings_decline(Some(&configured), true, true, Some("not a url".into())),
+            Some(Occ3Decline::InvalidEndpoint)
+        );
+        // The sentence names both keys and the missing tool.
+        let line = occ3_settings_decline_line(Occ3Decline::DisabledByPolicy);
+        assert!(line.contains("agentCommunication.occ3Enabled is false"));
+        assert!(line.contains("agentCommunication.occ3Experimental"));
+        assert!(line.contains("occ3_handoff tool is not installed"));
+        let line = occ3_settings_decline_line(Occ3Decline::InvalidEndpoint);
+        assert!(line.contains("blocked by settings"));
+        assert!(line.contains("occ3_handoff tool is not installed"));
     }
 
     #[test]
