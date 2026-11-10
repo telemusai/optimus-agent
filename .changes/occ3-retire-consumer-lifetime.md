@@ -1,0 +1,1 @@
+- Fixed premature OCC-3 capture retirement invalidating an admitted receiver's terminal commit or completion-proof read; deferred cleanup now waits for an atomic, identity-bound proof snapshot.

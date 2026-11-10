@@ -114,6 +114,10 @@ def test_control_retire_fences_before_snapshot(monkeypatch):
         def get(self, handle, allow_retired=True):
             return NS(descriptor=NS(principal_digest="p", source_session_id="s"))
 
+        def defer_client_retire(self, record):
+            calls.append(("retire_guard",))
+            return False  # No admitted consumer owns this fixture's capture.
+
         def retire(self, handle=None, attempt_id=None):
             calls.append(("retire", handle))
             return {"revoked": True}
@@ -132,8 +136,10 @@ def test_control_retire_fences_before_snapshot(monkeypatch):
                 "payload": {"source_handle": "h", "source_session_id": "s",
                             "principal_digest": "p"}}
     monkeypatch.setattr(w, "_release_content_state", lambda record: None)
-    w.WorkerRuntime.control(runtime, envelope)
+    reply = w.WorkerRuntime.control(runtime, envelope)
+    assert reply["ok"] is True, reply
     order = [c[0] for c in calls]
-    assert "fence" in order and "retire" in order
+    assert "retire_guard" in order and "fence" in order and "retire" in order
+    assert order.index("retire_guard") < order.index("fence"), "guard must run before release"
     assert order.index("fence") < order.index("retire"), "retire must snapshot post-fence"
     assert runtime.poisoned is False

@@ -38,6 +38,7 @@ _ADMISSION_DETAILS = frozenset((
     'latent_registry.reserve_capture.tombstone_capacity',
     'latent_registry.reserve_capture.active_slot',
     'latent_registry.reserve_capture.byte_capacity',
+    'latent_registry.retire.consumer_pending',
     'latent_worker.admit_request.request_identity',
     'latent_worker.admit_request.capture_reserved',
     'latent_worker.admit_request.consume_leased',
@@ -646,7 +647,7 @@ def control_request(command_id, operation, payload):
     identifier(command_id)
     require(operation in {"health", "enroll_session", "reserve_capture", "reserve_consume",
                           "publish", "publication_status", "status", "retire", "bind_output",
-                          "release_lease"})
+                          "release_lease", "finish_consume"})
     bounded_payload(payload)
     return {"schema": "occ3.control.v1", "command_id": command_id,
             "operation": operation, "payload": payload}

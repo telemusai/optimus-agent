@@ -309,7 +309,11 @@ class LatentBackend:
         state = self.attempts.get(reservation.attempt_id)
         require(state is not None and state["reservation"] == reservation and completion.native_rid == reservation.native_rid, "identity")
         d = state["descriptor"]
-        record = await self.client.call("status", {"attempt_id": d.attempt_id, "principal_digest": d.principal_digest})
+        # Atomically read terminal evidence and release the worker's proof
+        # hold; a deferred source retire may reclaim only after that read.
+        record = await self.client.call("finish_consume", {
+            "attempt_id": d.attempt_id, "principal_digest": d.principal_digest},
+            command_id="finish-" + d.reservation_id)
         require(record["state"] == "terminal" and not record["revoked"], "not_ready")
         t = record["terminal"]
         require(t["native_rid"] == d.native_rid and record["source"]["capture_commit_id"] == d.source_capture_commit_id, "identity")
