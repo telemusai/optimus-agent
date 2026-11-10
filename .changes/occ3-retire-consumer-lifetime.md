@@ -1,1 +1,2 @@
 - Fixed premature OCC-3 capture retirement invalidating an admitted receiver's terminal commit or completion-proof read; deferred cleanup now waits for an atomic, identity-bound proof snapshot.
+- Recorded a live TP8 injected-state early-retire busy response, completed native-use receipt, and confirmed late cleanup in `reports/occ3-retire-lifetime-20261110/`; this validates one transport lifetime, not benchmark accuracy or full CUDA qualification.
