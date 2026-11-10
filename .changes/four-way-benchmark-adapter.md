@@ -42,7 +42,45 @@ live CLI harness that drives real optimus-agent daemon sessions.
   guard_outputs list the guard scans, while stage_outputs stays the full
   diagnostic log. Selftest extended from 47 to 48 checks: a roster dump does not
   trip the scoped guard; the same string from a transport command does.
+- Family-pool concurrent mode (throughput design, workers/throughput-design.md):
+  `--pool-size N` (default 1 = the serial path, byte-identical) amortizes the
+  ~15-minute held-parent turn over N trials. One pool prompt admits all 2N
+  stand-by children in a single parent model turn (`--parents-per-pool` splits
+  the pairs across M parallel parents); discovery is name-based with the
+  stand-by relay verified from the child transcripts, and the parent is matched
+  by its first user message equaling the exact pool prompt (unique per pool).
+- Per-trial state refactor for concurrency: stage_outputs/guard_outputs and the
+  held-parent handle move to per-trial/per-pool contexts (PairContext with its
+  own sink lists, PoolContext/ParentUnit owning the parent Popen + session), so
+  concurrent trials cannot cross-contaminate guard evidence; the serial path
+  keeps the harness fields untouched.
+- run_matrix pool path: resume-filtered work queue ordered round-robin across
+  arms, occ3-capped batches (`--max-occ3-per-pool`, default 2, because the
+  native-capture slot is serialized: RuntimeProfile max_active 1), one pool per
+  batch, thread-per-pair trials, JSONL appends under a lock, and a global
+  locked name counter so fwS/fwL/fwP names never collide across batches,
+  pools, or retries.
+- Pool teardown: parents stopped by name (archiving a parent aborts its
+  children, run4 evidence), Popen kill, sid fallback when the rename never
+  landed, belt-and-braces child stops, roster-shrink verification, all bounded
+  by `--pool-teardown-timeout` (default 300 s). A hung parent never blocks
+  discovered pairs: a missing pair is only declared at `--pool-spawn-timeout`
+  (default 1200 s, no idle-based early exit - run5 showed idle rosters do not
+  prove a turn is over), its work item is requeued once, and the second miss
+  is terminal. A trial that fails mid-body returns to a later batch (never
+  retried inside its batch; its pair is dead), bounded by --max-trials.
+  `--trial-deadline` (default 3600 s) abandons an overrunning thread (daemon
+  thread) and records terminal_error=trial_deadline_exceeded.
+- Adapter-crash resume: pool mode preflights a sweep of roster-ACTIVE fw*
+  sessions older than run start (archived sessions untouched).
+- Selftest extended from 48 to 63 checks: pool flag parsing (defaults and
+  values), pool prompt (2N admissions + keepalive + DONE naming every pair),
+  name-counter/pair/parent naming, batch planning (occ3 cap, coverage, all-occ3
+  edge, task/pair assignment), round-robin work order, concurrent JSONL append
+  under a lock, per-pair guard-sink isolation, teardown naming.
 
 NOT-RUN: live four-way trials after the held-parent and completion/standby fixes
 (smoke runs 1-5 all failed at the spawn stage; both fixes are offline-verified only,
-47/47 selftest checks, py_compile clean).
+63/63 selftest checks, py_compile clean). Pool mode is additionally verified only
+against an offline fake-daemon simulation (normal / missing-pair requeue /
+fail-once retry / deadline / four-arm cap scenarios); no live pool run yet.

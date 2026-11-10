@@ -46,19 +46,32 @@ Usage (live, exactly what the executor runs):
     --cli "C:/Users/openclawuser/optimus-assistant-main-preparation-20261012-030555/candidate/optimus-0.1.44-main-20261109-122335/bin/optimus-rust.exe" ^
     --model "dgx-glm53-occ3/glm-5.3" ^
     --arms txt,occ1,occ2,occ3 --tasks-per-family 10
+
+Family-pool mode (throughput design, workers/throughput-design.md):
+  run --live --pool-size N runs N trials concurrently. One held parent turn
+  spawns all 2N stand-by children (names fwS/fwL per pair), the scheduler
+  assigns (arm, task) work items to the discovered pairs, threads drive the
+  unchanged per-trial stages, and teardown stops the parents by name (which
+  archives them and aborts their children - run4 evidence). All pool flags
+  default OFF; --pool-size 1 (default) keeps the serial path byte-identical.
 """
 
 from __future__ import annotations
 
 import argparse
+import dataclasses
 import json
 import os
 import re
+import shutil
 import statistics
 import subprocess
 import sys
+import tempfile
+import threading
 import time
 import uuid
+from collections import deque
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
@@ -142,6 +155,18 @@ STANDBY_PROMPT = (
 # spawn completion also accepts a quiet or idle parent once both children
 # have been discovered.
 PARENT_QUIET_S = 60.0
+
+# Family-pool mode (throughput design): one held parent turn spawns 2N
+# children so N trials run concurrently per batch. All flags default to the
+# serial behavior; --pool-size 1 keeps the serial code path untouched.
+POOL_MODE_MIN_SIZE = 2           # --pool-size >= this activates pool mode
+DEFAULT_POOL_SIZE = 1
+DEFAULT_PARENTS_PER_POOL = 1
+DEFAULT_MAX_OCC3_PER_POOL = 2    # native-capture slot is serialized (max_active: 1)
+DEFAULT_POOL_SPAWN_TIMEOUT = 1200.0
+DEFAULT_TRIAL_DEADLINE = 3600.0
+DEFAULT_POOL_TEARDOWN_TIMEOUT = 300.0
+POLL_INTERVAL_S = 5.0
 
 # ---------------------------------------------------------------------------
 # Task loading + checkers (reused verbatim from the existing framework)
@@ -432,6 +457,39 @@ It returns immediately with a handle. Do NOT wait for it, do NOT inspect it, do 
 DONE {speaker_name}=<its rlm_child_id> {listener_name}=<its rlm_child_id>"""
 
 
+def parent_spawn_prompt_pool(pairs: list) -> str:
+    """Pool spawn prompt (family-pool mode): ONE parent model turn admits
+    every pair's two children (each rlm admission returns immediately, so a
+    single turn covers all of them), then holds the same non-blocking
+    keep-alive as the serial parent. The DONE line names every pair; pool
+    readiness is verified from the children (by name), not from this prose."""
+    spawns = []
+    for pair in pairs:
+        spawns.append(
+            f"handle_l_{pair.index:04d} = await rlm({STANDBY_PROMPT!r}, name={pair.listener_name!r})"
+        )
+        spawns.append(
+            f"handle_s_{pair.index:04d} = await rlm({STANDBY_PROMPT!r}, name={pair.speaker_name!r})"
+        )
+    done_pairs = " ".join(
+        f"{p.speaker_name}=<its rlm_child_id> {p.listener_name}=<its rlm_child_id>"
+        for p in pairs
+    )
+    n_children = 2 * len(pairs)
+    return f"""You are the setup agent for a multi-trial benchmark pool. Your only job is to spawn {n_children} subagents with the rlm skill (they form speaker/listener pairs), keep your session alive, and then finish your turn.
+
+In your Python kernel run exactly these {n_children} spawns, in one cell, in this order (all children inherit your model; do not request a different model):
+
+{chr(10).join(spawns)}
+
+Do not modify the sub-task text. Do not send the children any messages. Do not inspect them. After all admissions return, keep your session alive by launching a NON-BLOCKING long-lived shell handle in your Python kernel with exactly:
+
+h = bash('ping -n 7200 127.0.0.1')
+
+It returns immediately with a handle. Do NOT wait for it, do NOT inspect it, do NOT close it. Then reply with exactly:
+DONE {done_pairs}"""
+
+
 def listener_setup_prompt(task: dict, speaker_name: str) -> str:
     return f"""This message is from the benchmark operator, not from Agent A. It sets up your task.
 
@@ -665,6 +723,96 @@ class CliError(RuntimeError):
     pass
 
 
+@dataclasses.dataclass
+class PairContext:
+    """Per-trial state for one pre-spawned speaker/listener pair (pool mode).
+
+    A pair serves exactly ONE (arm, task) trial and is never reused, so its
+    stage/guard output lists are private to that trial once a worker thread
+    owns it (thread-safe by construction; _run sinks through _tl.pair)."""
+
+    index: int
+    speaker_name: str = ""
+    listener_name: str = ""
+    speaker_entry: dict | None = None
+    listener_entry: dict | None = None
+    parent: "ParentUnit | None" = dataclasses.field(default=None, repr=False)
+    discovered: bool = False
+    stage_outputs: list[str] = dataclasses.field(default_factory=list)
+    guard_outputs: list[str] = dataclasses.field(default_factory=list)
+
+    def __post_init__(self) -> None:
+        if not self.speaker_name:
+            self.speaker_name = f"fwS{self.index:04d}"
+        if not self.listener_name:
+            self.listener_name = f"fwL{self.index:04d}"
+
+    def session_file(self, role: str) -> str | None:
+        entry = self.speaker_entry if role == "speaker" else self.listener_entry
+        if not entry:
+            return None
+        return entry.get("sessionFile") or entry.get("session_file")
+
+
+@dataclasses.dataclass
+class ParentUnit:
+    """One held parent turn owning a subset of a pool's pairs.
+
+    `name` is fwP<first pair index> so it never collides across batches,
+    pools, or retries (the pair index counter is global)."""
+
+    name: str
+    pairs: list  # list[PairContext]
+    prompt: str
+    proc: subprocess.Popen | None = None
+    session: dict | None = None
+    renamed: bool = False
+
+
+@dataclasses.dataclass
+class PoolContext:
+    """A spawned pool: its held parents and all their pairs."""
+
+    parents: list  # list[ParentUnit]
+    pairs: list    # list[PairContext]
+    before: set = dataclasses.field(default_factory=set)
+    spawned_at: float = 0.0
+
+
+@dataclasses.dataclass
+class WorkItem:
+    """One (arm, task) work unit on the pool-mode queue (identity semantics:
+    no __eq__, so `id(item)` membership is stable under threading)."""
+
+    arm: str
+    task: dict
+    attempts: int = 0
+    requeued_missing_pair: bool = False
+    pair_index: int = 0
+
+
+class NameCounter:
+    """Global, thread-safe, monotonically increasing pair-name counter.
+
+    Mirrors the serial loop's `index += 1`-per-attempt discipline: every
+    allocated pair (including failed/missing ones) consumes a number, so
+    fwS/fwL/fwP names never collide across batches, pools, or retries."""
+
+    def __init__(self, start: int = 0):
+        self._lock = threading.Lock()
+        self._value = start
+
+    def next(self) -> int:
+        with self._lock:
+            self._value += 1
+            return self._value
+
+    @property
+    def value(self) -> int:
+        with self._lock:
+            return self._value
+
+
 class LiveHarness:
     def __init__(self, cli: str, model: str, run_dir: Path, answer_timeout_s: float,
                  send_timeout_s: float, verbose: bool = False,
@@ -691,6 +839,11 @@ class LiveHarness:
         # Named sessions owned by the trial currently in flight (children then
         # parent); swept best-effort at cleanup and on any trial failure.
         self._trial_sessions: list[str] = []
+        # Per-thread sink binding for pool-mode worker threads: a thread that
+        # sets self._tl.pair routes its CLI outputs into that pair's private
+        # lists (required for any concurrency); unbound threads (the serial
+        # path, pool spawn/teardown) keep the harness fields above.
+        self._tl = threading.local()
 
     def _provider_model_flags(self) -> list[str]:
         # The CLI takes --provider and --model as SEPARATE flags; a compound
@@ -716,17 +869,32 @@ class LiveHarness:
                 cmd = [self.cli, "--daemon-socket", self.daemon_socket, *args]
         return cmd
 
+    def _stage_sinks(self) -> tuple[list[str], list[str]]:
+        """The (stage, guard) output sinks of the CALLING thread.
+
+        A pool worker thread binds its PairContext once (self._tl.pair) so
+        every CLI output of that trial lands in the trial's own lists; threads
+        without a binding (the serial path, pool spawn/teardown) fall back to
+        the harness fields."""
+        pair = getattr(self._tl, "pair", None)
+        if pair is not None:
+            return pair.stage_outputs, pair.guard_outputs
+        return self.stage_outputs, self.guard_outputs
+
     def _run(self, args: list[str], timeout: float, check: bool = True,
              transport: bool = False) -> subprocess.CompletedProcess:
         # transport=True tags a command that exercises the message-transport
-        # path (the CLI `send` turns). Only transport outputs reach
-        # self.guard_outputs, the list guard_legacy_410 scans, so roster dumps
+        # path (the CLI `send` turns). Only transport outputs reach the
+        # guard sink, the list guard_legacy_410 scans, so roster dumps
         # (list --all --json carries every session's firstMessage, and an
         # unrelated idle session mentions legacy /occ3/v1 routes + 410)
-        # cannot trip the guard; stage_outputs keeps the full diagnostic log.
+        # cannot trip the guard; the stage sink keeps the full diagnostic log.
+        # Both sinks are per-calling-thread (see _stage_sinks) so concurrent
+        # pool trials cannot cross-contaminate each other's guard evidence.
         cmd = self._build_cmd(args)
         if self.verbose:
             print(f"  [cli] {' '.join(args[:6])}{' ...' if len(args) > 6 else ''}", flush=True)
+        stage_sink, guard_sink = self._stage_sinks()
         try:
             proc = subprocess.run(
                 cmd,
@@ -738,14 +906,14 @@ class LiveHarness:
             )
         except subprocess.TimeoutExpired as exc:
             note = f"timeout: {' '.join(args[:4])}: {exc}"
-            self.stage_outputs.append(note)
+            stage_sink.append(note)
             if transport:  # a transport timeout string may legitimately mention routes
-                self.guard_outputs.append(note)
+                guard_sink.append(note)
             raise CliError(f"CLI timeout: {' '.join(args[:4])}") from exc
         outputs = [proc.stdout or "", proc.stderr or ""]
-        self.stage_outputs.extend(outputs)
+        stage_sink.extend(outputs)
         if transport:
-            self.guard_outputs.extend(outputs)
+            guard_sink.extend(outputs)
         if check and proc.returncode != 0:
             raise CliError(
                 f"CLI failed ({proc.returncode}): {' '.join(args[:4])}: "
@@ -855,19 +1023,288 @@ class LiveHarness:
             self._run(["stop", name], timeout=120, check=False)
         self._kill_held_parent()
 
+    # -- family-pool mode ----------------------------------------------------
+
+    def _standby_verified(self, pair: "PairContext") -> bool:
+        """Both children relayed the stand-by prompt verbatim (first user msg)."""
+        for role in ("speaker", "listener"):
+            path = pair.session_file(role)
+            if not path:
+                return False
+            records = parse_session_records(path)
+            users = [_message_text(m) for m in records if _role(m) == "user"]
+            if not users or users[0].strip() != STANDBY_PROMPT:
+                return False
+        return True
+
+    def _find_parent_by_prompt(self, sessions: list, before: set, child_names: set,
+                                prompt: str, claimed: set) -> dict | None:
+        """The new roster entry whose first user message IS the exact pool
+        prompt (unique per pool, so several pools spawning in overlap cannot
+        be confused; the "remaining new session" fallback is not used here)."""
+        for entry in sessions:
+            sid = entry.get("activeSessionId") or entry.get("sessionId")
+            if sid in before or sid in claimed:
+                continue
+            name = entry.get("sessionName") or entry.get("name") or ""
+            if name in child_names:
+                continue
+            path = entry.get("sessionFile")
+            if not path:
+                continue
+            records = parse_session_records(path)
+            users = [_message_text(m) for m in records if _role(m) == "user"]
+            if users and users[0].strip() == prompt.strip():
+                return entry
+        return None
+
+    def _spawn_pool(self, pairs: list, parents_per_pool: int = 1,
+                    spawn_timeout_s: float | None = None) -> "PoolContext":
+        """Spawn one family pool: M held parent turns admitting all 2N children.
+
+        Readiness = every child discovered BY NAME with the stand-by prompt
+        verified (the DONE literal is secondary). A parent that never settles
+        never blocks the discovered pairs: after the spawn deadline the pool
+        returns with missing pairs flagged (their work items are requeued by
+        the caller) and the parent Popens are killed; teardown stops the
+        parent sessions by name."""
+        if not pairs:
+            raise CliError("_spawn_pool: no pairs to spawn")
+        timeout = float(spawn_timeout_s if spawn_timeout_s is not None else self.spawn_timeout_s)
+        parents = max(1, min(int(parents_per_pool), len(pairs)))
+        chunk_size = -(-len(pairs) // parents)  # ceil division
+        units: list[ParentUnit] = []
+        for start in range(0, len(pairs), chunk_size):
+            chunk = pairs[start:start + chunk_size]
+            unit = ParentUnit(
+                name=f"fwP{chunk[0].index:04d}",
+                pairs=chunk,
+                prompt=parent_spawn_prompt_pool(chunk),
+            )
+            for pair in chunk:
+                pair.parent = unit
+            units.append(unit)
+        child_names = {p.speaker_name for p in pairs} | {p.listener_name for p in pairs}
+        before = {s.get("activeSessionId") or s.get("sessionId") for s in self.list_sessions()}
+        spawned_at = time.time()
+        for unit in units:
+            # Same held-parent mechanism as the serial path: a --print session
+            # archives (aborting its children) when its turn completes, so the
+            # prompt makes it hold a non-blocking keep-alive handle and the
+            # adapter kills the Popen at teardown / spawn deadline.
+            unit.proc = subprocess.Popen(
+                self._build_cmd(["--print", *self._provider_model_flags(), "--cwd", str(self.run_dir), unit.prompt]),
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+                stdin=subprocess.DEVNULL,
+                text=True,
+                encoding="utf-8",
+                errors="replace",
+            )
+        claimed: set = set()
+        full_discovery = False
+        deadline = time.perf_counter() + timeout
+        while time.perf_counter() < deadline:
+            sessions = self.list_sessions()
+            for entry in sessions:
+                name = entry.get("sessionName") or entry.get("name") or ""
+                sid = entry.get("activeSessionId") or entry.get("sessionId")
+                if sid in before or name not in child_names:
+                    continue
+                for pair in pairs:
+                    if name == pair.speaker_name and pair.speaker_entry is None:
+                        pair.speaker_entry = entry
+                    elif name == pair.listener_name and pair.listener_entry is None:
+                        pair.listener_entry = entry
+            for pair in pairs:
+                if (not pair.discovered and pair.speaker_entry and pair.listener_entry
+                        and self._standby_verified(pair)):
+                    pair.discovered = True
+            sid_to_entry = {
+                e.get("activeSessionId") or e.get("sessionId"): e for e in sessions
+            }
+            for unit in units:
+                if unit.session is None:
+                    found = self._find_parent_by_prompt(
+                        sessions, before, child_names, unit.prompt, claimed
+                    )
+                    if found is not None:
+                        unit.session = found
+                        claimed.add(found.get("activeSessionId") or found.get("sessionId"))
+                else:
+                    sid = (unit.session or {}).get("activeSessionId") or (unit.session or {}).get("sessionId")
+                    current = sid_to_entry.get(sid)
+                    if current is not None:
+                        unit.session = current  # keep the live roster entry fresh
+            if all(p.discovered for p in pairs) and all(u.session is not None for u in units):
+                full_discovery = True
+                break
+            # NOTE: no idle-based early exit. Run5 evidence shows a hung
+            # parent can sit roster-idle while a healthy one is still
+            # admitting (idle does not prove the turn is over), so a missing
+            # pair is only ever declared at the --pool-spawn-timeout deadline
+            # (throughput design §7, row 1).
+            time.sleep(POLL_INTERVAL_S)
+        # Filesystem fallback for children the roster never showed (same shape
+        # as the serial path): new session files whose first user message is
+        # the stand-by prompt, assigned to the still-missing pair slots.
+        missing_slots: list[tuple["PairContext", str]] = []
+        for pair in pairs:
+            for role, has in (("speaker", pair.speaker_entry), ("listener", pair.listener_entry)):
+                if has is None:
+                    missing_slots.append((pair, role))
+        if missing_slots and self.sessions_dir and os.path.isdir(self.sessions_dir):
+            known_files = {
+                (p.speaker_entry or {}).get("sessionFile") for p in pairs
+            } | {
+                (p.listener_entry or {}).get("sessionFile") for p in pairs
+            }
+            for path in Path(self.sessions_dir).rglob("*.jsonl"):
+                if not missing_slots:
+                    break
+                if str(path) in known_files:
+                    continue
+                try:
+                    stat = path.stat()
+                    if stat.st_mtime < spawned_at - 5 or stat.st_size > 4_000_000:
+                        continue
+                    records = parse_session_records(path)
+                    users = [_message_text(m) for m in records if _role(m) == "user"]
+                    if not users or users[0].strip() != STANDBY_PROMPT:
+                        continue
+                except OSError:
+                    continue
+                pair, role = missing_slots.pop(0)
+                entry = {
+                    "sessionFile": str(path),
+                    "sessionName": pair.speaker_name if role == "speaker" else pair.listener_name,
+                }
+                if role == "speaker":
+                    pair.speaker_entry = entry
+                else:
+                    pair.listener_entry = entry
+            for pair in pairs:
+                if (not pair.discovered and pair.speaker_entry and pair.listener_entry
+                        and self._standby_verified(pair)):
+                    pair.discovered = True
+        if not full_discovery:
+            # Stuck or partial spawn: kill the held parent CLIs now (the
+            # sessions are stopped by name at teardown). Discovered pairs are
+            # NOT blocked - their trials run; missing pairs are requeued.
+            for unit in units:
+                if unit.proc is not None and unit.proc.poll() is None:
+                    unit.proc.kill()
+        # Rename the parents for stop-by-name teardown (best effort: a hung
+        # parent must not fail the batch; teardown falls back to the sid).
+        for unit in units:
+            sid = (unit.session or {}).get("activeSessionId") or (unit.session or {}).get("sessionId")
+            if unit.session is not None and sid:
+                proc = self._run(["rename", str(sid), unit.name], timeout=60, check=False)
+                unit.renamed = proc.returncode == 0
+        return PoolContext(parents=units, pairs=pairs, before=before, spawned_at=spawned_at)
+
+    def _teardown_pool(self, pool: "PoolContext", teardown_timeout_s: float = 300.0) -> dict:
+        """Teardown of one pool, bounded by teardown_timeout_s.
+
+        Order: stop each parent BY NAME (archiving the parent aborts its
+        children - run4 evidence), fall back to the parent's session id when
+        the rename never landed, kill the held parent Popens, then belt-and-
+        braces stop any child still roster-active by name, and verify the
+        roster shrank. A hung parent can only cost its bounded stop window,
+        never the batch."""
+        info: dict = {"stopped": [], "lingering": [], "killed_procs": 0}
+        deadline = time.perf_counter() + max(float(teardown_timeout_s), 1.0)
+        for unit in pool.parents:
+            remaining = deadline - time.perf_counter()
+            if remaining > 0:
+                self._run(["stop", unit.name], timeout=min(120.0, remaining), check=False)
+                info["stopped"].append(unit.name)
+            sid = (unit.session or {}).get("activeSessionId") or (unit.session or {}).get("sessionId")
+            if unit.session is not None and not unit.renamed and sid:
+                remaining = deadline - time.perf_counter()
+                if remaining > 0:
+                    self._run(["stop", str(sid)], timeout=min(120.0, remaining), check=False)
+        for unit in pool.parents:  # local handles are always killed, deadline or not
+            if unit.proc is not None and unit.proc.poll() is None:
+                unit.proc.kill()
+                info["killed_procs"] += 1
+        pool_names = {u.name for u in pool.parents} | {
+            name for p in pool.pairs for name in (p.speaker_name, p.listener_name)
+        }
+        try:
+            active_names = {
+                e.get("sessionName") or e.get("name") or ""
+                for e in self.list_sessions(include_saved=False)
+            }
+        except CliError:
+            active_names = None
+        if active_names is not None:
+            for name in sorted(pool_names):
+                if name in active_names:
+                    remaining = deadline - time.perf_counter()
+                    if remaining <= 0:
+                        break
+                    self._run(["stop", name], timeout=min(120.0, remaining), check=False)
+            try:
+                after_names = {
+                    e.get("sessionName") or e.get("name") or ""
+                    for e in self.list_sessions(include_saved=False)
+                }
+            except CliError:
+                after_names = set()
+            info["lingering"] = sorted(pool_names & after_names)
+        return info
+
+    def preflight_fw_sweep(self, run_started_at: float) -> list[str]:
+        """Adapter-crash resume safety net (pool mode): stop roster-ACTIVE fw*
+        sessions that existed before this run started. A crashed pool run
+        leaves keep-alive children and held parents on the roster; archived
+        sessions are the daemon's business and are not touched."""
+        stopped: list[str] = []
+        try:
+            sessions = self.list_sessions(include_saved=False)
+        except CliError:
+            return stopped
+        for entry in sessions:
+            name = entry.get("sessionName") or entry.get("name") or ""
+            if not name.startswith("fw"):
+                continue
+            path = entry.get("sessionFile")
+            started = None
+            if path:
+                try:
+                    started = Path(path).stat().st_ctime  # Windows: creation time
+                except OSError:
+                    started = None
+            if started is not None and started > run_started_at - 5:
+                continue  # not older than run start: not a leftover of a crash
+            self._run(["stop", name], timeout=120, check=False)
+            stopped.append(name)
+        return stopped
+
     # -- one trial ---------------------------------------------------------
 
-    def run_trial(self, arm: str, task: dict, trial_index: int) -> dict:
+    def run_trial(self, arm: str, task: dict, trial_index: int,
+                  pair: "PairContext | None" = None) -> dict:
         t_start = time.perf_counter()
-        self.stage_outputs = []  # full log, kept for diagnostics
-        self.guard_outputs = []  # transport-scoped log; guards are evaluated per trial
+        if pair is None:
+            self.stage_outputs = []  # full log, kept for diagnostics
+            self.guard_outputs = []  # transport-scoped log; guards are evaluated per trial
+        # Pool mode: the pre-spawned pair's own lists are the sinks (bound by
+        # the worker thread via self._tl.pair); the harness fields stay
+        # untouched so concurrent trials cannot cross-contaminate evidence.
         trial_id = f"t{trial_index:04d}-{arm}-{task['task_id']}"
-        speaker_name = f"fwS{trial_index:04d}"
-        listener_name = f"fwL{trial_index:04d}"
-        parent_name = f"fwP{trial_index:04d}"
-        # Children hold keep-alive handles once spawned, so every named
-        # session of this trial must be swept at cleanup and on failure.
-        self._trial_sessions = [speaker_name, listener_name, parent_name]
+        if pair is not None:
+            speaker_name = pair.speaker_name
+            listener_name = pair.listener_name
+            parent_name = pair.parent.name if pair.parent is not None else f"fwP{trial_index:04d}"
+        else:
+            speaker_name = f"fwS{trial_index:04d}"
+            listener_name = f"fwL{trial_index:04d}"
+            parent_name = f"fwP{trial_index:04d}"
+            # Children hold keep-alive handles once spawned, so every named
+            # session of this trial must be swept at cleanup and on failure.
+            self._trial_sessions = [speaker_name, listener_name, parent_name]
         chain: list[dict] = []
         record = {
             "schema": TRIAL_SCHEMA,
@@ -1042,7 +1479,23 @@ class LiveHarness:
                 "listener": children[listener_name],
             }
 
-        family = stage("spawn_family", _spawn_parent)
+        if pair is not None:
+            def _pool_pair_ready():
+                if pair.speaker_entry is None or pair.listener_entry is None:
+                    raise CliError(
+                        f"pool pair incomplete: {pair.speaker_name}/{pair.listener_name}"
+                    )
+                if pair.parent is None or pair.parent.session is None:
+                    raise CliError("pool parent session not identified")
+                return {
+                    "parent": pair.parent.session,
+                    "speaker": pair.speaker_entry,
+                    "listener": pair.listener_entry,
+                }
+
+            family = stage("pool_pair_ready", _pool_pair_ready)
+        else:
+            family = stage("spawn_family", _spawn_parent)
         speaker_entry = family["speaker"]
         listener_entry = family["listener"]
         speaker_file = speaker_entry.get("sessionFile") or speaker_entry.get("session_file")
@@ -1219,7 +1672,8 @@ class LiveHarness:
         }
 
         # 9. guards -------------------------------------------------------------
-        record["guards"]["legacy_410"] = guard_legacy_410(self.guard_outputs)
+        guard_src = pair.guard_outputs if pair is not None else self.guard_outputs
+        record["guards"]["legacy_410"] = guard_legacy_410(guard_src)
         record["guards"]["mislabel"] = guard_mislabel(arm, record["effective_label_alpha"] or "", record["native_success"])
         record["guards"]["synthetic_backend"] = guard_synthetic_backend(
             [json.dumps(record["delivery"]), json.dumps(record["identities"]), self.model],
@@ -1237,9 +1691,16 @@ class LiveHarness:
 
         # 10. cleanup (best effort) ---------------------------------------------
         def _cleanup():
-            # Children first (they hold keep-alive handles and stay
-            # roster-active), then the parent session, then the held CLI.
-            self.sweep_trial_sessions()
+            if pair is not None:
+                # Pool mode: stop only this pair's children (the pair is
+                # single-use); the pool parent and its Popen are owned by
+                # _teardown_pool, never by a trial.
+                for name in (pair.speaker_name, pair.listener_name):
+                    self._run(["stop", name], timeout=120, check=False)
+            else:
+                # Children first (they hold keep-alive handles and stay
+                # roster-active), then the parent session, then the held CLI.
+                self.sweep_trial_sessions()
             return True
 
         stage("cleanup", _cleanup)
@@ -1489,6 +1950,161 @@ def dry_selftest(tasks_per_family: int, cli: str, model: str) -> tuple[bool, lis
         f"roster_only={roster_only} after_transport={after_transport} full_log={full_log_would_trip}",
     )
 
+    # 14. family-pool flag surface ----------------------------------------------
+    pool_parser = build_arg_parser()
+    pool_defaults = pool_parser.parse_args(["run"])
+    check("pool_flags_default_off",
+          pool_defaults.pool_size == 1 and pool_defaults.parents_per_pool == 1
+          and pool_defaults.max_occ3_per_pool == 2
+          and pool_defaults.pool_spawn_timeout == 1200.0
+          and pool_defaults.trial_deadline == 3600.0
+          and pool_defaults.pool_teardown_timeout == 300.0,
+          f"pool_size={pool_defaults.pool_size} parents={pool_defaults.parents_per_pool} "
+          f"max_occ3={pool_defaults.max_occ3_per_pool} spawn={pool_defaults.pool_spawn_timeout} "
+          f"deadline={pool_defaults.trial_deadline} teardown={pool_defaults.pool_teardown_timeout}")
+    pool_parsed = pool_parser.parse_args([
+        "run", "--pool-size", "8", "--parents-per-pool", "2", "--max-occ3-per-pool", "1",
+        "--pool-spawn-timeout", "900", "--trial-deadline", "1800", "--pool-teardown-timeout", "60",
+    ])
+    check("pool_flags_parsed",
+          pool_parsed.pool_size == 8 and pool_parsed.parents_per_pool == 2
+          and pool_parsed.max_occ3_per_pool == 1 and pool_parsed.pool_spawn_timeout == 900.0
+          and pool_parsed.trial_deadline == 1800.0 and pool_parsed.pool_teardown_timeout == 60.0,
+          f"size={pool_parsed.pool_size} parents={pool_parsed.parents_per_pool} "
+          f"occ3={pool_parsed.max_occ3_per_pool}")
+
+    # 15. pool spawn prompt: 2N admissions + keepalive + DONE naming all pairs --
+    pool_pairs = [PairContext(index=k) for k in (7, 8, 9)]
+    pool_prompt = parent_spawn_prompt_pool(pool_pairs)
+    done_tail = pool_prompt.split("DONE ", 1)[1]
+    check("pool_prompt_spawns",
+          pool_prompt.count("await rlm(") == 6
+          and pool_prompt.count(repr(STANDBY_PROMPT)) == 6
+          and all(p.speaker_name in pool_prompt and p.listener_name in pool_prompt
+                  for p in pool_pairs),
+          f"{pool_prompt.count('await rlm(')} spawn lines for 3 pairs")
+    check("pool_prompt_keepalive_done",
+          "h = bash('ping -n 7200 127.0.0.1')" in pool_prompt
+          and all(name in done_tail
+                  for p in pool_pairs for name in (p.speaker_name, p.listener_name)),
+          "keepalive handle + DONE line naming every pair")
+
+    # 16. pair naming + global counter (no collisions across pools/retries) -----
+    counter = NameCounter()
+    seq = [counter.next() for _ in range(3)]
+    check("name_counter", seq == [1, 2, 3] and counter.value == 3, str(seq))
+    pair_one = PairContext(index=1)
+    check("pair_naming",
+          pair_one.speaker_name == "fwS0001" and pair_one.listener_name == "fwL0001",
+          f"{pair_one.speaker_name}/{pair_one.listener_name}")
+    chunks = [pool_pairs[:1], pool_pairs[1:]]
+    parent_names = [f"fwP{c[0].index:04d}" for c in chunks]
+    check("pool_parent_naming",
+          parent_names == ["fwP0007", "fwP0008"],
+          "parent name = fwP<first pair index>, distinct across chunks")
+
+    # 17. batch planning: occ3 cap, coverage, task/pair assignment --------------
+    spec = ["txt", "occ1", "occ2", "occ3", "txt", "occ1", "occ2", "occ3",
+            "txt", "occ1", "occ2", "occ3"]
+    queue_items = [WorkItem(arm=a, task={"task_id": f"{a}-{i:02d}", "family": "A"})
+                   for i, a in enumerate(spec)]
+    pool_queue = deque(queue_items)
+    planned = []
+    while pool_queue:
+        planned.append(take_batch(pool_queue, 4, 2))
+    all_ids = [item.task["task_id"] for batch in planned for item in batch]
+    check("batch_occ3_cap",
+          all(sum(1 for item in batch if item.arm == "occ3") <= 2 for batch in planned)
+          and all(len(batch) <= 4 for batch in planned),
+          f"{len(planned)} batches, occ3 per batch="
+          f"{[sum(1 for i in b if i.arm == 'occ3') for b in planned]}")
+    check("batch_coverage",
+          sorted(all_ids) == sorted(item.task["task_id"] for item in queue_items),
+          f"{len(all_ids)} scheduled of {len(queue_items)}")
+    occ3_queue = deque([WorkItem(arm="occ3", task={"task_id": f"occ3-{i}", "family": "A"})
+                        for i in range(6)])
+    occ3_batches = []
+    while occ3_queue:
+        occ3_batches.append(take_batch(occ3_queue, 8, 2))
+    check("batch_occ3_only",
+          [len(b) for b in occ3_batches] == [2, 2, 2],
+          f"cap binds before pool width: {[len(b) for b in occ3_batches]}")
+    assign_counter = NameCounter()
+    assigned = {}
+    for batch in planned:
+        for item in batch:
+            item.pair_index = assign_counter.next()
+            assigned[item.task["task_id"]] = (
+                f"t{item.pair_index:04d}-{item.arm}-{item.task['task_id']}"
+            )
+    check("batch_pair_assignment",
+          len(set(assigned.values())) == len(queue_items)
+          and assigned["occ3-03"] == f"t0004-occ3-occ3-03",
+          f"{len(set(assigned.values()))} unique trial ids")
+
+    # 18. pool work ordering: round-robin across arms ----------------------------
+    rr = build_pool_work(["txt", "occ1"], tasks[:3])
+    check("pool_work_round_robin",
+          [i.arm for i in rr] == ["txt", "occ1", "txt", "occ1", "txt", "occ1"],
+          str([i.arm for i in rr]))
+
+    # 19. concurrent JSONL append under a lock -----------------------------------
+    tmpdir = tempfile.mkdtemp(prefix="fw-pool-selftest-")
+    try:
+        tmp_jsonl = Path(tmpdir) / "concurrent.jsonl"
+        append_lock = threading.Lock()
+
+        def _append_many(thread_id: int) -> None:
+            for i in range(50):
+                with append_lock:
+                    with tmp_jsonl.open("a", encoding="utf-8") as fh:
+                        fh.write(json.dumps({"thread": thread_id, "i": i}) + "\n")
+
+        appenders = [threading.Thread(target=_append_many, args=(k,)) for k in range(4)]
+        for thread in appenders:
+            thread.start()
+        for thread in appenders:
+            thread.join()
+        written = [line for line in tmp_jsonl.read_text(encoding="utf-8").splitlines() if line]
+        parsed = [json.loads(line) for line in written]
+        check("concurrent_append",
+              len(parsed) == 200 and all(p["thread"] in range(4) for p in parsed),
+              f"{len(parsed)} lines from 4 threads")
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+    # 20. per-pair sink isolation (pool concurrency prerequisite) ------------------
+    sink_pair = PairContext(index=99)
+    subprocess.run = _fake_subprocess_run
+    try:
+        probe_harness.stage_outputs = []
+        probe_harness.guard_outputs = []
+        probe_harness._tl.pair = sink_pair
+        probe_harness._run(["send", "fwL0099", "--message", "ping"], timeout=5, check=False, transport=True)
+        probe_harness._tl.pair = None
+        probe_harness.stage_outputs = []
+        probe_harness.guard_outputs = []
+        probe_harness._run(["list", "--json"], timeout=5, check=False)
+    finally:
+        subprocess.run = _real_subprocess_run
+    check("pool_stage_sink_isolation",
+          len(sink_pair.stage_outputs) >= 2 and len(sink_pair.guard_outputs) >= 2
+          and len(probe_harness.stage_outputs) >= 2 and probe_harness.guard_outputs == [],
+          f"pair sinks s={len(sink_pair.stage_outputs)} g={len(sink_pair.guard_outputs)}; "
+          f"harness sinks s={len(probe_harness.stage_outputs)} g={len(probe_harness.guard_outputs)}")
+
+    # 21. teardown naming: the names _teardown_pool stops ------------------------
+    pool_units = [ParentUnit(name="fwP0007", pairs=pool_pairs[:1], prompt="p")]
+    pool_ctx = PoolContext(parents=pool_units, pairs=pool_pairs, before=set(), spawned_at=0.0)
+    teardown_names = {u.name for u in pool_ctx.parents} | {
+        name for p in pool_ctx.pairs for name in (p.speaker_name, p.listener_name)
+    }
+    check("pool_teardown_naming",
+          teardown_names == {"fwP0007", "fwS0007", "fwL0007", "fwS0008",
+                             "fwL0008", "fwS0009", "fwL0009"}
+          and all(re.fullmatch(r"fw[PSL]\d{4}", name) for name in teardown_names),
+          str(sorted(teardown_names)))
+
     print(f"selftest: {len(checks) - len(failures)}/{len(checks)} checks passed")
     for name, ok, detail in checks:
         mark = "PASS" if ok else "FAIL"
@@ -1583,6 +2199,267 @@ def aggregate(trials: list[dict]) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Family-pool scheduling + concurrent matrix runner (pool mode only;
+# --pool-size 1 keeps the serial loop in run_matrix untouched)
+# ---------------------------------------------------------------------------
+
+
+def build_pool_work(arms: list, tasks: list) -> list:
+    """Work list ordered round-robin across arms so per-arm results accumulate
+    evenly across batches (pool mode only; the serial loop keeps its arm-major
+    order for byte-identical behavior)."""
+    work: list[WorkItem] = []
+    for i in range(len(tasks)):
+        for arm in arms:
+            work.append(WorkItem(arm=arm, task=tasks[i]))
+    return work
+
+
+def take_batch(pending: "deque[WorkItem]", pool_size: int, max_occ3: int) -> list:
+    """Pop the next batch from `pending`, honoring the per-batch occ3 cap.
+
+    Occ3 trials contend for the single native-capture slot
+    (RuntimeProfile_max_active: 1), so at most `max_occ3` of them share one
+    batch; cap-excluded occ3 items are deferred to the FRONT of the queue so
+    the next batch places them first. Never returns an empty batch while
+    `pending` is non-empty (pool_size >= 1 and max_occ3 >= 1 are validated by
+    the caller: the first item always fits)."""
+    batch: list[WorkItem] = []
+    deferred: list[WorkItem] = []
+    occ3_used = 0
+    while pending and len(batch) < pool_size:
+        item = pending.popleft()
+        if item.arm == "occ3":
+            if occ3_used >= max_occ3:
+                deferred.append(item)
+                continue
+            occ3_used += 1
+        batch.append(item)
+    for item in reversed(deferred):
+        pending.appendleft(item)
+    return batch
+
+
+def _run_pool_matrix(harness: "LiveHarness", args, arms: list, tasks: list,
+                     completed: set, run_id: str, out_jsonl: Path) -> list:
+    """Family-pool concurrent execution (throughput design §2).
+
+    Work queue -> occ3-capped batches -> one pool per batch (held parents
+    admitting 2N children) -> thread-per-pair trials -> bounded join ->
+    teardown. JSONL appends, the record registry and the global name counter
+    are serialized under one lock. A trial that fails mid-body returns to the
+    queue for a LATER batch (never retried inside its batch: its pair is
+    dead); missing pairs are requeued once; deadline-missed threads are
+    abandoned (daemon threads) and recorded as trial_deadline_exceeded."""
+    run_started_at = time.time()
+    swept = harness.preflight_fw_sweep(run_started_at)
+    if swept:
+        print(
+            f"[pool] preflight swept {len(swept)} roster-active fw* leftover(s): "
+            f"{swept[:6]}{'...' if len(swept) > 6 else ''}",
+            flush=True,
+        )
+    work = build_pool_work(arms, tasks)
+    pending: "deque[WorkItem]" = deque(
+        item for item in work if (item.arm, item.task["task_id"]) not in completed
+    )
+    skipped = len(work) - len(pending)
+    if skipped:
+        print(f"[skip] {skipped} (arm, task) pair(s) already recorded", flush=True)
+    counter = NameCounter()
+    lock = threading.Lock()
+    recorded: set[int] = set()
+    trials: list[dict] = []
+    owned_names: list[str] = []
+    batch_no = 0
+
+    def append_record(record: dict) -> None:
+        trials.append(record)
+        with out_jsonl.open("a", encoding="utf-8") as fh:
+            fh.write(json.dumps(record, ensure_ascii=True) + "\n")
+
+    def failure_record(item: WorkItem, terminal_error: str, pair) -> dict:
+        return {
+            "schema": TRIAL_SCHEMA,
+            "campaign_id": CAMPAIGN_ID,
+            "run_id": run_id,
+            "trial_id": f"t{item.pair_index:04d}-{item.arm}-{item.task['task_id']}",
+            "task_id": item.task["task_id"],
+            "family": item.task["family"],
+            "difficulty": item.task.get("difficulty"),
+            "seed": SEED,
+            "mode": item.arm,
+            "arm": item.arm,
+            "requested_protocol": item.arm,
+            "model": args.model,
+            "terminal_error": terminal_error,
+            "guards": {
+                "legacy_410": guard_legacy_410(pair.guard_outputs if pair is not None else []),
+                "native_receipt_missing": item.arm == "occ3",
+                "mislabel": None,
+                "synthetic_backend": None,
+            },
+        }
+
+    def print_summary(record: dict) -> None:
+        err = record.get("terminal_error")
+        answer = (record.get("b") or {}).get("answer")
+        print(
+            f"  -> effective={record.get('effective_protocol')} "
+            f"strict={record.get('strict', {}).get('exact_match')} "
+            f"historical={record.get('historical', {}).get('correct')} "
+            f"answer={str(answer)[:40]!r} error={err}",
+            flush=True,
+        )
+
+    def handle_missing(item: WorkItem, reason: str) -> None:
+        # A missing pair is a spawn-side miss (never a partially delivered
+        # family: no trial ever touched it): requeue once; the second miss is
+        # terminal for this run and recorded.
+        with lock:
+            if id(item) in recorded:
+                return
+            if item.requeued_missing_pair:
+                recorded.add(id(item))
+                record = failure_record(item, reason, None)
+                append_record(record)
+                print_summary(record)
+            else:
+                item.requeued_missing_pair = True
+                pending.appendleft(item)
+
+    def worker(item: WorkItem, pair: "PairContext") -> None:
+        try:
+            if id(item) in recorded:
+                return  # deadline fallback already recorded this item
+            item.attempts += 1
+            harness._tl.pair = pair  # route this thread's CLI outputs to the pair
+            record = harness.run_trial(item.arm, item.task, pair.index, pair=pair)
+            record["run_id"] = run_id
+            record["attempt_count"] = item.attempts
+            with lock:
+                if id(item) in recorded:
+                    return
+                recorded.add(id(item))
+                append_record(record)
+                print_summary(record)
+        except (CliError,) as exc:
+            print(
+                f"  trial error ({item.arm} {item.task['task_id']}, "
+                f"attempt {item.attempts}/{args.max_trials}): {exc}",
+                flush=True,
+            )
+            with lock:
+                if id(item) in recorded:
+                    return
+                if item.attempts >= args.max_trials:
+                    recorded.add(id(item))
+                    record = failure_record(
+                        item, f"trial_failed_after_{args.max_trials}_attempts", pair
+                    )
+                    append_record(record)
+                    print_summary(record)
+                else:
+                    pending.appendleft(item)  # retried in a later batch
+        except Exception as exc:  # noqa: BLE001 - a worker must never kill the batch
+            with lock:
+                if id(item) in recorded:
+                    return
+                recorded.add(id(item))
+                record = failure_record(
+                    item, f"worker_exception: {type(exc).__name__}: {exc}"[:300], pair
+                )
+                append_record(record)
+                print_summary(record)
+
+    while pending:
+        if any(id(item) in recorded for item in pending):
+            # rare: a deadline-abandoned thread requeued an already-recorded item
+            stale = deque(item for item in pending if id(item) not in recorded)
+            pending = stale
+        batch = take_batch(pending, args.pool_size, args.max_occ3_per_pool)
+        if not batch:
+            break
+        batch_no += 1
+        # The main thread owns the harness sinks during a batch (workers use
+        # their pair sinks): reset them per batch so the spawn/teardown roster
+        # dumps cannot accumulate across the whole run.
+        harness.stage_outputs = []
+        harness.guard_outputs = []
+        pairs = []
+        for item in batch:
+            item.pair_index = counter.next()  # global under the counter's lock
+            pairs.append(PairContext(index=item.pair_index))
+        # Expected parent names mirror _spawn_pool's chunking (parent name =
+        # fwP<first pair index of its chunk>): tracked up front so the final
+        # sweep also covers a pool whose spawn failed partway through.
+        parents_n = max(1, min(args.parents_per_pool, len(pairs)))
+        chunk_size = -(-len(pairs) // parents_n)
+        expected_parents = [f"fwP{pairs[i].index:04d}" for i in range(0, len(pairs), chunk_size)]
+        with lock:
+            owned_names.extend(expected_parents)
+            owned_names.extend(
+                name for p in pairs for name in (p.speaker_name, p.listener_name)
+            )
+        occ3_n = sum(1 for item in batch if item.arm == "occ3")
+        print(
+            f"[pool] batch {batch_no}: {len(batch)} trials ({occ3_n} occ3), "
+            f"pairs {pairs[0].speaker_name}..{pairs[-1].speaker_name}",
+            flush=True,
+        )
+        try:
+            pool = harness._spawn_pool(
+                pairs, args.parents_per_pool, args.pool_spawn_timeout
+            )
+        except (CliError, OSError) as exc:
+            print(f"  pool spawn failed: {exc}", flush=True)
+            for item in batch:
+                handle_missing(item, "pool_spawn_failed_after_requeue")
+            continue
+        runnable = [(item, pair) for item, pair in zip(batch, pairs) if pair.discovered]
+        for item, pair in zip(batch, pairs):
+            if not pair.discovered:
+                print(
+                    f"  [miss] {item.arm} {item.task['task_id']}: pair "
+                    f"{pair.speaker_name} never discovered; requeued",
+                    flush=True,
+                )
+                handle_missing(item, "pool_pair_missing_after_requeue")
+        threads: list[tuple[threading.Thread, WorkItem, "PairContext"]] = []
+        for item, pair in runnable:
+            thread = threading.Thread(
+                target=worker, args=(item, pair), daemon=True,
+                name=f"fwtrial-{pair.speaker_name}",
+            )
+            threads.append((thread, item, pair))
+            thread.start()
+        deadline = time.perf_counter() + args.trial_deadline
+        for thread, item, _pair in threads:
+            thread.join(timeout=max(0.0, deadline - time.perf_counter()))
+        with lock:
+            for thread, item, pair in threads:
+                if thread.is_alive() and id(item) not in recorded:
+                    # abandoned (daemon) thread: the pair is dead, teardown
+                    # stops it; a late thread completion is skipped below.
+                    recorded.add(id(item))
+                    record = failure_record(item, "trial_deadline_exceeded", pair)
+                    append_record(record)
+                    print_summary(record)
+        info = harness._teardown_pool(pool, args.pool_teardown_timeout)
+        if info.get("lingering"):
+            print(
+                f"  [pool] teardown: {len(info['lingering'])} session(s) still "
+                f"active: {info['lingering'][:6]}",
+                flush=True,
+            )
+
+    # Final belt-and-braces: never leave this run's named sessions running.
+    for name in list(owned_names):
+        harness._run(["stop", name], timeout=120, check=False)
+    return trials
+
+
+# ---------------------------------------------------------------------------
 # Matrix runner
 # ---------------------------------------------------------------------------
 
@@ -1612,6 +2489,7 @@ def run_matrix(args) -> int:
             f'  python research/taskbench/four_way_adapter.py run --live '
             f'--cli "{args.cli}" --model "{args.model}" '
             f'--arms {",".join(arms)} --tasks-per-family {args.tasks_per_family}'
+            + (f' --pool-size {args.pool_size}' if args.pool_size > 1 else '')
         )
         return 0
 
@@ -1640,6 +2518,28 @@ def run_matrix(args) -> int:
                     completed.add((rec.get("arm"), rec.get("task_id")))
                 except json.JSONDecodeError:
                     continue
+
+    if args.pool_size < 1:
+        print("--pool-size must be >= 1 (1 = serial, >1 = family-pool mode)", file=sys.stderr)
+        return 2
+
+    if args.pool_size > 1:
+        # Family-pool mode. --pool-size 1 (default) falls through to the
+        # serial loop below, which stays byte-identical to the pre-pool code.
+        if (args.parents_per_pool < 1 or args.max_occ3_per_pool < 1
+                or args.pool_spawn_timeout <= 0 or args.trial_deadline <= 0
+                or args.pool_teardown_timeout <= 0):
+            print(
+                "invalid pool flags: --parents-per-pool and --max-occ3-per-pool "
+                "must be >= 1; pool timeouts must be > 0",
+                file=sys.stderr,
+            )
+            return 2
+        trials = _run_pool_matrix(harness, args, arms, tasks, completed, run_id, out_jsonl)
+        agg = aggregate(trials)
+        out_json.write_text(json.dumps(agg, indent=2, ensure_ascii=True) + "\n", encoding="utf-8")
+        print(f"wrote {out_json} and appended {len(trials)} trials to {out_jsonl}")
+        return 0
 
     trials: list[dict] = []
     index = 0
@@ -1713,7 +2613,7 @@ def run_matrix(args) -> int:
 # ---------------------------------------------------------------------------
 
 
-def main() -> int:
+def build_arg_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter
     )
@@ -1746,7 +2646,26 @@ def main() -> int:
                     help="infra-level trial attempts (never retries wrong answers)")
     run.add_argument("--resume", action="store_true", help="skip (arm, task) pairs already in the JSONL")
     run.add_argument("--verbose", action="store_true")
+    # Family-pool mode (throughput design): all flags default to the serial
+    # behavior; --pool-size 1 keeps the serial code path byte-identical.
+    run.add_argument("--pool-size", type=int, default=DEFAULT_POOL_SIZE,
+                    help="speaker/listener pairs per pool = concurrent trials per batch "
+                         f"(default {DEFAULT_POOL_SIZE} = serial; >= {POOL_MODE_MIN_SIZE} activates pool mode)")
+    run.add_argument("--parents-per-pool", type=int, default=DEFAULT_PARENTS_PER_POOL,
+                    help="split a pool's pairs across this many parallel held parent turns")
+    run.add_argument("--max-occ3-per-pool", type=int, default=DEFAULT_MAX_OCC3_PER_POOL,
+                    help="occ3 trials per batch (the native-capture slot is serialized: max_active 1)")
+    run.add_argument("--pool-spawn-timeout", type=float, default=DEFAULT_POOL_SPAWN_TIMEOUT,
+                    help="seconds to wait for the pool's pairs (scales roughly as 900 + 60*N for large N)")
+    run.add_argument("--trial-deadline", type=float, default=DEFAULT_TRIAL_DEADLINE,
+                    help="hard per-trial watchdog; an overrunning thread is abandoned and recorded")
+    run.add_argument("--pool-teardown-timeout", type=float, default=DEFAULT_POOL_TEARDOWN_TIMEOUT,
+                    help="seconds to stop a pool's sessions at batch end (parents first, then children)")
+    return parser
 
+
+def main() -> int:
+    parser = build_arg_parser()
     args = parser.parse_args()
     if args.cmd == "selftest":
         ok, failures = dry_selftest(args.tasks_per_family, args.cli, args.model)
