@@ -6,3 +6,6 @@ Added:
     completed code-task conditions with source sha256 provenance.
   - Record of the two later GSM8K item-19 native OCC-3 authorization attempts
     (one rejected before work, one failed_uncertain after 137.7 s); no score.
+  - Completed the GPQA-Diamond baseline results file: 198 rows (160 historical
+    + 38 continuation rows joined by index), 73/198 correct, with segment
+    provenance recorded in the summary JSON.

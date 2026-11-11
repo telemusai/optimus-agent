@@ -25,6 +25,13 @@ The GSM8K native OCC-3 v7 batch (items 2-19) is complete at **16/17 correct
 on completed items** with item 19 never started; see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
+A code-task sweep on the same server started 2026-11-11 with the
+`runner.py` harness: HumanEval+ (n=164) is complete for all three conditions
+and MBPP+ (n=378) for baseline and TextMAS sequential; MBPP+ hierarchical and
+both ARC splits are still running and are listed under NOT-RUN. See the
+Code-task sweep section below. A second item-19 retry attempt under the v7
+protocol ran 2026-11-11 and ended `failed_uncertain` without a score; see
+[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
 ## Setup
 
@@ -84,6 +91,33 @@ Conditions:
   4096-token cap.
 - Latency is the per-item time with up to 16 requests in flight.
 
+### Code-task sweep (HumanEval+, MBPP+; interim)
+
+Run 2026-11-11 with `harness/runner.py` on the same GLM-5.3 SGLang endpoint.
+Prompts and scoring mirror the repo: one agent for baseline, the four-agent
+TextMAS prompts for sequential/hierarchical, the last ```python fenced block
+extracted and executed with the gold tests in the offline `latentmas-sandbox:py311`
+docker container (no network, read-only, uid 65534). One sample per item.
+
+| Task | Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean latency |
+|---|---|---|---|---|---|---|---|---|
+| HumanEval+ | baseline | 142/164 | 86.6% | 80.5-91.0% | - | 10.4% | 1,404 | 10.6 s |
+| HumanEval+ | TextMAS sequential | 143/164 | 87.2% | 81.2-91.5% | b=5, c=6, p=1.0 | 29.3% | 6,890 | 51.2 s |
+| HumanEval+ | TextMAS hierarchical | 149/164 | 90.9% | 85.5-94.4% | b=5, c=12, p=0.143 | 10.4% | 3,813 | 25.8 s |
+| MBPP+ | baseline | 303/378 | 80.2% | 75.8-83.9% | - | 8.5% | 1,162 | 8.4 s |
+| MBPP+ | TextMAS sequential | 303/378 | 80.2% | 75.8-83.9% | b=13, c=13, p=1.0 | 25.7% | 6,415 | 48.8 s |
+
+- "Truncated" is the share of items in which at least one model call stopped
+  at the 4096-token cap; HumanEval+ sequential truncation is visible in its
+  29.3% rate and its mean latency.
+- HumanEval+ hierarchical is the only condition so far above its baseline
+  Wilson interval overlap: +4.3 points, McNemar p=0.143 (not significant at 5%).
+- Raw model outputs are not committed (11 MB per file); per-item correctness,
+  token and latency rows plus source sha256 values are in
+  `results/*_safe.json`, and aggregate metrics in `results/*_summary.json`.
+- MBPP+ hierarchical (80/378 at the 05:56 UTC snapshot) and ARC-Easy /
+  ARC-Challenge (not started) are NOT-RUN and excluded from the table.
+
 ### GSM8K (first 20 test items)
 
 | Condition | Items | Correct | Accuracy | 95% CI | Tokens (prompt + completion, all items) |
@@ -129,6 +163,11 @@ filename does not certify isolated scoring or completed native use):
 The remaining 38 items completed at 2026-11-10 14:01 UTC. The original 160 rows
 were preserved and their joins/scoring rechecked offline. All capped responses
 remain in the denominator; no 16k rerun or answer repair was performed.
+`results/glm53_gpqa_baseline.jsonl` now contains all 198 rows: the preserved
+160 historical rows plus the 38 continuation rows joined by index, with the
+continuation correctness taken from the scored fragment (no re-derivation).
+Segment provenance and aggregate metrics are in
+`results/glm53_gpqa_baseline_summary.json`.
 
 The continuation kept the upstream prompts, actual `glm-5.3` model, 4096-token
 cap, temperature 0.6, top_p 0.95 and concurrency 16. It used a single HTTP attempt

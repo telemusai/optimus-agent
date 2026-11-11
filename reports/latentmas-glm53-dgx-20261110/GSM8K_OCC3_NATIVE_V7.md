@@ -57,3 +57,22 @@ admission.
   against the 92.9% historical adjudicated 14-item run (overlapping items,
   different protocol version).
 - Item 19 remains NOT-RUN.
+
+## Later item-19 attempts (2026-11-11)
+
+Two further single-use authorizations were consumed on item 19 after the daemon
+was upgraded to 0.1.45; neither produced a score. Both are recorded here so the
+16/17 readout above stays tied to its original batch.
+
+- v4 retry batch `native-v7-batch-20261111t045500z`: rejected
+  `approval_expired_or_too_long` before any work (2 h expiry exceeds the 1 h
+  cap). Re-armed attempt rejected `RemoteRejected` because `--old-root` was
+  passed as a path instead of the session id. No model work ran.
+- v5 retry batch `native-v7-batch-20261111t052800z`: fresh 55-minute
+  authorization, all prior batches pinned. The item ran 137.7 s with all four
+  roles spawned and real native work observed, then ended
+  `failed_uncertain` with the runner's `item_exit_or_work_cleanup_bound`
+  terminal (the item journal records a role generation failure/truncation).
+  Cleanup was confirmed and the run artifacts are retained on the DGX under
+  `runs/item-19/`. Authorization is single-use and terminal, so the item
+  requires another fresh authorization; it was not retried automatically.
