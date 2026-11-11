@@ -14,3 +14,12 @@ Added:
   - ARC-Easy (n=300) baseline results: 285/300 correct, 95.0% accuracy.
   - ARC-Easy (n=300) TextMAS sequential results: 290/300 correct, 96.67%
     accuracy, McNemar vs baseline b=6, c=11, p=0.332.
+  - ARC-Easy TextMAS hierarchical (200/300, 66.67%) and the full ARC-Challenge
+    sweep: baseline 286/300 (95.3%), TextMAS sequential 297/300 (99.0%,
+    McNemar p=0.0074), TextMAS hierarchical 215/300 (71.7%).
+  - Fresh full-300 GSM8K sweep: baseline 280/300 (93.3%), TextMAS sequential
+    277/300 (92.3%), TextMAS hierarchical 286/300 (95.3%).
+  - Data-quality note for the 2026-11-11 sweep: ARC-Challenge sequential and
+    hierarchical rows deduplicated after a restart race (one row per item
+    kept; accuracy unaffected; latencies not comparable); mixed 16/32 client
+    in-flight concurrency across conditions.

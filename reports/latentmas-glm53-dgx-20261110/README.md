@@ -26,14 +26,15 @@ on completed items** with item 19 never started; see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
 A code-task sweep on the same server started 2026-11-11 with the
-`runner.py` harness: HumanEval+ (n=164) and MBPP+ (n=378) are complete for all
-three conditions (MBPP+ TextMAS hierarchical 323/378, 85.45%). ARC-Easy baseline
-and TextMAS sequential are complete (285/300, 95.0% and 290/300, 96.67%);
-ARC-Easy hierarchical and all ARC-Challenge conditions remain in flight on a
-restarted runner and are listed under NOT-RUN. See the Code-task sweep and
-ARC-Easy sections below. A second item-19 retry attempt under the v7
-protocol ran 2026-11-11 and ended `failed_uncertain` without a score; see
-[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
+`runner.py` harness: HumanEval+ (n=164), MBPP+ (n=378), ARC-Easy (n=300),
+ARC-Challenge (n=300) and a fresh GSM8K run (n=300) are complete for all three
+conditions. MBPP+ TextMAS hierarchical is 323/378 (85.45%), ARC-Challenge
+TextMAS sequential is 297/300 (99.0%, McNemar p=0.0074 vs baseline), and the
+hierarchical letter-choice collapse (GPQA 5.05%, ARC-Easy 66.67%, ARC-Challenge
+71.67%) is now documented across three tasks. MedQA TextMAS hierarchical is the
+last in-flight condition. See the task sections below. A second item-19 retry
+attempt under the v7 protocol ran 2026-11-11 and ended `failed_uncertain`
+without a score; see [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
 ## Setup
 
@@ -127,14 +128,58 @@ docker container (no network, read-only, uid 65534). One sample per item.
 
 From the same 2026-11-11 `runner.py` sweep on the same GLM-5.3 SGLang endpoint,
 run on the ARC-Easy test split. One sample per item, upstream LatentMAS prompts
-and scoring; gold answers are letters. ARC-Easy TextMAS hierarchical and all
-ARC-Challenge conditions are NOT-RUN (restarted runner finishing them) and
-excluded.
+and scoring; gold answers are letters.
 
 | Task | Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean latency |
 |---|---|---|---|---|---|---|---|---|
 | ARC-Easy | baseline | 285/300 | 95.0% | 91.9-96.9% | - | 0.7% | 392 | 2.8 s |
 | ARC-Easy | TextMAS sequential | 290/300 | 96.7% | 94.0-98.2% | b=6, c=11, p=0.332 | 2.0% | 3,834 | 31.3 s |
+| ARC-Easy | TextMAS hierarchical | 200/300 | 66.7% | 61.2-71.8% | b=93, c=8, p=1.74e-19 | 1.3% | 1,012 | 9.2 s |
+
+ARC-Easy hierarchical drops far below baseline (significant), consistent with
+the GPQA hierarchical result: the hierarchical prompt routing degrades
+letter-choice answering.
+
+### ARC-Challenge (interim, 300 items)
+
+Same sweep and contract as ARC-Easy. ARC-Challenge sequential is the only
+sequential condition so far significantly above its baseline (+3.7 points,
+p=0.0074); hierarchical drops below it, again consistent with the
+letter-choice hierarchical pattern.
+
+| Task | Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean latency |
+|---|---|---|---|---|---|---|---|---|
+| ARC-Challenge | baseline | 286/300 | 95.3% | 92.3-97.2% | - | 0.0% | 405 | 3.0 s |
+| ARC-Challenge | TextMAS sequential | 297/300 | 99.0% | 97.1-99.7% | b=2, c=13, p=0.00739 | 4.3% | 4,065 | 36.1 s |
+| ARC-Challenge | TextMAS hierarchical | 215/300 | 71.7% | 66.3-76.5% | b=78, c=7, p=2.8e-16 | 0.0% | 1,081 | 18.8 s |
+
+### GSM8K (full 300-item run)
+
+A fresh full-300 GSM8K sweep was run 2026-11-11 with `runner_fast.py` (same
+prompts and scoring as the other 2026-11-11 rows). It complements the 20-item
+cohort below, which remains the paired comparison for the native OCC-3 runs.
+
+| Task | Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean latency |
+|---|---|---|---|---|---|---|---|---|
+| GSM8K | baseline | 280/300 | 93.3% | 89.9-95.6% | - | 0.3% | 252 | 2.7 s |
+| GSM8K | TextMAS sequential | 277/300 | 92.3% | 88.8-94.8% | b=7, c=4, p=0.549 | 1.0% | 2,697 | 34.3 s |
+| GSM8K | TextMAS hierarchical | 286/300 | 95.3% | 92.3-97.2% | b=2, c=8, p=0.109 | 0.7% | 973 | 11.7 s |
+
+Per-item rows are in `results/glm53_gsm8k300_*_safe.json`; the 20-item cohort
+files keep their original names.
+
+### Data-quality note (2026-11-11 sweep)
+
+- ARC-Challenge sequential and hierarchical rows were deduplicated after a
+  restart race (a kill did not land and two runner processes appended the same
+  indices; one row per item kept, first occurrence). Raw doubles are retained
+  in `.dedupe-backup.jsonl` on the runner host; the summaries carry
+  `row_dedupe` and `concurrency_note` fields. Accuracy is unaffected; latency
+  columns for those two conditions are not comparable.
+- Conditions started after 06:54 UTC ran at 32 client in-flight requests
+  (matching the server `max-running-requests 32`); earlier 2026-11-11
+  conditions ran at 16. Accuracy is unaffected; cross-condition latency
+  comparisons between those groups are not valid.
 
 ### GSM8K (first 20 test items)
 
