@@ -24,8 +24,10 @@ MedQA300 baseline is complete at **174/300 (58.00%)**; see
 TextMAS hierarchical completed 2026-11-11 at **109/300 (36.33%)**, a
 significant drop vs baseline (McNemar b=103, c=38, p=4.1e-08) and the same
 letter-choice hierarchical collapse as GPQA/ARC.
-The GSM8K native OCC-3 v7 batch (items 2-19) is complete at **16/17 correct
-on completed items** with item 19 never started; see
+The GSM8K native OCC-3 v7 cohort is complete and pinned-scorer verified at
+**17/19 correct on eligible items** (89.5%, exact McNemar p=1.0 vs the paired
+baseline on the same 19 items; item 1 never ran, item 19 was completed by the
+v7 retry after the daemon upgrade to 0.1.45); see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
 A code-task sweep on the same server started 2026-11-11 with the
@@ -35,9 +37,12 @@ conditions. MBPP+ TextMAS hierarchical is 323/378 (85.45%), ARC-Challenge
 TextMAS sequential is 297/300 (99.0%, McNemar p=0.0074 vs baseline), and the
 hierarchical letter-choice collapse is now documented across four tasks (GPQA
 5.05%, ARC-Easy 66.67%, ARC-Challenge 71.67%, MedQA 36.33%); MedQA TextMAS
-hierarchical completed the 27/27 TextMAS matrix. See the task sections below. A second item-19 retry
-attempt under the v7 protocol ran 2026-11-11 and ended `failed_uncertain`
-without a score; see [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
+hierarchical completed the 27/27 TextMAS matrix. See the task sections below. The
+item-19 retry attempts are recorded in
+[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md): after a
+`failed_uncertain` 2026-11-11 attempt and a daemon-schemaRevision-blocked
+attempt, the v7 retry completed item 19 (correct) and the full native cohort
+is pinned-scorer verified at 17/19.
 
 ## Setup
 
@@ -217,9 +222,16 @@ On items 0-13, all three conditions miss only item 12 (McNemar OCC-3 vs baseline
 b=0, c=0). The GSM8K API rows were produced with `bench_lib.run_baseline` and
 `bench_lib.run_text_mas`. The driver command for these rows was not saved.
 
-A later 18-item native OCC-3 v7 batch (items 2-19) completed 17 items with all
-transport gates valid and a derived offline join of 16/17 correct; item 12 is
-again the only miss. Item 19 was blocked before start. See
+The later native OCC-3 v7 runs (items 2-18 in the 2026-11-10 batch, item 0
+separately, and item 19 by the v7 retry after the 0.1.45 daemon upgrade)
+reached 19 completed items with all transport and cleanup gates valid. The
+pinned offline scorers give **17/19 correct** (item 12 predicted 12 vs gold 13;
+item 2 is a formatting loss - `FINAL_ANSWER: $70,000` read as `000` by the
+upstream last-number extractor that both API conditions' `\boxed{}` output
+avoids). Exact McNemar vs the paired baseline on the same 19 items: native 17,
+baseline 18, TextMAS-sequential 18, p=1.0. Safe rows and summary:
+`results/glm53_gsm8k_native_occ3_v7_safe.json`, per-item public score
+reports in `results/native_v7/score-public-*.json`. See
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
 OCC-3 protocol labels on the 14 items in the historical `clean` file (that
@@ -413,16 +425,15 @@ bindings, strict scoring, accounting and sanitized evidence.
 
 ## NOT-RUN
 
-- The `latent_mas` condition, because it needs model internals.
-- ARC-Challenge and GSM8K-300 have no published result here. HumanEval+, MBPP+
-  and ARC-Easy interim results are in the sections above; ARC-Easy hierarchical
-  is in flight on a restarted runner. MedQA baseline and TextMAS sequential are
-  complete above; its hierarchical condition is not run. Manifests are listed in
-  `MANIFESTS.json`.
-- OCC-3 items 14-19, and a completed rerun of items 0-13 on the PR #279 stack.
-  The later item-0 smoke failed and remains separate from these denominators.
+- The `latent_mas` condition, because it needs model internals; this also
+  applies to the native OCC-3 track. Manifests are listed in `MANIFESTS.json`.
+- Native OCC-3 GSM8K item 1 (setup failure in its original batch, never
+  retried), and a completed rerun of items 0-13 on the PR #279 stack. The later
+  item-0 smoke failed and remains separate from these denominators.
 - AIME and GPQA at a higher token cap.
-- Token accounting for OCC-3 rows.
+- Token accounting for the historical OCC-3 API rows. The native v7 cohort
+  does carry provider-reported token sums per item (see the safe rows), but the
+  two conditions are not token-budget matched.
 
 ## Files
 
@@ -431,6 +442,9 @@ bindings, strict scoring, accounting and sanitized evidence.
 | `results/*.jsonl` | Per-item records; API rows include model outputs except GPQA; OCC-3 rows omit role/judger outputs |
 | `results/*_summary.json*` | Per-condition summaries written by the runner |
 | `results/glm53_gsm8k_occ3_clean.jsonl` | OCC-3 rows: hop states, receipt ids, native/total hops, wall time, scoring notes |
+| `results/glm53_gsm8k_native_occ3_v7_safe.json` | Native OCC-3 v7 cohort: per-item correct/truncated/tokens/latency rows (19 eligible items), source sha pins |
+| `results/glm53_gsm8k_native_occ3_v7_summary.json` | Native OCC-3 v7 cohort summary: 17/19 (89.5%), CI, McNemar vs paired baseline, latency and token aggregates |
+| `results/native_v7/score-public-*.json` | Pinned-scorer public reports per native cohort (item 0, batch items 2-18, item 19 v7): counts, hashes, usage; no predictions |
 | `harness/runner.py`, `harness/bench_lib.py` | Resumable runner and OpenAI-compatible client adapter for the LatentMAS prompts |
 | `harness/occ3_lib.py`, `harness/occ3_v3_prompts.py` | Historical OCC-3 helpers/prompts, retained unchanged; not a validated team recipe |
 | `smoke-validation.md`, `server-smoke-excerpt.txt` | Post-update smoke failure and bounded server-log evidence |

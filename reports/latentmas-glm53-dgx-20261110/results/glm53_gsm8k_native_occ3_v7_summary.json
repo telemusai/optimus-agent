@@ -1,0 +1,31 @@
+{
+ "task": "gsm8k",
+ "condition": "occ3_agent_native_v7",
+ "n": 19,
+ "correct": 17,
+ "accuracy": 0.8947368421052632,
+ "ci_lo": 0.6860591728889099,
+ "ci_hi": 0.9706414397011299,
+ "mcnemar_b": 0,
+ "mcnemar_c": 1,
+ "mcnemar_p": 1.0,
+ "paired_against": "glm53_gsm8k_baseline.historical20 (19 shared items)",
+ "wall_s": 3226.0,
+ "mean_latency_s": 169.79,
+ "median_latency_s": 169.407,
+ "p95_latency_s": 256.465,
+ "prompt_per_item": 98312.6,
+ "completion_per_item": 15073.4,
+ "reasoning_per_item": null,
+ "truncation_rate": 0.0,
+ "invalid_answer_rate": 0.0,
+ "tasks_per_s": 0.0059,
+ "latency_semantics": "item_wall_seconds_including_setup, serial native batch",
+ "token_semantics": "provider-reported counters summed over all role records per item (record counts 23-28)",
+ "scoring": "pinned offline scorer score_native_gsm8k_v3/v7 (exact upstream extract+normalize vs manifest gold), three era cohorts joined",
+ "never_run_items": [
+  1
+ ],
+ "denominator_note": "20-item paired historical cohort; 19 items eligible (item 1 never ran)",
+ "formatting_loss_note": "Item 2 final line was 'FINAL_ANSWER: $70,000'; the pinned upstream extractor (last-number regex, no boxed form) read '000' and scored it wrong. Both TextMAS conditions emitted \\boxed{70000} and parsed correctly. Same pinned rule across all conditions; recorded as strict-incorrect, not excluded."
+}

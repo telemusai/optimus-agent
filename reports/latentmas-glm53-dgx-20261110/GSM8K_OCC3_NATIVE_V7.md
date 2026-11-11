@@ -10,9 +10,17 @@ four-role OCC-3 native-handoff condition (`occ3_agent_native_v7`).
 - Item 19 never started: `blocked_before_start`,
   reason `insufficient_immutable_authority_or_deadline`. It requires fresh
   authorization; it was not silently retried.
-- Derived offline join: **16/17 correct** on the completed items. The single
-  miss is item 12 (predicted 12, gold 13) - the same item 12 the historical
-  14-item run and both API conditions missed on their overlap.
+- Pinned-scorer offline result (below): **15/17 correct** on this batch's
+  completed items; **17/19 correct** across the full native cohort (item 0 and
+  the v7 item-19 retry included). The two misses on this batch are item 12
+  (predicted 12, gold 13 - the same item 12 the historical 14-item run and both
+  API conditions missed on their overlap) and item 2, a formatting loss: the
+  final line read `FINAL_ANSWER: $70,000` and the pinned upstream extractor
+  (last-number regex, no boxed form) read `000`. Both API conditions emitted
+  `\boxed{70000}` and parsed correctly. The same pinned rule scored all
+  conditions; item 2 stays strict-incorrect and is not excluded. The earlier
+  informal transcript join said 16/17; the pinned scorer is authoritative and
+  the difference is exactly this item 2.
 - Wrapper exited 2 (batch stopped, not crashed); zero failed inference
   terminals. Total item wall time 48.9 min (mean 172.5 s, median 171.7 s,
   range 102.9-264.5 s).
@@ -20,12 +28,21 @@ four-role OCC-3 native-handoff condition (`occ3_agent_native_v7`).
   item 1 failed setup in the prior batch and was not rerun. Both remain
   outside this batch's denominator.
 
-The join is a derived readout, not the runner's own scoring: the plan records
-`scoring: offline_separate_runner_groups_no_correctness_join`. The method and
-per-item rows are in `results/native_v7/derived-join.json`: the last
-`FINAL_ANSWER:` numeric from each judger transcript (`item.json`), normalized
-(string-compare on comma-stripped integers) against the manifest gold. All 17
-judger transcripts ended in a parseable `FINAL_ANSWER`.
+The final numbers come from pinned offline scorers, not the runner (the plan
+records `scoring: offline_separate_runner_groups_no_correctness_join`):
+`score_native_gsm8k_v3.py` for the item-0 run and this batch (0.1.41-era
+artifacts) and `score_native_gsm8k_v7.py` for the item-19 v7 retry (0.1.45
+daemon, schemaRevision 47). Each scorer re-reads the frozen run directories,
+validates the daemon/protocol identity, per-item approval bindings, context
+inventories, standby records and cleanup gates, then applies the upstream
+`extract_gsm8k_answer`/`normalize_answer` functions to the raw judger final and
+string-compares against the manifest gold. Per-item counts and hashes (no
+predictions) are in `results/native_v7/score-public-*.json`; the combined safe
+rows and summary are `results/glm53_gsm8k_native_occ3_v7_safe.json` and
+`results/glm53_gsm8k_native_occ3_v7_summary.json`. The earlier
+`derived-join.json` (last `FINAL_ANSWER:` numeric from the judger transcript)
+is retained for provenance; it agreed with the pinned scorer on every item
+except item 2.
 
 ## Provenance
 
@@ -53,16 +70,20 @@ admission.
 - `transport_valid` proves the native protocol completed its gates per item.
   It is not a claim that every hop avoided text fallback; the per-hop
   admitted/completed split is in each item journal, not summarized here.
-- 16/17 is a single sample on one benchmark; no significance test is claimed
-  against the 92.9% historical adjudicated 14-item run (overlapping items,
-  different protocol version).
-- Item 19 remains NOT-RUN.
+- 17/19 is a single sample on one benchmark. Exact McNemar against the paired
+  20-item historical cohort (19 shared items: native 17, baseline 18,
+  TextMAS-sequential 18) is p=1.0 - no significant difference.
+- Item 1 remains NOT-RUN (setup failure in the item-1 batch, never retried);
+  it is excluded from the eligible count, and the 20-item denominator note is
+  in the summary JSON.
 
 ## Later item-19 attempts (2026-11-11)
 
-Two further single-use authorizations were consumed on item 19 after the daemon
-was upgraded to 0.1.45; neither produced a score. Both are recorded here so the
-16/17 readout above stays tied to its original batch.
+Four further single-use authorizations were consumed on item 19 after the
+daemon was upgraded to 0.1.45. The first three produced no score; the fourth
+(v7) completed the item and is included in the 17/19 cohort number above. All
+are recorded here so the batch-level readout above stays tied to its original
+batch.
 
 - v4 retry batch `native-v7-batch-20261111t045500z`: rejected
   `approval_expired_or_too_long` before any work (2 h expiry exceeds the 1 h
@@ -76,3 +97,18 @@ was upgraded to 0.1.45; neither produced a score. Both are recorded here so the
   Cleanup was confirmed and the run artifacts are retained on the DGX under
   `runs/item-19/`. Authorization is single-use and terminal, so the item
   requires another fresh authorization; it was not retried automatically.
+
+- v6 retry batch `native-v7-batch-gsm8k-item19-v6-20261111t055343z`: blocked
+  before start. Root cause: the v6 controller variant pinned daemon
+  `schemaRevision` 46, and the upgraded 0.1.45 daemon reports 47, so the
+  controller's `DaemonClient.handshake` rejected with
+  `unreviewed_schema_revision` before any model work. No authorization was
+  consumed by model work; the batch is terminal with reason `Stop`.
+- v7 retry batch `native-v7-batch-gsm8k-item19-v7-20261111t055343z`:
+  regenerated controller/scorer variants with the schemaRevision-47 gate,
+  validated offline (contract report, prior-scope pins over the full v6->v5->
+  v4->v3->item1->item0 chain, live read-only daemon probe) and then ran.
+  **Item 19 completed in 192.5 s with all transport and cleanup gates green,
+  and the pinned scorer marked it correct.** The 17/19 cohort number above
+  includes this item. Full artifact set retained on the DGX (111 role-cycle
+  snapshots, standby records, cleanup proof).
