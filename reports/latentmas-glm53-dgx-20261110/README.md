@@ -21,6 +21,9 @@ repair or rerun; source-contract review found no discrepancy. See
 MedQA300 baseline is complete at **174/300 (58.00%)**; see
 [MEDQA_BASELINE.md](MEDQA_BASELINE.md). TextMAS sequential is complete at
 **268/300 (89.33%)**; see [MEDQA_TEXTMAS_SEQUENTIAL.md](MEDQA_TEXTMAS_SEQUENTIAL.md).
+The GSM8K native OCC-3 v7 batch (items 2-19) is complete at **16/17 correct
+on completed items** with item 19 never started; see
+[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 Four calls per item versus one baseline call are not budget matched.
 
 ## Setup
@@ -94,6 +97,11 @@ Conditions:
 On items 0-13, all three conditions miss only item 12 (McNemar OCC-3 vs baseline:
 b=0, c=0). The GSM8K API rows were produced with `bench_lib.run_baseline` and
 `bench_lib.run_text_mas`. The driver command for these rows was not saved.
+
+A later 18-item native OCC-3 v7 batch (items 2-19) completed 17 items with all
+transport gates valid and a derived offline join of 16/17 correct; item 12 is
+again the only miss. Item 19 was blocked before start. See
+[GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
 OCC-3 protocol labels on the 14 items in the historical `clean` file (that
 filename does not certify isolated scoring or completed native use):

@@ -5,3 +5,4 @@
 - Added the completed 198-item GPQA TextMAS hierarchical result, source-contract recheck, and sanitized accounting without repairing or rerunning the low score.
 - Added the completed MedQA300 baseline result with strict historical scoring, gold-separated offline audit, and sanitized usage and timing.
 - Added the completed MedQA300 TextMAS sequential result, sanitized accounting, and explicit four-call versus one-call comparison limits.
+- Added the completed GSM8K native OCC-3 v7 batch (17/18 items, 16/17 derived-correct, item 19 not run) with ledger, outcome, plan and derived-join artifacts.
