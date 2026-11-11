@@ -61,6 +61,28 @@ def _max_turn_seconds_from_env():
     return value
 
 
+def _capture_busy_wait_seconds_from_env():
+    """Read the per-boot source-capture busy-wait window. Trusted bootstrap only.
+
+    OCC3_CAPTURE_BUSY_WAIT_SECONDS: absent -> the BufferProfile default (10 s);
+    0 disables both capture busy waits. Unparseable or outside
+    [0, CAPTURE_BUSY_WAIT_MAX_SECONDS] -> InstallationError, so a mistyped
+    value never serves the default or a window the client headroom does not
+    cover.
+    """
+    from .chat_adapter import CAPTURE_BUSY_WAIT_MAX_SECONDS, BufferProfile
+    raw = os.environ.get("OCC3_CAPTURE_BUSY_WAIT_SECONDS")
+    if raw is None:
+        return BufferProfile.capture_busy_wait_seconds
+    try:
+        value = float(raw)
+    except ValueError:
+        raise InstallationError("capture_busy_wait_seconds_invalid") from None
+    if not (math.isfinite(value) and 0.0 <= value <= CAPTURE_BUSY_WAIT_MAX_SECONDS):
+        raise InstallationError("capture_busy_wait_seconds_invalid") from None
+    return value
+
+
 @dataclass(repr=False)
 class _BrokerGate:
     authority: object
@@ -971,9 +993,11 @@ async def install_native_runtime(app, tokenizer_manager, *, experimental_opt_in=
             raise InstallationError("control_client_occupied")
         _check_route_conflicts(app)
         from .chat_adapter import BufferProfile
-        # Only the default profile takes the per-boot turn window; a trusted
-        # caller's explicit profile passes through untouched.
-        profile = (BufferProfile(max_turn_seconds=_max_turn_seconds_from_env())
+        # Only the default profile takes the per-boot turn and capture
+        # busy-wait windows; a trusted caller's explicit profile passes
+        # through untouched.
+        profile = (BufferProfile(max_turn_seconds=_max_turn_seconds_from_env(),
+                                 capture_busy_wait_seconds=_capture_busy_wait_seconds_from_env())
                    if buffer_profile is None else buffer_profile)
         if type(profile) is not BufferProfile or profile.max_buffer_bytes > 4194304:
             raise InstallationError("unsupported_buffer_profile")

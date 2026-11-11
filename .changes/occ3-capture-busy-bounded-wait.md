@@ -1,0 +1,3 @@
+- Added bounded server-side busy waits for OCC-3 source captures. Registry active-slot declines re-enroll; proven pre-admission scheduler busy declines retry the same native request. Both share one absolute window; quota still fails fast.
+- Added `OCC3_CAPTURE_BUSY_WAIT_SECONDS` (default 10 seconds, range 0–10). Zero disables both busy waits. Source admission bound and client resend headroom are 25 seconds by default; receiver admission behavior is unchanged.
+- Fixed busy retries after pinned SGLang request normalization while preserving descriptor identity, mutation checks, cancellation, replay fences, and capture deadlines.

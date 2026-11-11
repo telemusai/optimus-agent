@@ -1231,3 +1231,75 @@ async def test_max_turn_window_env_never_overrides_explicit_profile(
     installation = getattr(f.app, install._INSTALLED_ATTR)
     assert installation.adapter.profile.max_turn_seconds == 300
     assert installation.adapter.profile is explicit
+
+
+##############################
+# OCC3_CAPTURE_BUSY_WAIT_SECONDS: per-boot shared capture busy-wait window
+
+async def test_capture_busy_wait_env_absent_keeps_default(transaction_fixture, monkeypatch):
+    monkeypatch.delenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raising=False)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert receipt.installed
+    installation = getattr(f.app, install._INSTALLED_ATTR)
+    assert installation.adapter.profile.capture_busy_wait_seconds == 10.0
+
+
+@pytest.mark.parametrize("raw,value", [("0", 0.0), ("2.5", 2.5), ("10", 10.0)])
+async def test_capture_busy_wait_env_reaches_installed_profile(
+        transaction_fixture, monkeypatch, raw, value):
+    """0 disables both busy waits; the cap is the window the client's
+    25 s resend headroom covers."""
+    monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
+    monkeypatch.delenv("OCC3_MAX_TURN_SECONDS", raising=False)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert receipt.installed
+    profile = getattr(f.app, install._INSTALLED_ATTR).adapter.profile
+    assert profile.capture_busy_wait_seconds == value
+    assert profile.max_turn_seconds == 300.0
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "-1", "10.01", "60", "nan", "inf", "1e999"])
+async def test_capture_busy_wait_env_invalid_declines_install_fail_closed(
+        transaction_fixture, monkeypatch, raw):
+    monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm, experimental_opt_in=True)
+    assert not receipt.installed and receipt.code == "capture_busy_wait_seconds_invalid"
+    assert getattr(f.app, install._INSTALLED_ATTR, None) is None
+
+
+async def test_capture_busy_wait_env_never_overrides_explicit_profile(
+        transaction_fixture, monkeypatch):
+    monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", "2")
+    from occ3_sglang.chat_adapter import BufferProfile
+    explicit = BufferProfile(capture_busy_wait_seconds=0)
+    f = transaction_fixture
+    receipt = await install.install_native_runtime(f.app, f.tm,
+        experimental_opt_in=True, buffer_profile=explicit)
+    assert receipt.installed
+    assert getattr(f.app, install._INSTALLED_ATTR).adapter.profile is explicit
+
+
+@pytest.mark.parametrize("seconds", [-.1, 10.5, float("nan"), float("inf")])
+def test_buffer_profile_rejects_capture_busy_wait_outside_headroom(seconds):
+    from occ3_sglang.chat_adapter import BufferProfile
+    with pytest.raises(ValueError):
+        BufferProfile(capture_busy_wait_seconds=seconds)
+
+
+@pytest.mark.parametrize("raw,expected", [(None, 10.0), ("0", 0.0), ("2.5", 2.5), ("10", 10.0)])
+def test_capture_busy_wait_env_reader_valid(monkeypatch, raw, expected):
+    if raw is None:
+        monkeypatch.delenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raising=False)
+    else:
+        monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
+    assert install._capture_busy_wait_seconds_from_env() == expected
+
+
+@pytest.mark.parametrize("raw", ["", "abc", "-1", "10.01", "60", "nan", "inf", "1e999"])
+def test_capture_busy_wait_env_reader_invalid(monkeypatch, raw):
+    monkeypatch.setenv("OCC3_CAPTURE_BUSY_WAIT_SECONDS", raw)
+    with pytest.raises(install.InstallationError, match="^capture_busy_wait_seconds_invalid$"):
+        install._capture_busy_wait_seconds_from_env()
