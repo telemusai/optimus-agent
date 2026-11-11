@@ -1,0 +1,15 @@
+{
+  "tag": "glm53_gsm8k_baseline",
+  "n": 20,
+  "correct": 19,
+  "accuracy": 0.95,
+  "wall_s": 14.05,
+  "mean_latency_s": 0.702,
+  "median_latency_s": 0.649,
+  "p95_latency_s": 1.647,
+  "tasks_per_s": 1.4234,
+  "total_prompt_tokens": 2773,
+  "total_completion_tokens": 4979,
+  "total_reasoning_tokens": 2298,
+  "newly_run": 20
+}

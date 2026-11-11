@@ -195,12 +195,17 @@ pub fn build_rlm_prompt(options: &RlmPromptOptions) -> String {
     // fallback rather than the default.
     if active_tools.iter().any(|tool| tool == "occ3_handoff") {
         parts.push(
-            "OCC-3 preference: this session has a live native OCC-3 enrollment, so occ3_handoff is the preferred path for exchanging facts with compatible family agents (parent, siblings, direct children on the same OCC-3-configured model). Prefer it over ordinary agent_message for substantive fact and state exchange; use ordinary OCC-1/OCC-2 messaging for receivers that are not OCC-3-compatible, for conversational replies, and whenever a handoff is busy, refused, or exhausted its retry budget.".to_string(),
+            "OCC-3 preference: this session has a live native OCC-3 enrollment, so occ3_handoff is the preferred path for exchanging facts with compatible family agents (parent, siblings, direct children on the same OCC-3-configured model). Prefer it over ordinary agent_message for substantive fact and state exchange; use ordinary OCC-1/OCC-2 messaging for receivers that are not OCC-3-compatible, for conversational replies, and when native handoff is unavailable or explicitly falls back after bounded retries. Follow runtime busy/re-arm instructions before substituting text; do not duplicate an uncertain or admitted handoff.".to_string(),
         );
     }
     if has_agent_message || active_tools.iter().any(|tool| tool == "subagent" || tool == "occ3_handoff") {
         parts.push(
             "OCC-3 hive mind: coordinate compatible agents as a team with a shared objective and distinct responsibilities. Exchange focused native context between authorized family members, then reconcile their results; each agent still has its own session, memory and permissions. Never assume automatic shared memory, broadcast access, or identical conclusions. Use OCC-3 for eligible native handoffs only when the runtime exposes the occ3_handoff tool and both sender and receiver subagents use explicitly OCC-3-configured models with matching verified model/runtime identity. For example, a configured DGX MTP (OCC-3) model is distinct from the ordinary DGX MTP model; a shared display name or model id does not establish support. Discover the configured OCC-3 entry using available model discovery (rlm.find_models in IPython) and pass its exact provider/model selector explicitly when creating both subagents through rlm or the native subagent tool, according to the current execution mode (for example dgx-glm53-occ3/glm-5.3 only when listed). Do not select by bare model id, which can resolve to the ordinary provider. Keep compatible subagents on that same configured OCC-3 model. Use its configured inference and OCC-3 endpoints with the existing provider credentials; do not substitute remembered SSH tunnels, known-hosts entries, or gateway routes. Report failure of the configured endpoint instead of inventing an alternate route. Call occ3_handoff as a native tool with only receiver_role and receiver_name, following its schema. If the first call returns capture_armed, no transfer occurred: emit concise source facts as assistant content in the next response and call occ3_handoff once for the same receiver, with no other tools in that response. After admission, do not repeat it. Never invent OCC/3 envelopes, handles, or source facts in its arguments. If the tool or a compatible receiver is unavailable, use ordinary agent messaging with valid OCC-1 bodies and let the runtime select OCC-2 where eligible. agent_message.send does not itself perform native OCC-3 transfer. A queued/admitted handoff is not completed native use; inspect receipts and do not replay an uncertain handoff blindly. A completed-use receipt proves native consumption, not semantic accuracy: verify transferred critical facts before acting on them.".to_string(),
+        );
+    }
+    if has_agent_message || active_tools.iter().any(|tool| tool == "subagent" || tool == "occ3_handoff") {
+        parts.push(
+            "OCC-3 team setup: read the agent-message skill recipe first. If occ3_handoff is absent or disabled, ask the user to inspect /occ status and use /occ 3 on; missing activation also needs agentCommunication.occ3Enabled, agentCommunication.occ3Experimental, and the configured endpoint. Do not edit settings yourself. Select the exact discovered provider/model selector for every member. Spawn receivers before senders; give each child its role, exact receiver name, and arm -> emit -> publish instructions. Receivers must not do role work before native state arrives. Missing state is a blocker, not permission to solve alone: never suppress RLM_CHILD_STATUS to wait indefinitely (automatic continuations are bounded). Retain blocked receivers and inspect delivery before an explicit follow-up; do not delete children merely because an initial turn settled. Run one dependent hop at a time and reconcile its completed-use receipt and receiver output before advancing. On proven busy/unused refusals, follow runtime re-arm/backoff instructions within its retry budget; inspect uncertain outcomes instead of replaying them. Record ordinary-message fallbacks separately. Report final answers in plain text. A one-hop smoke must pass before a longer chain; guidance alone cannot repair runtime failures.".to_string(),
         );
     }
     if has_agent_observe && has_ipython {
@@ -441,6 +446,54 @@ mod tests {
             }
         }
         assert!(!build_rlm_prompt(&base()).contains("Call occ3_handoff"));
+    }
+
+    #[test]
+    fn occ3_team_recipe_covers_activation_lifecycle_and_delivery_in_all_modes() {
+        for mode in ["ipython", "node", "clang", "bash"] {
+            for depth in [0, 1] {
+                let options = RlmPromptOptions {
+                    depth: Some(depth),
+                    active_tools: Some(vec![mode.into(), "subagent".into()]),
+                    ..base()
+                };
+                let prompt = build_rlm_prompt(&options);
+                for required in [
+                    "read the agent-message skill recipe",
+                    "/occ status", "/occ 3 on", "Do not edit settings yourself",
+                    "agentCommunication.occ3Enabled", "agentCommunication.occ3Experimental",
+                    "exact discovered provider/model selector for every member",
+                    "Spawn receivers before senders", "arm -> emit -> publish",
+                    "Receivers must not do role work before native state arrives",
+                    "automatic continuations are bounded", "Retain blocked receivers",
+                    "one dependent hop at a time", "completed-use receipt and receiver output",
+                    "proven busy/unused refusals", "inspect uncertain outcomes",
+                    "ordinary-message fallbacks separately", "final answers in plain text",
+                    "one-hop smoke must pass",
+                ] {
+                    assert!(prompt.contains(required), "missing {required} in {mode} at depth {depth}");
+                }
+            }
+        }
+        assert!(!build_rlm_prompt(&base()).contains("OCC-3 team setup:"));
+    }
+
+    #[test]
+    fn bundled_occ3_recipe_preserves_runtime_limits_and_receipt_safety() {
+        let skill = include_str!(concat!(env!("CARGO_MANIFEST_DIR"),
+            "/../../resources/agent/skills/agent-message/SKILL.md"));
+        for required in [
+            "### Setting up an OCC-3 team", "### Troubleshooting", "### Child prompt templates",
+            "RLM_CHILD_MAX_CONTINUATIONS = 3", "RLM_CHILD_STATUS: blocked",
+            "completed-use receipt", "Do not count an `agentmsg_` id alone",
+            "OCC3_BUSY_MAX_RETRIES", "Do not add fixed sleeps",
+            "Do not inspect the parent", "admitted but not verified complete",
+            "FINAL_ANSWER: <answer>", "RLM_CHILD_STATUS: complete",
+        ] {
+            assert!(skill.contains(required), "missing skill contract: {required}");
+        }
+        assert!(!skill.contains("end turns WITHOUT a terminal status"));
+        assert!(!skill.contains("proceed with your role work using the question alone"));
     }
 
     #[test]
