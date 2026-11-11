@@ -21,6 +21,9 @@ repair or rerun; source-contract review found no discrepancy. See
 MedQA300 baseline is complete at **174/300 (58.00%)**; see
 [MEDQA_BASELINE.md](MEDQA_BASELINE.md). TextMAS sequential is complete at
 **268/300 (89.33%)**; see [MEDQA_TEXTMAS_SEQUENTIAL.md](MEDQA_TEXTMAS_SEQUENTIAL.md).
+TextMAS hierarchical completed 2026-11-11 at **109/300 (36.33%)**, a
+significant drop vs baseline (McNemar b=103, c=38, p=4.1e-08) and the same
+letter-choice hierarchical collapse as GPQA/ARC.
 The GSM8K native OCC-3 v7 batch (items 2-19) is complete at **16/17 correct
 on completed items** with item 19 never started; see
 [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
@@ -30,9 +33,9 @@ A code-task sweep on the same server started 2026-11-11 with the
 ARC-Challenge (n=300) and a fresh GSM8K run (n=300) are complete for all three
 conditions. MBPP+ TextMAS hierarchical is 323/378 (85.45%), ARC-Challenge
 TextMAS sequential is 297/300 (99.0%, McNemar p=0.0074 vs baseline), and the
-hierarchical letter-choice collapse (GPQA 5.05%, ARC-Easy 66.67%, ARC-Challenge
-71.67%) is now documented across three tasks. MedQA TextMAS hierarchical is the
-last in-flight condition. See the task sections below. A second item-19 retry
+hierarchical letter-choice collapse is now documented across four tasks (GPQA
+5.05%, ARC-Easy 66.67%, ARC-Challenge 71.67%, MedQA 36.33%); MedQA TextMAS
+hierarchical completed the 27/27 TextMAS matrix. See the task sections below. A second item-19 retry
 attempt under the v7 protocol ran 2026-11-11 and ended `failed_uncertain`
 without a score; see [GSM8K_OCC3_NATIVE_V7.md](GSM8K_OCC3_NATIVE_V7.md).
 
@@ -167,6 +170,25 @@ cohort below, which remains the paired comparison for the native OCC-3 runs.
 
 Per-item rows are in `results/glm53_gsm8k300_*_safe.json`; the 20-item cohort
 files keep their original names.
+
+### MedQA TextMAS hierarchical (300 items)
+
+Run 2026-11-11 with the same bundle driver as the sequential condition
+(`bench_noncode.py`, noncode launch spec), 300 items, upstream LatentMAS
+hierarchical prompts (Math/Science/Code -> Task Summarizer), offline scoring
+identical to the sequential run (`exact_upstream_extract_normalize_on_historical_final_compare_exact_manifest_gold`).
+
+| Condition | Correct | Accuracy | 95% CI | McNemar vs baseline | Truncated | Completion tokens/item | Mean role-latency sum |
+|---|---|---|---|---|---|---|---|
+| baseline | 174/300 | 58.0% | 52.4-63.5% | - | - | - | 8.3 s |
+| TextMAS sequential | 268/300 | 89.3% | 85.3-92.3% | b=9, c=103, p=2.3e-21 | - | - | 49.4 s |
+| TextMAS hierarchical | 109/300 | 36.3% | 31.2-41.8% | b=103, c=38, p=4.1e-08 | 46 | 3,997 | 27.9 s |
+
+MedQA hierarchical collapses the same way as GPQA and both ARC splits: the
+hierarchical routing degrades letter-choice answering (46/300 responses also hit
+the 4096-token cap). Per-item rows are in
+`results/medqa_textmas_hierarchical_safe.json`; the bundle artifacts
+(items/roles/journal/provenance, scored-private/safe) remain on the runner host.
 
 ### Data-quality note (2026-11-11 sweep)
 

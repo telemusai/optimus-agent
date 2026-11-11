@@ -23,3 +23,6 @@ Added:
     hierarchical rows deduplicated after a restart race (one row per item
     kept; accuracy unaffected; latencies not comparable); mixed 16/32 client
     in-flight concurrency across conditions.
+  - MedQA TextMAS hierarchical completing the 27/27 TextMAS matrix: 109/300
+    (36.33%), McNemar vs baseline b=103, c=38, p=4.1e-08; the hierarchical
+    letter-choice collapse now spans GPQA, ARC-Easy, ARC-Challenge and MedQA.
