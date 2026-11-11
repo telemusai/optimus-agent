@@ -474,12 +474,12 @@ mod tests {
     /// without the tray right status, and with the selectable open hint.
     ///
     /// Measured bands (see the campaign report): the caller's stages keep
-    /// the slots down to the compact-health stage boundary (width 61);
+    /// the slots down to the compact-health stage boundary (width 71);
     /// below that the status the caller supplies carries no slots at all
     /// (out of this component's ownership). Within this component the rule
     /// is: whenever the supplied status carries the OCC3.2 slot and fits one
     /// row, the render must show it - no ellipsization may eat it - and at
-    /// widths 104-110 the four-segment status renders on one more status
+    /// widths 126-132 the five-segment status renders on one more status
     /// row instead of overflowing or losing the slot.
     /// The production caller's four status stages
     /// (`context_health_indicator::status_line`) at the caller's own budget,
@@ -487,7 +487,7 @@ mod tests {
     /// communication slots, so below the compact-health boundary the caller
     /// supplies a status with no slot in it at all.
     fn caller_status(width: usize) -> String {
-        let indicators = ["TXT", "OCC1", "OCC2", "OCC3.2"]
+        let indicators = ["TXT", "OCC1", "OCC2", "OCC3.1", "OCC3.2"]
             .iter()
             .map(|label| format!("\x1b[2;38;5;39m\u{25cb} {label}\x1b[22;39m"))
             .collect::<Vec<_>>()
@@ -510,6 +510,8 @@ mod tests {
     #[test]
     fn l1_occ3_slot_never_ellipsized_when_the_caller_status_carries_it() {
         crate::modes::interactive::theme::theme::init_theme(Some("dark"), false);
+        let mut below: std::collections::BTreeMap<usize, usize> = std::collections::BTreeMap::new();
+        let mut inline: Vec<usize> = Vec::new();
         for width in 20..=200usize {
             let status = caller_status(width);
             for with_right in [false, true] {
@@ -544,18 +546,28 @@ mod tests {
                         "width {width} (right={with_right}) ellipsized the OCC3.2 slot away:\n{text}"
                     );
                 }
-                // The L-1 row rule: at the widths where the four-segment
+                // The L-1 row rule: at the widths where the five-segment
                 // status cannot sit inline with the counts, the summary
-                // renders one more status row and keeps the slot.
-                if (104..=110).contains(&width) && carried {
-                    assert!(
-                        rows.len() >= 4,
-                        "width {width} (right={with_right}) must render one more status row:\n{rows:?}"
-                    );
-                    assert!(text.contains("OCC3.2"), "width {width} lost OCC3.2");
+                // renders one more status row and keeps the slot. The band
+                // is collected and pinned after the loop.
+                if carried && visible_width(&status) + 2 <= width {
+                    if rows.len() >= 4 {
+                        below.entry(width).and_modify(|count| *count += 1).or_insert(1);
+                    } else {
+                        inline.push(width);
+                    }
                 }
             }
         }
+        // The measured second-row band: every carried width from the
+        // compact-health boundary up to 132 renders the extra row in both
+        // right-status combos (the with-right combo alone extends to 137);
+        // above that the status sits inline again.
+        let both: std::collections::BTreeSet<usize> = below.into_iter()
+            .filter(|(_, count)| *count == 2).map(|(width, _)| width).collect();
+        let expected_band: std::collections::BTreeSet<usize> = (71..=132).collect();
+        assert_eq!(both, expected_band, "measured five-segment second-row band");
+        assert!(inline.iter().all(|width| *width > 132), "inline widths must start above the band: {inline:?}");
     }
 
     /// The measured band, pinned: the caller's stages first carry the four
@@ -568,7 +580,7 @@ mod tests {
         let first = (2..=200usize)
             .find(|width| caller_status(*width).contains("OCC3.2"))
             .expect("the caller must carry the slots at some width");
-        assert_eq!(first, 61, "measured compact-health stage boundary");
+        assert_eq!(first, 71, "measured compact-health stage boundary");
         for width in first..=200usize {
             assert!(
                 caller_status(width).contains("OCC3.2"),
@@ -594,10 +606,15 @@ mod tests {
                 let rows = line.render(width as f64);
                 assert!(rows.iter().all(|row| visible_width(row) <= width), "{width}: {rows:?}");
                 let text = pi_tui::utils::strip_ansi(&rows.join("\n"));
-                assert!(!text.contains("CONFIG") && !text.contains("CFG") && !text.contains("OCC3.1"),
+                assert!(!text.contains("CONFIG") && !text.contains("CFG")
+                    && !text.contains("OCC3.1 seq") && !text.contains("OCC3.1 hier") && !text.contains("OCC3.1 off"),
                     "{width}: configuration leaked into the tray: {text}");
-                if width >= 80 {
+                if width >= 83 {
                     assert!(text.contains("STREAM TPS ~50.0  CTX HEALTH GREEN 100"), "{width}: {text}");
+                } else if width >= 80 {
+                    // Five slots push the full-health stage out at 80-83:
+                    // the compact-health stage carries the slots instead.
+                    assert!(text.contains("STREAM TPS ~50.0  CTX G100"), "{width}: {text}");
                 }
             }
         }

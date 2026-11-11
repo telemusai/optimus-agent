@@ -170,6 +170,13 @@ impl AgentSession {
         Ok(())
     }
 
+    /// True while this session owns an active TextMAS run (armed, preparing,
+    /// or ready for the parent turn). Display signal only.
+    pub fn is_textmas_active(&self) -> bool {
+        self.textmas.lock().unwrap().run.as_ref()
+            .is_some_and(|run| !matches!(run.phase, Phase::Failed(_)))
+    }
+
     pub(super) fn textmas_failure(&self) -> Option<String> {
         self.textmas.lock().unwrap().run.as_ref().and_then(|run| match &run.phase {
             Phase::Failed(error) => Some(error.clone()), _ => None,

@@ -585,6 +585,9 @@ pub struct AgentConnectionModelCycleResult {
 #[serde(rename_all = "camelCase")]
 pub struct Occ3Modes {
     pub textmas_mode: crate::core::occ::textmas::TextMasMode,
+    /// True while a TextMAS preparation run is active in this session.
+    #[serde(default)]
+    pub textmas_active: bool,
     pub latent_enabled: bool,
     pub latent_active: bool,
     pub latent_available: bool,

@@ -98,8 +98,10 @@ in the [agent-message guide](../skills/agent-message/SKILL.md) and
 
 ## Reading the lights
 
-The bottom status row shows delivery lights only: `TXT`, `OCC1`, `OCC2` and
-`OCC3.2`. Each fills and brightens while its channel is in use; the **OCC3.2**
+The bottom status row shows delivery lights only: `TXT`, `OCC1`, `OCC2`,
+`OCC3.1` and `OCC3.2`. Each fills and brightens while its channel is in use.
+The **OCC3.1** light pulses only while a TextMAS run is actively executing on
+the selected model; configuring a mode alone never lights it. The **OCC3.2**
 light blinks only while native latent transport is actively delivering, and it
 requires a validated completed-use receipt. A model's text claiming a handoff,
 a selected mode, a visible tool or a queued request cannot produce that proof.

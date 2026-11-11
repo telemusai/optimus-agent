@@ -114,7 +114,7 @@ fn graph_flashes_the_edge_and_occ3_indicator_for_a_completed_native_handoff() {
     assert_eq!(links, [("a", "b")]);
     assert_eq!(
         strip_ansi(&graph.activity.indicators(now)),
-        "○ TXT  ○ OCC1  ○ OCC2  ● OCC3.2"
+        "○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ● OCC3.2"
     );
     // The link expires with the pulse window like every other message edge.
     graph.observe(&rows, &parent("root"), false, now + PULSE);

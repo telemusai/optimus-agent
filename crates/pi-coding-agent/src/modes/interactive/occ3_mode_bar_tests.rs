@@ -37,7 +37,7 @@ fn snapshot(session: &str, modes: Option<Occ3Modes>) -> local::AgentConnectionSt
 }
 
 fn modes(textmas_mode: TextMasMode, enabled: bool, active: bool, available: bool) -> Occ3Modes {
-    Occ3Modes { textmas_mode, latent_enabled: enabled, latent_active: active, latent_available: available }
+    Occ3Modes { textmas_mode, textmas_active: false, latent_enabled: enabled, latent_active: active, latent_available: available }
 }
 
 fn roster() -> Arc<Roster> {
@@ -109,12 +109,12 @@ fn occ3_mode_bar_never_renders_configuration() {
                     assert!(rows.iter().all(|row| visible_width(row) <= width), "{style}/{name}/{width}: {rows:?}");
                     let text = strip_ansi(&rows.join("\n"));
                     assert!(!text.contains("CONFIG") && !text.contains("CFG")
-                        && !text.contains("OCC3.1") && !text.contains("OCC3.2 on")
-                        && !text.contains("OCC3.2 off") && !text.contains("OCC3.2 blocked"),
+                        && !text.contains("OCC3.1 seq") && !text.contains("OCC3.1 hier") && !text.contains("OCC3.1 off")
+                        && !text.contains("OCC3.2 on") && !text.contains("OCC3.2 off") && !text.contains("OCC3.2 blocked"),
                         "{style}/{name}/{width}: configuration leaked into the tray: {text}");
                     if width >= 80 {
                         assert!(text.contains("OCC3.2"), "{style}/{name}/{width}: delivery light missing: {text}");
-                        assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.2"), "{style}/{name}/{width}: {text}");
+                        assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ○ OCC3.2"), "{style}/{name}/{width}: {text}");
                         assert!(text.contains("STREAM TPS —  CTX HEALTH GREEN 100"), "{text}");
                         if width >= 110 { assert!(text.contains("Jev"), "{text}"); }
                         let title = strip_ansi(&rows[0]);
@@ -141,8 +141,10 @@ fn occ3_mode_bar_refresh_and_session_change_stay_configuration_free() {
         h.mode.borrow_mut().apply_connection_state_snapshot(snapshot(session, mode));
         let rows = bar.render(110.0);
         let text = strip_ansi(&rows.join("\n"));
-        assert!(!text.contains("CONFIG") && !text.contains("OCC3.1"), "bottom row: {text}");
-        assert!(text.contains("OCC3.2"), "delivery light lost: {text}");
+        assert!(!text.contains("CONFIG") && !text.contains("CFG"), "bottom row: {text}");
+        assert!(text.contains("OCC3.1") && text.contains("OCC3.2"), "delivery lights lost: {text}");
+        assert!(!text.contains("OCC3.1 seq") && !text.contains("OCC3.1 hier") && !text.contains("OCC3.1 off"),
+            "configuration leaked: {text}");
         assert!(bar.pulse_deadline.is_none());
     }
 }
@@ -204,9 +206,10 @@ fn occ3_mode_bar_body_claims_only_pulse_txt() {
     deliver(&roster, "body-claim", None);
     let rows = bar.render(160.0);
     let delivery = strip_ansi(&bar.communication.indicators(Instant::now()));
-    assert_eq!(delivery, "● TXT  ○ OCC1  ○ OCC2  ○ OCC3.2");
+    assert_eq!(delivery, "● TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ○ OCC3.2");
     let text = strip_ansi(&rows.join("\n"));
-    assert!(!text.contains("OCC3.1"), "configuration leaked: {text}");
+    assert!(!text.contains("OCC3.1 seq") && !text.contains("OCC3.1 hier"), "configuration leaked: {text}");
+    assert!(text.contains("○ OCC3.1"), "OCC3.1 light missing: {text}");
 }
 
 #[test]
@@ -235,17 +238,44 @@ fn occ3_mode_bar_fullscreen_paint_preserves_delivery_tps_context_and_draft() {
                 assert!(frame.iter().all(|row| visible_width(row) <= width), "{style}/{width}/{height}: {frame:?}");
                 let text = frame.join("\n");
                 let plain = strip_ansi(&text);
-                assert!(!plain.contains("CONFIG") && !plain.contains("OCC3.1"),
+                assert!(!plain.contains("CONFIG") && !plain.contains("CFG")
+                    && !plain.contains("OCC3.1 seq") && !plain.contains("OCC3.1 hier") && !plain.contains("OCC3.1 off"),
                     "{style}/{width}/{height}: configuration leaked: {plain}");
                 for label in ["STREAM TPS", "CTX", "preserve this draft"] {
                     assert!(text.contains(label), "{style}/{width}/{height} missing {label}: {text}");
                 }
                 if width >= 80 {
-                    assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.2"),
+                    assert!(text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ○ OCC3.2"),
                         "{style}/{width}/{height} missing delivery lights: {text}");
                 }
                 capture(&format!("fullscreen-{style}-{width}-{height}"), &frame);
             }
         }
     }
+}
+
+/// The OCC3.1 light pulses while the session's TextMAS run is active and
+/// fades when the run settles - configuration alone never lights it.
+#[test]
+fn occ3_mode_bar_occ31_light_tracks_active_textmas_runs() {
+    let h = super::super::ui_tests::FrameHarness::new("textmas-pulse-fixture");
+    let mut mode = modes(TextMasMode::Sequential, true, false, false);
+    h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("parent", Some(mode.clone())));
+    let mut bar = Bar::new(h.mode.clone());
+    *bar.roster.lock().unwrap() = Some(roster());
+    let idle = bar.render(160.0);
+    let idle_text = strip_ansi(&idle.join("\n"));
+    assert!(idle_text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ○ OCC3.2"), "{idle_text}");
+
+    mode.textmas_active = true;
+    h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("parent", Some(mode.clone())));
+    let active = bar.render(160.0);
+    let active_text = strip_ansi(&active.join("\n"));
+    assert!(active_text.contains("○ TXT  ○ OCC1  ○ OCC2  ● OCC3.1  ○ OCC3.2"), "{active_text}");
+
+    mode.textmas_active = false;
+    h.mode.borrow_mut().apply_connection_state_snapshot(snapshot("parent", Some(mode.clone())));
+    let settled = bar.render(160.0);
+    let settled_text = strip_ansi(&settled.join("\n"));
+    assert!(settled_text.contains("○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ○ OCC3.2"), "{settled_text}");
 }

@@ -35,7 +35,8 @@ not a slash command.
 
 ## Controls, accounting and failure handling
 
-- The bottom status row shows delivery lights only; the OCC3.2 light blinks during actual native latent delivery and is distinct from
+- The bottom status row shows delivery lights only (`TXT`, `OCC1`, `OCC2`, `OCC3.1`, `OCC3.2`); the OCC3.1 light pulses during an
+  active TextMAS run and the OCC3.2 light blinks during actual native latent delivery, both distinct from
   message pulses. A selected mode, exposed tool or queued handoff is not proof
   of completed communication.
 - OCC-2 and latent preferences preserve one another. TextMAS has a separate

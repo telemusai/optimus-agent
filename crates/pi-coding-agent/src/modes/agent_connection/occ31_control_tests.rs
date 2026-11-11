@@ -117,7 +117,7 @@ fn occ31_optional_metadata_unknown_values_never_break_legacy_attachment() {
         value["occ3Modes"] = malformed;
         assert!(serde_json::from_value::<AgentConnectionState>(value.clone()).unwrap().occ3_modes.is_none());
     }
-    let modes = Occ3Modes { textmas_mode: TextMasMode::Sequential, latent_enabled:true, latent_active:false, latent_available:false };
+    let modes = Occ3Modes { textmas_mode: TextMasMode::Sequential, textmas_active: false, latent_enabled:true, latent_active:false, latent_available:false };
     value["occ3Modes"] = serde_json::to_value(&modes).unwrap();
     assert_eq!(serde_json::from_value::<AgentConnectionState>(value.clone()).unwrap().occ3_modes, Some(modes));
     #[derive(serde::Deserialize)]

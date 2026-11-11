@@ -239,7 +239,7 @@ mod tests {
 
     #[test]
     fn queue_badge_drops_before_delivery_slots_at_width_boundary() {
-        let communication = "○ TXT  ○ OCC1  ○ OCC2  ● OCC3.2";
+        let communication = "○ TXT  ○ OCC1  ○ OCC2  ○ OCC3.1  ● OCC3.2";
         let throughput = "STREAM TPS ~50.0";
         let input = input(100.0);
         let expected = format!("{communication}  {throughput}  {}", Indicator::from_input(&input).label(true));
