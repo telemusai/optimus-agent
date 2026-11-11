@@ -505,6 +505,7 @@ pub struct AgentConnectionState {
     pub execution_mode: Option<crate::core::execution_mode::ExecutionMode>,
     pub context_usage: ContextUsage,
     pub recap: Option<String>,
+    pub occ3_modes: Option<crate::modes::agent_connection::types::Occ3Modes>,
 }
 
 /// Stand-in for `AgentConnectionSessionContext`.

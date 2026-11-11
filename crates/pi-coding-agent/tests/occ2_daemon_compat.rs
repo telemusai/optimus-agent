@@ -109,6 +109,60 @@ fn hello_frames_distinguish_the_storage_semantics_across_versions() {
     assert!(!current.supports("occ2_communication"));
 }
 
+
+#[test]
+fn occ31_schema47_is_optional_and_keeps_old_startup_and_occ2_contracts() {
+    use pi_coding_agent::modes::daemon::daemon_client::DaemonHello;
+    use pi_coding_agent::modes::daemon::daemon_protocol::{
+        DaemonCompatibilityHello, daemon_outbound_compatibility, meets_daemon_command_compatibility,
+    };
+    use pi_coding_agent::modes::daemon::daemon_supervisor;
+    assert_eq!(DAEMON_SCHEMA_REVISION, 47);
+    assert!(DAEMON_DEFAULT_SERVER_CAPABILITIES.contains(&DaemonServerCapability::Occ31Textmas));
+    let current = DaemonCompatibilityHello {
+        protocol: daemon_protocol_info(), schema_revision: Some(47),
+        server_capabilities: Some(DAEMON_DEFAULT_SERVER_CAPABILITIES.into_iter().chain([DaemonServerCapability::AgentRoster]).collect()),
+    };
+    let mut old = current.clone();
+    old.schema_revision = Some(46);
+    old.server_capabilities.as_mut().unwrap().retain(|cap| *cap != DaemonServerCapability::Occ31Textmas);
+    for command in ["occ31_get_preferences", "occ31_set_mode", "occ32_set_enabled"] {
+        assert_eq!(daemon_command_compatibility(command), DaemonCommandCompatibility::gated(47, DaemonServerCapability::Occ31Textmas));
+        assert_eq!(daemon_command_plane(command), Some("session"));
+        assert!(DAEMON_COMMAND_TYPES.contains(&command));
+        assert!(daemon_supervisor::DAEMON_COMMAND_TYPES.contains(&command));
+        assert!(!meets_daemon_command_compatibility(&old, &daemon_command_compatibility(command)));
+        assert!(meets_daemon_command_compatibility(&current, &daemon_command_compatibility(command)));
+    }
+    assert!(READ_ONLY_DAEMON_COMMANDS.contains(&"occ31_get_preferences"));
+    assert!(!READ_ONLY_DAEMON_COMMANDS.contains(&"occ31_set_mode"));
+    assert!(!READ_ONLY_DAEMON_COMMANDS.contains(&"occ32_set_enabled"));
+    for command in ["create", "attach", "reattach", "list", "get_state", "roster_subscribe", "occ_get_preferences", "occ_set_preferences"] {
+        assert!(meets_daemon_command_compatibility(&old, &daemon_command_compatibility(command)));
+        assert!(meets_daemon_command_compatibility(&current, &daemon_command_compatibility(command)));
+    }
+    for event in ["daemon_hello", "response", "session_attached", "session_resynced", "roster_update"] {
+        assert!(meets_daemon_command_compatibility(&old, &daemon_outbound_compatibility(event)));
+        assert!(meets_daemon_command_compatibility(&current, &daemon_outbound_compatibility(event)));
+    }
+    // Both gates matter: even a mistakenly advertised capability on schema46 is unavailable.
+    for revision in [None, Some(46), Some(47)] {
+        let hello = DaemonHello::from_value(&json!({"type":"daemon_hello", "protocol":daemon_protocol_info(),
+            "schemaRevision":revision,"serverCapabilities":["occ31_textmas","occ_session_preferences"]})).unwrap();
+        assert_eq!(hello.supports("occ31_textmas"), revision == Some(47));
+        assert!(hello.supports("occ_session_preferences"));
+    }
+    // Old clients use string capabilities and ignore added optional greeting fields.
+    #[derive(serde::Deserialize)]
+    #[serde(rename_all="camelCase")]
+    struct LegacyHello { protocol: pi_coding_agent::modes::daemon::daemon_protocol::DaemonProtocolInfo, server_capabilities: Vec<String> }
+    let old_reader: LegacyHello = serde_json::from_value(json!({
+        "protocol":daemon_protocol_info(), "schemaRevision":47, "serverCapabilities":DAEMON_DEFAULT_SERVER_CAPABILITIES.as_slice(),
+    })).unwrap();
+    assert_eq!(old_reader.protocol.version, 7);
+    assert!(old_reader.server_capabilities.iter().any(|cap| cap == "occ_session_preferences"));
+}
+
 // ---------------------------------------------------------------------------
 // Offline: preference resolution semantics
 // ---------------------------------------------------------------------------
@@ -666,4 +720,77 @@ fn daemon_reports_inherited_preferences_for_subagent_chats() {
     );
     client.close().await;
         });
+}
+
+// Isolated fake-provider profile, no prompts or model requests. The daemon is
+// authoritative even though the test client has no matching local profile.
+#[test]
+fn daemon_owns_independent_occ31_and_occ32_preferences_without_latent_model_support() {
+    let fixture = PrivateDaemon::new();
+    let settings_before = fs::read(fixture.agent_dir.join("settings.json")).unwrap();
+    let models_before = fs::read(fixture.agent_dir.join("models.json")).unwrap();
+    let mut daemon = OwnedDaemon { process: fixture.spawn("occ31-daemon"), socket: fixture.socket.clone() };
+    wait_for_daemon(&mut daemon);
+    let file = tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let client = Arc::new(DaemonClient::create(&fixture.socket));
+        client.connect(1000).await.unwrap();
+        assert!(client.wait_for_hello(1000).await.unwrap().supports("occ31_textmas"));
+        let id = create_session(&client, &fixture, None).await;
+        let other = create_session(&client, &fixture, None).await;
+        let state = request(&client, json!({"type":"get_connection_state","activeSessionId":id})).await;
+        assert_eq!(state["model"]["provider"], "local-cli-fixture");
+        assert_eq!(state["occ3Modes"], json!({"textmasMode":"off","latentEnabled":false,"latentActive":false,"latentAvailable":false}));
+        let file = state["sessionFile"].as_str().unwrap().to_string();
+        let pref = pi_coding_agent::core::occ::textmas_settings::preference_path(&file);
+        assert!(pref.starts_with(fixture.root.path()));
+        assert!(!pref.exists());
+        assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":id})).await,
+            json!({"occ31Mode":"off","inherited":false,"sourceSessionId":null}));
+        request(&client, json!({"type":"occ_set_preferences","activeSessionId":id,"occ2Enabled":false})).await;
+        let latent = request(&client, json!({"type":"occ32_set_enabled","activeSessionId":id,"enabled":true})).await;
+        assert_eq!(latent["occ32Enabled"], true);
+        assert_eq!(latent["applied"], true);
+        let old_lane_bytes = fs::read(session_settings::preference_path(&file)).unwrap();
+        for mode in ["sequential", "off", "hierarchical"] {
+            let echo = request(&client, json!({"type":"occ31_set_mode","activeSessionId":id,"mode":mode})).await;
+            assert_eq!(echo["occ31Mode"], mode);
+            assert_eq!(echo["applied"], true);
+            assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":id})).await["occ31Mode"], mode);
+            assert_eq!(fs::read(session_settings::preference_path(&file)).unwrap(), old_lane_bytes);
+        }
+        let state = request(&client, json!({"type":"get_connection_state","activeSessionId":id})).await;
+        assert_eq!(state["occ3Modes"], json!({"textmasMode":"hierarchical","latentEnabled":true,"latentActive":false,"latentAvailable":false}));
+        assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":other})).await["occ31Mode"], "off");
+        for mode in [Value::Null, json!("on"), json!(true), json!("hierarchal")] {
+            assert!(request_result(&client, json!({"type":"occ31_set_mode","activeSessionId":id,"mode":mode})).await.is_err());
+        }
+        assert!(request_result(&client, json!({"type":"occ32_set_enabled","activeSessionId":id,"enabled":"yes"})).await.is_err());
+        assert!(request_result(&client, json!({"type":"occ31_set_mode","activeSessionId":"missing","mode":"off"})).await.is_err());
+        for corrupt in ["not json".to_string(), "x".repeat(4097)] {
+            fs::write(&pref, corrupt).unwrap();
+            assert!(request_result(&client, json!({"type":"occ31_get_preferences","activeSessionId":id})).await.is_err());
+            assert_eq!(request(&client, json!({"type":"occ_get_preferences","activeSessionId":id})).await["occ2Enabled"], false);
+            assert!(request(&client, json!({"type":"get_connection_state","activeSessionId":id})).await.get("occ3Modes").is_none());
+        }
+        request(&client, json!({"type":"occ31_set_mode","activeSessionId":id,"mode":"hierarchical"})).await;
+        request(&client, json!({"type":"occ_set_preferences","activeSessionId":id,"occ2Enabled":true})).await;
+        assert!(session_settings::resolve(&file).unwrap().occ3_enabled, "OCC2 setter must preserve latent ON");
+        request(&client, json!({"type":"occ32_set_enabled","activeSessionId":id,"enabled":false})).await;
+        assert!(session_settings::load(&file).unwrap(), "latent setter must preserve OCC2 ON");
+        client.close().await;
+        file
+    });
+    drop(daemon);
+    let mut daemon = OwnedDaemon { process: fixture.spawn("occ31-restart"), socket: fixture.socket.clone() };
+    wait_for_daemon(&mut daemon);
+    tokio::runtime::Builder::new_current_thread().enable_all().build().unwrap().block_on(async {
+        let client = Arc::new(DaemonClient::create(&fixture.socket));
+        client.connect(1000).await.unwrap();
+        let resumed = create_session(&client, &fixture, Some(&file)).await;
+        assert_eq!(request(&client, json!({"type":"occ31_get_preferences","activeSessionId":resumed})).await["occ31Mode"], "hierarchical");
+        assert_eq!(request(&client, json!({"type":"get_connection_state","activeSessionId":resumed})).await["occ3Modes"]["latentEnabled"], false);
+        client.close().await;
+    });
+    assert_eq!(fs::read(fixture.agent_dir.join("settings.json")).unwrap(), settings_before);
+    assert_eq!(fs::read(fixture.agent_dir.join("models.json")).unwrap(), models_before);
 }

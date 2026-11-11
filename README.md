@@ -311,13 +311,14 @@ Experimental model-facing output reduction, iterative-summary consolidation, and
 
 ## OCC agent communication
 
-OCC (Optimus Compact Communication) lets cooperating agents exchange structured tasks, progress, evidence, and results with less repeated prose. The three levels describe different ways to represent that information; ordinary conversational messages can still use plain text.
+OCC (Optimus Compact Communication) combines structured agent messaging with optional multi-agent reasoning. OCC3.1 is a text-based workflow; OCC3.2 is the existing experimental latent-state transport. Ordinary conversational messages can still use plain text.
 
 | Level | What it does | Status on main |
 | --- | --- | --- |
 | **OCC-1 — structured English** | Uses a deterministic `KEY=VALUE` grammar for task identity, status, findings, evidence references, and next actions. Agents can validate and reconstruct the message without guessing. | Available throughout; the authoring format and fallback. |
 | **OCC-2 — symbolic dialects** | Encodes eligible OCC-1 messages using a shared, versioned symbol codebook. The receiver reuses a codebook already present in its context instead of receiving the full legend with every message. | Enabled by default for chats without a saved preference; selected adaptively per message. |
-| **OCC-3 — latent communication** | Experimental native handoff of captured model state between compatible family agents. | Exposed through `occ3_handoff` only after configured activation and live verification. Both subagents must use explicitly OCC-3-supported models with matching exact model/runtime identity. Ordinary hosted APIs or an ordinary DGX model entry are not enough. |
+| **OCC3.1 — TextMAS** | Planner, Critic and Refiner exchange text before the ordinary parent agent judges the drafts and answers or executes the task. | Off by default. Sequential and hierarchical modes use the selected ordinary model API; no latent server is required. These extra model calls consume tokens and add latency. |
+| **OCC3.2 — latent communication** | Experimental native handoff of captured model state between compatible family agents. | Exposed through `occ3_handoff` only after configured activation and live verification. Both subagents must use explicitly OCC-3-supported models with matching exact model/runtime identity. Ordinary hosted APIs or an ordinary DGX model entry are not enough. |
 
 OCC-2 negotiates a shared dialect and considers message size, codebook cost, available evaluation evidence, and recent decode failures. Enabling it does not force every message into symbols: small messages, incompatible peers, and messages rejected by the selection guards stay on OCC-1. Plain text and OCC-1 deltas keep their existing form. The enabled experimental path can use unevaluated dialects under reference cost assumptions, so enablement is not proof of savings for your model pair. Each symbolic message retains an OCC-1 fallback; invalid symbolic data uses the validated fallback and records a failure for future selection.
 
@@ -326,19 +327,27 @@ In the repository's DGX GLM 5.3 evaluation, OCC-2 reduced average **wire tokens 
 ### Control OCC for the current chat
 
 ```text
-/occ             # open communication controls
-/occ status      # show the effective setting
-/occ 2 on        # enable adaptive OCC-2
-/occ 2 off       # use OCC-1 only for structured messages
-/occ 3 on        # save the experimental OCC-3 preference for a supported model
-/occ 3 off       # disable the saved OCC-3 preference
+/occ                     # open communication controls
+/occ status              # show the independent modes
+/occ 2 on                # enable adaptive OCC-2
+/occ 2 off               # use OCC-1 only for structured messages
+/occ 3 sequential        # enable OCC3.1 sequential TextMAS
+/occ 3 hierarchical      # enable OCC3.1 independent drafts, then final judgement
+/occ 3 off               # disable OCC3.1 only
+/occ 3.1 sequential      # explicit OCC3.1 alias
+/occ 3.2 on              # opt into latent communication for a supported model
+/occ 3.2 off             # disable the latent preference only
 ```
 
 Settings remain **per chat** and survive resume and daemon restart. Subagents dynamically inherit their nearest parent's saved preference unless they have their own override; unrelated chats and independent forks keep their own settings. Upgrading to v0.1.34 enables OCC-2 in chats with no saved preference, including resumed chats. A previously saved off preference stays off. OCC-1 remains available as the fallback in either mode.
 
-The OCC-3 menu checks the selected model's `occ3` configuration and refuses enablement for unsupported models. For example, use the explicitly configured **DGX MTP (OCC-3)** model for both subagents, not its ordinary DGX MTP counterpart. `/occ status` reports the saved preference and configuration eligibility. When the selected model is OCC-3 configured but settings.json would decline activation, `/occ status` names the missing settings and `/occ 3 on` warns instead of reporting success. The chat override gates native actions and is inherited by subagents. With no override, an installed native connector follows the global opt-in. Installing the connector still requires the existing `agentCommunication.occ3Enabled` and `occ3Experimental` settings, a configured endpoint, and a successful live handshake. When activation declines for a model with an enabled `occ3` block, the daemon log records `occ3 activation declined reason=<code>`; ordinary models stay silent. Both sender and receiver require native permits and matching verified model/runtime identity.
+OCC3.1 runs three tool-free preparation calls: **Planner**, **Critic**, then **Refiner**. Sequential mode passes earlier drafts to later stages. Hierarchical mode gives all three stages the same original context without peer drafts, then gives their text to the parent **Judger/executor**. The independent stages currently execute serially. The final parent keeps its normal tools and approval policy. Only genuine user turns in the root chat start this workflow; background messages, internal continuations and child sessions do not recursively multiply it. This is an Optimus product adaptation, not the exact benchmark harness or a claim that benchmark scores transfer to this workflow. See [OCC3.1 / OCC3.2](resources/agent/docs/occ3-modes.md) for costs, limits and failure handling.
 
-Agents are instructed to use `occ3_handoff` when it is exposed and the pair is eligible, and ordinary OCC-2/OCC-1/TXT messaging otherwise. They discover the configured model and pass its exact provider/model selector to both subagents (for example, `dgx-glm53-occ3/glm-5.3` when listed), using its configured endpoints and credentials rather than remembered SSH routes. The first `occ3_handoff` call arms capture without sending; after `capture_armed`, the agent emits concise source content and calls it again for the same receiver. `agent_message.send` does not automatically transfer native state. The subagent bar shows **OCC3** only after a completed native-use receipt; a preference, handshake, or queued handoff is not completion or proof of semantic accuracy. See the [agent-message guide](resources/agent/skills/agent-message/SKILL.md) for the supported API and fallback behavior.
+**Command migration in v0.1.45:** `/occ 3 off` now controls TextMAS, not latent communication. Use `/occ 3.2 off` for latent. `/occ 3 on` gives migration guidance rather than silently enabling either feature. Bare `/occ 3`, `/occ 3.1` and `/occ 3.2` do not change a setting. The existing `/occ occ3 on|off` argument alias remains explicitly latent. There is no `/occ3` slash command. TextMAS controls require a host advertising `occ31_textmas`; older hosts remain usable but cannot enable this feature.
+
+The OCC3.2 menu checks the selected model's `occ3` configuration and refuses enablement for unsupported models. For example, use the explicitly configured **DGX MTP (OCC-3)** model for both subagents, not its ordinary DGX MTP counterpart. `/occ status` reports the saved preference and configuration eligibility. When the selected model is OCC-3 configured but settings.json would decline activation, `/occ status` names the missing settings and `/occ 3.2 on` warns instead of reporting success. The chat override gates native actions and is inherited by subagents. With no override, an installed native connector follows the global opt-in. Installing the connector still requires the existing `agentCommunication.occ3Enabled` and `occ3Experimental` settings, a configured endpoint, and a successful live handshake. When activation declines for a model with an enabled `occ3` block, the daemon log records `occ3 activation declined reason=<code>`; ordinary models stay silent. Both sender and receiver require native permits and matching verified model/runtime identity.
+
+Agents are instructed to use `occ3_handoff` when it is exposed and the pair is eligible, and ordinary OCC-2/OCC-1/TXT messaging otherwise. They discover the configured model and pass its exact provider/model selector to both subagents (for example, `dgx-glm53-occ3/glm-5.3` when listed), using its configured endpoints and credentials rather than remembered SSH routes. The first `occ3_handoff` call arms capture without sending; after `capture_armed`, the agent emits concise source content and calls it again for the same receiver. `agent_message.send` does not automatically transfer native state. The status bar shows delivery lights only; the **OCC3.1** light pulses while a TextMAS run is actively executing, and the **OCC3.2** light blinks while native latent transport is actively delivering, and that pulse still requires a completed native-use receipt; a preference, handshake, or queued handoff is not completion or proof of semantic accuracy. See the [agent-message guide](resources/agent/skills/agent-message/SKILL.md) for the supported API and fallback behavior.
 
 ## Jev integration
 
@@ -638,7 +647,7 @@ Use **Ctrl+S** to stash an unfinished prompt. After an ordinary prompt is accept
 | `/heartbeat` | Configure recurring session prompts |
 | `/tree`, `/fork`, `/clone` | Navigate or branch session history |
 | `/telegram` | Manage the Telegram connection |
-| `/occ` | Inspect or change OCC-2 and the supported-model OCC-3 preference; OCC-1 remains the fallback |
+| `/occ` | Control OCC-2, OCC3.1 TextMAS and the supported-model OCC3.2 latent preference independently |
 | `/jev` | Configure Jev credentials, models, full-Jev, Dynamic questions, individual feature gates, and compaction |
 | `/settings`, `/mcp`, `/reload` | Configure and reload integrations and resources |
 

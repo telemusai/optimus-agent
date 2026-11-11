@@ -495,6 +495,7 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
             let persisted_recap = manager.get_latest_agent_status().map(|status| status.summary);
             (manager.get_cwd(), manager.get_session_dir(), manager.get_leaf_id(), compaction_count, persisted_recap)
         };
+        let occ3_global_opt_in = session.settings_manager.lock().unwrap().get_agent_communication_occ3_opt_in();
         AgentSessionRuntimeSnapshotSource {
             session: crate::modes::agent_connection::snapshot::AgentSessionSnapshotSource {
                 session_id: session.session_id(),
@@ -534,6 +535,8 @@ impl InProcessRuntimeHost for InProcessRuntimeHostAdapter {
                 // the list until the next turn removes it; the panel must
                 // not present that boundary turn as a live enrollment.
                 occ3_native_dead: session.experimental_native_occ3().map(|native| native.is_dead()).unwrap_or(false),
+                occ3_global_opt_in,
+                textmas_active: session.is_textmas_active(),
                 // `contextUsage: session.getContextUsage()` (snapshot.ts:56).
                 context_usage: serde_json::to_value(session.get_context_usage()).unwrap(),
                 persisted_recap,

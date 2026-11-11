@@ -1,11 +1,16 @@
-# OCC-3 sender queue
+# OCC3.2 latent sender queue
+
+OCC3.2 is the display name of the existing OCC-3 transport. Its APIs and queue
+records keep their existing names. Use `/occ 3.2 on|off` for its preference;
+`/occ 3 off` controls the separate [OCC3.1 TextMAS mode](occ3-modes.md).
 
 The status bar shows a blue round `QUEUED n` badge for handoffs waiting to
 capture or send (`pending` and `armed`). It alternates filled/bold and
 hollow/dim every 500 ms. Published, admitted, completed, failed and cancelled
 handoffs do not count. At zero, the badge and its animation deadline disappear.
 On narrow terminals, the optional queue badge drops before compacting health or dropping delivery indicators.
-The separate OCC3 delivery indicator pulses only on completed native use.
+The separate OCC3.2 delivery indicator pulses only on completed native use.
+Its enabled/configured state is not evidence of a completed handoff.
 
 Queue notices are durable audit history, not commands to repeat a handoff.
 Only the current pending head can request a fresh capture. Admission clears

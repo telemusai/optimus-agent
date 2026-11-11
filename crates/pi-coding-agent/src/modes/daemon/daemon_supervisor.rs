@@ -155,7 +155,7 @@ pub fn supervisor_server_capabilities() -> Vec<String> {
 }
 
 /// `DAEMON_COMMAND_TYPES`.
-pub const DAEMON_COMMAND_TYPES: [&str; 113] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 116] = [
     "ack_result",
     "list",
     "list_agent_peers",
@@ -270,6 +270,9 @@ pub const DAEMON_COMMAND_TYPES: [&str; 113] = [
     // worker that implements them is ever reached.
     "occ_get_preferences",
     "occ_set_preferences",
+    "occ31_get_preferences",
+    "occ31_set_mode",
+    "occ32_set_enabled",
     "occ_resolve_queue_entry",
     "extension_ui_response",
     "prepare_update_restart",

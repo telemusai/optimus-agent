@@ -4809,6 +4809,7 @@ fn project_state(state: wire::AgentConnectionState) -> local::AgentConnectionSta
             percent: number(&state.context_usage, "percent"),
         },
         recap: state.recap,
+        occ3_modes: state.occ3_modes,
     }
 }
 
@@ -7226,6 +7227,7 @@ fn apply_event_legacy_for_speed(
             own_usage: pi_ai::types::Usage::default(),
             total_usage: pi_ai::types::Usage::default(),
             context_usage: None,
+            textmas_usage: None,
             children: Vec::new(),
         };
         let text = crate::modes::interactive::components::context_tree_format::format_context_tree(

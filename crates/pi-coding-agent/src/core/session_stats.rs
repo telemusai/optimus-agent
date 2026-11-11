@@ -30,6 +30,9 @@ pub struct SessionStats {
     pub total_messages: i64,
     pub tokens: SessionStatsTokens,
     pub cost: f64,
+    /// Known auxiliary spend is a subtotal, never proof that unreported calls were free.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub textmas_usage: Option<crate::core::occ::textmas::TextMasUsageSummary>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub context_usage: Option<ContextUsage>,
 }
@@ -66,6 +69,7 @@ mod tests {
                 total: 10.0,
             },
             cost: 0.5,
+            textmas_usage: None,
             context_usage: None,
         };
         let value = serde_json::to_value(&stats).unwrap();

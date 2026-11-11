@@ -714,7 +714,7 @@ pub struct DaemonHistoryRange {
 }
 
 /// `DAEMON_COMMAND_TYPES` (ported verbatim from daemon-mode.ts).
-pub const DAEMON_COMMAND_TYPES: [&str; 106] = [
+pub const DAEMON_COMMAND_TYPES: [&str; 109] = [
     "ack_result",
     "list",
     "list_saved_sessions",
@@ -822,6 +822,9 @@ pub const DAEMON_COMMAND_TYPES: [&str; 106] = [
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_get_preferences",
     "occ_set_preferences",
+    "occ31_get_preferences",
+    "occ31_set_mode",
+    "occ32_set_enabled",
     // Manual OCC-3 queue resolution (schema revision 46): optional and
     // capability-gated; an old daemon answers "Unknown daemon command".
     "occ_resolve_queue_entry",
@@ -5924,6 +5927,32 @@ impl AgentDaemon {
                     "occ_set_preferences",
                     Some(value),
                 )))
+            }
+            "occ32_set_enabled" => {
+                let enabled = body.get("enabled").and_then(Value::as_bool)
+                    .ok_or_else(|| "enabled must be a boolean".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::session_settings::set_latent_preferences(&session_file, enabled)?;
+                Ok(Some(DaemonResponse::success(id, "occ32_set_enabled", Some(value))))
+            }
+            "occ31_get_preferences" => {
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::preferences(&session_file)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_get_preferences", Some(value))))
+            }
+            "occ31_set_mode" => {
+                let mode: crate::core::occ::textmas::TextMasMode = serde_json::from_value(
+                    body.get("mode").cloned().unwrap_or(Value::Null)
+                ).map_err(|_| "mode must be off, sequential, or hierarchical".to_string())?;
+                let state = self.get_session_state(active_session_id)?;
+                let session_file = self.session_of(&state).session_file()
+                    .ok_or_else(|| "This chat has no saved session identity".to_string())?;
+                let value = crate::core::occ::textmas_settings::set_mode(&session_file, mode)?;
+                Ok(Some(DaemonResponse::success(id, "occ31_set_mode", Some(value))))
             }
             // Manual resolution (schema 46): cancel or explicitly confirmed
             // re-emit of ONE uncertain entry on the attached session's own

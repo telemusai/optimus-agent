@@ -186,3 +186,76 @@ fn saved_child_discovery_is_scoped_to_the_session_artifacts() {
     );
     assert!(child_dirs(Path::new(&unrelated)).is_empty());
 }
+
+
+#[test]
+fn textmas_accounting_is_deduplicated_separate_and_keeps_unknown_costs() {
+    use crate::core::occ::textmas::{TextMasCallStatus, TextMasRole, TextMasUsageRecord, USAGE_CUSTOM_TYPE};
+    let custom = |id: &str, parent: &str, record: TextMasUsageRecord| json!({
+        "id":id,"parentId":parent,"type":"custom","customType":USAGE_CUSTOM_TYPE,"data":record
+    });
+    let started = TextMasUsageRecord::new("task", TextMasRole::Planner, TextMasCallStatus::Started, None);
+    let finished = TextMasUsageRecord::new("task", TextMasRole::Planner, TextMasCallStatus::Completed, Some(usage(11.0, 4.0, 2.0)));
+    let cancelled = TextMasUsageRecord::new("task", TextMasRole::Critic, TextMasCallStatus::Cancelled, None);
+    let entries = vec![
+        json!({"id":"u","type":"message","message":{"role":"user"}}),
+        custom("s", "u", started), custom("d", "s", finished.clone()),
+        custom("dup", "d", finished), custom("c", "dup", cancelled),
+        assistant("a", "c", "model", usage(3.0, 2.0, 0.0)),
+        custom("offbranch", "u", TextMasUsageRecord::new("other", TextMasRole::Refiner, TextMasCallStatus::Started, None)),
+    ];
+    let reduced: Vec<_> = entries.iter().map(usage_entry).collect();
+    let mut accounting = account(&reduced, Some("a"));
+    assert_eq!(accounting.total(), 5.0, "do not forge ordinary provider calls");
+    assert_eq!(accounting.turns, [5.0]);
+    assert_eq!(accounting.models.len(), 1);
+    let summary = accounting.textmas_usage.as_ref().unwrap();
+    assert_eq!(summary.calls, 2);
+    assert_eq!(summary.unknown_usage_calls, 1);
+    assert_eq!(summary.unknown_cost_calls, 1);
+    assert_eq!(summary.known_subtotal.total_tokens, 17.0);
+    accounting.merge(account(&[custom("child", "", TextMasUsageRecord::new("task", TextMasRole::Planner, TextMasCallStatus::Started, None))], Some("child")));
+    let summary = accounting.textmas_usage.unwrap();
+    assert_eq!(summary.calls, 3, "distinct sessions retain separate call identities");
+    assert_eq!(summary.unknown_usage_calls, 2);
+    assert_eq!(summary.unknown_cost_calls, 2);
+    assert_eq!(summary.known_subtotal.total_tokens, 17.0);
+}
+
+#[test]
+fn stats_projection_drops_arbitrary_or_malformed_textmas_payloads() {
+    let entry = json!({"id":"a","type":"custom","customType":"occ31_textmas_usage",
+        "data":{"privateDraft":"DO_NOT_CACHE","usage":{"input":10}}});
+    let reduced = usage_entry(&entry);
+    assert!(reduced.get("data").is_none());
+    assert!(!reduced.to_string().contains("DO_NOT_CACHE"));
+    assert!(account(&[reduced], Some("a")).textmas_usage.is_none());
+}
+
+
+#[test]
+fn mixed_textmas_token_reports_keep_raw_usage_and_correct_display_subtotal() {
+    use crate::core::occ::textmas::{TextMasCallStatus, TextMasRole, TextMasUsageRecord, USAGE_CUSTOM_TYPE};
+    let mut full = usage(10.0, 0.0, 0.0);
+    full.total_tokens = 10.0;
+    let mut components = usage(20.0, 0.0, 0.0);
+    components.total_tokens = 0.0;
+    let mut total_only = Usage::default();
+    total_only.total_tokens = 30.0;
+    let mut entries = Vec::new();
+    let mut parent = String::new();
+    for (index, (role, usage)) in TextMasRole::ALL.into_iter().zip([full, components, total_only]).enumerate() {
+        let id = format!("record-{index}");
+        entries.push(usage_entry(&json!({"id":id,"parentId":parent,"type":"custom","customType":USAGE_CUSTOM_TYPE,
+            "data":TextMasUsageRecord::new("mixed", role, TextMasCallStatus::Completed, Some(usage))})));
+        parent = id;
+    }
+    let mut stats = account(&entries, Some(&parent));
+    let summary = stats.textmas_usage.as_ref().unwrap();
+    assert_eq!(summary.known_tokens, 60.0);
+    assert_eq!(summary.known_subtotal.total_tokens, 40.0, "raw provider fields remain untouched");
+    assert_eq!(summary.known_subtotal.input, 30.0);
+    stats.merge(account(&entries, Some(&parent)));
+    assert_eq!(stats.textmas_usage.as_ref().unwrap().known_tokens, 120.0);
+    assert_eq!(stats.total(), 0.0, "overhead is not a fake ordinary model reply");
+}

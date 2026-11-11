@@ -1,10 +1,8 @@
-//! Chat-local OCC controls. The host that owns the session persists them:
-//! daemons expose the capability-gated `occ_get_preferences` /
-//! `occ_set_preferences` commands (schema revision 41), so a client never
-//! writes OCC-2 storage the daemon may not read. OCC-3 retains its existing
-//! chat-local preference; native activation is configured separately.
-
+//! Chat-local OCC controls. Schema47 hosts own independent TextMAS and latent
+//! preferences; schema41 OCC2 payloads stay unchanged. Old hosts never receive
+//! TextMAS writes. Historical local latent writes are explicitly unverified.
 use super::*;
+use crate::core::occ::textmas::TextMasMode;
 
 #[derive(Debug, PartialEq)]
 enum Choice {
@@ -12,6 +10,8 @@ enum Choice {
     Status,
     Set(bool),
     SetOcc3(bool),
+    TextMasMenu,
+    SetTextMas(TextMasMode),
     /// `/occ queue`: the same queue view the status panel carries.
     Queue,
     /// `/occ queue cancel <queueId>`: manual resolution of one uncertain
@@ -33,34 +33,42 @@ fn parse(args: &str) -> Result<Choice, String> {
         ["queue", "reemit", queue_id] => Ok(Choice::QueueReemit(queue_id.to_string())),
         ["1"] | ["occ1"] | ["off"] | ["2", "off"] | ["occ2", "off"] => Ok(Choice::Set(false)),
         ["2"] | ["occ2"] | ["on"] | ["2", "on"] | ["occ2", "on"] => Ok(Choice::Set(true)),
-        ["3", "on"] | ["occ3", "on"] => Ok(Choice::SetOcc3(true)),
-        ["3", "off"] | ["occ3", "off"] | ["3"] | ["occ3"] => Ok(Choice::SetOcc3(false)),
-        _ => Err("Usage: /occ [status|queue|1|2 on|2 off|3 on|3 off|queue cancel <id>|queue reemit <id>]. OCC-1 remains enabled as the fallback; OCC-2 is enabled by default; OCC-3 requires a live connector handshake. queue cancel/reemit resolve one uncertain native handoff; reemit states the duplicate risk before sending.".into()),
+        ["3"] | ["3.1"] => Ok(Choice::TextMasMenu),
+        ["3", "off"] | ["3.1", "off"] => Ok(Choice::SetTextMas(TextMasMode::Off)),
+        ["3", "sequential"] | ["3.1", "sequential"] => Ok(Choice::SetTextMas(TextMasMode::Sequential)),
+        ["3" | "3.1", "hierarchical" | "hierarchal" | "hiearical"] => Ok(Choice::SetTextMas(TextMasMode::Hierarchical)),
+        ["3", "on"] | ["3.1", "on"] => Err("OCC3.1 needs a mode: /occ 3 sequential or /occ 3 hierarchical. For the old latent preference use /occ 3.2 on.".into()),
+        ["3.2", "on"] | ["occ3", "on"] => Ok(Choice::SetOcc3(true)),
+        ["3.2", "off"] | ["occ3", "off"] => Ok(Choice::SetOcc3(false)),
+        ["3.2"] | ["occ3"] => Ok(Choice::Status),
+        _ => Err("Usage: /occ [status|queue|1|2 on|2 off|3 off|3 sequential|3 hierarchical|3.1 off|3.1 sequential|3.1 hierarchical|3.2 on|3.2 off|queue cancel <id>|queue reemit <id>]. Bare 3 or 3.1 opens the TextMAS menu; bare 3.2 shows status. OCC3.1 works with any supported model. OCC3.2 alone requires native latent support. Queue reemit requires duplicate-risk confirmation.".into()),
     }
 }
 
-fn status(enabled: bool) -> String {
-    status_occ3(enabled, false)
-}
-
+#[cfg(test)]
 fn status_occ3(enabled: bool, occ3_enabled: bool) -> String {
     status_occ3_native(enabled, occ3_enabled, false)
 }
 
-/// `live_native`: this chat currently has an installed native OCC-3
-/// enrollment (the occ3_handoff tool is active). Then OCC-3 is not merely
+/// `live_native`: this chat currently has an installed native OCC3.2
+/// enrollment (the occ3_handoff tool is active). Then OCC3.2 is not merely
 /// allowed - it is the preferred channel for compatible-family fact
 /// exchange, and the panel says so.
+#[cfg(test)]
 fn status_occ3_native(enabled: bool, occ3_enabled: bool, live_native: bool) -> String {
-    let occ3_state = if live_native {
-        "PREFERRED (live native enrollment; occ3_handoff is the preferred path for compatible family fact exchange)"
-    } else if occ3_enabled {
-        "ON"
-    } else {
-        "OFF"
+    status_occ3_observed(enabled, Some((occ3_enabled, live_native)))
+}
+
+/// Unavailable optional metadata must never be rendered as an explicit OFF.
+fn status_occ3_observed(enabled: bool, latent: Option<(bool, bool)>) -> String {
+    let occ3_state = match latent {
+        Some((true, true)) => "PREFERRED (live native enrollment; occ3_handoff is the preferred path for compatible family fact exchange)",
+        Some((true, false)) => "ON",
+        Some((false, _)) => "OFF",
+        None => "unavailable",
     };
     format!(
-        "Agent communication (this chat)\n\nOCC-1: ON (fallback)\nOCC-2: {} (adaptive symbolic encoding; default ON)\nOCC-3: {} (chat preference; same-exact-model native handoffs)\n\n/occ 2 on enables OCC-2; /occ 2 off returns to OCC-1; /occ 3 on saves the OCC-3 preference; /occ 3 off blocks native handoffs for this chat.\nNative OCC-3 still requires agentCommunication.occ3Enabled and occ3Experimental, a configured model endpoint, and a successful live connector handshake. An explicit chat preference gates native actions dynamically; it does not install a missing connector. Without a chat override, an installed native connector follows the existing global opt-in. Agents use occ3_handoff only when the runtime exposes it; ordinary messages retain their OCC-2/OCC-1/TXT path.\nSaved for this chat and inherited by its subagents unless they have an override. Other chats are unchanged.\nTXT / OCC1 / OCC2 indicators reflect delivered messages; OCC3 requires a completed native-use receipt, not just enablement or a queued handoff.",
+        "Agent communication (this chat)\n\nOCC-1: ON (fallback)\nOCC-2: {} (adaptive symbolic encoding; default ON)\nOCC3.2: {} (chat preference; same-exact-model native handoffs)\n\n/occ 2 on enables OCC-2; /occ 2 off disables only OCC-2. /occ 3 or /occ 3.1 opens the TextMAS menu; off, sequential, and hierarchical control only OCC3.1. /occ 3.2 on|off controls only the latent preference.\nOCC3.1 works with any model supported by Optimus, local or hosted, using the selected provider. Its three tool-free preparation calls precede the ordinary parent turn and add latency/token use.\nNative OCC3.2 still requires agentCommunication.occ3Enabled and occ3Experimental, a configured model endpoint, and a successful live connector handshake. An explicit chat preference gates native actions dynamically; it does not install a missing connector. Without a latent override, native activation follows the existing global opt-in. Agents use occ3_handoff only when the runtime exposes it; ordinary messages retain their OCC-2/OCC-1/TXT path.\nSaved independently for this chat and inherited by its subagents unless they have an override. Other chats are unchanged.\nTXT / OCC1 / OCC2 indicators reflect delivered messages; the OCC3.2 activity pulse requires a completed native-use receipt, not enablement or a queued handoff. Persistent OCC3.1/OCC3.2 labels show configuration only.",
         if enabled { "ON" } else { "OFF" },
         occ3_state
     )
@@ -156,9 +164,10 @@ fn queue_table_row(entry: &crate::core::occ::queue::CommunicationQueueEntry) -> 
 }
 
 /// Host-authoritative OCC-2 status and provenance, alongside the existing
-/// chat-local OCC-3 preference. `queue` is this chat's own native handoff
+/// chat-local OCC3.2 preference. `queue` is this chat's own native handoff
 /// queue, projected from its notices; the family-wide count lives in the
 /// subagents bar badge.
+#[cfg(test)]
 fn status_of(
     payload: &serde_json::Value,
     occ3_enabled: bool,
@@ -168,14 +177,23 @@ fn status_of(
 }
 
 /// `status_of` with the chat's native-enrollment liveness, so the panel
-/// reports OCC-3 as the preferred channel when the connector is live.
+/// reports OCC3.2 as the preferred channel when the connector is live.
+#[cfg(test)]
 fn status_of_native(
     payload: &serde_json::Value,
     occ3_enabled: bool,
     live_native: bool,
     queue: Option<&crate::core::occ::queue::CommunicationQueueSnapshot>,
 ) -> Result<String, String> {
-    let mut panel = status_occ3_native(enabled_of(payload)?, occ3_enabled, live_native);
+    status_of_observed(payload, Some((occ3_enabled, live_native)), queue)
+}
+
+fn status_of_observed(
+    payload: &serde_json::Value,
+    latent: Option<(bool, bool)>,
+    queue: Option<&crate::core::occ::queue::CommunicationQueueSnapshot>,
+) -> Result<String, String> {
+    let mut panel = status_occ3_observed(enabled_of(payload)?, latent);
     if let Some(queue) = queue {
         // The whole-queue blocked state first: a queue whose persisted
         // artifact could not be loaded safely refuses new handoffs, and the
@@ -203,7 +221,7 @@ fn status_of_native(
         }
         if !queue.entries.is_empty() {
             panel.push_str(&format!(
-                "\nNative handoff queue: {} waiting (pending/armed; the blue QUEUED marker flashes while waiting, independently of the OCC3 completed-use delivery pulse).",
+                "\nNative handoff queue: {} waiting (pending/armed; the blue QUEUED marker flashes while waiting, independently of the OCC3.2 completed-use delivery pulse).",
                 queue.pending_total
             ));
             for entry in &queue.entries {
@@ -240,6 +258,24 @@ fn status_of_native(
     Ok(panel)
 }
 
+/// Compose independent observations after an acknowledged mutation or a status read.
+/// Only invalid own-lane payloads fail; optional read failures stay visible in the panel.
+fn status_with_optional_observations(
+    payload: &serde_json::Value,
+    latent: Result<(bool, bool, bool), String>,
+    textmas: Result<String, String>,
+    queue: Option<&crate::core::occ::queue::CommunicationQueueSnapshot>,
+) -> Result<String, String> {
+    let observed = latent.as_ref().ok().map(|(enabled, available, active)| (*enabled, *active && *available));
+    let mut panel = status_of_observed(payload, observed, queue)?;
+    if let Err(error) = latent { panel.push_str(&format!("\nOCC3.2 configuration unavailable: {error}")); }
+    match textmas {
+        Ok(status) => panel.push_str(&format!("\n\n{status}")),
+        Err(error) => panel.push_str(&format!("\n\nOCC3.1: unavailable ({error})")),
+    }
+    Ok(panel)
+}
+
 async fn write_preference(
     connection: &Arc<dyn wire::AgentConnection>,
     route: &Route,
@@ -250,7 +286,13 @@ async fn write_preference(
             let value = connection.set_occ_preferences(enabled).await?;
             // The daemon-authoritative echo, rendered with any provenance it
             // reports; an invalid echo is an error, never a success panel.
-            Ok(CommandOutput::TransientStatus(status_of(&value, false, None)?))
+            if value["applied"].as_bool() != Some(true) || enabled_of(&value)? != enabled {
+                return Err("Host did not confirm the requested OCC-2 preference".into());
+            }
+            let panel = status_with_optional_observations(&value,
+                read_occ3_preference_native(connection).await,
+                textmas_status(connection).await, None)?;
+            Ok(CommandOutput::TransientStatus(format!("OCC-2 preference saved: {}.\n{panel}", if enabled { "ON" } else { "OFF" })))
         }
         Route::LegacyLocal => {
             let state = connection.get_state().await?;
@@ -260,22 +302,27 @@ async fn write_preference(
             // preferences (same machine) or may not (older storage); the
             // warning keeps both outcomes honest while OCC-1 stays available.
             Ok(CommandOutput::Warning(format!(
-                "Saved the OCC-2 preference for this chat locally, but this daemon does not advertise OCC-2 session controls (Optimus Agent v0.1.34 or later). The preference takes effect only when the daemon reads session preferences; OCC-1 remains the default and fallback.\n\n{}",
-                status(enabled)
+                "Saved the OCC-2 preference ({}) for this chat locally, but this daemon does not advertise OCC-2 session controls (Optimus Agent v0.1.34 or later). The preference takes effect only when the daemon reads session preferences; OCC-1 remains the default and fallback. Other modes are unchanged; their host state is not confirmed by this local write.",
+                if enabled { "ON" } else { "OFF" }
             )))
         }
         Route::Unsupported => Ok(CommandOutput::Warning(UNSUPPORTED.into())),
     }
 }
 
-const MENU_CHOICES: [&str; 4] = [
-    "OCC-1 only",
+const MENU_CHOICES: [&str; 7] = [
+    "Disable OCC-2 (keep OCC-1 fallback)",
     "Enable OCC-2 (default)",
-    "Enable OCC-3 preference (experimental)",
-    "Disable OCC-3 preference",
+    "Enable OCC3.2 preference (experimental)",
+    "Disable OCC3.2 preference",
+    "OCC3.1 off (default)",
+    "OCC3.1 sequential",
+    "OCC3.1 hierarchical",
 ];
-const OCC3_UNAVAILABLE: &str = "OCC-3 unavailable for this model";
-const OCC3_MODEL_REQUIRED: &str = "OCC-3 requires a model with an enabled, supported occ3 configuration in models.json. Select an OCC-3 model, such as your DGX MTP (OCC-3) entry. Both sender and receiver subagents must use compatible OCC-3 models and pass the live exact-model/runtime handshake; a matching model name alone is insufficient. Unsupported pairs use ordinary OCC-2/OCC-1/TXT communication.";
+const TEXTMAS_CHOICES: [&str; 3] = [MENU_CHOICES[4], MENU_CHOICES[5], MENU_CHOICES[6]];
+const TEXTMAS_UNSUPPORTED: &str = "This host does not support OCC3.1 controls (occ31_textmas, schema 47). Update the daemon to Optimus Agent v0.1.45 or later. No preference was changed; other communication remains available.";
+const OCC3_UNAVAILABLE: &str = "OCC3.2 unavailable for this model";
+const OCC3_MODEL_REQUIRED: &str = "OCC3.2 requires a model with an enabled, supported occ3 configuration in models.json. Select an OCC3.2 model, such as your DGX MTP (OCC3.2) entry. Both sender and receiver subagents must use compatible OCC3.2 models and pass the live exact-model/runtime handshake; a matching model name alone is insufficient. Unsupported pairs use ordinary OCC-2/OCC-1/TXT communication.";
 
 fn model_supports_occ3(model: Option<&pi_ai::types::Model>) -> bool {
     use crate::core::occ3_connectors::activation::{configured_connector, Occ3ActivationRequest};
@@ -287,7 +334,7 @@ fn model_supports_occ3(model: Option<&pi_ai::types::Model>) -> bool {
 
 /// The settings half of native activation for the selected model: the
 /// configuration-only decline under this host's `agentCommunication` opt-in
-/// and endpoint override. `None` when the model is not OCC-3 configured (the
+/// and endpoint override. `None` when the model is not OCC3.2 configured (the
 /// "unavailable" line covers it) or the gate passes. No network: the daemon
 /// still owns the live handshake.
 fn occ3_settings_decline(
@@ -328,11 +375,11 @@ fn occ3_settings_decline_line(decline: crate::core::occ3_connectors::activation:
     use crate::core::occ3_connectors::activation::{Occ3Decline, OCC3_POLICY_REMEDY};
     match decline {
         Occ3Decline::DisabledByPolicy | Occ3Decline::ExperimentalAckRequired => format!(
-            "Native OCC-3 is disabled by settings ({}), so the occ3_handoff tool is not installed. To enable it, {OCC3_POLICY_REMEDY}. New chats and subagents read these settings when they start.",
+            "Native OCC3.2 is disabled by settings ({}), so the occ3_handoff tool is not installed. To enable it, {OCC3_POLICY_REMEDY}. New chats and subagents read these settings when they start.",
             decline.message()
         ),
         other => format!(
-            "Native OCC-3 is blocked by settings ({}), so the occ3_handoff tool is not installed.",
+            "Native OCC3.2 is blocked by settings ({}), so the occ3_handoff tool is not installed.",
             other.message()
         ),
     }
@@ -347,6 +394,9 @@ fn menu_choice(value: &str) -> Result<Choice, String> {
         Some(1) => Ok(Choice::Set(true)),
         Some(2) => Ok(Choice::SetOcc3(true)),
         Some(3) => Ok(Choice::SetOcc3(false)),
+        Some(4) => Ok(Choice::SetTextMas(TextMasMode::Off)),
+        Some(5) => Ok(Choice::SetTextMas(TextMasMode::Sequential)),
+        Some(6) => Ok(Choice::SetTextMas(TextMasMode::Hierarchical)),
         _ => Err("Unknown OCC selection".into()),
     }
 }
@@ -355,27 +405,32 @@ async fn read_occ3_preference(connection: &Arc<dyn wire::AgentConnection>) -> Re
     read_occ3_preference_native(connection).await.map(|(enabled, supported, _live)| (enabled, supported))
 }
 
-/// The chat's OCC-3 resolution with liveness: `(preference, model
+/// The chat's OCC3.2 resolution with liveness: `(preference, model
 /// supported, live native enrollment)`. `live` is true only when the
 /// occ3_handoff tool is active in this chat - the connector enrolled and
-/// the runtime exposes it - which is what makes OCC-3 the preferred
+/// the runtime exposes it - which is what makes OCC3.2 the preferred
 /// channel rather than merely allowed.
 async fn read_occ3_preference_native(connection: &Arc<dyn wire::AgentConnection>) -> Result<(bool, bool, bool), String> {
-    // Match the existing chat-local OCC-3 write path; the OCC-2 daemon
-    // preference payload does not include OCC-3.
+    // Match the existing chat-local OCC3.2 write path; the OCC-2 daemon
+    // preference payload does not include OCC3.2.
     let state = connection.get_state().await?;
+    if connection.supports_occ31_textmas() {
+        let modes = state.occ3_modes.as_ref().ok_or("Host OCC3 configuration is unavailable; check session preferences")?;
+        return Ok((modes.latent_enabled, modes.latent_available, modes.latent_active && modes.latent_available));
+    }
     // The tool name lingers on a dead enrollment until the next turn removes
     // it, so liveness additionally requires the permit to be alive.
     let live = state.active_tool_names.iter().any(|name| name == "occ3_handoff")
         && !state.occ3_native_dead;
     let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
     let preference = crate::core::occ::session_settings::resolve(session_file)?;
-    let enabled = if preference.source_session_id.is_some() {
+    let enabled = if preference.occ3_source_session_id.is_some() {
         preference.occ3_enabled
     } else {
         live
     };
-    Ok((enabled, model_supports_occ3(state.model.as_ref()), live))
+    let supported = model_supports_occ3(state.model.as_ref());
+    Ok((enabled, supported, live && supported))
 }
 
 /// This chat's queue entry with the given id, from the notice projection.
@@ -428,7 +483,7 @@ async fn queue_resolution(
 ) -> Result<CommandOutput, String> {
     if !connection.supports_occ_queue_resolution() {
         return Ok(CommandOutput::Warning(
-            "This session host does not support OCC-3 queue resolution (agent_communication_queue_control, schema revision 46). Update the daemon; until then, uncertain entries stay visible and unresolved - no automatic retry or duplicate will occur.".into(),
+            "This session host does not support OCC3.2 queue resolution (agent_communication_queue_control, schema revision 46). Update the daemon; until then, uncertain entries stay visible and unresolved - no automatic retry or duplicate will occur.".into(),
         ));
     }
     // The dialog states what it can prove from the projection; the
@@ -476,29 +531,64 @@ async fn queue_resolution(
     }
 }
 
+fn textmas_mode_of(payload: &serde_json::Value) -> Result<TextMasMode, String> {
+    serde_json::from_value(payload.get("occ31Mode").cloned().unwrap_or(serde_json::Value::Null))
+        .map_err(|_| "Host returned an invalid OCC3.1 preference".into())
+}
+
+fn textmas_status_of(payload: &serde_json::Value) -> Result<String, String> {
+    let mode = textmas_mode_of(payload)?;
+    let inherited = if payload["inherited"].as_bool() == Some(true) {
+        format!(" (inherited from chat {})", payload["sourceSessionId"].as_str().unwrap_or("unknown"))
+    } else { String::new() };
+    Ok(format!("OCC3.1: {}{inherited} (TextMAS configuration, not completed use). Works with any supported model, local or hosted. Sequential passes drafts between three tool-free roles; hierarchical uses three independent drafts. The ordinary parent turn keeps its normal tools. Preparation adds latency and token use.", mode.as_str()))
+}
+
+async fn textmas_status(connection: &Arc<dyn wire::AgentConnection>) -> Result<String, String> {
+    if !connection.supports_occ31_textmas() {
+        return Ok(format!("OCC3.1: unavailable. {TEXTMAS_UNSUPPORTED}"));
+    }
+    textmas_status_of(&connection.get_occ31_preferences().await?)
+}
+
+/// Only the session host writes this preference, irrespective of provider/model.
+async fn write_textmas(connection: &Arc<dyn wire::AgentConnection>, mode: TextMasMode) -> Result<CommandOutput, String> {
+    if !connection.supports_occ31_textmas() {
+        return Ok(CommandOutput::Warning(TEXTMAS_UNSUPPORTED.into()));
+    }
+    let value = connection.set_occ31_mode(mode).await?;
+    if value["applied"].as_bool() != Some(true) || textmas_mode_of(&value)? != mode {
+        return Err("Host did not confirm the requested OCC3.1 mode".into());
+    }
+    Ok(CommandOutput::TransientStatus(format!("{}\nSaved for this chat and inherited dynamically by subagents. OCC-2 and OCC3.2 are unchanged; new root user turns use this mode.", textmas_status_of(&value)?)))
+}
+
 pub(super) async fn run(
     connection: &Arc<dyn wire::AgentConnection>,
     send: &mpsc::Sender<HostEvent>,
     args: &str,
 ) -> Result<CommandOutput, String> {
-    let choice = parse(args)?;
-    // Manual queue resolution is gated on its own connection capability,
-    // not on the OCC-2 preference route: resolve before any preference
-    // read. `/occ queue` itself is the status panel's queue view.
-    let choice = match choice {
-        Choice::QueueCancel(queue_id) => {
-            return queue_resolution(connection, send, &queue_id, false).await;
-        }
-        Choice::QueueReemit(queue_id) => {
-            return queue_resolution(connection, send, &queue_id, true).await;
-        }
+    let choice = match parse(args)? {
+        Choice::QueueCancel(queue_id) => return queue_resolution(connection, send, &queue_id, false).await,
+        Choice::QueueReemit(queue_id) => return queue_resolution(connection, send, &queue_id, true).await,
         Choice::Queue => Choice::Status,
+        Choice::TextMasMenu => {
+            if !connection.supports_occ31_textmas() {
+                return Ok(CommandOutput::Warning(TEXTMAS_UNSUPPORTED.into()));
+            }
+            let title = textmas_status(connection).await?;
+            match select(send, &title, &TEXTMAS_CHOICES).await {
+                Some(value) => menu_choice(&value)?,
+                None => return Ok(CommandOutput::Nothing),
+            }
+        }
         other => other,
     };
-    let route = route(
-        connection.supports_occ_session_preferences(),
-        connection.supports_occ2_communication(),
-    );
+    // TextMAS is independent of OCC2 and native latent model/capability gates.
+    if let Choice::SetTextMas(mode) = choice {
+        return write_textmas(connection, mode).await;
+    }
+    let route = route(connection.supports_occ_session_preferences(), connection.supports_occ2_communication());
     if route == Route::Unsupported {
         return Ok(CommandOutput::Warning(UNSUPPORTED.into()));
     }
@@ -506,55 +596,44 @@ pub(super) async fn run(
     let enabled = enabled_of(&payload)?;
     let choice = match choice {
         Choice::Status => {
-            let (occ3_enabled, supported, live_native) = read_occ3_preference_native(connection).await?;
-            // This chat's own native handoff queue, projected from its
-            // notices; a failed read renders the panel without the queue
-            // section instead of failing the status command. The state read
-            // awaits before the closure so no async block hides inside
-            // and_then (E0728).
+            let latent = read_occ3_preference_native(connection).await;
             let session_id = connection.get_state().await.ok()
                 .and_then(|state| (!state.session_id.is_empty()).then_some(state.session_id))
                 .unwrap_or_default();
             let queue = match connection.get_messages().await {
                 Ok(messages) if !messages.is_empty() => Some(
-                    crate::core::occ::queue::from_queue_notices(&messages, &session_id, ""),
-                ),
+                    crate::core::occ::queue::from_queue_notices(&messages, &session_id, "")),
                 _ => None,
             };
-            let mut panel = status_of_native(&payload, occ3_enabled, live_native, queue.as_ref())?;
-            panel.push_str(if supported {
-                "\nSelected model: OCC-3 configured. The receiver must also be OCC-3 configured with matching verified model/runtime identity."
-            } else {
-                "\nSelected model: OCC-3 unavailable. Use an explicitly configured OCC-3 model for both subagents."
-            });
-            // Model eligibility alone is not activation: name a settings
-            // decline instead of letting "configured" imply the tool.
-            if supported && !live_native {
-                if let Ok(state) = connection.get_state().await {
+            let mut panel = status_with_optional_observations(&payload, latent.clone(), textmas_status(connection).await, queue.as_ref())?;
+            if let Ok((_, supported, _)) = &latent {
+                panel.push_str(if *supported {
+                    "\nSelected model: OCC3.2 configured. The receiver must also be OCC3.2 configured with matching verified model/runtime identity."
+                } else {
+                    "\nSelected model: OCC3.2 unavailable. This does not restrict OCC3.1 TextMAS."
+                });
+            }
+            if matches!(latent, Ok((_, true, false))) {
+                if connection.supports_occ31_textmas() {
+                    panel.push_str("\nNative OCC3.2 is not active on the host. Saving its preference does not install an enrollment or bypass host settings.");
+                } else if let Ok(state) = connection.get_state().await {
                     if let Some(decline) = occ3_settings_decline_now(state.model.as_ref(), &state.cwd) {
-                        panel.push('\n');
-                        panel.push_str(&occ3_settings_decline_line(decline));
+                        panel.push_str(&format!("\n{}", occ3_settings_decline_line(decline)));
                     }
                 }
             }
             return Ok(CommandOutput::Panel(panel));
         }
         Choice::Menu => {
-            // The menu title intentionally shows the saved ON/OFF preference,
-            // not the live PREFERRED state: the menu toggles the preference,
-            // while the status panel reports liveness. The two labels can
-            // differ for the same chat by design (preference ON + tool
-            // present = PREFERRED in the panel, ON in the menu).
-            let (occ3_enabled, supported) = read_occ3_preference(connection).await?;
-            let title = format!(
-                "OCC-1 ON · OCC-2 {} · OCC-3 {} (preference)",
-                if enabled { "ON" } else { "OFF" },
-                if occ3_enabled { "ON" } else { "OFF" },
-            );
+            let latent = read_occ3_preference(connection).await;
+            let (label, supported) = match latent {
+                Ok((value, supported)) => (if value { "ON" } else { "OFF" }, supported),
+                Err(_) => ("unavailable", false),
+            };
+            let textmas = textmas_status(connection).await.unwrap_or_else(|error| format!("OCC3.1 unavailable: {error}"));
+            let title = format!("OCC-1 ON · OCC-2 {} · OCC3.2 {} (preference)\n{}", if enabled { "ON" } else { "OFF" }, label, textmas);
             let mut choices = MENU_CHOICES;
-            if !supported {
-                choices[2] = OCC3_UNAVAILABLE;
-            }
+            if !supported { choices[2] = OCC3_UNAVAILABLE; }
             match select(send, &title, &choices).await {
                 Some(value) => menu_choice(&value)?,
                 None => return Ok(CommandOutput::Nothing),
@@ -562,38 +641,37 @@ pub(super) async fn run(
         }
         choice => choice,
     };
-    // OCC-3 keeps its existing chat-local storage path. This does not
-    // change the daemon protocol or install a native connector.
-    if let Choice::SetOcc3(value) = choice {
-        let state = connection.get_state().await?;
-        if value && !model_supports_occ3(state.model.as_ref()) {
-            return Ok(CommandOutput::Warning(OCC3_MODEL_REQUIRED.into()));
-        }
-        let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
-        let resolution = crate::core::occ::session_settings::resolve(session_file)?;
-        crate::core::occ::session_settings::save_occ3(
-            session_file,
-            resolution.occ2_enabled,
-            value,
-        )?;
-        // The chat preference only gates native actions; it does not
-        // install the connector. Say so when the settings opt-in would
-        // decline, instead of reporting a bare success.
-        if value {
-            if let Some(decline) = occ3_settings_decline_now(state.model.as_ref(), &state.cwd) {
-                return Ok(CommandOutput::Warning(format!(
-                    "OCC-3 preference saved for this chat. {}",
-                    occ3_settings_decline_line(decline)
-                )));
-            }
-        }
-        return Ok(CommandOutput::TransientStatus(status_occ3(enabled, value)));
-    }
     match choice {
+        Choice::SetTextMas(mode) => write_textmas(connection, mode).await,
+        Choice::SetOcc3(value) => {
+            let state = connection.get_state().await?;
+            if value && !model_supports_occ3(state.model.as_ref()) {
+                return Ok(CommandOutput::Warning(OCC3_MODEL_REQUIRED.into()));
+            }
+            if connection.supports_occ31_textmas() {
+                let echo = connection.set_occ32_enabled(value).await?;
+                if echo["applied"].as_bool() != Some(true) || echo["occ32Enabled"].as_bool() != Some(value) {
+                    return Err("Host did not confirm the requested OCC3.2 preference".into());
+                }
+                let panel = status_with_optional_observations(&payload,
+                    read_occ3_preference_native(connection).await,
+                    textmas_status(connection).await, None)?;
+                return Ok(CommandOutput::TransientStatus(format!("OCC3.2 preference saved: {}.\n{panel}\nOCC3.1 and OCC-2 are unchanged. This is configuration, not a completed-use receipt.", if value { "ON" } else { "OFF" })));
+            }
+            // Historical local path is unverified for an older/foreign daemon.
+            // Never report that its host preference changed from this write.
+            let session_file = state.session_file.as_deref().ok_or("This chat has no saved session identity")?;
+            crate::core::occ::session_settings::save_latent(session_file, value)?;
+            Ok(CommandOutput::Warning("Saved only the client-local OCC3.2 preference. This older daemon lacks host-owned controls; its effective preference is unverified and may be unchanged. Update to v0.1.45 or later for authoritative controls. OCC3.1 and OCC-2 are unchanged.".into()))
+        }
         Choice::Set(value) => write_preference(connection, &route, value).await,
-        _ => unreachable!("menu, status and OCC-3 handled above"),
+        _ => unreachable!("menu/status handled above"),
     }
 }
+
+#[cfg(test)]
+#[path = "occ_control_status_tests.rs"]
+mod optional_status_tests;
 
 #[cfg(test)]
 mod tests {
@@ -612,12 +690,23 @@ mod tests {
         for args in ["1 off", "2 maybe", "2 on off"] {
             assert!(parse(args).is_err());
         }
-        for args in ["3 on", "occ3 on"] {
+        for args in ["3.2 on", "occ3 on"] {
             assert_eq!(parse(args).unwrap(), Choice::SetOcc3(true));
         }
-        for args in ["3 off", "occ3 off", "3", "occ3"] {
+        for args in ["3.2 off", "occ3 off"] {
             assert_eq!(parse(args).unwrap(), Choice::SetOcc3(false));
         }
+        for args in ["3", "3.1"] { assert_eq!(parse(args).unwrap(), Choice::TextMasMenu); }
+        for args in ["3.2", "occ3"] { assert_eq!(parse(args).unwrap(), Choice::Status); }
+        for prefix in ["3", "3.1"] {
+            assert_eq!(parse(&format!("{prefix} off")).unwrap(), Choice::SetTextMas(TextMasMode::Off));
+            assert_eq!(parse(&format!("{prefix} sequential")).unwrap(), Choice::SetTextMas(TextMasMode::Sequential));
+            for spelling in ["hierarchical", "hierarchal", "hiearical"] {
+                assert_eq!(parse(&format!("{prefix} {spelling}")).unwrap(), Choice::SetTextMas(TextMasMode::Hierarchical));
+            }
+            assert!(parse(&format!("{prefix} on")).unwrap_err().contains("/occ 3.2 on"));
+        }
+        for args in ["3 maybe", "3.2 sequential", "3.1 hierarchical off"] { assert!(parse(args).is_err()); }
     }
 
     #[test]
@@ -734,6 +823,7 @@ mod tests {
                 occ2_enabled: enabled,
                 occ3_enabled: false,
                 source_session_id: Some("chat".into()),
+                occ3_source_session_id: None,
             }), enabled);
         }
     }
@@ -744,11 +834,14 @@ mod tests {
         // channel) from a merely-saved chat preference (ON) and an explicit
         // opt-out (OFF).
         let preferred = status_occ3_native(true, true, true);
-        assert!(preferred.contains("OCC-3: PREFERRED (live native enrollment"));
+        assert!(preferred.contains("OCC3.2: PREFERRED (live native enrollment"));
         assert!(preferred.contains("occ3_handoff is the preferred path for compatible family fact exchange"));
         // Without liveness the old wording is preserved exactly.
         assert_eq!(status_occ3_native(true, true, false), status_occ3(true, true));
-        assert!(status_occ3_native(true, false, false).contains("OCC-3: OFF"));
+        assert!(status_occ3_native(true, false, false).contains("OCC3.2: OFF"));
+        // A stale live enrollment must never defeat an explicit OFF preference.
+        assert!(status_occ3_native(true, false, true).contains("OCC3.2: OFF"));
+        assert!(!status_occ3_native(true, false, true).contains("OCC3.2: PREFERRED"));
     }
 
     #[test]
@@ -789,7 +882,7 @@ mod tests {
         };
         let panel = status_of(&own, true, Some(&queue)).unwrap();
         assert!(panel.contains("OCC-2: ON"));
-        assert!(panel.contains("OCC-3: ON"));
+        assert!(panel.contains("OCC3.2: ON"));
         assert!(panel.contains("An explicit chat preference gates native actions dynamically"));
         assert!(!panel.contains("Inherited from chat"));
         // Count line uses the full pending total, not the bounded list.
@@ -819,7 +912,7 @@ mod tests {
         let inherited = serde_json::json!({"occ2Enabled": true, "inherited": true, "sourceSessionId": "parent-7"});
         let panel = status_of(&inherited, false, None).unwrap();
         assert!(panel.contains("OCC-2: ON"));
-        assert!(panel.contains("OCC-3: OFF"));
+        assert!(panel.contains("OCC3.2: OFF"));
         assert!(panel.contains("Inherited from chat parent-7"));
         // A host response without the toggle is an error, never a silent value.
         assert!(status_of(&serde_json::json!({}), false, None).is_err());
@@ -831,6 +924,9 @@ mod tests {
         assert_eq!(menu_choice(MENU_CHOICES[1]).unwrap(), Choice::Set(true));
         assert_eq!(menu_choice(MENU_CHOICES[2]).unwrap(), Choice::SetOcc3(true));
         assert_eq!(menu_choice(MENU_CHOICES[3]).unwrap(), Choice::SetOcc3(false));
+        assert_eq!(menu_choice(MENU_CHOICES[4]).unwrap(), Choice::SetTextMas(TextMasMode::Off));
+        assert_eq!(menu_choice(MENU_CHOICES[5]).unwrap(), Choice::SetTextMas(TextMasMode::Sequential));
+        assert_eq!(menu_choice(MENU_CHOICES[6]).unwrap(), Choice::SetTextMas(TextMasMode::Hierarchical));
         assert!(menu_choice("unknown").is_err());
     }
 
@@ -841,7 +937,7 @@ mod tests {
         assert!(!model_supports_occ3(None));
         let mut model = Model {
             id: "glm-5.3".into(),
-            name: "GLM-5.3 - DGX MTP (OCC-3)".into(),
+            name: "GLM-5.3 - DGX MTP (OCC3.2)".into(),
             ..Default::default()
         };
         // Even the expected display name cannot opt an ordinary model in.
@@ -892,7 +988,7 @@ mod tests {
             method: None,
             artifact_digest: None,
         });
-        // No model, or a model without OCC-3: the "unavailable" line covers
+        // No model, or a model without OCC3.2: the "unavailable" line covers
         // it, so there is no settings decline to report.
         assert_eq!(occ3_settings_decline(None, false, false, None), None);
         assert_eq!(occ3_settings_decline(Some(&ordinary), false, false, None), None);
